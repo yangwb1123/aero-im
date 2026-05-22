@@ -13,5 +13,7 @@ data/
 .sqlx/
 secrets/
 config.toml
+__pycache__/
+*.pyc
 
 
