@@ -56,7 +56,9 @@ pub fn build(state: AppState) -> Router {
         .route("/whep/:stream_id", post(whep_post))
         // Agents (Bot/Agent participants)
         .route("/api/agents", post(create_agent))
+        .route("/api/participants", get(search_participants))
         .route("/api/participants/:id", get(get_participant))
+        .route("/api/rooms/:id/members/list", get(list_room_members))
         // MLS E2E (server is opaque relay; clients run openmls)
         .route("/api/mls/key-packages", post(mls_publish_kp))
         .route("/api/mls/key-packages/:participant", get(mls_consume_kp))
@@ -318,15 +320,39 @@ async fn room_search(
     let limit = req.limit.unwrap_or(20);
     let mode = req.mode.as_deref().unwrap_or("auto");
 
-    let hits = match mode {
-        "vector" if s.ai.is_some() => {
-            // Embed via AI service. Fallback to FTS if no AI.
-            // Note: we can't call embed_text on the AiBackend trait directly here.
-            // For now use FTS — vector search is wired via the AI worker when it
-            // returns embedded query through `ai_jobs`. Keep client-facing fallback simple.
-            s.messages.search_fts(room, &req.query, limit).await.map_err(AeroError::from)?
+    let hits = match (mode, &s.ai) {
+        ("vector", Some(ai)) => {
+            let embedding = ai
+                .embed_text(&req.query)
+                .await
+                .map_err(|e| AeroError::Upstream(format!("ai embed: {e}")))?;
+            s.messages
+                .search_vector(room, embedding, limit)
+                .await
+                .map_err(AeroError::from)?
         }
-        _ => s.messages.search_fts(room, &req.query, limit).await.map_err(AeroError::from)?,
+        ("hybrid", Some(ai)) => {
+            // FTS + vector fused with simple max-score merge.
+            let mut fts = s
+                .messages
+                .search_fts(room, &req.query, limit)
+                .await
+                .map_err(AeroError::from)?;
+            if let Ok(embedding) = ai.embed_text(&req.query).await {
+                let vec_hits = s
+                    .messages
+                    .search_vector(room, embedding, limit)
+                    .await
+                    .map_err(AeroError::from)?;
+                fts = merge_hits(fts, vec_hits, limit);
+            }
+            fts
+        }
+        _ => s
+            .messages
+            .search_fts(room, &req.query, limit)
+            .await
+            .map_err(AeroError::from)?,
     };
 
     Ok(Json(serde_json::json!({
@@ -625,6 +651,43 @@ async fn get_participant(
     Ok(Json(serde_json::to_value(p).map_err(AeroError::from)?))
 }
 
+#[derive(Deserialize)]
+struct ParticipantSearchQuery {
+    q: String,
+    #[serde(default)]
+    limit: Option<i64>,
+}
+
+async fn search_participants(
+    State(s): State<AppState>,
+    _auth: AuthUser,
+    Query(p): Query<ParticipantSearchQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let limit = p.limit.unwrap_or(20);
+    let list = s.participants.search(&p.q, limit).await.map_err(AeroError::from)?;
+    Ok(Json(serde_json::to_value(list).map_err(AeroError::from)?))
+}
+
+async fn list_room_members(
+    State(s): State<AppState>,
+    auth: AuthUser,
+    Path(room_str): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let room = parse_room_id(&room_str)?;
+    if !s.rooms.is_member(room, auth.participant_id).await.map_err(AeroError::from)? {
+        return Err(AeroError::Forbidden("not a room member".into()).into());
+    }
+    let ids = s.rooms.members(room).await.map_err(AeroError::from)?;
+    // Resolve to full Participant objects.
+    let mut out = Vec::with_capacity(ids.len());
+    for pid in ids {
+        if let Ok(Some(p)) = s.participants.get(pid).await {
+            out.push(p);
+        }
+    }
+    Ok(Json(serde_json::to_value(out).map_err(AeroError::from)?))
+}
+
 // ----- MLS (P8) — opaque-bytes relay -----
 
 #[derive(Deserialize)]
@@ -856,6 +919,31 @@ fn parse_room_kind(s: &str) -> AeroResult<RoomKind> {
         "channel" => Ok(RoomKind::Channel),
         _ => Err(AeroError::Invalid(format!("unknown room kind: {s}"))),
     }
+}
+
+/// Merge two SearchHit lists (FTS + vector). Dedupes by message id, takes the
+/// max score per id, returns top `limit` ordered by score desc.
+fn merge_hits(
+    a: Vec<aero_storage::SearchHit>,
+    b: Vec<aero_storage::SearchHit>,
+    limit: i64,
+) -> Vec<aero_storage::SearchHit> {
+    use std::collections::HashMap;
+    let mut best: HashMap<MessageId, aero_storage::SearchHit> = HashMap::new();
+    for h in a.into_iter().chain(b.into_iter()) {
+        let id = h.message.id;
+        match best.get(&id) {
+            Some(existing) if existing.score >= h.score => {}
+            _ => {
+                best.insert(id, h);
+            }
+        }
+    }
+    let mut out: Vec<_> = best.into_values().collect();
+    out.sort_by(|x, y| y.score.partial_cmp(&x.score).unwrap_or(std::cmp::Ordering::Equal));
+    let limit = limit.clamp(1, 100) as usize;
+    out.truncate(limit);
+    out
 }
 
 fn parse_room_id(s: &str) -> AeroResult<RoomId> {

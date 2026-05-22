@@ -157,4 +157,16 @@ export const api = {
   rtcConfig() {
     return request('GET', '/api/rtc/config');
   },
+  getParticipant(id) {
+    return request('GET', `/api/participants/${encodeURIComponent(id)}`);
+  },
+  searchParticipants(q, limit = 20) {
+    return request('GET', '/api/participants', { query: { q, limit } });
+  },
+  listRoomMembers(roomId) {
+    return request('GET', `/api/rooms/${encodeURIComponent(roomId)}/members/list`);
+  },
+  createAgent({ display_name, kind = 'bot', avatar_url } = {}) {
+    return request('POST', '/api/agents', { body: { display_name, kind, avatar_url } });
+  },
 };

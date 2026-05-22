@@ -837,6 +837,71 @@ input, textarea, select, button { font-family: inherit; }
   margin-left: 6px;
 }
 
+/* mention picker */
+.mention-pop {
+  position: fixed;
+  background: var(--bg-1);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  box-shadow: 0 10px 24px rgba(0,0,0,.45);
+  display: flex;
+  flex-direction: column;
+  z-index: 90;
+  width: 280px;
+  padding: 4px;
+}
+.mention-item {
+  appearance: none;
+  background: transparent;
+  border: 0;
+  display: flex; align-items: center; gap: 8px;
+  width: 100%;
+  padding: 6px 8px;
+  border-radius: 6px;
+  text-align: left;
+  font-size: 13px;
+  color: var(--text);
+  cursor: pointer;
+}
+.mention-item.active, .mention-item:hover { background: var(--bg-3); }
+.mention-avatar {
+  display: inline-grid; place-items: center;
+  width: 22px; height: 22px;
+  border-radius: 5px;
+  font-size: 10px;
+  color: #fff;
+  font-weight: 600;
+}
+.mention-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mention-kind { color: var(--text-mute); font-size: 11px; }
+
+/* read receipts strip */
+.msg .read-strip {
+  margin-top: 2px;
+  display: flex;
+  gap: 4px;
+  justify-content: flex-end;
+}
+.msg .read-strip .read-avatar {
+  width: 14px; height: 14px;
+  border-radius: 50%;
+  font-size: 9px;
+  display: grid; place-items: center;
+  color: #fff;
+  font-weight: 600;
+}
+
+/* flash highlight when scrolled to from search/cite */
+.msg.flash { animation: flash 1s ease-out; }
+@keyframes flash { 0% { background: rgba(99,102,241,.16); } 100% { background: transparent; } }
+
+/* dragover state */
+.msg-scroll.drop-active {
+  outline: 2px dashed var(--brand-1);
+  outline-offset: -8px;
+  background: rgba(99,102,241,.04);
+}
+
 /* responsive — collapse right pane on narrow */
 @media (max-width: 900px) {
   .view-chat { grid-template-columns: 220px 1fr; }

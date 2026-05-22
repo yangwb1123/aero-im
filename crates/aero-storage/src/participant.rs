@@ -126,6 +126,51 @@ impl ParticipantRepo {
         })
     }
 
+    /// Substring search over display_name + credentials.email. Returns up to
+    /// `limit` participants ordered by display_name. Excludes soft-removed rows.
+    pub async fn search(
+        &self,
+        query: &str,
+        limit: i64,
+    ) -> Result<Vec<Participant>, sqlx::Error> {
+        let q = query.trim();
+        if q.is_empty() {
+            return Ok(Vec::new());
+        }
+        let pattern = format!("%{}%", q.replace('%', "\\%"));
+        let limit = limit.clamp(1, 50);
+        let rows = sqlx::query_as::<_, (uuid::Uuid, String, String, Option<String>, Option<uuid::Uuid>, time::OffsetDateTime)>(
+            r#"SELECT DISTINCT p.id, p.kind, p.display_name, p.avatar_url, p.created_by, p.created_at
+               FROM participants p
+               LEFT JOIN credentials c ON c.participant_id = p.id
+               WHERE p.display_name ILIKE $1 OR c.email ILIKE $1
+               ORDER BY p.display_name ASC
+               LIMIT $2"#,
+        )
+        .bind(&pattern)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, kind, name, avatar, creator, at)| {
+                let kind = match kind.as_str() {
+                    "human" => ParticipantKind::Human,
+                    "agent" => ParticipantKind::Agent,
+                    _ => ParticipantKind::Bot,
+                };
+                Participant {
+                    id: ParticipantId::from_uuid(id),
+                    kind,
+                    display_name: name,
+                    avatar_url: avatar,
+                    created_by: creator.map(ParticipantId::from_uuid),
+                    created_at: at,
+                }
+            })
+            .collect())
+    }
+
     pub async fn list_bots_in_room(
         &self,
         room: aero_common::RoomId,

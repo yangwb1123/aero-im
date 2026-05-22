@@ -309,8 +309,44 @@ function handleReadReceipt(f) {
   const map = state.receiptsByRoom.get(room_id) || new Map();
   map.set(participant, { last_read_message_id: last_message_id, updated_at: at });
   state.receiptsByRoom.set(room_id, map);
-  // Visual: nothing fancy here yet — could overlay a small avatar strip on own messages.
-  // Skip in P2 to keep DOM churn low.
+  if (room_id === state.currentRoomId) refreshReadStrips();
+}
+
+// Render a tiny avatar strip under each of my messages showing who's read up to it.
+function refreshReadStrips() {
+  const roomId = state.currentRoomId;
+  if (!roomId || !state.me) return;
+  const myPid = state.me.id;
+  const recmap = state.receiptsByRoom.get(roomId) || new Map();
+  // For each message of mine, compute set of other participants whose
+  // last_read_message_id >= this message id.
+  const arr = state.messagesByRoom.get(roomId) || [];
+  for (const m of arr) {
+    if (m.sender_id !== myPid) continue;
+    const node = els.msgList.querySelector('[data-msg-id="' + cssEscape(m.id) + '"]');
+    if (!node) continue;
+    let strip = node.querySelector('.read-strip');
+    if (!strip) {
+      strip = document.createElement('div');
+      strip.className = 'read-strip';
+      node.querySelector('.msg-body').appendChild(strip);
+    }
+    strip.replaceChildren();
+    const readers = [];
+    for (const [pid, r] of recmap.entries()) {
+      if (pid === myPid) continue;
+      if (r.last_read_message_id >= m.id) readers.push(pid);
+    }
+    for (const pid of readers.slice(0, 5)) {
+      const p = state.participants.get(pid);
+      const a = document.createElement('span');
+      a.className = 'read-avatar';
+      a.setAttribute('style', avatarStyleFromId(pid));
+      a.textContent = (p?.display_name || '?')[0];
+      a.title = p?.display_name || pid.slice(0, 6);
+      strip.appendChild(a);
+    }
+  }
 }
 
 function handleTyping(f) {
@@ -416,7 +452,10 @@ async function switchRoom(roomId) {
     const map = new Map();
     for (const r of rs || []) map.set(r.participant_id, r);
     state.receiptsByRoom.set(roomId, map);
+    refreshReadStrips();
   }).catch(() => {});
+  // Restore AI conversation history from sessionStorage for this room.
+  restoreAiHistory(roomId);
 }
 
 async function loadHistory(roomId, { initial = false } = {}) {
@@ -477,8 +516,8 @@ function rerenderCurrentRoom() {
   for (const [, p] of state.pendingByTempId)
     if (p.room_id === roomId) els.msgList.appendChild(renderMsgWithReactions(p, { pending: true }));
   els.msgEmpty.hidden = arr.length > 0 || state.pendingByTempId.size > 0;
-  // refresh reactions
   for (const m of arr) refreshReactionsFor(m.id);
+  refreshReadStrips();
 }
 
 function renderMsgWithReactions(m, opts = {}) {
@@ -567,9 +606,20 @@ els.composerInput.addEventListener('input', () => {
   els.composerSend.disabled = !els.composerInput.value.trim();
   autoGrow(els.composerInput);
   sendTypingThrottled(true);
+  maybeShowMentionMenu();
 });
-els.composerInput.addEventListener('blur', () => sendTypingThrottled(false));
+els.composerInput.addEventListener('blur', () => { sendTypingThrottled(false); setTimeout(closeMentionMenu, 120); });
 els.composerInput.addEventListener('keydown', (e) => {
+  if (mentionState.open) {
+    if (e.key === 'ArrowDown') { e.preventDefault(); moveMention(1); return; }
+    if (e.key === 'ArrowUp')   { e.preventDefault(); moveMention(-1); return; }
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      pickMention();
+      return;
+    }
+    if (e.key === 'Escape')    { closeMentionMenu(); return; }
+  }
   if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
     e.preventDefault();
     submitComposer();
@@ -598,10 +648,10 @@ function autoGrow(ta) {
 
 function submitComposer() {
   if (!state.currentRoomId) return;
-  const text = els.composerInput.value.replace(/\s+$/g, '');
-  if (!text.trim()) return;
+  const raw = els.composerInput.value.replace(/\s+$/g, '');
+  if (!raw.trim()) return;
   const roomId = state.currentRoomId;
-  const blocks = [{ type: 'text', content: text }];
+  const blocks = composeBlocksFromInput(raw);
   optimisticAdd(roomId, blocks);
   ws.sendMessage(roomId, blocks, null);
   ws.typing(roomId, false);
@@ -609,6 +659,114 @@ function submitComposer() {
   els.composerInput.value = '';
   els.composerSend.disabled = true;
   autoGrow(els.composerInput);
+  closeMentionMenu();
+}
+
+function composeBlocksFromInput(text) {
+  const blocks = [];
+  const re = /@([0-9A-HJKMNP-TV-Za-hjkmnp-tv-z]{25,26})\b/g;
+  let last = 0;
+  let m;
+  while ((m = re.exec(text))) {
+    if (m.index > last) {
+      const seg = text.slice(last, m.index);
+      if (seg) blocks.push({ type: 'text', content: seg });
+    }
+    blocks.push({ type: 'mention', participant: m[1] });
+    last = m.index + m[0].length;
+  }
+  if (last < text.length) {
+    const seg = text.slice(last);
+    if (seg) blocks.push({ type: 'text', content: seg });
+  }
+  if (!blocks.length) blocks.push({ type: 'text', content: text });
+  return blocks;
+}
+
+const mentionState = { open: false, items: [], index: 0, anchor: 0, pop: null };
+
+async function maybeShowMentionMenu() {
+  const input = els.composerInput;
+  const pos = input.selectionStart || input.value.length;
+  const before = input.value.slice(0, pos);
+  const m = before.match(/(?:^|\s)@([A-Za-z0-9]{0,12})$/);
+  if (!m || !state.currentRoomId) { closeMentionMenu(); return; }
+  const query = m[1];
+  mentionState.anchor = pos - m[0].length;
+  let members = state.roomMembers && state.roomMembers.get && state.roomMembers.get(state.currentRoomId);
+  if (!members) {
+    try {
+      members = await api.listRoomMembers(state.currentRoomId);
+      state.roomMembers = state.roomMembers || new Map();
+      state.roomMembers.set(state.currentRoomId, members);
+      for (const p of members) state.participants.set(p.id, p);
+    } catch { members = []; }
+  }
+  const q = query.toLowerCase();
+  const filtered = (members || [])
+    .filter((p) => (p.display_name || '').toLowerCase().includes(q) || p.id.toLowerCase().includes(q))
+    .slice(0, 8);
+  if (!filtered.length) { closeMentionMenu(); return; }
+  mentionState.items = filtered;
+  mentionState.index = 0;
+  openMentionMenu();
+}
+
+function openMentionMenu() {
+  closeMentionMenu();
+  const pop = document.createElement('div');
+  pop.className = 'mention-pop';
+  for (let i = 0; i < mentionState.items.length; i++) {
+    const p = mentionState.items[i];
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.className = 'mention-item' + (i === mentionState.index ? ' active' : '');
+    const av = document.createElement('span');
+    av.className = 'mention-avatar';
+    av.setAttribute('style', avatarStyleFromId(p.id));
+    av.textContent = (p.display_name || '?')[0];
+    const nm = document.createElement('span');
+    nm.className = 'mention-name';
+    nm.textContent = p.display_name || p.id.slice(0, 8);
+    const kn = document.createElement('span');
+    kn.className = 'mention-kind';
+    kn.textContent = p.kind;
+    b.appendChild(av); b.appendChild(nm); b.appendChild(kn);
+    b.addEventListener('mousedown', (e) => { e.preventDefault(); mentionState.index = i; pickMention(); });
+    pop.appendChild(b);
+  }
+  document.body.appendChild(pop);
+  const r = els.composerInput.getBoundingClientRect();
+  pop.style.bottom = (window.innerHeight - r.top + 6) + 'px';
+  pop.style.left = (r.left + 18) + 'px';
+  mentionState.pop = pop;
+  mentionState.open = true;
+}
+function closeMentionMenu() {
+  if (mentionState.pop && mentionState.pop.parentNode) mentionState.pop.parentNode.removeChild(mentionState.pop);
+  mentionState.pop = null;
+  mentionState.open = false;
+}
+function moveMention(delta) {
+  const n = mentionState.items.length;
+  if (!n) return;
+  mentionState.index = (mentionState.index + delta + n) % n;
+  openMentionMenu();
+}
+function pickMention() {
+  const p = mentionState.items[mentionState.index];
+  if (!p) return;
+  const input = els.composerInput;
+  const cursor = input.selectionStart || input.value.length;
+  const before = input.value.slice(0, cursor);
+  const after = input.value.slice(cursor);
+  const newBefore = before.replace(/@[A-Za-z0-9]{0,12}$/, '@' + p.id + ' ');
+  input.value = newBefore + after;
+  const pos = newBefore.length;
+  input.setSelectionRange(pos, pos);
+  els.composerSend.disabled = !input.value.trim();
+  closeMentionMenu();
+  input.focus();
 }
 
 function optimisticAdd(roomId, blocks) {
@@ -628,11 +786,15 @@ els.btnAttach.addEventListener('click', () => els.fileInput.click());
 els.fileInput.addEventListener('change', async () => {
   const f = els.fileInput.files?.[0];
   if (!f) return;
-  if (!state.currentRoomId) { toast('请先选择房间', 'error'); return; }
   els.fileInput.value = '';
-  toast(`上传 ${f.name}…`, 'info');
+  await uploadAndSend(f);
+});
+
+async function uploadAndSend(file) {
+  if (!state.currentRoomId) { toast('请先选择房间', 'error'); return; }
+  toast(`上传 ${file.name}…`, 'info');
   try {
-    const blob = await api.uploadBlob(f);
+    const blob = await api.uploadBlob(file);
     const block = {
       type: 'file',
       blob_id: blob.id,
@@ -645,6 +807,29 @@ els.fileInput.addEventListener('change', async () => {
   } catch (err) {
     if (err instanceof ApiError && err.status === 401) forceReauth();
     else toast(`上传失败:${err.message}`, 'error');
+  }
+}
+
+// Drag-and-drop file upload into the message area.
+['dragenter', 'dragover'].forEach((evt) => {
+  els.msgScroll.addEventListener(evt, (e) => {
+    if (!e.dataTransfer || !Array.from(e.dataTransfer.types || []).includes('Files')) return;
+    e.preventDefault();
+    els.msgScroll.classList.add('drop-active');
+  });
+});
+['dragleave', 'dragend'].forEach((evt) => {
+  els.msgScroll.addEventListener(evt, () => els.msgScroll.classList.remove('drop-active'));
+});
+els.msgScroll.addEventListener('drop', async (e) => {
+  if (!e.dataTransfer) return;
+  e.preventDefault();
+  els.msgScroll.classList.remove('drop-active');
+  const files = Array.from(e.dataTransfer.files || []);
+  for (const f of files) {
+    // serial to keep order
+    // eslint-disable-next-line no-await-in-loop
+    await uploadAndSend(f);
   }
 });
 
@@ -801,6 +986,47 @@ function appendAiMessage(q, a, citations = []) {
   }
   els.aiResults.appendChild(wrap);
   els.aiResults.scrollTop = els.aiResults.scrollHeight;
+  saveAiHistory(state.currentRoomId, { q, a, citations });
+}
+
+function aiStoreKey(roomId) { return 'aero_ai_history:' + roomId; }
+function saveAiHistory(roomId, entry) {
+  if (!roomId) return;
+  try {
+    const k = aiStoreKey(roomId);
+    const raw = sessionStorage.getItem(k);
+    const arr = raw ? JSON.parse(raw) : [];
+    arr.push({ ...entry, ts: Date.now() });
+    if (arr.length > 50) arr.shift();
+    sessionStorage.setItem(k, JSON.stringify(arr));
+  } catch (e) { /* quota; ignore */ }
+}
+function restoreAiHistory(roomId) {
+  els.aiResults.replaceChildren();
+  if (!roomId) return;
+  try {
+    const k = aiStoreKey(roomId);
+    const raw = sessionStorage.getItem(k);
+    if (!raw) return;
+    const arr = JSON.parse(raw);
+    for (const e of arr) {
+      const wrap = document.createElement('div'); wrap.className = 'ai-message';
+      const qEl = document.createElement('div'); qEl.className = 'ai-q'; qEl.textContent = e.q;
+      const aEl = document.createElement('div'); aEl.className = 'ai-a'; aEl.textContent = e.a;
+      wrap.appendChild(qEl); wrap.appendChild(aEl);
+      if (Array.isArray(e.citations) && e.citations.length) {
+        const row = document.createElement('div');
+        for (const c of e.citations) {
+          const chip = document.createElement('span'); chip.className = 'ai-cite';
+          chip.textContent = '↗ ' + String(c).slice(0, 6);
+          chip.addEventListener('click', () => { els.drawerAi.hidden = true; scrollToMessage(c); });
+          row.appendChild(chip);
+        }
+        wrap.appendChild(row);
+      }
+      els.aiResults.appendChild(wrap);
+    }
+  } catch (err) { /* ignore */ }
 }
 
 function scrollToMessage(id) {

@@ -46,4 +46,8 @@ impl AiBackend for AiServiceAdapter {
             citations: result.citations.into_iter().collect::<Vec<MessageId>>(),
         })
     }
+
+    async fn embed_text(&self, text: &str) -> Result<Vec<f32>, String> {
+        self.inner.embed_text(text).await.map_err(|e| e.to_string())
+    }
 }

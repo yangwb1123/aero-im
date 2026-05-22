@@ -30,6 +30,10 @@ pub trait AiBackend: Send + Sync + 'static {
         question: &str,
         k: usize,
     ) -> Result<AiAnswer, String>;
+    /// Compute an embedding for the given text. Used by the search route's
+    /// `mode=vector` path. Falls back to a deterministic local hash embedder
+    /// when no remote API key is configured.
+    async fn embed_text(&self, text: &str) -> Result<Vec<f32>, String>;
 }
 
 #[derive(Debug, Clone)]
