@@ -6,6 +6,10 @@
 //! passthrough placeholder mode, whatever the RTMP encoder gave us) and we
 //! manage the manifest math.
 
+pub mod ts;
+
+pub use ts::{empty_ts_segment, FlvToTsConverter, MuxError};
+
 use std::path::{Path, PathBuf};
 
 use bytes::Bytes;

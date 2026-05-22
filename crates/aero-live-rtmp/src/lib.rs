@@ -14,35 +14,31 @@
 //!    `SEGMENT_DURATION_SECS`.
 //! 5. On disconnect or fatal protocol error, mark the row `ended`.
 //!
-//! ## Muxing strategy: passthrough placeholder
+//! ## Muxing strategy: real MPEG-TS (since P9.4)
 //!
-//! `rml_rtmp` exposes audio and video payloads as raw FLV tag bodies (H.264
-//! AVCC / AAC raw, prefixed with the FLV codec/keyframe byte and a 3-byte
-//! composition-time offset). Re-multiplexing those into proper MPEG-TS would
-//! require a full TS muxer plus an Annex-B converter — both are out of scope
-//! for the P4 spike.
+//! Each video/audio FLV tag body is fed through [`FlvToTsConverter`]
+//! (in `aero-live-hls`), which:
+//! 1. Extracts SPS/PPS from the first AVCDecoderConfigurationRecord and
+//!    AAC AudioSpecificConfig.
+//! 2. Converts AVCC NALUs → Annex-B (with AUD + SPS/PPS prepended on each
+//!    keyframe), AAC raw → ADTS frames.
+//! 3. Wraps access units in PES packets with 90 kHz PTS/DTS.
+//! 4. Slices PES into 188-byte TS packets at PID 0x100/0x101.
+//! 5. Drains a segment with a fresh PAT + PMT prefix.
 //!
-//! Per the task instructions this crate ships the **passthrough placeholder**
-//! path: each ~2-second window is concatenated as `[u32be tag_size][tag bytes]`
-//! pairs and written verbatim into `{stream_id}/{index}.ts`. A browser HLS
-//! player **will not** play these segments back as-is — that's by design. The
-//! purpose is to verify the end-to-end ingest plumbing (handshake → DB flip →
-//! HLS manifest → file rotation) without depending on a heavy mux library.
-//! Real TS muxing is a follow-up.
-//!
-//! Operators see this warning loudly at every publish start:
-//! `"emitting passthrough placeholder segments — browsers cannot play these"`.
+//! Browser HLS players (Safari natively, hls.js elsewhere) can decode the
+//! output directly. The placeholder warning emitted in earlier versions has
+//! been removed.
 
-use std::collections::VecDeque;
 use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aero_live_core::{hls_path_for, hls_url_for, LiveError, LiveIngest, LiveResult, LiveStreamConfig};
-use aero_live_hls::{HlsWriter, DEFAULT_SEGMENT_EXT};
+use aero_live_hls::{FlvToTsConverter, HlsWriter, DEFAULT_SEGMENT_EXT};
 use aero_storage::StreamRepo;
 use async_trait::async_trait;
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::Bytes;
 use rml_rtmp::handshake::{Handshake, HandshakeProcessResult, PeerType};
 use rml_rtmp::sessions::{
     ServerSession, ServerSessionConfig, ServerSessionEvent, ServerSessionResult,
@@ -66,7 +62,7 @@ const SOCKET_READ_BUF: usize = 8 * 1024;
 /// net: 32 MiB is well above 2s of broadcast video at any sane bitrate.
 const MAX_SEGMENT_BUFFER_BYTES: usize = 32 * 1024 * 1024;
 
-/// FLV tag types used by the placeholder muxer. Matches the values RTMP uses
+/// FLV tag types used by the TS muxer. Matches the values RTMP uses
 /// directly so we can mirror them when dropping payloads onto disk.
 const FLV_TAG_AUDIO: u8 = 0x08;
 const FLV_TAG_VIDEO: u8 = 0x09;
@@ -303,15 +299,12 @@ async fn process_results(
                                         "hls writer init: {e}"
                                     ))
                                 })?
-                                // Keep `.ts` extension even in placeholder mode so the manifest
-                                // entries look right; players still won't play these, but
-                                // operators expect the file extension regardless.
                                 .with_segment_ext(DEFAULT_SEGMENT_EXT);
 
-                            warn!(
+                            info!(
                                 stream_id = %stream.id,
                                 stream_key = %stream_key,
-                                "emitting passthrough placeholder segments — browsers cannot play these"
+                                "RTMP publisher accepted; emitting MPEG-TS segments"
                             );
 
                             let more = session
@@ -398,10 +391,11 @@ async fn run_publish_loop(
     let (tx, mut rx) = mpsc::channel::<MediaChunk>(1024);
 
     let segmenter = tokio::spawn(async move {
-        let mut buffer: VecDeque<MediaChunk> = VecDeque::new();
+        let mut mux = FlvToTsConverter::new();
         let mut buffer_bytes: usize = 0;
         let mut segment_start = Instant::now();
         let mut ticker = interval(Duration::from_millis(250));
+        info!(%stream_id, "TS muxer started; segment duration={}s", SEGMENT_DURATION_SECS);
         loop {
             tokio::select! {
                 maybe = rx.recv() => {
@@ -410,18 +404,25 @@ async fn run_publish_loop(
                             buffer_bytes = buffer_bytes.saturating_add(chunk.data.len());
                             if buffer_bytes > MAX_SEGMENT_BUFFER_BYTES {
                                 warn!(buffer_bytes, "RTMP segment buffer overflow — dropping current window");
-                                buffer.clear();
+                                mux = FlvToTsConverter::new();
                                 buffer_bytes = 0;
                                 segment_start = Instant::now();
                                 continue;
                             }
-                            buffer.push_back(chunk);
+                            let res = match chunk.kind {
+                                FLV_TAG_VIDEO => mux.push_video_tag(&chunk.data, chunk.timestamp_ms),
+                                FLV_TAG_AUDIO => mux.push_audio_tag(&chunk.data, chunk.timestamp_ms),
+                                _ => Ok(()),
+                            };
+                            if let Err(e) = res {
+                                warn!(error = ?e, "TS muxer dropped a tag");
+                            }
                         }
                         None => {
                             // Sender dropped — flush whatever remains and exit.
-                            if !buffer.is_empty() {
+                            if mux.has_segment_data() {
                                 let elapsed = segment_start.elapsed().as_secs_f32().max(0.001);
-                                flush_segment(&mut hls, &mut buffer, elapsed).await;
+                                flush_ts_segment(&mut hls, &mut mux, elapsed).await;
                             }
                             if let Err(e) = hls.finish().await {
                                 warn!(error = %e, %stream_id, "hls finish failed");
@@ -432,10 +433,10 @@ async fn run_publish_loop(
                 }
                 _ = ticker.tick() => {
                     if segment_start.elapsed() >= Duration::from_secs(SEGMENT_DURATION_SECS)
-                        && !buffer.is_empty()
+                        && mux.has_segment_data()
                     {
                         let elapsed = segment_start.elapsed().as_secs_f32();
-                        flush_segment(&mut hls, &mut buffer, elapsed).await;
+                        flush_ts_segment(&mut hls, &mut mux, elapsed).await;
                         buffer_bytes = 0;
                         segment_start = Instant::now();
                     }
@@ -531,32 +532,21 @@ struct MediaChunk {
     data: Bytes,
 }
 
-/// Concatenate all queued chunks into a single "segment" blob and hand it to
-/// the HLS writer. In placeholder mode we prefix each chunk with a small
-/// header so a future debugging tool can pick the stream apart.
-async fn flush_segment(
+/// Drain the converter's pending TS bytes (prepending PAT+PMT) and hand them
+/// to the HLS writer. The converter keeps codec config + saw_first_keyframe
+/// state across segments so subsequent calls remain valid TS.
+async fn flush_ts_segment(
     hls: &mut HlsWriter,
-    buffer: &mut VecDeque<MediaChunk>,
+    mux: &mut FlvToTsConverter,
     duration_secs: f32,
 ) {
-    if buffer.is_empty() {
+    if !mux.has_segment_data() {
         return;
     }
-    let approx_size: usize = buffer.iter().map(|c| c.data.len() + 9).sum();
-    let mut blob = BytesMut::with_capacity(approx_size);
-    for chunk in buffer.drain(..) {
-        // [tag_kind:u8][timestamp:u32][payload_len:u32][payload...]
-        blob.put_u8(chunk.kind);
-        blob.put_u32(chunk.timestamp_ms);
-        // Length-prefix so a downstream tool can split chunks back out.
-        let len = u32::try_from(chunk.data.len()).unwrap_or(u32::MAX);
-        blob.put_u32(len);
-        blob.put_slice(&chunk.data);
-    }
-    let frozen = blob.freeze();
-    match hls.push_segment(frozen, duration_secs).await {
-        Ok(path) => debug!(?path, duration_secs, "wrote placeholder segment"),
-        Err(e) => warn!(error = %e, "failed to write placeholder segment"),
+    let bytes = mux.drain_segment();
+    match hls.push_segment(bytes, duration_secs).await {
+        Ok(path) => debug!(?path, duration_secs, "wrote TS segment"),
+        Err(e) => warn!(error = %e, "failed to write TS segment"),
     }
 }
 
