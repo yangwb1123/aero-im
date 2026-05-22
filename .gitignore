@@ -1,0 +1,13 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+.env
+.env.local
+.idea/
+.vscode/
+*.log
+node_modules/
+dist/
+.DS_Store
+data/
+.sqlx/
