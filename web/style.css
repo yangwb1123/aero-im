@@ -625,6 +625,16 @@ input, textarea, select, button { font-family: inherit; }
   transition: background .12s ease, color .12s ease;
 }
 .composer-aux button:hover { color: var(--text); background: var(--bg-3); }
+.composer-aux button.recording {
+  background: rgba(239, 68, 68, .18);
+  color: var(--danger);
+  border-color: var(--danger);
+  animation: pulse 1.2s infinite;
+}
+@keyframes pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, .35); }
+  50%      { box-shadow: 0 0 0 6px rgba(239, 68, 68, .0); }
+}
 
 /* typing indicator */
 .typing-bar {

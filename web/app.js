@@ -926,6 +926,90 @@ async function uploadAndSend(file) {
   }
 }
 
+// ---------- voice recording ----------
+const btnVoice = document.getElementById('btn-voice');
+const voiceState = { rec: null, chunks: [], started: 0, stream: null };
+if (btnVoice) {
+  btnVoice.addEventListener('click', toggleRecording);
+}
+
+async function toggleRecording() {
+  if (voiceState.rec) {
+    stopRecording();
+    return;
+  }
+  if (!state.currentRoomId) { toast('请先选择房间', 'error'); return; }
+  if (!navigator.mediaDevices || !window.MediaRecorder) {
+    toast('浏览器不支持录音', 'error'); return;
+  }
+  try {
+    voiceState.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const mime = MediaRecorder.isTypeSupported('audio/webm;codecs=opus') ? 'audio/webm;codecs=opus' : '';
+    voiceState.rec = mime ? new MediaRecorder(voiceState.stream, { mimeType: mime }) : new MediaRecorder(voiceState.stream);
+    voiceState.chunks = [];
+    voiceState.started = Date.now();
+    voiceState.rec.addEventListener('dataavailable', (e) => {
+      if (e.data && e.data.size > 0) voiceState.chunks.push(e.data);
+    });
+    voiceState.rec.addEventListener('stop', onVoiceStop);
+    voiceState.rec.start(250);
+    btnVoice.classList.add('recording');
+    btnVoice.textContent = '⏹';
+    btnVoice.title = '点击停止';
+    toast('录音中…', 'info');
+  } catch (err) {
+    toast(`录音失败:${err.message}`, 'error');
+    cleanupVoice();
+  }
+}
+
+function stopRecording() {
+  if (voiceState.rec && voiceState.rec.state !== 'inactive') {
+    voiceState.rec.stop();
+  }
+}
+
+async function onVoiceStop() {
+  const durationMs = Date.now() - voiceState.started;
+  const blob = new Blob(voiceState.chunks, { type: voiceState.rec?.mimeType || 'audio/webm' });
+  cleanupVoice();
+  if (blob.size < 200) {
+    toast('录音太短', 'error');
+    return;
+  }
+  if (!state.currentRoomId) return;
+  toast('上传录音…', 'info');
+  try {
+    const file = new File([blob], `voice-${Date.now()}.webm`, { type: blob.type });
+    const meta = await api.uploadBlob(file);
+    const voiceBlock = {
+      type: 'voice',
+      blob_id: meta.id,
+      duration_ms: durationMs,
+    };
+    optimisticAdd(state.currentRoomId, [voiceBlock]);
+    ws.sendMessage(state.currentRoomId, [voiceBlock], state.replyTo ? state.replyTo.id : null);
+    clearReply();
+  } catch (err) {
+    if (err instanceof ApiError && err.status === 401) forceReauth();
+    else toast(`上传失败:${err.message}`, 'error');
+  }
+}
+
+function cleanupVoice() {
+  if (voiceState.stream) {
+    for (const t of voiceState.stream.getTracks()) t.stop();
+  }
+  voiceState.rec = null;
+  voiceState.chunks = [];
+  voiceState.stream = null;
+  if (btnVoice) {
+    btnVoice.classList.remove('recording');
+    btnVoice.textContent = '🎙';
+    btnVoice.title = '按住录音 / 点击开始';
+  }
+}
+
 // Drag-and-drop file upload into the message area.
 ['dragenter', 'dragover'].forEach((evt) => {
   els.msgScroll.addEventListener(evt, (e) => {
