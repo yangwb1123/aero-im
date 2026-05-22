@@ -37,4 +37,10 @@ impl PresenceStore {
         let _: () = self.client.del(&key).await?;
         Ok(())
     }
+
+    /// Cheap connectivity probe.
+    pub async fn ping(&self) -> anyhow::Result<()> {
+        let _: Option<String> = self.client.get("__aero_health").await?;
+        Ok(())
+    }
 }

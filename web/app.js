@@ -87,6 +87,8 @@ const els = {
   formNewRoom: $('#form-new-room'),
   modalAddMember: $('#modal-add-member'),
   formAddMember: $('#form-add-member'),
+  modalProfile: $('#modal-profile'),
+  formProfile: $('#form-profile'),
 
   drawerSearch: $('#drawer-search'),
   searchInput: $('#search-input'),
@@ -1033,6 +1035,35 @@ els.msgScroll.addEventListener('drop', async (e) => {
   }
 });
 
+// ---------- profile editing ----------
+els.meAvatar.addEventListener('click', () => {
+  if (!state.me) return;
+  els.formProfile.querySelector('[name="display_name"]').value = state.me.display_name || '';
+  els.formProfile.querySelector('[name="avatar_url"]').value = state.me.avatar_url || '';
+  openModal(els.modalProfile);
+});
+els.formProfile.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const fd = new FormData(els.formProfile);
+  const display_name = String(fd.get('display_name') || '').trim();
+  const avatar_url_raw = String(fd.get('avatar_url') || '').trim();
+  if (!display_name) { toast('显示名不能空', 'error'); return; }
+  setBusy(els.formProfile, true);
+  try {
+    const me = await api.updateMe({ display_name, avatar_url: avatar_url_raw || null });
+    state.me = me;
+    state.participants.set(me.id, me);
+    els.meName.textContent = me.display_name || '—';
+    els.meEmail.textContent = me.email || me.id || '';
+    els.meAvatar.textContent = initialOf(me.display_name || me.email);
+    closeModal(els.modalProfile);
+    toast('已更新', 'ok');
+  } catch (err) {
+    if (err instanceof ApiError && err.status === 401) forceReauth();
+    else toast(`更新失败:${err.message}`, 'error');
+  } finally { setBusy(els.formProfile, false); }
+});
+
 // ---------- new room ----------
 els.btnNewRoom.addEventListener('click', () => openModal(els.modalNewRoom));
 els.formNewRoom.addEventListener('submit', async (e) => {
@@ -1078,7 +1109,7 @@ els.formAddMember.addEventListener('submit', async (e) => {
 // ---------- modal helpers ----------
 function openModal(m) { m.hidden = false; }
 function closeModal(m) { m.hidden = true; }
-for (const m of [els.modalNewRoom, els.modalAddMember, els.modalGoLive, els.modalStreamInfo]) {
+for (const m of [els.modalNewRoom, els.modalAddMember, els.modalGoLive, els.modalStreamInfo, els.modalProfile]) {
   if (!m) continue;
   m.addEventListener('click', (e) => {
     if (e.target === m) closeModal(m);
@@ -1087,7 +1118,7 @@ for (const m of [els.modalNewRoom, els.modalAddMember, els.modalGoLive, els.moda
 }
 document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') {
-    for (const m of [els.modalNewRoom, els.modalAddMember, els.modalGoLive, els.modalStreamInfo])
+    for (const m of [els.modalNewRoom, els.modalAddMember, els.modalGoLive, els.modalStreamInfo, els.modalProfile])
       if (m && !m.hidden) closeModal(m);
     for (const d of [els.drawerSearch, els.drawerAi, els.drawerLive])
       if (d && !d.hidden) d.hidden = true;

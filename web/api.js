@@ -86,6 +86,12 @@ export const api = {
   me() {
     return request('GET', '/api/me');
   },
+  updateMe({ display_name, avatar_url } = {}) {
+    const body = {};
+    if (display_name !== undefined) body.display_name = display_name;
+    if (avatar_url !== undefined) body.avatar_url = avatar_url;
+    return request('PATCH', '/api/me', { body });
+  },
   createRoom({ kind, name }) {
     const body = { kind };
     if (name && name.trim()) body.name = name.trim();

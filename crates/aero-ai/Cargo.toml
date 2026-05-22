@@ -21,6 +21,7 @@ futures.workspace = true
 
 reqwest.workspace = true
 sqlx.workspace = true
+bytes.workspace = true
 
 serde.workspace = true
 serde_json.workspace = true

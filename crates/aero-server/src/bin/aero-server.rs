@@ -198,6 +198,17 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // ---------- Voice transcript dispatcher ----------
+    {
+        let state_clone = state.clone();
+        let ai = ai_service.clone();
+        tokio::spawn(async move {
+            if let Err(e) = aero_server::transcribe_bot::run(state_clone, ai).await {
+                tracing::error!(error = ?e, "transcribe_bot listener exited");
+            }
+        });
+    }
+
     // ---------- Router ----------
     let hls_dir = std::path::PathBuf::from(&cfg.server.hls_dir);
     if let Err(e) = std::fs::create_dir_all(&hls_dir) {

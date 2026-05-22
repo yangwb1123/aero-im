@@ -204,6 +204,47 @@ impl ParticipantRepo {
             .collect())
     }
 
+    /// Patch display_name and/or avatar_url. Passing `None` for a field leaves
+    /// it unchanged. Returns the updated row.
+    pub async fn update_profile(
+        &self,
+        id: ParticipantId,
+        display_name: Option<&str>,
+        avatar_url: Option<Option<&str>>,
+    ) -> Result<Option<Participant>, sqlx::Error> {
+        let row = sqlx::query_as::<_, (uuid::Uuid, String, String, Option<String>, Option<uuid::Uuid>, time::OffsetDateTime)>(
+            r#"UPDATE participants SET
+                 display_name = COALESCE($2, display_name),
+                 avatar_url   = CASE
+                                  WHEN $3::boolean THEN $4
+                                  ELSE avatar_url
+                                END
+               WHERE id = $1
+            RETURNING id, kind, display_name, avatar_url, created_by, created_at"#,
+        )
+        .bind(id.to_uuid())
+        .bind(display_name)
+        .bind(avatar_url.is_some())
+        .bind(avatar_url.flatten())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(id, kind, name, avatar, creator, at)| {
+            let kind = match kind.as_str() {
+                "human" => ParticipantKind::Human,
+                "agent" => ParticipantKind::Agent,
+                _ => ParticipantKind::Bot,
+            };
+            Participant {
+                id: ParticipantId::from_uuid(id),
+                kind,
+                display_name: name,
+                avatar_url: avatar,
+                created_by: creator.map(ParticipantId::from_uuid),
+                created_at: at,
+            }
+        }))
+    }
+
     pub async fn get(&self, id: ParticipantId) -> Result<Option<Participant>, sqlx::Error> {
         let row = sqlx::query_as::<_, (uuid::Uuid, String, String, Option<String>, Option<uuid::Uuid>, time::OffsetDateTime)>(
             r#"SELECT id, kind, display_name, avatar_url, created_by, created_at

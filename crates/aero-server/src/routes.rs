@@ -29,7 +29,7 @@ pub fn build(state: AppState) -> Router {
         // Auth
         .route("/api/auth/register", post(auth_register))
         .route("/api/auth/login", post(auth_login))
-        .route("/api/me", get(me))
+        .route("/api/me", get(me).patch(update_me))
         // Rooms
         .route("/api/rooms", post(create_room).get(list_rooms))
         .route("/api/rooms/:id/members", post(add_member))
@@ -71,8 +71,65 @@ pub fn build(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn health() -> &'static str {
-    "ok"
+async fn health(State(s): State<AppState>) -> Json<serde_json::Value> {
+    use std::time::Duration;
+    let pg_ok = tokio::time::timeout(Duration::from_secs(2), async {
+        sqlx::query_scalar::<_, i32>("SELECT 1")
+            .fetch_one(s.participants.pool())
+            .await
+    })
+    .await;
+    let pg = match pg_ok {
+        Ok(Ok(_)) => "ok",
+        Ok(Err(_)) => "fail",
+        Err(_) => "timeout",
+    };
+
+    let redis_ok = tokio::time::timeout(Duration::from_secs(2), async {
+        // PresenceStore holds a RedisClient; we re-resolve via the participant
+        // pool's cousin — easier: just construct a tiny ad-hoc client using a
+        // sentinel through the existing presence handle.
+        s.presence.ping().await
+    })
+    .await;
+    let redis = match redis_ok {
+        Ok(Ok(_)) => "ok",
+        Ok(Err(_)) => "fail",
+        Err(_) => "timeout",
+    };
+
+    // NATS: bus reference is required at boot; if the connection has dropped,
+    // downstream publish/subscribe will start logging warnings. Surface "ok"
+    // here unless we can cheaply probe. We do a fire-and-forget publish on a
+    // subject the IM_EVENTS stream covers — sub-millisecond when up, errors
+    // out almost immediately when down.
+    let nats_ok = tokio::time::timeout(Duration::from_secs(2), async {
+        s.bus
+            .publish("im.events.health", bytes::Bytes::from_static(b"ping"))
+            .await
+    })
+    .await;
+    let nats = match nats_ok {
+        Ok(Ok(_)) => "ok",
+        Ok(Err(_)) => "fail",
+        Err(_) => "timeout",
+    };
+
+    let overall = if pg == "ok" && redis == "ok" && nats == "ok" {
+        "ok"
+    } else {
+        "degraded"
+    };
+
+    Json(serde_json::json!({
+        "status": overall,
+        "deps": {
+            "postgres": pg,
+            "redis": redis,
+            "nats": nats,
+        },
+        "version": env!("CARGO_PKG_VERSION"),
+    }))
 }
 
 // ----- Auth -----
@@ -109,6 +166,45 @@ async fn me(State(s): State<AppState>, auth: AuthUser) -> ApiResult<Json<serde_j
         .map_err(AeroError::from)?
         .ok_or_else(|| AeroError::NotFound("participant".into()))?;
     Ok(Json(serde_json::to_value(p).map_err(AeroError::from)?))
+}
+
+#[derive(Deserialize)]
+struct UpdateMeReq {
+    #[serde(default)]
+    display_name: Option<String>,
+    /// Outer Option = field present; inner Option = nullable on the wire.
+    #[serde(default, deserialize_with = "deserialize_optional_field")]
+    avatar_url: Option<Option<String>>,
+}
+
+fn deserialize_optional_field<'de, D, T>(d: D) -> std::result::Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    Option::<T>::deserialize(d).map(Some)
+}
+
+async fn update_me(
+    State(s): State<AppState>,
+    auth: AuthUser,
+    Json(req): Json<UpdateMeReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let name = req.display_name.as_deref().map(|n| n.trim()).filter(|n| !n.is_empty());
+    if let Some(n) = name {
+        if n.len() > 64 {
+            return Err(AeroError::Invalid("display_name too long".into()).into());
+        }
+    }
+    let url = req.avatar_url.map(|inner| inner.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()));
+    let url_ref = url.as_ref().map(|inner| inner.as_deref());
+    let updated = s
+        .participants
+        .update_profile(auth.participant_id, name, url_ref)
+        .await
+        .map_err(AeroError::from)?
+        .ok_or_else(|| AeroError::NotFound("participant".into()))?;
+    Ok(Json(serde_json::to_value(updated).map_err(AeroError::from)?))
 }
 
 // ----- Rooms -----

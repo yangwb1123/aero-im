@@ -53,6 +53,8 @@ bytes.workspace = true
 dashmap.workspace = true
 parking_lot.workspace = true
 base64 = "0.22"
+async-nats.workspace = true
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 
 [dev-dependencies]
 pretty_assertions.workspace = true

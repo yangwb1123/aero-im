@@ -19,6 +19,7 @@ use aero_storage::{AiJobRepo, MessageRepo, RoomRepo, SearchHit};
 use crate::anthropic::{AnthropicClient, ChatMsg};
 use crate::embed::{default_embedder, Embedder};
 use crate::error::{AiError, Result};
+use crate::transcribe::{default_transcriber, Transcriber};
 
 /// Result of an `answer_question` call.
 ///
@@ -36,6 +37,7 @@ pub struct AnswerResult {
 pub struct AiService {
     anthropic: Option<Arc<AnthropicClient>>,
     embedder: Arc<dyn Embedder + Send + Sync>,
+    transcriber: Arc<dyn Transcriber>,
     ai_jobs: AiJobRepo,
     messages: MessageRepo,
     rooms: RoomRepo,
@@ -45,17 +47,30 @@ impl AiService {
     pub fn new(
         anthropic: Option<Arc<AnthropicClient>>,
         embedder: Arc<dyn Embedder + Send + Sync>,
+        transcriber: Arc<dyn Transcriber>,
         ai_jobs: AiJobRepo,
         messages: MessageRepo,
         rooms: RoomRepo,
     ) -> Self {
-        Self { anthropic, embedder, ai_jobs, messages, rooms }
+        Self { anthropic, embedder, transcriber, ai_jobs, messages, rooms }
     }
 
     /// Construct from env: Anthropic optional, embedder picks Voyage if configured
     /// else local hash. Repos are required since they're owned by the server.
     pub fn from_env(ai_jobs: AiJobRepo, messages: MessageRepo, rooms: RoomRepo) -> Self {
-        Self::new(AnthropicClient::from_env(), default_embedder(), ai_jobs, messages, rooms)
+        Self::new(
+            AnthropicClient::from_env(),
+            default_embedder(),
+            default_transcriber(),
+            ai_jobs,
+            messages,
+            rooms,
+        )
+    }
+
+    /// Transcribe an audio blob via the configured transcriber.
+    pub async fn transcribe(&self, bytes: bytes::Bytes, mime: &str) -> Result<String> {
+        self.transcriber.transcribe(bytes, mime).await
     }
 
     // ---------- accessors (for the worker) ----------

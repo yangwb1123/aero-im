@@ -260,6 +260,30 @@
     </div>
   </div>
 
+  <!-- modal: edit profile -->
+  <div id="modal-profile" class="modal" hidden>
+    <div class="modal-card">
+      <header class="modal-head">
+        <h3>编辑资料</h3>
+        <button class="btn-icon" data-close>×</button>
+      </header>
+      <form id="form-profile" class="modal-body">
+        <label>
+          <span>显示名</span>
+          <input type="text" name="display_name" required maxlength="64" />
+        </label>
+        <label>
+          <span>头像 URL(留空清除)</span>
+          <input type="url" name="avatar_url" placeholder="https://…" />
+        </label>
+        <footer class="modal-foot">
+          <button type="button" class="btn-ghost" data-close>取消</button>
+          <button type="submit" class="btn-primary">保存</button>
+        </footer>
+      </form>
+    </div>
+  </div>
+
   <!-- modal: add member -->
   <div id="modal-add-member" class="modal" hidden>
     <div class="modal-card">

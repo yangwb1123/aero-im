@@ -17,10 +17,12 @@ pub mod anthropic;
 pub mod embed;
 pub mod error;
 pub mod service;
+pub mod transcribe;
 pub mod worker;
 
 pub use anthropic::{AnthropicClient, ChatMsg};
 pub use embed::{default_embedder, Embedder, HashEmbedder, VoyageEmbedder, EMBED_DIM};
 pub use error::{AiError, Result};
 pub use service::{AiService, AnswerResult};
+pub use transcribe::{default_transcriber, StubTranscriber, Transcriber, WhisperTranscriber};
 pub use worker::AiWorker;

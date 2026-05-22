@@ -121,6 +121,40 @@ impl MessageRepo {
         Ok(result.rows_affected() > 0)
     }
 
+    /// Patch transcripts onto the Voice blocks of a message that don't have
+    /// one yet. Called by the transcribe bot — bypasses the sender-only edit
+    /// check because the AI is acting on behalf of the system.
+    /// Returns the updated message (or None if the row is missing/deleted).
+    pub async fn update_voice_transcript(
+        &self,
+        id: MessageId,
+        transcript: &str,
+    ) -> Result<Option<Message>, sqlx::Error> {
+        let row = sqlx::query_as::<_, MessageRow>(
+            r#"UPDATE messages SET
+                 blocks = (
+                   SELECT jsonb_agg(
+                     CASE WHEN elem->>'type' = 'voice'
+                              AND (elem->>'transcript') IS NULL
+                          THEN elem || jsonb_build_object('transcript', $2::text)
+                          ELSE elem
+                     END
+                   )
+                   FROM jsonb_array_elements(blocks) AS elem
+                 ),
+                 searchable_text = searchable_text || E'\n' || $2,
+                 edited_at = NOW(),
+                 embedding = NULL
+               WHERE id = $1 AND deleted_at IS NULL
+            RETURNING id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at"#,
+        )
+        .bind(id.to_uuid())
+        .bind(transcript)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(Message::from))
+    }
+
     /// Update the embedding column for a message. Called by the AI worker.
     pub async fn update_embedding(
         &self,

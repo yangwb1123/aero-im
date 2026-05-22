@@ -28,6 +28,13 @@ impl RedisCache {
     pub fn client(&self) -> &RedisClient {
         &self.client
     }
+
+    /// Cheap connectivity probe — round-trips a GET on a sentinel key.
+    /// Returns Ok(()) on any successful exchange, including a miss.
+    pub async fn ping(&self) -> anyhow::Result<()> {
+        let _: Option<String> = self.client.get("__aero_health").await?;
+        Ok(())
+    }
 }
 
 #[async_trait]
