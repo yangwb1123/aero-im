@@ -69,10 +69,16 @@ impl Hub {
                 return;
             }
         };
+        self.fan_out_raw(recipients, &json);
+    }
+
+    /// Send a pre-serialized text frame to every connection of every recipient.
+    /// Useful when the JSON has already been built upstream.
+    pub fn fan_out_raw(&self, recipients: &[ParticipantId], text: &str) {
         for pid in recipients {
             if let Some(senders) = self.conns.get(pid) {
                 for tx in senders.iter() {
-                    let _ = tx.send(axum::extract::ws::Message::Text(json.clone()));
+                    let _ = tx.send(axum::extract::ws::Message::Text(text.to_owned()));
                 }
             }
         }

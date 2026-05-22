@@ -23,6 +23,22 @@ pub struct ServerConfig {
     pub host: String,
     pub port: u16,
     pub web_dir: String,
+    #[serde(default = "default_blob_dir")]
+    pub blob_dir: String,
+    #[serde(default = "default_hls_dir")]
+    pub hls_dir: String,
+    #[serde(default = "default_rtmp_listen")]
+    pub rtmp_listen: String,
+}
+
+fn default_blob_dir() -> String {
+    "data/blobs".into()
+}
+fn default_hls_dir() -> String {
+    "data/hls".into()
+}
+fn default_rtmp_listen() -> String {
+    "0.0.0.0:1935".into()
 }
 
 #[derive(Debug, Clone, Deserialize)]

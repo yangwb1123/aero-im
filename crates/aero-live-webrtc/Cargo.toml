@@ -13,4 +13,15 @@ workspace = true
 aero-common.workspace = true
 aero-live-core.workspace = true
 aero-signaling.workspace = true
+
+tokio = { workspace = true, features = ["rt", "sync", "macros"] }
+async-trait.workspace = true
+bytes.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 tracing.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+ulid = { workspace = true, features = ["serde", "uuid"] }
+time.workspace = true
+parking_lot.workspace = true

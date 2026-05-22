@@ -1,8 +1,8 @@
 //! `ImService` — the IM business facade.
 //!
-//! Coordinates the storage repositories (`RoomRepo`, `MessageRepo`,
-//! `ParticipantRepo`) and the event bus (`EventBus`). All business invariants
-//! (membership checks, validation) live here so HTTP/WS handlers stay thin.
+//! Coordinates the storage repositories and the event bus. All business
+//! invariants (membership checks, validation, authorization) live here so
+//! HTTP/WS handlers stay thin.
 //!
 //! See `docs/specs/2026-05-22-aero-im-design.md` §4.2 for the protocol contract.
 
@@ -11,28 +11,29 @@ use std::sync::Arc;
 use aero_bus::traits::BusError;
 use aero_bus::EventBus;
 use aero_common::{
-    Block, Error, Message, MessageEnvelope, MessageId, ParticipantId, Result, Room, RoomId,
-    RoomKind,
+    Block, CallEvent, CallId, CallKind, CallMode, CallSession, Error, Message, MessageEnvelope,
+    MessageId, ParticipantId, ReactionOp, ReactionSummary, ReadReceipt, Result, Room, RoomEvent,
+    RoomId, RoomKind,
 };
 use aero_storage::{
-    message::NewMessage, MessageRepo, ParticipantRepo, RoomRepo,
+    message::NewMessage, AiJobKind, AiJobRepo, CallRepo, MessageRepo, ParticipantRepo,
+    ReactionRepo, ReceiptRepo, RoomRepo,
 };
 use async_trait::async_trait;
-use tracing::instrument;
+use std::collections::BTreeMap;
+use tracing::{instrument, warn};
 
 use crate::events::ImEvent;
+use crate::moderator::{ModerationVerdict, Moderator};
 use crate::validation::validate_blocks;
 
-/// Subject prefix used for high-level control-plane events.
 const EVENTS_SUBJECT: &str = "im.events";
 
 /// Object-safe view of [`EventBus`] used internally for dependency injection.
 ///
 /// The upstream [`EventBus`] trait declares a generic default method (`publish_json<T>`)
 /// which makes it not dyn-compatible. Rather than patching `aero-bus`, we wrap any
-/// [`EventBus`] implementation in this object-safe shim. The blanket impl below lets
-/// callers pass `Arc::new(JetStreamBus::connect(...).await?)` directly via
-/// [`ImService::new`].
+/// [`EventBus`] implementation in this object-safe shim.
 #[async_trait]
 pub trait BusSink: Send + Sync + 'static {
     async fn publish_bytes(&self, subject: &str, payload: bytes::Bytes)
@@ -53,7 +54,6 @@ where
     }
 }
 
-/// Serialize a value and publish it via an object-safe bus handle.
 async fn publish_event<T: serde::Serialize>(
     bus: &dyn BusSink,
     subject: &str,
@@ -63,61 +63,96 @@ async fn publish_event<T: serde::Serialize>(
     bus.publish_bytes(subject, bytes.into()).await
 }
 
-/// IM business facade.
-///
-/// Holds Postgres repositories (cheap clones — they wrap an `Arc<PgPool>`) and an
-/// `Arc<dyn BusSink>` shim around any [`EventBus`] for NATS publishing. Designed to
-/// live behind an `Arc` in the Axum app state.
+/// IM business facade. Cheap to clone (repositories wrap `Arc<PgPool>`).
 #[derive(Clone)]
 pub struct ImService {
     rooms: RoomRepo,
     messages: MessageRepo,
-    #[allow(dead_code)] // Reserved for P2 (profile lookups, mentions).
+    #[allow(dead_code)] // Reserved for mention lookups, P3+.
     participants: ParticipantRepo,
+    receipts: ReceiptRepo,
+    reactions: ReactionRepo,
+    calls: CallRepo,
+    ai_jobs: AiJobRepo,
     bus: Arc<dyn BusSink>,
+    moderator: Arc<dyn Moderator>,
 }
 
 impl ImService {
-    /// Construct from any [`EventBus`] implementation. The argument is converted into
-    /// the object-safe [`BusSink`] shim so the service can be polymorphic over the
-    /// concrete bus type (NATS in prod, an in-memory mock in tests).
+    /// Construct from any [`EventBus`] implementation. Repositories are passed
+    /// in to keep this crate independent of `PgPool`/Redis types.
     ///
-    /// Spec §4.2 calls for `Arc<dyn EventBus>`; because the upstream `EventBus` trait
-    /// is not dyn-compatible (it carries a generic default method), we route through
-    /// [`BusSink`] without changing the dependency-injection ergonomics.
+    /// Picks a default moderator from `AERO_BLOCKED_WORDS` env at construction
+    /// time, or `AllowAllModerator` if unset.
+    #[allow(clippy::too_many_arguments)]
     pub fn new<B: EventBus + 'static>(
         rooms: RoomRepo,
         messages: MessageRepo,
         participants: ParticipantRepo,
+        receipts: ReceiptRepo,
+        reactions: ReactionRepo,
+        calls: CallRepo,
+        ai_jobs: AiJobRepo,
         bus: Arc<B>,
+    ) -> Self {
+        let moderator: Arc<dyn Moderator> = match crate::moderator::KeywordModerator::from_env() {
+            Some(m) => Arc::new(m),
+            None => Arc::new(crate::moderator::AllowAllModerator),
+        };
+        Self {
+            rooms,
+            messages,
+            participants,
+            receipts,
+            reactions,
+            calls,
+            ai_jobs,
+            bus: bus as Arc<dyn BusSink>,
+            moderator,
+        }
+    }
+
+    /// Inject a custom moderator (overrides env default).
+    #[must_use]
+    pub fn with_moderator(mut self, moderator: Arc<dyn Moderator>) -> Self {
+        self.moderator = moderator;
+        self
+    }
+
+    /// Lower-level constructor for tests with a pre-built bus sink.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_sink(
+        rooms: RoomRepo,
+        messages: MessageRepo,
+        participants: ParticipantRepo,
+        receipts: ReceiptRepo,
+        reactions: ReactionRepo,
+        calls: CallRepo,
+        ai_jobs: AiJobRepo,
+        bus: Arc<dyn BusSink>,
     ) -> Self {
         Self {
             rooms,
             messages,
             participants,
-            bus: bus as Arc<dyn BusSink>,
+            receipts,
+            reactions,
+            calls,
+            ai_jobs,
+            bus,
+            moderator: Arc::new(crate::moderator::AllowAllModerator),
         }
     }
 
-    /// Lower-level constructor for tests or custom adapters that already hold a
-    /// `BusSink` trait object.
-    pub fn from_sink(
-        rooms: RoomRepo,
-        messages: MessageRepo,
-        participants: ParticipantRepo,
-        bus: Arc<dyn BusSink>,
-    ) -> Self {
-        Self { rooms, messages, participants, bus }
-    }
-
-    /// NATS subject used for per-room message broadcast (see spec §4.2).
+    /// NATS subject used for per-room broadcast (see spec §4.2).
     #[must_use]
     pub fn room_subject(room: RoomId) -> String {
         format!("im.room.{room}")
     }
 
-    /// Create a new room. The `creator` is automatically inserted as `owner` by the
-    /// storage layer.
+    // ---------------------------------------------------------- ROOM lifecycle
+
+    /// Create a new room.
     #[instrument(skip(self), fields(?creator, ?kind))]
     pub async fn create_room(
         &self,
@@ -126,7 +161,6 @@ impl ImService {
         name: Option<String>,
     ) -> Result<Room> {
         let room = self.rooms.create(kind, name, creator).await?;
-        // Best-effort high-level event; never block the caller on bus failures.
         let event = ImEvent::RoomCreated(room.clone());
         if let Err(err) = publish_event(
             self.bus.as_ref(),
@@ -135,16 +169,12 @@ impl ImService {
         )
         .await
         {
-            tracing::warn!(?err, room_id = %room.id, "publish RoomCreated failed");
+            warn!(?err, room_id = %room.id, "publish RoomCreated failed");
         }
         Ok(room)
     }
 
-    /// Add a member to a room.
-    ///
-    /// P1 authorization: `actor` must themselves be a member of the room.
-    /// TODO(P2): replace with role-based check (`owner`/`admin` only) by reading the
-    /// `room_members.role` column.
+    /// Add a member to a room. `actor` must themselves be a member.
     #[instrument(skip(self), fields(?actor, ?room, ?member))]
     pub async fn add_member(
         &self,
@@ -166,7 +196,7 @@ impl ImService {
         )
         .await
         {
-            tracing::warn!(?err, %room, %member, "publish MemberAdded failed");
+            warn!(?err, %room, %member, "publish MemberAdded failed");
         }
         Ok(())
     }
@@ -174,21 +204,18 @@ impl ImService {
     /// List rooms the participant belongs to.
     #[instrument(skip(self), fields(?who))]
     pub async fn list_my_rooms(&self, who: ParticipantId) -> Result<Vec<Room>> {
-        let rooms = self.rooms.rooms_for(who).await?;
-        Ok(rooms)
+        Ok(self.rooms.rooms_for(who).await?)
     }
 
-    /// Persist a new message and broadcast it on the per-room NATS subject.
-    ///
-    /// Flow:
-    /// 1. Membership check (`Error::Forbidden` if `sender` is not in the room).
-    /// 2. Block validation (`Error::Invalid` on failure).
-    /// 3. Insert into `messages`.
-    /// 4. Fetch recipients for the envelope.
-    /// 5. Publish [`MessageEnvelope`] on `im.room.{room_id}`.
-    ///
-    /// Returns the persisted [`Message`]. Bus failures are *not* fatal — the message
-    /// is durable in PG and a downstream replay job can republish later.
+    /// Snapshot the current member set of a room (for callee fan-out, etc).
+    pub async fn room_members(&self, room: RoomId) -> Result<Vec<ParticipantId>> {
+        Ok(self.rooms.members(room).await?)
+    }
+
+    // ---------------------------------------------------------- MESSAGES
+
+    /// Persist a new message and broadcast it. Returns the persisted message.
+    /// Bus failures are *not* fatal — the message is durable in PG.
     #[instrument(
         skip(self, blocks),
         fields(?sender, ?room, block_count = blocks.len(), reply_to = ?reply_to)
@@ -200,17 +227,16 @@ impl ImService {
         blocks: Vec<Block>,
         reply_to: Option<MessageId>,
     ) -> Result<Message> {
-        // 1. Membership check.
         if !self.rooms.is_member(room, sender).await? {
             return Err(Error::Forbidden(format!(
                 "sender {sender} is not a member of room {room}"
             )));
         }
-
-        // 2. Block validation.
         validate_blocks(&blocks)?;
+        if let ModerationVerdict::Block(reason) = self.moderator.check(&blocks) {
+            return Err(Error::Invalid(reason));
+        }
 
-        // 3. Persist.
         let message = self
             .messages
             .insert(NewMessage {
@@ -222,24 +248,109 @@ impl ImService {
             })
             .await?;
 
-        // 4. Recipients = current room members at publish time.
         let recipients = self.rooms.members(room).await.unwrap_or_else(|err| {
-            tracing::warn!(?err, %room, "fetching recipients failed; publishing without fan-out hint");
+            warn!(?err, %room, "fetching recipients failed; publishing without fan-out hint");
             Vec::new()
         });
-
-        // 5. Publish.
         let envelope = MessageEnvelope { message: message.clone(), recipients };
-        let subject = Self::room_subject(room);
-        if let Err(err) = publish_event(self.bus.as_ref(), &subject, &envelope).await {
-            tracing::warn!(?err, %subject, message_id = %message.id, "publish MessageSent failed");
+
+        self.publish_room_event(room, &RoomEvent::Message(envelope)).await;
+
+        // Best-effort enqueue an embed job (AI worker will pick it up).
+        if !message.searchable_text().is_empty() {
+            if let Err(err) = self
+                .ai_jobs
+                .enqueue(
+                    AiJobKind::Embed,
+                    Some(message.id.to_uuid()),
+                    serde_json::json!({"room_id": room.to_string()}),
+                )
+                .await
+            {
+                warn!(?err, message_id = %message.id, "enqueue embed job failed");
+            }
         }
 
         Ok(message)
     }
 
-    /// Paginated history. `before` is exclusive — pass the oldest already-known
-    /// `MessageId` to fetch the next page.
+    /// Edit a message. Only the sender may edit; soft-deleted messages refuse.
+    #[instrument(skip(self, blocks), fields(?actor, ?id))]
+    pub async fn edit_message(
+        &self,
+        actor: ParticipantId,
+        id: MessageId,
+        blocks: Vec<Block>,
+    ) -> Result<Message> {
+        let existing = self
+            .messages
+            .get(id)
+            .await?
+            .ok_or_else(|| Error::NotFound(format!("message {id}")))?;
+        if existing.deleted_at.is_some() {
+            return Err(Error::Conflict("message is deleted".into()));
+        }
+        if existing.sender_id != actor {
+            return Err(Error::Forbidden("only sender may edit".into()));
+        }
+        validate_blocks(&blocks)?;
+
+        let updated = self
+            .messages
+            .edit(id, blocks)
+            .await?
+            .ok_or_else(|| Error::Conflict("edit raced with delete".into()))?;
+
+        self.publish_room_event(updated.room_id, &RoomEvent::Edited(updated.clone()))
+            .await;
+
+        if !updated.searchable_text().is_empty() {
+            if let Err(err) = self
+                .ai_jobs
+                .enqueue(
+                    AiJobKind::Embed,
+                    Some(updated.id.to_uuid()),
+                    serde_json::json!({"room_id": updated.room_id.to_string()}),
+                )
+                .await
+            {
+                warn!(?err, %id, "enqueue re-embed failed");
+            }
+        }
+        Ok(updated)
+    }
+
+    /// Soft-delete a message. Sender or room-owner may delete.
+    #[instrument(skip(self), fields(?actor, ?id))]
+    pub async fn delete_message(&self, actor: ParticipantId, id: MessageId) -> Result<()> {
+        let existing = self
+            .messages
+            .get(id)
+            .await?
+            .ok_or_else(|| Error::NotFound(format!("message {id}")))?;
+        if existing.deleted_at.is_some() {
+            return Ok(());
+        }
+        if existing.sender_id != actor && !self.rooms.is_member(existing.room_id, actor).await? {
+            return Err(Error::Forbidden("only sender or room member may delete".into()));
+        }
+        if existing.sender_id != actor {
+            return Err(Error::Forbidden("only sender may delete in P2".into()));
+        }
+        self.messages.soft_delete(id).await?;
+        self.publish_room_event(
+            existing.room_id,
+            &RoomEvent::Deleted {
+                room_id: existing.room_id,
+                message_id: id,
+                by: actor,
+            },
+        )
+        .await;
+        Ok(())
+    }
+
+    /// Paginated history. `before` is exclusive.
     #[instrument(skip(self), fields(?who, ?room, ?before, limit))]
     pub async fn history(
         &self,
@@ -249,12 +360,162 @@ impl ImService {
         limit: i64,
     ) -> Result<Vec<Message>> {
         if !self.rooms.is_member(room, who).await? {
-            return Err(Error::Forbidden(format!(
-                "{who} is not a member of room {room}"
-            )));
+            return Err(Error::Forbidden(format!("{who} is not a member of room {room}")));
         }
-        let msgs = self.messages.list_recent(room, before, limit).await?;
-        Ok(msgs)
+        Ok(self.messages.list_recent(room, before, limit).await?)
+    }
+
+    /// Fetch reaction aggregates for a batch of messages.
+    pub async fn reactions_for(
+        &self,
+        message_ids: &[MessageId],
+    ) -> Result<BTreeMap<MessageId, Vec<ReactionSummary>>> {
+        Ok(self.reactions.summaries_for(message_ids).await?)
+    }
+
+    // ---------------------------------------------------------- REACTIONS
+
+    /// Toggle a reaction on a message. Caller must be a member of the message's room.
+    #[instrument(skip(self), fields(?actor, ?message_id, emoji))]
+    pub async fn toggle_reaction(
+        &self,
+        actor: ParticipantId,
+        message_id: MessageId,
+        emoji: &str,
+    ) -> Result<ReactionOp> {
+        let msg = self
+            .messages
+            .get(message_id)
+            .await?
+            .ok_or_else(|| Error::NotFound(format!("message {message_id}")))?;
+        if !self.rooms.is_member(msg.room_id, actor).await? {
+            return Err(Error::Forbidden("not a room member".into()));
+        }
+        if emoji.is_empty() || emoji.len() > 32 {
+            return Err(Error::Invalid("emoji length".into()));
+        }
+        let op = self.reactions.toggle(message_id, actor, emoji).await?;
+        self.publish_room_event(
+            msg.room_id,
+            &RoomEvent::Reaction {
+                room_id: msg.room_id,
+                message_id,
+                participant: actor,
+                emoji: emoji.to_owned(),
+                op,
+            },
+        )
+        .await;
+        Ok(op)
+    }
+
+    // ---------------------------------------------------------- READ RECEIPTS
+
+    /// Move a participant's read cursor in a room.
+    #[instrument(skip(self), fields(?actor, ?room, ?last_read))]
+    pub async fn mark_read(
+        &self,
+        actor: ParticipantId,
+        room: RoomId,
+        last_read: MessageId,
+    ) -> Result<ReadReceipt> {
+        if !self.rooms.is_member(room, actor).await? {
+            return Err(Error::Forbidden("not a room member".into()));
+        }
+        let receipt = self.receipts.mark_read(room, actor, last_read).await?;
+        self.publish_room_event(
+            room,
+            &RoomEvent::Read {
+                room_id: room,
+                participant: actor,
+                last_message_id: last_read,
+                at: receipt.updated_at,
+            },
+        )
+        .await;
+        Ok(receipt)
+    }
+
+    pub async fn receipts_for(&self, room: RoomId) -> Result<Vec<ReadReceipt>> {
+        Ok(self.receipts.list_for_room(room).await?)
+    }
+
+    // ---------------------------------------------------------- TYPING
+
+    /// Broadcast a typing indicator. No persistence.
+    pub async fn typing(
+        &self,
+        actor: ParticipantId,
+        room: RoomId,
+        on: bool,
+    ) -> Result<()> {
+        if !self.rooms.is_member(room, actor).await? {
+            return Err(Error::Forbidden("not a room member".into()));
+        }
+        self.publish_room_event(
+            room,
+            &RoomEvent::Typing { room_id: room, participant: actor, on },
+        )
+        .await;
+        Ok(())
+    }
+
+    // ---------------------------------------------------------- CALLS (P3)
+
+    /// Start a call session (1:1 or group) and broadcast an invite to the callees.
+    #[instrument(skip(self, sdp), fields(?initiator, ?room, ?kind, ?mode))]
+    pub async fn start_call(
+        &self,
+        initiator: ParticipantId,
+        room: RoomId,
+        kind: CallKind,
+        mode: CallMode,
+        sdp: String,
+    ) -> Result<CallSession> {
+        if !self.rooms.is_member(room, initiator).await? {
+            return Err(Error::Forbidden("not a room member".into()));
+        }
+        let mut callees = self.rooms.members(room).await?;
+        callees.retain(|p| *p != initiator);
+        let call_id = CallId::new();
+        let session = self
+            .calls
+            .start(call_id, room, initiator, kind, mode, &callees)
+            .await?;
+        self.publish_room_event(
+            room,
+            &RoomEvent::Call(CallEvent::Invite {
+                call_id,
+                room_id: room,
+                from: initiator,
+                to: callees,
+                kind,
+                sdp,
+            }),
+        )
+        .await;
+        Ok(session)
+    }
+
+    /// Forward an answer/ICE/end signaling event to the targeted participant(s).
+    /// `room` is required for routing on the per-room subject.
+    pub async fn relay_call_event(&self, room: RoomId, event: CallEvent) -> Result<()> {
+        if let CallEvent::End { call_id, reason, .. } = &event {
+            if let Err(err) = self.calls.end(*call_id, reason).await {
+                warn!(?err, %call_id, "persist call end failed");
+            }
+        }
+        self.publish_room_event(room, &RoomEvent::Call(event)).await;
+        Ok(())
+    }
+
+    // ---------------------------------------------------------- internal
+
+    async fn publish_room_event(&self, room: RoomId, event: &RoomEvent) {
+        let subject = Self::room_subject(room);
+        if let Err(err) = publish_event(self.bus.as_ref(), &subject, event).await {
+            warn!(?err, %subject, "publish RoomEvent failed");
+        }
     }
 }
 
@@ -273,14 +534,12 @@ mod tests {
 
     #[test]
     fn mock_bus_records_publish() {
-        // Sanity check that the mock works the way the DB-integration tests rely on.
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         let bus = Arc::new(MockBus::default());
         rt.block_on(async {
-            // Concrete-type call (not via `dyn`) — `publish_json` is allowed here.
             bus.publish_json("im.test", &serde_json::json!({"k": "v"}))
                 .await
                 .unwrap();
@@ -292,7 +551,6 @@ mod tests {
 
     #[test]
     fn publish_event_helper_through_dyn() {
-        // Ensures the object-safe helper actually flows through a `&dyn BusSink`.
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()

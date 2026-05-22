@@ -61,7 +61,7 @@ function shortId(id) {
 }
 
 // ---------- block rendering (safe: builds DOM nodes) ----------
-function appendBlock(parent, b) {
+function appendBlock(parent, b, ctx = {}) {
   if (!b || typeof b !== 'object') return;
   switch (b.type) {
     case 'text': {
@@ -84,6 +84,77 @@ function appendBlock(parent, b) {
       parent.appendChild(pre);
       return;
     }
+    case 'mention': {
+      const pid = b.participant;
+      const name = ctx.participants?.get?.(pid)?.display_name || shortId(pid);
+      const tag = el('span', { className: 'mention' });
+      tag.textContent = `@${name}`;
+      parent.appendChild(tag);
+      return;
+    }
+    case 'file': {
+      const url = b.blob_id ? `/api/blobs/${encodeURIComponent(b.blob_id)}` : '#';
+      const isImg = b.kind === 'image';
+      if (isImg) {
+        const img = el('img', { className: 'attachment-img', attrs: { src: url, alt: b.name || '' } });
+        parent.appendChild(img);
+      } else {
+        const a = el('a', {
+          className: 'attachment-file',
+          attrs: { href: url, target: '_blank', rel: 'noopener' },
+        });
+        const ic = el('span', { className: 'attachment-icon', text: iconForKind(b.kind) });
+        const meta = el('span', { className: 'attachment-meta' });
+        meta.appendChild(el('span', { className: 'attachment-name', text: b.name || '附件' }));
+        meta.appendChild(el('span', { className: 'attachment-size muted', text: humanSize(b.size) }));
+        a.appendChild(ic);
+        a.appendChild(meta);
+        parent.appendChild(a);
+      }
+      return;
+    }
+    case 'voice': {
+      const url = b.blob_id ? `/api/blobs/${encodeURIComponent(b.blob_id)}` : '';
+      const wrap = el('div', { className: 'voice-block' });
+      const audio = el('audio', { attrs: { src: url, controls: 'controls', preload: 'none' } });
+      wrap.appendChild(audio);
+      if (b.transcript) {
+        wrap.appendChild(el('div', { className: 'voice-transcript', text: b.transcript }));
+      }
+      parent.appendChild(wrap);
+      return;
+    }
+    case 'card': {
+      const wrap = el('div', { className: 'card-block' });
+      const title = b.payload?.title || b.schema || 'card';
+      wrap.appendChild(el('div', { className: 'card-title', text: String(title) }));
+      const body = b.payload?.body || b.payload?.text || '';
+      if (body) wrap.appendChild(el('div', { className: 'card-body', text: String(body) }));
+      parent.appendChild(wrap);
+      return;
+    }
+    case 'tool_call': {
+      const wrap = el('div', { className: 'tool-call' });
+      wrap.appendChild(el('div', { className: 'tool-call-head', text: `🛠 ${b.tool || 'tool'}` }));
+      const args = el('pre', { className: 'tool-call-args' });
+      args.textContent = JSON.stringify(b.args ?? {}, null, 2);
+      wrap.appendChild(args);
+      if (b.result !== undefined && b.result !== null) {
+        const r = el('pre', { className: 'tool-call-result' });
+        r.textContent = JSON.stringify(b.result, null, 2);
+        wrap.appendChild(r);
+      }
+      parent.appendChild(wrap);
+      return;
+    }
+    case 'thought': {
+      if (b.hidden) return;
+      const wrap = el('div', { className: 'thought' });
+      wrap.appendChild(el('span', { className: 'thought-mark', text: '💭' }));
+      wrap.appendChild(el('span', { text: b.content || '' }));
+      parent.appendChild(wrap);
+      return;
+    }
     default: {
       const s = el('span', { className: 'unknown-block' });
       s.textContent = `[${String(b.type || 'unknown')}]`;
@@ -91,14 +162,31 @@ function appendBlock(parent, b) {
     }
   }
 }
-function buildBlocks(blocks) {
+
+function iconForKind(k) {
+  switch (k) {
+    case 'image': return '🖼';
+    case 'video': return '🎬';
+    case 'audio': return '🎵';
+    case 'document': return '📄';
+    default: return '📎';
+  }
+}
+function humanSize(n) {
+  if (!Number.isFinite(n)) return '';
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
+  return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
+}
+function buildBlocks(blocks, ctx = {}) {
   const frag = document.createDocumentFragment();
   if (!Array.isArray(blocks) || !blocks.length) {
     const empty = el('span', { className: 'unknown-block', text: '[empty]' });
     frag.appendChild(empty);
     return frag;
   }
-  for (const b of blocks) appendBlock(frag, b);
+  for (const b of blocks) appendBlock(frag, b, ctx);
   return frag;
 }
 
@@ -113,9 +201,14 @@ export function renderMessage(m, mePid, participants, opts = {}) {
   const isSelf = m.sender_id === mePid;
   const sender = participants.get(m.sender_id);
   const senderName = sender?.display_name || (isSelf ? '我' : shortId(m.sender_id));
+  const isDeleted = Boolean(m.deleted_at);
 
   const wrap = el('div', {
-    className: 'msg' + (isSelf ? ' self' : '') + (opts.pending ? ' pending' : ''),
+    className:
+      'msg' +
+      (isSelf ? ' self' : '') +
+      (opts.pending ? ' pending' : '') +
+      (isDeleted ? ' deleted' : ''),
     dataset: {
       msgId: m.id,
       senderId: m.sender_id || '',
@@ -132,16 +225,82 @@ export function renderMessage(m, mePid, participants, opts = {}) {
   const timeEl = el('span', { className: 'time', text: formatHM(m.created_at) });
   meta.appendChild(senderEl);
   meta.appendChild(timeEl);
+  if (m.edited_at) {
+    meta.appendChild(el('span', { className: 'edited muted', text: '· 已编辑' }));
+  }
 
   const bubble = el('div', { className: 'msg-bubble' });
-  bubble.appendChild(buildBlocks(m.blocks));
+  if (isDeleted) {
+    bubble.appendChild(el('span', { className: 'muted', text: '消息已删除' }));
+  } else {
+    bubble.appendChild(buildBlocks(m.blocks, { participants }));
+  }
+
+  // hover actions row (right-aligned mini buttons for owner; reactions for all)
+  const actions = el('div', { className: 'msg-actions' });
+  if (!isDeleted) {
+    const btnReact = el('button', { className: 'msg-act', attrs: { title: '反应' } });
+    btnReact.textContent = '☺';
+    btnReact.dataset.action = 'react';
+    actions.appendChild(btnReact);
+    if (isSelf) {
+      const btnEdit = el('button', { className: 'msg-act', attrs: { title: '编辑' } });
+      btnEdit.textContent = '✏';
+      btnEdit.dataset.action = 'edit';
+      const btnDel = el('button', { className: 'msg-act', attrs: { title: '删除' } });
+      btnDel.textContent = '🗑';
+      btnDel.dataset.action = 'delete';
+      actions.appendChild(btnEdit);
+      actions.appendChild(btnDel);
+    }
+  }
+
+  // reactions row (filled in by app after summaries fetch)
+  const reactions = el('div', { className: 'msg-reactions', dataset: { msgId: m.id } });
 
   body.appendChild(meta);
   body.appendChild(bubble);
+  body.appendChild(reactions);
+  body.appendChild(actions);
 
   wrap.appendChild(avatar);
   wrap.appendChild(body);
   return wrap;
+}
+
+// Render reaction chips into the message's `.msg-reactions` slot.
+export function renderReactionsInto(node, summaries, myPid, onClick) {
+  node.replaceChildren();
+  if (!Array.isArray(summaries) || !summaries.length) return;
+  for (const s of summaries) {
+    const chip = el('button', {
+      className: 'reaction-chip' + (s.participants?.includes?.(myPid) ? ' mine' : ''),
+      attrs: { type: 'button', title: (s.participants || []).join(', ') },
+    });
+    chip.dataset.emoji = s.emoji;
+    chip.appendChild(el('span', { className: 'reaction-emoji', text: s.emoji }));
+    chip.appendChild(el('span', { className: 'reaction-count', text: String(s.count || 0) }));
+    if (typeof onClick === 'function') {
+      chip.addEventListener('click', () => onClick(s.emoji));
+    }
+    node.appendChild(chip);
+  }
+}
+
+// Render typing indicator under the message list.
+export function renderTypingInto(node, names) {
+  node.replaceChildren();
+  if (!names || !names.length) {
+    node.hidden = true;
+    return;
+  }
+  node.hidden = false;
+  const text =
+    names.length === 1
+      ? `${names[0]} 正在输入…`
+      : `${names.slice(0, 2).join('、')} 等 ${names.length} 人正在输入…`;
+  node.appendChild(el('span', { className: 'typing-dots', text: '•••' }));
+  node.appendChild(el('span', { text }));
 }
 
 // ---------- room item ----------

@@ -87,6 +87,14 @@
           <span id="room-meta" class="muted"></span>
         </div>
         <div class="room-head-actions">
+          <div class="head-tools">
+            <button id="btn-search" type="button" title="搜索">🔍 搜索</button>
+            <button id="btn-ai" type="button" title="问 AI">✨ AI</button>
+            <button id="btn-call-audio" type="button" title="发起语音通话">📞</button>
+            <button id="btn-call-video" type="button" title="发起视频通话">📹</button>
+            <button id="btn-go-live" type="button" title="开播">🔴 开播</button>
+            <button id="btn-live-page" type="button" title="直播大厅">📺</button>
+          </div>
           <button id="btn-add-member" class="btn-ghost" hidden>+ 添加成员</button>
         </div>
       </header>
@@ -96,13 +104,19 @@
         <div id="msg-empty" class="msg-empty muted" hidden>暂无消息,开个头吧。</div>
       </div>
 
+      <div id="typing-bar" class="typing-bar" hidden></div>
+
       <form id="composer" class="composer" hidden>
+        <div class="composer-aux">
+          <button type="button" id="btn-attach" title="附件">📎</button>
+        </div>
         <textarea
           id="composer-input"
           placeholder="输入消息,回车发送,Shift+回车换行"
           rows="1"
           maxlength="8000"></textarea>
         <button type="submit" id="composer-send" class="btn-primary" disabled>发送</button>
+        <input id="file-input" type="file" hidden />
       </form>
     </main>
 
@@ -140,6 +154,108 @@
           <button type="submit" class="btn-primary">创建</button>
         </footer>
       </form>
+    </div>
+  </div>
+
+  <!-- drawer: search -->
+  <aside id="drawer-search" class="drawer" hidden>
+    <header class="drawer-head">
+      <h3>搜索房间消息</h3>
+      <button class="btn-icon" data-close-drawer="search">×</button>
+    </header>
+    <div class="drawer-foot">
+      <input id="search-input" class="drawer-input" placeholder="关键词 / 自然语言查询…" />
+    </div>
+    <div id="search-results" class="drawer-body">
+      <div class="muted" style="text-align:center;padding:24px 0;font-size:12.5px;">输入关键词回车开搜。</div>
+    </div>
+  </aside>
+
+  <!-- drawer: AI -->
+  <aside id="drawer-ai" class="drawer" hidden>
+    <header class="drawer-head">
+      <h3>问 AI (RAG)</h3>
+      <div style="display:flex;gap:6px;">
+        <button id="btn-ai-summarize" class="btn-ghost">摘要</button>
+        <button class="btn-icon" data-close-drawer="ai">×</button>
+      </div>
+    </header>
+    <div id="ai-results" class="drawer-body"></div>
+    <div class="drawer-foot">
+      <input id="ai-input" class="drawer-input" placeholder="基于本房间历史向 AI 提问…" />
+    </div>
+  </aside>
+
+  <!-- drawer: live streams -->
+  <aside id="drawer-live" class="drawer" hidden>
+    <header class="drawer-head">
+      <h3>直播大厅</h3>
+      <button class="btn-icon" data-close-drawer="live">×</button>
+    </header>
+    <div id="live-list" class="drawer-body live-list"></div>
+  </aside>
+
+  <!-- modal: go live -->
+  <div id="modal-go-live" class="modal" hidden>
+    <div class="modal-card">
+      <header class="modal-head">
+        <h3>开播</h3>
+        <button class="btn-icon" data-close>×</button>
+      </header>
+      <form id="form-go-live" class="modal-body">
+        <label>
+          <span>标题</span>
+          <input type="text" name="title" required maxlength="120" placeholder="例如:周会直播" />
+        </label>
+        <label>
+          <span>协议</span>
+          <select name="protocol">
+            <option value="rtmp">RTMP(ffmpeg/OBS)</option>
+            <option value="whip">WHIP(浏览器直推)</option>
+            <option value="srt">SRT</option>
+          </select>
+        </label>
+        <footer class="modal-foot">
+          <button type="button" class="btn-ghost" data-close>取消</button>
+          <button type="submit" class="btn-primary">创建</button>
+        </footer>
+      </form>
+    </div>
+  </div>
+
+  <!-- modal: stream ingest info -->
+  <div id="modal-stream-info" class="modal" hidden>
+    <div class="modal-card">
+      <header class="modal-head">
+        <h3>推流信息</h3>
+        <button class="btn-icon" data-close>×</button>
+      </header>
+      <div class="modal-body">
+        <label>
+          <span>推流地址(复制到 OBS / ffmpeg)</span>
+          <input id="stream-ingest" type="text" readonly />
+        </label>
+        <label>
+          <span>HLS 拉流地址</span>
+          <input id="stream-hls" type="text" readonly />
+        </label>
+        <div class="muted" style="font-size:12px;">
+          示例:<code>ffmpeg -re -i video.mp4 -c copy -f flv &lt;ingest&gt;</code>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- call overlay -->
+  <div id="call-overlay" class="call-overlay" hidden>
+    <div class="call-videos">
+      <div class="call-tile"><video id="call-local" autoplay muted playsinline></video><span class="label">我</span></div>
+      <div class="call-tile"><video id="call-remote" autoplay playsinline></video><span class="label">对方</span></div>
+    </div>
+    <div class="call-controls">
+      <button id="call-mute">静音</button>
+      <button id="call-cam">关摄像头</button>
+      <button id="call-end" class="end">挂断</button>
     </div>
   </div>
 

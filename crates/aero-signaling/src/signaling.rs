@@ -1,0 +1,92 @@
+//! Validators for SDP blobs and ICE candidates carried by `CallEvent`.
+//!
+//! The WS layer calls [`validate_call_event`] before relaying any signaling
+//! event onto the bus, so malformed payloads never reach peers.
+
+use aero_common::CallEvent;
+use serde_json::Value;
+
+use crate::errors::SignalingError;
+
+/// Upper bound for SDP blobs we accept. Real-world SDP is a few KiB; 64 KiB
+/// leaves generous headroom while preventing denial-of-service by oversized
+/// strings being relayed unmodified to other peers.
+pub const MAX_SDP_BYTES: usize = 64 * 1024;
+
+/// Upper bound for a single ICE candidate JSON blob (8 KiB).
+pub const MAX_CANDIDATE_BYTES: usize = 8 * 1024;
+
+/// Validate an SDP offer/answer body.
+///
+/// Performs lightweight structural checks only — the full SDP grammar is
+/// re-parsed by the browser. We just ensure it looks like an SDP document
+/// (starts with `v=0`) and is within the size cap.
+pub fn validate_sdp(sdp: &str) -> Result<(), SignalingError> {
+    if sdp.is_empty() {
+        return Err(SignalingError::InvalidSdp("empty"));
+    }
+    if sdp.len() > MAX_SDP_BYTES {
+        return Err(SignalingError::InvalidSdp("exceeds 64 KiB"));
+    }
+    // SDP must start with version line `v=0`. Allow optional BOM/whitespace
+    // trimming but require the very first non-whitespace token.
+    let head = sdp.trim_start();
+    if !head.starts_with("v=0") {
+        return Err(SignalingError::InvalidSdp("missing v=0 line"));
+    }
+    Ok(())
+}
+
+/// Validate an ICE candidate JSON payload.
+///
+/// Expected shape (matches the browser `RTCIceCandidateInit`):
+/// ```json
+/// { "candidate": "candidate:...", "sdpMid": "0", "sdpMLineIndex": 0 }
+/// ```
+///
+/// We only require that `candidate` is a non-empty string, and that the
+/// serialized blob fits in [`MAX_CANDIDATE_BYTES`].
+pub fn validate_ice_candidate(candidate: &Value) -> Result<(), SignalingError> {
+    let obj = candidate
+        .as_object()
+        .ok_or(SignalingError::InvalidCandidate("not a JSON object"))?;
+
+    let cand = obj
+        .get("candidate")
+        .ok_or(SignalingError::InvalidCandidate("missing 'candidate' field"))?;
+    let cand_str = cand
+        .as_str()
+        .ok_or(SignalingError::InvalidCandidate("'candidate' is not a string"))?;
+    if cand_str.is_empty() {
+        return Err(SignalingError::InvalidCandidate("'candidate' is empty"));
+    }
+
+    // Serialize once to check the overall envelope size.
+    let serialized = serde_json::to_vec(candidate)
+        .map_err(|_| SignalingError::InvalidCandidate("not serializable"))?;
+    if serialized.len() > MAX_CANDIDATE_BYTES {
+        return Err(SignalingError::InvalidCandidate("exceeds 8 KiB"));
+    }
+
+    Ok(())
+}
+
+/// Per-variant validation for a `CallEvent` before it is relayed.
+pub fn validate_call_event(ev: &CallEvent) -> Result<(), SignalingError> {
+    match ev {
+        CallEvent::Invite { sdp, to, .. } => {
+            if to.is_empty() {
+                return Err(SignalingError::Protocol("invite has no recipients".into()));
+            }
+            validate_sdp(sdp)
+        }
+        CallEvent::Answer { sdp, .. } => validate_sdp(sdp),
+        CallEvent::Ice { candidate, .. } => validate_ice_candidate(candidate),
+        CallEvent::End { reason, .. } => {
+            if reason.len() > 256 {
+                return Err(SignalingError::Protocol("end reason exceeds 256 bytes".into()));
+            }
+            Ok(())
+        }
+    }
+}

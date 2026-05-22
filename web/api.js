@@ -30,7 +30,7 @@ export class ApiError extends Error {
   }
 }
 
-async function request(method, path, { body, query, withAuth = true } = {}) {
+async function request(method, path, { body, query, withAuth = true, raw = false } = {}) {
   const headers = { 'Accept': 'application/json' };
   if (body !== undefined) headers['Content-Type'] = 'application/json';
   if (withAuth) {
@@ -49,10 +49,13 @@ async function request(method, path, { body, query, withAuth = true } = {}) {
   }
   let resp;
   try {
+    if (raw && body !== undefined) {
+      delete headers['Content-Type']; // let browser set multipart boundary
+    }
     resp = await fetch(url, {
       method,
       headers,
-      body: body !== undefined ? JSON.stringify(body) : undefined,
+      body: raw ? body : body !== undefined ? JSON.stringify(body) : undefined,
     });
   } catch (e) {
     throw new ApiError(0, null, `网络错误:${e.message}`);
@@ -88,6 +91,9 @@ export const api = {
     if (name && name.trim()) body.name = name.trim();
     return request('POST', '/api/rooms', { body });
   },
+  listRooms() {
+    return request('GET', '/api/rooms');
+  },
   addMember(roomId, participantId) {
     return request('POST', `/api/rooms/${encodeURIComponent(roomId)}/members`, {
       body: { participant_id: participantId },
@@ -97,5 +103,58 @@ export const api = {
     return request('GET', `/api/rooms/${encodeURIComponent(roomId)}/messages`, {
       query: { before, limit },
     });
+  },
+  editMessage(id, blocks) {
+    return request('PATCH', `/api/messages/${encodeURIComponent(id)}`, { body: { blocks } });
+  },
+  deleteMessage(id) {
+    return request('DELETE', `/api/messages/${encodeURIComponent(id)}`);
+  },
+  toggleReaction(messageId, emoji) {
+    return request('POST', `/api/messages/${encodeURIComponent(messageId)}/reactions`, {
+      body: { emoji },
+    });
+  },
+  reactionsBatch(messageIds) {
+    return request('POST', '/api/messages/reactions', { body: { message_ids: messageIds } });
+  },
+  markRead(roomId, lastMessageId) {
+    return request('POST', `/api/rooms/${encodeURIComponent(roomId)}/read`, {
+      body: { last_message_id: lastMessageId },
+    });
+  },
+  listReceipts(roomId) {
+    return request('GET', `/api/rooms/${encodeURIComponent(roomId)}/receipts`);
+  },
+  search(roomId, { query, limit = 20, mode = 'auto' } = {}) {
+    return request('POST', `/api/rooms/${encodeURIComponent(roomId)}/search`, {
+      body: { query, limit, mode },
+    });
+  },
+  uploadBlob(file) {
+    const fd = new FormData();
+    fd.append('file', file, file.name || 'file');
+    return request('POST', '/api/blobs', { body: fd, raw: true });
+  },
+  blobUrl(id) {
+    return `/api/blobs/${encodeURIComponent(id)}`;
+  },
+  aiSummarize(roomId, lastN = 50) {
+    return request('POST', '/api/ai/summarize', { body: { room_id: roomId, last_n: lastN } });
+  },
+  aiAsk(roomId, question, k = 8) {
+    return request('POST', '/api/ai/ask', { body: { room_id: roomId, question, k } });
+  },
+  createStream({ title, room_id, protocol = 'rtmp' }) {
+    return request('POST', '/api/streams', { body: { title, room_id, protocol } });
+  },
+  listStreams() {
+    return request('GET', '/api/streams');
+  },
+  getStream(id) {
+    return request('GET', `/api/streams/${encodeURIComponent(id)}`);
+  },
+  rtcConfig() {
+    return request('GET', '/api/rtc/config');
   },
 };

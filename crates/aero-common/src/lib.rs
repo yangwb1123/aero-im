@@ -12,6 +12,7 @@
 pub mod config;
 pub mod error;
 pub mod ids;
+pub mod mls;
 pub mod model;
 pub mod telemetry;
 pub mod time;
@@ -19,6 +20,7 @@ pub mod time;
 pub use error::{Error, Result};
 pub use ids::{BlobId, MessageId, ParticipantId, RoomId};
 pub use model::{
-    Block, FileKind, Message, MessageEnvelope, Participant, ParticipantKind, Room, RoomKind, Span,
-    SpanStyle,
+    Block, Blob, CallEvent, CallId, CallKind, CallMode, CallSession, FileKind, Message,
+    MessageEnvelope, Participant, ParticipantKind, ReactionOp, ReactionSummary, Reaction,
+    ReadReceipt, Room, RoomEvent, RoomKind, Span, SpanStyle, Stream, StreamProtocol, StreamStatus,
 };

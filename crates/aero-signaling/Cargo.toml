@@ -13,4 +13,7 @@ workspace = true
 aero-common.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+thiserror.workspace = true
 tracing.workspace = true
+time.workspace = true
+url.workspace = true

@@ -1,22 +1,26 @@
-//! AI control plane: gateway, RAG, agent runtime, MCP host, moderation.
+//! AI control plane for Aero IM (P2 milestone).
 //!
-//! Real implementation begins in P2 (semantic search, summarization).
-//! In P1 we expose the trait-level surface so callers (e.g. embedding worker stubs)
-//! compile against stable interfaces.
+//! Wires together:
+//! - [`anthropic::AnthropicClient`] — thin Messages API client driven by env
+//!   (`ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL`).
+//! - [`embed::Embedder`] — pluggable embedding interface with two impls:
+//!   `VoyageEmbedder` (production) and `HashEmbedder` (deterministic fallback).
+//! - [`service::AiService`] — high-level operations (embed / summarize / answer)
+//!   composed from the above + `aero-storage` repos.
+//! - [`worker::AiWorker`] — long-running drain of the `ai_jobs` queue.
+//!
+//! The server constructs a single `AiService` from env, hands an `Arc` of it to
+//! its Axum router (for live request paths), and spawns an `AiWorker` task for
+//! background work.
 
-use async_trait::async_trait;
+pub mod anthropic;
+pub mod embed;
+pub mod error;
+pub mod service;
+pub mod worker;
 
-#[async_trait]
-pub trait Embedder: Send + Sync {
-    async fn embed(&self, text: &str) -> anyhow::Result<Vec<f32>>;
-}
-
-/// No-op embedder used in P1; real implementations land in P2.
-pub struct NoopEmbedder;
-
-#[async_trait]
-impl Embedder for NoopEmbedder {
-    async fn embed(&self, _text: &str) -> anyhow::Result<Vec<f32>> {
-        Ok(Vec::new())
-    }
-}
+pub use anthropic::{AnthropicClient, ChatMsg};
+pub use embed::{default_embedder, Embedder, HashEmbedder, VoyageEmbedder, EMBED_DIM};
+pub use error::{AiError, Result};
+pub use service::{AiService, AnswerResult};
+pub use worker::AiWorker;

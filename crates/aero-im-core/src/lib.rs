@@ -12,10 +12,12 @@
 //! - [`events`] — high-level [`ImEvent`] published on `im.events.*`.
 
 mod events;
+mod moderator;
 mod service;
 mod validation;
 
 pub use events::ImEvent;
+pub use moderator::{AllowAllModerator, KeywordModerator, Moderator, ModerationVerdict};
 pub use service::{BusSink, ImService};
 pub use validation::{
     validate_blocks, ValidationError, MAX_BLOCKS, MAX_CODE_BYTES, MAX_TEXT_BYTES,

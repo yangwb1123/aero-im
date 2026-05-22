@@ -24,11 +24,15 @@ aero-storage.workspace = true
 aero-auth.workspace = true
 aero-im-core.workspace = true
 aero-ai.workspace = true
+aero-live-core.workspace = true
+aero-live-rtmp.workspace = true
+aero-live-whip.workspace = true
+aero-signaling.workspace = true
 
 sqlx.workspace = true
 
-tokio.workspace = true
-tokio-util.workspace = true
+tokio = { workspace = true, features = ["full"] }
+tokio-util = { workspace = true, features = ["rt"] }
 futures.workspace = true
 async-trait.workspace = true
 
@@ -48,6 +52,7 @@ uuid.workspace = true
 bytes.workspace = true
 dashmap.workspace = true
 parking_lot.workspace = true
+base64 = "0.22"
 
 [dev-dependencies]
 pretty_assertions.workspace = true

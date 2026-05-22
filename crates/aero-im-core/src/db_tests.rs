@@ -13,7 +13,10 @@
 use std::sync::Arc;
 
 use aero_common::{Block, RoomKind};
-use aero_storage::{db::PgPool, MessageRepo, ParticipantRepo, RoomRepo};
+use aero_storage::{
+    db::PgPool, AiJobRepo, CallRepo, MessageRepo, ParticipantRepo, ReactionRepo, ReceiptRepo,
+    RoomRepo,
+};
 
 use crate::service::ImService;
 use crate::test_util::MockBus;
@@ -37,7 +40,11 @@ fn service(pool: PgPool) -> ImService {
     ImService::new(
         RoomRepo::new(pool.clone()),
         MessageRepo::new(pool.clone()),
-        ParticipantRepo::new(pool),
+        ParticipantRepo::new(pool.clone()),
+        ReceiptRepo::new(pool.clone()),
+        ReactionRepo::new(pool.clone()),
+        CallRepo::new(pool.clone()),
+        AiJobRepo::new(pool),
         bus,
     )
 }
@@ -135,7 +142,11 @@ async fn send_message_publishes_envelope() {
     let svc = ImService::new(
         RoomRepo::new(pool.clone()),
         MessageRepo::new(pool.clone()),
-        ParticipantRepo::new(pool),
+        ParticipantRepo::new(pool.clone()),
+        ReceiptRepo::new(pool.clone()),
+        ReactionRepo::new(pool.clone()),
+        CallRepo::new(pool.clone()),
+        AiJobRepo::new(pool),
         bus.clone(),
     );
     let room = svc

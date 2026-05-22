@@ -11,8 +11,28 @@ workspace = true
 
 [dependencies]
 aero-common.workspace = true
+aero-storage.workspace = true
+aero-bus.workspace = true
+
+tokio.workspace = true
+tokio-util.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+
+reqwest.workspace = true
+sqlx.workspace = true
+
 serde.workspace = true
 serde_json.workspace = true
-tracing.workspace = true
-async-trait.workspace = true
+
+thiserror.workspace = true
 anyhow.workspace = true
+tracing.workspace = true
+
+time.workspace = true
+ulid.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+pretty_assertions.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }

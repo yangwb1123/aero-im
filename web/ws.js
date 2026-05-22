@@ -112,6 +112,33 @@ export class WsClient {
   sendMessage(roomId, blocks, replyTo = null) {
     return this.send({ type: 'send_message', room_id: roomId, blocks, reply_to: replyTo });
   }
+  editMessage(id, blocks) {
+    return this.send({ type: 'edit_message', id, blocks });
+  }
+  deleteMessage(id) {
+    return this.send({ type: 'delete_message', id });
+  }
+  react(messageId, emoji) {
+    return this.send({ type: 'react', message_id: messageId, emoji });
+  }
+  markRead(roomId, lastMessageId) {
+    return this.send({ type: 'mark_read', room_id: roomId, last_message_id: lastMessageId });
+  }
+  typing(roomId, on) {
+    return this.send({ type: 'typing', room_id: roomId, on });
+  }
+  callInvite(roomId, kind, sdp, mode = 'p2p') {
+    return this.send({ type: 'call_invite', room_id: roomId, kind, mode, sdp });
+  }
+  callAnswer(callId, roomId, to, sdp) {
+    return this.send({ type: 'call_answer', call_id: callId, room_id: roomId, to, sdp });
+  }
+  callIce(callId, roomId, to, candidate) {
+    return this.send({ type: 'call_ice', call_id: callId, room_id: roomId, to, candidate });
+  }
+  callEnd(callId, roomId, reason = 'hangup') {
+    return this.send({ type: 'call_end', call_id: callId, room_id: roomId, reason });
+  }
 
   close() {
     this.closedByUser = true;

@@ -189,6 +189,276 @@ pub struct MessageEnvelope {
     pub recipients: Vec<ParticipantId>,
 }
 
+// ---------- Reactions (P2) ----------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Reaction {
+    pub message_id: MessageId,
+    pub participant_id: ParticipantId,
+    pub emoji: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+}
+
+/// Aggregate of reactions on a message — one entry per unique emoji.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReactionSummary {
+    pub emoji: String,
+    pub count: u32,
+    pub participants: Vec<ParticipantId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReactionOp {
+    Add,
+    Remove,
+}
+
+// ---------- Read receipts (P2) ----------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReadReceipt {
+    pub room_id: RoomId,
+    pub participant_id: ParticipantId,
+    pub last_read_message_id: MessageId,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: OffsetDateTime,
+}
+
+// ---------- Blobs (P2) ----------
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Blob {
+    pub id: BlobId,
+    pub owner_id: ParticipantId,
+    pub kind: FileKind,
+    pub name: String,
+    pub mime: String,
+    pub size: u64,
+    pub sha256: Option<String>,
+    pub storage_key: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub finalized_at: Option<OffsetDateTime>,
+}
+
+// ---------- Live streams (P4/P5) ----------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StreamStatus {
+    Idle,
+    Live,
+    Ended,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StreamProtocol {
+    Rtmp,
+    Whip,
+    Srt,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Stream {
+    pub id: ulid::Ulid,
+    pub owner_id: ParticipantId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub room_id: Option<RoomId>,
+    pub title: String,
+    pub stream_key: String,
+    pub status: StreamStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hls_path: Option<String>,
+    pub protocol: StreamProtocol,
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub started_at: Option<OffsetDateTime>,
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub ended_at: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+}
+
+// ---------- Call sessions + signaling (P3/P6) ----------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CallKind {
+    Audio,
+    Video,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CallMode {
+    P2p,
+    Sfu,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct CallId(pub ulid::Ulid);
+
+impl CallId {
+    #[must_use]
+    pub fn new() -> Self {
+        Self(ulid::Ulid::new())
+    }
+    #[must_use]
+    pub fn to_uuid(&self) -> uuid::Uuid {
+        uuid::Uuid::from_u128(self.0 .0)
+    }
+    #[must_use]
+    pub fn from_uuid(u: uuid::Uuid) -> Self {
+        Self(ulid::Ulid(u.as_u128()))
+    }
+}
+
+impl Default for CallId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Display for CallId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl std::str::FromStr for CallId {
+    type Err = ulid::DecodeError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(ulid::Ulid::from_str(s)?))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CallSession {
+    pub id: CallId,
+    pub room_id: RoomId,
+    pub initiator: ParticipantId,
+    pub kind: CallKind,
+    pub mode: CallMode,
+    #[serde(with = "time::serde::rfc3339")]
+    pub started_at: OffsetDateTime,
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub ended_at: Option<OffsetDateTime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_reason: Option<String>,
+}
+
+/// WebRTC signaling event. Routed via `RoomEvent::Call(...)` on the bus.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum CallEvent {
+    Invite {
+        call_id: CallId,
+        room_id: RoomId,
+        from: ParticipantId,
+        to: Vec<ParticipantId>,
+        kind: CallKind,
+        sdp: String,
+    },
+    Answer {
+        call_id: CallId,
+        from: ParticipantId,
+        to: ParticipantId,
+        sdp: String,
+    },
+    Ice {
+        call_id: CallId,
+        from: ParticipantId,
+        to: ParticipantId,
+        candidate: serde_json::Value,
+    },
+    End {
+        call_id: CallId,
+        room_id: RoomId,
+        by: ParticipantId,
+        reason: String,
+    },
+}
+
+// ---------- Unified room-scoped event (NATS + WS wire) ----------
+
+/// Every per-room real-time event flows through this tagged enum on the NATS
+/// `im.room.{room_id}` subject. Subscribers fan out by recipient list.
+///
+/// The web client receives the same shape (minus envelope-level routing fields)
+/// over the WebSocket as `{"type":"room_event", "event": <RoomEvent>}`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RoomEvent {
+    /// A new message was sent.
+    Message(MessageEnvelope),
+    /// An existing message was edited.
+    Edited(Message),
+    /// A message was soft-deleted.
+    Deleted {
+        room_id: RoomId,
+        message_id: MessageId,
+        by: ParticipantId,
+    },
+    /// A reaction was toggled.
+    Reaction {
+        room_id: RoomId,
+        message_id: MessageId,
+        participant: ParticipantId,
+        emoji: String,
+        op: ReactionOp,
+    },
+    /// A read receipt was updated.
+    Read {
+        room_id: RoomId,
+        participant: ParticipantId,
+        last_message_id: MessageId,
+        #[serde(with = "time::serde::rfc3339")]
+        at: OffsetDateTime,
+    },
+    /// Best-effort typing indicator (no DB persistence).
+    Typing {
+        room_id: RoomId,
+        participant: ParticipantId,
+        on: bool,
+    },
+    /// WebRTC signaling (P3/P6).
+    Call(CallEvent),
+}
+
+impl RoomEvent {
+    /// The set of intended recipients for this event. Empty means "fan out to all
+    /// room members" — the bus subscriber will look up membership.
+    #[must_use]
+    pub fn explicit_recipients(&self) -> Vec<ParticipantId> {
+        match self {
+            RoomEvent::Message(e) => e.recipients.clone(),
+            RoomEvent::Call(CallEvent::Invite { to, .. }) => to.clone(),
+            RoomEvent::Call(CallEvent::Answer { to, .. } | CallEvent::Ice { to, .. }) => vec![*to],
+            _ => Vec::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn room_id(&self) -> Option<RoomId> {
+        match self {
+            RoomEvent::Message(e) => Some(e.message.room_id),
+            RoomEvent::Edited(m) => Some(m.room_id),
+            RoomEvent::Deleted { room_id, .. }
+            | RoomEvent::Reaction { room_id, .. }
+            | RoomEvent::Read { room_id, .. }
+            | RoomEvent::Typing { room_id, .. } => Some(*room_id),
+            RoomEvent::Call(CallEvent::Invite { room_id, .. } | CallEvent::End { room_id, .. }) => {
+                Some(*room_id)
+            }
+            RoomEvent::Call(CallEvent::Answer { .. } | CallEvent::Ice { .. }) => None,
+        }
+    }
+}
+
 // ---------- Tests ----------
 
 #[cfg(test)]

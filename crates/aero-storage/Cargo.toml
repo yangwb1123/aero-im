@@ -28,6 +28,8 @@ tracing.workspace = true
 time.workspace = true
 ulid.workspace = true
 uuid.workspace = true
+rand.workspace = true
+bytes.workspace = true
 
 [dev-dependencies]
 pretty_assertions.workspace = true
