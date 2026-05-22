@@ -229,6 +229,17 @@ export function renderMessage(m, mePid, participants, opts = {}) {
     meta.appendChild(el('span', { className: 'edited muted', text: '· 已编辑' }));
   }
 
+  // Optional reply chip — references the parent message.
+  if (m.reply_to && opts.replyTarget) {
+    const r = opts.replyTarget;
+    const chip = el('div', { className: 'reply-chip' });
+    chip.dataset.targetId = r.id;
+    const sName = participants.get(r.sender_id)?.display_name || shortId(r.sender_id);
+    chip.appendChild(el('span', { className: 'reply-sender', text: sName }));
+    chip.appendChild(el('span', { className: 'reply-text', text: textPreviewOf(r.blocks).slice(0, 80) }));
+    body.appendChild(chip);
+  }
+
   const bubble = el('div', { className: 'msg-bubble' });
   if (isDeleted) {
     bubble.appendChild(el('span', { className: 'muted', text: '消息已删除' }));
@@ -242,7 +253,11 @@ export function renderMessage(m, mePid, participants, opts = {}) {
     const btnReact = el('button', { className: 'msg-act', attrs: { title: '反应' } });
     btnReact.textContent = '☺';
     btnReact.dataset.action = 'react';
+    const btnReply = el('button', { className: 'msg-act', attrs: { title: '回复' } });
+    btnReply.textContent = '↩';
+    btnReply.dataset.action = 'reply';
     actions.appendChild(btnReact);
+    actions.appendChild(btnReply);
     if (isSelf) {
       const btnEdit = el('button', { className: 'msg-act', attrs: { title: '编辑' } });
       btnEdit.textContent = '✏';
@@ -303,10 +318,28 @@ export function renderTypingInto(node, names) {
   node.appendChild(el('span', { text }));
 }
 
+function textPreviewOf(blocks) {
+  if (!Array.isArray(blocks)) return '';
+  const out = [];
+  for (const b of blocks) {
+    if (!b || typeof b !== 'object') continue;
+    switch (b.type) {
+      case 'text': out.push(b.content || ''); break;
+      case 'code': out.push('[code]'); break;
+      case 'file': out.push('[' + (b.name || 'file') + ']'); break;
+      case 'voice': out.push('[voice]'); break;
+      case 'mention': out.push('@…'); break;
+      case 'card': out.push('[card]'); break;
+      default: break;
+    }
+  }
+  return out.join(' ').trim();
+}
+
 // ---------- room item ----------
-export function renderRoomItem(room, { active = false } = {}) {
+export function renderRoomItem(room, { active = false, unread = 0 } = {}) {
   const wrap = el('div', {
-    className: 'room-item' + (active ? ' active' : ''),
+    className: 'room-item' + (active ? ' active' : '') + (unread > 0 ? ' has-unread' : ''),
     dataset: { roomId: room.id },
   });
   const label = room.name || (room.kind === 'direct' ? 'Direct Message' : `Room ${shortId(room.id)}`);
@@ -316,6 +349,10 @@ export function renderRoomItem(room, { active = false } = {}) {
   text.appendChild(el('div', { className: 'room-sub', text: `${room.kind || 'room'} · ${shortId(room.id)}` }));
   wrap.appendChild(avatar);
   wrap.appendChild(text);
+  if (unread > 0) {
+    const badge = el('span', { className: 'room-badge', text: unread > 99 ? '99+' : String(unread) });
+    wrap.appendChild(badge);
+  }
   return wrap;
 }
 

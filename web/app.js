@@ -25,12 +25,15 @@ const state = {
   reachedTop: new Set(),
   pendingByTempId: new Map(),
   // P2
-  typing: new Map(), // roomId -> Map(pid -> timestamp)
-  reactionsByMsg: new Map(), // messageId -> [{emoji,count,participants}]
-  receiptsByRoom: new Map(), // roomId -> Map(pid -> {last_read_message_id, updated_at})
+  typing: new Map(),
+  reactionsByMsg: new Map(),
+  receiptsByRoom: new Map(),
   lastTypingSentAt: 0,
+  // P9.5
+  unreadByRoom: new Map(),    // room_id -> count
+  replyTo: null,              // { id, sender_id, blocks } when composing a reply
   // Call
-  call: null, // { id, roomId, kind, peers: Map(pid -> RTCPeerConnection), localStream, ... }
+  call: null,
   rtcConfig: null,
 };
 
@@ -184,6 +187,13 @@ function enterChat() {
   hookWs();
   refreshRoomsFromServer();
   api.rtcConfig().then((c) => { state.rtcConfig = c; }).catch(() => {});
+  // Ask for notification permission once (silent if denied).
+  if ('Notification' in window && Notification.permission === 'default') {
+    Notification.requestPermission().catch(() => {});
+  }
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden && state.currentRoomId) clearUnread(state.currentRoomId);
+  });
 }
 
 function avatarStyleFromId(id) {
@@ -246,11 +256,56 @@ function handleIncomingMessage(m) {
   if (arr.some((x) => x.id === m.id)) return;
   arr.push(m);
   state.messagesByRoom.set(m.room_id, arr);
-  if (m.room_id === state.currentRoomId) {
+  const isCurrent = m.room_id === state.currentRoomId;
+  const tabFocused = !document.hidden;
+  if (isCurrent && tabFocused) {
     appendMessageEl(renderMsgWithReactions(m), { scroll: true });
     hideEmptyIfNeeded();
     maybeMarkRead(m);
+  } else {
+    bumpUnread(m.room_id);
+    if (!isMine) notify(m);
+    if (isCurrent) {
+      // Tab is hidden but room is active — still append, just don't mark read.
+      appendMessageEl(renderMsgWithReactions(m), { scroll: true });
+      hideEmptyIfNeeded();
+    }
   }
+}
+
+function bumpUnread(roomId) {
+  const cur = state.unreadByRoom.get(roomId) || 0;
+  state.unreadByRoom.set(roomId, cur + 1);
+  refreshRoomList();
+  updateTitleBadge();
+}
+
+function clearUnread(roomId) {
+  if (state.unreadByRoom.get(roomId)) {
+    state.unreadByRoom.delete(roomId);
+    refreshRoomList();
+    updateTitleBadge();
+  }
+}
+
+function updateTitleBadge() {
+  let total = 0;
+  for (const n of state.unreadByRoom.values()) total += n;
+  document.title = (total > 0 ? `(${total}) ` : '') + 'Aero IM';
+}
+
+function notify(m) {
+  if (!('Notification' in window)) return;
+  if (Notification.permission !== 'granted') return;
+  const sender = state.participants.get(m.sender_id);
+  const title = (sender?.display_name || 'New message') + ' · Aero IM';
+  const body = (m.blocks || []).map((b) => b?.content || '').join(' ').slice(0, 80) || '[attachment]';
+  const n = new Notification(title, { body, tag: m.id });
+  n.onclick = () => {
+    window.focus();
+    if (m.room_id !== state.currentRoomId) switchRoom(m.room_id);
+    n.close();
+  };
 }
 
 function handleEdited(m) {
@@ -418,7 +473,8 @@ function refreshRoomList() {
     return;
   }
   for (const r of list) {
-    const node = renderRoomItem(r, { active: r.id === state.currentRoomId });
+    const unread = state.unreadByRoom.get(r.id) || 0;
+    const node = renderRoomItem(r, { active: r.id === state.currentRoomId, unread });
     node.addEventListener('click', () => switchRoom(r.id));
     els.roomList.appendChild(node);
   }
@@ -432,6 +488,7 @@ function setActiveRoomVisual() {
 async function switchRoom(roomId) {
   if (state.currentRoomId === roomId) return;
   state.currentRoomId = roomId;
+  clearUnread(roomId);
   setActiveRoomVisual();
   const room = state.rooms.get(roomId);
   els.roomName.textContent = room?.name || `Room ${roomId.slice(0, 6)}…`;
@@ -521,8 +578,22 @@ function rerenderCurrentRoom() {
 }
 
 function renderMsgWithReactions(m, opts = {}) {
+  // Hydrate reply_to with the parent message snippet if available.
+  if (m.reply_to && !opts.replyTarget) {
+    const arr = state.messagesByRoom.get(m.room_id) || [];
+    const parent = arr.find((x) => x.id === m.reply_to);
+    if (parent) opts = { ...opts, replyTarget: parent };
+  }
   const node = renderMessage(m, state.me?.id, state.participants, opts);
   wireMsgActions(node, m);
+  // Click on the reply chip jumps to the parent.
+  const chip = node.querySelector('.reply-chip');
+  if (chip) {
+    chip.addEventListener('click', () => {
+      const tid = chip.dataset.targetId;
+      if (tid) scrollToMessage(tid);
+    });
+  }
   return node;
 }
 
@@ -545,7 +616,50 @@ function wireMsgActions(node, m) {
     if (act === 'delete') {
       if (confirm('删除这条消息?')) ws.deleteMessage(m.id);
     }
+    if (act === 'reply') beginReply(m);
   });
+}
+
+function beginReply(m) {
+  state.replyTo = { id: m.id, sender_id: m.sender_id, blocks: m.blocks };
+  renderReplyChip();
+  els.composerInput.focus();
+}
+
+function clearReply() {
+  state.replyTo = null;
+  renderReplyChip();
+}
+
+function renderReplyChip() {
+  let row = document.getElementById('composer-reply');
+  if (!state.replyTo) {
+    if (row) row.remove();
+    return;
+  }
+  if (!row) {
+    row = document.createElement('div');
+    row.id = 'composer-reply';
+    row.className = 'composer-reply';
+    els.composer.insertBefore(row, els.composer.firstChild);
+  }
+  row.replaceChildren();
+  const sname = state.participants.get(state.replyTo.sender_id)?.display_name || state.replyTo.sender_id.slice(0, 6);
+  const txt = (state.replyTo.blocks || []).map((b) => b?.content || '').join(' ').slice(0, 60);
+  const lbl = document.createElement('span');
+  lbl.className = 'composer-reply-label';
+  lbl.textContent = '↩ 回复 ' + sname + ': ';
+  const body = document.createElement('span');
+  body.className = 'composer-reply-text';
+  body.textContent = txt;
+  const x = document.createElement('button');
+  x.type = 'button';
+  x.className = 'composer-reply-x';
+  x.textContent = '×';
+  x.addEventListener('click', clearReply);
+  row.appendChild(lbl);
+  row.appendChild(body);
+  row.appendChild(x);
 }
 
 function beginEditMessage(m) {
@@ -652,14 +766,16 @@ function submitComposer() {
   if (!raw.trim()) return;
   const roomId = state.currentRoomId;
   const blocks = composeBlocksFromInput(raw);
-  optimisticAdd(roomId, blocks);
-  ws.sendMessage(roomId, blocks, null);
+  const replyTo = state.replyTo ? state.replyTo.id : null;
+  optimisticAdd(roomId, blocks, replyTo);
+  ws.sendMessage(roomId, blocks, replyTo);
   ws.typing(roomId, false);
   state.lastTypingSentAt = 0;
   els.composerInput.value = '';
   els.composerSend.disabled = true;
   autoGrow(els.composerInput);
   closeMentionMenu();
+  clearReply();
 }
 
 function composeBlocksFromInput(text) {
@@ -769,11 +885,11 @@ function pickMention() {
   input.focus();
 }
 
-function optimisticAdd(roomId, blocks) {
+function optimisticAdd(roomId, blocks, replyTo = null) {
   const tempId = '_pending_' + crypto.randomUUID();
   const pending = {
     id: tempId, room_id: roomId, sender_id: state.me?.id, blocks,
-    reply_to: null, metadata: {}, created_at: new Date().toISOString(),
+    reply_to: replyTo, metadata: {}, created_at: new Date().toISOString(),
     edited_at: null, deleted_at: null,
   };
   state.pendingByTempId.set(tempId, pending);

@@ -902,6 +902,68 @@ input, textarea, select, button { font-family: inherit; }
   background: rgba(99,102,241,.04);
 }
 
+/* reply chip on messages */
+.reply-chip {
+  display: inline-flex; gap: 6px;
+  font-size: 11px;
+  padding: 3px 8px;
+  background: var(--bg-3);
+  border-radius: 4px;
+  margin-bottom: 4px;
+  cursor: pointer;
+  max-width: 80%;
+  border-left: 2px solid var(--brand-1);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-mute);
+}
+.reply-chip:hover { background: var(--bg-2); }
+.reply-chip .reply-sender { font-weight: 600; color: var(--text); flex-shrink: 0; }
+.reply-chip .reply-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.msg.self .reply-chip { align-self: flex-end; }
+
+/* composer reply chip */
+.composer { grid-template-columns: auto 1fr auto; }
+.composer-reply {
+  grid-column: 1 / -1;
+  display: flex; gap: 6px; align-items: center;
+  background: var(--bg-1);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 4px 8px;
+  font-size: 12px;
+  color: var(--text-mute);
+}
+.composer-reply-label { color: var(--text); font-weight: 600; }
+.composer-reply-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; }
+.composer-reply-x {
+  appearance: none;
+  background: transparent;
+  border: 0;
+  color: var(--text-mute);
+  font-size: 18px;
+  cursor: pointer;
+  padding: 0 4px;
+  line-height: 1;
+}
+.composer-reply-x:hover { color: var(--text); }
+
+/* unread badge in room list */
+.room-item.has-unread .room-title { font-weight: 700; color: var(--text); }
+.room-badge {
+  margin-left: auto;
+  background: var(--brand-1);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  padding: 1px 6px;
+  border-radius: 999px;
+  min-width: 18px;
+  text-align: center;
+}
+.room-item.active .room-badge { background: var(--brand-2); }
+
 /* responsive — collapse right pane on narrow */
 @media (max-width: 900px) {
   .view-chat { grid-template-columns: 220px 1fr; }
