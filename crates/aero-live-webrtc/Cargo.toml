@@ -1,0 +1,16 @@
+[package]
+name = "aero-live-webrtc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+aero-common.workspace = true
+aero-live-core.workspace = true
+aero-signaling.workspace = true
+tracing.workspace = true
