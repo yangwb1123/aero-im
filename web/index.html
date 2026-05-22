@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Aero IM — Debug Client</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <!-- toast container -->
+  <div id="toast-stack" class="toast-stack" aria-live="polite"></div>
+
+  <!-- AUTH VIEW -->
+  <section id="view-auth" class="view view-auth" hidden>
+    <div class="auth-card">
+      <header class="auth-header">
+        <div class="brand-mark">A</div>
+        <h1>Aero IM</h1>
+        <p class="muted">debug client · 联调专用</p>
+      </header>
+
+      <nav class="tabs" role="tablist">
+        <button class="tab active" data-tab="login" role="tab">登录</button>
+        <button class="tab" data-tab="register" role="tab">注册</button>
+      </nav>
+
+      <form id="form-login" class="auth-form" data-tab-panel="login">
+        <label>
+          <span>邮箱</span>
+          <input type="email" name="email" autocomplete="email" required />
+        </label>
+        <label>
+          <span>密码</span>
+          <input type="password" name="password" autocomplete="current-password" required minlength="6" />
+        </label>
+        <button type="submit" class="btn-primary">登录</button>
+      </form>
+
+      <form id="form-register" class="auth-form" data-tab-panel="register" hidden>
+        <label>
+          <span>邮箱</span>
+          <input type="email" name="email" autocomplete="email" required />
+        </label>
+        <label>
+          <span>显示名</span>
+          <input type="text" name="display_name" autocomplete="nickname" required minlength="1" maxlength="64" />
+        </label>
+        <label>
+          <span>密码</span>
+          <input type="password" name="password" autocomplete="new-password" required minlength="6" />
+        </label>
+        <button type="submit" class="btn-primary">注册并登录</button>
+      </form>
+    </div>
+  </section>
+
+  <!-- CHAT VIEW -->
+  <section id="view-chat" class="view view-chat" hidden>
+    <aside class="pane pane-left">
+      <header class="pane-head">
+        <div class="brand-row">
+          <div class="brand-mark sm">A</div>
+          <span class="brand-name">Aero IM</span>
+          <span id="ws-dot" class="ws-dot ws-down" title="WebSocket"></span>
+        </div>
+        <button id="btn-new-room" class="btn-ghost" title="新建房间">+ 新建</button>
+      </header>
+
+      <div id="room-list" class="room-list"></div>
+
+      <footer class="pane-foot">
+        <div class="me-row">
+          <div id="me-avatar" class="avatar">·</div>
+          <div class="me-info">
+            <div id="me-name" class="me-name">—</div>
+            <div id="me-email" class="me-email muted"></div>
+          </div>
+        </div>
+        <button id="btn-logout" class="btn-link">退出</button>
+      </footer>
+    </aside>
+
+    <main class="pane pane-center">
+      <header id="room-head" class="room-head">
+        <div class="room-head-title">
+          <h2 id="room-name">选择房间</h2>
+          <span id="room-meta" class="muted"></span>
+        </div>
+        <div class="room-head-actions">
+          <button id="btn-add-member" class="btn-ghost" hidden>+ 添加成员</button>
+        </div>
+      </header>
+
+      <div id="msg-scroll" class="msg-scroll">
+        <div id="msg-list" class="msg-list"></div>
+        <div id="msg-empty" class="msg-empty muted" hidden>暂无消息,开个头吧。</div>
+      </div>
+
+      <form id="composer" class="composer" hidden>
+        <textarea
+          id="composer-input"
+          placeholder="输入消息,回车发送,Shift+回车换行"
+          rows="1"
+          maxlength="8000"></textarea>
+        <button type="submit" id="composer-send" class="btn-primary" disabled>发送</button>
+      </form>
+    </main>
+
+    <aside class="pane pane-right">
+      <header class="pane-head">
+        <span class="pane-title">在线成员</span>
+        <span id="online-count" class="badge">0</span>
+      </header>
+      <div id="online-list" class="online-list"></div>
+    </aside>
+  </section>
+
+  <!-- modal: new room -->
+  <div id="modal-new-room" class="modal" hidden>
+    <div class="modal-card">
+      <header class="modal-head">
+        <h3>新建房间</h3>
+        <button class="btn-icon" data-close>×</button>
+      </header>
+      <form id="form-new-room" class="modal-body">
+        <label>
+          <span>类型</span>
+          <select name="kind">
+            <option value="group">群组 group</option>
+            <option value="channel">频道 channel</option>
+            <option value="direct">直接消息 direct</option>
+          </select>
+        </label>
+        <label>
+          <span>名称(group/channel 可填)</span>
+          <input type="text" name="name" maxlength="64" placeholder="例如:研发联调" />
+        </label>
+        <footer class="modal-foot">
+          <button type="button" class="btn-ghost" data-close>取消</button>
+          <button type="submit" class="btn-primary">创建</button>
+        </footer>
+      </form>
+    </div>
+  </div>
+
+  <!-- modal: add member -->
+  <div id="modal-add-member" class="modal" hidden>
+    <div class="modal-card">
+      <header class="modal-head">
+        <h3>添加成员</h3>
+        <button class="btn-icon" data-close>×</button>
+      </header>
+      <form id="form-add-member" class="modal-body">
+        <label>
+          <span>Participant ID</span>
+          <input type="text" name="participant_id" required placeholder="01J..." />
+        </label>
+        <footer class="modal-foot">
+          <button type="button" class="btn-ghost" data-close>取消</button>
+          <button type="submit" class="btn-primary">添加</button>
+        </footer>
+      </form>
+    </div>
+  </div>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>

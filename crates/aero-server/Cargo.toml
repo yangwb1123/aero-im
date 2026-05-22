@@ -1,0 +1,53 @@
+[package]
+name = "aero-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "aero-server"
+path = "src/bin/aero-server.rs"
+
+[[bin]]
+name = "aero-cli"
+path = "src/bin/aero-cli.rs"
+
+[dependencies]
+aero-common.workspace = true
+aero-bus.workspace = true
+aero-storage.workspace = true
+aero-auth.workspace = true
+aero-im-core.workspace = true
+aero-ai.workspace = true
+
+sqlx.workspace = true
+
+tokio.workspace = true
+tokio-util.workspace = true
+futures.workspace = true
+async-trait.workspace = true
+
+axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+hyper.workspace = true
+
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+time.workspace = true
+ulid.workspace = true
+uuid.workspace = true
+bytes.workspace = true
+dashmap.workspace = true
+parking_lot.workspace = true
+
+[dev-dependencies]
+pretty_assertions.workspace = true

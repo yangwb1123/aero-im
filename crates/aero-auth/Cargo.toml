@@ -1,0 +1,38 @@
+[package]
+name = "aero-auth"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+aero-common.workspace = true
+aero-storage.workspace = true
+
+tokio.workspace = true
+axum.workspace = true
+async-trait.workspace = true
+
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+time.workspace = true
+
+jsonwebtoken.workspace = true
+argon2.workspace = true
+password-hash.workspace = true
+rand.workspace = true
+rsa.workspace = true
+
+# sqlx is reachable only through the storage layer's error type; we name it to
+# inspect `is_unique_violation()` for friendly Conflict mapping.
+sqlx.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

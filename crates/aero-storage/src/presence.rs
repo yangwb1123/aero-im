@@ -2,16 +2,16 @@
 //! Kept in Redis with TTL so crashed clients age out automatically.
 
 use aero_common::{ParticipantId, RoomId};
-use fred::prelude::*;
+use fred::prelude::{Expiration, KeysInterface, RedisClient};
 use std::time::Duration;
 
 #[derive(Clone)]
 pub struct PresenceStore {
-    client: Client,
+    client: RedisClient,
 }
 
 impl PresenceStore {
-    pub fn new(client: Client) -> Self {
+    pub fn new(client: RedisClient) -> Self {
         Self { client }
     }
 

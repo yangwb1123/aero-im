@@ -1,5 +1,5 @@
 [package]
-name = "aero-common"
+name = "aero-im-core"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,21 +10,23 @@ publish = false
 workspace = true
 
 [dependencies]
+aero-common.workspace = true
+aero-storage.workspace = true
+aero-bus.workspace = true
+
+tokio.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+
 serde.workspace = true
 serde_json.workspace = true
-serde_with.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
-ulid.workspace = true
-uuid.workspace = true
-time.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
-figment.workspace = true
-dotenvy.workspace = true
-url.workspace = true
-sqlx.workspace = true
+time.workspace = true
+bytes.workspace = true
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync"] }
 pretty_assertions.workspace = true
-serde_json.workspace = true
+sqlx.workspace = true

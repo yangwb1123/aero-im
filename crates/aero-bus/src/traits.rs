@@ -34,11 +34,18 @@ pub trait EventBus: Send + Sync {
     async fn publish(&self, subject: &str, payload: bytes::Bytes) -> BusResult<()>;
 
     /// Publish a JSON-serializable event.
+    ///
+    /// `Self: Sized` so the trait remains dyn-compatible — callers holding
+    /// `Arc<dyn EventBus>` should serialize externally and call [`publish`].
+    /// Concrete impls (`JetStreamBus`) get the ergonomic shortcut.
     async fn publish_json<T: serde::Serialize + Send + Sync>(
         &self,
         subject: &str,
         value: &T,
-    ) -> BusResult<()> {
+    ) -> BusResult<()>
+    where
+        Self: Sized,
+    {
         let bytes = serde_json::to_vec(value)?;
         self.publish(subject, bytes.into()).await
     }

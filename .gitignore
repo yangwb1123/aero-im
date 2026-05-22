@@ -11,3 +11,7 @@ dist/
 .DS_Store
 data/
 .sqlx/
+secrets/
+config.toml
+
+

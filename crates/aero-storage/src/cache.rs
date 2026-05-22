@@ -1,7 +1,7 @@
 //! Redis-backed key/value cache used for short-lived session and rate-limit data.
 
 use async_trait::async_trait;
-use fred::prelude::*;
+use fred::prelude::{Builder, ClientLike, Expiration, KeysInterface, RedisClient, RedisConfig};
 use std::time::Duration;
 
 #[async_trait]
@@ -13,15 +13,20 @@ pub trait Cache: Send + Sync {
 
 #[derive(Clone)]
 pub struct RedisCache {
-    client: Client,
+    client: RedisClient,
 }
 
 impl RedisCache {
     pub async fn connect(url: &str) -> anyhow::Result<Self> {
-        let cfg = Config::from_url(url)?;
+        let cfg = RedisConfig::from_url(url)?;
         let client = Builder::from_config(cfg).build()?;
         client.init().await?;
         Ok(Self { client })
+    }
+
+    /// Borrow the underlying client (used by `PresenceStore` to share a connection).
+    pub fn client(&self) -> &RedisClient {
+        &self.client
     }
 }
 
