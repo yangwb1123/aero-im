@@ -974,6 +974,28 @@ input, textarea, select, button { font-family: inherit; }
 }
 .room-item.active .room-badge { background: var(--brand-2); }
 
+/* inline stream card */
+.stream-card {
+  margin-top: 6px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--bg-1);
+  overflow: hidden;
+  max-width: 480px;
+}
+.stream-card-head { display: flex; align-items: center; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--line); }
+.stream-card-live {
+  background: var(--danger);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  padding: 1px 6px;
+  border-radius: 999px;
+}
+.stream-card-title { font-weight: 600; font-size: 13px; }
+.stream-card-video { width: 100%; aspect-ratio: 16 / 9; background: #000; display: block; }
+.stream-card-meta { padding: 6px 12px; font-size: 11px; word-break: break-all; }
+
 /* responsive — collapse right pane on narrow */
 @media (max-width: 900px) {
   .view-chat { grid-template-columns: 220px 1fr; }

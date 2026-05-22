@@ -652,7 +652,7 @@ async fn stream_create(
         .create(NewStream {
             owner_id: auth.participant_id,
             room_id,
-            title: req.title,
+            title: req.title.clone(),
             protocol: proto,
             stream_key: None,
         })
@@ -665,6 +665,28 @@ async fn stream_create(
         StreamProtocol::Srt => format!("srt://{}?streamid={}", strip_scheme(&s.public_base_url), stream.stream_key),
     };
     let hls_url = format!("/hls/{}/index.m3u8", stream.id);
+
+    // Best-effort: drop a stream card into the linked room so members can watch
+    // inline. Failures don't block stream creation.
+    if let Some(room) = room_id {
+        let card = aero_common::Block::Card {
+            schema: "stream".into(),
+            payload: serde_json::json!({
+                "stream_id": stream.id.to_string(),
+                "title": stream.title,
+                "protocol": format!("{:?}", stream.protocol).to_lowercase(),
+                "hls_url": hls_url,
+                "ingest_url": ingest_url,
+            }),
+        };
+        if let Err(e) = s
+            .im
+            .send_message(auth.participant_id, room, vec![card], None)
+            .await
+        {
+            tracing::warn!(error = ?e, %room, "stream announce message failed");
+        }
+    }
 
     Ok(Json(serde_json::json!({
         "stream": stream,

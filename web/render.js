@@ -125,6 +125,10 @@ function appendBlock(parent, b, ctx = {}) {
       return;
     }
     case 'card': {
+      if (b.schema === 'stream' && b.payload && b.payload.hls_url) {
+        parent.appendChild(buildStreamCard(b.payload));
+        return;
+      }
       const wrap = el('div', { className: 'card-block' });
       const title = b.payload?.title || b.schema || 'card';
       wrap.appendChild(el('div', { className: 'card-title', text: String(title) }));
@@ -160,6 +164,44 @@ function appendBlock(parent, b, ctx = {}) {
       s.textContent = `[${String(b.type || 'unknown')}]`;
       parent.appendChild(s);
     }
+  }
+}
+
+function buildStreamCard(payload) {
+  const wrap = el('div', { className: 'stream-card' });
+  const head = el('div', { className: 'stream-card-head' });
+  const live = el('span', { className: 'stream-card-live', text: 'LIVE' });
+  const title = el('div', { className: 'stream-card-title', text: payload.title || '直播' });
+  head.appendChild(live);
+  head.appendChild(title);
+  wrap.appendChild(head);
+  const video = el('video', {
+    attrs: { controls: 'controls', playsinline: 'true', muted: 'true', preload: 'metadata' },
+    className: 'stream-card-video',
+  });
+  attachHls(video, payload.hls_url);
+  wrap.appendChild(video);
+  const meta = el('div', { className: 'stream-card-meta muted' });
+  meta.textContent = `${(payload.protocol || 'rtmp').toUpperCase()} · ${payload.hls_url}`;
+  wrap.appendChild(meta);
+  return wrap;
+}
+
+function attachHls(video, src) {
+  if (!src) return;
+  // Safari (and iOS) natively supports HLS.
+  if (video.canPlayType('application/vnd.apple.mpegurl')) {
+    video.src = src;
+    return;
+  }
+  // hls.js is loaded from CDN in index.html; if unavailable, fall back.
+  const HlsLib = window.Hls;
+  if (HlsLib && typeof HlsLib === 'function' && HlsLib.isSupported && HlsLib.isSupported()) {
+    const hls = new HlsLib({ lowLatencyMode: true, liveSyncDurationCount: 2 });
+    hls.loadSource(src);
+    hls.attachMedia(video);
+  } else {
+    video.src = src;
   }
 }
 
