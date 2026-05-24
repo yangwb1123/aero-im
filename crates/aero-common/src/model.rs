@@ -381,6 +381,22 @@ pub enum CallEvent {
         by: ParticipantId,
         reason: String,
     },
+    /// Live caption line (P3 实时字幕翻译). Broadcast to the room during a call.
+    /// `text` is the recognized speech; `translated` is filled by the server's
+    /// AI backend for final lines when a target language differs from `lang`.
+    Caption {
+        call_id: CallId,
+        room_id: RoomId,
+        from: ParticipantId,
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        lang: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        translated: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        translated_lang: Option<String>,
+        is_final: bool,
+    },
 }
 
 // ---------- Unified room-scoped event (NATS + WS wire) ----------
@@ -451,9 +467,11 @@ impl RoomEvent {
             | RoomEvent::Reaction { room_id, .. }
             | RoomEvent::Read { room_id, .. }
             | RoomEvent::Typing { room_id, .. } => Some(*room_id),
-            RoomEvent::Call(CallEvent::Invite { room_id, .. } | CallEvent::End { room_id, .. }) => {
-                Some(*room_id)
-            }
+            RoomEvent::Call(
+                CallEvent::Invite { room_id, .. }
+                | CallEvent::End { room_id, .. }
+                | CallEvent::Caption { room_id, .. },
+            ) => Some(*room_id),
             RoomEvent::Call(CallEvent::Answer { .. } | CallEvent::Ice { .. }) => None,
         }
     }
@@ -489,6 +507,30 @@ mod tests {
             Block::ToolCall { tool, .. } => assert_eq!(tool, "search"),
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn caption_event_tagged_and_routes_to_room() {
+        let room = RoomId::new();
+        let ev = RoomEvent::Call(CallEvent::Caption {
+            call_id: CallId::new(),
+            room_id: room,
+            from: ParticipantId::new(),
+            text: "你好".into(),
+            lang: Some("zh-CN".into()),
+            translated: Some("hello".into()),
+            translated_lang: Some("en".into()),
+            is_final: true,
+        });
+        // Fans out to all room members (no explicit recipient list).
+        assert!(ev.explicit_recipients().is_empty());
+        assert_eq!(ev.room_id(), Some(room));
+
+        let j = serde_json::to_string(&ev).unwrap();
+        assert!(j.contains("\"kind\":\"call\""));
+        assert!(j.contains("\"op\":\"caption\""));
+        let back: RoomEvent = serde_json::from_str(&j).unwrap();
+        assert_eq!(back.room_id(), Some(room));
     }
 
     #[test]

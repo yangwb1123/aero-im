@@ -254,9 +254,20 @@
       <div class="call-tile"><video id="call-local" autoplay muted playsinline></video><span class="label">我</span></div>
       <div class="call-tile"><video id="call-remote" autoplay playsinline></video><span class="label">对方</span></div>
     </div>
+    <div id="call-captions" class="call-captions" hidden></div>
     <div class="call-controls">
       <button id="call-mute">静音</button>
       <button id="call-cam">关摄像头</button>
+      <button id="call-cc" title="实时字幕(语音识别)">字幕</button>
+      <select id="call-cc-lang" title="把我的话翻译成…">
+        <option value="">不翻译</option>
+        <option value="en">→ English</option>
+        <option value="zh">→ 中文</option>
+        <option value="ja">→ 日本語</option>
+        <option value="ko">→ 한국어</option>
+        <option value="fr">→ Français</option>
+        <option value="es">→ Español</option>
+      </select>
       <button id="call-end" class="end">挂断</button>
     </div>
   </div>

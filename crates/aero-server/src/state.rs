@@ -36,6 +36,9 @@ pub trait AiBackend: Send + Sync + 'static {
     /// `mode=vector` path. Falls back to a deterministic local hash embedder
     /// when no remote API key is configured.
     async fn embed_text(&self, text: &str) -> Result<Vec<f32>, String>;
+    /// Translate text into `target_lang`. Used for live call captions (P3).
+    /// Echoes the source text when no LLM is configured.
+    async fn translate(&self, text: &str, target_lang: &str) -> Result<String, String>;
 }
 
 #[derive(Debug, Clone)]

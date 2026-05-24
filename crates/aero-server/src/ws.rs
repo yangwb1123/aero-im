@@ -81,6 +81,19 @@ enum ClientFrame {
         #[serde(default)]
         reason: Option<String>,
     },
+    /// Live caption line during a call. When `target_lang` is set and differs
+    /// from `lang`, the server translates *final* lines via the AI backend.
+    CallCaption {
+        call_id: CallId,
+        room_id: RoomId,
+        text: String,
+        #[serde(default)]
+        lang: Option<String>,
+        #[serde(default)]
+        target_lang: Option<String>,
+        #[serde(default)]
+        is_final: bool,
+    },
     /// Start watching a live stream (danmaku/gift fan-out + viewer count).
     WatchStream { stream_id: Ulid },
     /// Stop watching a live stream.
@@ -280,6 +293,44 @@ async fn handle_text(
                 )
                 .await?;
         }
+        ClientFrame::CallCaption { call_id, room_id, text, lang, target_lang, is_final } => {
+            let text = text.trim().to_string();
+            if text.is_empty() {
+                return Ok(());
+            }
+            // Translate only *final* lines, only when a distinct target language
+            // is set and an AI backend is available. Interim lines relay verbatim
+            // to keep latency low.
+            let (translated, translated_lang) = match (is_final, target_lang.as_deref(), &state.ai) {
+                (true, Some(target), Some(ai))
+                    if lang.as_deref().map_or(true, |l| !same_lang(l, target)) =>
+                {
+                    match ai.translate(&text, target).await {
+                        Ok(t) if !t.trim().is_empty() => {
+                            (Some(t), Some(target.to_string()))
+                        }
+                        _ => (None, None),
+                    }
+                }
+                _ => (None, None),
+            };
+            state
+                .im
+                .relay_call_event(
+                    room_id,
+                    CallEvent::Caption {
+                        call_id,
+                        room_id,
+                        from: pid,
+                        text,
+                        lang,
+                        translated,
+                        translated_lang,
+                        is_final,
+                    },
+                )
+                .await?;
+        }
         ClientFrame::WatchStream { stream_id } => {
             state.hub.watch_stream(stream_id, pid);
             // Replay a small danmaku backlog so the new watcher has context.
@@ -361,6 +412,27 @@ pub async fn run_bus_listener(state: AppState) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Loose BCP-47 comparison on the primary subtag, so `en` and `en-US` are the
+/// same language and the server skips a no-op translation.
+fn same_lang(a: &str, b: &str) -> bool {
+    let primary = |s: &str| s.split(['-', '_']).next().unwrap_or(s).to_ascii_lowercase();
+    primary(a) == primary(b)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::same_lang;
+
+    #[test]
+    fn same_lang_matches_on_primary_subtag() {
+        assert!(same_lang("en", "en-US"));
+        assert!(same_lang("zh-CN", "zh-Hans"));
+        assert!(same_lang("EN", "en"));
+        assert!(!same_lang("en", "zh"));
+        assert!(!same_lang("zh-CN", "en-US"));
+    }
 }
 
 /// Background loop that subscribes to `live.stream.*` and pushes each

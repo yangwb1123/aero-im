@@ -195,6 +195,28 @@ impl AiService {
         };
         Ok(AnswerResult { answer: fallback, citations })
     }
+
+    // ---------- translation (P3 实时字幕翻译) ----------
+
+    /// Translate `text` into `target_lang` (a human label or BCP-47 code).
+    ///
+    /// Uses Anthropic when configured; otherwise returns the source text
+    /// unchanged so live captions still display (just untranslated). Tuned for
+    /// short, low-latency caption lines.
+    pub async fn translate(&self, text: &str, target_lang: &str) -> Result<String> {
+        let text = text.trim();
+        if text.is_empty() {
+            return Ok(String::new());
+        }
+        if let Some(client) = &self.anthropic {
+            let system = TRANSLATE_SYSTEM_PROMPT;
+            let user = format!(
+                "目标语言: {target_lang}\n只输出译文本身,不要解释、不要引号。\n\n原文:\n{text}"
+            );
+            return client.complete(system, &[ChatMsg::user(user)], 400).await;
+        }
+        Ok(text.to_owned())
+    }
 }
 
 // ---------- helpers ----------
@@ -207,6 +229,10 @@ const SUMMARIZE_SYSTEM_PROMPT: &str = "\
 - 行动项:谁在何时之前需要做什么(若无可省略)\n\
 \n\
 约束:不要复述原文,不要超过 200 字,不要使用 Markdown 标题,只输出无序列表项(以 `-` 开头)。";
+
+const TRANSLATE_SYSTEM_PROMPT: &str = "\
+你是一个实时字幕翻译引擎。把用户提供的口语化文本翻译成目标语言,保持简洁口语风格。\
+只输出译文本身,不要添加任何解释、注释、标点修饰或引号。";
 
 const ANSWER_SYSTEM_PROMPT: &str = "\
 你是一个基于检索增强生成(RAG)的问答助手。请严格基于提供的聊天上下文回答用户问题,\

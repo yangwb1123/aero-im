@@ -50,4 +50,8 @@ impl AiBackend for AiServiceAdapter {
     async fn embed_text(&self, text: &str) -> Result<Vec<f32>, String> {
         self.inner.embed_text(text).await.map_err(|e| e.to_string())
     }
+
+    async fn translate(&self, text: &str, target_lang: &str) -> Result<String, String> {
+        self.inner.translate(text, target_lang).await.map_err(|e| e.to_string())
+    }
 }

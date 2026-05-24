@@ -116,6 +116,9 @@ const els = {
   callMute: $('#call-mute'),
   callCam: $('#call-cam'),
   callEnd: $('#call-end'),
+  callCaptions: $('#call-captions'),
+  callCc: $('#call-cc'),
+  callCcLang: $('#call-cc-lang'),
 };
 
 // ---------- view switching ----------
@@ -1427,6 +1430,8 @@ els.btnCallVideo.addEventListener('click', () => startCall('video'));
 els.callEnd.addEventListener('click', () => endCall('hangup'));
 els.callMute.addEventListener('click', () => toggleTrack('audio'));
 els.callCam.addEventListener('click', () => toggleTrack('video'));
+els.callCc.addEventListener('click', () => toggleCaptions());
+els.callCcLang.addEventListener('change', () => { if (state.call) state.call.targetLang = els.callCcLang.value || null; });
 
 function toggleTrack(kind) {
   const s = state.call?.localStream;
@@ -1525,12 +1530,18 @@ async function handleCall(event) {
     catch (err) { console.warn('addIceCandidate', err); }
   } else if (op === 'end') {
     if (state.call && state.call.id === event.call_id) endCall('remote_end');
+  } else if (op === 'caption') {
+    if (!state.call || state.call.id !== event.call_id) return;
+    if (event.from === state.me?.id) return; // our own captions render locally
+    const name = state.participants.get(event.from)?.display_name || '对方';
+    renderCaption(event.from, name, event.text, event.translated, event.is_final);
   }
 }
 
 function endCall(reason) {
   const c = state.call;
   if (!c) { els.callOverlay.hidden = true; return; }
+  stopRecognition();
   try { c.pc?.close(); } catch {}
   try { c.localStream?.getTracks().forEach((t) => t.stop()); } catch {}
   if (c.id && c.roomId) {
@@ -1538,8 +1549,96 @@ function endCall(reason) {
   }
   els.callLocal.srcObject = null;
   els.callRemote.srcObject = null;
+  els.callCaptions.replaceChildren();
+  els.callCaptions.hidden = true;
+  els.callCc.classList.remove('active');
   els.callOverlay.hidden = true;
   state.call = null;
+}
+
+// ---------- live captions (P3 实时字幕翻译) ----------
+
+function toggleCaptions() {
+  if (!state.call) return;
+  if (state.call.recog) { stopRecognition(); return; }
+  const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+  if (!SR) { toast('当前浏览器不支持语音识别(建议 Chrome/Edge)', 'error'); return; }
+  const srcLang = navigator.language || 'zh-CN';
+  state.call.srcLang = srcLang;
+  state.call.targetLang = els.callCcLang.value || null;
+  let recog;
+  try { recog = new SR(); } catch (e) { toast('字幕启动失败', 'error'); return; }
+  recog.lang = srcLang;
+  recog.continuous = true;
+  recog.interimResults = true;
+  recog.addEventListener('result', (e) => onSpeech(e));
+  recog.addEventListener('error', (e) => { if (e.error !== 'no-speech') console.warn('[speech]', e.error); });
+  recog.addEventListener('end', () => {
+    // SpeechRecognition stops itself periodically; restart while captions are on.
+    if (state.call && state.call.recog === recog) {
+      try { recog.start(); } catch {}
+    }
+  });
+  try { recog.start(); } catch (e) { toast('字幕启动失败', 'error'); return; }
+  state.call.recog = recog;
+  els.callCc.classList.add('active');
+  els.callCaptions.hidden = false;
+}
+
+function stopRecognition() {
+  const c = state.call;
+  if (c?.recog) {
+    const r = c.recog;
+    c.recog = null; // prevent the 'end' handler from restarting
+    try { r.stop(); } catch {}
+  }
+  els.callCc?.classList.remove('active');
+}
+
+function onSpeech(e) {
+  if (!state.call) return;
+  for (let i = e.resultIndex; i < e.results.length; i++) {
+    const res = e.results[i];
+    const text = (res[0]?.transcript || '').trim();
+    if (!text) continue;
+    const isFinal = res.isFinal;
+    // Render my own caption locally; broadcast (server translates final lines).
+    renderCaption('me', '我', text, null, isFinal);
+    ws.callCaption(state.call.id, state.call.roomId, text, state.call.srcLang, isFinal, state.call.targetLang);
+  }
+}
+
+// Maintain a rolling subtitle list; one in-progress (interim) line per speaker.
+function renderCaption(key, name, text, translated, isFinal) {
+  const box = els.callCaptions;
+  if (!box) return;
+  box.hidden = false;
+  state.call._capLines = state.call._capLines || new Map();
+  let line = state.call._capLines.get(key);
+  if (!line) {
+    line = document.createElement('div');
+    line.className = 'cap-line';
+    const who = document.createElement('span');
+    who.className = 'cap-who';
+    who.textContent = `${name}: `;
+    const orig = document.createElement('span');
+    orig.className = 'cap-text';
+    const tr = document.createElement('div');
+    tr.className = 'cap-tr';
+    line.appendChild(who);
+    line.appendChild(orig);
+    line.appendChild(tr);
+    box.appendChild(line);
+    line._orig = orig;
+    line._tr = tr;
+    state.call._capLines.set(key, line);
+  }
+  line._orig.textContent = text;
+  if (translated) line._tr.textContent = translated;
+  line.classList.toggle('interim', !isFinal);
+  if (isFinal) state.call._capLines.delete(key); // next utterance starts a fresh line
+  while (box.childElementCount > 5) box.removeChild(box.firstElementChild);
+  box.scrollTop = box.scrollHeight;
 }
 
 // ---------- utilities ----------

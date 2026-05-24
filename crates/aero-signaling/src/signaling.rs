@@ -88,5 +88,14 @@ pub fn validate_call_event(ev: &CallEvent) -> Result<(), SignalingError> {
             }
             Ok(())
         }
+        CallEvent::Caption { text, .. } => {
+            if text.is_empty() {
+                return Err(SignalingError::Protocol("caption text is empty".into()));
+            }
+            if text.len() > 2000 {
+                return Err(SignalingError::Protocol("caption text exceeds 2000 bytes".into()));
+            }
+            Ok(())
+        }
     }
 }

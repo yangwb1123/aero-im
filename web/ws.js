@@ -139,6 +139,12 @@ export class WsClient {
   callEnd(callId, roomId, reason = 'hangup') {
     return this.send({ type: 'call_end', call_id: callId, room_id: roomId, reason });
   }
+  callCaption(callId, roomId, text, lang, isFinal, targetLang) {
+    return this.send({
+      type: 'call_caption', call_id: callId, room_id: roomId,
+      text, lang: lang || null, target_lang: targetLang || null, is_final: !!isFinal,
+    });
+  }
 
   // ----- live interactivity (P4 弹幕 + 礼物) -----
   watchStream(streamId) { return this.send({ type: 'watch_stream', stream_id: streamId }); }
