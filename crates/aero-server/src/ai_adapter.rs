@@ -54,4 +54,8 @@ impl AiBackend for AiServiceAdapter {
     async fn translate(&self, text: &str, target_lang: &str) -> Result<String, String> {
         self.inner.translate(text, target_lang).await.map_err(|e| e.to_string())
     }
+
+    async fn moderate(&self, text: &str) -> Result<Option<String>, String> {
+        self.inner.moderate(text).await.map_err(|e| e.to_string())
+    }
 }

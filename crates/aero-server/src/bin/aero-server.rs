@@ -231,6 +231,17 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // ---------- AI content moderation (opt-in: AERO_AI_MODERATION) ----------
+    if std::env::var("AERO_AI_MODERATION").is_ok() {
+        let state_clone = state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = aero_server::moderation_bot::run(state_clone).await {
+                tracing::error!(error = ?e, "moderation_bot listener exited");
+            }
+        });
+        info!("AI moderation enabled");
+    }
+
     // ---------- Router ----------
     let hls_dir = std::path::PathBuf::from(&cfg.server.hls_dir);
     if let Err(e) = std::fs::create_dir_all(&hls_dir) {

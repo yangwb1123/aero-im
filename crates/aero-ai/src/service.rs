@@ -217,6 +217,37 @@ impl AiService {
         }
         Ok(text.to_owned())
     }
+
+    // ---------- moderation (P5 AI 内容审核) ----------
+
+    /// Classify a message body. Returns `Some(reason)` to block, `None` to allow.
+    ///
+    /// Requires Anthropic; without it returns `None` (the synchronous
+    /// `AERO_BLOCKED_WORDS` keyword filter in `ImService` remains the only gate).
+    /// Conservative by construction: only an explicit `BLOCK` verdict blocks.
+    pub async fn moderate(&self, text: &str) -> Result<Option<String>> {
+        let text = text.trim();
+        if text.is_empty() {
+            return Ok(None);
+        }
+        let Some(client) = &self.anthropic else {
+            return Ok(None);
+        };
+        let verdict = client
+            .complete(MODERATE_SYSTEM_PROMPT, &[ChatMsg::user(format!("待审核内容:\n{text}"))], 120)
+            .await?;
+        Ok(parse_moderation_verdict(&verdict))
+    }
+}
+
+/// Parse a moderation verdict line. Protocol: `SAFE` (allow → `None`) or
+/// `BLOCK: <reason>` (→ `Some(reason)`). Conservative: anything that isn't an
+/// explicit `BLOCK` is treated as safe.
+fn parse_moderation_verdict(raw: &str) -> Option<String> {
+    raw.trim().strip_prefix("BLOCK").map(|rest| {
+        let reason = rest.trim_start_matches([':', '：', ' ']).trim();
+        if reason.is_empty() { "内容违规".to_owned() } else { reason.to_owned() }
+    })
 }
 
 // ---------- helpers ----------
@@ -233,6 +264,11 @@ const SUMMARIZE_SYSTEM_PROMPT: &str = "\
 const TRANSLATE_SYSTEM_PROMPT: &str = "\
 你是一个实时字幕翻译引擎。把用户提供的口语化文本翻译成目标语言,保持简洁口语风格。\
 只输出译文本身,不要添加任何解释、注释、标点修饰或引号。";
+
+const MODERATE_SYSTEM_PROMPT: &str = "\
+你是一个内容安全审核器,服务于企业协作 IM。判断给定文本是否包含应被拦截的内容\
+(暴力威胁、仇恨与歧视、露骨色情、违法交易、严重骚扰)。保持克制:仅在明确违规时拦截。\n\
+只输出一行:安全则输出 `SAFE`;应拦截则输出 `BLOCK: <简短中文理由>`。不要输出其它任何内容。";
 
 const ANSWER_SYSTEM_PROMPT: &str = "\
 你是一个基于检索增强生成(RAG)的问答助手。请严格基于提供的聊天上下文回答用户问题,\
@@ -315,6 +351,21 @@ mod tests {
     use super::*;
     use aero_common::{Block, ParticipantId};
     use time::OffsetDateTime;
+
+    #[test]
+    fn moderation_verdict_parsing() {
+        assert_eq!(parse_moderation_verdict("SAFE"), None);
+        assert_eq!(parse_moderation_verdict("  safe\n"), None); // not "BLOCK" → allow
+        assert_eq!(
+            parse_moderation_verdict("BLOCK: 暴力威胁"),
+            Some("暴力威胁".to_owned())
+        );
+        assert_eq!(
+            parse_moderation_verdict("BLOCK：色情内容"), // fullwidth colon
+            Some("色情内容".to_owned())
+        );
+        assert_eq!(parse_moderation_verdict("BLOCK"), Some("内容违规".to_owned()));
+    }
 
     fn mk_msg(text: &str) -> Message {
         Message {

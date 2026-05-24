@@ -350,6 +350,34 @@ impl ImService {
         Ok(())
     }
 
+    /// System action: soft-delete a message flagged by AI moderation and
+    /// broadcast the removal. Unlike [`delete_message`] this bypasses the
+    /// sender-only authorization check — the caller is the trusted moderation
+    /// pipeline, not a participant. `reason` is logged, not sent to clients.
+    #[instrument(skip(self), fields(?message_id, reason))]
+    pub async fn moderate_delete(&self, message_id: MessageId, reason: &str) -> Result<()> {
+        let existing = self
+            .messages
+            .get(message_id)
+            .await?
+            .ok_or_else(|| Error::NotFound(format!("message {message_id}")))?;
+        if existing.deleted_at.is_some() {
+            return Ok(());
+        }
+        self.messages.soft_delete(message_id).await?;
+        warn!(%message_id, reason, "message removed by AI moderation");
+        self.publish_room_event(
+            existing.room_id,
+            &RoomEvent::Deleted {
+                room_id: existing.room_id,
+                message_id,
+                by: existing.sender_id,
+            },
+        )
+        .await;
+        Ok(())
+    }
+
     /// Paginated history. `before` is exclusive.
     #[instrument(skip(self), fields(?who, ?room, ?before, limit))]
     pub async fn history(

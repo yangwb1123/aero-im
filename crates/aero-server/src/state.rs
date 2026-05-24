@@ -39,6 +39,9 @@ pub trait AiBackend: Send + Sync + 'static {
     /// Translate text into `target_lang`. Used for live call captions (P3).
     /// Echoes the source text when no LLM is configured.
     async fn translate(&self, text: &str, target_lang: &str) -> Result<String, String>;
+    /// Moderate a message body (P5). `Some(reason)` blocks, `None` allows.
+    /// Returns `None` when no LLM is configured.
+    async fn moderate(&self, text: &str) -> Result<Option<String>, String>;
 }
 
 #[derive(Debug, Clone)]
