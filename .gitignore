@@ -17,3 +17,6 @@ __pycache__/
 *.pyc
 
 
+
+# Claude Code agent worktrees
+.claude/
