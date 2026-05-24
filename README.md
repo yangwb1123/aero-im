@@ -110,7 +110,12 @@ bash scripts/smoke.sh http://localhost:3030      # P1 happy path
 python3 scripts/ws_smoke.py                       # WS fan-out(2 客户端互发)
 python3 scripts/smoke_p2.py                       # P2 全功能:edit/react/read/search/blob/AI/stream/MLS
 python3 scripts/smoke_live.py                     # P11 弹幕/礼物/观看人数 WS 扇出 + 榜单 + 主播下播
+python3 scripts/smoke_captions.py                 # P3 字幕中继:call_caption → 房间 call/op:caption 扇出
 ```
+
+> 运行时验证(2026-05-24,真实 PG/Redis/NATS):`smoke_p2` / `smoke_live` /
+> `smoke_captions` 全部端到端通过。注意 `data/` 由容器以 root 创建,本地起服务需把
+> 附件/HLS 目录改到可写路径:`AERO__SERVER__BLOB_DIR=/tmp/aero/blobs AERO__SERVER__HLS_DIR=/tmp/aero/hls`。
 
 ## 直播测试
 
