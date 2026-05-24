@@ -94,6 +94,22 @@ enum ClientFrame {
         #[serde(default)]
         is_final: bool,
     },
+    /// Join (or start) a group call (P6 mesh). Omit `call_id` to start a new one.
+    CallJoin {
+        room_id: RoomId,
+        kind: CallKind,
+        #[serde(default)]
+        call_id: Option<CallId>,
+    },
+    /// Leave a group call.
+    CallLeave { call_id: CallId, room_id: RoomId },
+    /// A per-pair mesh offer to one peer in a group call.
+    CallOffer {
+        call_id: CallId,
+        room_id: RoomId,
+        to: ParticipantId,
+        sdp: String,
+    },
     /// Start watching a live stream (danmaku/gift fan-out + viewer count).
     WatchStream { stream_id: Ulid },
     /// Stop watching a live stream.
@@ -329,6 +345,58 @@ async fn handle_text(
                         is_final,
                     },
                 )
+                .await?;
+        }
+        ClientFrame::CallJoin { room_id, kind, call_id } => {
+            if !state.rooms.is_member(room_id, pid).await? {
+                let _ = tx.send(Message::Text(
+                    serde_json::to_string(&ServerFrame::Error {
+                        code: "forbidden",
+                        msg: "not a member".into(),
+                    })
+                    .unwrap_or_default(),
+                ));
+                return Ok(());
+            }
+            let call_id = match call_id {
+                Some(c) => c,
+                None => {
+                    let c = CallId::new();
+                    // Best-effort session row; the live roster is in the Hub.
+                    if let Err(e) =
+                        state.calls.start(c, room_id, pid, kind, CallMode::Sfu, &[]).await
+                    {
+                        warn!(error = ?e, "persist group call session failed");
+                    }
+                    c
+                }
+            };
+            let existing = state.hub.call_join(call_id, pid);
+            // Tell the joiner who is already in the call (whom to connect to).
+            state
+                .im
+                .relay_call_event(
+                    room_id,
+                    CallEvent::Roster { call_id, to: pid, members: existing, kind },
+                )
+                .await?;
+            // Tell the room a new peer joined.
+            state
+                .im
+                .relay_call_event(room_id, CallEvent::Join { call_id, room_id, from: pid, kind })
+                .await?;
+        }
+        ClientFrame::CallLeave { call_id, room_id } => {
+            state.hub.call_leave(call_id, pid);
+            state
+                .im
+                .relay_call_event(room_id, CallEvent::Leave { call_id, room_id, from: pid })
+                .await?;
+        }
+        ClientFrame::CallOffer { call_id, room_id, to, sdp } => {
+            state
+                .im
+                .relay_call_event(room_id, CallEvent::Offer { call_id, from: pid, to, sdp })
                 .await?;
         }
         ClientFrame::WatchStream { stream_id } => {

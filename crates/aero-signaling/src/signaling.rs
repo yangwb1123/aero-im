@@ -97,5 +97,9 @@ pub fn validate_call_event(ev: &CallEvent) -> Result<(), SignalingError> {
             }
             Ok(())
         }
+        // Group-call (P6 mesh) coordination events: membership signals carry no
+        // SDP; the per-pair `Offer` does.
+        CallEvent::Join { .. } | CallEvent::Leave { .. } | CallEvent::Roster { .. } => Ok(()),
+        CallEvent::Offer { sdp, .. } => validate_sdp(sdp),
     }
 }

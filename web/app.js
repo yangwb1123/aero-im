@@ -1495,14 +1495,15 @@ async function handleCall(event) {
       return;
     }
     if (state.call) return; // already in another call
-    if (!confirm(`收到 ${event.kind} 通话邀请,接听?`)) {
+    const callKind = event.call_kind || event.kind; // server renamed kind→call_kind on the wire
+    if (!confirm(`收到 ${callKind} 通话邀请,接听?`)) {
       ws.callEnd(event.call_id, event.room_id, 'declined');
       return;
     }
     try {
-      const localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: event.kind === 'video' });
+      const localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: callKind === 'video' });
       state.call = {
-        id: event.call_id, roomId: event.room_id, kind: event.kind,
+        id: event.call_id, roomId: event.room_id, kind: callKind,
         pc: null, localStream, remoteStream: null, peer: event.from,
       };
       els.callLocal.srcObject = localStream;

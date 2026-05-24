@@ -360,6 +360,9 @@ pub enum CallEvent {
         room_id: RoomId,
         from: ParticipantId,
         to: Vec<ParticipantId>,
+        // Renamed on the wire to avoid colliding with `RoomEvent`'s `kind` tag
+        // when this enum is flattened into `RoomEvent::Call` on the bus.
+        #[serde(rename = "call_kind")]
         kind: CallKind,
         sdp: String,
     },
@@ -396,6 +399,38 @@ pub enum CallEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         translated_lang: Option<String>,
         is_final: bool,
+    },
+    /// Group call (P6 mesh): a participant joined. Broadcast to the room so
+    /// existing members can establish a peer connection to the newcomer.
+    Join {
+        call_id: CallId,
+        room_id: RoomId,
+        from: ParticipantId,
+        #[serde(rename = "call_kind")]
+        kind: CallKind,
+    },
+    /// Group call: a participant left. Peers tear down the connection to them.
+    Leave {
+        call_id: CallId,
+        room_id: RoomId,
+        from: ParticipantId,
+    },
+    /// Group call: server → joiner, listing the members already in the call so
+    /// the joiner knows whom to connect to (glare-free: lower id offers).
+    Roster {
+        call_id: CallId,
+        to: ParticipantId,
+        members: Vec<ParticipantId>,
+        #[serde(rename = "call_kind")]
+        kind: CallKind,
+    },
+    /// Group call: a per-pair mesh offer (distinct from the 1:1 `Invite`, which
+    /// prompts the callee — `Offer` is auto-answered within an active call).
+    Offer {
+        call_id: CallId,
+        from: ParticipantId,
+        to: ParticipantId,
+        sdp: String,
     },
 }
 
@@ -453,7 +488,12 @@ impl RoomEvent {
         match self {
             RoomEvent::Message(e) => e.recipients.clone(),
             RoomEvent::Call(CallEvent::Invite { to, .. }) => to.clone(),
-            RoomEvent::Call(CallEvent::Answer { to, .. } | CallEvent::Ice { to, .. }) => vec![*to],
+            RoomEvent::Call(
+                CallEvent::Answer { to, .. }
+                | CallEvent::Ice { to, .. }
+                | CallEvent::Roster { to, .. }
+                | CallEvent::Offer { to, .. },
+            ) => vec![*to],
             _ => Vec::new(),
         }
     }
@@ -470,9 +510,16 @@ impl RoomEvent {
             RoomEvent::Call(
                 CallEvent::Invite { room_id, .. }
                 | CallEvent::End { room_id, .. }
-                | CallEvent::Caption { room_id, .. },
+                | CallEvent::Caption { room_id, .. }
+                | CallEvent::Join { room_id, .. }
+                | CallEvent::Leave { room_id, .. },
             ) => Some(*room_id),
-            RoomEvent::Call(CallEvent::Answer { .. } | CallEvent::Ice { .. }) => None,
+            RoomEvent::Call(
+                CallEvent::Answer { .. }
+                | CallEvent::Ice { .. }
+                | CallEvent::Roster { .. }
+                | CallEvent::Offer { .. },
+            ) => None,
         }
     }
 }
@@ -529,6 +576,48 @@ mod tests {
         let j = serde_json::to_string(&ev).unwrap();
         assert!(j.contains("\"kind\":\"call\""));
         assert!(j.contains("\"op\":\"caption\""));
+        let back: RoomEvent = serde_json::from_str(&j).unwrap();
+        assert_eq!(back.room_id(), Some(room));
+    }
+
+    #[test]
+    fn group_call_events_route_correctly() {
+        let room = RoomId::new();
+        let joiner = ParticipantId::new();
+        let call = CallId::new();
+
+        // Join broadcasts to the whole room.
+        let join = RoomEvent::Call(CallEvent::Join {
+            call_id: call,
+            room_id: room,
+            from: joiner,
+            kind: CallKind::Video,
+        });
+        assert!(join.explicit_recipients().is_empty());
+        assert_eq!(join.room_id(), Some(room));
+
+        // Roster is targeted to the joiner only.
+        let peer = ParticipantId::new();
+        let roster = RoomEvent::Call(CallEvent::Roster {
+            call_id: call,
+            to: joiner,
+            members: vec![peer],
+            kind: CallKind::Video,
+        });
+        assert_eq!(roster.explicit_recipients(), vec![joiner]);
+        assert_eq!(roster.room_id(), None);
+
+        // Offer is targeted to one peer.
+        let offer = RoomEvent::Call(CallEvent::Offer {
+            call_id: call,
+            from: joiner,
+            to: peer,
+            sdp: "v=0\r\n".into(),
+        });
+        assert_eq!(offer.explicit_recipients(), vec![peer]);
+
+        let j = serde_json::to_string(&join).unwrap();
+        assert!(j.contains("\"op\":\"join\""));
         let back: RoomEvent = serde_json::from_str(&j).unwrap();
         assert_eq!(back.room_id(), Some(room));
     }
