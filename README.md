@@ -18,6 +18,7 @@ AI-Native 即时通讯 + 直播平台,Rust 实现。
 | **Agent in channel** | `@bot` 自动回复(基于 RAG) | ✅ |
 | **内容审核** | `AERO_BLOCKED_WORDS` 关键词预审 + AI 异步审核(`AERO_AI_MODERATION`) | ✅ |
 | **1:1 通话** | WebRTC P2P(浏览器原生),信令走 NATS | ✅ |
+| **群通话(mesh)** | 多人全网格 WebRTC,服务端协调 roster + 无眩光配对(小 id 发 offer) | ✅ |
 | **实时字幕翻译** | 浏览器语音识别 → 字幕,最终行经 Anthropic 翻译 | ✅ |
 | **直播 RTMP→HLS** | rml_rtmp 摄入,真 MPEG-TS muxing(SPS/PPS/ADTS) | ✅ |
 | **直播弹幕 + 礼物** | 弹幕轨道 + 礼物目录/飘屏/榜单 + 实时观看人数(NATS `live.stream.*`) | ✅ |
@@ -170,9 +171,9 @@ ffmpeg -re -i sample.mp4 -c:v libx264 -c:a aac -f flv rtmp://localhost/live/<str
 
 ### WebSocket(`/ws?token=<jwt>`)
 
-客户端帧:`join_room` `send_message` `edit_message` `delete_message` `react` `mark_read` `typing` `call_invite` `call_answer` `call_ice` `call_end` `call_caption` `watch_stream` `unwatch_stream` `stream_chat` `stream_gift` `ping`
+客户端帧:`join_room` `send_message` `edit_message` `delete_message` `react` `mark_read` `typing` `call_invite` `call_answer` `call_ice` `call_end` `call_caption` `call_join` `call_leave` `call_offer` `watch_stream` `unwatch_stream` `stream_chat` `stream_gift` `ping`
 
-服务端帧:`welcome` `presence` `message` `edited` `deleted` `reaction` `read` `typing` `call`(含 `op:"caption"`)`stream_event`(`chat`/`gift`/`viewers`/`status`)`error` `pong`
+服务端帧:`welcome` `presence` `message` `edited` `deleted` `reaction` `read` `typing` `call`(`op`: `invite`/`answer`/`ice`/`end`/`caption`/`join`/`leave`/`roster`/`offer`)`stream_event`(`chat`/`gift`/`viewers`/`status`)`error` `pong`
 
 ## 验证
 
@@ -192,7 +193,7 @@ cargo build --bin aero-server    # 二进制成功
 | **P3** | 1:1 通话 + 实时字幕翻译 | ✅ |
 | **P4** | RTMP→HLS(真 TS) + 弹幕 + 礼物 | ✅ |
 | **P5** | WHIP/WHEP 信令 + 关键词审核 + AI 审核 | ✅ |
-| **P6** | SFU 路由模型 + AI Agent 进频道 | ✅(媒体面见下) |
+| **P6** | 群通话(mesh,浏览器原生媒体)+ AI Agent 进频道;SFU 路由模型 | ✅(SFU 媒体面见下) |
 | **P7** | SRT + TURN | ✅(占位) |
 | **P8** | MLS E2E | ✅(scaffold) |
 | **P9** | 真 TS muxing / vector 搜 / mention / read avatars / smoke_p2 | ✅ |
@@ -200,7 +201,7 @@ cargo build --bin aero-server    # 二进制成功
 
 后续可继续推进的(都是重力气活,需真实媒体链路联调):
 - WHIP/WHEP **媒体面**:str0m DTLS-SRTP 终结 + RTP 注入 HLS muxer
-- SFU **媒体面**:str0m 多 peer 转发 + Simulcast/SVC + congestion(群通话/互动直播)
+- SFU **媒体面**:str0m 多 peer 转发 + Simulcast/SVC + congestion(mesh 已覆盖小群,SFU 用于大房间扩展)
 - SRT **真协议**:srt-tokio 集成
 - MLS **客户端**:web 加 openmls-wasm,加密 payload 透传
 

@@ -93,6 +93,7 @@
             <button id="btn-ai" type="button" title="问 AI">✨ AI</button>
             <button id="btn-call-audio" type="button" title="发起语音通话">📞</button>
             <button id="btn-call-video" type="button" title="发起视频通话">📹</button>
+            <button id="btn-call-group" type="button" title="发起群视频通话(mesh)">👥</button>
             <button id="btn-go-live" type="button" title="开播">🔴 开播</button>
             <button id="btn-live-page" type="button" title="直播大厅">📺</button>
           </div>
@@ -269,6 +270,17 @@
         <option value="es">→ Español</option>
       </select>
       <button id="call-end" class="end">挂断</button>
+    </div>
+  </div>
+
+  <!-- group call overlay (P6 mesh) -->
+  <div id="gcall-overlay" class="call-overlay" hidden>
+    <div id="gcall-grid" class="gcall-grid"></div>
+    <div class="call-controls">
+      <button id="gcall-mute">静音</button>
+      <button id="gcall-cam">关摄像头</button>
+      <span id="gcall-count" class="gcall-count">1 人</span>
+      <button id="gcall-leave" class="end">离开</button>
     </div>
   </div>
 

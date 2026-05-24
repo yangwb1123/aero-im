@@ -34,6 +34,7 @@ const state = {
   replyTo: null,              // { id, sender_id, blocks } when composing a reply
   // Call
   call: null,
+  gcall: null,               // group (mesh) call: { id, roomId, kind, localStream, peers:Map }
   rtcConfig: null,
   // P11 live interactivity
   giftCatalog: [],
@@ -70,6 +71,7 @@ const els = {
   btnAi: $('#btn-ai'),
   btnCallAudio: $('#btn-call-audio'),
   btnCallVideo: $('#btn-call-video'),
+  btnCallGroup: $('#btn-call-group'),
   btnGoLive: $('#btn-go-live'),
   btnLivePage: $('#btn-live-page'),
 
@@ -119,6 +121,12 @@ const els = {
   callCaptions: $('#call-captions'),
   callCc: $('#call-cc'),
   callCcLang: $('#call-cc-lang'),
+  gcallOverlay: $('#gcall-overlay'),
+  gcallGrid: $('#gcall-grid'),
+  gcallMute: $('#gcall-mute'),
+  gcallCam: $('#gcall-cam'),
+  gcallLeave: $('#gcall-leave'),
+  gcallCount: $('#gcall-count'),
 };
 
 // ---------- view switching ----------
@@ -1427,6 +1435,10 @@ function closeEmojiPicker() { if (emojiPop?.parentNode) emojiPop.parentNode.remo
 // ---------- 1:1 call (WebRTC P2P) ----------
 els.btnCallAudio.addEventListener('click', () => startCall('audio'));
 els.btnCallVideo.addEventListener('click', () => startCall('video'));
+els.btnCallGroup.addEventListener('click', () => startGroupCall('video'));
+els.gcallLeave.addEventListener('click', () => leaveGroupCall());
+els.gcallMute.addEventListener('click', () => gcallToggleTrack('audio'));
+els.gcallCam.addEventListener('click', () => gcallToggleTrack('video'));
 els.callEnd.addEventListener('click', () => endCall('hangup'));
 els.callMute.addEventListener('click', () => toggleTrack('audio'));
 els.callCam.addEventListener('click', () => toggleTrack('video'));
@@ -1487,6 +1499,15 @@ function makePeer() {
 
 async function handleCall(event) {
   const op = event?.op;
+  // ---- group-call (P6 mesh) routing ----
+  if (op === 'roster') return gcallOnRoster(event);
+  if (op === 'join') return gcallOnJoin(event);
+  if (op === 'leave') return gcallOnLeave(event);
+  if (op === 'offer') return gcallOnOffer(event);
+  // answer/ice belonging to the active group call route to the mesh handlers
+  if (state.gcall && event.call_id === state.gcall.id && (op === 'answer' || op === 'ice')) {
+    return op === 'answer' ? gcallOnAnswer(event) : gcallOnIce(event);
+  }
   if (op === 'invite') {
     if (event.from === state.me?.id) {
       state.call = state.call || { id: event.call_id, roomId: event.room_id };
@@ -1640,6 +1661,189 @@ function renderCaption(key, name, text, translated, isFinal) {
   if (isFinal) state.call._capLines.delete(key); // next utterance starts a fresh line
   while (box.childElementCount > 5) box.removeChild(box.firstElementChild);
   box.scrollTop = box.scrollHeight;
+}
+
+// ---------- group call (P6 mesh) ----------
+// Full-mesh: each participant holds one RTCPeerConnection per other participant.
+// Glare-free pairing — for any pair, the peer with the smaller participant id
+// creates the offer. Media is browser-native P2P; the server only relays
+// signaling + tracks the roster.
+
+function rtcIceConfig() {
+  return state.rtcConfig
+    ? { iceServers: state.rtcConfig.ice_servers || state.rtcConfig.iceServers }
+    : { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+}
+
+const gcallPrompted = new Set(); // call_ids we've already offered to join
+
+// Start a new group call in the current room (callId === null → server creates).
+function startGroupCall(kind) { return enterGroupCall(state.currentRoomId, kind, null); }
+
+// Join an existing group call we were invited to.
+function joinGroupCall(roomId, kind, callId) { return enterGroupCall(roomId, kind, callId); }
+
+async function enterGroupCall(roomId, kind, callId) {
+  if (!roomId) { toast('请选择房间', 'error'); return; }
+  if (state.gcall) { toast('已在群通话中', 'error'); return; }
+  if (state.call) { toast('请先结束 1:1 通话', 'error'); return; }
+  try {
+    const localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: kind === 'video' });
+    state.gcall = { id: callId, roomId, kind, localStream, peers: new Map() };
+    els.gcallGrid.replaceChildren();
+    addGcallTile('me', '我', localStream, true);
+    els.gcallOverlay.hidden = false;
+    updateGcallCount();
+    ws.callJoin(roomId, kind, callId); // null → create; else join existing → server sends roster
+  } catch (err) {
+    toast(`群通话失败:${err.message}`, 'error');
+    leaveGroupCall();
+  }
+}
+
+function promptJoinGroupCall(ev) {
+  if (gcallPrompted.has(ev.call_id)) return;
+  gcallPrompted.add(ev.call_id);
+  const name = state.participants.get(ev.from)?.display_name || '有人';
+  const kind = ev.call_kind || 'video';
+  if (confirm(`${name} 发起了群通话,加入?`)) {
+    joinGroupCall(ev.room_id, kind, ev.call_id);
+  }
+}
+
+function gcallPeer(peerId) {
+  if (!state.gcall) return null;
+  let entry = state.gcall.peers.get(peerId);
+  if (entry) return entry;
+  const pc = new RTCPeerConnection(rtcIceConfig());
+  pc.addEventListener('icecandidate', (e) => {
+    if (e.candidate && state.gcall) ws.callIce(state.gcall.id, state.gcall.roomId, peerId, e.candidate.toJSON());
+  });
+  pc.addEventListener('track', (e) => {
+    const name = state.participants.get(peerId)?.display_name || peerId.slice(0, 6);
+    addGcallTile(peerId, name, e.streams[0], false);
+  });
+  pc.addEventListener('connectionstatechange', () => {
+    if (pc.connectionState === 'failed' || pc.connectionState === 'closed') removeGcallPeer(peerId);
+  });
+  for (const t of state.gcall.localStream.getTracks()) pc.addTrack(t, state.gcall.localStream);
+  entry = { pc };
+  state.gcall.peers.set(peerId, entry);
+  updateGcallCount();
+  return entry;
+}
+
+async function gcallOfferTo(peerId) {
+  const entry = gcallPeer(peerId);
+  if (!entry) return;
+  try {
+    const offer = await entry.pc.createOffer();
+    await entry.pc.setLocalDescription(offer);
+    ws.callOffer(state.gcall.id, state.gcall.roomId, peerId, offer.sdp);
+  } catch (err) { console.warn('[gcall offer]', err); }
+}
+
+async function gcallOnRoster(ev) {
+  if (!state.gcall) return;
+  state.gcall.id = ev.call_id;
+  for (const m of (ev.members || [])) {
+    if (m === state.me?.id) continue;
+    // lower id offers; otherwise wait for their offer
+    if (String(state.me?.id) < String(m)) await gcallOfferTo(m);
+  }
+}
+
+async function gcallOnJoin(ev) {
+  if (ev.from === state.me?.id) return;
+  if (!state.gcall) {
+    // Invited to a group call we're not in yet — offer to join.
+    promptJoinGroupCall(ev);
+    return;
+  }
+  if (ev.call_id !== state.gcall.id) return;
+  if (String(state.me?.id) < String(ev.from)) await gcallOfferTo(ev.from);
+}
+
+async function gcallOnOffer(ev) {
+  if (!state.gcall || ev.call_id !== state.gcall.id) return;
+  if (ev.to !== state.me?.id) return;
+  const entry = gcallPeer(ev.from);
+  if (!entry) return;
+  try {
+    await entry.pc.setRemoteDescription({ type: 'offer', sdp: ev.sdp });
+    const ans = await entry.pc.createAnswer();
+    await entry.pc.setLocalDescription(ans);
+    ws.callAnswer(state.gcall.id, state.gcall.roomId, ev.from, ans.sdp);
+  } catch (err) { console.warn('[gcall offer-in]', err); }
+}
+
+async function gcallOnAnswer(ev) {
+  const entry = state.gcall?.peers.get(ev.from);
+  if (!entry) return;
+  try { await entry.pc.setRemoteDescription({ type: 'answer', sdp: ev.sdp }); }
+  catch (err) { console.warn('[gcall answer]', err); }
+}
+
+async function gcallOnIce(ev) {
+  const entry = state.gcall?.peers.get(ev.from);
+  if (!entry) return;
+  try { await entry.pc.addIceCandidate(ev.candidate); }
+  catch (err) { console.warn('[gcall ice]', err); }
+}
+
+function gcallOnLeave(ev) {
+  if (!state.gcall || ev.call_id !== state.gcall.id) return;
+  removeGcallPeer(ev.from);
+}
+
+function removeGcallPeer(peerId) {
+  const entry = state.gcall?.peers.get(peerId);
+  if (!entry) return;
+  try { entry.pc.close(); } catch {}
+  state.gcall.peers.delete(peerId);
+  const tile = els.gcallGrid.querySelector(`[data-peer="${cssEscape(peerId)}"]`);
+  if (tile) tile.remove();
+  updateGcallCount();
+}
+
+function gcallToggleTrack(kind) {
+  const s = state.gcall?.localStream;
+  if (!s) return;
+  for (const t of s.getTracks()) if (t.kind === kind) t.enabled = !t.enabled;
+}
+
+function leaveGroupCall() {
+  const g = state.gcall;
+  if (!g) { els.gcallOverlay.hidden = true; return; }
+  if (g.id) { try { ws.callLeave(g.id, g.roomId); } catch {} }
+  for (const [, entry] of g.peers) { try { entry.pc.close(); } catch {} }
+  try { g.localStream?.getTracks().forEach((t) => t.stop()); } catch {}
+  els.gcallGrid.replaceChildren();
+  els.gcallOverlay.hidden = true;
+  state.gcall = null;
+}
+
+function addGcallTile(peerId, label, stream, muted) {
+  let tile = els.gcallGrid.querySelector(`[data-peer="${cssEscape(peerId)}"]`);
+  if (!tile) {
+    tile = document.createElement('div');
+    tile.className = 'call-tile';
+    tile.dataset.peer = peerId;
+    const v = document.createElement('video');
+    v.autoplay = true; v.playsInline = true; v.muted = !!muted;
+    const lab = document.createElement('span');
+    lab.className = 'label';
+    lab.textContent = label;
+    tile.appendChild(v); tile.appendChild(lab);
+    els.gcallGrid.appendChild(tile);
+  }
+  tile.querySelector('video').srcObject = stream;
+  updateGcallCount();
+}
+
+function updateGcallCount() {
+  if (!state.gcall) return;
+  els.gcallCount.textContent = `${state.gcall.peers.size + 1} 人`;
 }
 
 // ---------- utilities ----------

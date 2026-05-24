@@ -820,6 +820,19 @@ input, textarea, select, button { font-family: inherit; }
   padding: 10px 14px; cursor: pointer; font-size: 13px;
 }
 
+/* group call (P6 mesh): dynamic tile grid */
+.gcall-grid {
+  display: grid; gap: 8px; padding: 16px; align-content: center; overflow: auto;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+}
+.gcall-grid .call-tile { position: relative; background: #000; border-radius: 10px; overflow: hidden; aspect-ratio: 4 / 3; }
+.gcall-grid .call-tile video { width: 100%; height: 100%; object-fit: cover; }
+.gcall-grid .call-tile .label {
+  position: absolute; left: 8px; bottom: 8px; font-size: 12px; color: #fff;
+  background: rgba(0,0,0,.5); padding: 2px 8px; border-radius: 999px;
+}
+.gcall-count { color: var(--text-mute); font-size: 13px; align-self: center; }
+
 /* live captions (P3 实时字幕翻译) */
 .call-captions {
   position: absolute; left: 50%; bottom: 96px; transform: translateX(-50%);

@@ -145,6 +145,16 @@ export class WsClient {
       text, lang: lang || null, target_lang: targetLang || null, is_final: !!isFinal,
     });
   }
+  // ----- group call (P6 mesh) -----
+  callJoin(roomId, kind, callId = null) {
+    return this.send({ type: 'call_join', room_id: roomId, kind, call_id: callId });
+  }
+  callLeave(callId, roomId) {
+    return this.send({ type: 'call_leave', call_id: callId, room_id: roomId });
+  }
+  callOffer(callId, roomId, to, sdp) {
+    return this.send({ type: 'call_offer', call_id: callId, room_id: roomId, to, sdp });
+  }
 
   // ----- live interactivity (P4 弹幕 + 礼物) -----
   watchStream(streamId) { return this.send({ type: 'watch_stream', stream_id: streamId }); }
