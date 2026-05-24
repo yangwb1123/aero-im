@@ -2,26 +2,59 @@
 //!
 //! ## Scope
 //!
-//! Provides the **routing data model** for an str0m-driven SFU:
+//! A real [`str0m`](https://docs.rs/str0m)-backed SFU: each participant is a
+//! sans-IO `str0m` [`Rtc`](str0m::Rtc) instance ([`SfuPeer`]); one publisher's
+//! RTP is forwarded to every subscriber that subscribed to that track, with
+//! per-subscriber sequence-number / timestamp remapping.
 //!
 //! - [`SfuRouter`] — keyed by call id, tracks publishers and subscribers with
 //!   simple add/remove semantics. Holds the per-call media routing topology.
 //! - [`PeerRole`] — `Publisher` / `Subscriber` / `Bidirectional`.
-//! - [`MediaForwarder`] — abstraction the real str0m loop will implement to
-//!   forward RTP packets from one peer to another with minimal copying.
+//! - [`SfuPeer`] — wraps a `str0m` `Rtc`: SDP offer/answer + the
+//!   `poll_output`/`handle_input` loop exposed as [`peer::PeerProgress`].
+//! - [`SfuForwarder`] — the real [`MediaForwarder`]: routes inbound RTP from a
+//!   publisher to subscriber peers, writing remapped RTP onto each subscriber's
+//!   matching outbound `str0m` stream.
+//! - [`remap`] — the **pure**, fully unit-tested routing + RTP header-remap
+//!   bookkeeping (`ForwardTable`, `RtpRemapper`), with no IO dependency.
 //!
-//! ## What's *not* implemented here
+//! ## What's verified vs. pending
 //!
-//! The actual str0m event loop, ICE/DTLS/SRTP termination, RTP packet
-//! forwarding, and congestion-aware simulcast/SVC routing are **out of scope
-//! for P6**. The structural pieces above let `aero-server` reason about call
-//! membership and route signaling without bringing in str0m yet.
+//! Compiles against `str0m` 0.19 (RTP mode, pure-Rust crypto backend) and the
+//! pure routing/remap logic is unit-tested. The actual ICE/DTLS/SRTP handshake
+//! and end-to-end browser forwarding require a live UDP socket + real browsers
+//! and are **not** runtime-verifiable here; the server wiring of the UDP loop is
+//! intentionally out of scope (the loop is provided as a clean API on
+//! [`SfuPeer`]).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use aero_common::{CallId, ParticipantId};
 use parking_lot::RwLock;
+use thiserror::Error;
+
+pub mod forward;
+pub mod peer;
+pub mod remap;
+
+pub use forward::SfuForwarder;
+pub use peer::{InboundRtp, KeyframeReq, PeerProgress, SfuPeer};
+pub use remap::{ForwardTable, ForwardTarget, RemappedRtp, RtpKey, RtpRemapper};
+
+/// Errors surfaced by the `str0m`-backed peer / forwarder.
+#[derive(Debug, Error)]
+pub enum SfuError {
+    /// SDP offer/answer parsing or negotiation failed.
+    #[error("sdp error: {0}")]
+    Sdp(String),
+    /// Inbound datagram could not be parsed as STUN/DTLS/RTP.
+    #[error("net error: {0}")]
+    Net(String),
+    /// The underlying `str0m` `Rtc` returned an error.
+    #[error("rtc error: {0}")]
+    Rtc(String),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PeerRole {
@@ -39,7 +72,9 @@ pub struct SfuRouter {
 #[derive(Default)]
 struct CallState {
     peers: HashMap<ParticipantId, PeerRole>,
+    /// `published_mid -> owning publisher`.
     tracks: HashMap<String, ParticipantId>,
+    /// `subscriber -> set of published mids they receive`.
     subscriptions: HashMap<ParticipantId, HashSet<String>>,
 }
 
@@ -57,7 +92,9 @@ impl SfuRouter {
 
     pub fn remove_peer(&self, call: CallId, peer: ParticipantId) -> bool {
         let mut w = self.inner.write();
-        let Some(state) = w.get_mut(&call) else { return false };
+        let Some(state) = w.get_mut(&call) else {
+            return false;
+        };
         state.peers.remove(&peer);
         state.subscriptions.remove(&peer);
         state.tracks.retain(|_, owner| *owner != peer);
@@ -78,13 +115,26 @@ impl SfuRouter {
     pub fn add_subscription(&self, call: CallId, mid: &str, subscriber: ParticipantId) {
         let mut w = self.inner.write();
         let state = w.entry(call).or_default();
-        state.subscriptions.entry(subscriber).or_default().insert(mid.to_owned());
+        state
+            .subscriptions
+            .entry(subscriber)
+            .or_default()
+            .insert(mid.to_owned());
+    }
+
+    /// The publisher that owns `mid`, if known.
+    #[must_use]
+    pub fn owner_of(&self, call: CallId, mid: &str) -> Option<ParticipantId> {
+        let r = self.inner.read();
+        r.get(&call).and_then(|s| s.tracks.get(mid).copied())
     }
 
     #[must_use]
     pub fn subscribers_for(&self, call: CallId, mid: &str) -> Vec<ParticipantId> {
         let r = self.inner.read();
-        let Some(state) = r.get(&call) else { return Vec::new() };
+        let Some(state) = r.get(&call) else {
+            return Vec::new();
+        };
         state
             .subscriptions
             .iter()
@@ -106,6 +156,10 @@ impl SfuRouter {
     }
 }
 
+/// Abstraction the SFU loop uses to fan a publisher's RTP out to subscribers.
+///
+/// The real implementation is [`SfuForwarder`] (which also exposes the
+/// header-aware [`SfuForwarder::on_rtp`]); [`NullForwarder`] is the test/no-op.
 #[async_trait::async_trait]
 pub trait MediaForwarder: Send + Sync {
     async fn forward_rtp(&self, call: CallId, mid: &str, packet: bytes::Bytes);
@@ -154,6 +208,16 @@ mod tests {
         assert_eq!(s.len(), 2);
         assert!(s.contains(&sub1));
         assert!(s.contains(&sub2));
+    }
+
+    #[test]
+    fn owner_of_resolves_publisher() {
+        let r = SfuRouter::new();
+        let call = CallId::new();
+        let pub_ = ParticipantId::new();
+        r.add_track(call, "v0", pub_);
+        assert_eq!(r.owner_of(call, "v0"), Some(pub_));
+        assert_eq!(r.owner_of(call, "missing"), None);
     }
 
     #[test]
