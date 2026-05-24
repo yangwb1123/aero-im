@@ -16,7 +16,7 @@ aero-live-hls.workspace = true
 aero-signaling.workspace = true
 aero-storage.workspace = true
 
-tokio = { workspace = true, features = ["sync", "rt"] }
+tokio = { workspace = true, features = ["sync", "rt", "net", "time", "macros"] }
 async-trait.workspace = true
 bytes.workspace = true
 serde.workspace = true
@@ -28,4 +28,8 @@ ulid = { workspace = true, features = ["serde", "uuid"] }
 uuid.workspace = true
 time.workspace = true
 parking_lot.workspace = true
-rand.workspace = true
+
+# WebRTC media plane (P5). sans-IO; pure-Rust crypto backend (`rust-crypto`)
+# avoids native build deps (openssl / aws-lc-rs+nasm) so the crate always
+# compiles in CI without a C toolchain.
+str0m = { version = "0.19", default-features = false, features = ["rust-crypto"] }
