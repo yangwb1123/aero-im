@@ -6,6 +6,8 @@ use aero_auth::AuthService;
 use aero_bus::EventBus;
 use aero_im_core::ImService;
 use aero_live_whip::WhipRegistry;
+
+use crate::live::LiveService;
 use aero_storage::{
     AiJobRepo, BlobRepo, BlobStore, CallRepo, KeyPackageRepo, MessageRepo, MlsGroupRepo,
     ParticipantRepo, PresenceStore, ReactionRepo, ReceiptRepo, RoomRepo, StreamRepo,
@@ -46,6 +48,7 @@ pub struct AiAnswer {
 pub struct AppState {
     pub auth: AuthService,
     pub im: Arc<ImService>,
+    pub live: LiveService,
     pub participants: ParticipantRepo,
     pub rooms: RoomRepo,
     pub messages: MessageRepo,

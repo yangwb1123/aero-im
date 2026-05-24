@@ -12,6 +12,7 @@
 pub mod config;
 pub mod error;
 pub mod ids;
+pub mod live;
 pub mod mls;
 pub mod model;
 pub mod telemetry;
@@ -19,6 +20,9 @@ pub mod time;
 
 pub use error::{Error, Result};
 pub use ids::{BlobId, MessageId, ParticipantId, RoomId};
+pub use live::{
+    gift_by_id, gift_catalog, Gift, GiftLeaderRow, StreamChatLine, StreamEvent, StreamGiftLine,
+};
 pub use model::{
     Block, Blob, CallEvent, CallId, CallKind, CallMode, CallSession, FileKind, Message,
     MessageEnvelope, Participant, ParticipantKind, ReactionOp, ReactionSummary, Reaction,

@@ -140,6 +140,16 @@ export class WsClient {
     return this.send({ type: 'call_end', call_id: callId, room_id: roomId, reason });
   }
 
+  // ----- live interactivity (P4 弹幕 + 礼物) -----
+  watchStream(streamId) { return this.send({ type: 'watch_stream', stream_id: streamId }); }
+  unwatchStream(streamId) { return this.send({ type: 'unwatch_stream', stream_id: streamId }); }
+  streamChat(streamId, body) {
+    return this.send({ type: 'stream_chat', stream_id: streamId, body });
+  }
+  streamGift(streamId, giftId, qty = 1) {
+    return this.send({ type: 'stream_gift', stream_id: streamId, gift_id: giftId, qty });
+  }
+
   close() {
     this.closedByUser = true;
     if (this._reconnectTimer) { clearTimeout(this._reconnectTimer); this._reconnectTimer = null; }

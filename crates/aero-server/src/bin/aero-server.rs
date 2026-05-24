@@ -13,9 +13,11 @@ use aero_im_core::ImService;
 use aero_live_core::LiveStreamConfig;
 use aero_live_rtmp::spawn_rtmp_ingest;
 use aero_live_whip::WhipRegistry;
-use aero_server::{ai_adapter::AiServiceAdapter, hub::Hub, routes, state::AppState, ws};
+use aero_server::{
+    ai_adapter::AiServiceAdapter, hub::Hub, live::LiveService, routes, state::AppState, ws,
+};
 use aero_storage::{
-    connect_pg, migrate, AiJobRepo, BlobRepo, CallRepo, KeyPackageRepo, LocalFsBlobStore,
+    connect_pg, migrate, AiJobRepo, BlobRepo, CallRepo, KeyPackageRepo, LiveRepo, LocalFsBlobStore,
     MessageRepo, MlsGroupRepo, ParticipantRepo, PresenceStore, ReactionRepo, ReceiptRepo,
     RedisCache, RoomRepo, StreamRepo,
 };
@@ -51,6 +53,7 @@ async fn main() -> anyhow::Result<()> {
     let ai_jobs = AiJobRepo::new(pg.clone());
     let blobs = BlobRepo::new(pg.clone());
     let streams = StreamRepo::new(pg.clone());
+    let live_repo = LiveRepo::new(pg.clone());
     let key_packages = KeyPackageRepo::new(pg.clone());
     let mls_groups = MlsGroupRepo::new(pg.clone());
     let presence = PresenceStore::new(cache.client().clone());
@@ -98,6 +101,14 @@ async fn main() -> anyhow::Result<()> {
         ai_jobs.clone(),
         jetstream.clone(),
     ));
+
+    // ---------- Live service (danmaku / gifts / viewers) ----------
+    let live = LiveService::new(
+        streams.clone(),
+        live_repo,
+        participants.clone(),
+        bus_dyn.clone(),
+    );
 
     // ---------- AI service ----------
     // The AiService is always constructed — it falls back to a deterministic local
@@ -150,6 +161,7 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState {
         auth,
         im,
+        live,
         participants,
         rooms,
         messages,
@@ -183,6 +195,16 @@ async fn main() -> anyhow::Result<()> {
         tokio::spawn(async move {
             if let Err(e) = ws::run_bus_listener(state_clone).await {
                 tracing::error!(error = ?e, "bus listener exited");
+            }
+        });
+    }
+
+    // ---------- Live bus listener (danmaku / gifts / viewers) ----------
+    {
+        let state_clone = state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = ws::run_live_bus_listener(state_clone).await {
+                tracing::error!(error = ?e, "live bus listener exited");
             }
         });
     }

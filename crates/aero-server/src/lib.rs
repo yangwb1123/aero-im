@@ -5,6 +5,7 @@ pub mod transcribe_bot;
 pub mod ai_adapter;
 pub mod error;
 pub mod hub;
+pub mod live;
 pub mod routes;
 pub mod state;
 pub mod ws;

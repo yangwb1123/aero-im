@@ -8,8 +8,9 @@ use std::sync::Arc;
 
 use aero_common::{
     Block, CallEvent, CallId, CallKind, CallMode, MessageId, ParticipantId, ReactionOp, RoomEvent,
-    RoomId,
+    RoomId, StreamEvent,
 };
+use ulid::Ulid;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -80,6 +81,19 @@ enum ClientFrame {
         #[serde(default)]
         reason: Option<String>,
     },
+    /// Start watching a live stream (danmaku/gift fan-out + viewer count).
+    WatchStream { stream_id: Ulid },
+    /// Stop watching a live stream.
+    UnwatchStream { stream_id: Ulid },
+    /// Post a danmaku line on a stream.
+    StreamChat { stream_id: Ulid, body: String },
+    /// Send a gift on a stream (`qty` defaults to 1).
+    StreamGift {
+        stream_id: Ulid,
+        gift_id: String,
+        #[serde(default)]
+        qty: Option<u32>,
+    },
     Ping,
 }
 
@@ -106,6 +120,8 @@ enum ServerFrame<'a> {
     },
     Typing { room_id: RoomId, participant: ParticipantId, on: bool },
     Call { event: CallEvent },
+    /// Per-stream interactivity event (danmaku/gift/viewers/status).
+    StreamEvent { event: StreamEvent },
     Error { code: &'a str, msg: String },
     Pong,
 }
@@ -264,6 +280,31 @@ async fn handle_text(
                 )
                 .await?;
         }
+        ClientFrame::WatchStream { stream_id } => {
+            state.hub.watch_stream(stream_id, pid);
+            // Replay a small danmaku backlog so the new watcher has context.
+            if let Ok(lines) = state.live.recent_chat(stream_id, 30).await {
+                for line in lines {
+                    let frame = ServerFrame::StreamEvent { event: StreamEvent::Chat(line) };
+                    let _ = tx.send(Message::Text(
+                        serde_json::to_string(&frame).unwrap_or_default(),
+                    ));
+                }
+            }
+            let count = state.hub.stream_viewer_count(stream_id);
+            state.live.publish_viewers(stream_id, count).await;
+        }
+        ClientFrame::UnwatchStream { stream_id } => {
+            state.hub.unwatch_stream(stream_id, pid);
+            let count = state.hub.stream_viewer_count(stream_id);
+            state.live.publish_viewers(stream_id, count).await;
+        }
+        ClientFrame::StreamChat { stream_id, body } => {
+            state.live.post_chat(pid, stream_id, body).await?;
+        }
+        ClientFrame::StreamGift { stream_id, gift_id, qty } => {
+            state.live.send_gift(pid, stream_id, &gift_id, qty.unwrap_or(1)).await?;
+        }
     }
     Ok(())
 }
@@ -315,6 +356,39 @@ pub async fn run_bus_listener(state: AppState) -> anyhow::Result<()> {
                     continue;
                 }
                 warn!(error = ?e, "bad envelope on bus");
+                let _ = sub.nack().await;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Background loop that subscribes to `live.stream.*` and pushes each
+/// [`StreamEvent`] to local watchers of that stream. Uses an *ephemeral*
+/// consumer: live interactivity is broadcast (every instance must see every
+/// event to fan out to its own watchers) and a few dropped danmaku across a
+/// restart are immaterial. Started once per process at boot.
+pub async fn run_live_bus_listener(state: AppState) -> anyhow::Result<()> {
+    use aero_bus::EventBus;
+    let bus: Arc<dyn EventBus> = state.bus.clone();
+    let mut stream = bus
+        .subscribe("live.stream.*", None)
+        .await
+        .map_err(|e| anyhow::anyhow!("subscribe live: {e}"))?;
+    info!("live bus listener started");
+    while let Some(sub) = stream.next().await {
+        match serde_json::from_slice::<StreamEvent>(sub.payload()) {
+            Ok(event) => {
+                let watchers = state.hub.stream_watchers(event.stream_id());
+                if !watchers.is_empty() {
+                    let frame = ServerFrame::StreamEvent { event };
+                    let json = serde_json::to_string(&frame).unwrap_or_default();
+                    state.hub.fan_out_raw(&watchers, &json);
+                }
+                let _ = sub.ack().await;
+            }
+            Err(e) => {
+                warn!(error = ?e, "bad StreamEvent on bus");
                 let _ = sub.nack().await;
             }
         }

@@ -50,6 +50,12 @@ pub fn build(state: AppState) -> Router {
         // Live streams
         .route("/api/streams", post(stream_create).get(stream_list))
         .route("/api/streams/:id", get(stream_get))
+        .route("/api/streams/:id/end", post(stream_end))
+        // Live interactivity (P4 弹幕 + 礼物)
+        .route("/api/live/gifts", get(live_gift_catalog))
+        .route("/api/streams/:id/chat", get(stream_chat_list).post(stream_chat_post))
+        .route("/api/streams/:id/gifts", get(stream_gift_list).post(stream_gift_send))
+        .route("/api/streams/:id/leaderboard", get(stream_leaderboard))
         // WHIP / WHEP — body is SDP text, response is SDP text
         .route("/whip/:stream_key", post(whip_post))
         .route("/whip/resource/:stream_id", axum::routing::delete(whip_delete))
@@ -673,6 +679,7 @@ async fn stream_create(
             schema: "stream".into(),
             payload: serde_json::json!({
                 "stream_id": stream.id.to_string(),
+                "owner_id": stream.owner_id.to_string(),
                 "title": stream.title,
                 "protocol": format!("{:?}", stream.protocol).to_lowercase(),
                 "hls_url": hls_url,
@@ -717,6 +724,103 @@ async fn stream_get(
         .map_err(AeroError::from)?
         .ok_or_else(|| AeroError::NotFound("stream".into()))?;
     Ok(Json(serde_json::to_value(stream).map_err(AeroError::from)?))
+}
+
+// ----- Live interactivity (P4 弹幕 + 礼物) -----
+
+fn parse_stream_id(s: &str) -> AeroResult<ulid::Ulid> {
+    ulid::Ulid::from_str(s).map_err(|e| AeroError::Invalid(format!("stream id: {e}")))
+}
+
+#[derive(Deserialize)]
+struct LimitQuery {
+    #[serde(default)]
+    limit: Option<i64>,
+}
+
+/// Static gift catalog — the client renders the gift bar from this.
+async fn live_gift_catalog(_auth: AuthUser) -> Json<serde_json::Value> {
+    Json(serde_json::json!({ "gifts": aero_common::gift_catalog() }))
+}
+
+async fn stream_chat_list(
+    State(s): State<AppState>,
+    _auth: AuthUser,
+    Path(id_str): Path<String>,
+    Query(q): Query<LimitQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let id = parse_stream_id(&id_str)?;
+    let chat = s.live.recent_chat(id, q.limit.unwrap_or(50)).await?;
+    Ok(Json(serde_json::json!({ "chat": chat })))
+}
+
+#[derive(Deserialize)]
+struct ChatPostReq {
+    body: String,
+}
+
+async fn stream_chat_post(
+    State(s): State<AppState>,
+    auth: AuthUser,
+    Path(id_str): Path<String>,
+    Json(req): Json<ChatPostReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let id = parse_stream_id(&id_str)?;
+    let line = s.live.post_chat(auth.participant_id, id, req.body).await?;
+    Ok(Json(serde_json::to_value(line).map_err(AeroError::from)?))
+}
+
+async fn stream_gift_list(
+    State(s): State<AppState>,
+    _auth: AuthUser,
+    Path(id_str): Path<String>,
+    Query(q): Query<LimitQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let id = parse_stream_id(&id_str)?;
+    let gifts = s.live.recent_gifts(id, q.limit.unwrap_or(30)).await?;
+    Ok(Json(serde_json::json!({ "gifts": gifts })))
+}
+
+#[derive(Deserialize)]
+struct GiftSendReq {
+    gift_id: String,
+    #[serde(default)]
+    qty: Option<u32>,
+}
+
+async fn stream_gift_send(
+    State(s): State<AppState>,
+    auth: AuthUser,
+    Path(id_str): Path<String>,
+    Json(req): Json<GiftSendReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let id = parse_stream_id(&id_str)?;
+    let line = s
+        .live
+        .send_gift(auth.participant_id, id, &req.gift_id, req.qty.unwrap_or(1))
+        .await?;
+    Ok(Json(serde_json::to_value(line).map_err(AeroError::from)?))
+}
+
+async fn stream_leaderboard(
+    State(s): State<AppState>,
+    _auth: AuthUser,
+    Path(id_str): Path<String>,
+    Query(q): Query<LimitQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let id = parse_stream_id(&id_str)?;
+    let rows = s.live.leaderboard(id, q.limit.unwrap_or(10)).await?;
+    Ok(Json(serde_json::json!({ "leaderboard": rows })))
+}
+
+async fn stream_end(
+    State(s): State<AppState>,
+    auth: AuthUser,
+    Path(id_str): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let id = parse_stream_id(&id_str)?;
+    s.live.end_stream(auth.participant_id, id).await?;
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 fn strip_scheme(url: &str) -> String {

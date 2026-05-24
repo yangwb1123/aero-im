@@ -160,6 +160,30 @@ export const api = {
   getStream(id) {
     return request('GET', `/api/streams/${encodeURIComponent(id)}`);
   },
+  endStream(id) {
+    return request('POST', `/api/streams/${encodeURIComponent(id)}/end`);
+  },
+  // ----- live interactivity (P4 弹幕 + 礼物) -----
+  liveGifts() {
+    return request('GET', '/api/live/gifts');
+  },
+  streamChatList(id, limit = 50) {
+    return request('GET', `/api/streams/${encodeURIComponent(id)}/chat`, { query: { limit } });
+  },
+  postStreamChat(id, body) {
+    return request('POST', `/api/streams/${encodeURIComponent(id)}/chat`, { body: { body } });
+  },
+  streamGiftList(id, limit = 30) {
+    return request('GET', `/api/streams/${encodeURIComponent(id)}/gifts`, { query: { limit } });
+  },
+  sendGift(id, giftId, qty = 1) {
+    return request('POST', `/api/streams/${encodeURIComponent(id)}/gifts`, {
+      body: { gift_id: giftId, qty },
+    });
+  },
+  streamLeaderboard(id, limit = 10) {
+    return request('GET', `/api/streams/${encodeURIComponent(id)}/leaderboard`, { query: { limit } });
+  },
   rtcConfig() {
     return request('GET', '/api/rtc/config');
   },

@@ -996,6 +996,68 @@ input, textarea, select, button { font-family: inherit; }
 .stream-card-video { width: 100%; aspect-ratio: 16 / 9; background: #000; display: block; }
 .stream-card-meta { padding: 6px 12px; font-size: 11px; word-break: break-all; }
 
+/* ---------- live interactivity: viewers / danmaku / gifts (P11) ---------- */
+.stream-card-viewers { margin-left: auto; font-size: 11px; color: var(--text-mute); }
+.stream-card-end {
+  background: var(--bg-3); color: var(--text); border: 1px solid var(--line);
+  font-size: 11px; padding: 2px 8px; border-radius: var(--radius-sm); cursor: pointer;
+}
+.stream-card-end:hover { border-color: var(--danger); color: var(--danger); }
+.stream-card-live.ended { background: var(--text-dim); }
+
+.stream-card-stage { position: relative; }
+.danmaku-layer { position: absolute; inset: 0; overflow: hidden; pointer-events: none; }
+.danmaku-item {
+  position: absolute; left: 100%; white-space: nowrap;
+  font-size: 13px; font-weight: 600; color: #fff;
+  text-shadow: 0 1px 3px rgba(0,0,0,.9);
+  animation: danmaku-fly 8s linear forwards;
+}
+.danmaku-who { opacity: .8; }
+@keyframes danmaku-fly {
+  from { transform: translateX(0); }
+  to   { transform: translateX(calc(-100% - 480px)); }
+}
+.gift-float {
+  position: absolute; left: 50%; bottom: 12%; transform: translateX(-50%);
+  font-size: 48px; pointer-events: none; animation: gift-pop 3.4s ease-out forwards;
+}
+@keyframes gift-pop {
+  0%   { opacity: 0; transform: translateX(-50%) scale(.4); }
+  15%  { opacity: 1; transform: translateX(-50%) scale(1.25); }
+  35%  { transform: translateX(-50%) scale(1); }
+  100% { opacity: 0; transform: translateX(-50%) translateY(-60px) scale(1); }
+}
+.gift-bar { display: flex; gap: 6px; flex-wrap: wrap; padding: 8px 12px; border-top: 1px solid var(--line); }
+.gift-btn {
+  display: flex; align-items: center; gap: 4px;
+  background: var(--bg-3); border: 1px solid var(--line); color: var(--text);
+  border-radius: var(--radius-sm); padding: 4px 8px; cursor: pointer; font-size: 13px;
+}
+.gift-btn:hover { border-color: var(--brand-1); }
+.gift-icon { font-size: 16px; }
+.gift-coins { font-size: 11px; color: var(--text-mute); }
+.gift-feed { padding: 6px 12px 0; display: flex; flex-direction: column; gap: 2px; }
+.gift-feed:empty { display: none; }
+.gift-feed-row {
+  font-size: 11.5px; color: var(--text); background: var(--bg-2);
+  border-radius: var(--radius-sm); padding: 3px 8px;
+  display: flex; gap: 6px; align-items: center; animation: gift-feed-in .25s ease-out;
+}
+@keyframes gift-feed-in { from { opacity: 0; transform: translateY(4px); } to { opacity: 1; transform: none; } }
+.gift-feed-icon { font-size: 14px; }
+.danmaku-composer { display: flex; gap: 6px; padding: 8px 12px; border-top: 1px solid var(--line); }
+.danmaku-input {
+  flex: 1; background: var(--bg); border: 1px solid var(--line); color: var(--text);
+  border-radius: var(--radius-sm); padding: 6px 10px; font-size: 12.5px;
+}
+.danmaku-input:focus { outline: none; border-color: var(--brand-1); }
+.danmaku-send {
+  background: var(--bg-3); border: 1px solid var(--line); color: var(--text);
+  border-radius: var(--radius-sm); padding: 6px 12px; cursor: pointer; font-size: 12.5px;
+}
+.danmaku-send:hover { border-color: var(--brand-1); }
+
 /* responsive — collapse right pane on narrow */
 @media (max-width: 900px) {
   .view-chat { grid-template-columns: 220px 1fr; }

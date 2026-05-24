@@ -80,6 +80,23 @@ impl JetStreamBus {
             .map_err(|e| BusError::Nats(e.to_string()))?;
         info!(stream = "AI_QUEUE", "declared");
 
+        // Live-stream interactivity (danmaku/gifts/viewers). High-volume and
+        // short-lived — a small retention window is plenty for late-joiner
+        // backlog and cross-instance fan-out.
+        self.js
+            .get_or_create_stream(stream::Config {
+                name: "LIVE_EVENTS".into(),
+                subjects: vec!["live.stream.*".into()],
+                retention: stream::RetentionPolicy::Limits,
+                max_age: std::time::Duration::from_secs(6 * 3600),
+                max_messages: 200_000,
+                storage: stream::StorageType::File,
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| BusError::Nats(e.to_string()))?;
+        info!(stream = "LIVE_EVENTS", "declared");
+
         Ok(())
     }
 }
@@ -111,6 +128,8 @@ impl EventBus for JetStreamBus {
             "IM_EVENTS"
         } else if subject.starts_with("ai.queue.") {
             "AI_QUEUE"
+        } else if subject.starts_with("live.stream.") {
+            "LIVE_EVENTS"
         } else {
             return Err(BusError::Nats(format!("unknown subject prefix: {subject}")));
         };

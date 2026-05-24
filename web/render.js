@@ -126,7 +126,7 @@ function appendBlock(parent, b, ctx = {}) {
     }
     case 'card': {
       if (b.schema === 'stream' && b.payload && b.payload.hls_url) {
-        parent.appendChild(buildStreamCard(b.payload));
+        parent.appendChild(buildStreamCard(b.payload, ctx));
         return;
       }
       const wrap = el('div', { className: 'card-block' });
@@ -167,24 +167,139 @@ function appendBlock(parent, b, ctx = {}) {
   }
 }
 
-function buildStreamCard(payload) {
+// Interactive live-stream card: HLS video + danmaku overlay + gift bar +
+// viewer count. `ctx.live` (optional) supplies the catalog + the watch/chat/gift
+// callbacks and a `register(streamId, controller)` hook so the app can route
+// incoming `stream_event` frames back to this card.
+function buildStreamCard(payload, ctx = {}) {
+  const live = ctx.live || {};
+  const streamId = payload.stream_id || '';
   const wrap = el('div', { className: 'stream-card' });
+  if (streamId) wrap.dataset.streamId = streamId;
+
+  // ---- head: LIVE badge · title · viewer count (· end for owner) ----
   const head = el('div', { className: 'stream-card-head' });
-  const live = el('span', { className: 'stream-card-live', text: 'LIVE' });
+  const liveBadge = el('span', { className: 'stream-card-live', text: 'LIVE' });
   const title = el('div', { className: 'stream-card-title', text: payload.title || '直播' });
-  head.appendChild(live);
+  const viewers = el('span', { className: 'stream-card-viewers', text: '👁 0' });
+  head.appendChild(liveBadge);
   head.appendChild(title);
+  head.appendChild(viewers);
+  if (payload.owner_id && live.meId && payload.owner_id === live.meId && typeof live.end === 'function') {
+    const endBtn = el('button', { className: 'stream-card-end', attrs: { type: 'button', title: '结束直播' }, text: '结束' });
+    endBtn.addEventListener('click', () => live.end(streamId));
+    head.appendChild(endBtn);
+  }
   wrap.appendChild(head);
+
+  // ---- stage: video + danmaku overlay + gift float layer ----
+  const stage = el('div', { className: 'stream-card-stage' });
   const video = el('video', {
     attrs: { controls: 'controls', playsinline: 'true', muted: 'true', preload: 'metadata' },
     className: 'stream-card-video',
   });
   attachHls(video, payload.hls_url);
-  wrap.appendChild(video);
+  const danmaku = el('div', { className: 'danmaku-layer' });
+  stage.appendChild(video);
+  stage.appendChild(danmaku);
+  wrap.appendChild(stage);
+
+  // ---- gift bar ----
+  const giftBar = el('div', { className: 'gift-bar' });
+  const catalog = Array.isArray(live.gifts) ? live.gifts : [];
+  for (const g of catalog) {
+    const btn = el('button', {
+      className: 'gift-btn',
+      attrs: { type: 'button', title: `${g.name} · ${g.coins} 币` },
+    });
+    btn.appendChild(el('span', { className: 'gift-icon', text: g.icon }));
+    btn.appendChild(el('span', { className: 'gift-coins', text: String(g.coins) }));
+    btn.addEventListener('click', () => {
+      if (typeof live.gift === 'function') live.gift(streamId, g.id, 1);
+    });
+    giftBar.appendChild(btn);
+  }
+  if (catalog.length) wrap.appendChild(giftBar);
+
+  // ---- recent-gift ticker ----
+  const giftFeed = el('div', { className: 'gift-feed' });
+  wrap.appendChild(giftFeed);
+
+  // ---- danmaku composer ----
+  const composer = el('form', { className: 'danmaku-composer' });
+  const input = el('input', {
+    className: 'danmaku-input',
+    attrs: { type: 'text', maxlength: '200', placeholder: '发条弹幕…' },
+  });
+  const send = el('button', { className: 'danmaku-send', attrs: { type: 'submit' }, text: '发送' });
+  composer.appendChild(input);
+  composer.appendChild(send);
+  composer.addEventListener('submit', (e) => {
+    e.preventDefault();
+    const v = input.value.trim();
+    if (!v) return;
+    if (typeof live.chat === 'function') live.chat(streamId, v);
+    input.value = '';
+  });
+  wrap.appendChild(composer);
+
   const meta = el('div', { className: 'stream-card-meta muted' });
   meta.textContent = `${(payload.protocol || 'rtmp').toUpperCase()} · ${payload.hls_url}`;
   wrap.appendChild(meta);
+
+  // ---- controller handed to the app for live event routing ----
+  const controller = {
+    streamId,
+    addChat(line) { spawnDanmaku(danmaku, line); },
+    addGift(line) { spawnGift(giftFeed, danmaku, line); },
+    setViewers(n) { viewers.textContent = `👁 ${Number(n) || 0}`; },
+    setStatus(status) {
+      if (status === 'ended') {
+        liveBadge.textContent = 'ENDED';
+        liveBadge.classList.add('ended');
+      } else {
+        liveBadge.textContent = 'LIVE';
+        liveBadge.classList.remove('ended');
+      }
+    },
+  };
+  if (streamId && typeof live.register === 'function') live.register(streamId, controller);
   return wrap;
+}
+
+// Fly one danmaku line across the overlay. DOM-only; auto-removes after the
+// CSS animation (with a hard timeout as a safety net).
+function spawnDanmaku(layer, line) {
+  if (!layer) return;
+  const item = el('div', { className: 'danmaku-item' });
+  item.appendChild(el('span', { className: 'danmaku-who', text: `${line.sender_name || '匿名'}: ` }));
+  item.appendChild(el('span', { className: 'danmaku-text', text: line.body || '' }));
+  const track = Math.floor(Math.random() * 4); // 4 vertical lanes
+  item.style.top = `${6 + track * 22}%`;
+  layer.appendChild(item);
+  const drop = () => item.remove();
+  item.addEventListener('animationend', drop);
+  setTimeout(drop, 12000);
+}
+
+// Show a gift: a ticker row in the feed + a big floating glyph over the video.
+function spawnGift(feed, layer, line) {
+  if (feed) {
+    const row = el('div', { className: 'gift-feed-row' });
+    row.appendChild(el('span', { className: 'gift-feed-icon', text: line.gift_icon || '🎁' }));
+    const label = `${line.sender_name || '匿名'} 送出 ${line.gift_name || line.gift_id || '礼物'} ×${line.qty || 1}`;
+    row.appendChild(el('span', { className: 'gift-feed-text', text: label }));
+    feed.prepend(row);
+    while (feed.childElementCount > 5) feed.lastElementChild.remove();
+    setTimeout(() => row.remove(), 8000);
+  }
+  if (layer) {
+    const float = el('div', { className: 'gift-float', text: line.gift_icon || '🎁' });
+    layer.appendChild(float);
+    const drop = () => float.remove();
+    float.addEventListener('animationend', drop);
+    setTimeout(drop, 4000);
+  }
 }
 
 function attachHls(video, src) {
@@ -286,7 +401,7 @@ export function renderMessage(m, mePid, participants, opts = {}) {
   if (isDeleted) {
     bubble.appendChild(el('span', { className: 'muted', text: '消息已删除' }));
   } else {
-    bubble.appendChild(buildBlocks(m.blocks, { participants }));
+    bubble.appendChild(buildBlocks(m.blocks, { participants, live: opts.live }));
   }
 
   // hover actions row (right-aligned mini buttons for owner; reactions for all)
