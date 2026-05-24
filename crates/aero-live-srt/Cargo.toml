@@ -14,6 +14,8 @@ aero-common.workspace = true
 aero-live-core.workspace = true
 aero-storage.workspace = true
 
+aero-live-hls.workspace = true
+
 tokio = { workspace = true, features = ["net", "io-util", "rt", "sync", "macros"] }
 async-trait.workspace = true
 bytes.workspace = true
@@ -24,3 +26,13 @@ serde.workspace = true
 serde_json.workspace = true
 time.workspace = true
 ulid = { workspace = true, features = ["serde", "uuid"] }
+
+# Time-limited TURN credentials (coturn `use-auth-secret` REST convention):
+# password = base64(HMAC_SHA1(shared_secret, username)). RustCrypto stack.
+hmac = "0.12"
+sha1 = "0.10"
+base64 = "0.22"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "fs", "io-util", "sync"] }
+tempfile = "3"
