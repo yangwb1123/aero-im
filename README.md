@@ -3,7 +3,7 @@
 AI-Native 即时通讯 + 直播平台,Rust 实现。
 
 - 设计:[`docs/specs/2026-05-22-aero-im-design.md`](docs/specs/2026-05-22-aero-im-design.md)
-- 状态:**P0–P11 全部就位**,媒体面(str0m WHIP/SFU + SRT/TURN)已实现核心逻辑(185 个单元测试通过,16 个 crate,~22,000 行 Rust + Web)
+- 状态:**P0–P11 全部就位**,媒体面(str0m WHIP/SFU + SRT 握手 + TURN)已实现并字节级单测(220 个单元测试通过,16 个 crate,~25,000 行 Rust + Web)
 
 ## 功能矩阵
 
@@ -22,9 +22,9 @@ AI-Native 即时通讯 + 直播平台,Rust 实现。
 | **实时字幕翻译** | 浏览器语音识别 → 字幕,最终行经 Anthropic 翻译 | ✅ |
 | **直播 RTMP→HLS** | rml_rtmp 摄入,真 MPEG-TS muxing(SPS/PPS/ADTS) | ✅ |
 | **直播弹幕 + 礼物** | 弹幕轨道 + 礼物目录/飘屏/榜单 + 实时观看人数(NATS `live.stream.*`) | ✅ |
-| **WHIP/WHEP** | str0m 真 SDP 应答 + 事件循环 + H.264 RTP 解包(RFC 6184:单 NAL/FU-A/STAP-A);AU→HLS 收尾 + 浏览器联调待做 | ✅ 媒体面 |
+| **WHIP/WHEP** | str0m 真 SDP 应答 + 事件循环 + H.264 RTP 解包(RFC 6184)**→ 真 HLS 产出**(合成 RTP→.ts/.m3u8 字节级集成测试);仅余浏览器 ICE/DTLS 联调 | ✅ 媒体面 |
 | **SFU** | str0m 选择性转发(发布者 RTP → 订阅者)+ 每订阅者 seq/ts 重映射;ICE/DTLS 端到端联调待做 | ✅ 媒体面 |
-| **SRT 摄入** | `MpegTsSegmenter`(TS→HLS,关键帧切片,已测)+ 时限 TURN 凭据(HMAC-SHA1,RFC 2202 向量);SRT 握手层待接 srt-tokio | ✅ |
+| **SRT 摄入** | 手写 SRT HSv5 握手 + 包编解码 + StreamID 解码(已测)→ `MpegTsSegmenter`(TS→HLS,关键帧切片)+ 时限 TURN 凭据;仅余加密/可靠性/真实推流联调 | ✅ |
 | **MLS E2E** | KeyPackage + 群状态服务端透传 | ✅ scaffold |
 
 ## 架构
@@ -179,7 +179,7 @@ ffmpeg -re -i sample.mp4 -c:v libx264 -c:a aac -f flv rtmp://localhost/live/<str
 
 ```bash
 cargo check --workspace          # 干净
-cargo test --workspace --lib     # 185 pass / 0 fail / 3 ignored(DB 集成)
+cargo test --workspace --lib     # 220 pass / 0 fail / 3 ignored(DB 集成)
 cargo build --bin aero-server    # 二进制成功
 ```
 
@@ -199,10 +199,10 @@ cargo build --bin aero-server    # 二进制成功
 | **P9** | 真 TS muxing / vector 搜 / mention / read avatars / smoke_p2 | ✅ |
 | **P11** | 直播弹幕 + 虚拟礼物 + 观看人数 | ✅ |
 
-媒体面已落地核心逻辑(str0m 0.19,纯 Rust crypto),剩余为需真实媒体链路的端到端联调:
-- WHIP/WHEP:str0m SDP 应答 + RTP H.264 解包已实现并单测;**待做** AU→HLS 收尾 + 浏览器推流联调
+媒体面已落地(str0m 0.19,纯 Rust crypto),并尽可能字节级单测;剩余仅为需真实媒体链路/浏览器的端到端联调:
+- WHIP/WHEP:SDP 应答 + RTP H.264 解包 + **RTP→.ts/.m3u8 已字节级集成测试**;**待做** 仅浏览器 ICE/DTLS/SRTP 推流联调
 - SFU:str0m 选择性转发 + RTP 重映射已实现并单测;**待做** ICE/DTLS/SRTP 端到端 + Simulcast/拥塞控制
-- SRT:`MpegTsSegmenter` + 时限 TURN 凭据已实现并单测;**待做** 接 srt-tokio 完成握手/解密层
+- SRT:HSv5 握手 + 包编解码 + TS→HLS 已实现并单测;**待做** 加密(AES/KMREQ)、ACK/NAK 可靠性、真实 ffmpeg 推流联调
 - (E2E/MLS 客户端为 spec 非目标,服务端透传 scaffold 已超出要求)
 - MLS **客户端**:web 加 openmls-wasm,加密 payload 透传
 
