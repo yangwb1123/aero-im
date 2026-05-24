@@ -13,21 +13,32 @@
 //! ## SRT socket layer status
 //!
 //! The fully-testable core — TS demux + keyframe-aligned HLS segmentation
-//! ([`segmenter::MpegTsSegmenter`]) — is implemented and unit-tested. The SRT
-//! *wire protocol* (handshake, ACK/NAK, congestion control, AEAD) is heavy: the
-//! `srt-tokio`/`srt-protocol` stack pulls in ~30 transitive crates (crypto,
-//! `regex`, …) and was deliberately **not** vendored here to keep this crate's
-//! build small and reliable. The listener below binds UDP and is wired through
-//! [`LiveIngest`] exactly like RTMP — including the `streamid` → stream-key
-//! lookup and the [`StreamRepo`] live/ended lifecycle — but the SRT handshake +
-//! demux of caller payloads is marked pending (see [`SrtIngest::run`]). When the
-//! protocol layer lands, it feeds bytes straight into [`MpegTsSegmenter`] and
-//! the rest of the pipeline below is ready.
+//! ([`segmenter::MpegTsSegmenter`]) — is implemented and unit-tested. Rather
+//! than vendor the heavy `srt-tokio`/`srt-protocol` stack (~30 transitive
+//! crates: crypto, `regex`, …), this crate now hand-rolls a **minimal,
+//! unencrypted** SRT (`HSv5`) wire layer in [`protocol`] sufficient to accept a
+//! caller→listener MPEG-TS push:
+//!
+//! - the 16-byte SRT header + 48-byte handshake CIF codec,
+//! - the listener-side INDUCTION → CONCLUSION handshake with SYN cookies,
+//! - the `streamid=` (StreamID/SID) extension decode that carries the stream
+//!   key,
+//! - and the data-packet payload extraction feeding [`MpegTsSegmenter`].
+//!
+//! [`SrtIngest`] binds the UDP socket, drives the handshake per peer, resolves
+//! the stream by SID via [`StreamRepo`] + `mark_live`, and feeds subsequent data
+//! payloads into the segmenter → [`SrtSession`] → HLS path. **Pending** (and
+//! documented as such): AES encryption (`KMREQ`/`KMRSP`), ACK/NAK
+//! retransmission, congestion control, and packet reordering — the v1 data
+//! plane is best-effort, in-order. See [`protocol`] for the full pending list.
 
+pub mod protocol;
 pub mod segmenter;
 
+pub use protocol::{Handshake, HandshakeMachine, HsAction, HsState, SrtHeader};
 pub use segmenter::{MpegTsSegmenter, SegmentEvent, TS_PACKET_SIZE, TS_SYNC_BYTE};
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -38,9 +49,47 @@ use aero_live_core::{
 use aero_live_hls::{HlsWriter, DEFAULT_SEGMENT_EXT};
 use aero_storage::StreamRepo;
 use async_trait::async_trait;
+use protocol::{ControlType, PacketKind, SRT_HEADER_LEN};
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
+
+/// Maximum UDP datagram we read for one SRT packet. SRT defaults to a 1500-byte
+/// MTU; 2048 leaves comfortable headroom for jumbo-ish payloads without large
+/// per-recv allocations.
+const SRT_RECV_BUF: usize = 2048;
+
+/// Per-process secret folded into SYN cookies. Randomised at construction so
+/// cookies aren't predictable across restarts (anti-SYN-flood). Injected via the
+/// constructor for deterministic tests.
+///
+/// We avoid pulling in `rand` for this single value: a SYN-cookie seed only
+/// needs to be unpredictable to a remote attacker, not cryptographically
+/// uniform. We fold together the high-resolution wall clock and a heap-address
+/// nonce (ASLR-randomised per process) via FNV-1a, which is ample entropy to
+/// keep cookies unguessable across restarts.
+fn random_cookie_seed() -> u32 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    const FNV_OFFSET: u32 = 0x811c_9dc5;
+    const FNV_PRIME: u32 = 0x0100_0193;
+    let mut h = FNV_OFFSET;
+    let mut mix = |word: u128| {
+        for b in word.to_ne_bytes() {
+            h ^= u32::from(b);
+            h = h.wrapping_mul(FNV_PRIME);
+        }
+    };
+    // High-resolution time since the epoch (nanoseconds).
+    if let Ok(d) = SystemTime::now().duration_since(UNIX_EPOCH) {
+        mix(d.as_nanos());
+    }
+    // A freshly-allocated box's address is ASLR-randomised per process, adding
+    // entropy that differs across restarts even within the same nanosecond.
+    let nonce = Box::new(0u8);
+    mix((std::ptr::from_ref::<u8>(&*nonce) as usize) as u128);
+    h
+}
 
 /// How long a single HLS segment covers in wall-clock time, matching the RTMP
 /// ingest cadence so players see a consistent target duration across protocols.
@@ -54,16 +103,44 @@ const SEGMENT_DURATION_SECS_F32: f32 = 2.0;
 ///
 /// Binds the UDP socket SRT runs on (RTMP port + 1 by convention) and is wired
 /// into the server boot path through [`LiveIngest`], mirroring the RTMP backend.
-/// The keyframe-aligned MPEG-TS segmentation it would drive lives in
-/// [`MpegTsSegmenter`] and is fully unit-tested; the SRT handshake/demux is the
-/// only pending piece (see the module docs).
-#[derive(Debug, Default, Clone)]
-pub struct SrtIngest;
+/// Drives the hand-rolled, unencrypted SRT (`HSv5`) handshake in [`protocol`] per
+/// peer, then feeds keyframe-aligned MPEG-TS segments (via the fully unit-tested
+/// [`MpegTsSegmenter`]) into the HLS path. AES, ACK/NAK retransmission and
+/// reordering are pending (see the module docs).
+#[derive(Debug, Clone)]
+pub struct SrtIngest {
+    /// The SRT socket id this listener presents to callers.
+    listener_socket_id: u32,
+    /// Per-listener secret folded into SYN cookies.
+    cookie_seed: u32,
+}
+
+impl Default for SrtIngest {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl SrtIngest {
     #[must_use]
     pub fn new() -> Self {
-        Self
+        Self {
+            // A fixed, non-zero listener id is fine: callers address us by the
+            // id we hand back in the INDUCTION response, and we only run one
+            // logical listener per socket.
+            listener_socket_id: 0x5254_0001, // "RT\0\x01"
+            cookie_seed: random_cookie_seed(),
+        }
+    }
+
+    /// Construct with an explicit listener socket id and cookie seed — used by
+    /// tests that need deterministic cookies.
+    #[must_use]
+    pub fn with_identity(listener_socket_id: u32, cookie_seed: u32) -> Self {
+        Self {
+            listener_socket_id,
+            cookie_seed,
+        }
     }
 
     /// Resolve the SRT listen address from the shared live config. SRT shares
@@ -75,40 +152,63 @@ impl SrtIngest {
     }
 }
 
+/// Wall-clock seconds, used to mint/validate SYN cookies. Pulled out so the
+/// handshake remains testable with injected time.
+fn now_unix() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+/// Per-peer connection state on the shared UDP socket: either still shaking
+/// hands, or established and feeding an [`SrtSession`].
+enum PeerState {
+    /// Handshake in progress.
+    Handshaking(HandshakeMachine),
+    /// Handshake complete; data payloads flow into this session.
+    Streaming {
+        stream_id: ulid::Ulid,
+        session: Box<SrtSession>,
+    },
+}
+
 #[async_trait]
 impl LiveIngest for SrtIngest {
     async fn run(&self, repo: StreamRepo, cfg: Arc<LiveStreamConfig>) -> LiveResult<()> {
-        // `repo` is the lifecycle handle a real SRT connection would hand to
-        // [`resolve_stream`] once it has read the `streamid`. The skeleton below
-        // has no accepted connection to resolve yet, so keep it bound (named,
-        // not `_`) to document the wiring; `&repo` is touched here to make that
-        // explicit and to silence an unused-binding lint without hiding intent.
-        let _ = &repo;
         let listen = Self::listen_addr(&cfg)?;
         let sock = UdpSocket::bind(listen).await.map_err(LiveError::Io)?;
         info!(
             %listen,
             hls_dir = %cfg.hls_dir.display(),
-            "SRT ingest listening (MPEG-TS demux + HLS segmenting ready; \
-             SRT wire protocol pending — see crate docs)"
+            "SRT ingest listening (unencrypted HSv5 handshake + MPEG-TS → HLS; \
+             AES/ACK-NAK/reordering pending — see crate docs)"
         );
 
-        // Listener skeleton. A real SRT stack would, per accepted connection:
-        //   1. Complete the SRT handshake and read the `streamid` extension.
-        //   2. `resolve_stream(&repo, &cfg, streamid)` to open an [`SrtSession`].
-        //   3. Feed each received MPEG-TS datagram to `session.feed(bytes)`.
-        //   4. Call `session.finish()` on disconnect.
-        // Until that lands we keep the socket bound (so the port + metrics
-        // surface are stable) and log unexpected traffic.
-        let mut buf = vec![0u8; 2048];
+        // SRT multiplexes every caller over the one listener UDP socket, keyed
+        // by source address. We hold a small map of per-peer state: callers that
+        // are still shaking hands, and established sessions feeding the
+        // segmenter. (Reliability/reordering is best-effort, in-order for v1.)
+        let mut peers: HashMap<SocketAddr, PeerState> = HashMap::new();
+        let mut buf = vec![0u8; SRT_RECV_BUF];
+
         loop {
             match timeout(Duration::from_secs(60), sock.recv_from(&mut buf)).await {
                 Ok(Ok((n, peer))) => {
-                    warn!(
-                        %peer,
-                        bytes = n,
-                        "SRT: received datagram but wire protocol is not yet implemented; ignoring"
-                    );
+                    let datagram = &buf[..n];
+                    if let Err(e) =
+                        handle_datagram(self, &sock, &repo, &cfg, &mut peers, peer, datagram).await
+                    {
+                        warn!(%peer, error = %e, "SRT: dropping peer after error");
+                        if let Some(PeerState::Streaming { session, .. }) = peers.remove(&peer) {
+                            // Best-effort finalize so the manifest gets an
+                            // ENDLIST even on a hard error.
+                            finalize_session(*session, &repo, None).await;
+                        } else {
+                            peers.remove(&peer);
+                        }
+                    }
                 }
                 Ok(Err(e)) => {
                     warn!(error = ?e, "SRT recv_from failed");
@@ -116,6 +216,113 @@ impl LiveIngest for SrtIngest {
                 }
                 Err(_) => { /* idle tick — keep the listener alive */ }
             }
+        }
+    }
+}
+
+/// Route one received datagram for `peer` through the handshake or data plane.
+async fn handle_datagram(
+    ingest: &SrtIngest,
+    sock: &UdpSocket,
+    repo: &StreamRepo,
+    cfg: &LiveStreamConfig,
+    peers: &mut HashMap<SocketAddr, PeerState>,
+    peer: SocketAddr,
+    datagram: &[u8],
+) -> LiveResult<()> {
+    // A SHUTDOWN control packet tears the session down cleanly.
+    if is_shutdown(datagram) {
+        if let Some(PeerState::Streaming {
+            session,
+            stream_id,
+        }) = peers.remove(&peer)
+        {
+            info!(%peer, %stream_id, "SRT: peer sent SHUTDOWN; finalizing");
+            finalize_session(*session, repo, Some(stream_id)).await;
+        } else {
+            peers.remove(&peer);
+        }
+        return Ok(());
+    }
+
+    let entry = peers
+        .entry(peer)
+        .or_insert_with(|| PeerState::Handshaking(HandshakeMachine::new(
+            ingest.listener_socket_id,
+            ingest.cookie_seed,
+        )));
+
+    match entry {
+        PeerState::Handshaking(machine) => {
+            match machine.handle_packet(datagram, peer, now_unix()) {
+                Ok(HsAction::Reply(bytes)) => {
+                    sock.send_to(&bytes, peer).await.map_err(LiveError::Io)?;
+                    Ok(())
+                }
+                Ok(HsAction::Established {
+                    stream_id,
+                    agreement,
+                }) => {
+                    // Confirm the handshake to the caller, then resolve the
+                    // stream key carried by the SID and open a session.
+                    sock.send_to(&agreement, peer)
+                        .await
+                        .map_err(LiveError::Io)?;
+                    let (id, session) = resolve_stream(repo, cfg, &stream_id).await?;
+                    info!(%peer, stream_id = %id, sid = %stream_id, "SRT: handshake complete; streaming");
+                    *entry = PeerState::Streaming {
+                        stream_id: id,
+                        session: Box::new(session),
+                    };
+                    Ok(())
+                }
+                Ok(HsAction::Ignore) => Ok(()),
+                Err(e) => Err(LiveError::Protocol(format!("SRT handshake: {e}"))),
+            }
+        }
+        PeerState::Streaming { session, .. } => {
+            // Established: strip the 16-byte SRT data header and feed the
+            // MPEG-TS payload to the segmenter. Control packets (KEEPALIVE,
+            // ACK, …) are acknowledged-by-ignoring for now.
+            if let Some(payload) = data_payload(datagram) {
+                session.feed(payload).await?;
+            } else {
+                debug!(%peer, "SRT: ignoring non-data packet on established session");
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Whether `datagram` is an SRT SHUTDOWN control packet.
+fn is_shutdown(datagram: &[u8]) -> bool {
+    matches!(
+        SrtHeader::parse(datagram).map(|h| h.kind),
+        Some(PacketKind::Control {
+            control_type: ControlType::Shutdown,
+            ..
+        })
+    )
+}
+
+/// Extract the MPEG-TS payload from a data packet, stripping the 16-byte SRT
+/// header. Returns `None` for control packets or truncated datagrams.
+fn data_payload(datagram: &[u8]) -> Option<&[u8]> {
+    let header = SrtHeader::parse(datagram)?;
+    if header.is_control() {
+        return None;
+    }
+    datagram.get(SRT_HEADER_LEN..).filter(|p| !p.is_empty())
+}
+
+/// Flush and finalize a session's HLS output, marking the stream ended.
+async fn finalize_session(mut session: SrtSession, repo: &StreamRepo, stream_id: Option<ulid::Ulid>) {
+    if let Err(e) = session.finish().await {
+        warn!(error = %e, "SRT: error finalizing HLS on disconnect");
+    }
+    if let Some(id) = stream_id {
+        if let Err(e) = repo.mark_ended(id).await {
+            warn!(error = %e, %id, "SRT: failed to mark stream ended");
         }
     }
 }
@@ -502,6 +709,69 @@ mod tests {
         let addr = SrtIngest::listen_addr(&cfg).unwrap();
         assert_eq!(addr.port(), 1936);
         assert_eq!(addr.ip(), cfg.rtmp_listen.ip());
+    }
+
+    // ---- data-plane glue: SRT header stripping & SHUTDOWN detection ----
+
+    #[test]
+    fn data_payload_strips_srt_header_and_yields_ts_bytes() {
+        // A data packet wrapping an MPEG-TS payload: 16-byte SRT header + body.
+        let header = SrtHeader {
+            kind: PacketKind::Data {
+                seq_no: 5,
+                msg_word: 0,
+            },
+            timestamp: 0,
+            dest_socket_id: 1,
+        };
+        let mut pkt = bytes::BytesMut::new();
+        header.write_to(&mut pkt);
+        let body = [0x47u8, 0x40, 0x00, 0x10, 0xDE, 0xAD]; // looks like a TS chunk
+        pkt.extend_from_slice(&body);
+        let payload = data_payload(&pkt).expect("data packet yields a payload");
+        assert_eq!(payload, &body, "payload is everything after the 16B header");
+    }
+
+    #[test]
+    fn data_payload_rejects_control_packets() {
+        let ka = SrtHeader {
+            kind: PacketKind::Control {
+                control_type: ControlType::KeepAlive,
+                subtype: 0,
+                type_specific: 0,
+            },
+            timestamp: 0,
+            dest_socket_id: 1,
+        };
+        assert!(data_payload(&ka.to_bytes()).is_none(), "control has no TS payload");
+        // Truncated datagram → None, never a panic.
+        assert!(data_payload(&[0u8; 4]).is_none());
+    }
+
+    #[test]
+    fn is_shutdown_detects_only_shutdown_control() {
+        let shutdown = SrtHeader {
+            kind: PacketKind::Control {
+                control_type: ControlType::Shutdown,
+                subtype: 0,
+                type_specific: 0,
+            },
+            timestamp: 0,
+            dest_socket_id: 1,
+        };
+        assert!(is_shutdown(&shutdown.to_bytes()));
+
+        let ka = SrtHeader {
+            kind: PacketKind::Control {
+                control_type: ControlType::KeepAlive,
+                subtype: 0,
+                type_specific: 0,
+            },
+            timestamp: 0,
+            dest_socket_id: 1,
+        };
+        assert!(!is_shutdown(&ka.to_bytes()), "keep-alive is not shutdown");
+        assert!(!is_shutdown(&[0u8; 4]), "short datagram is not shutdown");
     }
 
     #[test]
