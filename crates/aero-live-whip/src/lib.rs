@@ -1,33 +1,44 @@
-//! WHIP (WebRTC-HTTP Ingestion) + WHEP (WebRTC-HTTP Egress) handlers.
+//! WHIP (WebRTC-HTTP Ingestion, RFC 9725) ingest with a **real** str0m media
+//! plane.
 //!
-//! ## Scope
+//! ## Scope (P5)
 //!
-//! Implements the **HTTP signaling surface** of WHIP (RFC 9725) and WHEP for the
-//! Aero live-streaming stack:
+//! This crate terminates a browser WHIP publisher's WebRTC session using the
+//! [`str0m`] sans-IO WebRTC implementation and routes its H.264 media toward
+//! HLS:
 //!
-//! - `WhipSession::handle_offer(sdp)` — parse a publisher's SDP offer, register
-//!   the stream as live, and return an answer SDP + a Location resource id.
-//! - `WhepSession::handle_offer(sdp)` — parse a player's SDP offer and return an
-//!   answer pointing at the active publisher.
-//! - `WhipRegistry` — in-memory map of `stream_key → resource_id`. Persistent
-//!   stream lifecycle lives in `StreamRepo` (DB) via the server.
+//! - [`accept_whip_offer`] — parse the publisher's SDP **offer** with str0m and
+//!   return a [`WhipResource`] carrying a **real** SDP answer (str0m-generated
+//!   DTLS fingerprint, ICE ufrag/pwd, and a host ICE candidate at the ingest
+//!   address). This replaces the previous hand-rolled answer string while
+//!   keeping the same signature the server's `POST /whip/:stream_key` route
+//!   already calls.
+//! - [`WhipSession`] ([`session`]) — owns the `Rtc` and runs the standard
+//!   str0m event loop (`poll_output` → UDP `Transmit`/`Timeout`,
+//!   `handle_input` ← UDP `Receive`/`Timeout`). Spawning it is the server's job
+//!   (out of scope here), so it is provided as a clean, tested-where-possible
+//!   API rather than auto-started.
+//! - [`H264Depacketizer`](depacketize::H264Depacketizer) ([`depacketize`]) — an
+//!   RFC 6184 H.264 depacketizer (single-NAL, FU-A, STAP-A) that reassembles
+//!   Annex-B access units from received RTP. Heavily unit-tested.
+//! - [`MediaSink`](hls_sink::MediaSink) ([`hls_sink`]) — the access-unit → HLS
+//!   boundary, including the Annex-B↔AVCC repackaging that lets the existing
+//!   `aero_live_hls::FlvToTsConverter` be reused.
 //!
-//! ## What's *not* implemented here
+//! - [`WhipRegistry`] — in-memory map of `stream_id → resource`, enforcing a
+//!   single live publisher per stream.
 //!
-//! Real WebRTC media routing (DTLS, SRTP, RTP packetization, jitter buffer,
-//! congestion control) is **out of scope** for P5. Those belong in
-//! `aero-live-webrtc` (P6, str0m-based SFU). This crate's responsibility is
-//! limited to:
-//! - Generating a *plausible* SDP answer that lets the browser publish:
-//!   it advertises a recvonly audio + recvonly video m-section that mirrors
-//!   the offer's codecs, with a hard-coded ICE ufrag/pwd, DTLS fingerprint,
-//!   and a placeholder ICE candidate pointing at the configured ingest host.
-//! - Flipping the corresponding row in `streams` to `live` / `ended`.
+//! ## Verified vs. pending
 //!
-//! The intended next step is for the server's WHIP handler to hand the SDP
-//! pair (offer + this crate's answer) to `aero-live-webrtc` once that crate
-//! lands, where it'll mediate the actual DTLS handshake and forward the
-//! resulting RTP into `aero-live-hls` (or a SFU fan-out for WHEP).
+//! Compiles and is unit-tested: SDP offer→answer (str0m), the H.264
+//! depacketizer, and the Annex-B/AVCC bridge. **Pending live validation** (no
+//! browser publisher available in CI): the end-to-end ICE/DTLS handshake driven
+//! by [`WhipSession::run`], and the final segmenter glue described in
+//! [`hls_sink`].
+
+pub mod depacketize;
+pub mod hls_sink;
+pub mod session;
 
 use std::sync::Arc;
 
@@ -36,6 +47,8 @@ use aero_signaling::signaling::validate_sdp;
 use parking_lot::Mutex;
 use thiserror::Error;
 use ulid::Ulid;
+
+pub use session::{SessionError, WhipSession};
 
 #[derive(Debug, Error)]
 pub enum WhipError {
@@ -47,6 +60,15 @@ pub enum WhipError {
     Conflict,
     #[error("internal: {0}")]
     Internal(String),
+}
+
+impl From<SessionError> for WhipError {
+    fn from(e: SessionError) -> Self {
+        match e {
+            SessionError::Offer(m) => WhipError::InvalidSdp(m),
+            other => WhipError::Internal(other.to_string()),
+        }
+    }
 }
 
 /// Live publisher resource — what the WHIP server hands back for resource control.
@@ -93,127 +115,56 @@ impl WhipRegistry {
     }
 }
 
-/// Construct a `WhipResource` for the given stream and offer.
+/// Accept a WHIP SDP offer and produce a [`WhipResource`] with a **real**
+/// str0m-generated SDP answer.
 ///
-/// The answer SDP is a stub — it parses enough of the offer to know the m-section
-/// shapes (audio/video), then emits a deterministic answer suitable for the
-/// browser to start ICE/DTLS negotiation against. The actual DTLS endpoint is
-/// the server's UDP socket (when one is wired); until then, the publisher will
-/// stay in `ICE-checking` state and time out, which is the expected behavior of
-/// a P5 placeholder.
+/// Signature is unchanged from the P5 placeholder so the server's
+/// `POST /whip/:stream_key` route keeps compiling against it. Internally it now
+/// builds a [`WhipSession`] (str0m `Rtc` + host candidate) and returns the
+/// negotiated answer.
+///
+/// The session itself is *discarded* by this convenience entry point because
+/// the route only needs the answer to reply over HTTP. To actually terminate
+/// media, the server should instead call [`WhipSession::accept`] directly,
+/// keep the returned session, bind a UDP socket at the advertised ingest
+/// address, and spawn [`WhipSession::run`]. This split keeps the HTTP-signaling
+/// surface and the media-plane lifetime decoupled (the latter is out of scope
+/// to wire from this crate).
 pub fn accept_whip_offer(
     stream: &Stream,
     offer_sdp: &str,
     ingest_host: &str,
     ingest_port: u16,
 ) -> Result<WhipResource, WhipError> {
+    // Cheap structural gate first (size cap, `v=0`), then hand to str0m which
+    // does the full SDP parse + answer generation.
     validate_sdp(offer_sdp).map_err(|e| WhipError::InvalidSdp(e.to_string()))?;
 
-    let resource_id = Ulid::new();
-    let ice_ufrag = random_token(8);
-    let ice_pwd = random_token(24);
-    let dtls_fingerprint = format!("sha-256 {}", hex_pseudo_fingerprint());
+    let (_session, answer) = WhipSession::accept(offer_sdp, ingest_host, ingest_port)?;
+    let answer_sdp = answer.to_sdp_string();
 
-    // Mirror m-section types from the offer so the browser accepts the answer.
-    let want_audio = offer_sdp.contains("m=audio");
-    let want_video = offer_sdp.contains("m=video");
-
-    let mut answer = String::new();
-    answer.push_str("v=0\r\n");
-    answer.push_str(&format!("o=- {} 2 IN IP4 0.0.0.0\r\n", ulid::Ulid::new().0));
-    answer.push_str("s=-\r\n");
-    answer.push_str("t=0 0\r\n");
-    answer.push_str("a=group:BUNDLE 0 1\r\n");
-    answer.push_str("a=msid-semantic: WMS aero\r\n");
-
-    let mut mid: u32 = 0;
-    if want_audio {
-        push_m_section(
-            &mut answer,
-            "audio",
-            mid,
-            &ice_ufrag,
-            &ice_pwd,
-            &dtls_fingerprint,
-            ingest_host,
-            ingest_port,
-        );
-        mid += 1;
-    }
-    if want_video {
-        push_m_section(
-            &mut answer,
-            "video",
-            mid,
-            &ice_ufrag,
-            &ice_pwd,
-            &dtls_fingerprint,
-            ingest_host,
-            ingest_port,
-        );
-    }
+    // Surface the negotiated ICE/DTLS params on the resource for callers that
+    // log or proxy them. They are parsed out of the answer str0m produced.
+    let ice_ufrag = sdp_value(&answer_sdp, "a=ice-ufrag:").unwrap_or_default();
+    let ice_pwd = sdp_value(&answer_sdp, "a=ice-pwd:").unwrap_or_default();
+    let dtls_fingerprint = sdp_value(&answer_sdp, "a=fingerprint:").unwrap_or_default();
 
     Ok(WhipResource {
         stream_id: stream.id,
-        resource_id,
+        resource_id: Ulid::new(),
         ice_ufrag,
         ice_pwd,
         dtls_fingerprint,
-        answer_sdp: answer,
+        answer_sdp,
     })
 }
 
-fn push_m_section(
-    sdp: &mut String,
-    kind: &str,
-    mid: u32,
-    ice_ufrag: &str,
-    ice_pwd: &str,
-    fingerprint: &str,
-    host: &str,
-    port: u16,
-) {
-    use std::fmt::Write;
-    let pt = if kind == "audio" { 111 } else { 96 };
-    let codec = if kind == "audio" {
-        "opus/48000/2"
-    } else {
-        "VP8/90000"
-    };
-    writeln!(sdp, "m={kind} 9 UDP/TLS/RTP/SAVPF {pt}\r").ok();
-    writeln!(sdp, "c=IN IP4 0.0.0.0\r").ok();
-    writeln!(sdp, "a=mid:{mid}\r").ok();
-    writeln!(sdp, "a=recvonly\r").ok();
-    writeln!(sdp, "a=rtcp-mux\r").ok();
-    writeln!(sdp, "a=ice-ufrag:{ice_ufrag}\r").ok();
-    writeln!(sdp, "a=ice-pwd:{ice_pwd}\r").ok();
-    writeln!(sdp, "a=fingerprint:{fingerprint}\r").ok();
-    writeln!(sdp, "a=setup:active\r").ok();
-    writeln!(sdp, "a=rtpmap:{pt} {codec}\r").ok();
-    writeln!(
-        sdp,
-        "a=candidate:1 1 UDP 2130706431 {host} {port} typ host\r"
-    )
-    .ok();
-}
-
-fn random_token(len: usize) -> String {
-    use rand::Rng;
-    let mut rng = rand::thread_rng();
-    (0..len)
-        .map(|_| {
-            let c = rng.gen_range(b'a'..=b'z');
-            c as char
-        })
-        .collect()
-}
-
-fn hex_pseudo_fingerprint() -> String {
-    use rand::Rng;
-    let mut rng = rand::thread_rng();
-    (0..32)
-        .map(|i| format!("{:02X}{}", rng.gen::<u8>(), if i == 31 { "" } else { ":" }))
-        .collect()
+/// Pull the value following the first `prefix` SDP attribute line (trimmed of
+/// trailing CR). Returns `None` if absent.
+fn sdp_value(sdp: &str, prefix: &str) -> Option<String> {
+    sdp.lines()
+        .find_map(|l| l.strip_prefix(prefix))
+        .map(|v| v.trim_end_matches('\r').trim().to_string())
 }
 
 #[cfg(test)]
@@ -237,17 +188,54 @@ mod tests {
         }
     }
 
-    const MIN_OFFER: &str = "v=0\r\no=- 1 2 IN IP4 0.0.0.0\r\ns=-\r\nt=0 0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\n";
+    /// A real WHIP publisher offer str0m can parse (mirrors a browser's
+    /// sendonly audio+video with ICE/DTLS attributes).
+    const OFFER: &str = "v=0\r\n\
+o=- 4611731400430051336 2 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+a=group:BUNDLE 0 1\r\n\
+a=msid-semantic: WMS\r\n\
+m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n\
+c=IN IP4 0.0.0.0\r\n\
+a=rtcp:9 IN IP4 0.0.0.0\r\n\
+a=ice-ufrag:abcd\r\n\
+a=ice-pwd:abcdefghijklmnopqrstuvwx\r\n\
+a=fingerprint:sha-256 11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00\r\n\
+a=setup:actpass\r\n\
+a=mid:0\r\n\
+a=sendonly\r\n\
+a=rtcp-mux\r\n\
+a=rtpmap:111 opus/48000/2\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
+c=IN IP4 0.0.0.0\r\n\
+a=rtcp:9 IN IP4 0.0.0.0\r\n\
+a=ice-ufrag:abcd\r\n\
+a=ice-pwd:abcdefghijklmnopqrstuvwx\r\n\
+a=fingerprint:sha-256 11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00\r\n\
+a=setup:actpass\r\n\
+a=mid:1\r\n\
+a=sendonly\r\n\
+a=rtcp-mux\r\n\
+a=rtpmap:96 H264/90000\r\n\
+a=fmtp:96 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f\r\n";
 
     #[test]
-    fn accept_emits_answer_with_two_m_sections() {
+    fn accept_emits_real_str0m_answer() {
         let s = stub_stream();
-        let r = accept_whip_offer(&s, MIN_OFFER, "127.0.0.1", 9000).unwrap();
+        let r = accept_whip_offer(&s, OFFER, "127.0.0.1", 9000).unwrap();
+        assert_eq!(r.stream_id, s.id);
+        assert!(r.answer_sdp.starts_with("v=0"));
         assert!(r.answer_sdp.contains("m=audio"));
         assert!(r.answer_sdp.contains("m=video"));
-        assert!(r.answer_sdp.contains("a=ice-ufrag:"));
-        assert!(r.answer_sdp.contains("a=ice-pwd:"));
-        assert!(r.answer_sdp.contains("a=fingerprint:sha-256 "));
+        // str0m populates these; our parser lifts them onto the resource.
+        assert!(!r.ice_ufrag.is_empty(), "ice-ufrag should be extracted");
+        assert!(!r.ice_pwd.is_empty(), "ice-pwd should be extracted");
+        assert!(
+            r.dtls_fingerprint.starts_with("sha-256"),
+            "fingerprint: {}",
+            r.dtls_fingerprint
+        );
     }
 
     #[test]
@@ -258,15 +246,31 @@ mod tests {
     }
 
     #[test]
+    fn rejects_structurally_valid_but_unparseable_offer() {
+        let s = stub_stream();
+        // Passes the `v=0` gate but is not a complete SDP str0m can accept.
+        let err = accept_whip_offer(&s, "v=0\r\nbroken", "127.0.0.1", 9000).unwrap_err();
+        assert!(matches!(err, WhipError::InvalidSdp(_)));
+    }
+
+    #[test]
     fn registry_enforces_single_publisher() {
         let reg = WhipRegistry::new();
         let s = stub_stream();
-        let r = accept_whip_offer(&s, MIN_OFFER, "127.0.0.1", 9000).unwrap();
+        let r = accept_whip_offer(&s, OFFER, "127.0.0.1", 9000).unwrap();
         reg.insert(r.clone()).unwrap();
-        let r2 = accept_whip_offer(&s, MIN_OFFER, "127.0.0.1", 9000).unwrap();
+        let r2 = accept_whip_offer(&s, OFFER, "127.0.0.1", 9000).unwrap();
         assert!(matches!(reg.insert(r2).unwrap_err(), WhipError::Conflict));
         reg.remove(s.id);
-        let r3 = accept_whip_offer(&s, MIN_OFFER, "127.0.0.1", 9000).unwrap();
+        let r3 = accept_whip_offer(&s, OFFER, "127.0.0.1", 9000).unwrap();
         reg.insert(r3).unwrap();
+    }
+
+    #[test]
+    fn sdp_value_extracts_and_trims() {
+        let sdp = "v=0\r\na=ice-ufrag:XYZ\r\na=ice-pwd:secretvalue\r\n";
+        assert_eq!(sdp_value(sdp, "a=ice-ufrag:").as_deref(), Some("XYZ"));
+        assert_eq!(sdp_value(sdp, "a=ice-pwd:").as_deref(), Some("secretvalue"));
+        assert_eq!(sdp_value(sdp, "a=missing:"), None);
     }
 }
