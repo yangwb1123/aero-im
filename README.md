@@ -3,7 +3,7 @@
 AI-Native 即时通讯 + 直播平台,Rust 实现。
 
 - 设计:[`docs/specs/2026-05-22-aero-im-design.md`](docs/specs/2026-05-22-aero-im-design.md)
-- 状态:**P0–P9 全部就位**(102 个单元测试通过,16 个 crate,~17,000 行 Rust + Web)
+- 状态:**P0–P11 全部就位**(110 个单元测试通过,16 个 crate,~18,000 行 Rust + Web)
 
 ## 功能矩阵
 
@@ -16,9 +16,11 @@ AI-Native 即时通讯 + 直播平台,Rust 实现。
 | **RAG 搜索** | FTS / 向量(pgvector) / hybrid 模式 | ✅ |
 | **AI** | Anthropic Messages(`claude-sonnet-4-6`)、Voyage 嵌入、AI 摘要、RAG 问答、`ai_jobs` 工作队列 | ✅ |
 | **Agent in channel** | `@bot` 自动回复(基于 RAG) | ✅ |
-| **内容审核** | `AERO_BLOCKED_WORDS` 关键词预审 | ✅ |
+| **内容审核** | `AERO_BLOCKED_WORDS` 关键词预审 + AI 异步审核(`AERO_AI_MODERATION`) | ✅ |
 | **1:1 通话** | WebRTC P2P(浏览器原生),信令走 NATS | ✅ |
+| **实时字幕翻译** | 浏览器语音识别 → 字幕,最终行经 Anthropic 翻译 | ✅ |
 | **直播 RTMP→HLS** | rml_rtmp 摄入,真 MPEG-TS muxing(SPS/PPS/ADTS) | ✅ |
+| **直播弹幕 + 礼物** | 弹幕轨道 + 礼物目录/飘屏/榜单 + 实时观看人数(NATS `live.stream.*`) | ✅ |
 | **WHIP/WHEP** | HTTP 信令(媒体面 P6 接入 str0m) | ✅ scaffold |
 | **SFU** | 路由数据模型 (peers/tracks/subscriptions) | ✅ scaffold |
 | **SRT 摄入** | UDP 监听占位 + TURN(coturn) 配置渲染 | ✅ scaffold |
@@ -89,10 +91,11 @@ open http://localhost:3030
 
 | 名字 | 作用 |
 |---|---|
-| `ANTHROPIC_API_KEY` | 启用真实 LLM 摘要 / 问答(否则启发式 fallback) |
+| `ANTHROPIC_API_KEY` | 启用真实 LLM 摘要 / 问答 / 字幕翻译 / 内容审核(否则启发式 fallback) |
 | `ANTHROPIC_MODEL` | 默认 `claude-sonnet-4-6` |
 | `VOYAGE_API_KEY` | 启用 Voyage embeddings(1024 维);否则用确定性 HashEmbedder |
-| `AERO_BLOCKED_WORDS` | 逗号分隔,关键词审核 |
+| `AERO_BLOCKED_WORDS` | 逗号分隔,关键词审核(同步预审) |
+| `AERO_AI_MODERATION` | 置位后启用 AI 异步内容审核(每条消息一次 LLM 调用;需 `ANTHROPIC_API_KEY`) |
 | `AERO_STUN_URLS` | STUN(默认 stun.l.google.com:19302) |
 | `AERO_TURN_URL` / `AERO_TURN_USERNAME` / `AERO_TURN_PASSWORD` | TURN 凭据(浏览器 ICE 兜底) |
 | `AERO_TURN_SHARED_SECRET` / `AERO_TURN_REALM` / `AERO_TURN_EXTERNAL_IP` | coturn 配置 |
@@ -106,6 +109,7 @@ open http://localhost:3030
 bash scripts/smoke.sh http://localhost:3030      # P1 happy path
 python3 scripts/ws_smoke.py                       # WS fan-out(2 客户端互发)
 python3 scripts/smoke_p2.py                       # P2 全功能:edit/react/read/search/blob/AI/stream/MLS
+python3 scripts/smoke_live.py                     # P11 弹幕/礼物/观看人数 WS 扇出 + 榜单 + 主播下播
 ```
 
 ## 直播测试
@@ -144,9 +148,15 @@ ffmpeg -re -i sample.mp4 -c:v libx264 -c:a aac -f flv rtmp://localhost/live/<str
 
 ### 直播 + RTC
 - `POST /api/streams` `body: {title, protocol, room_id?}`
-- `GET /api/streams` `GET /api/streams/:id`
+- `GET /api/streams` `GET /api/streams/:id` `POST /api/streams/:id/end`(主播下播)
 - `GET /api/rtc/config` → `{ice_servers, ice_transport_policy}`
 - `POST /whip/:stream_key` `DELETE /whip/resource/:id` `POST /whep/:stream_id`(body: SDP 文本)
+
+### 直播互动(弹幕 + 礼物)
+- `GET /api/live/gifts` → 礼物目录
+- `GET /api/streams/:id/chat` `POST /api/streams/:id/chat` `body: {body}`
+- `GET /api/streams/:id/gifts` `POST /api/streams/:id/gifts` `body: {gift_id, qty?}`
+- `GET /api/streams/:id/leaderboard` → 打赏榜
 
 ### MLS
 - `POST /api/mls/key-packages` `body: {ciphersuite, payload_b64}`
@@ -155,15 +165,15 @@ ffmpeg -re -i sample.mp4 -c:v libx264 -c:a aac -f flv rtmp://localhost/live/<str
 
 ### WebSocket(`/ws?token=<jwt>`)
 
-客户端帧:`join_room` `send_message` `edit_message` `delete_message` `react` `mark_read` `typing` `call_invite` `call_answer` `call_ice` `call_end` `ping`
+客户端帧:`join_room` `send_message` `edit_message` `delete_message` `react` `mark_read` `typing` `call_invite` `call_answer` `call_ice` `call_end` `call_caption` `watch_stream` `unwatch_stream` `stream_chat` `stream_gift` `ping`
 
-服务端帧:`welcome` `presence` `message` `edited` `deleted` `reaction` `read` `typing` `call` `error` `pong`
+服务端帧:`welcome` `presence` `message` `edited` `deleted` `reaction` `read` `typing` `call`(含 `op:"caption"`)`stream_event`(`chat`/`gift`/`viewers`/`status`)`error` `pong`
 
 ## 验证
 
 ```bash
 cargo check --workspace          # 干净
-cargo test --workspace --lib     # 102 pass / 0 fail / 3 ignored(DB 集成)
+cargo test --workspace --lib     # 110 pass / 0 fail / 3 ignored(DB 集成)
 cargo build --bin aero-server    # 二进制成功
 ```
 
@@ -174,17 +184,18 @@ cargo build --bin aero-server    # 二进制成功
 | **P0** | Workspace + 基础设施 | ✅ |
 | **P1** | AI-Ready IM MVP | ✅ |
 | **P2** | 协作 + RAG + Agent | ✅ |
-| **P3** | 1:1 通话 | ✅ |
-| **P4** | RTMP→HLS(真 TS) | ✅ |
-| **P5** | WHIP/WHEP + 审核 | ✅(信令层) |
-| **P6** | SFU + AI Agent | ✅(路由模型 + Agent) |
+| **P3** | 1:1 通话 + 实时字幕翻译 | ✅ |
+| **P4** | RTMP→HLS(真 TS) + 弹幕 + 礼物 | ✅ |
+| **P5** | WHIP/WHEP 信令 + 关键词审核 + AI 审核 | ✅ |
+| **P6** | SFU 路由模型 + AI Agent 进频道 | ✅(媒体面见下) |
 | **P7** | SRT + TURN | ✅(占位) |
 | **P8** | MLS E2E | ✅(scaffold) |
 | **P9** | 真 TS muxing / vector 搜 / mention / read avatars / smoke_p2 | ✅ |
+| **P11** | 直播弹幕 + 虚拟礼物 + 观看人数 | ✅ |
 
-后续可继续推进的(都是重力气活):
+后续可继续推进的(都是重力气活,需真实媒体链路联调):
 - WHIP/WHEP **媒体面**:str0m DTLS-SRTP 终结 + RTP 注入 HLS muxer
-- SFU **媒体面**:str0m 多 peer 转发 + Simulcast/SVC + congestion
+- SFU **媒体面**:str0m 多 peer 转发 + Simulcast/SVC + congestion(群通话/互动直播)
 - SRT **真协议**:srt-tokio 集成
 - MLS **客户端**:web 加 openmls-wasm,加密 payload 透传
 
