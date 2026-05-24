@@ -160,6 +160,45 @@ impl WhipSession {
         &self.video_pts
     }
 
+    /// Drive this session straight into HLS on disk under `stream_dir`.
+    ///
+    /// This is the canonical production wiring of the P5 media path, kept here so
+    /// it compiles against the real types even though it cannot *run* without a
+    /// browser completing ICE/DTLS:
+    ///
+    /// 1. Build the [`HlsSink`] / [`HlsSegmentWriter`] pair rooted at
+    ///    `stream_dir` (the caller composes `hls_dir/{stream_id}`).
+    /// 2. Spawn the async writer (it owns [`aero_live_hls::HlsWriter`] and does
+    ///    the disk I/O off the str0m hot path).
+    /// 3. [`run`](Self::run) the str0m loop with the sink; depacketized H.264
+    ///    access units become keyframe-aligned `.ts` segments + `index.m3u8`.
+    ///
+    /// Dropping the sink when `run` returns closes the channel, so the writer
+    /// finalizes the manifest and reports how many segments it persisted.
+    ///
+    /// The `socket` must be bound to [`local_addr`](Self::local_addr).
+    pub async fn run_to_hls(
+        self,
+        socket: UdpSocket,
+        stream_dir: std::path::PathBuf,
+        target_duration_secs: u32,
+    ) -> Result<u64, SessionError> {
+        let (sink, writer) = crate::hls_sink::hls_sink(stream_dir, target_duration_secs)
+            .await
+            .map_err(|e| SessionError::Io(std::io::Error::other(e.to_string())))?;
+        let writer_task = tokio::spawn(writer.run());
+        // Run the media plane; the sink is moved in and dropped on return, which
+        // closes the channel and lets the writer task finalize the manifest.
+        // `Box::pin` keeps this combined future off the stack (the str0m `run`
+        // future is large) — see clippy::large_futures.
+        Box::pin(self.run(socket, sink)).await?;
+        match writer_task.await {
+            Ok(Ok(segments)) => Ok(segments),
+            Ok(Err(e)) => Err(SessionError::Io(std::io::Error::other(e.to_string()))),
+            Err(join) => Err(SessionError::Io(std::io::Error::other(join.to_string()))),
+        }
+    }
+
     /// Run the str0m event loop until the connection closes or errors.
     ///
     /// This is the canonical sans-IO driver:
@@ -396,5 +435,201 @@ a=fmtp:96 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f
         // Sanity on the PTS conversion helper used in the run loop. 1.5s → 135000.
         let mt = str0m::media::MediaTime::from_seconds(1.5);
         assert_eq!(media_time_to_90k(mt), 135_000);
+    }
+
+    // =================== Browser-free RTP → HLS E2E ===================
+    //
+    // Proves the *byte-level* media path the str0m loop drives once an RTP
+    // packet has arrived: RTP payload → H264Depacketizer (Annex-B AU) → HlsSink
+    // (avcC synthesis + FlvToTsConverter mux + keyframe segment cut) → HlsWriter
+    // (.ts + index.m3u8 on disk). No ICE/DTLS/SRTP and no browser — those still
+    // need a live publisher (see the crate/session docs); everything *after* a
+    // received RTP packet is exercised here.
+
+    use crate::depacketize::H264Depacketizer;
+    use crate::hls_sink::{hls_sink, MediaSink};
+
+    /// 4-byte Annex-B start code, for asserting on reassembled bytes.
+    const SC: [u8; 4] = [0, 0, 0, 1];
+
+    /// Replicates [`WhipSession::on_rtp`]'s video path against a raw RTP payload:
+    /// push it through the *real* depacketizer, and on the marker bit flush the
+    /// completed Annex-B access unit to `sink` with a 90 kHz PTS. This is the
+    /// exact reassembly + AU-boundary logic the run loop performs (str0m hands us
+    /// the payload + marker), minus the network transport.
+    fn feed_rtp(
+        depack: &mut H264Depacketizer,
+        au: &mut BytesMut,
+        sink: &mut impl MediaSink,
+        payload: &[u8],
+        marker: bool,
+        pts_90k: u64,
+    ) {
+        depack.push(payload, marker, au).expect("depacketize");
+        if marker && !au.is_empty() {
+            let frame = au.split().freeze();
+            sink.on_video_au(frame, pts_90k).expect("sink accepts AU");
+        }
+    }
+
+    /// A STAP-A RTP payload aggregating the given whole NAL units (each = header
+    /// byte + body). RFC 6184 §5.7.1: `[STAP-A hdr][ (u16 size)(NAL) ]+`.
+    fn stap_a(nals: &[&[u8]]) -> Vec<u8> {
+        let mut p = vec![0x78u8]; // F=0, NRI=3, type=24 (STAP-A)
+        for nal in nals {
+            p.extend_from_slice(&u16::try_from(nal.len()).unwrap().to_be_bytes());
+            p.extend_from_slice(nal);
+        }
+        p
+    }
+
+    /// Fragment a whole NAL unit (header byte + body) into `chunks` FU-A packets
+    /// (RFC 6184 §5.8), exercising the depacketizer's reassembly. Returns the
+    /// per-packet payloads in order (Start … Middle … End).
+    fn fu_a(nal_header: u8, body: &[u8], chunks: usize) -> Vec<Vec<u8>> {
+        assert!(chunks >= 2, "need at least start+end");
+        let fu_indicator = (nal_header & 0xE0) | 28; // keep F|NRI, type=28
+        let fu_type = nal_header & 0x1F;
+        let per = body.len().div_ceil(chunks).max(1);
+        let mut out = Vec::new();
+        let mut i = 0;
+        let mut idx = 0;
+        while i < body.len() {
+            let end_byte = (i + per).min(body.len());
+            let is_first = idx == 0;
+            let is_last = end_byte >= body.len();
+            let mut fu_header = fu_type;
+            if is_first {
+                fu_header |= 0x80; // Start
+            }
+            if is_last {
+                fu_header |= 0x40; // End
+            }
+            let mut pkt = vec![fu_indicator, fu_header];
+            pkt.extend_from_slice(&body[i..end_byte]);
+            out.push(pkt);
+            i = end_byte;
+            idx += 1;
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn rtp_h264_to_hls_writes_real_segments_and_manifest() {
+        // A minimal-but-structurally-valid SPS: header 0x67, then
+        // profile_idc/constraint/level (0x42,0x00,0x1F) + a couple RBSP bytes.
+        let sps: &[u8] = &[0x67, 0x42, 0x00, 0x1F, 0xAC, 0xD9];
+        let pps: &[u8] = &[0x68, 0xCE, 0x3C, 0x80];
+
+        let dir = crate::testutil::TempDir::new().unwrap();
+        let stream_dir = dir.path().join("01HWHIPSTREAMID");
+        let (mut sink, writer) = hls_sink(stream_dir.clone(), 2).await.unwrap();
+        let writer_task = tokio::spawn(writer.run());
+
+        let mut depack = H264Depacketizer::new();
+        let mut au = BytesMut::new();
+
+        // ---- Access unit 1 (keyframe): STAP-A(SPS,PPS) + FU-A(IDR) ----
+        // Parameter sets arrive aggregated (no marker — same AU continues).
+        feed_rtp(&mut depack, &mut au, &mut sink, &stap_a(&[sps, pps]), false, 0);
+        // IDR slice fragmented across 3 FU-A packets; the last carries the marker
+        // bit that terminates the access unit.
+        let idr_body = [0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99];
+        let frags = fu_a(0x65, &idr_body, 3); // 0x65 = IDR slice NAL header
+        let n = frags.len();
+        for (k, frag) in frags.iter().enumerate() {
+            let last = k == n - 1;
+            feed_rtp(&mut depack, &mut au, &mut sink, frag, last, 0);
+        }
+        assert!(!depack.is_reassembling(), "FU-A fully reassembled");
+        assert_eq!(sink.video_aus(), 1, "one keyframe AU so far");
+
+        // ---- Access units 2-4 (non-IDR P-frames), single-NAL packets ----
+        // 0x41 = non-IDR coded slice (NRI=2, type 1). Each is its own AU (marker
+        // set), with increasing PTS so segment durations are positive.
+        for (i, pts) in [(1u8, 3_000u64), (2, 6_000), (3, 9_000)] {
+            let nal = [0x41u8, 0xA0 | i, 0xB0, 0xC0];
+            feed_rtp(&mut depack, &mut au, &mut sink, &nal, true, pts);
+        }
+        assert_eq!(sink.video_aus(), 4, "1 keyframe + 3 P-frames");
+
+        // End of stream: drop the sink so the writer flushes the trailing
+        // (single) GOP and finalizes the manifest.
+        drop(sink);
+        let segments = writer_task.await.unwrap().unwrap();
+
+        // ---- Assert real HLS output on disk ----
+        assert!(segments >= 1, "at least one .ts segment persisted, got {segments}");
+        let seg0 = stream_dir.join("0.ts");
+        assert!(seg0.exists(), "0.ts must exist on disk");
+        let ts_bytes = std::fs::read(&seg0).unwrap();
+        assert!(!ts_bytes.is_empty(), "segment file is non-empty");
+        assert_eq!(ts_bytes.len() % 188, 0, "whole 188-byte MPEG-TS packets");
+        assert_eq!(ts_bytes[0], 0x47, "TS sync byte at start (PAT)");
+        assert_eq!(ts_bytes[188], 0x47, "TS sync byte for PMT packet");
+
+        let manifest_path = stream_dir.join("index.m3u8");
+        let manifest = std::fs::read_to_string(&manifest_path).unwrap();
+        assert!(!manifest.is_empty(), "manifest is non-empty");
+        assert!(manifest.starts_with("#EXTM3U"), "manifest header:\n{manifest}");
+        assert!(manifest.contains("#EXT-X-VERSION:3"), "manifest:\n{manifest}");
+        assert!(manifest.contains("#EXT-X-TARGETDURATION:2"), "manifest:\n{manifest}");
+        assert!(manifest.contains("#EXTINF:"), "per-segment duration:\n{manifest}");
+        assert!(manifest.contains("0.ts"), "segment name in manifest:\n{manifest}");
+        assert!(manifest.contains("#EXT-X-ENDLIST"), "finalized:\n{manifest}");
+    }
+
+    #[tokio::test]
+    async fn rtp_multi_gop_cuts_segment_at_second_keyframe() {
+        // Two keyframes separated by a P-frame: the depacketizer + sink must cut
+        // the first segment at the *second* keyframe (every segment starts on a
+        // keyframe), so two .ts files land on disk.
+        let sps: &[u8] = &[0x67, 0x42, 0x00, 0x1F, 0xAC, 0xD9];
+        let pps: &[u8] = &[0x68, 0xCE, 0x3C, 0x80];
+
+        let dir = crate::testutil::TempDir::new().unwrap();
+        let stream_dir = dir.path().join("multi-gop");
+        let (mut sink, writer) = hls_sink(stream_dir.clone(), 2).await.unwrap();
+        let writer_task = tokio::spawn(writer.run());
+
+        let mut depack = H264Depacketizer::new();
+        let mut au = BytesMut::new();
+
+        // GOP 1: SPS+PPS+IDR (single-NAL IDR this time, marker terminates AU).
+        feed_rtp(&mut depack, &mut au, &mut sink, &stap_a(&[sps, pps]), false, 0);
+        feed_rtp(&mut depack, &mut au, &mut sink, &[0x65, 0x01, 0x02, 0x03], true, 0);
+        // A P-frame.
+        feed_rtp(&mut depack, &mut au, &mut sink, &[0x41, 0x04, 0x05], true, 3_000);
+        // GOP 2: SPS+PPS+IDR → cuts GOP 1 into 0.ts before muxing this keyframe.
+        feed_rtp(&mut depack, &mut au, &mut sink, &stap_a(&[sps, pps]), false, 6_000);
+        feed_rtp(&mut depack, &mut au, &mut sink, &[0x65, 0x06, 0x07], true, 6_000);
+        assert_eq!(sink.segments_emitted(), 1, "one cut at the 2nd keyframe");
+
+        drop(sink);
+        let segments = writer_task.await.unwrap().unwrap();
+        assert_eq!(segments, 2, "GOP1 (cut) + GOP2 (flushed on close)");
+        assert!(stream_dir.join("0.ts").exists());
+        assert!(stream_dir.join("1.ts").exists());
+        let manifest = std::fs::read_to_string(stream_dir.join("index.m3u8")).unwrap();
+        assert!(manifest.contains("0.ts") && manifest.contains("1.ts"), "{manifest}");
+        assert!(manifest.contains("#EXT-X-ENDLIST"));
+    }
+
+    #[test]
+    fn fu_a_helper_roundtrips_through_depacketizer() {
+        // Guard the test helper itself: FU-A fragments must reassemble to the
+        // original Annex-B NAL via the real depacketizer.
+        let mut d = H264Depacketizer::new();
+        let mut out = BytesMut::new();
+        let body = [0xDEu8, 0xAD, 0xBE, 0xEF, 0x01];
+        let frags = fu_a(0x65, &body, 3);
+        let n = frags.len();
+        for (k, f) in frags.iter().enumerate() {
+            d.push(f, k == n - 1, &mut out).unwrap();
+        }
+        let mut expected = SC.to_vec();
+        expected.push(0x65);
+        expected.extend_from_slice(&body);
+        assert_eq!(&out[..], &expected[..]);
     }
 }

@@ -23,22 +23,34 @@
 //!   Annex-B access units from received RTP. Heavily unit-tested.
 //! - [`MediaSink`](hls_sink::MediaSink) ([`hls_sink`]) — the access-unit → HLS
 //!   boundary, including the Annex-B↔AVCC repackaging that lets the existing
-//!   `aero_live_hls::FlvToTsConverter` be reused.
+//!   `aero_live_hls::FlvToTsConverter` be reused, plus the concrete
+//!   [`HlsSink`](hls_sink::HlsSink) that synthesizes an avcC from the first
+//!   keyframe's SPS/PPS, muxes MPEG-TS, cuts segments on IDR keyframes, and
+//!   drives [`aero_live_hls::HlsWriter`] (via an async
+//!   [`HlsSegmentWriter`](hls_sink::HlsSegmentWriter)) to persist `.ts` +
+//!   `index.m3u8`.
 //!
 //! - [`WhipRegistry`] — in-memory map of `stream_id → resource`, enforcing a
 //!   single live publisher per stream.
 //!
 //! ## Verified vs. pending
 //!
-//! Compiles and is unit-tested: SDP offer→answer (str0m), the H.264
-//! depacketizer, and the Annex-B/AVCC bridge. **Pending live validation** (no
-//! browser publisher available in CI): the end-to-end ICE/DTLS handshake driven
-//! by [`WhipSession::run`], and the final segmenter glue described in
-//! [`hls_sink`].
+//! Compiles and is tested: SDP offer→answer (str0m), the H.264 depacketizer, the
+//! Annex-B/AVCC bridge, and — new in P5 — the **complete RTP→HLS media path** at
+//! the byte level: an integration test ([`session`] tests) feeds synthetic H.264
+//! RTP packets (single-NAL, STAP-A, FU-A) through the real depacketizer into
+//! [`HlsSink`](hls_sink::HlsSink) and asserts real `.ts` segments + a well-formed
+//! `index.m3u8` land on disk. **Still pending live validation** (no browser
+//! publisher available in CI): only the ICE/DTLS/SRTP handshake that delivers
+//! those RTP packets — i.e. [`WhipSession::run`]'s transport — everything
+//! downstream of a received RTP packet is now exercised.
 
 pub mod depacketize;
 pub mod hls_sink;
 pub mod session;
+
+#[cfg(test)]
+pub(crate) mod testutil;
 
 use std::sync::Arc;
 
@@ -48,6 +60,7 @@ use parking_lot::Mutex;
 use thiserror::Error;
 use ulid::Ulid;
 
+pub use hls_sink::{hls_sink, HlsSegment, HlsSegmentWriter, HlsSink, MediaSink};
 pub use session::{SessionError, WhipSession};
 
 #[derive(Debug, Error)]
