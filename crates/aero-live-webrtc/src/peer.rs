@@ -54,6 +54,15 @@ pub struct InboundRtp {
     pub wallclock: Instant,
     /// Payload bytes (no RTP header).
     pub payload: Vec<u8>,
+    /// Simulcast RID (Restriction Identifier) if present in the RTP header
+    /// extension. `None` for non-simulcast tracks.
+    pub rid: Option<str0m::media::Rid>,
+    /// Whether this packet begins a keyframe (intra frame). In RTP-mode the
+    /// SFU does **not** parse codec bitstreams, so this is `false` by default
+    /// when constructed from a raw `str0m` [`RtpPacket`]. Set it to `true` from
+    /// an out-of-band source (e.g. a codec-aware pre-processing step or a test
+    /// harness) when you know the packet carries an IDR/keyframe.
+    pub is_keyframe: bool,
 }
 
 impl InboundRtp {
@@ -64,6 +73,8 @@ impl InboundRtp {
             seq_no: p.seq_no,
             rtp_time: p.header.timestamp,
             marker: p.header.marker,
+            rid: p.header.ext_vals.rid,
+            is_keyframe: false, // not detectable from raw RTP without codec parsing
             ext_vals: p.header.ext_vals.clone(),
             wallclock: p.timestamp,
             payload: p.payload.clone(),
