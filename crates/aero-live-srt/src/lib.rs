@@ -32,10 +32,17 @@
 //! retransmission, congestion control, and packet reordering — the v1 data
 //! plane is best-effort, in-order. See [`protocol`] for the full pending list.
 
+pub mod crypto;
 pub mod protocol;
+pub mod reliability;
 pub mod segmenter;
 
+pub use crypto::{
+    KkFlag, KmMessage, KmMessageType, KeyUnwrapError, SrtCrypto,
+    aes_key_unwrap, aes_key_wrap, pbkdf2_kek,
+};
 pub use protocol::{Handshake, HandshakeMachine, HsAction, HsState, SrtHeader};
+pub use reliability::{Action, ReliabilityState, RttEstimator, seq_diff, seq_lt, seq_next};
 pub use segmenter::{MpegTsSegmenter, SegmentEvent, TS_PACKET_SIZE, TS_SYNC_BYTE};
 
 use std::collections::HashMap;

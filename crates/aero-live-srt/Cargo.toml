@@ -33,6 +33,11 @@ hmac = "0.12"
 sha1 = "0.10"
 base64 = "0.22"
 
+# SRT AES crypto: PBKDF2-HMAC-SHA1 KEK derivation + AES-128 for key-wrap and
+# AES-CTR data-plane encryption. All pure-Rust RustCrypto crates, unsafe-free.
+pbkdf2 = { version = "0.12", default-features = false }
+aes = "0.8"
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "fs", "io-util", "sync"] }
 tempfile = "3"
