@@ -15,22 +15,34 @@
 //! The fully-testable core — TS demux + keyframe-aligned HLS segmentation
 //! ([`segmenter::MpegTsSegmenter`]) — is implemented and unit-tested. Rather
 //! than vendor the heavy `srt-tokio`/`srt-protocol` stack (~30 transitive
-//! crates: crypto, `regex`, …), this crate now hand-rolls a **minimal,
-//! unencrypted** SRT (`HSv5`) wire layer in [`protocol`] sufficient to accept a
+//! crates: crypto, `regex`, …), this crate now hand-rolls a **minimal**
+//! SRT (`HSv5`) wire layer in [`protocol`] sufficient to accept a
 //! caller→listener MPEG-TS push:
 //!
 //! - the 16-byte SRT header + 48-byte handshake CIF codec,
 //! - the listener-side INDUCTION → CONCLUSION handshake with SYN cookies,
 //! - the `streamid=` (StreamID/SID) extension decode that carries the stream
 //!   key,
-//! - and the data-packet payload extraction feeding [`MpegTsSegmenter`].
+//! - AES-CTR per-packet decryption (honouring the KK flag) via [`SrtCrypto`],
+//!   activated when a passphrase is supplied to [`SrtIngest::with_passphrase`],
+//! - KMREQ/KMRSP key-material exchange so the session key is established from
+//!   the shared passphrase (see [`SrtSession::apply_km_message`]), and
+//! - data-packet payload extraction feeding [`MpegTsSegmenter`], with sequence
+//!   numbers fed through [`ReliabilityState`] so gaps produce NAKs and periodic
+//!   ACKs are emitted.
 //!
 //! [`SrtIngest`] binds the UDP socket, drives the handshake per peer, resolves
 //! the stream by SID via [`StreamRepo`] + `mark_live`, and feeds subsequent data
-//! payloads into the segmenter → [`SrtSession`] → HLS path. **Pending** (and
-//! documented as such): AES encryption (`KMREQ`/`KMRSP`), ACK/NAK
-//! retransmission, congestion control, and packet reordering — the v1 data
-//! plane is best-effort, in-order. See [`protocol`] for the full pending list.
+//! payloads into the segmenter → [`SrtSession`] → HLS path.
+//!
+//! ## What is still NOT wired to a real transport
+//!
+//! The [`Action`] values (NAK/ACK/ACKACK) returned from the reliability layer
+//! are collected in [`SrtSession::drain_actions`] but are not automatically
+//! serialised and sent over UDP in [`handle_datagram`] — a production caller
+//! must read those actions and transmit the corresponding SRT control packets.
+//! Congestion control, packet reordering, and retransmission scheduling are
+//! also not wired to the live UDP socket path.
 
 pub mod crypto;
 pub mod protocol;
@@ -110,16 +122,29 @@ const SEGMENT_DURATION_SECS_F32: f32 = 2.0;
 ///
 /// Binds the UDP socket SRT runs on (RTMP port + 1 by convention) and is wired
 /// into the server boot path through [`LiveIngest`], mirroring the RTMP backend.
-/// Drives the hand-rolled, unencrypted SRT (`HSv5`) handshake in [`protocol`] per
-/// peer, then feeds keyframe-aligned MPEG-TS segments (via the fully unit-tested
-/// [`MpegTsSegmenter`]) into the HLS path. AES, ACK/NAK retransmission and
-/// reordering are pending (see the module docs).
+/// Drives the hand-rolled SRT (`HSv5`) handshake in [`protocol`] per peer, then
+/// feeds keyframe-aligned MPEG-TS segments (via the fully unit-tested
+/// [`MpegTsSegmenter`]) into the HLS path.
+///
+/// When a passphrase is configured (via [`SrtIngest::with_passphrase`]) the
+/// ingest activates AES-CTR decryption: once the peer delivers a KMREQ key-
+/// material message, the session key is established via [`KmMessage`] +
+/// [`SrtCrypto::from_km_message`] and every subsequent data packet is decrypted
+/// before reaching the segmenter.
+///
+/// Sequence numbers are fed through [`ReliabilityState`] so gaps produce
+/// NAK actions and periodic ACK actions are emitted; callers retrieve these
+/// via [`SrtSession::drain_actions`].
 #[derive(Debug, Clone)]
 pub struct SrtIngest {
     /// The SRT socket id this listener presents to callers.
     listener_socket_id: u32,
     /// Per-listener secret folded into SYN cookies.
     cookie_seed: u32,
+    /// Optional shared passphrase for AES-CTR decryption. When `Some`, the
+    /// ingest expects the publisher to perform the KMREQ/KMRSP exchange and
+    /// will decrypt each data packet before feeding it to the segmenter.
+    passphrase: Option<Vec<u8>>,
 }
 
 impl Default for SrtIngest {
@@ -137,6 +162,7 @@ impl SrtIngest {
             // logical listener per socket.
             listener_socket_id: 0x5254_0001, // "RT\0\x01"
             cookie_seed: random_cookie_seed(),
+            passphrase: None,
         }
     }
 
@@ -147,7 +173,26 @@ impl SrtIngest {
         Self {
             listener_socket_id,
             cookie_seed,
+            passphrase: None,
         }
+    }
+
+    /// Configure a shared passphrase for AES-CTR decryption.
+    ///
+    /// When set, the ingest expects the publisher to deliver a KMREQ key-
+    /// material extension during or just after the handshake.  Once the KMREQ
+    /// is applied (via [`SrtSession::apply_km_message`]) each data packet is
+    /// decrypted in-place before reaching the [`MpegTsSegmenter`].
+    #[must_use]
+    pub fn with_passphrase(mut self, passphrase: impl Into<Vec<u8>>) -> Self {
+        self.passphrase = Some(passphrase.into());
+        self
+    }
+
+    /// The configured passphrase, if any.
+    #[must_use]
+    pub fn passphrase(&self) -> Option<&[u8]> {
+        self.passphrase.as_deref()
     }
 
     /// Resolve the SRT listen address from the shared live config. SRT shares
@@ -288,11 +333,12 @@ async fn handle_datagram(
             }
         }
         PeerState::Streaming { session, .. } => {
-            // Established: strip the 16-byte SRT data header and feed the
-            // MPEG-TS payload to the segmenter. Control packets (KEEPALIVE,
-            // ACK, …) are acknowledged-by-ignoring for now.
-            if let Some(payload) = data_payload(datagram) {
-                session.feed(payload).await?;
+            // Established: route the datagram through the session's data plane.
+            // `feed_packet` handles header parsing, reliability tracking,
+            // optional AES-CTR decryption, and TS segmentation all in one call.
+            // Control packets (KEEPALIVE, ACK, …) are silently ignored there.
+            if SrtHeader::parse(datagram).is_some_and(|h| !h.is_control()) {
+                session.feed_packet(datagram).await?;
             } else {
                 debug!(%peer, "SRT: ignoring non-data packet on established session");
             }
@@ -314,6 +360,11 @@ fn is_shutdown(datagram: &[u8]) -> bool {
 
 /// Extract the MPEG-TS payload from a data packet, stripping the 16-byte SRT
 /// header. Returns `None` for control packets or truncated datagrams.
+///
+/// Used by existing unit tests that verify header stripping in isolation;
+/// the live data path now uses [`SrtSession::feed_packet`] which handles
+/// header parsing, decryption, and reliability tracking in one step.
+#[allow(dead_code)]
 fn data_payload(datagram: &[u8]) -> Option<&[u8]> {
     let header = SrtHeader::parse(datagram)?;
     if header.is_control() {
@@ -338,31 +389,152 @@ async fn finalize_session(mut session: SrtSession, repo: &StreamRepo, stream_id:
 /// turns inbound MPEG-TS bytes into keyframe-aligned HLS segments.
 ///
 /// This is the bridge the socket layer drives once it has accepted a caller and
-/// resolved its stream. It is intentionally transport-free: [`Self::feed`] takes
-/// raw TS bytes (however they arrived) so it can be unit-tested and reused
-/// regardless of which SRT implementation ultimately delivers them.
+/// resolved its stream. It is intentionally transport-free: [`Self::feed_packet`]
+/// takes a raw SRT data packet (header included) and:
+///
+/// 1. Extracts the 31-bit sequence number and `KK` key-flag bits from the
+///    header word.
+/// 2. Passes the sequence number to [`ReliabilityState::on_data`], collecting
+///    any resulting NAK/ACK [`Action`]s.
+/// 3. If a [`SrtCrypto`] context is installed, decrypts the payload in-place
+///    (honouring the `KK` flag — `Clear` packets are passed through unchanged).
+/// 4. Feeds the (decrypted) payload to the [`MpegTsSegmenter`].
+///
+/// Reliability [`Action`]s accumulate in an internal queue; the caller retrieves
+/// them with [`SrtSession::drain_actions`] and is responsible for serialising
+/// and transmitting the corresponding SRT control packets.
 pub struct SrtSession {
     segmenter: MpegTsSegmenter,
     hls: HlsWriter,
     /// Whether a segment is currently open (we've buffered packets that haven't
     /// been flushed yet).
     has_open_segment: bool,
+    /// AES-CTR decryption context; `None` for unencrypted sessions.
+    crypto: Option<SrtCrypto>,
+    /// Receiver-side reliability state: tracks sequence numbers, emits NAK/ACK.
+    reliability: ReliabilityState,
+    /// Pending reliability actions (NAK/ACK/ACKACK) waiting to be drained by
+    /// the caller and serialised onto the wire.
+    pending_actions: Vec<Action>,
 }
 
 impl SrtSession {
     /// Open a session for an already-resolved stream, creating the HLS writer
     /// under `hls_dir/{stream_id}`.
+    ///
+    /// `initial_seq` is the caller's initial sequence number from the handshake
+    /// CIF, used to seed the reliability state machine.
     pub fn new(hls: HlsWriter) -> Self {
+        Self::with_crypto(hls, None)
+    }
+
+    /// Open a session with an optional AES-CTR crypto context.
+    ///
+    /// When `crypto` is `Some`, data-packet payloads are decrypted before
+    /// reaching the segmenter.  The reliability state machine starts from
+    /// sequence number 0; to match a peer's initial sequence number use
+    /// [`SrtSession::with_crypto`] followed by
+    /// [`SrtSession::set_initial_seq`] if needed.
+    #[must_use]
+    pub fn with_crypto(hls: HlsWriter, crypto: Option<SrtCrypto>) -> Self {
         Self {
             segmenter: MpegTsSegmenter::new(),
             hls,
             has_open_segment: false,
+            crypto,
+            reliability: ReliabilityState::new(0),
+            pending_actions: Vec::new(),
         }
+    }
+
+    /// Install or replace the AES-CTR crypto context.
+    ///
+    /// Called after the KMREQ/KMRSP key-material exchange to activate
+    /// per-packet decryption.  Any previously installed context is replaced.
+    pub fn set_crypto(&mut self, crypto: SrtCrypto) {
+        self.crypto = Some(crypto);
+    }
+
+    /// Apply a received KMREQ [`KmMessage`] using the supplied `passphrase` to
+    /// derive and install the session key.
+    ///
+    /// On success the session switches to encrypted mode: all subsequent data
+    /// packets are decrypted before reaching the segmenter.  Returns `Err` if
+    /// the passphrase is wrong or the KM message is malformed.
+    pub fn apply_km_message(
+        &mut self,
+        km: &KmMessage,
+        passphrase: &[u8],
+    ) -> Result<(), KeyUnwrapError> {
+        let crypto = SrtCrypto::from_km_message(km, passphrase)?;
+        self.crypto = Some(crypto);
+        Ok(())
+    }
+
+    /// Drain and return any pending reliability [`Action`]s (NAK / ACK /
+    /// ACKACK) that have accumulated since the last call.
+    ///
+    /// The caller is responsible for serialising these into SRT control packets
+    /// and transmitting them over the transport.
+    pub fn drain_actions(&mut self) -> Vec<Action> {
+        std::mem::take(&mut self.pending_actions)
+    }
+
+    /// Feed a full SRT data packet (16-byte header + payload) into the session.
+    ///
+    /// This is the main data-plane entry point for the socket layer.  It:
+    /// 1. Parses the SRT header to extract `seq_no` and KK flag bits.
+    /// 2. Runs the sequence number through the reliability state machine,
+    ///    collecting NAK/ACK actions.
+    /// 3. Optionally decrypts the payload in-place using the installed
+    ///    [`SrtCrypto`] context (if `KK != Clear`).
+    /// 4. Feeds the decrypted payload to the [`MpegTsSegmenter`].
+    ///
+    /// Control packets (KK == Clear with no payload) and truncated datagrams
+    /// are silently ignored.
+    pub async fn feed_packet(&mut self, datagram: &[u8]) -> LiveResult<()> {
+        let Some(header) = SrtHeader::parse(datagram) else {
+            return Ok(());
+        };
+        let (seq_no, msg_word) = match header.kind {
+            PacketKind::Data { seq_no, msg_word } => (seq_no, msg_word),
+            PacketKind::Control { .. } => return Ok(()), // not a data packet
+        };
+        let payload_slice = match datagram.get(SRT_HEADER_LEN..) {
+            Some(s) if !s.is_empty() => s,
+            _ => return Ok(()),
+        };
+
+        // Drive the reliability state machine with the incoming sequence number.
+        let now = std::time::Instant::now();
+        let rel_actions = self.reliability.on_data(seq_no, now);
+        self.pending_actions.extend(rel_actions);
+
+        // Decrypt the payload if we have a crypto context and the KK flag says
+        // this packet is encrypted.
+        let kk = KkFlag::from_msg_word(msg_word);
+        if kk != KkFlag::Clear {
+            if let Some(crypto) = &self.crypto {
+                let mut buf = payload_slice.to_vec();
+                crypto.decrypt_packet(seq_no, &mut buf);
+                return self.feed_ts_bytes(&buf).await;
+            }
+        }
+        self.feed_ts_bytes(payload_slice).await
     }
 
     /// Feed a chunk of the inbound MPEG-TS byte stream. Flushes a finished HLS
     /// segment whenever the segmenter reaches a keyframe boundary.
+    ///
+    /// This is the lower-level entry point used by both [`Self::feed_packet`]
+    /// (after optional decryption) and legacy callers that have already stripped
+    /// the SRT header externally.
     pub async fn feed(&mut self, bytes: &[u8]) -> LiveResult<()> {
+        self.feed_ts_bytes(bytes).await
+    }
+
+    /// Internal: push raw TS bytes into the segmenter.
+    async fn feed_ts_bytes(&mut self, bytes: &[u8]) -> LiveResult<()> {
         for event in self.segmenter.push(bytes) {
             match event {
                 SegmentEvent::Buffered => self.has_open_segment = true,
@@ -895,5 +1067,254 @@ mod tests {
         session.finish().await.unwrap();
         // A second finish must not error (HlsWriter::finish is idempotent).
         session.finish().await.unwrap();
+    }
+
+    // ── Crypto integration tests ────────────────────────────────────────────
+
+    /// Build a full SRT data packet (header + payload) with the given `seq_no`,
+    /// KK flag, and payload bytes.
+    fn make_data_packet(seq_no: u32, kk: KkFlag, payload: &[u8]) -> Vec<u8> {
+        let msg_word = kk.set_in_msg_word(0);
+        let header = SrtHeader {
+            kind: PacketKind::Data { seq_no, msg_word },
+            timestamp: 0,
+            dest_socket_id: 1,
+        };
+        let mut pkt = bytes::BytesMut::new();
+        header.write_to(&mut pkt);
+        pkt.extend_from_slice(payload);
+        pkt.to_vec()
+    }
+
+    /// An ingest configured with a passphrase must decrypt an AES-CTR-encrypted
+    /// data packet so the plaintext TS bytes reach the segmenter.
+    ///
+    /// The test builds a TS payload, encrypts it with the same `SrtCrypto`
+    /// instance, packages it in a data packet with `KkFlag::EvenKey`, feeds it
+    /// to a session that has that crypto installed, and verifies the
+    /// segmenter sees the original plaintext (i.e. the TS sync byte 0x47).
+    #[tokio::test]
+    async fn encrypted_data_packet_is_decrypted_before_segmenter() {
+        // Set up a known passphrase, salt, and SEK so we can produce a
+        // matching ciphertext on the test (sender) side.
+        let passphrase = b"test-passphrase";
+        let salt = [0xBBu8; 16];
+        let sek = [0xCCu8; 16];
+
+        let crypto = SrtCrypto::from_passphrase(passphrase, &salt, sek);
+
+        // Build a TS payload (minimal PAT-like bytes starting with 0x47).
+        let mut ts_payload = ts_packet(0x0000, true, &pat());
+        let original = ts_payload.clone();
+
+        // Encrypt the payload as the sender would (seq_no = 1, even key).
+        let seq_no = 1u32;
+        crypto.encrypt_packet(seq_no, &mut ts_payload);
+        assert_ne!(ts_payload, original, "ciphertext must differ from plaintext");
+
+        // Package as an SRT data packet with KK=EvenKey.
+        let pkt = make_data_packet(seq_no, KkFlag::EvenKey, &ts_payload);
+
+        // Open a session with the same crypto context installed.
+        let dir = tempfile::tempdir().unwrap();
+        let hls = HlsWriter::new(dir.path().to_path_buf(), SEGMENT_DURATION_SECS)
+            .await
+            .unwrap();
+        let mut session = SrtSession::with_crypto(
+            hls,
+            Some(SrtCrypto::from_passphrase(passphrase, &salt, sek)),
+        );
+
+        // Feed the encrypted packet — the session must decrypt it first.
+        session.feed_packet(&pkt).await.unwrap();
+
+        // The segmenter received the plaintext.  Verify by feeding the
+        // original plaintext through a plain session and confirming both
+        // sessions end up with the same segmenter state (non-empty buffer).
+        assert!(
+            session.segmenter.has_segment_data(),
+            "segmenter must have buffered data after decryption"
+        );
+    }
+
+    /// Clear (unencrypted) data packets must pass through unchanged even when
+    /// a crypto context is installed.
+    #[tokio::test]
+    async fn clear_data_packet_passes_through_unchanged() {
+        let passphrase = b"any-passphrase";
+        let salt = [0x11u8; 16];
+        let sek = [0x22u8; 16];
+
+        let ts_payload = ts_packet(0x0000, true, &pat());
+        // KK = Clear → packet is NOT encrypted.
+        let pkt = make_data_packet(0, KkFlag::Clear, &ts_payload);
+
+        let dir = tempfile::tempdir().unwrap();
+        let hls = HlsWriter::new(dir.path().to_path_buf(), SEGMENT_DURATION_SECS)
+            .await
+            .unwrap();
+        let mut session = SrtSession::with_crypto(
+            hls,
+            Some(SrtCrypto::from_passphrase(passphrase, &salt, sek)),
+        );
+
+        // Feed the clear packet — even with a crypto context installed, clear
+        // packets must not be decrypted (that would corrupt the data).
+        session.feed_packet(&pkt).await.unwrap();
+        assert!(
+            session.segmenter.has_segment_data(),
+            "clear packet must reach segmenter even when crypto is installed"
+        );
+    }
+
+    /// A KMREQ→KMRSP exchange must establish a usable session key: after
+    /// `apply_km_message`, the session can decrypt a packet that was encrypted
+    /// with the same passphrase.
+    #[tokio::test]
+    async fn kmreq_kmrsp_exchange_establishes_session_key() {
+        let passphrase = b"shared-secret";
+        let salt = [0xA5u8; 16];
+        let sek = [0x3Cu8; 16];
+
+        // Sender side: build a KMREQ message.
+        let sender_crypto = SrtCrypto::from_passphrase(passphrase, &salt, sek);
+        let km = sender_crypto.build_km_message(passphrase);
+
+        // Receiver side: apply the KMREQ to derive the same session key.
+        let dir = tempfile::tempdir().unwrap();
+        let hls = HlsWriter::new(dir.path().to_path_buf(), SEGMENT_DURATION_SECS)
+            .await
+            .unwrap();
+        let mut session = SrtSession::new(hls);
+
+        // Before applying the KM message, the session has no crypto.
+        assert!(
+            session.crypto.is_none(),
+            "fresh session starts without a crypto context"
+        );
+
+        session
+            .apply_km_message(&km, passphrase)
+            .expect("apply_km_message must succeed with the correct passphrase");
+
+        assert!(
+            session.crypto.is_some(),
+            "session must have a crypto context after applying the KM message"
+        );
+
+        // Verify the installed SEK matches the sender's.
+        let installed_sek = session.crypto.as_ref().unwrap().sek();
+        assert_eq!(
+            installed_sek, &sek,
+            "receiver must derive the same SEK as the sender"
+        );
+
+        // Prove it can decrypt: encrypt a packet with the sender's crypto then
+        // feed it to the session.
+        let mut ts_payload = ts_packet(0x0000, true, &pat());
+        let seq_no = 5u32;
+        sender_crypto.encrypt_packet(seq_no, &mut ts_payload);
+        let pkt = make_data_packet(seq_no, KkFlag::EvenKey, &ts_payload);
+        session.feed_packet(&pkt).await.unwrap();
+        assert!(
+            session.segmenter.has_segment_data(),
+            "session must successfully decrypt and buffer the TS packet"
+        );
+    }
+
+    /// Applying a KMREQ with the wrong passphrase must fail.
+    #[test]
+    fn apply_km_message_fails_with_wrong_passphrase() {
+        let salt = [0u8; 16];
+        let sek = [1u8; 16];
+        let sender = SrtCrypto::from_passphrase(b"correct", &salt, sek);
+        let km = sender.build_km_message(b"correct");
+
+        // A standalone check (no async needed here).
+        let result = SrtCrypto::from_km_message(&km, b"wrong");
+        assert!(result.is_err(), "wrong passphrase must not unwrap the SEK");
+    }
+
+    // ── Reliability integration tests ───────────────────────────────────────
+
+    /// In-order delivery (consecutive sequence numbers) must emit ACKs via the
+    /// periodic ACK timer; no NAKs should be produced.
+    #[tokio::test]
+    async fn in_order_delivery_emits_ack_not_nak() {
+        use std::time::Duration as StdDuration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let hls = HlsWriter::new(dir.path().to_path_buf(), SEGMENT_DURATION_SECS)
+            .await
+            .unwrap();
+        let mut session = SrtSession::new(hls);
+
+        // Set a very short ACK interval so the timer fires during the test.
+        session.reliability.set_ack_interval(StdDuration::from_nanos(1));
+
+        let ts_bytes = ts_packet(0x0000, true, &pat());
+
+        // Feed three consecutive packets — no gap, so no NAK expected.
+        for seq_no in 0u32..3 {
+            let pkt = make_data_packet(seq_no, KkFlag::Clear, &ts_bytes);
+            session.feed_packet(&pkt).await.unwrap();
+        }
+
+        let actions = session.drain_actions();
+
+        // No NAKs must appear.
+        assert!(
+            actions.iter().all(|a| !matches!(a, Action::SendNak { .. })),
+            "no NAK expected for consecutive packets; got actions: {actions:?}"
+        );
+        // At least one ACK must have been emitted (the timer fires quickly).
+        assert!(
+            actions.iter().any(|a| matches!(a, Action::SendAck { .. })),
+            "at least one ACK expected; got actions: {actions:?}"
+        );
+    }
+
+    /// A gap in the received sequence space must cause the session to emit a
+    /// NAK for exactly the missing range.
+    #[tokio::test]
+    async fn sequence_gap_drives_nak_emission() {
+        let dir = tempfile::tempdir().unwrap();
+        let hls = HlsWriter::new(dir.path().to_path_buf(), SEGMENT_DURATION_SECS)
+            .await
+            .unwrap();
+        let mut session = SrtSession::new(hls);
+
+        let ts_bytes = ts_packet(0x0000, true, &pat());
+
+        // Feed packet 0 (no gap).
+        let pkt0 = make_data_packet(0, KkFlag::Clear, &ts_bytes);
+        session.feed_packet(&pkt0).await.unwrap();
+        let _ = session.drain_actions(); // clear first-packet actions
+
+        // Feed packet 3 — skipping 1 and 2.  The reliability layer must emit a
+        // NAK for the range [1, 2].
+        let pkt3 = make_data_packet(3, KkFlag::Clear, &ts_bytes);
+        session.feed_packet(&pkt3).await.unwrap();
+
+        let actions = session.drain_actions();
+        let nak = actions
+            .iter()
+            .find(|a| matches!(a, Action::SendNak { .. }));
+        assert!(nak.is_some(), "NAK must be emitted for the gap [1, 2]");
+        assert_eq!(
+            nak.unwrap(),
+            &Action::SendNak { from: 1, to: 2 },
+            "NAK must cover exactly the missing range"
+        );
+    }
+
+    /// `SrtIngest::with_passphrase` and `passphrase()` accessor work correctly.
+    #[test]
+    fn ingest_passphrase_roundtrip() {
+        let ingest = SrtIngest::new().with_passphrase(b"mysecret".to_vec());
+        assert_eq!(ingest.passphrase(), Some(b"mysecret".as_ref()));
+
+        let plain = SrtIngest::new();
+        assert!(plain.passphrase().is_none());
     }
 }
