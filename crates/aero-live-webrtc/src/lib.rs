@@ -35,6 +35,7 @@ use parking_lot::RwLock;
 use thiserror::Error;
 
 pub mod forward;
+pub mod h264;
 pub mod peer;
 pub mod remap;
 pub mod rtcp_feedback;

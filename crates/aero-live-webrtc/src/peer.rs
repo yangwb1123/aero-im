@@ -32,6 +32,7 @@ use str0m::net::{Protocol, Receive};
 use str0m::rtp::{ExtensionValues, RtpPacket, SeqNo};
 use str0m::{Event, Input, Output, Rtc};
 
+use crate::h264::h264_payload_is_keyframe;
 use crate::SfuError;
 
 /// One forwarded RTP packet lifted out of `str0m`'s [`RtpPacket`] into the
@@ -57,16 +58,24 @@ pub struct InboundRtp {
     /// Simulcast RID (Restriction Identifier) if present in the RTP header
     /// extension. `None` for non-simulcast tracks.
     pub rid: Option<str0m::media::Rid>,
-    /// Whether this packet begins a keyframe (intra frame). In RTP-mode the
-    /// SFU does **not** parse codec bitstreams, so this is `false` by default
-    /// when constructed from a raw `str0m` [`RtpPacket`]. Set it to `true` from
-    /// an out-of-band source (e.g. a codec-aware pre-processing step or a test
-    /// harness) when you know the packet carries an IDR/keyframe.
+    /// Whether this packet begins a keyframe (intra frame).
+    ///
+    /// Set from [`crate::h264::h264_payload_is_keyframe`] when the RTP payload
+    /// is decoded as H.264 (RFC 6184). Detects single-NAL IDR (type 5),
+    /// SPS (type 7), PPS (type 8), FU-A START fragments of an IDR, and STAP-A
+    /// aggregates that contain any of those NAL types.
+    ///
+    /// **Limitation**: only H.264 is detected. For VP8, VP9, AV1, or any other
+    /// codec this field is `false` — the SFU has no codec-agnostic way to detect
+    /// intra frames from raw RTP in RTP-forwarding mode.
     pub is_keyframe: bool,
 }
 
 impl InboundRtp {
     fn from_packet(p: &RtpPacket) -> Self {
+        // Attempt H.264 keyframe detection from the raw payload.  For any other
+        // codec this returns false (see `h264_payload_is_keyframe` docs).
+        let is_keyframe = h264_payload_is_keyframe(&p.payload);
         Self {
             mid: p.header.ext_vals.mid.unwrap_or_else(|| mid_fallback(p)),
             pt: p.header.payload_type,
@@ -74,7 +83,7 @@ impl InboundRtp {
             rtp_time: p.header.timestamp,
             marker: p.header.marker,
             rid: p.header.ext_vals.rid,
-            is_keyframe: false, // not detectable from raw RTP without codec parsing
+            is_keyframe,
             ext_vals: p.header.ext_vals.clone(),
             wallclock: p.timestamp,
             payload: p.payload.clone(),
