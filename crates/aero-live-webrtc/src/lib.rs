@@ -37,10 +37,14 @@ use thiserror::Error;
 pub mod forward;
 pub mod peer;
 pub mod remap;
+pub mod rtcp_feedback;
+pub mod simulcast;
 
 pub use forward::SfuForwarder;
 pub use peer::{InboundRtp, KeyframeReq, PeerProgress, SfuPeer};
 pub use remap::{ForwardTable, ForwardTarget, RemappedRtp, RtpKey, RtpRemapper};
+pub use rtcp_feedback::{KeyframeGate, ParsedFeedback, PendingKeyframeRequest};
+pub use simulcast::{ForwardDecision, LayerKind, LayerSelector, LayerSelectorTable, LayerSet, SimulcastLayer};
 
 /// Errors surfaced by the `str0m`-backed peer / forwarder.
 #[derive(Debug, Error)]
