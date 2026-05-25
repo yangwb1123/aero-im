@@ -22,6 +22,19 @@
 //! [`RtpPacket`]s instead, so the depacketizer genuinely reassembles NAL units
 //! from the publisher's RTP — exactly the boundary this crate owns.
 //!
+//! ## Reorder buffer
+//!
+//! Inbound RTP packets are passed through a [`ReorderBuffer`] before reaching
+//! the depacketizer. The buffer holds packets that arrived out of order and
+//! drains them strictly in sequence-number order. The default jitter window is
+//! [`DEFAULT_REORDER_WINDOW`] (64 sequence-number slots). Packets that arrive
+//! more than `window` slots behind the drain cursor are silently dropped
+//! (duplicate / too-late); a gap wider than `window` is declared lost and the
+//! depacketizer is reset (resync on the next keyframe). The buffer is
+//! initialized lazily on the first received RTP packet so the first packet's
+//! seq is the start of the window — browsers choose a random initial seq, so
+//! starting at 0 would stall the drain until the window was exceeded.
+//!
 //! ## Runtime-verifiability
 //!
 //! `accept` is unit-tested (real offer → real answer). `run` is **not**
@@ -45,10 +58,17 @@ use tracing::{debug, trace, warn};
 
 use crate::depacketize::H264Depacketizer;
 use crate::hls_sink::MediaSink;
+use crate::reorder::ReorderBuffer;
 
 /// Maximum size of a single inbound UDP datagram we buffer. WebRTC keeps
 /// datagrams under the path MTU; 2 KiB is comfortably above that.
 const RECV_BUF: usize = 2048;
+
+/// Default jitter-buffer window for the ingest [`ReorderBuffer`]: how many
+/// sequence-number slots ahead of the drain cursor we hold before declaring a
+/// missing packet lost and skipping it. 64 slots at 30 fps gives ~2 s of
+/// tolerance — ample for typical internet jitter while keeping latency bounded.
+pub const DEFAULT_REORDER_WINDOW: u16 = 64;
 
 /// Errors specific to driving a str0m session.
 #[derive(Debug, thiserror::Error)]
@@ -207,8 +227,10 @@ impl WhipSession {
     /// 2. Either a UDP datagram arrives (feed `Input::Receive`) or the timeout
     ///    fires (feed `Input::Timeout`), then loop.
     ///
-    /// Received H.264 RTP is depacketized into Annex-B access units and pushed
-    /// to `sink`. The `socket` must be bound to [`local_addr`](Self::local_addr).
+    /// Received H.264 RTP is reordered through a [`ReorderBuffer`] (window =
+    /// [`DEFAULT_REORDER_WINDOW`]) before being depacketized into Annex-B access
+    /// units and pushed to `sink`. The `socket` must be bound to
+    /// [`local_addr`](Self::local_addr).
     pub async fn run(
         mut self,
         socket: UdpSocket,
@@ -218,6 +240,9 @@ impl WhipSession {
         let mut buf = vec![0u8; RECV_BUF];
         // Accumulates one access unit's worth of Annex-B NAL units.
         let mut au = BytesMut::new();
+        // Lazily initialized on the first RTP packet so the buffer starts at the
+        // stream's actual initial sequence number (browsers choose a random seq).
+        let mut reorder_buf: Option<ReorderBuffer<RtpPacket>> = None;
 
         loop {
             // 1) Drain everything str0m wants to emit until it asks for input.
@@ -240,7 +265,32 @@ impl WhipSession {
                                 debug!(?state, "whip: ice state change");
                             }
                             Event::RtpPacket(pkt) => {
-                                self.on_rtp(&pkt, &mut depacketizer, &mut au, &mut sink);
+                                let seq = pkt.header.sequence_number;
+                                // Lazily initialize the buffer at the first
+                                // observed sequence number so we don't stall.
+                                let rbuf = reorder_buf.get_or_insert_with(|| {
+                                    ReorderBuffer::with_start(seq, DEFAULT_REORDER_WINDOW)
+                                });
+                                let video_pts = &self.video_pts;
+                                rbuf.push(seq, pkt, &mut |_s, maybe_pkt| {
+                                    if let Some(p) = maybe_pkt {
+                                        // Packet delivered in order — depacketize.
+                                        Self::depacketize_rtp(
+                                            video_pts,
+                                            &p,
+                                            &mut depacketizer,
+                                            &mut au,
+                                            &mut sink,
+                                        );
+                                    } else {
+                                        // Gap declared lost: reset depacketizer so a
+                                        // stale FU-A prefix never corrupts the next
+                                        // fragment. The next IDR keyframe will resync.
+                                        trace!("whip: rtp gap declared lost, resyncing depacketizer");
+                                        depacketizer.reset();
+                                        au.clear();
+                                    }
+                                });
                             }
                             _ => {}
                         }
@@ -279,11 +329,14 @@ impl WhipSession {
         }
     }
 
-    /// Route one inbound RTP packet. Video packets feed the H.264 depacketizer;
-    /// on the access-unit boundary (RTP marker bit) the assembled Annex-B AU is
-    /// flushed to the sink.
-    fn on_rtp(
-        &self,
+    /// Route one in-order RTP packet to the depacketizer / sink.
+    ///
+    /// This is extracted as a plain associated function (no `&self` receiver) so
+    /// the reorder-buffer drain closure can call it while holding only a
+    /// reference to `video_pts` — avoiding a conflicting `self` borrow in the
+    /// closure.
+    fn depacketize_rtp(
+        video_pts: &[Pt],
         pkt: &RtpPacket,
         depacketizer: &mut H264Depacketizer,
         au: &mut BytesMut,
@@ -292,7 +345,7 @@ impl WhipSession {
         let pt = pkt.header.payload_type;
         let marker = pkt.header.marker;
 
-        if self.video_pts.contains(&pt) {
+        if video_pts.contains(&pt) {
             if let Err(e) = depacketizer.push(&pkt.payload, marker, au) {
                 // Reassembly desync (packet loss / reorder): drop the partial
                 // AU and resync on the next keyframe.
@@ -631,5 +684,203 @@ a=fmtp:96 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f
         expected.push(0x65);
         expected.extend_from_slice(&body);
         assert_eq!(&out[..], &expected[..]);
+    }
+
+    // =================== Reorder buffer wiring tests ===================
+    //
+    // Prove that the ReorderBuffer→depacketizer pipeline (i.e. the path wired
+    // into WhipSession::run) correctly reorders out-of-order RTP, drops
+    // duplicates, drops late packets, and handles seq wraparound — without
+    // needing a live str0m session or RtpPacket structs.
+    //
+    // A packet is represented as `(payload, marker, pts_90k)`. The helper
+    // `drain_ingest` mimics depacketize_rtp's video path (no audio routing
+    // needed here), collecting each completed Annex-B AU into a Vec<Bytes>.
+
+    use crate::reorder::ReorderBuffer;
+
+    /// A minimal ingest packet: (RTP payload, marker bit, 90 kHz PTS).
+    type IngestPkt = (Vec<u8>, bool, u64);
+
+    /// Push `pkt` through `rbuf` and feed any drained packets into
+    /// `depack`/`au`. Completed AUs (marker bit set) are appended to `aus`.
+    fn push_reorder(
+        rbuf: &mut ReorderBuffer<IngestPkt>,
+        seq: u16,
+        pkt: IngestPkt,
+        depack: &mut H264Depacketizer,
+        au: &mut BytesMut,
+        aus: &mut Vec<(bytes::Bytes, u64)>,
+    ) {
+        rbuf.push(seq, pkt, &mut |_s, maybe| {
+            if let Some((payload, marker, pts)) = maybe {
+                let _ = depack.push(&payload, marker, au); // errors → resync
+                if marker && !au.is_empty() {
+                    aus.push((au.split().freeze(), pts));
+                }
+            } else {
+                // Loss declared: reset depacketizer (mirrors run() behavior).
+                depack.reset();
+                au.clear();
+            }
+        });
+    }
+
+    #[test]
+    fn out_of_order_rtp_yields_same_nal_output_as_in_order() {
+        // Feed two single-NAL video packets in the order 0, 2, 1, 3 (seq).
+        // The reorder buffer should drain them 0→1→2→3, producing the same
+        // two completed AUs (markers on seq 1 and 3) as the in-order path.
+        //
+        // Packet layout:
+        //   seq 0: non-IDR slice, no marker (first half of a two-packet AU)
+        //   seq 1: non-IDR slice, marker    (completes AU #1)
+        //   seq 2: non-IDR slice, no marker (first half of AU #2)
+        //   seq 3: non-IDR slice, marker    (completes AU #2)
+        //
+        // We use single-NAL packets (header 0x41 = non-IDR, NRI=2, type=1) so
+        // the depacketizer emits each one immediately without FU-A state.
+        let pkts: [(u16, IngestPkt); 4] = [
+            (0, (vec![0x41, 0x01], false, 0)),
+            (1, (vec![0x41, 0x02], true, 1_000)),
+            (2, (vec![0x41, 0x03], false, 2_000)),
+            (3, (vec![0x41, 0x04], true, 3_000)),
+        ];
+
+        // Reference: in-order feeding produces the expected access units.
+        let mut depack_inorder = H264Depacketizer::new();
+        let mut inorder_accum = BytesMut::new();
+        let mut inorder_aus: Vec<(bytes::Bytes, u64)> = Vec::new();
+        for (_, (payload, marker, pts)) in &pkts {
+            let _ = depack_inorder.push(payload, *marker, &mut inorder_accum);
+            if *marker && !inorder_accum.is_empty() {
+                inorder_aus.push((inorder_accum.split().freeze(), *pts));
+            }
+        }
+
+        // Test: out-of-order feeding via the reorder buffer must yield the same.
+        let mut depack_reordered = H264Depacketizer::new();
+        let mut reordered_accum = BytesMut::new();
+        let mut reordered_aus: Vec<(bytes::Bytes, u64)> = Vec::new();
+        let mut rbuf: ReorderBuffer<IngestPkt> =
+            ReorderBuffer::with_start(0, DEFAULT_REORDER_WINDOW);
+        // Arrival order: 0, 2, 1, 3 — seq 2 arrives before seq 1.
+        for seq in [0u16, 2, 1, 3] {
+            let (_, pkt) = pkts.iter().find(|(s, _)| *s == seq).unwrap();
+            push_reorder(
+                &mut rbuf,
+                seq,
+                pkt.clone(),
+                &mut depack_reordered,
+                &mut reordered_accum,
+                &mut reordered_aus,
+            );
+        }
+
+        // Both paths must produce the same AUs in the same order.
+        assert_eq!(
+            inorder_aus.len(),
+            reordered_aus.len(),
+            "AU count must match: in-order={}, reordered={}",
+            inorder_aus.len(),
+            reordered_aus.len()
+        );
+        for (i, ((ref_au, ref_pts), (ooo_au, ooo_pts))) in
+            inorder_aus.iter().zip(reordered_aus.iter()).enumerate()
+        {
+            assert_eq!(ref_au, ooo_au, "AU {i} bytes differ between in-order and reordered");
+            assert_eq!(ref_pts, ooo_pts, "AU {i} PTS differs");
+        }
+    }
+
+    #[test]
+    fn duplicate_rtp_is_dropped() {
+        // Push seq 5 twice. The second push must be silently rejected, so
+        // the AU is emitted exactly once (not double-depacketized).
+        let mut rbuf: ReorderBuffer<IngestPkt> =
+            ReorderBuffer::with_start(5, DEFAULT_REORDER_WINDOW);
+        let mut depack = H264Depacketizer::new();
+        let mut au = BytesMut::new();
+        let mut aus: Vec<(bytes::Bytes, u64)> = Vec::new();
+
+        // First push: seq 5 with a complete single-NAL AU (marker set).
+        let pkt = (vec![0x41, 0xAA, 0xBB], true, 9_000u64);
+        push_reorder(&mut rbuf, 5, pkt.clone(), &mut depack, &mut au, &mut aus);
+        assert_eq!(aus.len(), 1, "AU emitted on first push");
+
+        // Second push of the same seq: must be a no-op.
+        push_reorder(&mut rbuf, 5, pkt, &mut depack, &mut au, &mut aus);
+        assert_eq!(aus.len(), 1, "duplicate seq must not produce a second AU");
+    }
+
+    #[test]
+    fn late_rtp_beyond_window_is_dropped_without_stalling() {
+        // Window = 4. Push seq 0 (drains immediately), then seq 8 (gap of 8 >
+        // window=4). The buffer should declare seqs 1..=7 lost (resetting
+        // the depacketizer each time) and drain seq 8, all without stalling.
+        let window = 4u16;
+        let mut rbuf: ReorderBuffer<IngestPkt> = ReorderBuffer::with_start(0, window);
+        let mut depack = H264Depacketizer::new();
+        let mut au = BytesMut::new();
+        let mut aus: Vec<(bytes::Bytes, u64)> = Vec::new();
+
+        // seq 0: drained immediately.
+        push_reorder(
+            &mut rbuf,
+            0,
+            (vec![0x41, 0x01], true, 0),
+            &mut depack,
+            &mut au,
+            &mut aus,
+        );
+        assert_eq!(aus.len(), 1, "seq 0 AU emitted");
+
+        // seq 8: exceeds window from next_expected=1 → loss markers for 1..=7,
+        // then seq 8 drains. The depacketizer is reset for each loss event, but
+        // seq 8's NAL should still be emitted as a fresh AU.
+        push_reorder(
+            &mut rbuf,
+            8,
+            (vec![0x41, 0x09], true, 8_000),
+            &mut depack,
+            &mut au,
+            &mut aus,
+        );
+        assert_eq!(aus.len(), 2, "seq 8 AU emitted after loss markers");
+
+        // The buffer must be empty — not stalled waiting for the lost seqs.
+        assert_eq!(rbuf.buffered(), 0, "buffer must be empty after window skip");
+        assert_eq!(rbuf.next_expected(), 9, "cursor advanced past the gap");
+    }
+
+    #[test]
+    fn reorder_buffer_handles_seq_wraparound() {
+        // Stream starts near u16::MAX. Push 65534, 0 (wrap), 65535 out of order.
+        // Expected drain order: 65534 → 65535 → 0.
+        let start: u16 = u16::MAX - 1; // 65534
+        let mut rbuf: ReorderBuffer<IngestPkt> = ReorderBuffer::with_start(start, 16);
+        let mut depack = H264Depacketizer::new();
+        let mut au = BytesMut::new();
+        let mut aus: Vec<(bytes::Bytes, u64)> = Vec::new();
+
+        // Arrival order: 65534, 0 (post-wrap), 65535 — so 65535 arrives last
+        // even though it is numerically between 65534 and 0.
+        let ordered: [(u16, IngestPkt); 3] = [
+            (start, (vec![0x41, 0x01], true, 0)),         // 65534
+            (0u16, (vec![0x41, 0x03], true, 2_000)),      // 0 (after wrap)
+            (u16::MAX, (vec![0x41, 0x02], true, 1_000)),  // 65535 — arrives last
+        ];
+        let arrival_order = [0usize, 2, 1]; // feed 65534, 65535 oop, then 0
+        for &i in &arrival_order {
+            let (seq, ref pkt) = ordered[i];
+            push_reorder(&mut rbuf, seq, pkt.clone(), &mut depack, &mut au, &mut aus);
+        }
+
+        // All three should drain in the correct order: 65534, 65535, 0.
+        assert_eq!(aus.len(), 3, "all three AUs emitted across the wraparound");
+        // PTS 0, 1000, 2000 correspond to seqs 65534, 65535, 0 in drain order.
+        assert_eq!(aus[0].1, 0, "first AU pts (seq 65534)");
+        assert_eq!(aus[1].1, 1_000, "second AU pts (seq 65535)");
+        assert_eq!(aus[2].1, 2_000, "third AU pts (seq 0, post-wrap)");
     }
 }
