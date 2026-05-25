@@ -44,11 +44,13 @@
 //! Congestion control, packet reordering, and retransmission scheduling are
 //! also not wired to the live UDP socket path.
 
+pub mod control;
 pub mod crypto;
 pub mod protocol;
 pub mod reliability;
 pub mod segmenter;
 
+pub use control::{decode_nak_loss_list, encode_control};
 pub use crypto::{
     KkFlag, KmMessage, KmMessageType, KeyUnwrapError, SrtCrypto,
     aes_key_unwrap, aes_key_wrap, pbkdf2_kek,
@@ -478,6 +480,45 @@ impl SrtSession {
     /// and transmitting them over the transport.
     pub fn drain_actions(&mut self) -> Vec<Action> {
         std::mem::take(&mut self.pending_actions)
+    }
+
+    /// Drain all pending reliability actions and return them as ready-to-send
+    /// SRT control-packet byte vectors.
+    ///
+    /// Each returned `Vec<u8>` is a complete, correctly-framed SRT control
+    /// packet (16-byte header + CIF) that the UDP transport can `send_to` the
+    /// peer address directly.
+    ///
+    /// - ACK packets carry the full ACK CIF (ack-seq-no, current RTT + RTT
+    ///   variance from the embedded [`ReliabilityState`], zeroes for untracked
+    ///   fields).
+    /// - NAK packets carry a loss-list CIF using SRT range encoding (high bit
+    ///   set = range start).
+    /// - ACKACK packets are a header-only (no CIF body).
+    /// - [`Action::SendData`] actions are **not** serialised by this method
+    ///   (they are data-plane, not control-plane); they are dropped silently.
+    ///
+    /// The `dst_socket_id` of every encoded packet is set to `peer_socket_id`.
+    /// The timestamp word is set to 0 (not tracked in the current
+    /// implementation; a production caller should pass `now − connect_time` in
+    /// microseconds).
+    ///
+    /// # What still needs a real UDP loop
+    ///
+    /// This method serialises the packets but does NOT transmit them.  The
+    /// caller must read the returned bytes and call `sock.send_to(bytes, peer)`
+    /// for each one.  Retransmission scheduling, congestion control, and the
+    /// periodic keep-alive timer are also not wired to this path.
+    pub fn drain_control_packets(&mut self, peer_socket_id: u32) -> Vec<Vec<u8>> {
+        let actions = std::mem::take(&mut self.pending_actions);
+        let rtt_us = u32::try_from(self.reliability.rtt().as_micros())
+            .unwrap_or(u32::MAX);
+        let rttvar_us = u32::try_from(self.reliability.rttvar().as_micros())
+            .unwrap_or(u32::MAX);
+        actions
+            .iter()
+            .filter_map(|a| control::encode_control(a, peer_socket_id, 0, rtt_us, rttvar_us))
+            .collect()
     }
 
     /// Feed a full SRT data packet (16-byte header + payload) into the session.
@@ -1316,5 +1357,166 @@ mod tests {
 
         let plain = SrtIngest::new();
         assert!(plain.passphrase().is_none());
+    }
+
+    // ── drain_control_packets integration tests ──────────────────────────────
+
+    /// In-order delivery produces ACK control packets via `drain_control_packets`,
+    /// and none of them are NAK packets.
+    #[tokio::test]
+    async fn drain_control_packets_in_order_yields_ack_not_nak() {
+        use std::time::Duration as StdDuration;
+        use protocol::{ControlType, PacketKind};
+
+        let dir = tempfile::tempdir().unwrap();
+        let hls = HlsWriter::new(dir.path().to_path_buf(), SEGMENT_DURATION_SECS)
+            .await
+            .unwrap();
+        let mut session = SrtSession::new(hls);
+        // Fire the ACK timer immediately.
+        session.reliability.set_ack_interval(StdDuration::from_nanos(1));
+
+        let ts_bytes = ts_packet(0x0000, true, &pat());
+        let peer_socket_id = 0xBEEF_1234u32;
+
+        // Feed three consecutive packets.
+        for seq_no in 0u32..3 {
+            let pkt = make_data_packet(seq_no, KkFlag::Clear, &ts_bytes);
+            session.feed_packet(&pkt).await.unwrap();
+        }
+
+        let ctrl_pkts = session.drain_control_packets(peer_socket_id);
+        assert!(
+            !ctrl_pkts.is_empty(),
+            "drain_control_packets must return at least one packet for in-order delivery"
+        );
+
+        // Every packet must be a valid SRT header addressed to the peer.
+        for pkt in &ctrl_pkts {
+            let hdr = SrtHeader::parse(pkt).expect("must be a valid SRT header");
+            assert!(hdr.is_control(), "every returned packet must be a control packet");
+            assert_eq!(hdr.dest_socket_id, peer_socket_id);
+        }
+
+        // At least one must be an ACK.
+        let has_ack = ctrl_pkts.iter().any(|pkt| {
+            SrtHeader::parse(pkt).is_some_and(|h| {
+                matches!(
+                    h.kind,
+                    PacketKind::Control {
+                        control_type: ControlType::Ack,
+                        ..
+                    }
+                )
+            })
+        });
+        assert!(has_ack, "at least one ACK control packet expected");
+
+        // None must be a NAK.
+        let has_nak = ctrl_pkts.iter().any(|pkt| {
+            SrtHeader::parse(pkt).is_some_and(|h| {
+                matches!(
+                    h.kind,
+                    PacketKind::Control {
+                        control_type: ControlType::Nak,
+                        ..
+                    }
+                )
+            })
+        });
+        assert!(!has_nak, "no NAK expected for consecutive packets");
+    }
+
+    /// A sequence gap drives `drain_control_packets` to yield a NAK packet
+    /// whose decoded loss list covers the exact missing range.
+    #[tokio::test]
+    async fn drain_control_packets_gap_yields_nak_with_correct_loss_list() {
+        use protocol::{ControlType, PacketKind, SRT_HEADER_LEN};
+
+        let dir = tempfile::tempdir().unwrap();
+        let hls = HlsWriter::new(dir.path().to_path_buf(), SEGMENT_DURATION_SECS)
+            .await
+            .unwrap();
+        let mut session = SrtSession::new(hls);
+
+        let ts_bytes = ts_packet(0x0000, true, &pat());
+        let peer_socket_id = 0xCAFE_BABEu32;
+
+        // Feed packet 0.
+        let pkt0 = make_data_packet(0, KkFlag::Clear, &ts_bytes);
+        session.feed_packet(&pkt0).await.unwrap();
+        // Drain to reset the pending-action queue.
+        let _ = session.drain_control_packets(peer_socket_id);
+
+        // Feed packet 3, skipping 1 and 2 → gap [1, 2].
+        let pkt3 = make_data_packet(3, KkFlag::Clear, &ts_bytes);
+        session.feed_packet(&pkt3).await.unwrap();
+
+        let ctrl_pkts = session.drain_control_packets(peer_socket_id);
+
+        // Find the NAK packet.
+        let nak_pkt = ctrl_pkts.iter().find(|pkt| {
+            SrtHeader::parse(pkt).is_some_and(|h| {
+                matches!(
+                    h.kind,
+                    PacketKind::Control {
+                        control_type: ControlType::Nak,
+                        ..
+                    }
+                )
+            })
+        });
+        assert!(nak_pkt.is_some(), "NAK control packet must be emitted for the gap [1, 2]");
+
+        let nak_pkt = nak_pkt.unwrap();
+        let hdr = SrtHeader::parse(nak_pkt).unwrap();
+        assert_eq!(hdr.dest_socket_id, peer_socket_id);
+
+        // Decode the loss list from the NAK CIF body.
+        let body = &nak_pkt[SRT_HEADER_LEN..];
+        let ranges = decode_nak_loss_list(body);
+
+        // The gap [1, 2] must appear as a range (from=1, to=2).
+        assert_eq!(
+            ranges,
+            vec![(1, 2)],
+            "NAK loss list must cover exactly the missing range [1, 2]"
+        );
+    }
+
+    /// `drain_control_packets` must leave the pending-actions queue empty, so a
+    /// second call returns nothing (no double-send).
+    #[tokio::test]
+    async fn drain_control_packets_is_consuming() {
+        use std::time::Duration as StdDuration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let hls = HlsWriter::new(dir.path().to_path_buf(), SEGMENT_DURATION_SECS)
+            .await
+            .unwrap();
+        let mut session = SrtSession::new(hls);
+        // Use a tiny ACK interval so the timer fires on the second packet.
+        session.reliability.set_ack_interval(StdDuration::from_nanos(1));
+
+        let ts_bytes = ts_packet(0x0000, true, &pat());
+
+        // First packet — sets the timer but doesn't fire it yet.
+        let pkt0 = make_data_packet(0, KkFlag::Clear, &ts_bytes);
+        session.feed_packet(&pkt0).await.unwrap();
+
+        // Second packet — fires the ACK timer (interval = 1 ns, definitely elapsed).
+        let pkt1 = make_data_packet(1, KkFlag::Clear, &ts_bytes);
+        session.feed_packet(&pkt1).await.unwrap();
+
+        // First drain must return packets (at least one ACK).
+        let first = session.drain_control_packets(0);
+        assert!(!first.is_empty(), "first drain must return at least one packet");
+
+        // Second drain must be empty — actions consumed.
+        let second = session.drain_control_packets(0);
+        assert!(
+            second.is_empty(),
+            "second drain must return nothing; actions already consumed"
+        );
     }
 }
