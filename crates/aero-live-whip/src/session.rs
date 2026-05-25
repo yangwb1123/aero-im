@@ -56,8 +56,11 @@ use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc, RtcError};
 use tokio::net::UdpSocket;
 use tracing::{debug, trace, warn};
 
+use std::sync::Arc;
+
 use crate::depacketize::H264Depacketizer;
 use crate::hls_sink::MediaSink;
+use crate::relay::MediaRelay;
 use crate::reorder::ReorderBuffer;
 
 /// Maximum size of a single inbound UDP datagram we buffer. WebRTC keeps
@@ -95,6 +98,12 @@ pub enum SessionError {
 /// Construct with [`WhipSession::accept`]; the returned [`SdpAnswer`] is sent
 /// back to the browser over HTTP, then [`WhipSession::run`] is spawned on the
 /// UDP socket bound to the advertised ingest address.
+///
+/// Optionally, attach a [`MediaRelay`] with [`with_relay`](Self::with_relay)
+/// before calling `run`. When a relay is attached every depacketized H.264
+/// access unit is published to it (in addition to the [`MediaSink`]) so that
+/// WHEP subscribers can receive the live stream via a relay-backed
+/// [`Subscription`](crate::relay::Subscription).
 pub struct WhipSession {
     rtc: Rtc,
     /// The address str0m advertised as its host candidate; the UDP socket the
@@ -104,6 +113,10 @@ pub struct WhipSession {
     /// H.264 depacketizer in RTP mode (where packets carry only a PT, not a
     /// media kind). Captured at `accept` time since negotiation is complete.
     video_pts: Vec<Pt>,
+    /// Optional relay hub: when `Some`, each depacketized video access unit is
+    /// also published here so WHEP subscribers can receive it. `None` → no
+    /// relay tap (existing behaviour unchanged).
+    relay: Option<Arc<MediaRelay>>,
 }
 
 impl WhipSession {
@@ -156,6 +169,7 @@ impl WhipSession {
                 rtc,
                 local_addr,
                 video_pts,
+                relay: None,
             },
             answer,
         ))
@@ -178,6 +192,20 @@ impl WhipSession {
     #[must_use]
     pub fn video_payload_types(&self) -> &[Pt] {
         &self.video_pts
+    }
+
+    /// Attach a [`MediaRelay`] so that every depacketized H.264 access unit is
+    /// also published to it (in addition to the [`MediaSink`]).
+    ///
+    /// This is purely additive — sessions without a relay behave exactly as
+    /// before. The relay is shared via `Arc` so the caller can keep a handle
+    /// to add subscribers at any time.
+    ///
+    /// Call before [`run`](Self::run) or [`run_to_hls`](Self::run_to_hls).
+    #[must_use]
+    pub fn with_relay(mut self, relay: Arc<MediaRelay>) -> Self {
+        self.relay = Some(relay);
+        self
     }
 
     /// Drive this session straight into HLS on disk under `stream_dir`.
@@ -272,6 +300,7 @@ impl WhipSession {
                                     ReorderBuffer::with_start(seq, DEFAULT_REORDER_WINDOW)
                                 });
                                 let video_pts = &self.video_pts;
+                                let relay_ref = self.relay.as_deref();
                                 rbuf.push(seq, pkt, &mut |_s, maybe_pkt| {
                                     if let Some(p) = maybe_pkt {
                                         // Packet delivered in order — depacketize.
@@ -281,6 +310,7 @@ impl WhipSession {
                                             &mut depacketizer,
                                             &mut au,
                                             &mut sink,
+                                            relay_ref,
                                         );
                                     } else {
                                         // Gap declared lost: reset depacketizer so a
@@ -329,18 +359,23 @@ impl WhipSession {
         }
     }
 
-    /// Route one in-order RTP packet to the depacketizer / sink.
+    /// Route one in-order RTP packet to the depacketizer / sink, and
+    /// optionally to a [`MediaRelay`] tap.
     ///
     /// This is extracted as a plain associated function (no `&self` receiver) so
     /// the reorder-buffer drain closure can call it while holding only a
     /// reference to `video_pts` — avoiding a conflicting `self` borrow in the
     /// closure.
+    ///
+    /// When `relay` is `Some`, every completed video access unit is also
+    /// published to it (additive — the sink path is unchanged).
     fn depacketize_rtp(
         video_pts: &[Pt],
         pkt: &RtpPacket,
         depacketizer: &mut H264Depacketizer,
         au: &mut BytesMut,
         sink: &mut impl MediaSink,
+        relay: Option<&MediaRelay>,
     ) {
         let pt = pkt.header.payload_type;
         let marker = pkt.header.marker;
@@ -358,6 +393,12 @@ impl WhipSession {
             if marker && !au.is_empty() {
                 let frame = au.split().freeze();
                 let pts_90k = media_time_to_90k(pkt.time);
+                // Optional relay tap: publish the AU to WHEP subscribers.
+                // Done before the sink call so the relay gets the data even if
+                // the sink errors.
+                if let Some(r) = relay {
+                    r.publish(frame.clone(), pts_90k);
+                }
                 if let Err(e) = sink.on_video_au(frame, pts_90k) {
                     warn!(error = %e, "whip: media sink rejected video AU");
                 }
