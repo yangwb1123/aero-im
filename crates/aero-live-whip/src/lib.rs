@@ -48,6 +48,7 @@
 pub mod depacketize;
 pub mod hls_sink;
 pub mod packetize;
+pub mod relay;
 pub mod reorder;
 pub mod session;
 pub mod whep;
@@ -64,6 +65,7 @@ use thiserror::Error;
 use ulid::Ulid;
 
 pub use hls_sink::{hls_sink, HlsSegment, HlsSegmentWriter, HlsSink, MediaSink};
+pub use relay::{MediaRelay, Subscription};
 pub use session::{SessionError, WhipSession};
 pub use whep::{accept_whep_offer, NalSource, WhepSession};
 
