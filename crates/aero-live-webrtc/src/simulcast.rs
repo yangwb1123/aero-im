@@ -356,6 +356,18 @@ impl LayerSelectorTable {
             .get_mut(&(subscriber, pub_mid.to_owned()))
             .map(|sel| sel.should_forward(rid, is_keyframe))
     }
+
+    /// Test helper: immutable access to the [`LayerSelector`] for a given pair.
+    /// Only compiled in `#[cfg(test)]` builds.
+    #[cfg(test)]
+    #[must_use]
+    pub fn selector_for(
+        &self,
+        subscriber: ParticipantId,
+        pub_mid: &str,
+    ) -> Option<&LayerSelector> {
+        self.selectors.get(&(subscriber, pub_mid.to_owned()))
+    }
 }
 
 #[cfg(test)]
