@@ -3,7 +3,7 @@
 AI-Native 即时通讯 + 直播平台,Rust 实现。
 
 - 设计:[`docs/specs/2026-05-22-aero-im-design.md`](docs/specs/2026-05-22-aero-im-design.md)
-- 状态:**P0–P11 全部就位**,媒体面协议栈深化(WHIP/WHEP + SFU 联播/RTCP + SRT 加密/可靠性)已实现并字节级单测(377 个单元测试通过,15 个 crate,约 28,700 行 Rust + Web)
+- 状态:**P0–P11 全部就位**,媒体面协议栈深化(WHIP/WHEP + SFU 联播/RTCP + SRT 加密/可靠性)已实现并字节级单测(394 个单元测试通过,15 个 crate,约 29,000 行 Rust + Web)
 
 ## 功能矩阵
 
@@ -179,7 +179,7 @@ ffmpeg -re -i sample.mp4 -c:v libx264 -c:a aac -f flv rtmp://localhost/live/<str
 
 ```bash
 cargo check --workspace          # 干净
-cargo test --workspace --lib     # 377 pass / 0 fail / 3 ignored(DB 集成)
+cargo test --workspace --lib     # 394 pass / 0 fail / 3 ignored(DB 集成)
 cargo build --bin aero-server    # 二进制成功
 cargo clippy -p aero-live-srt -p aero-live-webrtc -p aero-live-whip --all-targets  # 媒体面 crate 零告警
 # 注:`cargo clippy --workspace --all-targets` 在 aero-storage/aero-server 等既有 crate 下仍有 pedantic 告警(非本批次引入,待清理)
@@ -202,9 +202,9 @@ cargo clippy -p aero-live-srt -p aero-live-webrtc -p aero-live-whip --all-target
 | **P11** | 直播弹幕 + 虚拟礼物 + 观看人数 | ✅ |
 
 媒体面已落地(str0m 0.19,纯 Rust crypto),协议栈深化并尽可能字节级单测;剩余为需真实媒体链路/浏览器的端到端联调或传输回路接线:
-- WHIP/WHEP:H.264 解包/打包(FU-A/STAP-A)+ 重排序缓冲 + **RTP→.ts/.m3u8 字节级集成测试** + `WhepSession` egress(sendonly SDP 应答 + 打包)均已实现并单测;**待做** 浏览器 ICE/DTLS/SRTP 推/拉流联调、WHEP 媒体源接入服务端 `/whep` 路由
+- WHIP/WHEP:H.264 解包/打包(FU-A/STAP-A)+ 重排序缓冲 + **RTP→.ts/.m3u8 字节级集成测试** + `WhepSession` egress + **WHIP→WHEP 媒体中继(NAL 扇出)** + `/whep` 路由协商 sendonly SDP 均已实现并单测;**待做** 浏览器 ICE/DTLS/SRTP 推/拉流联调、中继接入实时 run loop
 - SFU:选择性转发 + RTP 重映射 + **Simulcast 分层选择 + RTCP PLI/FIR + H.264 关键帧检测** 已实现并单测;**待做** ICE/DTLS/SRTP 端到端、分层目标码率自适应(拥塞控制)
-- SRT:HSv5 握手 + 包编解码 + **AES-CTR 加密(KMREQ/KMRSP + RFC 3394)+ ACK/NAK 可靠性 + 控制包序列化** 已实现并单测;**待做** UDP 发送/重传回路接线、拥塞控制、真实 ffmpeg 推流联调
+- SRT:HSv5 握手 + 包编解码 + **AES-CTR 加密(KMREQ/KMRSP + RFC 3394)+ ACK/NAK 可靠性 + 控制包序列化 + 收发/重传 pump(`SrtSink` trait)** 已实现并单测;**待做** 绑定真实 UDP socket、拥塞控制、真实 ffmpeg 推流联调
 - (E2E/MLS 客户端为 spec 非目标,服务端透传 scaffold 已超出要求)
 
 ---
