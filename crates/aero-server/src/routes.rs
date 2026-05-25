@@ -7,7 +7,7 @@ use aero_common::{
     BlobId, Error as AeroError, FileKind, MessageId, ParticipantId, Result as AeroResult, RoomId,
     RoomKind, StreamProtocol,
 };
-use aero_live_whip::{accept_whip_offer, WhipError};
+use aero_live_whip::{accept_whep_offer, accept_whip_offer, SessionError, WhipError};
 use aero_storage::{blob::NewBlob, stream::NewStream};
 use axum::{
     extract::{Multipart, Path, Query, State},
@@ -1084,21 +1084,30 @@ async fn whip_delete(
 async fn whep_post(
     State(s): State<AppState>,
     Path(stream_id_str): Path<String>,
-    _sdp_offer: String,
+    sdp_offer: String,
 ) -> ApiResult<axum::response::Response> {
     use axum::http::{header, StatusCode};
     let stream_id = ulid::Ulid::from_str(&stream_id_str)
         .map_err(|e| AeroError::Invalid(format!("stream id: {e}")))?;
-    let resource = s
-        .whip
+    // A live publisher must exist for there to be anything to play back.
+    s.whip
         .get(stream_id)
         .ok_or_else(|| AeroError::NotFound("no live publisher".into()))?;
-    // P5 placeholder: return the *publisher's answer* SDP for clients to inspect.
-    // Real WHEP requires re-publishing the SFU side as sendonly — wired in P6.
+    // Negotiate a real WHEP *sendonly* SDP answer for the viewer's recvonly offer
+    // (str0m via `WhepSession`). NOTE: the WHIP->WHEP media relay — forwarding the
+    // publisher's RTP into this egress session — and browser playback are not yet
+    // wired; that path requires a live publisher + browser (absent from CI).
+    let answer = accept_whep_offer(&sdp_offer, &s.ingest_host, s.ingest_port).map_err(|e| match e {
+        SessionError::Offer(m) => AeroError::Invalid(format!("whep offer: {m}")),
+        SessionError::Addr(h, p) => {
+            AeroError::Internal(anyhow::anyhow!("whep egress addr {h}:{p}"))
+        }
+        other => AeroError::Internal(anyhow::anyhow!(other.to_string())),
+    })?;
     let resp = (
         StatusCode::CREATED,
         [(header::CONTENT_TYPE, "application/sdp")],
-        resource.answer_sdp,
+        answer,
     )
         .into_response();
     Ok(resp)
