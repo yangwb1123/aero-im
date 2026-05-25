@@ -50,6 +50,7 @@ pub mod hls_sink;
 pub mod packetize;
 pub mod reorder;
 pub mod session;
+pub mod whep;
 
 #[cfg(test)]
 pub(crate) mod testutil;
@@ -64,6 +65,7 @@ use ulid::Ulid;
 
 pub use hls_sink::{hls_sink, HlsSegment, HlsSegmentWriter, HlsSink, MediaSink};
 pub use session::{SessionError, WhipSession};
+pub use whep::{accept_whep_offer, NalSource, WhepSession};
 
 #[derive(Debug, Error)]
 pub enum WhipError {
