@@ -47,6 +47,7 @@
 pub mod control;
 pub mod crypto;
 pub mod protocol;
+pub mod pump;
 pub mod reliability;
 pub mod segmenter;
 
@@ -56,6 +57,7 @@ pub use crypto::{
     aes_key_unwrap, aes_key_wrap, pbkdf2_kek,
 };
 pub use protocol::{Handshake, HandshakeMachine, HsAction, HsState, SrtHeader};
+pub use pump::SrtSink;
 pub use reliability::{Action, ReliabilityState, RttEstimator, seq_diff, seq_lt, seq_next};
 pub use segmenter::{MpegTsSegmenter, SegmentEvent, TS_PACKET_SIZE, TS_SYNC_BYTE};
 
@@ -414,10 +416,14 @@ pub struct SrtSession {
     /// AES-CTR decryption context; `None` for unencrypted sessions.
     crypto: Option<SrtCrypto>,
     /// Receiver-side reliability state: tracks sequence numbers, emits NAK/ACK.
-    reliability: ReliabilityState,
+    /// `pub(crate)` so the sibling `pump` module can drive retransmits and
+    /// read/write the ACK interval in tests without exposing the field publicly.
+    pub(crate) reliability: ReliabilityState,
     /// Pending reliability actions (NAK/ACK/ACKACK) waiting to be drained by
     /// the caller and serialised onto the wire.
-    pending_actions: Vec<Action>,
+    /// `pub(crate)` so the `pump` module can push ACKACK/etc. actions that
+    /// arrive outside the normal `feed_packet` path (e.g. from `on_ack`).
+    pub(crate) pending_actions: Vec<Action>,
 }
 
 impl SrtSession {
