@@ -47,6 +47,8 @@
 
 pub mod depacketize;
 pub mod hls_sink;
+pub mod packetize;
+pub mod reorder;
 pub mod session;
 
 #[cfg(test)]
