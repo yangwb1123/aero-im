@@ -47,7 +47,7 @@ AI：Anthropic Messages `claude-sonnet-4-6`、Voyage 1024 维嵌入；无 key �
 ```bash
 make up                                    # 起 PG/Redis/NATS/Jaeger/MinIO
 make jwt-keys env                          # 生成 RS256 PEM + 写配置
-cargo run --bin aero-cli -- migrate        # 迁移，幂等（0001 IM · 0002 collab · 0003 MLS）
+cargo run --bin aero-cli -- migrate        # 迁移，幂等（0001 IM · 0002 collab · 0003 MLS · 0004 转写 · 0005 直播 · 0006 多租户 · 0007 审计）
 AERO__SERVER__BLOB_DIR=/tmp/aero/blobs AERO__SERVER__HLS_DIR=/tmp/aero/hls \
   cargo run --bin aero-server              # :3030 HTTP/WS，:1935 RTMP
 ```
@@ -56,7 +56,7 @@ AERO__SERVER__BLOB_DIR=/tmp/aero/blobs AERO__SERVER__HLS_DIR=/tmp/aero/hls \
 
 ```bash
 cargo check  --workspace                   # 干净
-cargo test   --workspace --lib             # 220 pass（最近一次绿：2026-05-24）
+cargo test   --workspace --lib             # 547 pass（最近一次绿：2026-05-29）；PG 门控测试用 `-- --ignored`（需 DATABASE_URL + 已迁移）
 cargo clippy --workspace --all-targets     # all+pedantic=warn，零新增警告
 ```
 
