@@ -14,7 +14,9 @@ use aero_storage::{
 };
 use axum::extract::FromRef;
 
+use crate::config::WsConfig;
 use crate::hub::Hub;
+use crate::rate_limit::RateLimiter;
 
 /// Type-erased handle to whatever AI backend is wired (or `None`).
 /// Concrete type lives in `aero-ai`; we route through this trait to keep the
@@ -70,6 +72,10 @@ pub struct AppState {
     pub presence: PresenceStore,
     pub bus: Arc<dyn EventBus>,
     pub hub: Arc<Hub>,
+    /// Per-connection WS back-pressure policy (bounded send-queue capacity etc.).
+    pub ws_config: WsConfig,
+    /// Per-client API rate limiter (in-memory token buckets).
+    pub rate_limiter: RateLimiter,
     /// Optional — only present when an Anthropic / Voyage API key is configured.
     pub ai: Option<Arc<dyn AiBackend>>,
     /// Public-facing base URL (used to render absolute ingest/playback URLs).
