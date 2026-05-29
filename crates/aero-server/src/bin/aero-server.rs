@@ -246,6 +246,51 @@ async fn main() -> anyhow::Result<()> {
             .and_then(|s| s.parse().ok())
             .unwrap_or(40000),
     };
+    // ---------- Message-retention sweep (ROADMAP 方向一 合规) ----------
+    // Periodically soft-delete messages whose workspace set a retention window
+    // and whose age exceeds it (per-workspace cutoff evaluated in one set-based
+    // UPDATE). Best-effort: errors are logged, never panic the server; the task
+    // exits on the shutdown token. Interval is configurable via
+    // `AERO__SERVER__RETENTION_SWEEP_SECS` (default 3600s = hourly); a value of 0
+    // disables the sweep entirely.
+    {
+        let workspaces = state.workspaces.clone();
+        let cancel = ai_shutdown.clone();
+        let sweep_secs = std::env::var("AERO__SERVER__RETENTION_SWEEP_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(3600);
+        if sweep_secs == 0 {
+            info!("retention sweep disabled (AERO__SERVER__RETENTION_SWEEP_SECS=0)");
+        } else {
+            info!(interval_secs = sweep_secs, "retention sweep enabled");
+            tokio::spawn(async move {
+                let mut tick =
+                    tokio::time::interval(std::time::Duration::from_secs(sweep_secs));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                // First tick fires immediately; skip it so startup isn't a sweep,
+                // then sweep on each subsequent interval until shutdown.
+                tick.tick().await;
+                loop {
+                    tokio::select! {
+                        () = cancel.cancelled() => {
+                            info!("retention sweep: shutdown signal received, exiting");
+                            break;
+                        }
+                        _ = tick.tick() => {
+                            let now = time::OffsetDateTime::now_utc();
+                            match workspaces.sweep_expired_messages(now).await {
+                                Ok(0) => {}
+                                Ok(n) => info!(swept = n, "retention sweep soft-deleted messages"),
+                                Err(e) => warn!(error = ?e, "retention sweep failed"),
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    }
+
     let _ = ai_shutdown; // keep token alive for the worker
 
     // ---------- DB pool saturation gauges (ROADMAP 方向四) ----------

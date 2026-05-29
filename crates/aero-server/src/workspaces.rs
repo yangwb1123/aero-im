@@ -26,7 +26,8 @@ use aero_common::{
     AuditId, Error as AeroError, ParticipantId, Result as AeroResult, WorkspaceId, WorkspaceRole,
 };
 use aero_storage::{
-    role_can_assign, role_can_invite, role_can_manage_member, role_can_remove, WorkspaceRepo,
+    role_can_assign, role_can_invite, role_can_manage_member, role_can_remove,
+    validate_retention_days, WorkspaceRepo,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -54,6 +55,8 @@ pub fn routes() -> Router<AppState> {
         .route("/api/workspaces/:id", axum::routing::delete(delete_workspace))
         // Owner-only full-tenant export (GDPR data portability).
         .route("/api/workspaces/:id/export", get(export_workspace))
+        // Admin/owner: set or clear the per-workspace message-retention window.
+        .route("/api/workspaces/:id/retention", axum::routing::put(set_retention))
         .route("/api/workspaces/:id/members", get(list_members).post(add_member))
         .route(
             "/api/workspaces/:id/members/:pid",
@@ -209,6 +212,22 @@ pub fn authorize_delete(caller: WorkspaceRole) -> AeroResult<()> {
         Ok(())
     } else {
         Err(AeroError::Forbidden("workspace deletion requires owner".into()))
+    }
+}
+
+/// May `caller` set the workspace's message-retention policy? **Admin/owner**
+/// (ROADMAP 方向一 合规 — 按组织的留存策略). Configuring retention is workspace
+/// administration (like managing members), not the owner-only destructive
+/// erasure of [`authorize_delete`] — so it gates on
+/// [`WorkspaceRole::can_administer`], the same bar as the audit trail.
+///
+/// # Errors
+/// [`AeroError::Forbidden`] for non-administrators (members / guests).
+pub fn authorize_set_retention(caller: WorkspaceRole) -> AeroResult<()> {
+    if caller.can_administer() {
+        Ok(())
+    } else {
+        Err(AeroError::Forbidden("setting retention requires admin".into()))
     }
 }
 
@@ -379,6 +398,48 @@ async fn delete_workspace(
     }
     // Durable erasure record outside the (now-deleted) tenant's audit trail.
     tracing::info!(%ws, actor = %auth.participant_id, "workspace.delete (erased)");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize)]
+struct SetRetentionReq {
+    /// Retention window in whole days, or `null` to clear the policy (keep
+    /// forever). A missing key is treated the same as `null`.
+    #[serde(default)]
+    days: Option<i32>,
+}
+
+/// `PUT /api/workspaces/:id/retention` — **admin/owner**: set (or, with
+/// `days: null`, clear) the workspace's message-retention window (ROADMAP 方向一
+/// 合规 — 按组织的留存策略). A `Some(n)` opts the tenant into having messages
+/// older than `n` days soft-deleted by the periodic sweep; `null` keeps messages
+/// forever. `n < 1` is rejected as `400 Invalid` (a zero/negative window would
+/// mark everything expired). Emits a `"workspace.retention_set"` audit event.
+async fn set_retention(
+    State(s): State<AppState>,
+    auth: AuthUser,
+    Path(id_str): Path<String>,
+    Json(req): Json<SetRetentionReq>,
+) -> ApiResult<StatusCode> {
+    let ws = parse_workspace_id(&id_str)?;
+    let caller = caller_role(&s.workspaces, ws, auth.participant_id).await?;
+    authorize_set_retention(caller)?;
+    // Reject a non-positive window before touching the DB (pure storage rule).
+    validate_retention_days(req.days)
+        .map_err(|n| AeroError::Invalid(format!("retention days must be >= 1, got {n}")))?;
+    s.workspaces
+        .set_retention(ws, req.days)
+        .await
+        .map_err(AeroError::from)?;
+    audit(
+        &s,
+        ws,
+        auth.participant_id,
+        "workspace.retention_set",
+        None,
+        serde_json::json!({ "days": req.days }),
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -582,6 +643,47 @@ mod tests {
         for r in ALL {
             assert_eq!(allowed(&authorize_export(r)), r.can_manage_workspace());
             assert_eq!(allowed(&authorize_delete(r)), r.can_manage_workspace());
+        }
+    }
+
+    // ----- authorize_set_retention (compliance, admin/owner-only) -----
+
+    #[test]
+    fn set_retention_is_admin_and_owner_only_over_all_roles() {
+        // Exhaustive over the 4 roles: admin + owner may set retention; member
+        // and guest may not. Unlike export/delete (owner-only), retention is a
+        // workspace-administration action, so admin qualifies too.
+        for r in ALL {
+            assert_eq!(
+                allowed(&authorize_set_retention(r)),
+                r.can_administer(),
+                "retention allowed only for admin/owner, role {r:?}"
+            );
+        }
+        assert!(allowed(&authorize_set_retention(WorkspaceRole::Owner)));
+        assert!(allowed(&authorize_set_retention(WorkspaceRole::Admin)));
+        assert!(!allowed(&authorize_set_retention(WorkspaceRole::Member)));
+        assert!(!allowed(&authorize_set_retention(WorkspaceRole::Guest)));
+    }
+
+    #[test]
+    fn set_retention_non_admin_denials_are_403() {
+        // Member and guest denials surface as 403 (authorization), not 400/404.
+        for r in [WorkspaceRole::Guest, WorkspaceRole::Member] {
+            assert_eq!(status_of(&authorize_set_retention(r)), 403, "role {r:?}");
+        }
+    }
+
+    #[test]
+    fn set_retention_matches_audit_view_gate() {
+        // Retention-set and audit-view share the same admin bar, so they must
+        // agree for every role (both are `can_administer`-gated).
+        for r in ALL {
+            assert_eq!(
+                allowed(&authorize_set_retention(r)),
+                allowed(&authorize_view_audit(r)),
+                "role {r:?}"
+            );
         }
     }
 
