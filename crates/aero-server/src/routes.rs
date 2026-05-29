@@ -1236,6 +1236,11 @@ async fn whip_post(
     s.whip
         .insert(resource.clone())
         .map_err(|_| AeroError::Conflict("publisher present".into()))?;
+    // Sticky routing (ROADMAP 方向二): advertise that THIS node now ingests the
+    // stream, so WHEP pulls landing on other nodes can be redirected here.
+    if let Err(e) = s.stream_routes.publish(stream.id, &s.public_base_url).await {
+        tracing::warn!(error=?e, stream=%stream.id, "stream route publish failed");
+    }
     let hls_path = format!("/hls/{}/index.m3u8", stream.id);
     if let Err(e) = s.streams.mark_live(stream.id, &hls_path).await {
         tracing::warn!(error=?e, "mark live failed");
@@ -1261,6 +1266,9 @@ async fn whip_delete(
     let stream_id = ulid::Ulid::from_str(&stream_id_str)
         .map_err(|e| AeroError::Invalid(format!("stream id: {e}")))?;
     s.whip.remove(stream_id);
+    if let Err(e) = s.stream_routes.unpublish(stream_id).await {
+        tracing::warn!(error=?e, stream=%stream_id, "stream route unpublish failed");
+    }
     if let Err(e) = s.streams.mark_ended(stream_id).await {
         tracing::warn!(error=?e, "mark ended failed");
     }
@@ -1275,10 +1283,29 @@ async fn whep_post(
     use axum::http::{header, StatusCode};
     let stream_id = ulid::Ulid::from_str(&stream_id_str)
         .map_err(|e| AeroError::Invalid(format!("stream id: {e}")))?;
-    // A live publisher must exist for there to be anything to play back.
-    s.whip
-        .get(stream_id)
-        .ok_or_else(|| AeroError::NotFound("no live publisher".into()))?;
+    // A live publisher must exist for there to be anything to play back. If it
+    // isn't on THIS node, the stream may be ingested elsewhere: sticky routing
+    // (ROADMAP 方向二) redirects the viewer to the owning node, so a stream
+    // ingested on node A is playable from node B without inter-node media relay.
+    if s.whip.get(stream_id).is_none() {
+        let located = s
+            .stream_routes
+            .locate(stream_id)
+            .await
+            .map_err(|e| AeroError::Internal(anyhow::anyhow!("stream route lookup: {e}")))?;
+        if let Some(home) = aero_storage::redirect_base(&s.public_base_url, located.as_deref()) {
+            use axum::http::{header, HeaderValue};
+            let target = format!("{}/whep/{}", home.trim_end_matches('/'), stream_id);
+            let mut resp = StatusCode::TEMPORARY_REDIRECT.into_response();
+            resp.headers_mut().insert(
+                header::LOCATION,
+                HeaderValue::from_str(&target)
+                    .map_err(|e| AeroError::Internal(anyhow::anyhow!("redirect target: {e}")))?,
+            );
+            return Ok(resp);
+        }
+        return Err(AeroError::NotFound("no live publisher".into()).into());
+    }
     // Negotiate a real WHEP *sendonly* SDP answer for the viewer's recvonly offer
     // (str0m via `WhepSession`). NOTE: the WHIP->WHEP media relay — forwarding the
     // publisher's RTP into this egress session — and browser playback are not yet

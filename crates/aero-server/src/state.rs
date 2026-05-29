@@ -11,7 +11,7 @@ use crate::live::LiveService;
 use aero_storage::{
     AiJobRepo, AuditRepo, BlobRepo, BlobStore, CallRepo, CallRosterStore, KeyPackageRepo,
     MessageRepo, MlsGroupRepo, ParticipantRepo, PresenceStore, ReactionRepo, ReceiptRepo, RoomRepo,
-    StreamRepo, StreamViewerStore, WorkspaceRepo,
+    StreamRepo, StreamRouteRegistry, StreamViewerStore, WorkspaceRepo,
 };
 use axum::extract::FromRef;
 
@@ -87,6 +87,10 @@ pub struct AppState {
     /// nodes (ROADMAP 方向二). The local [`Hub`] still tracks the roster for
     /// per-process mesh delivery.
     pub call_roster: CallRosterStore,
+    /// Cross-node stream routing: `stream_id -> ingesting node's base URL`
+    /// (Redis, TTL). Lets a WHEP pull on a node that isn't ingesting the stream
+    /// redirect the client to the node that is — sticky routing (ROADMAP 方向二).
+    pub stream_routes: StreamRouteRegistry,
     pub bus: Arc<dyn EventBus>,
     pub hub: Arc<Hub>,
     /// Per-connection WS back-pressure policy (bounded send-queue capacity etc.).
