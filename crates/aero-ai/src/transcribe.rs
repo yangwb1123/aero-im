@@ -2,7 +2,7 @@
 //! get a `transcript` field after persistence.
 //!
 //! Two impls:
-//! - [`WhisperTranscriber`] — POSTs to OpenAI's `/v1/audio/transcriptions`
+//! - [`WhisperTranscriber`] — POSTs to `OpenAI`'s `/v1/audio/transcriptions`
 //!   (model `whisper-1`) when `OPENAI_API_KEY` is set.
 //! - [`StubTranscriber`] — returns a placeholder string when no key is
 //!   configured, so dev paths still flow without remote calls.
