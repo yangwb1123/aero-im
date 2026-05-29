@@ -25,9 +25,9 @@ use aero_server::{
     ws,
 };
 use aero_storage::{
-    connect_pg, migrate, AiJobRepo, BlobRepo, CallRepo, KeyPackageRepo, LiveRepo, LocalFsBlobStore,
-    MessageRepo, MlsGroupRepo, ParticipantRepo, PresenceStore, ReactionRepo, ReceiptRepo,
-    RedisCache, RoomRepo, StreamRepo, WorkspaceRepo,
+    connect_pg, migrate, AiJobRepo, BlobRepo, CallRepo, CallRosterStore, KeyPackageRepo, LiveRepo,
+    LocalFsBlobStore, MessageRepo, MlsGroupRepo, ParticipantRepo, PresenceStore, ReactionRepo,
+    ReceiptRepo, RedisCache, RoomRepo, StreamRepo, StreamViewerStore, WorkspaceRepo,
 };
 use tokio_util::sync::CancellationToken;
 use anyhow::Context;
@@ -77,6 +77,11 @@ async fn main() -> anyhow::Result<()> {
     let key_packages = KeyPackageRepo::new(pg.clone());
     let mls_groups = MlsGroupRepo::new(pg.clone());
     let presence = PresenceStore::new(cache.client().clone());
+    // Cross-node live presence (ROADMAP 方向二/五): viewer counts + call rosters
+    // live in Redis (sorted-set-with-heartbeat) so multi-node audiences/calls are
+    // counted once cluster-wide, sharing the same Redis client as `PresenceStore`.
+    let stream_viewers = StreamViewerStore::new(cache.client().clone());
+    let call_roster = CallRosterStore::new(cache.client().clone());
 
     // ---------- Blob storage ----------
     let blob_root = std::path::PathBuf::from(&cfg.server.blob_dir);
@@ -213,6 +218,8 @@ async fn main() -> anyhow::Result<()> {
         key_packages,
         mls_groups,
         presence,
+        stream_viewers,
+        call_roster,
         bus: bus_dyn,
         hub,
         ws_config: ws_cfg,
