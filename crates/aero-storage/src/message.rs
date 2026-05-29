@@ -210,6 +210,41 @@ impl MessageRepo {
         Ok(rows.into_iter().map(Message::from).collect())
     }
 
+    /// Fetch up to `limit` messages in a room STRICTLY AFTER the `after` cursor,
+    /// in ascending `(created_at, id)` order.
+    ///
+    /// This is the forward complement to [`Self::list_recent`] (which pages
+    /// backward via `before`). A reconnecting client passes its last-seen
+    /// message id as `after` to catch up, in chronological order, on whatever it
+    /// missed while disconnected (ROADMAP 方向五: 断线重连补偿).
+    ///
+    /// Because [`MessageId`] is a time-sortable ULID stored as a UUID, ordering
+    /// by `id` is equivalent to ordering by `(created_at, id)` and the keyset
+    /// predicate `id > $cursor` is a stable, index-friendly forward cursor —
+    /// the exact mirror of `list_recent`'s `id < $cursor` / `ORDER BY id DESC`.
+    pub async fn list_since(
+        &self,
+        room: RoomId,
+        after: MessageId,
+        limit: i64,
+    ) -> Result<Vec<Message>, sqlx::Error> {
+        let limit = clamp_page_limit(limit);
+        let rows = sqlx::query_as::<_, MessageRow>(
+            r"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at
+               FROM messages
+               WHERE room_id = $1 AND id > $2 AND deleted_at IS NULL
+               ORDER BY id ASC
+               LIMIT $3",
+        )
+        .bind(room.to_uuid())
+        .bind(after.to_uuid())
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.into_iter().map(Message::from).collect())
+    }
+
     /// Find messages in a room missing an embedding. Used by the embedding worker
     /// at startup to catch up on backlog before the live queue takes over.
     pub async fn list_without_embedding(&self, limit: i64) -> Result<Vec<Message>, sqlx::Error> {
@@ -303,6 +338,15 @@ fn searchable_of(blocks: &[Block]) -> String {
         .join("\n")
 }
 
+/// Clamp a caller-supplied page size into the safe `[1, 200]` window used by
+/// the keyset pagination queries ([`MessageRepo::list_since`]), matching the
+/// bound `list_recent` applies inline. Factored out so the cursor/ordering
+/// contract is unit-testable without a live database.
+#[inline]
+fn clamp_page_limit(limit: i64) -> i64 {
+    limit.clamp(1, 200)
+}
+
 #[derive(sqlx::FromRow)]
 struct MessageRow {
     id: uuid::Uuid,
@@ -343,5 +387,49 @@ struct ScoredMessageRow {
 impl From<ScoredMessageRow> for SearchHit {
     fn from(r: ScoredMessageRow) -> Self {
         Self { message: Message::from(r.msg), score: r.score }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clamp_page_limit;
+    use aero_common::MessageId;
+    use ulid::Ulid;
+
+    #[test]
+    fn page_limit_is_clamped_into_window() {
+        // Below the floor clamps up to 1; zero and negatives are never honored.
+        assert_eq!(clamp_page_limit(0), 1);
+        assert_eq!(clamp_page_limit(-50), 1);
+        assert_eq!(clamp_page_limit(1), 1);
+        // In-window values pass through untouched.
+        assert_eq!(clamp_page_limit(50), 50);
+        assert_eq!(clamp_page_limit(200), 200);
+        // Above the ceiling clamps down to 200, matching `list_recent`.
+        assert_eq!(clamp_page_limit(201), 200);
+        assert_eq!(clamp_page_limit(i64::MAX), 200);
+    }
+
+    /// The `list_since` keyset cursor relies on `MessageId` (a time-sortable
+    /// ULID) ordering by `id` being equivalent to chronological order, so that
+    /// `WHERE id > $after ORDER BY id ASC` returns exactly the messages created
+    /// strictly after the cursor, oldest-first. Verify that ordering contract
+    /// without a database: ULIDs minted with increasing timestamps sort by id.
+    #[test]
+    fn message_id_ordering_is_chronological() {
+        // Three ids with strictly increasing timestamp components.
+        let a = MessageId::from_ulid(Ulid::from_parts(1_000, 0));
+        let b = MessageId::from_ulid(Ulid::from_parts(2_000, 0));
+        let c = MessageId::from_ulid(Ulid::from_parts(3_000, 0));
+
+        // Ascending by id == ascending by creation time.
+        assert!(a < b && b < c);
+
+        // "Strictly after cursor `a`" excludes `a` and includes later ids, the
+        // forward complement of list_recent's `id < before`.
+        let after = a;
+        let mut got: Vec<MessageId> = [a, b, c].into_iter().filter(|m| *m > after).collect();
+        got.sort();
+        assert_eq!(got, vec![b, c]);
     }
 }
