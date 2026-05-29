@@ -9,8 +9,9 @@ use aero_live_whip::WhipRegistry;
 
 use crate::live::LiveService;
 use aero_storage::{
-    AiJobRepo, BlobRepo, BlobStore, CallRepo, KeyPackageRepo, MessageRepo, MlsGroupRepo,
-    ParticipantRepo, PresenceStore, ReactionRepo, ReceiptRepo, RoomRepo, StreamRepo, WorkspaceRepo,
+    AiJobRepo, BlobRepo, BlobStore, CallRepo, CallRosterStore, KeyPackageRepo, MessageRepo,
+    MlsGroupRepo, ParticipantRepo, PresenceStore, ReactionRepo, ReceiptRepo, RoomRepo, StreamRepo,
+    StreamViewerStore, WorkspaceRepo,
 };
 use axum::extract::FromRef;
 
@@ -74,6 +75,16 @@ pub struct AppState {
     pub key_packages: KeyPackageRepo,
     pub mls_groups: MlsGroupRepo,
     pub presence: PresenceStore,
+    /// Cluster-correct live-stream viewer set (Redis sorted-set-with-heartbeat).
+    /// Authoritative source of the viewer COUNT broadcast in [`aero_common::StreamEvent::Viewers`]
+    /// so audiences spread across nodes are not each counted locally (ROADMAP 方向二/五).
+    /// The local [`Hub`] still tracks watchers for per-process event fan-out.
+    pub stream_viewers: StreamViewerStore,
+    /// Cluster-correct group-call roster (Redis). Authoritative source of the
+    /// roster/count reported to clients so a multi-node call is consistent across
+    /// nodes (ROADMAP 方向二). The local [`Hub`] still tracks the roster for
+    /// per-process mesh delivery.
+    pub call_roster: CallRosterStore,
     pub bus: Arc<dyn EventBus>,
     pub hub: Arc<Hub>,
     /// Per-connection WS back-pressure policy (bounded send-queue capacity etc.).

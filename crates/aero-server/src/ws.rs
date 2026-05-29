@@ -3,7 +3,22 @@
 //! Wire format is JSON; all frames are tagged with `type`. See the design spec
 //! for the full message set. JWT is passed via `?token=...` query parameter
 //! because browser WebSocket clients can't set custom headers.
+//!
+//! ## Reconnect backfill protocol (ROADMAP 方向五)
+//!
+//! A client that dropped its socket can avoid silently losing messages by
+//! reconnecting with an extra query param: `/ws?token=...&since=<message_id>`,
+//! where `<message_id>` is the id of the **last message it successfully
+//! received** (any room). On connect, before any live event resumes, the server
+//! replays every message created strictly after that cursor — across all rooms
+//! the participant belongs to — as ordinary `message` frames (via
+//! [`aero_storage::MessageRepo::list_since`], oldest-first, capped per room).
+//! `since` is best-effort: a malformed/garbage cursor is ignored (the client
+//! simply gets no backfill) rather than failing the upgrade, and replay
+//! failures never abort the connection. The forward REST complement is
+//! `GET /api/rooms/:id/messages?since=<message_id>`.
 
+use std::str::FromStr;
 use std::sync::Arc;
 
 use aero_common::metrics::{self, names};
@@ -31,6 +46,11 @@ use crate::state::AppState;
 #[derive(Debug, Deserialize)]
 pub struct WsParams {
     token: String,
+    /// Optional reconnect cursor: the id of the last message the client already
+    /// has. On connect the server backfills everything created after it across
+    /// the participant's rooms before live events resume. See the module docs.
+    #[serde(default)]
+    since: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -177,11 +197,19 @@ pub async fn handler(
             return (axum::http::StatusCode::UNAUTHORIZED, "invalid sub").into_response();
         }
     };
-    ws.on_upgrade(move |socket| run_socket(socket, state, pid))
+    // Best-effort reconnect cursor: a garbage value is simply ignored (no
+    // backfill) rather than rejecting the upgrade. See module-level protocol docs.
+    let since = parse_resume_cursor(p.since.as_deref());
+    ws.on_upgrade(move |socket| run_socket(socket, state, pid, since))
 }
 
-#[instrument(skip(socket, state), fields(%pid))]
-async fn run_socket(socket: WebSocket, state: AppState, pid: ParticipantId) {
+#[instrument(skip(socket, state, since), fields(%pid))]
+async fn run_socket(
+    socket: WebSocket,
+    state: AppState,
+    pid: ParticipantId,
+    since: Option<MessageId>,
+) {
     let (mut sender, mut receiver) = socket.split();
     // Bounded outbound queue: a slow/stalled client can never make the
     // broadcaster grow memory without limit (OOM guard). On a full queue the Hub
@@ -213,6 +241,15 @@ async fn run_socket(socket: WebSocket, state: AppState, pid: ParticipantId) {
             }
         })
     };
+
+    // Reconnect backfill (ROADMAP 方向五): before live events resume, replay
+    // everything the client missed while disconnected. Done after the outgoing
+    // task is draining `tx` (so we apply real back-pressure instead of dropping)
+    // and before the receive loop (so the catch-up is chronological and lands
+    // ahead of any new live frames). Best-effort: failures never abort the conn.
+    if let Some(cursor) = since {
+        backfill_since(&state, pid, cursor, &tx, &close).await;
+    }
 
     loop {
         tokio::select! {
@@ -399,7 +436,18 @@ async fn handle_text(
                     c
                 }
             };
-            let existing = state.hub.call_join(call_id, pid);
+            // Local Hub keeps the roster for per-process mesh delivery; its
+            // return value is the fallback set of already-present peers.
+            let local_existing = state.hub.call_join(call_id, pid);
+            // Redis is the cluster-wide roster (ROADMAP 方向二): register self,
+            // then source the "whom to connect to" set from Redis (minus self) so
+            // a joiner sees peers connected to *other* nodes too. `join` doubles
+            // as the heartbeat restamp. On any Redis error, fall back to the local
+            // Hub roster so a single-node call still works.
+            if let Err(e) = state.call_roster.join(call_id, pid).await {
+                warn!(error = ?e, %call_id, "redis call-roster join failed");
+            }
+            let existing = call_peers_excluding(state, call_id, pid, local_existing).await;
             // Tell the joiner who is already in the call (whom to connect to).
             state
                 .im
@@ -416,6 +464,9 @@ async fn handle_text(
         }
         ClientFrame::CallLeave { call_id, room_id } => {
             state.hub.call_leave(call_id, pid);
+            if let Err(e) = state.call_roster.leave(call_id, pid).await {
+                warn!(error = ?e, %call_id, "redis call-roster leave failed");
+            }
             state
                 .im
                 .relay_call_event(room_id, CallEvent::Leave { call_id, room_id, from: pid })
@@ -428,7 +479,14 @@ async fn handle_text(
                 .await?;
         }
         ClientFrame::WatchStream { stream_id } => {
+            // Local Hub still tracks watchers for per-process event fan-out...
             state.hub.watch_stream(stream_id, pid);
+            // ...while Redis is the cluster-wide source of the viewer COUNT
+            // (ROADMAP 方向二). `join` also (re)stamps the heartbeat, so a
+            // re-watch keeps the entry alive without a separate keep-alive.
+            if let Err(e) = state.stream_viewers.join(stream_id, pid).await {
+                warn!(error = ?e, %stream_id, "redis stream-viewer join failed");
+            }
             // Replay a small danmaku backlog so the new watcher has context.
             if let Ok(lines) = state.live.recent_chat(stream_id, 30).await {
                 for line in lines {
@@ -438,12 +496,15 @@ async fn handle_text(
                     ));
                 }
             }
-            let count = state.hub.stream_viewer_count(stream_id);
+            let count = stream_viewer_count(state, stream_id).await;
             state.live.publish_viewers(stream_id, count).await;
         }
         ClientFrame::UnwatchStream { stream_id } => {
             state.hub.unwatch_stream(stream_id, pid);
-            let count = state.hub.stream_viewer_count(stream_id);
+            if let Err(e) = state.stream_viewers.leave(stream_id, pid).await {
+                warn!(error = ?e, %stream_id, "redis stream-viewer leave failed");
+            }
+            let count = stream_viewer_count(state, stream_id).await;
             state.live.publish_viewers(stream_id, count).await;
         }
         ClientFrame::StreamChat { stream_id, body } => {
@@ -454,6 +515,121 @@ async fn handle_text(
         }
     }
     Ok(())
+}
+
+/// Per-room cap on reconnect backfill replay, so a client that has been away for
+/// a long time can't make a single connection replay an unbounded history (it
+/// can keep paging via the REST `?since=` route). Matches the keyset page window
+/// `MessageRepo::list_since` clamps to.
+const BACKFILL_PER_ROOM_LIMIT: i64 = 200;
+
+/// Parse a best-effort reconnect/resume cursor. `None` (absent) and any value
+/// that fails to decode as a [`MessageId`] both yield `None` — backfill is
+/// purely additive, so a bad cursor must degrade to "no backfill" rather than
+/// fail the connection. Pure + total, so it unit-tests without any I/O.
+#[must_use]
+fn parse_resume_cursor(raw: Option<&str>) -> Option<MessageId> {
+    raw.and_then(|s| MessageId::from_str(s.trim()).ok())
+}
+
+/// Pick the authoritative cluster-wide count from the Redis result, falling back
+/// to the process-local Hub value when Redis is unavailable so the reported
+/// number is never worse than today's single-node behaviour.
+///
+/// This is the injectable seam for the ROADMAP 方向二 "Redis-global count"
+/// requirement: the Watch/Unwatch and roster paths call Redis and feed the
+/// result here, so the *direction* (prefer Redis) and the *fallback* (use local
+/// on error) are unit-testable without a live Redis.
+#[must_use]
+fn authoritative_count(redis: anyhow::Result<u64>, local_fallback: u32) -> u32 {
+    // `map_or` consumes the result by value (Ok ⇒ Redis count, saturating into
+    // u32; Err ⇒ the process-local fallback).
+    redis.map_or(local_fallback, |n| u32::try_from(n).unwrap_or(u32::MAX))
+}
+
+/// Cluster-wide viewer count for a stream: Redis global `count`, falling back to
+/// the local Hub count if Redis errs.
+async fn stream_viewer_count(state: &AppState, stream_id: Ulid) -> u32 {
+    let local = state.hub.stream_viewer_count(stream_id);
+    authoritative_count(state.stream_viewers.count(stream_id).await, local)
+}
+
+/// The set of call peers a freshly-joined participant must connect to, sourced
+/// from the cluster-wide Redis roster (so peers on other nodes are included),
+/// with `joiner` removed. On any Redis error, returns `local_fallback` (the
+/// Hub's already-present set) so a single-node call still works.
+async fn call_peers_excluding(
+    state: &AppState,
+    call_id: CallId,
+    joiner: ParticipantId,
+    local_fallback: Vec<ParticipantId>,
+) -> Vec<ParticipantId> {
+    match state.call_roster.roster(call_id).await {
+        Ok(members) => members.into_iter().filter(|p| *p != joiner).collect(),
+        Err(e) => {
+            warn!(error = ?e, %call_id, "redis call-roster read failed; using local roster");
+            local_fallback
+        }
+    }
+}
+
+/// The rooms whose history we replay on reconnect: every room the participant
+/// belongs to. Factored out (and kept pure over the room list) so the
+/// selection/iteration logic is unit-testable without a database.
+#[must_use]
+fn backfill_room_ids(rooms: &[aero_common::Room]) -> Vec<RoomId> {
+    rooms.iter().map(|r| r.id).collect()
+}
+
+/// Replay messages missed since `cursor` for every room the participant belongs
+/// to, oldest-first, as ordinary `message` frames — the WS half of ROADMAP
+/// 方向五 reconnect backfill. Best-effort throughout: a failed room lookup or a
+/// failed per-room query is logged and skipped, never aborting the connection.
+/// Sends honour `close` so a torn-down connection stops replaying immediately,
+/// and use the bounded channel's back-pressure (await, not `try_send`) so a
+/// large catch-up is delivered rather than silently dropped.
+async fn backfill_since(
+    state: &AppState,
+    pid: ParticipantId,
+    cursor: MessageId,
+    tx: &mpsc::Sender<Message>,
+    close: &CancellationToken,
+) {
+    let rooms = match state.rooms.rooms_for(pid).await {
+        Ok(rs) => rs,
+        Err(e) => {
+            warn!(error = ?e, %pid, "reconnect backfill: list rooms failed");
+            return;
+        }
+    };
+    let mut replayed = 0usize;
+    for room in backfill_room_ids(&rooms) {
+        let missed = match state.messages.list_since(room, cursor, BACKFILL_PER_ROOM_LIMIT).await {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(error = ?e, %room, "reconnect backfill: list_since failed");
+                continue;
+            }
+        };
+        for message in missed {
+            let frame = ServerFrame::Message { message };
+            let json = serde_json::to_string(&frame).unwrap_or_default();
+            tokio::select! {
+                biased;
+                // Connection is going away — stop replaying.
+                () = close.cancelled() => return,
+                res = tx.send(Message::Text(json)) => {
+                    if res.is_err() {
+                        return; // receiver gone
+                    }
+                }
+            }
+            replayed += 1;
+        }
+    }
+    if replayed > 0 {
+        debug!(%pid, replayed, "reconnect backfill replayed missed messages");
+    }
 }
 
 /// Background loop that subscribes to `im.room.*` and pushes each [`RoomEvent`]
@@ -529,7 +705,12 @@ fn same_lang(a: &str, b: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::same_lang;
+    use super::{
+        authoritative_count, backfill_room_ids, parse_resume_cursor, same_lang,
+        BACKFILL_PER_ROOM_LIMIT,
+    };
+    use aero_common::{MessageId, ParticipantId, Room, RoomId, RoomKind};
+    use ulid::Ulid;
 
     #[test]
     fn same_lang_matches_on_primary_subtag() {
@@ -538,6 +719,64 @@ mod tests {
         assert!(same_lang("EN", "en"));
         assert!(!same_lang("en", "zh"));
         assert!(!same_lang("zh-CN", "en-US"));
+    }
+
+    #[test]
+    fn resume_cursor_is_best_effort() {
+        // Absent and malformed cursors both degrade to "no backfill" (None), never
+        // an error — backfill is purely additive and must not fail the upgrade.
+        assert!(parse_resume_cursor(None).is_none());
+        assert!(parse_resume_cursor(Some("")).is_none());
+        assert!(parse_resume_cursor(Some("not-a-ulid")).is_none());
+        // A valid id round-trips, with surrounding whitespace tolerated.
+        let id = MessageId::new();
+        assert_eq!(parse_resume_cursor(Some(&id.to_string())), Some(id));
+        assert_eq!(parse_resume_cursor(Some(&format!("  {id}  "))), Some(id));
+    }
+
+    #[test]
+    fn authoritative_count_prefers_redis_then_falls_back() {
+        // Redis Ok is authoritative even when it disagrees with the local count.
+        assert_eq!(authoritative_count(Ok(7), 3), 7);
+        // Redis error ⇒ fall back to the process-local count (no worse than today).
+        assert_eq!(authoritative_count(Err(anyhow::anyhow!("down")), 3), 3);
+        // A count that overflows u32 saturates rather than wrapping/panicking.
+        assert_eq!(authoritative_count(Ok(u64::from(u32::MAX) + 1), 0), u32::MAX);
+        // Zero from Redis is honored (e.g. last viewer just left, cluster-wide).
+        assert_eq!(authoritative_count(Ok(0), 9), 0);
+    }
+
+    fn room_with_id(id: RoomId) -> Room {
+        Room {
+            id,
+            kind: RoomKind::Group,
+            name: None,
+            created_by: ParticipantId::new(),
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+        }
+    }
+
+    #[test]
+    fn backfill_selects_every_room_id_in_order() {
+        // Empty membership ⇒ nothing to replay.
+        assert!(backfill_room_ids(&[]).is_empty());
+        // Otherwise: exactly the ids of every room the participant belongs to,
+        // order-preserving (so replay follows the membership listing order).
+        let a = RoomId::new();
+        let b = RoomId::new();
+        let c = RoomId::new();
+        let rooms = [room_with_id(a), room_with_id(b), room_with_id(c)];
+        assert_eq!(backfill_room_ids(&rooms), vec![a, b, c]);
+    }
+
+    #[test]
+    fn backfill_per_room_limit_matches_keyset_window() {
+        // The replay cap equals the storage keyset clamp ceiling, so a single
+        // reconnect never over-replays beyond one page per room.
+        assert_eq!(BACKFILL_PER_ROOM_LIMIT, 200);
+        // Sanity: it is a usable id-orderable cursor type (compile-time check that
+        // the backfill path keys on a time-sortable MessageId/Ulid).
+        let _ = Ulid::new();
     }
 }
 

@@ -319,8 +319,35 @@ async fn add_member(
 
 #[derive(Deserialize)]
 struct HistoryQuery {
+    /// Backward keyset cursor (exclusive): page toward older messages.
     before: Option<String>,
+    /// Forward keyset cursor (exclusive): catch up on messages created AFTER this
+    /// id, ascending — the reconnect-backfill complement of `before`
+    /// (ROADMAP 方向五). Mutually exclusive with `before`.
+    since: Option<String>,
     limit: Option<i64>,
+}
+
+/// Default history page size when the client omits `limit`.
+const DEFAULT_HISTORY_LIMIT: i64 = 100;
+/// Hard ceiling on a history page, mirroring the clamp the storage keyset
+/// queries (`list_recent` / `list_since`) apply. Applied here too so the cap is
+/// validated at the edge and unit-testable without a database.
+const MAX_HISTORY_LIMIT: i64 = 200;
+
+/// Resolve the effective page size: default when absent, clamped into
+/// `[1, MAX_HISTORY_LIMIT]`. Pure, so the cap/floor is unit-tested offline.
+#[must_use]
+fn history_limit(requested: Option<i64>) -> i64 {
+    requested.unwrap_or(DEFAULT_HISTORY_LIMIT).clamp(1, MAX_HISTORY_LIMIT)
+}
+
+/// Parse an optional `MessageId` cursor query param, mapping a decode failure to
+/// an `Invalid` API error tagged with `field` (e.g. `"before"` / `"since"`).
+fn parse_cursor(raw: Option<&str>, field: &str) -> AeroResult<Option<MessageId>> {
+    raw.map(|s| MessageId::from_str(s.trim()))
+        .transpose()
+        .map_err(|e| AeroError::Invalid(format!("{field} id: {e}")))
 }
 
 async fn room_history(
@@ -330,13 +357,25 @@ async fn room_history(
     Query(q): Query<HistoryQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let room = parse_room_id(&room_str)?;
-    let before = q
-        .before
-        .as_deref()
-        .map(MessageId::from_str)
-        .transpose()
-        .map_err(|e| AeroError::Invalid(format!("before id: {e}")))?;
-    let limit = q.limit.unwrap_or(100);
+    let limit = history_limit(q.limit);
+    // `before` pages backward, `since` pages forward — combining them is
+    // ambiguous, so reject rather than silently pick one.
+    if q.before.is_some() && q.since.is_some() {
+        return Err(AeroError::Invalid("before and since are mutually exclusive".into()).into());
+    }
+    let since = parse_cursor(q.since.as_deref(), "since")?;
+
+    if let Some(after) = since {
+        // Forward catch-up (ROADMAP 方向五). `ImService::history` only exposes the
+        // backward path, so authorize here exactly as it does, then read forward.
+        if !s.rooms.is_member(room, auth.participant_id).await.map_err(AeroError::from)? {
+            return Err(AeroError::Forbidden("not a member".into()).into());
+        }
+        let msgs = s.messages.list_since(room, after, limit).await.map_err(AeroError::from)?;
+        return Ok(Json(serde_json::to_value(msgs).map_err(AeroError::from)?));
+    }
+
+    let before = parse_cursor(q.before.as_deref(), "before")?;
     let msgs = s.im.history(auth.participant_id, room, before, limit).await?;
     Ok(Json(serde_json::to_value(msgs).map_err(AeroError::from)?))
 }
@@ -1278,5 +1317,77 @@ mod tests {
         let bytes = axum::body::to_bytes(resp.into_body(), 1 << 16).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["status"], "ok");
+    }
+
+    #[test]
+    fn history_limit_defaults_and_clamps() {
+        // Absent ⇒ the documented default page size.
+        assert_eq!(history_limit(None), DEFAULT_HISTORY_LIMIT);
+        // Below the floor clamps up to 1; zero/negatives are never honored.
+        assert_eq!(history_limit(Some(0)), 1);
+        assert_eq!(history_limit(Some(-10)), 1);
+        // In-window values pass through.
+        assert_eq!(history_limit(Some(50)), 50);
+        assert_eq!(history_limit(Some(MAX_HISTORY_LIMIT)), MAX_HISTORY_LIMIT);
+        // Above the ceiling clamps down to the cap (mirrors the storage clamp).
+        assert_eq!(history_limit(Some(MAX_HISTORY_LIMIT + 1)), MAX_HISTORY_LIMIT);
+        assert_eq!(history_limit(Some(i64::MAX)), MAX_HISTORY_LIMIT);
+    }
+
+    #[test]
+    fn parse_cursor_validates_and_labels() {
+        // Absent ⇒ Ok(None).
+        assert!(parse_cursor(None, "since").unwrap().is_none());
+        // Valid id ⇒ Some(id), whitespace tolerated.
+        let id = MessageId::new();
+        assert_eq!(parse_cursor(Some(&id.to_string()), "since").unwrap(), Some(id));
+        assert_eq!(parse_cursor(Some(&format!(" {id} ")), "before").unwrap(), Some(id));
+        // Garbage ⇒ Invalid error carrying the field label so the client knows
+        // which cursor was bad.
+        let err = parse_cursor(Some("nope"), "since").unwrap_err();
+        match err {
+            AeroError::Invalid(msg) => assert!(msg.contains("since id"), "got: {msg}"),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    /// Router-level test that the history route path + `HistoryQuery` extractor
+    /// accept the `?since=` (and `before`/`limit`) params offline. Mounts the
+    /// real path pattern and the real `HistoryQuery` type on a stand-in handler
+    /// (the production handler needs a full `AppState` → PG/Redis, absent in CI),
+    /// so this proves routing + query extraction without external deps.
+    #[tokio::test]
+    async fn history_route_accepts_since_query() {
+        async fn probe(
+            Path(room): Path<String>,
+            Query(q): Query<HistoryQuery>,
+        ) -> Json<serde_json::Value> {
+            Json(serde_json::json!({
+                "room": room,
+                "since": q.since,
+                "before": q.before,
+                "limit": q.limit,
+            }))
+        }
+        let app: Router =
+            Router::new().route("/api/rooms/:id/messages", get(probe));
+
+        let id = MessageId::new();
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri(format!("/api/rooms/room-1/messages?since={id}&limit=50"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // 200 (not 404/400) proves the path matched and `since` deserialized.
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 16).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["since"], id.to_string());
+        assert_eq!(v["limit"], 50);
+        assert!(v["before"].is_null());
     }
 }
