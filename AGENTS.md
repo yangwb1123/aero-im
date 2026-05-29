@@ -56,7 +56,7 @@ AERO__SERVER__BLOB_DIR=/tmp/aero/blobs AERO__SERVER__HLS_DIR=/tmp/aero/hls \
 
 ```bash
 cargo check  --workspace                   # 干净
-cargo test   --workspace --lib             # 550 pass（最近一次绿：2026-05-29）；PG 门控测试用 `-- --ignored`（需 DATABASE_URL + 已迁移）
+cargo test   --workspace --lib             # 576 pass（最近一次绿：2026-05-29）；PG 门控测试用 `-- --ignored`（需 DATABASE_URL + 已迁移）
 cargo clippy --workspace --all-targets     # all+pedantic=warn，零新增警告
 ```
 
