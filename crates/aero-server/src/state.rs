@@ -16,6 +16,7 @@ use axum::extract::FromRef;
 
 use crate::config::WsConfig;
 use crate::hub::Hub;
+use crate::metrics::MetricsConfig;
 use crate::rate_limit::RateLimiter;
 
 /// Type-erased handle to whatever AI backend is wired (or `None`).
@@ -76,6 +77,8 @@ pub struct AppState {
     pub ws_config: WsConfig,
     /// Per-client API rate limiter (in-memory token buckets).
     pub rate_limiter: RateLimiter,
+    /// `/metrics` exposure policy (enable flag + optional scrape token).
+    pub metrics: Arc<MetricsConfig>,
     /// Optional — only present when an Anthropic / Voyage API key is configured.
     pub ai: Option<Arc<dyn AiBackend>>,
     /// Public-facing base URL (used to render absolute ingest/playback URLs).
@@ -90,5 +93,11 @@ pub struct AppState {
 impl FromRef<AppState> for AuthService {
     fn from_ref(state: &AppState) -> Self {
         state.auth.clone()
+    }
+}
+
+impl FromRef<AppState> for Arc<MetricsConfig> {
+    fn from_ref(state: &AppState) -> Self {
+        state.metrics.clone()
     }
 }

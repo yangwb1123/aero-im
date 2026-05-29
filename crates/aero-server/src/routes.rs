@@ -20,12 +20,16 @@ use bytes::Bytes;
 use serde::Deserialize;
 
 use crate::error::ApiResult;
+use crate::metrics;
 use crate::state::AppState;
 use crate::ws;
 
 pub fn build(state: AppState) -> Router {
-    Router::new()
+    let mut router = Router::new()
         .route("/health", get(health))
+        // k8s-style probes: liveness is process-up only; readiness gates on deps.
+        .route("/health/live", get(health_live))
+        .route("/health/ready", get(health_ready))
         // Auth
         .route("/api/auth/register", post(auth_register))
         .route("/api/auth/login", post(auth_login))
@@ -73,11 +77,23 @@ pub fn build(state: AppState) -> Router {
         // RTC config
         .route("/api/rtc/config", get(rtc_config))
         // WebSocket
-        .route("/ws", get(ws::handler))
-        .with_state(state)
+        .route("/ws", get(ws::handler));
+
+    // Prometheus scrape endpoint (ROADMAP 方向四). Mounted unless disabled; the
+    // handler self-gates on an optional bearer token. Left here (not behind the
+    // auth extractor) so a scraper without a participant token can reach it,
+    // mirroring `/health`.
+    if state.metrics.enabled {
+        router = router.route("/metrics", get(metrics::metrics_handler));
+    }
+
+    router.with_state(state)
 }
 
-async fn health(State(s): State<AppState>) -> Json<serde_json::Value> {
+/// Probe each backing dependency (PG / Redis / NATS) with a short timeout.
+/// Each result is `"ok"` / `"fail"` / `"timeout"`. Shared by `/health` and
+/// `/health/ready` so the two never drift.
+async fn probe_deps(s: &AppState) -> (&'static str, &'static str, &'static str) {
     use std::time::Duration;
     let pg_ok = tokio::time::timeout(Duration::from_secs(2), async {
         sqlx::query_scalar::<_, i32>("SELECT 1")
@@ -121,6 +137,13 @@ async fn health(State(s): State<AppState>) -> Json<serde_json::Value> {
         Err(_) => "timeout",
     };
 
+    (pg, redis, nats)
+}
+
+/// Legacy combined health endpoint (kept for backward-compat). Always 200; the
+/// body's `status` is `"ok"` only when every dependency probes healthy.
+async fn health(State(s): State<AppState>) -> Json<serde_json::Value> {
+    let (pg, redis, nats) = probe_deps(&s).await;
     let overall = if pg == "ok" && redis == "ok" && nats == "ok" {
         "ok"
     } else {
@@ -136,6 +159,40 @@ async fn health(State(s): State<AppState>) -> Json<serde_json::Value> {
         },
         "version": env!("CARGO_PKG_VERSION"),
     }))
+}
+
+/// Liveness probe (k8s `livenessProbe`): the process is up and serving. Always
+/// 200 — it must *not* depend on PG/Redis/NATS, or a transient backend blip
+/// would get the pod killed and restarted (making the outage worse).
+async fn health_live() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "ok",
+            "version": env!("CARGO_PKG_VERSION"),
+        })),
+    )
+}
+
+/// Readiness probe (k8s `readinessProbe`): 200 only when every dependency is
+/// reachable, else 503 so the pod is pulled from the load-balancer rotation
+/// until it recovers (without being restarted).
+async fn health_ready(State(s): State<AppState>) -> impl IntoResponse {
+    let (pg, redis, nats) = probe_deps(&s).await;
+    let ready = pg == "ok" && redis == "ok" && nats == "ok";
+    let status = if ready { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
+    (
+        status,
+        Json(serde_json::json!({
+            "status": if ready { "ready" } else { "not_ready" },
+            "deps": {
+                "postgres": pg,
+                "redis": redis,
+                "nats": nats,
+            },
+            "version": env!("CARGO_PKG_VERSION"),
+        })),
+    )
 }
 
 // ----- Auth -----
@@ -1190,4 +1247,33 @@ fn merge_hits(
 
 fn parse_room_id(s: &str) -> AeroResult<RoomId> {
     RoomId::from_str(s).map_err(|e| AeroError::Invalid(format!("room id: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request as HttpRequest;
+    use tower::ServiceExt as _; // `oneshot`
+
+    /// The liveness handler takes no state, so it mounts on a state-free router
+    /// and is fully testable offline (it must never touch PG/Redis/NATS).
+    #[tokio::test]
+    async fn health_live_returns_200_without_dependencies() {
+        let app: Router = Router::new().route("/health/live", get(health_live));
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/health/live")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 16).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["status"], "ok");
+    }
 }

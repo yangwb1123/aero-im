@@ -24,6 +24,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use aero_common::metrics::{self, names};
 use aero_common::{CallId, ParticipantId, RoomId};
 use dashmap::DashMap;
 use serde::Serialize;
@@ -108,6 +109,11 @@ pub struct Hub {
     /// When a connection's bounded queue is full, also disconnect it (vs. only
     /// dropping the message).
     disconnect_on_full: bool,
+    /// Metrics sink for the connection gauge. `None` (the default / production
+    /// path) emits to the process-global registry via the free functions; tests
+    /// inject a fresh [`Registry`] so the gauge can be asserted in isolation,
+    /// immune to other parallel tests mutating the global gauge.
+    metrics: Option<Arc<aero_common::metrics::Registry>>,
 }
 
 impl Hub {
@@ -125,14 +131,55 @@ impl Hub {
         })
     }
 
+    /// Test-only: build a Hub whose connection gauge writes to `registry`
+    /// (instead of the process-global one), so gauge assertions are isolated from
+    /// other parallel tests sharing the global registry.
+    #[cfg(test)]
+    fn with_metrics_registry(
+        cfg: WsConfig,
+        registry: Arc<aero_common::metrics::Registry>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            disconnect_on_full: cfg.disconnect_on_full,
+            metrics: Some(registry),
+            ..Self::default()
+        })
+    }
+
+    /// Increment the connection gauge on whichever registry is wired.
+    fn gauge_inc(&self) {
+        match &self.metrics {
+            Some(r) => r.inc_gauge(names::WS_CONNECTIONS),
+            None => metrics::inc_gauge(names::WS_CONNECTIONS),
+        }
+    }
+
+    /// Decrement the connection gauge on whichever registry is wired.
+    fn gauge_dec(&self) {
+        match &self.metrics {
+            Some(r) => r.dec_gauge(names::WS_CONNECTIONS),
+            None => metrics::dec_gauge(names::WS_CONNECTIONS),
+        }
+    }
+
     pub fn register(&self, pid: ParticipantId, tx: WsSender) {
         self.conns.entry(pid).or_default().push(tx);
+        // Connection-count gauge (ROADMAP 方向四): one inc per *connection*, so a
+        // multi-device user contributes once per open socket. Paired with the
+        // dec in `unregister` / laggy-prune so the gauge tracks live sockets.
+        self.gauge_inc();
         debug!(%pid, "ws registered");
     }
 
     pub fn unregister(&self, pid: ParticipantId, tx: &WsSender) {
         if let Some(mut entry) = self.conns.get_mut(&pid) {
+            let before = entry.len();
             entry.retain(|s| !s.same_channel(tx));
+            // Decrement once per connection actually removed (idempotent if the
+            // socket was already pruned by the laggy-client path in `fan_out_raw`).
+            for _ in 0..(before - entry.len()) {
+                self.gauge_dec();
+            }
             if entry.is_empty() {
                 drop(entry);
                 self.conns.remove(&pid);
@@ -252,6 +299,12 @@ impl Hub {
                 }
             }
             if !drop_idx.is_empty() {
+                // Each pruned sender is a live socket going away (closed receiver
+                // or evicted laggy client) without a matching `unregister`, so keep
+                // the connection gauge honest by decrementing here too.
+                for _ in 0..drop_idx.len() {
+                    self.gauge_dec();
+                }
                 // Remove highest indices first so earlier ones stay valid.
                 for i in drop_idx.into_iter().rev() {
                     senders.swap_remove(i);
@@ -330,6 +383,20 @@ mod tests {
         let (tx, rx) = mpsc::channel(cap);
         let close = CancellationToken::new();
         (WsSender::new(tx, close.clone()), rx, close)
+    }
+
+    /// Read the unlabeled `aero_ws_connections` gauge value from a *specific*
+    /// registry's exposition. The WS-gauge tests inject a fresh registry so they
+    /// can assert absolute values without racing the process-global gauge that
+    /// every other connection test mutates in parallel.
+    fn ws_gauge_in(registry: &aero_common::metrics::Registry) -> f64 {
+        let out = registry.render_prometheus();
+        for line in out.lines() {
+            if let Some(rest) = line.strip_prefix(&format!("{} ", names::WS_CONNECTIONS)) {
+                return rest.trim().parse().unwrap_or(0.0);
+            }
+        }
+        0.0
     }
 
     #[test]
@@ -532,5 +599,67 @@ mod tests {
         assert!(!hub.subs.contains_key(&pid));
         assert!(hub.stream_watchers(stream).is_empty());
         assert!(hub.call_members(call).is_empty());
+    }
+
+    #[test]
+    fn ws_gauge_tracks_register_and_unregister() {
+        // Fresh registry ⇒ isolated, absolute assertions (starts at 0).
+        let reg = Arc::new(aero_common::metrics::Registry::new());
+        let hub = Hub::with_metrics_registry(WsConfig::default(), reg.clone());
+        let pid = ParticipantId::new();
+        let (tx, _rx, _c) = make_conn(4);
+
+        assert!((ws_gauge_in(&reg) - 0.0).abs() < 1e-9, "starts at 0");
+        hub.register(pid, tx.clone());
+        assert!((ws_gauge_in(&reg) - 1.0).abs() < 1e-9, "register ⇒ +1");
+
+        hub.unregister(pid, &tx);
+        assert!((ws_gauge_in(&reg) - 0.0).abs() < 1e-9, "unregister ⇒ back to 0");
+    }
+
+    #[test]
+    fn ws_gauge_counts_each_connection_for_multi_device() {
+        // Two devices for one participant ⇒ gauge counts *connections* (2),
+        // matching one inc per register and one dec per unregister.
+        let reg = Arc::new(aero_common::metrics::Registry::new());
+        let hub = Hub::with_metrics_registry(WsConfig::default(), reg.clone());
+        let pid = ParticipantId::new();
+        let (tx1, _rx1, _c1) = make_conn(4);
+        let (tx2, _rx2, _c2) = make_conn(4);
+
+        hub.register(pid, tx1.clone());
+        hub.register(pid, tx2.clone());
+        assert!((ws_gauge_in(&reg) - 2.0).abs() < 1e-9, "two conns ⇒ 2");
+
+        hub.unregister(pid, &tx1);
+        assert!((ws_gauge_in(&reg) - 1.0).abs() < 1e-9, "one left ⇒ 1");
+        hub.unregister(pid, &tx2);
+        assert!((ws_gauge_in(&reg) - 0.0).abs() < 1e-9, "both gone ⇒ 0");
+    }
+
+    #[test]
+    fn ws_gauge_idempotent_when_unregistering_already_pruned_conn() {
+        // A laggy client pruned by fan_out_raw decrements the gauge once; the
+        // socket task's later `unregister` must NOT double-decrement.
+        let reg = Arc::new(aero_common::metrics::Registry::new());
+        let cfg = WsConfig { send_queue_capacity: 1, disconnect_on_full: true };
+        let hub = Hub::with_metrics_registry(cfg, reg.clone());
+        let pid = ParticipantId::new();
+        let (tx, _rx, _close) = make_conn(1); // stalled consumer
+
+        hub.register(pid, tx.clone());
+        assert!((ws_gauge_in(&reg) - 1.0).abs() < 1e-9);
+
+        hub.fan_out_raw(&[pid], "fills the single slot");
+        hub.fan_out_raw(&[pid], "overflow"); // full → evict + prune (gauge -1)
+        assert!((ws_gauge_in(&reg) - 0.0).abs() < 1e-9, "eviction ⇒ back to 0");
+
+        // The connection is already gone; unregister finds nothing to remove and
+        // therefore does not decrement again (no negative gauge).
+        hub.unregister(pid, &tx);
+        assert!(
+            (ws_gauge_in(&reg) - 0.0).abs() < 1e-9,
+            "unregister of an already-pruned conn must not double-decrement"
+        );
     }
 }

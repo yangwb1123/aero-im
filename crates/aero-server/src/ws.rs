@@ -6,6 +6,7 @@
 
 use std::sync::Arc;
 
+use aero_common::metrics::{self, names};
 use aero_common::{
     Block, CallEvent, CallId, CallKind, CallMode, MessageId, ParticipantId, ReactionOp, RoomEvent,
     RoomId, StreamEvent,
@@ -479,6 +480,14 @@ pub async fn run_bus_listener(state: AppState) -> anyhow::Result<()> {
                         }
                     }
                 };
+                // Message-throughput counter (ROADMAP 方向四): the bus is the single
+                // source of truth for accepted messages — every chat message (REST
+                // or WS) lands here exactly once before fan-out — so counting only
+                // `Message` events here is the non-double-counting choke point
+                // (other RoomEvent variants are edits/reactions/typing, not new msgs).
+                if matches!(event, RoomEvent::Message(_)) {
+                    metrics::inc_counter(names::MESSAGES_SENT_TOTAL, 1);
+                }
                 let frame = room_event_to_frame_json(&event);
                 state.hub.fan_out_raw(&recipients, &frame);
                 let _ = sub.ack().await;
@@ -493,6 +502,8 @@ pub async fn run_bus_listener(state: AppState) -> anyhow::Result<()> {
                     } else {
                         env.recipients.clone()
                     };
+                    // Legacy envelope path also carries exactly one new message.
+                    metrics::inc_counter(names::MESSAGES_SENT_TOTAL, 1);
                     let frame = serde_json::json!({
                         "type": "message",
                         "message": env.message,
