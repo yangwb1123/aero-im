@@ -23,7 +23,7 @@ pub mod transcribe;
 pub mod worker;
 
 pub use anthropic::{AnthropicClient, ChatMsg};
-pub use budget::CostBudget;
+pub use budget::{CostBudget, KeyedCostBudget};
 pub use metrics::CostModel;
 pub use embed::{default_embedder, Embedder, HashEmbedder, VoyageEmbedder, EMBED_DIM};
 pub use error::{AiError, Result};

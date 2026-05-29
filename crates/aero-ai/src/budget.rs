@@ -13,6 +13,8 @@
 //! Thread-safe: a single [`CostBudget`] is shared by all concurrent in-flight
 //! jobs via `&` and guarded by a `Mutex`. The critical section is O(1).
 
+use std::collections::HashMap;
+use std::hash::Hash;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -34,6 +36,41 @@ struct State {
     used: u32,
     /// When the current window began.
     window_start: Instant,
+}
+
+impl State {
+    /// A fresh, empty window anchored at `now`.
+    fn fresh(now: Instant) -> Self {
+        Self { used: 0, window_start: now }
+    }
+
+    /// Roll over to a new window if `window` has elapsed since this one began.
+    fn roll_if_elapsed(&mut self, now: Instant, window: Duration) {
+        if now.duration_since(self.window_start) >= window {
+            self.used = 0;
+            self.window_start = now;
+        }
+    }
+
+    /// Roll if needed, then consume up to `n` units, returning how many were
+    /// granted (`0..=n`). The one place the window math lives, shared by the
+    /// global and keyed budgets.
+    fn acquire_up_to(&mut self, now: Instant, window: Duration, max: u32, n: u32) -> u32 {
+        self.roll_if_elapsed(now, window);
+        let grant = max.saturating_sub(self.used).min(n);
+        self.used += grant;
+        grant
+    }
+
+    /// Units consumed in the current window, accounting for an elapsed roll-over
+    /// (without mutating: a stale window reads as empty).
+    fn used_now(&self, now: Instant, window: Duration) -> u32 {
+        if now.duration_since(self.window_start) >= window {
+            0
+        } else {
+            self.used
+        }
+    }
 }
 
 /// A fixed-window call/cost budget.
@@ -71,7 +108,7 @@ impl CostBudget {
         Self {
             max_per_window: max_per_window.max(1),
             window,
-            state: Mutex::new(State { used: 0, window_start: now }),
+            state: Mutex::new(State::fresh(now)),
             clock,
         }
     }
@@ -94,14 +131,7 @@ impl CostBudget {
     pub fn acquire_up_to(&self, n: u32) -> u32 {
         let now = self.clock.now();
         let mut st = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if now.duration_since(st.window_start) >= self.window {
-            st.used = 0;
-            st.window_start = now;
-        }
-        let remaining = self.max_per_window.saturating_sub(st.used);
-        let grant = remaining.min(n);
-        st.used += grant;
-        grant
+        st.acquire_up_to(now, self.window, self.max_per_window, n)
     }
 
     /// Units remaining in the current window without consuming any.
@@ -115,14 +145,113 @@ impl CostBudget {
     pub fn used(&self) -> u32 {
         let now = self.clock.now();
         let st = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if now.duration_since(st.window_start) >= self.window {
-            0
-        } else {
-            st.used
-        }
+        st.used_now(now, self.window)
     }
 
     /// The configured per-window ceiling.
+    #[must_use]
+    pub fn limit(&self) -> u32 {
+        self.max_per_window
+    }
+}
+
+/// A per-key (per-tenant) fixed-window cost budget.
+///
+/// Maintains an **independent** [`CostBudget`]-style window for each key `K`,
+/// every window capped at the same `max_per_window` / `window`. Exhausting one
+/// key's budget leaves every other key untouched — so one abusive workspace
+/// cannot starve the others of paid AI capacity (ROADMAP 方向三: per-tenant
+/// token/cost budget).
+///
+/// The intended key is [`aero_common::WorkspaceId`], but the type stays generic
+/// over any `K: Eq + Hash + Clone` so it is trivially unit-testable and reusable.
+/// A key's window is created **lazily** on first touch, so unseen keys cost
+/// nothing.
+///
+/// Thread-safe: shared by all concurrent in-flight jobs via `&self`; a single
+/// `Mutex<HashMap<K, _>>` guards the per-key windows. The critical section is
+/// O(1) per call (one hash lookup + the same O(1) window math as [`CostBudget`]).
+/// A `Mutex<HashMap>` (rather than a sharded map) is deliberate: keys are
+/// few (workspaces) and the section is tiny, matching the global budget's design.
+pub struct KeyedCostBudget<K: Eq + Hash + Clone> {
+    max_per_window: u32,
+    window: Duration,
+    windows: Mutex<HashMap<K, State>>,
+    clock: Box<dyn Clock>,
+}
+
+impl<K: Eq + Hash + Clone> std::fmt::Debug for KeyedCostBudget<K> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let live = self
+            .windows
+            .lock()
+            .map_or_else(|e| e.into_inner().len(), |w| w.len());
+        f.debug_struct("KeyedCostBudget")
+            .field("max_per_window", &self.max_per_window)
+            .field("window", &self.window)
+            .field("live_keys", &live)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<K: Eq + Hash + Clone> KeyedCostBudget<K> {
+    /// Create a keyed budget admitting at most `max_per_window` units per rolling
+    /// `window` **per key**. As with [`CostBudget`], a `max_per_window` of 0 is
+    /// clamped to 1 so a misconfiguration can never wedge a key permanently.
+    #[must_use]
+    pub fn new(max_per_window: u32, window: Duration) -> Self {
+        Self::with_clock(max_per_window, window, Box::new(SystemClock))
+    }
+
+    fn with_clock(max_per_window: u32, window: Duration, clock: Box<dyn Clock>) -> Self {
+        Self {
+            max_per_window: max_per_window.max(1),
+            window,
+            windows: Mutex::new(HashMap::new()),
+            clock,
+        }
+    }
+
+    /// Try to consume one unit of `key`'s budget.
+    ///
+    /// Returns `true` (consuming one unit) when `key`'s current window has
+    /// capacity, `false` once that key's window is exhausted. Other keys are
+    /// unaffected. Creates the key's window lazily on first touch.
+    pub fn try_acquire(&self, key: K) -> bool {
+        self.acquire_up_to(key, 1) == 1
+    }
+
+    /// Consume up to `n` units of `key`'s budget atomically, returning how many
+    /// were granted (`0..=n`). Mirrors [`CostBudget::acquire_up_to`] but scoped to
+    /// one key; the key's window is created lazily on first touch.
+    pub fn acquire_up_to(&self, key: K, n: u32) -> u32 {
+        let now = self.clock.now();
+        let mut map = self.windows.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let st = map.entry(key).or_insert_with(|| State::fresh(now));
+        st.acquire_up_to(now, self.window, self.max_per_window, n)
+    }
+
+    /// Units remaining in `key`'s current window without consuming any.
+    ///
+    /// An untouched key reports the full [`Self::limit`] (its window is created
+    /// lazily, so a read alone never allocates an entry).
+    #[must_use]
+    pub fn available(&self, key: &K) -> u32 {
+        self.max_per_window.saturating_sub(self.used(key))
+    }
+
+    /// Units already consumed in `key`'s current window (diagnostics / metrics).
+    ///
+    /// Reports 0 for an untouched key or one whose window has rolled over. This
+    /// is a pure read: it neither creates an entry nor mutates a stale window.
+    #[must_use]
+    pub fn used(&self, key: &K) -> u32 {
+        let now = self.clock.now();
+        let map = self.windows.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.get(key).map_or(0, |st| st.used_now(now, self.window))
+    }
+
+    /// The configured per-window ceiling (identical for every key).
     #[must_use]
     pub fn limit(&self) -> u32 {
         self.max_per_window
@@ -169,6 +298,15 @@ mod tests {
     fn budget_with(max: u32, window: Duration) -> (CostBudget, Arc<FakeClock>) {
         let clk = Arc::new(FakeClock::new());
         let b = CostBudget::with_clock(max, window, Box::new(SharedClock(Arc::clone(&clk))));
+        (b, clk)
+    }
+
+    fn keyed_budget_with(
+        max: u32,
+        window: Duration,
+    ) -> (KeyedCostBudget<&'static str>, Arc<FakeClock>) {
+        let clk = Arc::new(FakeClock::new());
+        let b = KeyedCostBudget::with_clock(max, window, Box::new(SharedClock(Arc::clone(&clk))));
         (b, clk)
     }
 
@@ -261,5 +399,177 @@ mod tests {
         }
         let total: u32 = handles.into_iter().map(|h| h.join().unwrap()).sum();
         assert_eq!(total, 50, "exactly limit-many acquisitions across all threads");
+    }
+
+    // ---- KeyedCostBudget ----------------------------------------------------
+
+    #[test]
+    fn keyed_each_key_admits_up_to_limit_then_denies() {
+        let (b, _clk) = keyed_budget_with(3, Duration::from_secs(60));
+        assert_eq!(b.limit(), 3);
+        for _ in 0..3 {
+            assert!(b.try_acquire("a"));
+        }
+        assert!(!b.try_acquire("a"), "4th acquire over a limit of 3 must be denied");
+        assert_eq!(b.used(&"a"), 3);
+        assert_eq!(b.available(&"a"), 0);
+    }
+
+    #[test]
+    fn keyed_exhausting_one_key_leaves_others_with_full_budget() {
+        // The core isolation guarantee: an abusive tenant cannot starve others.
+        let (b, _clk) = keyed_budget_with(3, Duration::from_secs(60));
+
+        // Drain key "a" completely.
+        assert_eq!(b.acquire_up_to("a", 100), 3);
+        assert!(!b.try_acquire("a"), "a is exhausted");
+        assert_eq!(b.used(&"a"), 3);
+
+        // "b" is entirely unaffected and still has its full, independent limit.
+        assert_eq!(b.available(&"b"), 3, "untouched key reports the full ceiling");
+        assert_eq!(b.used(&"b"), 0);
+        assert!(b.try_acquire("b"));
+        assert!(b.try_acquire("b"));
+        assert!(b.try_acquire("b"));
+        assert!(!b.try_acquire("b"), "b now exhausted on its own window");
+
+        // Draining "b" still did not give "a" anything back.
+        assert!(!b.try_acquire("a"));
+        // And a third, never-touched key remains fully available.
+        assert_eq!(b.available(&"c"), 3);
+    }
+
+    #[test]
+    fn keyed_untouched_key_reads_do_not_allocate_or_consume() {
+        let (b, _clk) = keyed_budget_with(4, Duration::from_secs(60));
+        // Pure reads on a key we never acquired against.
+        assert_eq!(b.used(&"ghost"), 0);
+        assert_eq!(b.available(&"ghost"), 4);
+        // Those reads must not have created a window: the key still has full budget.
+        assert_eq!(b.acquire_up_to("ghost", 4), 4);
+        assert_eq!(b.available(&"ghost"), 0);
+    }
+
+    #[test]
+    fn keyed_acquire_up_to_grants_partial_then_zero_per_key() {
+        let (b, _clk) = keyed_budget_with(5, Duration::from_secs(60));
+        assert_eq!(b.available(&"a"), 5);
+        assert_eq!(b.acquire_up_to("a", 3), 3);
+        assert_eq!(b.available(&"a"), 2);
+        assert_eq!(b.acquire_up_to("a", 10), 2, "clamped to remaining");
+        assert_eq!(b.available(&"a"), 0);
+        assert_eq!(b.acquire_up_to("a", 4), 0, "nothing left this window for a");
+
+        // A different key is on its own fresh budget.
+        assert_eq!(b.acquire_up_to("b", 10), 5, "b clamped to its own full limit");
+        assert_eq!(b.available(&"b"), 0);
+    }
+
+    #[test]
+    fn keyed_acquire_up_to_zero_is_a_noop() {
+        let (b, _clk) = keyed_budget_with(5, Duration::from_secs(60));
+        assert_eq!(b.acquire_up_to("a", 0), 0);
+        assert_eq!(b.available(&"a"), 5);
+    }
+
+    #[test]
+    fn keyed_windows_reset_independently_after_elapsing() {
+        let (b, clk) = keyed_budget_with(2, Duration::from_secs(10));
+
+        // Exhaust "a" at t=0.
+        assert!(b.try_acquire("a"));
+        assert!(b.try_acquire("a"));
+        assert!(!b.try_acquire("a"), "a exhausted within window");
+
+        // Advance 5s, then first-touch "b" — its window is anchored at t=5s, so it
+        // rolls over on a *different* schedule than "a".
+        clk.advance(Duration::from_secs(5));
+        assert!(b.try_acquire("b"));
+        assert!(b.try_acquire("b"));
+        assert!(!b.try_acquire("b"), "b exhausted within its own window");
+
+        // t=11s: a's window (started t=0) has elapsed and refreshes...
+        clk.advance(Duration::from_secs(6));
+        assert!(b.try_acquire("a"), "a's new window admits again");
+        assert!(b.try_acquire("a"));
+        assert!(!b.try_acquire("a"), "a's new window exhausted at limit again");
+        // ...but b's window (started t=5s) has NOT yet elapsed at t=11s.
+        assert!(!b.try_acquire("b"), "b still in its first window at t=11s");
+
+        // t=16s: b's window has now elapsed too and refreshes.
+        clk.advance(Duration::from_secs(5));
+        assert!(b.try_acquire("b"), "b's new window admits again");
+        assert!(b.try_acquire("b"));
+        assert!(!b.try_acquire("b"));
+    }
+
+    #[test]
+    fn keyed_used_reports_zero_in_a_fresh_window_per_key() {
+        let (b, clk) = keyed_budget_with(5, Duration::from_secs(10));
+        assert!(b.try_acquire("a"));
+        assert_eq!(b.used(&"a"), 1);
+        clk.advance(Duration::from_secs(11));
+        // No acquire yet, but a's window has rolled — used() reflects a fresh window.
+        assert_eq!(b.used(&"a"), 0);
+        assert_eq!(b.available(&"a"), 5);
+    }
+
+    #[test]
+    fn keyed_zero_limit_is_clamped_to_one_per_key() {
+        let (b, _clk) = keyed_budget_with(0, Duration::from_secs(60));
+        assert_eq!(b.limit(), 1);
+        assert!(b.try_acquire("a"));
+        assert!(!b.try_acquire("a"));
+        // Independent key still gets its own single unit.
+        assert!(b.try_acquire("b"));
+        assert!(!b.try_acquire("b"));
+    }
+
+    #[test]
+    fn keyed_concurrent_same_key_never_exceeds_that_keys_limit() {
+        use std::sync::Arc as StdArc;
+        use std::thread;
+
+        let b = StdArc::new(KeyedCostBudget::<&'static str>::new(50, Duration::from_secs(600)));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let b = StdArc::clone(&b);
+            handles.push(thread::spawn(move || {
+                let mut granted = 0u32;
+                for _ in 0..100 {
+                    if b.try_acquire("hot") {
+                        granted += 1;
+                    }
+                }
+                granted
+            }));
+        }
+        let total: u32 = handles.into_iter().map(|h| h.join().unwrap()).sum();
+        assert_eq!(total, 50, "exactly limit-many acquisitions on the contended key");
+    }
+
+    #[test]
+    fn keyed_concurrent_distinct_keys_each_get_their_own_full_limit() {
+        use std::sync::Arc as StdArc;
+        use std::thread;
+
+        // 8 threads, each hammering a distinct key concurrently. Every key must
+        // independently grant exactly its full limit — no cross-key interference.
+        let b = StdArc::new(KeyedCostBudget::<u32>::new(50, Duration::from_secs(600)));
+        let mut handles = Vec::new();
+        for k in 0..8u32 {
+            let b = StdArc::clone(&b);
+            handles.push(thread::spawn(move || {
+                let mut granted = 0u32;
+                for _ in 0..100 {
+                    if b.try_acquire(k) {
+                        granted += 1;
+                    }
+                }
+                granted
+            }));
+        }
+        let total: u32 = handles.into_iter().map(|h| h.join().unwrap()).sum();
+        assert_eq!(total, 8 * 50, "each of the 8 keys granted its full independent limit");
     }
 }
