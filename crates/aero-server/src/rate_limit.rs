@@ -124,6 +124,9 @@ pub async fn layer(
     if state.rate_limiter.check(key) {
         Ok(next.run(request).await)
     } else {
+        // Observability (ROADMAP 方向四): count limiter rejections so a 429 spike
+        // (abuse / misbehaving client) is visible on the dashboard.
+        crate::metrics::record_rate_limit_rejection();
         Err(ApiError(AeroError::RateLimited))
     }
 }

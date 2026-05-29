@@ -8,7 +8,7 @@ use std::{net::SocketAddr, sync::Arc};
 use aero_ai::{AiService, AiWorker};
 use aero_auth::AuthService;
 use aero_bus::{EventBus, JetStreamBus, JetStreamConfig};
-use aero_common::{config::AppConfig, telemetry};
+use aero_common::{config::AppConfig, metrics as common_metrics, telemetry};
 use aero_im_core::ImService;
 use aero_live_core::LiveStreamConfig;
 use aero_live_rtmp::spawn_rtmp_ingest;
@@ -18,6 +18,7 @@ use aero_server::{
     config::{GatewayConfig, WsConfig},
     hub::Hub,
     live::LiveService,
+    metrics::{self as server_metrics, MetricsConfig},
     rate_limit::{self, RateLimiter},
     routes,
     state::AppState,
@@ -44,6 +45,10 @@ use tracing::{info, warn};
 async fn main() -> anyhow::Result<()> {
     let cfg = AppConfig::load().context("load config")?;
     let _guard = telemetry::init(&cfg.telemetry, "aero-server");
+
+    // Seed the process-global metrics registry with HELP/TYPE for the well-known
+    // ROADMAP 方向四 signals so `/metrics` advertises them even before first use.
+    common_metrics::register_known_metrics(common_metrics::global());
 
     info!(version = env!("CARGO_PKG_VERSION"), "starting aero-server");
 
@@ -169,6 +174,7 @@ async fn main() -> anyhow::Result<()> {
     // ---------- Gateway hardening config ----------
     let gateway_cfg = GatewayConfig::from_env();
     let ws_cfg = WsConfig::from_env();
+    let metrics_cfg = MetricsConfig::from_env();
     info!(
         timeout_secs = gateway_cfg.request_timeout.as_secs(),
         max_body_bytes = gateway_cfg.max_body_bytes,
@@ -177,6 +183,8 @@ async fn main() -> anyhow::Result<()> {
         rl_per_sec = gateway_cfg.rate_limit.per_second,
         rl_burst = gateway_cfg.rate_limit.burst,
         ws_send_queue = ws_cfg.send_queue_capacity,
+        metrics_enabled = metrics_cfg.enabled,
+        metrics_auth = metrics_cfg.bearer_token.is_some(),
         "gateway hardening configured"
     );
 
@@ -207,6 +215,7 @@ async fn main() -> anyhow::Result<()> {
         hub,
         ws_config: ws_cfg,
         rate_limiter: RateLimiter::new(gateway_cfg.rate_limit),
+        metrics: Arc::new(metrics_cfg.clone()),
         ai: Some(Arc::new(AiServiceAdapter::new(ai_service.clone()))),
         public_base_url,
         whip: WhipRegistry::new(),
@@ -218,6 +227,29 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or(40000),
     };
     let _ = ai_shutdown; // keep token alive for the worker
+
+    // ---------- DB pool saturation gauges (ROADMAP 方向四) ----------
+    // Periodically publish sqlx pool stats so dashboards can alert on pool
+    // exhaustion (in-use approaching size = requests will start queueing).
+    {
+        let pool = pg.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                let size = pool.size();
+                // `num_idle()` is usize; pool sizes are tiny, so a saturating
+                // narrowing to u32 is exact in practice and lint-clean.
+                let idle = u32::try_from(pool.num_idle()).unwrap_or(u32::MAX);
+                let in_use = size.saturating_sub(idle);
+                let max = pool.options().get_max_connections();
+                common_metrics::set_gauge(common_metrics::names::DB_POOL_SIZE, f64::from(max));
+                // In-use = total open connections minus those sitting idle.
+                common_metrics::set_gauge(common_metrics::names::DB_POOL_IN_USE, f64::from(in_use));
+            }
+        });
+    }
 
     // ---------- Bus listener ----------
     {
@@ -283,10 +315,13 @@ async fn main() -> anyhow::Result<()> {
     let cors = build_cors(&gateway_cfg);
 
     // Global protective middleware stack (outermost → innermost):
-    //   trace → cors → concurrency-limit → rate-limit → timeout → body-limit.
+    //   trace → http-metrics → cors → concurrency-limit → rate-limit → timeout
+    //   → body-limit.
     // Concurrency + timeout are optional (0 disables). Rate limiting wires the
     // dormant `Error::RateLimited` (429). Tracing stays outermost so even
-    // rejected requests are observed.
+    // rejected requests are observed; HTTP metrics sit just inside it so the RED
+    // counters/histogram capture *every* response — including rate-limit 429s,
+    // concurrency rejections, and timeouts produced by the inner layers.
     let timeout_layer = (!gateway_cfg.request_timeout.is_zero()).then(|| {
         TimeoutLayer::with_status_code(
             axum::http::StatusCode::REQUEST_TIMEOUT,
@@ -297,6 +332,7 @@ async fn main() -> anyhow::Result<()> {
         .then(|| tower::limit::ConcurrencyLimitLayer::new(gateway_cfg.max_concurrency));
     let middleware = ServiceBuilder::new()
         .layer(TraceLayer::new_for_http())
+        .layer(axum::middleware::from_fn(server_metrics::http_metrics_layer))
         .layer(cors)
         .option_layer(concurrency_layer)
         .layer(axum::middleware::from_fn_with_state(
