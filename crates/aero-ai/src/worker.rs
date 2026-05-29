@@ -52,7 +52,7 @@ use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
-use crate::budget::CostBudget;
+use crate::budget::{CostBudget, KeyedCostBudget};
 use crate::error::{AiError, Result};
 use crate::metrics::{self as ai_metrics, CostModel};
 use crate::service::AiService;
@@ -72,14 +72,20 @@ const IDLE_SLEEP: Duration = Duration::from_secs(1);
 ///
 /// Follows the project's `AERO__SECTION__KEY` double-underscore convention:
 /// - `AERO__AI__MAX_CONCURRENCY` — max jobs processed in parallel (default 4).
-/// - `AERO__AI__MAX_CALLS_PER_WINDOW` — paid-call ceiling per window (default 120).
+/// - `AERO__AI__MAX_CALLS_PER_WINDOW` — global paid-call ceiling per window (default 120).
+/// - `AERO__AI__MAX_CALLS_PER_WINDOW_PER_WS` — per-workspace paid-call ceiling per
+///   window (default 120 — same as global, i.e. permissive until tightened).
 /// - `AERO__AI__BUDGET_WINDOW_SECS` — rolling window length in seconds (default 60).
 #[derive(Debug, Clone, Copy)]
 pub struct WorkerConfig {
     /// Maximum number of jobs processed concurrently within one worker process.
     pub max_concurrency: usize,
-    /// Ceiling on paid-API-bearing jobs admitted per [`Self::budget_window`].
+    /// Global ceiling on paid-API-bearing jobs admitted per [`Self::budget_window`].
     pub max_calls_per_window: u32,
+    /// Per-workspace ceiling per window. Bounds any single tenant's share so one
+    /// busy/abusive workspace cannot consume the whole global window. A job whose
+    /// workspace has hit this is *deferred* to the next window, not dropped.
+    pub max_calls_per_window_per_workspace: u32,
     /// Length of the rolling budget window.
     pub budget_window: Duration,
 }
@@ -89,6 +95,7 @@ impl Default for WorkerConfig {
         Self {
             max_concurrency: 4,
             max_calls_per_window: 120,
+            max_calls_per_window_per_workspace: 120,
             budget_window: Duration::from_secs(60),
         }
     }
@@ -108,6 +115,11 @@ impl WorkerConfig {
             max_calls_per_window: env_parse::<u32>("AERO__AI__MAX_CALLS_PER_WINDOW")
                 .filter(|&n| n >= 1)
                 .unwrap_or(d.max_calls_per_window),
+            max_calls_per_window_per_workspace: env_parse::<u32>(
+                "AERO__AI__MAX_CALLS_PER_WINDOW_PER_WS",
+            )
+            .filter(|&n| n >= 1)
+            .unwrap_or(d.max_calls_per_window_per_workspace),
             budget_window: env_parse::<u64>("AERO__AI__BUDGET_WINDOW_SECS")
                 .filter(|&n| n >= 1)
                 .map_or(d.budget_window, Duration::from_secs),
@@ -136,6 +148,9 @@ pub(crate) trait JobQueue: Send + Sync {
     async fn claim(&self, n: i32) -> Result<Vec<AiJob>>;
     async fn complete(&self, id: Ulid, result: serde_json::Value) -> Result<()>;
     async fn fail(&self, id: Ulid, error: &str, max_attempts: i32) -> Result<()>;
+    /// Return a claimed job to `queued` no earlier than `until`, without spending
+    /// a retry attempt — used to defer a job whose workspace is over budget.
+    async fn defer(&self, id: Ulid, until: time::OffsetDateTime) -> Result<()>;
 }
 
 /// Processes a single claimed job. Production impl delegates to the per-kind
@@ -186,10 +201,15 @@ impl AiWorker {
     pub async fn run(&self, shutdown: CancellationToken) {
         let queue = AiJobQueue { svc: Arc::clone(&self.svc) };
         let budget = CostBudget::new(self.cfg.max_calls_per_window, self.cfg.budget_window);
+        let keyed = KeyedCostBudget::<uuid::Uuid>::new(
+            self.cfg.max_calls_per_window_per_workspace,
+            self.cfg.budget_window,
+        );
         run_loop(
             &queue,
             self,
             &budget,
+            &keyed,
             self.cfg,
             aero_common::metrics::global(),
             &self.cost_model,
@@ -305,6 +325,9 @@ impl JobQueue for AiJobQueue {
     async fn fail(&self, id: Ulid, error: &str, max_attempts: i32) -> Result<()> {
         Ok(self.svc.ai_jobs().fail(id, error, max_attempts).await?)
     }
+    async fn defer(&self, id: Ulid, until: time::OffsetDateTime) -> Result<()> {
+        Ok(self.svc.ai_jobs().defer(id, until).await?)
+    }
 }
 
 /// True if `attempts` (post-claim) is *beyond* the retry cap, i.e. the row
@@ -357,6 +380,7 @@ async fn run_loop<Q, P>(
     queue: &Q,
     proc: &P,
     budget: &CostBudget,
+    keyed: &KeyedCostBudget<uuid::Uuid>,
     cfg: WorkerConfig,
     reg: &Registry,
     cost_model: &CostModel,
@@ -413,17 +437,45 @@ async fn run_loop<Q, P>(
             continue;
         }
 
-        // Charge the budget for exactly the jobs we claimed. Conservative: free
-        // job kinds (e.g. Moderate, idempotent embed no-ops) also count, so the
+        // Per-workspace budget gate (ROADMAP 方向三): a job whose workspace has
+        // exhausted its per-tenant window is *deferred* to the next window (not
+        // dropped, not failed), so one busy/abusive tenant can't monopolise the
+        // global window. Jobs without a workspace are governed by the global
+        // budget only. `defer` returns the row to `queued` without burning a retry.
+        let defer_until = time::OffsetDateTime::now_utc() + cfg.budget_window;
+        let mut runnable = Vec::with_capacity(jobs.len());
+        for job in jobs {
+            match job.workspace_id {
+                Some(ws) if !keyed.try_acquire(ws) => {
+                    if let Err(e) = queue.defer(job.id, defer_until).await {
+                        tracing::warn!(error = %e, job = %job.id, "defer (ws budget) failed; running");
+                        runnable.push(job);
+                    } else {
+                        tracing::debug!(job = %job.id, "deferred: workspace budget window exhausted");
+                    }
+                }
+                _ => runnable.push(job),
+            }
+        }
+        if runnable.is_empty() {
+            // Everything claimed this tick was deferred; back off briefly.
+            if sleep_or_cancel(IDLE_SLEEP, shutdown).await {
+                return;
+            }
+            continue;
+        }
+
+        // Charge the GLOBAL budget for exactly the jobs we'll run. Conservative:
+        // free job kinds (e.g. Moderate, idempotent embed no-ops) also count, so the
         // window is a strict upper bound on paid calls rather than an exact one.
-        let charged = budget.acquire_up_to(u32::try_from(jobs.len()).unwrap_or(u32::MAX));
-        tracing::debug!(claimed = jobs.len(), charged, "ai worker: batch claimed");
+        let charged = budget.acquire_up_to(u32::try_from(runnable.len()).unwrap_or(u32::MAX));
+        tracing::debug!(claimed = runnable.len(), charged, "ai worker: batch claimed");
 
         // Queue-depth gauge: reflect the outstanding (claimed, not-yet-terminal)
         // work for this process. It rises with the claimed batch and returns to 0
         // once the batch has drained.
-        ai_metrics::set_queue_depth(reg, jobs.len());
-        process_batch(queue, proc, &sem, jobs, reg, cost_model, shutdown).await;
+        ai_metrics::set_queue_depth(reg, runnable.len());
+        process_batch(queue, proc, &sem, runnable, reg, cost_model, shutdown).await;
         ai_metrics::set_queue_depth(reg, 0);
     }
 }
@@ -746,11 +798,18 @@ mod tests {
 
     // ---------- test doubles ----------
 
+    /// A per-workspace budget so permissive it never defers — for the tests that
+    /// exercise the global path and use workspace-less jobs.
+    fn unlimited_keyed() -> KeyedCostBudget<uuid::Uuid> {
+        KeyedCostBudget::new(u32::MAX, Duration::from_secs(3600))
+    }
+
     fn mk_job(kind: AiJobKind, attempts: i32) -> AiJob {
         AiJob {
             id: Ulid::new(),
             kind,
             target_id: None,
+            workspace_id: None,
             status: AiJobStatus::Running,
             attempts,
             payload: serde_json::Value::Null,
@@ -769,6 +828,8 @@ mod tests {
     #[derive(Default)]
     struct FakeQueue {
         rows: Mutex<Vec<FakeRow>>,
+        /// Ids passed to `defer`, in order — lets tests assert deferrals.
+        deferred: Mutex<Vec<Ulid>>,
     }
 
     #[derive(Clone)]
@@ -783,7 +844,11 @@ mod tests {
                 .into_iter()
                 .map(|job| FakeRow { job, status: AiJobStatus::Queued })
                 .collect();
-            Self { rows: Mutex::new(rows) }
+            Self { rows: Mutex::new(rows), deferred: Mutex::default() }
+        }
+
+        fn deferred_ids(&self) -> Vec<Ulid> {
+            self.deferred.lock().unwrap().clone()
         }
 
         fn status_of(&self, id: Ulid) -> AiJobStatus {
@@ -838,6 +903,16 @@ mod tests {
                 } else {
                     AiJobStatus::Queued
                 };
+            }
+            Ok(())
+        }
+        async fn defer(&self, id: Ulid, _until: time::OffsetDateTime) -> Result<()> {
+            self.deferred.lock().unwrap().push(id);
+            let mut rows = self.rows.lock().unwrap();
+            if let Some(r) = rows.iter_mut().find(|r| r.job.id == id) {
+                // Mirror the repo: back to queued, attempt refunded.
+                r.status = AiJobStatus::Queued;
+                r.job.attempts = (r.job.attempts - 1).max(0);
             }
             Ok(())
         }
@@ -1074,6 +1149,7 @@ mod tests {
                 &queue,
                 &proc,
                 &budget,
+                &unlimited_keyed(),
                 WorkerConfig::default(),
                 &test_reg(),
                 &test_cost(),
@@ -1095,7 +1171,7 @@ mod tests {
         let queue = FakeQueue::with_jobs(jobs);
         let proc = OkCounter::new();
         let budget = CostBudget::new(3, Duration::from_secs(3600));
-        let cfg = WorkerConfig { max_concurrency: 4, max_calls_per_window: 3, budget_window: Duration::from_secs(3600) };
+        let cfg = WorkerConfig { max_concurrency: 4, max_calls_per_window: 3, max_calls_per_window_per_workspace: u32::MAX, budget_window: Duration::from_secs(3600) };
         let shutdown = CancellationToken::new();
         let reg = test_reg();
         let cost = test_cost();
@@ -1106,7 +1182,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(300)).await;
             token.cancel();
         });
-        run_loop(&queue, &proc, &budget, cfg, &reg, &cost, &shutdown).await;
+        run_loop(&queue, &proc, &budget, &unlimited_keyed(), cfg, &reg, &cost, &shutdown).await;
         handle.await.unwrap();
 
         assert_eq!(proc.ran.load(Ordering::SeqCst), 3, "processed exactly the budget");
@@ -1145,7 +1221,7 @@ mod tests {
         let queue = FakeQueue::with_jobs(jobs);
         let proc = OkCounter::new();
         let budget = CostBudget::new(5, Duration::from_secs(3600));
-        let cfg = WorkerConfig { max_concurrency: 2, max_calls_per_window: 5, budget_window: Duration::from_secs(3600) };
+        let cfg = WorkerConfig { max_concurrency: 2, max_calls_per_window: 5, max_calls_per_window_per_workspace: u32::MAX, budget_window: Duration::from_secs(3600) };
         let shutdown = CancellationToken::new();
 
         let token = shutdown.clone();
@@ -1153,12 +1229,48 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(200)).await;
             token.cancel();
         });
-        run_loop(&queue, &proc, &budget, cfg, &test_reg(), &test_cost(), &shutdown).await;
+        run_loop(&queue, &proc, &budget, &unlimited_keyed(), cfg, &test_reg(), &test_cost(), &shutdown).await;
         handle.await.unwrap();
 
         assert_eq!(proc.ran.load(Ordering::SeqCst), 5);
         assert_eq!(queue.count_status(AiJobStatus::Done), 5, "all claimed jobs completed");
         assert_eq!(queue.count_status(AiJobStatus::Running), 0, "no orphaned running rows");
+    }
+
+    #[tokio::test]
+    async fn run_loop_defers_jobs_over_the_per_workspace_budget() {
+        // Two jobs for the SAME workspace, whose per-window allowance is 1 (global
+        // budget is ample). The affordable one runs; the other is DEFERRED — not
+        // failed, not dropped — so a single tenant can't exceed its share
+        // (ROADMAP 方向三 per-tenant budget).
+        let ws = uuid::Uuid::from_u128(7);
+        let mut a = mk_job(AiJobKind::Summarize, 1);
+        a.workspace_id = Some(ws);
+        let mut b = mk_job(AiJobKind::Summarize, 1);
+        b.workspace_id = Some(ws);
+        let b_id = b.id;
+        let queue = FakeQueue::with_jobs(vec![a, b]);
+        let proc = OkCounter::new();
+        let budget = CostBudget::new(100, Duration::from_secs(3600)); // global: ample
+        let keyed = KeyedCostBudget::<uuid::Uuid>::new(1, Duration::from_secs(3600)); // 1 per ws
+        let cfg = WorkerConfig {
+            max_concurrency: 2,
+            max_calls_per_window: 100,
+            max_calls_per_window_per_workspace: 1,
+            budget_window: Duration::from_secs(3600),
+        };
+        let shutdown = CancellationToken::new();
+        let token = shutdown.clone();
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            token.cancel();
+        });
+        run_loop(&queue, &proc, &budget, &keyed, cfg, &test_reg(), &test_cost(), &shutdown).await;
+        handle.await.unwrap();
+
+        assert_eq!(proc.ran.load(Ordering::SeqCst), 1, "only the within-budget job runs");
+        assert!(queue.deferred_ids().contains(&b_id), "over-budget job was deferred");
+        assert_eq!(queue.count_status(AiJobStatus::Done), 1, "exactly one job completed");
     }
 
     // ---------- (方向四) observability instrumentation ----------
@@ -1245,6 +1357,7 @@ mod tests {
         let cfg = WorkerConfig {
             max_concurrency: 4,
             max_calls_per_window: 100,
+            max_calls_per_window_per_workspace: u32::MAX,
             budget_window: Duration::from_secs(3600),
         };
         let shutdown = CancellationToken::new();
@@ -1261,7 +1374,7 @@ mod tests {
             token.cancel();
             mid
         });
-        run_loop(&queue, &probe, &budget, cfg, &reg, &cost, &shutdown).await;
+        run_loop(&queue, &probe, &budget, &unlimited_keyed(), cfg, &reg, &cost, &shutdown).await;
         let mid = handle.await.unwrap();
 
         assert!(

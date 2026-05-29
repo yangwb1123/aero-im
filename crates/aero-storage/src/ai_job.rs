@@ -37,6 +37,9 @@ pub struct AiJob {
     pub id: Ulid,
     pub kind: AiJobKind,
     pub target_id: Option<uuid::Uuid>,
+    /// Owning workspace (tenant), for per-tenant cost budgeting. `None` when it
+    /// couldn't be resolved at enqueue time — such jobs are billed globally only.
+    pub workspace_id: Option<uuid::Uuid>,
     pub status: AiJobStatus,
     pub attempts: i32,
     pub payload: serde_json::Value,
@@ -60,6 +63,7 @@ impl AiJobRepo {
         &self,
         kind: AiJobKind,
         target_id: Option<uuid::Uuid>,
+        workspace_id: Option<uuid::Uuid>,
         payload: serde_json::Value,
     ) -> Result<Ulid, sqlx::Error> {
         let id = Ulid::new();
@@ -70,12 +74,13 @@ impl AiJobRepo {
             AiJobKind::Answer => "answer",
         };
         sqlx::query(
-            r#"INSERT INTO ai_jobs (id, kind, target_id, status, payload)
-               VALUES ($1, $2, $3, 'queued', $4)"#,
+            r#"INSERT INTO ai_jobs (id, kind, target_id, workspace_id, status, payload)
+               VALUES ($1, $2, $3, $4, 'queued', $5)"#,
         )
         .bind(uuid::Uuid::from_u128(id.0))
         .bind(kind_s)
         .bind(target_id)
+        .bind(workspace_id)
         .bind(&payload)
         .execute(&self.pool)
         .await?;
@@ -96,8 +101,8 @@ impl AiJobRepo {
                      FOR UPDATE SKIP LOCKED
                      LIMIT $1
                 )
-                RETURNING id, kind, target_id, status, attempts, payload, result, error,
-                          scheduled_at, started_at, finished_at"#,
+                RETURNING id, kind, target_id, workspace_id, status, attempts, payload, result,
+                          error, scheduled_at, started_at, finished_at"#,
         )
         .bind(n)
         .fetch_all(&self.pool)
@@ -146,6 +151,30 @@ impl AiJobRepo {
         .await?;
         Ok(())
     }
+
+    /// Return a claimed job to the queue, scheduled no earlier than `until`,
+    /// WITHOUT consuming a retry attempt (a deferral is not a failure). Used by
+    /// the worker to push back a job whose workspace has exhausted its per-tenant
+    /// budget window, so the work is delayed rather than dropped.
+    pub async fn defer(
+        &self,
+        id: Ulid,
+        until: time::OffsetDateTime,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r"UPDATE ai_jobs
+                  SET status = 'queued',
+                      scheduled_at = $2,
+                      started_at = NULL,
+                      attempts = GREATEST(attempts - 1, 0)
+                WHERE id = $1",
+        )
+        .bind(uuid::Uuid::from_u128(id.0))
+        .bind(until)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
 }
 
 #[derive(sqlx::FromRow)]
@@ -153,6 +182,7 @@ struct AiJobRow {
     id: uuid::Uuid,
     kind: String,
     target_id: Option<uuid::Uuid>,
+    workspace_id: Option<uuid::Uuid>,
     status: String,
     attempts: i32,
     payload: serde_json::Value,
@@ -182,6 +212,7 @@ impl From<AiJobRow> for AiJob {
             id: Ulid(r.id.as_u128()),
             kind,
             target_id: r.target_id,
+            workspace_id: r.workspace_id,
             status,
             attempts: r.attempts,
             payload: r.payload,

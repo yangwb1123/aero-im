@@ -384,11 +384,15 @@ impl ImService {
 
         // Best-effort enqueue an embed job (AI worker will pick it up).
         if !message.searchable_text().is_empty() {
+            // Tag the embed job with the room's workspace so the AI worker can
+            // meter paid-API spend per tenant (best-effort; None bills globally).
+            let ws = self.rooms.room_workspace(room).await.ok().flatten().map(|w| w.to_uuid());
             if let Err(err) = self
                 .ai_jobs
                 .enqueue(
                     AiJobKind::Embed,
                     Some(message.id.to_uuid()),
+                    ws,
                     serde_json::json!({"room_id": room.to_string()}),
                 )
                 .await
@@ -431,11 +435,19 @@ impl ImService {
             .await;
 
         if !updated.searchable_text().is_empty() {
+            let ws = self
+                .rooms
+                .room_workspace(updated.room_id)
+                .await
+                .ok()
+                .flatten()
+                .map(|w| w.to_uuid());
             if let Err(err) = self
                 .ai_jobs
                 .enqueue(
                     AiJobKind::Embed,
                     Some(updated.id.to_uuid()),
+                    ws,
                     serde_json::json!({"room_id": updated.room_id.to_string()}),
                 )
                 .await
