@@ -80,6 +80,48 @@ impl BlobRepo {
         .await?;
         Ok(row.map(Blob::from))
     }
+
+    /// Authorization check for blob download (IDOR guard).
+    ///
+    /// A blob has no direct room column; it is linked to rooms only by being
+    /// referenced from a `File`/`Voice` block (`{"blob_id": "<ulid>"}`) inside a
+    /// message's `blocks` JSONB. A participant may access a blob when either:
+    ///
+    /// * they uploaded it (`blobs.owner_id`), or
+    /// * it is referenced by a message in a room they belong to.
+    ///
+    /// The containment predicate (`blocks @> '[{"blob_id": ...}]'`) is served by
+    /// the existing `messages_blocks_gin` GIN index. Read-only; no row is
+    /// returned, only the boolean verdict.
+    pub async fn is_accessible_by(
+        &self,
+        id: BlobId,
+        viewer: ParticipantId,
+    ) -> Result<bool, sqlx::Error> {
+        // The blob id is stored in JSONB as its ULID string (BlobId is
+        // `#[serde(transparent)]` over Ulid), so match on the Display form.
+        let blob_ref = blob_ref_predicate(id);
+        let row = sqlx::query_as::<_, (bool,)>(
+            r"SELECT EXISTS (
+                   -- uploader always has access
+                   SELECT 1 FROM blobs b
+                   WHERE b.id = $1 AND b.owner_id = $2
+                   UNION ALL
+                   -- or the blob is referenced by a message in a room the viewer is in
+                   SELECT 1
+                   FROM messages m
+                   JOIN room_members rm ON rm.room_id = m.room_id
+                   WHERE rm.participant_id = $2
+                     AND m.blocks @> $3
+               ) AS ok",
+        )
+        .bind(id.to_uuid())
+        .bind(viewer.to_uuid())
+        .bind(blob_ref)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.0)
+    }
 }
 
 #[derive(sqlx::FromRow)]
@@ -94,6 +136,14 @@ struct BlobRow {
     storage_key: String,
     created_at: time::OffsetDateTime,
     finalized_at: Option<time::OffsetDateTime>,
+}
+
+/// JSONB containment predicate matching any message `blocks` array that
+/// references `id`. Used as the right-hand side of the `blocks @> $3` filter in
+/// [`BlobRepo::is_accessible_by`]. Factored out so the linkage shape can be
+/// unit-tested against real serialized blocks without a database.
+fn blob_ref_predicate(id: BlobId) -> serde_json::Value {
+    serde_json::json!([{ "blob_id": id.to_string() }])
 }
 
 impl From<BlobRow> for Blob {
@@ -117,5 +167,71 @@ impl From<BlobRow> for Blob {
             created_at: r.created_at,
             finalized_at: r.finalized_at,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aero_common::{Block, FileKind};
+    use serde_json::Value;
+
+    /// Faithful re-implementation of the Postgres `@>` (jsonb-contains) operator,
+    /// enough to validate the `is_accessible_by` predicate against real serialized
+    /// blocks without a live database. `outer @> inner` is true when every part of
+    /// `inner` is present in `outer`: objects match by key/value subset, arrays
+    /// match when each element of `inner` is contained in *some* element of
+    /// `outer`, and scalars match by equality.
+    fn jsonb_contains(outer: &Value, inner: &Value) -> bool {
+        match (outer, inner) {
+            (Value::Object(o), Value::Object(i)) => i
+                .iter()
+                .all(|(k, iv)| o.get(k).is_some_and(|ov| jsonb_contains(ov, iv))),
+            (Value::Array(o), Value::Array(i)) => i
+                .iter()
+                .all(|iv| o.iter().any(|ov| jsonb_contains(ov, iv))),
+            _ => outer == inner,
+        }
+    }
+
+    fn blocks_json(blocks: &[Block]) -> Value {
+        serde_json::to_value(blocks).expect("serialize blocks")
+    }
+
+    #[test]
+    fn predicate_matches_file_block_referencing_blob() {
+        let id = BlobId::new();
+        let blocks = vec![
+            Block::text("see attachment"),
+            Block::File { blob_id: id, kind: FileKind::Image, name: "p.png".into(), size: 12 },
+        ];
+        // Postgres would evaluate `blocks @> blob_ref_predicate(id)`.
+        assert!(jsonb_contains(&blocks_json(&blocks), &blob_ref_predicate(id)));
+    }
+
+    #[test]
+    fn predicate_matches_voice_block_referencing_blob() {
+        let id = BlobId::new();
+        let blocks = vec![Block::Voice { blob_id: id, duration_ms: 800, transcript: None }];
+        assert!(jsonb_contains(&blocks_json(&blocks), &blob_ref_predicate(id)));
+    }
+
+    #[test]
+    fn predicate_rejects_blocks_referencing_a_different_blob() {
+        let wanted = BlobId::new();
+        let other = BlobId::new();
+        let blocks = vec![
+            Block::text("unrelated"),
+            Block::File { blob_id: other, kind: FileKind::Document, name: "x".into(), size: 1 },
+        ];
+        // A blob id that appears in no block must not be considered referenced.
+        assert!(!jsonb_contains(&blocks_json(&blocks), &blob_ref_predicate(wanted)));
+    }
+
+    #[test]
+    fn predicate_rejects_blocks_with_no_attachment() {
+        let id = BlobId::new();
+        let blocks = vec![Block::text("just text"), Block::text("more text")];
+        assert!(!jsonb_contains(&blocks_json(&blocks), &blob_ref_predicate(id)));
     }
 }

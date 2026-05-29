@@ -525,7 +525,7 @@ async fn blob_upload(
 
 async fn blob_download(
     State(s): State<AppState>,
-    _auth: AuthUser,
+    auth: AuthUser,
     Path(id_str): Path<String>,
 ) -> ApiResult<axum::response::Response> {
     let id = BlobId::from_str(&id_str)
@@ -536,6 +536,17 @@ async fn blob_download(
         .await
         .map_err(AeroError::from)?
         .ok_or_else(|| AeroError::NotFound("blob".into()))?;
+    // IDOR guard: a logged-in user may only download a blob they uploaded or one
+    // referenced by a message in a room they belong to. Without this any holder
+    // of a blob id could read any attachment.
+    if !s
+        .blobs
+        .is_accessible_by(id, auth.participant_id)
+        .await
+        .map_err(AeroError::from)?
+    {
+        return Err(AeroError::Forbidden("blob".into()).into());
+    }
     let bytes: Bytes = s
         .blob_store
         .get(id)

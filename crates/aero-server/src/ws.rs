@@ -21,8 +21,10 @@ use axum::{
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, instrument, warn};
 
+use crate::hub::WsSender;
 use crate::state::AppState;
 
 #[derive(Debug, Deserialize)]
@@ -180,43 +182,68 @@ pub async fn handler(
 #[instrument(skip(socket, state), fields(%pid))]
 async fn run_socket(socket: WebSocket, state: AppState, pid: ParticipantId) {
     let (mut sender, mut receiver) = socket.split();
-    let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
-    state.hub.register(pid, tx.clone());
+    // Bounded outbound queue: a slow/stalled client can never make the
+    // broadcaster grow memory without limit (OOM guard). On a full queue the Hub
+    // drops the frame and — per config — disconnects the client via `close`.
+    let (tx, mut rx) = mpsc::channel::<Message>(state.ws_config.send_queue_capacity);
+    let close = CancellationToken::new();
+    state.hub.register(pid, WsSender::new(tx.clone(), close.clone()));
 
-    let _ = tx.send(Message::Text(
+    let _ = tx.try_send(Message::Text(
         serde_json::to_string(&ServerFrame::Welcome { participant: pid }).unwrap_or_default(),
     ));
 
-    let outgoing = tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            if sender.send(msg).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    while let Some(Ok(msg)) = receiver.next().await {
-        match msg {
-            Message::Text(text) => {
-                if let Err(e) = handle_text(&text, &state, pid, &tx).await {
-                    let _ = tx.send(Message::Text(
-                        serde_json::to_string(&ServerFrame::Error {
-                            code: "handler",
-                            msg: e.to_string(),
-                        })
-                        .unwrap_or_default(),
-                    ));
+    let outgoing = {
+        let close = close.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    () = close.cancelled() => break,
+                    msg = rx.recv() => match msg {
+                        Some(msg) => {
+                            if sender.send(msg).await.is_err() {
+                                break;
+                            }
+                        }
+                        None => break,
+                    },
                 }
             }
-            Message::Ping(p) => {
-                let _ = tx.send(Message::Pong(p));
+        })
+    };
+
+    loop {
+        tokio::select! {
+            // The Hub asked us to drop this connection (laggy / evicted).
+            () = close.cancelled() => break,
+            incoming = receiver.next() => {
+                let Some(Ok(msg)) = incoming else { break };
+                match msg {
+                    Message::Text(text) => {
+                        if let Err(e) = handle_text(&text, &state, pid, &tx).await {
+                            let _ = tx.try_send(Message::Text(
+                                serde_json::to_string(&ServerFrame::Error {
+                                    code: "handler",
+                                    msg: e.to_string(),
+                                })
+                                .unwrap_or_default(),
+                            ));
+                        }
+                    }
+                    Message::Ping(p) => {
+                        let _ = tx.try_send(Message::Pong(p));
+                    }
+                    Message::Close(_) => break,
+                    _ => {}
+                }
             }
-            Message::Close(_) => break,
-            _ => {}
         }
     }
 
-    state.hub.unregister(pid, &tx);
+    let registered = WsSender::new(tx, close.clone());
+    state.hub.unregister(pid, &registered);
+    close.cancel();
     outgoing.abort();
     info!(%pid, "ws closed");
 }
@@ -225,18 +252,18 @@ async fn handle_text(
     text: &str,
     state: &AppState,
     pid: ParticipantId,
-    tx: &mpsc::UnboundedSender<Message>,
+    tx: &mpsc::Sender<Message>,
 ) -> anyhow::Result<()> {
     let frame: ClientFrame = serde_json::from_str(text)?;
     match frame {
         ClientFrame::Ping => {
-            let _ = tx.send(Message::Text(
+            let _ = tx.try_send(Message::Text(
                 serde_json::to_string(&ServerFrame::Pong).unwrap_or_default(),
             ));
         }
         ClientFrame::JoinRoom { room_id } => {
             if !state.rooms.is_member(room_id, pid).await? {
-                let _ = tx.send(Message::Text(
+                let _ = tx.try_send(Message::Text(
                     serde_json::to_string(&ServerFrame::Error {
                         code: "forbidden",
                         msg: "not a member".into(),
@@ -247,7 +274,7 @@ async fn handle_text(
             }
             state.hub.join_room(room_id, pid);
             let online = state.hub.room_members_online(room_id);
-            let _ = tx.send(Message::Text(
+            let _ = tx.try_send(Message::Text(
                 serde_json::to_string(&ServerFrame::Presence { room_id, online })
                     .unwrap_or_default(),
             ));
@@ -349,7 +376,7 @@ async fn handle_text(
         }
         ClientFrame::CallJoin { room_id, kind, call_id } => {
             if !state.rooms.is_member(room_id, pid).await? {
-                let _ = tx.send(Message::Text(
+                let _ = tx.try_send(Message::Text(
                     serde_json::to_string(&ServerFrame::Error {
                         code: "forbidden",
                         msg: "not a member".into(),
@@ -405,7 +432,7 @@ async fn handle_text(
             if let Ok(lines) = state.live.recent_chat(stream_id, 30).await {
                 for line in lines {
                     let frame = ServerFrame::StreamEvent { event: StreamEvent::Chat(line) };
-                    let _ = tx.send(Message::Text(
+                    let _ = tx.try_send(Message::Text(
                         serde_json::to_string(&frame).unwrap_or_default(),
                     ));
                 }

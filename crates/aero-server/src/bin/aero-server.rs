@@ -14,7 +14,14 @@ use aero_live_core::LiveStreamConfig;
 use aero_live_rtmp::spawn_rtmp_ingest;
 use aero_live_whip::WhipRegistry;
 use aero_server::{
-    ai_adapter::AiServiceAdapter, hub::Hub, live::LiveService, routes, state::AppState, ws,
+    ai_adapter::AiServiceAdapter,
+    config::{GatewayConfig, WsConfig},
+    hub::Hub,
+    live::LiveService,
+    rate_limit::{self, RateLimiter},
+    routes,
+    state::AppState,
+    ws,
 };
 use aero_storage::{
     connect_pg, migrate, AiJobRepo, BlobRepo, CallRepo, KeyPackageRepo, LiveRepo, LocalFsBlobStore,
@@ -23,7 +30,14 @@ use aero_storage::{
 };
 use tokio_util::sync::CancellationToken;
 use anyhow::Context;
-use tower_http::{cors::CorsLayer, services::ServeDir, trace::TraceLayer};
+use axum::extract::DefaultBodyLimit;
+use tower::ServiceBuilder;
+use tower_http::{
+    cors::{AllowOrigin, CorsLayer},
+    services::ServeDir,
+    timeout::TimeoutLayer,
+    trace::TraceLayer,
+};
 use tracing::{info, warn};
 
 #[tokio::main]
@@ -152,8 +166,22 @@ async fn main() -> anyhow::Result<()> {
     }
     info!(addr = %live_cfg.rtmp_listen, "rtmp ingest listening");
 
+    // ---------- Gateway hardening config ----------
+    let gateway_cfg = GatewayConfig::from_env();
+    let ws_cfg = WsConfig::from_env();
+    info!(
+        timeout_secs = gateway_cfg.request_timeout.as_secs(),
+        max_body_bytes = gateway_cfg.max_body_bytes,
+        max_concurrency = gateway_cfg.max_concurrency,
+        cors_origins = gateway_cfg.cors_allowed_origins.len(),
+        rl_per_sec = gateway_cfg.rate_limit.per_second,
+        rl_burst = gateway_cfg.rate_limit.burst,
+        ws_send_queue = ws_cfg.send_queue_capacity,
+        "gateway hardening configured"
+    );
+
     // ---------- Hub ----------
-    let hub = Hub::new();
+    let hub = Hub::with_ws_config(ws_cfg);
 
     // ---------- Compose state ----------
     let public_base_url = std::env::var("AERO_PUBLIC_BASE_URL")
@@ -177,6 +205,8 @@ async fn main() -> anyhow::Result<()> {
         presence,
         bus: bus_dyn,
         hub,
+        ws_config: ws_cfg,
+        rate_limiter: RateLimiter::new(gateway_cfg.rate_limit),
         ai: Some(Arc::new(AiServiceAdapter::new(ai_service.clone()))),
         public_base_url,
         whip: WhipRegistry::new(),
@@ -247,16 +277,68 @@ async fn main() -> anyhow::Result<()> {
     if let Err(e) = std::fs::create_dir_all(&hls_dir) {
         warn!(error = %e, dir = %hls_dir.display(), "create hls dir failed");
     }
+
+    // CORS: tighten to a configured allow-list in production; fall back to the
+    // permissive dev default only when no origins are configured.
+    let cors = build_cors(&gateway_cfg);
+
+    // Global protective middleware stack (outermost → innermost):
+    //   trace → cors → concurrency-limit → rate-limit → timeout → body-limit.
+    // Concurrency + timeout are optional (0 disables). Rate limiting wires the
+    // dormant `Error::RateLimited` (429). Tracing stays outermost so even
+    // rejected requests are observed.
+    let timeout_layer = (!gateway_cfg.request_timeout.is_zero()).then(|| {
+        TimeoutLayer::with_status_code(
+            axum::http::StatusCode::REQUEST_TIMEOUT,
+            gateway_cfg.request_timeout,
+        )
+    });
+    let concurrency_layer = (gateway_cfg.max_concurrency > 0)
+        .then(|| tower::limit::ConcurrencyLimitLayer::new(gateway_cfg.max_concurrency));
+    let middleware = ServiceBuilder::new()
+        .layer(TraceLayer::new_for_http())
+        .layer(cors)
+        .option_layer(concurrency_layer)
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            rate_limit::layer,
+        ))
+        .option_layer(timeout_layer)
+        .layer(DefaultBodyLimit::max(gateway_cfg.max_body_bytes));
+
     let app = routes::build(state.clone())
         .nest_service("/hls", ServeDir::new(&hls_dir))
         .fallback_service(ServeDir::new(&cfg.server.web_dir))
-        .layer(TraceLayer::new_for_http())
-        .layer(CorsLayer::permissive());
+        .layer(middleware);
 
     let addr: SocketAddr = format!("{}:{}", cfg.server.host, cfg.server.port).parse()?;
     info!(%addr, "listening");
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    // `into_make_service_with_connect_info` exposes the peer address to the
+    // rate-limit middleware (for IP keying of unauthenticated requests).
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
+}
+
+/// Build the CORS layer from config: an explicit origin allow-list when one is
+/// configured, otherwise the permissive dev default.
+fn build_cors(cfg: &GatewayConfig) -> CorsLayer {
+    if cfg.cors_allowed_origins.is_empty() {
+        warn!("CORS permissive (dev default) — set AERO_CORS_ALLOWED_ORIGINS for production");
+        return CorsLayer::permissive();
+    }
+    let origins: Vec<axum::http::HeaderValue> = cfg
+        .cors_allowed_origins
+        .iter()
+        .filter_map(|o| o.parse().ok())
+        .collect();
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::list(origins))
+        .allow_methods(tower_http::cors::Any)
+        .allow_headers(tower_http::cors::Any)
 }
 
