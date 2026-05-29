@@ -116,16 +116,22 @@ async fn main() -> anyhow::Result<()> {
     .context("init AuthService")?;
 
     // ---------- IM service ----------
-    let im = Arc::new(ImService::new(
-        rooms.clone(),
-        messages.clone(),
-        participants.clone(),
-        receipts.clone(),
-        reactions.clone(),
-        calls.clone(),
-        ai_jobs.clone(),
-        jetstream.clone(),
-    ));
+    // `with_workspaces` wires the tenant repo so the workspace-scoped methods
+    // (`create_room_in_workspace`, `assert_room_access`) have their backing store;
+    // without it they return an internal error instead of enforcing tenancy.
+    let im = Arc::new(
+        ImService::new(
+            rooms.clone(),
+            messages.clone(),
+            participants.clone(),
+            receipts.clone(),
+            reactions.clone(),
+            calls.clone(),
+            ai_jobs.clone(),
+            jetstream.clone(),
+        )
+        .with_workspaces(workspaces.clone()),
+    );
 
     // ---------- Live service (danmaku / gifts / viewers) ----------
     let live = LiveService::new(
