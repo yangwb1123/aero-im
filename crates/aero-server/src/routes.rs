@@ -772,9 +772,9 @@ async fn ai_summarize(
     Json(req): Json<AiSummarizeReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let room = parse_room_id(&req.room_id)?;
-    if !s.rooms.is_member(room, auth.participant_id).await.map_err(AeroError::from)? {
-        return Err(AeroError::Forbidden("not a member".into()).into());
-    }
+    // Tenant guard (workspace + room membership) — defense-in-depth on AI output
+    // derived from a room's messages; supersedes the prior bare room-membership check.
+    s.im.assert_room_access(auth.participant_id, room).await?;
     let last_n = req.last_n.unwrap_or(50);
     let ai = s.ai.as_ref().ok_or_else(|| AeroError::Upstream("AI not configured".into()))?;
     let summary = ai
@@ -798,9 +798,8 @@ async fn ai_ask(
     Json(req): Json<AiAskReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let room = parse_room_id(&req.room_id)?;
-    if !s.rooms.is_member(room, auth.participant_id).await.map_err(AeroError::from)? {
-        return Err(AeroError::Forbidden("not a member".into()).into());
-    }
+    // Tenant guard (workspace + room membership) — defense-in-depth on RAG output.
+    s.im.assert_room_access(auth.participant_id, room).await?;
     let k = req.k.unwrap_or(8);
     let ai = s.ai.as_ref().ok_or_else(|| AeroError::Upstream("AI not configured".into()))?;
     let answer = ai
