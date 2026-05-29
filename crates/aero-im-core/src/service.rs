@@ -13,11 +13,11 @@ use aero_bus::EventBus;
 use aero_common::{
     Block, CallEvent, CallId, CallKind, CallMode, CallSession, Error, Message, MessageEnvelope,
     MessageId, ParticipantId, ReactionOp, ReactionSummary, ReadReceipt, Result, Room, RoomEvent,
-    RoomId, RoomKind,
+    RoomId, RoomKind, WorkspaceId, WorkspaceRole,
 };
 use aero_storage::{
     message::NewMessage, AiJobKind, AiJobRepo, CallRepo, MessageRepo, ParticipantRepo,
-    ReactionRepo, ReceiptRepo, RoomRepo,
+    ReactionRepo, ReceiptRepo, RoomRepo, WorkspaceRepo,
 };
 use async_trait::async_trait;
 use std::collections::BTreeMap;
@@ -28,6 +28,24 @@ use crate::moderator::{ModerationVerdict, Moderator};
 use crate::validation::validate_blocks;
 
 const EVENTS_SUBJECT: &str = "im.events";
+
+/// Whether a workspace member holding `role` may create a channel (room) in that
+/// workspace. Members and above may; guests may not. Pure decision function so it
+/// is exhaustively unit-testable without a database.
+#[must_use]
+pub fn can_create_channel(role: WorkspaceRole) -> bool {
+    role.at_least(WorkspaceRole::Member)
+}
+
+/// Whether a participant may access a room's data, given (a) whether they belong
+/// to the room's workspace and (b) whether they are a member of the room itself.
+/// Both must hold — workspace membership alone is not enough, nor is a stale room
+/// membership in a workspace they've been removed from. Pure decision function,
+/// unit-tested as a truth table.
+#[must_use]
+pub fn can_access_room(is_workspace_member: bool, is_room_member: bool) -> bool {
+    is_workspace_member && is_room_member
+}
 
 /// Object-safe view of [`EventBus`] used internally for dependency injection.
 ///
@@ -67,6 +85,11 @@ async fn publish_event<T: serde::Serialize>(
 #[derive(Clone)]
 pub struct ImService {
     rooms: RoomRepo,
+    /// Tenancy repo for workspace-scoped authorization. Optional so the existing
+    /// constructors stay signature-compatible; wire it via
+    /// [`with_workspaces`](ImService::with_workspaces) to enable the
+    /// workspace-scoped methods.
+    workspaces: Option<WorkspaceRepo>,
     messages: MessageRepo,
     #[allow(dead_code)] // Reserved for mention lookups, P3+.
     participants: ParticipantRepo,
@@ -101,6 +124,7 @@ impl ImService {
         };
         Self {
             rooms,
+            workspaces: None,
             messages,
             participants,
             receipts,
@@ -119,6 +143,18 @@ impl ImService {
         self
     }
 
+    /// Wire in the workspace repository, enabling the workspace-scoped methods
+    /// ([`create_room_in_workspace`](ImService::create_room_in_workspace),
+    /// [`assert_room_access`](ImService::assert_room_access)). Additive builder,
+    /// mirroring [`with_moderator`](ImService::with_moderator); without it those
+    /// methods return an internal error rather than silently skipping tenant
+    /// checks.
+    #[must_use]
+    pub fn with_workspaces(mut self, workspaces: WorkspaceRepo) -> Self {
+        self.workspaces = Some(workspaces);
+        self
+    }
+
     /// Lower-level constructor for tests with a pre-built bus sink.
     #[allow(clippy::too_many_arguments)]
     pub fn from_sink(
@@ -133,6 +169,7 @@ impl ImService {
     ) -> Self {
         Self {
             rooms,
+            workspaces: None,
             messages,
             participants,
             receipts,
@@ -172,6 +209,95 @@ impl ImService {
             warn!(?err, room_id = %room.id, "publish RoomCreated failed");
         }
         Ok(room)
+    }
+
+    /// Reference to the wired workspace repo, or a clear internal error if the
+    /// service was built without [`with_workspaces`](Self::with_workspaces).
+    fn workspaces(&self) -> Result<&WorkspaceRepo> {
+        self.workspaces.as_ref().ok_or_else(|| {
+            Error::Internal(anyhow::anyhow!(
+                "ImService used for a workspace-scoped operation without a WorkspaceRepo \
+                 (call ImService::with_workspaces)"
+            ))
+        })
+    }
+
+    /// Create a channel inside `workspace` on behalf of `creator` — the tenant
+    /// choke point. Verifies `creator` is a workspace member whose role permits
+    /// channel creation ([`can_create_channel`]); otherwise returns
+    /// [`Error::Forbidden`]. On success delegates to
+    /// [`RoomRepo::create_in_workspace`](aero_storage::RoomRepo::create_in_workspace)
+    /// so the room carries its `workspace_id`, then publishes `RoomCreated`.
+    #[instrument(skip(self), fields(?creator, ?workspace, ?kind))]
+    pub async fn create_room_in_workspace(
+        &self,
+        creator: ParticipantId,
+        workspace: WorkspaceId,
+        kind: RoomKind,
+        name: Option<String>,
+    ) -> Result<Room> {
+        let role = self
+            .workspaces()?
+            .member_role(workspace, creator)
+            .await?
+            .ok_or_else(|| {
+                Error::Forbidden(format!(
+                    "{creator} is not a member of workspace {workspace}"
+                ))
+            })?;
+        if !can_create_channel(role) {
+            return Err(Error::Forbidden(format!(
+                "role {role:?} may not create channels in workspace {workspace}"
+            )));
+        }
+
+        let room = self
+            .rooms
+            .create_in_workspace(workspace, kind, name, creator)
+            .await?;
+        let event = ImEvent::RoomCreated(room.clone());
+        if let Err(err) = publish_event(
+            self.bus.as_ref(),
+            &format!("{EVENTS_SUBJECT}.room.created"),
+            &event,
+        )
+        .await
+        {
+            warn!(?err, room_id = %room.id, "publish RoomCreated failed");
+        }
+        Ok(room)
+    }
+
+    /// The single reusable tenant guard: assert `participant` may access `room`.
+    ///
+    /// Resolves the room's owning workspace via
+    /// [`RoomRepo::room_workspace`](aero_storage::RoomRepo::room_workspace) and
+    /// requires BOTH workspace membership AND room membership
+    /// ([`can_access_room`]). Returns [`Error::NotFound`] if the room does not
+    /// exist, otherwise [`Error::Forbidden`] when access is denied. Servers
+    /// should call this before serving any of a room's data.
+    #[instrument(skip(self), fields(?participant, ?room))]
+    pub async fn assert_room_access(
+        &self,
+        participant: ParticipantId,
+        room: RoomId,
+    ) -> Result<()> {
+        let workspace = self
+            .rooms
+            .room_workspace(room)
+            .await?
+            .ok_or_else(|| Error::NotFound(format!("room {room}")))?;
+
+        let is_workspace_member = self.workspaces()?.is_member(workspace, participant).await?;
+        let is_room_member = self.rooms.is_member(room, participant).await?;
+
+        if can_access_room(is_workspace_member, is_room_member) {
+            Ok(())
+        } else {
+            Err(Error::Forbidden(format!(
+                "{participant} may not access room {room}"
+            )))
+        }
     }
 
     /// Add a member to a room. `actor` must themselves be a member.
@@ -598,5 +724,51 @@ mod tests {
         assert_eq!(log.len(), 1);
         assert_eq!(log[0].0, "im.events.room.created");
         assert!(std::str::from_utf8(&log[0].1).unwrap().contains("\"ok\":true"));
+    }
+
+    // ---- Pure tenancy-authorization decisions (DB-free, exhaustive) ----
+
+    const ALL_ROLES: [WorkspaceRole; 4] = [
+        WorkspaceRole::Guest,
+        WorkspaceRole::Member,
+        WorkspaceRole::Admin,
+        WorkspaceRole::Owner,
+    ];
+
+    #[test]
+    fn can_create_channel_is_member_and_above() {
+        assert!(!can_create_channel(WorkspaceRole::Guest));
+        assert!(can_create_channel(WorkspaceRole::Member));
+        assert!(can_create_channel(WorkspaceRole::Admin));
+        assert!(can_create_channel(WorkspaceRole::Owner));
+    }
+
+    #[test]
+    fn can_create_channel_matches_at_least_member_for_all_roles() {
+        for r in ALL_ROLES {
+            assert_eq!(
+                can_create_channel(r),
+                r.at_least(WorkspaceRole::Member),
+                "role {r:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn can_access_room_requires_both_memberships() {
+        // Full truth table over (workspace_member, room_member).
+        assert!(!can_access_room(false, false));
+        assert!(!can_access_room(true, false));
+        assert!(!can_access_room(false, true));
+        assert!(can_access_room(true, true));
+    }
+
+    #[test]
+    fn can_access_room_is_logical_and() {
+        for ws in [false, true] {
+            for room in [false, true] {
+                assert_eq!(can_access_room(ws, room), ws && room, "({ws}, {room})");
+            }
+        }
     }
 }
