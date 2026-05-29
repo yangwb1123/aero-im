@@ -49,6 +49,11 @@ use crate::state::AppState;
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/workspaces", post(create_workspace).get(list_workspaces))
+        // Owner-only erasure (ROADMAP 方向一 合规); GET of a single workspace is
+        // intentionally not (yet) offered here — listing is via `/api/workspaces`.
+        .route("/api/workspaces/:id", axum::routing::delete(delete_workspace))
+        // Owner-only full-tenant export (GDPR data portability).
+        .route("/api/workspaces/:id/export", get(export_workspace))
         .route("/api/workspaces/:id/members", get(list_members).post(add_member))
         .route(
             "/api/workspaces/:id/members/:pid",
@@ -176,6 +181,37 @@ pub fn authorize_view_audit(caller: WorkspaceRole) -> AeroResult<()> {
     }
 }
 
+/// May `caller` export the workspace's complete data snapshot? **Owner-only**
+/// (ROADMAP 方向一 合规 — GDPR data portability). A full tenant export is the
+/// most sensitive read in the system — every channel, message, member and the
+/// audit trail — so it is restricted to the workspace owner; even admins are
+/// denied. Delegates the owner check to [`WorkspaceRole::can_manage_workspace`].
+///
+/// # Errors
+/// [`AeroError::Forbidden`] for any non-owner role.
+pub fn authorize_export(caller: WorkspaceRole) -> AeroResult<()> {
+    if caller.can_manage_workspace() {
+        Ok(())
+    } else {
+        Err(AeroError::Forbidden("workspace export requires owner".into()))
+    }
+}
+
+/// May `caller` delete (erase) the entire workspace? **Owner-only** (ROADMAP
+/// 方向一 合规 — right-to-be-forgotten). Hard-deleting a tenant and all its data
+/// is irreversible, so it is restricted to the owner; admins cannot. Delegates
+/// the owner check to [`WorkspaceRole::can_manage_workspace`].
+///
+/// # Errors
+/// [`AeroError::Forbidden`] for any non-owner role.
+pub fn authorize_delete(caller: WorkspaceRole) -> AeroResult<()> {
+    if caller.can_manage_workspace() {
+        Ok(())
+    } else {
+        Err(AeroError::Forbidden("workspace deletion requires owner".into()))
+    }
+}
+
 /// Resolve the caller's role in a workspace, rejecting non-members.
 ///
 /// Used by every member-scoped route so the "must be a member" check (and its
@@ -289,6 +325,61 @@ async fn list_audit(
         .await
         .map_err(AeroError::from)?;
     Ok(Json(serde_json::to_value(events).map_err(AeroError::from)?))
+}
+
+/// `GET /api/workspaces/:id/export` — **owner-only**: a complete data snapshot
+/// of the tenant (workspace row, members, channels with their messages, audit
+/// trail), for GDPR-style data portability (ROADMAP 方向一 合规). Per-room
+/// messages are bounded server-side (see
+/// [`aero_storage::EXPORT_MESSAGES_PER_ROOM`]).
+async fn export_workspace(
+    State(s): State<AppState>,
+    auth: AuthUser,
+    Path(id_str): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let ws = parse_workspace_id(&id_str)?;
+    let caller = caller_role(&s.workspaces, ws, auth.participant_id).await?;
+    authorize_export(caller)?;
+    let snapshot = s
+        .workspaces
+        .export(ws)
+        .await
+        .map_err(AeroError::from)?
+        // A caller resolved a role above, so the workspace existed then; treat a
+        // racing disappearance as 404.
+        .ok_or_else(|| AeroError::NotFound("workspace".into()))?;
+    // Record that an export was taken, into the workspace's own audit trail
+    // (the export already happened, so this row is not part of the snapshot).
+    audit(&s, ws, auth.participant_id, "workspace.export", None, serde_json::json!({})).await;
+    Ok(Json(serde_json::to_value(snapshot).map_err(AeroError::from)?))
+}
+
+/// `DELETE /api/workspaces/:id` — **owner-only**: hard-delete the workspace and
+/// everything scoped to it (ROADMAP 方向一 合规 — erasure). The repo runs the
+/// cascade atomically in one transaction.
+///
+/// An `"workspace.delete"` audit event is emitted **before** the delete. Because
+/// `audit_events` is itself `ON DELETE CASCADE` on `workspaces`, that row is then
+/// removed along with the tenant — so the deletion is also recorded via
+/// `tracing` (a durable, out-of-tenant log) to retain an erasure record.
+async fn delete_workspace(
+    State(s): State<AppState>,
+    auth: AuthUser,
+    Path(id_str): Path<String>,
+) -> ApiResult<StatusCode> {
+    let ws = parse_workspace_id(&id_str)?;
+    let caller = caller_role(&s.workspaces, ws, auth.participant_id).await?;
+    authorize_delete(caller)?;
+    // Best-effort audit BEFORE deletion (the row cascade-deletes with the tenant).
+    audit(&s, ws, auth.participant_id, "workspace.delete", None, serde_json::json!({})).await;
+    let deleted = s.workspaces.delete(ws).await.map_err(AeroError::from)?;
+    if !deleted {
+        // Raced with another deleter between the role check and the delete.
+        return Err(AeroError::NotFound("workspace".into()).into());
+    }
+    // Durable erasure record outside the (now-deleted) tenant's audit trail.
+    tracing::info!(%ws, actor = %auth.participant_id, "workspace.delete (erased)");
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Deserialize)]
@@ -441,6 +532,57 @@ mod tests {
         assert!(!allowed(&authorize_view_audit(WorkspaceRole::Guest)));
         // Denials surface as 403, not 404/500.
         assert_eq!(status_of(&authorize_view_audit(WorkspaceRole::Member)), 403);
+    }
+
+    // ----- authorize_export / authorize_delete (compliance, owner-only) -----
+
+    #[test]
+    fn export_is_owner_only_over_all_roles() {
+        // Exhaustive over the 4 roles: only Owner may export; everyone else is
+        // denied — including Admin (export is stricter than admin/audit).
+        for r in ALL {
+            assert_eq!(
+                allowed(&authorize_export(r)),
+                r == WorkspaceRole::Owner,
+                "export allowed only for owner, role {r:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn export_non_owner_denials_are_403() {
+        // Every non-owner denial is an authorization failure (403), not 400/404.
+        for r in [WorkspaceRole::Guest, WorkspaceRole::Member, WorkspaceRole::Admin] {
+            assert_eq!(status_of(&authorize_export(r)), 403, "role {r:?}");
+        }
+    }
+
+    #[test]
+    fn delete_is_owner_only_over_all_roles() {
+        for r in ALL {
+            assert_eq!(
+                allowed(&authorize_delete(r)),
+                r == WorkspaceRole::Owner,
+                "delete allowed only for owner, role {r:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn delete_non_owner_denials_are_403() {
+        for r in [WorkspaceRole::Guest, WorkspaceRole::Member, WorkspaceRole::Admin] {
+            assert_eq!(status_of(&authorize_delete(r)), 403, "role {r:?}");
+        }
+    }
+
+    #[test]
+    fn export_and_delete_agree_with_can_manage_workspace() {
+        // The guards delegate to the same owner predicate, so they must track it
+        // exactly for every role (no drift between storage and HTTP layers).
+        for r in ALL {
+            assert_eq!(allowed(&authorize_export(r)), r.can_manage_workspace());
+            assert_eq!(allowed(&authorize_delete(r)), r.can_manage_workspace());
+        }
     }
 
     // ----- authorize_invite -----
