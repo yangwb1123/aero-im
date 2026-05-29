@@ -23,13 +23,13 @@
 use std::str::FromStr;
 
 use aero_common::{
-    Error as AeroError, ParticipantId, Result as AeroResult, WorkspaceId, WorkspaceRole,
+    AuditId, Error as AeroError, ParticipantId, Result as AeroResult, WorkspaceId, WorkspaceRole,
 };
 use aero_storage::{
     role_can_assign, role_can_invite, role_can_manage_member, role_can_remove, WorkspaceRepo,
 };
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     routing::{get, post},
     Json, Router,
@@ -54,6 +54,23 @@ pub fn routes() -> Router<AppState> {
             "/api/workspaces/:id/members/:pid",
             axum::routing::patch(change_member_role).delete(remove_member),
         )
+        .route("/api/workspaces/:id/audit", get(list_audit))
+}
+
+/// Append an audit event without ever failing the caller's request: the trail is
+/// observability, not a transactional invariant, so a logging hiccup must not
+/// roll back a successful administrative action.
+async fn audit(
+    s: &AppState,
+    workspace: WorkspaceId,
+    actor: ParticipantId,
+    action: &str,
+    target: Option<&str>,
+    detail: serde_json::Value,
+) {
+    if let Err(e) = s.audit.append(workspace, Some(actor), action, target, detail).await {
+        tracing::warn!(error = ?e, %workspace, action, "audit append failed");
+    }
 }
 
 // ---------- Pure authorization decisions (DB-free, unit-tested) ----------
@@ -142,6 +159,23 @@ fn parse_participant_id(s: &str) -> AeroResult<ParticipantId> {
     ParticipantId::from_str(s).map_err(|e| AeroError::Invalid(format!("participant id: {e}")))
 }
 
+fn parse_audit_id(s: &str) -> AeroResult<AuditId> {
+    AuditId::from_str(s).map_err(|e| AeroError::Invalid(format!("audit cursor: {e}")))
+}
+
+/// May `caller` read the workspace's audit trail? Restricted to admins/owners —
+/// the trail exposes who-did-what across the tenant, so members/guests are denied.
+///
+/// # Errors
+/// [`AeroError::Forbidden`] for non-administrators.
+pub fn authorize_view_audit(caller: WorkspaceRole) -> AeroResult<()> {
+    if caller.can_administer() {
+        Ok(())
+    } else {
+        Err(AeroError::Forbidden("audit trail requires admin".into()))
+    }
+}
+
 /// Resolve the caller's role in a workspace, rejecting non-members.
 ///
 /// Used by every member-scoped route so the "must be a member" check (and its
@@ -191,6 +225,15 @@ async fn create_workspace(
         .create(name.to_owned(), slug.to_owned(), auth.participant_id)
         .await
         .map_err(AeroError::from)?;
+    audit(
+        &s,
+        ws.id,
+        auth.participant_id,
+        "workspace.create",
+        None,
+        serde_json::json!({ "name": name, "slug": slug }),
+    )
+    .await;
     Ok(Json(serde_json::to_value(ws).map_err(AeroError::from)?))
 }
 
@@ -221,6 +264,34 @@ async fn list_members(
 }
 
 #[derive(Deserialize)]
+struct AuditQuery {
+    /// Keyset cursor: return events strictly older than this audit id.
+    before: Option<String>,
+    /// Page size (clamped server-side).
+    limit: Option<i64>,
+}
+
+/// `GET /api/workspaces/:id/audit` — admin/owner only: the workspace's audit
+/// trail, newest first, keyset-paginated via `?before=<audit_id>&limit=<n>`.
+async fn list_audit(
+    State(s): State<AppState>,
+    auth: AuthUser,
+    Path(id_str): Path<String>,
+    Query(q): Query<AuditQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let ws = parse_workspace_id(&id_str)?;
+    let caller = caller_role(&s.workspaces, ws, auth.participant_id).await?;
+    authorize_view_audit(caller)?;
+    let before = q.before.as_deref().map(parse_audit_id).transpose()?;
+    let events = s
+        .audit
+        .list_for_workspace(ws, before, q.limit)
+        .await
+        .map_err(AeroError::from)?;
+    Ok(Json(serde_json::to_value(events).map_err(AeroError::from)?))
+}
+
+#[derive(Deserialize)]
 struct AddMemberReq {
     participant_id: String,
     role: WorkspaceRole,
@@ -242,6 +313,15 @@ async fn add_member(
         .add_member(ws, target, req.role)
         .await
         .map_err(AeroError::from)?;
+    audit(
+        &s,
+        ws,
+        auth.participant_id,
+        "member.add",
+        Some(&target.to_string()),
+        serde_json::json!({ "role": req.role }),
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -277,6 +357,15 @@ async fn change_member_role(
         .update_member_role(ws, subject_id, req.role)
         .await
         .map_err(AeroError::from)?;
+    audit(
+        &s,
+        ws,
+        auth.participant_id,
+        "member.role_change",
+        Some(&subject_id.to_string()),
+        serde_json::json!({ "from": subject_role, "to": req.role }),
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -302,6 +391,15 @@ async fn remove_member(
         .remove_member(ws, subject_id)
         .await
         .map_err(AeroError::from)?;
+    audit(
+        &s,
+        ws,
+        auth.participant_id,
+        "member.remove",
+        Some(&subject_id.to_string()),
+        serde_json::json!({ "was": subject_role, "self": is_self }),
+    )
+    .await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -333,6 +431,16 @@ mod tests {
 
     fn allowed(r: &AeroResult<()>) -> bool {
         r.is_ok()
+    }
+
+    #[test]
+    fn audit_view_is_admin_and_owner_only() {
+        assert!(allowed(&authorize_view_audit(WorkspaceRole::Owner)));
+        assert!(allowed(&authorize_view_audit(WorkspaceRole::Admin)));
+        assert!(!allowed(&authorize_view_audit(WorkspaceRole::Member)));
+        assert!(!allowed(&authorize_view_audit(WorkspaceRole::Guest)));
+        // Denials surface as 403, not 404/500.
+        assert_eq!(status_of(&authorize_view_audit(WorkspaceRole::Member)), 403);
     }
 
     // ----- authorize_invite -----

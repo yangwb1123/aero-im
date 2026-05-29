@@ -4,6 +4,7 @@
 //! offering high-level methods that other crates call. SQL stays inside this crate.
 
 pub mod ai_job;
+pub mod audit;
 pub mod blob;
 pub mod blob_store;
 pub mod cache;
@@ -22,6 +23,7 @@ pub mod stream;
 pub mod workspace;
 
 pub use ai_job::{AiJob, AiJobKind, AiJobRepo, AiJobStatus};
+pub use audit::{AuditEvent, AuditRepo};
 pub use blob::{BlobRepo, NewBlob};
 pub use blob_store::{BlobStore, BlobStoreError, LocalFsBlobStore};
 pub use cache::{Cache, RedisCache};

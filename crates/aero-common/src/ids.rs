@@ -108,6 +108,10 @@ define_id!(
     /// Identifies a workspace (tenant / org). Rooms and members belong to one.
     WorkspaceId
 );
+define_id!(
+    /// Identifies a single audit-trail event (workspace administration log).
+    AuditId
+);
 
 #[cfg(test)]
 mod tests {
