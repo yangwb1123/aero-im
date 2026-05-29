@@ -6,6 +6,7 @@
 //! - Cross-cutting `Error` and `Result` aliases
 //! - Configuration loading (`AppConfig`)
 //! - Tracing/OTel initialization
+//! - A lightweight metrics registry + Prometheus exposition (`metrics`)
 //!
 //! Other crates depend on this one and re-export domain-specific types as needed.
 
@@ -13,6 +14,7 @@ pub mod config;
 pub mod error;
 pub mod ids;
 pub mod live;
+pub mod metrics;
 pub mod mls;
 pub mod model;
 pub mod telemetry;
