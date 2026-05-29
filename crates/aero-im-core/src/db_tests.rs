@@ -12,10 +12,10 @@
 
 use std::sync::Arc;
 
-use aero_common::{Block, RoomKind};
+use aero_common::{Block, RoomKind, WorkspaceRole};
 use aero_storage::{
     db::PgPool, AiJobRepo, CallRepo, MessageRepo, ParticipantRepo, ReactionRepo, ReceiptRepo,
-    RoomRepo,
+    RoomRepo, WorkspaceRepo,
 };
 
 use crate::service::ImService;
@@ -44,9 +44,22 @@ fn service(pool: PgPool) -> ImService {
         ReceiptRepo::new(pool.clone()),
         ReactionRepo::new(pool.clone()),
         CallRepo::new(pool.clone()),
-        AiJobRepo::new(pool),
+        AiJobRepo::new(pool.clone()),
         bus,
     )
+    // Workspace-scoped methods need the tenancy repo wired in (additive builder).
+    .with_workspaces(WorkspaceRepo::new(pool))
+}
+
+async fn new_participant(participants: &ParticipantRepo, prefix: &str) -> aero_common::Participant {
+    participants
+        .create_human(aero_storage::participant::NewHuman {
+            email: unique_email(prefix),
+            display_name: prefix.into(),
+            password_hash: "x".into(),
+        })
+        .await
+        .unwrap()
 }
 
 #[tokio::test]
@@ -164,5 +177,239 @@ async fn send_message_publishes_envelope() {
         log.iter().any(|(s, _)| s == &ImService::room_subject(room.id)),
         "no publish on im.room.{room_id}: {log:?}",
         room_id = room.id
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Workspace-scoped tenancy methods (additive). These document and compile-verify
+// the new RoomRepo/WorkspaceRepo/ImService behavior; they run only against a live
+// Postgres with the 0006 workspace migration applied.
+// ---------------------------------------------------------------------------
+
+fn unique_slug(prefix: &str) -> String {
+    format!("{prefix}-{}", aero_common::WorkspaceId::new())
+}
+
+#[tokio::test]
+#[ignore = "requires running Postgres with migrations applied"]
+async fn create_room_in_workspace_member_succeeds_room_carries_workspace() {
+    let pool = pool();
+    let participants = ParticipantRepo::new(pool.clone());
+    let workspaces = WorkspaceRepo::new(pool.clone());
+    let rooms = RoomRepo::new(pool.clone());
+
+    let alice = new_participant(&participants, "alice").await;
+    // create() enrolls alice as workspace owner.
+    let ws = workspaces
+        .create("Acme".into(), unique_slug("acme"), alice.id)
+        .await
+        .unwrap();
+
+    let svc = service(pool);
+    let room = svc
+        .create_room_in_workspace(alice.id, ws.id, RoomKind::Channel, Some("general".into()))
+        .await
+        .unwrap();
+
+    // The room must be stamped with its owning workspace.
+    assert_eq!(rooms.room_workspace(room.id).await.unwrap(), Some(ws.id));
+    // And it must appear in the workspace-scoped listing for alice.
+    let scoped = rooms.rooms_for_in_workspace(alice.id, ws.id).await.unwrap();
+    assert!(scoped.iter().any(|r| r.id == room.id));
+}
+
+#[tokio::test]
+#[ignore = "requires running Postgres with migrations applied"]
+async fn create_room_in_workspace_non_member_forbidden() {
+    let pool = pool();
+    let participants = ParticipantRepo::new(pool.clone());
+    let workspaces = WorkspaceRepo::new(pool.clone());
+
+    let owner = new_participant(&participants, "owner").await;
+    let outsider = new_participant(&participants, "outsider").await;
+    let ws = workspaces
+        .create("Acme".into(), unique_slug("acme"), owner.id)
+        .await
+        .unwrap();
+
+    let svc = service(pool);
+    let err = svc
+        .create_room_in_workspace(outsider.id, ws.id, RoomKind::Channel, None)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, aero_common::Error::Forbidden(_)), "got {err:?}");
+}
+
+#[tokio::test]
+#[ignore = "requires running Postgres with migrations applied"]
+async fn create_room_in_workspace_guest_forbidden() {
+    let pool = pool();
+    let participants = ParticipantRepo::new(pool.clone());
+    let workspaces = WorkspaceRepo::new(pool.clone());
+
+    let owner = new_participant(&participants, "owner").await;
+    let guest = new_participant(&participants, "guest").await;
+    let ws = workspaces
+        .create("Acme".into(), unique_slug("acme"), owner.id)
+        .await
+        .unwrap();
+    workspaces
+        .add_member(ws.id, guest.id, WorkspaceRole::Guest)
+        .await
+        .unwrap();
+
+    let svc = service(pool);
+    let err = svc
+        .create_room_in_workspace(guest.id, ws.id, RoomKind::Channel, None)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, aero_common::Error::Forbidden(_)), "got {err:?}");
+}
+
+#[tokio::test]
+#[ignore = "requires running Postgres with migrations applied"]
+async fn assert_room_access_allows_workspace_and_room_member() {
+    let pool = pool();
+    let participants = ParticipantRepo::new(pool.clone());
+    let workspaces = WorkspaceRepo::new(pool.clone());
+
+    let alice = new_participant(&participants, "alice").await;
+    let ws = workspaces
+        .create("Acme".into(), unique_slug("acme"), alice.id)
+        .await
+        .unwrap();
+
+    let svc = service(pool);
+    let room = svc
+        .create_room_in_workspace(alice.id, ws.id, RoomKind::Channel, None)
+        .await
+        .unwrap();
+
+    // alice is both a workspace member and (as creator/owner) a room member.
+    svc.assert_room_access(alice.id, room.id).await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "requires running Postgres with migrations applied"]
+async fn assert_room_access_denies_non_room_member_in_same_workspace() {
+    let pool = pool();
+    let participants = ParticipantRepo::new(pool.clone());
+    let workspaces = WorkspaceRepo::new(pool.clone());
+
+    let alice = new_participant(&participants, "alice").await;
+    let bob = new_participant(&participants, "bob").await;
+    let ws = workspaces
+        .create("Acme".into(), unique_slug("acme"), alice.id)
+        .await
+        .unwrap();
+    // bob is in the workspace but NOT in the room alice creates.
+    workspaces
+        .add_member(ws.id, bob.id, WorkspaceRole::Member)
+        .await
+        .unwrap();
+
+    let svc = service(pool);
+    let room = svc
+        .create_room_in_workspace(alice.id, ws.id, RoomKind::Channel, None)
+        .await
+        .unwrap();
+
+    let err = svc.assert_room_access(bob.id, room.id).await.unwrap_err();
+    assert!(matches!(err, aero_common::Error::Forbidden(_)), "got {err:?}");
+}
+
+#[tokio::test]
+#[ignore = "requires running Postgres with migrations applied"]
+async fn assert_room_access_unknown_room_is_not_found() {
+    let pool = pool();
+    let participants = ParticipantRepo::new(pool.clone());
+    let alice = new_participant(&participants, "alice").await;
+
+    let svc = service(pool);
+    let err = svc
+        .assert_room_access(alice.id, aero_common::RoomId::new())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, aero_common::Error::NotFound(_)), "got {err:?}");
+}
+
+#[tokio::test]
+#[ignore = "requires running Postgres with migrations applied"]
+async fn update_member_role_upserts_idempotently() {
+    let pool = pool();
+    let participants = ParticipantRepo::new(pool.clone());
+    let workspaces = WorkspaceRepo::new(pool.clone());
+
+    let owner = new_participant(&participants, "owner").await;
+    let member = new_participant(&participants, "member").await;
+    let ws = workspaces
+        .create("Acme".into(), unique_slug("acme"), owner.id)
+        .await
+        .unwrap();
+
+    // Insert path: member did not exist yet.
+    workspaces
+        .update_member_role(ws.id, member.id, WorkspaceRole::Member)
+        .await
+        .unwrap();
+    assert_eq!(
+        workspaces.member_role(ws.id, member.id).await.unwrap(),
+        Some(WorkspaceRole::Member)
+    );
+
+    // Update path: overwrite existing role (what add_member's DO NOTHING couldn't do).
+    workspaces
+        .update_member_role(ws.id, member.id, WorkspaceRole::Admin)
+        .await
+        .unwrap();
+    assert_eq!(
+        workspaces.member_role(ws.id, member.id).await.unwrap(),
+        Some(WorkspaceRole::Admin)
+    );
+
+    // Idempotent re-apply.
+    workspaces
+        .update_member_role(ws.id, member.id, WorkspaceRole::Admin)
+        .await
+        .unwrap();
+    assert_eq!(
+        workspaces.member_role(ws.id, member.id).await.unwrap(),
+        Some(WorkspaceRole::Admin)
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires running Postgres with migrations applied"]
+async fn rooms_for_in_workspace_is_tenant_scoped() {
+    let pool = pool();
+    let participants = ParticipantRepo::new(pool.clone());
+    let workspaces = WorkspaceRepo::new(pool.clone());
+    let rooms = RoomRepo::new(pool.clone());
+
+    let alice = new_participant(&participants, "alice").await;
+    let ws_a = workspaces
+        .create("A".into(), unique_slug("a"), alice.id)
+        .await
+        .unwrap();
+    let ws_b = workspaces
+        .create("B".into(), unique_slug("b"), alice.id)
+        .await
+        .unwrap();
+
+    let svc = service(pool);
+    let room_a = svc
+        .create_room_in_workspace(alice.id, ws_a.id, RoomKind::Channel, None)
+        .await
+        .unwrap();
+    let room_b = svc
+        .create_room_in_workspace(alice.id, ws_b.id, RoomKind::Channel, None)
+        .await
+        .unwrap();
+
+    let in_a = rooms.rooms_for_in_workspace(alice.id, ws_a.id).await.unwrap();
+    assert!(in_a.iter().any(|r| r.id == room_a.id));
+    assert!(
+        !in_a.iter().any(|r| r.id == room_b.id),
+        "workspace A listing must not leak workspace B's room"
     );
 }

@@ -91,6 +91,32 @@ impl WorkspaceRepo {
         Ok(())
     }
 
+    /// Set (insert-or-update) a member's role, idempotently.
+    ///
+    /// Unlike [`add_member`](Self::add_member) — whose `ON CONFLICT DO NOTHING`
+    /// leaves an existing row untouched — this upserts: a fresh member is created
+    /// with `role`, and an existing member's role is overwritten. This replaces
+    /// the remove-then-add dance callers previously needed to change a role.
+    pub async fn update_member_role(
+        &self,
+        workspace: WorkspaceId,
+        participant: ParticipantId,
+        role: WorkspaceRole,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r"INSERT INTO workspace_members (workspace_id, participant_id, role, joined_at)
+               VALUES ($1, $2, $3, NOW())
+               ON CONFLICT (workspace_id, participant_id)
+               DO UPDATE SET role = EXCLUDED.role",
+        )
+        .bind(workspace.to_uuid())
+        .bind(participant.to_uuid())
+        .bind(role.as_str())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Remove a member from a workspace. No-op if they were not a member.
     pub async fn remove_member(
         &self,
