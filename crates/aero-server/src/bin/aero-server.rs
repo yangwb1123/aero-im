@@ -279,7 +279,8 @@ async fn main() -> anyhow::Result<()> {
                         }
                         _ = tick.tick() => {
                             let now = time::OffsetDateTime::now_utc();
-                            match workspaces.sweep_expired_messages(now).await {
+                            // None = sweep every policied workspace (the global periodic sweep).
+                            match workspaces.sweep_expired_messages(now, None).await {
                                 Ok(0) => {}
                                 Ok(n) => info!(swept = n, "retention sweep soft-deleted messages"),
                                 Err(e) => warn!(error = ?e, "retention sweep failed"),

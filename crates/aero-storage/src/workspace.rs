@@ -559,9 +559,13 @@ impl WorkspaceRepo {
     /// `embedding = NULL`), so a swept message is indistinguishable from one a
     /// user deleted. `now` is passed in (not `NOW()`) so the cutoff is testable
     /// and the whole batch shares one consistent instant.
+    /// Soft-delete messages past their workspace's retention window. `only`
+    /// scopes the sweep to a single workspace (`Some`) or every policied
+    /// workspace (`None`, the periodic global sweep). Returns rows swept.
     pub async fn sweep_expired_messages(
         &self,
         now: time::OffsetDateTime,
+        only: Option<WorkspaceId>,
     ) -> Result<u64, sqlx::Error> {
         let result = sqlx::query(
             r"UPDATE messages m
@@ -575,9 +579,11 @@ impl WorkspaceRepo {
                 AND m.deleted_at IS NULL
                 AND w.retention_days IS NOT NULL
                 AND w.retention_days > 0
+                AND ($2::uuid IS NULL OR w.id = $2)
                 AND m.created_at < $1 - make_interval(days => w.retention_days)",
         )
         .bind(now)
+        .bind(only.map(|w| w.to_uuid()))
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected())
@@ -1078,7 +1084,7 @@ mod db_tests {
         // 10 days old: within the window → kept.
         let fresh = insert_message_at(&p, room, owner, now - time::Duration::days(10)).await;
 
-        let swept = repo.sweep_expired_messages(now).await.unwrap();
+        let swept = repo.sweep_expired_messages(now, Some(ws)).await.unwrap();
         assert_eq!(swept, 1, "exactly the one 40-day-old message is swept");
 
         // The old message now wears the canonical soft-delete shape.
@@ -1098,13 +1104,13 @@ mod db_tests {
         let p = pool();
         let repo = WorkspaceRepo::new(p.clone());
         let owner = new_participant(&p).await;
-        let (_ws, room, _seeded) = seed_workspace(&repo, &p, owner).await;
+        let (ws, room, _seeded) = seed_workspace(&repo, &p, owner).await;
         // No set_retention call → retention_days stays NULL (keep forever).
 
         let now = time::OffsetDateTime::now_utc();
         let ancient = insert_message_at(&p, room, owner, now - time::Duration::days(3650)).await;
 
-        let swept = repo.sweep_expired_messages(now).await.unwrap();
+        let swept = repo.sweep_expired_messages(now, Some(ws)).await.unwrap();
         assert_eq!(swept, 0, "a policy-less workspace is never swept");
         assert!(message_state(&p, ancient).await.0.is_none(), "10-year message kept");
     }
@@ -1127,13 +1133,19 @@ mod db_tests {
         let old_a = insert_message_at(&p, room_a, owner_a, now - time::Duration::days(30)).await;
         let old_b = insert_message_at(&p, room_b, owner_b, now - time::Duration::days(30)).await;
 
-        let first = repo.sweep_expired_messages(now).await.unwrap();
+        let first = repo.sweep_expired_messages(now, Some(ws_a)).await.unwrap();
         assert_eq!(first, 1, "only A's old message is swept; B is untouched");
         assert!(message_state(&p, old_a).await.0.is_some(), "A's old message swept");
         assert!(message_state(&p, old_b).await.0.is_none(), "B's old message survives");
+        // B has no policy: scoping the sweep to B deletes nothing.
+        assert_eq!(
+            repo.sweep_expired_messages(now, Some(ws_b)).await.unwrap(),
+            0,
+            "unpolicied workspace B is never swept"
+        );
 
         // A second sweep finds nothing new (already-deleted rows are excluded).
-        let second = repo.sweep_expired_messages(now).await.unwrap();
+        let second = repo.sweep_expired_messages(now, Some(ws_a)).await.unwrap();
         assert_eq!(second, 0, "sweep is idempotent — no double-deletion");
     }
 
@@ -1153,7 +1165,7 @@ mod db_tests {
 
         let now = time::OffsetDateTime::now_utc();
         let old = insert_message_at(&p, room, owner, now - time::Duration::days(365)).await;
-        assert_eq!(repo.sweep_expired_messages(now).await.unwrap(), 0, "cleared policy = no sweep");
+        assert_eq!(repo.sweep_expired_messages(now, Some(ws)).await.unwrap(), 0, "cleared policy = no sweep");
         assert!(message_state(&p, old).await.0.is_none(), "message kept after policy cleared");
     }
 }
