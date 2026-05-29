@@ -10,7 +10,7 @@ use aero_live_whip::WhipRegistry;
 use crate::live::LiveService;
 use aero_storage::{
     AiJobRepo, BlobRepo, BlobStore, CallRepo, KeyPackageRepo, MessageRepo, MlsGroupRepo,
-    ParticipantRepo, PresenceStore, ReactionRepo, ReceiptRepo, RoomRepo, StreamRepo,
+    ParticipantRepo, PresenceStore, ReactionRepo, ReceiptRepo, RoomRepo, StreamRepo, WorkspaceRepo,
 };
 use axum::extract::FromRef;
 
@@ -60,6 +60,9 @@ pub struct AppState {
     pub live: LiveService,
     pub participants: ParticipantRepo,
     pub rooms: RoomRepo,
+    /// Workspace / org (tenant) membership + role store. Backs the
+    /// ROADMAP 方向一 management API in [`crate::workspaces`].
+    pub workspaces: WorkspaceRepo,
     pub messages: MessageRepo,
     pub receipts: ReceiptRepo,
     pub reactions: ReactionRepo,

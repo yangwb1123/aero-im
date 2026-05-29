@@ -27,7 +27,7 @@ use aero_server::{
 use aero_storage::{
     connect_pg, migrate, AiJobRepo, BlobRepo, CallRepo, KeyPackageRepo, LiveRepo, LocalFsBlobStore,
     MessageRepo, MlsGroupRepo, ParticipantRepo, PresenceStore, ReactionRepo, ReceiptRepo,
-    RedisCache, RoomRepo, StreamRepo,
+    RedisCache, RoomRepo, StreamRepo, WorkspaceRepo,
 };
 use tokio_util::sync::CancellationToken;
 use anyhow::Context;
@@ -65,6 +65,7 @@ async fn main() -> anyhow::Result<()> {
     // ---------- Repos ----------
     let participants = ParticipantRepo::new(pg.clone());
     let rooms = RoomRepo::new(pg.clone());
+    let workspaces = WorkspaceRepo::new(pg.clone());
     let messages = MessageRepo::new(pg.clone());
     let receipts = ReceiptRepo::new(pg.clone());
     let reactions = ReactionRepo::new(pg.clone());
@@ -200,6 +201,7 @@ async fn main() -> anyhow::Result<()> {
         live,
         participants,
         rooms,
+        workspaces,
         messages,
         receipts,
         reactions,
