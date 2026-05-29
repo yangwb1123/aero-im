@@ -104,6 +104,10 @@ define_id!(
     /// Identifies a stored blob (file, voice, image).
     BlobId
 );
+define_id!(
+    /// Identifies a workspace (tenant / org). Rooms and members belong to one.
+    WorkspaceId
+);
 
 #[cfg(test)]
 mod tests {
