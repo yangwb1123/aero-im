@@ -47,15 +47,20 @@ impl RoomRepo {
         };
 
         let mut tx = self.pool.begin().await?;
+        // Legacy/untenanted room creation lands in the all-zero "default"
+        // workspace — the same tenant the 0006 migration backfilled pre-tenancy
+        // rooms into. `rooms.workspace_id` is NOT NULL with no DB default, so this
+        // bind is required; tenant-aware callers use `create_in_workspace`.
         sqlx::query(
-            r#"INSERT INTO rooms (id, kind, name, created_by, created_at)
-               VALUES ($1, $2, $3, $4, $5)"#,
+            r#"INSERT INTO rooms (id, kind, name, created_by, created_at, workspace_id)
+               VALUES ($1, $2, $3, $4, $5, $6)"#,
         )
         .bind(id.to_uuid())
         .bind(kind_s)
         .bind(&name)
         .bind(created_by.to_uuid())
         .bind(created_at)
+        .bind(uuid::Uuid::nil())
         .execute(&mut *tx)
         .await?;
 
