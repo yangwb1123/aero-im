@@ -45,6 +45,7 @@
 //! those RTP packets — i.e. [`WhipSession::run`]'s transport — everything
 //! downstream of a received RTP packet is now exercised.
 
+pub mod cascade;
 pub mod depacketize;
 pub mod hls_sink;
 pub mod packetize;
@@ -64,6 +65,10 @@ use parking_lot::Mutex;
 use thiserror::Error;
 use ulid::Ulid;
 
+pub use cascade::{
+    decide_cascade, CascadeDecision, CascadeInputs, CascadeRelay, FakeUpstream, UpstreamAu,
+    UpstreamSource,
+};
 pub use hls_sink::{hls_sink, HlsSegment, HlsSegmentWriter, HlsSink, MediaSink};
 pub use relay::{MediaRelay, Subscription};
 pub use session::{SessionError, WhipSession};
