@@ -176,9 +176,16 @@ impl CostBudget {
 pub struct KeyedCostBudget<K: Eq + Hash + Clone> {
     max_per_window: u32,
     window: Duration,
+    max_keys: usize,
     windows: Mutex<HashMap<K, State>>,
     clock: Box<dyn Clock>,
 }
+
+/// Default ceiling on simultaneously-tracked keys. Bounds memory so an
+/// attacker-influenceable key space (e.g. mass workspace creation) cannot grow
+/// the map without limit. Far above any realistic count of concurrently-active
+/// tenants; elapsed windows are reclaimed before this is hit.
+pub const DEFAULT_MAX_KEYS: usize = 100_000;
 
 impl<K: Eq + Hash + Clone> std::fmt::Debug for KeyedCostBudget<K> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -207,9 +214,19 @@ impl<K: Eq + Hash + Clone> KeyedCostBudget<K> {
         Self {
             max_per_window: max_per_window.max(1),
             window,
+            max_keys: DEFAULT_MAX_KEYS,
             windows: Mutex::new(HashMap::new()),
             clock,
         }
+    }
+
+    /// Override the live-key ceiling (default [`DEFAULT_MAX_KEYS`]). Once this
+    /// many keys have active (non-elapsed) windows, a *new* key is denied rather
+    /// than tracked, bounding memory. `0` is clamped to 1.
+    #[must_use]
+    pub fn with_max_keys(mut self, max_keys: usize) -> Self {
+        self.max_keys = max_keys.max(1);
+        self
     }
 
     /// Try to consume one unit of `key`'s budget.
@@ -225,8 +242,27 @@ impl<K: Eq + Hash + Clone> KeyedCostBudget<K> {
     /// were granted (`0..=n`). Mirrors [`CostBudget::acquire_up_to`] but scoped to
     /// one key; the key's window is created lazily on first touch.
     pub fn acquire_up_to(&self, key: K, n: u32) -> u32 {
+        // A zero-unit request never consumes budget, so it must never allocate a
+        // map entry — otherwise a flood of `acquire_up_to(unique_key, 0)` would
+        // grow the map unbounded for free.
+        if n == 0 {
+            return 0;
+        }
         let now = self.clock.now();
         let mut map = self.windows.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !map.contains_key(&key) {
+            // A new key is about to be tracked. First reclaim any windows that
+            // have fully elapsed (dropping a zero-use rolled-over window is
+            // behaviourally identical to recreating it fresh on next touch), then
+            // enforce the live-key ceiling so an unbounded key space cannot
+            // translate into unbounded memory.
+            if map.len() >= self.max_keys {
+                map.retain(|_, st| st.used_now(now, self.window) > 0);
+            }
+            if map.len() >= self.max_keys {
+                return 0;
+            }
+        }
         let st = map.entry(key).or_insert_with(|| State::fresh(now));
         st.acquire_up_to(now, self.window, self.max_per_window, n)
     }
@@ -255,6 +291,12 @@ impl<K: Eq + Hash + Clone> KeyedCostBudget<K> {
     #[must_use]
     pub fn limit(&self) -> u32 {
         self.max_per_window
+    }
+
+    /// Number of keys currently holding a tracked window (test/diagnostic).
+    #[cfg(test)]
+    fn live_keys(&self) -> usize {
+        self.windows.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len()
     }
 }
 
@@ -470,6 +512,40 @@ mod tests {
         let (b, _clk) = keyed_budget_with(5, Duration::from_secs(60));
         assert_eq!(b.acquire_up_to("a", 0), 0);
         assert_eq!(b.available(&"a"), 5);
+        // A zero-unit request must NOT allocate a window — otherwise a flood of
+        // unique zero-requests would grow the map unbounded (memory DoS).
+        assert_eq!(b.live_keys(), 0, "n=0 must not allocate a key entry");
+    }
+
+    #[test]
+    fn keyed_live_key_ceiling_denies_new_keys_then_eviction_reclaims() {
+        // Cap at 2 live keys, 10s windows.
+        let clk = Arc::new(FakeClock::new());
+        let b = KeyedCostBudget::<&'static str>::with_clock(
+            3,
+            Duration::from_secs(10),
+            Box::new(SharedClock(Arc::clone(&clk))),
+        )
+        .with_max_keys(2);
+
+        // Two distinct active keys fill the map to capacity.
+        assert!(b.try_acquire("a"));
+        assert!(b.try_acquire("b"));
+        assert_eq!(b.live_keys(), 2);
+
+        // A third, brand-new key is DENIED (not tracked) while the map is full of
+        // still-active windows — memory is bounded.
+        assert_eq!(b.acquire_up_to("c", 1), 0, "new key denied at capacity");
+        assert_eq!(b.live_keys(), 2, "denied key was not inserted");
+
+        // Existing keys still work at capacity.
+        assert!(b.try_acquire("a"), "already-tracked key unaffected by the cap");
+
+        // Once the active windows elapse, the next new key triggers eviction of
+        // the rolled-over windows and is admitted again.
+        clk.advance(Duration::from_secs(11));
+        assert!(b.try_acquire("c"), "new key admitted after stale windows reclaimed");
+        assert!(b.live_keys() <= 2, "map stays within the key ceiling");
     }
 
     #[test]
