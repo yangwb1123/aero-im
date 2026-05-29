@@ -17,12 +17,14 @@ pub mod anthropic;
 pub mod budget;
 pub mod embed;
 pub mod error;
+pub mod metrics;
 pub mod service;
 pub mod transcribe;
 pub mod worker;
 
 pub use anthropic::{AnthropicClient, ChatMsg};
 pub use budget::CostBudget;
+pub use metrics::CostModel;
 pub use embed::{default_embedder, Embedder, HashEmbedder, VoyageEmbedder, EMBED_DIM};
 pub use error::{AiError, Result};
 pub use service::{AiService, AnswerResult};

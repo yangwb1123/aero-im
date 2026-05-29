@@ -7,7 +7,7 @@
 //! ## Hardening (方向三 + 方向五)
 //!
 //! These handlers call **paid** external APIs (Anthropic / Voyage), so the loop
-//! is guarded on four axes:
+//! is guarded on four axes (plus observability, below):
 //!
 //! 1. **Bounded concurrency** — a claimed batch is processed concurrently up to
 //!    [`WorkerConfig::max_concurrency`] permits via a [`Semaphore`], instead of a
@@ -29,10 +29,21 @@
 //!
 //! Concurrency *beyond* a single process still scales horizontally: Postgres
 //! `FOR UPDATE SKIP LOCKED` lets multiple worker processes claim disjoint rows.
+//!
+//! ## Observability (方向四)
+//!
+//! Each job emits metrics into [`aero_common::metrics`] (see [`crate::metrics`]):
+//! per-kind **job duration** (histogram), **estimated cost** (counter, coarse —
+//! see [`CostModel`]), and **outcome** counters (success / failure / dead-letter).
+//! The run-loop also keeps the **queue-depth** gauge in step as batches are
+//! claimed and drained. The recording layer takes an injectable `&Registry` so it
+//! unit-tests against a fresh registry; production wires it to the process-global
+//! one via [`aero_common::metrics::global`].
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use aero_common::metrics::Registry;
 use aero_common::{MessageId, RoomId};
 use aero_storage::{AiJob, AiJobKind};
 use async_trait::async_trait;
@@ -43,6 +54,7 @@ use ulid::Ulid;
 
 use crate::budget::CostBudget;
 use crate::error::{AiError, Result};
+use crate::metrics::{self as ai_metrics, CostModel};
 use crate::service::AiService;
 
 /// Maximum delivery attempts before a job is dead-lettered.
@@ -137,6 +149,7 @@ pub(crate) trait JobProcessor: Send + Sync {
 pub struct AiWorker {
     svc: Arc<AiService>,
     cfg: WorkerConfig,
+    cost_model: CostModel,
 }
 
 impl AiWorker {
@@ -149,7 +162,16 @@ impl AiWorker {
     /// Construct a worker with an explicit config (used in tests / embedding).
     #[must_use]
     pub fn with_config(svc: Arc<AiService>, cfg: WorkerConfig) -> Self {
-        Self { svc, cfg }
+        Self { svc, cfg, cost_model: CostModel::default() }
+    }
+
+    /// Override the per-kind cost estimate used for the `AI_COST_MICROS_TOTAL`
+    /// metric (defaults to [`CostModel::default`]). The estimate is coarse — see
+    /// [`CostModel`] — and exists for budget alerting, not billing.
+    #[must_use]
+    pub fn with_cost_model(mut self, cost_model: CostModel) -> Self {
+        self.cost_model = cost_model;
+        self
     }
 
     /// Run the worker until `shutdown` is cancelled.
@@ -157,10 +179,23 @@ impl AiWorker {
     /// Errors fetching the next batch are logged but do not terminate the loop;
     /// individual job errors are persisted via `JobQueue::fail`. The outer task
     /// thus survives transient Postgres hiccups.
+    ///
+    /// Metrics are emitted to the process-global registry
+    /// ([`aero_common::metrics::global`]); the `/metrics` route lives in
+    /// `aero-server`.
     pub async fn run(&self, shutdown: CancellationToken) {
         let queue = AiJobQueue { svc: Arc::clone(&self.svc) };
         let budget = CostBudget::new(self.cfg.max_calls_per_window, self.cfg.budget_window);
-        run_loop(&queue, self, &budget, self.cfg, &shutdown).await;
+        run_loop(
+            &queue,
+            self,
+            &budget,
+            self.cfg,
+            aero_common::metrics::global(),
+            &self.cost_model,
+            &shutdown,
+        )
+        .await;
     }
 
     async fn process_inner(&self, job: AiJob) -> Result<serde_json::Value> {
@@ -290,14 +325,41 @@ fn should_skip_embed(searchable_text: &str) -> bool {
     searchable_text.trim().is_empty()
 }
 
+/// Whether a *successful* job of `kind` actually hit a paid upstream, used to
+/// decide if it should charge the cost metric. Derived from the handler's result
+/// shape so it stays in lockstep with the handlers:
+/// - `Moderate` is a local stub → never paid.
+/// - `Embed` skips the paid call on the idempotent no-op path, which the handler
+///   marks with a `skipped` field → unpaid when that field is present.
+/// - `Summarize` / `Answer` always make a completion call on success → paid.
+///
+/// Only called on the success path: a *failed* call may or may not have been
+/// billed upstream, so we conservatively do not charge it (the budget guard is
+/// the hard per-window ceiling on spend regardless). The metric is a coarse
+/// budget signal, not an invoice — see [`crate::metrics::CostModel`].
+#[must_use]
+fn was_paid(kind: AiJobKind, result: &serde_json::Value) -> bool {
+    match kind {
+        AiJobKind::Moderate => false,
+        AiJobKind::Embed => result.get("skipped").is_none(),
+        AiJobKind::Summarize | AiJobKind::Answer => true,
+    }
+}
+
 /// The generic run-loop. Parameterised over [`JobQueue`] + [`JobProcessor`] so
 /// the control flow (bounded concurrency, dead-letter guard, budget gating,
 /// shutdown) is exercised by unit tests against in-memory fakes.
+///
+/// `reg` is the metrics registry (injectable for tests; the process-global one in
+/// production) and `cost_model` the per-kind cost estimate.
+#[allow(clippy::too_many_arguments)]
 async fn run_loop<Q, P>(
     queue: &Q,
     proc: &P,
     budget: &CostBudget,
     cfg: WorkerConfig,
+    reg: &Registry,
+    cost_model: &CostModel,
     shutdown: &CancellationToken,
 ) where
     Q: JobQueue + ?Sized,
@@ -357,7 +419,12 @@ async fn run_loop<Q, P>(
         let charged = budget.acquire_up_to(u32::try_from(jobs.len()).unwrap_or(u32::MAX));
         tracing::debug!(claimed = jobs.len(), charged, "ai worker: batch claimed");
 
-        process_batch(queue, proc, &sem, jobs, shutdown).await;
+        // Queue-depth gauge: reflect the outstanding (claimed, not-yet-terminal)
+        // work for this process. It rises with the claimed batch and returns to 0
+        // once the batch has drained.
+        ai_metrics::set_queue_depth(reg, jobs.len());
+        process_batch(queue, proc, &sem, jobs, reg, cost_model, shutdown).await;
+        ai_metrics::set_queue_depth(reg, 0);
     }
 }
 
@@ -367,11 +434,14 @@ async fn run_loop<Q, P>(
 /// is drained concurrently so the bound is a throughput limit, not a deadlock,
 /// when the batch is larger than the permit count. On shutdown, already-started
 /// jobs are awaited to a terminal state; no new jobs are started.
+#[allow(clippy::too_many_arguments)]
 async fn process_batch<Q, P>(
     queue: &Q,
     proc: &P,
     sem: &Arc<Semaphore>,
     jobs: Vec<AiJob>,
+    reg: &Registry,
+    cost_model: &CostModel,
     shutdown: &CancellationToken,
 ) where
     Q: JobQueue + ?Sized,
@@ -406,7 +476,7 @@ async fn process_batch<Q, P>(
         inflight.push(async move {
             // Keep the permit alive for the duration of the task.
             let _permit = permit;
-            run_one(queue, proc, job).await;
+            run_one(queue, proc, job, reg, cost_model).await;
         });
     }
 
@@ -423,8 +493,9 @@ where
 }
 
 /// Drive a single job through dead-letter guard → process → queue state
-/// transition (complete on success, fail/dead-letter on error).
-async fn run_one<Q, P>(queue: &Q, proc: &P, job: AiJob)
+/// transition (complete on success, fail/dead-letter on error), recording
+/// duration / cost / outcome metrics into `reg` along the way.
+async fn run_one<Q, P>(queue: &Q, proc: &P, job: AiJob, reg: &Registry, cost_model: &CostModel)
 where
     Q: JobQueue + ?Sized,
     P: JobProcessor + ?Sized,
@@ -435,20 +506,32 @@ where
 
     // Dead-letter defense in depth: never *spend* on a job already past the cap.
     // The storage layer also dead-letters on fail(), so this is belt-and-braces
-    // against a row that re-entered the queue out of band.
+    // against a row that re-entered the queue out of band. No paid call happens,
+    // so no duration/cost is recorded — only the dead-letter outcome.
     if is_over_attempt_cap(attempts) {
         tracing::warn!(job_id = %id, attempts, "ai worker: over attempt cap, dead-lettering without spend");
+        ai_metrics::record_outcome(reg, kind, ai_metrics::OUTCOME_DEAD_LETTER);
         fail_job(queue, id, "exceeded MAX_ATTEMPTS").await;
         return;
     }
 
-    let disposition = match proc.process(job).await {
+    // Time the actual processing — the histogram covers the work whether it
+    // succeeds or fails (a slow failure is still a latency signal).
+    let started = Instant::now();
+    let outcome = proc.process(job).await;
+    ai_metrics::record_duration(reg, kind, started.elapsed().as_secs_f64());
+
+    let disposition = match outcome {
         Ok(result) => Disposition::Done(result),
         Err(e) => Disposition::Failed(e.to_string()),
     };
 
     match disposition {
         Disposition::Done(result) => {
+            // Cost is charged on success only; `was_paid` excludes stub/no-op
+            // kinds so skipped work does not inflate the (coarse) spend estimate.
+            ai_metrics::record_cost(reg, cost_model, kind, was_paid(kind, &result));
+            ai_metrics::record_outcome(reg, kind, ai_metrics::OUTCOME_SUCCESS);
             if let Err(e) = queue.complete(id, result).await {
                 tracing::error!(job_id = %id, error = %e, "ai worker: completion write failed");
             } else {
@@ -456,6 +539,7 @@ where
             }
         }
         Disposition::Failed(err) => {
+            ai_metrics::record_outcome(reg, kind, ai_metrics::OUTCOME_FAILURE);
             tracing::warn!(job_id = %id, ?kind, error = %err, "ai worker: job failed");
             fail_job(queue, id, &err).await;
         }
@@ -511,6 +595,17 @@ mod tests {
     use aero_storage::AiJobStatus;
     use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
     use std::sync::Mutex;
+
+    /// A fresh, isolated registry for a test — never the process-global one,
+    /// which is shared across the binary's parallel tests and would be flaky.
+    fn test_reg() -> Registry {
+        Registry::new()
+    }
+
+    /// Default cost model for tests that don't assert on cost.
+    fn test_cost() -> CostModel {
+        CostModel::default()
+    }
 
     // ---------- existing parse/payload tests ----------
 
@@ -578,6 +673,27 @@ mod tests {
         // Real content → must embed.
         assert!(!should_skip_embed("hello"));
         assert!(!should_skip_embed("  hi  "));
+    }
+
+    #[test]
+    fn was_paid_matches_handler_result_shapes() {
+        // Embed: skip marker → unpaid; real embedding result → paid.
+        assert!(!was_paid(
+            AiJobKind::Embed,
+            &serde_json::json!({ "skipped": "empty", "updated": false })
+        ));
+        assert!(was_paid(
+            AiJobKind::Embed,
+            &serde_json::json!({ "dim": 1024, "model": "voyage", "updated": true })
+        ));
+        // Moderate is a local stub → never paid, regardless of result.
+        assert!(!was_paid(
+            AiJobKind::Moderate,
+            &serde_json::json!({ "verdict": "ok", "stub": true })
+        ));
+        // Summarize / Answer always make a completion call on success.
+        assert!(was_paid(AiJobKind::Summarize, &serde_json::json!({ "summary": "x" })));
+        assert!(was_paid(AiJobKind::Answer, &serde_json::json!({ "answer": "y" })));
     }
 
     /// A no-op Embed (empty text) returns the `skipped` marker and performs no
@@ -780,6 +896,19 @@ mod tests {
         }
     }
 
+    /// Processor that succeeds returning a caller-supplied result Value — lets a
+    /// metrics test drive the exact handler-result shape (e.g. an embed skip
+    /// marker) that `was_paid` keys off, without a DB-backed service.
+    struct FixedResult {
+        value: serde_json::Value,
+    }
+    #[async_trait]
+    impl JobProcessor for FixedResult {
+        async fn process(&self, _job: AiJob) -> Result<serde_json::Value> {
+            Ok(self.value.clone())
+        }
+    }
+
     // ---------- (2) dead-letter / poison-pill ----------
 
     #[tokio::test]
@@ -791,6 +920,8 @@ mod tests {
         let shutdown = CancellationToken::new();
         let sem = Arc::new(Semaphore::new(4));
 
+        let reg = test_reg();
+        let cost = test_cost();
         // Drive enough passes that, *if* the job kept being re-queued, it would be
         // processed well beyond MAX_ATTEMPTS.
         for _ in 0..(MAX_ATTEMPTS + 5) {
@@ -798,7 +929,7 @@ mod tests {
             if claimed.is_empty() {
                 break;
             }
-            process_batch(&queue, &proc, &sem, claimed, &shutdown).await;
+            process_batch(&queue, &proc, &sem, claimed, &reg, &cost, &shutdown).await;
         }
 
         // Terminal: dead, exactly MAX_ATTEMPTS deliveries, never re-claimed after.
@@ -812,6 +943,17 @@ mod tests {
 
         // A further claim returns nothing — the dead row is not re-picked.
         assert!(queue.claim(BATCH_SIZE).await.unwrap().is_empty());
+
+        // Metrics: every attempt failed → MAX_ATTEMPTS failure outcomes recorded
+        // for this kind (the storage layer flips the row to `dead`; the run-loop
+        // sees each delivery as a `failure`, not an over-cap `dead_letter`).
+        let out = reg.render_prometheus();
+        assert!(
+            out.contains(&format!(
+                r#"aero_ai_jobs_total{{kind="summarize",outcome="failure"}} {MAX_ATTEMPTS}"#
+            )),
+            "expected {MAX_ATTEMPTS} failure outcomes:\n{out}"
+        );
     }
 
     #[tokio::test]
@@ -826,11 +968,25 @@ mod tests {
             rows[0].status = AiJobStatus::Running;
         }
         let proc = AlwaysFail { calls: AtomicUsize::new(0) };
+        let reg = test_reg();
+        let cost = test_cost();
 
-        run_one(&queue, &proc, job).await;
+        run_one(&queue, &proc, job, &reg, &cost).await;
 
         assert_eq!(proc.calls.load(Ordering::SeqCst), 0, "must not spend past the cap");
         assert_eq!(queue.status_of(id), AiJobStatus::Dead);
+
+        // Over-cap path records a dead-letter outcome and no duration/cost (the
+        // paid processor was never invoked).
+        let out = reg.render_prometheus();
+        assert!(
+            out.contains(r#"aero_ai_jobs_total{kind="summarize",outcome="dead_letter"} 1"#),
+            "expected a dead_letter outcome:\n{out}"
+        );
+        assert!(
+            !out.contains("aero_ai_job_duration_seconds_count"),
+            "no duration should be recorded when nothing is processed:\n{out}"
+        );
     }
 
     // ---------- (1) bounded concurrency ----------
@@ -847,7 +1003,7 @@ mod tests {
         let limit = 4usize;
         let sem = Arc::new(Semaphore::new(limit));
 
-        process_batch(&queue, &probe, &sem, claimed.clone(), &shutdown).await;
+        process_batch(&queue, &probe, &sem, claimed.clone(), &test_reg(), &test_cost(), &shutdown).await;
 
         assert_eq!(probe.total.load(Ordering::SeqCst), claimed.len());
         let peak = probe.peak.load(Ordering::SeqCst);
@@ -866,7 +1022,7 @@ mod tests {
         let shutdown = CancellationToken::new();
         let sem = Arc::new(Semaphore::new(1));
 
-        process_batch(&queue, &probe, &sem, claimed.clone(), &shutdown).await;
+        process_batch(&queue, &probe, &sem, claimed.clone(), &test_reg(), &test_cost(), &shutdown).await;
 
         assert_eq!(probe.peak.load(Ordering::SeqCst), 1, "concurrency=1 must serialize");
         assert_eq!(probe.total.load(Ordering::SeqCst), claimed.len());
@@ -890,7 +1046,7 @@ mod tests {
 
         tokio::time::timeout(
             Duration::from_secs(2),
-            process_batch(&queue, &probe, &sem, claimed.clone(), &shutdown),
+            process_batch(&queue, &probe, &sem, claimed.clone(), &test_reg(), &test_cost(), &shutdown),
         )
         .await
         .expect("process_batch must return promptly when cancelled");
@@ -914,7 +1070,15 @@ mod tests {
         // Must return without hanging on the idle sleep.
         tokio::time::timeout(
             Duration::from_secs(2),
-            run_loop(&queue, &proc, &budget, WorkerConfig::default(), &shutdown),
+            run_loop(
+                &queue,
+                &proc,
+                &budget,
+                WorkerConfig::default(),
+                &test_reg(),
+                &test_cost(),
+                &shutdown,
+            ),
         )
         .await
         .expect("run_loop should exit promptly when shutdown is cancelled");
@@ -933,6 +1097,8 @@ mod tests {
         let budget = CostBudget::new(3, Duration::from_secs(3600));
         let cfg = WorkerConfig { max_concurrency: 4, max_calls_per_window: 3, budget_window: Duration::from_secs(3600) };
         let shutdown = CancellationToken::new();
+        let reg = test_reg();
+        let cost = test_cost();
 
         // Run the loop briefly; it should drain the budget, then idle-back-off.
         let token = shutdown.clone();
@@ -940,7 +1106,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(300)).await;
             token.cancel();
         });
-        run_loop(&queue, &proc, &budget, cfg, &shutdown).await;
+        run_loop(&queue, &proc, &budget, cfg, &reg, &cost, &shutdown).await;
         handle.await.unwrap();
 
         assert_eq!(proc.ran.load(Ordering::SeqCst), 3, "processed exactly the budget");
@@ -948,6 +1114,26 @@ mod tests {
         // Remaining rows are still queued (not failed, not dead) for a later window.
         assert_eq!(queue.count_status(AiJobStatus::Queued), 17, "rest left for later window");
         assert_eq!(queue.count_status(AiJobStatus::Dead), 0);
+
+        // End-to-end metrics for the run-loop: exactly 3 successful summarize
+        // outcomes, a matching cost charge, and the queue-depth gauge settled
+        // back to 0 after the (single) batch drained.
+        let out = reg.render_prometheus();
+        assert!(
+            out.contains(r#"aero_ai_jobs_total{kind="summarize",outcome="success"} 3"#),
+            "expected 3 successes:\n{out}"
+        );
+        let want_cost = cost.summarize_micros * 3;
+        assert!(
+            out.contains(&format!(
+                r#"aero_ai_cost_micros_total{{kind="summarize"}} {want_cost}"#
+            )),
+            "expected summarize cost {want_cost}:\n{out}"
+        );
+        assert!(
+            out.contains("\naero_ai_queue_depth 0\n"),
+            "queue depth should settle to 0:\n{out}"
+        );
     }
 
     #[tokio::test]
@@ -967,11 +1153,125 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(200)).await;
             token.cancel();
         });
-        run_loop(&queue, &proc, &budget, cfg, &shutdown).await;
+        run_loop(&queue, &proc, &budget, cfg, &test_reg(), &test_cost(), &shutdown).await;
         handle.await.unwrap();
 
         assert_eq!(proc.ran.load(Ordering::SeqCst), 5);
         assert_eq!(queue.count_status(AiJobStatus::Done), 5, "all claimed jobs completed");
         assert_eq!(queue.count_status(AiJobStatus::Running), 0, "no orphaned running rows");
+    }
+
+    // ---------- (方向四) observability instrumentation ----------
+
+    #[tokio::test]
+    async fn run_one_success_records_duration_cost_and_outcome() {
+        // A successful Answer job records: a duration observation, the cost
+        // estimate for its kind, and one success outcome — all on a FRESH
+        // registry (never the flaky process-global one).
+        let job = mk_job(AiJobKind::Answer, 1);
+        let id = job.id;
+        let queue = FakeQueue::with_jobs(vec![job.clone()]);
+        {
+            // Mark it running so complete() has a row to flip (mirrors a claim).
+            let mut rows = queue.rows.lock().unwrap();
+            rows[0].status = AiJobStatus::Running;
+        }
+        let proc = FixedResult { value: serde_json::json!({ "answer": "42" }) };
+        let reg = test_reg();
+        let cost = test_cost();
+
+        run_one(&queue, &proc, job, &reg, &cost).await;
+
+        assert_eq!(queue.status_of(id), AiJobStatus::Done);
+        let out = reg.render_prometheus();
+        assert!(
+            out.contains(r#"aero_ai_job_duration_seconds_count{kind="answer"} 1"#),
+            "duration not recorded:\n{out}"
+        );
+        assert!(
+            out.contains(&format!(
+                r#"aero_ai_cost_micros_total{{kind="answer"}} {}"#,
+                cost.answer_micros
+            )),
+            "cost not recorded:\n{out}"
+        );
+        assert!(
+            out.contains(r#"aero_ai_jobs_total{kind="answer",outcome="success"} 1"#),
+            "success outcome not recorded:\n{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_one_embed_skip_records_zero_cost_but_still_succeeds() {
+        // An idempotent embed no-op (handler returns a `skipped` marker) must
+        // record duration + a SUCCESS outcome but charge ZERO cost.
+        let job = mk_job(AiJobKind::Embed, 1);
+        let queue = FakeQueue::with_jobs(vec![job.clone()]);
+        {
+            let mut rows = queue.rows.lock().unwrap();
+            rows[0].status = AiJobStatus::Running;
+        }
+        let proc = FixedResult {
+            value: serde_json::json!({ "skipped": "empty", "updated": false }),
+        };
+        let reg = test_reg();
+        let cost = test_cost();
+
+        run_one(&queue, &proc, job, &reg, &cost).await;
+
+        let out = reg.render_prometheus();
+        assert!(
+            out.contains(r#"aero_ai_jobs_total{kind="embed",outcome="success"} 1"#),
+            "embed skip is still a success:\n{out}"
+        );
+        assert!(
+            out.contains(r#"aero_ai_cost_micros_total{kind="embed"} 0"#),
+            "embed skip must charge zero cost:\n{out}"
+        );
+        assert!(
+            out.contains(r#"aero_ai_job_duration_seconds_count{kind="embed"} 1"#),
+            "duration still recorded for a skip:\n{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_loop_sets_queue_depth_gauge_during_a_batch() {
+        // A slow processor lets us observe the queue-depth gauge while a batch is
+        // in flight: it must equal the claimed batch size, then return to 0.
+        let jobs: Vec<AiJob> = (0..3).map(|_| mk_job(AiJobKind::Moderate, 1)).collect();
+        let queue = FakeQueue::with_jobs(jobs);
+        let probe = ConcurrencyProbe::new(); // sleeps 20ms per job
+        let budget = CostBudget::new(100, Duration::from_secs(3600));
+        let cfg = WorkerConfig {
+            max_concurrency: 4,
+            max_calls_per_window: 100,
+            budget_window: Duration::from_secs(3600),
+        };
+        let shutdown = CancellationToken::new();
+        let reg = Arc::new(test_reg());
+        let cost = test_cost();
+
+        // Sample the gauge mid-batch (after the batch is claimed but before it
+        // drains), then cancel.
+        let token = shutdown.clone();
+        let sample_reg = Arc::clone(&reg);
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(8)).await;
+            let mid = sample_reg.render_prometheus();
+            token.cancel();
+            mid
+        });
+        run_loop(&queue, &probe, &budget, cfg, &reg, &cost, &shutdown).await;
+        let mid = handle.await.unwrap();
+
+        assert!(
+            mid.contains("\naero_ai_queue_depth 3\n"),
+            "queue depth should reflect the 3-job batch mid-flight:\n{mid}"
+        );
+        // After draining, it settles back to 0.
+        assert!(
+            reg.render_prometheus().contains("\naero_ai_queue_depth 0\n"),
+            "queue depth should return to 0 after drain"
+        );
     }
 }
