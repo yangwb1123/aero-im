@@ -77,7 +77,10 @@ pub fn build(state: AppState) -> Router {
         // RTC config
         .route("/api/rtc/config", get(rtc_config))
         // WebSocket
-        .route("/ws", get(ws::handler));
+        .route("/ws", get(ws::handler))
+        // Workspace / Org management (ROADMAP 方向一 — multi-tenant foundation).
+        // Defined alongside their RBAC guards in `crate::workspaces`.
+        .merge(crate::workspaces::routes());
 
     // Prometheus scrape endpoint (ROADMAP 方向四). Mounted unless disabled; the
     // handler self-gates on an optional bearer token. Left here (not behind the
