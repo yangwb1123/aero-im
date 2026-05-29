@@ -269,15 +269,12 @@ async fn change_member_role(
         .ok_or_else(|| AeroError::NotFound("workspace member".into()))?;
     // Pure RBAC decision over (caller, new_role, current subject role).
     authorize_role_change(caller, req.role, subject_role)?;
-    // `add_member` is `ON CONFLICT DO NOTHING`, so it would NOT update an existing
-    // row. Re-roling must therefore go through remove + add to actually persist
-    // the new role for an already-present member.
+    // Single idempotent upsert: `update_member_role` overwrites an existing
+    // member's role atomically, replacing the prior remove-then-add dance (which
+    // briefly dropped the member and risked leaving them removed if the re-add
+    // failed).
     s.workspaces
-        .remove_member(ws, subject_id)
-        .await
-        .map_err(AeroError::from)?;
-    s.workspaces
-        .add_member(ws, subject_id, req.role)
+        .update_member_role(ws, subject_id, req.role)
         .await
         .map_err(AeroError::from)?;
     Ok(StatusCode::NO_CONTENT)

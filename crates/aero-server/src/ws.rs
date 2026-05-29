@@ -319,6 +319,11 @@ async fn handle_text(
             debug!(%pid, %room_id, "joined room");
         }
         ClientFrame::SendMessage { room_id, blocks, reply_to } => {
+            // Tenant guard: the sender must belong to BOTH the room's workspace and
+            // the room before a message is accepted. `ImService::send_message`
+            // re-checks room membership (a distinct, retained check); this adds the
+            // workspace-membership dimension. Maps to the WS `error` frame on denial.
+            state.im.assert_room_access(pid, room_id).await?;
             state.im.send_message(pid, room_id, blocks, reply_to).await?;
         }
         ClientFrame::EditMessage { id, blocks } => {

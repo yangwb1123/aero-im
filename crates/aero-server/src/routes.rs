@@ -5,7 +5,7 @@ use std::str::FromStr;
 use aero_auth::{AuthUser, LoginRequest, RegisterRequest};
 use aero_common::{
     BlobId, Error as AeroError, FileKind, MessageId, ParticipantId, Result as AeroResult, RoomId,
-    RoomKind, StreamProtocol,
+    RoomKind, StreamProtocol, WorkspaceId, WorkspaceRole,
 };
 use aero_live_whip::{accept_whep_offer, accept_whip_offer, SessionError, WhipError};
 use aero_storage::{blob::NewBlob, stream::NewStream};
@@ -205,6 +205,17 @@ async fn auth_register(
     Json(req): Json<RegisterRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let out = s.auth.register(req).await?;
+    // Enroll the brand-new participant into the legacy/default workspace so they
+    // immediately belong to a tenant — otherwise they could not create rooms
+    // (`create_room_in_workspace` requires workspace membership). `add_member` is
+    // an idempotent `ON CONFLICT DO NOTHING` upsert, so a retry is harmless. We
+    // propagate failures (rather than swallowing) to preserve the invariant
+    // "registered ⇒ workspace member"; the default workspace is guaranteed to
+    // exist by migration 0006's backfill.
+    s.workspaces
+        .add_member(DEFAULT_WORKSPACE_ID, out.participant.id, WorkspaceRole::Member)
+        .await
+        .map_err(AeroError::from)?;
     Ok(Json(serde_json::json!({
         "access_token": out.access_token,
         "refresh_token": out.refresh_token,
@@ -275,10 +286,40 @@ async fn update_me(
 
 // ----- Rooms -----
 
+/// The legacy / default workspace (tenant) that all pre-tenancy data was
+/// backfilled into by migration `0006_workspaces.sql` — the all-zero UUID, i.e.
+/// the `WorkspaceId` whose underlying u128 is 0. Single-tenant clients that omit
+/// a `workspace_id` (room creation) or `?workspace_id=` (room listing) operate
+/// against this workspace, so existing callers keep working unchanged while the
+/// required `rooms.workspace_id` (NOT NULL, no default) is always supplied.
+const DEFAULT_WORKSPACE_ID: WorkspaceId = WorkspaceId(ulid::Ulid(0));
+
+/// Resolve the workspace for a room operation: the explicitly-requested one when
+/// present, else [`DEFAULT_WORKSPACE_ID`]. Pure, so the "provided vs absent"
+/// default-selection rule is unit-tested offline (Postgres absent in CI).
+///
+/// # Errors
+/// [`AeroError::Invalid`] when a present id fails to decode as a [`WorkspaceId`].
+fn resolve_workspace_id(requested: Option<&str>) -> AeroResult<WorkspaceId> {
+    match requested {
+        Some(raw) => {
+            WorkspaceId::from_str(raw.trim())
+                .map_err(|e| AeroError::Invalid(format!("workspace id: {e}")))
+        }
+        None => Ok(DEFAULT_WORKSPACE_ID),
+    }
+}
+
 #[derive(Deserialize)]
 struct CreateRoomReq {
     kind: String,
     name: Option<String>,
+    /// Optional tenant the channel is created in. Absent ⇒ [`DEFAULT_WORKSPACE_ID`]
+    /// (keeps single-tenant clients working). The handler routes through
+    /// [`ImService::create_room_in_workspace`](aero_im_core::ImService::create_room_in_workspace)
+    /// either way, so the room always carries its required `workspace_id`.
+    #[serde(default)]
+    workspace_id: Option<String>,
 }
 
 async fn create_room(
@@ -287,15 +328,43 @@ async fn create_room(
     Json(req): Json<CreateRoomReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let kind = parse_room_kind(&req.kind)?;
-    let room = s.im.create_room(auth.participant_id, kind, req.name).await?;
+    let workspace = resolve_workspace_id(req.workspace_id.as_deref())?;
+    // Tenant choke point: verifies workspace membership + channel-create privilege
+    // and persists `rooms.workspace_id` (fixes the NOT-NULL room-create regression
+    // the old `create_room` hit after migration 0006).
+    let room = s
+        .im
+        .create_room_in_workspace(auth.participant_id, workspace, kind, req.name)
+        .await?;
     Ok(Json(serde_json::to_value(room).map_err(AeroError::from)?))
+}
+
+#[derive(Deserialize)]
+struct ListRoomsQuery {
+    /// Optional tenant scope. Present ⇒ only the caller's rooms in that workspace
+    /// (`rooms_for_in_workspace`); absent ⇒ all the caller's rooms (legacy behavior).
+    #[serde(default)]
+    workspace_id: Option<String>,
 }
 
 async fn list_rooms(
     State(s): State<AppState>,
     auth: AuthUser,
+    Query(q): Query<ListRoomsQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let rooms = s.im.list_my_rooms(auth.participant_id).await?;
+    // Scoped to a workspace when `?workspace_id=` is given; otherwise unchanged
+    // (every room the caller belongs to, across tenants).
+    let rooms = match q.workspace_id.as_deref() {
+        Some(raw) => {
+            let ws = WorkspaceId::from_str(raw.trim())
+                .map_err(|e| AeroError::Invalid(format!("workspace id: {e}")))?;
+            s.rooms
+                .rooms_for_in_workspace(auth.participant_id, ws)
+                .await
+                .map_err(AeroError::from)?
+        }
+        None => s.im.list_my_rooms(auth.participant_id).await?,
+    };
     Ok(Json(serde_json::to_value(rooms).map_err(AeroError::from)?))
 }
 
@@ -311,6 +380,10 @@ async fn add_member(
     Json(req): Json<AddMemberReq>,
 ) -> ApiResult<axum::http::StatusCode> {
     let room = parse_room_id(&room_str)?;
+    // Tenant guard: the actor must belong to BOTH the room's workspace and the
+    // room itself before they may add anyone. `ImService::add_member` re-checks
+    // the actor's room membership (a distinct, retained check).
+    s.im.assert_room_access(auth.participant_id, room).await?;
     let member = ParticipantId::from_str(&req.participant_id)
         .map_err(|e| AeroError::Invalid(format!("participant id: {e}")))?;
     s.im.add_member(auth.participant_id, room, member).await?;
@@ -357,6 +430,10 @@ async fn room_history(
     Query(q): Query<HistoryQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let room = parse_room_id(&room_str)?;
+    // Tenant guard: workspace + room membership. Subsumes the bare room-membership
+    // check the forward (`since`) branch used to do, and complements the
+    // membership check `ImService::history` does on the backward (`before`) path.
+    s.im.assert_room_access(auth.participant_id, room).await?;
     let limit = history_limit(q.limit);
     // `before` pages backward, `since` pages forward — combining them is
     // ambiguous, so reject rather than silently pick one.
@@ -366,11 +443,8 @@ async fn room_history(
     let since = parse_cursor(q.since.as_deref(), "since")?;
 
     if let Some(after) = since {
-        // Forward catch-up (ROADMAP 方向五). `ImService::history` only exposes the
-        // backward path, so authorize here exactly as it does, then read forward.
-        if !s.rooms.is_member(room, auth.participant_id).await.map_err(AeroError::from)? {
-            return Err(AeroError::Forbidden("not a member".into()).into());
-        }
+        // Forward catch-up (ROADMAP 方向五). Access already asserted above;
+        // `ImService::history` only exposes the backward path, so read forward here.
         let msgs = s.messages.list_since(room, after, limit).await.map_err(AeroError::from)?;
         return Ok(Json(serde_json::to_value(msgs).map_err(AeroError::from)?));
     }
@@ -394,6 +468,8 @@ async fn mark_read(
     Json(req): Json<MarkReadReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let room = parse_room_id(&room_str)?;
+    // Tenant guard (workspace + room membership) before recording a receipt.
+    s.im.assert_room_access(auth.participant_id, room).await?;
     let mid = MessageId::from_str(&req.last_message_id)
         .map_err(|e| AeroError::Invalid(format!("message id: {e}")))?;
     let r = s.im.mark_read(auth.participant_id, room, mid).await?;
@@ -406,9 +482,9 @@ async fn list_receipts(
     Path(room_str): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let room = parse_room_id(&room_str)?;
-    if !s.rooms.is_member(room, auth.participant_id).await.map_err(AeroError::from)? {
-        return Err(AeroError::Forbidden("not a member".into()).into());
-    }
+    // Tenant guard (workspace + room membership) — supersedes the prior bare
+    // room-membership check.
+    s.im.assert_room_access(auth.participant_id, room).await?;
     let rs = s.im.receipts_for(room).await?;
     Ok(Json(serde_json::to_value(rs).map_err(AeroError::from)?))
 }
@@ -512,9 +588,9 @@ async fn room_search(
     Json(req): Json<SearchReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let room = parse_room_id(&room_str)?;
-    if !s.rooms.is_member(room, auth.participant_id).await.map_err(AeroError::from)? {
-        return Err(AeroError::Forbidden("not a member".into()).into());
-    }
+    // Tenant guard (workspace + room membership) — supersedes the prior bare
+    // room-membership check before searching the room's messages.
+    s.im.assert_room_access(auth.participant_id, room).await?;
     if req.query.trim().is_empty() {
         return Err(AeroError::Invalid("empty query".into()).into());
     }
@@ -1006,9 +1082,9 @@ async fn list_room_members(
     Path(room_str): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let room = parse_room_id(&room_str)?;
-    if !s.rooms.is_member(room, auth.participant_id).await.map_err(AeroError::from)? {
-        return Err(AeroError::Forbidden("not a room member".into()).into());
-    }
+    // Tenant guard (workspace + room membership) — supersedes the prior bare
+    // room-membership check before listing the room's members.
+    s.im.assert_room_access(auth.participant_id, room).await?;
     let ids = s.rooms.members(room).await.map_err(AeroError::from)?;
     // Resolve to full Participant objects.
     let mut out = Vec::with_capacity(ids.len());
@@ -1389,5 +1465,137 @@ mod tests {
         assert_eq!(v["since"], id.to_string());
         assert_eq!(v["limit"], 50);
         assert!(v["before"].is_null());
+    }
+
+    // ----- Workspace scoping (multi-tenant rollout) -----
+
+    #[test]
+    fn default_workspace_id_is_the_all_zero_uuid() {
+        // Migration 0006 backfilled `rooms.workspace_id` (and the default
+        // workspace row) with the all-zero UUID. The const MUST map to exactly
+        // that, or omitting `workspace_id` would target the wrong (or a
+        // nonexistent) tenant.
+        assert_eq!(DEFAULT_WORKSPACE_ID.to_uuid(), uuid::Uuid::nil());
+        // And it round-trips through the same UUID constructor the storage layer
+        // binds with.
+        assert_eq!(DEFAULT_WORKSPACE_ID, WorkspaceId::from_uuid(uuid::Uuid::nil()));
+    }
+
+    #[test]
+    fn resolve_workspace_id_defaults_when_absent() {
+        // Absent (single-tenant client) ⇒ the legacy default workspace.
+        assert_eq!(resolve_workspace_id(None).unwrap(), DEFAULT_WORKSPACE_ID);
+    }
+
+    #[test]
+    fn resolve_workspace_id_uses_provided_value() {
+        // Present + valid ⇒ exactly that workspace, whitespace tolerated.
+        let ws = WorkspaceId::new();
+        assert_eq!(resolve_workspace_id(Some(&ws.to_string())).unwrap(), ws);
+        assert_eq!(resolve_workspace_id(Some(&format!("  {ws}  "))).unwrap(), ws);
+    }
+
+    #[test]
+    fn resolve_workspace_id_rejects_garbage() {
+        // Present + undecodable ⇒ Invalid (400), NOT a silent fall-through to the
+        // default (which would mask a client bug and cross tenant boundaries).
+        let err = resolve_workspace_id(Some("not-a-ulid")).unwrap_err();
+        match err {
+            AeroError::Invalid(msg) => assert!(msg.contains("workspace id"), "got: {msg}"),
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    /// Router-level proof that `CreateRoomReq` parses the OPTIONAL `workspace_id`
+    /// body field and that the handler's default-selection composes correctly:
+    /// omitting it resolves to [`DEFAULT_WORKSPACE_ID`], supplying it resolves to
+    /// that id. Uses a stand-in handler with the real request type + the real
+    /// `resolve_workspace_id` (the production handler needs a full `AppState`).
+    #[tokio::test]
+    async fn create_room_body_parses_optional_workspace_id() {
+        async fn probe(Json(req): Json<CreateRoomReq>) -> Json<serde_json::Value> {
+            let ws = resolve_workspace_id(req.workspace_id.as_deref())
+                .expect("valid workspace id in test");
+            Json(serde_json::json!({ "kind": req.kind, "workspace": ws.to_string() }))
+        }
+        let app: Router = Router::new().route("/api/rooms", post(probe));
+
+        // (a) Body WITHOUT workspace_id ⇒ resolves to the default workspace.
+        let resp = app
+            .clone()
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/api/rooms")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"kind":"group","name":"hi"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 16).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["kind"], "group");
+        assert_eq!(v["workspace"], DEFAULT_WORKSPACE_ID.to_string());
+
+        // (b) Body WITH workspace_id ⇒ resolves to exactly that workspace.
+        let ws = WorkspaceId::new();
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri("/api/rooms")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"kind":"channel","workspace_id":"{ws}"}}"#
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 16).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["kind"], "channel");
+        assert_eq!(v["workspace"], ws.to_string());
+    }
+
+    /// Router-level proof that `list_rooms`'s `ListRoomsQuery` extractor accepts an
+    /// optional `?workspace_id=` and exposes it (present vs absent) so the handler
+    /// can branch scoped-vs-all. Stand-in handler (the real one needs `AppState`).
+    #[tokio::test]
+    async fn list_rooms_query_parses_optional_workspace_id() {
+        async fn probe(Query(q): Query<ListRoomsQuery>) -> Json<serde_json::Value> {
+            Json(serde_json::json!({ "workspace_id": q.workspace_id }))
+        }
+        let app: Router = Router::new().route("/api/rooms", get(probe));
+
+        // Absent ⇒ None (handler keeps legacy "all my rooms" behavior).
+        let resp = app
+            .clone()
+            .oneshot(HttpRequest::builder().uri("/api/rooms").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 16).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(v["workspace_id"].is_null());
+
+        // Present ⇒ surfaced verbatim (handler scopes via rooms_for_in_workspace).
+        let ws = WorkspaceId::new();
+        let resp = app
+            .oneshot(
+                HttpRequest::builder()
+                    .uri(format!("/api/rooms?workspace_id={ws}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 16).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["workspace_id"], ws.to_string());
     }
 }
