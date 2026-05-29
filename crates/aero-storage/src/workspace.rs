@@ -499,6 +499,89 @@ impl WorkspaceRepo {
         tx.commit().await?;
         Ok(result.rows_affected() > 0)
     }
+
+    // ----------------------------------------- compliance: retention policy
+
+    /// Set (or, with `days = None`, clear) the workspace's message-retention
+    /// window, in whole days (ROADMAP 方向一 合规 — 按组织的留存策略).
+    ///
+    /// `None` means "keep forever" — the default. A `Some(n)` opts the tenant in
+    /// to having messages older than `n` days soft-deleted by the periodic sweep
+    /// ([`sweep_expired_messages`](Self::sweep_expired_messages)). Callers should
+    /// validate the value with [`validate_retention_days`] first; this method
+    /// writes whatever it is given (a non-positive value would simply mark every
+    /// message expired, which the route layer rejects).
+    pub async fn set_retention(
+        &self,
+        workspace: WorkspaceId,
+        days: Option<i32>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(r"UPDATE workspaces SET retention_days = $2 WHERE id = $1")
+            .bind(workspace.to_uuid())
+            .bind(days)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// The workspace's configured retention window in days, or `None` if the
+    /// workspace keeps messages forever (or does not exist). The outer
+    /// `Result`/inner `Option` collapse "no such workspace" and "no policy set"
+    /// to the same `None`: both mean "nothing to sweep".
+    pub async fn retention_days(
+        &self,
+        workspace: WorkspaceId,
+    ) -> Result<Option<i32>, sqlx::Error> {
+        let row = sqlx::query_as::<_, (Option<i32>,)>(
+            r"SELECT retention_days FROM workspaces WHERE id = $1",
+        )
+        .bind(workspace.to_uuid())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.and_then(|(d,)| d))
+    }
+
+    /// Soft-delete every not-already-deleted message whose room belongs to a
+    /// workspace that has a retention policy and whose `created_at` is older than
+    /// that workspace's window, as of `now`. Returns the number of messages
+    /// swept (ROADMAP 方向一 合规 — 按组织的留存策略).
+    ///
+    /// One set-based `UPDATE` joins `messages → rooms → workspaces` so the cutoff
+    /// is evaluated **per workspace** in the database (`created_at < now -
+    /// retention_days days`); workspaces with `retention_days IS NULL` (keep
+    /// forever) and any `retention_days <= 0` are excluded entirely — a
+    /// non-positive window never sweeps anything, so a mis-set policy fails safe
+    /// rather than erasing a whole tenant.
+    ///
+    /// The mutation is **byte-for-byte the same** soft-delete
+    /// [`MessageRepo::soft_delete`](crate::MessageRepo::soft_delete) applies
+    /// (`deleted_at`, `blocks = '[]'::jsonb`, `searchable_text = ''`,
+    /// `embedding = NULL`), so a swept message is indistinguishable from one a
+    /// user deleted. `now` is passed in (not `NOW()`) so the cutoff is testable
+    /// and the whole batch shares one consistent instant.
+    pub async fn sweep_expired_messages(
+        &self,
+        now: time::OffsetDateTime,
+    ) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query(
+            r"UPDATE messages m
+                 SET deleted_at = $1,
+                     blocks = '[]'::jsonb,
+                     searchable_text = '',
+                     embedding = NULL
+               FROM rooms r
+               JOIN workspaces w ON w.id = r.workspace_id
+              WHERE m.room_id = r.id
+                AND m.deleted_at IS NULL
+                AND w.retention_days IS NOT NULL
+                AND w.retention_days > 0
+                AND m.created_at < $1 - make_interval(days => w.retention_days)",
+        )
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
 }
 
 /// Parse a DB `kind` token into a [`RoomKind`], defaulting unknown tokens to
@@ -576,6 +659,40 @@ pub fn role_can_assign(actor: WorkspaceRole, target: WorkspaceRole) -> bool {
 #[must_use]
 pub fn role_can_manage_member(actor: WorkspaceRole, subject: WorkspaceRole) -> bool {
     actor.can_administer() && actor.at_least(subject)
+}
+
+// ---------- Pure retention-policy helpers (DB-free, unit-tested) ----------
+
+/// Smallest accepted retention window, in days. A policy must keep messages for
+/// at least one day; anything shorter is treated as a configuration error rather
+/// than "soft-delete almost everything immediately".
+pub const MIN_RETENTION_DAYS: i32 = 1;
+
+/// Validate a retention setting before it is persisted.
+///
+/// `None` (keep forever) is always valid. A `Some(n)` is valid only when
+/// `n >= MIN_RETENTION_DAYS`; `Err` carries the offending value so the route
+/// layer can surface a `400`. Kept DB-free so the rule is unit-tested offline.
+///
+/// # Errors
+/// Returns `Err(days)` when `days = Some(n)` with `n < MIN_RETENTION_DAYS`.
+pub fn validate_retention_days(days: Option<i32>) -> Result<(), i32> {
+    match days {
+        None => Ok(()),
+        Some(n) if n >= MIN_RETENTION_DAYS => Ok(()),
+        Some(n) => Err(n),
+    }
+}
+
+/// Compute the soft-delete cutoff for a `days`-day retention window relative to
+/// `now`: messages strictly older than the returned instant are expired.
+///
+/// This mirrors, in Rust, the `now - make_interval(days => …)` the sweep does in
+/// SQL — exposed as a pure function so the cutoff arithmetic is unit-testable
+/// without a database. (`days` is the workspace's configured window.)
+#[must_use]
+pub fn retention_cutoff(now: time::OffsetDateTime, days: i32) -> time::OffsetDateTime {
+    now - time::Duration::days(i64::from(days))
 }
 
 #[cfg(test)]
@@ -657,6 +774,44 @@ mod tests {
             assert!(!role_can_manage_member(WorkspaceRole::Member, subject));
             assert!(!role_can_manage_member(WorkspaceRole::Guest, subject));
         }
+    }
+
+    // ----- retention-policy helpers -----
+
+    #[test]
+    fn validate_retention_accepts_none_and_positive() {
+        // None = keep forever, always valid.
+        assert!(validate_retention_days(None).is_ok());
+        // The floor and anything above it are accepted.
+        assert!(validate_retention_days(Some(MIN_RETENTION_DAYS)).is_ok());
+        assert!(validate_retention_days(Some(1)).is_ok());
+        assert!(validate_retention_days(Some(30)).is_ok());
+        assert!(validate_retention_days(Some(3650)).is_ok());
+        assert!(validate_retention_days(Some(i32::MAX)).is_ok());
+    }
+
+    #[test]
+    fn validate_retention_rejects_below_floor_and_echoes_value() {
+        // Zero and negatives are configuration errors; the bad value is returned.
+        assert_eq!(validate_retention_days(Some(0)), Err(0));
+        assert_eq!(validate_retention_days(Some(-1)), Err(-1));
+        assert_eq!(validate_retention_days(Some(-365)), Err(-365));
+        assert_eq!(validate_retention_days(Some(i32::MIN)), Err(i32::MIN));
+    }
+
+    #[test]
+    fn retention_cutoff_subtracts_exactly_n_days() {
+        // A fixed reference instant; the cutoff is `now - days`.
+        let now = time::OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        assert_eq!(retention_cutoff(now, 1), now - time::Duration::days(1));
+        assert_eq!(retention_cutoff(now, 30), now - time::Duration::days(30));
+        // A message exactly `days` old sits ON the cutoff (the sweep uses a
+        // strict `<`, so it is NOT yet expired); one a hair older is expired.
+        let cutoff = retention_cutoff(now, 7);
+        let exactly_seven_days_old = now - time::Duration::days(7);
+        assert_eq!(exactly_seven_days_old, cutoff, "boundary is inclusive of cutoff");
+        assert!(now - time::Duration::days(8) < cutoff, "8-day-old is past cutoff");
+        assert!(now - time::Duration::days(6) > cutoff, "6-day-old is within window");
     }
 }
 
@@ -862,5 +1017,143 @@ mod db_tests {
             .await
             .unwrap();
         assert_eq!((a_rooms, a_msgs), (0, 0), "A's room + message deleted");
+    }
+
+    // ----- retention sweep -----
+
+    /// Insert a message into `room` with an explicit `created_at`, returning its
+    /// id. Lets the sweep tests place messages on either side of a retention
+    /// cutoff deterministically.
+    async fn insert_message_at(
+        p: &PgPool,
+        room: RoomId,
+        sender: ParticipantId,
+        created_at: time::OffsetDateTime,
+    ) -> MessageId {
+        let id = MessageId::new();
+        sqlx::query(
+            r"INSERT INTO messages (id, room_id, sender_id, blocks, searchable_text, created_at)
+               VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(id.to_uuid())
+        .bind(room.to_uuid())
+        .bind(sender.to_uuid())
+        .bind(serde_json::json!([{ "type": "text", "text": "retained body" }]))
+        .bind("retained body")
+        .bind(created_at)
+        .execute(p)
+        .await
+        .expect("insert dated message");
+        id
+    }
+
+    /// The `(deleted_at, blocks, searchable_text)` of a message — enough to
+    /// assert the sweep applied exactly the soft-delete shape.
+    async fn message_state(
+        p: &PgPool,
+        id: MessageId,
+    ) -> (Option<time::OffsetDateTime>, serde_json::Value, String) {
+        sqlx::query_as::<_, (Option<time::OffsetDateTime>, serde_json::Value, String)>(
+            r"SELECT deleted_at, blocks, searchable_text FROM messages WHERE id = $1",
+        )
+        .bind(id.to_uuid())
+        .fetch_one(p)
+        .await
+        .expect("message exists")
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn sweep_soft_deletes_only_messages_past_the_window() {
+        let p = pool();
+        let repo = WorkspaceRepo::new(p.clone());
+        let owner = new_participant(&p).await;
+        // seed_workspace also inserts one `now()`-dated message we expect to keep.
+        let (ws, room, recent_seeded) = seed_workspace(&repo, &p, owner).await;
+        repo.set_retention(ws, Some(30)).await.unwrap();
+
+        let now = time::OffsetDateTime::now_utc();
+        // 40 days old: strictly past the 30-day cutoff → swept.
+        let old = insert_message_at(&p, room, owner, now - time::Duration::days(40)).await;
+        // 10 days old: within the window → kept.
+        let fresh = insert_message_at(&p, room, owner, now - time::Duration::days(10)).await;
+
+        let swept = repo.sweep_expired_messages(now).await.unwrap();
+        assert_eq!(swept, 1, "exactly the one 40-day-old message is swept");
+
+        // The old message now wears the canonical soft-delete shape.
+        let (deleted_at, blocks, text) = message_state(&p, old).await;
+        assert!(deleted_at.is_some(), "old message is soft-deleted");
+        assert_eq!(blocks, serde_json::json!([]), "blocks cleared to []");
+        assert_eq!(text, "", "searchable_text cleared");
+
+        // The within-window messages are untouched.
+        assert!(message_state(&p, fresh).await.0.is_none(), "10-day message kept");
+        assert!(message_state(&p, recent_seeded).await.0.is_none(), "now() message kept");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn sweep_skips_workspaces_without_a_policy() {
+        let p = pool();
+        let repo = WorkspaceRepo::new(p.clone());
+        let owner = new_participant(&p).await;
+        let (_ws, room, _seeded) = seed_workspace(&repo, &p, owner).await;
+        // No set_retention call → retention_days stays NULL (keep forever).
+
+        let now = time::OffsetDateTime::now_utc();
+        let ancient = insert_message_at(&p, room, owner, now - time::Duration::days(3650)).await;
+
+        let swept = repo.sweep_expired_messages(now).await.unwrap();
+        assert_eq!(swept, 0, "a policy-less workspace is never swept");
+        assert!(message_state(&p, ancient).await.0.is_none(), "10-year message kept");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn sweep_isolates_workspaces_and_is_idempotent() {
+        let p = pool();
+        let repo = WorkspaceRepo::new(p.clone());
+        let owner_a = new_participant(&p).await;
+        let owner_b = new_participant(&p).await;
+        let (ws_a, room_a, _sa) = seed_workspace(&repo, &p, owner_a).await;
+        let (ws_b, room_b, _sb) = seed_workspace(&repo, &p, owner_b).await;
+        // Only A opts into retention; B keeps forever.
+        repo.set_retention(ws_a, Some(7)).await.unwrap();
+        assert_eq!(repo.retention_days(ws_a).await.unwrap(), Some(7), "A policy persisted");
+        assert_eq!(repo.retention_days(ws_b).await.unwrap(), None, "B has no policy");
+
+        let now = time::OffsetDateTime::now_utc();
+        let old_a = insert_message_at(&p, room_a, owner_a, now - time::Duration::days(30)).await;
+        let old_b = insert_message_at(&p, room_b, owner_b, now - time::Duration::days(30)).await;
+
+        let first = repo.sweep_expired_messages(now).await.unwrap();
+        assert_eq!(first, 1, "only A's old message is swept; B is untouched");
+        assert!(message_state(&p, old_a).await.0.is_some(), "A's old message swept");
+        assert!(message_state(&p, old_b).await.0.is_none(), "B's old message survives");
+
+        // A second sweep finds nothing new (already-deleted rows are excluded).
+        let second = repo.sweep_expired_messages(now).await.unwrap();
+        assert_eq!(second, 0, "sweep is idempotent — no double-deletion");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn set_retention_can_clear_back_to_keep_forever() {
+        let p = pool();
+        let repo = WorkspaceRepo::new(p.clone());
+        let owner = new_participant(&p).await;
+        let (ws, room, _seeded) = seed_workspace(&repo, &p, owner).await;
+
+        repo.set_retention(ws, Some(1)).await.unwrap();
+        assert_eq!(repo.retention_days(ws).await.unwrap(), Some(1));
+        // Clearing the policy stops the sweep from touching the tenant.
+        repo.set_retention(ws, None).await.unwrap();
+        assert_eq!(repo.retention_days(ws).await.unwrap(), None);
+
+        let now = time::OffsetDateTime::now_utc();
+        let old = insert_message_at(&p, room, owner, now - time::Duration::days(365)).await;
+        assert_eq!(repo.sweep_expired_messages(now).await.unwrap(), 0, "cleared policy = no sweep");
+        assert!(message_state(&p, old).await.0.is_none(), "message kept after policy cleared");
     }
 }

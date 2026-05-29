@@ -42,6 +42,7 @@ pub use room::RoomRepo;
 pub use stream::{NewStream, StreamRepo};
 pub use stream_route::{redirect_base, StreamRouteRegistry, DEFAULT_TTL as STREAM_ROUTE_TTL};
 pub use workspace::{
-    role_can_assign, role_can_invite, role_can_manage_member, role_can_remove, RoomExport,
-    WorkspaceExport, WorkspaceRepo, EXPORT_MESSAGES_PER_ROOM,
+    retention_cutoff, role_can_assign, role_can_invite, role_can_manage_member, role_can_remove,
+    validate_retention_days, RoomExport, WorkspaceExport, WorkspaceRepo, EXPORT_MESSAGES_PER_ROOM,
+    MIN_RETENTION_DAYS,
 };
