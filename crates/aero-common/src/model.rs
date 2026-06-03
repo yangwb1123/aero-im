@@ -282,6 +282,29 @@ pub struct Stream {
     pub created_at: OffsetDateTime,
 }
 
+/// A finalized stream recording / VOD: a snapshot of a stream's HLS playlist,
+/// retained after the live stream ends so members can play it back later. The
+/// `hls_path` is the same playlist path the live pipeline wrote (under the
+/// configured `hls_dir`); a `playback_url` is rendered from it at the HTTP edge.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Vod {
+    pub id: crate::ids::VodId,
+    /// The stream this recording was finalized from. Not a hard FK — a VOD may
+    /// outlive its stream row.
+    pub stream_id: ulid::Ulid,
+    pub owner_id: ParticipantId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub room_id: Option<RoomId>,
+    pub title: String,
+    /// Playlist path (e.g. `/hls/<stream_id>/index.m3u8`) the VOD plays back from.
+    pub hls_path: String,
+    /// Recording duration in whole seconds, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_secs: Option<u32>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+}
+
 // ---------- Call sessions + signaling (P3/P6) ----------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

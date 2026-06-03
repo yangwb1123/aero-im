@@ -112,6 +112,11 @@ define_id!(
     /// Identifies a single audit-trail event (workspace administration log).
     AuditId
 );
+define_id!(
+    /// Identifies a stored stream VOD / recording (a finalized live stream that
+    /// members can list and play back later).
+    VodId
+);
 
 #[cfg(test)]
 mod tests {

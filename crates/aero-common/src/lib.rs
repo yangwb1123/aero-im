@@ -22,7 +22,7 @@ pub mod time;
 pub mod workspace;
 
 pub use error::{Error, Result};
-pub use ids::{AuditId, BlobId, MessageId, ParticipantId, RoomId, WorkspaceId};
+pub use ids::{AuditId, BlobId, MessageId, ParticipantId, RoomId, VodId, WorkspaceId};
 pub use live::{
     gift_by_id, gift_catalog, Gift, GiftLeaderRow, StreamChatLine, StreamEvent, StreamGiftLine,
 };
@@ -30,5 +30,6 @@ pub use model::{
     Block, Blob, CallEvent, CallId, CallKind, CallMode, CallSession, FileKind, Message,
     MessageEnvelope, Participant, ParticipantKind, ReactionOp, ReactionSummary, Reaction,
     ReadReceipt, Room, RoomEvent, RoomKind, Span, SpanStyle, Stream, StreamProtocol, StreamStatus,
+    Vod,
 };
 pub use workspace::{Workspace, WorkspaceMember, WorkspaceRole};
