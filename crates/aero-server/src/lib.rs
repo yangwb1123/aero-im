@@ -7,6 +7,7 @@ pub mod ai_adapter;
 pub mod bookmarks;
 pub mod collab;
 pub mod config;
+pub mod emoji;
 pub mod error;
 pub mod hub;
 pub mod invitations;

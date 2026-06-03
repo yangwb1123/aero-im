@@ -133,6 +133,10 @@ define_id!(
     /// Identifies a workspace invitation / shareable invite link.
     InvitationId
 );
+define_id!(
+    /// Identifies a workspace custom emoji (`:shipit:`), backed by an image blob.
+    EmojiId
+);
 
 #[cfg(test)]
 mod tests {

@@ -101,7 +101,9 @@ pub fn build(state: AppState) -> Router {
         // Notification preferences: per-channel mute + per-user Do-Not-Disturb.
         .merge(crate::notif_prefs::routes())
         // Saved items / bookmarks (personal save-for-later, per-user cross-room).
-        .merge(crate::bookmarks::routes());
+        .merge(crate::bookmarks::routes())
+        // Workspace custom emoji (`:shipit:`): name → uploaded image blob.
+        .merge(crate::emoji::routes());
 
     // Prometheus scrape endpoint (ROADMAP 方向四). Mounted unless disabled; the
     // handler self-gates on an optional bearer token. Left here (not behind the

@@ -23,7 +23,7 @@ pub mod workspace;
 
 pub use error::{Error, Result};
 pub use ids::{
-    AuditId, BlobId, InvitationId, MessageId, NotificationId, ParticipantId, RoomId,
+    AuditId, BlobId, EmojiId, InvitationId, MessageId, NotificationId, ParticipantId, RoomId,
     ScheduledMessageId, ScimTokenId, WebhookId, WorkspaceId,
 };
 pub use live::{
