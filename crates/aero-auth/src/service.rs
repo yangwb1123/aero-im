@@ -162,6 +162,19 @@ impl AuthService {
         self.jwt.verify(token)
     }
 
+    /// Mint a fresh access+refresh token pair for an already-known participant,
+    /// without a password check.
+    ///
+    /// This is the entry point for non-password logins that have *already*
+    /// authenticated the participant by other means — e.g. the SSO/OIDC flow,
+    /// which validates an external IdP's ID token and then needs *our* tokens for
+    /// the resolved (or JIT-provisioned) participant. It is the same token
+    /// material `register`/`login` issue, just decoupled from credential
+    /// verification.
+    pub fn issue_for_participant(&self, pid: aero_common::ParticipantId) -> Result<AuthTokens> {
+        self.issue_pair(pid)
+    }
+
     fn issue_pair(&self, pid: aero_common::ParticipantId) -> Result<AuthTokens> {
         Ok(AuthTokens {
             access_token: self.jwt.issue(pid, TokenKind::Access)?,

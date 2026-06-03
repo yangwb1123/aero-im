@@ -11,6 +11,7 @@ pub mod live;
 pub mod metrics;
 pub mod rate_limit;
 pub mod routes;
+pub mod sso;
 pub mod state;
 pub mod workspaces;
 pub mod ws;
