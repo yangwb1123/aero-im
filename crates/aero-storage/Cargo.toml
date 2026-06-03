@@ -30,6 +30,11 @@ ulid.workspace = true
 uuid.workspace = true
 rand.workspace = true
 bytes.workspace = true
+# Link unfurling (0024): sha2/hex hash a URL into the unfurl_cache primary key;
+# reqwest is the real `ReqwestUnfurler` HTTP transport for fetching OG metadata.
+sha2 = "0.10"
+hex = "0.4"
+reqwest.workspace = true
 
 [dev-dependencies]
 pretty_assertions.workspace = true
