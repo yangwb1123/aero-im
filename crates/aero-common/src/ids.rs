@@ -112,6 +112,11 @@ define_id!(
     /// Identifies a single audit-trail event (workspace administration log).
     AuditId
 );
+define_id!(
+    /// Identifies a Personal Access Token (PAT) — a long-lived, participant-owned
+    /// credential for programmatic REST API access.
+    PatId
+);
 
 #[cfg(test)]
 mod tests {

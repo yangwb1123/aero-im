@@ -12,8 +12,10 @@
 pub mod extractor;
 pub mod jwt;
 pub mod password;
+pub mod pat;
 pub mod service;
 
 pub use extractor::AuthUser;
 pub use jwt::{Claims, JwtCodec, TokenKind};
+pub use pat::{PatVerifier, SharedPatVerifier};
 pub use service::{AuthService, AuthTokens, LoginRequest, RegisterRequest, RegisterResponse};

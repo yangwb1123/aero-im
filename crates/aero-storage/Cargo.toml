@@ -30,6 +30,8 @@ ulid.workspace = true
 uuid.workspace = true
 rand.workspace = true
 bytes.workspace = true
+# PAT (0019): SHA-256 hashing of personal access tokens — only the hash is stored.
+sha2 = "0.10"
 
 [dev-dependencies]
 pretty_assertions.workspace = true

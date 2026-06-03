@@ -26,7 +26,7 @@ use aero_server::{
 };
 use aero_storage::{
     connect_pg, migrate, AiJobRepo, AuditRepo, BlobRepo, CallRepo, CallRosterStore, KeyPackageRepo,
-    LiveRepo, LocalFsBlobStore, MessageRepo, MlsGroupRepo, ParticipantRepo, PresenceStore,
+    LiveRepo, LocalFsBlobStore, MessageRepo, MlsGroupRepo, ParticipantRepo, PatRepo, PresenceStore,
     ReactionRepo, ReceiptRepo, RedisCache, RoomRepo, StreamRepo, StreamRouteRegistry,
     StreamViewerStore, WorkspaceRepo,
 };
@@ -116,7 +116,11 @@ async fn main() -> anyhow::Result<()> {
         std::time::Duration::from_secs(cfg.auth.access_ttl_secs),
         std::time::Duration::from_secs(cfg.auth.refresh_ttl_secs),
     )
-    .context("init AuthService")?;
+    .context("init AuthService")?
+    // Personal Access Tokens (0019): accept an `aero_pat_*` bearer credential on
+    // every AuthUser route, resolved against `pat_tokens`. Without this the
+    // extractor accepts JWTs only.
+    .with_pat_verifier(Arc::new(PatRepo::new(pg.clone())));
 
     // ---------- IM service ----------
     // `with_workspaces` wires the tenant repo so the workspace-scoped methods

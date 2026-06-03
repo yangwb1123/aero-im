@@ -15,6 +15,7 @@ pub mod live_presence;
 pub mod message;
 pub mod mls;
 pub mod participant;
+pub mod pat;
 pub mod presence;
 pub mod reaction;
 pub mod receipt;
@@ -35,6 +36,7 @@ pub use live_presence::{CallRosterStore, StreamViewerStore, DEFAULT_TTL as LIVE_
 pub use message::{MessageRepo, NewMessage, SearchHit};
 pub use mls::{KeyPackageRepo, MlsGroupRepo};
 pub use participant::ParticipantRepo;
+pub use pat::{PatRepo, PatSummary};
 pub use presence::PresenceStore;
 pub use reaction::ReactionRepo;
 pub use receipt::ReceiptRepo;

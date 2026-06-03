@@ -82,15 +82,20 @@ where
             return Err(AuthRejection::new("empty bearer token"));
         }
 
-        let claims = svc
-            .verify(token)
-            .map_err(|_| AuthRejection::new("invalid or expired token"))?;
-        if claims.kind != crate::jwt::TokenKind::Access {
-            return Err(AuthRejection::new("not an access token"));
-        }
-        let pid = claims
-            .participant_id()
-            .map_err(|_| AuthRejection::new("invalid sub claim"))?;
+        // Primary path: a short-lived access JWT (unchanged behaviour). On
+        // success we're done. On *any* JWT failure we fall through to the PAT
+        // path below — a Personal Access Token is a valid bearer credential too.
+        let pid = match svc.verify(token) {
+            Ok(claims) if claims.kind == crate::jwt::TokenKind::Access => claims
+                .participant_id()
+                .map_err(|_| AuthRejection::new("invalid sub claim"))?,
+            // Either not a valid JWT, or a JWT of the wrong kind (e.g. a refresh
+            // token presented as a bearer). Try a PAT before rejecting.
+            _ => svc
+                .verify_pat(token)
+                .await
+                .ok_or_else(|| AuthRejection::new("invalid or expired token"))?,
+        };
 
         // Stash the participant id in request extensions so downstream layers
         // (logging, authorization checks) can read it without re-decoding.
