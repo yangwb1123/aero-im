@@ -19,5 +19,6 @@ pub mod webhooks;
 pub mod workspaces;
 pub mod ws;
 pub mod channels;
+pub mod scheduled;
 
 pub use state::AppState;

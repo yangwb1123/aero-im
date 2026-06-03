@@ -125,6 +125,10 @@ define_id!(
     /// Identifies a SCIM 2.0 provisioning bearer token (per-workspace, RFC 7644).
     ScimTokenId
 );
+define_id!(
+    /// Identifies a scheduled message ("Send later") / reminder, pending delivery.
+    ScheduledMessageId
+);
 
 #[cfg(test)]
 mod tests {

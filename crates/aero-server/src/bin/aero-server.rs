@@ -344,6 +344,17 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // ---------- Scheduled-message dispatcher ("Send later" + reminders) ----------
+    // Polls for due rows (`scheduled_at <= now`, undelivered) and delivers them
+    // via ImService::send_message. Exits on the shutdown token.
+    {
+        let state_clone = state.clone();
+        let cancel = ai_shutdown.clone();
+        tokio::spawn(async move {
+            aero_server::scheduled::run_scheduled_dispatcher(state_clone, cancel).await;
+        });
+    }
+
     // ---------- Outgoing webhook dispatcher ----------
     // Subscribes to `im.room.*` (durable "aero-webhooks", distinct cursor from the
     // WS listener) and delivers RoomEvent::Message to each room's active outgoing
