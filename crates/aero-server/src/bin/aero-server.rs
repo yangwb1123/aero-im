@@ -407,6 +407,20 @@ async fn main() -> anyhow::Result<()> {
         info!("AI moderation enabled");
     }
 
+    // ---------- Link unfurling (opt-in: AERO_UNFURL) ----------
+    // Subscribes to room messages, fetches OG metadata for any URLs, and appends
+    // a link-preview Card by editing the message. The live HTTP fetch is the seam.
+    if std::env::var("AERO_UNFURL").is_ok() {
+        let state_clone = state.clone();
+        let cache = aero_storage::UnfurlRepo::new(pg.clone());
+        tokio::spawn(async move {
+            if let Err(e) = aero_server::unfurl_bot::run(state_clone, cache).await {
+                tracing::error!(error = ?e, "unfurl_bot listener exited");
+            }
+        });
+        info!("link unfurling enabled");
+    }
+
     // ---------- Router ----------
     let hls_dir = std::path::PathBuf::from(&cfg.server.hls_dir);
     if let Err(e) = std::fs::create_dir_all(&hls_dir) {

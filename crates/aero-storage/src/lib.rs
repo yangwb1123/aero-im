@@ -32,6 +32,7 @@ pub mod sso;
 pub mod stream;
 pub mod stream_mod;
 pub mod stream_route;
+pub mod unfurl;
 pub mod user_status;
 pub mod vod;
 pub mod webhook;
@@ -73,6 +74,7 @@ pub use sso::SsoRepo;
 pub use stream::{NewStream, StreamRepo};
 pub use stream_mod::{ban_active, StreamBan, StreamModRepo};
 pub use stream_route::{redirect_base, StreamRouteRegistry, DEFAULT_TTL as STREAM_ROUTE_TTL};
+pub use unfurl::{UnfurlRepo, Unfurler};
 pub use user_status::UserStatusRepo;
 pub use vod::{playback_url, VodRepo};
 pub use webhook::{
