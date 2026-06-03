@@ -723,9 +723,11 @@ async fn apply_active_membership(
     }
 }
 
-/// `DELETE /scim/v2/Users/:id` — deprovision: remove workspace membership + mark
-/// the SCIM row inactive (the global participant is retained). 204 on success,
-/// 404 if the user was not provisioned in this workspace.
+/// `DELETE /scim/v2/Users/:id` — deprovision: remove the SCIM mapping row (RFC
+/// 7644 §3.6 — a subsequent GET 404s) + revoke workspace membership; the global
+/// participant identity is retained. 204 on success, 404 if the user was not
+/// provisioned in this workspace. (Deactivation without deletion is `PATCH
+/// active=false`, which keeps the row.)
 async fn delete_user(
     State(s): State<AppState>,
     headers: HeaderMap,

@@ -367,9 +367,13 @@ impl ScimRepo {
     ) -> Result<bool, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
 
+        // RFC 7644 §3.6: DELETE removes the resource — a subsequent GET must 404.
+        // So the SCIM mapping row is deleted (distinct from PATCH `active=false`,
+        // which keeps the row and is still retrievable). The GLOBAL participant
+        // identity is retained — only this workspace's SCIM provisioning + access
+        // is revoked.
         let result = sqlx::query(
-            r"UPDATE scim_users SET active = false, updated_at = now()
-               WHERE workspace_id = $1 AND participant_id = $2",
+            r"DELETE FROM scim_users WHERE workspace_id = $1 AND participant_id = $2",
         )
         .bind(workspace.to_uuid())
         .bind(participant.to_uuid())
@@ -575,20 +579,26 @@ mod db_tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].participant_id, participant);
 
-        // Deactivate (deprovision): SCIM row inactive + membership removed,
-        // participant retained.
-        assert!(scim.delete_user(ws, participant).await.unwrap(), "row existed");
-        let after = scim.get_user(ws, participant).await.unwrap().expect("row retained");
-        assert!(!after.active, "marked inactive");
-        assert!(!ws_repo.is_member(ws, participant).await.unwrap(), "membership removed");
+        // Deactivate (PATCH active=false): the SCIM row is RETAINED but inactive,
+        // so a subsequent GET still returns it (RFC: an inactive user is valid).
+        let deactivated = scim.set_active(ws, participant, false).await.unwrap().expect("exists");
+        assert!(!deactivated.active, "marked inactive");
         assert!(
             scim.get_user(ws, participant).await.unwrap().is_some(),
-            "global participant + SCIM row retained for later GET/reactivation"
+            "deactivated row retained for later GET/reactivation"
         );
-
-        // set_active can reactivate.
+        // …and can be reactivated.
         let reactivated = scim.set_active(ws, participant, true).await.unwrap().expect("exists");
         assert!(reactivated.active);
+
+        // Delete (DELETE): the SCIM row is REMOVED (RFC 7644 §3.6 — a later GET
+        // 404s) + membership revoked, but the global participant is retained.
+        assert!(scim.delete_user(ws, participant).await.unwrap(), "row existed");
+        assert!(
+            scim.get_user(ws, participant).await.unwrap().is_none(),
+            "deleted SCIM row is gone (GET would 404)"
+        );
+        assert!(!ws_repo.is_member(ws, participant).await.unwrap(), "membership removed");
     }
 
     #[tokio::test]
