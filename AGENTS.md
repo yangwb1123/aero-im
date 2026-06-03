@@ -47,7 +47,7 @@ AI：Anthropic Messages `claude-sonnet-4-6`、Voyage 1024 维嵌入；无 key �
 ```bash
 make up                                    # 起 PG/Redis/NATS/Jaeger/MinIO
 make jwt-keys env                          # 生成 RS256 PEM + 写配置
-cargo run --bin aero-cli -- migrate        # 迁移，幂等（0001 IM · 0002 collab · 0003 MLS · 0004 转写 · 0005 直播 · 0006 多租户 · 0007 审计 · 0008 AI-job 租户标记 · 0009 消息留存 · 0010 通知 · 0011 置顶）
+cargo run --bin aero-cli -- migrate        # 迁移，幂等（0001 IM · 0002 collab · 0003 MLS · 0004 转写 · 0005 直播 · 0006 多租户 · 0007 审计 · 0008 AI-job 租户标记 · 0009 消息留存 · 0010 通知 · 0011 置顶 · 0012 频道 · 0013 webhook · 0014 SSO · 0015 SCIM）
 AERO__SERVER__BLOB_DIR=/tmp/aero/blobs AERO__SERVER__HLS_DIR=/tmp/aero/hls \
   cargo run --bin aero-server              # :3030 HTTP/WS，:1935 RTMP
 ```
@@ -56,7 +56,7 @@ AERO__SERVER__BLOB_DIR=/tmp/aero/blobs AERO__SERVER__HLS_DIR=/tmp/aero/hls \
 
 ```bash
 cargo check  --workspace                   # 干净
-cargo test   --workspace --lib             # 584 pass（最近一次绿：2026-06-03）；PG 门控测试用 `-- --ignored`（需 DATABASE_URL + 已迁移）
+cargo test   --workspace --lib             # 628 pass（最近一次绿：2026-06-03）；PG 门控测试用 `-- --ignored`（需 DATABASE_URL + 已迁移）
 cargo clippy --workspace --all-targets     # all+pedantic=warn，零新增警告
 ```
 
@@ -72,8 +72,9 @@ cargo clippy --workspace --all-targets     # all+pedantic=warn，零新增警告
 ## 范围红线（动手前确认）
 
 - ✅ **在范围内、已实现（应用层）**：P0–P7 —— IM / 协作 / RAG / AI / 1:1 与群通话(mesh) / 字幕翻译 / RTMP·WHIP·SRT 直播 / 审核。媒体面核心已落地并尽量字节级单测。
+- ✅ **To-B 协作 + 企业接入（已实现，活验证）**：线程回复 + @提及通知 + 未读/提及计数 + 置顶（`collab` 模块）；频道治理（公开/私有 / 加入·退出 / 归档 / topic，`channels`）；入站/出站 Webhook（HMAC 签名，`webhooks`，出站投递 `run_webhook_dispatcher`）；SSO via OIDC（ID-token 校验 + JIT 开通，`aero-auth::oidc` + `sso`）；SCIM 2.0 用户开通（`scim`，RFC 7643/7644）。新功能挂载法：新 `RoomEvent` variant（注意 `kind` tag 冲突）+ 仓储新文件 + `pub fn routes()` 模块 `.merge` 进 `routes::build`，仓储用 `XRepo::new(state.pg.clone())`。
 - 🚫 **明确非目标，别做**：P8 = **MLS 端到端加密 + 联邦**。服务端仅做不透明字节透传 scaffold（数据模型预留），**不要实现客户端 MLS 加密 / openmls-wasm**。"无 E2E 加密" 是产品既定决策。
-- 🛠️ **剩余真实工作**集中在媒体协议完整性、且**可单测**：SRT AES/KMREQ 加密 + ACK/NAK 可靠性、SFU Simulcast + RTCP(PLI/FIR) 反馈、WHEP egress 打包。
+- 🛠️ **可单测的剩余工作**（媒体协议完整性，多已落地）：SRT AES/KMREQ + ACK/NAK、SFU Simulcast + RTCP(PLI/FIR)、WHEP egress。企业接入的**真实链路**为 seam：OIDC 的 JWKS 拉取（逻辑已单测）、出站 Webhook 的真实 HTTP 投递（签名/构造已单测）、SCIM 的真实 IdP 驱动。
 - ⛔ **本沙箱无法端到端验证、别标 "done"**：浏览器 ICE/DTLS/SRTP 推流、真实 ffmpeg/OBS 推流。环境无浏览器 / 真实媒体源，后台长驻进程会被回收（exit 144），服务器**只能前台跑**。报告这类项写 "待真实链路联调"，不要写完成。
 
 ## 已知坑
