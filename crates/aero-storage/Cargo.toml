@@ -30,6 +30,12 @@ ulid.workspace = true
 uuid.workspace = true
 rand.workspace = true
 bytes.workspace = true
+# Webhooks (0013): HMAC-SHA256 signing of outgoing deliveries + SHA-256 hashing
+# of incoming tokens; reqwest is the real `WebhookSender` HTTP transport.
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+reqwest.workspace = true
 
 [dev-dependencies]
 pretty_assertions.workspace = true

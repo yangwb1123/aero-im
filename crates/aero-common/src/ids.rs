@@ -112,6 +112,11 @@ define_id!(
     /// Identifies a single audit-trail event (workspace administration log).
     AuditId
 );
+define_id!(
+    /// Identifies a single webhook (incoming inbound-message hook or outgoing
+    /// event-delivery hook).
+    WebhookId
+);
 
 #[cfg(test)]
 mod tests {
