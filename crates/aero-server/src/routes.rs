@@ -114,7 +114,10 @@ pub fn build(state: AppState) -> Router {
         // In-room polls: create / vote / live tally / creator-close.
         .merge(crate::polls::routes())
         // Live-stream chat moderation: owner bans/timeouts viewers from danmaku.
-        .merge(crate::stream_mod::routes());
+        .merge(crate::stream_mod::routes())
+        // Stream VOD / recording: flag a stream for recording, finalize a stream
+        // into a VOD, and list/get/delete recordings (each with a playback URL).
+        .merge(crate::vod::routes());
 
     // Prometheus scrape endpoint (ROADMAP 方向四). Mounted unless disabled; the
     // handler self-gates on an optional bearer token. Left here (not behind the
@@ -1046,7 +1049,25 @@ async fn stream_end(
 ) -> ApiResult<Json<serde_json::Value>> {
     let id = parse_stream_id(&id_str)?;
     s.live.end_stream(auth.participant_id, id).await?;
-    Ok(Json(serde_json::json!({ "ok": true })))
+    // Auto-finalize a VOD when the stream was flagged for recording. Best-effort:
+    // the stream has already ended, so a recording hiccup must not fail the
+    // request. Re-read the (now-Ended) stream so the VOD captures the final state.
+    // The explicit `POST /api/streams/:id/vod` route remains the canonical path.
+    let mut recorded_vod: Option<serde_json::Value> = None;
+    if let Ok(Some(stream)) = s.streams.get(id).await {
+        let flagged = aero_storage::VodRepo::new(s.participants.pool().clone())
+            .is_recording(id)
+            .await
+            .unwrap_or(Some(false))
+            .unwrap_or(false);
+        if flagged {
+            match crate::vod::finalize_recording(&s, &stream).await {
+                Ok(vod) => recorded_vod = serde_json::to_value(&vod).ok(),
+                Err(e) => tracing::warn!(error = ?e, stream = %id, "auto-VOD finalize failed"),
+            }
+        }
+    }
+    Ok(Json(serde_json::json!({ "ok": true, "vod": recorded_vod })))
 }
 
 fn strip_scheme(url: &str) -> String {

@@ -24,7 +24,7 @@ pub mod workspace;
 pub use error::{Error, Result};
 pub use ids::{
     AuditId, BlobId, EmojiId, InvitationId, MessageId, NotificationId, ParticipantId, PatId,
-    PollId, RoomId, ScheduledMessageId, ScimTokenId, WebhookId, WorkspaceId,
+    PollId, RoomId, ScheduledMessageId, ScimTokenId, VodId, WebhookId, WorkspaceId,
 };
 pub use live::{
     gift_by_id, gift_catalog, Gift, GiftLeaderRow, StreamChatLine, StreamEvent, StreamGiftLine,
@@ -34,6 +34,6 @@ pub use model::{
     Message, MessageEnvelope, Notification, NotificationKind, Participant, ParticipantKind, PinOp,
     PinnedMessage, Poll, PollOp, PollTally, Presence, ReactionOp, ReactionSummary, Reaction,
     ReadReceipt, Room, RoomEvent, RoomKind, RoomUnread, Span, SpanStyle, Stream, StreamProtocol,
-    StreamStatus, ThreadSummary, UserStatus,
+    StreamStatus, ThreadSummary, UserStatus, Vod,
 };
 pub use workspace::{Workspace, WorkspaceMember, WorkspaceRole};

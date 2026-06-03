@@ -146,6 +146,11 @@ define_id!(
     /// Identifies a poll (question + options) created in a room.
     PollId
 );
+define_id!(
+    /// Identifies a stored stream VOD / recording (a finalized live stream that
+    /// members can list and play back later).
+    VodId
+);
 
 #[cfg(test)]
 mod tests {

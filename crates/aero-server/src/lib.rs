@@ -23,6 +23,7 @@ pub mod sso;
 pub mod state;
 pub mod stream_mod;
 pub mod user_status;
+pub mod vod;
 pub mod webhooks;
 pub mod workspaces;
 pub mod ws;
