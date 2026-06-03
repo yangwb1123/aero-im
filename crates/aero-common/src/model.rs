@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-use crate::ids::{BlobId, MessageId, ParticipantId, RoomId};
+use crate::ids::{BlobId, MessageId, NotificationId, ParticipantId, RoomId};
 
 // ---------- Participant ----------
 
@@ -224,6 +224,111 @@ pub struct ReadReceipt {
     pub last_read_message_id: MessageId,
     #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
+}
+
+// ---------- Threads ----------
+
+/// Aggregate view of a thread (a root message + its replies), used to render the
+/// "N replies" affordance without fetching the whole reply set. Produced by the
+/// message repository from the existing `messages.reply_to` linkage.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ThreadSummary {
+    /// The root message the replies hang off of.
+    pub root_id: MessageId,
+    /// Number of (non-deleted) replies in the thread.
+    pub reply_count: u32,
+    /// Distinct repliers (capped) — used to render participant avatars.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub repliers: Vec<ParticipantId>,
+    /// Id of the most recent reply (a time-sortable ULID), if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_reply_id: Option<MessageId>,
+    /// Timestamp of the most recent reply, if any.
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub last_reply_at: Option<OffsetDateTime>,
+}
+
+// ---------- Notifications (mentions & thread replies) ----------
+
+/// Why a participant was notified about a message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NotificationKind {
+    /// The message contains a `Block::Mention` targeting the recipient.
+    Mention,
+    /// The message is a `reply_to` a message the recipient sent.
+    Reply,
+}
+
+impl NotificationKind {
+    /// Lowercase DB/wire token.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Mention => "mention",
+            Self::Reply => "reply",
+        }
+    }
+
+    /// Parse a DB/wire token, defaulting unknown values to [`Self::Mention`].
+    #[must_use]
+    pub fn from_str_lenient(s: &str) -> Self {
+        match s {
+            "reply" => Self::Reply,
+            _ => Self::Mention,
+        }
+    }
+}
+
+/// A durable inbox entry: "you were mentioned / replied to in this message".
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Notification {
+    pub id: NotificationId,
+    /// The recipient whose inbox this lands in.
+    pub participant_id: ParticipantId,
+    pub room_id: RoomId,
+    pub message_id: MessageId,
+    pub kind: NotificationKind,
+    /// Who triggered it (the message sender), if known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor_id: Option<ParticipantId>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+    /// `None` until the recipient marks it read.
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub read_at: Option<OffsetDateTime>,
+}
+
+/// Per-room unread tally for a participant: total unread messages plus the
+/// subset that mention them. Drives the sidebar unread + mention badges.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoomUnread {
+    pub room_id: RoomId,
+    /// Unread messages (created after the participant's read receipt, not their own).
+    pub unread: u32,
+    /// Unread notifications (mentions/replies) in this room.
+    pub mentions: u32,
+}
+
+// ---------- Pinned messages ----------
+
+/// Whether a pin event pinned or unpinned a message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PinOp {
+    Pin,
+    Unpin,
+}
+
+/// A pinned message record (provenance + the message itself when listed).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PinnedMessage {
+    pub room_id: RoomId,
+    /// The pinned message (joined in on listing).
+    pub message: Message,
+    pub pinned_by: ParticipantId,
+    #[serde(with = "time::serde::rfc3339")]
+    pub pinned_at: OffsetDateTime,
 }
 
 // ---------- Blobs (P2) ----------
@@ -476,6 +581,28 @@ pub enum RoomEvent {
         participant: ParticipantId,
         on: bool,
     },
+    /// A participant was notified (mentioned or replied-to). Targeted to the
+    /// `mentioned` recipient only so their client can raise a badge/toast even
+    /// while viewing another room. The durable copy lives in `notifications`.
+    Notify {
+        room_id: RoomId,
+        message_id: MessageId,
+        mentioned: ParticipantId,
+        by: ParticipantId,
+        // Renamed on the wire to avoid colliding with `RoomEvent`'s `kind` tag
+        // (the same fix `CallEvent` uses for `call_kind`). Clients read
+        // `notify_kind`.
+        #[serde(rename = "notify_kind")]
+        kind: NotificationKind,
+    },
+    /// A message was pinned or unpinned. Fans out to the whole room so every
+    /// member's pinned-panel stays in sync.
+    Pin {
+        room_id: RoomId,
+        message_id: MessageId,
+        by: ParticipantId,
+        op: PinOp,
+    },
     /// WebRTC signaling (P3/P6).
     Call(CallEvent),
 }
@@ -487,6 +614,7 @@ impl RoomEvent {
     pub fn explicit_recipients(&self) -> Vec<ParticipantId> {
         match self {
             RoomEvent::Message(e) => e.recipients.clone(),
+            RoomEvent::Notify { mentioned, .. } => vec![*mentioned],
             RoomEvent::Call(CallEvent::Invite { to, .. }) => to.clone(),
             RoomEvent::Call(
                 CallEvent::Answer { to, .. }
@@ -506,7 +634,9 @@ impl RoomEvent {
             RoomEvent::Deleted { room_id, .. }
             | RoomEvent::Reaction { room_id, .. }
             | RoomEvent::Read { room_id, .. }
-            | RoomEvent::Typing { room_id, .. } => Some(*room_id),
+            | RoomEvent::Typing { room_id, .. }
+            | RoomEvent::Notify { room_id, .. }
+            | RoomEvent::Pin { room_id, .. } => Some(*room_id),
             RoomEvent::Call(
                 CallEvent::Invite { room_id, .. }
                 | CallEvent::End { room_id, .. }

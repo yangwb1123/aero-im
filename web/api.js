@@ -199,4 +199,38 @@ export const api = {
   createAgent({ display_name, kind = 'bot', avatar_url } = {}) {
     return request('POST', '/api/agents', { body: { display_name, kind, avatar_url } });
   },
+
+  // ----- threads (Wave 1) -----
+  thread(rootMessageId, { after, limit = 50 } = {}) {
+    return request('GET', `/api/messages/${encodeURIComponent(rootMessageId)}/thread`, {
+      query: { after, limit },
+    });
+  },
+
+  // ----- notifications + unread (Wave 1) -----
+  listNotifications({ unread = false, before, limit = 50 } = {}) {
+    return request('GET', '/api/notifications', { query: { unread, before, limit } });
+  },
+  notificationCount() {
+    return request('GET', '/api/notifications/count');
+  },
+  markNotificationsRead({ ids, all = false, room_id } = {}) {
+    return request('POST', '/api/notifications/read', { body: { ids: ids || [], all, room_id } });
+  },
+  unread() {
+    return request('GET', '/api/unread');
+  },
+
+  // ----- pinned messages (Wave 1) -----
+  listPins(roomId) {
+    return request('GET', `/api/rooms/${encodeURIComponent(roomId)}/pins`);
+  },
+  pinMessage(roomId, messageId) {
+    return request('POST', `/api/rooms/${encodeURIComponent(roomId)}/pins`, {
+      body: { message_id: messageId },
+    });
+  },
+  unpinMessage(roomId, messageId) {
+    return request('DELETE', `/api/rooms/${encodeURIComponent(roomId)}/pins/${encodeURIComponent(messageId)}`);
+  },
 };

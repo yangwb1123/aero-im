@@ -112,6 +112,10 @@ define_id!(
     /// Identifies a single audit-trail event (workspace administration log).
     AuditId
 );
+define_id!(
+    /// Identifies a single notification (mention / thread-reply inbox entry).
+    NotificationId
+);
 
 #[cfg(test)]
 mod tests {

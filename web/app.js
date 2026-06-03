@@ -252,6 +252,8 @@ function hookWs() {
   ws.on('msg:reaction', (f) => handleReaction(f));
   ws.on('msg:read', (f) => handleReadReceipt(f));
   ws.on('msg:typing', (f) => handleTyping(f));
+  ws.on('msg:notify', (f) => handleNotify(f));
+  ws.on('msg:pin', (f) => handlePin(f));
   ws.on('msg:presence', (f) => handlePresence(f));
   ws.on('msg:call', (f) => handleCall(f.event));
   ws.on('msg:stream_event', (f) => handleStreamEvent(f.event));
@@ -330,6 +332,31 @@ function notify(m) {
     if (m.room_id !== state.currentRoomId) switchRoom(m.room_id);
     n.close();
   };
+}
+
+// Wave 1: someone @-mentioned or replied to me (targeted realtime frame).
+function handleNotify(f) {
+  if (!f || f.mentioned !== state.me?.id) return;
+  const sender = state.participants.get(f.by);
+  const who = sender?.display_name || '有人';
+  const verb = f.notify_kind === 'reply' ? '回复了你' : '提到了你';
+  const room = state.rooms.get(f.room_id);
+  const where = room?.name ? `「${room.name}」` : '';
+  toast(`${who} 在${where}${verb}`, 'info');
+  if ('Notification' in window && Notification.permission === 'granted') {
+    const n = new Notification(`${who} ${verb} · Aero IM`, { tag: f.message_id });
+    n.onclick = () => {
+      window.focus();
+      if (f.room_id !== state.currentRoomId) switchRoom(f.room_id);
+      n.close();
+    };
+  }
+}
+
+// Wave 1: a message was pinned/unpinned in a room (fans out to all members).
+function handlePin(f) {
+  if (!f || f.room_id !== state.currentRoomId) return;
+  toast(f.op === 'pin' ? '一条消息被置顶' : '取消了一条置顶', 'info');
 }
 
 function handleEdited(m) {

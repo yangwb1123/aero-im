@@ -12,12 +12,13 @@ use aero_bus::traits::BusError;
 use aero_bus::EventBus;
 use aero_common::{
     Block, CallEvent, CallId, CallKind, CallMode, CallSession, Error, Message, MessageEnvelope,
-    MessageId, ParticipantId, ReactionOp, ReactionSummary, ReadReceipt, Result, Room, RoomEvent,
-    RoomId, RoomKind, WorkspaceId, WorkspaceRole,
+    MessageId, NotificationKind, ParticipantId, ReactionOp, ReactionSummary, ReadReceipt, Result,
+    Room, RoomEvent, RoomId, RoomKind, WorkspaceId, WorkspaceRole,
 };
+use aero_common::{PinOp, PinnedMessage};
 use aero_storage::{
-    message::NewMessage, AiJobKind, AiJobRepo, CallRepo, MessageRepo, ParticipantRepo,
-    ReactionRepo, ReceiptRepo, RoomRepo, WorkspaceRepo,
+    message::NewMessage, AiJobKind, AiJobRepo, CallRepo, MessageRepo, NotificationRepo,
+    ParticipantRepo, PinRepo, ReactionRepo, ReceiptRepo, RoomRepo, WorkspaceRepo,
 };
 use async_trait::async_trait;
 use std::collections::BTreeMap;
@@ -97,6 +98,14 @@ pub struct ImService {
     reactions: ReactionRepo,
     calls: CallRepo,
     ai_jobs: AiJobRepo,
+    /// Notification inbox (mentions / thread replies). Optional so the existing
+    /// constructors stay signature-compatible; wire it via
+    /// [`with_notifications`](ImService::with_notifications) to persist + push
+    /// notifications on send. Without it, sends still succeed (no inbox writes).
+    notifications: Option<NotificationRepo>,
+    /// Pinned-messages store. Optional builder ([`with_pins`](ImService::with_pins));
+    /// the pin/unpin/list methods return an internal error if it isn't wired.
+    pins: Option<PinRepo>,
     bus: Arc<dyn BusSink>,
     moderator: Arc<dyn Moderator>,
 }
@@ -131,6 +140,8 @@ impl ImService {
             reactions,
             calls,
             ai_jobs,
+            notifications: None,
+            pins: None,
             bus: bus as Arc<dyn BusSink>,
             moderator,
         }
@@ -155,6 +166,25 @@ impl ImService {
         self
     }
 
+    /// Wire in the notification inbox, enabling mention/reply notifications on
+    /// [`send_message`](Self::send_message). Additive builder mirroring
+    /// [`with_workspaces`](Self::with_workspaces); without it, sends succeed but
+    /// write no inbox entries.
+    #[must_use]
+    pub fn with_notifications(mut self, notifications: NotificationRepo) -> Self {
+        self.notifications = Some(notifications);
+        self
+    }
+
+    /// Wire in the pinned-messages store, enabling
+    /// [`pin_message`](Self::pin_message) / [`unpin_message`](Self::unpin_message)
+    /// / [`list_pins`](Self::list_pins). Additive builder.
+    #[must_use]
+    pub fn with_pins(mut self, pins: PinRepo) -> Self {
+        self.pins = Some(pins);
+        self
+    }
+
     /// Lower-level constructor for tests with a pre-built bus sink.
     #[allow(clippy::too_many_arguments)]
     pub fn from_sink(
@@ -176,6 +206,8 @@ impl ImService {
             reactions,
             calls,
             ai_jobs,
+            notifications: None,
+            pins: None,
             bus,
             moderator: Arc::new(crate::moderator::AllowAllModerator),
         }
@@ -378,9 +410,15 @@ impl ImService {
             warn!(?err, %room, "fetching recipients failed; publishing without fan-out hint");
             Vec::new()
         });
-        let envelope = MessageEnvelope { message: message.clone(), recipients };
+        let envelope = MessageEnvelope {
+            message: message.clone(),
+            recipients: recipients.clone(),
+        };
 
         self.publish_room_event(room, &RoomEvent::Message(envelope)).await;
+
+        // Mention / thread-reply notifications (best-effort; never blocks the send).
+        self.dispatch_notifications(&message, &recipients).await;
 
         // Best-effort enqueue an embed job (AI worker will pick it up).
         if !message.searchable_text().is_empty() {
@@ -675,7 +713,141 @@ impl ImService {
         Ok(())
     }
 
+    // ---------------------------------------------------------- PINS
+
+    /// Reference to the wired pin store, or a clear internal error if the service
+    /// was built without [`with_pins`](Self::with_pins).
+    fn pins(&self) -> Result<&PinRepo> {
+        self.pins.as_ref().ok_or_else(|| {
+            Error::Internal(anyhow::anyhow!(
+                "ImService used for a pin operation without a PinRepo (call ImService::with_pins)"
+            ))
+        })
+    }
+
+    /// Pin a message in a room. Requires the actor to have room access and the
+    /// message to actually belong to the room. Broadcasts `RoomEvent::Pin` on a
+    /// newly-created pin. Returns `true` if a new pin was created (idempotent).
+    #[instrument(skip(self), fields(?actor, ?room, ?message))]
+    pub async fn pin_message(
+        &self,
+        actor: ParticipantId,
+        room: RoomId,
+        message: MessageId,
+    ) -> Result<bool> {
+        self.assert_room_access(actor, room).await?;
+        // The message must exist, not be deleted, and belong to this room — else a
+        // member of room A could pin room B's message into their panel.
+        let msg = self
+            .messages
+            .get(message)
+            .await?
+            .filter(|m| m.deleted_at.is_none())
+            .ok_or_else(|| Error::NotFound(format!("message {message}")))?;
+        if msg.room_id != room {
+            return Err(Error::Invalid(format!(
+                "message {message} does not belong to room {room}"
+            )));
+        }
+        let created = self.pins()?.pin(room, message, actor).await?;
+        if created {
+            self.publish_room_event(
+                room,
+                &RoomEvent::Pin { room_id: room, message_id: message, by: actor, op: PinOp::Pin },
+            )
+            .await;
+        }
+        Ok(created)
+    }
+
+    /// Unpin a message. Requires room access. Broadcasts `RoomEvent::Pin`
+    /// (`Unpin`) when a pin was actually removed. Returns `true` if removed.
+    #[instrument(skip(self), fields(?actor, ?room, ?message))]
+    pub async fn unpin_message(
+        &self,
+        actor: ParticipantId,
+        room: RoomId,
+        message: MessageId,
+    ) -> Result<bool> {
+        self.assert_room_access(actor, room).await?;
+        let removed = self.pins()?.unpin(room, message).await?;
+        if removed {
+            self.publish_room_event(
+                room,
+                &RoomEvent::Pin { room_id: room, message_id: message, by: actor, op: PinOp::Unpin },
+            )
+            .await;
+        }
+        Ok(removed)
+    }
+
+    /// List a room's pinned messages (newest first). Requires room access.
+    pub async fn list_pins(
+        &self,
+        actor: ParticipantId,
+        room: RoomId,
+    ) -> Result<Vec<PinnedMessage>> {
+        self.assert_room_access(actor, room).await?;
+        Ok(self.pins()?.list_for_room(room).await?)
+    }
+
     // ---------------------------------------------------------- internal
+
+    /// Persist + push mention/thread-reply notifications for a freshly-sent
+    /// message. Best-effort: a failure is logged and never blocks the send.
+    /// No-op when the notification inbox isn't wired
+    /// ([`with_notifications`](Self::with_notifications)). `members` is the room's
+    /// member set — a mention or reply targeting someone outside it (e.g. a stale
+    /// `@`) is skipped, and the sender never notifies themselves. An explicit
+    /// `@`-mention outranks a thread reply for the same recipient.
+    async fn dispatch_notifications(&self, message: &Message, members: &[ParticipantId]) {
+        let Some(repo) = self.notifications.as_ref() else {
+            return;
+        };
+        let sender = message.sender_id;
+        let room = message.room_id;
+        let member_set: std::collections::BTreeSet<ParticipantId> =
+            members.iter().copied().collect();
+
+        // recipient -> kind. BTreeMap insert order: reply first, then mentions
+        // overwrite (an explicit mention is the stronger signal).
+        let mut targets: BTreeMap<ParticipantId, NotificationKind> = BTreeMap::new();
+
+        if let Some(parent_id) = message.reply_to {
+            if let Ok(Some(parent)) = self.messages.get(parent_id).await {
+                let author = parent.sender_id;
+                if author != sender && member_set.contains(&author) {
+                    targets.insert(author, NotificationKind::Reply);
+                }
+            }
+        }
+        for p in mentioned_participants(&message.blocks) {
+            if p != sender && member_set.contains(&p) {
+                targets.insert(p, NotificationKind::Mention);
+            }
+        }
+
+        for (recipient, kind) in targets {
+            if let Err(err) = repo
+                .insert(recipient, room, message.id, kind, Some(sender))
+                .await
+            {
+                warn!(?err, %recipient, "persist notification failed");
+                continue;
+            }
+            self.publish_room_event(
+                room,
+                &RoomEvent::Notify {
+                    room_id: room,
+                    message_id: message.id,
+                    mentioned: recipient,
+                    by: sender,
+                    kind,
+                },
+            )
+            .await;
+        }
+    }
 
     async fn publish_room_event(&self, room: RoomId, event: &RoomEvent) {
         let subject = Self::room_subject(room);
@@ -683,6 +855,22 @@ impl ImService {
             warn!(?err, %subject, "publish RoomEvent failed");
         }
     }
+}
+
+/// Extract the distinct participants `@`-mentioned in a message's blocks, in
+/// first-appearance order. Pure helper so mention parsing is unit-testable
+/// without a database or bus.
+fn mentioned_participants(blocks: &[Block]) -> Vec<ParticipantId> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    for b in blocks {
+        if let Block::Mention { participant } = b {
+            if seen.insert(*participant) {
+                out.push(*participant);
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -696,6 +884,25 @@ mod tests {
         let subject = ImService::room_subject(room);
         assert!(subject.starts_with("im.room."));
         assert!(subject.ends_with(&room.to_string()));
+    }
+
+    #[test]
+    fn mentioned_participants_dedups_in_order_and_ignores_non_mentions() {
+        let a = ParticipantId::new();
+        let b = ParticipantId::new();
+        let blocks = vec![
+            Block::text("hey"),
+            Block::Mention { participant: a },
+            Block::text("and"),
+            Block::Mention { participant: b },
+            // duplicate mention of `a` is collapsed
+            Block::Mention { participant: a },
+        ];
+        let got = mentioned_participants(&blocks);
+        assert_eq!(got, vec![a, b], "distinct mentions, first-appearance order");
+
+        // No mentions => empty.
+        assert!(mentioned_participants(&[Block::text("plain")]).is_empty());
     }
 
     #[test]

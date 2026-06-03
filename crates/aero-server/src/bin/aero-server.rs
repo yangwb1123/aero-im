@@ -26,9 +26,9 @@ use aero_server::{
 };
 use aero_storage::{
     connect_pg, migrate, AiJobRepo, AuditRepo, BlobRepo, CallRepo, CallRosterStore, KeyPackageRepo,
-    LiveRepo, LocalFsBlobStore, MessageRepo, MlsGroupRepo, ParticipantRepo, PresenceStore,
-    ReactionRepo, ReceiptRepo, RedisCache, RoomRepo, StreamRepo, StreamRouteRegistry,
-    StreamViewerStore, WorkspaceRepo,
+    LiveRepo, LocalFsBlobStore, MessageRepo, MlsGroupRepo, NotificationRepo, ParticipantRepo,
+    PinRepo, PresenceStore, ReactionRepo, ReceiptRepo, RedisCache, RoomRepo, StreamRepo,
+    StreamRouteRegistry, StreamViewerStore, WorkspaceRepo,
 };
 use tokio_util::sync::CancellationToken;
 use anyhow::Context;
@@ -69,6 +69,8 @@ async fn main() -> anyhow::Result<()> {
     let workspaces = WorkspaceRepo::new(pg.clone());
     let audit = AuditRepo::new(pg.clone());
     let messages = MessageRepo::new(pg.clone());
+    let notifications = NotificationRepo::new(pg.clone());
+    let pins = PinRepo::new(pg.clone());
     let receipts = ReceiptRepo::new(pg.clone());
     let reactions = ReactionRepo::new(pg.clone());
     let calls = CallRepo::new(pg.clone());
@@ -133,7 +135,9 @@ async fn main() -> anyhow::Result<()> {
             ai_jobs.clone(),
             jetstream.clone(),
         )
-        .with_workspaces(workspaces.clone()),
+        .with_workspaces(workspaces.clone())
+        .with_notifications(notifications.clone())
+        .with_pins(pins.clone()),
     );
 
     // ---------- Live service (danmaku / gifts / viewers) ----------
@@ -218,6 +222,8 @@ async fn main() -> anyhow::Result<()> {
         workspaces,
         audit,
         messages,
+        notifications,
+        pins,
         receipts,
         reactions,
         calls,

@@ -10,8 +10,9 @@ use aero_live_whip::WhipRegistry;
 use crate::live::LiveService;
 use aero_storage::{
     AiJobRepo, AuditRepo, BlobRepo, BlobStore, CallRepo, CallRosterStore, KeyPackageRepo,
-    MessageRepo, MlsGroupRepo, ParticipantRepo, PresenceStore, ReactionRepo, ReceiptRepo, RoomRepo,
-    StreamRepo, StreamRouteRegistry, StreamViewerStore, WorkspaceRepo,
+    MessageRepo, MlsGroupRepo, NotificationRepo, ParticipantRepo, PinRepo, PresenceStore,
+    ReactionRepo, ReceiptRepo, RoomRepo, StreamRepo, StreamRouteRegistry, StreamViewerStore,
+    WorkspaceRepo,
 };
 use axum::extract::FromRef;
 
@@ -67,6 +68,10 @@ pub struct AppState {
     /// Append-only workspace audit trail (ROADMAP 方向一 合规).
     pub audit: AuditRepo,
     pub messages: MessageRepo,
+    /// Per-recipient notification inbox (mentions / thread replies).
+    pub notifications: NotificationRepo,
+    /// Pinned-messages store (per-room).
+    pub pins: PinRepo,
     pub receipts: ReceiptRepo,
     pub reactions: ReactionRepo,
     pub calls: CallRepo,

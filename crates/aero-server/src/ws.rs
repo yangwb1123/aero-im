@@ -23,8 +23,8 @@ use std::sync::Arc;
 
 use aero_common::metrics::{self, names};
 use aero_common::{
-    Block, CallEvent, CallId, CallKind, CallMode, MessageId, ParticipantId, ReactionOp, RoomEvent,
-    RoomId, StreamEvent,
+    Block, CallEvent, CallId, CallKind, CallMode, MessageId, NotificationKind, ParticipantId,
+    PinOp, ReactionOp, RoomEvent, RoomId, StreamEvent,
 };
 use ulid::Ulid;
 use axum::{
@@ -171,6 +171,16 @@ enum ServerFrame<'a> {
         at: time::OffsetDateTime,
     },
     Typing { room_id: RoomId, participant: ParticipantId, on: bool },
+    /// You were mentioned / replied to (targeted to the recipient only).
+    Notify {
+        room_id: RoomId,
+        message_id: MessageId,
+        mentioned: ParticipantId,
+        by: ParticipantId,
+        notify_kind: NotificationKind,
+    },
+    /// A message was pinned/unpinned in a room (fans out to all members).
+    Pin { room_id: RoomId, message_id: MessageId, by: ParticipantId, op: PinOp },
     Call { event: CallEvent },
     /// Per-stream interactivity event (danmaku/gift/viewers/status).
     StreamEvent { event: StreamEvent },
@@ -834,6 +844,12 @@ fn room_event_to_frame_json(event: &RoomEvent) -> String {
         }
         RoomEvent::Typing { room_id, participant, on } => {
             ServerFrame::Typing { room_id, participant, on }
+        }
+        RoomEvent::Notify { room_id, message_id, mentioned, by, kind } => {
+            ServerFrame::Notify { room_id, message_id, mentioned, by, notify_kind: kind }
+        }
+        RoomEvent::Pin { room_id, message_id, by, op } => {
+            ServerFrame::Pin { room_id, message_id, by, op }
         }
         RoomEvent::Call(call) => ServerFrame::Call { event: call },
     };

@@ -328,6 +328,119 @@ impl MessageRepo {
         .await?;
         Ok(rows.into_iter().map(SearchHit::from).collect())
     }
+
+    // ------------------------------------------------------------- THREADS
+
+    /// List the (non-deleted) replies hanging off a root message, oldest first,
+    /// paginated by a keyset cursor. A "thread" is the flat set of messages whose
+    /// `reply_to` points at `root` (matching Slack's flat-thread model). `after`
+    /// is an exclusive lower bound — pass the newest id seen to page forward.
+    pub async fn thread_replies(
+        &self,
+        root: MessageId,
+        after: Option<MessageId>,
+        limit: i64,
+    ) -> Result<Vec<Message>, sqlx::Error> {
+        let limit = clamp_page_limit(limit);
+        let rows = sqlx::query_as::<_, MessageRow>(
+            r"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at
+               FROM messages
+               WHERE reply_to = $1
+                 AND deleted_at IS NULL
+                 AND ($2::uuid IS NULL OR id > $2)
+               ORDER BY id ASC
+               LIMIT $3",
+        )
+        .bind(root.to_uuid())
+        .bind(after.map(|m| m.to_uuid()))
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(Message::from).collect())
+    }
+
+    /// Summarize a thread: reply count, distinct repliers (capped at 8 for avatar
+    /// rendering), and the newest reply id/time. Returns a zero-count summary when
+    /// the root has no replies. Drives the "N replies" affordance in history.
+    pub async fn thread_summary(
+        &self,
+        root: MessageId,
+    ) -> Result<aero_common::ThreadSummary, sqlx::Error> {
+        // Postgres has no `max(uuid)` aggregate, so the newest reply is taken via
+        // an ordered single-row read (ids are time-sortable ULIDs stored as UUID,
+        // so `ORDER BY id DESC LIMIT 1` is the most recent reply).
+        let count = sqlx::query_as::<_, (i64,)>(
+            r"SELECT COUNT(*) FROM messages WHERE reply_to = $1 AND deleted_at IS NULL",
+        )
+        .bind(root.to_uuid())
+        .fetch_one(&self.pool)
+        .await?;
+
+        let last = sqlx::query_as::<_, (uuid::Uuid, time::OffsetDateTime)>(
+            r"SELECT id, created_at
+               FROM messages
+               WHERE reply_to = $1 AND deleted_at IS NULL
+               ORDER BY id DESC
+               LIMIT 1",
+        )
+        .bind(root.to_uuid())
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let repliers = sqlx::query_as::<_, (uuid::Uuid,)>(
+            r"SELECT DISTINCT sender_id
+               FROM messages
+               WHERE reply_to = $1 AND deleted_at IS NULL
+               LIMIT 8",
+        )
+        .bind(root.to_uuid())
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(aero_common::ThreadSummary {
+            root_id: root,
+            reply_count: u32::try_from(count.0).unwrap_or(u32::MAX),
+            repliers: repliers
+                .into_iter()
+                .map(|(u,)| ParticipantId::from_uuid(u))
+                .collect(),
+            last_reply_id: last.map(|(id, _)| MessageId::from_uuid(id)),
+            last_reply_at: last.map(|(_, at)| at),
+        })
+    }
+
+    // ------------------------------------------------------------- UNREAD
+
+    /// Per-room count of messages the participant has not yet read — messages in
+    /// rooms they belong to, created after their read receipt (or all, if none),
+    /// excluding their own. Only rooms with at least one unread appear. Backs the
+    /// sidebar unread badge; pairs with
+    /// [`NotificationRepo::unread_counts_by_room`](crate::NotificationRepo::unread_counts_by_room)
+    /// for the mention badge.
+    pub async fn unread_counts_by_room(
+        &self,
+        participant: ParticipantId,
+    ) -> Result<Vec<(RoomId, u32)>, sqlx::Error> {
+        let rows = sqlx::query_as::<_, (uuid::Uuid, i64)>(
+            r"SELECT m.room_id, COUNT(*)
+               FROM messages m
+               JOIN room_members rm
+                 ON rm.room_id = m.room_id AND rm.participant_id = $1
+               LEFT JOIN read_receipts rr
+                 ON rr.room_id = m.room_id AND rr.participant_id = $1
+               WHERE m.deleted_at IS NULL
+                 AND m.sender_id <> $1
+                 AND (rr.last_read_message_id IS NULL OR m.id > rr.last_read_message_id)
+               GROUP BY m.room_id",
+        )
+        .bind(participant.to_uuid())
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(r, c)| (RoomId::from_uuid(r), u32::try_from(c).unwrap_or(u32::MAX)))
+            .collect())
+    }
 }
 
 fn searchable_of(blocks: &[Block]) -> String {
