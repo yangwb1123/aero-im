@@ -23,6 +23,7 @@ pub mod receipt;
 pub mod room;
 pub mod stream;
 pub mod stream_route;
+pub mod webhook;
 pub mod workspace;
 
 pub use ai_job::{AiJob, AiJobKind, AiJobRepo, AiJobStatus};
@@ -45,6 +46,11 @@ pub use receipt::ReceiptRepo;
 pub use room::RoomRepo;
 pub use stream::{NewStream, StreamRepo};
 pub use stream_route::{redirect_base, StreamRouteRegistry, DEFAULT_TTL as STREAM_ROUTE_TTL};
+pub use webhook::{
+    build_delivery, event_matches, generate_secret, generate_token, hash_token, sign_payload,
+    Delivery, FakeSender, IncomingHook, IncomingHookSummary, OutgoingHookSummary, OutgoingTarget,
+    ReqwestSender, WebhookRepo, WebhookSender, SIGNATURE_HEADER, TIMESTAMP_HEADER,
+};
 pub use workspace::{
     retention_cutoff, role_can_assign, role_can_invite, role_can_manage_member, role_can_remove,
     validate_retention_days, RoomExport, WorkspaceExport, WorkspaceRepo, EXPORT_MESSAGES_PER_ROOM,

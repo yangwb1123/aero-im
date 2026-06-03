@@ -116,6 +116,11 @@ define_id!(
     /// Identifies a single notification (mention / thread-reply inbox entry).
     NotificationId
 );
+define_id!(
+    /// Identifies a single webhook (incoming inbound-message hook or outgoing
+    /// event-delivery hook).
+    WebhookId
+);
 
 #[cfg(test)]
 mod tests {

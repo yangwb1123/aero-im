@@ -23,7 +23,7 @@ pub mod workspace;
 
 pub use error::{Error, Result};
 pub use ids::{
-    AuditId, BlobId, MessageId, NotificationId, ParticipantId, RoomId, WorkspaceId,
+    AuditId, BlobId, MessageId, NotificationId, ParticipantId, RoomId, WebhookId, WorkspaceId,
 };
 pub use live::{
     gift_by_id, gift_catalog, Gift, GiftLeaderRow, StreamChatLine, StreamEvent, StreamGiftLine,

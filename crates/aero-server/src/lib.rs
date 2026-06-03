@@ -13,6 +13,7 @@ pub mod metrics;
 pub mod rate_limit;
 pub mod routes;
 pub mod state;
+pub mod webhooks;
 pub mod workspaces;
 pub mod ws;
 pub mod channels;

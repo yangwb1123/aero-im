@@ -344,6 +344,19 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // ---------- Outgoing webhook dispatcher ----------
+    // Subscribes to `im.room.*` (durable "aero-webhooks", distinct cursor from the
+    // WS listener) and delivers RoomEvent::Message to each room's active outgoing
+    // webhooks via the real reqwest sender — best-effort, logs non-2xx/transport.
+    {
+        let state_clone = state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = aero_server::webhooks::run_webhook_dispatcher(state_clone).await {
+                tracing::error!(error = ?e, "webhook dispatcher exited");
+            }
+        });
+    }
+
     // ---------- Agent bot dispatcher ----------
     {
         let state_clone = state.clone();
