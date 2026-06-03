@@ -284,6 +284,7 @@ fn event_kind(event: &RoomEvent) -> &'static str {
         RoomEvent::Notify { .. } => "notify",
         RoomEvent::Pin { .. } => "pin",
         RoomEvent::Membership { .. } => "membership",
+        RoomEvent::Poll { .. } => "poll",
         RoomEvent::Call(_) => "call",
     }
 }

@@ -142,6 +142,10 @@ define_id!(
     /// credential for programmatic REST API access.
     PatId
 );
+define_id!(
+    /// Identifies a poll (question + options) created in a room.
+    PollId
+);
 
 #[cfg(test)]
 mod tests {

@@ -110,7 +110,9 @@ pub fn build(state: AppState) -> Router {
         // Personal Access Tokens: mint/list/revoke long-lived API credentials.
         // The minted token works as a bearer credential on every AuthUser route
         // (the extractor accepts a PAT wherever it accepts a JWT).
-        .merge(crate::pat::routes());
+        .merge(crate::pat::routes())
+        // In-room polls: create / vote / live tally / creator-close.
+        .merge(crate::polls::routes());
 
     // Prometheus scrape endpoint (ROADMAP 方向四). Mounted unless disabled; the
     // handler self-gates on an optional bearer token. Left here (not behind the
