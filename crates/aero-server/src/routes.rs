@@ -120,7 +120,10 @@ pub fn build(state: AppState) -> Router {
         .merge(crate::vod::routes())
         // Message forwarding / share: copy a message's content into another room
         // (Slack "Forward"), prefixed with a `forwarded_message` provenance card.
-        .merge(crate::forward::routes());
+        .merge(crate::forward::routes())
+        // Built-in slash-commands (/me, /shrug, /giphy, /remind): parse `/cmd args`
+        // typed in a room and apply the effect off the hot send path.
+        .merge(crate::commands::routes());
 
     // Prometheus scrape endpoint (ROADMAP 方向四). Mounted unless disabled; the
     // handler self-gates on an optional bearer token. Left here (not behind the
