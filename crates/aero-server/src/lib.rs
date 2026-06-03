@@ -4,6 +4,7 @@ pub mod agent_bot;
 pub mod moderation_bot;
 pub mod transcribe_bot;
 pub mod ai_adapter;
+pub mod bookmarks;
 pub mod collab;
 pub mod config;
 pub mod error;
