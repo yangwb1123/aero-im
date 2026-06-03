@@ -112,6 +112,10 @@ define_id!(
     /// Identifies a single audit-trail event (workspace administration log).
     AuditId
 );
+define_id!(
+    /// Identifies a workspace invitation / shareable invite link.
+    InvitationId
+);
 
 #[cfg(test)]
 mod tests {

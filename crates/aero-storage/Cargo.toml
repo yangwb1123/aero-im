@@ -30,6 +30,10 @@ ulid.workspace = true
 uuid.workspace = true
 rand.workspace = true
 bytes.workspace = true
+# Invitations (0017): SHA-256 hashing of invite tokens (only the hash is stored;
+# the plaintext is shown once). Both already resolved in Cargo.lock transitively.
+sha2 = "0.10"
+hex = "0.4"
 
 [dev-dependencies]
 pretty_assertions.workspace = true
