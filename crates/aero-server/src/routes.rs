@@ -117,7 +117,10 @@ pub fn build(state: AppState) -> Router {
         .merge(crate::stream_mod::routes())
         // Stream VOD / recording: flag a stream for recording, finalize a stream
         // into a VOD, and list/get/delete recordings (each with a playback URL).
-        .merge(crate::vod::routes());
+        .merge(crate::vod::routes())
+        // Message forwarding / share: copy a message's content into another room
+        // (Slack "Forward"), prefixed with a `forwarded_message` provenance card.
+        .merge(crate::forward::routes());
 
     // Prometheus scrape endpoint (ROADMAP 方向四). Mounted unless disabled; the
     // handler self-gates on an optional bearer token. Left here (not behind the

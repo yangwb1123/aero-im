@@ -29,6 +29,7 @@ pub mod webhooks;
 pub mod workspaces;
 pub mod ws;
 pub mod channels;
+pub mod forward;
 pub mod scheduled;
 pub mod search;
 
