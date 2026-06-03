@@ -21,6 +21,7 @@ pub mod routes;
 pub mod scim;
 pub mod sso;
 pub mod state;
+pub mod stream_mod;
 pub mod user_status;
 pub mod webhooks;
 pub mod workspaces;

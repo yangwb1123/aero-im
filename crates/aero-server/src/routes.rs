@@ -112,7 +112,9 @@ pub fn build(state: AppState) -> Router {
         // (the extractor accepts a PAT wherever it accepts a JWT).
         .merge(crate::pat::routes())
         // In-room polls: create / vote / live tally / creator-close.
-        .merge(crate::polls::routes());
+        .merge(crate::polls::routes())
+        // Live-stream chat moderation: owner bans/timeouts viewers from danmaku.
+        .merge(crate::stream_mod::routes());
 
     // Prometheus scrape endpoint (ROADMAP 方向四). Mounted unless disabled; the
     // handler self-gates on an optional bearer token. Left here (not behind the
@@ -983,6 +985,13 @@ async fn stream_chat_post(
     Json(req): Json<ChatPostReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let id = parse_stream_id(&id_str)?;
+    // Reject a banned/timed-out poster before the line is accepted/broadcast.
+    if aero_storage::StreamModRepo::new(s.participants.pool().clone())
+        .is_banned(id, auth.participant_id, time::OffsetDateTime::now_utc())
+        .await?
+    {
+        return Err(AeroError::Forbidden("banned from this stream's chat".into()).into());
+    }
     let line = s.live.post_chat(auth.participant_id, id, req.body).await?;
     Ok(Json(serde_json::to_value(line).map_err(AeroError::from)?))
 }

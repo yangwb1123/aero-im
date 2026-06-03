@@ -30,6 +30,7 @@ pub mod room;
 pub mod scim;
 pub mod sso;
 pub mod stream;
+pub mod stream_mod;
 pub mod stream_route;
 pub mod user_status;
 pub mod webhook;
@@ -69,6 +70,7 @@ pub use room::RoomRepo;
 pub use scim::{ScimRepo, ScimUserRow};
 pub use sso::SsoRepo;
 pub use stream::{NewStream, StreamRepo};
+pub use stream_mod::{ban_active, StreamBan, StreamModRepo};
 pub use stream_route::{redirect_base, StreamRouteRegistry, DEFAULT_TTL as STREAM_ROUTE_TTL};
 pub use user_status::UserStatusRepo;
 pub use webhook::{
