@@ -47,7 +47,7 @@ AI：Anthropic Messages `claude-sonnet-4-6`、Voyage 1024 维嵌入；无 key �
 ```bash
 make up                                    # 起 PG/Redis/NATS/Jaeger/MinIO
 make jwt-keys env                          # 生成 RS256 PEM + 写配置
-cargo run --bin aero-cli -- migrate        # 迁移，幂等（0001 IM · 0002 collab · 0003 MLS · 0004 转写 · 0005 直播 · 0006 多租户 · 0007 审计 · 0008 AI-job 租户标记 · 0009 消息留存 · 0010 通知 · 0011 置顶 · 0012 频道 · 0013 webhook · 0014 SSO · 0015 SCIM · 0016 定时消息 · 0017 邀请 · 0018 通知偏好/免打扰 · 0019 PAT · 0020 收藏 · 0021 自定义表情 · 0022 用户状态）
+cargo run --bin aero-cli -- migrate        # 迁移，幂等（0001 IM · 0002 collab · 0003 MLS · 0004 转写 · 0005 直播 · 0006 多租户 · 0007 审计 · 0008 AI-job 租户标记 · 0009 消息留存 · 0010 通知 · 0011 置顶 · 0012 频道 · 0013 webhook · 0014 SSO · 0015 SCIM · 0016 定时消息 · 0017 邀请 · 0018 通知偏好/免打扰 · 0019 PAT · 0020 收藏 · 0021 自定义表情 · 0022 用户状态 · 0023 投票 · 0024 链接预览缓存 · 0025 VOD · 0026 直播聊天封禁）
 AERO__SERVER__BLOB_DIR=/tmp/aero/blobs AERO__SERVER__HLS_DIR=/tmp/aero/hls \
   cargo run --bin aero-server              # :3030 HTTP/WS，:1935 RTMP
 ```
@@ -56,7 +56,7 @@ AERO__SERVER__BLOB_DIR=/tmp/aero/blobs AERO__SERVER__HLS_DIR=/tmp/aero/hls \
 
 ```bash
 cargo check  --workspace                   # 干净
-cargo test   --workspace --lib             # 666 pass（最近一次绿：2026-06-03）；PG 门控测试用 `-- --ignored`（需 DATABASE_URL + 已迁移）
+cargo test   --workspace --lib             # 707 pass（最近一次绿：2026-06-03）；PG 门控测试用 `-- --ignored`（需 DATABASE_URL + 已迁移）
 cargo clippy --workspace --all-targets     # all+pedantic=warn，零新增警告
 ```
 
@@ -72,7 +72,7 @@ cargo clippy --workspace --all-targets     # all+pedantic=warn，零新增警告
 ## 范围红线（动手前确认）
 
 - ✅ **在范围内、已实现（应用层）**：P0–P7 —— IM / 协作 / RAG / AI / 1:1 与群通话(mesh) / 字幕翻译 / RTMP·WHIP·SRT 直播 / 审核。媒体面核心已落地并尽量字节级单测。
-- ✅ **To-B 协作 + 企业接入（已实现，活验证）**：线程回复 + @提及通知 + 未读/提及计数 + 置顶（`collab`）；频道治理（公开/私有 / 加入·退出 / 归档 / topic，`channels`）；入站/出站 Webhook（HMAC 签名，`webhooks`，出站投递 `run_webhook_dispatcher`）；SSO via OIDC（`aero-auth::oidc` + `sso`）；SCIM 2.0（`scim`，RFC 7643/7644）；定时消息/提醒（`scheduled` + 后台投递 `run_scheduled_dispatcher`）；工作区邀请/邀请链接（`invitations`）；跨房间全局搜索（`search`，`MessageRepo::search_all_rooms`，按成员资格 SQL 过滤）；通知偏好——频道免打扰 + 每用户 DND（`notif_prefs`，在 `ImService::dispatch_notifications` 经 `should_notify` 抑制，fail-open）；个人访问令牌 PAT（`aero-storage::pat` + `aero-auth` 的 `PatVerifier` 注入 `AuthService`，`AuthUser` extractor 在 JWT 失败后回落到 `aero_pat_*` PAT——所有 `AuthUser` 路由都可用 PAT 作 Bearer）；收藏/稍后看（`bookmark`）；工作区自定义表情（`emoji`，名称→已上传 blob）；用户自定义状态 + presence（`user_status`，与 Redis 即时在线分离）。新功能挂载法：新 `RoomEvent` variant（注意 `kind` tag 冲突）+ 仓储新文件 + `pub fn routes()` 模块 `.merge` 进 `routes::build`，仓储用 `XRepo::new(state.pg.clone())`；定时类后台任务在 bin `tokio::spawn`。⚠️ `webhook`/`scim`/`invitation` 各自有 `generate_token`/`hash_token`——只有 `webhook` 的在 crate root re-export，其余走 `aero_storage::<mod>::` 子路径避免重名冲突。
+- ✅ **To-B 协作 + 企业接入（已实现，活验证）**：线程回复 + @提及通知 + 未读/提及计数 + 置顶（`collab`）；频道治理（公开/私有 / 加入·退出 / 归档 / topic，`channels`）；入站/出站 Webhook（HMAC 签名，`webhooks`，出站投递 `run_webhook_dispatcher`）；SSO via OIDC（`aero-auth::oidc` + `sso`）；SCIM 2.0（`scim`，RFC 7643/7644）；定时消息/提醒（`scheduled` + 后台投递 `run_scheduled_dispatcher`）；工作区邀请/邀请链接（`invitations`）；跨房间全局搜索（`search`，`MessageRepo::search_all_rooms`，按成员资格 SQL 过滤）；通知偏好——频道免打扰 + 每用户 DND（`notif_prefs`，在 `ImService::dispatch_notifications` 经 `should_notify` 抑制，fail-open）；个人访问令牌 PAT（`aero-storage::pat` + `aero-auth` 的 `PatVerifier` 注入 `AuthService`，`AuthUser` extractor 在 JWT 失败后回落到 `aero_pat_*` PAT——所有 `AuthUser` 路由都可用 PAT 作 Bearer）；收藏/稍后看（`bookmark`）；工作区自定义表情（`emoji`，名称→已上传 blob）；用户自定义状态 + presence（`user_status`，与 Redis 即时在线分离）；投票（`polls`，`RoomEvent::Poll` 直播计票）；链接预览/unfurl（`unfurl` + `unfurl_bot` 监听器，OG 抓取=seam，opt-in `AERO_UNFURL`）；直播录制/点播 VOD（`vod`，录制生命周期+回放 URL；真实切片采集走既有 HLS writer=seam）；直播聊天封禁/禁言（`stream_mod`，REST+WS 两条 danmaku 路径都校验）。新功能挂载法：新 `RoomEvent` variant（注意 `kind` tag 冲突）+ 仓储新文件 + `pub fn routes()` 模块 `.merge` 进 `routes::build`，仓储用 `XRepo::new(state.pg.clone())`；定时类后台任务在 bin `tokio::spawn`。⚠️ `webhook`/`scim`/`invitation` 各自有 `generate_token`/`hash_token`——只有 `webhook` 的在 crate root re-export，其余走 `aero_storage::<mod>::` 子路径避免重名冲突。
 - 🚫 **明确非目标，别做**：P8 = **MLS 端到端加密 + 联邦**。服务端仅做不透明字节透传 scaffold（数据模型预留），**不要实现客户端 MLS 加密 / openmls-wasm**。"无 E2E 加密" 是产品既定决策。
 - 🛠️ **可单测的剩余工作**（媒体协议完整性，多已落地）：SRT AES/KMREQ + ACK/NAK、SFU Simulcast + RTCP(PLI/FIR)、WHEP egress。企业接入的**真实链路**为 seam：OIDC 的 JWKS 拉取（逻辑已单测）、出站 Webhook 的真实 HTTP 投递（签名/构造已单测）、SCIM 的真实 IdP 驱动。
 - ⛔ **本沙箱无法端到端验证、别标 "done"**：浏览器 ICE/DTLS/SRTP 推流、真实 ffmpeg/OBS 推流。环境无浏览器 / 真实媒体源，后台长驻进程会被回收（exit 144），服务器**只能前台跑**。报告这类项写 "待真实链路联调"，不要写完成。
