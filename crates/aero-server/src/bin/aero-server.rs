@@ -216,6 +216,7 @@ async fn main() -> anyhow::Result<()> {
     let state = AppState {
         auth,
         im,
+        pg: pg.clone(),
         live,
         participants,
         rooms,

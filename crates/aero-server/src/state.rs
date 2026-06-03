@@ -10,7 +10,7 @@ use aero_live_whip::WhipRegistry;
 use crate::live::LiveService;
 use aero_storage::{
     AiJobRepo, AuditRepo, BlobRepo, BlobStore, CallRepo, CallRosterStore, KeyPackageRepo,
-    MessageRepo, MlsGroupRepo, NotificationRepo, ParticipantRepo, PinRepo, PresenceStore,
+    MessageRepo, MlsGroupRepo, NotificationRepo, ParticipantRepo, PgPool, PinRepo, PresenceStore,
     ReactionRepo, ReceiptRepo, RoomRepo, StreamRepo, StreamRouteRegistry, StreamViewerStore,
     WorkspaceRepo,
 };
@@ -59,6 +59,10 @@ pub struct AiAnswer {
 pub struct AppState {
     pub auth: AuthService,
     pub im: Arc<ImService>,
+    /// Shared Postgres pool. Lets feature modules construct their own repositories
+    /// inline (`XRepo::new(state.pg.clone())`) without threading a new field
+    /// through `AppState` for every addition — repos are cheap `Arc<PgPool>` wrappers.
+    pub pg: PgPool,
     pub live: LiveService,
     pub participants: ParticipantRepo,
     pub rooms: RoomRepo,
