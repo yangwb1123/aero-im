@@ -20,6 +20,7 @@ pub mod reaction;
 pub mod receipt;
 pub mod room;
 pub mod stream;
+pub mod stream_mod;
 pub mod stream_route;
 pub mod workspace;
 
@@ -40,6 +41,7 @@ pub use reaction::ReactionRepo;
 pub use receipt::ReceiptRepo;
 pub use room::RoomRepo;
 pub use stream::{NewStream, StreamRepo};
+pub use stream_mod::{ban_active, StreamBan, StreamModRepo};
 pub use stream_route::{redirect_base, StreamRouteRegistry, DEFAULT_TTL as STREAM_ROUTE_TTL};
 pub use workspace::{
     retention_cutoff, role_can_assign, role_can_invite, role_can_manage_member, role_can_remove,

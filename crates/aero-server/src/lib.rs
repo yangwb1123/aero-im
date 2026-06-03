@@ -12,6 +12,7 @@ pub mod metrics;
 pub mod rate_limit;
 pub mod routes;
 pub mod state;
+pub mod stream_mod;
 pub mod workspaces;
 pub mod ws;
 

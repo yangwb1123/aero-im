@@ -513,6 +513,17 @@ async fn handle_text(
             state.live.publish_viewers(stream_id, count).await;
         }
         ClientFrame::StreamChat { stream_id, body } => {
+            // Reject a banned/timed-out poster before the line is accepted/broadcast
+            // (mirrors the REST `stream_chat_post` guard).
+            if aero_storage::StreamModRepo::new(state.participants.pool().clone())
+                .is_banned(stream_id, pid, time::OffsetDateTime::now_utc())
+                .await?
+            {
+                return Err(aero_common::Error::Forbidden(
+                    "banned from this stream's chat".into(),
+                )
+                .into());
+            }
             state.live.post_chat(pid, stream_id, body).await?;
         }
         ClientFrame::StreamGift { stream_id, gift_id, qty } => {
