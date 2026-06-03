@@ -200,8 +200,8 @@ mod db_tests {
             .expect("insert participant");
         let room = RoomId::new();
         sqlx::query(
-            "INSERT INTO rooms (id, kind, name, created_by, created_at)
-             VALUES ($1,'channel',$2,$3, now())",
+            "INSERT INTO rooms (id, kind, name, created_by, created_at, workspace_id)
+             VALUES ($1,'channel',$2,$3, now(), '00000000-0000-0000-0000-000000000000')",
         )
         .bind(room.to_uuid())
         .bind("bm-room")
