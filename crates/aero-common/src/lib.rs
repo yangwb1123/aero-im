@@ -32,7 +32,8 @@ pub use live::{
 pub use model::{
     Block, Blob, CallEvent, CallId, CallKind, CallMode, CallSession, FileKind, MembershipOp,
     Message, MessageEnvelope, Notification, NotificationKind, Participant, ParticipantKind, PinOp,
-    PinnedMessage, ReactionOp, ReactionSummary, Reaction, ReadReceipt, Room, RoomEvent, RoomKind,
-    RoomUnread, Span, SpanStyle, Stream, StreamProtocol, StreamStatus, ThreadSummary,
+    PinnedMessage, Presence, ReactionOp, ReactionSummary, Reaction, ReadReceipt, Room, RoomEvent,
+    RoomKind, RoomUnread, Span, SpanStyle, Stream, StreamProtocol, StreamStatus, ThreadSummary,
+    UserStatus,
 };
 pub use workspace::{Workspace, WorkspaceMember, WorkspaceRole};

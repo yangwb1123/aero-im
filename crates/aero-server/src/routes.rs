@@ -103,7 +103,10 @@ pub fn build(state: AppState) -> Router {
         // Saved items / bookmarks (personal save-for-later, per-user cross-room).
         .merge(crate::bookmarks::routes())
         // Workspace custom emoji (`:shipit:`): name → uploaded image blob.
-        .merge(crate::emoji::routes());
+        .merge(crate::emoji::routes())
+        // Durable user custom status + presence preference (profile-visible;
+        // distinct from the ephemeral Redis online tracking).
+        .merge(crate::user_status::routes());
 
     // Prometheus scrape endpoint (ROADMAP 方向四). Mounted unless disabled; the
     // handler self-gates on an optional bearer token. Left here (not behind the
