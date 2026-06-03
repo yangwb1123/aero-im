@@ -3,7 +3,7 @@
 //! P2 additions: searchable_text column populated on insert/edit, edit + soft-delete,
 //! full-text + trigram + vector search, embedding update for the AI worker.
 
-use aero_common::{Block, Message, MessageId, ParticipantId, RoomId};
+use aero_common::{Block, Message, MessageId, ParticipantId, RoomId, WorkspaceId};
 use pgvector::Vector;
 use sqlx::PgPool;
 
@@ -441,6 +441,89 @@ impl MessageRepo {
             .map(|(r, c)| (RoomId::from_uuid(r), u32::try_from(c).unwrap_or(u32::MAX)))
             .collect())
     }
+
+    // ------------------------------------------------ CROSS-ROOM (GLOBAL) SEARCH
+
+    /// Full-text + trigram search across **every room the caller belongs to**
+    /// (Slack-style global search). The `JOIN room_members` predicate is the
+    /// security guard: only rooms in which `participant` is a member are scanned,
+    /// so a hit can never leak a room the caller isn't in. Scoring mirrors
+    /// [`Self::search_fts`] (`GREATEST(ts_rank, similarity)`), and each returned
+    /// [`Message`] carries its `room_id` so the client can label which room the
+    /// hit came from.
+    pub async fn search_all_rooms(
+        &self,
+        participant: ParticipantId,
+        query: &str,
+        limit: i64,
+    ) -> Result<Vec<SearchHit>, sqlx::Error> {
+        let limit = limit.clamp(1, 100);
+        let rows = sqlx::query_as::<_, ScoredMessageRow>(
+            r#"SELECT
+                 m.id, m.room_id, m.sender_id, m.blocks, m.reply_to, m.metadata,
+                 m.created_at, m.edited_at, m.deleted_at,
+                 GREATEST(
+                   ts_rank(m.search_tsv, websearch_to_tsquery('simple', $2)),
+                   similarity(m.searchable_text, $2)
+                 ) AS score
+               FROM messages m
+               JOIN room_members rm
+                 ON rm.room_id = m.room_id AND rm.participant_id = $1
+               WHERE m.deleted_at IS NULL
+                 AND (
+                   m.search_tsv @@ websearch_to_tsquery('simple', $2)
+                   OR m.searchable_text % $2
+                 )
+               ORDER BY score DESC, m.id DESC
+               LIMIT $3"#,
+        )
+        .bind(participant.to_uuid())
+        .bind(query)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(SearchHit::from).collect())
+    }
+
+    /// Tenant-scoped variant of [`Self::search_all_rooms`]: same membership guard,
+    /// additionally restricted to rooms in `workspace`. Lets a multi-tenant client
+    /// search within one workspace without surfacing the caller's rooms in others.
+    pub async fn search_all_rooms_in_workspace(
+        &self,
+        participant: ParticipantId,
+        workspace: WorkspaceId,
+        query: &str,
+        limit: i64,
+    ) -> Result<Vec<SearchHit>, sqlx::Error> {
+        let limit = limit.clamp(1, 100);
+        let rows = sqlx::query_as::<_, ScoredMessageRow>(
+            r#"SELECT
+                 m.id, m.room_id, m.sender_id, m.blocks, m.reply_to, m.metadata,
+                 m.created_at, m.edited_at, m.deleted_at,
+                 GREATEST(
+                   ts_rank(m.search_tsv, websearch_to_tsquery('simple', $2)),
+                   similarity(m.searchable_text, $2)
+                 ) AS score
+               FROM messages m
+               JOIN room_members rm
+                 ON rm.room_id = m.room_id AND rm.participant_id = $1
+               WHERE m.deleted_at IS NULL
+                 AND m.room_id IN (SELECT id FROM rooms WHERE workspace_id = $4)
+                 AND (
+                   m.search_tsv @@ websearch_to_tsquery('simple', $2)
+                   OR m.searchable_text % $2
+                 )
+               ORDER BY score DESC, m.id DESC
+               LIMIT $3"#,
+        )
+        .bind(participant.to_uuid())
+        .bind(query)
+        .bind(limit)
+        .bind(workspace.to_uuid())
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(SearchHit::from).collect())
+    }
 }
 
 fn searchable_of(blocks: &[Block]) -> String {
@@ -544,5 +627,117 @@ mod tests {
         let mut got: Vec<MessageId> = [a, b, c].into_iter().filter(|m| *m > after).collect();
         got.sort();
         assert_eq!(got, vec![b, c]);
+    }
+}
+
+#[cfg(test)]
+mod db_tests {
+    use super::{MessageRepo, NewMessage};
+    use aero_common::{Block, ParticipantId, RoomId, WorkspaceId};
+    use sqlx::PgPool;
+
+    fn pool() -> PgPool {
+        let url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://aero:aero_dev_pw@localhost:5432/aero".into());
+        sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect_lazy(&url)
+            .expect("connect_lazy never fails on a well-formed URL")
+    }
+
+    // Insert a throwaway participant so messages/membership FKs are satisfiable.
+    async fn participant(p: &PgPool) -> ParticipantId {
+        let id = ParticipantId::new();
+        sqlx::query("INSERT INTO participants (id, kind, display_name) VALUES ($1, 'human', $2)")
+            .bind(id.to_uuid())
+            .bind(format!("search-actor-{id}"))
+            .execute(p)
+            .await
+            .expect("insert participant");
+        id
+    }
+
+    // Insert a throwaway room (in the all-zero default workspace) created by
+    // `creator`. The all-zero `WorkspaceId` is the post-migration-0006 default
+    // tenant, which is guaranteed to exist.
+    async fn room(p: &PgPool, creator: ParticipantId) -> RoomId {
+        let id = RoomId::new();
+        sqlx::query(
+            "INSERT INTO rooms (id, kind, name, created_by, workspace_id) VALUES ($1,'group',$2,$3,$4)",
+        )
+        .bind(id.to_uuid())
+        .bind(format!("search-room-{id}"))
+        .bind(creator.to_uuid())
+        .bind(WorkspaceId(ulid::Ulid(0)).to_uuid())
+        .execute(p)
+        .await
+        .expect("insert room");
+        id
+    }
+
+    async fn join(p: &PgPool, room: RoomId, who: ParticipantId) {
+        sqlx::query(
+            "INSERT INTO room_members (room_id, participant_id, role) VALUES ($1,$2,'member')",
+        )
+        .bind(room.to_uuid())
+        .bind(who.to_uuid())
+        .execute(p)
+        .await
+        .expect("insert membership");
+    }
+
+    /// A hit may surface only from a room the caller is a member of: the
+    /// `JOIN room_members` guard must scope global search to the caller's rooms.
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn search_all_rooms_is_membership_scoped() {
+        let p = pool();
+        let repo = MessageRepo::new(p.clone());
+
+        let me = participant(&p).await;
+        let other = participant(&p).await;
+
+        // A room I belong to, and one I do NOT (created/owned by someone else).
+        let mine = room(&p, me).await;
+        let theirs = room(&p, other).await;
+        join(&p, mine, me).await;
+        join(&p, theirs, other).await; // membership for `other`, not for `me`.
+
+        // A distinctive token present in BOTH rooms' messages.
+        let needle = format!("xqzzytoken{}", ParticipantId::new());
+        let in_mine = repo
+            .insert(NewMessage {
+                room_id: mine,
+                sender_id: me,
+                blocks: vec![Block::text(format!("hello {needle} world"))],
+                reply_to: None,
+                metadata: serde_json::json!({}),
+            })
+            .await
+            .expect("insert mine");
+        repo.insert(NewMessage {
+            room_id: theirs,
+            sender_id: other,
+            blocks: vec![Block::text(format!("secret {needle} stuff"))],
+            reply_to: None,
+            metadata: serde_json::json!({}),
+        })
+        .await
+        .expect("insert theirs");
+
+        let hits = repo.search_all_rooms(me, &needle, 50).await.expect("search");
+
+        assert!(
+            hits.iter().all(|h| h.message.room_id == mine),
+            "every hit comes from a room the caller belongs to"
+        );
+        assert!(
+            hits.iter().any(|h| h.message.id == in_mine.id),
+            "the matching message in the caller's room is found"
+        );
+        assert!(
+            !hits.iter().any(|h| h.message.room_id == theirs),
+            "a message in a room the caller is NOT in never leaks"
+        );
     }
 }

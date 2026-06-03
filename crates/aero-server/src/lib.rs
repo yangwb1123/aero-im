@@ -21,5 +21,6 @@ pub mod workspaces;
 pub mod ws;
 pub mod channels;
 pub mod scheduled;
+pub mod search;
 
 pub use state::AppState;

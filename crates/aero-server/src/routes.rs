@@ -95,7 +95,9 @@ pub fn build(state: AppState) -> Router {
         // driven by `crate::scheduled::run_scheduled_dispatcher`.
         .merge(crate::scheduled::routes())
         // Workspace invitations / shareable invite links (ROADMAP 方向一).
-        .merge(crate::invitations::routes());
+        .merge(crate::invitations::routes())
+        // Cross-room (workspace-wide) message search, membership-scoped.
+        .merge(crate::search::routes());
 
     // Prometheus scrape endpoint (ROADMAP 方向四). Mounted unless disabled; the
     // handler self-gates on an optional bearer token. Left here (not behind the
