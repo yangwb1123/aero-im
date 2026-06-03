@@ -524,6 +524,70 @@ impl RoomEvent {
     }
 }
 
+// ---------- User custom status + presence ----------
+
+/// A user's coarse presence preference. This is the DURABLE, user-chosen
+/// preference shown on a profile — distinct from the ephemeral Redis online
+/// tracking in `aero_storage::PresenceStore` (which records whether a client is
+/// currently connected to a room). Serialized as a lowercase token on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Presence {
+    /// Available / online by choice.
+    Active,
+    /// Stepped away but still reachable.
+    Away,
+    /// Appears offline by choice.
+    Offline,
+}
+
+impl Presence {
+    /// Lowercase DB/wire token.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Away => "away",
+            Self::Offline => "offline",
+        }
+    }
+
+    /// Parse a DB/wire token, defaulting unknown/empty values to [`Self::Active`].
+    /// Mirrors `NotificationKind::from_str_lenient` so a malformed stored token
+    /// never fails a read.
+    #[must_use]
+    pub fn from_str_lenient(s: &str) -> Self {
+        match s {
+            "away" => Self::Away,
+            "offline" => Self::Offline,
+            _ => Self::Active,
+        }
+    }
+}
+
+/// A user-set custom status (emoji + free text, like Slack's "🏝️ On vacation")
+/// plus a coarse [`Presence`] preference. One per participant. The custom status
+/// (`emoji`/`text`) may auto-expire at `expires_at`; once it has passed, readers
+/// treat the custom status as cleared (emoji/text become `None`) while keeping
+/// the `presence` preference. Backs `migrations/0022_user_status.sql`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserStatus {
+    pub participant_id: ParticipantId,
+    /// Emoji shorthand, e.g. `:palm_tree:`. `None` when no custom status is set
+    /// (or it has expired).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emoji: Option<String>,
+    /// Free-form status text, e.g. "On vacation". `None` when unset/expired.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    pub presence: Presence,
+    /// Optional auto-expiry for the custom status. `None` means it never expires.
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub expires_at: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub updated_at: OffsetDateTime,
+}
+
 // ---------- Tests ----------
 
 #[cfg(test)]
@@ -640,5 +704,37 @@ mod tests {
             deleted_at: None,
         };
         assert_eq!(m.searchable_text(), "hello\nfn main() {}");
+    }
+
+    #[test]
+    fn presence_token_roundtrip_and_lenient_parse() {
+        for p in [Presence::Active, Presence::Away, Presence::Offline] {
+            assert_eq!(Presence::from_str_lenient(p.as_str()), p);
+        }
+        // Lowercase serde tokens.
+        assert_eq!(serde_json::to_string(&Presence::Away).unwrap(), "\"away\"");
+        // Unknown / empty tokens default to Active (never fails a read).
+        assert_eq!(Presence::from_str_lenient("bogus"), Presence::Active);
+        assert_eq!(Presence::from_str_lenient(""), Presence::Active);
+    }
+
+    #[test]
+    fn user_status_json_roundtrip() {
+        let status = UserStatus {
+            participant_id: ParticipantId::new(),
+            emoji: Some(":palm_tree:".into()),
+            text: Some("On vacation".into()),
+            presence: Presence::Away,
+            expires_at: None,
+            updated_at: time::OffsetDateTime::UNIX_EPOCH,
+        };
+        let j = serde_json::to_string(&status).unwrap();
+        assert!(j.contains("\"presence\":\"away\""));
+        assert!(j.contains(":palm_tree:"));
+        let back: UserStatus = serde_json::from_str(&j).unwrap();
+        assert_eq!(back.participant_id, status.participant_id);
+        assert_eq!(back.emoji.as_deref(), Some(":palm_tree:"));
+        assert_eq!(back.presence, Presence::Away);
+        assert!(back.expires_at.is_none());
     }
 }
