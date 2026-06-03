@@ -29,8 +29,8 @@ pub use live::{
     gift_by_id, gift_catalog, Gift, GiftLeaderRow, StreamChatLine, StreamEvent, StreamGiftLine,
 };
 pub use model::{
-    Block, Blob, CallEvent, CallId, CallKind, CallMode, CallSession, FileKind, Message,
-    MessageEnvelope, Notification, NotificationKind, Participant, ParticipantKind, PinOp,
+    Block, Blob, CallEvent, CallId, CallKind, CallMode, CallSession, FileKind, MembershipOp,
+    Message, MessageEnvelope, Notification, NotificationKind, Participant, ParticipantKind, PinOp,
     PinnedMessage, ReactionOp, ReactionSummary, Reaction, ReadReceipt, Room, RoomEvent, RoomKind,
     RoomUnread, Span, SpanStyle, Stream, StreamProtocol, StreamStatus, ThreadSummary,
 };

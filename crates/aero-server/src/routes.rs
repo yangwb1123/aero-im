@@ -81,7 +81,9 @@ pub fn build(state: AppState) -> Router {
         // Workspace / Org management (ROADMAP 方向一 — multi-tenant foundation).
         // Defined alongside their RBAC guards in `crate::workspaces`.
         .merge(crate::workspaces::routes())
-        .merge(crate::collab::routes());
+        .merge(crate::collab::routes())
+        // Channel management (public/private, join/leave, archive, topic/desc).
+        .merge(crate::channels::routes());
 
     // Prometheus scrape endpoint (ROADMAP 方向四). Mounted unless disabled; the
     // handler self-gates on an optional bearer token. Left here (not behind the
