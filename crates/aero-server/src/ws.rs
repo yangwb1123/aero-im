@@ -23,8 +23,8 @@ use std::sync::Arc;
 
 use aero_common::metrics::{self, names};
 use aero_common::{
-    Block, CallEvent, CallId, CallKind, CallMode, MessageId, ParticipantId, ReactionOp, RoomEvent,
-    RoomId, StreamEvent,
+    Block, CallEvent, CallId, CallKind, CallMode, MessageId, ParticipantId, PollId, PollOp,
+    ReactionOp, RoomEvent, RoomId, StreamEvent,
 };
 use ulid::Ulid;
 use axum::{
@@ -172,6 +172,9 @@ enum ServerFrame<'a> {
     },
     Typing { room_id: RoomId, participant: ParticipantId, on: bool },
     Call { event: CallEvent },
+    /// A poll was created/voted/closed in a room (fans out to all members so the
+    /// tally stays live).
+    Poll { room_id: RoomId, poll_id: PollId, op: PollOp },
     /// Per-stream interactivity event (danmaku/gift/viewers/status).
     StreamEvent { event: StreamEvent },
     Error { code: &'a str, msg: String },
@@ -836,6 +839,7 @@ fn room_event_to_frame_json(event: &RoomEvent) -> String {
             ServerFrame::Typing { room_id, participant, on }
         }
         RoomEvent::Call(call) => ServerFrame::Call { event: call },
+        RoomEvent::Poll { room_id, poll_id, op } => ServerFrame::Poll { room_id, poll_id, op },
     };
     serde_json::to_string(&frame)
         .unwrap_or_else(|_| "{\"type\":\"error\",\"code\":\"serialize\",\"msg\":\"\"}".into())

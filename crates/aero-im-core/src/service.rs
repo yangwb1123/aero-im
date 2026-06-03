@@ -675,6 +675,15 @@ impl ImService {
         Ok(())
     }
 
+    /// Broadcast an already-constructed [`RoomEvent`] on the room's subject.
+    /// Thin public seam (mirrors [`relay_call_event`](Self::relay_call_event))
+    /// letting feature modules that own their own storage — e.g. polls — fan out a
+    /// room event without re-implementing the bus plumbing. Best-effort: a publish
+    /// failure is logged, never surfaced.
+    pub async fn broadcast_room_event(&self, room: RoomId, event: RoomEvent) {
+        self.publish_room_event(room, &event).await;
+    }
+
     // ---------------------------------------------------------- internal
 
     async fn publish_room_event(&self, room: RoomId, event: &RoomEvent) {

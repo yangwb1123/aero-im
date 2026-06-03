@@ -9,6 +9,7 @@ pub mod error;
 pub mod hub;
 pub mod live;
 pub mod metrics;
+pub mod polls;
 pub mod rate_limit;
 pub mod routes;
 pub mod state;

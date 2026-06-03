@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-use crate::ids::{BlobId, MessageId, ParticipantId, RoomId};
+use crate::ids::{BlobId, MessageId, ParticipantId, PollId, RoomId};
 
 // ---------- Participant ----------
 
@@ -434,6 +434,60 @@ pub enum CallEvent {
     },
 }
 
+// ---------- Polls ----------
+
+/// A poll created in a room: a question with 2..=10 options, single- or
+/// multi-choice. Members vote; everyone sees the live tally; the creator closes
+/// it. Backs `migrations/0023_polls.sql`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Poll {
+    pub id: PollId,
+    pub room_id: RoomId,
+    pub created_by: ParticipantId,
+    pub question: String,
+    /// Ordered option labels; a vote references one by its index.
+    pub options: Vec<String>,
+    /// `true` ⇒ a participant may pick several options; `false` ⇒ exactly one.
+    pub multi: bool,
+    /// Set once the creator closes the poll; `None` while it accepts votes.
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub closed_at: Option<OffsetDateTime>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+}
+
+impl Poll {
+    /// Whether the poll is closed (no longer accepting votes).
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.closed_at.is_some()
+    }
+}
+
+/// A poll plus its current per-option vote counts. `counts[i]` is the number of
+/// votes for `poll.options[i]`; `total` is the sum (a multi-choice poll can have
+/// more votes than voters).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PollTally {
+    pub poll: Poll,
+    pub counts: Vec<u32>,
+    pub total: u32,
+}
+
+/// What happened to a poll, carried on [`RoomEvent::Poll`] so clients refresh the
+/// tally. Renamed nowhere needed — `op` is the field name (the enum tag is `kind`
+/// on `RoomEvent`, and this is a plain field, not flattened).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PollOp {
+    /// A poll was created.
+    Created,
+    /// A vote was cast or changed.
+    Voted,
+    /// The poll was closed by its creator.
+    Closed,
+}
+
 // ---------- Unified room-scoped event (NATS + WS wire) ----------
 
 /// Every per-room real-time event flows through this tagged enum on the NATS
@@ -478,6 +532,13 @@ pub enum RoomEvent {
     },
     /// WebRTC signaling (P3/P6).
     Call(CallEvent),
+    /// A poll was created, voted on, or closed. Fans out to the whole room so
+    /// every member's tally stays live. `op` carries which transition occurred.
+    Poll {
+        room_id: RoomId,
+        poll_id: PollId,
+        op: PollOp,
+    },
 }
 
 impl RoomEvent {
@@ -506,7 +567,8 @@ impl RoomEvent {
             RoomEvent::Deleted { room_id, .. }
             | RoomEvent::Reaction { room_id, .. }
             | RoomEvent::Read { room_id, .. }
-            | RoomEvent::Typing { room_id, .. } => Some(*room_id),
+            | RoomEvent::Typing { room_id, .. }
+            | RoomEvent::Poll { room_id, .. } => Some(*room_id),
             RoomEvent::Call(
                 CallEvent::Invite { room_id, .. }
                 | CallEvent::End { room_id, .. }
@@ -620,6 +682,32 @@ mod tests {
         assert!(j.contains("\"op\":\"join\""));
         let back: RoomEvent = serde_json::from_str(&j).unwrap();
         assert_eq!(back.room_id(), Some(room));
+    }
+
+    #[test]
+    fn poll_event_tagged_and_fans_to_room() {
+        let room = RoomId::new();
+        let ev = RoomEvent::Poll {
+            room_id: room,
+            poll_id: crate::ids::PollId::new(),
+            op: PollOp::Created,
+        };
+        // No explicit recipient list ⇒ fans out to the whole room.
+        assert!(ev.explicit_recipients().is_empty());
+        assert_eq!(ev.room_id(), Some(room));
+
+        let j = serde_json::to_string(&ev).unwrap();
+        assert!(j.contains("\"kind\":\"poll\""));
+        assert!(j.contains("\"op\":\"created\""));
+        let back: RoomEvent = serde_json::from_str(&j).unwrap();
+        assert_eq!(back.room_id(), Some(room));
+        assert!(matches!(back, RoomEvent::Poll { op: PollOp::Created, .. }));
+
+        // Voted / Closed round-trip too.
+        let voted = RoomEvent::Poll { room_id: room, poll_id: crate::ids::PollId::new(), op: PollOp::Voted };
+        assert!(serde_json::to_string(&voted).unwrap().contains("\"op\":\"voted\""));
+        let closed = RoomEvent::Poll { room_id: room, poll_id: crate::ids::PollId::new(), op: PollOp::Closed };
+        assert!(serde_json::to_string(&closed).unwrap().contains("\"op\":\"closed\""));
     }
 
     #[test]

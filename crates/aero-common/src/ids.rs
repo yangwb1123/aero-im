@@ -112,6 +112,10 @@ define_id!(
     /// Identifies a single audit-trail event (workspace administration log).
     AuditId
 );
+define_id!(
+    /// Identifies a poll (question + options) created in a room.
+    PollId
+);
 
 #[cfg(test)]
 mod tests {
