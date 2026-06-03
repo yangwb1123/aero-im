@@ -14,6 +14,7 @@ pub mod invitations;
 pub mod live;
 pub mod metrics;
 pub mod notif_prefs;
+pub mod pat;
 pub mod rate_limit;
 pub mod routes;
 pub mod scim;

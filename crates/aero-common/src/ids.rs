@@ -137,6 +137,11 @@ define_id!(
     /// Identifies a workspace custom emoji (`:shipit:`), backed by an image blob.
     EmojiId
 );
+define_id!(
+    /// Identifies a Personal Access Token (PAT) — a long-lived, participant-owned
+    /// credential for programmatic REST API access.
+    PatId
+);
 
 #[cfg(test)]
 mod tests {

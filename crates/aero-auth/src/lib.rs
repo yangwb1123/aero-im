@@ -13,6 +13,7 @@ pub mod extractor;
 pub mod jwt;
 pub mod oidc;
 pub mod password;
+pub mod pat;
 pub mod service;
 
 pub use extractor::AuthUser;
@@ -21,4 +22,5 @@ pub use oidc::{
     validate_id_token, JwksKeyProvider, KeyProvider, OidcClaims, OidcConfig, OidcError,
     StaticKeyProvider,
 };
+pub use pat::{PatVerifier, SharedPatVerifier};
 pub use service::{AuthService, AuthTokens, LoginRequest, RegisterRequest, RegisterResponse};

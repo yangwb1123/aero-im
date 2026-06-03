@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::jwt::{Claims, JwtCodec, TokenKind};
 use crate::password;
+use crate::pat::SharedPatVerifier;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RegisterRequest {
@@ -41,18 +42,46 @@ pub struct RegisterResponse {
     pub refresh_token: String,
 }
 
-/// Cheap-to-clone (clones share the underlying repo and JWT keys).
+/// Cheap-to-clone (clones share the underlying repo, JWT keys, and — when wired —
+/// the PAT verifier behind an `Arc`).
 #[derive(Clone)]
 pub struct AuthService {
     repo: ParticipantRepo,
     jwt: JwtCodec,
+    /// Optional hook for Personal Access Token (PAT) auth. When present, the
+    /// [`AuthUser`](crate::extractor::AuthUser) extractor accepts an
+    /// `aero_pat_*` bearer token wherever it accepts an access JWT, resolving it
+    /// through this verifier. `None` (the default) means PAT auth is disabled and
+    /// only JWTs are accepted — behaviour is then identical to before PATs.
+    pat_verifier: Option<SharedPatVerifier>,
 }
 
 impl AuthService {
     /// Constructs the service from its dependencies. Prefer [`Self::from_pem`]
-    /// when starting up directly from `AuthConfig`.
+    /// when starting up directly from `AuthConfig`. PAT auth is off until
+    /// [`Self::with_pat_verifier`] is called.
     pub fn new(repo: ParticipantRepo, jwt: JwtCodec) -> Self {
-        Self { repo, jwt }
+        Self {
+            repo,
+            jwt,
+            pat_verifier: None,
+        }
+    }
+
+    /// Enable Personal Access Token authentication by injecting the verifier that
+    /// resolves a hashed PAT to its owner (typically an
+    /// [`aero_storage::PatRepo`], which implements
+    /// [`PatVerifier`](crate::pat::PatVerifier)). Builder-style so it composes
+    /// with [`Self::new`] / [`Self::from_pem`] at startup:
+    ///
+    /// ```ignore
+    /// let auth = AuthService::from_pem(repo.clone(), ..)?
+    ///     .with_pat_verifier(Arc::new(PatRepo::new(pg.clone())));
+    /// ```
+    #[must_use]
+    pub fn with_pat_verifier(mut self, verifier: SharedPatVerifier) -> Self {
+        self.pat_verifier = Some(verifier);
+        self
     }
 
     /// Convenience constructor that builds the JWT codec inline from PEM strings.
@@ -173,6 +202,25 @@ impl AuthService {
     /// verification.
     pub fn issue_for_participant(&self, pid: aero_common::ParticipantId) -> Result<AuthTokens> {
         self.issue_pair(pid)
+    }
+
+    /// Attempt to authenticate a *plaintext* Personal Access Token, returning its
+    /// owner on success.
+    ///
+    /// Returns `None` when PAT auth is not wired (no verifier injected), the token
+    /// does not carry the PAT prefix, or it is unknown / revoked / expired. The
+    /// [`AuthUser`](crate::extractor::AuthUser) extractor calls this **after** a
+    /// JWT verification fails, so the JWT path is unchanged when no PAT is present.
+    ///
+    /// The plaintext is hashed here (via [`aero_storage::pat::hash_pat`]) and only
+    /// the hash is handed to the verifier — the raw secret never reaches storage.
+    pub async fn verify_pat(&self, token: &str) -> Option<aero_common::ParticipantId> {
+        let verifier = self.pat_verifier.as_ref()?;
+        if !token.starts_with(aero_storage::pat::PAT_PREFIX) {
+            return None;
+        }
+        let hash = aero_storage::pat::hash_pat(token);
+        verifier.verify(&hash).await
     }
 
     fn issue_pair(&self, pid: aero_common::ParticipantId) -> Result<AuthTokens> {
