@@ -112,6 +112,10 @@ define_id!(
     /// Identifies a single audit-trail event (workspace administration log).
     AuditId
 );
+define_id!(
+    /// Identifies a scheduled message ("Send later") / reminder, pending delivery.
+    ScheduledMessageId
+);
 
 #[cfg(test)]
 mod tests {

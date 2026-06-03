@@ -80,7 +80,10 @@ pub fn build(state: AppState) -> Router {
         .route("/ws", get(ws::handler))
         // Workspace / Org management (ROADMAP 方向一 — multi-tenant foundation).
         // Defined alongside their RBAC guards in `crate::workspaces`.
-        .merge(crate::workspaces::routes());
+        .merge(crate::workspaces::routes())
+        // Scheduled messages + reminders ("Send later"). Background delivery is
+        // driven by `crate::scheduled::run_scheduled_dispatcher`.
+        .merge(crate::scheduled::routes());
 
     // Prometheus scrape endpoint (ROADMAP 方向四). Mounted unless disabled; the
     // handler self-gates on an optional bearer token. Left here (not behind the

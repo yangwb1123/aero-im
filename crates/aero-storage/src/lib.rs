@@ -22,6 +22,7 @@ pub mod room;
 pub mod stream;
 pub mod stream_route;
 pub mod workspace;
+pub mod scheduled;
 
 pub use ai_job::{AiJob, AiJobKind, AiJobRepo, AiJobStatus};
 pub use audit::{AuditEvent, AuditRepo};
@@ -46,3 +47,4 @@ pub use workspace::{
     validate_retention_days, RoomExport, WorkspaceExport, WorkspaceRepo, EXPORT_MESSAGES_PER_ROOM,
     MIN_RETENTION_DAYS,
 };
+pub use scheduled::{ScheduledMessage, ScheduledRepo};
