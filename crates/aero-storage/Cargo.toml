@@ -30,6 +30,8 @@ ulid.workspace = true
 uuid.workspace = true
 rand.workspace = true
 bytes.workspace = true
+# SCIM (migration 0015): hash provisioning bearer tokens before storage.
+sha2 = "0.10"
 
 [dev-dependencies]
 pretty_assertions.workspace = true

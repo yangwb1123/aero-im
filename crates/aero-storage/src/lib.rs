@@ -19,6 +19,7 @@ pub mod presence;
 pub mod reaction;
 pub mod receipt;
 pub mod room;
+pub mod scim;
 pub mod stream;
 pub mod stream_route;
 pub mod workspace;
@@ -39,6 +40,7 @@ pub use presence::PresenceStore;
 pub use reaction::ReactionRepo;
 pub use receipt::ReceiptRepo;
 pub use room::RoomRepo;
+pub use scim::{generate_token, hash_token, ScimRepo, ScimUserRow};
 pub use stream::{NewStream, StreamRepo};
 pub use stream_route::{redirect_base, StreamRouteRegistry, DEFAULT_TTL as STREAM_ROUTE_TTL};
 pub use workspace::{

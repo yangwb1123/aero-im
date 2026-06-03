@@ -112,6 +112,10 @@ define_id!(
     /// Identifies a single audit-trail event (workspace administration log).
     AuditId
 );
+define_id!(
+    /// Identifies a SCIM 2.0 provisioning bearer token (per-workspace, RFC 7644).
+    ScimTokenId
+);
 
 #[cfg(test)]
 mod tests {
