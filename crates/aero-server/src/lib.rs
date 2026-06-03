@@ -5,6 +5,7 @@ pub mod moderation_bot;
 pub mod transcribe_bot;
 pub mod ai_adapter;
 pub mod config;
+pub mod emoji;
 pub mod error;
 pub mod hub;
 pub mod live;
