@@ -16,6 +16,7 @@ pub mod live_presence;
 pub mod message;
 pub mod mls;
 pub mod notification;
+pub mod notification_prefs;
 pub mod participant;
 pub mod pin;
 pub mod presence;
@@ -46,6 +47,7 @@ pub use live_presence::{CallRosterStore, StreamViewerStore, DEFAULT_TTL as LIVE_
 pub use message::{MessageRepo, NewMessage, SearchHit};
 pub use mls::{KeyPackageRepo, MlsGroupRepo};
 pub use notification::NotificationRepo;
+pub use notification_prefs::NotificationPrefsRepo;
 pub use participant::ParticipantRepo;
 pub use pin::PinRepo;
 pub use presence::PresenceStore;

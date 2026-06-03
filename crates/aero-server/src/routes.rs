@@ -97,7 +97,9 @@ pub fn build(state: AppState) -> Router {
         // Workspace invitations / shareable invite links (ROADMAP 方向一).
         .merge(crate::invitations::routes())
         // Cross-room (workspace-wide) message search, membership-scoped.
-        .merge(crate::search::routes());
+        .merge(crate::search::routes())
+        // Notification preferences: per-channel mute + per-user Do-Not-Disturb.
+        .merge(crate::notif_prefs::routes());
 
     // Prometheus scrape endpoint (ROADMAP 方向四). Mounted unless disabled; the
     // handler self-gates on an optional bearer token. Left here (not behind the

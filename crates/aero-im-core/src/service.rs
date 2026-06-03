@@ -17,8 +17,8 @@ use aero_common::{
 };
 use aero_common::{PinOp, PinnedMessage};
 use aero_storage::{
-    message::NewMessage, AiJobKind, AiJobRepo, CallRepo, MessageRepo, NotificationRepo,
-    ParticipantRepo, PinRepo, ReactionRepo, ReceiptRepo, RoomRepo, WorkspaceRepo,
+    message::NewMessage, AiJobKind, AiJobRepo, CallRepo, MessageRepo, NotificationPrefsRepo,
+    NotificationRepo, ParticipantRepo, PinRepo, ReactionRepo, ReceiptRepo, RoomRepo, WorkspaceRepo,
 };
 use async_trait::async_trait;
 use std::collections::BTreeMap;
@@ -115,6 +115,11 @@ pub struct ImService {
     /// Pinned-messages store. Optional builder ([`with_pins`](ImService::with_pins));
     /// the pin/unpin/list methods return an internal error if it isn't wired.
     pins: Option<PinRepo>,
+    /// Notification preferences (per-channel mute + per-user Do-Not-Disturb).
+    /// Optional builder ([`with_notification_prefs`](ImService::with_notification_prefs));
+    /// when present, [`should_notify`](ImService::should_notify) suppresses
+    /// notifications to muted/DND recipients. Without it, nothing is suppressed.
+    prefs: Option<NotificationPrefsRepo>,
     bus: Arc<dyn BusSink>,
     moderator: Arc<dyn Moderator>,
 }
@@ -151,6 +156,7 @@ impl ImService {
             ai_jobs,
             notifications: None,
             pins: None,
+            prefs: None,
             bus: bus as Arc<dyn BusSink>,
             moderator,
         }
@@ -194,6 +200,46 @@ impl ImService {
         self
     }
 
+    /// Wire in the notification-preferences store (per-channel mute + per-user
+    /// Do-Not-Disturb), enabling the suppression seam
+    /// ([`should_notify`](Self::should_notify)). Additive builder; without it,
+    /// nothing is suppressed and every notification recipient is notified.
+    #[must_use]
+    pub fn with_notification_prefs(mut self, prefs: NotificationPrefsRepo) -> Self {
+        self.prefs = Some(prefs);
+        self
+    }
+
+    /// Notification suppression seam for per-channel mute + per-user
+    /// Do-Not-Disturb. Returns whether a notification should be delivered to
+    /// `recipient` for `room`: `false` when the recipient has MUTED the room OR
+    /// is currently inside their DND window, `true` otherwise. DND is evaluated
+    /// against the current UTC minute-of-day for now. Best-effort and FAIL-OPEN:
+    /// no prefs store wired, or a lookup error, returns `true` so a glitch never
+    /// silently drops a notification.
+    async fn should_notify(&self, recipient: ParticipantId, room: RoomId) -> bool {
+        let Some(prefs) = self.prefs.as_ref() else {
+            return true;
+        };
+        let is_muted = match prefs.is_muted(recipient, room).await {
+            Ok(m) => m,
+            Err(err) => {
+                warn!(?err, %recipient, %room, "mute lookup failed; not suppressing");
+                return true;
+            }
+        };
+        let dnd = match prefs.get_dnd(recipient).await {
+            Ok(d) => d,
+            Err(err) => {
+                warn!(?err, %recipient, "DND lookup failed; not suppressing");
+                return true;
+            }
+        };
+        let now_minute =
+            aero_storage::notification_prefs::minute_of_day_utc(time::OffsetDateTime::now_utc());
+        !aero_storage::notification_prefs::should_suppress(is_muted, dnd, now_minute)
+    }
+
     /// Lower-level constructor for tests with a pre-built bus sink.
     #[allow(clippy::too_many_arguments)]
     pub fn from_sink(
@@ -217,6 +263,7 @@ impl ImService {
             ai_jobs,
             notifications: None,
             pins: None,
+            prefs: None,
             bus,
             moderator: Arc::new(crate::moderator::AllowAllModerator),
         }
@@ -957,6 +1004,11 @@ impl ImService {
         }
 
         for (recipient, kind) in targets {
+            // Per-channel mute / Do-Not-Disturb: skip recipients who have silenced
+            // this room or are in a DND window (fail-open if prefs unavailable).
+            if !self.should_notify(recipient, room).await {
+                continue;
+            }
             if let Err(err) = repo
                 .insert(recipient, room, message.id, kind, Some(sender))
                 .await

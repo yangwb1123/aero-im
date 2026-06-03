@@ -26,9 +26,9 @@ use aero_server::{
 };
 use aero_storage::{
     connect_pg, migrate, AiJobRepo, AuditRepo, BlobRepo, CallRepo, CallRosterStore, KeyPackageRepo,
-    LiveRepo, LocalFsBlobStore, MessageRepo, MlsGroupRepo, NotificationRepo, ParticipantRepo,
-    PinRepo, PresenceStore, ReactionRepo, ReceiptRepo, RedisCache, RoomRepo, StreamRepo,
-    StreamRouteRegistry, StreamViewerStore, WorkspaceRepo,
+    LiveRepo, LocalFsBlobStore, MessageRepo, MlsGroupRepo, NotificationPrefsRepo, NotificationRepo,
+    ParticipantRepo, PinRepo, PresenceStore, ReactionRepo, ReceiptRepo, RedisCache, RoomRepo,
+    StreamRepo, StreamRouteRegistry, StreamViewerStore, WorkspaceRepo,
 };
 use tokio_util::sync::CancellationToken;
 use anyhow::Context;
@@ -70,6 +70,7 @@ async fn main() -> anyhow::Result<()> {
     let audit = AuditRepo::new(pg.clone());
     let messages = MessageRepo::new(pg.clone());
     let notifications = NotificationRepo::new(pg.clone());
+    let notification_prefs = NotificationPrefsRepo::new(pg.clone());
     let pins = PinRepo::new(pg.clone());
     let receipts = ReceiptRepo::new(pg.clone());
     let reactions = ReactionRepo::new(pg.clone());
@@ -137,6 +138,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .with_workspaces(workspaces.clone())
         .with_notifications(notifications.clone())
+        .with_notification_prefs(notification_prefs.clone())
         .with_pins(pins.clone()),
     );
 
