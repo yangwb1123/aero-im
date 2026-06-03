@@ -14,5 +14,6 @@ pub mod routes;
 pub mod state;
 pub mod workspaces;
 pub mod ws;
+pub mod forward;
 
 pub use state::AppState;
