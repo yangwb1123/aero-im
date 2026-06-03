@@ -93,7 +93,9 @@ pub fn build(state: AppState) -> Router {
         .merge(crate::scim::routes())
         // Scheduled messages + reminders ("Send later"). Background delivery is
         // driven by `crate::scheduled::run_scheduled_dispatcher`.
-        .merge(crate::scheduled::routes());
+        .merge(crate::scheduled::routes())
+        // Workspace invitations / shareable invite links (ROADMAP 方向一).
+        .merge(crate::invitations::routes());
 
     // Prometheus scrape endpoint (ROADMAP 方向四). Mounted unless disabled; the
     // handler self-gates on an optional bearer token. Left here (not behind the

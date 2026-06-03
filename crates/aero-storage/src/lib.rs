@@ -10,6 +10,7 @@ pub mod blob_store;
 pub mod cache;
 pub mod call;
 pub mod db;
+pub mod invitation;
 pub mod live;
 pub mod live_presence;
 pub mod message;
@@ -36,6 +37,10 @@ pub use blob_store::{BlobStore, BlobStoreError, LocalFsBlobStore};
 pub use cache::{Cache, RedisCache};
 pub use call::CallRepo;
 pub use db::{connect_pg, migrate, PgPool};
+// `generate_token`/`hash_token` are NOT re-exported at the crate root (the webhook
+// module exports same-named helpers); invitation consumers use the
+// `aero_storage::invitation::` path.
+pub use invitation::{invitation_is_redeemable, Invitation, InvitationRepo};
 pub use live::LiveRepo;
 pub use live_presence::{CallRosterStore, StreamViewerStore, DEFAULT_TTL as LIVE_PRESENCE_TTL};
 pub use message::{MessageRepo, NewMessage, SearchHit};

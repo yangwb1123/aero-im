@@ -8,6 +8,7 @@ pub mod collab;
 pub mod config;
 pub mod error;
 pub mod hub;
+pub mod invitations;
 pub mod live;
 pub mod metrics;
 pub mod rate_limit;

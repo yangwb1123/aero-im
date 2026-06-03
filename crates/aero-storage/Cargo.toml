@@ -32,7 +32,7 @@ rand.workspace = true
 bytes.workspace = true
 # Webhooks (0013): HMAC-SHA256 signing of outgoing deliveries + SHA-256 hashing
 # of incoming tokens; reqwest is the real `WebhookSender` HTTP transport.
-# sha2 is shared with SCIM (0015) provisioning-token hashing.
+# sha2/hex are shared with SCIM (0015) + invitations (0017) token hashing.
 hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"

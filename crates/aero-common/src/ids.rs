@@ -129,6 +129,10 @@ define_id!(
     /// Identifies a scheduled message ("Send later") / reminder, pending delivery.
     ScheduledMessageId
 );
+define_id!(
+    /// Identifies a workspace invitation / shareable invite link.
+    InvitationId
+);
 
 #[cfg(test)]
 mod tests {
