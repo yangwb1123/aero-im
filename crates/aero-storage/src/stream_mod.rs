@@ -109,18 +109,20 @@ impl StreamModRepo {
         participant: ParticipantId,
         now: OffsetDateTime,
     ) -> Result<bool, sqlx::Error> {
-        let row = sqlx::query_scalar::<_, i64>(
-            r"SELECT 1 FROM stream_bans
-               WHERE stream_id = $1
-                 AND participant_id = $2
-                 AND (until IS NULL OR until > $3)",
+        let banned = sqlx::query_scalar::<_, bool>(
+            r"SELECT EXISTS(
+                SELECT 1 FROM stream_bans
+                 WHERE stream_id = $1
+                   AND participant_id = $2
+                   AND (until IS NULL OR until > $3)
+              )",
         )
         .bind(Uuid::from_u128(stream.0))
         .bind(participant.to_uuid())
         .bind(now)
-        .fetch_optional(&self.pool)
+        .fetch_one(&self.pool)
         .await?;
-        Ok(row.is_some())
+        Ok(banned)
     }
 
     /// All bans recorded for a stream (active and expired-timeout rows), newest
