@@ -85,7 +85,9 @@ pub fn build(state: AppState) -> Router {
         // Channel management (public/private, join/leave, archive, topic/desc).
         .merge(crate::channels::routes())
         // Webhooks (incoming inbound-message hooks + outgoing event delivery).
-        .merge(crate::webhooks::routes());
+        .merge(crate::webhooks::routes())
+        // SSO via OIDC: ID-token login + JIT provisioning (POST /api/auth/oidc).
+        .merge(crate::sso::routes());
 
     // Prometheus scrape endpoint (ROADMAP 方向四). Mounted unless disabled; the
     // handler self-gates on an optional bearer token. Left here (not behind the
