@@ -11,9 +11,9 @@ use std::sync::Arc;
 use aero_bus::traits::BusError;
 use aero_bus::EventBus;
 use aero_common::{
-    Block, CallEvent, CallId, CallKind, CallMode, CallSession, Error, Message, MessageEnvelope,
-    MessageId, ParticipantId, ReactionOp, ReactionSummary, ReadReceipt, Result, Room, RoomEvent,
-    RoomId, RoomKind, WorkspaceId, WorkspaceRole,
+    Block, CallEvent, CallId, CallKind, CallMode, CallSession, Error, MembershipOp, Message,
+    MessageEnvelope, MessageId, ParticipantId, ReactionOp, ReactionSummary, ReadReceipt, Result,
+    Room, RoomEvent, RoomId, RoomKind, WorkspaceId, WorkspaceRole,
 };
 use aero_storage::{
     message::NewMessage, AiJobKind, AiJobRepo, CallRepo, MessageRepo, ParticipantRepo,
@@ -45,6 +45,15 @@ pub fn can_create_channel(role: WorkspaceRole) -> bool {
 #[must_use]
 pub fn can_access_room(is_workspace_member: bool, is_room_member: bool) -> bool {
     is_workspace_member && is_room_member
+}
+
+/// Whether a workspace member may join a channel given (a) it is public
+/// (not private) and (b) it is not archived. Both must hold: a private or
+/// archived channel is not openly joinable. Pure decision function, unit-tested
+/// as a truth table.
+#[must_use]
+pub fn can_join_public_channel(is_private: bool, is_archived: bool) -> bool {
+    !is_private && !is_archived
 }
 
 /// Object-safe view of [`EventBus`] used internally for dependency injection.
@@ -331,6 +340,126 @@ impl ImService {
     #[instrument(skip(self), fields(?who))]
     pub async fn list_my_rooms(&self, who: ParticipantId) -> Result<Vec<Room>> {
         Ok(self.rooms.rooms_for(who).await?)
+    }
+
+    // ---------------------------------------------------------- CHANNELS
+
+    /// Join a public channel. The room must be a non-archived PUBLIC channel in a
+    /// workspace the actor belongs to ([`can_join_public_channel`]); then the
+    /// actor is enrolled and a `Membership { Join }` event fans out to the room.
+    /// Idempotent at the storage layer (re-join is a no-op upsert).
+    #[instrument(skip(self), fields(?actor, ?room))]
+    pub async fn join_channel(&self, actor: ParticipantId, room: RoomId) -> Result<()> {
+        let workspace = self
+            .rooms
+            .room_workspace(room)
+            .await?
+            .ok_or_else(|| Error::NotFound(format!("room {room}")))?;
+        if !self.workspaces()?.is_member(workspace, actor).await? {
+            return Err(Error::Forbidden(format!(
+                "{actor} is not a member of workspace {workspace}"
+            )));
+        }
+        let is_private = self
+            .rooms
+            .is_private(room)
+            .await?
+            .ok_or_else(|| Error::NotFound(format!("room {room}")))?;
+        let is_archived = self.rooms.is_archived(room).await?.unwrap_or(false);
+        if !can_join_public_channel(is_private, is_archived) {
+            return Err(Error::Forbidden(format!(
+                "channel {room} is not openly joinable (private or archived)"
+            )));
+        }
+        self.rooms.add_member(room, actor).await?;
+        self.publish_room_event(
+            room,
+            &RoomEvent::Membership { room_id: room, participant: actor, op: MembershipOp::Join },
+        )
+        .await;
+        Ok(())
+    }
+
+    /// Leave a channel the actor is a member of. Emits `Membership { Leave }`.
+    /// Idempotent: leaving a room you are not in is a no-op success.
+    #[instrument(skip(self), fields(?actor, ?room))]
+    pub async fn leave_channel(&self, actor: ParticipantId, room: RoomId) -> Result<()> {
+        // The room must exist (resolve its tenant) before we touch membership.
+        self.rooms
+            .room_workspace(room)
+            .await?
+            .ok_or_else(|| Error::NotFound(format!("room {room}")))?;
+        self.rooms.remove_member(room, actor).await?;
+        self.publish_room_event(
+            room,
+            &RoomEvent::Membership { room_id: room, participant: actor, op: MembershipOp::Leave },
+        )
+        .await;
+        Ok(())
+    }
+
+    /// Archive (or un-archive) a channel. Requires the actor be a member of the
+    /// room (authorization kept simple but real).
+    #[instrument(skip(self), fields(?actor, ?room, archived))]
+    pub async fn archive_channel(
+        &self,
+        actor: ParticipantId,
+        room: RoomId,
+        archived: bool,
+    ) -> Result<()> {
+        if !self.rooms.is_member(room, actor).await? {
+            return Err(Error::Forbidden(format!(
+                "{actor} is not a member of room {room}"
+            )));
+        }
+        self.rooms.set_archived(room, archived).await?;
+        Ok(())
+    }
+
+    /// Update a channel's metadata (topic, description, visibility). Each field is
+    /// optional — only provided fields are written. Requires the actor be a member
+    /// of the room. Returns the refreshed [`Room`] (base shape; channel metadata
+    /// lives on the row but is not part of the wire `Room`).
+    #[instrument(skip(self), fields(?actor, ?room))]
+    pub async fn set_channel_meta(
+        &self,
+        actor: ParticipantId,
+        room: RoomId,
+        topic: Option<Option<String>>,
+        description: Option<Option<String>>,
+        is_private: Option<bool>,
+    ) -> Result<()> {
+        if !self.rooms.is_member(room, actor).await? {
+            return Err(Error::Forbidden(format!(
+                "{actor} is not a member of room {room}"
+            )));
+        }
+        if let Some(topic) = topic {
+            self.rooms.set_topic(room, topic.as_deref()).await?;
+        }
+        if let Some(description) = description {
+            self.rooms.set_description(room, description.as_deref()).await?;
+        }
+        if let Some(is_private) = is_private {
+            self.rooms.set_visibility(room, is_private).await?;
+        }
+        Ok(())
+    }
+
+    /// List the public, joinable channels of a workspace. Requires the actor be a
+    /// member of the workspace.
+    #[instrument(skip(self), fields(?actor, ?workspace))]
+    pub async fn list_workspace_channels(
+        &self,
+        actor: ParticipantId,
+        workspace: WorkspaceId,
+    ) -> Result<Vec<Room>> {
+        if !self.workspaces()?.is_member(workspace, actor).await? {
+            return Err(Error::Forbidden(format!(
+                "{actor} is not a member of workspace {workspace}"
+            )));
+        }
+        Ok(self.rooms.list_public_channels(workspace).await?)
     }
 
     /// Snapshot the current member set of a room (for callee fan-out, etc).
@@ -780,6 +909,29 @@ mod tests {
         for ws in [false, true] {
             for room in [false, true] {
                 assert_eq!(can_access_room(ws, room), ws && room, "({ws}, {room})");
+            }
+        }
+    }
+
+    #[test]
+    fn can_join_public_channel_requires_public_and_not_archived() {
+        // Truth table over (is_private, is_archived): joinable only when public
+        // AND not archived.
+        assert!(can_join_public_channel(false, false));
+        assert!(!can_join_public_channel(true, false));
+        assert!(!can_join_public_channel(false, true));
+        assert!(!can_join_public_channel(true, true));
+    }
+
+    #[test]
+    fn can_join_public_channel_is_neither_private_nor_archived() {
+        for private in [false, true] {
+            for archived in [false, true] {
+                assert_eq!(
+                    can_join_public_channel(private, archived),
+                    !private && !archived,
+                    "({private}, {archived})"
+                );
             }
         }
     }

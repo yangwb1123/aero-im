@@ -23,8 +23,8 @@ use std::sync::Arc;
 
 use aero_common::metrics::{self, names};
 use aero_common::{
-    Block, CallEvent, CallId, CallKind, CallMode, MessageId, ParticipantId, ReactionOp, RoomEvent,
-    RoomId, StreamEvent,
+    Block, CallEvent, CallId, CallKind, CallMode, MembershipOp, MessageId, ParticipantId,
+    ReactionOp, RoomEvent, RoomId, StreamEvent,
 };
 use ulid::Ulid;
 use axum::{
@@ -171,6 +171,8 @@ enum ServerFrame<'a> {
         at: time::OffsetDateTime,
     },
     Typing { room_id: RoomId, participant: ParticipantId, on: bool },
+    /// A participant joined/left a channel (fans out to all room members).
+    Membership { room_id: RoomId, participant: ParticipantId, op: MembershipOp },
     Call { event: CallEvent },
     /// Per-stream interactivity event (danmaku/gift/viewers/status).
     StreamEvent { event: StreamEvent },
@@ -834,6 +836,9 @@ fn room_event_to_frame_json(event: &RoomEvent) -> String {
         }
         RoomEvent::Typing { room_id, participant, on } => {
             ServerFrame::Typing { room_id, participant, on }
+        }
+        RoomEvent::Membership { room_id, participant, op } => {
+            ServerFrame::Membership { room_id, participant, op }
         }
         RoomEvent::Call(call) => ServerFrame::Call { event: call },
     };

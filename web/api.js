@@ -199,4 +199,27 @@ export const api = {
   createAgent({ display_name, kind = 'bot', avatar_url } = {}) {
     return request('POST', '/api/agents', { body: { display_name, kind, avatar_url } });
   },
+
+  // ----- channel management (public/private, join/leave, archive, meta) -----
+  listChannels(workspaceId) {
+    return request('GET', `/api/workspaces/${encodeURIComponent(workspaceId)}/channels`);
+  },
+  joinRoom(roomId) {
+    return request('POST', `/api/rooms/${encodeURIComponent(roomId)}/join`);
+  },
+  leaveRoom(roomId) {
+    return request('POST', `/api/rooms/${encodeURIComponent(roomId)}/leave`);
+  },
+  archiveRoom(roomId, archived = true) {
+    return request('POST', `/api/rooms/${encodeURIComponent(roomId)}/archive`, {
+      body: { archived },
+    });
+  },
+  updateChannel(roomId, { topic, description, is_private } = {}) {
+    const body = {};
+    if (topic !== undefined) body.topic = topic;
+    if (description !== undefined) body.description = description;
+    if (is_private !== undefined) body.is_private = is_private;
+    return request('PATCH', `/api/rooms/${encodeURIComponent(roomId)}/channel`, { body });
+  },
 };

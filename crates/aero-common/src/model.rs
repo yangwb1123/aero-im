@@ -215,6 +215,17 @@ pub enum ReactionOp {
     Remove,
 }
 
+// ---------- Channel membership (channels) ----------
+
+/// Whether a `RoomEvent::Membership` records a participant joining or leaving a
+/// channel. Carried on the room-scoped event so members keep their roster in sync.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MembershipOp {
+    Join,
+    Leave,
+}
+
 // ---------- Read receipts (P2) ----------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -476,6 +487,13 @@ pub enum RoomEvent {
         participant: ParticipantId,
         on: bool,
     },
+    /// A participant joined or left a channel. Fans out to the whole room so
+    /// every member's roster stays in sync. `op` carries join-vs-leave.
+    Membership {
+        room_id: RoomId,
+        participant: ParticipantId,
+        op: MembershipOp,
+    },
     /// WebRTC signaling (P3/P6).
     Call(CallEvent),
 }
@@ -506,7 +524,8 @@ impl RoomEvent {
             RoomEvent::Deleted { room_id, .. }
             | RoomEvent::Reaction { room_id, .. }
             | RoomEvent::Read { room_id, .. }
-            | RoomEvent::Typing { room_id, .. } => Some(*room_id),
+            | RoomEvent::Typing { room_id, .. }
+            | RoomEvent::Membership { room_id, .. } => Some(*room_id),
             RoomEvent::Call(
                 CallEvent::Invite { room_id, .. }
                 | CallEvent::End { room_id, .. }
@@ -620,6 +639,31 @@ mod tests {
         assert!(j.contains("\"op\":\"join\""));
         let back: RoomEvent = serde_json::from_str(&j).unwrap();
         assert_eq!(back.room_id(), Some(room));
+    }
+
+    #[test]
+    fn membership_event_tagged_and_fans_to_room() {
+        let room = RoomId::new();
+        let who = ParticipantId::new();
+        let ev = RoomEvent::Membership { room_id: room, participant: who, op: MembershipOp::Join };
+        // No explicit recipient list ⇒ fans out to the whole room.
+        assert!(ev.explicit_recipients().is_empty());
+        assert_eq!(ev.room_id(), Some(room));
+
+        let j = serde_json::to_string(&ev).unwrap();
+        assert!(j.contains("\"kind\":\"membership\""));
+        assert!(j.contains("\"op\":\"join\""));
+        let back: RoomEvent = serde_json::from_str(&j).unwrap();
+        assert_eq!(back.room_id(), Some(room));
+        assert!(matches!(
+            back,
+            RoomEvent::Membership { op: MembershipOp::Join, .. }
+        ));
+
+        // Leave round-trips too.
+        let leave = RoomEvent::Membership { room_id: room, participant: who, op: MembershipOp::Leave };
+        let j = serde_json::to_string(&leave).unwrap();
+        assert!(j.contains("\"op\":\"leave\""));
     }
 
     #[test]
