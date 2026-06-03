@@ -12,6 +12,7 @@ pub mod live;
 pub mod metrics;
 pub mod rate_limit;
 pub mod routes;
+pub mod scim;
 pub mod sso;
 pub mod state;
 pub mod webhooks;

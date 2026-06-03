@@ -87,7 +87,10 @@ pub fn build(state: AppState) -> Router {
         // Webhooks (incoming inbound-message hooks + outgoing event delivery).
         .merge(crate::webhooks::routes())
         // SSO via OIDC: ID-token login + JIT provisioning (POST /api/auth/oidc).
-        .merge(crate::sso::routes());
+        .merge(crate::sso::routes())
+        // SCIM 2.0 provisioning (RFC 7643/7644). Bearer-token (not JWT) auth on
+        // /scim/v2/*; AuthUser-gated token mint/revoke. See `crate::scim`.
+        .merge(crate::scim::routes());
 
     // Prometheus scrape endpoint (ROADMAP 方向四). Mounted unless disabled; the
     // handler self-gates on an optional bearer token. Left here (not behind the

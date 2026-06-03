@@ -121,6 +121,10 @@ define_id!(
     /// event-delivery hook).
     WebhookId
 );
+define_id!(
+    /// Identifies a SCIM 2.0 provisioning bearer token (per-workspace, RFC 7644).
+    ScimTokenId
+);
 
 #[cfg(test)]
 mod tests {
