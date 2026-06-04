@@ -123,7 +123,11 @@ pub fn build(state: AppState) -> Router {
         .merge(crate::forward::routes())
         // Built-in slash-commands (/me, /shrug, /giphy, /remind): parse `/cmd args`
         // typed in a room and apply the effect off the hot send path.
-        .merge(crate::commands::routes());
+        .merge(crate::commands::routes())
+        // Server-persisted per-room composer drafts (private to the author, one
+        // per (participant, room), upsert-replaces). Follows the user across
+        // devices/reloads like Slack drafts.
+        .merge(crate::drafts::routes());
 
     // Prometheus scrape endpoint (ROADMAP 方向四). Mounted unless disabled; the
     // handler self-gates on an optional bearer token. Left here (not behind the

@@ -11,6 +11,7 @@ pub mod bookmark;
 pub mod cache;
 pub mod call;
 pub mod db;
+pub mod draft;
 pub mod emoji;
 pub mod invitation;
 pub mod live;
@@ -47,6 +48,7 @@ pub use bookmark::{BookmarkRepo, SavedMessage};
 pub use cache::{Cache, RedisCache};
 pub use call::CallRepo;
 pub use db::{connect_pg, migrate, PgPool};
+pub use draft::{Draft, DraftRepo};
 pub use emoji::{is_valid_emoji_name, CustomEmoji, EmojiRepo};
 // `generate_token`/`hash_token` are NOT re-exported at the crate root (the webhook
 // module exports same-named helpers); invitation consumers use the
