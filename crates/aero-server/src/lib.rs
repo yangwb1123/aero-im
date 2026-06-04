@@ -8,6 +8,7 @@ pub mod ai_adapter;
 pub mod bookmarks;
 pub mod collab;
 pub mod config;
+pub mod drafts;
 pub mod emoji;
 pub mod error;
 pub mod hub;
