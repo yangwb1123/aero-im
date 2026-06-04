@@ -20,21 +20,24 @@
 //! resolve the room + caller display name, call the pure function, and apply the
 //! outcome.
 //!
-//! ## `/remind` is a stub (no scheduler in this base)
+//! ## `/remind` is wired to the durable scheduler
 //!
-//! This branch predates the `scheduled` ("Send later") module, so there is no
-//! durable scheduler to hand a reminder to. Rather than silently drop it,
-//! `/remind <when> <text>` is a **documented no-op stub**: it parses (so the
-//! grammar is real and tested) and the handler immediately posts a "reminder
-//! noted" confirmation card back into the room — the same `Block::Card` seam the
-//! real feature would use, so wiring a `ScheduledRepo` later is a drop-in
-//! replacement for the [`CommandOutcome::Remind`] arm of [`run_command`] with no
-//! change to the pure layer.
+//! `/remind <when> <text>` parses the relative time ([`parse_reminder_delay`] —
+//! `10m`, `2h`, `30s`, `1d`, with an optional leading `in`), computes an absolute
+//! delivery instant, and persists a self-authored reminder note into the room via
+//! [`ScheduledRepo`](aero_storage::ScheduledRepo). The existing
+//! [`run_scheduled_dispatcher`](crate::scheduled::run_scheduled_dispatcher) then
+//! delivers it at the due time through the same [`ImService::send_message`] path
+//! every message takes — so the reminder lands as a normal room message. The pure
+//! layer is unchanged: [`render_command`] still yields a [`CommandOutcome::Remind`]
+//! `{ when_raw, text }`; only the async handler arm resolves it against the clock
+//! and hands it to the scheduler.
 
 use std::str::FromStr;
 
 use aero_auth::AuthUser;
 use aero_common::{Block, Error as AeroError, ParticipantId, RoomId};
+use aero_storage::ScheduledRepo;
 use axum::{
     extract::{Path, State},
     routing::{get, post},
@@ -68,10 +71,10 @@ pub fn routes() -> Router<AppState> {
 pub enum CommandOutcome {
     /// Post these blocks to the room as a normal message (the common case).
     Post(Vec<Block>),
-    /// A reminder request: deliver `text` at the time named by `when_raw`. In this
-    /// base there is no scheduler, so the handler turns it into a confirmation card
-    /// (see the module docs); the variant is kept so a real scheduler is a pure
-    /// drop-in later.
+    /// A reminder request: deliver `text` at the relative time named by `when_raw`
+    /// (e.g. `10m`). The async handler resolves `when_raw` against the clock via
+    /// [`parse_reminder_delay`] and persists it through
+    /// [`ScheduledRepo`](aero_storage::ScheduledRepo) for later delivery.
     Remind { when_raw: String, text: String },
     /// Reply only to the caller, without posting to the room.
     Ephemeral(String),
@@ -168,6 +171,53 @@ fn split_remind(rest: &str) -> (String, String) {
     (when.to_string(), text.to_string())
 }
 
+/// Upper bound on a reminder delay: one year. A request further out is rejected so
+/// a fat-fingered unit can't stage a near-permanent row.
+const MAX_REMINDER_SECS: u64 = 365 * 86_400;
+
+/// Parse a `/remind` relative time phrase into a concrete [`Duration`].
+///
+/// Accepts `<positive-integer><unit>` (an optional leading `in` and surrounding
+/// whitespace are tolerated, case-insensitively): e.g. `10m`, `2h`, `30s`, `1d`,
+/// `in 90m`, `2 hours`. Units: `s`/`sec`/`second(s)`, `m`/`min`/`minute(s)`,
+/// `h`/`hr`/`hour(s)`, `d`/`day(s)`. Returns `None` for anything it can't read as a
+/// strictly-positive delay within [`MAX_REMINDER_SECS`] — including a bare number
+/// (no unit), zero, an unknown unit, or overflow. Pure, so it unit-tests without a
+/// clock or database.
+///
+/// [`Duration`]: std::time::Duration
+#[must_use]
+pub fn parse_reminder_delay(when_raw: &str) -> Option<std::time::Duration> {
+    let lower = when_raw.trim().to_ascii_lowercase();
+    // An optional leading `in ` ("in 2h") is folded away before parsing.
+    let body = lower.strip_prefix("in ").map_or(lower.as_str(), str::trim);
+    if body.is_empty() {
+        return None;
+    }
+    // Split the leading digit run from the trailing unit. `find` returning `None`
+    // means the whole thing is digits — i.e. no unit — which we reject.
+    let split = body.find(|c: char| !c.is_ascii_digit())?;
+    if split == 0 {
+        return None; // no leading number (e.g. "soon")
+    }
+    let (num_str, unit) = body.split_at(split);
+    let n: u64 = num_str.parse().ok()?;
+    if n == 0 {
+        return None;
+    }
+    let secs = match unit.trim() {
+        "s" | "sec" | "secs" | "second" | "seconds" => n,
+        "m" | "min" | "mins" | "minute" | "minutes" => n.checked_mul(60)?,
+        "h" | "hr" | "hrs" | "hour" | "hours" => n.checked_mul(3_600)?,
+        "d" | "day" | "days" => n.checked_mul(86_400)?,
+        _ => return None,
+    };
+    if secs > MAX_REMINDER_SECS {
+        return None;
+    }
+    Some(std::time::Duration::from_secs(secs))
+}
+
 /// Built-in command names + a one-line help string each. Single source of truth
 /// for both the `/api/commands` autocomplete payload and the names list. Pure.
 #[must_use]
@@ -176,7 +226,7 @@ pub fn builtin_help() -> Vec<(&'static str, &'static str)> {
         ("me", "/me <action> — post an emote/action line (\"* you wave\")"),
         ("shrug", "/shrug [text] — append ¯\\_(ツ)_/¯ to your message"),
         ("giphy", "/giphy <query> — drop a GIF card for <query>"),
-        ("remind", "/remind <when> <text> — note a reminder (e.g. 10m, 2h, in 30s)"),
+        ("remind", "/remind <when> <text> — schedule a reminder (e.g. 10m, 2h, in 30s)"),
     ]
 }
 
@@ -227,8 +277,9 @@ struct RunCommandReq {
 ///   path normal messages take); the persisted message is returned.
 /// * [`CommandOutcome::Ephemeral`] → returned as `{ "ephemeral": msg }`, not posted.
 /// * [`CommandOutcome::Error`] → `400 Invalid`.
-/// * [`CommandOutcome::Remind`] → posts a "reminder noted" confirmation card to the
-///   room (this base has no scheduler — see the module docs) and returns it.
+/// * [`CommandOutcome::Remind`] → schedules a self-authored reminder note for later
+///   delivery via [`ScheduledRepo`](aero_storage::ScheduledRepo); returns the new
+///   reminder id and the resolved delivery time. A time it can't parse is a `400`.
 ///
 /// [`ImService::send_message`]: aero_im_core::ImService::send_message
 async fn run_command(
@@ -252,20 +303,30 @@ async fn run_command(
         CommandOutcome::Ephemeral(msg) => Ok(Json(serde_json::json!({ "ephemeral": msg }))),
         CommandOutcome::Error(e) => Err(AeroError::Invalid(e).into()),
         CommandOutcome::Remind { when_raw, text } => {
-            // No durable scheduler in this base: acknowledge with a confirmation
-            // card so the request isn't silently dropped. A future `ScheduledRepo`
-            // wiring replaces just this arm (the pure layer is unchanged).
-            let card = Block::Card {
-                schema: "reminder".into(),
-                payload: serde_json::json!({
-                    "status": "noted",
-                    "when": when_raw,
-                    "text": text,
-                    "note": "reminders are not yet scheduled on this server",
-                }),
-            };
-            let msg = s.im.send_message(auth.participant_id, room, vec![card], None).await?;
-            Ok(Json(serde_json::to_value(msg).map_err(AeroError::from)?))
+            // Resolve the relative time against the clock, then stage a self-authored
+            // reminder note in the room via the durable scheduler. The background
+            // `run_scheduled_dispatcher` replays it through `send_message` at the due
+            // time, so the reminder arrives as an ordinary room message.
+            let delay = parse_reminder_delay(&when_raw).ok_or_else(|| {
+                AeroError::Invalid(format!(
+                    "couldn't read the time '{when_raw}'; try 10m, 2h, 30s, 1d \
+                     (e.g. /remind 10m stand up)"
+                ))
+            })?;
+            let deliver_at = time::OffsetDateTime::now_utc()
+                + time::Duration::seconds(i64::try_from(delay.as_secs()).unwrap_or(i64::MAX));
+            let blocks = vec![Block::text(format!("⏰ Reminder: {text}"))];
+            let id = ScheduledRepo::new(s.pg.clone())
+                .create(room, auth.participant_id, &blocks, None, deliver_at)
+                .await?;
+            Ok(Json(serde_json::json!({
+                "scheduled": true,
+                "reminder_id": id,
+                "deliver_at": deliver_at
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_default(),
+                "text": text,
+            })))
         }
     }
 }
@@ -419,6 +480,49 @@ mod tests {
         assert!(matches!(render_command("remind", "", "Dee"), CommandOutcome::Error(_)));
         // Only a "when", no note.
         assert!(matches!(render_command("remind", "10m", "Dee"), CommandOutcome::Error(_)));
+    }
+
+    // ---- parse_reminder_delay ----
+
+    fn secs(when: &str) -> Option<u64> {
+        parse_reminder_delay(when).map(|d| d.as_secs())
+    }
+
+    #[test]
+    fn reminder_delay_parses_each_unit() {
+        assert_eq!(secs("30s"), Some(30));
+        assert_eq!(secs("10m"), Some(600));
+        assert_eq!(secs("2h"), Some(7_200));
+        assert_eq!(secs("1d"), Some(86_400));
+    }
+
+    #[test]
+    fn reminder_delay_tolerates_in_prefix_case_and_spacing() {
+        assert_eq!(secs("in 2h"), Some(7_200));
+        assert_eq!(secs("IN 90m"), Some(5_400));
+        assert_eq!(secs("  45M  "), Some(2_700));
+        // Long-form units and an internal space.
+        assert_eq!(secs("2 hours"), Some(7_200));
+        assert_eq!(secs("15 minutes"), Some(900));
+    }
+
+    #[test]
+    fn reminder_delay_rejects_garbage_zero_and_bare_numbers() {
+        assert_eq!(secs(""), None);
+        assert_eq!(secs("soon"), None);
+        assert_eq!(secs("10"), None); // no unit
+        assert_eq!(secs("0m"), None); // zero is not a delay
+        assert_eq!(secs("5y"), None); // unknown unit
+        assert_eq!(secs("m10"), None); // unit before number
+    }
+
+    #[test]
+    fn reminder_delay_caps_at_one_year() {
+        // 365d is allowed; 366d is over the ceiling.
+        assert_eq!(secs("365d"), Some(MAX_REMINDER_SECS));
+        assert_eq!(secs("366d"), None);
+        // Multiplication overflow is rejected (None), not a panic.
+        assert_eq!(secs("99999999999999999999d"), None);
     }
 
     // ---- render_command: unknown ----
