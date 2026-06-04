@@ -136,7 +136,10 @@ pub fn build(state: AppState) -> Router {
         // Single-channel guest accounts (To-B external collaborators). Admin-only
         // guest enrollment / listing / removal; defined alongside its RBAC guard
         // in `crate::guests`.
-        .merge(crate::guests::routes());
+        .merge(crate::guests::routes())
+        // AI-native on-demand message translation (reuses the caption-translation
+        // backend seam; echoes the source when no LLM key is configured).
+        .merge(crate::translate::routes());
 
     // Prometheus scrape endpoint (ROADMAP 方向四). Mounted unless disabled; the
     // handler self-gates on an optional bearer token. Left here (not behind the

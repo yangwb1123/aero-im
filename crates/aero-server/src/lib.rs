@@ -36,5 +36,6 @@ pub mod forward;
 pub mod scheduled;
 pub mod scheduled_streams;
 pub mod search;
+pub mod translate;
 
 pub use state::AppState;

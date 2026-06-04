@@ -213,8 +213,26 @@ def main():
     req("POST", f"/api/rooms/{Rr}/command", {"text": "/remind soon do the thing"}, token=A, expect=400)
     ok("unparseable reminder time rejected (400)")
 
+    # ---------------- AI message translation ----------------
+    say("translate: any message's text → target language (echoes source w/o an LLM key)")
+    # Post a message via the slash-command path (returns the persisted message).
+    posted = req("POST", f"/api/rooms/{Rr}/command", {"text": "/me hello world from alice"}, token=A)
+    Mid = posted.get("id")
+    if not Mid:
+        fail(f"no message id from /me post: {posted}")
+    tr = req("POST", f"/api/messages/{Mid}/translate", {"target_lang": "es"}, token=A)
+    if "hello world from alice" not in (tr.get("original") or ""):
+        fail(f"translate did not return original text: {tr}")
+    if not (tr.get("translated") or "").strip():
+        fail(f"translate returned empty translation: {tr}")
+    ok(f"message translated (target={tr.get('target_lang')}, translated len={len(tr.get('translated',''))})")
+    # Empty target rejected; a stranger (no room access) is forbidden.
+    req("POST", f"/api/messages/{Mid}/translate", {"target_lang": "  "}, token=A, expect=400)
+    req("POST", f"/api/messages/{Mid}/translate", {"target_lang": "es"}, token=C, expect=403)
+    ok("empty target rejected (400); non-member translate forbidden (403)")
+
     print("\n\033[1;32m✅ Wave-8 smoke PASSED "
-          "(post-policy, guests, scheduled-streams, drafts, /remind)\033[0m")
+          "(post-policy, guests, scheduled-streams, drafts, /remind, translate)\033[0m")
 
 
 if __name__ == "__main__":
