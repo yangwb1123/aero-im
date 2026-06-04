@@ -462,6 +462,15 @@ impl ImService {
     }
 
     /// Add a member to a room. `actor` must themselves be a member.
+    ///
+    /// Guest enforcement (single-channel guests): a participant flagged as a guest
+    /// in the room's workspace may NOT be added to (or self-join) an arbitrary
+    /// public channel through this path — guests are confined to the specific
+    /// channel(s) they were explicitly invited to, which the admin guest endpoint
+    /// wires up directly. Adding a guest here is denied with [`Error::Forbidden`].
+    /// This guard *fails open* when no [`WorkspaceRepo`] is wired
+    /// ([`with_workspaces`](Self::with_workspaces) absent) so non-tenant tests and
+    /// single-tenant deployments are unaffected.
     #[instrument(skip(self), fields(?actor, ?room, ?member))]
     pub async fn add_member(
         &self,
@@ -473,6 +482,19 @@ impl ImService {
             return Err(Error::Forbidden(format!(
                 "actor {actor} is not a member of room {room}"
             )));
+        }
+        // Deny adding a guest into an arbitrary channel. Resolve the room's
+        // workspace and check the guest flag there; if tenancy is not wired
+        // (`workspaces` is None) we skip the check entirely (fail open).
+        if let Some(workspaces) = self.workspaces.as_ref() {
+            if let Some(workspace) = self.rooms.room_workspace(room).await? {
+                if workspaces.is_guest(workspace, member).await? {
+                    return Err(Error::Forbidden(format!(
+                        "guest {member} may not be added to channel {room}; \
+                         guests are confined to their invited channel(s)"
+                    )));
+                }
+            }
         }
         self.rooms.add_member(room, member).await?;
         let event = ImEvent::MemberAdded { room, participant: member };
@@ -510,6 +532,17 @@ impl ImService {
         if !self.workspaces()?.is_member(workspace, actor).await? {
             return Err(Error::Forbidden(format!(
                 "{actor} is not a member of workspace {workspace}"
+            )));
+        }
+        // Single-channel guests may NOT self-join open channels: they are confined
+        // to the channel(s) an admin explicitly placed them in (the guest admin
+        // endpoint), mirroring the guard in [`add_member`]. `join_channel` only
+        // runs when a `WorkspaceRepo` is wired (the membership check above already
+        // required it), so there is no fail-open branch to add here.
+        if self.workspaces()?.is_guest(workspace, actor).await? {
+            return Err(Error::Forbidden(format!(
+                "guest {actor} may not self-join channel {room}; \
+                 guests are confined to their invited channel(s)"
             )));
         }
         let is_private = self

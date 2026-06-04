@@ -270,6 +270,93 @@ impl WorkspaceRepo {
         Ok(row.0 > 0)
     }
 
+    // ------------------------------------------------ single-channel guests (0027)
+
+    /// Enroll (or promote) `participant` as a **guest** member of `workspace`.
+    ///
+    /// A guest is an external collaborator who belongs to the workspace but may
+    /// only be in the specific channel(s) they were explicitly invited to; the
+    /// channel-join path denies a guest self-joining any other (public) channel.
+    /// Idempotent upsert:
+    /// - **insert**: a fresh row at `role = 'member'` with `is_guest = true`;
+    /// - **conflict** (already a member): set `is_guest = true`, leaving the
+    ///   existing `role` untouched (so a member is flagged as a guest without an
+    ///   accidental role change, and a re-invite is a harmless no-op delta).
+    ///
+    /// The `role` stays `member` (not the `'guest'` role token) deliberately: the
+    /// guest constraint is the boolean flag the join guard reads, decoupled from
+    /// the RBAC role ladder.
+    pub async fn add_guest_member(
+        &self,
+        workspace: WorkspaceId,
+        participant: ParticipantId,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r"INSERT INTO workspace_members (workspace_id, participant_id, role, is_guest, joined_at)
+               VALUES ($1, $2, $3, true, NOW())
+               ON CONFLICT (workspace_id, participant_id)
+               DO UPDATE SET is_guest = true",
+        )
+        .bind(workspace.to_uuid())
+        .bind(participant.to_uuid())
+        .bind(WorkspaceRole::Member.as_str())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Whether `participant` is a **guest** member of `workspace` (i.e. a member
+    /// row exists with `is_guest = true`). Non-members and ordinary members both
+    /// return `false`. This is the predicate the channel-join guard consults to
+    /// deny a guest self-joining a public channel.
+    pub async fn is_guest(
+        &self,
+        workspace: WorkspaceId,
+        participant: ParticipantId,
+    ) -> Result<bool, sqlx::Error> {
+        let row = sqlx::query_as::<_, (bool,)>(
+            r"SELECT COALESCE(BOOL_OR(is_guest), false)
+               FROM workspace_members
+               WHERE workspace_id = $1 AND participant_id = $2",
+        )
+        .bind(workspace.to_uuid())
+        .bind(participant.to_uuid())
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.0)
+    }
+
+    /// List the workspace's guest members (`is_guest = true`), oldest joiners
+    /// first — the same ordering as [`list_members`](Self::list_members), so the
+    /// admin guest-list view is stable. The reported `role` is whatever the row
+    /// actually holds (normally `Member`), since "guest" is a flag, not the role.
+    pub async fn list_guests(
+        &self,
+        workspace: WorkspaceId,
+    ) -> Result<Vec<WorkspaceMember>, sqlx::Error> {
+        let rows = sqlx::query_as::<_, (uuid::Uuid, uuid::Uuid, String, time::OffsetDateTime)>(
+            r"SELECT workspace_id, participant_id, role, joined_at
+               FROM workspace_members
+               WHERE workspace_id = $1 AND is_guest = true
+               ORDER BY joined_at ASC, participant_id ASC",
+        )
+        .bind(workspace.to_uuid())
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(ws, pid, role, joined_at)| WorkspaceMember {
+                workspace_id: WorkspaceId::from_uuid(ws),
+                participant_id: ParticipantId::from_uuid(pid),
+                // Default unknown tokens to the least-privileged role rather than
+                // dropping the row, mirroring `list_members`.
+                role: WorkspaceRole::from_db_str(&role).unwrap_or(WorkspaceRole::Guest),
+                joined_at,
+            })
+            .collect())
+    }
+
     /// Fetch a single workspace row, or `None` if it does not exist. Used by the
     /// export path to resolve the tenant before gathering its data.
     pub async fn get(&self, workspace: WorkspaceId) -> Result<Option<Workspace>, sqlx::Error> {
@@ -1167,5 +1254,93 @@ mod db_tests {
         let old = insert_message_at(&p, room, owner, now - time::Duration::days(365)).await;
         assert_eq!(repo.sweep_expired_messages(now, Some(ws)).await.unwrap(), 0, "cleared policy = no sweep");
         assert!(message_state(&p, old).await.0.is_none(), "message kept after policy cleared");
+    }
+
+    // ----- single-channel guests (0027) -----
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn add_guest_member_flags_and_is_guest_detects() {
+        let p = pool();
+        let repo = WorkspaceRepo::new(p.clone());
+        let owner = new_participant(&p).await;
+        let (ws, _room, _msg) = seed_workspace(&repo, &p, owner).await;
+        let guest = new_participant(&p).await;
+
+        // Brand-new participant, not yet a member: neither member nor guest.
+        assert!(!repo.is_member(ws, guest).await.unwrap(), "not a member yet");
+        assert!(!repo.is_guest(ws, guest).await.unwrap(), "not a guest yet");
+
+        repo.add_guest_member(ws, guest).await.unwrap();
+        // Now a member, flagged as a guest, with role stored as `member`.
+        assert!(repo.is_member(ws, guest).await.unwrap(), "guest is a member");
+        assert!(repo.is_guest(ws, guest).await.unwrap(), "guest flag set");
+        assert_eq!(
+            repo.member_role(ws, guest).await.unwrap(),
+            Some(WorkspaceRole::Member),
+            "guest role stays member; guest-ness is a flag"
+        );
+
+        // The owner is an ordinary member, never a guest.
+        assert!(!repo.is_guest(ws, owner).await.unwrap(), "owner is not a guest");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn add_guest_member_is_idempotent_and_promotes_existing_member() {
+        let p = pool();
+        let repo = WorkspaceRepo::new(p.clone());
+        let owner = new_participant(&p).await;
+        let (ws, _room, _msg) = seed_workspace(&repo, &p, owner).await;
+        let member = new_participant(&p).await;
+
+        // Enroll as an ordinary member first, then promote to guest.
+        repo.add_member(ws, member, WorkspaceRole::Member).await.unwrap();
+        assert!(!repo.is_guest(ws, member).await.unwrap(), "plain member is not a guest");
+
+        repo.add_guest_member(ws, member).await.unwrap();
+        assert!(repo.is_guest(ws, member).await.unwrap(), "member promoted to guest");
+        // The role is untouched by the conflict-update branch.
+        assert_eq!(
+            repo.member_role(ws, member).await.unwrap(),
+            Some(WorkspaceRole::Member),
+            "promotion leaves role unchanged"
+        );
+
+        // Re-inviting an existing guest is a harmless no-op.
+        repo.add_guest_member(ws, member).await.unwrap();
+        assert!(repo.is_guest(ws, member).await.unwrap(), "re-invite keeps guest flag");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn list_guests_returns_only_guests_and_remove_clears_them() {
+        let p = pool();
+        let repo = WorkspaceRepo::new(p.clone());
+        let owner = new_participant(&p).await;
+        let (ws, _room, _msg) = seed_workspace(&repo, &p, owner).await;
+        let plain = new_participant(&p).await;
+        let guest_a = new_participant(&p).await;
+        let guest_b = new_participant(&p).await;
+
+        repo.add_member(ws, plain, WorkspaceRole::Member).await.unwrap();
+        repo.add_guest_member(ws, guest_a).await.unwrap();
+        repo.add_guest_member(ws, guest_b).await.unwrap();
+
+        let guests = repo.list_guests(ws).await.unwrap();
+        let ids: Vec<_> = guests.iter().map(|m| m.participant_id).collect();
+        assert!(ids.contains(&guest_a), "guest_a listed");
+        assert!(ids.contains(&guest_b), "guest_b listed");
+        assert!(!ids.contains(&owner), "owner (member) not listed");
+        assert!(!ids.contains(&plain), "plain member not listed");
+        assert_eq!(guests.len(), 2, "exactly the two guests");
+
+        // Removing a guest removes their membership entirely.
+        repo.remove_member(ws, guest_a).await.unwrap();
+        assert!(!repo.is_member(ws, guest_a).await.unwrap(), "removed guest is no longer a member");
+        assert!(!repo.is_guest(ws, guest_a).await.unwrap(), "removed guest is no longer a guest");
+        let after = repo.list_guests(ws).await.unwrap();
+        assert_eq!(after.len(), 1, "one guest left");
+        assert_eq!(after[0].participant_id, guest_b, "guest_b remains");
     }
 }

@@ -132,7 +132,11 @@ pub fn build(state: AppState) -> Router {
         // upcoming live stream (title/time/optional room); members list upcoming,
         // the creator cancels. Announcement record only — going live still uses
         // the existing `/api/streams` ingest path.
-        .merge(crate::scheduled_streams::routes());
+        .merge(crate::scheduled_streams::routes())
+        // Single-channel guest accounts (To-B external collaborators). Admin-only
+        // guest enrollment / listing / removal; defined alongside its RBAC guard
+        // in `crate::guests`.
+        .merge(crate::guests::routes());
 
     // Prometheus scrape endpoint (ROADMAP 方向四). Mounted unless disabled; the
     // handler self-gates on an optional bearer token. Left here (not behind the

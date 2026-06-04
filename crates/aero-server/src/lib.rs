@@ -11,6 +11,7 @@ pub mod config;
 pub mod drafts;
 pub mod emoji;
 pub mod error;
+pub mod guests;
 pub mod hub;
 pub mod invitations;
 pub mod live;
