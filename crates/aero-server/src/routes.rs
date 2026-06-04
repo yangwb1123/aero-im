@@ -145,7 +145,11 @@ pub fn build(state: AppState) -> Router {
         .merge(crate::translate::routes())
         // "Remind me about this message" (Slack-style): set a relative-time reminder
         // anchored to a specific message; reuses the durable scheduler — no new table.
-        .merge(crate::message_reminders::routes());
+        .merge(crate::message_reminders::routes())
+        // Per-user channel sidebar sections (Slack/Teams "sections"): a user groups
+        // their channels into named, ordered, PRIVATE folders scoped to a workspace.
+        // Pure organizational metadata over existing rooms.
+        .merge(crate::channel_sections::routes());
 
     // Prometheus scrape endpoint (ROADMAP 方向四). Mounted unless disabled; the
     // handler self-gates on an optional bearer token. Left here (not behind the

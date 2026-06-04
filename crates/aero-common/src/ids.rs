@@ -162,6 +162,12 @@ define_id!(
     /// query the owner can list, re-run, or delete.
     SavedSearchId
 );
+define_id!(
+    /// Identifies a per-user channel-sidebar section — a named, ordered folder a
+    /// participant groups their channels under, private to that user and scoped to
+    /// one workspace.
+    ChannelSectionId
+);
 
 #[cfg(test)]
 mod tests {
