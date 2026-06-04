@@ -19,7 +19,7 @@ mod validation;
 pub use events::ImEvent;
 pub use moderator::{AllowAllModerator, KeywordModerator, Moderator, ModerationVerdict};
 pub use service::{
-    can_access_room, can_create_channel, can_join_public_channel, BusSink, ImService,
+    can_access_room, can_create_channel, can_join_public_channel, post_allowed, BusSink, ImService,
 };
 pub use validation::{
     validate_blocks, ValidationError, MAX_BLOCKS, MAX_CODE_BYTES, MAX_TEXT_BYTES,

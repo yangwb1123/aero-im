@@ -304,6 +304,47 @@ impl RoomRepo {
         Ok(row.map(|(a,)| a))
     }
 
+    // ----------------------------------------------- post policy (migration 0030)
+
+    /// The participant who created a room, or `None` if the room does not exist.
+    /// Used by the post-policy guard to recognize the room creator (who may
+    /// always post in an `admins`-only channel).
+    pub async fn created_by(&self, room: RoomId) -> Result<Option<ParticipantId>, sqlx::Error> {
+        let row = sqlx::query_as::<_, (uuid::Uuid,)>(r"SELECT created_by FROM rooms WHERE id = $1")
+            .bind(room.to_uuid())
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|(by,)| ParticipantId::from_uuid(by)))
+    }
+
+    /// Set a room's post policy (migration 0030). Valid values are `everyone`
+    /// (any room member may post — the default, unchanged behavior) and `admins`
+    /// (only the room creator or a workspace Admin/Owner may post; everyone else
+    /// can read but not post). Validating the policy string is the caller's
+    /// responsibility — an unrecognized value is treated as `everyone` at the
+    /// enforcement site, never as a lockout.
+    pub async fn set_post_policy(&self, room: RoomId, policy: &str) -> Result<(), sqlx::Error> {
+        sqlx::query(r"UPDATE rooms SET post_policy = $2 WHERE id = $1")
+            .bind(room.to_uuid())
+            .bind(policy)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// A room's post policy. The `post_policy` column is `NOT NULL DEFAULT
+    /// 'everyone'` (migration 0030), so a plain SELECT always yields a value for
+    /// an existing row. A missing row (or, defensively, a NULL) falls back to
+    /// `everyone` — the open default — so a glitch never silently locks posting.
+    pub async fn post_policy(&self, room: RoomId) -> Result<String, sqlx::Error> {
+        let row =
+            sqlx::query_as::<_, (Option<String>,)>(r"SELECT post_policy FROM rooms WHERE id = $1")
+                .bind(room.to_uuid())
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.and_then(|(p,)| p).unwrap_or_else(|| "everyone".to_owned()))
+    }
+
     /// Public, non-archived channels in a workspace — the discovery listing a
     /// workspace member browses to find joinable channels. Newest first. Uses the
     /// partial index `rooms_public_channels_idx` (migration 0012).
@@ -512,5 +553,29 @@ mod db_tests {
         assert!(!repo.is_member(room, joiner).await.unwrap());
         repo.remove_member(room, joiner).await.unwrap();
         assert!(!repo.is_member(room, joiner).await.unwrap());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn post_policy_roundtrip_defaults_to_everyone() {
+        let p = pool();
+        let repo = RoomRepo::new(p.clone());
+        let (ws, actor) = fixture(&p).await;
+        let room = insert_channel(&p, ws, actor, false).await;
+
+        // A fresh row carries the NOT NULL DEFAULT 'everyone' (migration 0030).
+        assert_eq!(repo.post_policy(room).await.unwrap(), "everyone");
+        // The creator is recoverable for the post-policy guard.
+        assert_eq!(repo.created_by(room).await.unwrap(), Some(actor));
+
+        repo.set_post_policy(room, "admins").await.unwrap();
+        assert_eq!(repo.post_policy(room).await.unwrap(), "admins");
+
+        repo.set_post_policy(room, "everyone").await.unwrap();
+        assert_eq!(repo.post_policy(room).await.unwrap(), "everyone");
+
+        // Unknown room ⇒ open default, never an error (fail-open on read).
+        assert_eq!(repo.post_policy(RoomId::new()).await.unwrap(), "everyone");
+        assert_eq!(repo.created_by(RoomId::new()).await.unwrap(), None);
     }
 }

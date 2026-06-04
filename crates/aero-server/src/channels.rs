@@ -28,6 +28,10 @@ pub fn routes() -> Router<AppState> {
         .route("/api/rooms/:id/leave", post(leave_channel))
         .route("/api/rooms/:id/archive", post(archive_channel))
         .route("/api/rooms/:id/channel", axum::routing::patch(update_channel))
+        .route(
+            "/api/rooms/:id/post-policy",
+            get(get_post_policy).put(set_post_policy),
+        )
 }
 
 fn parse_room(s: &str) -> Result<RoomId, AeroError> {
@@ -137,4 +141,39 @@ async fn update_channel(
         .set_channel_meta(auth.participant_id, room, topic, description, req.is_private)
         .await?;
     Ok(Json(serde_json::json!({ "updated": true })))
+}
+
+#[derive(Deserialize)]
+struct PostPolicyReq {
+    /// `"everyone"` (default — any member may post) or `"admins"` (announcements
+    /// only: room creator or workspace Admin/Owner). Validated in the service.
+    policy: String,
+}
+
+/// `PUT /api/rooms/:id/post-policy` — set a room's post policy (announcement
+/// channels). Body `{ "policy": "everyone" | "admins" }`. The caller must be the
+/// room creator OR a workspace Admin/Owner; an invalid policy string is a 400.
+async fn set_post_policy(
+    State(s): State<AppState>,
+    auth: AuthUser,
+    Path(room_str): Path<String>,
+    Json(req): Json<PostPolicyReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let room = parse_room(&room_str)?;
+    s.im
+        .set_room_post_policy(auth.participant_id, room, &req.policy)
+        .await?;
+    Ok(Json(serde_json::json!({ "policy": req.policy })))
+}
+
+/// `GET /api/rooms/:id/post-policy` — read a room's post policy. Caller must be
+/// able to access the room.
+async fn get_post_policy(
+    State(s): State<AppState>,
+    auth: AuthUser,
+    Path(room_str): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let room = parse_room(&room_str)?;
+    let policy = s.im.room_post_policy(auth.participant_id, room).await?;
+    Ok(Json(serde_json::json!({ "policy": policy })))
 }
