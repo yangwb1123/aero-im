@@ -6,6 +6,7 @@ pub mod transcribe_bot;
 pub mod ai_adapter;
 pub mod config;
 pub mod error;
+pub mod guests;
 pub mod hub;
 pub mod live;
 pub mod metrics;
