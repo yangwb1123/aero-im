@@ -123,7 +123,12 @@ pub fn build(state: AppState) -> Router {
         .merge(crate::forward::routes())
         // Built-in slash-commands (/me, /shrug, /giphy, /remind): parse `/cmd args`
         // typed in a room and apply the effect off the hot send path.
-        .merge(crate::commands::routes());
+        .merge(crate::commands::routes())
+        // Scheduled streams (live-event announcements): a member announces an
+        // upcoming live stream (title/time/optional room); members list upcoming,
+        // the creator cancels. Announcement record only — going live still uses
+        // the existing `/api/streams` ingest path.
+        .merge(crate::scheduled_streams::routes());
 
     // Prometheus scrape endpoint (ROADMAP 方向四). Mounted unless disabled; the
     // handler self-gates on an optional bearer token. Left here (not behind the

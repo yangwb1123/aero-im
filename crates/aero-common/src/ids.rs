@@ -151,6 +151,12 @@ define_id!(
     /// members can list and play back later).
     VodId
 );
+define_id!(
+    /// Identifies a scheduled live-stream announcement — an upcoming stream a
+    /// workspace member announces ahead of time (title + time + optional room),
+    /// distinct from the actual stream the ingest path later creates.
+    ScheduledStreamId
+);
 
 #[cfg(test)]
 mod tests {
