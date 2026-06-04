@@ -24,8 +24,8 @@ pub mod workspace;
 pub use error::{Error, Result};
 pub use ids::{
     AuditId, BlobId, EmojiId, InvitationId, MessageId, NotificationId, ParticipantId, PatId,
-    PollId, RoomId, ScheduledMessageId, ScheduledStreamId, ScimTokenId, VodId, WebhookId,
-    WorkspaceId,
+    PollId, RoomId, SavedSearchId, ScheduledMessageId, ScheduledStreamId, ScimTokenId, VodId,
+    WebhookId, WorkspaceId,
 };
 pub use live::{
     gift_by_id, gift_catalog, Gift, GiftLeaderRow, StreamChatLine, StreamEvent, StreamGiftLine,

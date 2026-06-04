@@ -28,6 +28,7 @@ pub mod presence;
 pub mod reaction;
 pub mod receipt;
 pub mod room;
+pub mod saved_search;
 pub mod scim;
 pub mod sso;
 pub mod stream;
@@ -69,6 +70,7 @@ pub use presence::PresenceStore;
 pub use reaction::ReactionRepo;
 pub use receipt::ReceiptRepo;
 pub use room::RoomRepo;
+pub use saved_search::{SavedSearch, SavedSearchRepo};
 // SCIM token helpers (`generate_token`/`hash_token`) are intentionally NOT
 // re-exported at the crate root: the webhook module exports same-named helpers,
 // so SCIM consumers reach these via the `aero_storage::scim::` path instead.

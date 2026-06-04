@@ -21,6 +21,7 @@ pub mod pat;
 pub mod polls;
 pub mod rate_limit;
 pub mod routes;
+pub mod saved_searches;
 pub mod scim;
 pub mod sso;
 pub mod state;
