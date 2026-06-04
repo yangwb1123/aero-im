@@ -64,7 +64,11 @@ def main():
     B, Bpid = register("bob", ts)
     ws = req("POST", "/api/workspaces", {"name": f"Wave9 {ts}", "slug": f"w9-{ts}"}, token=A)
     W = ws["id"]
-    ok(f"workspace {W[:8]} owned by alice")
+    # Bob is a workspace member (so the per-user privacy check below exercises
+    # "member-but-not-owner sees none", not the workspace-membership gate).
+    req("POST", f"/api/workspaces/{W}/members", {"participant_id": Bpid, "role": "member"},
+        token=A, expect=[200, 204])
+    ok(f"workspace {W[:8]} owned by alice; bob enrolled as member")
 
     # ---------------- Channel sections ----------------
     say("sections: create, assign channels, list, remove, rename, delete; private per user")
