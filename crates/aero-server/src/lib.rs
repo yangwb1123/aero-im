@@ -33,6 +33,7 @@ pub mod channels;
 pub mod commands;
 pub mod forward;
 pub mod scheduled;
+pub mod scheduled_streams;
 pub mod search;
 
 pub use state::AppState;

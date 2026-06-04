@@ -127,7 +127,12 @@ pub fn build(state: AppState) -> Router {
         // Server-persisted per-room composer drafts (private to the author, one
         // per (participant, room), upsert-replaces). Follows the user across
         // devices/reloads like Slack drafts.
-        .merge(crate::drafts::routes());
+        .merge(crate::drafts::routes())
+        // Scheduled streams (live-event announcements): a member announces an
+        // upcoming live stream (title/time/optional room); members list upcoming,
+        // the creator cancels. Announcement record only — going live still uses
+        // the existing `/api/streams` ingest path.
+        .merge(crate::scheduled_streams::routes());
 
     // Prometheus scrape endpoint (ROADMAP 方向四). Mounted unless disabled; the
     // handler self-gates on an optional bearer token. Left here (not behind the

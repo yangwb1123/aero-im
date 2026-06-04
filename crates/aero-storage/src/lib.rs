@@ -39,6 +39,7 @@ pub mod vod;
 pub mod webhook;
 pub mod workspace;
 pub mod scheduled;
+pub mod scheduled_stream;
 
 pub use ai_job::{AiJob, AiJobKind, AiJobRepo, AiJobStatus};
 pub use audit::{AuditEvent, AuditRepo};
@@ -90,3 +91,4 @@ pub use workspace::{
     MIN_RETENTION_DAYS,
 };
 pub use scheduled::{ScheduledMessage, ScheduledRepo};
+pub use scheduled_stream::{ScheduledStream, ScheduledStreamRepo};
