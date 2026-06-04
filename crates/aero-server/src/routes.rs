@@ -139,7 +139,10 @@ pub fn build(state: AppState) -> Router {
         .merge(crate::guests::routes())
         // AI-native on-demand message translation (reuses the caption-translation
         // backend seam; echoes the source when no LLM key is configured).
-        .merge(crate::translate::routes());
+        .merge(crate::translate::routes())
+        // "Remind me about this message" (Slack-style): set a relative-time reminder
+        // anchored to a specific message; reuses the durable scheduler — no new table.
+        .merge(crate::message_reminders::routes());
 
     // Prometheus scrape endpoint (ROADMAP 方向四). Mounted unless disabled; the
     // handler self-gates on an optional bearer token. Left here (not behind the

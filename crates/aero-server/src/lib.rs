@@ -33,6 +33,7 @@ pub mod ws;
 pub mod channels;
 pub mod commands;
 pub mod forward;
+pub mod message_reminders;
 pub mod scheduled;
 pub mod scheduled_streams;
 pub mod search;
