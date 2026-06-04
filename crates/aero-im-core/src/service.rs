@@ -57,6 +57,22 @@ pub fn can_join_public_channel(is_private: bool, is_archived: bool) -> bool {
     !is_private && !is_archived
 }
 
+/// Whether a sender may post in a room under its `post_policy` (announcement
+/// channels, migration 0030). `everyone` (the default and any UNRECOGNIZED value)
+/// always allows — an unknown policy is treated as the open default so a typo
+/// never silently locks a channel. `admins` allows only when the sender is the
+/// room's creator OR a workspace Admin/Owner. Pure decision function so the rule
+/// is unit-tested without a database; [`ImService::assert_can_post`] supplies
+/// `is_admin`/`is_creator`.
+#[must_use]
+pub fn post_allowed(policy: &str, is_admin: bool, is_creator: bool) -> bool {
+    match policy {
+        "admins" => is_admin || is_creator,
+        // "everyone" and any unrecognized policy fall through to the open default.
+        _ => true,
+    }
+}
+
 /// Object-safe view of [`EventBus`] used internally for dependency injection.
 ///
 /// The upstream [`EventBus`] trait declares a generic default method (`publish_json<T>`)
@@ -388,6 +404,63 @@ impl ImService {
         }
     }
 
+    /// Announcement-channel post guard (migration 0030). Reads the room's
+    /// `post_policy` and decides via [`post_allowed`]:
+    ///
+    /// - `everyone` (the default, the overwhelmingly common case): returns
+    ///   `Ok(())` after one cheap query — no membership re-check, no role lookup.
+    /// - `admins`: allowed only when `sender` is the room's `created_by` OR a
+    ///   workspace Admin/Owner of the room's workspace (the SAME admin
+    ///   determination [`assert_room_access`](Self::assert_room_access) uses —
+    ///   `member_role` + [`WorkspaceRole::can_administer`]). If no `WorkspaceRepo`
+    ///   is wired, falls back to allowing the room creator only (never panics, so
+    ///   non-tenant tests keep working).
+    ///
+    /// Returns [`Error::Forbidden`] when posting is denied. Membership is assumed
+    /// already checked by the caller; this layers the policy on top.
+    async fn assert_can_post(&self, sender: ParticipantId, room: RoomId) -> Result<()> {
+        let policy = self.rooms.post_policy(room).await?;
+        // Fast path: open channels (and any unknown policy) never do extra work.
+        if post_allowed(&policy, false, false) {
+            return Ok(());
+        }
+
+        // Restricted ('admins'): the creator may always post.
+        let is_creator = self.rooms.created_by(room).await? == Some(sender);
+        // A workspace Admin/Owner may also post.
+        let is_admin = self.is_workspace_admin_of_room(sender, room).await?;
+
+        if post_allowed(&policy, is_admin, is_creator) {
+            Ok(())
+        } else {
+            Err(Error::Forbidden(format!(
+                "room {room} is announcements-only; {sender} may not post"
+            )))
+        }
+    }
+
+    /// Whether `participant` is a workspace Admin/Owner of `room`'s workspace —
+    /// the SAME admin determination [`assert_room_access`](Self::assert_room_access)
+    /// relies on (`member_role` + [`WorkspaceRole::can_administer`]). Returns
+    /// `false` (never an error) when no `WorkspaceRepo` is wired or the room has
+    /// no resolvable workspace, so non-tenant callers degrade gracefully.
+    async fn is_workspace_admin_of_room(
+        &self,
+        participant: ParticipantId,
+        room: RoomId,
+    ) -> Result<bool> {
+        let Some(workspaces) = self.workspaces.as_ref() else {
+            return Ok(false);
+        };
+        let Some(ws) = self.rooms.room_workspace(room).await? else {
+            return Ok(false);
+        };
+        Ok(workspaces
+            .member_role(ws, participant)
+            .await?
+            .is_some_and(WorkspaceRole::can_administer))
+    }
+
     /// Add a member to a room. `actor` must themselves be a member.
     #[instrument(skip(self), fields(?actor, ?room, ?member))]
     pub async fn add_member(
@@ -525,6 +598,48 @@ impl ImService {
         Ok(())
     }
 
+    /// Set a room's post policy (announcement channels, migration 0030). `policy`
+    /// must be `everyone` or `admins` — any other value is rejected with
+    /// [`Error::Invalid`]. The actor must be the room's creator OR a workspace
+    /// Admin/Owner of the room's workspace (the SAME governance bar as the rest of
+    /// channel administration); otherwise [`Error::Forbidden`]. Returns
+    /// [`Error::NotFound`] for an unknown room.
+    #[instrument(skip(self), fields(?actor, ?room, policy))]
+    pub async fn set_room_post_policy(
+        &self,
+        actor: ParticipantId,
+        room: RoomId,
+        policy: &str,
+    ) -> Result<()> {
+        if policy != "everyone" && policy != "admins" {
+            return Err(Error::Invalid(format!(
+                "post_policy must be 'everyone' or 'admins', got {policy:?}"
+            )));
+        }
+        let creator = self
+            .rooms
+            .created_by(room)
+            .await?
+            .ok_or_else(|| Error::NotFound(format!("room {room}")))?;
+        let is_creator = creator == actor;
+        let is_admin = self.is_workspace_admin_of_room(actor, room).await?;
+        if !is_creator && !is_admin {
+            return Err(Error::Forbidden(format!(
+                "{actor} may not change the post policy of room {room}"
+            )));
+        }
+        self.rooms.set_post_policy(room, policy).await?;
+        Ok(())
+    }
+
+    /// Read a room's post policy (`everyone` or `admins`). The actor must be able
+    /// to access the room ([`assert_room_access`](Self::assert_room_access)).
+    #[instrument(skip(self), fields(?actor, ?room))]
+    pub async fn room_post_policy(&self, actor: ParticipantId, room: RoomId) -> Result<String> {
+        self.assert_room_access(actor, room).await?;
+        Ok(self.rooms.post_policy(room).await?)
+    }
+
     /// List the public, joinable channels of a workspace. Requires the actor be a
     /// member of the workspace.
     #[instrument(skip(self), fields(?actor, ?workspace))]
@@ -566,6 +681,9 @@ impl ImService {
                 "sender {sender} is not a member of room {room}"
             )));
         }
+        // Announcement-channel guard (migration 0030). Cheap: a single policy read
+        // that short-circuits for the overwhelmingly common `everyone` rooms.
+        self.assert_can_post(sender, room).await?;
         validate_blocks(&blocks)?;
         if let ModerationVerdict::Block(reason) = self.moderator.check(&blocks) {
             return Err(Error::Invalid(reason));
@@ -1200,6 +1318,59 @@ mod tests {
                     !private && !archived,
                     "({private}, {archived})"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn post_allowed_everyone_is_always_true() {
+        // The open default ignores admin/creator standing entirely.
+        for is_admin in [false, true] {
+            for is_creator in [false, true] {
+                assert!(
+                    post_allowed("everyone", is_admin, is_creator),
+                    "everyone always permits (admin={is_admin}, creator={is_creator})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn post_allowed_admins_requires_admin_or_creator() {
+        // 'admins' permits exactly the admin OR the creator; a plain member is denied.
+        assert!(post_allowed("admins", true, false), "workspace admin may post");
+        assert!(post_allowed("admins", false, true), "room creator may post");
+        assert!(post_allowed("admins", true, true), "admin+creator may post");
+        assert!(
+            !post_allowed("admins", false, false),
+            "a plain member may not post in an announcements-only channel"
+        );
+    }
+
+    #[test]
+    fn post_allowed_admins_is_logical_or_of_admin_and_creator() {
+        for is_admin in [false, true] {
+            for is_creator in [false, true] {
+                assert_eq!(
+                    post_allowed("admins", is_admin, is_creator),
+                    is_admin || is_creator,
+                    "(admin={is_admin}, creator={is_creator})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn post_allowed_unknown_policy_falls_back_to_everyone() {
+        // An unrecognized/typo'd policy fails OPEN (treated as everyone), never a
+        // silent lockout — matches the read-side default in `RoomRepo::post_policy`.
+        for is_admin in [false, true] {
+            for is_creator in [false, true] {
+                assert!(
+                    post_allowed("bogus", is_admin, is_creator),
+                    "unknown policy permits like everyone (admin={is_admin}, creator={is_creator})"
+                );
+                assert!(post_allowed("", is_admin, is_creator), "empty policy permits");
             }
         }
     }
