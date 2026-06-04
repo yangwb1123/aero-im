@@ -157,6 +157,11 @@ define_id!(
     /// distinct from the actual stream the ingest path later creates.
     ScheduledStreamId
 );
+define_id!(
+    /// Identifies a saved search — a per-user, workspace-scoped named search
+    /// query the owner can list, re-run, or delete.
+    SavedSearchId
+);
 
 #[cfg(test)]
 mod tests {

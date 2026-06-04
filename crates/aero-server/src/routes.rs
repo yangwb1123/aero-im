@@ -98,6 +98,9 @@ pub fn build(state: AppState) -> Router {
         .merge(crate::invitations::routes())
         // Cross-room (workspace-wide) message search, membership-scoped.
         .merge(crate::search::routes())
+        // Saved searches: per-user, workspace-scoped named queries — list/run/
+        // delete. Running reuses the same membership-scoped cross-room search.
+        .merge(crate::saved_searches::routes())
         // Notification preferences: per-channel mute + per-user Do-Not-Disturb.
         .merge(crate::notif_prefs::routes())
         // Saved items / bookmarks (personal save-for-later, per-user cross-room).
