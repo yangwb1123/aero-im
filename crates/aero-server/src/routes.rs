@@ -139,7 +139,11 @@ pub fn build(state: AppState) -> Router {
         .merge(crate::guests::routes())
         // AI-native on-demand message translation (reuses the caption-translation
         // backend seam; echoes the source when no LLM key is configured).
-        .merge(crate::translate::routes());
+        .merge(crate::translate::routes())
+        // Per-user channel sidebar sections (Slack/Teams "sections"): a user groups
+        // their channels into named, ordered, PRIVATE folders scoped to a workspace.
+        // Pure organizational metadata over existing rooms.
+        .merge(crate::channel_sections::routes());
 
     // Prometheus scrape endpoint (ROADMAP 方向四). Mounted unless disabled; the
     // handler self-gates on an optional bearer token. Left here (not behind the

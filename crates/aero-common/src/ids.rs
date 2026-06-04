@@ -157,6 +157,12 @@ define_id!(
     /// distinct from the actual stream the ingest path later creates.
     ScheduledStreamId
 );
+define_id!(
+    /// Identifies a per-user channel-sidebar section — a named, ordered folder a
+    /// participant groups their channels under, private to that user and scoped to
+    /// one workspace.
+    ChannelSectionId
+);
 
 #[cfg(test)]
 mod tests {
