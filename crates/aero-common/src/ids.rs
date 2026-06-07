@@ -193,6 +193,11 @@ define_id!(
     /// repeating cadence — hourly/daily/weekly).
     RecurringMessageId
 );
+define_id!(
+    /// Identifies a channel join request (a pending request to join a channel,
+    /// awaiting owner/admin approval).
+    JoinRequestId
+);
 
 #[cfg(test)]
 mod tests {

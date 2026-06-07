@@ -59,6 +59,9 @@ pub mod dm;
 pub mod recurring_message;
 pub mod reaction_detail;
 pub mod default_channel;
+// Wave 13 (0043 + read-only group_dm): group DM, channel join requests.
+pub mod group_dm;
+pub mod join_request;
 
 pub use ai_job::{AiJob, AiJobKind, AiJobRepo, AiJobStatus};
 pub use audit::{AuditEvent, AuditRepo};
@@ -129,3 +132,6 @@ pub use dm::DmRepo;
 pub use recurring_message::{next_occurrence, RecurringMessage, RecurringMessageRepo};
 pub use reaction_detail::{EmojiReactors, ReactionDetailRepo};
 pub use default_channel::DefaultChannelRepo;
+// Wave 13 re-exports.
+pub use group_dm::GroupDmRepo;
+pub use join_request::{JoinRequest, JoinRequestRepo};

@@ -186,7 +186,16 @@ pub fn build(state: AppState) -> Router {
         // Reaction detail: who reacted with each emoji.
         .merge(crate::reaction_detail::routes())
         // Workspace default channels (admin-set; new members auto-join).
-        .merge(crate::default_channels::routes());
+        .merge(crate::default_channels::routes())
+        // ---- Wave 13 ----
+        // Group DM (multi-person direct) find-or-create.
+        .merge(crate::group_dm::routes())
+        // AI action-item extraction from a channel.
+        .merge(crate::action_items::routes())
+        // Channel join requests (request → owner/admin approve/deny).
+        .merge(crate::join_requests::routes())
+        // Per-conversation export (single room/DM message history).
+        .merge(crate::conversation_export::routes());
 
     // Prometheus scrape endpoint (ROADMAP 方向四). Mounted unless disabled; the
     // handler self-gates on an optional bearer token. Left here (not behind the
