@@ -17,8 +17,9 @@ use aero_common::{
 };
 use aero_common::{PinOp, PinnedMessage};
 use aero_storage::{
-    message::NewMessage, AiJobKind, AiJobRepo, CallRepo, MessageRepo, NotificationPrefsRepo,
-    NotificationRepo, ParticipantRepo, PinRepo, ReactionRepo, ReceiptRepo, RoomRepo, WorkspaceRepo,
+    message::NewMessage, AiJobKind, AiJobRepo, CallRepo, KeywordAlertRepo, MessageEditRepo,
+    MessageRepo, NotificationPrefsRepo, NotificationRepo, ParticipantRepo, PinRepo, ReactionRepo,
+    ReceiptRepo, RoomRepo, UserGroupRepo, WorkspaceRepo,
 };
 use async_trait::async_trait;
 use std::collections::BTreeMap;
@@ -136,6 +137,21 @@ pub struct ImService {
     /// when present, [`should_notify`](ImService::should_notify) suppresses
     /// notifications to muted/DND recipients. Without it, nothing is suppressed.
     prefs: Option<NotificationPrefsRepo>,
+    /// User-group store (`@-usergroups`). Optional builder
+    /// ([`with_user_groups`](Self::with_user_groups)); when present,
+    /// [`dispatch_notifications`](Self::dispatch_notifications) expands an
+    /// `@handle` group mention into a notification for every group member.
+    user_groups: Option<UserGroupRepo>,
+    /// Message edit-history store. Optional builder
+    /// ([`with_message_edits`](Self::with_message_edits)); when present,
+    /// [`edit_message`](Self::edit_message) archives the replaced version before
+    /// overwriting it.
+    message_edits: Option<MessageEditRepo>,
+    /// Keyword / highlight-alert store. Optional builder
+    /// ([`with_keyword_alerts`](Self::with_keyword_alerts)); when present,
+    /// [`dispatch_notifications`](Self::dispatch_notifications) also notifies any
+    /// member subscribed to a keyword the message contains.
+    keyword_alerts: Option<KeywordAlertRepo>,
     bus: Arc<dyn BusSink>,
     moderator: Arc<dyn Moderator>,
 }
@@ -173,6 +189,9 @@ impl ImService {
             notifications: None,
             pins: None,
             prefs: None,
+            user_groups: None,
+            message_edits: None,
+            keyword_alerts: None,
             bus: bus as Arc<dyn BusSink>,
             moderator,
         }
@@ -223,6 +242,34 @@ impl ImService {
     #[must_use]
     pub fn with_notification_prefs(mut self, prefs: NotificationPrefsRepo) -> Self {
         self.prefs = Some(prefs);
+        self
+    }
+
+    /// Wire in the user-group store, enabling `@handle` group-mention fan-out in
+    /// [`dispatch_notifications`](Self::dispatch_notifications). Additive builder;
+    /// without it, group handles in a message are ignored (only direct
+    /// `Block::Mention`s and replies notify).
+    #[must_use]
+    pub fn with_user_groups(mut self, user_groups: UserGroupRepo) -> Self {
+        self.user_groups = Some(user_groups);
+        self
+    }
+
+    /// Wire in the message edit-history store, enabling prior-version capture in
+    /// [`edit_message`](Self::edit_message). Additive builder; without it, edits
+    /// still succeed but no history row is written.
+    #[must_use]
+    pub fn with_message_edits(mut self, message_edits: MessageEditRepo) -> Self {
+        self.message_edits = Some(message_edits);
+        self
+    }
+
+    /// Wire in the keyword-alert store, enabling keyword/highlight notifications in
+    /// [`dispatch_notifications`](Self::dispatch_notifications). Additive builder;
+    /// without it, keyword subscriptions never fire.
+    #[must_use]
+    pub fn with_keyword_alerts(mut self, keyword_alerts: KeywordAlertRepo) -> Self {
+        self.keyword_alerts = Some(keyword_alerts);
         self
     }
 
@@ -280,6 +327,9 @@ impl ImService {
             notifications: None,
             pins: None,
             prefs: None,
+            user_groups: None,
+            message_edits: None,
+            keyword_alerts: None,
             bus,
             moderator: Arc::new(crate::moderator::AllowAllModerator),
         }
@@ -790,6 +840,20 @@ impl ImService {
         }
         validate_blocks(&blocks)?;
 
+        // Archive the version being replaced (best-effort; never blocks the edit).
+        // The capture happens BEFORE the overwrite so `message_edits` accumulates
+        // every prior version, oldest-first by `recorded_at`.
+        if let Some(history) = self.message_edits.as_ref() {
+            match serde_json::to_value(&existing.blocks) {
+                Ok(old_blocks) => {
+                    if let Err(err) = history.record(id, actor, &old_blocks).await {
+                        warn!(?err, %id, "record edit history failed");
+                    }
+                }
+                Err(err) => warn!(?err, %id, "serialize prior blocks for history failed"),
+            }
+        }
+
         let updated = self
             .messages
             .edit(id, blocks)
@@ -1163,6 +1227,52 @@ impl ImService {
             }
         }
 
+        // Group mentions (`@handle`) + keyword/highlight alerts. Both are weaker
+        // signals than an explicit mention/reply, so they only ADD a target
+        // (`or_insert` never overrides a stronger kind already recorded), only for
+        // room members (a non-member can't see the message), and never the sender.
+        // Both need the room's workspace; fetch it once, and only when at least one
+        // of the two stores is wired. Best-effort: a lookup error is logged, not
+        // fatal.
+        if self.user_groups.is_some() || self.keyword_alerts.is_some() {
+            if let Some(workspace) = self.rooms.room_workspace(room).await.ok().flatten() {
+                if let Some(groups) = self.user_groups.as_ref() {
+                    for handle in group_handle_tokens(&message.blocks) {
+                        let Ok(Some(group)) = groups.resolve(workspace, &handle).await else {
+                            continue;
+                        };
+                        match groups.members(group.id).await {
+                            Ok(members) => {
+                                for m in members {
+                                    if m != sender && member_set.contains(&m) {
+                                        targets.entry(m).or_insert(NotificationKind::Mention);
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                warn!(?err, group = %group.id, "group members lookup failed");
+                            }
+                        }
+                    }
+                }
+                if let Some(alerts) = self.keyword_alerts.as_ref() {
+                    let text = message.searchable_text();
+                    if !text.is_empty() {
+                        match alerts.matching_subscribers(workspace, &text).await {
+                            Ok(subs) => {
+                                for s in subs {
+                                    if s != sender && member_set.contains(&s) {
+                                        targets.entry(s).or_insert(NotificationKind::Mention);
+                                    }
+                                }
+                            }
+                            Err(err) => warn!(?err, %room, "keyword subscriber lookup failed"),
+                        }
+                    }
+                }
+            }
+        }
+
         for (recipient, kind) in targets {
             // Per-channel mute / Do-Not-Disturb: skip recipients who have silenced
             // this room or are in a DND window (fail-open if prefs unavailable).
@@ -1214,6 +1324,46 @@ fn mentioned_participants(blocks: &[Block]) -> Vec<ParticipantId> {
     out
 }
 
+/// Extract distinct `@handle` tokens from a message's text blocks — lowercased and
+/// de-duplicated in first-appearance order. A handle is `@` followed by one or more
+/// ASCII alphanumerics / `_` / `-` (the same alphabet user-group handles are stored
+/// in). These are resolved against workspace user-group handles to fan a group
+/// mention out to its members; a token that matches no group is simply ignored.
+/// Pure, so it is unit-testable without a database or bus.
+fn group_handle_tokens(blocks: &[Block]) -> Vec<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    for b in blocks {
+        let Block::Text { content, .. } = b else {
+            continue;
+        };
+        let bytes = content.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'@' {
+                let start = i + 1;
+                let mut j = start;
+                while j < bytes.len()
+                    && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_' || bytes[j] == b'-')
+                {
+                    j += 1;
+                }
+                if j > start {
+                    // start..j are ASCII byte offsets ⇒ always char boundaries.
+                    let token = content[start..j].to_ascii_lowercase();
+                    if seen.insert(token.clone()) {
+                        out.push(token);
+                    }
+                }
+                i = j.max(start);
+            } else {
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1244,6 +1394,20 @@ mod tests {
 
         // No mentions => empty.
         assert!(mentioned_participants(&[Block::text("plain")]).is_empty());
+    }
+
+    #[test]
+    fn group_handle_tokens_extracts_lowercases_and_dedups() {
+        let blocks = vec![
+            Block::text("hey @Eng and @ops, ping @eng again"),
+            Block::text("also @on-call_team! and a bare @ and email a@b.com"),
+        ];
+        let got = group_handle_tokens(&blocks);
+        // first-appearance order, lowercased, deduped; "eng" not repeated.
+        assert_eq!(got, vec!["eng", "ops", "on-call_team", "b"]);
+        // The bare "@ " yields no token; non-text blocks are ignored.
+        assert!(group_handle_tokens(&[Block::text("no handles here")]).is_empty());
+        assert!(group_handle_tokens(&[Block::Mention { participant: ParticipantId::new() }]).is_empty());
     }
 
     #[test]

@@ -40,5 +40,12 @@ pub mod scheduled;
 pub mod scheduled_streams;
 pub mod search;
 pub mod translate;
+// Wave 10 (0033-0038).
+pub mod announcements;
+pub mod favorites;
+pub mod keyword_alerts;
+pub mod message_history;
+pub mod profiles;
+pub mod user_groups;
 
 pub use state::AppState;

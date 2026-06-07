@@ -168,6 +168,26 @@ define_id!(
     /// one workspace.
     ChannelSectionId
 );
+define_id!(
+    /// Identifies a user group (`@-usergroup`) — a workspace-scoped, named set of
+    /// participants that can be `@`-mentioned as one to notify every member.
+    UserGroupId
+);
+define_id!(
+    /// Identifies a single archived prior version of an edited message (one row per
+    /// edit, capturing the blocks that were replaced).
+    MessageEditId
+);
+define_id!(
+    /// Identifies a per-user keyword / highlight alert — a workspace-scoped term that
+    /// notifies its owner whenever a message contains it.
+    KeywordAlertId
+);
+define_id!(
+    /// Identifies a workspace announcement / banner posted by an admin (optionally
+    /// time-limited via an expiry).
+    AnnouncementId
+);
 
 #[cfg(test)]
 mod tests {

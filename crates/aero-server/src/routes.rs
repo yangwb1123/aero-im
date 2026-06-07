@@ -149,7 +149,24 @@ pub fn build(state: AppState) -> Router {
         // Per-user channel sidebar sections (Slack/Teams "sections"): a user groups
         // their channels into named, ordered, PRIVATE folders scoped to a workspace.
         // Pure organizational metadata over existing rooms.
-        .merge(crate::channel_sections::routes());
+        .merge(crate::channel_sections::routes())
+        // ---- Wave 10 (0033-0038) ----
+        // User groups (@-usergroups): workspace-scoped named member sets that can be
+        // @-mentioned as one. CRUD + membership; mention fan-out wired in ImService.
+        .merge(crate::user_groups::routes())
+        // Per-user starred/favorite channels (flat list, distinct from sections).
+        .merge(crate::favorites::routes())
+        // Custom user profile fields (title/pronouns/timezone/phone/status) in a
+        // side table — does not touch the participants row or `update_me`.
+        .merge(crate::profiles::routes())
+        // Message edit history: read prior versions of an edited message (capture
+        // on edit is wired in ImService::edit_message).
+        .merge(crate::message_history::routes())
+        // Keyword / highlight alerts: per-user subscriptions that notify on match
+        // (dispatch wired in ImService::dispatch_notifications).
+        .merge(crate::keyword_alerts::routes())
+        // Workspace announcements / banners: admin posts, members read active ones.
+        .merge(crate::announcements::routes());
 
     // Prometheus scrape endpoint (ROADMAP 方向四). Mounted unless disabled; the
     // handler self-gates on an optional bearer token. Left here (not behind the

@@ -42,6 +42,14 @@ pub mod webhook;
 pub mod workspace;
 pub mod scheduled;
 pub mod scheduled_stream;
+// Wave 10 (0033-0038): user groups, channel favorites, profiles, message edit
+// history, keyword alerts, workspace announcements.
+pub mod announcement;
+pub mod channel_favorite;
+pub mod keyword_alert;
+pub mod message_edit;
+pub mod profile;
+pub mod user_group;
 
 pub use ai_job::{AiJob, AiJobKind, AiJobRepo, AiJobStatus};
 pub use audit::{AuditEvent, AuditRepo};
@@ -96,3 +104,10 @@ pub use workspace::{
 };
 pub use scheduled::{ScheduledMessage, ScheduledRepo};
 pub use scheduled_stream::{ScheduledStream, ScheduledStreamRepo};
+// Wave 10 re-exports.
+pub use announcement::{is_active, Announcement, AnnouncementRepo};
+pub use channel_favorite::ChannelFavoriteRepo;
+pub use keyword_alert::{normalize_keyword, KeywordAlert, KeywordAlertRepo};
+pub use message_edit::{MessageEdit, MessageEditRepo};
+pub use profile::{Profile, ProfileRepo};
+pub use user_group::{normalize_handle, UserGroup, UserGroupRepo};

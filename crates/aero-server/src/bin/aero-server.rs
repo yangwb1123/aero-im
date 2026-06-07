@@ -27,8 +27,9 @@ use aero_server::{
 use aero_storage::{
     connect_pg, migrate, AiJobRepo, AuditRepo, BlobRepo, CallRepo, CallRosterStore, KeyPackageRepo,
     LiveRepo, LocalFsBlobStore, MessageRepo, MlsGroupRepo, NotificationPrefsRepo, NotificationRepo,
-    ParticipantRepo, PatRepo, PinRepo, PresenceStore, ReactionRepo, ReceiptRepo, RedisCache,
-    RoomRepo, StreamRepo, StreamRouteRegistry, StreamViewerStore, WorkspaceRepo,
+    KeywordAlertRepo, MessageEditRepo, ParticipantRepo, PatRepo, PinRepo, PresenceStore,
+    ReactionRepo, ReceiptRepo, RedisCache, RoomRepo, StreamRepo, StreamRouteRegistry,
+    StreamViewerStore, UserGroupRepo, WorkspaceRepo,
 };
 use tokio_util::sync::CancellationToken;
 use anyhow::Context;
@@ -143,7 +144,12 @@ async fn main() -> anyhow::Result<()> {
         .with_workspaces(workspaces.clone())
         .with_notifications(notifications.clone())
         .with_notification_prefs(notification_prefs.clone())
-        .with_pins(pins.clone()),
+        .with_pins(pins.clone())
+        // Wave 10: @-usergroup mention fan-out, message edit-history capture, and
+        // keyword/highlight-alert dispatch — all hang off the shared PG pool.
+        .with_user_groups(UserGroupRepo::new(pg.clone()))
+        .with_message_edits(MessageEditRepo::new(pg.clone()))
+        .with_keyword_alerts(KeywordAlertRepo::new(pg.clone())),
     );
 
     // ---------- Live service (danmaku / gifts / viewers) ----------
