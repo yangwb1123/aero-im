@@ -52,5 +52,11 @@ pub mod files;
 pub mod read_all;
 pub mod stream_follows;
 pub mod thread_subs;
+// Wave 12.
+pub mod dm;
+pub mod recurring;
+pub mod catchup;
+pub mod reaction_detail;
+pub mod default_channels;
 
 pub use state::AppState;

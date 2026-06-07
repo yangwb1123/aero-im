@@ -188,6 +188,11 @@ define_id!(
     /// time-limited via an expiry).
     AnnouncementId
 );
+define_id!(
+    /// Identifies a recurring scheduled message (a message template posted on a
+    /// repeating cadence — hourly/daily/weekly).
+    RecurringMessageId
+);
 
 #[cfg(test)]
 mod tests {

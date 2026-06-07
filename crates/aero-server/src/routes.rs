@@ -175,7 +175,18 @@ pub fn build(state: AppState) -> Router {
         // Thread follow/subscribe: follow a root message to be notified of new replies.
         .merge(crate::thread_subs::routes())
         // Mark-all-read: clear unread for a room or across all the caller's rooms.
-        .merge(crate::read_all::routes());
+        .merge(crate::read_all::routes())
+        // ---- Wave 12 ----
+        // Direct-message (1:1) find-or-create.
+        .merge(crate::dm::routes())
+        // Recurring scheduled messages (hourly/daily/weekly).
+        .merge(crate::recurring::routes())
+        // AI "catch me up": summarize the caller's unread in a room.
+        .merge(crate::catchup::routes())
+        // Reaction detail: who reacted with each emoji.
+        .merge(crate::reaction_detail::routes())
+        // Workspace default channels (admin-set; new members auto-join).
+        .merge(crate::default_channels::routes());
 
     // Prometheus scrape endpoint (ROADMAP 方向四). Mounted unless disabled; the
     // handler self-gates on an optional bearer token. Left here (not behind the
@@ -311,6 +322,9 @@ async fn auth_register(
         .add_member(DEFAULT_WORKSPACE_ID, out.participant.id, WorkspaceRole::Member)
         .await
         .map_err(AeroError::from)?;
+    // Onboarding: auto-join the new participant into the default workspace's
+    // default channels (Wave 12). Best-effort — never fails registration.
+    crate::default_channels::auto_join_defaults(&s, DEFAULT_WORKSPACE_ID, out.participant.id).await;
     Ok(Json(serde_json::json!({
         "access_token": out.access_token,
         "refresh_token": out.refresh_token,

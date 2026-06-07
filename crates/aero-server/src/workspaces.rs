@@ -474,6 +474,9 @@ async fn add_member(
         serde_json::json!({ "role": req.role }),
     )
     .await;
+    // Onboarding: auto-join the new member into this workspace's default channels
+    // (Wave 12). Best-effort — never fails the member-add.
+    crate::default_channels::auto_join_defaults(&s, ws, target).await;
     Ok(StatusCode::NO_CONTENT)
 }
 

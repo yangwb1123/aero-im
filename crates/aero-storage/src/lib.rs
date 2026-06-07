@@ -54,6 +54,11 @@ pub mod user_group;
 pub mod file_index;
 pub mod stream_follow;
 pub mod thread_subscription;
+// Wave 12 (0041-0042 + read-only dm/reaction-detail): dm, recurring msgs, reaction detail, default channels.
+pub mod dm;
+pub mod recurring_message;
+pub mod reaction_detail;
+pub mod default_channel;
 
 pub use ai_job::{AiJob, AiJobKind, AiJobRepo, AiJobStatus};
 pub use audit::{AuditEvent, AuditRepo};
@@ -119,3 +124,8 @@ pub use user_group::{normalize_handle, UserGroup, UserGroupRepo};
 pub use file_index::{FileIndexRepo, SharedFile};
 pub use stream_follow::StreamFollowRepo;
 pub use thread_subscription::ThreadSubscriptionRepo;
+// Wave 12 re-exports.
+pub use dm::DmRepo;
+pub use recurring_message::{next_occurrence, RecurringMessage, RecurringMessageRepo};
+pub use reaction_detail::{EmojiReactors, ReactionDetailRepo};
+pub use default_channel::DefaultChannelRepo;

@@ -28,8 +28,8 @@ use aero_storage::{
     connect_pg, migrate, AiJobRepo, AuditRepo, BlobRepo, CallRepo, CallRosterStore, KeyPackageRepo,
     LiveRepo, LocalFsBlobStore, MessageRepo, MlsGroupRepo, NotificationPrefsRepo, NotificationRepo,
     KeywordAlertRepo, MessageEditRepo, ParticipantRepo, PatRepo, PinRepo, PresenceStore,
-    ReactionRepo, ReceiptRepo, RedisCache, RoomRepo, StreamRepo, StreamRouteRegistry,
-    StreamViewerStore, ThreadSubscriptionRepo, UserGroupRepo, WorkspaceRepo,
+    ReactionRepo, ReceiptRepo, RecurringMessageRepo, RedisCache, RoomRepo, StreamRepo,
+    StreamRouteRegistry, StreamViewerStore, ThreadSubscriptionRepo, UserGroupRepo, WorkspaceRepo,
 };
 use tokio_util::sync::CancellationToken;
 use anyhow::Context;
@@ -366,6 +366,17 @@ async fn main() -> anyhow::Result<()> {
         let cancel = ai_shutdown.clone();
         tokio::spawn(async move {
             aero_server::scheduled::run_scheduled_dispatcher(state_clone, cancel).await;
+        });
+    }
+
+    // ---------- Recurring-message dispatcher (Wave 12) ----------
+    // Posts each active recurring message when due (next_run <= now) via
+    // ImService::send_message, then advances next_run by its cadence.
+    {
+        let recurring_repo = RecurringMessageRepo::new(state.pg.clone());
+        let im_clone = state.im.clone();
+        tokio::spawn(async move {
+            aero_server::recurring::run_recurring_dispatcher(recurring_repo, im_clone, 30).await;
         });
     }
 
