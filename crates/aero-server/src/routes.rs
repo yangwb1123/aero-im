@@ -166,7 +166,16 @@ pub fn build(state: AppState) -> Router {
         // (dispatch wired in ImService::dispatch_notifications).
         .merge(crate::keyword_alerts::routes())
         // Workspace announcements / banners: admin posts, members read active ones.
-        .merge(crate::announcements::routes());
+        .merge(crate::announcements::routes())
+        // ---- Wave 11 ----
+        // Per-channel Files tab: list file/media attachments shared in a room.
+        .merge(crate::files::routes())
+        // Stream/creator follow: follow a participant; followers are notified on go-live.
+        .merge(crate::stream_follows::routes())
+        // Thread follow/subscribe: follow a root message to be notified of new replies.
+        .merge(crate::thread_subs::routes())
+        // Mark-all-read: clear unread for a room or across all the caller's rooms.
+        .merge(crate::read_all::routes());
 
     // Prometheus scrape endpoint (ROADMAP 方向四). Mounted unless disabled; the
     // handler self-gates on an optional bearer token. Left here (not behind the

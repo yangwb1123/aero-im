@@ -19,7 +19,7 @@ use aero_common::{PinOp, PinnedMessage};
 use aero_storage::{
     message::NewMessage, AiJobKind, AiJobRepo, CallRepo, KeywordAlertRepo, MessageEditRepo,
     MessageRepo, NotificationPrefsRepo, NotificationRepo, ParticipantRepo, PinRepo, ReactionRepo,
-    ReceiptRepo, RoomRepo, UserGroupRepo, WorkspaceRepo,
+    ReceiptRepo, RoomRepo, ThreadSubscriptionRepo, UserGroupRepo, WorkspaceRepo,
 };
 use async_trait::async_trait;
 use std::collections::BTreeMap;
@@ -152,6 +152,11 @@ pub struct ImService {
     /// [`dispatch_notifications`](Self::dispatch_notifications) also notifies any
     /// member subscribed to a keyword the message contains.
     keyword_alerts: Option<KeywordAlertRepo>,
+    /// Thread-subscription store. Optional builder
+    /// ([`with_thread_subs`](Self::with_thread_subs)); when present,
+    /// [`dispatch_notifications`](Self::dispatch_notifications) notifies everyone
+    /// who followed a reply's root message (Wave 11).
+    thread_subs: Option<ThreadSubscriptionRepo>,
     bus: Arc<dyn BusSink>,
     moderator: Arc<dyn Moderator>,
 }
@@ -192,6 +197,7 @@ impl ImService {
             user_groups: None,
             message_edits: None,
             keyword_alerts: None,
+            thread_subs: None,
             bus: bus as Arc<dyn BusSink>,
             moderator,
         }
@@ -273,6 +279,15 @@ impl ImService {
         self
     }
 
+    /// Wire in the thread-subscription store, enabling thread-follow notifications
+    /// in [`dispatch_notifications`](Self::dispatch_notifications). Additive
+    /// builder; without it, a reply only notifies the root author + @-mentions.
+    #[must_use]
+    pub fn with_thread_subs(mut self, thread_subs: ThreadSubscriptionRepo) -> Self {
+        self.thread_subs = Some(thread_subs);
+        self
+    }
+
     /// Notification suppression seam for per-channel mute + per-user
     /// Do-Not-Disturb. Returns whether a notification should be delivered to
     /// `recipient` for `room`: `false` when the recipient has MUTED the room OR
@@ -330,6 +345,7 @@ impl ImService {
             user_groups: None,
             message_edits: None,
             keyword_alerts: None,
+            thread_subs: None,
             bus,
             moderator: Arc::new(crate::moderator::AllowAllModerator),
         }
@@ -1227,6 +1243,39 @@ impl ImService {
             }
         }
 
+        // Thread followers (Wave 11): when this message is a reply, everyone who
+        // explicitly followed its root message is notified (∩ room members, never
+        // the sender). Reply-kind; `or_insert` so a stronger direct mention wins.
+        if let (Some(subs_repo), Some(root)) = (self.thread_subs.as_ref(), message.reply_to) {
+            match subs_repo.subscribers(root).await {
+                Ok(subs) => {
+                    for s in subs {
+                        if s != sender && member_set.contains(&s) {
+                            targets.entry(s).or_insert(NotificationKind::Reply);
+                        }
+                    }
+                }
+                Err(err) => warn!(?err, %root, "thread subscribers lookup failed"),
+            }
+        }
+
+        // `@handle` tokens parsed once: reused for broadcast mentions (below) and
+        // for user-group resolution (further down).
+        let handle_tokens = group_handle_tokens(&message.blocks);
+
+        // Broadcast mentions (`@channel` / `@everyone` / `@here` / `@all`): notify
+        // EVERY room member. Pure and store-free (online-only filtering for `@here`
+        // would need presence wiring — a documented refinement). `or_insert` never
+        // downgrades a stronger direct mention/reply, and mute/DND still applies in
+        // the delivery loop below; the sender never notifies themselves.
+        if handle_tokens.iter().any(|t| is_broadcast_token(t)) {
+            for &m in &member_set {
+                if m != sender {
+                    targets.entry(m).or_insert(NotificationKind::Mention);
+                }
+            }
+        }
+
         // Group mentions (`@handle`) + keyword/highlight alerts. Both are weaker
         // signals than an explicit mention/reply, so they only ADD a target
         // (`or_insert` never overrides a stronger kind already recorded), only for
@@ -1237,8 +1286,12 @@ impl ImService {
         if self.user_groups.is_some() || self.keyword_alerts.is_some() {
             if let Some(workspace) = self.rooms.room_workspace(room).await.ok().flatten() {
                 if let Some(groups) = self.user_groups.as_ref() {
-                    for handle in group_handle_tokens(&message.blocks) {
-                        let Ok(Some(group)) = groups.resolve(workspace, &handle).await else {
+                    for handle in &handle_tokens {
+                        // Broadcast tokens aren't group handles — skip the lookup.
+                        if is_broadcast_token(handle) {
+                            continue;
+                        }
+                        let Ok(Some(group)) = groups.resolve(workspace, handle).await else {
                             continue;
                         };
                         match groups.members(group.id).await {
@@ -1322,6 +1375,15 @@ fn mentioned_participants(blocks: &[Block]) -> Vec<ParticipantId> {
         }
     }
     out
+}
+
+/// Whether an `@handle` token is a broadcast/special mention that targets the
+/// whole channel rather than a single user-group. `@channel`, `@everyone`, `@all`,
+/// and `@here` (the Slack-standard set) all fan out to every room member. Pure, so
+/// it is unit-testable without a database. Tokens are already lowercased by
+/// [`group_handle_tokens`].
+fn is_broadcast_token(token: &str) -> bool {
+    matches!(token, "channel" | "everyone" | "all" | "here")
 }
 
 /// Extract distinct `@handle` tokens from a message's text blocks — lowercased and
@@ -1408,6 +1470,20 @@ mod tests {
         // The bare "@ " yields no token; non-text blocks are ignored.
         assert!(group_handle_tokens(&[Block::text("no handles here")]).is_empty());
         assert!(group_handle_tokens(&[Block::Mention { participant: ParticipantId::new() }]).is_empty());
+    }
+
+    #[test]
+    fn broadcast_tokens_recognized_case_insensitively() {
+        // group_handle_tokens lowercases, so is_broadcast_token sees lowercase.
+        for t in ["channel", "everyone", "all", "here"] {
+            assert!(is_broadcast_token(t), "{t} is a broadcast mention");
+        }
+        for t in ["eng", "ops", "channels", "everybody", ""] {
+            assert!(!is_broadcast_token(t), "{t} is NOT a broadcast mention");
+        }
+        // End-to-end through the token extractor: "@channel" in text is detected.
+        let toks = group_handle_tokens(&[Block::text("hey @Channel ship it")]);
+        assert!(toks.iter().any(|t| is_broadcast_token(t)), "@Channel detected");
     }
 
     #[test]

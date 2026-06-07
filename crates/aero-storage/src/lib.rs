@@ -50,6 +50,10 @@ pub mod keyword_alert;
 pub mod message_edit;
 pub mod profile;
 pub mod user_group;
+// Wave 11 (0039-0040 + read-only file index): files tab, stream follow, thread follow.
+pub mod file_index;
+pub mod stream_follow;
+pub mod thread_subscription;
 
 pub use ai_job::{AiJob, AiJobKind, AiJobRepo, AiJobStatus};
 pub use audit::{AuditEvent, AuditRepo};
@@ -111,3 +115,7 @@ pub use keyword_alert::{normalize_keyword, KeywordAlert, KeywordAlertRepo};
 pub use message_edit::{MessageEdit, MessageEditRepo};
 pub use profile::{Profile, ProfileRepo};
 pub use user_group::{normalize_handle, UserGroup, UserGroupRepo};
+// Wave 11 re-exports.
+pub use file_index::{FileIndexRepo, SharedFile};
+pub use stream_follow::StreamFollowRepo;
+pub use thread_subscription::ThreadSubscriptionRepo;

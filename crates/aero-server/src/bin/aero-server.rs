@@ -29,7 +29,7 @@ use aero_storage::{
     LiveRepo, LocalFsBlobStore, MessageRepo, MlsGroupRepo, NotificationPrefsRepo, NotificationRepo,
     KeywordAlertRepo, MessageEditRepo, ParticipantRepo, PatRepo, PinRepo, PresenceStore,
     ReactionRepo, ReceiptRepo, RedisCache, RoomRepo, StreamRepo, StreamRouteRegistry,
-    StreamViewerStore, UserGroupRepo, WorkspaceRepo,
+    StreamViewerStore, ThreadSubscriptionRepo, UserGroupRepo, WorkspaceRepo,
 };
 use tokio_util::sync::CancellationToken;
 use anyhow::Context;
@@ -149,7 +149,9 @@ async fn main() -> anyhow::Result<()> {
         // keyword/highlight-alert dispatch — all hang off the shared PG pool.
         .with_user_groups(UserGroupRepo::new(pg.clone()))
         .with_message_edits(MessageEditRepo::new(pg.clone()))
-        .with_keyword_alerts(KeywordAlertRepo::new(pg.clone())),
+        .with_keyword_alerts(KeywordAlertRepo::new(pg.clone()))
+        // Wave 11: thread-follow notifications (reply → root-message subscribers).
+        .with_thread_subs(ThreadSubscriptionRepo::new(pg.clone())),
     );
 
     // ---------- Live service (danmaku / gifts / viewers) ----------

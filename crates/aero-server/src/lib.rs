@@ -47,5 +47,10 @@ pub mod keyword_alerts;
 pub mod message_history;
 pub mod profiles;
 pub mod user_groups;
+// Wave 11.
+pub mod files;
+pub mod read_all;
+pub mod stream_follows;
+pub mod thread_subs;
 
 pub use state::AppState;
