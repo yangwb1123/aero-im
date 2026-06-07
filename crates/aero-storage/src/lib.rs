@@ -62,6 +62,10 @@ pub mod default_channel;
 // Wave 13 (0043 + read-only group_dm): group DM, channel join requests.
 pub mod group_dm;
 pub mod join_request;
+// Wave 14 (0044-0046): TOTP 2FA secrets, workspace deactivation, message templates.
+pub mod totp;
+pub mod deactivation;
+pub mod message_template;
 
 pub use ai_job::{AiJob, AiJobKind, AiJobRepo, AiJobStatus};
 pub use audit::{AuditEvent, AuditRepo};
@@ -135,3 +139,7 @@ pub use default_channel::DefaultChannelRepo;
 // Wave 13 re-exports.
 pub use group_dm::GroupDmRepo;
 pub use join_request::{JoinRequest, JoinRequestRepo};
+// Wave 14 re-exports.
+pub use totp::TotpRepo;
+pub use deactivation::{DeactivatedMember, DeactivationRepo};
+pub use message_template::{MessageTemplate, MessageTemplateRepo};

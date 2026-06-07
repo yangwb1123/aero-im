@@ -27,9 +27,10 @@ use aero_server::{
 use aero_storage::{
     connect_pg, migrate, AiJobRepo, AuditRepo, BlobRepo, CallRepo, CallRosterStore, KeyPackageRepo,
     LiveRepo, LocalFsBlobStore, MessageRepo, MlsGroupRepo, NotificationPrefsRepo, NotificationRepo,
-    KeywordAlertRepo, MessageEditRepo, ParticipantRepo, PatRepo, PinRepo, PresenceStore,
-    ReactionRepo, ReceiptRepo, RecurringMessageRepo, RedisCache, RoomRepo, StreamRepo,
-    StreamRouteRegistry, StreamViewerStore, ThreadSubscriptionRepo, UserGroupRepo, WorkspaceRepo,
+    DeactivationRepo, KeywordAlertRepo, MessageEditRepo, ParticipantRepo, PatRepo, PinRepo,
+    PresenceStore, ReactionRepo, ReceiptRepo, RecurringMessageRepo, RedisCache, RoomRepo,
+    StreamRepo, StreamRouteRegistry, StreamViewerStore, ThreadSubscriptionRepo, UserGroupRepo,
+    WorkspaceRepo,
 };
 use tokio_util::sync::CancellationToken;
 use anyhow::Context;
@@ -151,7 +152,9 @@ async fn main() -> anyhow::Result<()> {
         .with_message_edits(MessageEditRepo::new(pg.clone()))
         .with_keyword_alerts(KeywordAlertRepo::new(pg.clone()))
         // Wave 11: thread-follow notifications (reply → root-message subscribers).
-        .with_thread_subs(ThreadSubscriptionRepo::new(pg.clone())),
+        .with_thread_subs(ThreadSubscriptionRepo::new(pg.clone()))
+        // Wave 14: workspace deactivation gate in assert_room_access.
+        .with_deactivations(DeactivationRepo::new(pg.clone())),
     );
 
     // ---------- Live service (danmaku / gifts / viewers) ----------

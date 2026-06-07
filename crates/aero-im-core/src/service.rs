@@ -17,9 +17,9 @@ use aero_common::{
 };
 use aero_common::{PinOp, PinnedMessage};
 use aero_storage::{
-    message::NewMessage, AiJobKind, AiJobRepo, CallRepo, KeywordAlertRepo, MessageEditRepo,
-    MessageRepo, NotificationPrefsRepo, NotificationRepo, ParticipantRepo, PinRepo, ReactionRepo,
-    ReceiptRepo, RoomRepo, ThreadSubscriptionRepo, UserGroupRepo, WorkspaceRepo,
+    message::NewMessage, AiJobKind, AiJobRepo, CallRepo, DeactivationRepo, KeywordAlertRepo,
+    MessageEditRepo, MessageRepo, NotificationPrefsRepo, NotificationRepo, ParticipantRepo, PinRepo,
+    ReactionRepo, ReceiptRepo, RoomRepo, ThreadSubscriptionRepo, UserGroupRepo, WorkspaceRepo,
 };
 use async_trait::async_trait;
 use std::collections::BTreeMap;
@@ -157,6 +157,11 @@ pub struct ImService {
     /// [`dispatch_notifications`](Self::dispatch_notifications) notifies everyone
     /// who followed a reply's root message (Wave 11).
     thread_subs: Option<ThreadSubscriptionRepo>,
+    /// Workspace deactivation store. Optional builder
+    /// ([`with_deactivations`](Self::with_deactivations)); when present,
+    /// [`assert_room_access`](Self::assert_room_access) denies a member who has
+    /// been deactivated in the room's workspace (Wave 14).
+    deactivations: Option<DeactivationRepo>,
     bus: Arc<dyn BusSink>,
     moderator: Arc<dyn Moderator>,
 }
@@ -198,6 +203,7 @@ impl ImService {
             message_edits: None,
             keyword_alerts: None,
             thread_subs: None,
+            deactivations: None,
             bus: bus as Arc<dyn BusSink>,
             moderator,
         }
@@ -288,6 +294,15 @@ impl ImService {
         self
     }
 
+    /// Wire in the workspace-deactivation store, enabling access revocation in
+    /// [`assert_room_access`](Self::assert_room_access). Additive builder; without
+    /// it, no deactivation check is applied (every member keeps access).
+    #[must_use]
+    pub fn with_deactivations(mut self, deactivations: DeactivationRepo) -> Self {
+        self.deactivations = Some(deactivations);
+        self
+    }
+
     /// Notification suppression seam for per-channel mute + per-user
     /// Do-Not-Disturb. Returns whether a notification should be delivered to
     /// `recipient` for `room`: `false` when the recipient has MUTED the room OR
@@ -346,6 +361,7 @@ impl ImService {
             message_edits: None,
             keyword_alerts: None,
             thread_subs: None,
+            deactivations: None,
             bus,
             moderator: Arc::new(crate::moderator::AllowAllModerator),
         }
@@ -457,6 +473,17 @@ impl ImService {
             .room_workspace(room)
             .await?
             .ok_or_else(|| Error::NotFound(format!("room {room}")))?;
+
+        // Deactivation gate (Wave 14): a member deactivated in this room's
+        // workspace is locked out of its room data, even if still a row in
+        // `room_members`. No-op when the store isn't wired.
+        if let Some(deact) = self.deactivations.as_ref() {
+            if deact.is_deactivated(workspace, participant).await? {
+                return Err(Error::Forbidden(format!(
+                    "{participant} is deactivated in workspace {workspace}"
+                )));
+            }
+        }
 
         let is_workspace_member = self.workspaces()?.is_member(workspace, participant).await?;
         let is_room_member = self.rooms.is_member(room, participant).await?;

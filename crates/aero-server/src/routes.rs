@@ -195,7 +195,14 @@ pub fn build(state: AppState) -> Router {
         // Channel join requests (request → owner/admin approve/deny).
         .merge(crate::join_requests::routes())
         // Per-conversation export (single room/DM message history).
-        .merge(crate::conversation_export::routes());
+        .merge(crate::conversation_export::routes())
+        // ---- Wave 14 ----
+        // Two-factor auth (TOTP) self-management; login enforcement is in auth_login.
+        .merge(crate::twofa::routes())
+        // Workspace user deactivation (admin); access enforcement is in assert_room_access.
+        .merge(crate::deactivation::routes())
+        // Message templates / canned responses.
+        .merge(crate::templates::routes());
 
     // Prometheus scrape endpoint (ROADMAP 方向四). Mounted unless disabled; the
     // handler self-gates on an optional bearer token. Left here (not behind the
@@ -341,11 +348,41 @@ async fn auth_register(
     })))
 }
 
+/// Login request — email + password, plus an optional `totp` code that is
+/// *required* when the account has activated two-factor auth (Wave 14).
+#[derive(Deserialize)]
+struct LoginReq {
+    email: String,
+    password: String,
+    #[serde(default)]
+    totp: Option<String>,
+}
+
 async fn auth_login(
     State(s): State<AppState>,
-    Json(req): Json<LoginRequest>,
+    Json(req): Json<LoginReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let out = s.auth.login(req).await?;
+    let out = s
+        .auth
+        .login(LoginRequest { email: req.email, password: req.password })
+        .await?;
+    // Two-factor enforcement (Wave 14): once a participant has ACTIVATED TOTP, a
+    // valid current code must accompany the (already-verified) password. Returns
+    // 401 `2fa_required` when the code is missing or wrong, so a stolen password
+    // alone can't complete the login.
+    let totp = aero_storage::TotpRepo::new(s.pg.clone());
+    if totp.is_activated(out.participant.id).await.map_err(AeroError::from)? {
+        let secret = totp
+            .get_secret(out.participant.id)
+            .await
+            .map_err(AeroError::from)?
+            .ok_or_else(|| AeroError::Internal(anyhow::anyhow!("2FA activated without a secret")))?;
+        let now = u64::try_from(time::OffsetDateTime::now_utc().unix_timestamp()).unwrap_or(0);
+        let code = req.totp.as_deref().unwrap_or("");
+        if !aero_auth::totp::verify(&secret, code, now) {
+            return Err(AeroError::Unauthorized("2fa_required".into()).into());
+        }
+    }
     Ok(Json(serde_json::json!({
         "access_token": out.access_token,
         "refresh_token": out.refresh_token,

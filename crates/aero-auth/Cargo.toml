@@ -30,6 +30,12 @@ password-hash.workspace = true
 rand.workspace = true
 rsa.workspace = true
 
+# TOTP (RFC 6238) 2FA: HMAC-SHA1 over the time-step counter. Both are small,
+# pure RustCrypto crates already present in the lockfile (transitive deps); base32
+# is hand-rolled in `totp` so no extra dependency is needed for it.
+hmac = "0.12"
+sha1 = "0.10"
+
 # OIDC JWKS fetch (SSO): live retrieval of the IdP's signing keys. This is the
 # one network seam in `oidc`; the validation logic itself is unit-tested offline.
 reqwest.workspace = true

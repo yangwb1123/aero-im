@@ -198,6 +198,11 @@ define_id!(
     /// awaiting owner/admin approval).
     JoinRequestId
 );
+define_id!(
+    /// Identifies a saved message template / canned response (a reusable message
+    /// body a user can post into a room on demand).
+    MessageTemplateId
+);
 
 #[cfg(test)]
 mod tests {

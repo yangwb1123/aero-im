@@ -15,6 +15,7 @@ pub mod oidc;
 pub mod password;
 pub mod pat;
 pub mod service;
+pub mod totp;
 
 pub use extractor::AuthUser;
 pub use jwt::{Claims, JwtCodec, TokenKind};

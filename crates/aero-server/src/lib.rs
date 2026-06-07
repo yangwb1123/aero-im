@@ -63,5 +63,9 @@ pub mod group_dm;
 pub mod action_items;
 pub mod join_requests;
 pub mod conversation_export;
+// Wave 14.
+pub mod twofa;
+pub mod deactivation;
+pub mod templates;
 
 pub use state::AppState;
