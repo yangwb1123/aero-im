@@ -47,7 +47,7 @@ AI：Anthropic Messages `claude-sonnet-4-6`、Voyage 1024 维嵌入；无 key �
 ```bash
 make up                                    # 起 PG/Redis/NATS/Jaeger/MinIO
 make jwt-keys env                          # 生成 RS256 PEM + 写配置
-cargo run --bin aero-cli -- migrate        # 迁移，幂等（0001 IM · 0002 collab · 0003 MLS · 0004 转写 · 0005 直播 · 0006 多租户 · 0007 审计 · 0008 AI-job 租户标记 · 0009 消息留存 · 0010 通知 · 0011 置顶 · 0012 频道 · 0013 webhook · 0014 SSO · 0015 SCIM · 0016 定时消息 · 0017 邀请 · 0018 通知偏好/免打扰 · 0019 PAT · 0020 收藏 · 0021 自定义表情 · 0022 用户状态 · 0023 投票 · 0024 链接预览缓存 · 0025 VOD · 0026 直播聊天封禁 · 0027 访客账号 · 0028 消息草稿 · 0029 预告直播 · 0030 频道发言策略 · 0031 频道分组 · 0032 保存的搜索）
+cargo run --bin aero-cli -- migrate        # 迁移，幂等（0001 IM · 0002 collab · 0003 MLS · 0004 转写 · 0005 直播 · 0006 多租户 · 0007 审计 · 0008 AI-job 租户标记 · 0009 消息留存 · 0010 通知 · 0011 置顶 · 0012 频道 · 0013 webhook · 0014 SSO · 0015 SCIM · 0016 定时消息 · 0017 邀请 · 0018 通知偏好/免打扰 · 0019 PAT · 0020 收藏 · 0021 自定义表情 · 0022 用户状态 · 0023 投票 · 0024 链接预览缓存 · 0025 VOD · 0026 直播聊天封禁 · 0027 访客账号 · 0028 消息草稿 · 0029 预告直播 · 0030 频道发言策略 · 0031 频道分组 · 0032 保存的搜索 · 0033 用户组(@-usergroups) · 0034 频道收藏 · 0035 用户资料字段 · 0036 消息编辑历史 · 0037 关键词提醒 · 0038 工作区公告）
 AERO__SERVER__BLOB_DIR=/tmp/aero/blobs AERO__SERVER__HLS_DIR=/tmp/aero/hls \
   cargo run --bin aero-server              # :3030 HTTP/WS，:1935 RTMP
 ```
