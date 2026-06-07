@@ -3,7 +3,7 @@
 AI-Native 即时通讯 + 直播平台,Rust 实现。
 
 - 设计:[`docs/specs/2026-05-22-aero-im-design.md`](docs/specs/2026-05-22-aero-im-design.md)
-- 状态:**P0–P11 全部就位** + **13 轮 To-B 协作/企业扩展**(52 个功能点,迁移 0001–0043)。媒体面协议栈深化(WHIP/WHEP + SFU 联播/RTCP + SRT 加密/可靠性)已实现并字节级单测(**767 个 hermetic 单元测试通过**,15 个 crate)
+- 状态:**P0–P11 全部就位** + **14 轮 To-B 协作/企业扩展**(55 个功能点,迁移 0001–0046)。媒体面协议栈深化(WHIP/WHEP + SFU 联播/RTCP + SRT 加密/可靠性)已实现并字节级单测(**777 个 hermetic 单元测试通过**,15 个 crate)
 
 ## 功能矩阵
 
@@ -40,7 +40,8 @@ AI-Native 即时通讯 + 直播平台,Rust 实现。
 | **消息生命周期** | 定时发送 / 提醒(消息锚定) / 编辑历史(Wave 10) / 留存策略 / 链接预览(unfurl) | ✅ |
 | **搜索** | 房间内 + 跨房间(成员边界) + 保存的搜索 | ✅ |
 | **投票 / 公告** | 房间内投票(实时计票) / 工作区公告横幅(Wave 10) | ✅ |
-| **企业接入** | 多租户·RBAC / 审计 / SSO(OIDC) / SCIM 2.0 / PAT / Webhook(入·出) / 邀请 / 数据导出·删除 / 访客账号 | ✅ |
+| **企业接入** | 多租户·RBAC / 审计 / SSO(OIDC) / SCIM 2.0 / PAT / **2FA·TOTP(Wave 14)** / Webhook(入·出) / 邀请 / 数据导出·删除 / 访客账号 / **成员停用(Wave 14)** | ✅ |
+| **生产力** | 消息模板/常用语(canned responses, Wave 14) | ✅ |
 | **可观测 / 治理** | Prometheus 指标 / OTLP 链路 / liveness·readiness / 限流 / 按租户 AI 预算 / 死信 | ✅ |
 
 ## 架构
@@ -195,7 +196,7 @@ ffmpeg -re -i sample.mp4 -c:v libx264 -c:a aac -f flv rtmp://localhost/live/<str
 
 ```bash
 cargo check --workspace          # 干净
-cargo test --workspace --lib     # 767 pass / 0 fail / 97 ignored(DB 集成,需 --ignored + DATABASE_URL)
+cargo test --workspace --lib     # 777 pass / 0 fail / 100 ignored(DB 集成,需 --ignored + DATABASE_URL)
 cargo build --bin aero-server    # 二进制成功
 cargo clippy -p aero-live-srt -p aero-live-webrtc -p aero-live-whip --all-targets  # 媒体面 crate 零告警
 # 注:`cargo clippy --workspace --all-targets` 在 aero-storage/aero-server 等既有 crate 下仍有 pedantic 告警(非本批次引入,待清理)
