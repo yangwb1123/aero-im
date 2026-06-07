@@ -67,5 +67,10 @@ pub mod conversation_export;
 pub mod twofa;
 pub mod deactivation;
 pub mod templates;
+// Wave 15.
+pub mod session;
+pub mod search_advanced;
+pub mod smart_replies;
+pub mod channel_roles;
 
 pub use state::AppState;

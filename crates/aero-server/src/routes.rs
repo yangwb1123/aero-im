@@ -202,7 +202,16 @@ pub fn build(state: AppState) -> Router {
         // Workspace user deactivation (admin); access enforcement is in assert_room_access.
         .merge(crate::deactivation::routes())
         // Message templates / canned responses.
-        .merge(crate::templates::routes());
+        .merge(crate::templates::routes())
+        // ---- Wave 15 ----
+        // Session management: access-token refresh + logout/revocation.
+        .merge(crate::session::routes())
+        // Advanced search operators (from:/in:/before:/after:).
+        .merge(crate::search_advanced::routes())
+        // AI smart replies: suggested reply options for a room.
+        .merge(crate::smart_replies::routes())
+        // Channel role management: view roles, change role, transfer ownership.
+        .merge(crate::channel_roles::routes());
 
     // Prometheus scrape endpoint (ROADMAP 方向四). Mounted unless disabled; the
     // handler self-gates on an optional bearer token. Left here (not behind the

@@ -66,6 +66,10 @@ pub mod join_request;
 pub mod totp;
 pub mod deactivation;
 pub mod message_template;
+// Wave 15 (0047 + read-only search/role): revoked tokens, search operators, channel roles.
+pub mod revoked_token;
+pub mod search_query;
+pub mod room_role;
 
 pub use ai_job::{AiJob, AiJobKind, AiJobRepo, AiJobStatus};
 pub use audit::{AuditEvent, AuditRepo};
@@ -143,3 +147,8 @@ pub use join_request::{JoinRequest, JoinRequestRepo};
 pub use totp::TotpRepo;
 pub use deactivation::{DeactivatedMember, DeactivationRepo};
 pub use message_template::{MessageTemplate, MessageTemplateRepo};
+// Wave 15 re-exports. (revoked_token::hash_token is NOT re-exported at the crate
+// root — it collides with scim/webhook; reach it via aero_storage::revoked_token::.)
+pub use revoked_token::RevokedTokenRepo;
+pub use search_query::{parse_search_query, AdvancedSearchRepo, ParsedQuery};
+pub use room_role::RoomRoleRepo;
