@@ -3,7 +3,7 @@
 AI-Native 即时通讯 + 直播平台,Rust 实现。
 
 - 设计:[`docs/specs/2026-05-22-aero-im-design.md`](docs/specs/2026-05-22-aero-im-design.md)
-- 状态:**P0–P11 全部就位** + **11 轮 To-B 协作/企业扩展**(43 个功能点,迁移 0001–0040)。媒体面协议栈深化(WHIP/WHEP + SFU 联播/RTCP + SRT 加密/可靠性)已实现并字节级单测(**761 个 hermetic 单元测试通过**,15 个 crate)
+- 状态:**P0–P11 全部就位** + **12 轮 To-B 协作/企业扩展**(48 个功能点,迁移 0001–0042)。媒体面协议栈深化(WHIP/WHEP + SFU 联播/RTCP + SRT 加密/可靠性)已实现并字节级单测(**765 个 hermetic 单元测试通过**,15 个 crate)
 
 ## 功能矩阵
 
@@ -28,6 +28,10 @@ AI-Native 即时通讯 + 直播平台,Rust 实现。
 | **MLS E2E** | KeyPackage + 群状态服务端透传 | ✅ scaffold |
 | **协作核心** | 线程回复 / @提及通知 / 广播提及(@channel·@here·@everyone) / 线程订阅 / 未读计数 / 标记全部已读 / 置顶 / 反应 / 已读 / typing / 草稿 / 转发 / 斜杠命令 / 文件标签 | ✅ |
 | **关注 / 社交图** | 关注创作者(following·followers, Wave 11) | ✅ |
+| **私聊 / DM** | 1:1 私聊找回或新建(find-or-create, Wave 12) | ✅ |
+| **消息调度** | 定时发送(一次性) / 周期消息(hourly·daily·weekly, Wave 12) / 提醒 | ✅ |
+| **AI 协作** | 房间摘要 / RAG 问答 / @bot / 翻译 / **"帮我补课"未读摘要(catch-up, Wave 12)** | ✅ |
+| **互动细节** | 谁点了表情(reaction detail, Wave 12) / 默认频道自动加入(Wave 12) | ✅ |
 | **频道治理** | 公开·私有 / 加入·退出 / 归档 / topic / 发言策略(公告频道) / 侧边栏分组 / 收藏 | ✅ |
 | **用户组 @-usergroups** | 工作区命名成员集，`@handle` 提及扇出到全组(Wave 10) | ✅ |
 | **个性化** | 自定义状态+presence / 资料字段(title·pronouns·tz·phone, Wave 10) / 自定义表情 / 收藏 / 通知偏好(频道静音+DND) / 关键词提醒(Wave 10) | ✅ |
@@ -189,7 +193,7 @@ ffmpeg -re -i sample.mp4 -c:v libx264 -c:a aac -f flv rtmp://localhost/live/<str
 
 ```bash
 cargo check --workspace          # 干净
-cargo test --workspace --lib     # 761 pass / 0 fail / 88 ignored(DB 集成,需 --ignored + DATABASE_URL)
+cargo test --workspace --lib     # 765 pass / 0 fail / 95 ignored(DB 集成,需 --ignored + DATABASE_URL)
 cargo build --bin aero-server    # 二进制成功
 cargo clippy -p aero-live-srt -p aero-live-webrtc -p aero-live-whip --all-targets  # 媒体面 crate 零告警
 # 注:`cargo clippy --workspace --all-targets` 在 aero-storage/aero-server 等既有 crate 下仍有 pedantic 告警(非本批次引入,待清理)
