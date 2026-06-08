@@ -47,6 +47,23 @@ impl ChatMsg {
     }
 }
 
+/// Real token usage parsed from an Anthropic Messages API response.
+///
+/// The response JSON carries a top-level `usage` object — these are the actual
+/// billed token counts (not an estimate), used to compute real per-job cost (方向三
+/// AI cost realism). Cache-related token fields the API also returns
+/// (`cache_creation_input_tokens` / `cache_read_input_tokens`) are ignored here:
+/// this client does not use prompt caching, so they are always zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Usage {
+    /// Tokens consumed by the prompt (system + messages).
+    #[serde(default)]
+    pub input_tokens: u32,
+    /// Tokens generated in the assistant reply.
+    #[serde(default)]
+    pub output_tokens: u32,
+}
+
 /// HTTP client for `POST /v1/messages`.
 ///
 /// Holds a long-lived `reqwest::Client` so connections are pooled across calls.
@@ -109,12 +126,31 @@ impl AnthropicClient {
     ///
     /// Non-text blocks (e.g. `tool_use`) are skipped — this client deliberately
     /// only supports plain text generation for P2.
+    ///
+    /// This is a thin wrapper over [`Self::complete_with_usage`] that discards the
+    /// usage — preserved for callers (CLI, [`crate::service::AiService`] helpers)
+    /// that only need the text.
     pub async fn complete(
         &self,
         system: &str,
         messages: &[ChatMsg],
         max_tokens: u32,
     ) -> Result<String> {
+        self.complete_with_usage(system, messages, max_tokens).await.map(|(text, _usage)| text)
+    }
+
+    /// Like [`Self::complete`] but also returns the real token [`Usage`] parsed
+    /// from the response's top-level `usage` object.
+    ///
+    /// Callers that record cost (the worker) use this; callers that only need the
+    /// text use [`Self::complete`]. Keeping both avoids churning every call site
+    /// while still surfacing real token counts where they matter (方向三).
+    pub async fn complete_with_usage(
+        &self,
+        system: &str,
+        messages: &[ChatMsg],
+        max_tokens: u32,
+    ) -> Result<(String, Usage)> {
         if messages.is_empty() {
             return Err(AiError::Invalid("messages must not be empty".into()));
         }
@@ -148,14 +184,16 @@ impl AnthropicClient {
         }
 
         let parsed: ResponseBody = serde_json::from_str(&raw)?;
-        Ok(parsed
+        let usage = parsed.usage.unwrap_or_default();
+        let text = parsed
             .content
             .into_iter()
             .filter_map(|b| match b {
                 ContentBlock::Text { text } => Some(text),
                 ContentBlock::Other => None,
             })
-            .collect::<String>())
+            .collect::<String>();
+        Ok((text, usage))
     }
 
     /// Stream the assistant's reply as text-delta chunks.
@@ -246,6 +284,11 @@ struct RequestBody<'a> {
 struct ResponseBody {
     #[serde(default)]
     content: Vec<ContentBlock>,
+    /// Top-level `usage` object — present on every successful non-streaming
+    /// Messages response. `Option` so a malformed/older response without it
+    /// degrades to zero usage rather than failing the whole job.
+    #[serde(default)]
+    usage: Option<Usage>,
 }
 
 #[derive(Deserialize)]
@@ -393,6 +436,53 @@ mod tests {
             })
             .collect::<String>();
         assert_eq!(joined, "Hello world");
+    }
+
+    #[test]
+    fn response_parses_usage_from_anthropic_shape() {
+        // Mirrors a real Anthropic Messages API response: a top-level `usage`
+        // object alongside `content`, including the cache fields we ignore.
+        let raw = r#"{
+            "id": "msg_01XYZ",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-sonnet-4-6",
+            "content": [{"type":"text","text":"42"}],
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 1234,
+                "output_tokens": 56,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0
+            }
+        }"#;
+        let parsed: ResponseBody = serde_json::from_str(raw).unwrap();
+        let usage = parsed.usage.expect("usage must be present");
+        assert_eq!(usage.input_tokens, 1234);
+        assert_eq!(usage.output_tokens, 56);
+    }
+
+    #[test]
+    fn usage_deserializes_standalone_object() {
+        let u: Usage = serde_json::from_str(r#"{"input_tokens":10,"output_tokens":20}"#).unwrap();
+        assert_eq!(u, Usage { input_tokens: 10, output_tokens: 20 });
+    }
+
+    #[test]
+    fn response_without_usage_defaults_to_none() {
+        // An older/malformed response missing `usage` must not fail to parse —
+        // it degrades to None (callers treat that as zero usage).
+        let raw = r#"{"content":[{"type":"text","text":"hi"}]}"#;
+        let parsed: ResponseBody = serde_json::from_str(raw).unwrap();
+        assert!(parsed.usage.is_none());
+    }
+
+    #[test]
+    fn usage_fields_default_to_zero_when_partial() {
+        // Defensive: a usage object missing one field defaults it to zero rather
+        // than failing (the `#[serde(default)]` on each field).
+        let u: Usage = serde_json::from_str(r#"{"input_tokens":7}"#).unwrap();
+        assert_eq!(u, Usage { input_tokens: 7, output_tokens: 0 });
     }
 
     #[test]

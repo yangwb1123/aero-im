@@ -86,6 +86,15 @@ pub struct CostModel {
     pub moderate_micros: u64,
     /// Estimated micro-USD for an `Answer` job.
     pub answer_micros: u64,
+    /// Micro-USD per 1M **input** tokens for the Anthropic completion model.
+    /// Used by [`Self::token_micros`] to compute REAL cost from the token counts
+    /// the Anthropic response reports, replacing the flat per-kind estimate when
+    /// usage is available (方向三 AI cost realism). Default tracks Claude Sonnet
+    /// 4.6 list pricing ($3 / 1M input).
+    pub input_micros_per_mtok: u64,
+    /// Micro-USD per 1M **output** tokens. Default tracks Claude Sonnet 4.6 list
+    /// pricing ($15 / 1M output).
+    pub output_micros_per_mtok: u64,
 }
 
 impl Default for CostModel {
@@ -99,12 +108,25 @@ impl Default for CostModel {
             moderate_micros: 0,
             // ~$0.005 per answer (retrieval + a larger completion), coarse.
             answer_micros: 5_000,
+            // Claude Sonnet 4.6 list price: $3 / 1M input, $15 / 1M output
+            // (= 3_000_000 / 15_000_000 micro-USD per 1M tokens). Configurable so
+            // deployments can match their actual model + negotiated pricing.
+            input_micros_per_mtok: 3_000_000,
+            output_micros_per_mtok: 15_000_000,
         }
     }
 }
 
+/// Divisor for per-1M-token rates: 1 million tokens.
+const TOKENS_PER_MTOK: u64 = 1_000_000;
+
 impl CostModel {
     /// The estimated micro-USD cost for a job of `kind`.
+    ///
+    /// This is the COARSE flat-per-kind estimate, used as a fallback when real
+    /// token usage is not available (e.g. the heuristic / no-Anthropic path).
+    /// Prefer [`Self::token_micros`] whenever the Anthropic response reported
+    /// actual token counts.
     #[must_use]
     pub fn micros_for(&self, kind: AiJobKind) -> u64 {
         match kind {
@@ -113,6 +135,23 @@ impl CostModel {
             AiJobKind::Moderate => self.moderate_micros,
             AiJobKind::Answer => self.answer_micros,
         }
+    }
+
+    /// REAL micro-USD cost from actual `(input_tokens, output_tokens)`.
+    ///
+    /// `cost = input * input_rate / 1M + output * output_rate / 1M`, computed in
+    /// `u128` to avoid overflow on large token counts, then saturated back to
+    /// `u64` micros. This is the billing-grounded figure used in place of the flat
+    /// estimate whenever the worker has the token counts from the Anthropic
+    /// response (方向三). Integer division truncates sub-micro fractions — a
+    /// negligible, consistently-downward rounding for a budget signal.
+    #[must_use]
+    pub fn token_micros(&self, input_tokens: u32, output_tokens: u32) -> u64 {
+        let input = u128::from(input_tokens) * u128::from(self.input_micros_per_mtok)
+            / u128::from(TOKENS_PER_MTOK);
+        let output = u128::from(output_tokens) * u128::from(self.output_micros_per_mtok)
+            / u128::from(TOKENS_PER_MTOK);
+        u64::try_from(input + output).unwrap_or(u64::MAX)
     }
 }
 
@@ -135,6 +174,31 @@ pub fn record_duration(reg: &Registry, kind: AiJobKind, secs: f64) {
 /// present once it has been touched).
 pub fn record_cost(reg: &Registry, model: &CostModel, kind: AiJobKind, paid: bool) {
     let micros = if paid { model.micros_for(kind) } else { 0 };
+    reg.inc_counter_labeled(
+        names::AI_COST_MICROS_TOTAL,
+        micros,
+        &[("kind", kind_label(kind))],
+    );
+}
+
+/// Record the REAL cost of one job from actual Anthropic token counts, labeled by
+/// kind, against the same [`names::AI_COST_MICROS_TOTAL`] counter as
+/// [`record_cost`].
+///
+/// Cost is `model.token_micros(input, output)` — the billing-grounded figure (方向三)
+/// rather than the coarse flat per-kind estimate. The worker calls this on the
+/// success path whenever the response surfaced usage; it falls back to
+/// [`record_cost`] (the estimate) when usage is absent (e.g. the heuristic
+/// no-Anthropic path). Zero tokens record a zero-valued series so the `kind`
+/// stays visible on dashboards.
+pub fn record_token_cost(
+    reg: &Registry,
+    model: &CostModel,
+    kind: AiJobKind,
+    input_tokens: u32,
+    output_tokens: u32,
+) {
+    let micros = model.token_micros(input_tokens, output_tokens);
     reg.inc_counter_labeled(
         names::AI_COST_MICROS_TOTAL,
         micros,
@@ -197,9 +261,77 @@ mod tests {
             summarize_micros: 2,
             moderate_micros: 3,
             answer_micros: 4,
+            input_micros_per_mtok: 1_000_000,
+            output_micros_per_mtok: 2_000_000,
         };
         assert_eq!(m.micros_for(AiJobKind::Embed), 1);
         assert_eq!(m.micros_for(AiJobKind::Answer), 4);
+    }
+
+    #[test]
+    fn token_micros_uses_default_sonnet_rates() {
+        let m = CostModel::default();
+        // 1M input tokens at $3/1M = 3_000_000 micros; 1M output at $15/1M.
+        assert_eq!(m.token_micros(1_000_000, 0), 3_000_000);
+        assert_eq!(m.token_micros(0, 1_000_000), 15_000_000);
+        // A realistic small call: 1234 in / 56 out.
+        //   input  = 1234 * 3_000_000 / 1_000_000 = 3702
+        //   output =   56 * 15_000_000 / 1_000_000 = 840
+        assert_eq!(m.token_micros(1234, 56), 3702 + 840);
+        // Zero usage → zero cost.
+        assert_eq!(m.token_micros(0, 0), 0);
+    }
+
+    #[test]
+    fn token_micros_honours_configured_rates() {
+        // $1/1M input, $4/1M output.
+        let m = CostModel {
+            input_micros_per_mtok: 1_000_000,
+            output_micros_per_mtok: 4_000_000,
+            ..CostModel::default()
+        };
+        // 500k input = 500_000 micros; 250k output = 1_000_000 micros.
+        assert_eq!(m.token_micros(500_000, 250_000), 500_000 + 1_000_000);
+    }
+
+    #[test]
+    fn token_micros_does_not_overflow_on_large_counts() {
+        // u32::MAX tokens at the default rates must not panic / wrap — the u128
+        // intermediate keeps it exact, then saturates to u64 if needed.
+        let m = CostModel::default();
+        let cost = m.token_micros(u32::MAX, u32::MAX);
+        // u32::MAX ≈ 4.29e9 tokens; cost is well within u64 range, so it's exact.
+        let want = u64::from(u32::MAX) * 3 + u64::from(u32::MAX) * 15;
+        assert_eq!(cost, want);
+    }
+
+    #[test]
+    fn record_token_cost_accumulates_real_cost_per_kind() {
+        let r = Registry::new();
+        let m = CostModel::default();
+        // Two answer calls with real token counts.
+        record_token_cost(&r, &m, AiJobKind::Answer, 1000, 100); // 3000 + 1500 = 4500
+        record_token_cost(&r, &m, AiJobKind::Answer, 2000, 200); // 6000 + 3000 = 9000
+        let out = r.render_prometheus();
+        let want = 4500 + 9000;
+        assert!(
+            out.contains(&format!(
+                r#"aero_ai_cost_micros_total{{kind="answer"}} {want}"#
+            )),
+            "real token cost wrong (want {want}):\n{out}"
+        );
+    }
+
+    #[test]
+    fn record_token_cost_zero_tokens_records_zero_series() {
+        let r = Registry::new();
+        let m = CostModel::default();
+        record_token_cost(&r, &m, AiJobKind::Summarize, 0, 0);
+        let out = r.render_prometheus();
+        assert!(
+            out.contains(r#"aero_ai_cost_micros_total{kind="summarize"} 0"#),
+            "zero-token cost must record a zero series:\n{out}"
+        );
     }
 
     #[test]

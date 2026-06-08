@@ -52,6 +52,7 @@ use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
+use crate::anthropic::Usage;
 use crate::budget::{CostBudget, KeyedCostBudget};
 use crate::error::{AiError, Result};
 use crate::metrics::{self as ai_metrics, CostModel};
@@ -273,12 +274,14 @@ impl AiWorker {
         let p: SummarizePayload = serde_json::from_value(job.payload.clone())?;
         let room = parse_room_id(&p.room_id)?;
         let last_n = p.last_n.unwrap_or(50);
-        let summary = self.svc.summarize_room(room, last_n).await?;
-        Ok(serde_json::json!({
+        let (summary, usage) = self.svc.summarize_room_with_usage(room, last_n).await?;
+        let mut result = serde_json::json!({
             "summary": summary,
             "anthropic": self.svc.has_anthropic(),
             "last_n": last_n,
-        }))
+        });
+        attach_usage(&mut result, usage);
+        Ok(result)
     }
 
     async fn handle_moderate(&self, job: &AiJob) -> Result<serde_json::Value> {
@@ -324,13 +327,15 @@ impl AiWorker {
         let p: AnswerPayload = serde_json::from_value(job.payload.clone())?;
         let room = parse_room_id(&p.room_id)?;
         let k = p.k.unwrap_or(8);
-        let result = self.svc.answer_question(room, &p.question, k).await?;
-        let citations: Vec<String> = result.citations.iter().map(MessageId::to_string).collect();
-        Ok(serde_json::json!({
-            "answer": result.answer,
+        let (answer, usage) = self.svc.answer_question_with_usage(room, &p.question, k).await?;
+        let citations: Vec<String> = answer.citations.iter().map(MessageId::to_string).collect();
+        let mut result = serde_json::json!({
+            "answer": answer.answer,
             "citations": citations,
             "anthropic": self.svc.has_anthropic(),
-        }))
+        });
+        attach_usage(&mut result, usage);
+        Ok(result)
     }
 }
 
@@ -392,6 +397,35 @@ fn should_skip_embed(searchable_text: &str) -> bool {
 /// billed upstream, so we conservatively do not charge it (the budget guard is
 /// the hard per-window ceiling on spend regardless). The metric is a coarse
 /// budget signal, not an invoice — see [`crate::metrics::CostModel`].
+/// Embed real Anthropic token [`Usage`] into a job's result JSON under a `usage`
+/// key, so it is durably recorded by `AiJobRepo::complete` and queryable later
+/// (方向三 — usage is part of the persisted result). A no-op when `usage` is
+/// `None` (the heuristic / no-Anthropic path made no paid call).
+fn attach_usage(result: &mut serde_json::Value, usage: Option<Usage>) {
+    if let (Some(obj), Some(u)) = (result.as_object_mut(), usage) {
+        obj.insert(
+            "usage".to_string(),
+            serde_json::json!({
+                "input_tokens": u.input_tokens,
+                "output_tokens": u.output_tokens,
+            }),
+        );
+    }
+}
+
+/// Read the real token usage back out of a completed job's result, if a handler
+/// recorded it via [`attach_usage`]. Returns `None` when the result has no
+/// `usage` object (heuristic path, stub kinds, idempotent skips), in which case
+/// the worker falls back to the flat per-kind cost estimate.
+#[must_use]
+fn usage_from_result(result: &serde_json::Value) -> Option<Usage> {
+    let u = result.get("usage")?;
+    Some(Usage {
+        input_tokens: u32::try_from(u.get("input_tokens")?.as_u64()?).ok()?,
+        output_tokens: u32::try_from(u.get("output_tokens")?.as_u64()?).ok()?,
+    })
+}
+
 #[must_use]
 fn was_paid(kind: AiJobKind, result: &serde_json::Value) -> bool {
     match kind {
@@ -616,9 +650,22 @@ where
 
     match disposition {
         Disposition::Done(result) => {
-            // Cost is charged on success only; `was_paid` excludes stub/no-op
-            // kinds so skipped work does not inflate the (coarse) spend estimate.
-            ai_metrics::record_cost(reg, cost_model, kind, was_paid(kind, &result));
+            // Cost is charged on success only. Prefer the REAL token-based cost
+            // when the handler recorded actual Anthropic usage (方向三); otherwise
+            // fall back to the coarse flat per-kind estimate. `was_paid` still
+            // gates the estimate path so stub/no-op kinds record zero — the usage
+            // path is only taken when a real paid completion reported tokens.
+            if let Some(usage) = usage_from_result(&result) {
+                ai_metrics::record_token_cost(
+                    reg,
+                    cost_model,
+                    kind,
+                    usage.input_tokens,
+                    usage.output_tokens,
+                );
+            } else {
+                ai_metrics::record_cost(reg, cost_model, kind, was_paid(kind, &result));
+            }
             ai_metrics::record_outcome(reg, kind, ai_metrics::OUTCOME_SUCCESS);
             if let Err(e) = queue.complete(id, result).await {
                 tracing::error!(job_id = %id, error = %e, "ai worker: completion write failed");
@@ -1355,6 +1402,89 @@ mod tests {
         assert!(
             out.contains(r#"aero_ai_jobs_total{kind="answer",outcome="success"} 1"#),
             "success outcome not recorded:\n{out}"
+        );
+    }
+
+    // ---------- (方向三) real token usage → cost ----------
+
+    #[test]
+    fn attach_and_read_usage_round_trips() {
+        let mut result = serde_json::json!({ "answer": "x" });
+        attach_usage(&mut result, Some(Usage { input_tokens: 100, output_tokens: 25 }));
+        // The usage is now part of the persisted result JSON (queryable).
+        assert_eq!(result["usage"]["input_tokens"], 100);
+        assert_eq!(result["usage"]["output_tokens"], 25);
+        // And reads back as the same Usage.
+        let u = usage_from_result(&result).expect("usage present");
+        assert_eq!(u, Usage { input_tokens: 100, output_tokens: 25 });
+    }
+
+    #[test]
+    fn attach_usage_none_is_noop_and_reads_back_none() {
+        let mut result = serde_json::json!({ "summary": "x" });
+        attach_usage(&mut result, None);
+        assert!(result.get("usage").is_none());
+        assert!(usage_from_result(&result).is_none());
+    }
+
+    #[tokio::test]
+    async fn run_one_records_real_token_cost_when_usage_present() {
+        // A successful Answer job whose result carries REAL token usage must
+        // charge the cost counter the token-based figure, not the flat estimate.
+        let job = mk_job(AiJobKind::Answer, 1);
+        let queue = FakeQueue::with_jobs(vec![job.clone()]);
+        {
+            let mut rows = queue.rows.lock().unwrap();
+            rows[0].status = AiJobStatus::Running;
+        }
+        // Result shape a real handler produces: answer + usage block.
+        let proc = FixedResult {
+            value: serde_json::json!({
+                "answer": "42",
+                "usage": { "input_tokens": 1000, "output_tokens": 100 },
+            }),
+        };
+        let reg = test_reg();
+        let cost = CostModel::default();
+
+        run_one(&queue, &proc, job, &reg, &cost).await;
+
+        // Real token cost: 1000*3 + 100*15 = 3000 + 1500 = 4500 micros (default
+        // Sonnet rates) — NOT the flat answer_micros estimate (5000).
+        let want = cost.token_micros(1000, 100);
+        assert_ne!(want, cost.answer_micros, "test must distinguish real vs estimate");
+        let out = reg.render_prometheus();
+        assert!(
+            out.contains(&format!(
+                r#"aero_ai_cost_micros_total{{kind="answer"}} {want}"#
+            )),
+            "expected real token cost {want}, not the flat estimate:\n{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_one_falls_back_to_estimate_when_usage_absent() {
+        // A successful Summarize job WITHOUT a usage block (heuristic / no-key
+        // path) must fall back to the flat per-kind estimate.
+        let job = mk_job(AiJobKind::Summarize, 1);
+        let queue = FakeQueue::with_jobs(vec![job.clone()]);
+        {
+            let mut rows = queue.rows.lock().unwrap();
+            rows[0].status = AiJobStatus::Running;
+        }
+        let proc = FixedResult { value: serde_json::json!({ "summary": "x", "anthropic": false }) };
+        let reg = test_reg();
+        let cost = CostModel::default();
+
+        run_one(&queue, &proc, job, &reg, &cost).await;
+
+        let out = reg.render_prometheus();
+        assert!(
+            out.contains(&format!(
+                r#"aero_ai_cost_micros_total{{kind="summarize"}} {}"#,
+                cost.summarize_micros
+            )),
+            "expected the flat estimate fallback:\n{out}"
         );
     }
 

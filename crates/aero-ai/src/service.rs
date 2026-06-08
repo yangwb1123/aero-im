@@ -20,7 +20,7 @@ use std::pin::Pin;
 
 use futures::stream::Stream;
 
-use crate::anthropic::{AnthropicClient, ChatMsg};
+use crate::anthropic::{AnthropicClient, ChatMsg, Usage};
 use crate::embed::{default_embedder, Embedder};
 use crate::error::{AiError, Result};
 use crate::transcribe::{default_transcriber, Transcriber};
@@ -134,6 +134,21 @@ impl AiService {
     /// Uses Anthropic when configured; otherwise returns a deterministic
     /// "last 5 lines" fallback so the feature degrades gracefully in dev.
     pub async fn summarize_room(&self, room: RoomId, last_n: usize) -> Result<String> {
+        self.summarize_room_with_usage(room, last_n).await.map(|(summary, _usage)| summary)
+    }
+
+    /// Like [`Self::summarize_room`] but also returns the real Anthropic token
+    /// [`Usage`] when a completion was made.
+    ///
+    /// `usage` is `None` on the no-Anthropic heuristic path (or an empty room) so
+    /// the worker can fall back to the flat cost estimate; it is `Some` whenever a
+    /// paid completion produced the summary, letting the worker record REAL cost
+    /// (方向三).
+    pub async fn summarize_room_with_usage(
+        &self,
+        room: RoomId,
+        last_n: usize,
+    ) -> Result<(String, Option<Usage>)> {
         // `last_n` is clamped to [1, 200] so this `as i64` is always safe.
         #[allow(clippy::cast_possible_wrap)]
         let limit = last_n.clamp(1, 200) as i64;
@@ -142,7 +157,7 @@ impl AiService {
         recent.reverse();
 
         if recent.is_empty() {
-            return Ok(String::new());
+            return Ok((String::new(), None));
         }
 
         let transcript = render_transcript(&recent);
@@ -153,10 +168,11 @@ impl AiService {
                 "请阅读以下聊天记录,并按照系统指令给出要点摘要。\n\n聊天记录:\n{transcript}"
             );
             let msgs = vec![ChatMsg::user(user)];
-            return client.complete(system, &msgs, 600).await;
+            let (summary, usage) = client.complete_with_usage(system, &msgs, 600).await?;
+            return Ok((summary, Some(usage)));
         }
 
-        Ok(heuristic_summary(&recent))
+        Ok((heuristic_summary(&recent), None))
     }
 
     /// Summarize an arbitrary block of text into a short recap + action items.
@@ -207,6 +223,21 @@ impl AiService {
         question: &str,
         k: usize,
     ) -> Result<AnswerResult> {
+        self.answer_question_with_usage(room, question, k).await.map(|(res, _usage)| res)
+    }
+
+    /// Like [`Self::answer_question`] but also returns the real Anthropic token
+    /// [`Usage`] when a completion was made.
+    ///
+    /// `usage` is `None` on the no-Anthropic fallback path so the worker can fall
+    /// back to the flat cost estimate; it is `Some` whenever a paid completion
+    /// produced the answer, letting the worker record REAL cost (方向三).
+    pub async fn answer_question_with_usage(
+        &self,
+        room: RoomId,
+        question: &str,
+        k: usize,
+    ) -> Result<(AnswerResult, Option<Usage>)> {
         let q = question.trim();
         if q.is_empty() {
             return Err(AiError::Invalid("question must not be empty".into()));
@@ -226,8 +257,9 @@ impl AiService {
             let user = format!(
                 "问题: {q}\n\n相关聊天上下文(每段已附 ID,引用时使用):\n{context}\n\n请基于上述上下文作答,若信息不足请说明。"
             );
-            let answer = client.complete(system, &[ChatMsg::user(user)], 800).await?;
-            return Ok(AnswerResult { answer, citations });
+            let (answer, usage) =
+                client.complete_with_usage(system, &[ChatMsg::user(user)], 800).await?;
+            return Ok((AnswerResult { answer, citations }, Some(usage)));
         }
 
         // No Anthropic — return the raw context so the UI can still surface
@@ -238,7 +270,7 @@ impl AiService {
         } else {
             format!("（未配置 Anthropic,以下为检索到的相关消息上下文:）\n\n{context}")
         };
-        Ok(AnswerResult { answer: fallback, citations })
+        Ok((AnswerResult { answer: fallback, citations }, None))
     }
 
     /// Streaming variant of [`Self::answer_question`].
