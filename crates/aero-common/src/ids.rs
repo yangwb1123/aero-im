@@ -203,6 +203,35 @@ define_id!(
     /// body a user can post into a room on demand).
     MessageTemplateId
 );
+// ---- Wave 16 ----
+define_id!(
+    /// Identifies a channel canvas — a per-channel collaborative document (a
+    /// titled rich document whose body is a JSON array of blocks). A channel may
+    /// own several; any member with room access may edit one.
+    CanvasId
+);
+define_id!(
+    /// Identifies a channel bookmark — a pinned link / resource shown in a
+    /// channel's header (title + url + optional emoji), distinct from a pinned
+    /// message or a personal saved item.
+    ChannelBookmarkId
+);
+define_id!(
+    /// Identifies a live-stream discovery category (Twitch-style: Gaming, Music,
+    /// Coding…) — a slug-addressable bucket a stream can be assigned to so viewers
+    /// can browse live streams by category.
+    StreamCategoryId
+);
+define_id!(
+    /// Identifies a creator membership tier (name + monthly price + perks) that a
+    /// creator defines for viewers to subscribe at — like a Twitch sub tier.
+    CreatorTierId
+);
+define_id!(
+    /// Identifies a creator subscription — one viewer's recurring membership to a
+    /// creator at a chosen tier (at most one per creator/subscriber pair).
+    SubscriptionId
+);
 
 #[cfg(test)]
 mod tests {

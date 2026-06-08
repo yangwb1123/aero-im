@@ -73,4 +73,12 @@ pub mod search_advanced;
 pub mod smart_replies;
 pub mod channel_roles;
 
+// ---- Wave 16 ----
+pub mod analytics;
+pub mod canvas;
+pub mod channel_bookmarks;
+pub mod directory;
+pub mod stream_discovery;
+pub mod subscriptions;
+
 pub use state::AppState;

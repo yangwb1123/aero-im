@@ -71,6 +71,14 @@ pub mod revoked_token;
 pub mod search_query;
 pub mod room_role;
 
+// ---- Wave 16 ----
+pub mod analytics;
+pub mod canvas;
+pub mod channel_bookmark;
+pub mod creator_subscription;
+pub mod directory;
+pub mod stream_category;
+
 pub use ai_job::{AiJob, AiJobKind, AiJobRepo, AiJobStatus};
 pub use audit::{AuditEvent, AuditRepo};
 pub use blob::{BlobRepo, NewBlob};
@@ -152,3 +160,14 @@ pub use message_template::{MessageTemplate, MessageTemplateRepo};
 pub use revoked_token::RevokedTokenRepo;
 pub use search_query::{parse_search_query, AdvancedSearchRepo, ParsedQuery};
 pub use room_role::RoomRoleRepo;
+
+// ---- Wave 16 re-exports ----
+pub use analytics::{
+    AnalyticsRepo, ChannelMessageCount, DayCount, WorkspaceAnalytics, MAX_TIMELINE_DAYS,
+    MAX_TOP_CHANNELS,
+};
+pub use canvas::{Canvas, CanvasRepo};
+pub use channel_bookmark::{ChannelBookmark, ChannelBookmarkRepo};
+pub use creator_subscription::{CreatorSubscription, CreatorTier, SubscriptionRepo};
+pub use directory::{DirectoryEntry, DirectoryRepo};
+pub use stream_category::{StreamCategory, StreamCategoryRepo};

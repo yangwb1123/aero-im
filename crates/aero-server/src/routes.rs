@@ -211,7 +211,20 @@ pub fn build(state: AppState) -> Router {
         // AI smart replies: suggested reply options for a room.
         .merge(crate::smart_replies::routes())
         // Channel role management: view roles, change role, transfer ownership.
-        .merge(crate::channel_roles::routes());
+        .merge(crate::channel_roles::routes())
+        // ---- Wave 16 ----
+        // Channel canvas: per-channel collaborative documents (create/list/get/edit/delete).
+        .merge(crate::canvas::routes())
+        // Channel bookmarks / header links: pinned per-channel resources.
+        .merge(crate::channel_bookmarks::routes())
+        // Stream categories & discovery: browse live streams by category/tag.
+        .merge(crate::stream_discovery::routes())
+        // Creator subscriptions / membership tiers (recurring support; complements gifts).
+        .merge(crate::subscriptions::routes())
+        // Workspace analytics: admin-only aggregate stats (overview/top-channels/timeline).
+        .merge(crate::analytics::routes())
+        // People directory: searchable workspace member list surfacing profile fields.
+        .merge(crate::directory::routes());
 
     // Prometheus scrape endpoint (ROADMAP 方向四). Mounted unless disabled; the
     // handler self-gates on an optional bearer token. Left here (not behind the
