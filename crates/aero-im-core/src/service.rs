@@ -917,9 +917,21 @@ impl ImService {
             }
         }
 
-        // Throughput observability (ROADMAP 方向五): count accepted messages and
-        // record the hot-path latency so dashboards can answer "messages/sec".
-        aero_common::metrics::inc_counter(aero_common::metrics::names::MESSAGES_SENT_TOTAL, 1);
+        // Throughput observability (ROADMAP 方向五): count accepted messages —
+        // layered by room_type for capacity planning — and record the hot-path
+        // latency so dashboards can answer "messages/sec". The room-kind lookup
+        // is best-effort (a single PK read); "unknown" on miss never fails send.
+        let room_type = match self.rooms.room_kind(room).await {
+            Ok(Some(RoomKind::Direct)) => "direct",
+            Ok(Some(RoomKind::Group)) => "group",
+            Ok(Some(RoomKind::Channel)) => "channel",
+            _ => "unknown",
+        };
+        aero_common::metrics::inc_counter_labeled(
+            aero_common::metrics::names::MESSAGES_SENT_TOTAL,
+            1,
+            &[("room_type", room_type)],
+        );
         aero_common::metrics::observe_histogram_labeled(
             aero_common::metrics::names::MESSAGE_PROCESSING_DURATION_SECONDS,
             started.elapsed().as_secs_f64(),

@@ -280,6 +280,10 @@ async fn main() -> anyhow::Result<()> {
         ws_config: ws_cfg,
         rate_limiter: RateLimiter::new(gateway_cfg.rate_limit),
         auth_rate_limiter: RateLimiter::new(gateway_cfg.auth_rate_limit),
+        // Per-route credential limits (ROADMAP 方向三): 5/min on login, 3/hour on
+        // forgot-password — fractional refill rates the integer config can't express.
+        login_rate_limiter: RateLimiter::with_rate(5.0 / 60.0, 5.0),
+        forgot_rate_limiter: RateLimiter::with_rate(3.0 / 3600.0, 3.0),
         metrics: Arc::new(metrics_cfg.clone()),
         ai: Some(Arc::new(AiServiceAdapter::new(ai_service.clone()))),
         public_base_url,
@@ -375,13 +379,22 @@ async fn main() -> anyhow::Result<()> {
         let dlq_pool = pg.clone();
         tokio::spawn(async move {
             let repo = aero_storage::AiJobRepo::new(dlq_pool);
+            // Emit one gauge series per job kind so an operator can see WHICH AI
+            // workflow (moderation vs summarisation vs …) is dead-lettering.
+            const KINDS: &[&str] = &["embed", "summarize", "moderate", "answer"];
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tick.tick().await;
-                match repo.count_dead(None).await {
-                    Ok(n) => common_metrics::set_gauge(common_metrics::names::AI_DEAD_LETTER_QUEUE_SIZE, n as f64),
-                    Err(e) => tracing::warn!(error = %e, "ai dlq count query failed"),
+                for kind in KINDS {
+                    match repo.count_dead(Some(kind)).await {
+                        Ok(n) => common_metrics::set_gauge_labeled(
+                            common_metrics::names::AI_DEAD_LETTER_QUEUE_SIZE,
+                            n as f64,
+                            &[("kind", kind)],
+                        ),
+                        Err(e) => tracing::warn!(error = %e, %kind, "ai dlq count query failed"),
+                    }
                 }
             }
         });

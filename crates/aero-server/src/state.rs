@@ -152,8 +152,14 @@ pub struct AppState {
     pub ws_config: WsConfig,
     /// Per-client API rate limiter (in-memory token buckets).
     pub rate_limiter: RateLimiter,
-    /// Stricter limiter applied only to credential-accepting auth endpoints.
+    /// Stricter limiter applied to credential-accepting auth endpoints
+    /// (register / reset / refresh).
     pub auth_rate_limiter: RateLimiter,
+    /// Tightest limiter, login only — 5 / minute / client (ROADMAP 方向三).
+    pub login_rate_limiter: RateLimiter,
+    /// Forgot-password limiter — 3 / hour / client, throttles email enumeration
+    /// and reset-mail spam (ROADMAP 方向三).
+    pub forgot_rate_limiter: RateLimiter,
     /// `/metrics` exposure policy (enable flag + optional scrape token).
     pub metrics: Arc<MetricsConfig>,
     /// Optional — only present when an Anthropic / Voyage API key is configured.

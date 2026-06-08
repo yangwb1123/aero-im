@@ -795,18 +795,28 @@ async fn delete_message(
     let id = MessageId::from_str(&id_str)
         .map_err(|e| AeroError::Invalid(format!("message id: {e}")))?;
 
-    // Pre-fetch room_id before the delete so we can look up the workspace for audit.
-    let room_id = s.messages.get(id).await.map_err(AeroError::from)?.map(|m| m.room_id);
+    // Pre-fetch the message before the delete so the audit trail can record
+    // the room AND a content digest (the blocks are cleared by the soft-delete,
+    // so this is the only chance to capture "what was deleted").
+    let pre = s.messages.get(id).await.map_err(AeroError::from)?;
+    let room_id = pre.as_ref().map(|m| m.room_id);
+    let digest = pre.as_ref().map(|m| {
+        let text = m.searchable_text();
+        // Char-boundary-safe 120-char summary so the audit row stays compact.
+        text.chars().take(120).collect::<String>()
+    });
 
     s.im.delete_message(auth.participant_id, id).await?;
 
-    // Best-effort audit: resolve workspace and append a message.delete event.
+    // Best-effort audit: resolve workspace and append a `message.deleted` event
+    // carrying the operator, the deleted message id, and its content digest.
     if let Some(rid) = room_id {
         let actor = auth.participant_id;
         let target = id.to_string();
         if let Ok(Some(ws)) = s.rooms.room_workspace(rid).await {
-            if let Err(e) = s.audit.append(ws, Some(actor), "message.delete", Some(&target), serde_json::json!({"room_id": rid})).await {
-                tracing::warn!(error = ?e, %ws, "message.delete audit append failed");
+            let details = serde_json::json!({ "room_id": rid, "digest": digest });
+            if let Err(e) = s.audit.append(ws, Some(actor), "message.deleted", Some(&target), details).await {
+                tracing::warn!(error = ?e, %ws, "message.deleted audit append failed");
             }
         }
     }

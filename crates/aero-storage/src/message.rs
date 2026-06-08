@@ -109,16 +109,67 @@ impl MessageRepo {
     }
 
     /// Soft-delete a message. Caller has already checked authorization.
+    ///
+    /// GDPR 方向四: before clearing the blocks, any blob the message attached
+    /// (`File` / `Voice` blocks) is enqueued into `blob_gc_queue` so the
+    /// background GC job deletes its storage object — UNLESS another *live*
+    /// message still references the same blob. The shared-blob case is real
+    /// because owner-scoped SHA-256 dedup lets two messages point at one blob;
+    /// the reference check (a containment scan over remaining live blocks) runs
+    /// AFTER this row's blocks are cleared, so it never counts the row being
+    /// deleted. All in one transaction.
     pub async fn soft_delete(&self, id: MessageId) -> Result<bool, sqlx::Error> {
-        let result = sqlx::query(
+        let mut tx = self.pool.begin().await?;
+
+        // Read + lock the row; capture its blocks so we can extract blob ids.
+        let row = sqlx::query_as::<_, (serde_json::Value,)>(
+            "SELECT blocks FROM messages WHERE id = $1 AND deleted_at IS NULL FOR UPDATE",
+        )
+        .bind(id.to_uuid())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((blocks_json,)) = row else {
+            tx.commit().await?;
+            return Ok(false);
+        };
+        let blob_ids = attached_blob_ids(&blocks_json);
+
+        sqlx::query(
             r#"UPDATE messages
                   SET deleted_at = NOW(), blocks = '[]'::jsonb, searchable_text = '', embedding = NULL
                WHERE id = $1 AND deleted_at IS NULL"#,
         )
         .bind(id.to_uuid())
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
-        Ok(result.rows_affected() > 0)
+
+        // Enqueue each attached blob for GC unless another live message still
+        // references it. The ULID string is globally unique, so a substring
+        // containment test over the remaining live blocks is a safe reference
+        // check (this row's blocks are already cleared above).
+        for blob in blob_ids {
+            let still_referenced = sqlx::query_as::<_, (bool,)>(
+                r"SELECT EXISTS(
+                    SELECT 1 FROM messages
+                     WHERE deleted_at IS NULL AND blocks::text LIKE $1
+                  )",
+            )
+            .bind(format!("%{blob}%"))
+            .fetch_one(&mut *tx)
+            .await?
+            .0;
+            if !still_referenced {
+                sqlx::query(
+                    r"INSERT INTO blob_gc_queue (blob_id) VALUES ($1) ON CONFLICT (blob_id) DO NOTHING",
+                )
+                .bind(blob.to_uuid())
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
+
+        tx.commit().await?;
+        Ok(true)
     }
 
     /// Patch transcripts onto the Voice blocks of a message that don't have
@@ -600,6 +651,20 @@ fn searchable_of(blocks: &[Block]) -> String {
         .join("\n")
 }
 
+/// Extract the blob ids a message's blocks reference (`File` + `Voice` blocks).
+/// Used by [`MessageRepo::soft_delete`] to enqueue attachments for GC. A block
+/// shape that doesn't deserialize is skipped rather than failing the delete.
+fn attached_blob_ids(blocks_json: &serde_json::Value) -> Vec<aero_common::BlobId> {
+    let blocks: Vec<Block> = serde_json::from_value(blocks_json.clone()).unwrap_or_default();
+    blocks
+        .iter()
+        .filter_map(|b| match b {
+            Block::File { blob_id, .. } | Block::Voice { blob_id, .. } => Some(*blob_id),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Maximum rows returned by [`MessageRepo::by_sender`] (personal GDPR export).
 const EXPORT_SENDER_CAP: i64 = 500;
 
@@ -657,9 +722,36 @@ impl From<ScoredMessageRow> for SearchHit {
 
 #[cfg(test)]
 mod tests {
-    use super::clamp_page_limit;
-    use aero_common::MessageId;
+    use super::{attached_blob_ids, clamp_page_limit};
+    use aero_common::{BlobId, Block, FileKind, MessageId};
     use ulid::Ulid;
+
+    #[test]
+    fn attached_blob_ids_extracts_file_and_voice_blobs_only() {
+        let file_blob = BlobId::new();
+        let voice_blob = BlobId::new();
+        let blocks = vec![
+            Block::text("hello"),
+            Block::File {
+                blob_id: file_blob,
+                kind: FileKind::Document,
+                name: "doc.pdf".into(),
+                size: 10,
+            },
+            Block::Voice { blob_id: voice_blob, duration_ms: 1000, transcript: None },
+        ];
+        let json = serde_json::to_value(&blocks).unwrap();
+        let got = attached_blob_ids(&json);
+        assert_eq!(got, vec![file_blob, voice_blob]);
+    }
+
+    #[test]
+    fn attached_blob_ids_empty_for_text_only_and_garbage() {
+        let text_only = serde_json::to_value(vec![Block::text("nothing here")]).unwrap();
+        assert!(attached_blob_ids(&text_only).is_empty());
+        // A malformed blocks value yields no ids rather than panicking.
+        assert!(attached_blob_ids(&serde_json::json!({"not": "an array"})).is_empty());
+    }
 
     #[test]
     fn page_limit_is_clamped_into_window() {

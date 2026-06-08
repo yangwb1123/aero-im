@@ -237,6 +237,17 @@ impl RoomRepo {
         Ok(row.map(|(ws,)| WorkspaceId::from_uuid(ws)))
     }
 
+    /// The room's [`RoomKind`] (`direct` / `group` / `channel`). Used to label
+    /// message-throughput metrics by room type (ROADMAP 方向五). A single PK
+    /// lookup; `None` when the room is absent.
+    pub async fn room_kind(&self, room: RoomId) -> Result<Option<RoomKind>, sqlx::Error> {
+        let row = sqlx::query_as::<_, (String,)>("SELECT kind FROM rooms WHERE id = $1")
+            .bind(room.to_uuid())
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(|(k,)| room_kind_from_str(&k)))
+    }
+
     // ------------------------------------------------ channels (migration 0012)
 
     /// Set a room's visibility (`is_private`). A public (non-private) channel is

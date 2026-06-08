@@ -70,6 +70,22 @@ impl RateLimiter {
         }
     }
 
+    /// Build a limiter with an explicit fractional refill rate (tokens/second)
+    /// and burst capacity. Lets a *window*-style limit be expressed — e.g.
+    /// "5 per minute" ⇒ `with_rate(5.0 / 60.0, 5.0)`, "3 per hour" ⇒
+    /// `with_rate(3.0 / 3600.0, 3.0)` — which the integer-per-second [`Self::new`]
+    /// cannot. Used for the high-risk credential endpoints (ROADMAP 方向三).
+    /// Both inputs are floored to a tiny positive value / 1.0 so a misconfig
+    /// can't stall or divide by zero.
+    #[must_use]
+    pub fn with_rate(per_second: f64, burst: f64) -> Self {
+        Self {
+            buckets: Arc::new(DashMap::new()),
+            rate: per_second.max(f64::MIN_POSITIVE),
+            capacity: burst.max(1.0),
+        }
+    }
+
     /// Account for one request from `key` at instant `now`.
     ///
     /// Returns `true` if the request is permitted (a token was consumed), or
@@ -107,7 +123,8 @@ impl RateLimiter {
     }
 }
 
-/// Auth endpoints that accept credentials — these get a stricter token bucket.
+/// Auth endpoints that accept credentials — these get a stricter token bucket
+/// (the general one, beyond the two per-path limiters below).
 const SENSITIVE_AUTH_PATHS: &[&str] = &[
     "/api/auth/login",
     "/api/auth/register",
@@ -116,12 +133,16 @@ const SENSITIVE_AUTH_PATHS: &[&str] = &[
     "/api/auth/refresh",
 ];
 
-/// Axum middleware enforcing per-client rate limits.
+/// Axum middleware enforcing per-client rate limits with per-route severity
+/// (ROADMAP 方向三):
 ///
-/// Credential-accepting auth endpoints (`SENSITIVE_AUTH_PATHS`) use the tighter
-/// `auth_rate_limiter` (default 3 req/s, burst 5) to frustrate brute-force and
-/// credential-stuffing attacks. All other routes use the general `rate_limiter`
-/// (default 20 req/s, burst 40).
+/// * `/api/auth/login` — `login_rate_limiter` (5 / minute / client): the
+///   credential-stuffing front door, so it gets the tightest sustained cap.
+/// * `/api/auth/forgot-password` — `forgot_rate_limiter` (3 / hour / client):
+///   the email-enumeration / reset-spam vector.
+/// * other `SENSITIVE_AUTH_PATHS` (register / reset / refresh) — the general
+///   `auth_rate_limiter` (default 3 req/s, burst 5).
+/// * everything else — the baseline `rate_limiter` (default 20 req/s, burst 40).
 ///
 /// Keys by the authenticated participant when the request carries a valid bearer
 /// token, otherwise by client IP (honouring a single `X-Forwarded-For` hop, then
@@ -135,10 +156,11 @@ pub async fn layer(
     next: Next,
 ) -> Result<Response, ApiError> {
     let key = client_key(&state, &headers, connect_info.map(|ci| ci.0));
-    let limiter = if SENSITIVE_AUTH_PATHS.contains(&request.uri().path()) {
-        &state.auth_rate_limiter
-    } else {
-        &state.rate_limiter
+    let limiter = match request.uri().path() {
+        "/api/auth/login" => &state.login_rate_limiter,
+        "/api/auth/forgot-password" => &state.forgot_rate_limiter,
+        p if SENSITIVE_AUTH_PATHS.contains(&p) => &state.auth_rate_limiter,
+        _ => &state.rate_limiter,
     };
     if limiter.check(key) {
         Ok(next.run(request).await)
@@ -278,6 +300,38 @@ mod tests {
         let half = t0 + Duration::from_millis(500);
         assert!(rl.check_at(key.clone(), half));
         assert!(!rl.check_at(key, half));
+    }
+
+    #[test]
+    fn with_rate_enforces_per_minute_window() {
+        // 5 / minute, burst 5: five immediate requests pass, the sixth is 429.
+        let rl = RateLimiter::with_rate(5.0 / 60.0, 5.0);
+        let key = ip_key(11);
+        let t0 = Instant::now();
+        for _ in 0..5 {
+            assert!(rl.check_at(key.clone(), t0));
+        }
+        assert!(!rl.check_at(key.clone(), t0), "6th within the minute is rejected");
+        // 12s ⇒ +1 token at 5/min (one token per 12s); a single request passes.
+        let t1 = t0 + Duration::from_secs(12);
+        assert!(rl.check_at(key.clone(), t1));
+        assert!(!rl.check_at(key, t1));
+    }
+
+    #[test]
+    fn with_rate_enforces_per_hour_window() {
+        // 3 / hour, burst 3: three pass, fourth 429; needs 1200s for a refill.
+        let rl = RateLimiter::with_rate(3.0 / 3600.0, 3.0);
+        let key = ip_key(12);
+        let t0 = Instant::now();
+        for _ in 0..3 {
+            assert!(rl.check_at(key.clone(), t0));
+        }
+        assert!(!rl.check_at(key.clone(), t0));
+        // 10 minutes is NOT enough (need 20 min for one token at 3/hr).
+        assert!(!rl.check_at(key.clone(), t0 + Duration::from_secs(600)));
+        // 20 minutes ⇒ exactly one token.
+        assert!(rl.check_at(key, t0 + Duration::from_secs(1200)));
     }
 
     #[test]

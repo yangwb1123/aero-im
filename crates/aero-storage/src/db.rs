@@ -14,10 +14,17 @@ pub type PgPool = sqlx::PgPool;
 /// different node while keeping the slot available for bursty traffic.
 const POOL_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Idle timeout: a connection sitting unused for this long is closed and the
+/// slot released back to Postgres (ROADMAP 方向一). Prevents a burst that
+/// briefly inflated the pool from pinning `max_connections` server-side
+/// indefinitely, and lets a restarted/failed-over PG reclaim stale sessions.
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
+
 pub async fn connect_pg(url: &str, max_conns: u32) -> Result<PgPool, sqlx::Error> {
     PgPoolOptions::new()
         .max_connections(max_conns)
         .acquire_timeout(POOL_ACQUIRE_TIMEOUT)
+        .idle_timeout(POOL_IDLE_TIMEOUT)
         .connect(url)
         .await
 }
