@@ -1,221 +1,161 @@
-# Aero IM — 扩展路线图(ROADMAP · 第二版)
+# Aero IM — 扩展路线图（ROADMAP · 第三版）
 
-> **资深架构师 / 产品经理视角。** 基于 2026-06-08 全局代码扫描,当前基线为 Wave 24 + Post-Wave 补全(87 功能点、65 条迁移、846 单测、全部第一版 ROADMAP 方向已交付)。  
-> 本文只做规划与论证,不含任何代码。  
-> 工程约定见 [`AGENTS.md`](AGENTS.md),交付状态见 [`README.md`](README.md)。
-
----
-
-> ## ✅ 交付状态(2026-06-08 更新,第二版五方向)
->
-> 本文五个方向的**功能需求点已全部交付并验证**(897 单测 / 0 失败;`scripts/smoke_roadmap_v2.py` 19/19、`scripts/smoke_gap_close.py` 13/13 真机冒烟通过)。逐方向:
->
-> - **方向三 安全加固 — DONE.** 刷新令牌轮换+吊销、上传 MIME 白名单+SHA-256 去重、按路由限流(`/login` 5/分、`/forgot-password` 3/时)。
-> - **方向四 GDPR — DONE.** 账号软删除+消息匿名化+会话吊销、同步 `GET /api/me/export` + **异步完整导出**(`POST /api/me/export/async` → 后台 worker 生成不设上限的全量归档 → 参与者私有 blob,24h 下载链接,过期 GC;migration 0070)、`blob_gc_queue`+后台 GC、逐消息附件 GC(带共享 blob 引用守卫)、特权操作审计(`message.deleted` 含摘要 / `stream_key.rotated` / `channel_role.changed` / `session.revoked`)。
-> - **方向二 移动推送 — DONE(至真实链路边界).** `push_tokens` 注册表、`aero-push`(FCM+APNs 网关,token-provider seam)、`push_bot` 分发(@提及/回复/未接来电/任务指派,死 token 回收);DND/snooze 经 `should_notify` 透传遵守。真实 FCM/APNs 网络往返需凭据,沙箱内不可验证(seam + mock 单测)。
-> - **方向一 集群就绪 — 大部分 DONE.** 房间 presence 跨节点(Redis sorted-set)、`S3BlobStore`(SigV4,AWS 向量单测)经 `AERO_BLOB_BACKEND` 切换、`PgPool` acquire+idle timeout。NATS 发布失败**刻意不返回 503**(持久化在先 + 重连回填 = 不丢数据,503 会致重发;以发布错误计数器为运营信号——见 `ImService::publish_room_event` 注释)。真实 S3/MinIO、第二节点为基础设施验证项。
-> - **方向五 可观测性 — DONE.** 消息吞吐 counter(按 `room_type`)+ histogram、NATS 消费积压 gauge、SRT/WHIP 媒体指标、AI 死信 gauge(按 `kind`)+管理 API、可配置 trace 采样率 + 高优先级强制采样。
->
-> **未做的只剩:** 一处刻意偏离(NATS 发布失败不返回 503——持久化+回填已保证不丢数据,见正文)、一处次要精修(逐事件推送 badge **计数**——`badge_only_payload` 能力已具备,只是未接真实未读数驱动)、基础设施验证项(上述真实 S3/FCM/APNs/SRT/浏览器/第二节点)、与既定非目标(MLS 端到端、联邦、原生移动 SDK)。
+> **资深架构师 / 产品经理视角。** 基于 2026-06-09 一次性全局代码扫描（16 crates / 69 迁移 / ~102 路由 / web SPA）。
+> 本文只做规划与论证，**不含任何代码**。工程约定见 [`AGENTS.md`](AGENTS.md)，功能矩阵见 [`README.md`](README.md)。
+> 每条结论附代码证据（`file:line`），可逐条核验。
 
 ---
 
-## 0. 当前基线确认
+## 缘起：前两版已交付，本版是「下一座山」
 
-全局扫描确认以下部分已正确交付,后续工作建立在其之上:
+应用层与前两版 ROADMAP 已落地，**本版不再堆 CRUD**，只攻三件决定产品上限的事：**规模、正确性、差异化深度**。
 
-- **内容安全**: `AiJobKind::Moderate` 调用 Anthropic 分类 API,返回结构化 verdict;`KeywordModerator` 为预审前置过滤。
-- **通话编排**: `aero-im-call::CallOrchestrator` 完整实现 invite/answer/end/join/leave;ws.rs 通过 ImService 驱动全生命周期;SFU peer 注册/拆除通过 `SfuRouter`。
-- **SRT 可靠性**: `pump()` 调用已接入 UDP send 回路;ACK/NAK/ACKACK 正确发回发送方。
-- **WHIP 级联**: `WhepUpstreamSource` 实现 `UpstreamSource`,通过 WHEP SDP 交换 + str0m 接收 RTP → Annex-B 接入 `CascadeRelay`。
-- **AI 流式 + 记忆**: `/api/ai/ask/stream` 返回 SSE;`ask_with_context()` 通过 Redis `AiContextStore` 保留滚动会话历史。
-- **Quick Wins 全部完成**: 有界 WS channel、Blob IDOR 防护、WS since 游标、Hub O(1) 注销、Tower TimeoutLayer、CORS 白名单、jti nonce。
+- **第一版（P0–P11）已交付**：IM/协作/AI/直播/通话/企业接入全功能集（见 README 功能矩阵）。
+- **第二版五方向已交付**（详见 git 历史与 README）：① 集群就绪（Redis 跨节点 presence、`S3BlobStore`、连接池超时）② 移动推送（`aero-push` FCM/APNs）③ 安全加固（刷新令牌轮换、上传 MIME 白名单、按路由限流）④ GDPR（账号软删匿名化、`/api/me/export` 异步全量导出、blob GC、特权审计）⑤ 可观测性（吞吐/积压/媒体/死信指标）。
+
+> **本版与第二版的关系**：第二版把「单机原型」推到「集群可运行」。第三版接着回答下一个问题——**当真实流量进来时，最先崩的、最伤信任的、最花钱的是什么**。下面 5 个方向均为扫描中**实测仍存在**的缺口，已逐一与第二版交付物核对，不重复已完成项。
 
 ---
 
-## 方向一：生产集群就绪——从单节点原型到水平可扩展服务
+## 总览与优先级
 
-### 代码证据
+三大产品支柱：**协作可信赖**、**互动直播是差异化**、**AI-native 可持续**。
 
-**Blob 存储**(`crates/aero-storage/src/blob_store.rs` 第 34 行):  
-`LocalFsBlobStore` 将文件写入节点本地磁盘 `blob_dir`。在三节点部署中,节点 A 上传的文件在节点 B 上不可访问。`BlobStore` trait 已定义(第 23 行),S3/MinIO 适配口已预留但从未实现。
+| 优先级 | 方向 | 解决什么 | 支柱 | 体量 |
+|---|---|---|---|---|
+| **P0** | 一、实时投递完整性 | 补上「不丢数据」保证的最后一公里：客户端重连回填 + 事件去重 + 多端一致 | 协作 | M |
+| **P0** | 二、媒体面跨节点化 | 群通话/大型互动直播突破单机天花板 + 自适应码率 | 直播 | L–XL |
+| **P1** | 三、AI 成本真实化与 RAG 完整性 | 真实 token 计费 + 检索不漏召回 | AI | M–L |
+| **P1** | 四、数据面写放大与热点查询 | 大房间 `@everyone`、未读计数、向量检索的规模化 | 协作/直播 | M–L |
+| **P2** | 五、企业级加固的下一层 | 静默误配、租户级限流、故障韧性、鉴权护栏 | To-B 信任 | M |
 
-**Hub 在线人数**(`crates/aero-server/src/hub.rs` 第 216、254 行):  
-`room_members_online()` 和 `stream_viewer_count()` 返回的是**当前进程内**的连接数。即使 `StreamViewerStore`(Redis HyperLogLog)已在 `live_presence.rs` 中实现,Hub 的两个方法仍从本地 `DashMap` 读取,多节点环境下将返回不准确数据。
-
-**NATS 发布静默失败**(`crates/aero-im-core/src/service.rs` 第 1489 行):
-
-```
-if let Err(err) = publish_event(...) {
-    warn!(?err, %subject, "publish RoomEvent failed");  // 仅 warn,不向调用方返回错误
-}
-```
-
-消息已写入 Postgres,但 NATS 断开时广播静默丢失。调用方收到 `200 OK`,但其他节点上的 WebSocket 订阅者永远不会收到该消息。
-
-**数据库连接池**(`crates/aero-storage/src/db.rs` 第 8 行):  
-`PgPoolOptions::new().max_connections(max_conns)` 未设置 `acquire_timeout`,连接耗尽时请求将无限阻塞。
-
-### 为什么优先级最高
-
-1. **不可绕过的物理约束**: Blob 存储是本地文件系统这一事实意味着无论如何增加节点,都无法做到无状态横向扩展。这不是性能问题,而是正确性问题——节点 B 的 CDN 请求会直接返回 404。
-2. **在线人数不一致是产品级 Bug**: 直播间显示 "1200 观看" 但实际 3 节点各显示约 400——用户体验崩溃,创作者数据分析失真,广告主无法信任数据。
-3. **NATS 静默失败是未记录的数据丢失**: 当前行为是 "消息入库但不广播",用户感知为 "消息发出但对方看不到"。这在 B2B 企业场景中是合规风险,不只是 UX 问题。
-
-### "完成"的样子
-
-- `BlobStore` 有一个生产级 `S3BlobStore`(从环境变量 `AERO_BLOB_BACKEND=s3` 切换);`LocalFsBlobStore` 保留用于本地开发。
-- `/api/rooms/:id/online` 和计数端点从 Redis 聚合数据读取,Hub 本地数据作为 Redis 不可用时的降级兜底。
-- `publish_room_event()` 失败时向调用方传播错误;HTTP 层在 NATS 不可用时返回 `503`(而非静默丢失);客户端重试协议有文档。
-- `PgPoolOptions` 明确配置 `acquire_timeout(Duration::from_secs(5))` 和 `idle_timeout`,连接耗尽时快速失败而非无限等待。
+> 建议落地顺序：**一 →（四穿插）→ 三 → 五 → 二**。一/四/五投入小、收益快且互相成就；二是差异化天花板，体量大，需独立立项。
 
 ---
 
-## 方向二：移动端推送通知——补全不在前台就失联的致命缺口
+## 方向一（P0）：实时投递完整性 —— 补上「不丢数据」保证的最后一公里
 
-### 代码证据
+### 为什么需要它（最高 ROI：保证已宣称，地基差一截）
 
-全局搜索 `FCM`、`APNs`、`push_notification`、`device_token`:**零匹配**。
+第二版方向一做了一个**关键且正确的设计决策**：消息「先持久化、再广播」，NATS 广播失败时**刻意不返回 503**（`crates/aero-im-core/src/service.rs:1527-1534` 注释明确论证）。其安全性的**全部依据**是一句话——**「持久化在先 + 重连回填 = 不丢数据」**。
 
-当前通知链路依赖 WebSocket 实时连接。当用户将 App 切到后台(iOS 15 秒后断开 WS,Android 电源管理主动 Kill),以下所有交互均无法触达:
+**问题在于：这个「重连回填」在客户端并没有真正接上。** 整套不丢数据的保证，地基塌了最后一块。
 
-- `@提及`(`crates/aero-storage/src/notification.rs` 中 `inbox` 表有持久化行,但无推送出口)
-- 未接来电(`crates/aero-server/src/ws.rs` CallEnd 分支写入 `activity_feed`,但无推送)
-- DM 私信、任务指派、审批请求、开播通知
+### 代码证据（已读）
 
-`aero-storage/src/notification.rs` 已有持久化通知模型;`ActivityFeedRepo` 写入逻辑完整。推送分发层完全缺失。
+- **客户端重连不回填**：服务端 `crates/aero-server/src/ws.rs:6-19` 已实现完整 `?since=<message_id>` 回放协议（第二版 Quick Win「WS since 游标」已交付服务端）。但 web 客户端 `web/ws.js:35-87` 的 `_open()` 重连只做指数退避，**从不携带 `?since=`、也不持久化 `lastSeenMessageId`**。→ 用户锁屏/切网/隧道断开重连后，**断连期间的消息静默丢失**——恰恰是第二版宣称已被回填兜住的场景。
+- **事件无去重**：`ws.rs:792-851` 的 bus 监听对 `Edited/Deleted/Reaction/Typing` 无 seq/幂等检查；NATS 至少一次 + 多实例故障转移会重复广播。客户端 `web/app.js:282` 只对「新消息」去重，**编辑/删除/反应不去重** → 撤回的消息重现、UI 闪烁。
+- **多端读状态回退**：`service.rs:1196-1216` 的 `mark_read` 是 `(room, participant, last_message_id)` 单行、无「只增不减」语义；B 设备用较小 id 覆盖 A 设备 → 全房间可见的已读位置倒退。未读计数（`notification.rs:100-109`）多端不互相失效，徽章在手机清零、桌面仍旧。
+- **直播弹幕无追赶**：`ws.rs:636-644` 观众进场仅回放最近 **30 行**且无 `since` 游标 → 快聊直播迟到几秒丢掉中间上百条弹幕（差异化场景里的体验硬伤）。
 
-### 为什么优先级高
+### 「完成」的样子
 
-1. **移动 App 失去核心价值**: 一个不能在后台接收消息通知的 IM App,用户留存率接近零。Slack、Teams、Lark 的移动用户日活之所以高,根本上依赖推送。没有推送 = 没有移动端产品。
-2. **基础设施已就位,工作量集中在分发层**: 通知模型(`inbox` 表)、未读计数、活动 Feed 全部完成。缺的只是:设备 token 注册表(一张 migration)+ FCM/APNs HTTP 调用(一个 `PushService` crate)+ 现有 notification 写入点之后插入分发调用。
-3. **企业客户的硬门槛**: 企业 IT 采购评审表上,推送通知是 "Required" 功能。没有它,无法进入任何 MDM 管理的企业移动设备部署。
+- web 客户端持久化 `lastSeenMessageId`（每房间），重连时携带 `?since=`；服务端给 `RoomEvent`/`StreamEvent` 加单调 `seq`，客户端据此**去重 + 排序**。
+- `mark_read` 改 `GREATEST` 语义（只前进不回退）并广播让多端收敛；未读徽章经事件驱动失效。
+- 弹幕引入与房间消息同款 `since` 追赶；重连回填的 200 条/房间上限（`ws.rs:681`）截断时**显式告知客户端继续拉**，消除静默缺口。
 
-### "完成"的样子
-
-- 新增 `device_tokens` 表:`(participant_id, device_id, platform: fcm|apns, token, updated_at)`;`POST /api/me/device-token` 注册/刷新。
-- `aero-push` crate 实现 `PushGateway` trait,两个具体实现:`FcmGateway`(Android/Web)和 `ApnsGateway`(iOS/macOS);令牌从环境变量注入,单测 mock 接口。
-- 现有 `inbox` 写入点(提及通知、未接来电、任务指派等)在写入后触发 `PushGateway::send(participant, payload)`,best-effort(推送失败不影响 IM 主链路)。
-- 推送 payload 遵循平台规范:FCM `data` 字段携带 `room_id`、`message_id`;APNs `aps.alert` 包含发送方昵称和前 N 个字符。
-- 静默推送(badge 更新)不唤醒屏幕;带内容的推送尊重 DND/snooze 状态(与现有 `NotificationPrefRepo` 联动)。
+**收益**：把第二版「不丢数据」从**承诺**变成**实绩**。体量 M，且多为接线既有协议，非从零造。
 
 ---
 
-## 方向三：安全加固——会话凭据与文件上传的已知漏洞
+## 方向二（P0）：媒体面跨节点化 —— 让互动直播/群通话突破单机天花板
 
-### 代码证据
+### 为什么需要它（首要差异化的规模天花板）
 
-**刷新令牌不轮换**(`crates/aero-auth/src/service.rs`):  
-刷新端点消费旧 token 并颁发新 access token,但旧刷新 token 未被吊销。攻击者窃取一次刷新 token 即可永久维持访问,直至用户主动登出。现有 `auth_sessions` 表有 `revoked_at` 字段,但刷新调用路径不写入该字段。
+互动直播 + 通话是**本产品首要差异化**。第二版已交付**直播级联**（`WhepUpstreamSource` 实现 `UpstreamSource`，跨节点拉一次本地扇出——观众侧规模问题已大幅缓解）。**仍未解的是「通话」侧**：群通话的 SFU 是**进程内单实例**，跨节点参与者无法互通——这让「大型互动连麦/多人会议」在架构上封顶。
 
-**文件上传无 MIME 白名单**(`crates/aero-server/src/routes.rs` 第 921–941 行):  
-`MAX_BLOB_BYTES = 32 MiB` 已限制大小,`guess_file_kind(&mime)` 已解析 MIME,但未拒绝任何类型。用户可上传 `application/x-msdownload`(Windows 可执行文件)、`text/x-shellscript`(Shell 脚本)等危险内容,经由 `/api/blobs/:id/download` 提供下载。同时 `sha256: None`(第 951 行),文件完整性无法校验,也无法去重。
+### 代码证据（已读）
 
-**无每端点速率限制差异化**(`crates/aero-server/src/rate_limit.rs`):  
-全局统一令牌桶,无法对高风险端点(`/api/auth/login`、`/api/auth/reset-password`、`/api/auth/forgot-password`)施加更严格的限制。当前架构允许以全局限速数量级发起凭据枚举攻击。
+- **群通话 SFU 单机**：`crates/aero-live-webrtc/src/lib.rs:73-85` 的 `SfuRouter` 把全部通话状态放在进程内 `HashMap<CallId, CallState>`；`crates/aero-im-call/src/lib.rs:74-86` 的 `join_group_call` 只加入本机 SFU。**A 在 node-1、B 在 node-2 的同一通话之间没有 RTP 桥** → 群通话规模被单机网卡 egress 钉死（现实约数百人/实例），无法跨节点重均衡/容灾。
+- **无自适应码率/拥塞控制**：`aero-live-webrtc` 的 `forward.rs`/`remap.rs` 无 TWCC/REMB 带宽估计；`crates/aero-live-srt/src/lib.rs:38-45` 注明缺 **RTT-based pacing / 拥塞控制**（注意：第二版已把 SRT 的 ACK/NAK `pump()` 接入 UDP 回路——此处缺的是**拥塞调度**，非可靠性回路）。→ 公网异构上行下，慢订阅者触发丢包→FIR→关键帧风暴→抖动放大。
+- **关键帧检测仅 H.264**：`aero-live-webrtc/src/peer.rs:64-71` 只识别 H.264 IDR/SPS/PPS；VP8/VP9/AV1 发布者拿不到层切换/迟到者的关键帧请求，迟到观众须等下一个自然关键帧。
 
-### 为什么优先级高
+### 「完成」的样子
 
-1. **刷新令牌不轮换是 OWASP A07(身份认证失败)**: 一旦 token 通过网络劫持、日志泄露或 XSS 被窃取,攻击者持有永久凭据。`auth_sessions.revoked_at` 字段已在数据库中,修复代价极低,但不修复则风险持续累积。
-2. **恶意文件上传是已知的平台级漏洞**: 企业 IM 平台曾多次发生通过文件上传分发 RAT(远程访问木马)的安全事件。MIME 白名单不能阻止所有威胁,但能拦截绝大多数脚本型攻击。
-3. **密码重置枚举是凭据接管的入口**: `/api/auth/forgot-password` 已做反枚举处理(不泄露是否存在该邮箱),但无速率限制意味着高频探测不受阻止。
+- **分布式通话基底（XL）**：Redis 支撑的跨节点参与者注册 + 节点间媒体中继桥（可复用直播级联同款思路），让同一 `CallId` 跨实例；通话可跨节点重均衡/容灾。
+- **自适应码率（L）**：SFU 转发器接入 TWCC/REMB 反馈环，按订阅者链路质量选层/降码率；SRT 接入 RTT pacing。
+- **多编解码（M）**：关键帧检测补 VP8/VP9（AV1 视采用情况）。
 
-### "完成"的样子
-
-- 刷新端点在颁发新 access token 后将旧 `auth_sessions` 行写入 `revoked_at = NOW()`;再次使用已吊销的刷新 token 返回 `401 Revoked`;`AuthService::refresh()` 内原子完成"吊销旧会话 + 创建新会话"。
-- `blob_upload` 路由维护 MIME 白名单(`image/*`、`video/*`、`audio/*`、`application/pdf`、`text/plain`、`application/zip` 等),拒绝 `application/x-*`、`text/x-shellscript`、所有可执行类型;同时计算并存储 `sha256` 用于去重和完整性校验。
-- 速率限制支持每路由配置:`/api/auth/login` 5 次/分钟/IP;`/api/auth/forgot-password` 3 次/小时/IP;其余路由保持现有全局限速。实现不变(仍用 `RateLimiter`),仅在路由注册时传入不同的 `RateLimitConfig`。
+**收益**：把差异化从「能演示」推到「能扛量」。**边界**：浏览器 ICE/DTLS/SRTP、真实 OBS/ffmpeg 推流本沙箱不可端到端验证（`AGENTS.md` 已注明），须 staging 用真实端联调；CI 内只覆盖路由/解包/选层逻辑。
 
 ---
 
-## 方向四：GDPR 合规与数据治理——法律义务,不是锦上添花
+## 方向三（P1）：AI 成本真实化与 RAG 完整性 —— 让 AI-native 可计费、可信任
 
-### 代码证据
+### 为什么需要它（商业化前提 + 功能可信）
 
-**用户删除不做消息归因处理**(`crates/aero-storage/src/participant.rs` 第 146–155 行):
+AI 是第三支柱。当前两处会直接伤害商业化与可信度：**成本不可见**（To-B 客户无法预测/控制账单）与 **RAG 静默漏召回**（「问你的工作区」给不完整答案却无任何信号）。第二版做了 DLQ + 预算窗口 + 成本计数器，但下面这层尚未触及。
 
-```sql
-DELETE FROM participants WHERE id = $1
-```
+### 代码证据（已读）
 
-直接硬删除参与者行。消息的 `sender_id` 外键要么级联删除(消息永久丢失,违反审计要求),要么成孤儿(消息保留但发送方消失,违反 GDPR 第 17 条的正确实现)。无论哪种结果都不合规。
+- **Token 计费是虚构的**：`crates/aero-ai/src/anthropic.rs` 只发 `max_tokens` 请求参数、**从不解析响应里的 `usage.input_tokens/output_tokens`**（全文件无 `usage` 字样，仅 `max_tokens`）；`metrics.rs:64-104` 的 `CostModel` 是硬编码 μ$ 估算（注释自承「order-of-magnitude，非账单级」）；预算门按**任务条数**而非 token。→ 一次跨万条消息的 RAG 提问被记成「1 个任务」，真实账单可能 5–10× 估算，容量规划无从谈起。
+- **RAG 漏召回**：`crates/aero-storage/src/message.rs:301` 的 `list_without_embedding()` **零调用点**（全仓搜索除定义外无引用）→ 存量消息无回填；编辑/删除把 embedding 置 NULL（`message.rs:98,139`）而检索 `WHERE embedding IS NOT NULL`（`message.rs:371`）→ 覆盖出现空洞，用户无感知。
+- **无重排**：检索仅 `ORDER BY embedding <=> $2` 裸余弦 top-k，无 rerank/多样性惩罚 → 语义近似但答非所问的命中挤占有限上下文（k≤20）。
+- **审核绕过队列**：`crates/aero-server/src/moderation_bot.rs:32-43` 对每条消息**同步**调 `ai.moderate()`，无预算门/无限流 → 消息洪峰 = 每分钟上千次 LLM 调用、成本不设防（开启即 foot-gun）。
+- **单 worker 吞吐瓶颈**：`crates/aero-ai/src/worker.rs:173-219` 每进程一个 worker、默认并发 4；交互式问答延迟敏感，队列积压即体感卡顿。
 
-**审计日志覆盖不完整**(`crates/aero-server/src/workspaces.rs`):  
-审计记录已覆盖成员加入/移除、角色变更、工作区删除。但以下操作**没有**审计记录:
-- 管理员删除消息(`DELETE /api/rooms/:id/messages/:msg_id` 路径无 audit append)
-- Stream key 轮换
-- 工作区成员强制登出(Wave 21 session revoke)
-- 频道角色变更
+### 「完成」的样子
 
-**无用户自助数据导出**(`/api/me/export` 端点不存在):  
-`workspaces.rs` 有工作区级导出(管理员权限),但 GDPR 第 20 条要求任何普通用户可获取其个人数据的可携带副本。
+- 从 Anthropic 响应解析真实 `usage` 写入 `ai_jobs.result`；预算改 token 维度，成本指标带 per-workspace 标签 + 看板。
+- 接线 `list_without_embedding` 做存量回填 + 「内容真变才重嵌」+ 入队去重；top-k 后加一层轻量重排（cross-encoder 或 BM25 融合）。
+- 审核改走带预算门的任务队列；审核删除独立审计、可复核（避免误杀无回溯）。
 
-**孤儿 Blob 永不清理**(`crates/aero-storage/src/message.rs` 第 112–122 行):  
-软删除清空 `blocks` 字段(blob ID 随之丢失),但从不调用 `BlobStore::delete()`。Blob 文件无限累积,无垃圾回收机制。
-
-### 为什么优先级高
-
-1. **GDPR 第 17 条"被遗忘权"是法定义务**: 在欧盟运营的平台,用户要求删除账户时必须删除或匿名化其个人数据。当前实现两种结果都不合规。监管处罚起点是年营业额的 2%。
-2. **不完整的审计日志在企业销售中是直接拒绝项**: ISO 27001、SOC 2 Type II 均要求对特权操作有完整审计轨迹。"管理员删除了哪些消息" 是最常见的安全审查问题之一,现在无法回答。
-3. **Blob 泄露是隐性存储成本**: 每条被删除的带附件消息都在磁盘上永久留存孤儿文件。规模化后存储账单持续增长,且这些文件可能包含已被用户"删除"的隐私图片。
-
-### "完成"的样子
-
-- `delete_participant()` 改为软删除:将 `participants.deleted_at` 置为当前时间,同时将该用户发送的所有消息执行 `blocks = '[{"type":"text","text":"[已注销用户]"}]'` 式匿名化;auth_sessions 全部吊销。
-- 审计日志新增事件类型:`message.deleted`(含操作者 ID + 被删消息摘要)、`stream_key.rotated`、`channel_role.changed`、`session.revoked`;所有管理员操作写入前统一过 `audit_append()` 函数。
-- `GET /api/me/export` 端点:异步生成包含该用户所有消息、文件上传列表、账户基本信息的 JSON 归档,返回 24 小时有效的下载链接;大型导出通过 AI 工作队列同款异步架构处理,避免超时。
-- 消息软删除路径在清空 `blocks` 时同步提取 blob IDs 并插入 `blob_gc_queue` 表;后台 GC Job(每小时)从队列消费,调用 `BlobStore::delete()`,确认后删除队列行。
+**收益**：成本可预测（商业化前提）+ AI 功能可信。体量 M–L。
 
 ---
 
-## 方向五：可观测性纵深——从"能跑"到"可运营"
+## 方向四（P1）：数据面写放大与热点查询 —— 大房间/大流下最先撞墙处
 
-### 代码证据
+### 为什么需要它（规模化的第一道墙）
 
-**已完成的可观测性基础**:  
-`crates/aero-server/src/metrics.rs` 已有:HTTP RED 指标(请求数/延迟/状态码)、速率限制拒绝计数器(第 49 行)、WS 连接 gauge(`WS_CONNECTIONS`)、DB 连接池指标。  
-`crates/aero-ai/src/worker.rs` 已有:AI Job 耗时直方图、成功/失败/死信计数器、队列深度 gauge、成本追踪。  
-`/health/live` 和 `/health/ready` 已按 k8s 规范分离。
+这些是工作区/频道/直播间**一变大就最先撞墙**的写放大与热点查询。尤其 `@everyone` 在大房间是 O(N) 同步循环——恰好高发于直播差异化场景。
 
-**缺失的关键信号**:
+### 代码证据（已读）
 
-_消息吞吐量_:`crates/aero-im-core/src/service.rs` 中 `send_message()`、`edit_message()`、`delete_message()` 路径均无 Prometheus counter/histogram。无法回答 "峰值每秒处理多少条消息" 这个最基本的运营问题。
+- **通知扇出同步 O(N)**：`crates/aero-im-core/src/service.rs:1498-1522` 的投递循环对每个收件人**串行** `await`：`should_notify` + `repo.insert` + `publish_room_event`。1 万人频道一次 `@everyone` = 1 万次 PG 往返 + 1 万次 NATS publish 串行 → 大型直播间一句广播即打爆。
+- **未读计数全表扫**：`message.rs:471-494` 的 `unread_counts_by_room` LEFT JOIN read_receipts 缺 `(room_id, deleted_at, sender_id)` 复合索引 → 10 万用户登录刷未读 = 并行扫数千万行。
+- **HNSW 默认参数**：`migrations/0001_init.sql:86-88` 建向量索引未调参（m=4/ef=64）→ 千万级向量后语义检索延迟 50ms→5s+。
+- **连接池写死 16**：`db.rs` → 万级并发下 16 槽位引发级联超时；多租户共享池，一条慢查询拖垮无关租户。
+- **慢消费者丢帧**：`hub.rs:284-327` 有界 mpsc 满即丢/踢，无补偿 → 5 千人直播间 1% 慢客户端 = 每秒数百帧丢失。
 
-_NATS 订阅者积压_:`crates/aero-bus/src/jetstream.rs` 消费者侧无 pending-acks gauge。当 AI Worker 因 Anthropic API 降速而积压时,无法可见,直到 NATS 内存溢出或消息过期。
+### 「完成」的样子
 
-_SRT/WHIP 媒体指标_:`crates/aero-live-srt/src/lib.rs` 和 WHIP 会话均无推流比特率、丢包率、活跃连接数 gauge。直播运营团队无法判断 "当前 OBS 推流质量如何"。
+- 通知扇出抽到后台任务（复用 AI 队列范式）+ 批量 insert + 每房间一条 Notify 事件。
+- 补热点路径复合索引；合并 `thread_summary` 三连查为一查（`message.rs:416-461`）。
+- HNSW 调参（m=8/ef_construction=128）；连接池配置化（64–128）。
+- 慢消费者掉线改为「触发 `?since` 回填」而非静默丢（与方向一协同）；热表时间分区列为 v2 schema 项（长期必做）。
 
-_AI 死信队列可见性_:`crates/aero-ai/src/worker.rs` 第 60–66 行:死信 job 标记 `status='dead'` 后停止重试,但无告警、无 API、无指标导出。运营需要手动查询数据库才能发现 AI 审核/摘要失败积压。
-
-_分布式追踪采样率_:`crates/aero-common/src/telemetry.rs` 已集成 OpenTelemetry,但采样率硬编码。高流量下全量追踪会产生海量 span 写入,淹没 Jaeger/Tempo。
-
-### 为什么优先级高
-
-1. **没有消息吞吐量指标,容量规划是瞎猜**: 无法回答 "数据库/NATS/Redis 在多少 MAU 时会成为瓶颈",就无法做数据驱动的扩容决策。这在 B2B 销售阶段会直接被技术评审问倒。
-2. **NATS 积压不可见是定时炸弹**: AI 审核 Worker 积压时,消息仍会正常投递给用户,但审核延迟可能从秒级扩大到小时级。没有 lag 指标,这个问题只有在监管审查时才会被发现。
-3. **直播质量指标是 B2B 直播 SLA 的前提**: 企业客户购买直播能力时会要求 SLA(如 "99.9% 帧接收率")。没有 SRT 丢包率指标,SLA 无从量化,合同无从签署。
-
-### "完成"的样子
-
-- `ImService::send_message()` 路径新增 `MESSAGES_SENT_TOTAL`(counter,按 `room_type` 标签分层)和 `MESSAGE_PROCESSING_DURATION_SECONDS`(histogram);edit/delete 路径类似。
-- `aero-bus` JetStream 消费者在每次 `pull_messages()` 后从 NATS server API 查询 `NumPending`,更新 `NATS_CONSUMER_PENDING_MESSAGES`(gauge,按 consumer_name 标签);30 秒查询一次。
-- SRT 会话在 `handle_datagram` 循环中更新:`SRT_ACTIVE_SESSIONS`(gauge)、`SRT_PACKETS_RECEIVED_TOTAL`、`SRT_PACKETS_LOST_TOTAL`;WHIP 会话类似统计 RTP 接收/解包失败计数。
-- `ai_jobs WHERE status='dead'` 通过定期 SQL 查询导出为 `AI_DEAD_LETTER_QUEUE_SIZE`(gauge,按 `kind` 标签);`/api/admin/ai/dlq` 端点允许管理员查看和重新入队死信 job。
-- OpenTelemetry 采样率通过环境变量 `AERO_TRACE_SAMPLE_RATE`(浮点,0.0–1.0,默认 0.01)配置;高优先级操作(登录、消息发送、通话创建)强制采样。
+**收益**：把瓶颈从「DB 拥塞」移回「应用逻辑」，为前述规模目标兜底。体量 M–L。
 
 ---
 
-## 建议排序
+## 方向五（P2）：企业级加固的下一层 —— 静默误配与租户公平
 
-| 优先级 | 方向 | 理由 | 预估规模 |
-|---|---|---|---|
-| **P0** | 方向三(安全加固) | 刷新 token 不轮换是已知漏洞,MIME 无白名单是恶意文件上传入口;修复代价低,不修复是持续风险 | 小(1–2 周) |
-| **P0** | 方向四(GDPR 合规) | 用户删除不匿名化消息在 EU 属违规;企业客户必问审计覆盖度 | 中(2–3 周) |
-| **P1** | 方向二(移动推送) | 无推送 = 无移动产品;FCM/APNs 接入是独立工程,基础设施(通知模型)已就绪 | 中(3–4 周) |
-| **P1** | 方向一(集群就绪) | Blob 本地存储和 NATS 静默失败在多节点部署时会直接爆发;应在第一次扩容前解决 | 大(4–6 周) |
-| **P2** | 方向五(可观测性) | 消息吞吐量和媒体质量指标是运营和 SLA 谈判的前提;基础已有,补全信号即可 | 小(1–2 周) |
+### 为什么需要它（To-B 信任的下一档）
+
+第二版补齐了安全/GDPR/可观测性的功能面。本方向针对的是**生产运维中的「沉默杀手」**：一个静默退回的存储配置、一次合谋的租户限流、一个 Redis 抖动引发的重启风暴——都不会报错，却会在最坏的时刻爆发。
+
+### 代码证据（已读）
+
+- **S3 静默退回本地盘**：`crates/aero-storage/src/s3_blob_store.rs:218-224` 的工厂在 `AERO_BLOB_BACKEND=s3` 但缺 `AERO_S3_BUCKET` 时**静默回退 LocalFsBlobStore**，无报错（第二版交付了 S3 后端，但**误配防护**未做）→ 运营者以为在 S3 实则写本地盘，多节点下附件互不可达 + 重启丢数据。应 **fail-loud** 并在 `/health` 暴露当前后端。
+- **限流无 per-tenant 档位**：`crates/aero-server/src/rate_limit.rs:39-123` 仅 per-client（20 req/s）；第二版加了按**路由**差异化（`/login` 5/分），但无每**工作区**上限 → 100 人工作区可合谋 2000 req/s 打爆共享 DB 池、拖垮其他租户。应加 per-workspace 档位（premium/free）。
+- **启动对 Redis/NATS 硬失败**：`bin/aero-server.rs:59-66` 启动时单次连接失败即退出、无退避 → K8s 里一次 DNS 抖动触发**重启风暴**、活跃 WS 连接全断。应改为带退避重试 + 就绪门控。
+- **鉴权无强制护栏**：隔离在查询层一致（`search.rs:38-76`、`directory.rs:48-61` 有 `assert_member`），但 ~102 路由**无系统性审计**——新加功能少调一次 `assert_room_access`/`member_role` 即跨租户泄露。应加 lint/测试：凡触达房间数据的路由必须经鉴权收口。
+- **CORS/护栏可被关掉**：`bin/aero-server.rs:624-643` CORS 无配置时退回「放行任意 origin」、限流/并发护栏「设 0 即禁用」，均不报错。多租户生产应 **fail-closed**——无 origin 配置即启动报错。
+
+### 「完成」的样子
+
+- S3 配置缺失即启动失败 + `/health` 暴露后端；启动对 Redis/NATS 带退避重试。
+- per-workspace 限流档位（Redis 计数）；CORS/并发护栏改 fail-closed。
+- 鉴权 lint/测试护栏覆盖全部房间数据路由；消息删除审计事务化（现为 best-effort，`routes.rs:811-822` 失败仅 warn）。
+
+**收益**：把「能跑」升级为「敢交付企业」。体量 M，多为防御性接线。
 
 ---
 
-> 落地原则承袭 [`AGENTS.md`](AGENTS.md):新功能沿用「`RoomEvent` → Hub 扇出」主轴;依赖只加到自身 crate;凡需真实外部服务(FCM/APNs、S3)才能验证的,不在沙箱内标「done」,以冒烟测试 + mock 单测为交付边界。  
-> 安全加固(方向三)的任何变更在合并前须经过独立安全审查,不走常规 Wave 流程。
+## 附：方法与边界
+
+- 本版由 6 个**只读**子代理并行扫描（实时投递 / 数据面 / 媒体面 / AI / 企业运维 / 自述债务），每条结论附 `file:line`，跨维度聚类去重、并逐项与第二版交付物核对后成此 5 方向。**未写任何业务代码。**
+- 体量记号：S<1d、M≈数日、L≈1–2 周、XL≈多人周/需独立立项。
+- **不变的非目标**（承袭 `AGENTS.md`，本版不据此扩展）：E2E 端到端加密客户端、联邦、移动端原生 SDK。
+- 标注为 seam 的真实链路（浏览器 ICE/DTLS/SRTP、真实 OBS/ffmpeg、真实 S3/FCM/APNs、第二节点）本沙箱不可端到端验证——相关项以 staging 联调为交付边界，勿在 CI 内标「done」。
