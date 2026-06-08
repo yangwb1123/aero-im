@@ -59,6 +59,7 @@ aero-live-whip  = { path = "crates/aero-live-whip" }
 aero-live-webrtc= { path = "crates/aero-live-webrtc" }
 aero-live-srt   = { path = "crates/aero-live-srt" }
 aero-ai         = { path = "crates/aero-ai" }
+aero-push       = { path = "crates/aero-push" }
 
 # Runtime
 tokio       = { version = "1.40", features = ["full"] }

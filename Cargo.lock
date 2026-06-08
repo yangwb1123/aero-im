@@ -298,6 +298,7 @@ dependencies = [
  "aero-live-core",
  "aero-live-rtmp",
  "aero-live-whip",
+ "aero-push",
  "aero-signaling",
  "aero-storage",
  "anyhow",

@@ -116,6 +116,7 @@ pub mod call_recap;
 pub mod workspace_security;
 pub mod me_export;
 pub mod push_tokens;
+pub mod push_bot;
 pub mod ai_dlq;
 
 // ---- Wave 16 Round 9 ----

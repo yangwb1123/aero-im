@@ -26,7 +26,7 @@ use aero_server::{
 };
 use aero_storage::{
     connect_pg, migrate, AiContextStore, AiJobRepo, AuditRepo, BlobRepo, CallRepo, CallRosterStore,
-    KeyPackageRepo, LiveRepo, LocalFsBlobStore, MessageRepo, MlsGroupRepo, NotificationPrefsRepo,
+    KeyPackageRepo, LiveRepo, MessageRepo, MlsGroupRepo, NotificationPrefsRepo,
     NotificationRepo, DeactivationRepo, KeywordAlertRepo, MessageEditRepo, ParticipantRepo, PatRepo,
     PinRepo, TotpRepo, PresenceStore, ReactionRepo, ReceiptRepo, RecurringMessageRepo, RedisCache,
     RoomRepo, StreamRepo, StreamRouteRegistry, StreamViewerStore, ThreadSubscriptionRepo,
@@ -93,11 +93,13 @@ async fn main() -> anyhow::Result<()> {
     let stream_routes = StreamRouteRegistry::new(cache.client().clone());
 
     // ---------- Blob storage ----------
+    // ROADMAP 方向一: pick the backend from AERO_BLOB_BACKEND (s3 ⇒ S3BlobStore
+    // from AERO_S3_* env, else the local-FS store rooted at blob_dir). Returns
+    // an Arc<dyn BlobStore> so the rest of the server is backend-agnostic.
     let blob_root = std::path::PathBuf::from(&cfg.server.blob_dir);
-    let blob_store = Arc::new(
-        LocalFsBlobStore::new(&blob_root).context("create blob dir")?,
-    );
-    info!(blob_dir = %blob_root.display(), "blob store ready");
+    let blob_store = aero_storage::blob_store_from_env(blob_root.clone());
+    let blob_backend = std::env::var("AERO_BLOB_BACKEND").unwrap_or_else(|_| "local".into());
+    info!(blob_dir = %blob_root.display(), backend = %blob_backend, "blob store ready");
 
     // ---------- Bus ----------
     let jetstream: Arc<JetStreamBus> = Arc::new(
@@ -234,6 +236,20 @@ async fn main() -> anyhow::Result<()> {
     // ---------- Compose state ----------
     let public_base_url = std::env::var("AERO_PUBLIC_BASE_URL")
         .unwrap_or_else(|_| format!("http://{}:{}", cfg.server.host, cfg.server.port));
+    // ---------- Mobile push gateways (ROADMAP 方向二) ----------
+    // Resolve FCM/APNs gateways from env. Each is None unless its credentials are
+    // present, so push degrades to "disabled" rather than failing boot. The real
+    // OAuth2 (FCM) / ES256-JWT (APNs) credential minting plugs into the
+    // TokenProvider seam — env vars AERO_PUSH_FCM_TOKEN / AERO_PUSH_APNS_TOKEN
+    // supply a static bearer for environments that mint it out-of-process (e.g. a
+    // sidecar); leaving them unset keeps that platform disabled. See aero-push.
+    let push_gateways = build_push_gateways();
+    info!(
+        fcm = push_gateways.fcm.is_some(),
+        apns = push_gateways.apns.is_some(),
+        "push gateways resolved"
+    );
+
     let state = AppState {
         auth,
         im,
@@ -274,6 +290,7 @@ async fn main() -> anyhow::Result<()> {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(40000),
+        push: push_gateways,
     };
     // ---------- Message-retention sweep (ROADMAP 方向一 合规) ----------
     // Periodically soft-delete messages whose workspace set a retention window
@@ -511,6 +528,20 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // ---------- Mobile push-dispatch bot (ROADMAP 方向二) ----------
+    // Subscribes to RoomEvent::Notify and pushes mentions/replies to the
+    // recipient's registered FCM/APNs devices. Only spawned when a gateway is
+    // configured — with push disabled it would be inert anyway.
+    if state.push.any_enabled() {
+        let state_clone = state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = aero_server::push_bot::run(state_clone).await {
+                tracing::error!(error = ?e, "push_bot listener exited");
+            }
+        });
+        info!("mobile push dispatch enabled");
+    }
+
     // ---------- "Went live" follower notifications (Wave 21) ----------
     // Subscribes to the live bus and, when a stream goes live, fans out a durable
     // "stream_live" activity-feed entry to each of the creator's followers.
@@ -613,6 +644,45 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
     Ok(())
+}
+
+/// Resolve the mobile push gateways from environment (ROADMAP 方向二).
+///
+/// FCM is enabled when `AERO_PUSH_FCM_PROJECT` is set; APNs when
+/// `AERO_PUSH_APNS_TOPIC` is set. Each uses a [`TokenProvider`] seam — the real
+/// short-lived credential (FCM OAuth2 bearer / APNs ES256 JWT) is minted there.
+/// For deployments that mint the credential out-of-process (a sidecar or an
+/// init container writing it to env), a static bearer can be supplied via
+/// `AERO_PUSH_FCM_TOKEN` / `AERO_PUSH_APNS_TOKEN`; absent that, the provider
+/// returns an `Auth` error at send time (logged, best-effort) so a
+/// misconfiguration never crashes the server. Returns all-`None` when neither
+/// platform is configured, leaving push disabled.
+fn build_push_gateways() -> aero_server::state::PushGateways {
+    use std::sync::Arc;
+
+    /// A [`TokenProvider`] that yields a fixed bearer read from `env_key`, or an
+    /// `Auth` error when that env var is unset. The seam where real OAuth2/JWT
+    /// minting replaces the static value.
+    fn static_bearer_provider(env_key: &'static str) -> aero_push::TokenProvider {
+        Arc::new(move || {
+            let key = env_key;
+            Box::pin(async move {
+                std::env::var(key).map_err(|_| {
+                    aero_push::PushError::Auth(format!("{key} unset (no push credential configured)"))
+                })
+            })
+        })
+    }
+
+    let fcm = std::env::var("AERO_PUSH_FCM_PROJECT").ok().map(|project| {
+        let gw = aero_push::FcmGateway::new(project, static_bearer_provider("AERO_PUSH_FCM_TOKEN"));
+        Arc::new(gw) as Arc<dyn aero_push::PushGateway>
+    });
+    let apns = std::env::var("AERO_PUSH_APNS_TOPIC").ok().map(|topic| {
+        let gw = aero_push::ApnsGateway::new(topic, static_bearer_provider("AERO_PUSH_APNS_TOKEN"));
+        Arc::new(gw) as Arc<dyn aero_push::PushGateway>
+    });
+    aero_server::state::PushGateways { fcm, apns }
 }
 
 /// Build the CORS layer from config: an explicit origin allow-list when one is

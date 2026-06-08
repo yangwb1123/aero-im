@@ -28,6 +28,7 @@ aero-live-core.workspace = true
 aero-live-rtmp.workspace = true
 aero-live-whip.workspace = true
 aero-signaling.workspace = true
+aero-push.workspace = true
 
 sqlx.workspace = true
 

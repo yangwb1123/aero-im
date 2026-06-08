@@ -165,6 +165,40 @@ pub struct AppState {
     /// Configured ingest host:port advertised in SDP candidates.
     pub ingest_host: String,
     pub ingest_port: u16,
+    /// Mobile push gateways (FCM/APNs). `None` per platform when the
+    /// corresponding credentials are not configured — the push-dispatch bot
+    /// then simply skips that platform (ROADMAP 方向二).
+    pub push: PushGateways,
+}
+
+/// The per-platform mobile push gateways, resolved from env at startup. Each is
+/// `None` when its credentials are absent so push degrades to "disabled" rather
+/// than failing server boot. Cheap to clone (each is an `Arc`).
+#[derive(Clone, Default)]
+pub struct PushGateways {
+    /// Firebase Cloud Messaging (Android + Web). Present when `AERO_PUSH_FCM_*` set.
+    pub fcm: Option<Arc<dyn aero_push::PushGateway>>,
+    /// Apple Push Notification service (iOS + macOS). Present when `AERO_PUSH_APNS_*` set.
+    pub apns: Option<Arc<dyn aero_push::PushGateway>>,
+}
+
+impl PushGateways {
+    /// The gateway for a stored platform string (`"fcm"` / `"apns"`), if configured.
+    #[must_use]
+    pub fn for_platform(&self, platform: &str) -> Option<&Arc<dyn aero_push::PushGateway>> {
+        match platform {
+            "fcm" => self.fcm.as_ref(),
+            "apns" => self.apns.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// True when at least one platform gateway is configured — lets the binary
+    /// skip spawning the push-dispatch listener entirely when push is disabled.
+    #[must_use]
+    pub fn any_enabled(&self) -> bool {
+        self.fcm.is_some() || self.apns.is_some()
+    }
 }
 
 impl FromRef<AppState> for AuthService {
