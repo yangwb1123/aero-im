@@ -524,6 +524,51 @@ impl MessageRepo {
         .await?;
         Ok(rows.into_iter().map(SearchHit::from).collect())
     }
+
+    /// Semantic (cosine-distance) variant of [`Self::search_all_rooms_in_workspace`]:
+    /// vector search across EVERY room the caller belongs to within `workspace`.
+    ///
+    /// The retrieval half of the workspace-wide RAG ask. Identical membership
+    /// boundary to [`Self::search_all_rooms_in_workspace`] — `JOIN room_members`
+    /// scopes to the caller's rooms and the `rooms.workspace_id` filter scopes to
+    /// the one tenant — but ranked by embedding distance (`<=>`) instead of FTS.
+    /// Caller supplies a normalized query embedding of the same dimension as
+    /// `messages.embedding`. There is no post-filter: a message in a room the
+    /// caller is not a member of can never be returned.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the query.
+    pub async fn search_vector_workspace(
+        &self,
+        participant: ParticipantId,
+        workspace: WorkspaceId,
+        embedding: Vec<f32>,
+        limit: i64,
+    ) -> Result<Vec<SearchHit>, sqlx::Error> {
+        let limit = limit.clamp(1, 100);
+        let v = Vector::from(embedding);
+        let rows = sqlx::query_as::<_, ScoredMessageRow>(
+            r"SELECT
+                 m.id, m.room_id, m.sender_id, m.blocks, m.reply_to, m.metadata,
+                 m.created_at, m.edited_at, m.deleted_at,
+                 (1 - (m.embedding <=> $2))::real AS score
+               FROM messages m
+               JOIN room_members rm
+                 ON rm.room_id = m.room_id AND rm.participant_id = $1
+               WHERE m.deleted_at IS NULL
+                 AND m.embedding IS NOT NULL
+                 AND m.room_id IN (SELECT id FROM rooms WHERE workspace_id = $4)
+               ORDER BY m.embedding <=> $2
+               LIMIT $3",
+        )
+        .bind(participant.to_uuid())
+        .bind(v)
+        .bind(limit)
+        .bind(workspace.to_uuid())
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(SearchHit::from).collect())
+    }
 }
 
 fn searchable_of(blocks: &[Block]) -> String {
@@ -738,6 +783,81 @@ mod db_tests {
         assert!(
             !hits.iter().any(|h| h.message.room_id == theirs),
             "a message in a room the caller is NOT in never leaks"
+        );
+    }
+
+    /// The workspace-wide RAG retrieval (`search_vector_workspace`) must honor the
+    /// same `JOIN room_members` boundary as the FTS variant: with two rooms in the
+    /// SAME workspace but only one joined by the caller, a vector hit may surface
+    /// only from the joined room — even when the message in the other room carries
+    /// an identical embedding (so distance alone would rank them equally).
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn search_vector_workspace_is_membership_scoped() {
+        let p = pool();
+        let repo = MessageRepo::new(p.clone());
+        // Both rooms live in the all-zero default workspace, so membership — not
+        // the workspace filter — is the discriminator under test.
+        let ws = WorkspaceId(ulid::Ulid(0));
+
+        let me = participant(&p).await;
+        let other = participant(&p).await;
+
+        let mine = room(&p, me).await;
+        let theirs = room(&p, other).await;
+        join(&p, mine, me).await;
+        join(&p, theirs, other).await; // membership for `other`, not for `me`.
+
+        // Insert a message in each room, then give BOTH an identical embedding so
+        // cosine distance to the query is the same — the only thing that can
+        // exclude `theirs` is the membership JOIN.
+        let in_mine = repo
+            .insert(NewMessage {
+                room_id: mine,
+                sender_id: me,
+                blocks: vec![Block::text("workspace rag in my room")],
+                reply_to: None,
+                metadata: serde_json::json!({}),
+            })
+            .await
+            .expect("insert mine");
+        let in_theirs = repo
+            .insert(NewMessage {
+                room_id: theirs,
+                sender_id: other,
+                blocks: vec![Block::text("workspace rag in their room")],
+                reply_to: None,
+                metadata: serde_json::json!({}),
+            })
+            .await
+            .expect("insert theirs");
+
+        // `messages.embedding` is `vector(1024)`; a uniform unit-ish vector is fine
+        // for the distance tie — identical on both rows.
+        let embedding = vec![0.1_f32; 1024];
+        repo.update_embedding(in_mine.id, embedding.clone())
+            .await
+            .expect("embed mine");
+        repo.update_embedding(in_theirs.id, embedding.clone())
+            .await
+            .expect("embed theirs");
+
+        let hits = repo
+            .search_vector_workspace(me, ws, embedding, 50)
+            .await
+            .expect("vector search");
+
+        assert!(
+            hits.iter().all(|h| h.message.room_id == mine),
+            "every vector hit comes from a room the caller belongs to"
+        );
+        assert!(
+            hits.iter().any(|h| h.message.id == in_mine.id),
+            "the embedded message in the caller's room is found"
+        );
+        assert!(
+            !hits.iter().any(|h| h.message.id == in_theirs.id),
+            "an embedded message in a room the caller is NOT in never leaks"
         );
     }
 }

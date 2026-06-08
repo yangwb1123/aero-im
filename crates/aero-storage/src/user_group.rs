@@ -240,6 +240,33 @@ impl UserGroupRepo {
         Ok(result.rows_affected() > 0)
     }
 
+    /// List the group ids `participant` belongs to within `workspace`. Joins
+    /// membership against `user_groups` so the result is tenant-scoped (a
+    /// participant may belong to groups across several workspaces). The seam the
+    /// information-barrier check ([`crate::BarrierRepo::barred`]) reads to map a
+    /// participant to their groups.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the query.
+    pub async fn groups_for(
+        &self,
+        workspace: WorkspaceId,
+        participant: ParticipantId,
+    ) -> Result<Vec<UserGroupId>, sqlx::Error> {
+        let rows = sqlx::query_as::<_, (uuid::Uuid,)>(
+            r"SELECT m.group_id
+               FROM user_group_members m
+               JOIN user_groups g ON g.id = m.group_id
+              WHERE g.workspace_id = $1 AND m.participant_id = $2
+              ORDER BY m.group_id ASC",
+        )
+        .bind(workspace.to_uuid())
+        .bind(participant.to_uuid())
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(g,)| UserGroupId::from_uuid(g)).collect())
+    }
+
     /// List the participant ids that belong to `group`, oldest membership first.
     /// The seam an `@handle` mention fan-out reads to find recipients.
     ///

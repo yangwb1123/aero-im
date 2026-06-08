@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 
-use aero_common::{Message, MessageId, RoomId};
+use aero_common::{Message, MessageId, ParticipantId, RoomId, WorkspaceId};
 use aero_storage::{AiJobRepo, MessageRepo, RoomRepo, SearchHit};
 
 use crate::anthropic::{AnthropicClient, ChatMsg};
@@ -190,6 +190,64 @@ impl AiService {
         // claim.
         let fallback = if hits.is_empty() {
             "（未配置 Anthropic,也未在房间内检索到相关消息。）".to_string()
+        } else {
+            format!("（未配置 Anthropic,以下为检索到的相关消息上下文:）\n\n{context}")
+        };
+        Ok(AnswerResult { answer: fallback, citations })
+    }
+
+    /// Answer a question grounded in EVERY room the caller belongs to within a
+    /// workspace — the flagship "ask your workspace" RAG flow.
+    ///
+    /// Mirrors [`Self::answer_question`] step-for-step (embed the question, top-k
+    /// vector search, ask Anthropic to answer using only the retrieved context and
+    /// cite the message IDs), but retrieves cross-room via
+    /// [`MessageRepo::search_vector_workspace`](aero_storage::MessageRepo::search_vector_workspace),
+    /// whose `JOIN room_members` / `rooms.workspace_id` boundary keeps results to
+    /// rooms the caller is a member of within `workspace`. Without Anthropic it
+    /// degrades identically to [`Self::answer_question`]: the joined context block
+    /// is returned as the answer so the UI can still surface grounded results.
+    ///
+    /// # Errors
+    /// Returns [`AiError::Invalid`] for an empty question; otherwise propagates
+    /// embedder, storage, or Anthropic failures.
+    pub async fn answer_question_workspace(
+        &self,
+        participant: ParticipantId,
+        workspace: WorkspaceId,
+        question: &str,
+        k: usize,
+    ) -> Result<AnswerResult> {
+        let q = question.trim();
+        if q.is_empty() {
+            return Err(AiError::Invalid("question must not be empty".into()));
+        }
+        // `k` is clamped to [1, 20] so this `as i64` is always safe.
+        #[allow(clippy::cast_possible_wrap)]
+        let k = k.clamp(1, 20) as i64;
+
+        let query_vec = self.embedder.embed_one(q).await?;
+        let hits: Vec<SearchHit> = self
+            .messages
+            .search_vector_workspace(participant, workspace, query_vec, k)
+            .await?;
+
+        let citations: Vec<MessageId> = hits.iter().map(|h| h.message.id).collect();
+        let context = render_context(&hits);
+
+        if let Some(client) = &self.anthropic {
+            let system = ANSWER_SYSTEM_PROMPT;
+            let user = format!(
+                "问题: {q}\n\n相关聊天上下文(每段已附 ID,引用时使用):\n{context}\n\n请基于上述上下文作答,若信息不足请说明。"
+            );
+            let answer = client.complete(system, &[ChatMsg::user(user)], 800).await?;
+            return Ok(AnswerResult { answer, citations });
+        }
+
+        // No Anthropic — return the raw context so the UI can still surface
+        // grounded results. This is a dev-mode escape hatch, not a quality claim.
+        let fallback = if hits.is_empty() {
+            "（未配置 Anthropic,也未在工作区内检索到相关消息。）".to_string()
         } else {
             format!("（未配置 Anthropic,以下为检索到的相关消息上下文:）\n\n{context}")
         };

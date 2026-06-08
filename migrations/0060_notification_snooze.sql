@@ -1,0 +1,14 @@
+-- 0060_notification_snooze.sql — one-off "pause notifications until <time>".
+--
+-- Slack "Pause notifications" / Teams quiet-time: silence ALL notifications ONCE
+-- until a given instant, distinct from the RECURRING daily DND window (0018's
+-- start_minute/end_minute). The two controls compose — a notification is
+-- suppressed while inside the daily DND window OR while the one-off snooze is
+-- still active OR the room is muted (0018's channel_mutes).
+--
+-- Stored as a nullable column on the existing per-participant `dnd_settings` row
+-- so a participant's quiet-time controls live together: NULL = not snoozed, a
+-- future timestamptz = snoozed until that instant (a past value is harmless — it
+-- simply reads as "not currently snoozed"). Purely additive and idempotent
+-- (safe to re-run); no existing column is reshaped.
+ALTER TABLE dnd_settings ADD COLUMN IF NOT EXISTS snooze_until TIMESTAMPTZ;  -- one-off pause; NULL = not snoozed

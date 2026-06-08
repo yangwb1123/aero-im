@@ -260,6 +260,13 @@ define_id!(
     /// no media is processed, so a clip is just metadata over a stream.
     ClipId
 );
+// ---- Wave 19 ----
+define_id!(
+    /// Identifies an information barrier / ethical wall — an admin-defined barred
+    /// PAIR of user-groups (Microsoft Purview-style). Members across a barred pair
+    /// may not DM each other or share a channel; the pair is symmetric.
+    BarrierId
+);
 
 #[cfg(test)]
 mod tests {

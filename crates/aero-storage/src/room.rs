@@ -374,6 +374,49 @@ impl RoomRepo {
             .collect())
     }
 
+    // ------------------------------------------ per-channel retention (0058)
+
+    /// Set (or, with `days = None`, clear back to "inherit the workspace
+    /// default") a room's message-retention override, in whole days (migration
+    /// 0058). A `Some(n)` makes this room's window take precedence over its
+    /// workspace's `retention_days` in the periodic sweep
+    /// ([`WorkspaceRepo::sweep_expired_messages`](crate::WorkspaceRepo::sweep_expired_messages));
+    /// `None` (the default) means the room inherits the workspace default.
+    /// Validating the value (`1..=3650`) is the caller's responsibility, mirroring
+    /// the workspace policy path; this method writes whatever it is given.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the update.
+    pub async fn set_retention_days(
+        &self,
+        room: RoomId,
+        days: Option<i32>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(r"UPDATE rooms SET retention_days = $2 WHERE id = $1")
+            .bind(room.to_uuid())
+            .bind(days)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// A room's retention override in whole days, or `None` when the room inherits
+    /// the workspace default (or does not exist). The outer `Result`/inner
+    /// `Option` collapse "no such room" and "no override set" to the same `None`:
+    /// both mean "fall back to the workspace policy" for the effective window.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the query.
+    pub async fn retention_days(&self, room: RoomId) -> Result<Option<i32>, sqlx::Error> {
+        let row = sqlx::query_as::<_, (Option<i32>,)>(
+            r"SELECT retention_days FROM rooms WHERE id = $1",
+        )
+        .bind(room.to_uuid())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.and_then(|(d,)| d))
+    }
+
     /// Remove a participant from a room (used by channel leave). Idempotent: a
     /// no-op when they were not a member.
     pub async fn remove_member(

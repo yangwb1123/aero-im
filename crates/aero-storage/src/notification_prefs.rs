@@ -10,11 +10,16 @@
 //!   time falls inside the window, no notifications are delivered. `None/None`
 //!   means no DND configured. A window with `start > end` wraps past midnight
 //!   (an *overnight* window).
+//! * **One-off snooze** — a single nullable `snooze_until` timestamp on the same
+//!   `dnd_settings` row (migration 0060). While `now < snooze_until` ALL
+//!   notifications are suppressed once, then it lapses on its own; `NULL` means
+//!   not snoozed. This is the Slack "Pause notifications" / Teams quiet-time
+//!   control, distinct from the recurring daily DND window above.
 //!
-//! The suppression *decision* is pure ([`in_dnd_window`] / [`should_suppress`])
-//! so it is exhaustively unit-testable without a database; the server consults
-//! these before persisting/pushing a notification. Purely additive: a NEW
-//! [`NotificationPrefsRepo`]; no existing repo is touched.
+//! The suppression *decision* is pure ([`in_dnd_window`] / [`should_suppress`] /
+//! [`is_snoozed`]) so it is exhaustively unit-testable without a database; the
+//! server consults these before persisting/pushing a notification. Purely
+//! additive: a NEW [`NotificationPrefsRepo`]; no existing repo is touched.
 
 use aero_common::{ParticipantId, RoomId};
 use sqlx::PgPool;
@@ -52,6 +57,15 @@ pub fn should_suppress(is_muted: bool, dnd: Option<(i32, i32)>, now_minute: i32)
         return true;
     }
     matches!(dnd, Some((start, end)) if in_dnd_window(now_minute, start, end))
+}
+
+/// Whether a one-off snooze is currently active: `snooze_until` is set and `now`
+/// has not yet reached it (`now < snooze_until`). An absent (`None`) or already
+/// elapsed snooze reads as inactive. Composes with [`should_suppress`] — a
+/// notification is silenced when EITHER is true. Pure, unit-tested.
+#[must_use]
+pub fn is_snoozed(snooze_until: Option<time::OffsetDateTime>, now: time::OffsetDateTime) -> bool {
+    matches!(snooze_until, Some(until) if now < until)
 }
 
 /// Minutes-of-day (`0..1440`) for an instant, computed from its UTC clock.
@@ -182,6 +196,63 @@ impl NotificationPrefsRepo {
             _ => None,
         })
     }
+
+    /// Arm (or clear) `participant`'s one-off notification snooze. Pass `Some`
+    /// future instant to pause ALL notifications until then, or `None` to clear
+    /// it. An idempotent upsert keyed on the participant that touches ONLY
+    /// `snooze_until`, so it preserves any configured daily DND window on the
+    /// same row. See [`clear_snooze`](Self::clear_snooze) for the clearing alias.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the upsert.
+    pub async fn set_snooze(
+        &self,
+        participant: ParticipantId,
+        until: Option<time::OffsetDateTime>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r"INSERT INTO dnd_settings (participant_id, snooze_until, updated_at)
+               VALUES ($1, $2, now())
+               ON CONFLICT (participant_id)
+               DO UPDATE SET snooze_until = EXCLUDED.snooze_until,
+                             updated_at   = now()",
+        )
+        .bind(participant.to_uuid())
+        .bind(until)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Clear `participant`'s one-off snooze (sets `snooze_until` back to `NULL`),
+    /// leaving any daily DND window intact. Idempotent — clearing an unset snooze
+    /// is a no-op. A thin alias for [`set_snooze`](Self::set_snooze) with `None`.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the underlying upsert.
+    pub async fn clear_snooze(&self, participant: ParticipantId) -> Result<(), sqlx::Error> {
+        self.set_snooze(participant, None).await
+    }
+
+    /// `participant`'s one-off snooze instant, or `None` when unset (no row, or a
+    /// row with a NULL `snooze_until`). Read alongside the DND row. A value in the
+    /// past is returned verbatim; callers decide "is it still active" via
+    /// [`is_snoozed`].
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the query.
+    pub async fn get_snooze(
+        &self,
+        participant: ParticipantId,
+    ) -> Result<Option<time::OffsetDateTime>, sqlx::Error> {
+        let row = sqlx::query_as::<_, (Option<time::OffsetDateTime>,)>(
+            r"SELECT snooze_until FROM dnd_settings WHERE participant_id = $1",
+        )
+        .bind(participant.to_uuid())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.and_then(|(snooze,)| snooze))
+    }
 }
 
 #[cfg(test)]
@@ -250,6 +321,29 @@ mod tests {
         assert!(!should_suppress(false, Some((540, 1020)), 100), "outside same-day window");
         assert!(should_suppress(false, Some((1320, 480)), 0), "inside overnight window");
         assert!(!should_suppress(false, Some((1320, 480)), 720), "outside overnight window");
+    }
+
+    #[test]
+    fn snooze_active_only_while_now_is_before_until() {
+        let now = time::OffsetDateTime::UNIX_EPOCH;
+        // Not snoozed when unset.
+        assert!(!is_snoozed(None, now), "no snooze set => inactive");
+        // Active while now is strictly before the target instant.
+        let future = now + time::Duration::hours(1);
+        assert!(is_snoozed(Some(future), now), "future snooze is active");
+        assert!(
+            is_snoozed(Some(future), future - time::Duration::seconds(1)),
+            "active one second before it lapses"
+        );
+        // Boundary is exclusive: at/after the instant it has lapsed.
+        assert!(!is_snoozed(Some(future), future), "lapses exactly at snooze_until");
+        assert!(
+            !is_snoozed(Some(future), future + time::Duration::seconds(1)),
+            "inactive after it lapses"
+        );
+        // A snooze already in the past reads as inactive.
+        let past = now - time::Duration::hours(1);
+        assert!(!is_snoozed(Some(past), now), "elapsed snooze is inactive");
     }
 
     #[test]
@@ -350,5 +444,47 @@ mod db_tests {
         // Clear it.
         repo.set_dnd(participant, None, None).await.unwrap();
         assert!(repo.get_dnd(participant).await.unwrap().is_none(), "DND cleared");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn notif_prefs_set_clear_and_read_snooze() {
+        let p = pool();
+        let repo = NotificationPrefsRepo::new(p.clone());
+        let (participant, _room) = fixture(&p).await;
+
+        assert!(repo.get_snooze(participant).await.unwrap().is_none(), "no snooze initially");
+
+        // Arm a future snooze; it round-trips (compare to whole seconds to dodge
+        // any sub-second precision difference on the wire).
+        let until = time::OffsetDateTime::now_utc() + time::Duration::hours(2);
+        repo.set_snooze(participant, Some(until)).await.unwrap();
+        let got = repo.get_snooze(participant).await.unwrap().expect("snooze set");
+        assert_eq!(
+            got.unix_timestamp(),
+            until.unix_timestamp(),
+            "snooze_until round-trips"
+        );
+        assert!(is_snoozed(Some(got), time::OffsetDateTime::now_utc()), "future snooze is active");
+
+        // Setting a DND window must not disturb the snooze (independent columns).
+        repo.set_dnd(participant, Some(540), Some(1020)).await.unwrap();
+        assert!(
+            repo.get_snooze(participant).await.unwrap().is_some(),
+            "set_dnd leaves snooze intact"
+        );
+
+        // Clear the snooze; the DND window must survive.
+        repo.clear_snooze(participant).await.unwrap();
+        assert!(repo.get_snooze(participant).await.unwrap().is_none(), "snooze cleared");
+        assert_eq!(
+            repo.get_dnd(participant).await.unwrap(),
+            Some((540, 1020)),
+            "clear_snooze leaves DND intact"
+        );
+
+        // Clearing again is idempotent.
+        repo.clear_snooze(participant).await.unwrap();
+        assert!(repo.get_snooze(participant).await.unwrap().is_none(), "second clear is a no-op");
     }
 }

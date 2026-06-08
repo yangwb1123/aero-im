@@ -117,6 +117,23 @@ async fn open_group_dm(
         .into());
     }
 
+    // Information barrier (ethical wall) enforcement: no two members may sit across
+    // a barred pair of user-groups. Checked over every unordered pair in the member
+    // set; built inline from the shared pool so the check is ALWAYS available. Group
+    // DMs live in the default workspace, so the barrier is evaluated there.
+    let barriers = aero_storage::BarrierRepo::new(s.pg.clone());
+    for (i, x) in members.iter().enumerate() {
+        for y in &members[i + 1..] {
+            if barriers
+                .barred(DEFAULT_WORKSPACE_ID, *x, *y)
+                .await
+                .map_err(AeroError::from)?
+            {
+                return Err(AeroError::Forbidden("information barrier".into()).into());
+            }
+        }
+    }
+
     let repo = GroupDmRepo::new(s.pg.clone());
     if let Some(room_id) = repo.find_exact(&members).await.map_err(AeroError::from)? {
         // Existing group DM for this exact set — return its full row (the caller is

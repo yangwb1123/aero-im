@@ -252,7 +252,16 @@ pub fn build(state: AppState) -> Router {
         // Stream / creator analytics: owner-only per-stream aggregate dashboard.
         .merge(crate::stream_analytics::routes())
         // Mark message / conversation as unread: roll the read cursor backwards.
-        .merge(crate::mark_unread::routes());
+        .merge(crate::mark_unread::routes())
+        // ---- Wave 19 ----
+        // Per-channel retention override: room.retention_days beats the workspace default.
+        .merge(crate::channel_retention::routes())
+        // Information barriers / ethical walls: barred user-group pairs can't DM/share.
+        .merge(crate::info_barriers::routes())
+        // Snooze notifications: one-off pause until a timestamp (distinct from DND).
+        .merge(crate::snooze::routes())
+        // Workspace-wide RAG ask: cross-channel AI Q&A bounded by membership.
+        .merge(crate::workspace_ask::routes());
 
     // Prometheus scrape endpoint (ROADMAP 方向四). Mounted unless disabled; the
     // handler self-gates on an optional bearer token. Left here (not behind the

@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use aero_ai::AiService;
-use aero_common::{MessageId, RoomId};
+use aero_common::{MessageId, ParticipantId, RoomId, WorkspaceId};
 use async_trait::async_trait;
 
 use crate::state::{AiAnswer, AiBackend};
@@ -39,6 +39,24 @@ impl AiBackend for AiServiceAdapter {
         let result = self
             .inner
             .answer_question(room, question, k)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(AiAnswer {
+            answer: result.answer,
+            citations: result.citations.into_iter().collect::<Vec<MessageId>>(),
+        })
+    }
+
+    async fn answer_question_workspace(
+        &self,
+        participant: ParticipantId,
+        workspace: WorkspaceId,
+        question: &str,
+        k: usize,
+    ) -> Result<AiAnswer, String> {
+        let result = self
+            .inner
+            .answer_question_workspace(participant, workspace, question, k)
             .await
             .map_err(|e| e.to_string())?;
         Ok(AiAnswer {

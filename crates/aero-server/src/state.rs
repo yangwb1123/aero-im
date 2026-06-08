@@ -37,6 +37,17 @@ pub trait AiBackend: Send + Sync + 'static {
         question: &str,
         k: usize,
     ) -> Result<AiAnswer, String>;
+    /// Answer a question across EVERY room the caller belongs to in a workspace
+    /// (the "ask your workspace" RAG flow). Retrieval is membership- and
+    /// workspace-bounded; degrades without an LLM key exactly like
+    /// [`AiBackend::answer_question`]. Backs `POST /api/workspaces/:id/ask`.
+    async fn answer_question_workspace(
+        &self,
+        participant: aero_common::ParticipantId,
+        workspace: aero_common::WorkspaceId,
+        question: &str,
+        k: usize,
+    ) -> Result<AiAnswer, String>;
     /// Compute an embedding for the given text. Used by the search route's
     /// `mode=vector` path. Falls back to a deterministic local hash embedder
     /// when no remote API key is configured.

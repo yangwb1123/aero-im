@@ -304,12 +304,13 @@ impl ImService {
     }
 
     /// Notification suppression seam for per-channel mute + per-user
-    /// Do-Not-Disturb. Returns whether a notification should be delivered to
-    /// `recipient` for `room`: `false` when the recipient has MUTED the room OR
-    /// is currently inside their DND window, `true` otherwise. DND is evaluated
-    /// against the current UTC minute-of-day for now. Best-effort and FAIL-OPEN:
-    /// no prefs store wired, or a lookup error, returns `true` so a glitch never
-    /// silently drops a notification.
+    /// Do-Not-Disturb + one-off snooze. Returns whether a notification should be
+    /// delivered to `recipient` for `room`: `false` when the recipient has MUTED
+    /// the room, is currently inside their daily DND window, OR has an active
+    /// one-off snooze (`now < snooze_until`); `true` otherwise. DND/snooze are
+    /// evaluated against the current UTC clock for now. Best-effort and
+    /// FAIL-OPEN: no prefs store wired, or a lookup error, returns `true` so a
+    /// glitch never silently drops a notification.
     async fn should_notify(&self, recipient: ParticipantId, room: RoomId) -> bool {
         let Some(prefs) = self.prefs.as_ref() else {
             return true;
@@ -328,8 +329,18 @@ impl ImService {
                 return true;
             }
         };
-        let now_minute =
-            aero_storage::notification_prefs::minute_of_day_utc(time::OffsetDateTime::now_utc());
+        let now = time::OffsetDateTime::now_utc();
+        // One-off snooze (Slack "Pause notifications"): suppress while still
+        // active, in ADDITION to the recurring window + per-room mute.
+        match prefs.get_snooze(recipient).await {
+            Ok(snooze) if aero_storage::notification_prefs::is_snoozed(snooze, now) => return false,
+            Ok(_) => {}
+            Err(err) => {
+                warn!(?err, %recipient, "snooze lookup failed; not suppressing");
+                return true;
+            }
+        }
+        let now_minute = aero_storage::notification_prefs::minute_of_day_utc(now);
         !aero_storage::notification_prefs::should_suppress(is_muted, dnd, now_minute)
     }
 

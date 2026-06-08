@@ -98,4 +98,10 @@ pub mod mark_unread;
 pub mod stream_analytics;
 pub mod stream_key;
 
+// ---- Wave 19 ----
+pub mod channel_retention;
+pub mod info_barriers;
+pub mod snooze;
+pub mod workspace_ask;
+
 pub use state::AppState;

@@ -91,6 +91,9 @@ pub mod workspace_files;
 pub mod clip;
 pub mod stream_stats;
 
+// ---- Wave 19 ----
+pub mod info_barrier;
+
 pub use ai_job::{AiJob, AiJobKind, AiJobRepo, AiJobStatus};
 pub use audit::{AuditEvent, AuditRepo};
 pub use blob::{BlobRepo, NewBlob};
@@ -195,3 +198,6 @@ pub use workspace_files::{WorkspaceFile, WorkspaceFileRepo};
 // ---- Wave 18 re-exports ----
 pub use clip::{Clip, ClipRepo};
 pub use stream_stats::{StreamAnalytics, StreamStatsRepo};
+
+// ---- Wave 19 re-exports ----
+pub use info_barrier::{BarrierRepo, InfoBarrier};

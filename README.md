@@ -3,7 +3,7 @@
 AI-Native 即时通讯 + 直播平台,Rust 实现。
 
 - 设计:[`docs/specs/2026-05-22-aero-im-design.md`](docs/specs/2026-05-22-aero-im-design.md)
-- 状态:**P0–P11 全部就位** + **18 轮 To-B 协作/企业扩展**(77 个功能点,迁移 0001–0057)。媒体面协议栈深化(WHIP/WHEP + SFU 联播/RTCP + SRT 加密/可靠性)已实现并字节级单测(**812 个 hermetic 单元测试通过**,15 个 crate)
+- 状态:**P0–P11 全部就位** + **19 轮 To-B 协作/企业扩展**(81 个功能点,迁移 0001–0060)。媒体面协议栈深化(WHIP/WHEP + SFU 联播/RTCP + SRT 加密/可靠性)已实现并字节级单测(**817 个 hermetic 单元测试通过**,15 个 crate)
 
 ## 功能矩阵
 
@@ -63,6 +63,10 @@ AI-Native 即时通讯 + 直播平台,Rust 实现。
 | **直播切片 clips** | 观众标记 [start,end] 时间段分享(复用 HLS 播放列表客户端 seek, Wave 18) | ✅ |
 | **主播数据面板** | 单场聚合:礼物数/收入·弹幕数·独立发言人·时长(Wave 18) | ✅ |
 | **标记未读** | 把已读游标回拨,使房间重新标红(mark-as-unread 三方常见三连之一, Wave 18) | ✅ |
+| **按频道留存** | 每频道留存覆盖:房间 retention_days 优先于工作区默认(清扫用 COALESCE,与法务保全叠加, Wave 19) | ✅ |
+| **信息隔离墙** | 受限用户组对(Purview ethical walls):跨受限对成员禁止私聊(`barred` 校验, Wave 19) | ✅ |
+| **通知暂停** | 一次性 snooze 到指定时刻(区别于周期 DND, Wave 19) | ✅ |
+| **工作区级 RAG 问答** | 跨全部所在频道提问(成员边界向量检索 + LLM,旗舰企业 AI, Wave 19) | ✅ |
 
 ## 架构
 
@@ -216,7 +220,7 @@ ffmpeg -re -i sample.mp4 -c:v libx264 -c:a aac -f flv rtmp://localhost/live/<str
 
 ```bash
 cargo check --workspace          # 干净
-cargo test --workspace --lib     # 812 pass / 0 fail / 126 ignored(DB 集成,需 --ignored + DATABASE_URL)
+cargo test --workspace --lib     # 817 pass / 0 fail / 130 ignored(DB 集成,需 --ignored + DATABASE_URL)
 cargo build --bin aero-server    # 二进制成功
 cargo clippy -p aero-live-srt -p aero-live-webrtc -p aero-live-whip --all-targets  # 媒体面 crate 零告警
 # 注:`cargo clippy --workspace --all-targets` 在 aero-storage/aero-server 等既有 crate 下仍有 pedantic 告警(非本批次引入,待清理)

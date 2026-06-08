@@ -634,11 +634,15 @@ impl WorkspaceRepo {
     /// swept (ROADMAP 方向一 合规 — 按组织的留存策略).
     ///
     /// One set-based `UPDATE` joins `messages → rooms → workspaces` so the cutoff
-    /// is evaluated **per workspace** in the database (`created_at < now -
-    /// retention_days days`); workspaces with `retention_days IS NULL` (keep
-    /// forever) and any `retention_days <= 0` are excluded entirely — a
-    /// non-positive window never sweeps anything, so a mis-set policy fails safe
-    /// rather than erasing a whole tenant.
+    /// is evaluated **per room** in the database, against the EFFECTIVE window
+    /// `COALESCE(r.retention_days, w.retention_days)` — a room's own override
+    /// (migration 0058) takes precedence over its workspace default, and a room
+    /// with no override (`r.retention_days IS NULL`) inherits the workspace
+    /// policy. A row is swept when its effective window is non-NULL and `> 0` and
+    /// `created_at < now - effective days`; an effective window that is NULL (keep
+    /// forever) or `<= 0` is excluded entirely — a non-positive window never
+    /// sweeps anything, so a mis-set policy fails safe rather than erasing a whole
+    /// tenant or channel.
     ///
     /// The mutation is **byte-for-byte the same** soft-delete
     /// [`MessageRepo::soft_delete`](crate::MessageRepo::soft_delete) applies
@@ -664,10 +668,10 @@ impl WorkspaceRepo {
                JOIN workspaces w ON w.id = r.workspace_id
               WHERE m.room_id = r.id
                 AND m.deleted_at IS NULL
-                AND w.retention_days IS NOT NULL
-                AND w.retention_days > 0
+                AND COALESCE(r.retention_days, w.retention_days) IS NOT NULL
+                AND COALESCE(r.retention_days, w.retention_days) > 0
                 AND ($2::uuid IS NULL OR w.id = $2)
-                AND m.created_at < $1 - make_interval(days => w.retention_days)
+                AND m.created_at < $1 - make_interval(days => COALESCE(r.retention_days, w.retention_days))
                 AND NOT EXISTS (
                       SELECT 1 FROM legal_holds lh
                        WHERE lh.active
@@ -1260,6 +1264,73 @@ mod db_tests {
         let old = insert_message_at(&p, room, owner, now - time::Duration::days(365)).await;
         assert_eq!(repo.sweep_expired_messages(now, Some(ws)).await.unwrap(), 0, "cleared policy = no sweep");
         assert!(message_state(&p, old).await.0.is_none(), "message kept after policy cleared");
+    }
+
+    /// Insert a bare channel room in `workspace` (no retention override, no
+    /// auto-enrolled owner), returning its id. Lets the per-channel override sweep
+    /// test place several rooms in one tenant deterministically.
+    async fn insert_room(
+        p: &PgPool,
+        workspace: WorkspaceId,
+        creator: ParticipantId,
+    ) -> RoomId {
+        let id = RoomId::new();
+        sqlx::query(
+            r"INSERT INTO rooms (id, kind, name, created_by, created_at, workspace_id)
+               VALUES ($1, 'channel', $2, $3, now(), $4)",
+        )
+        .bind(id.to_uuid())
+        .bind(format!("room-{id}"))
+        .bind(creator.to_uuid())
+        .bind(workspace.to_uuid())
+        .execute(p)
+        .await
+        .expect("insert room");
+        id
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn sweep_room_override_takes_precedence_over_workspace_default() {
+        let p = pool();
+        let repo = WorkspaceRepo::new(p.clone());
+        let rooms = crate::room::RoomRepo::new(p.clone());
+        let owner = new_participant(&p).await;
+        // Workspace default: 30 days. `seed_workspace`'s room inherits it.
+        let (ws, inherit_room, _seeded) = seed_workspace(&repo, &p, owner).await;
+        repo.set_retention(ws, Some(30)).await.unwrap();
+
+        // A SHORTER override (7 days) and a LONGER override (365 days), both in the
+        // same workspace as the inheriting room.
+        let short_room = insert_room(&p, ws, owner).await;
+        let long_room = insert_room(&p, ws, owner).await;
+        rooms.set_retention_days(short_room, Some(7)).await.unwrap();
+        rooms.set_retention_days(long_room, Some(365)).await.unwrap();
+        assert_eq!(rooms.retention_days(short_room).await.unwrap(), Some(7), "short override persisted");
+        assert_eq!(rooms.retention_days(long_room).await.unwrap(), Some(365), "long override persisted");
+        assert_eq!(rooms.retention_days(inherit_room).await.unwrap(), None, "no override = inherit");
+
+        let now = time::OffsetDateTime::now_utc();
+        // 10 days old: KEPT under the 30-day default, but PAST the 7-day override.
+        let in_short = insert_message_at(&p, short_room, owner, now - time::Duration::days(10)).await;
+        // 3 days old: within the 7-day override → kept.
+        let fresh_short = insert_message_at(&p, short_room, owner, now - time::Duration::days(3)).await;
+        // 100 days old: SWEPT under the 30-day default, but WITHIN the 365-day override.
+        let in_long = insert_message_at(&p, long_room, owner, now - time::Duration::days(100)).await;
+        // 40 days old: swept under the inherited 30-day workspace default.
+        let in_inherit = insert_message_at(&p, inherit_room, owner, now - time::Duration::days(40)).await;
+
+        let swept = repo.sweep_expired_messages(now, Some(ws)).await.unwrap();
+        assert_eq!(swept, 2, "the short-override 10d message and the inherited 40d message");
+
+        // A shorter override sweeps a message the workspace default would have kept.
+        assert!(message_state(&p, in_short).await.0.is_some(), "shorter override swept the 10-day message");
+        // Within the shorter override → kept.
+        assert!(message_state(&p, fresh_short).await.0.is_none(), "3-day message within 7-day override kept");
+        // A longer override keeps a message the workspace default would have swept.
+        assert!(message_state(&p, in_long).await.0.is_none(), "longer override kept the 100-day message");
+        // No override inherits the workspace default.
+        assert!(message_state(&p, in_inherit).await.0.is_some(), "inherited default swept the 40-day message");
     }
 
     // ----- single-channel guests (0027) -----

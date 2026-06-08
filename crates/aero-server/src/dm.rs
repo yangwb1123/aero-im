@@ -73,6 +73,19 @@ async fn open_dm(
         return Err(AeroError::Invalid("cannot open a direct message with yourself".into()).into());
     }
 
+    // Information barrier (ethical wall) enforcement: if the caller and target sit
+    // across a barred pair of user-groups, they may not open a DM. The repo is
+    // built inline from the shared pool so the check is ALWAYS available; DMs live
+    // in the default workspace, so the barrier is evaluated there (which is where a
+    // single-tenant admin defines them).
+    if aero_storage::BarrierRepo::new(s.pg.clone())
+        .barred(DEFAULT_WORKSPACE_ID, auth.participant_id, target)
+        .await
+        .map_err(AeroError::from)?
+    {
+        return Err(AeroError::Forbidden("information barrier".into()).into());
+    }
+
     let dm = DmRepo::new(s.pg.clone());
     if let Some(room_id) = dm
         .find_direct(auth.participant_id, target)
