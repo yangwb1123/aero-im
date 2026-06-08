@@ -104,4 +104,19 @@ impl AiBackend for AiServiceAdapter {
             Box::pin(stream.map(|r| r.map_err(|e| e.to_string())));
         Ok((citations, boxed))
     }
+
+    async fn ask_with_context(
+        &self,
+        participant: ParticipantId,
+        room: RoomId,
+        question: &str,
+        k: usize,
+    ) -> Result<AiAnswer, String> {
+        let result = self
+            .inner
+            .ask_with_context(participant, room, question, k)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(AiAnswer { answer: result.answer, citations: result.citations })
+    }
 }

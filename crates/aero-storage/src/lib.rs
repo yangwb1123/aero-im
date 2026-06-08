@@ -3,6 +3,7 @@
 //! Repository pattern: each entity has a `*Repo` struct holding a `PgPool`,
 //! offering high-level methods that other crates call. SQL stays inside this crate.
 
+pub mod ai_context;
 pub mod ai_job;
 pub mod audit;
 pub mod blob;
@@ -99,6 +100,7 @@ pub mod info_barrier;
 pub mod activity_feed;
 pub mod auth_session;
 
+pub use ai_context::{AiContextStore, MAX_TURNS as AI_CONTEXT_MAX_TURNS};
 pub use ai_job::{AiJob, AiJobKind, AiJobRepo, AiJobStatus};
 pub use audit::{AuditEvent, AuditRepo};
 pub use blob::{BlobRepo, NewBlob};

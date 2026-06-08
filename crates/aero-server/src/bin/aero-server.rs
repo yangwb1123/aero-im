@@ -25,12 +25,12 @@ use aero_server::{
     ws,
 };
 use aero_storage::{
-    connect_pg, migrate, AiJobRepo, AuditRepo, BlobRepo, CallRepo, CallRosterStore, KeyPackageRepo,
-    LiveRepo, LocalFsBlobStore, MessageRepo, MlsGroupRepo, NotificationPrefsRepo, NotificationRepo,
-    DeactivationRepo, KeywordAlertRepo, MessageEditRepo, ParticipantRepo, PatRepo, PinRepo, TotpRepo,
-    PresenceStore, ReactionRepo, ReceiptRepo, RecurringMessageRepo, RedisCache, RoomRepo,
-    StreamRepo, StreamRouteRegistry, StreamViewerStore, ThreadSubscriptionRepo, UserGroupRepo,
-    WorkspaceRepo,
+    connect_pg, migrate, AiContextStore, AiJobRepo, AuditRepo, BlobRepo, CallRepo, CallRosterStore,
+    KeyPackageRepo, LiveRepo, LocalFsBlobStore, MessageRepo, MlsGroupRepo, NotificationPrefsRepo,
+    NotificationRepo, DeactivationRepo, KeywordAlertRepo, MessageEditRepo, ParticipantRepo, PatRepo,
+    PinRepo, TotpRepo, PresenceStore, ReactionRepo, ReceiptRepo, RecurringMessageRepo, RedisCache,
+    RoomRepo, StreamRepo, StreamRouteRegistry, StreamViewerStore, ThreadSubscriptionRepo,
+    UserGroupRepo, WorkspaceRepo,
 };
 use tokio_util::sync::CancellationToken;
 use anyhow::Context;
@@ -83,6 +83,7 @@ async fn main() -> anyhow::Result<()> {
     let live_repo = LiveRepo::new(pg.clone());
     let key_packages = KeyPackageRepo::new(pg.clone());
     let mls_groups = MlsGroupRepo::new(pg.clone());
+    let ai_context = AiContextStore::new(cache.client().clone());
     let presence = PresenceStore::new(cache.client().clone());
     // Cross-node live presence (ROADMAP 方向二/五): viewer counts + call rosters
     // live in Redis (sorted-set-with-heartbeat) so multi-node audiences/calls are
@@ -175,6 +176,7 @@ async fn main() -> anyhow::Result<()> {
         ai_jobs.clone(),
         messages.clone(),
         rooms.clone(),
+        Some(ai_context),
     ));
     info!("AI service constructed");
 

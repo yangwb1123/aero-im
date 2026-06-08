@@ -57,6 +57,7 @@ pub fn build(state: AppState) -> Router {
         .route("/api/ai/summarize", post(ai_summarize))
         .route("/api/ai/ask", post(ai_ask))
         .route("/api/ai/ask/stream", post(ai_ask_stream))
+        .route("/api/ai/ask/context", post(ai_ask_context))
         // Live streams
         .route("/api/streams", post(stream_create).get(stream_list))
         .route("/api/streams/:id", get(stream_get))
@@ -1139,6 +1140,25 @@ async fn ai_ask_stream(
     }));
 
     Sse::new(event_stream).keep_alive(KeepAlive::default()).into_response()
+}
+
+async fn ai_ask_context(
+    State(s): State<AppState>,
+    auth: AuthUser,
+    Json(req): Json<AiAskReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let room = parse_room_id(&req.room_id)?;
+    s.im.assert_room_access(auth.participant_id, room).await?;
+    let k = req.k.unwrap_or(8);
+    let ai = s.ai.as_ref().ok_or_else(|| AeroError::Upstream("AI not configured".into()))?;
+    let answer = ai
+        .ask_with_context(auth.participant_id, room, &req.question, k)
+        .await
+        .map_err(|e| AeroError::Upstream(format!("ai: {e}")))?;
+    Ok(Json(serde_json::json!({
+        "answer": answer.answer,
+        "citations": answer.citations,
+    })))
 }
 
 // ----- Streams (P4) -----

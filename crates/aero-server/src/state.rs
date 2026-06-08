@@ -81,6 +81,18 @@ pub trait AiBackend: Send + Sync + 'static {
         ),
         String,
     >;
+    /// RAG answer with rolling session context.
+    ///
+    /// Same as [`AiBackend::answer_question`] but prepends the last few
+    /// Q&A turns from Redis so the model can refer back to them, then appends
+    /// the new question and answer to the session history.
+    async fn ask_with_context(
+        &self,
+        participant: aero_common::ParticipantId,
+        room: aero_common::RoomId,
+        question: &str,
+        k: usize,
+    ) -> Result<AiAnswer, String>;
 }
 
 #[derive(Debug, Clone)]

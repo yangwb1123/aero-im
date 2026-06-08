@@ -14,7 +14,7 @@
 use std::sync::Arc;
 
 use aero_common::{Message, MessageId, ParticipantId, RoomId, WorkspaceId};
-use aero_storage::{AiJobRepo, MessageRepo, RoomRepo, SearchHit};
+use aero_storage::{AiContextStore, AiJobRepo, MessageRepo, RoomRepo, SearchHit};
 
 use std::pin::Pin;
 
@@ -45,6 +45,9 @@ pub struct AiService {
     ai_jobs: AiJobRepo,
     messages: MessageRepo,
     rooms: RoomRepo,
+    /// Optional Redis-backed rolling conversation context.
+    /// `None` when Redis is not configured or is unavailable at startup.
+    context: Option<AiContextStore>,
 }
 
 impl AiService {
@@ -55,13 +58,19 @@ impl AiService {
         ai_jobs: AiJobRepo,
         messages: MessageRepo,
         rooms: RoomRepo,
+        context: Option<AiContextStore>,
     ) -> Self {
-        Self { anthropic, embedder, transcriber, ai_jobs, messages, rooms }
+        Self { anthropic, embedder, transcriber, ai_jobs, messages, rooms, context }
     }
 
     /// Construct from env: Anthropic optional, embedder picks Voyage if configured
     /// else local hash. Repos are required since they're owned by the server.
-    pub fn from_env(ai_jobs: AiJobRepo, messages: MessageRepo, rooms: RoomRepo) -> Self {
+    pub fn from_env(
+        ai_jobs: AiJobRepo,
+        messages: MessageRepo,
+        rooms: RoomRepo,
+        context: Option<AiContextStore>,
+    ) -> Self {
         Self::new(
             AnthropicClient::from_env(),
             default_embedder(),
@@ -69,6 +78,7 @@ impl AiService {
             ai_jobs,
             messages,
             rooms,
+            context,
         )
     }
 
@@ -280,6 +290,85 @@ impl AiService {
         let stream: Pin<Box<dyn Stream<Item = Result<String>> + Send + 'static>> =
             Box::pin(futures::stream::once(async move { Ok(fallback) }));
         Ok((citations, stream))
+    }
+
+    /// Answer a question using both RAG context and rolling conversational memory.
+    ///
+    /// Extends [`Self::answer_question`] with session continuity: prior Q&A turns
+    /// for this `(participant, room)` pair are prepended as alternating
+    /// `user`/`assistant` messages so the model can refer back to them. After
+    /// the reply the new question and answer are appended to the session history
+    /// (trimmed to the last [`AI_CONTEXT_MAX_TURNS`] turns via Redis ZREMRANGEBYRANK).
+    ///
+    /// Without a context store or without Anthropic the method degrades silently
+    /// to [`Self::answer_question`] behaviour.
+    ///
+    /// # Errors
+    /// Returns [`AiError::Invalid`] for an empty question; otherwise propagates
+    /// embedder, storage, or Anthropic failures. Context store errors are logged
+    /// and swallowed — they never fail the answer.
+    pub async fn ask_with_context(
+        &self,
+        participant: ParticipantId,
+        room: RoomId,
+        question: &str,
+        k: usize,
+    ) -> Result<AnswerResult> {
+        let q = question.trim();
+        if q.is_empty() {
+            return Err(AiError::Invalid("question must not be empty".into()));
+        }
+        #[allow(clippy::cast_possible_wrap)]
+        let k = k.clamp(1, 20) as i64;
+
+        let query_vec = self.embedder.embed_one(q).await?;
+        let hits: Vec<SearchHit> = self.messages.search_vector(room, query_vec, k).await?;
+        let citations: Vec<MessageId> = hits.iter().map(|h| h.message.id).collect();
+        let context = render_context(&hits);
+
+        if let Some(client) = &self.anthropic {
+            // Load prior turns (best-effort; ignore errors so context store
+            // unavailability never blocks answering).
+            let prior_turns = if let Some(ctx) = &self.context {
+                ctx.get_turns(participant, room, 6).await.unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+
+            let mut messages: Vec<ChatMsg> = prior_turns
+                .into_iter()
+                .map(|(role, text)| ChatMsg { role, content: text })
+                .collect();
+
+            let user_msg = format!(
+                "问题: {q}\n\n相关聊天上下文(每段已附 ID,引用时使用):\n{context}\n\n请基于上述上下文作答,若信息不足请说明。"
+            );
+            messages.push(ChatMsg::user(user_msg));
+
+            let answer = client.complete(ANSWER_SYSTEM_PROMPT, &messages, 800).await?;
+
+            // Persist new Q&A turns; log but never fail on Redis errors.
+            // Store the raw question/answer (not the prompt with RAG context)
+            // so the session history reads as a natural conversation.
+            if let Some(ctx) = &self.context {
+                if let Err(e) = ctx.push_turn(participant, room, "user", q).await {
+                    tracing::warn!(error = %e, "ai context: failed to save user turn");
+                }
+                if let Err(e) = ctx.push_turn(participant, room, "assistant", &answer).await {
+                    tracing::warn!(error = %e, "ai context: failed to save assistant turn");
+                }
+            }
+
+            return Ok(AnswerResult { answer, citations });
+        }
+
+        // No Anthropic — fall back to raw context display.
+        let fallback = if hits.is_empty() {
+            "（未配置 Anthropic,也未在房间内检索到相关消息。）".to_string()
+        } else {
+            format!("（未配置 Anthropic,以下为检索到的相关消息上下文:）\n\n{context}")
+        };
+        Ok(AnswerResult { answer: fallback, citations })
     }
 
     /// Answer a question grounded in EVERY room the caller belongs to within a
