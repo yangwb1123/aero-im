@@ -1522,6 +1522,23 @@ impl ImService {
         }
     }
 
+    /// Publish a room event to the bus (cross-node fan-out).
+    ///
+    /// **Deliberate design (ROADMAP 方向一):** a publish failure is recorded
+    /// (warn + `NATS_PUBLISH_ERRORS_TOTAL`) but NOT propagated to the caller, so
+    /// the HTTP/WS send path still returns success. This is intentional and is
+    /// *not* the "silent data loss" the ROADMAP cautions against:
+    ///
+    /// - The message is already durably persisted in Postgres **before** this
+    ///   publish (persist-then-broadcast). NATS is the live fan-out, not the
+    ///   source of truth.
+    /// - Subscribers that missed the live event recover it through the reconnect
+    ///   **backfill** protocol (`MessageRepo::list_since` + `?since=` cursor) — so
+    ///   no message is lost even when NATS is down.
+    /// - Returning `503` here would instead induce **duplicate sends**: the client
+    ///   retries, re-inserting the already-persisted message. The publish-error
+    ///   counter (alertable) is the correct operational signal; the data path
+    ///   self-heals via backfill.
     async fn publish_room_event(&self, room: RoomId, event: &RoomEvent) {
         let subject = Self::room_subject(room);
         if let Err(err) = publish_event(self.bus.as_ref(), &subject, event).await {
