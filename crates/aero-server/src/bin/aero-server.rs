@@ -378,10 +378,10 @@ async fn main() -> anyhow::Result<()> {
     {
         let dlq_pool = pg.clone();
         tokio::spawn(async move {
-            let repo = aero_storage::AiJobRepo::new(dlq_pool);
             // Emit one gauge series per job kind so an operator can see WHICH AI
             // workflow (moderation vs summarisation vs …) is dead-lettering.
             const KINDS: &[&str] = &["embed", "summarize", "moderate", "answer"];
+            let repo = aero_storage::AiJobRepo::new(dlq_pool);
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
