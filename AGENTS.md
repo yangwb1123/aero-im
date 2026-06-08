@@ -1,53 +1,66 @@
 # AGENTS.md — Aero IM
 
-> 给编码 agent 的操作手册：**怎么在这个仓库干活、别踩哪些坑、什么在范围内**。
-> 功能清单 / API 速查 → `README.md`；架构设计与路线图 → `docs/specs/2026-05-22-aero-im-design.md`。
+> 编码 agent 的操作手册：**怎么在这仓库干活、别踩哪些坑、什么在范围内**。
+> 功能清单 / API 速查 / 实时测试数 → `README.md`；架构与路线图 → `docs/specs/2026-05-22-aero-im-design.md`。
 
-AI-Native 即时通讯 + 直播平台，纯 Rust。定位 To-B 协作（类 Slack），AI 走云 API 优先，互动直播为主。
+AI-Native 即时通讯 + 直播平台，纯 Rust。定位 To-B 协作（类 Slack/Lark）+ 互动直播，AI 走云 API 优先。
 
-## 架构主轴（先读这一段）
+## 架构主轴（先读这段）
 
-事件驱动 + 进程内扇出，是整个系统的复用骨架：
+事件驱动 + 进程内扇出，是全系统的复用骨架：
 
-- **房间实时** = `RoomEvent`（tagged enum, `tag="kind"`）→ NATS `im.room.{id}` → 进程内 `Hub` → WebSocket。
+- **房间实时** = `RoomEvent`（tagged enum，`tag="kind"`）→ NATS `im.room.{id}` → 进程内 `Hub` → WebSocket。
 - **直播实时** = `StreamEvent` → NATS `live.stream.{id}` → `Hub` → WebSocket。
-- **加一个房间实时功能** = 加一个 `RoomEvent` variant（`aero-common`）→ `ImService` 产出（`aero-im-core`）→ `Hub` 转发 → WS 帧（`aero-server`）→ web 客户端处理。直播功能同理走 `StreamEvent`。
-- ⚠️ tagged enum 的标签是 `kind`；**variant 内不要再有名为 `kind` 的字段**——会撞成反序列化 `duplicate field kind`（曾让 `CallEvent` 1:1 邀请挂掉，已用 `#[serde(rename = "call_kind")]` 修，客户端读 `call_kind || kind`）。
+- NATS 是**跨实例投递的事实源**，`Hub` 仅在本进程内扇出；多开实例即水平扩消息吞吐。Presence/观看数/通话 roster 走 Redis 做集群级聚合，不靠单进程内存。
+- ⚠️ tagged enum 的标签是 `kind`，**variant 内不要再有名为 `kind` 的字段**——会撞成 `duplicate field kind`（曾让 `CallEvent` 邀请挂掉，已 `#[serde(rename="call_kind")]` 修，客户端读 `call_kind || kind`）。
 
 ## crate 地图（15 个，依赖自下而上，勿成环）
 
 | 层 | crate | 职责 |
 |---|---|---|
-| 基础 | `aero-common` | **叶子**：所有共享类型 / ID / Block / RoomEvent / StreamEvent / Error / Config / telemetry |
-| 基础 | `aero-bus` | NATS JetStream EventBus trait + 实现 |
-| 基础 | `aero-storage` | sqlx 仓储（Message/Room/Receipt/Reaction/Blob/Call/AiJob/Stream/Presence/MLS）+ BlobStore |
-| 基础 | `aero-auth` | Argon2id + RS256 JWT + Axum extractor |
-| 基础 | `aero-signaling` | RtcConfig / IceServer / SDP·ICE 校验 / CallRoster |
-| IM | `aero-im-core` | `ImService` 编排（消息/编辑/删除/反应/已读/通话）+ `KeywordModerator` |
+| 基础 | `aero-common` | **叶子**：共享类型 / ID / Block / RoomEvent / StreamEvent / Error / Config / telemetry |
+| 基础 | `aero-bus` | NATS JetStream `EventBus` trait + 实现 |
+| 基础 | `aero-storage` | sqlx 仓储（每功能一个 `XRepo`）+ `BlobStore`（本地 FS，S3/MinIO 接口已留） |
+| 基础 | `aero-auth` | Argon2id + RS256 JWT + `AuthUser` extractor（JWT 失败回落 `aero_pat_*` PAT）+ OIDC + TOTP |
+| 基础 | `aero-signaling` | `RtcConfig` / `IceServer` / SDP·ICE 校验 / `CallRoster` |
+| IM | `aero-im-core` | `ImService` 编排（消息/编辑/删除/反应/已读/通知/通话）+ `KeywordModerator` |
 | IM | `aero-im-call` | P3+ 占位 |
-| IM | `aero-ai` | Anthropic / Voyage / HashEmbedder / `AiService` / `AiWorker` |
+| IM | `aero-ai` | Anthropic / Voyage / `HashEmbedder` / `AiService` / `AiWorker` |
 | 直播 | `aero-live-core` | `LiveIngest` trait + `IngestEvent` |
-| 直播 | `aero-live-rtmp` `-hls` | rml_rtmp 摄入 · `HlsWriter` + `FlvToTsConverter`（真 MPEG-TS mux） |
-| 直播 | `aero-live-whip` | str0m WHIP/WHEP：SDP 应答 + 事件循环 + RFC 6184 H.264 解包 + RTP→HLS |
-| 直播 | `aero-live-webrtc` | str0m SFU：选择性转发 + 每订阅者 RTP seq/ts 重映射 |
-| 直播 | `aero-live-srt` | 手写 SRT HSv5 握手 + 包编解码 + `MpegTsSegmenter`（TS→HLS）+ 时限 TURN 凭据 |
-| 组合 | `aero-server` | Axum gateway：HTTP + WS + WHIP/WHEP + HLS + RTMP `:1935` + `ai_adapter` + `agent_bot` + `Hub` |
+| 直播 | `aero-live-rtmp` · `-hls` | rml_rtmp 摄入 · `HlsWriter` + `FlvToTsConverter`（真 MPEG-TS mux） |
+| 直播 | `aero-live-whip` | str0m WHIP/WHEP：SDP 应答 + 事件循环 + RFC 6184 H.264 解包 + RTP→HLS + NAL 中继 |
+| 直播 | `aero-live-webrtc` | str0m SFU：选择性转发 + RTP seq/ts 重映射 + Simulcast + RTCP(PLI/FIR) |
+| 直播 | `aero-live-srt` | 手写 SRT HSv5 握手 + AES-CTR + ACK/NAK + `MpegTsSegmenter` + 时限 TURN 凭据 |
+| 组合 | `aero-server` | Axum gateway：HTTP + WS + WHIP/WHEP + HLS + RTMP `:1935` + bots + `Hub`；每功能一个 `pub fn routes()` 模块 |
 | 组合 | `web/` | 零依赖 ES2020 SPA（hls.js / RTCPeerConnection / SpeechRecognition CDN） |
 
-**放东西的位置**：共享类型 → `common`；表/仓储 → `storage`(+ `migrations/`)；房间功能 → `RoomEvent`；流功能 → `StreamEvent`；AI 能力 → `ai`；HTTP 路由 → `server`；媒体协议 → `live-*`。
+**东西放哪**：共享类型→`common`；表/仓储→`storage`(+`migrations/`)；房间功能→`RoomEvent`；流功能→`StreamEvent`；AI 能力→`ai`；HTTP 路由→`server`；媒体协议→`live-*`。
 
-## 技术栈基线
+**技术栈基线**：Rust 2021 / MSRV 1.80 · tokio · axum 0.7 · sqlx 0.8 · fred 9(Redis) · async-nats 0.36(JetStream) · str0m 0.19（`rust-crypto`，纯 Rust DTLS-SRTP）。存储：Postgres 17 + pgvector + pg_trgm · Redis 7 · JetStream。AI：`claude-sonnet-4-6` + Voyage 1024 维；**无 key 时退化到确定性 `HashEmbedder`/启发式，逻辑路径不变**（这是为什么沙箱里 AI 路由也能 200）。
 
-Rust 2021 / MSRV 1.80 · tokio · axum 0.7 · sqlx 0.8 · fred 9(Redis)· async-nats 0.36(JetStream)· thiserror · **str0m 0.19（`rust-crypto` 后端，纯 Rust DTLS-SRTP）**。
-存储：Postgres 17 + pgvector + pg_trgm · Redis 7 · JetStream（`IM_MESSAGES`/`IM_EVENTS`/`AI_QUEUE`；直播走 `live.stream.*` subject）· 附件默认本地 FS（S3/MinIO 接口已留）。
-AI：Anthropic Messages `claude-sonnet-4-6`、Voyage 1024 维嵌入；无 key 时退化到确定性 `HashEmbedder` / 启发式，逻辑路径不变。
+## 加一个功能：标准配方
+
+绝大多数新功能是**应用层**，走这条（范式照抄 `storage/src/saved_search.rs` + `server/src/saved_searches.rs`）：
+
+1. **迁移** `migrations/NNNN_x.sql`（下一个序号，`CREATE TABLE IF NOT EXISTS`、uuid 主键、幂等）。⚠️ 迁移在**编译期**被 `sqlx::migrate!` 嵌入 bin——**加了迁移文件必须先 `cargo build` 再 `aero-cli migrate`**，否则新迁移静默不生效。
+2. **新 ID**（如需，且要先于仓储——仓储的模型/方法会引用它）：`common/src/ids.rs` 的 `define_id!`。
+3. **仓储** `storage/src/x.rs`：`XRepo` 包 `PgPool`，方法 owner/room-scoped，配 `#[ignore]`+`DATABASE_URL` 门控的 db_tests；`lib.rs` 里 `pub mod`+`pub use`。
+4. **HTTP 模块** `server/src/x.rs`：`pub fn routes() -> Router<AppState>`，用 `XRepo::new(state.pg.clone())` **内联建仓储**（不必改 AppState/bin），`.merge` 进 `routes::build`；`lib.rs` 里 `pub mod`。
+5. **鉴权**：`AuthUser` extractor；房间数据路由**一律先** `ImService::assert_room_access(participant, room)`（注意参数顺序是 participant 在前；成员资格 + 停用的统一收口）；工作区管理端用 `WorkspaceRepo::member_role`（Owner/Admin）。
+6. **实时**（如需）：加 `RoomEvent`/`StreamEvent` variant（当心 `kind` tag）→ `Hub` 扇出 → WS 帧 → web 处理。
+7. **后台周期任务**（如需）：bin 里 `tokio::spawn`。既有：AI worker、scheduled/recurring/webhook 投递、留存清扫、agent/transcribe/moderation/unfurl 监听 bot。
+
+**媒体协议**（`live-*` crate）走不相交 crate；外部真实链路（绑 socket / 浏览器）做成 trait seam，逻辑单测、真实接线另算。
+
+**多 agent 并行集成（本仓库既定打法）**：一 agent 管一个**不相交单元**，git worktree 隔离，**先 `git reset --hard master` 校准基线**；依赖只加到自身 crate 的 `Cargo.toml`（别动 workspace root，`Cargo.lock` 由 git 自动合）。集成时**拉新文件**（`git checkout <sha> -- <paths>`）+ **手接共享文件**（`routes::build` 的 `.merge` 链、`lib.rs` re-export、`ids.rs`、`RoomEvent`/match 臂）——避免 N 路 append 冲突。合并后 `cargo check --workspace` 兜底。
 
 ## 开发循环
 
 ```bash
 make up                                    # 起 PG/Redis/NATS/Jaeger/MinIO
 make jwt-keys env                          # 生成 RS256 PEM + 写配置
-cargo run --bin aero-cli -- migrate        # 迁移，幂等（0001 IM · 0002 collab · 0003 MLS · 0004 转写 · 0005 直播 · 0006 多租户 · 0007 审计 · 0008 AI-job 租户标记 · 0009 消息留存 · 0010 通知 · 0011 置顶 · 0012 频道 · 0013 webhook · 0014 SSO · 0015 SCIM · 0016 定时消息 · 0017 邀请 · 0018 通知偏好/免打扰 · 0019 PAT · 0020 收藏 · 0021 自定义表情 · 0022 用户状态 · 0023 投票 · 0024 链接预览缓存 · 0025 VOD · 0026 直播聊天封禁 · 0027 访客账号 · 0028 消息草稿 · 0029 预告直播 · 0030 频道发言策略 · 0031 频道分组 · 0032 保存的搜索 · 0033 用户组(@-usergroups) · 0034 频道收藏 · 0035 用户资料字段 · 0036 消息编辑历史 · 0037 关键词提醒 · 0038 工作区公告 · 0039 直播关注 · 0040 线程订阅 · 0041 周期消息 · 0042 默认频道 · 0043 频道加入申请 · 0044 TOTP 双因子 · 0045 工作区停用 · 0046 消息模板 · 0047 令牌吊销/会话）
+cargo build --bin aero-cli --bin aero-server   # 迁移编译期嵌入，改了迁移先 build
+cargo run --bin aero-cli -- migrate        # 幂等；迁移 0001–00xx 按序号一功能一条，见 migrations/
 AERO__SERVER__BLOB_DIR=/tmp/aero/blobs AERO__SERVER__HLS_DIR=/tmp/aero/hls \
   cargo run --bin aero-server              # :3030 HTTP/WS，:1935 RTMP
 ```
@@ -56,29 +69,32 @@ AERO__SERVER__BLOB_DIR=/tmp/aero/blobs AERO__SERVER__HLS_DIR=/tmp/aero/hls \
 
 ```bash
 cargo check  --workspace                   # 干净
-cargo test   --workspace --lib             # 745 pass（最近一次绿：2026-06-04）；PG 门控测试用 `-- --ignored`（需 DATABASE_URL + 已迁移）
-cargo clippy --workspace --all-targets     # all+pedantic=warn，零新增警告
+cargo test   --workspace --lib             # 全绿是底线（实时数见 README）；PG 门控测试加 `-- --ignored`（需 DATABASE_URL + 已迁移）
+cargo clippy --workspace --all-targets     # 别新增警告（见下「约定」）
 ```
 
-冒烟（需服务在跑，`AERO_HOST=http://localhost:3030`）：`scripts/smoke_p2.py`（IM 全功能）· `smoke_live.py`（弹幕/礼物/观看人数）· `smoke_captions.py`（字幕中继）。
+冒烟（`AERO_HOST=http://localhost:3030`，服务须在跑）：`scripts/smoke_p2.py`（IM 全功能）· `smoke_live.py`（弹幕/礼物/观看数）· `smoke_captions.py`（字幕中继）· 各 `smoke_waveN.py`（对应批次）。
 
 ## 约定
 
-- `unsafe_code = forbid`；clippy `all`+`pedantic` 全开为 warn——别引入新警告。
-- 错误一律 `thiserror`，每 crate 一个 `Error`；跨 crate 复用的类型只放 `aero-common`。
-- 依赖加到**自己 crate 的 `Cargo.toml`**，不要动 workspace root。
-- **多 agent 并行**（本仓库的既定打法）：一个 agent 管一个**不相交** crate，用 git worktree 隔离，各自只改本 crate `Cargo.toml` → 合并零冲突（`Cargo.lock` 由 git 自动合）。合并后跑 `cargo check --workspace` 兜底。
+- workspace 级 lints：`unsafe_code = forbid`、`unreachable_pub = warn`、clippy `all`+`pedantic`=warn（已 `allow` 若干 pedantic：`module_name_repetitions`/`missing_errors_doc`/`missing_panics_doc`/`must_use_candidate` 等）。**别引入新警告**；既有 crate（storage/server 等）有存量 pedantic 债，非本批次别背。
+- 错误用 `thiserror`，每 crate 一个 `Error`；跨 crate 复用的类型只放 `aero-common`。
+- 公开项都写文档注释（仓库全文档化）。
+- ⚠️ `webhook`/`scim`/`invitation` 各有自己的 `generate_token`/`hash_token`（`revoked_token` 只有 `hash_token`）——只有 `webhook` 的在 crate root re-export，其余走 `aero_storage::<mod>::` 子路径，别撞名。
 
 ## 范围红线（动手前确认）
 
-- ✅ **在范围内、已实现（应用层）**：P0–P7 —— IM / 协作 / RAG / AI / 1:1 与群通话(mesh) / 字幕翻译 / RTMP·WHIP·SRT 直播 / 审核。媒体面核心已落地并尽量字节级单测。
-- ✅ **To-B 协作 + 企业接入（已实现，活验证）**：线程回复 + @提及通知 + 未读/提及计数 + 置顶（`collab`）；频道治理（公开/私有 / 加入·退出 / 归档 / topic，`channels`）；入站/出站 Webhook（HMAC 签名，`webhooks`，出站投递 `run_webhook_dispatcher`）；SSO via OIDC（`aero-auth::oidc` + `sso`）；SCIM 2.0（`scim`，RFC 7643/7644）；定时消息/提醒（`scheduled` + 后台投递 `run_scheduled_dispatcher`）；工作区邀请/邀请链接（`invitations`）；跨房间全局搜索（`search`，`MessageRepo::search_all_rooms`，按成员资格 SQL 过滤）；通知偏好——频道免打扰 + 每用户 DND（`notif_prefs`，在 `ImService::dispatch_notifications` 经 `should_notify` 抑制，fail-open）；个人访问令牌 PAT（`aero-storage::pat` + `aero-auth` 的 `PatVerifier` 注入 `AuthService`，`AuthUser` extractor 在 JWT 失败后回落到 `aero_pat_*` PAT——所有 `AuthUser` 路由都可用 PAT 作 Bearer）；收藏/稍后看（`bookmark`）；工作区自定义表情（`emoji`，名称→已上传 blob）；用户自定义状态 + presence（`user_status`，与 Redis 即时在线分离）；投票（`polls`，`RoomEvent::Poll` 直播计票）；链接预览/unfurl（`unfurl` + `unfurl_bot` 监听器，OG 抓取=seam，opt-in `AERO_UNFURL`）；直播录制/点播 VOD（`vod`，录制生命周期+回放 URL；真实切片采集走既有 HLS writer=seam）；直播聊天封禁/禁言（`stream_mod`，REST+WS 两条 danmaku 路径都校验）；消息转发/分享（`forward`，带来源 provenance card，剥离 mention 避免误通知）；内置斜杠命令（`commands`，`/me /shrug /giphy /remind`，纯解析+派发，`POST /api/rooms/:id/command`，`/remind` 已接 `ScheduledRepo`——`parse_reminder_delay` 把 `10m/2h/30s/1d`（含 `in` 前缀）解析成绝对时刻，落库由既有 `run_scheduled_dispatcher` 到点经 `send_message` 投递）。**Wave 8（2026-06-04，740 lib 测试，活验证 `scripts/smoke_wave8.py`）**：访客账号（`0027`，`workspace_members.is_guest`，`guests` 模块管理端 admin-gated，`ImService::{add_member,join_channel}` 双路守卫——访客不可被加入/自助加入受邀频道之外的频道，fail-open）；消息草稿（`0028`，`DraftRepo`，每 (用户,房间) 一条私有草稿 upsert，`PUT/GET/DELETE /api/rooms/:id/draft` + `GET /api/drafts`）；预告直播（`0029`，`ScheduledStreamId` + `ScheduledStreamRepo`，成员预告/列出未来场次、创建者取消，`/api/workspaces/:id/scheduled-streams`，仅公告记录、开播仍走既有 `/api/streams`）；公告频道/发言策略（`0030`，`rooms.post_policy`=`everyone|admins`，纯 `post_allowed` + `ImService::assert_can_post` 在 `send_message` 顶部把关——`everyone` 单查询快路径，`admins` 只许创建者/工作区管理员，未知值 fail-open；`PUT /api/rooms/:id/post-policy`）；AI 消息翻译（`translate`，`POST /api/messages/:id/translate`，复用字幕翻译 `AiBackend::translate` seam，无 LLM key 时回显源文、无 AI 服务时 502，与 summarize/ask 一致）。**Wave 9（2026-06-04，745 lib 测试，活验证 `scripts/smoke_wave9.py`）**：频道分组/侧边栏 sections（`0031`，`ChannelSectionId` + `ChannelSectionRepo`，每用户私有、工作区作用域，`/api/workspaces/:id/sections` + `/api/sections/:sid[/channels/:rid]`，所有变更 SQL 层 owner-scoped）；保存的搜索（`0032`，`SavedSearchId` + `SavedSearchRepo`，`/api/workspaces/:id/saved-searches` + `POST /api/saved-searches/:sid/run` 复用 `MessageRepo::search_all_rooms_in_workspace` 同一成员资格边界）；消息提醒"提醒我看这条"（`message_reminders`，无新表——`POST /api/messages/:id/remind {in}` 复用 `commands::parse_reminder_delay` + `ScheduledRepo`，到点投递引用该消息的卡片）。新功能挂载法：新 `RoomEvent` variant（注意 `kind` tag 冲突）+ 仓储新文件 + `pub fn routes()` 模块 `.merge` 进 `routes::build`，仓储用 `XRepo::new(state.pg.clone())`；定时类后台任务在 bin `tokio::spawn`。⚠️ `webhook`/`scim`/`invitation` 各自有 `generate_token`/`hash_token`——只有 `webhook` 的在 crate root re-export，其余走 `aero_storage::<mod>::` 子路径避免重名冲突。
-- 🚫 **明确非目标，别做**：P8 = **MLS 端到端加密 + 联邦**。服务端仅做不透明字节透传 scaffold（数据模型预留），**不要实现客户端 MLS 加密 / openmls-wasm**。"无 E2E 加密" 是产品既定决策。
-- 🛠️ **可单测的剩余工作**（媒体协议完整性，多已落地）：SRT AES/KMREQ + ACK/NAK、SFU Simulcast + RTCP(PLI/FIR)、WHEP egress。企业接入的**真实链路**为 seam：OIDC 的 JWKS 拉取（逻辑已单测）、出站 Webhook 的真实 HTTP 投递（签名/构造已单测）、SCIM 的真实 IdP 驱动。
-- ⛔ **本沙箱无法端到端验证、别标 "done"**：浏览器 ICE/DTLS/SRTP 推流、真实 ffmpeg/OBS 推流。环境无浏览器 / 真实媒体源，后台长驻进程会被回收（exit 144），服务器**只能前台跑**。报告这类项写 "待真实链路联调"，不要写完成。
+- ✅ **已实现范围 → 见 README 功能矩阵**（P0–P11 + 15 轮 To-B/企业扩展，迁移 0001–00xx，应用层功能集已完整）。**别重复造**：动手前 grep 模块名/迁移确认没做过。
+- 🚫 **非目标，别做**：MLS 端到端加密**客户端** + 联邦（服务端仅不透明字节透传 scaffold，数据模型预留）。"无 E2E" 是产品既定决策。移动端原生 SDK 同样非目标（Web 优先）。
+- 🛠️ **仍是 seam 的真实链路**（逻辑已单测，**别标 done**）：OIDC 的 JWKS 拉取、出站 Webhook/unfurl 的真实 HTTP 投递、SCIM 的真实 IdP 驱动、VOD 真实切片采集、SFU 跨节点媒体传输。
+- ⛔ **本沙箱无法端到端验证**：浏览器 ICE/DTLS/SRTP 推/拉流、真实 ffmpeg/OBS 推流。报告这类项写「待真实链路联调」，别写完成。
 
 ## 已知坑
 
-- `data/` 由容器以 root 创建 → 默认 `blob_dir`/`hls_dir` 写不进（Permission denied），用上面的 env 覆写到 `/tmp`。
-- config 环境变量前缀 `AERO__SECTION__KEY`（**双下划线**分段）。
-- zsh 下 `--include=*.rs` 这类裸 glob 会被 shell 抢先展开报错；加引号或改用 `rg`。
+- **服务器只能前台跑**：后台长驻网络进程会被回收（exit 144 / SIGURG），`dangerouslyDisableSandbox`、harness `run_in_background` 都不行。活冒烟法：前台跑 server，短命 smoke 放后台 subshell、跑完 `pkill aero-server`——`( wait-health; python3 smoke...; pkill aero-server ) & ; timeout 150 ./target/debug/aero-server`，smoke 输出重定向到文件再 `cat`。
+- **迁移编译期嵌入**（见配方 1）：加迁移后先 `cargo build` bin 再 `aero-cli migrate`。
+- **活验证用全新一次性库**：共享 dev 库的 `_sqlx_migrations` 账本可能被并行 agent 弄乱序导致 boot 时 `migrate()` 拒绝——`docker exec aero-postgres psql -U aero -d postgres -c 'CREATE DATABASE x'` 建新库再迁；**别手改账本**。
+- `data/` 由容器以 root 创建 → 默认 `blob_dir`/`hls_dir` 写不进，用上面 env 覆写到 `/tmp`。
+- config 环境变量前缀 `AERO__SECTION__KEY`（**双下划线**分段）；如 `AERO__DATABASE__URL`。
+- 限流默认 20/s，冒烟前设 `AERO_RATE_LIMIT_PER_SEC` 高些免误伤。
+- zsh 下裸 glob（`--include=*.rs`）会被 shell 抢先展开报错；加引号或用 `rg`。
