@@ -1055,6 +1055,40 @@ impl ImService {
             },
         )
         .await;
+        // Reaction notification: a freshly-ADDED reaction to someone else's message
+        // drops a durable inbox entry for the author (never self-notify on your own
+        // reaction). Best-effort + gated like every other notification (mute / DND /
+        // snooze via `should_notify`); only when a NotificationRepo is wired.
+        if op == ReactionOp::Add && actor != msg.sender_id {
+            if let Some(repo) = self.notifications.as_ref() {
+                if self.should_notify(msg.sender_id, msg.room_id).await {
+                    if let Err(err) = repo
+                        .insert(
+                            msg.sender_id,
+                            msg.room_id,
+                            message_id,
+                            NotificationKind::Reaction,
+                            Some(actor),
+                        )
+                        .await
+                    {
+                        warn!(?err, recipient = ?msg.sender_id, "persist reaction notification failed");
+                    } else {
+                        self.publish_room_event(
+                            msg.room_id,
+                            &RoomEvent::Notify {
+                                room_id: msg.room_id,
+                                message_id,
+                                mentioned: msg.sender_id,
+                                by: actor,
+                                kind: NotificationKind::Reaction,
+                            },
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
         Ok(op)
     }
 

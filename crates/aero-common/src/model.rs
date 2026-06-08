@@ -269,6 +269,8 @@ pub enum NotificationKind {
     Mention,
     /// The message is a `reply_to` a message the recipient sent.
     Reply,
+    /// Someone added an emoji reaction to a message the recipient authored.
+    Reaction,
 }
 
 impl NotificationKind {
@@ -278,6 +280,7 @@ impl NotificationKind {
         match self {
             Self::Mention => "mention",
             Self::Reply => "reply",
+            Self::Reaction => "reaction",
         }
     }
 
@@ -286,6 +289,7 @@ impl NotificationKind {
     pub fn from_str_lenient(s: &str) -> Self {
         match s {
             "reply" => Self::Reply,
+            "reaction" => Self::Reaction,
             _ => Self::Mention,
         }
     }
