@@ -33,3 +33,6 @@ parking_lot.workspace = true
 # avoids native build deps (openssl / aws-lc-rs+nasm) so the crate always
 # compiles in CI without a C toolchain.
 str0m = { version = "0.19", default-features = false, features = ["rust-crypto"] }
+
+# WHEP upstream relay client: HTTP SDP exchange with a peer node.
+reqwest = { workspace = true }

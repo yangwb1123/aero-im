@@ -52,6 +52,7 @@ pub mod packetize;
 pub mod relay;
 pub mod reorder;
 pub mod session;
+pub mod upstream;
 pub mod whep;
 
 #[cfg(test)]
@@ -72,6 +73,7 @@ pub use cascade::{
 pub use hls_sink::{hls_sink, HlsSegment, HlsSegmentWriter, HlsSink, MediaSink};
 pub use relay::{MediaRelay, Subscription};
 pub use session::{SessionError, WhipSession};
+pub use upstream::WhepUpstreamSource;
 pub use whep::{accept_whep_offer, NalSource, WhepSession};
 
 #[derive(Debug, Error)]
