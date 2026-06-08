@@ -882,10 +882,11 @@ impl ImService {
         // Mention / thread-reply notifications (best-effort; never blocks the send).
         self.dispatch_notifications(&message, &recipients).await;
 
-        // Best-effort enqueue an embed job (AI worker will pick it up).
-        if !message.searchable_text().is_empty() {
-            // Tag the embed job with the room's workspace so the AI worker can
-            // meter paid-API spend per tenant (best-effort; None bills globally).
+        // Best-effort enqueue embed + moderate jobs (AI worker picks them up).
+        let searchable = message.searchable_text();
+        if !searchable.is_empty() {
+            // Tag jobs with the room's workspace for per-tenant cost metering.
+            // Best-effort: None falls back to global budget tracking.
             let ws = self.rooms.room_workspace(room).await.ok().flatten().map(|w| w.to_uuid());
             if let Err(err) = self
                 .ai_jobs
@@ -898,6 +899,20 @@ impl ImService {
                 .await
             {
                 warn!(?err, message_id = %message.id, "enqueue embed job failed");
+            }
+            // Async AI moderation: classifies after publish so send latency is
+            // unaffected. BLOCK verdict triggers soft_delete in the worker.
+            if let Err(err) = self
+                .ai_jobs
+                .enqueue(
+                    AiJobKind::Moderate,
+                    Some(message.id.to_uuid()),
+                    ws,
+                    serde_json::json!({"text": searchable}),
+                )
+                .await
+            {
+                warn!(?err, message_id = %message.id, "enqueue moderate job failed");
             }
         }
 

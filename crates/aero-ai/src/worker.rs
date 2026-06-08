@@ -281,11 +281,43 @@ impl AiWorker {
         }))
     }
 
-    async fn handle_moderate(&self, _job: &AiJob) -> Result<serde_json::Value> {
-        // P5 will plug in real moderation (OpenAI Moderation or local classifier).
-        // For P2 we record a clean "ok" verdict so downstream consumers can wire
-        // their plumbing now.
-        Ok(serde_json::json!({ "verdict": "ok", "stub": true }))
+    async fn handle_moderate(&self, job: &AiJob) -> Result<serde_json::Value> {
+        let p: ModeratePayload = serde_json::from_value(job.payload.clone())?;
+        let verdict = self.svc.moderate(&p.text).await?;
+        let anthropic = self.svc.has_anthropic();
+
+        if let Some(reason) = verdict {
+            // BLOCK: soft-delete the offending message so it stops being visible.
+            if let Some(target) = job.target_id {
+                let id = MessageId::from_uuid(target);
+                match self.svc.messages().soft_delete(id).await {
+                    Ok(true) => {
+                        tracing::info!(message_id = %id, %reason, "moderation: blocked and removed");
+                    }
+                    Ok(false) => {
+                        // Already deleted by sender or a concurrent job — no-op.
+                        tracing::debug!(message_id = %id, "moderation: message already deleted");
+                    }
+                    Err(e) => {
+                        // Non-fatal: the verdict is still persisted; operator can
+                        // manually review via the audit log.
+                        tracing::warn!(error = %e, message_id = %id, "moderation: soft_delete failed");
+                    }
+                }
+            } else {
+                tracing::warn!(job_id = %job.id, "moderation: BLOCK verdict but no target_id to remove");
+            }
+            return Ok(serde_json::json!({
+                "verdict": "block",
+                "reason": reason,
+                "anthropic": anthropic,
+            }));
+        }
+
+        Ok(serde_json::json!({
+            "verdict": "safe",
+            "anthropic": anthropic,
+        }))
     }
 
     async fn handle_answer(&self, job: &AiJob) -> Result<serde_json::Value> {
@@ -363,7 +395,11 @@ fn should_skip_embed(searchable_text: &str) -> bool {
 #[must_use]
 fn was_paid(kind: AiJobKind, result: &serde_json::Value) -> bool {
     match kind {
-        AiJobKind::Moderate => false,
+        // Moderate is paid only when Anthropic was actually called; the handler
+        // records `"anthropic": true/false` in the result for exactly this check.
+        AiJobKind::Moderate => {
+            result.get("anthropic").and_then(|v| v.as_bool()).unwrap_or(false)
+        }
         AiJobKind::Embed => result.get("skipped").is_none(),
         AiJobKind::Summarize | AiJobKind::Answer => true,
     }
@@ -607,6 +643,11 @@ async fn fail_job<Q: JobQueue + ?Sized>(queue: &Q, id: Ulid, err: &str) {
 // ---------- payload shapes ----------
 
 #[derive(Debug, Deserialize)]
+struct ModeratePayload {
+    text: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct SummarizePayload {
     room_id: String,
     #[serde(default)]
@@ -738,10 +779,14 @@ mod tests {
             AiJobKind::Embed,
             &serde_json::json!({ "dim": 1024, "model": "voyage", "updated": true })
         ));
-        // Moderate is a local stub → never paid, regardless of result.
+        // Moderate: paid only when "anthropic": true (key configured + real call made).
+        assert!(was_paid(
+            AiJobKind::Moderate,
+            &serde_json::json!({ "verdict": "safe", "anthropic": true })
+        ));
         assert!(!was_paid(
             AiJobKind::Moderate,
-            &serde_json::json!({ "verdict": "ok", "stub": true })
+            &serde_json::json!({ "verdict": "safe", "anthropic": false })
         ));
         // Summarize / Answer always make a completion call on success.
         assert!(was_paid(AiJobKind::Summarize, &serde_json::json!({ "summary": "x" })));
