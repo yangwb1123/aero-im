@@ -234,3 +234,7 @@ pub use blob_gc::BlobGcRepo;
 // ---- ROADMAP 方向四 — GDPR async full export ----
 pub mod export_job;
 pub use export_job::{link_is_valid, ExportJob, ExportJobRepo, EXPORT_LINK_TTL};
+
+// ---- ROADMAP 方向五 — password reuse history ----
+pub mod password_history;
+pub use password_history::{PasswordHistoryRepo, HISTORY_DEPTH as PASSWORD_HISTORY_DEPTH};

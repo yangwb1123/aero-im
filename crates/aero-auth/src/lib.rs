@@ -13,11 +13,13 @@ pub mod extractor;
 pub mod jwt;
 pub mod oidc;
 pub mod password;
+pub mod password_policy;
 pub mod pat;
 pub mod service;
 pub mod totp;
 
 pub use extractor::AuthUser;
+pub use password_policy::PasswordPolicy;
 pub use jwt::{Claims, JwtCodec, TokenKind};
 pub use oidc::{
     validate_id_token, JwksKeyProvider, KeyProvider, OidcClaims, OidcConfig, OidcError,

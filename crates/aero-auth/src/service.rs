@@ -240,13 +240,10 @@ fn validate_email(email: &str) -> Result<()> {
 }
 
 fn validate_password(password: &str) -> Result<()> {
-    if password.len() < 8 {
-        return Err(Error::Invalid("password must be at least 8 chars".into()));
-    }
-    if password.len() > 1024 {
-        return Err(Error::Invalid("password is too long".into()));
-    }
-    Ok(())
+    // Delegate to the configurable policy (ROADMAP 方向五). Default behaviour is
+    // unchanged (min 8 / max 1024 / no class requirement); operators tighten via
+    // AERO_PASSWORD_* env without a code change.
+    crate::password_policy::validate(password)
 }
 
 /// Maps a `create_human` sqlx error to the right `aero_common::Error`.

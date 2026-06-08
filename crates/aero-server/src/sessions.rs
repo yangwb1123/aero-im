@@ -198,13 +198,29 @@ struct DeleteMeReq {
 /// `POST /api/auth/change-password` — update the authenticated user's password.
 ///
 /// 1. Verifies `current_password` against the stored hash.
-/// 2. Validates `new_password` meets strength requirements (≥ 8 chars).
+/// 2. Validates `new_password` against the configurable password policy and
+///    rejects reuse of the current or a recent password.
 /// 3. Hashes and persists the new password.
 /// 4. Revokes **all** active sessions so every device is forced to log in again.
 /// 5. Blacklists every revoked refresh-token hash so refresh attempts `401`.
 ///
 /// Returns `{ "sessions_invalidated": N }` on success. The caller's current
 /// session is included in the count — they must log in again immediately.
+/// Whether `candidate` matches the live `current_hash` or any of the participant's
+/// recent stored password hashes (argon2-verified). Enforces reuse history (方向五).
+async fn password_was_recently_used(
+    candidate: &str,
+    current_hash: &str,
+    history: &aero_storage::PasswordHistoryRepo,
+    participant: aero_common::ParticipantId,
+) -> Result<bool, AeroError> {
+    if auth_password::verify(candidate, current_hash).is_ok() {
+        return Ok(true);
+    }
+    let recent = history.recent(participant).await.map_err(AeroError::from)?;
+    Ok(recent.iter().any(|h| auth_password::verify(candidate, h).is_ok()))
+}
+
 async fn change_password(
     State(s): State<AppState>,
     auth: AuthUser,
@@ -221,12 +237,15 @@ async fn change_password(
     auth_password::verify(&req.current_password, &creds.password_hash)
         .map_err(|_| AeroError::Unauthorized("current_password is incorrect".into()))?;
 
-    // Validate the new password.
-    if req.new_password.len() < 8 {
-        return Err(AeroError::Invalid("new_password must be at least 8 characters".into()).into());
-    }
+    // Validate the new password against the configurable policy (方向五).
+    aero_auth::password_policy::validate(&req.new_password).map_err(AeroError::from)?;
     if req.new_password == req.current_password {
         return Err(AeroError::Invalid("new_password must differ from current_password".into()).into());
+    }
+    // Reuse history (方向五): reject reuse of the current or a recent password.
+    let history = aero_storage::PasswordHistoryRepo::new(s.pg.clone());
+    if password_was_recently_used(&req.new_password, &creds.password_hash, &history, auth.participant_id).await? {
+        return Err(AeroError::Invalid("new_password was used recently; choose a different one".into()).into());
     }
 
     // Hash and store the new password.
@@ -235,6 +254,10 @@ async fn change_password(
         .update_password_hash(auth.participant_id, &new_hash)
         .await
         .map_err(AeroError::from)?;
+    // Record the REPLACED hash so it cannot be reused for the next HISTORY_DEPTH changes.
+    if let Err(e) = history.record(auth.participant_id, &creds.password_hash).await {
+        tracing::warn!(error = ?e, "password history record failed");
+    }
 
     // Revoke all sessions (including the current one) and blacklist their tokens.
     let revoked = repo(&s)
@@ -351,7 +374,7 @@ async fn forgot_password(
 ///
 /// Validates:
 /// - The token exists, has not been used, and has not expired.
-/// - The new password is at least 8 characters.
+/// - The new password meets the configurable policy and is not a recent reuse.
 ///
 /// On success, updates the password hash and revokes all active sessions so
 /// every device is forced to log in with the new password.
@@ -359,9 +382,8 @@ async fn reset_password(
     State(s): State<AppState>,
     Json(req): Json<ResetPasswordReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    if req.new_password.len() < 8 {
-        return Err(AeroError::Invalid("new_password must be at least 8 characters".into()).into());
-    }
+    // Validate the new password against the configurable policy (方向五).
+    aero_auth::password_policy::validate(&req.new_password).map_err(AeroError::from)?;
     let hash = hash_reset_token(req.token.trim());
     let reset_repo = PasswordResetRepo::new(s.pg.clone());
     let participant = reset_repo
@@ -370,12 +392,31 @@ async fn reset_password(
         .map_err(AeroError::from)?
         .ok_or_else(|| AeroError::Unauthorized("reset token is invalid, expired, or already used".into()))?;
 
-    let new_hash = auth_password::hash(&req.new_password)?;
     let participants = ParticipantRepo::new(s.pg.clone());
+    // Reuse history (方向五): even via reset, reject the current or a recent password.
+    let history = aero_storage::PasswordHistoryRepo::new(s.pg.clone());
+    let old_hash = participants
+        .find_credentials_by_participant_id(participant)
+        .await
+        .map_err(AeroError::from)?
+        .map(|c| c.password_hash);
+    if let Some(ref old) = old_hash {
+        if password_was_recently_used(&req.new_password, old, &history, participant).await? {
+            return Err(AeroError::Invalid("new_password was used recently; choose a different one".into()).into());
+        }
+    }
+
+    let new_hash = auth_password::hash(&req.new_password)?;
     participants
         .update_password_hash(participant, &new_hash)
         .await
         .map_err(AeroError::from)?;
+    // Record the replaced hash into reuse history (best-effort).
+    if let Some(old) = old_hash {
+        if let Err(e) = history.record(participant, &old).await {
+            tracing::warn!(error = ?e, "password history record failed");
+        }
+    }
 
     // Revoke all active sessions and blacklist their tokens.
     let revoked = repo(&s)
