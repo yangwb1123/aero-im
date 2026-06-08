@@ -89,25 +89,103 @@ fn default_refresh_ttl() -> u64 {
     7 * 24 * 3600
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct TelemetryConfig {
     #[serde(default)]
     pub otlp_endpoint: Option<String>,
     #[serde(default = "default_log_level")]
     pub log_level: String,
+    /// OpenTelemetry trace sampling ratio in `[0.0, 1.0]`.
+    ///
+    /// `1.0` (the default) samples every trace — preserving always-on behavior;
+    /// operators lower it in production to cap exporter volume. Values are
+    /// clamped into range by [`TelemetryConfig::with_env_overrides`].
+    #[serde(default = "default_trace_sample_rate")]
+    pub trace_sample_rate: f64,
+}
+
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        Self {
+            otlp_endpoint: None,
+            log_level: default_log_level(),
+            trace_sample_rate: default_trace_sample_rate(),
+        }
+    }
 }
 
 fn default_log_level() -> String {
     "info,aero=debug".into()
 }
 
+fn default_trace_sample_rate() -> f64 {
+    1.0
+}
+
+/// Clamp an arbitrary sampling ratio into the valid `[0.0, 1.0]` range.
+fn clamp_sample_rate(rate: f64) -> f64 {
+    rate.clamp(0.0, 1.0)
+}
+
+impl TelemetryConfig {
+    /// Apply standalone-env overrides, then clamp sampling into range.
+    ///
+    /// `AERO_TRACE_SAMPLE_RATE` (single-underscore, distinct from figment's
+    /// `AERO__TELEMETRY__*` path) lets operators tune sampling without a config
+    /// file. Unparseable values are ignored; whatever rate results is clamped to
+    /// `[0.0, 1.0]`.
+    #[must_use]
+    pub fn with_env_overrides(mut self) -> Self {
+        if let Ok(raw) = std::env::var("AERO_TRACE_SAMPLE_RATE") {
+            if let Ok(parsed) = raw.trim().parse::<f64>() {
+                self.trace_sample_rate = parsed;
+            }
+        }
+        self.trace_sample_rate = clamp_sample_rate(self.trace_sample_rate);
+        self
+    }
+}
+
 impl AppConfig {
     /// Load from `config.toml` (optional) + `AERO__SECTION__KEY` env vars.
     pub fn load() -> Result<Self, figment::Error> {
         let _ = dotenvy::dotenv();
-        Figment::new()
+        let mut cfg: Self = Figment::new()
             .merge(Toml::file("config.toml"))
             .merge(Env::prefixed("AERO__").split("__"))
-            .extract()
+            .extract()?;
+        cfg.telemetry = cfg.telemetry.with_env_overrides();
+        Ok(cfg)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_trace_sample_rate_is_one() {
+        assert!((TelemetryConfig::default().trace_sample_rate - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn sample_rate_clamps_into_unit_range() {
+        assert!((clamp_sample_rate(-1.0) - 0.0).abs() < f64::EPSILON);
+        assert!((clamp_sample_rate(2.0) - 1.0).abs() < f64::EPSILON);
+        assert!((clamp_sample_rate(0.05) - 0.05).abs() < f64::EPSILON);
+        assert!((clamp_sample_rate(0.0) - 0.0).abs() < f64::EPSILON);
+        assert!((clamp_sample_rate(1.0) - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn with_env_overrides_clamps_out_of_range_value() {
+        let cfg = TelemetryConfig {
+            trace_sample_rate: 2.0,
+            ..TelemetryConfig::default()
+        }
+        .with_env_overrides();
+        // No env var set in this test: out-of-range struct value is still clamped.
+        assert!(cfg.trace_sample_rate <= 1.0);
+        assert!(cfg.trace_sample_rate >= 0.0);
     }
 }

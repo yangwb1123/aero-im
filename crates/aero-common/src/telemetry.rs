@@ -26,7 +26,7 @@ pub fn init(cfg: &TelemetryConfig, service_name: &'static str) -> TelemetryGuard
 
     // Best-effort OTLP provider: None when unconfigured or on build failure.
     let provider = cfg.otlp_endpoint.as_deref().and_then(|endpoint| {
-        match build_otlp_provider(endpoint, service_name) {
+        match build_otlp_provider(endpoint, service_name, cfg.trace_sample_rate) {
             Ok(p) => Some(p),
             Err(e) => {
                 eprintln!("OTLP export disabled (exporter build failed): {e:#}");
@@ -50,12 +50,22 @@ pub fn init(cfg: &TelemetryConfig, service_name: &'static str) -> TelemetryGuard
 }
 
 /// Build a batch-exporting tracer provider pointed at an OTLP/gRPC collector.
+///
+/// `sample_rate` is the trace sampling ratio in `[0.0, 1.0]` (already clamped by
+/// the config layer). It is applied as a parent-based `TraceIdRatioBased` sampler
+/// so root spans are sampled at `sample_rate` while child spans honor the parent
+/// decision.
 fn build_otlp_provider(
     endpoint: &str,
     service_name: &'static str,
+    sample_rate: f64,
 ) -> anyhow::Result<opentelemetry_sdk::trace::TracerProvider> {
     use opentelemetry::KeyValue;
     use opentelemetry_otlp::WithExportConfig;
+
+    let sampler = opentelemetry_sdk::trace::Sampler::ParentBased(Box::new(
+        opentelemetry_sdk::trace::Sampler::TraceIdRatioBased(sample_rate),
+    ));
 
     // opentelemetry-otlp 0.26 pipeline API: install_batch returns the
     // TracerProvider (which we keep in the guard to flush on shutdown).
@@ -67,9 +77,12 @@ fn build_otlp_provider(
                 .with_endpoint(endpoint.to_owned()),
         )
         .with_trace_config(
-            opentelemetry_sdk::trace::Config::default().with_resource(
-                opentelemetry_sdk::Resource::new(vec![KeyValue::new("service.name", service_name)]),
-            ),
+            opentelemetry_sdk::trace::Config::default()
+                .with_sampler(sampler)
+                .with_resource(opentelemetry_sdk::Resource::new(vec![KeyValue::new(
+                    "service.name",
+                    service_name,
+                )])),
         )
         .install_batch(opentelemetry_sdk::runtime::Tokio)?;
     Ok(provider)
