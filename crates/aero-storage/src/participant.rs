@@ -133,25 +133,83 @@ impl ParticipantRepo {
         Ok(rows.rows_affected() > 0)
     }
 
-    /// Hard-delete a participant and all dependent rows.
+    /// GDPR-compliant account deletion: soft-delete the participant and
+    /// anonymise their message content in one transaction.
     ///
-    /// The `participants` table is referenced by many FK columns that carry
-    /// `ON DELETE CASCADE` (`credentials`, `room_members`, `auth_sessions`, …), so a
-    /// single delete of the root row removes everything in one transaction.
-    /// Returns `true` when the row existed and was deleted, `false` when the id
-    /// was already absent (idempotent).
+    /// Steps (all within the same DB transaction):
+    /// 1. Mark `participants.deleted_at = NOW()` — keeps the row for FK integrity.
+    /// 2. Overwrite every non-deleted message the participant sent with a
+    ///    `[deleted]` placeholder and clear `searchable_text` (GDPR Art. 17).
+    /// 3. Revoke all active `auth_sessions` so existing tokens stop working.
+    ///
+    /// Returns `true` when the account existed and was freshly soft-deleted,
+    /// `false` when the participant was not found or was already deleted
+    /// (idempotent).
     ///
     /// # Errors
-    /// Propagates any [`sqlx::Error`] from the delete.
+    /// Propagates any [`sqlx::Error`] from the queries.
     pub async fn delete_participant(
         &self,
         participant_id: ParticipantId,
     ) -> Result<bool, sqlx::Error> {
-        let rows = sqlx::query("DELETE FROM participants WHERE id = $1")
+        let mut tx = self.pool.begin().await?;
+
+        let row = sqlx::query_as::<_, (Option<time::OffsetDateTime>,)>(
+            "SELECT deleted_at FROM participants WHERE id = $1",
+        )
+        .bind(participant_id.to_uuid())
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        // Not found or already deleted — nothing to do.
+        match row {
+            None | Some((Some(_),)) => {
+                tx.commit().await?;
+                return Ok(false);
+            }
+            Some((None,)) => {}
+        }
+
+        let now = time::OffsetDateTime::now_utc();
+
+        sqlx::query("UPDATE participants SET deleted_at = $1 WHERE id = $2")
+            .bind(now)
             .bind(participant_id.to_uuid())
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
-        Ok(rows.rows_affected() > 0)
+
+        // Anonymise message content (GDPR right-to-erasure).
+        sqlx::query(
+            r#"UPDATE messages
+               SET blocks          = '[{"type":"text","text":"[deleted]"}]'::jsonb,
+                   searchable_text = ''
+               WHERE sender_id = $1 AND deleted_at IS NULL"#,
+        )
+        .bind(participant_id.to_uuid())
+        .execute(&mut *tx)
+        .await?;
+
+        // Revoke all active sessions so existing tokens are immediately invalid.
+        sqlx::query(
+            "UPDATE auth_sessions SET revoked_at = $1 WHERE participant_id = $2 AND revoked_at IS NULL",
+        )
+        .bind(now)
+        .bind(participant_id.to_uuid())
+        .execute(&mut *tx)
+        .await?;
+
+        // Enqueue all owned blobs for background storage deletion.
+        sqlx::query(
+            r"INSERT INTO blob_gc_queue (blob_id)
+              SELECT id FROM blobs WHERE owner_id = $1
+              ON CONFLICT (blob_id) DO NOTHING",
+        )
+        .bind(participant_id.to_uuid())
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(true)
     }
 
     /// Replace the password hash stored for a participant.
@@ -227,7 +285,7 @@ impl ParticipantRepo {
             r#"SELECT DISTINCT p.id, p.kind, p.display_name, p.avatar_url, p.created_by, p.created_at
                FROM participants p
                LEFT JOIN credentials c ON c.participant_id = p.id
-               WHERE p.display_name ILIKE $1 OR c.email ILIKE $1
+               WHERE p.deleted_at IS NULL AND (p.display_name ILIKE $1 OR c.email ILIKE $1)
                ORDER BY p.display_name ASC
                LIMIT $2"#,
         )
@@ -263,7 +321,7 @@ impl ParticipantRepo {
             r#"SELECT p.id, p.kind, p.display_name, p.avatar_url, p.created_by, p.created_at
                FROM participants p
                JOIN room_members m ON m.participant_id = p.id
-               WHERE m.room_id = $1 AND p.kind IN ('bot','agent')"#,
+               WHERE m.room_id = $1 AND p.kind IN ('bot','agent') AND p.deleted_at IS NULL"#,
         )
         .bind(room.to_uuid())
         .fetch_all(&self.pool)
@@ -332,7 +390,7 @@ impl ParticipantRepo {
     pub async fn get(&self, id: ParticipantId) -> Result<Option<Participant>, sqlx::Error> {
         let row = sqlx::query_as::<_, (uuid::Uuid, String, String, Option<String>, Option<uuid::Uuid>, time::OffsetDateTime)>(
             r#"SELECT id, kind, display_name, avatar_url, created_by, created_at
-               FROM participants WHERE id = $1"#,
+               FROM participants WHERE id = $1 AND deleted_at IS NULL"#,
         )
         .bind(id.to_uuid())
         .fetch_optional(&self.pool)

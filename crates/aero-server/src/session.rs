@@ -18,11 +18,11 @@
 //! a NEW revoked-token repo; no existing handler or repo is touched. Mounted via
 //! [`routes`] and `.merge`d into the main router.
 
-use aero_auth::AuthUser;
+use aero_auth::{AuthUser, TokenKind};
 use aero_common::Error as AeroError;
 use aero_storage::revoked_token::{hash_token, RevokedTokenRepo};
 use aero_storage::SessionRepo;
-use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
+use axum::{extract::State, http::{HeaderMap, StatusCode}, routing::post, Json, Router};
 use serde::Deserialize;
 
 use crate::error::ApiResult;
@@ -42,14 +42,17 @@ struct RefreshReq {
     refresh_token: String,
 }
 
-/// `POST /api/auth/refresh` — mint a new access token from a refresh token.
+/// `POST /api/auth/refresh` — rotate the refresh token and mint a new access
+/// token.
 ///
 /// Deliberately has no [`AuthUser`] extractor: the access token may be expired, so
-/// the refresh token in the body is the only credential. The token is rejected
-/// `401` if it has been revoked (logged out) or is otherwise invalid; otherwise a
-/// fresh access token is issued and the response mirrors `auth_login`.
+/// the refresh token in the body is the only credential. The old refresh token is
+/// validated (signature, kind, revocation list), then immediately blacklisted so it
+/// can never be reused — a stolen token detected via re-use is rejected `401` on
+/// any subsequent attempt. The response mirrors `auth_login`.
 async fn refresh(
     State(s): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<RefreshReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let token = req.refresh_token.trim();
@@ -57,27 +60,39 @@ async fn refresh(
         return Err(AeroError::Invalid("refresh_token must not be empty".into()).into());
     }
 
-    // Reject a revoked (logged-out) refresh token before minting anything.
-    let revoked = RevokedTokenRepo::new(s.pg.clone());
-    if revoked.is_revoked(&hash_token(token)).await.map_err(AeroError::from)? {
+    // Reject a revoked (logged-out or previously rotated) refresh token.
+    let old_hash = hash_token(token);
+    let revoked_repo = RevokedTokenRepo::new(s.pg.clone());
+    if revoked_repo.is_revoked(&old_hash).await.map_err(AeroError::from)? {
         return Err(AeroError::Unauthorized("refresh token revoked".into()).into());
     }
 
-    // Reuse the AuthService's existing refresh logic. Any auth failure (bad
-    // signature, expired, wrong token kind) is already `Error::Unauthorized`, so
-    // `?` surfaces it as `401`.
-    let tokens = s.auth.refresh(token).await?;
+    // Verify signature and kind; extract participant. Any failure → 401.
+    let claims = s.auth.verify(token)?;
+    if claims.kind != TokenKind::Refresh {
+        return Err(AeroError::Unauthorized("not a refresh token".into()).into());
+    }
+    let pid = claims.participant_id()?;
 
-    // Wave 21: bump the active session's `last_seen_at` so the session inventory
-    // shows recent activity. Best-effort — a touch failure must NOT fail refresh.
-    if let Err(e) = SessionRepo::new(s.pg.clone()).touch(&hash_token(token)).await {
-        tracing::warn!(error = ?e, "auth session touch failed");
+    // Issue a fresh access + refresh token pair (token rotation).
+    let new_tokens = s.auth.issue_for_participant(pid)?;
+    let new_hash = hash_token(&new_tokens.refresh_token);
+
+    // Blacklist the old token immediately — hard failure: if we can't blacklist
+    // it the caller might try to reuse it, so we must not issue the new pair.
+    revoked_repo.revoke(&old_hash, Some(pid)).await.map_err(AeroError::from)?;
+
+    // Retire the old session row and register the new one (best-effort — the
+    // old token is already blacklisted above, so row misses are harmless).
+    let session_repo = SessionRepo::new(s.pg.clone());
+    if let Err(e) = session_repo.revoke_by_hash(&old_hash, pid).await {
+        tracing::warn!(error = ?e, "failed to retire old session on token rotate");
+    }
+    let ua = headers.get(axum::http::header::USER_AGENT).and_then(|v| v.to_str().ok());
+    if let Err(e) = session_repo.record(pid, &new_hash, ua).await {
+        tracing::warn!(error = ?e, "failed to record new session on token rotate");
     }
 
-    // Resolve the owning participant so the response carries the same shape as
-    // `auth_login`. Verifying the (already-validated) token again yields its
-    // claims; both steps map any failure to `401`.
-    let pid = s.auth.verify(token)?.participant_id()?;
     let participant = s
         .participants
         .get(pid)
@@ -86,8 +101,8 @@ async fn refresh(
         .ok_or_else(|| AeroError::Unauthorized("participant missing".into()))?;
 
     Ok(Json(serde_json::json!({
-        "access_token": tokens.access_token,
-        "refresh_token": tokens.refresh_token,
+        "access_token": new_tokens.access_token,
+        "refresh_token": new_tokens.refresh_token,
         "participant": participant,
     })))
 }

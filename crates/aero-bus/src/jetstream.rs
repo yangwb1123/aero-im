@@ -24,6 +24,15 @@ pub struct JetStreamBus {
     js: jetstream::Context,
 }
 
+/// Snapshot of a durable consumer's lag — how many messages are waiting to be
+/// delivered. Used for the `aero_nats_consumer_pending_messages` gauge.
+#[derive(Debug, Clone)]
+pub struct ConsumerLag {
+    pub stream: String,
+    pub consumer: String,
+    pub pending: u64,
+}
+
 impl JetStreamBus {
     #[instrument(skip(cfg))]
     pub async fn connect(cfg: JetStreamConfig) -> BusResult<Self> {
@@ -36,6 +45,26 @@ impl JetStreamBus {
             bus.bootstrap().await?;
         }
         Ok(bus)
+    }
+
+    /// Query how many messages are pending (undelivered) for a durable consumer.
+    ///
+    /// Returns `None` when the stream or consumer does not exist (e.g. before
+    /// the AI worker has subscribed for the first time). Used by the metrics
+    /// polling task — failures are warn-logged by the caller, not propagated.
+    pub async fn consumer_pending(
+        &self,
+        stream_name: &str,
+        consumer_name: &str,
+    ) -> BusResult<Option<u64>> {
+        let stream = match self.js.get_stream(stream_name).await {
+            Ok(s) => s,
+            Err(_) => return Ok(None),
+        };
+        match stream.consumer_info(consumer_name).await {
+            Ok(info) => Ok(Some(info.num_pending)),
+            Err(_) => Ok(None),
+        }
     }
 
     /// Declare the streams used by the application. Idempotent.

@@ -569,6 +569,27 @@ impl MessageRepo {
         .await?;
         Ok(rows.into_iter().map(SearchHit::from).collect())
     }
+
+    /// The most recent messages sent by `sender`, capped at [`EXPORT_SENDER_CAP`]
+    /// rows, newest first. Used exclusively for personal GDPR export
+    /// (`GET /api/me/export`); not suitable for paginated listing.
+    pub async fn by_sender(
+        &self,
+        sender: ParticipantId,
+    ) -> Result<Vec<Message>, sqlx::Error> {
+        let rows = sqlx::query_as::<_, MessageRow>(
+            r"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at
+               FROM messages
+               WHERE sender_id = $1 AND deleted_at IS NULL
+               ORDER BY created_at DESC, id DESC
+               LIMIT $2",
+        )
+        .bind(sender.to_uuid())
+        .bind(EXPORT_SENDER_CAP)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(Message::from).collect())
+    }
 }
 
 fn searchable_of(blocks: &[Block]) -> String {
@@ -578,6 +599,9 @@ fn searchable_of(blocks: &[Block]) -> String {
         .collect::<Vec<_>>()
         .join("\n")
 }
+
+/// Maximum rows returned by [`MessageRepo::by_sender`] (personal GDPR export).
+const EXPORT_SENDER_CAP: i64 = 500;
 
 /// Clamp a caller-supplied page size into the safe `[1, 200]` window used by
 /// the keyset pagination queries ([`MessageRepo::list_since`]), matching the

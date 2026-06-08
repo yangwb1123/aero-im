@@ -1490,6 +1490,10 @@ impl ImService {
         let subject = Self::room_subject(room);
         if let Err(err) = publish_event(self.bus.as_ref(), &subject, event).await {
             warn!(?err, %subject, "publish RoomEvent failed");
+            aero_common::metrics::inc_counter(
+                aero_common::metrics::names::NATS_PUBLISH_ERRORS_TOTAL,
+                1,
+            );
         }
     }
 }

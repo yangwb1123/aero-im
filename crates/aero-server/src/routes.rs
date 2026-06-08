@@ -3,6 +3,7 @@
 use std::str::FromStr;
 
 use futures::StreamExt as _;
+use sha2::Digest as _;
 
 use aero_auth::{AuthUser, LoginRequest, RegisterRequest};
 use aero_common::{
@@ -286,6 +287,12 @@ pub fn build(state: AppState) -> Router {
         // ImService::assert_room_access (a require-2FA member without activated TOTP
         // is locked out of room data until they enroll via /api/me/2fa).
         .merge(crate::workspace_security::routes())
+        // GDPR personal data export: GET /api/me/export (data portability).
+        .merge(crate::me_export::routes())
+        // Mobile push token registration: POST/DELETE/GET /api/me/push-token.
+        .merge(crate::push_tokens::routes())
+        // AI dead-letter queue admin API (ROADMAP 方向五).
+        .merge(crate::ai_dlq::routes())
         // ---- Wave 16 Round 9 ----
         // Per-room online roster + count: who is currently connected via WebSocket
         // in a room (in-process hub view). Useful for sidebar decoration and
@@ -787,7 +794,23 @@ async fn delete_message(
 ) -> ApiResult<StatusCode> {
     let id = MessageId::from_str(&id_str)
         .map_err(|e| AeroError::Invalid(format!("message id: {e}")))?;
+
+    // Pre-fetch room_id before the delete so we can look up the workspace for audit.
+    let room_id = s.messages.get(id).await.map_err(AeroError::from)?.map(|m| m.room_id);
+
     s.im.delete_message(auth.participant_id, id).await?;
+
+    // Best-effort audit: resolve workspace and append a message.delete event.
+    if let Some(rid) = room_id {
+        let actor = auth.participant_id;
+        let target = id.to_string();
+        if let Ok(Some(ws)) = s.rooms.room_workspace(rid).await {
+            if let Err(e) = s.audit.append(ws, Some(actor), "message.delete", Some(&target), serde_json::json!({"room_id": rid})).await {
+                tracing::warn!(error = ?e, %ws, "message.delete audit append failed");
+            }
+        }
+    }
+
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -920,6 +943,23 @@ async fn room_search(
 
 const MAX_BLOB_BYTES: usize = 32 * 1024 * 1024; // 32 MiB
 
+/// MIME-type prefix allowlist for uploads. Covers image, video, and audio.
+const ALLOWED_MIME_PREFIXES: &[&str] = &["image/", "video/", "audio/"];
+/// Exact MIME types allowed beyond the prefix allowlist above.
+const ALLOWED_MIME_EXACT: &[&str] = &[
+    "application/pdf",
+    "text/plain",
+    "text/csv",
+    "application/zip",
+    "application/x-zip-compressed",
+    "application/octet-stream", // browser default for binary files without an extension
+];
+
+fn is_allowed_mime(mime: &str) -> bool {
+    ALLOWED_MIME_PREFIXES.iter().any(|p| mime.starts_with(p))
+        || ALLOWED_MIME_EXACT.contains(&mime)
+}
+
 async fn blob_upload(
     State(s): State<AppState>,
     auth: AuthUser,
@@ -938,8 +978,30 @@ async fn blob_upload(
         if bytes.len() > MAX_BLOB_BYTES {
             return Err(AeroError::Invalid(format!("blob too large: {} bytes", bytes.len())).into());
         }
+        if !is_allowed_mime(&mime) {
+            return Err(AeroError::Invalid(format!("unsupported file type: {mime}")).into());
+        }
         let kind = guess_file_kind(&mime);
         let size = bytes.len() as u64;
+        let sha256_hex = hex::encode(sha2::Sha256::digest(&bytes));
+
+        // Content dedup (owner-scoped): if this participant already uploaded
+        // identical bytes, return the existing blob without re-writing storage.
+        if let Some(existing) = s
+            .blobs
+            .find_by_owner_sha256(auth.participant_id, &sha256_hex)
+            .await
+            .map_err(AeroError::from)?
+        {
+            return Ok(Json(serde_json::json!({
+                "id": existing.id,
+                "name": existing.name,
+                "mime": existing.mime,
+                "size": existing.size,
+                "kind": existing.kind,
+            })));
+        }
+
         let blob = s
             .blobs
             .create(NewBlob {
@@ -948,7 +1010,7 @@ async fn blob_upload(
                 name: name.clone(),
                 mime: mime.clone(),
                 size,
-                sha256: None,
+                sha256: Some(sha256_hex),
                 storage_key: format!("pending:{}", uuid::Uuid::new_v4()),
             })
             .await

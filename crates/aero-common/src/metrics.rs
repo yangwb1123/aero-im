@@ -81,6 +81,23 @@ pub mod names {
     /// Gauge: configured DB pool size (max connections).
     pub const DB_POOL_SIZE: &str = "aero_db_pool_size";
 
+    // --- Event bus (NATS publish errors + consumer backlog) ---
+    /// Counter: NATS publish errors (fan-out failures). Non-zero under sustained
+    /// NATS pressure; a spike indicates cluster messaging degradation.
+    pub const NATS_PUBLISH_ERRORS_TOTAL: &str = "aero_nats_publish_errors_total";
+    /// Gauge: undelivered messages pending in a durable consumer. Sampled every
+    /// 30 s. A growing value means the consumer is falling behind — alerts when
+    /// the AI worker is throttled or the WS fan-out can't keep up.
+    pub const NATS_CONSUMER_PENDING_MESSAGES: &str = "aero_nats_consumer_pending_messages";
+    /// Gauge: AI jobs in `dead` status (exhausted retries). Non-zero means
+    /// moderation / summarisation is silently failing; alert at threshold > 0.
+    pub const AI_DEAD_LETTER_QUEUE_SIZE: &str = "aero_ai_dlq_size";
+
+    // --- Live media ingest ---
+    /// Gauge: active WHIP ingest sessions (WebRTC streams currently being ingested).
+    /// Updated every 15 s alongside the DB pool gauges.
+    pub const LIVE_WHIP_SESSIONS: &str = "aero_live_whip_sessions";
+
     // --- HTTP (RED metrics, labeled by route + status) ---
     /// Counter: HTTP requests, labeled `route` + `status`.
     pub const HTTP_REQUESTS_TOTAL: &str = "aero_http_requests_total";

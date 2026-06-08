@@ -175,6 +175,61 @@ impl AiJobRepo {
         .await?;
         Ok(())
     }
+
+    /// Count dead-letter jobs, optionally filtered by `kind` ("moderate",
+    /// "summarize", etc.). Used for the `aero_ai_dlq_size` gauge.
+    pub async fn count_dead(&self, kind: Option<&str>) -> Result<i64, sqlx::Error> {
+        let row = if let Some(k) = kind {
+            sqlx::query_as::<_, (i64,)>(
+                "SELECT COUNT(*) FROM ai_jobs WHERE status = 'dead' AND kind = $1",
+            )
+            .bind(k)
+            .fetch_one(&self.pool)
+            .await?
+        } else {
+            sqlx::query_as::<_, (i64,)>(
+                "SELECT COUNT(*) FROM ai_jobs WHERE status = 'dead'",
+            )
+            .fetch_one(&self.pool)
+            .await?
+        };
+        Ok(row.0)
+    }
+
+    /// List the most-recently-failed dead-letter jobs, newest first. Capped at
+    /// `limit` (caller should pass a reasonable ceiling like 50).
+    pub async fn list_dead(&self, limit: i64) -> Result<Vec<AiJob>, sqlx::Error> {
+        let rows = sqlx::query_as::<_, AiJobRow>(
+            r"SELECT id, kind, target_id, workspace_id, status, attempts, payload,
+                     result, error, scheduled_at, started_at, finished_at
+               FROM ai_jobs
+              WHERE status = 'dead'
+              ORDER BY finished_at DESC NULLS LAST, id DESC
+              LIMIT $1",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(AiJob::from).collect())
+    }
+
+    /// Re-queue a dead-letter job: reset `status = 'queued'` and clear the
+    /// retry counter so it gets a fresh set of attempts. Returns `true` when
+    /// the row existed and was in `dead` state, `false` otherwise.
+    pub async fn requeue(&self, id: Ulid) -> Result<bool, sqlx::Error> {
+        let now = time::OffsetDateTime::now_utc();
+        let rows = sqlx::query(
+            r"UPDATE ai_jobs
+                 SET status = 'queued', attempts = 0,
+                     scheduled_at = $2, started_at = NULL, finished_at = NULL, error = NULL
+               WHERE id = $1 AND status = 'dead'",
+        )
+        .bind(uuid::Uuid::from_u128(id.0))
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(rows.rows_affected() > 0)
+    }
 }
 
 #[derive(sqlx::FromRow)]

@@ -25,6 +25,8 @@ pub trait BlobStore: Send + Sync + 'static {
     async fn put(&self, id: BlobId, bytes: Bytes) -> Result<String, BlobStoreError>;
     /// Returns the entire blob contents.
     async fn get(&self, id: BlobId) -> Result<Bytes, BlobStoreError>;
+    /// Deletes the storage object. `NotFound` is treated as success (idempotent).
+    async fn delete(&self, id: BlobId) -> Result<(), BlobStoreError>;
     /// Returns the storage key without reading anything.
     fn key_for(&self, id: BlobId) -> String;
 }
@@ -66,6 +68,15 @@ impl BlobStore for LocalFsBlobStore {
                 Ok(Bytes::from(buf))
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(BlobStoreError::NotFound),
+            Err(e) => Err(BlobStoreError::Io(e)),
+        }
+    }
+
+    async fn delete(&self, id: BlobId) -> Result<(), BlobStoreError> {
+        let path = self.path_for(id);
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(BlobStoreError::Io(e)),
         }
     }

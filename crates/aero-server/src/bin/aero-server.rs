@@ -263,6 +263,7 @@ async fn main() -> anyhow::Result<()> {
         hub,
         ws_config: ws_cfg,
         rate_limiter: RateLimiter::new(gateway_cfg.rate_limit),
+        auth_rate_limiter: RateLimiter::new(gateway_cfg.auth_rate_limit),
         metrics: Arc::new(metrics_cfg.clone()),
         ai: Some(Arc::new(AiServiceAdapter::new(ai_service.clone()))),
         public_base_url,
@@ -322,11 +323,13 @@ async fn main() -> anyhow::Result<()> {
 
     let _ = ai_shutdown; // keep token alive for the worker
 
-    // ---------- DB pool saturation gauges (ROADMAP 方向四) ----------
+    // ---------- DB pool + live session gauges (ROADMAP 方向四/五) ----------
     // Periodically publish sqlx pool stats so dashboards can alert on pool
     // exhaustion (in-use approaching size = requests will start queueing).
+    // Also emits the live WHIP session count for media-plane observability.
     {
         let pool = pg.clone();
+        let whip_reg = state.whip.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -341,6 +344,91 @@ async fn main() -> anyhow::Result<()> {
                 common_metrics::set_gauge(common_metrics::names::DB_POOL_SIZE, f64::from(max));
                 // In-use = total open connections minus those sitting idle.
                 common_metrics::set_gauge(common_metrics::names::DB_POOL_IN_USE, f64::from(in_use));
+                // Active live ingest sessions (ROADMAP 方向五 media-plane metrics).
+                common_metrics::set_gauge(
+                    common_metrics::names::LIVE_WHIP_SESSIONS,
+                    whip_reg.active_sessions() as f64,
+                );
+            }
+        });
+    }
+
+    // ---------- AI dead-letter queue size gauge (ROADMAP 方向五) ----------
+    {
+        let dlq_pool = pg.clone();
+        tokio::spawn(async move {
+            let repo = aero_storage::AiJobRepo::new(dlq_pool);
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                match repo.count_dead(None).await {
+                    Ok(n) => common_metrics::set_gauge(common_metrics::names::AI_DEAD_LETTER_QUEUE_SIZE, n as f64),
+                    Err(e) => tracing::warn!(error = %e, "ai dlq count query failed"),
+                }
+            }
+        });
+    }
+
+    // ---------- NATS consumer backlog gauges (ROADMAP 方向五) ----------
+    // Poll durable consumers every 30 s and emit pending-message gauges so ops
+    // can see if the AI worker or WS fan-out is falling behind.
+    {
+        let js_pending = jetstream.clone();
+        tokio::spawn(async move {
+            // Pairs of (stream, consumer) to monitor.
+            const CONSUMERS: &[(&str, &str)] = &[
+                ("IM_MESSAGES",  "aero-server"),  // WS fan-out
+                ("AI_QUEUE",     "aero-ai"),       // AI moderation/summarisation worker
+            ];
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                for (stream, consumer) in CONSUMERS {
+                    match js_pending.consumer_pending(stream, consumer).await {
+                        Ok(Some(n)) => {
+                            common_metrics::set_gauge_labeled(
+                                common_metrics::names::NATS_CONSUMER_PENDING_MESSAGES,
+                                n as f64,
+                                &[("stream", *stream), ("consumer", *consumer)],
+                            );
+                        }
+                        Ok(None) => {} // consumer not yet registered, skip
+                        Err(e) => tracing::warn!(error = %e, %stream, %consumer, "consumer_pending query failed"),
+                    }
+                }
+            }
+        });
+    }
+
+    // ---------- Blob GC (ROADMAP 方向四 — GDPR right-to-erasure) ----------
+    // Drain the blob_gc_queue once per minute: delete the storage object, then
+    // ack the queue entry. Best-effort — a failure is logged and retried next
+    // tick (the queue row is only removed on successful store deletion).
+    {
+        let gc_repo = aero_storage::BlobGcRepo::new(pg.clone());
+        let blob_store_gc = state.blob_store.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                match gc_repo.drain(50).await {
+                    Err(e) => tracing::warn!(error = %e, "blob_gc drain query failed"),
+                    Ok(ids) => {
+                        for id in ids {
+                            match blob_store_gc.delete(id).await {
+                                Ok(()) => {
+                                    if let Err(e) = gc_repo.ack(id).await {
+                                        tracing::warn!(error = %e, blob_id = %id, "blob_gc ack failed");
+                                    }
+                                }
+                                Err(e) => tracing::warn!(error = %e, blob_id = %id, "blob_gc delete failed"),
+                            }
+                        }
+                    }
+                }
             }
         });
     }

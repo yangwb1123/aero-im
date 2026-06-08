@@ -220,3 +220,11 @@ pub use password_reset::{
     generate_token as generate_reset_token, hash_reset_token, PasswordResetRepo,
     DEFAULT_TTL as RESET_TOKEN_TTL,
 };
+
+// ---- ROADMAP 方向二 — mobile push ----
+pub mod push_token;
+pub use push_token::{PushPlatform, PushToken, PushTokenRepo};
+
+// ---- ROADMAP 方向四 — GDPR blob GC ----
+pub mod blob_gc;
+pub use blob_gc::BlobGcRepo;

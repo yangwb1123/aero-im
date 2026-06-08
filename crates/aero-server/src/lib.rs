@@ -114,6 +114,9 @@ pub mod call_recap;
 
 // ---- Wave 24 ----
 pub mod workspace_security;
+pub mod me_export;
+pub mod push_tokens;
+pub mod ai_dlq;
 
 // ---- Wave 16 Round 9 ----
 pub mod online;

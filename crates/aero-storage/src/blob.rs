@@ -122,6 +122,51 @@ impl BlobRepo {
         .await?;
         Ok(row.0)
     }
+    /// Find an existing blob owned by `owner` with the exact SHA-256 content
+    /// hash. Used for deduplication in `blob_upload`: if the caller re-uploads
+    /// identical bytes, we return the existing blob id and skip the store write.
+    ///
+    /// Owner-scoped intentionally: sharing across owners would allow cross-user
+    /// timing-channel hash detection (GDPR / privacy concern).
+    pub async fn find_by_owner_sha256(
+        &self,
+        owner: ParticipantId,
+        sha256: &str,
+    ) -> Result<Option<Blob>, sqlx::Error> {
+        let row = sqlx::query_as::<_, BlobRow>(
+            r"SELECT id, owner_id, kind, name, mime, size, sha256, storage_key, created_at, finalized_at
+               FROM blobs
+               WHERE owner_id = $1 AND sha256 = $2
+               ORDER BY created_at DESC
+               LIMIT 1",
+        )
+        .bind(owner.to_uuid())
+        .bind(sha256)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(Blob::from))
+    }
+
+    /// All blobs uploaded by `owner`, newest first. Capped at `limit` rows.
+    /// Used for personal GDPR data export (`GET /api/me/export`).
+    pub async fn list_by_owner(
+        &self,
+        owner: ParticipantId,
+        limit: i64,
+    ) -> Result<Vec<Blob>, sqlx::Error> {
+        let rows = sqlx::query_as::<_, BlobRow>(
+            r"SELECT id, owner_id, kind, name, mime, size, sha256, storage_key, created_at, finalized_at
+               FROM blobs
+               WHERE owner_id = $1
+               ORDER BY created_at DESC, id DESC
+               LIMIT $2",
+        )
+        .bind(owner.to_uuid())
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(Blob::from).collect())
+    }
 }
 
 #[derive(sqlx::FromRow)]

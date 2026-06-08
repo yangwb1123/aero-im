@@ -139,6 +139,13 @@ impl WhipRegistry {
     pub fn get(&self, stream_id: Ulid) -> Option<WhipResource> {
         self.inner.lock().get(&stream_id).cloned()
     }
+
+    /// Number of active WHIP ingest sessions. Used to populate the
+    /// `aero_live_whip_sessions` gauge in the server's metric loop.
+    #[must_use]
+    pub fn active_sessions(&self) -> usize {
+        self.inner.lock().len()
+    }
 }
 
 /// Accept a WHIP SDP offer and produce a [`WhipResource`] with a **real**

@@ -107,11 +107,25 @@ impl RateLimiter {
     }
 }
 
-/// Axum middleware enforcing the per-client rate limit.
+/// Auth endpoints that accept credentials — these get a stricter token bucket.
+const SENSITIVE_AUTH_PATHS: &[&str] = &[
+    "/api/auth/login",
+    "/api/auth/register",
+    "/api/auth/forgot-password",
+    "/api/auth/reset-password",
+    "/api/auth/refresh",
+];
+
+/// Axum middleware enforcing per-client rate limits.
 ///
-/// Keys by the authenticated participant when the request carries a valid
-/// bearer token, otherwise by client IP (honouring a single `X-Forwarded-For`
-/// hop, then `ConnectInfo`). Over-budget requests short-circuit with
+/// Credential-accepting auth endpoints (`SENSITIVE_AUTH_PATHS`) use the tighter
+/// `auth_rate_limiter` (default 3 req/s, burst 5) to frustrate brute-force and
+/// credential-stuffing attacks. All other routes use the general `rate_limiter`
+/// (default 20 req/s, burst 40).
+///
+/// Keys by the authenticated participant when the request carries a valid bearer
+/// token, otherwise by client IP (honouring a single `X-Forwarded-For` hop, then
+/// `ConnectInfo`). Over-budget requests short-circuit with
 /// [`AeroError::RateLimited`] → 429.
 pub async fn layer(
     State(state): State<AppState>,
@@ -121,7 +135,12 @@ pub async fn layer(
     next: Next,
 ) -> Result<Response, ApiError> {
     let key = client_key(&state, &headers, connect_info.map(|ci| ci.0));
-    if state.rate_limiter.check(key) {
+    let limiter = if SENSITIVE_AUTH_PATHS.contains(&request.uri().path()) {
+        &state.auth_rate_limiter
+    } else {
+        &state.rate_limiter
+    };
+    if limiter.check(key) {
         Ok(next.run(request).await)
     } else {
         // Observability (ROADMAP 方向四): count limiter rejections so a 429 spike
@@ -233,6 +252,17 @@ mod tests {
         // Same instant, different key kind → its own fresh bucket.
         assert!(rl.check_at(i_key.clone(), t0));
         assert!(!rl.check_at(i_key, t0));
+    }
+
+    #[test]
+    fn sensitive_auth_paths_are_enumerated() {
+        // Verify the path list covers the expected credential endpoints.
+        assert!(SENSITIVE_AUTH_PATHS.contains(&"/api/auth/login"));
+        assert!(SENSITIVE_AUTH_PATHS.contains(&"/api/auth/register"));
+        assert!(SENSITIVE_AUTH_PATHS.contains(&"/api/auth/forgot-password"));
+        assert!(SENSITIVE_AUTH_PATHS.contains(&"/api/auth/reset-password"));
+        assert!(SENSITIVE_AUTH_PATHS.contains(&"/api/auth/refresh"));
+        assert!(!SENSITIVE_AUTH_PATHS.contains(&"/api/messages"));
     }
 
     #[test]

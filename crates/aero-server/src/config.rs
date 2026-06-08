@@ -25,8 +25,12 @@ pub struct GatewayConfig {
     /// CORS allow-list. Empty ⇒ permissive (dev default); otherwise only these
     /// exact origins are allowed.
     pub cors_allowed_origins: Vec<String>,
-    /// Per-client rate-limit settings.
+    /// Per-client rate-limit settings for general API endpoints.
     pub rate_limit: RateLimitConfig,
+    /// Stricter per-client rate-limit for credential-accepting auth endpoints
+    /// (`/api/auth/login`, `/api/auth/register`, `/api/auth/forgot-password`,
+    /// `/api/auth/reset-password`, `/api/auth/refresh`).
+    pub auth_rate_limit: RateLimitConfig,
 }
 
 /// Token-bucket rate-limit tunables (per client key).
@@ -57,6 +61,9 @@ impl Default for GatewayConfig {
             max_concurrency: 1024,
             cors_allowed_origins: Vec::new(),
             rate_limit: RateLimitConfig::default(),
+            // 3 req/s, burst 5 — tight enough to frustrate credential stuffing
+            // while allowing a human who fat-fingers their password a few retries.
+            auth_rate_limit: RateLimitConfig { per_second: 3, burst: 5 },
         }
     }
 }
@@ -73,6 +80,8 @@ impl GatewayConfig {
     ///   or empty keeps the permissive dev default.
     /// * `AERO_RATE_LIMIT_PER_SEC` — sustained per-client request rate.
     /// * `AERO_RATE_LIMIT_BURST` — per-client burst capacity.
+    /// * `AERO_AUTH_RATE_LIMIT_PER_SEC` — sustained rate for auth endpoints.
+    /// * `AERO_AUTH_RATE_LIMIT_BURST` — burst capacity for auth endpoints.
     #[must_use]
     pub fn from_env() -> Self {
         let d = Self::default();
@@ -95,6 +104,12 @@ impl GatewayConfig {
             rate_limit: RateLimitConfig {
                 per_second: env_parse("AERO_RATE_LIMIT_PER_SEC").unwrap_or(d.rate_limit.per_second),
                 burst: env_parse("AERO_RATE_LIMIT_BURST").unwrap_or(d.rate_limit.burst),
+            },
+            auth_rate_limit: RateLimitConfig {
+                per_second: env_parse("AERO_AUTH_RATE_LIMIT_PER_SEC")
+                    .unwrap_or(d.auth_rate_limit.per_second),
+                burst: env_parse("AERO_AUTH_RATE_LIMIT_BURST")
+                    .unwrap_or(d.auth_rate_limit.burst),
             },
         }
     }
@@ -153,6 +168,8 @@ mod tests {
         assert!(c.cors_allowed_origins.is_empty());
         assert_eq!(c.rate_limit.per_second, 20);
         assert_eq!(c.rate_limit.burst, 40);
+        assert_eq!(c.auth_rate_limit.per_second, 3);
+        assert_eq!(c.auth_rate_limit.burst, 5);
     }
 
     #[test]

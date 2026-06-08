@@ -152,6 +152,8 @@ pub struct AppState {
     pub ws_config: WsConfig,
     /// Per-client API rate limiter (in-memory token buckets).
     pub rate_limiter: RateLimiter,
+    /// Stricter limiter applied only to credential-accepting auth endpoints.
+    pub auth_rate_limiter: RateLimiter,
     /// `/metrics` exposure policy (enable flag + optional scrape token).
     pub metrics: Arc<MetricsConfig>,
     /// Optional — only present when an Anthropic / Voyage API key is configured.
