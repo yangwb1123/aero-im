@@ -844,6 +844,7 @@ impl ImService {
         blocks: Vec<Block>,
         reply_to: Option<MessageId>,
     ) -> Result<Message> {
+        let started = std::time::Instant::now();
         if !self.rooms.is_member(room, sender).await? {
             return Err(Error::Forbidden(format!(
                 "sender {sender} is not a member of room {room}"
@@ -916,6 +917,15 @@ impl ImService {
             }
         }
 
+        // Throughput observability (ROADMAP 方向五): count accepted messages and
+        // record the hot-path latency so dashboards can answer "messages/sec".
+        aero_common::metrics::inc_counter(aero_common::metrics::names::MESSAGES_SENT_TOTAL, 1);
+        aero_common::metrics::observe_histogram_labeled(
+            aero_common::metrics::names::MESSAGE_PROCESSING_DURATION_SECONDS,
+            started.elapsed().as_secs_f64(),
+            &[("op", "send")],
+        );
+
         Ok(message)
     }
 
@@ -927,6 +937,7 @@ impl ImService {
         id: MessageId,
         blocks: Vec<Block>,
     ) -> Result<Message> {
+        let started = std::time::Instant::now();
         let existing = self
             .messages
             .get(id)
@@ -999,12 +1010,19 @@ impl ImService {
                 warn!(?err, %id, "enqueue re-moderate failed");
             }
         }
+        aero_common::metrics::inc_counter(aero_common::metrics::names::MESSAGES_EDITED_TOTAL, 1);
+        aero_common::metrics::observe_histogram_labeled(
+            aero_common::metrics::names::MESSAGE_PROCESSING_DURATION_SECONDS,
+            started.elapsed().as_secs_f64(),
+            &[("op", "edit")],
+        );
         Ok(updated)
     }
 
     /// Soft-delete a message. Sender or room-owner may delete.
     #[instrument(skip(self), fields(?actor, ?id))]
     pub async fn delete_message(&self, actor: ParticipantId, id: MessageId) -> Result<()> {
+        let started = std::time::Instant::now();
         let existing = self
             .messages
             .get(id)
@@ -1029,6 +1047,12 @@ impl ImService {
             },
         )
         .await;
+        aero_common::metrics::inc_counter(aero_common::metrics::names::MESSAGES_DELETED_TOTAL, 1);
+        aero_common::metrics::observe_histogram_labeled(
+            aero_common::metrics::names::MESSAGE_PROCESSING_DURATION_SECONDS,
+            started.elapsed().as_secs_f64(),
+            &[("op", "delete")],
+        );
         Ok(())
     }
 

@@ -10,9 +10,11 @@
 //! - `GET /api/rooms/:id/online/count` — lightweight count-only variant for
 //!   badge polling, avoids fetching participant rows.
 //!
-//! **Single-node caveat**: the hub is in-process, so in a multi-node deployment
-//! each node only knows about its own connections. A cluster-accurate count would
-//! need a Redis PFADD/PFCOUNT layer (future work tracked in the ROADMAP).
+//! **Cluster-wide (ROADMAP 方向一)**: both endpoints read the room's
+//! [`PresenceStore`](aero_storage::PresenceStore) Redis sorted set, so the count
+//! and roster reflect connections across every node — not just this process. The
+//! in-process [`Hub`](crate::hub::Hub) roster is used only as a degradation
+//! fallback when Redis is unreachable.
 
 use std::str::FromStr;
 
@@ -42,8 +44,8 @@ fn parse_room(s: &str) -> Result<RoomId, AeroError> {
 /// WebSocket in this room (on this server node).
 ///
 /// Returns an array of `{ id, display_name }` objects, one per unique connected
-/// participant. In a multi-node cluster only this node's connections are visible;
-/// a Redis-backed `HyperLogLog` aggregate is the planned upgrade path.
+/// participant, aggregated cluster-wide from the room's Redis presence set (local
+/// hub roster used only if Redis is unreachable).
 async fn room_online(
     State(s): State<AppState>,
     auth: AuthUser,
@@ -52,7 +54,12 @@ async fn room_online(
     let room = parse_room(&id_str)?;
     s.im.assert_room_access(auth.participant_id, room).await?;
 
-    let ids = s.hub.room_members_online(room);
+    // Cluster-wide roster from Redis (ROADMAP 方向一); fall back to this node's
+    // local hub view if Redis is unreachable or has no entry yet.
+    let ids = match s.presence.members(room).await {
+        Ok(members) if !members.is_empty() => members,
+        _ => s.hub.room_members_online(room),
+    };
     // Fetch display names in one pass over the in-memory participant cache.
     let mut members = Vec::with_capacity(ids.len());
     for pid in ids {
@@ -70,7 +77,7 @@ async fn room_online(
 }
 
 /// `GET /api/rooms/:id/online/count` — the count of participants currently
-/// connected via WebSocket in this room (on this server node).
+/// connected via WebSocket in this room, aggregated cluster-wide via Redis.
 ///
 /// Lighter than the full `/online` endpoint: no participant row lookups. Use for
 /// badge polling or sidebar decoration where only the number matters.
@@ -81,7 +88,12 @@ async fn room_online_count(
 ) -> ApiResult<Json<serde_json::Value>> {
     let room = parse_room(&id_str)?;
     s.im.assert_room_access(auth.participant_id, room).await?;
-    let count = s.hub.room_members_online(room).len();
+    // Cluster-wide count from Redis (ROADMAP 方向一); fall back to the node-local
+    // hub count when Redis is unavailable.
+    let count = match s.presence.count(room).await {
+        Ok(n) => usize::try_from(n).unwrap_or(usize::MAX),
+        Err(_) => s.hub.room_members_online(room).len(),
+    };
     Ok(Json(serde_json::json!({ "count": count })))
 }
 

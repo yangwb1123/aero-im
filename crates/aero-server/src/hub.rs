@@ -217,6 +217,14 @@ impl Hub {
         self.rooms.get(&room).map(|e| e.clone()).unwrap_or_default()
     }
 
+    /// The rooms a participant has joined on THIS node (from the reverse index).
+    /// Used to fan out cluster-wide presence heartbeats/leaves to Redis on ping
+    /// and disconnect. Empty when the participant has joined no room channels.
+    #[must_use]
+    pub fn rooms_of(&self, pid: ParticipantId) -> Vec<RoomId> {
+        self.subs.get(&pid).map(|s| s.rooms.iter().copied().collect()).unwrap_or_default()
+    }
+
     // ---- live-stream watcher tracking (P4 互动直播) ----
 
     /// Mark a participant as watching a stream. Idempotent per participant

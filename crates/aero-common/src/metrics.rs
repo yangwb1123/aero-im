@@ -61,6 +61,15 @@ pub mod names {
     // --- Message throughput ---
     /// Counter: messages accepted / fanned out.
     pub const MESSAGES_SENT_TOTAL: &str = "aero_messages_sent_total";
+    /// Counter: messages edited (successful edits only).
+    pub const MESSAGES_EDITED_TOTAL: &str = "aero_messages_edited_total";
+    /// Counter: messages soft-deleted (successful deletes only).
+    pub const MESSAGES_DELETED_TOTAL: &str = "aero_messages_deleted_total";
+    /// Histogram: end-to-end message-mutation latency in seconds, labeled by
+    /// `op` (`send` / `edit` / `delete`). Answers "messages per second" and
+    /// surfaces hot-path regressions in the IM core.
+    pub const MESSAGE_PROCESSING_DURATION_SECONDS: &str =
+        "aero_message_processing_duration_seconds";
 
     // --- WebSocket connections (gauge, up/down) ---
     /// Gauge: currently-open WebSocket connections.

@@ -294,6 +294,15 @@ async fn run_socket(
         }
     }
 
+    // Cluster-wide presence (ROADMAP 方向一): drop this participant from every
+    // room's Redis presence set BEFORE the hub purges its local reverse index.
+    // Best-effort — crashed clients also age out via the heartbeat TTL.
+    for room in state.hub.rooms_of(pid) {
+        if let Err(e) = state.presence.leave(room, pid).await {
+            warn!(error = ?e, %room, %pid, "redis room-presence leave failed");
+        }
+    }
+
     let registered = WsSender::new(tx, close.clone());
     state.hub.unregister(pid, &registered);
     close.cancel();
@@ -313,6 +322,14 @@ async fn handle_text(
             let _ = tx.try_send(Message::Text(
                 serde_json::to_string(&ServerFrame::Pong).unwrap_or_default(),
             ));
+            // Treat the client heartbeat as a presence keep-alive: re-stamp every
+            // room this connection has joined so an idle-but-connected member does
+            // not age out of the cluster-wide presence set. Best-effort.
+            for room in state.hub.rooms_of(pid) {
+                if let Err(e) = state.presence.heartbeat(room, pid).await {
+                    warn!(error = ?e, %room, %pid, "redis room-presence heartbeat failed");
+                }
+            }
         }
         ClientFrame::JoinRoom { room_id } => {
             if !state.rooms.is_member(room_id, pid).await? {
@@ -326,7 +343,18 @@ async fn handle_text(
                 return Ok(());
             }
             state.hub.join_room(room_id, pid);
-            let online = state.hub.room_members_online(room_id);
+            // Cluster-wide presence (ROADMAP 方向一): stamp this participant into
+            // the room's Redis presence set so other nodes count them. Best-effort
+            // — a Redis miss only degrades the roster to node-local.
+            if let Err(e) = state.presence.join(room_id, pid).await {
+                warn!(error = ?e, %room_id, %pid, "redis room-presence join failed");
+            }
+            // Prefer the cluster-wide roster for the Presence frame; fall back to
+            // this node's local view if Redis is unreachable / empty.
+            let online = match state.presence.members(room_id).await {
+                Ok(members) if !members.is_empty() => members,
+                _ => state.hub.room_members_online(room_id),
+            };
             let _ = tx.try_send(Message::Text(
                 serde_json::to_string(&ServerFrame::Presence { room_id, online })
                     .unwrap_or_default(),
