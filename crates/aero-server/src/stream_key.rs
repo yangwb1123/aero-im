@@ -53,5 +53,47 @@ async fn rotate_key(
         .await
         .map_err(AeroError::from)?
         .ok_or_else(|| AeroError::NotFound(format!("stream {id}")))?;
+    // Best-effort privileged-operation audit (ROADMAP 方向四). The key has already
+    // rotated; a logging failure must only warn, never fail the request. Resolve
+    // the tenant from the stream's room (a roomless stream has no workspace to
+    // attribute, so it is skipped).
+    audit_rotated(&s, id, auth.participant_id).await;
     Ok(Json(serde_json::json!({ "stream_key": new_key })))
+}
+
+/// Record a `stream_key.rotated` audit event, attributing it to `actor` against
+/// the workspace of the stream's room. Best-effort throughout: any failure to
+/// resolve the room/workspace or to append the event is warn-logged and swallowed
+/// (the rotation already succeeded), and a stream with no room is silently skipped.
+async fn audit_rotated(s: &AppState, stream: Ulid, actor: aero_common::ParticipantId) {
+    let room = match s.streams.get(stream).await {
+        Ok(Some(st)) => st.room_id,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!(error = ?e, %stream, "stream_key audit: load stream failed");
+            return;
+        }
+    };
+    let Some(room) = room else { return };
+    let workspace = match s.rooms.room_workspace(room).await {
+        Ok(Some(ws)) => ws,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!(error = ?e, %stream, "stream_key audit: resolve workspace failed");
+            return;
+        }
+    };
+    if let Err(e) = s
+        .audit
+        .append(
+            workspace,
+            Some(actor),
+            "stream_key.rotated",
+            Some(&stream.to_string()),
+            serde_json::json!({ "stream_id": stream.to_string() }),
+        )
+        .await
+    {
+        tracing::warn!(error = ?e, %workspace, "stream_key.rotated audit append failed");
+    }
 }

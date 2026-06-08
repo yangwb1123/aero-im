@@ -157,10 +157,51 @@ async fn set_member_role(
         // Lost a race with a concurrent removal — the member is gone.
         return Err(AeroError::NotFound("room member".into()).into());
     }
+    // Best-effort privileged-operation audit (ROADMAP 方向四). The role change has
+    // already committed; a logging failure must only warn, never fail the request.
+    audit_role_changed(&s, room, auth.participant_id, target, role).await;
     Ok(Json(serde_json::json!({
         "participant_id": target,
         "role": role,
     })))
+}
+
+/// Record a `channel_role.changed` audit event, attributing it to `actor` against
+/// the workspace of the room. Best-effort throughout: failing to resolve the
+/// workspace or to append is warn-logged and swallowed (the role change already
+/// committed); a room with no resolvable workspace is silently skipped.
+async fn audit_role_changed(
+    s: &AppState,
+    room: RoomId,
+    actor: ParticipantId,
+    target: ParticipantId,
+    new_role: &str,
+) {
+    let workspace = match s.rooms.room_workspace(room).await {
+        Ok(Some(ws)) => ws,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::warn!(error = ?e, %room, "channel_role audit: resolve workspace failed");
+            return;
+        }
+    };
+    if let Err(e) = s
+        .audit
+        .append(
+            workspace,
+            Some(actor),
+            "channel_role.changed",
+            Some(&target.to_string()),
+            serde_json::json!({
+                "room_id": room.to_string(),
+                "target_participant": target.to_string(),
+                "new_role": new_role,
+            }),
+        )
+        .await
+    {
+        tracing::warn!(error = ?e, %workspace, "channel_role.changed audit append failed");
+    }
 }
 
 #[derive(Deserialize)]
@@ -202,5 +243,10 @@ async fn transfer_ownership(
         .set_role(room, auth.participant_id, DEMOTED_ROLE)
         .await
         .map_err(AeroError::from)?;
+    // Best-effort privileged-operation audit (ROADMAP 方向四): record both halves
+    // of the transfer (recipient → owner, former owner → demoted). Already
+    // committed above; logging failures only warn, never fail the request.
+    audit_role_changed(&s, room, auth.participant_id, to, "owner").await;
+    audit_role_changed(&s, room, auth.participant_id, auth.participant_id, DEMOTED_ROLE).await;
     Ok(Json(serde_json::json!({ "ok": true })))
 }

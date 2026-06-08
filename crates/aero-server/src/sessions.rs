@@ -96,7 +96,34 @@ async fn revoke_session(
         .revoke(&hash, Some(auth.participant_id))
         .await
         .map_err(AeroError::from)?;
+    // Best-effort privileged-operation audit (ROADMAP 方向四). A session revocation
+    // is account-scoped with no workspace context, so it is attributed to the
+    // all-zero default workspace (uuid nil), with the session id as target. The
+    // append already happened; a logging failure only warns, never fails the
+    // already-done revocation.
+    audit_session_revoked(&s, auth.participant_id, id).await;
     Ok(Json(serde_json::json!({ "revoked": true, "session_id": id })))
+}
+
+/// Record a `session.revoked` audit event for an explicit session-inventory
+/// revoke. Attributed to the all-zero default workspace (uuid nil) since the
+/// action has no tenant context; the session id is the target. Best-effort: an
+/// append failure is warn-logged and swallowed (the session is already revoked).
+async fn audit_session_revoked(s: &AppState, actor: aero_common::ParticipantId, session: SessionId) {
+    let workspace = aero_common::WorkspaceId::from_uuid(uuid::Uuid::nil());
+    if let Err(e) = s
+        .audit
+        .append(
+            workspace,
+            Some(actor),
+            "session.revoked",
+            Some(&session.to_string()),
+            serde_json::json!({ "session_id": session.to_string() }),
+        )
+        .await
+    {
+        tracing::warn!(error = ?e, "session.revoked audit append failed");
+    }
 }
 
 /// Request body for "sign out everywhere else" — the caller's current refresh

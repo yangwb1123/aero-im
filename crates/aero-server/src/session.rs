@@ -134,5 +134,38 @@ async fn logout(
     {
         tracing::warn!(error = ?e, "auth session logout revoke failed");
     }
+    // Best-effort privileged-operation audit (ROADMAP 方向四). Logout carries no
+    // workspace context, so the event is attributed to the all-zero default
+    // workspace (uuid nil). The full token hash is never recorded — only a short
+    // prefix. A logging failure only warns, never fails the already-done logout.
+    audit_session_revoked(&s, auth.participant_id, &hash).await;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Record a `session.revoked` audit event for a logout. Attributed to the
+/// all-zero default workspace (uuid nil) since logout has no tenant context, and
+/// carries only a short prefix of the refresh-token hash (never the full hash).
+/// Best-effort: an append failure is warn-logged and swallowed.
+async fn audit_session_revoked(
+    s: &AppState,
+    actor: aero_common::ParticipantId,
+    token_hash: &str,
+) {
+    let workspace = aero_common::WorkspaceId::from_uuid(uuid::Uuid::nil());
+    // A short, non-reversible prefix is enough to correlate without exposing the
+    // hash itself.
+    let prefix: String = token_hash.chars().take(12).collect();
+    if let Err(e) = s
+        .audit
+        .append(
+            workspace,
+            Some(actor),
+            "session.revoked",
+            None,
+            serde_json::json!({ "token_hash_prefix": prefix }),
+        )
+        .await
+    {
+        tracing::warn!(error = ?e, "session.revoked audit append failed");
+    }
 }
