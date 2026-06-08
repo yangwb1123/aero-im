@@ -87,6 +87,44 @@ impl AiJobRepo {
         Ok(id)
     }
 
+    /// Enqueue a job for `target_id` only if no `queued`/`running` job of the same
+    /// `kind` already targets it (ROADMAP 第三版 方向三 — embedding backfill). The
+    /// periodic backfill loop re-scans embedding-less messages every tick; without
+    /// this guard a message would accrue a duplicate Embed job each tick until the
+    /// worker caught up. Returns `Some(id)` when inserted, `None` when skipped.
+    pub async fn enqueue_unique(
+        &self,
+        kind: AiJobKind,
+        target_id: uuid::Uuid,
+        workspace_id: Option<uuid::Uuid>,
+        payload: serde_json::Value,
+    ) -> Result<Option<Ulid>, sqlx::Error> {
+        let id = Ulid::new();
+        let kind_s = match kind {
+            AiJobKind::Embed => "embed",
+            AiJobKind::Summarize => "summarize",
+            AiJobKind::Moderate => "moderate",
+            AiJobKind::Answer => "answer",
+        };
+        let res = sqlx::query(
+            r#"INSERT INTO ai_jobs (id, kind, target_id, workspace_id, status, payload)
+               SELECT $1, $2, $3, $4, 'queued', $5
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM ai_jobs
+                     WHERE kind = $2 AND target_id = $3
+                       AND status IN ('queued', 'running')
+                )"#,
+        )
+        .bind(uuid::Uuid::from_u128(id.0))
+        .bind(kind_s)
+        .bind(target_id)
+        .bind(workspace_id)
+        .bind(&payload)
+        .execute(&self.pool)
+        .await?;
+        Ok((res.rows_affected() > 0).then_some(id))
+    }
+
     /// Atomically claim up to `n` ready jobs and flip them to `running`.
     /// Skips locked rows so multiple workers can run concurrently.
     pub async fn claim(&self, n: i32) -> Result<Vec<AiJob>, sqlx::Error> {

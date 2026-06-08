@@ -541,6 +541,55 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // ---------- Embedding backfill (ROADMAP 第三版 方向三 — RAG completeness) ----------
+    // Messages can have embedding=NULL — an edit clears it, and pre-AI history was
+    // never embedded — so semantic search silently misses them. Every 5 min,
+    // enqueue dedup-guarded Embed jobs for a bounded batch of embedding-less
+    // messages; the AI worker fills them in (bounded by the existing per-ws + global
+    // AI budget). list_without_embedding shrinks as the worker catches up.
+    {
+        let msgs_bf = MessageRepo::new(pg.clone());
+        let jobs_bf = AiJobRepo::new(pg.clone());
+        let rooms_bf = RoomRepo::new(pg.clone());
+        let cancel = ai_shutdown.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(300));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    () = cancel.cancelled() => break,
+                    _ = tick.tick() => {}
+                }
+                match msgs_bf.list_without_embedding(200).await {
+                    Ok(batch) if !batch.is_empty() => {
+                        let mut enqueued = 0u32;
+                        for m in &batch {
+                            let ws = rooms_bf.room_workspace(m.room_id).await.ok().flatten().map(|w| w.to_uuid());
+                            match jobs_bf
+                                .enqueue_unique(
+                                    aero_storage::AiJobKind::Embed,
+                                    m.id.to_uuid(),
+                                    ws,
+                                    serde_json::json!({"room_id": m.room_id.to_string(), "backfill": true}),
+                                )
+                                .await
+                            {
+                                Ok(Some(_)) => enqueued += 1,
+                                Ok(None) => {}
+                                Err(e) => tracing::warn!(error = %e, msg = %m.id, "embed backfill enqueue failed"),
+                            }
+                        }
+                        if enqueued > 0 {
+                            info!(enqueued, scanned = batch.len(), "embedding backfill enqueued");
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(error = %e, "embed backfill scan failed"),
+                }
+            }
+        });
+    }
+
     // ---------- Outgoing webhook dispatcher ----------
     // Subscribes to `im.room.*` (durable "aero-webhooks", distinct cursor from the
     // WS listener) and delivers RoomEvent::Message to each room's active outgoing
