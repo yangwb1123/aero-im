@@ -17,6 +17,10 @@ pub enum BlobStoreError {
     Io(#[from] std::io::Error),
     #[error("not found")]
     NotFound,
+    /// Misconfiguration detected at startup (e.g. `AERO_BLOB_BACKEND=s3` with an
+    /// incomplete S3 config). Surfaced fail-loud rather than silently degrading.
+    #[error("blob store config: {0}")]
+    Config(String),
 }
 
 #[async_trait]

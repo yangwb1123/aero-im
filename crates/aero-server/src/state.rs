@@ -128,6 +128,9 @@ pub struct AppState {
     pub ai_jobs: AiJobRepo,
     pub blobs: BlobRepo,
     pub blob_store: Arc<dyn BlobStore>,
+    /// Active blob backend label (`"s3"` / `"local"`), surfaced on `/health` so
+    /// operators can confirm storage is wired as intended (ROADMAP 第三版 方向五).
+    pub blob_backend: &'static str,
     pub streams: StreamRepo,
     pub key_packages: KeyPackageRepo,
     pub mls_groups: MlsGroupRepo,

@@ -391,6 +391,9 @@ async fn health(State(s): State<AppState>) -> Json<serde_json::Value> {
             "redis": redis,
             "nats": nats,
         },
+        // Surface the active blob backend (s3/local) so operators can confirm
+        // storage is wired as intended — fail-loud's companion (方向五).
+        "blob_backend": s.blob_backend,
         "version": env!("CARGO_PKG_VERSION"),
     }))
 }

@@ -56,13 +56,22 @@ async fn main() -> anyhow::Result<()> {
     info!(version = env!("CARGO_PKG_VERSION"), "starting aero-server");
 
     // ---------- Persistence ----------
-    let pg = connect_pg(&cfg.database.url, cfg.database.max_connections)
-        .await
-        .context("connect postgres")?;
+    // ROADMAP 第三版 方向五: connect with bounded exponential backoff so a brief
+    // DNS / dependency blip at boot doesn't trigger a K8s restart storm (which
+    // would drop every active WS connection). Configurable attempts; gives up
+    // loudly after the budget so a genuinely-down dependency still surfaces.
+    let connect_attempts: u32 = std::env::var("AERO_STARTUP_CONNECT_ATTEMPTS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8);
+    let pg = connect_with_retry("postgres", connect_attempts, || {
+        connect_pg(&cfg.database.url, cfg.database.max_connections)
+    })
+    .await?;
     migrate(&pg).await.context("run migrations")?;
     info!("postgres migrated");
 
-    let cache = RedisCache::connect(&cfg.redis.url).await.context("redis connect")?;
+    let cache = connect_with_retry("redis", connect_attempts, || RedisCache::connect(&cfg.redis.url)).await?;
     info!("redis connected");
 
     // ---------- Repos ----------
@@ -93,22 +102,24 @@ async fn main() -> anyhow::Result<()> {
     let stream_routes = StreamRouteRegistry::new(cache.client().clone());
 
     // ---------- Blob storage ----------
-    // ROADMAP 方向一: pick the backend from AERO_BLOB_BACKEND (s3 ⇒ S3BlobStore
-    // from AERO_S3_* env, else the local-FS store rooted at blob_dir). Returns
-    // an Arc<dyn BlobStore> so the rest of the server is backend-agnostic.
+    // ROADMAP 方向一/方向五: pick the backend from AERO_BLOB_BACKEND. Fail LOUD —
+    // if AERO_BLOB_BACKEND=s3 but the S3 config is incomplete, abort startup
+    // rather than silently writing to node-local disk (a cluster that thinks
+    // it's on S3 but isn't = attachments unreachable across nodes, lost on restart).
     let blob_root = std::path::PathBuf::from(&cfg.server.blob_dir);
-    let blob_store = aero_storage::blob_store_from_env(blob_root.clone());
-    let blob_backend = std::env::var("AERO_BLOB_BACKEND").unwrap_or_else(|_| "local".into());
+    let (blob_store, blob_backend) = aero_storage::blob_store_from_env_checked(blob_root.clone())
+        .context("configure blob store")?;
     info!(blob_dir = %blob_root.display(), backend = %blob_backend, "blob store ready");
 
     // ---------- Bus ----------
     let jetstream: Arc<JetStreamBus> = Arc::new(
-        JetStreamBus::connect(JetStreamConfig {
-            url: cfg.nats.url.clone(),
-            bootstrap_streams: true,
+        connect_with_retry("nats", connect_attempts, || {
+            JetStreamBus::connect(JetStreamConfig {
+                url: cfg.nats.url.clone(),
+                bootstrap_streams: true,
+            })
         })
-        .await
-        .map_err(|e| anyhow::anyhow!("nats: {e}"))?,
+        .await?,
     );
     let bus_dyn: Arc<dyn EventBus> = jetstream.clone();
     info!("nats connected");
@@ -268,6 +279,7 @@ async fn main() -> anyhow::Result<()> {
         ai_jobs,
         blobs,
         blob_store,
+        blob_backend,
         streams,
         key_packages,
         mls_groups,
@@ -633,6 +645,18 @@ async fn main() -> anyhow::Result<()> {
         warn!(error = %e, dir = %hls_dir.display(), "create hls dir failed");
     }
 
+    // CORS fail-closed gate (ROADMAP 第三版 方向五): a production deployment sets
+    // AERO_CORS_REQUIRE_ORIGINS=1, which refuses to start with the permissive
+    // any-origin default — forcing an explicit allow-list rather than silently
+    // shipping a wide-open CORS policy. Dev (flag unset) keeps the convenient default.
+    if std::env::var("AERO_CORS_REQUIRE_ORIGINS").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        && gateway_cfg.cors_allowed_origins.is_empty()
+    {
+        anyhow::bail!(
+            "AERO_CORS_REQUIRE_ORIGINS is set but no AERO_CORS_ALLOWED_ORIGINS configured — \
+             refusing to start with a permissive any-origin CORS policy"
+        );
+    }
     // CORS: tighten to a configured allow-list in production; fall back to the
     // permissive dev default only when no origins are configured.
     let cors = build_cors(&gateway_cfg);
@@ -738,5 +762,37 @@ fn build_cors(cfg: &GatewayConfig) -> CorsLayer {
         .allow_origin(AllowOrigin::list(origins))
         .allow_methods(tower_http::cors::Any)
         .allow_headers(tower_http::cors::Any)
+}
+
+/// Connect to a startup dependency with bounded exponential backoff (ROADMAP
+/// 第三版 方向五). Retries `attempts` times (backoff 1s,2s,4s,… capped at 30s)
+/// before giving up loudly, so a brief boot-time DNS/availability blip doesn't
+/// crash the process into a K8s restart storm — but a genuinely-down dependency
+/// still surfaces as a hard startup failure.
+async fn connect_with_retry<T, E, F, Fut>(what: &str, attempts: u32, mut f: F) -> anyhow::Result<T>
+where
+    E: std::fmt::Display,
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+{
+    let attempts = attempts.max(1);
+    let mut delay = std::time::Duration::from_secs(1);
+    for attempt in 1..=attempts {
+        match f().await {
+            Ok(v) => return Ok(v),
+            Err(e) if attempt < attempts => {
+                warn!(
+                    dependency = %what, attempt, max = attempts, error = %e,
+                    backoff_secs = delay.as_secs(), "connect failed; retrying"
+                );
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(std::time::Duration::from_secs(30));
+            }
+            Err(e) => {
+                anyhow::bail!("{what} connect failed after {attempts} attempts: {e}");
+            }
+        }
+    }
+    unreachable!("loop returns on the final attempt")
 }
 

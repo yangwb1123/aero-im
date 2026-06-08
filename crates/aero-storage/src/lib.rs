@@ -110,7 +110,7 @@ pub use ai_job::{AiJob, AiJobKind, AiJobRepo, AiJobStatus};
 pub use audit::{AuditEvent, AuditRepo};
 pub use blob::{BlobRepo, NewBlob};
 pub use blob_store::{BlobStore, BlobStoreError, LocalFsBlobStore};
-pub use s3_blob_store::{blob_store_from_env, S3BlobStore, S3Config};
+pub use s3_blob_store::{blob_store_from_env, blob_store_from_env_checked, S3BlobStore, S3Config};
 pub use bookmark::{BookmarkRepo, SavedMessage};
 pub use cache::{Cache, RedisCache};
 pub use call::CallRepo;

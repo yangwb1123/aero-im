@@ -224,6 +224,39 @@ pub fn blob_store_from_env(local_dir: PathBuf) -> Arc<dyn BlobStore> {
     Arc::new(LocalFsBlobStore::new(&local_dir).expect("create local blob dir"))
 }
 
+/// Fail-loud variant of [`blob_store_from_env`] (ROADMAP 第三版 方向五).
+///
+/// Returns the store **and the active backend label** (`"s3"` / `"local"`). The
+/// critical difference: when `AERO_BLOB_BACKEND=s3` is set but the S3 config is
+/// incomplete, this returns `Err` instead of silently falling back to local disk
+/// — a misconfigured cluster that thinks it's on S3 but is actually writing to a
+/// node's local filesystem (attachments unreachable across nodes, lost on
+/// restart) is a silent data-correctness hazard. The bin propagates the `Err` to
+/// abort startup, and the label is surfaced on `/health/ready`.
+///
+/// # Errors
+/// [`BlobStoreError::Config`] when `AERO_BLOB_BACKEND=s3` but `AERO_S3_BUCKET`
+/// (etc.) is unset, or when the local directory can't be created.
+#[allow(clippy::needless_pass_by_value)]
+pub fn blob_store_from_env_checked(
+    local_dir: PathBuf,
+) -> Result<(Arc<dyn BlobStore>, &'static str), BlobStoreError> {
+    if std::env::var("AERO_BLOB_BACKEND").as_deref() == Ok("s3") {
+        let cfg = S3Config::from_env().ok_or_else(|| {
+            BlobStoreError::Config(
+                "AERO_BLOB_BACKEND=s3 but S3 config is incomplete (set AERO_S3_BUCKET / \
+                 AERO_S3_REGION / AERO_S3_ACCESS_KEY / AERO_S3_SECRET_KEY); refusing to \
+                 silently fall back to local-disk storage"
+                    .into(),
+            )
+        })?;
+        return Ok((Arc::new(S3BlobStore::new(cfg)), "s3"));
+    }
+    let local = LocalFsBlobStore::new(&local_dir)
+        .map_err(|e| BlobStoreError::Config(format!("create local blob dir: {e}")))?;
+    Ok((Arc::new(local), "local"))
+}
+
 // ----------------------------------------------------------- SigV4 (pure)
 
 /// The signed-request material produced by [`sign_request`]: the headers an HTTP
