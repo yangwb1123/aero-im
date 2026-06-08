@@ -140,6 +140,24 @@ async fn create_task(
         .create(room, auth.participant_id, title, assignee, source_message, req.due_at)
         .await
         .map_err(AeroError::from)?;
+
+    // Best-effort mobile push to a freshly-assigned assignee (ROADMAP 方向二).
+    // Skip when the assignee is the actor (no self-notify) or when no push gateway
+    // is configured. Out-of-band + best-effort, so a failed send never fails the
+    // create. No DND/snooze gate (a task assignment is worth surfacing regardless).
+    if let Some(assignee) = assignee {
+        if assignee != auth.participant_id && s.push.any_enabled() {
+            let payload = aero_push::PushPayload {
+                title: format!("New task assigned: {title}"),
+                body: String::new(),
+                room_id: Some(room.to_string()),
+                message_id: None,
+                badge: None,
+            };
+            crate::push_bot::push_to_participant(&s, assignee, &payload).await;
+        }
+    }
+
     Ok(reread(&s, id).await?)
 }
 

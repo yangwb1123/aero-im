@@ -432,6 +432,20 @@ async fn handle_text(
             match state.calls.unanswered_callees(call_id).await {
                 Ok(Some((initiator, callees))) => {
                     let feed = aero_storage::ActivityFeedRepo::new(state.pg.clone());
+                    // Resolve the caller's name once for the mobile push title;
+                    // only needed when a push gateway is actually configured.
+                    let push_enabled = state.push.any_enabled();
+                    let initiator_name = if push_enabled {
+                        state
+                            .participants
+                            .get(initiator)
+                            .await
+                            .ok()
+                            .flatten()
+                            .map_or_else(|| "Someone".to_string(), |p| p.display_name)
+                    } else {
+                        String::new()
+                    };
                     for callee in callees {
                         if callee == initiator {
                             continue;
@@ -441,6 +455,20 @@ async fn handle_text(
                             .await
                         {
                             tracing::warn!(error = ?e, %callee, "missed-call activity insert failed");
+                        }
+                        // Best-effort mobile push so an offline callee still sees the
+                        // missed call. No DND/snooze gate here (a missed call during
+                        // DND is still worth surfacing); out-of-band + best-effort, so
+                        // it can never fail the call-end relay.
+                        if push_enabled {
+                            let payload = aero_push::PushPayload {
+                                title: format!("Missed call from {initiator_name}"),
+                                body: String::new(),
+                                room_id: Some(room_id.to_string()),
+                                message_id: None,
+                                badge: None,
+                            };
+                            crate::push_bot::push_to_participant(state, callee, &payload).await;
                         }
                     }
                 }
