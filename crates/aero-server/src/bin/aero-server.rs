@@ -463,6 +463,18 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // ---------- Async full-export worker (ROADMAP 方向四) ----------
+    // Drains export_jobs: assembles each participant's COMPLETE (uncapped) data
+    // archive, stores it as a participant-owned blob, marks the job done. The
+    // synchronous /api/me/export stays capped; this is the GDPR-complete path.
+    {
+        let state_clone = state.clone();
+        let cancel = ai_shutdown.clone();
+        tokio::spawn(async move {
+            aero_server::me_export::run_export_dispatcher(state_clone, cancel, 15).await;
+        });
+    }
+
     // ---------- Bus listener ----------
     {
         let state_clone = state.clone();

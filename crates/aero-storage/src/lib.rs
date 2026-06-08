@@ -230,3 +230,7 @@ pub use push_token::{PushPlatform, PushToken, PushTokenRepo};
 // ---- ROADMAP 方向四 — GDPR blob GC ----
 pub mod blob_gc;
 pub use blob_gc::BlobGcRepo;
+
+// ---- ROADMAP 方向四 — GDPR async full export ----
+pub mod export_job;
+pub use export_job::{link_is_valid, ExportJob, ExportJobRepo, EXPORT_LINK_TTL};

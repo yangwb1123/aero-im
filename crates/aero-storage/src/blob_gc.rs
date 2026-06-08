@@ -39,6 +39,19 @@ impl BlobGcRepo {
         Ok(result.rows_affected())
     }
 
+    /// Enqueue a single blob for garbage collection (idempotent). Used to expire
+    /// a one-off artefact like a stale async-export archive — distinct from
+    /// [`Self::enqueue_for_owner`], which sweeps every blob an owner has.
+    pub async fn enqueue_one(&self, blob: BlobId) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r"INSERT INTO blob_gc_queue (blob_id) VALUES ($1) ON CONFLICT (blob_id) DO NOTHING",
+        )
+        .bind(blob.to_uuid())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Return up to `limit` blob IDs that need storage deletion, oldest first.
     pub async fn drain(&self, limit: i64) -> Result<Vec<BlobId>, sqlx::Error> {
         let rows = sqlx::query_as::<_, (uuid::Uuid,)>(

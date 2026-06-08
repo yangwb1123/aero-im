@@ -641,6 +641,34 @@ impl MessageRepo {
         .await?;
         Ok(rows.into_iter().map(Message::from).collect())
     }
+
+    /// Keyset page over ALL messages sent by `sender`, oldest-first, `id` strictly
+    /// after `after` (or from the start when `None`). The async full-export worker
+    /// (方向四) loops this until a short page to assemble a complete, uncapped
+    /// archive without holding a giant result set in memory. Includes deleted
+    /// rows' tombstones? No — only live messages (`deleted_at IS NULL`), matching
+    /// the synchronous export.
+    pub async fn by_sender_paged(
+        &self,
+        sender: ParticipantId,
+        after: Option<MessageId>,
+        limit: i64,
+    ) -> Result<Vec<Message>, sqlx::Error> {
+        let after_uuid = after.map(|m| m.to_uuid()).unwrap_or(uuid::Uuid::nil());
+        let rows = sqlx::query_as::<_, MessageRow>(
+            r"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at
+               FROM messages
+               WHERE sender_id = $1 AND deleted_at IS NULL AND id > $2
+               ORDER BY id ASC
+               LIMIT $3",
+        )
+        .bind(sender.to_uuid())
+        .bind(after_uuid)
+        .bind(limit.clamp(1, 1000))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(Message::from).collect())
+    }
 }
 
 fn searchable_of(blocks: &[Block]) -> String {
