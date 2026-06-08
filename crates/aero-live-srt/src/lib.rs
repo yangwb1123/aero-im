@@ -64,7 +64,7 @@ pub use segmenter::{MpegTsSegmenter, SegmentEvent, TS_PACKET_SIZE, TS_SYNC_BYTE}
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use aero_live_core::{
     hls_path_for, hls_url_for, LiveError, LiveIngest, LiveResult, LiveStreamConfig,
@@ -340,11 +340,26 @@ async fn handle_datagram(
             // Established: route the datagram through the session's data plane.
             // `feed_packet` handles header parsing, reliability tracking,
             // optional AES-CTR decryption, and TS segmentation all in one call.
-            // Control packets (KEEPALIVE, ACK, …) are silently ignored there.
-            if SrtHeader::parse(datagram).is_some_and(|h| !h.is_control()) {
+            // Control packets (KEEPALIVE, ACK, …) are silently ignored by
+            // feed_packet, but we still need to feed data packets so the
+            // reliability layer can schedule ACK/NAK responses.
+            let parsed_hdr = SrtHeader::parse(datagram);
+            if parsed_hdr.is_some_and(|h| !h.is_control()) {
                 session.feed_packet(datagram).await?;
             } else {
-                debug!(%peer, "SRT: ignoring non-data packet on established session");
+                debug!(%peer, "SRT: ignoring non-data control packet on established session");
+            }
+            // Flush ACK / NAK / ACKACK control packets back to the sender.
+            // Use the incoming packet's dest_socket_id as the peer id (mirrors
+            // how the handshake machine uses the remote socket id).
+            let peer_socket_id = parsed_hdr.map_or(0, |h| h.dest_socket_id);
+            let mut collected = Vec::new();
+            session.pump(&mut collected, Instant::now(), peer_socket_id);
+            for pkt in collected {
+                if let Err(e) = sock.send_to(&pkt, peer).await {
+                    warn!(%peer, error = %e, "SRT: control packet send failed; dropping peer");
+                    return Err(LiveError::Io(e));
+                }
             }
             Ok(())
         }

@@ -56,6 +56,16 @@ pub trait SrtSink {
     fn send(&mut self, bytes: &[u8]);
 }
 
+/// Convenience sink that collects packets into a `Vec` for later async dispatch.
+///
+/// The production receive loop uses this to gather all control packets from
+/// [`SrtSession::pump`], then sends them asynchronously via the UDP socket.
+impl SrtSink for Vec<Vec<u8>> {
+    fn send(&mut self, bytes: &[u8]) {
+        self.push(bytes.to_vec());
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // pump implementation
 // ─────────────────────────────────────────────────────────────────────────────
