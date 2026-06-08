@@ -587,6 +587,29 @@ impl WorkspaceRepo {
         Ok(result.rows_affected() > 0)
     }
 
+    // ----------------------------------------- workspace metadata update
+
+    /// Rename a workspace — update its `name` column in place.
+    ///
+    /// Returns `true` if the row existed and was updated, `false` for an unknown
+    /// workspace id. The caller is responsible for validating `new_name`
+    /// (non-empty, length ≤ 100) before calling this.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the update.
+    pub async fn update_name(
+        &self,
+        workspace: WorkspaceId,
+        new_name: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query("UPDATE workspaces SET name = $2 WHERE id = $1")
+            .bind(workspace.to_uuid())
+            .bind(new_name)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     // ----------------------------------------- compliance: retention policy
 
     /// Set (or, with `days = None`, clear) the workspace's message-retention

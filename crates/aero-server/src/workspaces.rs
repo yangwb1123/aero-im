@@ -52,7 +52,10 @@ pub fn routes() -> Router<AppState> {
         .route("/api/workspaces", post(create_workspace).get(list_workspaces))
         // Owner-only erasure (ROADMAP 方向一 合规); GET of a single workspace is
         // intentionally not (yet) offered here — listing is via `/api/workspaces`.
-        .route("/api/workspaces/:id", axum::routing::delete(delete_workspace))
+        .route(
+            "/api/workspaces/:id",
+            axum::routing::patch(update_workspace).delete(delete_workspace),
+        )
         // Owner-only full-tenant export (GDPR data portability).
         .route("/api/workspaces/:id/export", get(export_workspace))
         // Admin/owner: set or clear the per-workspace message-retention window.
@@ -231,6 +234,15 @@ pub fn authorize_set_retention(caller: WorkspaceRole) -> AeroResult<()> {
     }
 }
 
+/// Only admin and owner may rename a workspace.
+pub fn authorize_rename(caller: WorkspaceRole) -> AeroResult<()> {
+    if caller.can_administer() {
+        Ok(())
+    } else {
+        Err(AeroError::Forbidden("renaming a workspace requires admin".into()))
+    }
+}
+
 /// Resolve the caller's role in a workspace, rejecting non-members.
 ///
 /// Used by every member-scoped route so the "must be a member" check (and its
@@ -381,6 +393,62 @@ async fn export_workspace(
 /// `audit_events` is itself `ON DELETE CASCADE` on `workspaces`, that row is then
 /// removed along with the tenant — so the deletion is also recorded via
 /// `tracing` (a durable, out-of-tenant log) to retain an erasure record.
+/// Maximum length (in characters) of a workspace name.
+const MAX_NAME_LEN: usize = 100;
+
+#[derive(Deserialize)]
+struct UpdateWorkspaceReq {
+    /// New display name; required, non-empty, ≤ 100 chars.
+    name: String,
+}
+
+/// `PATCH /api/workspaces/:id` — **admin/owner**: update the workspace's display
+/// name. Returns the updated workspace row. Emits a `"workspace.renamed"` audit
+/// event so the change is visible in the workspace's audit trail.
+async fn update_workspace(
+    State(s): State<AppState>,
+    auth: AuthUser,
+    Path(id_str): Path<String>,
+    Json(req): Json<UpdateWorkspaceReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let ws = parse_workspace_id(&id_str)?;
+    let caller = caller_role(&s.workspaces, ws, auth.participant_id).await?;
+    authorize_rename(caller)?;
+
+    let name = req.name.trim().to_owned();
+    if name.is_empty() {
+        return Err(AeroError::Invalid("name must not be empty".into()).into());
+    }
+    if name.chars().count() > MAX_NAME_LEN {
+        return Err(AeroError::Invalid(
+            format!("name must be at most {MAX_NAME_LEN} characters"),
+        ).into());
+    }
+
+    let updated = s.workspaces.update_name(ws, &name).await.map_err(AeroError::from)?;
+    if !updated {
+        return Err(AeroError::NotFound("workspace".into()).into());
+    }
+
+    audit(
+        &s,
+        ws,
+        auth.participant_id,
+        "workspace.renamed",
+        None,
+        serde_json::json!({ "new_name": name }),
+    )
+    .await;
+
+    let workspace = s
+        .workspaces
+        .get(ws)
+        .await
+        .map_err(AeroError::from)?
+        .ok_or_else(|| AeroError::NotFound("workspace".into()))?;
+    Ok(Json(serde_json::to_value(workspace).map_err(AeroError::from)?))
+}
+
 async fn delete_workspace(
     State(s): State<AppState>,
     auth: AuthUser,
@@ -687,6 +755,26 @@ mod tests {
                 allowed(&authorize_view_audit(r)),
                 "role {r:?}"
             );
+        }
+    }
+
+    // ----- authorize_rename -----
+
+    #[test]
+    fn rename_is_admin_and_owner_only_over_all_roles() {
+        for r in ALL {
+            assert_eq!(
+                allowed(&authorize_rename(r)),
+                r.can_administer(),
+                "rename allowed only for admin/owner, role {r:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rename_non_admin_denials_are_403() {
+        for r in [WorkspaceRole::Guest, WorkspaceRole::Member] {
+            assert_eq!(status_of(&authorize_rename(r)), 403, "role {r:?}");
         }
     }
 
