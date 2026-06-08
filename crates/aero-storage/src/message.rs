@@ -296,6 +296,81 @@ impl MessageRepo {
         Ok(rows.into_iter().map(Message::from).collect())
     }
 
+    /// Fetch a window of messages CENTERED on `target` for the "jump to message"
+    /// permalink view (Slack-style): up to `half_window` live messages before the
+    /// target (id < target), the target itself, and up to `half_window` live
+    /// messages after it (id > target), all in the same room, merged and returned
+    /// in ascending `id` (chronological) order.
+    ///
+    /// `half_window` is clamped to `[1, 100]` (see [`clamp_half_window`]). The
+    /// "before" half is read `ORDER BY id DESC LIMIT half_window` (the nearest
+    /// preceding messages) and the "after" half `ORDER BY id ASC LIMIT
+    /// half_window`; both are then folded together with the target and sorted
+    /// ascending so the caller sees a single chronological slice. Soft-deleted
+    /// rows (`deleted_at IS NOT NULL`) are excluded, including the target — if the
+    /// target is deleted (or in another room) it simply won't appear in the
+    /// result, and the surrounding window is returned without it.
+    ///
+    /// Because [`MessageId`] is a time-sortable ULID stored as a UUID, ordering by
+    /// `id` is equivalent to chronological order — the same cursor contract as
+    /// [`Self::list_since`] / [`Self::list_recent`].
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the underlying queries.
+    pub async fn messages_around(
+        &self,
+        room: RoomId,
+        target: MessageId,
+        half_window: i64,
+    ) -> Result<Vec<Message>, sqlx::Error> {
+        let half_window = clamp_half_window(half_window);
+
+        let before = sqlx::query_as::<_, MessageRow>(
+            r"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at
+               FROM messages
+               WHERE room_id = $1 AND id < $2 AND deleted_at IS NULL
+               ORDER BY id DESC
+               LIMIT $3",
+        )
+        .bind(room.to_uuid())
+        .bind(target.to_uuid())
+        .bind(half_window)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let target_row = sqlx::query_as::<_, MessageRow>(
+            r"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at
+               FROM messages
+               WHERE room_id = $1 AND id = $2 AND deleted_at IS NULL",
+        )
+        .bind(room.to_uuid())
+        .bind(target.to_uuid())
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let after = sqlx::query_as::<_, MessageRow>(
+            r"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at
+               FROM messages
+               WHERE room_id = $1 AND id > $2 AND deleted_at IS NULL
+               ORDER BY id ASC
+               LIMIT $3",
+        )
+        .bind(room.to_uuid())
+        .bind(target.to_uuid())
+        .bind(half_window)
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut out: Vec<Message> = before
+            .into_iter()
+            .chain(target_row)
+            .chain(after)
+            .map(Message::from)
+            .collect();
+        out.sort_by_key(|m| m.id);
+        Ok(out)
+    }
+
     /// Find messages in a room missing an embedding. Used by the embedding worker
     /// at startup to catch up on backlog before the live queue takes over.
     pub async fn list_without_embedding(&self, limit: i64) -> Result<Vec<Message>, sqlx::Error> {
@@ -705,6 +780,16 @@ fn clamp_page_limit(limit: i64) -> i64 {
     limit.clamp(1, 200)
 }
 
+/// Clamp the caller-supplied half-window for [`MessageRepo::messages_around`]
+/// (the permalink "jump to message" context view) into `[1, 100]`. Each side of
+/// the target is fetched with this limit, so a caller can never pull an
+/// unbounded slice; zero/negative values clamp up to 1. Factored out so the
+/// window contract is unit-testable without a live database.
+#[inline]
+fn clamp_half_window(half_window: i64) -> i64 {
+    half_window.clamp(1, 100)
+}
+
 #[derive(sqlx::FromRow)]
 struct MessageRow {
     id: uuid::Uuid,
@@ -750,7 +835,7 @@ impl From<ScoredMessageRow> for SearchHit {
 
 #[cfg(test)]
 mod tests {
-    use super::{attached_blob_ids, clamp_page_limit};
+    use super::{attached_blob_ids, clamp_half_window, clamp_page_limit};
     use aero_common::{BlobId, Block, FileKind, MessageId};
     use ulid::Ulid;
 
@@ -793,6 +878,20 @@ mod tests {
         // Above the ceiling clamps down to 200, matching `list_recent`.
         assert_eq!(clamp_page_limit(201), 200);
         assert_eq!(clamp_page_limit(i64::MAX), 200);
+    }
+
+    #[test]
+    fn half_window_is_clamped_into_window() {
+        // Below the floor clamps up to 1; zero and negatives are never honored.
+        assert_eq!(clamp_half_window(0), 1);
+        assert_eq!(clamp_half_window(-7), 1);
+        assert_eq!(clamp_half_window(1), 1);
+        // In-window values pass through untouched.
+        assert_eq!(clamp_half_window(2), 2);
+        assert_eq!(clamp_half_window(100), 100);
+        // Above the ceiling clamps down to 100.
+        assert_eq!(clamp_half_window(101), 100);
+        assert_eq!(clamp_half_window(i64::MAX), 100);
     }
 
     /// The `list_since` keyset cursor relies on `MessageId` (a time-sortable
@@ -1003,5 +1102,54 @@ mod db_tests {
             !hits.iter().any(|h| h.message.id == in_theirs.id),
             "an embedded message in a room the caller is NOT in never leaks"
         );
+    }
+
+    /// `messages_around` returns a window straddling the target: with five
+    /// messages inserted in order, `half_window = 2` around the MIDDLE message
+    /// yields all five (two before, the target, two after) in ascending id order,
+    /// the target sitting dead center.
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn messages_around_straddles_target() {
+        let p = pool();
+        let repo = MessageRepo::new(p.clone());
+
+        let me = participant(&p).await;
+        let r = room(&p, me).await;
+        join(&p, r, me).await;
+
+        // Insert five messages in chronological order; ids are time-sortable
+        // ULIDs minted by `insert`, so insertion order == id order.
+        let mut ids = Vec::new();
+        for i in 0..5 {
+            let m = repo
+                .insert(NewMessage {
+                    room_id: r,
+                    sender_id: me,
+                    blocks: vec![Block::text(format!("around msg {i}"))],
+                    reply_to: None,
+                    metadata: serde_json::json!({}),
+                })
+                .await
+                .expect("insert");
+            ids.push(m.id);
+        }
+
+        let target = ids[2]; // the middle message
+        let window = repo
+            .messages_around(r, target, 2)
+            .await
+            .expect("messages_around");
+
+        let got: Vec<_> = window.iter().map(|m| m.id).collect();
+        // Two before + target + two after, all sorted ascending == every id.
+        assert_eq!(got, ids, "window straddles the target in chronological order");
+
+        // The target sits at the center of the returned slice.
+        let pos = window
+            .iter()
+            .position(|m| m.id == target)
+            .expect("target present in window");
+        assert_eq!(pos, 2, "target is dead center with two on each side");
     }
 }

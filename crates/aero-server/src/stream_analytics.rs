@@ -11,15 +11,19 @@
 //! shared [`StreamRepo`](aero_storage::StreamRepo) (`404` if unknown) and the
 //! caller must own it (`403` otherwise) before any analytics are returned.
 //!
-//! NOTE (future seam): peak / average *concurrent* viewers are intentionally not
-//! reported — there is no viewer-count sampling table to aggregate. See
-//! [`aero_storage::StreamStatsRepo`] for the seam.
+//! Concurrent-viewer history: the response now also carries `peak_viewers` /
+//! `avg_viewers` / `viewer_samples`, aggregated from the
+//! `stream_viewer_samples` table (migration 0072) via
+//! [`StreamViewerSampleRepo`](aero_storage::StreamViewerSampleRepo). Those rows
+//! are produced by the background [`run_viewer_sampler`], which snapshots the
+//! live Redis viewer count for each currently-live stream on an interval.
 
 use std::str::FromStr;
+use std::time::Duration;
 
 use aero_auth::AuthUser;
 use aero_common::{Error as AeroError, Result as AeroResult};
-use aero_storage::StreamStatsRepo;
+use aero_storage::{StreamRepo, StreamStatsRepo, StreamViewerSampleRepo, StreamViewerStore};
 use axum::{
     extract::{Path, State},
     routing::get,
@@ -29,6 +33,10 @@ use ulid::Ulid;
 
 use crate::error::ApiResult;
 use crate::state::AppState;
+
+/// Default sampling cadence for [`run_viewer_sampler`]: snapshot every live
+/// stream's concurrent-viewer count once per this interval.
+pub const VIEWER_SAMPLE_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Mount the stream-analytics route. Folded into the main router by
 /// [`crate::routes::build`]; kept separate so the analytics surface lives next to
@@ -45,7 +53,9 @@ fn parse_stream_id(s: &str) -> AeroResult<Ulid> {
 ///
 /// Resolves the stream (`404` if unknown), asserts the caller owns it (`403`
 /// otherwise), then returns the [`StreamAnalytics`](aero_storage::StreamAnalytics)
-/// aggregate as JSON.
+/// aggregate as JSON, extended with the concurrent-viewer history
+/// (`peak_viewers` / `avg_viewers` / `viewer_samples`) aggregated from the
+/// `stream_viewer_samples` table.
 async fn stream_analytics(
     State(s): State<AppState>,
     auth: AuthUser,
@@ -66,5 +76,64 @@ async fn stream_analytics(
         .analytics(stream_id)
         .await
         .map_err(AeroError::from)?;
-    Ok(Json(serde_json::to_value(stats).map_err(AeroError::from)?))
+    // Concurrent-viewer history (peak / avg) from the sampling table — closes the
+    // "not yet sampled" seam noted in aero_storage::stream_stats.
+    let viewers = StreamViewerSampleRepo::new(s.pg.clone())
+        .stats(stream_id)
+        .await
+        .map_err(AeroError::from)?;
+    let mut body = serde_json::to_value(stats).map_err(AeroError::from)?;
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("peak_viewers".into(), serde_json::json!(viewers.peak));
+        obj.insert("avg_viewers".into(), serde_json::json!(viewers.avg));
+        obj.insert("viewer_samples".into(), serde_json::json!(viewers.samples));
+    }
+    Ok(Json(body))
+}
+
+/// Background sampler: every [`VIEWER_SAMPLE_INTERVAL`], snapshot the live
+/// concurrent-viewer count for each currently-live stream into
+/// `stream_viewer_samples`, so peak / average concurrent viewers can be
+/// aggregated after the fact (the live count itself is ephemeral Redis state).
+///
+/// Spawned by the binary alongside the other dispatchers; it loops until the
+/// future is dropped. A per-tick failure (PG/Redis blip) is logged and the loop
+/// continues — a missed sample is harmless, the aggregate is over whatever rows
+/// landed. The Redis viewer count is read via [`StreamViewerStore::count`], the
+/// same source the live viewer-count broadcast uses, so a sample reflects the
+/// true cluster-wide audience.
+pub async fn run_viewer_sampler(
+    pg: aero_storage::PgPool,
+    viewers: StreamViewerStore,
+    stream_repo: StreamRepo,
+) {
+    let samples = StreamViewerSampleRepo::new(pg);
+    let mut tick = tokio::time::interval(VIEWER_SAMPLE_INTERVAL);
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    tracing::info!(
+        interval_secs = VIEWER_SAMPLE_INTERVAL.as_secs(),
+        "concurrent-viewer sampler started"
+    );
+    loop {
+        tick.tick().await;
+        let live = match stream_repo.list_live().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = ?e, "viewer sampler: list_live failed");
+                continue;
+            }
+        };
+        for stream in live {
+            match viewers.count(stream.id).await {
+                Ok(count) => {
+                    if let Err(e) = samples.record(stream.id, count).await {
+                        tracing::warn!(error = ?e, stream = %stream.id, "viewer sampler: record failed");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = ?e, stream = %stream.id, "viewer sampler: count failed");
+                }
+            }
+        }
+    }
 }

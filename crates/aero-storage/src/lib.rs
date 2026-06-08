@@ -36,6 +36,7 @@ pub mod saved_search;
 pub mod scim;
 pub mod sso;
 pub mod stream;
+pub mod stream_chat_settings;
 pub mod stream_mod;
 pub mod stream_route;
 pub mod unfurl;
@@ -143,6 +144,7 @@ pub use saved_search::{SavedSearch, SavedSearchRepo};
 pub use scim::{ScimRepo, ScimUserRow};
 pub use sso::SsoRepo;
 pub use stream::{NewStream, StreamRepo};
+pub use stream_chat_settings::{slow_mode_violation, StreamChatSettings, StreamChatSettingsRepo};
 pub use stream_mod::{ban_active, StreamBan, StreamModRepo};
 pub use stream_route::{redirect_base, StreamRouteRegistry, DEFAULT_TTL as STREAM_ROUTE_TTL};
 pub use unfurl::{UnfurlRepo, Unfurler};
@@ -238,3 +240,11 @@ pub use export_job::{link_is_valid, ExportJob, ExportJobRepo, EXPORT_LINK_TTL};
 // ---- ROADMAP 方向五 — password reuse history ----
 pub mod password_history;
 pub use password_history::{PasswordHistoryRepo, HISTORY_DEPTH as PASSWORD_HISTORY_DEPTH};
+
+// ---- Concurrent-viewer history sampling (peak/avg concurrent viewers) ----
+pub mod stream_viewer_sample;
+pub use stream_viewer_sample::{StreamViewerSampleRepo, ViewerStats};
+
+// ---- Workspace IP / network allowlist (authorized networks) ----
+pub mod ip_allowlist;
+pub use ip_allowlist::{ip_in_cidr, is_allowed, IpAllowEntry, IpAllowlistRepo};

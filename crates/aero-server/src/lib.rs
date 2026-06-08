@@ -45,6 +45,7 @@ pub mod announcements;
 pub mod favorites;
 pub mod keyword_alerts;
 pub mod message_history;
+pub mod message_context;
 pub mod profiles;
 pub mod user_groups;
 // Wave 11.
@@ -118,8 +119,14 @@ pub mod me_export;
 pub mod push_tokens;
 pub mod push_bot;
 pub mod ai_dlq;
+pub mod admin_sessions;
 
 // ---- Wave 16 Round 9 ----
 pub mod online;
+
+// ---- Parity batch: live chat modes, stream metadata edit, IP allowlist ----
+pub mod stream_chat_modes;
+pub mod stream_meta;
+pub mod ip_allowlist;
 
 pub use state::AppState;

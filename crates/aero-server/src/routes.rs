@@ -126,6 +126,9 @@ pub fn build(state: AppState) -> Router {
         .merge(crate::polls::routes())
         // Live-stream chat moderation: owner bans/timeouts viewers from danmaku.
         .merge(crate::stream_mod::routes())
+        // Live-stream chat modes: owner sets slow-mode / follower-only /
+        // subscriber-only (Twitch-style) for the danmaku chat.
+        .merge(crate::stream_chat_modes::routes())
         // Stream VOD / recording: flag a stream for recording, finalize a stream
         // into a VOD, and list/get/delete recordings (each with a playback URL).
         .merge(crate::vod::routes())
@@ -170,6 +173,9 @@ pub fn build(state: AppState) -> Router {
         // Message edit history: read prior versions of an edited message (capture
         // on edit is wired in ImService::edit_message).
         .merge(crate::message_history::routes())
+        // Message permalink / jump-to-message: a target message plus a centered
+        // window of surrounding context (Slack "jump to message").
+        .merge(crate::message_context::routes())
         // Keyword / highlight alerts: per-user subscriptions that notify on match
         // (dispatch wired in ImService::dispatch_notifications).
         .merge(crate::keyword_alerts::routes())
@@ -293,11 +299,19 @@ pub fn build(state: AppState) -> Router {
         .merge(crate::push_tokens::routes())
         // AI dead-letter queue admin API (ROADMAP 方向五).
         .merge(crate::ai_dlq::routes())
+        // Admin force-revoke a member's login sessions (offboarding).
+        .merge(crate::admin_sessions::routes())
         // ---- Wave 16 Round 9 ----
         // Per-room online roster + count: who is currently connected via WebSocket
         // in a room (in-process hub view). Useful for sidebar decoration and
         // mobile background badge polling without a persistent WS connection.
-        .merge(crate::online::routes());
+        .merge(crate::online::routes())
+        // ---- Live stream metadata edit ----
+        // Owner-only PATCH /api/streams/:id to rename a stream while live.
+        .merge(crate::stream_meta::routes())
+        // ---- Workspace IP / network allowlist (authorized networks) ----
+        // Admin-gated CRUD over a workspace's authorized CIDR ranges.
+        .merge(crate::ip_allowlist::routes());
 
     // Prometheus scrape endpoint (ROADMAP 方向四). Mounted unless disabled; the
     // handler self-gates on an optional bearer token. Left here (not behind the
@@ -1384,6 +1398,9 @@ async fn stream_chat_post(
     {
         return Err(AeroError::Forbidden("banned from this stream's chat".into()).into());
     }
+    // Enforce Twitch-style chat modes (slow mode / follower-only / subscriber-only)
+    // before the line is accepted/broadcast.
+    crate::stream_chat_modes::enforce_chat_modes(&s, id, auth.participant_id).await?;
     let line = s.live.post_chat(auth.participant_id, id, req.body).await?;
     Ok(Json(serde_json::to_value(line).map_err(AeroError::from)?))
 }

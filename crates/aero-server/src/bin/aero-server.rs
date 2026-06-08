@@ -517,6 +517,18 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // ---------- Concurrent-viewer sampler (peak/avg concurrent viewers) ----------
+    // Every 30s, sample each live stream's cluster-wide Redis viewer count into
+    // stream_viewer_samples so analytics can report peak/avg concurrent viewers.
+    {
+        let pg_sampler = state.pg.clone();
+        let viewers = state.stream_viewers.clone();
+        let stream_repo = state.streams.clone();
+        tokio::spawn(async move {
+            aero_server::stream_analytics::run_viewer_sampler(pg_sampler, viewers, stream_repo).await;
+        });
+    }
+
     // ---------- Outgoing webhook dispatcher ----------
     // Subscribes to `im.room.*` (durable "aero-webhooks", distinct cursor from the
     // WS listener) and delivers RoomEvent::Message to each room's active outgoing

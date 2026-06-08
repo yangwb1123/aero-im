@@ -665,6 +665,10 @@ async fn handle_text(
                 )
                 .into());
             }
+            // Enforce Twitch-style chat modes (slow mode / follower-only /
+            // subscriber-only) before the line is accepted/broadcast (mirrors the
+            // REST `stream_chat_post` guard).
+            crate::stream_chat_modes::enforce_chat_modes(state, stream_id, pid).await?;
             state.live.post_chat(pid, stream_id, body).await?;
         }
         ClientFrame::StreamGift { stream_id, gift_id, qty } => {

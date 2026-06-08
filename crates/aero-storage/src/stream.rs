@@ -114,6 +114,27 @@ impl StreamRepo {
         Ok(row.map(|(k,)| k))
     }
 
+    /// Change a stream's human-facing `title` (e.g. editing it while live —
+    /// the standard Twitch/YouTube "edit stream info" control). The `streams`
+    /// table carries no other free-text metadata column (description/category
+    /// live in separate tables, see migrations 0050), so only `title` is touched.
+    ///
+    /// Returns `true` when a row matched (the stream exists), `false` otherwise.
+    /// Ownership is enforced by the caller (see `crate::stream_meta`), mirroring
+    /// the owner check pattern in the HTTP layer; this method is unscoped on
+    /// purpose so the handler can return `404` vs `403` distinctly.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the update.
+    pub async fn update_title(&self, stream: Ulid, title: &str) -> Result<bool, sqlx::Error> {
+        let res = sqlx::query(r"UPDATE streams SET title = $2 WHERE id = $1")
+            .bind(uuid::Uuid::from_u128(stream.0))
+            .bind(title)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
     pub async fn mark_live(&self, id: Ulid, hls_path: &str) -> Result<(), sqlx::Error> {
         sqlx::query(
             r#"UPDATE streams
@@ -260,6 +281,45 @@ mod db_tests {
             Some(stream.id),
             "the new key resolves to the stream"
         );
+
+        // Cleanup so reruns stay self-contained.
+        sqlx::query("DELETE FROM streams WHERE owner_id = $1")
+            .bind(owner.to_uuid())
+            .execute(&p)
+            .await
+            .ok();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn update_title_persists_and_reports_match() {
+        let p = pool();
+        let repo = StreamRepo::new(p.clone());
+        let owner = owner(&p).await;
+
+        let stream = repo
+            .create(NewStream {
+                owner_id: owner,
+                room_id: None,
+                title: "original title".into(),
+                protocol: StreamProtocol::Rtmp,
+                stream_key: None,
+            })
+            .await
+            .expect("create stream");
+
+        // Updating an existing stream reports a match and persists the new title.
+        let matched = repo.update_title(stream.id, "renamed live").await.expect("update");
+        assert!(matched, "an existing stream's title update matches a row");
+        let reread = repo.get(stream.id).await.expect("get").expect("present");
+        assert_eq!(reread.title, "renamed live", "the new title is persisted");
+
+        // Updating a non-existent stream matches no row.
+        let missing = repo
+            .update_title(Ulid::new(), "ghost")
+            .await
+            .expect("update (missing)");
+        assert!(!missing, "an unknown stream id matches no row");
 
         // Cleanup so reruns stay self-contained.
         sqlx::query("DELETE FROM streams WHERE owner_id = $1")
