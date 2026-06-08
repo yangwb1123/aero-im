@@ -73,6 +73,10 @@ impl AiBackend for AiServiceAdapter {
         self.inner.translate(text, target_lang).await.map_err(|e| e.to_string())
     }
 
+    async fn summarize_text(&self, text: &str) -> Result<String, String> {
+        self.inner.summarize_text(text).await.map_err(|e| e.to_string())
+    }
+
     async fn moderate(&self, text: &str) -> Result<Option<String>, String> {
         self.inner.moderate(text).await.map_err(|e| e.to_string())
     }

@@ -419,6 +419,37 @@ async fn handle_text(
                 Ok(None) => {}
                 Err(e) => tracing::warn!(error = ?e, %call_id, "unanswered_callees lookup failed"),
             }
+            // Post-call AI recap (Wave 23): if the call left a transcript and an
+            // AI backend is wired, summarize what was said and store it onto the
+            // call session. Out-of-band + best-effort — never fails the call-end
+            // relay; degrades to a heuristic digest when no LLM key is configured.
+            if let Some(ai) = &state.ai {
+                let transcripts = aero_storage::CallTranscriptRepo::new(state.pg.clone());
+                match transcripts.lines(call_id).await {
+                    Ok(lines) if !lines.is_empty() => {
+                        let joined = lines
+                            .iter()
+                            .map(|l| format!("{}: {}", l.speaker_id, l.text))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        match ai.summarize_text(&joined).await {
+                            Ok(recap) if !recap.trim().is_empty() => {
+                                if let Err(e) = transcripts.set_recap(call_id, &recap).await {
+                                    tracing::warn!(error = ?e, %call_id, "call recap store failed");
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                tracing::warn!(error = %e, %call_id, "call recap summarize failed");
+                            }
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!(error = ?e, %call_id, "call transcript lines lookup failed");
+                    }
+                }
+            }
         }
         ClientFrame::CallCaption { call_id, room_id, text, lang, target_lang, is_final } => {
             let text = text.trim().to_string();
@@ -441,6 +472,19 @@ async fn handle_text(
                 }
                 _ => (None, None),
             };
+            // Persist final caption lines as a durable call transcript (the
+            // post-call AI recap is generated on CallEnd from these). Store the
+            // translated text when one was produced, else the original. Best-effort
+            // — never blocks or fails the low-latency caption relay.
+            if is_final {
+                let line = translated.as_deref().unwrap_or(text.as_str());
+                if let Err(e) = aero_storage::CallTranscriptRepo::new(state.pg.clone())
+                    .append(call_id, pid, line)
+                    .await
+                {
+                    tracing::warn!(error = ?e, %call_id, "call transcript append failed");
+                }
+            }
             state
                 .im
                 .relay_call_event(

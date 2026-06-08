@@ -145,6 +145,37 @@ impl AiService {
         Ok(heuristic_summary(&recent))
     }
 
+    /// Summarize an arbitrary block of text into a short recap + action items.
+    ///
+    /// Mirrors [`Self::summarize_room`] but summarizes the GIVEN text rather than
+    /// a room's message history — used for the post-call meeting recap, where the
+    /// caller joins a call's persisted transcript lines into one block. With an
+    /// Anthropic key it prompts the `complete` primitive for a concise recap with
+    /// action items; without a key it falls back to the SAME heuristic style
+    /// [`Self::summarize_room`] uses (a truncated first-lines digest). Never errors
+    /// on a missing key. Empty/blank input returns an empty string.
+    ///
+    /// # Errors
+    /// Propagates an Anthropic failure when a key IS configured; the no-key path
+    /// is infallible.
+    pub async fn summarize_text(&self, text: &str) -> Result<String> {
+        let text = text.trim();
+        if text.is_empty() {
+            return Ok(String::new());
+        }
+
+        if let Some(client) = &self.anthropic {
+            let system = RECAP_SYSTEM_PROMPT;
+            let user = format!(
+                "请阅读以下通话/会议记录,并按照系统指令给出简短复盘与行动项。\n\n记录:\n{text}"
+            );
+            let msgs = vec![ChatMsg::user(user)];
+            return client.complete(system, &msgs, 600).await;
+        }
+
+        Ok(heuristic_text_digest(text))
+    }
+
     // ---------- question answering ----------
 
     /// Answer a question grounded in a room's history.
@@ -319,6 +350,15 @@ const SUMMARIZE_SYSTEM_PROMPT: &str = "\
 \n\
 约束:不要复述原文,不要超过 200 字,不要使用 Markdown 标题,只输出无序列表项(以 `-` 开头)。";
 
+const RECAP_SYSTEM_PROMPT: &str = "\
+你是一个通话/会议复盘助手,服务于即时通讯系统。请阅读给定的通话字幕记录,用中文以无序列表\
+(每条 1-2 行)输出简短复盘,按以下结构组织:\n\
+- 摘要:本次通话讨论的关键话题或结论\n\
+- 决定:已经达成的共识或决策(若无可省略)\n\
+- 行动项:谁在何时之前需要做什么(若无可省略)\n\
+\n\
+约束:不要复述原文,不要超过 200 字,不要使用 Markdown 标题,只输出无序列表项(以 `-` 开头)。";
+
 const TRANSLATE_SYSTEM_PROMPT: &str = "\
 你是一个实时字幕翻译引擎。把用户提供的口语化文本翻译成目标语言,保持简洁口语风格。\
 只输出译文本身,不要添加任何解释、注释、标点修饰或引号。";
@@ -396,6 +436,25 @@ fn heuristic_summary(messages: &[Message]) -> String {
     lines.join("\n")
 }
 
+/// First-lines digest fallback used by [`AiService::summarize_text`] when
+/// Anthropic is disabled. Mirrors [`heuristic_summary`]'s shape: the first up-to-5
+/// non-blank lines of the text, each collapsed to one line, truncated, and
+/// rendered as a `-` bullet. Empty input yields an empty string.
+fn heuristic_text_digest(text: &str) -> String {
+    let mut lines = Vec::with_capacity(5);
+    for raw in text.lines() {
+        let one_line = raw.trim();
+        if one_line.is_empty() {
+            continue;
+        }
+        lines.push(format!("- {}", truncate_for_summary(one_line, 120)));
+        if lines.len() == 5 {
+            break;
+        }
+    }
+    lines.join("\n")
+}
+
 fn truncate_for_summary(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
@@ -458,6 +517,23 @@ mod tests {
     #[test]
     fn heuristic_summary_empty_when_no_messages() {
         assert_eq!(heuristic_summary(&[]), "");
+    }
+
+    #[test]
+    fn heuristic_text_digest_takes_first_five_nonblank_lines() {
+        let text = "line 0\n\n  line 1  \nline 2\nline 3\nline 4\nline 5\nline 6";
+        let d = heuristic_text_digest(text);
+        let lines: Vec<&str> = d.lines().collect();
+        assert_eq!(lines.len(), 5, "capped at 5 lines");
+        assert!(lines[0].starts_with("- "), "bullet form, got {}", lines[0]);
+        assert!(lines[0].contains("line 0"));
+        assert!(lines[1].contains("line 1"), "blank line skipped, whitespace trimmed");
+        assert!(lines[4].contains("line 4"));
+    }
+
+    #[test]
+    fn heuristic_text_digest_empty_when_blank() {
+        assert_eq!(heuristic_text_digest("   \n\n  "), "");
     }
 
     #[test]

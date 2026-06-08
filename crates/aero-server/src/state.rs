@@ -55,6 +55,11 @@ pub trait AiBackend: Send + Sync + 'static {
     /// Translate text into `target_lang`. Used for live call captions (P3).
     /// Echoes the source text when no LLM is configured.
     async fn translate(&self, text: &str, target_lang: &str) -> Result<String, String>;
+    /// Summarize an arbitrary block of text into a short recap + action items.
+    /// Used for the post-call meeting recap (the caller joins a call's persisted
+    /// transcript lines into one block). Degrades to a heuristic first-lines digest
+    /// when no LLM key is configured; never errors on a missing key.
+    async fn summarize_text(&self, text: &str) -> Result<String, String>;
     /// Moderate a message body (P5). `Some(reason)` blocks, `None` allows.
     /// Returns `None` when no LLM is configured.
     async fn moderate(&self, text: &str) -> Result<Option<String>, String>;

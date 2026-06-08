@@ -3,7 +3,7 @@
 AI-Native 即时通讯 + 直播平台,Rust 实现。
 
 - 设计:[`docs/specs/2026-05-22-aero-im-design.md`](docs/specs/2026-05-22-aero-im-design.md)
-- 状态:**P0–P11 全部就位** + **22 轮 To-B 协作/企业扩展**(85 个功能点,迁移 0001–0063)。媒体面协议栈深化(WHIP/WHEP + SFU 联播/RTCP + SRT 加密/可靠性)已实现并字节级单测(**817 个 hermetic 单元测试通过**,15 个 crate)
+- 状态:**P0–P11 全部就位** + **23 轮 To-B 协作/企业扩展**(86 个功能点,迁移 0001–0064)。媒体面协议栈深化(WHIP/WHEP + SFU 联播/RTCP + SRT 加密/可靠性)已实现并字节级单测(**819 个 hermetic 单元测试通过**,15 个 crate)
 
 ## 功能矩阵
 
@@ -71,6 +71,8 @@ AI-Native 即时通讯 + 直播平台,Rust 实现。
 | **会话/设备管理** | 活跃登录会话清单 + 撤销单个 / "登出其它所有设备"(与刷新令牌吊销联动, Wave 21) | ✅ |
 | **动态 feed / 开播通知** | 通用每用户动态 feed;关注的创作者开播 → 持久"开播"通知(独立于消息收件箱,golive_bot 总线扇出, Wave 21) | ✅ |
 | **未接来电通知** | 通话无人接听即结束 → 被叫的动态 feed 收到"未接来电"(已接听则不记, Wave 22) | ✅ |
+| **通话纪要 / AI 复盘** | 持久化最终字幕行,通话结束自动 AI 复盘(无 key 退化为启发式摘要);`/api/calls/:id/{transcript,recap}` 房间内可读(Wave 23) | ✅ |
+| **测试基线** | `cargo test --workspace --lib` = **819 通过 / 0 失败**;~35 个 PG 门控 db_test;每轮活冒烟(含 WS) | ✅ |
 
 ## 架构
 
@@ -224,7 +226,7 @@ ffmpeg -re -i sample.mp4 -c:v libx264 -c:a aac -f flv rtmp://localhost/live/<str
 
 ```bash
 cargo check --workspace          # 干净
-cargo test --workspace --lib     # 817 pass / 0 fail / 130 ignored(DB 集成,需 --ignored + DATABASE_URL)
+cargo test --workspace --lib     # 819 pass / 0 fail / 134 ignored(DB 集成,需 --ignored + DATABASE_URL)
 cargo build --bin aero-server    # 二进制成功
 cargo clippy -p aero-live-srt -p aero-live-webrtc -p aero-live-whip --all-targets  # 媒体面 crate 零告警
 # 注:`cargo clippy --workspace --all-targets` 在 aero-storage/aero-server 等既有 crate 下仍有 pedantic 告警(非本批次引入,待清理)

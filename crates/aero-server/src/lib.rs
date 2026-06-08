@@ -109,4 +109,7 @@ pub mod activity;
 pub mod golive_bot;
 pub mod sessions;
 
+// ---- Wave 23 ----
+pub mod call_recap;
+
 pub use state::AppState;

@@ -268,7 +268,12 @@ pub fn build(state: AppState) -> Router {
         .merge(crate::sessions::routes())
         // Activity feed: durable per-participant notices (e.g. a followed creator
         // going live), distinct from the message+room-scoped notification inbox.
-        .merge(crate::activity::routes());
+        .merge(crate::activity::routes())
+        // ---- Wave 23 ----
+        // Call-transcript persistence + post-call AI recap: read a call's persisted
+        // final caption lines and the AI summary produced when the call ended. The
+        // write path is the WS caption relay + CallEnd hook (see crate::ws).
+        .merge(crate::call_recap::routes());
 
     // Prometheus scrape endpoint (ROADMAP 方向四). Mounted unless disabled; the
     // handler self-gates on an optional bearer token. Left here (not behind the

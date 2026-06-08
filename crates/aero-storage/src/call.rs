@@ -113,6 +113,20 @@ impl CallRepo {
         Ok(rows.into_iter().map(CallSession::from).collect())
     }
 
+    /// The room a call belongs to, or `None` if the call id is unknown. Used to
+    /// access-gate per-call reads (transcript / recap) against the call's room.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the query.
+    pub async fn room_id(&self, id: CallId) -> Result<Option<RoomId>, sqlx::Error> {
+        let row: Option<(uuid::Uuid,)> =
+            sqlx::query_as(r"SELECT room_id FROM call_sessions WHERE id = $1")
+                .bind(id.to_uuid())
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map(|(r,)| RoomId::from_uuid(r)))
+    }
+
     /// Mark a call answered (first answer wins; later answers are no-ops). Lets a
     /// later [`end`](Self::end) distinguish a connected call from a missed one.
     ///
