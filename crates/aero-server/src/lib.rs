@@ -115,4 +115,7 @@ pub mod call_recap;
 // ---- Wave 24 ----
 pub mod workspace_security;
 
+// ---- Wave 16 Round 9 ----
+pub mod online;
+
 pub use state::AppState;

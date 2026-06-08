@@ -285,7 +285,12 @@ pub fn build(state: AppState) -> Router {
         // Workspace-wide 2FA enforcement: admin toggles require_2fa; the gate is in
         // ImService::assert_room_access (a require-2FA member without activated TOTP
         // is locked out of room data until they enroll via /api/me/2fa).
-        .merge(crate::workspace_security::routes());
+        .merge(crate::workspace_security::routes())
+        // ---- Wave 16 Round 9 ----
+        // Per-room online roster + count: who is currently connected via WebSocket
+        // in a room (in-process hub view). Useful for sidebar decoration and
+        // mobile background badge polling without a persistent WS connection.
+        .merge(crate::online::routes());
 
     // Prometheus scrape endpoint (ROADMAP 方向四). Mounted unless disabled; the
     // handler self-gates on an optional bearer token. Left here (not behind the
