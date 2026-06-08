@@ -370,6 +370,11 @@ async fn handle_text(
                     CallEvent::Answer { call_id, from: pid, to, sdp },
                 )
                 .await?;
+            // Mark the call answered so a later End is not flagged as missed
+            // (first answer wins; best-effort — never fails the relay).
+            if let Err(e) = state.calls.mark_answered(call_id).await {
+                tracing::warn!(error = ?e, %call_id, "mark_answered failed");
+            }
         }
         ClientFrame::CallIce { call_id, room_id, to, candidate } => {
             state
@@ -393,6 +398,27 @@ async fn handle_text(
                     },
                 )
                 .await?;
+            // Missed-call: if the call ended while never answered, drop a durable
+            // "call_missed" notice into each callee's activity feed (Wave 21).
+            // Out-of-band + best-effort — never fails the call-end relay.
+            match state.calls.unanswered_callees(call_id).await {
+                Ok(Some((initiator, callees))) => {
+                    let feed = aero_storage::ActivityFeedRepo::new(state.pg.clone());
+                    for callee in callees {
+                        if callee == initiator {
+                            continue;
+                        }
+                        if let Err(e) = feed
+                            .insert(callee, "call_missed", Some(initiator), Some(call_id.0), "Missed call")
+                            .await
+                        {
+                            tracing::warn!(error = ?e, %callee, "missed-call activity insert failed");
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => tracing::warn!(error = ?e, %call_id, "unanswered_callees lookup failed"),
+            }
         }
         ClientFrame::CallCaption { call_id, room_id, text, lang, target_lang, is_final } => {
             let text = text.trim().to_string();
