@@ -3,7 +3,7 @@
 AI-Native 即时通讯 + 直播平台,Rust 实现。
 
 - 设计:[`docs/specs/2026-05-22-aero-im-design.md`](docs/specs/2026-05-22-aero-im-design.md)
-- 状态:**P0–P11 全部就位** + **24 轮 To-B 协作/企业扩展**(87 个功能点,迁移 0001–0065)。媒体面协议栈深化(WHIP/WHEP + SFU 联播/RTCP + SRT 加密/可靠性)已实现并字节级单测(**819 个 hermetic 单元测试通过**,15 个 crate)
+- 状态:**P0–P11 全部就位** + **24 轮 To-B 协作/企业扩展**(87 个功能点,迁移 0001–0065)。全部 ROADMAP 功能需求已完成:内容安全(Anthropic 审核)、通话编排(CallOrchestrator + SFU)、SRT 可靠性(pump 回路)、WHIP 级联(WhepUpstreamSource)、AI 流式 + 会话记忆;媒体面协议栈深化(WHIP/WHEP + SFU 联播/RTCP + SRT 加密/可靠性)已实现并字节级单测(**841 个 hermetic 单元测试通过**,15 个 crate)
 
 ## 功能矩阵
 
@@ -106,7 +106,7 @@ AI-Native 即时通讯 + 直播平台,Rust 实现。
 - **aero-auth** — Argon2id + RS256 JWT + Axum extractor
 - **aero-signaling** — WebRTC IceServer / RtcConfig / SDP+ICE 校验 / CallRoster
 - **aero-im-core** — ImService(消息/编辑/删除/反应/已读/通话编排)+ KeywordModerator
-- **aero-im-call** — (P3+ 占位)
+- **aero-im-call** — 通话编排:`CallOrchestrator`(start/answer/end/join/leave + `SfuRouter` 对等管理 + 漏接检测)
 - **aero-ai** — Anthropic / Voyage / HashEmbedder / AiService / AiWorker
 - **aero-live-core** — LiveStreamConfig + LiveIngest trait + IngestEvent
 - **aero-live-hls** — HlsWriter(滚动 m3u8)+ FlvToTsConverter(真 MPEG-TS)
