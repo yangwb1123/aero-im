@@ -26,6 +26,7 @@ use aero_storage::revoked_token::{hash_token, RevokedTokenRepo};
 use aero_storage::{ParticipantRepo, SessionRepo};
 use axum::{
     extract::{Path, State},
+    http::StatusCode,
     routing::{get, post},
     Json, Router,
 };
@@ -41,6 +42,8 @@ pub fn routes() -> Router<AppState> {
         .route("/api/auth/sessions/:sid", axum::routing::delete(revoke_session))
         .route("/api/auth/sessions/revoke-others", post(revoke_others))
         .route("/api/auth/change-password", post(change_password))
+        .route("/api/auth/change-email", post(change_email))
+        .route("/api/me", axum::routing::delete(delete_me))
 }
 
 /// Build a [`SessionRepo`] from shared state, over the shared pool.
@@ -139,6 +142,17 @@ struct ChangePasswordReq {
     new_password: String,
 }
 
+#[derive(Deserialize)]
+struct ChangeEmailReq {
+    current_password: String,
+    new_email: String,
+}
+
+#[derive(Deserialize)]
+struct DeleteMeReq {
+    password: String,
+}
+
 /// `POST /api/auth/change-password` — update the authenticated user's password.
 ///
 /// 1. Verifies `current_password` against the stored hash.
@@ -194,4 +208,108 @@ async fn change_password(
     }
 
     Ok(Json(serde_json::json!({ "sessions_invalidated": revoked.len() })))
+}
+
+/// `POST /api/auth/change-email` — update the authenticated user's email address.
+///
+/// 1. Verifies `current_password` against the stored hash (guards against
+///    hijacked sessions making silent email changes).
+/// 2. Validates basic email shape (must contain `@` and a `.` after it).
+/// 3. Persists the new address; a unique-constraint violation returns `409` so
+///    the caller can detect "that address is already in use".
+/// 4. Returns `{ "email": "new@example.com" }` on success. No session revocation
+///    — an email change alone does not invalidate existing login sessions.
+async fn change_email(
+    State(s): State<AppState>,
+    auth: AuthUser,
+    Json(req): Json<ChangeEmailReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let participants = ParticipantRepo::new(s.pg.clone());
+
+    // Verify the caller's current password before allowing a silent email swap.
+    let creds = participants
+        .find_credentials_by_participant_id(auth.participant_id)
+        .await
+        .map_err(AeroError::from)?
+        .ok_or_else(|| AeroError::Forbidden("no credentials for this account".into()))?;
+    auth_password::verify(&req.current_password, &creds.password_hash)
+        .map_err(|_| AeroError::Unauthorized("current_password is incorrect".into()))?;
+
+    // Lightweight format check: must contain '@' with a '.' somewhere after it.
+    let email = req.new_email.trim().to_ascii_lowercase();
+    let valid = email
+        .find('@')
+        .and_then(|at| email[at + 1..].find('.'))
+        .is_some();
+    if !valid || email.len() < 5 {
+        return Err(AeroError::Invalid("new_email is not a valid address".into()).into());
+    }
+    if email == creds.email {
+        return Err(AeroError::Invalid("new_email must differ from the current address".into()).into());
+    }
+
+    participants
+        .update_email(auth.participant_id, &email)
+        .await
+        .map_err(|e| {
+            // UniqueViolation → 409 Conflict so the caller knows the address is taken.
+            if let sqlx::Error::Database(ref db) = e {
+                if db.code().as_deref() == Some("23505") {
+                    return AeroError::Conflict("that email address is already in use".into());
+                }
+            }
+            AeroError::from(e)
+        })?;
+
+    Ok(Json(serde_json::json!({ "email": email })))
+}
+
+/// `DELETE /api/me` — permanently delete the caller's account.
+///
+/// Requires the caller's `password` in the request body as a second factor
+/// of intent — a hijacked access token alone is not enough to destroy an account.
+///
+/// Steps:
+/// 1. Verify password against the stored hash.
+/// 2. Revoke + blacklist all active sessions so concurrent devices are signed out
+///    before the row vanishes.
+/// 3. Hard-delete the participant row; FK cascades handle credentials,
+///    `room_members`, `auth_sessions`, etc.
+/// 4. Returns `204 No Content` on success.
+async fn delete_me(
+    State(s): State<AppState>,
+    auth: AuthUser,
+    Json(req): Json<DeleteMeReq>,
+) -> ApiResult<StatusCode> {
+    let participants = ParticipantRepo::new(s.pg.clone());
+
+    // Password confirmation guards against accidental or hijacked deletion.
+    let creds = participants
+        .find_credentials_by_participant_id(auth.participant_id)
+        .await
+        .map_err(AeroError::from)?
+        .ok_or_else(|| AeroError::Forbidden("no credentials for this account".into()))?;
+    auth_password::verify(&req.password, &creds.password_hash)
+        .map_err(|_| AeroError::Unauthorized("password is incorrect".into()))?;
+
+    // Revoke and blacklist all active sessions so concurrent devices are kicked.
+    let revoked = repo(&s)
+        .revoke_all_for_participant(auth.participant_id)
+        .await
+        .map_err(AeroError::from)?;
+    let blacklist = RevokedTokenRepo::new(s.pg.clone());
+    for hash in &revoked {
+        blacklist
+            .revoke(hash, Some(auth.participant_id))
+            .await
+            .map_err(AeroError::from)?;
+    }
+
+    // Hard-delete; FK cascades remove credentials, room_members, etc.
+    participants
+        .delete_participant(auth.participant_id)
+        .await
+        .map_err(AeroError::from)?;
+
+    Ok(StatusCode::NO_CONTENT)
 }

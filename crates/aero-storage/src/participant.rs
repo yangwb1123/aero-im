@@ -109,6 +109,51 @@ impl ParticipantRepo {
         }))
     }
 
+    /// Replace the email address stored for a participant.
+    ///
+    /// Returns `true` if the row existed and was updated, `false` when no
+    /// credentials row exists for that participant (bots/agents). Propagates a
+    /// unique-constraint violation as-is so callers can map it to `409 Conflict`.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the update, including a
+    /// `UniqueViolation` if `new_email` is already taken by another account.
+    pub async fn update_email(
+        &self,
+        participant_id: ParticipantId,
+        new_email: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let rows = sqlx::query(
+            "UPDATE credentials SET email = $1 WHERE participant_id = $2",
+        )
+        .bind(new_email)
+        .bind(participant_id.to_uuid())
+        .execute(&self.pool)
+        .await?;
+        Ok(rows.rows_affected() > 0)
+    }
+
+    /// Hard-delete a participant and all dependent rows.
+    ///
+    /// The `participants` table is referenced by many FK columns that carry
+    /// `ON DELETE CASCADE` (`credentials`, `room_members`, `auth_sessions`, …), so a
+    /// single delete of the root row removes everything in one transaction.
+    /// Returns `true` when the row existed and was deleted, `false` when the id
+    /// was already absent (idempotent).
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the delete.
+    pub async fn delete_participant(
+        &self,
+        participant_id: ParticipantId,
+    ) -> Result<bool, sqlx::Error> {
+        let rows = sqlx::query("DELETE FROM participants WHERE id = $1")
+            .bind(participant_id.to_uuid())
+            .execute(&self.pool)
+            .await?;
+        Ok(rows.rows_affected() > 0)
+    }
+
     /// Replace the password hash stored for a participant.
     ///
     /// Returns `true` if the row existed and was updated, `false` when no
