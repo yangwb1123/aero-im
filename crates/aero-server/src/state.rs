@@ -1,5 +1,6 @@
 //! Shared application state injected into Axum handlers.
 
+use std::pin::Pin;
 use std::sync::Arc;
 
 use aero_auth::AuthService;
@@ -63,6 +64,23 @@ pub trait AiBackend: Send + Sync + 'static {
     /// Moderate a message body (P5). `Some(reason)` blocks, `None` allows.
     /// Returns `None` when no LLM is configured.
     async fn moderate(&self, text: &str) -> Result<Option<String>, String>;
+    /// Streaming variant of [`AiBackend::answer_question`].
+    ///
+    /// Returns `(citations, stream)` so the UI can render source chips before
+    /// the first token arrives. Stream items are `Ok(text_chunk)` or
+    /// `Err(message)` on a mid-stream error.
+    async fn answer_question_stream(
+        &self,
+        room: aero_common::RoomId,
+        question: &str,
+        k: usize,
+    ) -> Result<
+        (
+            Vec<aero_common::MessageId>,
+            Pin<Box<dyn futures::Stream<Item = Result<String, String>> + Send + 'static>>,
+        ),
+        String,
+    >;
 }
 
 #[derive(Debug, Clone)]

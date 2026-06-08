@@ -2,6 +2,8 @@
 
 use std::str::FromStr;
 
+use futures::StreamExt as _;
+
 use aero_auth::{AuthUser, LoginRequest, RegisterRequest};
 use aero_common::{
     BlobId, Error as AeroError, FileKind, MessageId, ParticipantId, Result as AeroResult, RoomId,
@@ -12,7 +14,10 @@ use aero_storage::{blob::NewBlob, stream::NewStream};
 use axum::{
     extract::{Multipart, Path, Query, State},
     http::{header, StatusCode},
-    response::IntoResponse,
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse,
+    },
     routing::{get, post},
     Json, Router,
 };
@@ -51,6 +56,7 @@ pub fn build(state: AppState) -> Router {
         // AI
         .route("/api/ai/summarize", post(ai_summarize))
         .route("/api/ai/ask", post(ai_ask))
+        .route("/api/ai/ask/stream", post(ai_ask_stream))
         // Live streams
         .route("/api/streams", post(stream_create).get(stream_list))
         .route("/api/streams/:id", get(stream_get))
@@ -1070,6 +1076,69 @@ async fn ai_ask(
         "answer": answer.answer,
         "citations": answer.citations,
     })))
+}
+
+/// Streaming variant of `ai_ask`.
+///
+/// Returns a Server-Sent Events stream with three event types:
+/// - `event: citations` — JSON array of message-ID strings; emitted first,
+///   before the first token, so the UI can render source chips immediately.
+/// - `event: delta` — one UTF-8 text fragment per Anthropic SSE chunk.
+/// - `event: done` — empty data; signals end of generation.
+/// - `event: error` — non-fatal; stream continues but a warning is logged.
+async fn ai_ask_stream(
+    State(s): State<AppState>,
+    auth: AuthUser,
+    Json(req): Json<AiAskReq>,
+) -> impl IntoResponse {
+    let room = match parse_room_id(&req.room_id) {
+        Ok(r) => r,
+        Err(e) => return crate::error::ApiError::from(e).into_response(),
+    };
+    if let Err(e) = s.im.assert_room_access(auth.participant_id, room).await {
+        return crate::error::ApiError::from(e).into_response();
+    }
+    let k = req.k.unwrap_or(8);
+
+    let Some(ai) = s.ai.as_ref() else {
+        let event = Event::default().event("done").data("AI not configured");
+        let stream = futures::stream::once(async move {
+            Ok::<_, std::convert::Infallible>(event)
+        });
+        return Sse::new(stream).into_response();
+    };
+    let ai = ai.clone();
+
+    let (citations, text_stream) =
+        match ai.answer_question_stream(room, &req.question, k).await {
+            Ok(v) => v,
+            Err(e) => {
+                return crate::error::ApiError::from(AeroError::Upstream(format!("ai: {e}")))
+                    .into_response();
+            }
+        };
+
+    let citations_json =
+        serde_json::to_string(&citations.iter().map(ToString::to_string).collect::<Vec<_>>())
+            .unwrap_or_else(|_| "[]".to_string());
+
+    let event_stream = futures::stream::once(async move {
+        Ok::<_, std::convert::Infallible>(
+            Event::default().event("citations").data(citations_json),
+        )
+    })
+    .chain(text_stream.map(|r| match r {
+        Ok(text) => Ok(Event::default().event("delta").data(text)),
+        Err(e) => {
+            tracing::warn!(error = %e, "ai stream chunk error");
+            Ok(Event::default().event("error").data(e))
+        }
+    }))
+    .chain(futures::stream::once(async {
+        Ok::<_, std::convert::Infallible>(Event::default().event("done").data(""))
+    }));
+
+    Sse::new(event_stream).keep_alive(KeepAlive::default()).into_response()
 }
 
 // ----- Streams (P4) -----

@@ -3,11 +3,13 @@
 //! aero-ai surface and lets us swap implementations later (e.g. local model,
 //! a managed agent service) without touching the routes.
 
+use std::pin::Pin;
 use std::sync::Arc;
 
 use aero_ai::AiService;
 use aero_common::{MessageId, ParticipantId, RoomId, WorkspaceId};
 use async_trait::async_trait;
+use futures::StreamExt as _;
 
 use crate::state::{AiAnswer, AiBackend};
 
@@ -79,5 +81,27 @@ impl AiBackend for AiServiceAdapter {
 
     async fn moderate(&self, text: &str) -> Result<Option<String>, String> {
         self.inner.moderate(text).await.map_err(|e| e.to_string())
+    }
+
+    async fn answer_question_stream(
+        &self,
+        room: RoomId,
+        question: &str,
+        k: usize,
+    ) -> Result<
+        (
+            Vec<MessageId>,
+            Pin<Box<dyn futures::Stream<Item = Result<String, String>> + Send + 'static>>,
+        ),
+        String,
+    > {
+        let (citations, stream) = self
+            .inner
+            .answer_question_stream(room, question, k)
+            .await
+            .map_err(|e| e.to_string())?;
+        let boxed: Pin<Box<dyn futures::Stream<Item = Result<String, String>> + Send + 'static>> =
+            Box::pin(stream.map(|r| r.map_err(|e| e.to_string())));
+        Ok((citations, boxed))
     }
 }

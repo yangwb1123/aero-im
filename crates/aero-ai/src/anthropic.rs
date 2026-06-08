@@ -1,14 +1,18 @@
 //! Thin client for the Anthropic Messages API.
 //!
-//! Only the subset we need: a single `complete()` call that takes a system prompt
-//! plus an ordered list of `(role, content)` turns and returns the concatenated
-//! text of the assistant's reply. Streaming and tool use are deliberately out of
-//! scope for P2 — the surface stays small so callers (summarize / answer) don't
-//! pay for features they don't use.
+//! Two call modes:
+//! - [`AnthropicClient::complete`] — batch: waits for the full reply, returns `String`.
+//! - [`AnthropicClient::complete_stream`] — streaming: sets `"stream":true`, parses
+//!   the SSE response, and yields text-delta chunks as they arrive. Callers get
+//!   lower time-to-first-token without changing the billing model.
 
+use std::collections::VecDeque;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
+use futures::stream::{Stream, StreamExt as _};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{AiError, Result};
@@ -153,6 +157,79 @@ impl AnthropicClient {
             })
             .collect::<String>())
     }
+
+    /// Stream the assistant's reply as text-delta chunks.
+    ///
+    /// Sets `"stream": true`; the Anthropic API responds with Server-Sent Events.
+    /// Only `content_block_delta` / `text_delta` events are yielded — all other
+    /// event types (`ping`, `message_start`, etc.) are silently dropped.
+    ///
+    /// # Errors
+    /// Returns `AiError::Invalid` if `messages` is empty, `AiError::Http` on
+    /// network errors, or `AiError::Anthropic` for non-2xx HTTP status.
+    pub async fn complete_stream(
+        &self,
+        system: &str,
+        messages: &[ChatMsg],
+        max_tokens: u32,
+    ) -> Result<impl Stream<Item = Result<String>> + Send + 'static> {
+        if messages.is_empty() {
+            return Err(AiError::Invalid("messages must not be empty".into()));
+        }
+
+        let body = StreamRequestBody {
+            model: self.model.clone(),
+            max_tokens,
+            system: system.to_string(),
+            messages: messages.to_vec(),
+            stream: true,
+        };
+
+        let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
+        let resp = self
+            .http
+            .post(&url)
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", API_VERSION)
+            .header("content-type", "application/json")
+            .json(&body)
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if !status.is_success() {
+            let raw = resp.text().await?;
+            return Err(AiError::Anthropic {
+                status: status.as_u16(),
+                message: truncate(&raw, 1024),
+            });
+        }
+
+        let byte_stream: Pin<Box<dyn Stream<Item = reqwest::Result<Bytes>> + Send>> =
+            Box::pin(resp.bytes_stream());
+
+        let stream = futures::stream::unfold(
+            (byte_stream, SseParser::default()),
+            |(mut bs, mut parser)| async move {
+                loop {
+                    if let Some(text) = parser.next_chunk() {
+                        return Some((Ok(text), (bs, parser)));
+                    }
+                    match bs.next().await {
+                        None => return None,
+                        Some(Err(e)) => {
+                            return Some((Err(AiError::Http(e.to_string())), (bs, parser)));
+                        }
+                        Some(Ok(bytes)) => {
+                            parser.push_bytes(&bytes);
+                        }
+                    }
+                }
+            },
+        );
+
+        Ok(stream)
+    }
 }
 
 // ---------- wire types ----------
@@ -177,6 +254,82 @@ enum ContentBlock {
     Text { text: String },
     #[serde(other)]
     Other,
+}
+
+/// Streaming request body — identical to [`RequestBody`] plus `"stream": true`.
+#[derive(Serialize)]
+struct StreamRequestBody {
+    model: String,
+    max_tokens: u32,
+    system: String,
+    messages: Vec<ChatMsg>,
+    stream: bool,
+}
+
+/// Incremental SSE parser for the Anthropic streaming response.
+///
+/// Anthropic frames each event as two header lines plus a blank separator:
+/// ```text
+/// event: content_block_delta
+/// data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"..."}}
+///
+/// ```
+/// We buffer raw bytes, split on `\n\n`, and extract text only from
+/// `content_block_delta` / `text_delta` pairs. Other event types are dropped.
+#[derive(Default)]
+struct SseParser {
+    buffer: String,
+    pending: VecDeque<String>,
+}
+
+impl SseParser {
+    fn push_bytes(&mut self, bytes: &Bytes) {
+        if let Ok(s) = std::str::from_utf8(bytes) {
+            self.buffer.push_str(s);
+            self.drain_events();
+        }
+    }
+
+    fn drain_events(&mut self) {
+        while let Some(pos) = self.buffer.find("\n\n") {
+            let block = self.buffer[..pos].to_string();
+            self.buffer.drain(..pos + 2);
+            if let Some(text) = extract_text_delta(&block) {
+                self.pending.push_back(text);
+            }
+        }
+    }
+
+    fn next_chunk(&mut self) -> Option<String> {
+        self.pending.pop_front()
+    }
+}
+
+/// Extract a text fragment from a single SSE event block.
+///
+/// Returns `Some(text)` only for `event: content_block_delta` blocks where
+/// `delta.type == "text_delta"`. All other events return `None`.
+fn extract_text_delta(block: &str) -> Option<String> {
+    let mut event_type: Option<&str> = None;
+    let mut data_json: Option<&str> = None;
+
+    for line in block.lines() {
+        if let Some(v) = line.strip_prefix("event: ") {
+            event_type = Some(v.trim());
+        } else if let Some(v) = line.strip_prefix("data: ") {
+            data_json = Some(v.trim());
+        }
+    }
+
+    if event_type? != "content_block_delta" {
+        return None;
+    }
+    let json: serde_json::Value = serde_json::from_str(data_json?).ok()?;
+    let delta = json.get("delta")?;
+    if delta.get("type")?.as_str()? != "text_delta" {
+        return None;
+    }
+    Some(delta.get("text")?.as_str()?.to_string())
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -249,5 +402,52 @@ mod tests {
         assert!(t.ends_with("..."));
         // Should not panic on non-ASCII boundary
         assert!(t.is_char_boundary(t.len()));
+    }
+
+    #[test]
+    fn sse_parser_extracts_text_delta() {
+        let block = "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"Hello\"}}";
+        assert_eq!(extract_text_delta(block), Some("Hello".into()));
+    }
+
+    #[test]
+    fn sse_parser_ignores_non_delta_events() {
+        let ping = "event: ping\ndata: {}";
+        assert_eq!(extract_text_delta(ping), None);
+
+        let start = "event: message_start\ndata: {\"type\":\"message_start\"}";
+        assert_eq!(extract_text_delta(start), None);
+    }
+
+    #[test]
+    fn sse_parser_ignores_non_text_delta_type() {
+        let block = "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\"}}";
+        assert_eq!(extract_text_delta(block), None);
+    }
+
+    #[test]
+    fn sse_parser_buffers_across_chunks() {
+        let mut p = SseParser::default();
+        // Split an event across two byte deliveries.
+        let part1 = b"event: content_block_delta\ndata: {\"type\":\"content_block_delt";
+        let part2 = b"a\",\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n";
+        p.push_bytes(&Bytes::from(part1.as_slice()));
+        assert_eq!(p.next_chunk(), None, "event not yet complete");
+        p.push_bytes(&Bytes::from(part2.as_slice()));
+        assert_eq!(p.next_chunk(), Some("Hi".into()));
+        assert_eq!(p.next_chunk(), None);
+    }
+
+    #[test]
+    fn sse_parser_queues_multiple_chunks() {
+        let mut p = SseParser::default();
+        let raw = concat!(
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"A\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"B\"}}\n\n",
+        );
+        p.push_bytes(&Bytes::from(raw.as_bytes()));
+        assert_eq!(p.next_chunk(), Some("A".into()));
+        assert_eq!(p.next_chunk(), Some("B".into()));
+        assert_eq!(p.next_chunk(), None);
     }
 }

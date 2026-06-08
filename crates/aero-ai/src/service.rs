@@ -16,6 +16,10 @@ use std::sync::Arc;
 use aero_common::{Message, MessageId, ParticipantId, RoomId, WorkspaceId};
 use aero_storage::{AiJobRepo, MessageRepo, RoomRepo, SearchHit};
 
+use std::pin::Pin;
+
+use futures::stream::Stream;
+
 use crate::anthropic::{AnthropicClient, ChatMsg};
 use crate::embed::{default_embedder, Embedder};
 use crate::error::{AiError, Result};
@@ -225,6 +229,57 @@ impl AiService {
             format!("（未配置 Anthropic,以下为检索到的相关消息上下文:）\n\n{context}")
         };
         Ok(AnswerResult { answer: fallback, citations })
+    }
+
+    /// Streaming variant of [`Self::answer_question`].
+    ///
+    /// Returns `(citations, stream)` where `citations` is available immediately
+    /// (before the first token arrives) so the UI can render source chips without
+    /// waiting for generation to finish.
+    ///
+    /// Without Anthropic the fallback answer is returned as a single-item stream
+    /// so callers need not special-case the no-key path.
+    ///
+    /// # Errors
+    /// Returns [`AiError::Invalid`] for an empty question; otherwise propagates
+    /// embedder, storage, or Anthropic failures.
+    pub async fn answer_question_stream(
+        &self,
+        room: RoomId,
+        question: &str,
+        k: usize,
+    ) -> Result<(Vec<MessageId>, Pin<Box<dyn Stream<Item = Result<String>> + Send + 'static>>)> {
+        let q = question.trim();
+        if q.is_empty() {
+            return Err(AiError::Invalid("question must not be empty".into()));
+        }
+        #[allow(clippy::cast_possible_wrap)]
+        let k = k.clamp(1, 20) as i64;
+
+        let query_vec = self.embedder.embed_one(q).await?;
+        let hits: Vec<SearchHit> = self.messages.search_vector(room, query_vec, k).await?;
+
+        let citations: Vec<MessageId> = hits.iter().map(|h| h.message.id).collect();
+        let context = render_context(&hits);
+
+        if let Some(client) = &self.anthropic {
+            let user = format!(
+                "问题: {q}\n\n相关聊天上下文(每段已附 ID,引用时使用):\n{context}\n\n请基于上述上下文作答,若信息不足请说明。"
+            );
+            let stream = client
+                .complete_stream(ANSWER_SYSTEM_PROMPT, &[ChatMsg::user(user)], 800)
+                .await?;
+            return Ok((citations, Box::pin(stream)));
+        }
+
+        let fallback = if hits.is_empty() {
+            "（未配置 Anthropic,也未在房间内检索到相关消息。）".to_string()
+        } else {
+            format!("（未配置 Anthropic,以下为检索到的相关消息上下文:）\n\n{context}")
+        };
+        let stream: Pin<Box<dyn Stream<Item = Result<String>> + Send + 'static>> =
+            Box::pin(futures::stream::once(async move { Ok(fallback) }));
+        Ok((citations, stream))
     }
 
     /// Answer a question grounded in EVERY room the caller belongs to within a
