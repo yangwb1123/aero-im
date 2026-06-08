@@ -19,7 +19,8 @@ use aero_common::{PinOp, PinnedMessage};
 use aero_storage::{
     message::NewMessage, AiJobKind, AiJobRepo, CallRepo, DeactivationRepo, KeywordAlertRepo,
     MessageEditRepo, MessageRepo, NotificationPrefsRepo, NotificationRepo, ParticipantRepo, PinRepo,
-    ReactionRepo, ReceiptRepo, RoomRepo, ThreadSubscriptionRepo, UserGroupRepo, WorkspaceRepo,
+    ReactionRepo, ReceiptRepo, RoomRepo, ThreadSubscriptionRepo, TotpRepo, UserGroupRepo,
+    WorkspaceRepo,
 };
 use async_trait::async_trait;
 use std::collections::BTreeMap;
@@ -162,6 +163,11 @@ pub struct ImService {
     /// [`assert_room_access`](Self::assert_room_access) denies a member who has
     /// been deactivated in the room's workspace (Wave 14).
     deactivations: Option<DeactivationRepo>,
+    /// Workspace 2FA-enforcement store. Optional builder
+    /// ([`with_totp`](Self::with_totp)); when present,
+    /// [`assert_room_access`](Self::assert_room_access) denies a member of a
+    /// `require_2fa` workspace who has not activated TOTP (Wave 24).
+    totp: Option<TotpRepo>,
     bus: Arc<dyn BusSink>,
     moderator: Arc<dyn Moderator>,
 }
@@ -204,6 +210,7 @@ impl ImService {
             keyword_alerts: None,
             thread_subs: None,
             deactivations: None,
+            totp: None,
             bus: bus as Arc<dyn BusSink>,
             moderator,
         }
@@ -303,6 +310,15 @@ impl ImService {
         self
     }
 
+    /// Wire the TOTP store so [`assert_room_access`](Self::assert_room_access)
+    /// enforces a workspace's `require_2fa` mandate (Wave 24). Additive builder;
+    /// without it, no 2FA gate is applied.
+    #[must_use]
+    pub fn with_totp(mut self, totp: TotpRepo) -> Self {
+        self.totp = Some(totp);
+        self
+    }
+
     /// Notification suppression seam for per-channel mute + per-user
     /// Do-Not-Disturb + one-off snooze. Returns whether a notification should be
     /// delivered to `recipient` for `room`: `false` when the recipient has MUTED
@@ -373,6 +389,7 @@ impl ImService {
             keyword_alerts: None,
             thread_subs: None,
             deactivations: None,
+            totp: None,
             bus,
             moderator: Arc::new(crate::moderator::AllowAllModerator),
         }
@@ -500,6 +517,20 @@ impl ImService {
         let is_room_member = self.rooms.is_member(room, participant).await?;
 
         if can_access_room(is_workspace_member, is_room_member) {
+            // 2FA enforcement gate (Wave 24): if this room's workspace mandates
+            // two-factor, a member who has not activated TOTP is locked out of its
+            // room data until they enroll. The `/api/me/2fa/*` enroll routes are not
+            // room-gated, so enrollment stays reachable. No-op when the store isn't
+            // wired or the workspace doesn't require 2FA.
+            if let Some(totp) = self.totp.as_ref() {
+                if self.workspaces()?.require_2fa(workspace).await?
+                    && !totp.is_activated(participant).await?
+                {
+                    return Err(Error::Forbidden(format!(
+                        "2fa_required: workspace {workspace} mandates two-factor auth; enroll via /api/me/2fa"
+                    )));
+                }
+            }
             Ok(())
         } else {
             Err(Error::Forbidden(format!(

@@ -27,7 +27,7 @@ use aero_server::{
 use aero_storage::{
     connect_pg, migrate, AiJobRepo, AuditRepo, BlobRepo, CallRepo, CallRosterStore, KeyPackageRepo,
     LiveRepo, LocalFsBlobStore, MessageRepo, MlsGroupRepo, NotificationPrefsRepo, NotificationRepo,
-    DeactivationRepo, KeywordAlertRepo, MessageEditRepo, ParticipantRepo, PatRepo, PinRepo,
+    DeactivationRepo, KeywordAlertRepo, MessageEditRepo, ParticipantRepo, PatRepo, PinRepo, TotpRepo,
     PresenceStore, ReactionRepo, ReceiptRepo, RecurringMessageRepo, RedisCache, RoomRepo,
     StreamRepo, StreamRouteRegistry, StreamViewerStore, ThreadSubscriptionRepo, UserGroupRepo,
     WorkspaceRepo,
@@ -154,7 +154,9 @@ async fn main() -> anyhow::Result<()> {
         // Wave 11: thread-follow notifications (reply → root-message subscribers).
         .with_thread_subs(ThreadSubscriptionRepo::new(pg.clone()))
         // Wave 14: workspace deactivation gate in assert_room_access.
-        .with_deactivations(DeactivationRepo::new(pg.clone())),
+        .with_deactivations(DeactivationRepo::new(pg.clone()))
+        // Wave 24: workspace-wide 2FA enforcement gate in assert_room_access.
+        .with_totp(TotpRepo::new(pg.clone())),
     );
 
     // ---------- Live service (danmaku / gifts / viewers) ----------

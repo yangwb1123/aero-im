@@ -273,7 +273,12 @@ pub fn build(state: AppState) -> Router {
         // Call-transcript persistence + post-call AI recap: read a call's persisted
         // final caption lines and the AI summary produced when the call ended. The
         // write path is the WS caption relay + CallEnd hook (see crate::ws).
-        .merge(crate::call_recap::routes());
+        .merge(crate::call_recap::routes())
+        // ---- Wave 24 ----
+        // Workspace-wide 2FA enforcement: admin toggles require_2fa; the gate is in
+        // ImService::assert_room_access (a require-2FA member without activated TOTP
+        // is locked out of room data until they enroll via /api/me/2fa).
+        .merge(crate::workspace_security::routes());
 
     // Prometheus scrape endpoint (ROADMAP 方向四). Mounted unless disabled; the
     // handler self-gates on an optional bearer token. Left here (not behind the

@@ -112,4 +112,7 @@ pub mod sessions;
 // ---- Wave 23 ----
 pub mod call_recap;
 
+// ---- Wave 24 ----
+pub mod workspace_security;
+
 pub use state::AppState;

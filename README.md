@@ -3,7 +3,7 @@
 AI-Native 即时通讯 + 直播平台,Rust 实现。
 
 - 设计:[`docs/specs/2026-05-22-aero-im-design.md`](docs/specs/2026-05-22-aero-im-design.md)
-- 状态:**P0–P11 全部就位** + **23 轮 To-B 协作/企业扩展**(86 个功能点,迁移 0001–0064)。媒体面协议栈深化(WHIP/WHEP + SFU 联播/RTCP + SRT 加密/可靠性)已实现并字节级单测(**819 个 hermetic 单元测试通过**,15 个 crate)
+- 状态:**P0–P11 全部就位** + **24 轮 To-B 协作/企业扩展**(87 个功能点,迁移 0001–0065)。媒体面协议栈深化(WHIP/WHEP + SFU 联播/RTCP + SRT 加密/可靠性)已实现并字节级单测(**819 个 hermetic 单元测试通过**,15 个 crate)
 
 ## 功能矩阵
 
@@ -72,6 +72,7 @@ AI-Native 即时通讯 + 直播平台,Rust 实现。
 | **动态 feed / 开播通知** | 通用每用户动态 feed;关注的创作者开播 → 持久"开播"通知(独立于消息收件箱,golive_bot 总线扇出, Wave 21) | ✅ |
 | **未接来电通知** | 通话无人接听即结束 → 被叫的动态 feed 收到"未接来电"(已接听则不记, Wave 22) | ✅ |
 | **通话纪要 / AI 复盘** | 持久化最终字幕行,通话结束自动 AI 复盘(无 key 退化为启发式摘要);`/api/calls/:id/{transcript,recap}` 房间内可读(Wave 23) | ✅ |
+| **工作区强制 2FA** | 管理员开启后,未启用 TOTP 的成员被 `assert_room_access` 挡在该工作区房间数据外,直至完成 enroll(`/api/me/2fa` 不受此门控, Wave 24) | ✅ |
 | **测试基线** | `cargo test --workspace --lib` = **819 通过 / 0 失败**;~35 个 PG 门控 db_test;每轮活冒烟(含 WS) | ✅ |
 
 ## 架构

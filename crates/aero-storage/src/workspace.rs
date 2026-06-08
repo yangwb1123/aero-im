@@ -628,6 +628,38 @@ impl WorkspaceRepo {
         Ok(row.and_then(|(d,)| d))
     }
 
+    /// Set whether this workspace mandates two-factor auth for its members
+    /// (migration 0065). Admin-gated at the route layer; enforced in
+    /// [`ImService::assert_room_access`](../../aero_im_core/index.html).
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the update.
+    pub async fn set_require_2fa(
+        &self,
+        workspace: WorkspaceId,
+        require: bool,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(r"UPDATE workspaces SET require_2fa = $2 WHERE id = $1")
+            .bind(workspace.to_uuid())
+            .bind(require)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Whether this workspace mandates two-factor auth. `false` for an unknown
+    /// workspace (fail-open: no workspace ⇒ no mandate).
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the query.
+    pub async fn require_2fa(&self, workspace: WorkspaceId) -> Result<bool, sqlx::Error> {
+        let row = sqlx::query_as::<_, (bool,)>(r"SELECT require_2fa FROM workspaces WHERE id = $1")
+            .bind(workspace.to_uuid())
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.is_some_and(|(r,)| r))
+    }
+
     /// Soft-delete every not-already-deleted message whose room belongs to a
     /// workspace that has a retention policy and whose `created_at` is older than
     /// that workspace's window, as of `now`. Returns the number of messages
