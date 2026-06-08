@@ -963,7 +963,8 @@ impl ImService {
         self.publish_room_event(updated.room_id, &RoomEvent::Edited(updated.clone()))
             .await;
 
-        if !updated.searchable_text().is_empty() {
+        let edit_text = updated.searchable_text();
+        if !edit_text.is_empty() {
             let ws = self
                 .rooms
                 .room_workspace(updated.room_id)
@@ -982,6 +983,20 @@ impl ImService {
                 .await
             {
                 warn!(?err, %id, "enqueue re-embed failed");
+            }
+            // Re-moderate the edited content: an edit can introduce harmful text
+            // that bypassed the original send-time keyword check. Best-effort.
+            if let Err(err) = self
+                .ai_jobs
+                .enqueue(
+                    AiJobKind::Moderate,
+                    Some(updated.id.to_uuid()),
+                    ws,
+                    serde_json::json!({"text": edit_text}),
+                )
+                .await
+            {
+                warn!(?err, %id, "enqueue re-moderate failed");
             }
         }
         Ok(updated)
