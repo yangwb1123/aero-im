@@ -1495,19 +1495,26 @@ impl ImService {
             }
         }
 
+        // Filter by mute / DND / snooze, then persist ALL survivors in ONE batch
+        // INSERT (ROADMAP 第三版 方向四 — write amplification). Previously each
+        // recipient was a separate INSERT transaction, so a large-room @everyone
+        // was O(N) PG round-trips on the send path. NB the per-recipient
+        // should_notify reads and the targeted Notify publishes remain O(N) —
+        // batching those prefs reads and moving the live publishes off the hot
+        // path are noted follow-ups; the dominant write cost is collapsed here.
+        let mut notifiable: Vec<(ParticipantId, NotificationKind)> = Vec::with_capacity(targets.len());
         for (recipient, kind) in targets {
-            // Per-channel mute / Do-Not-Disturb: skip recipients who have silenced
-            // this room or are in a DND window (fail-open if prefs unavailable).
-            if !self.should_notify(recipient, room).await {
-                continue;
+            if self.should_notify(recipient, room).await {
+                notifiable.push((recipient, kind));
             }
-            if let Err(err) = repo
-                .insert(recipient, room, message.id, kind, Some(sender))
-                .await
-            {
-                warn!(?err, %recipient, "persist notification failed");
-                continue;
-            }
+        }
+        if let Err(err) = repo.insert_many(room, message.id, Some(sender), &notifiable).await {
+            warn!(?err, %room, count = notifiable.len(), "batch persist notifications failed");
+            return;
+        }
+        // Targeted live hints: one Notify per recipient (the WS layer routes each
+        // to its single recipient via `explicit_recipients`). Best-effort.
+        for (recipient, kind) in notifiable {
             self.publish_room_event(
                 room,
                 &RoomEvent::Notify {

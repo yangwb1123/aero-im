@@ -66,6 +66,46 @@ impl NotificationRepo {
         Ok(id)
     }
 
+    /// Batch-insert notifications for many recipients of ONE message in a single
+    /// round-trip (ROADMAP 第三版 方向四 — write amplification). A large-room
+    /// `@everyone` previously did one INSERT transaction per recipient (O(N) PG
+    /// round-trips on the send path); this collapses them to a single multi-row
+    /// INSERT via `UNNEST`. `room`/`message`/`actor`/`created_at` are constant
+    /// across the batch; only `participant` + `kind` vary. Returns the row count.
+    /// A no-op (Ok(0)) for an empty `recipients`.
+    pub async fn insert_many(
+        &self,
+        room: RoomId,
+        message: MessageId,
+        actor: Option<ParticipantId>,
+        recipients: &[(ParticipantId, NotificationKind)],
+    ) -> Result<u64, sqlx::Error> {
+        if recipients.is_empty() {
+            return Ok(0);
+        }
+        let created_at = time::OffsetDateTime::now_utc();
+        let ids: Vec<uuid::Uuid> = recipients.iter().map(|_| NotificationId::new().to_uuid()).collect();
+        let pids: Vec<uuid::Uuid> = recipients.iter().map(|(p, _)| p.to_uuid()).collect();
+        let kinds: Vec<String> = recipients.iter().map(|(_, k)| k.as_str().to_owned()).collect();
+        let actor_uuid = actor.map(|a| a.to_uuid());
+        let res = sqlx::query(
+            r"INSERT INTO notifications
+                 (id, participant_id, room_id, message_id, kind, actor_id, created_at)
+              SELECT u.id, u.pid, $4, $5, u.kind, $6, $7
+                FROM UNNEST($1::uuid[], $2::uuid[], $3::text[]) AS u(id, pid, kind)",
+        )
+        .bind(&ids)
+        .bind(&pids)
+        .bind(&kinds)
+        .bind(room.to_uuid())
+        .bind(message.to_uuid())
+        .bind(actor_uuid)
+        .bind(created_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
     /// List a participant's notifications, newest first, paginated by a keyset
     /// cursor. `before` is an exclusive upper bound (pass the oldest id from the
     /// previous page to fetch the next). When `unread_only`, soft-filters to rows
