@@ -12,4 +12,12 @@ workspace = true
 [dependencies]
 aero-common.workspace = true
 aero-signaling.workspace = true
+aero-storage.workspace = true
+aero-live-webrtc.workspace = true
 tracing.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+sqlx = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
