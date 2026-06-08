@@ -407,6 +407,18 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // ---------- Out-of-office auto-responder bot (Wave 17) ----------
+    // Subscribes to room messages and, for any 1:1 DM whose other member has an
+    // active out-of-office status, posts their OOO message back once per sender.
+    {
+        let state_clone = state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = aero_server::ooo_bot::run(state_clone).await {
+                tracing::error!(error = ?e, "ooo_bot listener exited");
+            }
+        });
+    }
+
     // ---------- Voice transcript dispatcher ----------
     {
         let state_clone = state.clone();

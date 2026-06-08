@@ -79,6 +79,14 @@ pub mod creator_subscription;
 pub mod directory;
 pub mod stream_category;
 
+// ---- Wave 17 ----
+pub mod approval;
+pub mod legal_hold;
+pub mod org_chart;
+pub mod out_of_office;
+pub mod task;
+pub mod workspace_files;
+
 pub use ai_job::{AiJob, AiJobKind, AiJobRepo, AiJobStatus};
 pub use audit::{AuditEvent, AuditRepo};
 pub use blob::{BlobRepo, NewBlob};
@@ -171,3 +179,11 @@ pub use channel_bookmark::{ChannelBookmark, ChannelBookmarkRepo};
 pub use creator_subscription::{CreatorSubscription, CreatorTier, SubscriptionRepo};
 pub use directory::{DirectoryEntry, DirectoryRepo};
 pub use stream_category::{StreamCategory, StreamCategoryRepo};
+
+// ---- Wave 17 re-exports ----
+pub use approval::{Approval, ApprovalRepo};
+pub use legal_hold::{LegalHold, LegalHoldRepo};
+pub use org_chart::{OrgChartRepo, DEFAULT_CHAIN_DEPTH, MAX_CHAIN_DEPTH};
+pub use out_of_office::{within_window, OutOfOffice, OutOfOfficeRepo};
+pub use task::{validate_status, Task, TaskRepo};
+pub use workspace_files::{WorkspaceFile, WorkspaceFileRepo};

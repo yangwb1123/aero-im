@@ -232,6 +232,26 @@ define_id!(
     /// creator at a chosen tier (at most one per creator/subscriber pair).
     SubscriptionId
 );
+// ---- Wave 17 ----
+define_id!(
+    /// Identifies a legal hold / retention exemption — an admin-placed
+    /// preservation order over a single room (or, when its `room_id` is NULL, a
+    /// whole workspace) that exempts the covered messages from the periodic
+    /// retention sweep until released (eDiscovery preservation).
+    LegalHoldId
+);
+define_id!(
+    /// Identifies a task / to-do item tracked in a room — a durable, assignable,
+    /// stateful work item (title + optional assignee/due-date/source-message),
+    /// distinct from the AI action-item extraction that only summarizes.
+    TaskId
+);
+define_id!(
+    /// Identifies an approval request — a lightweight workspace-scoped approval
+    /// (Lark 审批 / approvals-lite): a requester addresses a single approver who
+    /// approves or denies it with an optional note (single-approver MVP).
+    ApprovalId
+);
 
 #[cfg(test)]
 mod tests {

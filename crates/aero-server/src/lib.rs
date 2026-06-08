@@ -81,4 +81,13 @@ pub mod directory;
 pub mod stream_discovery;
 pub mod subscriptions;
 
+// ---- Wave 17 ----
+pub mod approvals;
+pub mod legal_holds;
+pub mod ooo;
+pub mod ooo_bot;
+pub mod org_chart;
+pub mod tasks;
+pub mod workspace_files;
+
 pub use state::AppState;

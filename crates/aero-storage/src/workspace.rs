@@ -667,7 +667,13 @@ impl WorkspaceRepo {
                 AND w.retention_days IS NOT NULL
                 AND w.retention_days > 0
                 AND ($2::uuid IS NULL OR w.id = $2)
-                AND m.created_at < $1 - make_interval(days => w.retention_days)",
+                AND m.created_at < $1 - make_interval(days => w.retention_days)
+                AND NOT EXISTS (
+                      SELECT 1 FROM legal_holds lh
+                       WHERE lh.active
+                         AND (lh.room_id = r.id
+                              OR (lh.room_id IS NULL AND lh.workspace_id = r.workspace_id))
+                    )",
         )
         .bind(now)
         .bind(only.map(|w| w.to_uuid()))

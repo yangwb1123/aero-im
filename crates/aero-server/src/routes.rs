@@ -224,7 +224,22 @@ pub fn build(state: AppState) -> Router {
         // Workspace analytics: admin-only aggregate stats (overview/top-channels/timeline).
         .merge(crate::analytics::routes())
         // People directory: searchable workspace member list surfacing profile fields.
-        .merge(crate::directory::routes());
+        .merge(crate::directory::routes())
+        // ---- Wave 17 ----
+        // Out-of-office / auto-responder: self-service status CRUD (the bot delivers
+        // auto-replies out-of-band; see crate::ooo_bot, spawned in the bin).
+        .merge(crate::ooo::routes())
+        // Org chart / manager hierarchy: set/clear manager; read manager/reports/chain.
+        .merge(crate::org_chart::routes())
+        // Legal hold / retention exemption: admin holds a room/workspace; held rooms
+        // are excluded from the retention sweep (eDiscovery preservation).
+        .merge(crate::legal_holds::routes())
+        // Tasks / to-do tracker: durable assignable stateful room tasks.
+        .merge(crate::tasks::routes())
+        // Workspace-wide file browser: file attachments across the caller's rooms.
+        .merge(crate::workspace_files::routes())
+        // Approvals workflow (Lark 审批-lite): requester → single approver decision.
+        .merge(crate::approvals::routes());
 
     // Prometheus scrape endpoint (ROADMAP 方向四). Mounted unless disabled; the
     // handler self-gates on an optional bearer token. Left here (not behind the

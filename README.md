@@ -3,7 +3,7 @@
 AI-Native 即时通讯 + 直播平台,Rust 实现。
 
 - 设计:[`docs/specs/2026-05-22-aero-im-design.md`](docs/specs/2026-05-22-aero-im-design.md)
-- 状态:**P0–P11 全部就位** + **16 轮 To-B 协作/企业扩展**(65 个功能点,迁移 0001–0051)。媒体面协议栈深化(WHIP/WHEP + SFU 联播/RTCP + SRT 加密/可靠性)已实现并字节级单测(**789 个 hermetic 单元测试通过**,15 个 crate)
+- 状态:**P0–P11 全部就位** + **17 轮 To-B 协作/企业扩展**(71 个功能点,迁移 0001–0056)。媒体面协议栈深化(WHIP/WHEP + SFU 联播/RTCP + SRT 加密/可靠性)已实现并字节级单测(**801 个 hermetic 单元测试通过**,15 个 crate)
 
 ## 功能矩阵
 
@@ -51,6 +51,12 @@ AI-Native 即时通讯 + 直播平台,Rust 实现。
 | **创作者订阅** | 会员档位(名称·月费·权益)+ 订阅/退订 + 双向列表(补足一次性礼物的周期性支持, Wave 16) | ✅ |
 | **工作区分析** | 管理员聚合统计:总消息/近 7 日/房间数/成员数/活跃成员 + 热门频道 + 每日时间线(Wave 16) | ✅ |
 | **成员目录** | 工作区可搜索成员目录(姓名/职衔过滤,带 title·pronouns·timezone, Wave 16) | ✅ |
+| **缺勤自动回复** | 离开办公室状态(OOO)+ 后台 bot 在 1:1 私聊里对每个发送者自动回复一次(Wave 17) | ✅ |
+| **组织架构** | 汇报关系(经理/直属下属/汇报链,含环路保护, Wave 17) | ✅ |
+| **法务保全** | 法律保全/留存豁免:管理员对房间或工作区下保全令,留存清扫跳过被保全消息(eDiscovery, Wave 17) | ✅ |
+| **任务 / 待办** | 房间内可指派、带截止日与状态的任务(可由消息生成,区别于 AI 行动项提取, Wave 17) | ✅ |
+| **工作区文件浏览** | 跨成员所在全部房间聚合附件浏览(成员边界,Wave 17) | ✅ |
+| **审批流** | 工作区审批(Lark 审批-lite):请求人 → 单一审批人 批准/拒绝 + 备注(Wave 17) | ✅ |
 
 ## 架构
 
@@ -204,7 +210,7 @@ ffmpeg -re -i sample.mp4 -c:v libx264 -c:a aac -f flv rtmp://localhost/live/<str
 
 ```bash
 cargo check --workspace          # 干净
-cargo test --workspace --lib     # 789 pass / 0 fail / 112 ignored(DB 集成,需 --ignored + DATABASE_URL)
+cargo test --workspace --lib     # 801 pass / 0 fail / 121 ignored(DB 集成,需 --ignored + DATABASE_URL)
 cargo build --bin aero-server    # 二进制成功
 cargo clippy -p aero-live-srt -p aero-live-webrtc -p aero-live-whip --all-targets  # 媒体面 crate 零告警
 # 注:`cargo clippy --workspace --all-targets` 在 aero-storage/aero-server 等既有 crate 下仍有 pedantic 告警(非本批次引入,待清理)
