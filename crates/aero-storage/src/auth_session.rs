@@ -239,6 +239,28 @@ impl SessionRepo {
     ///
     /// # Errors
     /// Propagates any [`sqlx::Error`] from the update.
+    /// Revoke **all** active sessions for `participant`, including the current one.
+    ///
+    /// Returns the token hashes of every row that was revoked so callers can
+    /// blacklist them in `revoked_tokens`. Used by the password-change flow to
+    /// force re-authentication on every device after a credential rotation.
+    pub async fn revoke_all_for_participant(
+        &self,
+        participant: ParticipantId,
+    ) -> Result<Vec<String>, sqlx::Error> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            r"UPDATE auth_sessions
+                 SET revoked_at = now()
+               WHERE participant_id = $1
+                 AND revoked_at IS NULL
+           RETURNING token_hash",
+        )
+        .bind(participant.to_uuid())
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|r| r.0).collect())
+    }
+
     pub async fn revoke_others(
         &self,
         participant: ParticipantId,

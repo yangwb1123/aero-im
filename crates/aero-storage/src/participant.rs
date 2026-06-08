@@ -89,6 +89,45 @@ impl ParticipantRepo {
         }))
     }
 
+    /// Look up credentials by participant id (for password-change verification).
+    ///
+    /// Returns `None` when the participant has no credentials row (e.g. bots/agents).
+    pub async fn find_credentials_by_participant_id(
+        &self,
+        participant_id: ParticipantId,
+    ) -> Result<Option<CredentialRecord>, sqlx::Error> {
+        let row = sqlx::query_as::<_, (uuid::Uuid, String, String)>(
+            r#"SELECT participant_id, email, password_hash FROM credentials WHERE participant_id = $1"#,
+        )
+        .bind(participant_id.to_uuid())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(pid, email, hash)| CredentialRecord {
+            participant_id: ParticipantId::from_uuid(pid),
+            email,
+            password_hash: hash,
+        }))
+    }
+
+    /// Replace the password hash stored for a participant.
+    ///
+    /// Returns `true` if the row existed and was updated, `false` when no
+    /// credentials row exists for that participant (bots/agents).
+    pub async fn update_password_hash(
+        &self,
+        participant_id: ParticipantId,
+        new_hash: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let rows = sqlx::query(
+            r#"UPDATE credentials SET password_hash = $1 WHERE participant_id = $2"#,
+        )
+        .bind(new_hash)
+        .bind(participant_id.to_uuid())
+        .execute(&self.pool)
+        .await?;
+        Ok(rows.rows_affected() > 0)
+    }
+
     /// Create a non-human participant (Bot or Agent). No credentials row.
     pub async fn create_bot(
         &self,

@@ -20,10 +20,10 @@
 
 use std::str::FromStr;
 
-use aero_auth::AuthUser;
+use aero_auth::{password as auth_password, AuthUser};
 use aero_common::{Error as AeroError, SessionId};
 use aero_storage::revoked_token::{hash_token, RevokedTokenRepo};
-use aero_storage::SessionRepo;
+use aero_storage::{ParticipantRepo, SessionRepo};
 use axum::{
     extract::{Path, State},
     routing::{get, post},
@@ -40,6 +40,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/auth/sessions", get(list_sessions))
         .route("/api/auth/sessions/:sid", axum::routing::delete(revoke_session))
         .route("/api/auth/sessions/revoke-others", post(revoke_others))
+        .route("/api/auth/change-password", post(change_password))
 }
 
 /// Build a [`SessionRepo`] from shared state, over the shared pool.
@@ -130,4 +131,67 @@ async fn revoke_others(
             .map_err(AeroError::from)?;
     }
     Ok(Json(serde_json::json!({ "revoked_count": revoked.len() })))
+}
+
+#[derive(Deserialize)]
+struct ChangePasswordReq {
+    current_password: String,
+    new_password: String,
+}
+
+/// `POST /api/auth/change-password` — update the authenticated user's password.
+///
+/// 1. Verifies `current_password` against the stored hash.
+/// 2. Validates `new_password` meets strength requirements (≥ 8 chars).
+/// 3. Hashes and persists the new password.
+/// 4. Revokes **all** active sessions so every device is forced to log in again.
+/// 5. Blacklists every revoked refresh-token hash so refresh attempts `401`.
+///
+/// Returns `{ "sessions_invalidated": N }` on success. The caller's current
+/// session is included in the count — they must log in again immediately.
+async fn change_password(
+    State(s): State<AppState>,
+    auth: AuthUser,
+    Json(req): Json<ChangePasswordReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let participants = ParticipantRepo::new(s.pg.clone());
+
+    // Verify current password.
+    let creds = participants
+        .find_credentials_by_participant_id(auth.participant_id)
+        .await
+        .map_err(AeroError::from)?
+        .ok_or_else(|| AeroError::Forbidden("no credentials for this account".into()))?;
+    auth_password::verify(&req.current_password, &creds.password_hash)
+        .map_err(|_| AeroError::Unauthorized("current_password is incorrect".into()))?;
+
+    // Validate the new password.
+    if req.new_password.len() < 8 {
+        return Err(AeroError::Invalid("new_password must be at least 8 characters".into()).into());
+    }
+    if req.new_password == req.current_password {
+        return Err(AeroError::Invalid("new_password must differ from current_password".into()).into());
+    }
+
+    // Hash and store the new password.
+    let new_hash = auth_password::hash(&req.new_password)?;
+    participants
+        .update_password_hash(auth.participant_id, &new_hash)
+        .await
+        .map_err(AeroError::from)?;
+
+    // Revoke all sessions (including the current one) and blacklist their tokens.
+    let revoked = repo(&s)
+        .revoke_all_for_participant(auth.participant_id)
+        .await
+        .map_err(AeroError::from)?;
+    let blacklist = RevokedTokenRepo::new(s.pg.clone());
+    for hash in &revoked {
+        blacklist
+            .revoke(hash, Some(auth.participant_id))
+            .await
+            .map_err(AeroError::from)?;
+    }
+
+    Ok(Json(serde_json::json!({ "sessions_invalidated": revoked.len() })))
 }
