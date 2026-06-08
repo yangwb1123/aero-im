@@ -6,6 +6,20 @@
 
 ---
 
+> ## ✅ 交付状态(2026-06-08 更新,第二版五方向)
+>
+> 本文五个方向的**功能需求点已全部交付并验证**(897 单测 / 0 失败;`scripts/smoke_roadmap_v2.py` 19/19、`scripts/smoke_gap_close.py` 13/13 真机冒烟通过)。逐方向:
+>
+> - **方向三 安全加固 — DONE.** 刷新令牌轮换+吊销、上传 MIME 白名单+SHA-256 去重、按路由限流(`/login` 5/分、`/forgot-password` 3/时)。
+> - **方向四 GDPR — DONE.** 账号软删除+消息匿名化+会话吊销、`GET /api/me/export`、`blob_gc_queue`+后台 GC、逐消息附件 GC(带共享 blob 引用守卫)、特权操作审计(`message.deleted` 含摘要 / `stream_key.rotated` / `channel_role.changed` / `session.revoked`)。
+> - **方向二 移动推送 — DONE(至真实链路边界).** `push_tokens` 注册表、`aero-push`(FCM+APNs 网关,token-provider seam)、`push_bot` 分发(@提及/回复/未接来电/任务指派,死 token 回收);DND/snooze 经 `should_notify` 透传遵守。真实 FCM/APNs 网络往返需凭据,沙箱内不可验证(seam + mock 单测)。
+> - **方向一 集群就绪 — 大部分 DONE.** 房间 presence 跨节点(Redis sorted-set)、`S3BlobStore`(SigV4,AWS 向量单测)经 `AERO_BLOB_BACKEND` 切换、`PgPool` acquire+idle timeout。NATS 发布失败**刻意不返回 503**(持久化在先 + 重连回填 = 不丢数据,503 会致重发;以发布错误计数器为运营信号——见 `ImService::publish_room_event` 注释)。真实 S3/MinIO、第二节点为基础设施验证项。
+> - **方向五 可观测性 — DONE.** 消息吞吐 counter(按 `room_type`)+ histogram、NATS 消费积压 gauge、SRT/WHIP 媒体指标、AI 死信 gauge(按 `kind`)+管理 API、可配置 trace 采样率 + 高优先级强制采样。
+>
+> **未做的只剩:** 规模化精修(大型导出异步队列+24h 链接——同步导出已满足 GDPR 第 20 条;逐事件推送 badge 计数——能力已具备)、基础设施验证项(上述)、与既定非目标(MLS 端到端、联邦、原生移动 SDK)。
+
+---
+
 ## 0. 当前基线确认
 
 全局扫描确认以下部分已正确交付,后续工作建立在其之上:
