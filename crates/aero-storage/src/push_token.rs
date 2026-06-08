@@ -131,9 +131,8 @@ impl PushTokenRepo {
 
     /// Batch-fetch push tokens for multiple participants. Used by the push
     /// dispatch layer to look up all offline device tokens for a notification.
-    /// Returns at most `per_participant` tokens per participant (oldest first
-    /// after ordering by registered_at DESC, so the most-recently-registered
-    /// device is returned when limited).
+    /// Ordered by `registered_at` DESC within each participant, so the
+    /// most-recently-registered device sorts first.
     pub async fn tokens_for_participants(
         &self,
         participants: &[ParticipantId],
@@ -141,7 +140,7 @@ impl PushTokenRepo {
         if participants.is_empty() {
             return Ok(Vec::new());
         }
-        let uuids: Vec<Uuid> = participants.iter().map(|p| p.to_uuid()).collect();
+        let uuids: Vec<Uuid> = participants.iter().map(ParticipantId::to_uuid).collect();
         let rows = sqlx::query_as::<_, PushTokenRow>(
             r"SELECT id, participant_id, platform, token, registered_at
                FROM push_tokens
