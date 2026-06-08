@@ -46,6 +46,7 @@
 
 pub mod control;
 pub mod crypto;
+mod metrics;
 pub mod protocol;
 pub mod pump;
 pub mod reliability;
@@ -326,6 +327,10 @@ async fn handle_datagram(
                         .map_err(LiveError::Io)?;
                     let (id, session) = resolve_stream(repo, cfg, &stream_id).await?;
                     info!(%peer, stream_id = %id, sid = %stream_id, "SRT: handshake complete; streaming");
+                    // A new session is live: bump the process-wide gauge. The
+                    // matching decrement happens in `finalize_session`, the sole
+                    // teardown path for streaming peers.
+                    metrics::SessionCounter::added();
                     *entry = PeerState::Streaming {
                         stream_id: id,
                         session: Box::new(session),
@@ -345,6 +350,10 @@ async fn handle_datagram(
             // reliability layer can schedule ACK/NAK responses.
             let parsed_hdr = SrtHeader::parse(datagram);
             if parsed_hdr.is_some_and(|h| !h.is_control()) {
+                // Count inbound data datagrams + bytes on the established session.
+                // `feed_packet` itself attributes any detected loss to the
+                // packets-lost counter via the reliability NAK actions below.
+                metrics::record_datagram(datagram.len());
                 session.feed_packet(datagram).await?;
             } else {
                 debug!(%peer, "SRT: ignoring non-data control packet on established session");
@@ -393,7 +402,12 @@ fn data_payload(datagram: &[u8]) -> Option<&[u8]> {
 }
 
 /// Flush and finalize a session's HLS output, marking the stream ended.
+///
+/// This is the sole teardown path for an established (`Streaming`) peer, so it
+/// also decrements the process-wide active-sessions gauge here.
 async fn finalize_session(mut session: SrtSession, repo: &StreamRepo, stream_id: Option<ulid::Ulid>) {
+    // A streaming session is going away: re-publish the gauge one lower.
+    metrics::SessionCounter::removed();
     if let Err(e) = session.finish().await {
         warn!(error = %e, "SRT: error finalizing HLS on disconnect");
     }
@@ -570,6 +584,15 @@ impl SrtSession {
         // Drive the reliability state machine with the incoming sequence number.
         let now = std::time::Instant::now();
         let rel_actions = self.reliability.on_data(seq_no, now);
+        // Attribute detected loss to the packets-lost counter: each NAK reports
+        // an inclusive `[from, to]` range, so its span is the number of missing
+        // packets the receiver observed for that gap.
+        for action in &rel_actions {
+            if let Action::SendNak { from, to } = action {
+                let span = reliability::seq_diff(*from, *to) + 1;
+                metrics::record_lost(u64::try_from(span).unwrap_or(0));
+            }
+        }
         self.pending_actions.extend(rel_actions);
 
         // Decrypt the payload if we have a crypto context and the KK flag says
