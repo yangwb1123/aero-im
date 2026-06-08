@@ -15,6 +15,7 @@ members = [
     "crates/aero-live-webrtc",
     "crates/aero-live-srt",
     "crates/aero-ai",
+    "crates/aero-push",
     "crates/aero-server",
 ]
 
