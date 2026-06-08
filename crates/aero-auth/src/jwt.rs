@@ -26,6 +26,11 @@ pub enum TokenKind {
 }
 
 /// JWT payload. `sub` is the participant ULID rendered as a string.
+///
+/// `jti` is a per-token UUID v4 that makes every issued token globally unique,
+/// even when two tokens for the same participant are issued within the same
+/// second (identical `iat`). Without `jti`, same-second tokens produce the same
+/// content → the same `token_hash` → one session row instead of two.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Claims {
     pub sub: String,
@@ -33,6 +38,11 @@ pub struct Claims {
     pub iat: u64,
     pub exp: u64,
     pub kind: TokenKind,
+    /// Unique nonce (UUID v4). Populated by `JwtCodec::issue`; present in all
+    /// tokens generated from this version onward. Old tokens without `jti`
+    /// deserialize fine: serde defaults to an empty string, which is harmless.
+    #[serde(default)]
+    pub jti: String,
 }
 
 impl Claims {
@@ -98,6 +108,9 @@ impl JwtCodec {
     }
 
     /// Issues a new signed token for `participant` with the given `kind`.
+    ///
+    /// Each call generates a fresh `jti` (UUID v4) so tokens are globally unique
+    /// even when issued for the same participant within the same second.
     pub fn issue(&self, participant: ParticipantId, kind: TokenKind) -> Result<String> {
         let now = unix_now();
         let exp = now + self.ttl(kind).as_secs();
@@ -107,6 +120,7 @@ impl JwtCodec {
             iat: now,
             exp,
             kind,
+            jti: uuid::Uuid::new_v4().to_string(),
         };
         encode(&Header::new(Algorithm::RS256), &claims, &self.inner.encoding)
             .map_err(|e| Error::Internal(anyhow::anyhow!("jwt encode failed: {e}")))
@@ -214,6 +228,27 @@ mod tests {
         token.push(replacement);
         let res = c.verify(&token);
         assert!(matches!(res, Err(Error::Unauthorized(_))));
+    }
+
+    #[test]
+    fn same_second_tokens_are_distinct() {
+        // Two tokens for the same participant issued without any sleep must differ
+        // (different jti) so their hashes are distinct — Wave-21 session regression.
+        let c = codec(Duration::from_secs(3600), Duration::from_secs(3600));
+        let pid = ParticipantId::new();
+        let t1 = c.issue(pid, TokenKind::Refresh).unwrap();
+        let t2 = c.issue(pid, TokenKind::Refresh).unwrap();
+        assert_ne!(t1, t2, "same-second tokens must differ via jti");
+
+        // Both are still valid.
+        assert!(c.verify(&t1).is_ok());
+        assert!(c.verify(&t2).is_ok());
+
+        // jti is non-empty and the two values are distinct.
+        let c1 = c.verify(&t1).unwrap();
+        let c2 = c.verify(&t2).unwrap();
+        assert!(!c1.jti.is_empty(), "jti must be populated");
+        assert_ne!(c1.jti, c2.jti, "jti values must differ");
     }
 
     #[test]

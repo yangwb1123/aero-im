@@ -65,12 +65,10 @@ def sessions(token):
 def main():
     ts = int(time.time())
     say("setup: alice registers (device 1), then logs in twice more (devices 2 + 3)")
-    # NB refresh tokens are JWTs with second-granularity iat, so logins must be >1s
-    # apart to mint distinct tokens (one session row per distinct refresh-token hash).
+    # jti nonce (UUID v4) in every refresh token guarantees distinct hashes even
+    # when all three logins happen in the same second — no sleep needed.
     a1_access, a1_refresh, Apid = register("alice", ts)
-    time.sleep(1.1)
     a2_access, a2_refresh = login()
-    time.sleep(1.1)
     a3_access, a3_refresh = login()
     sl = sessions(a3_access)
     if len(sl) != 3:
