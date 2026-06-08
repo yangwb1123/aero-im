@@ -23,7 +23,9 @@ use std::str::FromStr;
 use aero_auth::{password as auth_password, AuthUser};
 use aero_common::{Error as AeroError, SessionId};
 use aero_storage::revoked_token::{hash_token, RevokedTokenRepo};
-use aero_storage::{ParticipantRepo, SessionRepo};
+use aero_storage::{
+    generate_reset_token, hash_reset_token, ParticipantRepo, PasswordResetRepo, SessionRepo,
+};
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -43,6 +45,8 @@ pub fn routes() -> Router<AppState> {
         .route("/api/auth/sessions/revoke-others", post(revoke_others))
         .route("/api/auth/change-password", post(change_password))
         .route("/api/auth/change-email", post(change_email))
+        .route("/api/auth/forgot-password", post(forgot_password))
+        .route("/api/auth/reset-password", post(reset_password))
         .route("/api/me", axum::routing::delete(delete_me))
 }
 
@@ -146,6 +150,17 @@ struct ChangePasswordReq {
 struct ChangeEmailReq {
     current_password: String,
     new_email: String,
+}
+
+#[derive(Deserialize)]
+struct ForgotPasswordReq {
+    email: String,
+}
+
+#[derive(Deserialize)]
+struct ResetPasswordReq {
+    token: String,
+    new_password: String,
 }
 
 #[derive(Deserialize)]
@@ -262,6 +277,93 @@ async fn change_email(
         })?;
 
     Ok(Json(serde_json::json!({ "email": email })))
+}
+
+/// `POST /api/auth/forgot-password` — issue a password-reset token for the
+/// given email address.
+///
+/// Always returns the same success body regardless of whether the address is
+/// registered — this prevents user-enumeration via error codes. When the address
+/// IS registered, a plaintext reset token is **logged** at INFO level (a real
+/// deployment would instead queue an email containing the token). The token
+/// expires in one hour and is single-use.
+async fn forgot_password(
+    State(s): State<AppState>,
+    Json(req): Json<ForgotPasswordReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let email = req.email.trim().to_ascii_lowercase();
+    // Best-effort: look up the participant; silently succeed if not found.
+    let participants = ParticipantRepo::new(s.pg.clone());
+    if let Ok(Some(creds)) = participants.find_credentials_by_email(&email).await {
+        let token = generate_reset_token();
+        let hash = hash_reset_token(&token);
+        let reset_repo = PasswordResetRepo::new(s.pg.clone());
+        // Best-effort: if storage fails, we log but still return success to
+        // avoid leaking whether the address is registered.
+        if let Err(e) = reset_repo
+            .create(creds.participant_id, &hash, aero_storage::RESET_TOKEN_TTL)
+            .await
+        {
+            tracing::warn!("failed to store reset token for {email}: {e}");
+        } else {
+            // In production this would dispatch an email with the token.
+            tracing::info!(
+                email = %email,
+                token = %token,
+                "password reset token issued (log-only; wire an email sender for production)"
+            );
+        }
+    }
+    Ok(Json(serde_json::json!({
+        "message": "If that address is registered, a reset link has been sent."
+    })))
+}
+
+/// `POST /api/auth/reset-password` — complete a password reset using a token
+/// issued by `POST /api/auth/forgot-password`.
+///
+/// Validates:
+/// - The token exists, has not been used, and has not expired.
+/// - The new password is at least 8 characters.
+///
+/// On success, updates the password hash and revokes all active sessions so
+/// every device is forced to log in with the new password.
+async fn reset_password(
+    State(s): State<AppState>,
+    Json(req): Json<ResetPasswordReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    if req.new_password.len() < 8 {
+        return Err(AeroError::Invalid("new_password must be at least 8 characters".into()).into());
+    }
+    let hash = hash_reset_token(req.token.trim());
+    let reset_repo = PasswordResetRepo::new(s.pg.clone());
+    let participant = reset_repo
+        .consume(&hash)
+        .await
+        .map_err(AeroError::from)?
+        .ok_or_else(|| AeroError::Unauthorized("reset token is invalid, expired, or already used".into()))?;
+
+    let new_hash = auth_password::hash(&req.new_password)?;
+    let participants = ParticipantRepo::new(s.pg.clone());
+    participants
+        .update_password_hash(participant, &new_hash)
+        .await
+        .map_err(AeroError::from)?;
+
+    // Revoke all active sessions and blacklist their tokens.
+    let revoked = repo(&s)
+        .revoke_all_for_participant(participant)
+        .await
+        .map_err(AeroError::from)?;
+    let blacklist = RevokedTokenRepo::new(s.pg.clone());
+    for h in &revoked {
+        blacklist
+            .revoke(h, Some(participant))
+            .await
+            .map_err(AeroError::from)?;
+    }
+
+    Ok(Json(serde_json::json!({ "ok": true, "sessions_invalidated": revoked.len() })))
 }
 
 /// `DELETE /api/me` — permanently delete the caller's account.

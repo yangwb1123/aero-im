@@ -100,6 +100,9 @@ pub mod info_barrier;
 pub mod activity_feed;
 pub mod auth_session;
 
+// ---- Wave 22 (Round 8) ----
+pub mod password_reset;
+
 pub use ai_context::{AiContextStore, MAX_TURNS as AI_CONTEXT_MAX_TURNS};
 pub use ai_job::{AiJob, AiJobKind, AiJobRepo, AiJobStatus};
 pub use audit::{AuditEvent, AuditRepo};
@@ -213,3 +216,7 @@ pub use info_barrier::{BarrierRepo, InfoBarrier};
 // ---- Wave 21 re-exports ----
 pub use activity_feed::{ActivityEntry, ActivityFeedRepo};
 pub use auth_session::{AuthSession, SessionRepo};
+pub use password_reset::{
+    generate_token as generate_reset_token, hash_reset_token, PasswordResetRepo,
+    DEFAULT_TTL as RESET_TOKEN_TTL,
+};
