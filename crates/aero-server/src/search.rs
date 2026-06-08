@@ -23,6 +23,27 @@ pub fn routes() -> Router<AppState> {
     Router::new().route("/api/search", post(search_all))
 }
 
+/// Default number of hits when the client doesn't specify a `limit`.
+const DEFAULT_SEARCH_LIMIT: i64 = 20;
+
+/// Hard ceiling on hits per search request. Cross-room search runs FTS/trigram
+/// scans, so an unbounded `limit` lets a single request materialise an
+/// arbitrarily large result set — memory + JSON-serialization pressure, and a
+/// cheap amplification/DoS vector against the shared DB pool. Every request is
+/// clamped to this bound regardless of what the client asks for.
+const MAX_SEARCH_LIMIT: i64 = 100;
+
+/// Clamp a client-supplied limit into `[1, MAX_SEARCH_LIMIT]`, defaulting a
+/// missing value to [`DEFAULT_SEARCH_LIMIT`].
+///
+/// A non-positive value (`0` or negative) floors up to `1` rather than erroring:
+/// search is best-effort and a degenerate limit should still return a
+/// deterministic, bounded result rather than an unbounded scan or an
+/// accidentally-empty one.
+fn clamp_search_limit(requested: Option<i64>) -> i64 {
+    requested.unwrap_or(DEFAULT_SEARCH_LIMIT).clamp(1, MAX_SEARCH_LIMIT)
+}
+
 #[derive(Deserialize)]
 struct SearchAllReq {
     query: String,
@@ -46,7 +67,7 @@ async fn search_all(
     if req.query.trim().is_empty() {
         return Err(AeroError::Invalid("empty query".into()).into());
     }
-    let limit = req.limit.unwrap_or(20);
+    let limit = clamp_search_limit(req.limit);
 
     let hits = match req.workspace_id.as_deref() {
         Some(raw) => {
@@ -73,4 +94,35 @@ async fn search_all(
             })
         }).collect::<Vec<_>>(),
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn search_limit_defaults_when_absent() {
+        assert_eq!(clamp_search_limit(None), DEFAULT_SEARCH_LIMIT);
+    }
+
+    #[test]
+    fn search_limit_clamps_to_ceiling() {
+        assert_eq!(clamp_search_limit(Some(1_000_000)), MAX_SEARCH_LIMIT);
+        assert_eq!(clamp_search_limit(Some(MAX_SEARCH_LIMIT + 1)), MAX_SEARCH_LIMIT);
+    }
+
+    #[test]
+    fn search_limit_floors_non_positive_to_one() {
+        // A degenerate limit must never reach SQL as 0 or a negative bind.
+        assert_eq!(clamp_search_limit(Some(0)), 1);
+        assert_eq!(clamp_search_limit(Some(-5)), 1);
+        assert_eq!(clamp_search_limit(Some(i64::MIN)), 1);
+    }
+
+    #[test]
+    fn search_limit_passes_through_in_range() {
+        assert_eq!(clamp_search_limit(Some(1)), 1);
+        assert_eq!(clamp_search_limit(Some(50)), 50);
+        assert_eq!(clamp_search_limit(Some(MAX_SEARCH_LIMIT)), MAX_SEARCH_LIMIT);
+    }
 }
