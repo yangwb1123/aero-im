@@ -5,7 +5,7 @@ use std::str::FromStr;
 use aero_auth::{AuthUser, LoginRequest, RegisterRequest};
 use aero_common::{
     BlobId, Error as AeroError, FileKind, MessageId, ParticipantId, Result as AeroResult, RoomId,
-    RoomKind, StreamProtocol, WorkspaceId, WorkspaceRole,
+    RoomKind, StreamEvent, StreamProtocol, StreamStatus, WorkspaceId, WorkspaceRole,
 };
 use aero_live_whip::{accept_whep_offer, accept_whip_offer, SessionError, WhipError};
 use aero_storage::{blob::NewBlob, stream::NewStream};
@@ -261,7 +261,14 @@ pub fn build(state: AppState) -> Router {
         // Snooze notifications: one-off pause until a timestamp (distinct from DND).
         .merge(crate::snooze::routes())
         // Workspace-wide RAG ask: cross-channel AI Q&A bounded by membership.
-        .merge(crate::workspace_ask::routes());
+        .merge(crate::workspace_ask::routes())
+        // ---- Wave 21 ----
+        // Active session inventory + remote / global sign-out: list active
+        // login sessions/devices, revoke one, or "sign out everywhere else".
+        .merge(crate::sessions::routes())
+        // Activity feed: durable per-participant notices (e.g. a followed creator
+        // going live), distinct from the message+room-scoped notification inbox.
+        .merge(crate::activity::routes());
 
     // Prometheus scrape endpoint (ROADMAP 方向四). Mounted unless disabled; the
     // handler self-gates on an optional bearer token. Left here (not behind the
@@ -381,8 +388,31 @@ async fn health_ready(State(s): State<AppState>) -> impl IntoResponse {
 
 // ----- Auth -----
 
+/// Best-effort: record an active login session keyed on the refresh token's hash
+/// (so it lines up with the revoked-token check), pulling the `User-Agent` from
+/// request headers when present. A failure here must NOT fail the login /
+/// registration, so any error is logged and swallowed. Wave 21.
+async fn record_session(
+    s: &AppState,
+    participant: ParticipantId,
+    refresh_token: &str,
+    headers: &header::HeaderMap,
+) {
+    let ua = headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok());
+    let hash = aero_storage::revoked_token::hash_token(refresh_token);
+    if let Err(e) = aero_storage::SessionRepo::new(s.pg.clone())
+        .record(participant, &hash, ua)
+        .await
+    {
+        tracing::warn!(error = ?e, %participant, "auth session record failed");
+    }
+}
+
 async fn auth_register(
     State(s): State<AppState>,
+    headers: header::HeaderMap,
     Json(req): Json<RegisterRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let out = s.auth.register(req).await?;
@@ -400,6 +430,8 @@ async fn auth_register(
     // Onboarding: auto-join the new participant into the default workspace's
     // default channels (Wave 12). Best-effort — never fails registration.
     crate::default_channels::auto_join_defaults(&s, DEFAULT_WORKSPACE_ID, out.participant.id).await;
+    // Wave 21: record the active session (best-effort; never fails registration).
+    record_session(&s, out.participant.id, &out.refresh_token, &headers).await;
     Ok(Json(serde_json::json!({
         "access_token": out.access_token,
         "refresh_token": out.refresh_token,
@@ -419,6 +451,7 @@ struct LoginReq {
 
 async fn auth_login(
     State(s): State<AppState>,
+    headers: header::HeaderMap,
     Json(req): Json<LoginReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let out = s
@@ -442,6 +475,9 @@ async fn auth_login(
             return Err(AeroError::Unauthorized("2fa_required".into()).into());
         }
     }
+    // Wave 21: record the active session (best-effort; never fails login). Done
+    // only after 2FA passes, so a half-completed login leaves no session row.
+    record_session(&s, out.participant.id, &out.refresh_token, &headers).await;
     Ok(Json(serde_json::json!({
         "access_token": out.access_token,
         "refresh_token": out.refresh_token,
@@ -1480,8 +1516,24 @@ async fn whip_post(
         tracing::warn!(error=?e, stream=%stream.id, "stream route publish failed");
     }
     let hls_path = format!("/hls/{}/index.m3u8", stream.id);
+    let was_live = matches!(stream.status, StreamStatus::Live);
     if let Err(e) = s.streams.mark_live(stream.id, &hls_path).await {
         tracing::warn!(error=?e, "mark live failed");
+    } else if !was_live {
+        // Announce the go-live on the live bus so the out-of-band golive_bot can fan
+        // out "went live" notices to the creator's followers (durable activity feed),
+        // without touching this ingest hot path. Only on the idle/ended->live edge,
+        // so a republish of an already-live stream does not re-notify. Best-effort.
+        let event = StreamEvent::Status { stream_id: stream.id, status: StreamStatus::Live };
+        match serde_json::to_vec(&event) {
+            Ok(bytes) => {
+                let subject = crate::live::LiveService::live_subject(stream.id);
+                if let Err(e) = s.bus.publish(&subject, bytes.into()).await {
+                    tracing::warn!(error=?e, stream=%stream.id, "go-live publish failed");
+                }
+            }
+            Err(e) => tracing::warn!(error=?e, "serialize go-live event failed"),
+        }
     }
     let mut resp = (
         StatusCode::CREATED,

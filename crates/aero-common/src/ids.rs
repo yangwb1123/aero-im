@@ -267,6 +267,20 @@ define_id!(
     /// may not DM each other or share a channel; the pair is symmetric.
     BarrierId
 );
+// ---- Wave 21 ----
+define_id!(
+    /// Identifies an active login session / device — one row per refresh-token-backed
+    /// login, recorded so a user (or admin) can list their active sessions and revoke
+    /// one or all-others ("sign out everywhere else").
+    SessionId
+);
+define_id!(
+    /// Identifies a single activity-feed entry — a durable, per-participant notice of
+    /// a non-message event (e.g. a followed creator going live). Distinct from the
+    /// message+room-scoped notification inbox: carries only a kind, optional
+    /// actor/subject, and a human summary, with no room or message.
+    ActivityId
+);
 
 #[cfg(test)]
 mod tests {

@@ -23,11 +23,11 @@ pub mod workspace;
 
 pub use error::{Error, Result};
 pub use ids::{
-    AnnouncementId, ApprovalId, AuditId, BarrierId, BlobId, CanvasId, ChannelBookmarkId,
+    ActivityId, AnnouncementId, ApprovalId, AuditId, BarrierId, BlobId, CanvasId, ChannelBookmarkId,
     ChannelSectionId, ClipId, CreatorTierId, EmojiId, InvitationId, JoinRequestId, KeywordAlertId,
     LegalHoldId, MessageEditId, MessageId, MessageTemplateId, NotificationId, ParticipantId, PatId,
     PollId, RecurringMessageId, RoomId, SavedSearchId, ScheduledMessageId, ScheduledStreamId,
-    ScimTokenId, StreamCategoryId, SubscriptionId, TaskId, UserGroupId, VodId, WebhookId,
+    ScimTokenId, SessionId, StreamCategoryId, SubscriptionId, TaskId, UserGroupId, VodId, WebhookId,
     WorkspaceId,
 };
 pub use live::{

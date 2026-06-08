@@ -54,6 +54,7 @@ struct OidcLoginReq {
 ///   check failed to the client).
 async fn oidc_login(
     axum::extract::State(s): axum::extract::State<AppState>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<OidcLoginReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     // 1. Load config from env; OIDC is off by default.
@@ -90,6 +91,19 @@ async fn oidc_login(
         .await
         .map_err(AeroError::from)?
         .ok_or_else(|| AeroError::NotFound("participant".into()))?;
+    // Wave 21: record the active session keyed on the refresh-token hash (so it
+    // lines up with the revoked-token check), pulling the `User-Agent` when sent.
+    // Best-effort — a record failure must NOT fail the SSO login.
+    let ua = headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok());
+    let hash = aero_storage::revoked_token::hash_token(&tokens.refresh_token);
+    if let Err(e) = aero_storage::SessionRepo::new(s.participants.pool().clone())
+        .record(participant_id, &hash, ua)
+        .await
+    {
+        tracing::warn!(error = ?e, %participant_id, "oidc auth session record failed");
+    }
     Ok(Json(serde_json::json!({
         "access_token": tokens.access_token,
         "refresh_token": tokens.refresh_token,

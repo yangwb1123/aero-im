@@ -104,4 +104,9 @@ pub mod info_barriers;
 pub mod snooze;
 pub mod workspace_ask;
 
+// ---- Wave 21 ----
+pub mod activity;
+pub mod golive_bot;
+pub mod sessions;
+
 pub use state::AppState;

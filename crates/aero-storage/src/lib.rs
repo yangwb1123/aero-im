@@ -94,6 +94,10 @@ pub mod stream_stats;
 // ---- Wave 19 ----
 pub mod info_barrier;
 
+// ---- Wave 21 ----
+pub mod activity_feed;
+pub mod auth_session;
+
 pub use ai_job::{AiJob, AiJobKind, AiJobRepo, AiJobStatus};
 pub use audit::{AuditEvent, AuditRepo};
 pub use blob::{BlobRepo, NewBlob};
@@ -201,3 +205,7 @@ pub use stream_stats::{StreamAnalytics, StreamStatsRepo};
 
 // ---- Wave 19 re-exports ----
 pub use info_barrier::{BarrierRepo, InfoBarrier};
+
+// ---- Wave 21 re-exports ----
+pub use activity_feed::{ActivityEntry, ActivityFeedRepo};
+pub use auth_session::{AuthSession, SessionRepo};

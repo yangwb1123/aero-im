@@ -21,6 +21,7 @@
 use aero_auth::AuthUser;
 use aero_common::Error as AeroError;
 use aero_storage::revoked_token::{hash_token, RevokedTokenRepo};
+use aero_storage::SessionRepo;
 use axum::{extract::State, http::StatusCode, routing::post, Json, Router};
 use serde::Deserialize;
 
@@ -67,6 +68,12 @@ async fn refresh(
     // `?` surfaces it as `401`.
     let tokens = s.auth.refresh(token).await?;
 
+    // Wave 21: bump the active session's `last_seen_at` so the session inventory
+    // shows recent activity. Best-effort — a touch failure must NOT fail refresh.
+    if let Err(e) = SessionRepo::new(s.pg.clone()).touch(&hash_token(token)).await {
+        tracing::warn!(error = ?e, "auth session touch failed");
+    }
+
     // Resolve the owning participant so the response carries the same shape as
     // `auth_login`. Verifying the (already-validated) token again yields its
     // claims; both steps map any failure to `401`.
@@ -98,9 +105,19 @@ async fn logout(
     if token.is_empty() {
         return Err(AeroError::Invalid("refresh_token must not be empty".into()).into());
     }
+    let hash = hash_token(token);
     RevokedTokenRepo::new(s.pg.clone())
-        .revoke(&hash_token(token), Some(auth.participant_id))
+        .revoke(&hash, Some(auth.participant_id))
         .await
         .map_err(AeroError::from)?;
+    // Wave 21: also retire the matching active-session row (owner-scoped) so the
+    // logged-out device drops out of the session inventory. Best-effort — the
+    // refresh token is already revoked above, so a session-row miss is harmless.
+    if let Err(e) = SessionRepo::new(s.pg.clone())
+        .revoke_by_hash(&hash, auth.participant_id)
+        .await
+    {
+        tracing::warn!(error = ?e, "auth session logout revoke failed");
+    }
     Ok(StatusCode::NO_CONTENT)
 }

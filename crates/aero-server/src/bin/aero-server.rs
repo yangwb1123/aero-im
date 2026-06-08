@@ -419,6 +419,18 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // ---------- "Went live" follower notifications (Wave 21) ----------
+    // Subscribes to the live bus and, when a stream goes live, fans out a durable
+    // "stream_live" activity-feed entry to each of the creator's followers.
+    {
+        let state_clone = state.clone();
+        tokio::spawn(async move {
+            if let Err(e) = aero_server::golive_bot::run(state_clone).await {
+                tracing::error!(error = ?e, "golive_bot listener exited");
+            }
+        });
+    }
+
     // ---------- Voice transcript dispatcher ----------
     {
         let state_clone = state.clone();
