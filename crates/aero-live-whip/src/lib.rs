@@ -48,6 +48,7 @@
 pub mod cascade;
 pub mod depacketize;
 pub mod hls_sink;
+pub(crate) mod metrics;
 pub mod packetize;
 pub mod relay;
 pub mod reorder;
@@ -142,9 +143,15 @@ impl WhipRegistry {
 
     /// Number of active WHIP ingest sessions. Used to populate the
     /// `aero_live_whip_sessions` gauge in the server's metric loop.
+    ///
+    /// As a side effect this re-publishes the `aero_whip_active_sessions` gauge
+    /// from the current count, so the data-plane gauge stays in step with the
+    /// registry without the server having to emit it separately.
     #[must_use]
     pub fn active_sessions(&self) -> usize {
-        self.inner.lock().len()
+        let n = self.inner.lock().len();
+        metrics::set_active_sessions(n);
+        n
     }
 }
 

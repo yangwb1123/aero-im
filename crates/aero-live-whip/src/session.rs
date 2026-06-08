@@ -60,6 +60,7 @@ use std::sync::Arc;
 
 use crate::depacketize::H264Depacketizer;
 use crate::hls_sink::MediaSink;
+use crate::metrics;
 use crate::relay::MediaRelay;
 use crate::reorder::ReorderBuffer;
 
@@ -293,6 +294,7 @@ impl WhipSession {
                                 debug!(?state, "whip: ice state change");
                             }
                             Event::RtpPacket(pkt) => {
+                                metrics::record_rtp_packet();
                                 let seq = pkt.header.sequence_number;
                                 // Lazily initialize the buffer at the first
                                 // observed sequence number so we don't stall.
@@ -384,6 +386,7 @@ impl WhipSession {
             if let Err(e) = depacketizer.push(&pkt.payload, marker, au) {
                 // Reassembly desync (packet loss / reorder): drop the partial
                 // AU and resync on the next keyframe.
+                metrics::record_depacketize_failure();
                 trace!(error = %e, "whip: h264 depacketize error, resyncing");
                 depacketizer.reset();
                 au.clear();
