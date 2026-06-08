@@ -49,12 +49,96 @@ pub fn init(cfg: &TelemetryConfig, service_name: &'static str) -> TelemetryGuard
     }
 }
 
+/// Attribute key that forces a span (and its trace) to be recorded+sampled
+/// regardless of the configured `AERO_TRACE_SAMPLE_RATE`. See
+/// [`ForcePrioritySampler`] for the override semantics and `wiring_notes` for
+/// how high-priority call sites set it.
+pub const FORCE_SAMPLE_KEY: &str = "aero.force_sample";
+
+/// Conventional OpenTelemetry priority attribute. A value `> 0` also forces the
+/// span to be sampled, matching the classic `sampling.priority` Jaeger idiom.
+pub const SAMPLING_PRIORITY_KEY: &str = "sampling.priority";
+
+/// A [`ShouldSample`] wrapper that force-samples high-priority spans.
+///
+/// In `should_sample` it inspects the span's start `attributes`: if any carry
+/// `aero.force_sample = true` (bool) or `sampling.priority > 0` (i64), it
+/// returns [`SamplingDecision::RecordAndSample`] outright. Otherwise it
+/// delegates verbatim to the wrapped `inner` sampler — so the normal
+/// `ParentBased(TraceIdRatioBased(rate))` probabilistic behavior is preserved
+/// for ordinary spans while critical operations (login, message-send,
+/// call-create) are always captured even when `AERO_TRACE_SAMPLE_RATE` is low.
+///
+/// # Marking a span as high-priority
+///
+/// `tracing-opentelemetry` maps a span field named `aero.force_sample` onto an
+/// `OTel` attribute of the same key. A high-priority call site therefore opts in
+/// by declaring the field on its `#[instrument]` span, e.g.:
+///
+/// ```ignore
+/// #[tracing::instrument(fields(aero.force_sample = true))]
+/// async fn login(/* … */) { /* … */ }
+/// ```
+///
+/// (Such call sites live in other crates and are intentionally NOT modified
+/// here.)
+#[derive(Clone, Debug)]
+struct ForcePrioritySampler {
+    inner: opentelemetry_sdk::trace::Sampler,
+}
+
+impl ForcePrioritySampler {
+    /// Wrap `inner`, force-sampling spans that carry a priority marker.
+    fn new(inner: opentelemetry_sdk::trace::Sampler) -> Self {
+        Self { inner }
+    }
+
+    /// True when `attributes` request forced sampling via either marker key.
+    fn is_forced(attributes: &[opentelemetry::KeyValue]) -> bool {
+        use opentelemetry::Value;
+        attributes.iter().any(|kv| match kv.key.as_str() {
+            FORCE_SAMPLE_KEY => matches!(kv.value, Value::Bool(true)),
+            SAMPLING_PRIORITY_KEY => matches!(kv.value, Value::I64(p) if p > 0),
+            _ => false,
+        })
+    }
+}
+
+impl opentelemetry_sdk::trace::ShouldSample for ForcePrioritySampler {
+    fn should_sample(
+        &self,
+        parent_context: Option<&opentelemetry::Context>,
+        trace_id: opentelemetry::trace::TraceId,
+        name: &str,
+        span_kind: &opentelemetry::trace::SpanKind,
+        attributes: &[opentelemetry::KeyValue],
+        links: &[opentelemetry::trace::Link],
+    ) -> opentelemetry::trace::SamplingResult {
+        if Self::is_forced(attributes) {
+            use opentelemetry::trace::TraceContextExt as _;
+            return opentelemetry::trace::SamplingResult {
+                decision: opentelemetry::trace::SamplingDecision::RecordAndSample,
+                attributes: Vec::new(),
+                // Preserve any inbound trace state, matching the SDK samplers.
+                trace_state: parent_context.map_or_else(
+                    opentelemetry::trace::TraceState::default,
+                    |ctx| ctx.span().span_context().trace_state().clone(),
+                ),
+            };
+        }
+        self.inner
+            .should_sample(parent_context, trace_id, name, span_kind, attributes, links)
+    }
+}
+
 /// Build a batch-exporting tracer provider pointed at an OTLP/gRPC collector.
 ///
 /// `sample_rate` is the trace sampling ratio in `[0.0, 1.0]` (already clamped by
 /// the config layer). It is applied as a parent-based `TraceIdRatioBased` sampler
 /// so root spans are sampled at `sample_rate` while child spans honor the parent
-/// decision.
+/// decision. That sampler is wrapped in a [`ForcePrioritySampler`] so spans
+/// tagged with [`FORCE_SAMPLE_KEY`] / [`SAMPLING_PRIORITY_KEY`] are always
+/// recorded+sampled regardless of `sample_rate`.
 fn build_otlp_provider(
     endpoint: &str,
     service_name: &'static str,
@@ -63,8 +147,10 @@ fn build_otlp_provider(
     use opentelemetry::KeyValue;
     use opentelemetry_otlp::WithExportConfig;
 
-    let sampler = opentelemetry_sdk::trace::Sampler::ParentBased(Box::new(
-        opentelemetry_sdk::trace::Sampler::TraceIdRatioBased(sample_rate),
+    let sampler = ForcePrioritySampler::new(opentelemetry_sdk::trace::Sampler::ParentBased(
+        Box::new(opentelemetry_sdk::trace::Sampler::TraceIdRatioBased(
+            sample_rate,
+        )),
     ));
 
     // opentelemetry-otlp 0.26 pipeline API: install_batch returns the
@@ -98,5 +184,66 @@ impl Drop for TelemetryGuard {
         if let Some(p) = self.provider.take() {
             let _ = p.shutdown();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use opentelemetry::trace::{SamplingDecision, SpanKind, TraceId};
+    use opentelemetry::KeyValue;
+    use opentelemetry_sdk::trace::ShouldSample as _;
+
+    /// Run the sampler against a root span (no parent) with the given start attrs.
+    fn decide(
+        sampler: &ForcePrioritySampler,
+        attributes: &[KeyValue],
+    ) -> SamplingDecision {
+        sampler
+            .should_sample(
+                None,
+                TraceId::from_bytes([1; 16]),
+                "test-span",
+                &SpanKind::Internal,
+                attributes,
+                &[],
+            )
+            .decision
+    }
+
+    #[test]
+    fn force_sample_attribute_overrides_always_off_inner() {
+        // Inner AlwaysOff would Drop everything; the marker must flip that.
+        let sampler = ForcePrioritySampler::new(opentelemetry_sdk::trace::Sampler::AlwaysOff);
+        let decision = decide(&sampler, &[KeyValue::new(FORCE_SAMPLE_KEY, true)]);
+        assert_eq!(decision, SamplingDecision::RecordAndSample);
+    }
+
+    #[test]
+    fn sampling_priority_above_zero_overrides_always_off_inner() {
+        let sampler = ForcePrioritySampler::new(opentelemetry_sdk::trace::Sampler::AlwaysOff);
+        let decision = decide(&sampler, &[KeyValue::new(SAMPLING_PRIORITY_KEY, 1_i64)]);
+        assert_eq!(decision, SamplingDecision::RecordAndSample);
+    }
+
+    #[test]
+    fn unmarked_span_delegates_to_inner() {
+        // Without a marker the wrapper must defer to the inner Drop decision.
+        let sampler = ForcePrioritySampler::new(opentelemetry_sdk::trace::Sampler::AlwaysOff);
+        assert_eq!(decide(&sampler, &[]), SamplingDecision::Drop);
+
+        // A falsey marker (false / priority 0) is NOT a force request.
+        assert_eq!(
+            decide(&sampler, &[KeyValue::new(FORCE_SAMPLE_KEY, false)]),
+            SamplingDecision::Drop
+        );
+        assert_eq!(
+            decide(&sampler, &[KeyValue::new(SAMPLING_PRIORITY_KEY, 0_i64)]),
+            SamplingDecision::Drop
+        );
+
+        // Delegation also passes through an AlwaysOn inner unchanged.
+        let on = ForcePrioritySampler::new(opentelemetry_sdk::trace::Sampler::AlwaysOn);
+        assert_eq!(decide(&on, &[]), SamplingDecision::RecordAndSample);
     }
 }
