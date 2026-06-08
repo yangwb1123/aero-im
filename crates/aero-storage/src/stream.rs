@@ -87,6 +87,33 @@ impl StreamRepo {
         Ok(row.map(Stream::from))
     }
 
+    /// Rotate (reset) a stream's secret `stream_key` to a freshly generated one,
+    /// owner-scoped: the update only matches when `id` belongs to `owner`, so a
+    /// non-owner (or a missing stream) leaves the row untouched and yields `None`.
+    /// Returns the new key on success. A leaked key can thus be invalidated
+    /// without recreating the stream (standard Twitch/YouTube control).
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the update.
+    pub async fn rotate_key(
+        &self,
+        id: Ulid,
+        owner: ParticipantId,
+    ) -> Result<Option<String>, sqlx::Error> {
+        let new_key = random_key();
+        let row: Option<(String,)> = sqlx::query_as(
+            r"UPDATE streams SET stream_key = $1
+               WHERE id = $2 AND owner_id = $3
+            RETURNING stream_key",
+        )
+        .bind(&new_key)
+        .bind(uuid::Uuid::from_u128(id.0))
+        .bind(owner.to_uuid())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(k,)| k))
+    }
+
     pub async fn mark_live(&self, id: Ulid, hls_path: &str) -> Result<(), sqlx::Error> {
         sqlx::query(
             r#"UPDATE streams
@@ -149,6 +176,98 @@ struct StreamRow {
     started_at: Option<time::OffsetDateTime>,
     ended_at: Option<time::OffsetDateTime>,
     created_at: time::OffsetDateTime,
+}
+
+/// PG-gated integration tests (run with a live Postgres + applied migrations):
+///
+/// ```text
+/// DATABASE_URL=postgres://aero:aero_dev_pw@localhost:5432/aero \
+///   cargo test -p aero-storage --lib -- --ignored rotate_key
+/// ```
+#[cfg(test)]
+mod db_tests {
+    use super::*;
+
+    fn pool() -> PgPool {
+        let url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://aero:aero_dev_pw@localhost:5432/aero".into());
+        sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect_lazy(&url)
+            .expect("connect_lazy never fails on a well-formed URL")
+    }
+
+    /// Create a throwaway owner participant so the test is self-contained.
+    async fn owner(p: &PgPool) -> ParticipantId {
+        let id = ParticipantId::new();
+        sqlx::query("INSERT INTO participants (id, kind, display_name) VALUES ($1, 'human', $2)")
+            .bind(id.to_uuid())
+            .bind(format!("stream-key-owner-{id}"))
+            .execute(p)
+            .await
+            .expect("insert participant");
+        id
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn rotate_key_changes_key_and_is_owner_scoped() {
+        let p = pool();
+        let repo = StreamRepo::new(p.clone());
+        let owner = owner(&p).await;
+        let stranger = ParticipantId::new();
+
+        let stream = repo
+            .create(NewStream {
+                owner_id: owner,
+                room_id: None,
+                title: "rotate-key test".into(),
+                protocol: StreamProtocol::Rtmp,
+                stream_key: None,
+            })
+            .await
+            .expect("create stream");
+        let original = stream.stream_key.clone();
+
+        // A non-owner cannot rotate the key: no row matches ⇒ None, key unchanged.
+        assert!(
+            repo.rotate_key(stream.id, stranger)
+                .await
+                .expect("rotate (stranger)")
+                .is_none(),
+            "stranger cannot rotate another owner's stream key"
+        );
+        let after_stranger = repo.get(stream.id).await.expect("get").expect("present");
+        assert_eq!(after_stranger.stream_key, original, "key untouched by stranger");
+
+        // The owner rotates: a NEW key is returned and persisted.
+        let rotated = repo
+            .rotate_key(stream.id, owner)
+            .await
+            .expect("rotate (owner)")
+            .expect("owner rotates");
+        assert_ne!(rotated, original, "rotated key differs from the original");
+        let reread = repo.get(stream.id).await.expect("get").expect("present");
+        assert_eq!(reread.stream_key, rotated, "persisted key matches the returned one");
+
+        // The old key no longer resolves; the new one does.
+        assert!(
+            repo.get_by_key(&original).await.expect("by old key").is_none(),
+            "the leaked key is invalidated"
+        );
+        assert_eq!(
+            repo.get_by_key(&rotated).await.expect("by new key").map(|s| s.id),
+            Some(stream.id),
+            "the new key resolves to the stream"
+        );
+
+        // Cleanup so reruns stay self-contained.
+        sqlx::query("DELETE FROM streams WHERE owner_id = $1")
+            .bind(owner.to_uuid())
+            .execute(&p)
+            .await
+            .ok();
+    }
 }
 
 impl From<StreamRow> for Stream {

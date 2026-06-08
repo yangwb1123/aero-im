@@ -3,7 +3,7 @@
 AI-Native 即时通讯 + 直播平台,Rust 实现。
 
 - 设计:[`docs/specs/2026-05-22-aero-im-design.md`](docs/specs/2026-05-22-aero-im-design.md)
-- 状态:**P0–P11 全部就位** + **17 轮 To-B 协作/企业扩展**(71 个功能点,迁移 0001–0056)。媒体面协议栈深化(WHIP/WHEP + SFU 联播/RTCP + SRT 加密/可靠性)已实现并字节级单测(**801 个 hermetic 单元测试通过**,15 个 crate)
+- 状态:**P0–P11 全部就位** + **18 轮 To-B 协作/企业扩展**(77 个功能点,迁移 0001–0057)。媒体面协议栈深化(WHIP/WHEP + SFU 联播/RTCP + SRT 加密/可靠性)已实现并字节级单测(**812 个 hermetic 单元测试通过**,15 个 crate)
 
 ## 功能矩阵
 
@@ -57,6 +57,12 @@ AI-Native 即时通讯 + 直播平台,Rust 实现。
 | **任务 / 待办** | 房间内可指派、带截止日与状态的任务(可由消息生成,区别于 AI 行动项提取, Wave 17) | ✅ |
 | **工作区文件浏览** | 跨成员所在全部房间聚合附件浏览(成员边界,Wave 17) | ✅ |
 | **审批流** | 工作区审批(Lark 审批-lite):请求人 → 单一审批人 批准/拒绝 + 备注(Wave 17) | ✅ |
+| **通话记录** | 每会话通话日志(read-only,复用已持久化的 call_sessions, Wave 18) | ✅ |
+| **推流密钥轮换** | 主播一键重置泄露的 stream key,无需重建直播(Wave 18) | ✅ |
+| **AI 写作助手** | 改写/调语气/精简/扩写(rewrite,复用翻译后端 seam, Wave 18) | ✅ |
+| **直播切片 clips** | 观众标记 [start,end] 时间段分享(复用 HLS 播放列表客户端 seek, Wave 18) | ✅ |
+| **主播数据面板** | 单场聚合:礼物数/收入·弹幕数·独立发言人·时长(Wave 18) | ✅ |
+| **标记未读** | 把已读游标回拨,使房间重新标红(mark-as-unread 三方常见三连之一, Wave 18) | ✅ |
 
 ## 架构
 
@@ -210,7 +216,7 @@ ffmpeg -re -i sample.mp4 -c:v libx264 -c:a aac -f flv rtmp://localhost/live/<str
 
 ```bash
 cargo check --workspace          # 干净
-cargo test --workspace --lib     # 801 pass / 0 fail / 121 ignored(DB 集成,需 --ignored + DATABASE_URL)
+cargo test --workspace --lib     # 812 pass / 0 fail / 126 ignored(DB 集成,需 --ignored + DATABASE_URL)
 cargo build --bin aero-server    # 二进制成功
 cargo clippy -p aero-live-srt -p aero-live-webrtc -p aero-live-whip --all-targets  # 媒体面 crate 零告警
 # 注:`cargo clippy --workspace --all-targets` 在 aero-storage/aero-server 等既有 crate 下仍有 pedantic 告警(非本批次引入,待清理)

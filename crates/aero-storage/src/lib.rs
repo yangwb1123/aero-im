@@ -87,6 +87,10 @@ pub mod out_of_office;
 pub mod task;
 pub mod workspace_files;
 
+// ---- Wave 18 ----
+pub mod clip;
+pub mod stream_stats;
+
 pub use ai_job::{AiJob, AiJobKind, AiJobRepo, AiJobStatus};
 pub use audit::{AuditEvent, AuditRepo};
 pub use blob::{BlobRepo, NewBlob};
@@ -187,3 +191,7 @@ pub use org_chart::{OrgChartRepo, DEFAULT_CHAIN_DEPTH, MAX_CHAIN_DEPTH};
 pub use out_of_office::{within_window, OutOfOffice, OutOfOfficeRepo};
 pub use task::{validate_status, Task, TaskRepo};
 pub use workspace_files::{WorkspaceFile, WorkspaceFileRepo};
+
+// ---- Wave 18 re-exports ----
+pub use clip::{Clip, ClipRepo};
+pub use stream_stats::{StreamAnalytics, StreamStatsRepo};

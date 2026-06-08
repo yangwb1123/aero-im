@@ -239,7 +239,20 @@ pub fn build(state: AppState) -> Router {
         // Workspace-wide file browser: file attachments across the caller's rooms.
         .merge(crate::workspace_files::routes())
         // Approvals workflow (Lark 审批-lite): requester → single approver decision.
-        .merge(crate::approvals::routes());
+        .merge(crate::approvals::routes())
+        // ---- Wave 18 ----
+        // Call history / call-log: per-conversation list of persisted call sessions.
+        .merge(crate::call_history::routes())
+        // Stream key rotation / reset: owner rotates a leaked stream key.
+        .merge(crate::stream_key::routes())
+        // AI writing assistant ("help me write"): rewrite / tone / concise.
+        .merge(crate::ai_rewrite::routes())
+        // Live-stream clips: viewer-marked [start,end] ranges over the HLS playlist.
+        .merge(crate::clips::routes())
+        // Stream / creator analytics: owner-only per-stream aggregate dashboard.
+        .merge(crate::stream_analytics::routes())
+        // Mark message / conversation as unread: roll the read cursor backwards.
+        .merge(crate::mark_unread::routes());
 
     // Prometheus scrape endpoint (ROADMAP 方向四). Mounted unless disabled; the
     // handler self-gates on an optional bearer token. Left here (not behind the

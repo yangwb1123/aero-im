@@ -90,4 +90,12 @@ pub mod org_chart;
 pub mod tasks;
 pub mod workspace_files;
 
+// ---- Wave 18 ----
+pub mod ai_rewrite;
+pub mod call_history;
+pub mod clips;
+pub mod mark_unread;
+pub mod stream_analytics;
+pub mod stream_key;
+
 pub use state::AppState;

@@ -1,0 +1,246 @@
+//! Live-stream clip repository (viewer-marked shareable highlight ranges).
+//!
+//! Backs `migrations/0057_clips.sql`. A viewer marks a timestamped
+//! `[start_secs, end_secs]` range of a live stream / VOD to share; playback reuses
+//! the stream's existing HLS playlist with a client-side seek to that range — no
+//! media is processed here, so a [`Clip`] is just metadata pointing at a stream
+//! plus an in/out point. This mirrors the [`VodRepo`](crate::VodRepo) pattern (a
+//! stream-referencing record whose `stream_id` is a plain column, not a cascading
+//! FK, so a clip outlives a pruned stream).
+//!
+//! Purely additive: a NEW [`ClipRepo`]; no existing repo is touched. The [`Clip`]
+//! model lives here (and is re-exported from the crate root) rather than in
+//! `aero-common`, since it is a storage-layer projection — like
+//! [`SavedSearch`](crate::SavedSearch). Range validation (`0 <= start < end` and a
+//! max duration) is the SERVER handler's job; this repo persists what it is given.
+//! [`ClipRepo::delete`] is creator-scoped, so a caller can only ever remove their
+//! own clips.
+
+use aero_common::{ClipId, ParticipantId};
+use serde::Serialize;
+use sqlx::PgPool;
+
+/// One live-stream clip — a viewer-marked `[start_secs, end_secs]` range of a
+/// stream / VOD, shared for playback over the stream's existing HLS playlist.
+///
+/// A storage-layer projection of a `stream_clips` row. `Serialize` so a handler
+/// can hand the row straight back as JSON; `created_at` renders as RFC 3339.
+#[derive(Debug, Clone, Serialize)]
+pub struct Clip {
+    /// The clip's unique id.
+    pub id: ClipId,
+    /// The stream / VOD this clip is taken from (a plain reference, not a hard FK —
+    /// a clip may outlive its stream row).
+    pub stream_id: ulid::Ulid,
+    /// The participant who created the clip.
+    pub creator_id: ParticipantId,
+    /// Human-readable title the creator gave the clip.
+    pub title: String,
+    /// Inclusive start offset into the stream, in whole seconds.
+    pub start_secs: i32,
+    /// Exclusive end offset into the stream, in whole seconds (`> start_secs`).
+    pub end_secs: i32,
+    /// When the clip was created (RFC 3339 on the wire).
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: time::OffsetDateTime,
+}
+
+/// The columns a [`Clip`] is built from, in select order. Shared by every query so
+/// the row decoding stays in one place.
+const COLUMNS: &str = "id, stream_id, creator_id, title, start_secs, end_secs, created_at";
+
+type Row = (
+    uuid::Uuid,
+    uuid::Uuid,
+    uuid::Uuid,
+    String,
+    i32,
+    i32,
+    time::OffsetDateTime,
+);
+
+fn row_to_model(r: Row) -> Clip {
+    let (id, stream_id, creator_id, title, start_secs, end_secs, created_at) = r;
+    Clip {
+        id: ClipId::from_uuid(id),
+        stream_id: ulid::Ulid(stream_id.as_u128()),
+        creator_id: ParticipantId::from_uuid(creator_id),
+        title,
+        start_secs,
+        end_secs,
+        created_at,
+    }
+}
+
+/// Repository over the `stream_clips` table (live-stream clips).
+///
+/// Cheap to clone — it just wraps a [`PgPool`] (itself an `Arc` internally), so
+/// the feature module builds one inline via [`ClipRepo::new`].
+#[derive(Clone)]
+#[must_use]
+pub struct ClipRepo {
+    pool: PgPool,
+}
+
+impl ClipRepo {
+    /// Build a repo over the given pool.
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
+    /// Persist a new clip on `stream`, returning its generated id. The caller has
+    /// already checked the stream exists and validated the `[start, end]` range.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the insert.
+    pub async fn create(
+        &self,
+        stream: ulid::Ulid,
+        creator: ParticipantId,
+        title: &str,
+        start_secs: i32,
+        end_secs: i32,
+    ) -> Result<ClipId, sqlx::Error> {
+        let id = ClipId::new();
+        sqlx::query(
+            r"INSERT INTO stream_clips
+                  (id, stream_id, creator_id, title, start_secs, end_secs)
+               VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(id.to_uuid())
+        .bind(uuid::Uuid::from_u128(stream.0))
+        .bind(creator.to_uuid())
+        .bind(title)
+        .bind(start_secs)
+        .bind(end_secs)
+        .execute(&self.pool)
+        .await?;
+        Ok(id)
+    }
+
+    /// Fetch one clip by id, or `None` if no such clip exists.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the query.
+    pub async fn get(&self, id: ClipId) -> Result<Option<Clip>, sqlx::Error> {
+        let sql = format!("SELECT {COLUMNS} FROM stream_clips WHERE id = $1");
+        let row = sqlx::query_as::<_, Row>(&sql)
+            .bind(id.to_uuid())
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(row_to_model))
+    }
+
+    /// A stream's clips, newest first.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the query.
+    pub async fn list_for_stream(&self, stream: ulid::Ulid) -> Result<Vec<Clip>, sqlx::Error> {
+        let sql = format!(
+            "SELECT {COLUMNS}
+               FROM stream_clips
+              WHERE stream_id = $1
+              ORDER BY created_at DESC, id DESC"
+        );
+        let rows = sqlx::query_as::<_, Row>(&sql)
+            .bind(uuid::Uuid::from_u128(stream.0))
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.into_iter().map(row_to_model).collect())
+    }
+
+    /// Delete a clip, scoped to its creator. Returns `true` iff a row was removed —
+    /// creator-scoped, so a caller can never delete another user's clip, and a
+    /// second delete (or a stranger's) is a no-op returning `false`.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the delete.
+    pub async fn delete(&self, id: ClipId, creator: ParticipantId) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query("DELETE FROM stream_clips WHERE id = $1 AND creator_id = $2")
+            .bind(id.to_uuid())
+            .bind(creator.to_uuid())
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+}
+
+/// PG-gated integration tests (run with a live Postgres + applied migrations):
+///
+/// ```text
+/// DATABASE_URL=postgres://aero:aero_dev_pw@localhost:5432/aero \
+///   cargo test -p aero-storage --lib -- --ignored clip_
+/// ```
+#[cfg(test)]
+mod db_tests {
+    use super::*;
+
+    fn pool() -> PgPool {
+        let url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://aero:aero_dev_pw@localhost:5432/aero".into());
+        sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect_lazy(&url)
+            .expect("connect_lazy never fails on a well-formed URL")
+    }
+
+    /// Create a throwaway creator participant so the test is self-contained.
+    async fn creator(p: &PgPool) -> ParticipantId {
+        let id = ParticipantId::new();
+        sqlx::query("INSERT INTO participants (id, kind, display_name) VALUES ($1, 'human', $2)")
+            .bind(id.to_uuid())
+            .bind(format!("clip-creator-{id}"))
+            .execute(p)
+            .await
+            .expect("insert participant");
+        id
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn clip_create_get_list_delete_creator_scoped() {
+        let p = pool();
+        let repo = ClipRepo::new(p.clone());
+        let stream = ulid::Ulid::new();
+        let owner = creator(&p).await;
+        let stranger = ParticipantId::new();
+
+        // create → get + list show it.
+        let id = repo
+            .create(stream, owner, "Best moment", 30, 75)
+            .await
+            .unwrap();
+
+        let got = repo.get(id).await.unwrap().expect("clip exists");
+        assert_eq!(got.id, id);
+        assert_eq!(got.stream_id, stream);
+        assert_eq!(got.creator_id, owner);
+        assert_eq!(got.title, "Best moment");
+        assert_eq!(got.start_secs, 30);
+        assert_eq!(got.end_secs, 75);
+
+        let listed = repo.list_for_stream(stream).await.unwrap();
+        assert!(listed.iter().any(|c| c.id == id), "list shows the clip");
+
+        // A stranger's delete is a no-op; the creator's first delete succeeds, the
+        // second is a no-op.
+        assert!(
+            !repo.delete(id, stranger).await.unwrap(),
+            "stranger cannot delete another user's clip"
+        );
+        assert!(repo.get(id).await.unwrap().is_some(), "still present");
+        assert!(repo.delete(id, owner).await.unwrap(), "creator deletes");
+        assert!(repo.get(id).await.unwrap().is_none(), "gone after delete");
+        assert!(
+            !repo.delete(id, owner).await.unwrap(),
+            "second delete is a no-op"
+        );
+
+        // Cleanup so reruns stay self-contained.
+        sqlx::query("DELETE FROM stream_clips WHERE creator_id = $1")
+            .bind(owner.to_uuid())
+            .execute(&p)
+            .await
+            .ok();
+    }
+}

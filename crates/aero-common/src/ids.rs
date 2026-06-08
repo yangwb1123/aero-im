@@ -252,6 +252,14 @@ define_id!(
     /// approves or denies it with an optional note (single-approver MVP).
     ApprovalId
 );
+// ---- Wave 18 ----
+define_id!(
+    /// Identifies a live-stream clip — a viewer-marked timestamped `[start, end]`
+    /// range of a live stream / VOD shared for playback (Twitch/YouTube-style).
+    /// Playback reuses the stream's existing HLS playlist with a client-side seek;
+    /// no media is processed, so a clip is just metadata over a stream.
+    ClipId
+);
 
 #[cfg(test)]
 mod tests {
