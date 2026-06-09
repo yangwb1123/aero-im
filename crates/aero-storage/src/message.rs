@@ -492,46 +492,47 @@ impl MessageRepo {
         &self,
         root: MessageId,
     ) -> Result<aero_common::ThreadSummary, sqlx::Error> {
-        // Postgres has no `max(uuid)` aggregate, so the newest reply is taken via
-        // an ordered single-row read (ids are time-sortable ULIDs stored as UUID,
-        // so `ORDER BY id DESC LIMIT 1` is the most recent reply).
-        let count = sqlx::query_as::<_, (i64,)>(
-            r"SELECT COUNT(*) FROM messages WHERE reply_to = $1 AND deleted_at IS NULL",
+        // Single round-trip (previously three: count + newest reply + distinct
+        // repliers, each re-scanning the same reply set). A `MATERIALIZED` CTE
+        // scans the replies ONCE; the scalar subqueries then read from it.
+        // Postgres has no `max(uuid)` aggregate, so the newest reply is the
+        // ordered single-row read (ids are time-sortable ULIDs stored as UUID, so
+        // `ORDER BY id DESC LIMIT 1` is the most recent). `repliers` is capped at 8
+        // distinct senders for avatar rendering; `array_agg` over the empty set
+        // yields `NULL` → decoded as `None` → an empty replier list.
+        #[allow(clippy::type_complexity)]
+        let (count, last_id, last_at, repliers): (
+            i64,
+            Option<uuid::Uuid>,
+            Option<time::OffsetDateTime>,
+            Option<Vec<uuid::Uuid>>,
+        ) = sqlx::query_as(
+            r"WITH replies AS MATERIALIZED (
+                  SELECT id, sender_id, created_at
+                    FROM messages
+                   WHERE reply_to = $1 AND deleted_at IS NULL
+              )
+              SELECT
+                  (SELECT COUNT(*) FROM replies),
+                  (SELECT id FROM replies ORDER BY id DESC LIMIT 1),
+                  (SELECT created_at FROM replies ORDER BY id DESC LIMIT 1),
+                  (SELECT array_agg(sender_id)
+                     FROM (SELECT DISTINCT sender_id FROM replies LIMIT 8) d)",
         )
         .bind(root.to_uuid())
         .fetch_one(&self.pool)
         .await?;
 
-        let last = sqlx::query_as::<_, (uuid::Uuid, time::OffsetDateTime)>(
-            r"SELECT id, created_at
-               FROM messages
-               WHERE reply_to = $1 AND deleted_at IS NULL
-               ORDER BY id DESC
-               LIMIT 1",
-        )
-        .bind(root.to_uuid())
-        .fetch_optional(&self.pool)
-        .await?;
-
-        let repliers = sqlx::query_as::<_, (uuid::Uuid,)>(
-            r"SELECT DISTINCT sender_id
-               FROM messages
-               WHERE reply_to = $1 AND deleted_at IS NULL
-               LIMIT 8",
-        )
-        .bind(root.to_uuid())
-        .fetch_all(&self.pool)
-        .await?;
-
         Ok(aero_common::ThreadSummary {
             root_id: root,
-            reply_count: u32::try_from(count.0).unwrap_or(u32::MAX),
+            reply_count: u32::try_from(count).unwrap_or(u32::MAX),
             repliers: repliers
+                .unwrap_or_default()
                 .into_iter()
-                .map(|(u,)| ParticipantId::from_uuid(u))
+                .map(ParticipantId::from_uuid)
                 .collect(),
-            last_reply_id: last.map(|(id, _)| MessageId::from_uuid(id)),
-            last_reply_at: last.map(|(_, at)| at),
+            last_reply_id: last_id.map(MessageId::from_uuid),
+            last_reply_at: last_at,
         })
     }
 
@@ -1027,6 +1028,76 @@ mod db_tests {
             !hits.iter().any(|h| h.message.room_id == theirs),
             "a message in a room the caller is NOT in never leaks"
         );
+    }
+
+    /// `thread_summary` returns reply count, distinct repliers, and the newest
+    /// reply id/time from a SINGLE consolidated query. Verifies the
+    /// `MATERIALIZED`-CTE rewrite preserves the original three-query semantics,
+    /// including the empty-thread (`array_agg` → NULL → no repliers) case.
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn thread_summary_counts_repliers_and_newest_reply() {
+        let p = pool();
+        let repo = MessageRepo::new(p.clone());
+        let me = participant(&p).await;
+        let other = participant(&p).await;
+        let r = room(&p, me).await;
+
+        let root = repo
+            .insert(NewMessage {
+                room_id: r,
+                sender_id: me,
+                blocks: vec![Block::text("root")],
+                reply_to: None,
+                metadata: serde_json::json!({}),
+            })
+            .await
+            .expect("root");
+
+        // Empty thread: no replies yet → zero count, no last reply, no repliers.
+        let empty = repo.thread_summary(root.id).await.expect("empty summary");
+        assert_eq!(empty.reply_count, 0);
+        assert!(empty.repliers.is_empty());
+        assert!(empty.last_reply_id.is_none());
+        assert!(empty.last_reply_at.is_none());
+
+        // Two replies from two distinct senders; the second is the newest (ULID
+        // ids are monotonic, so the later insert has the larger id).
+        repo.insert(NewMessage {
+            room_id: r,
+            sender_id: me,
+            blocks: vec![Block::text("reply 1")],
+            reply_to: Some(root.id),
+            metadata: serde_json::json!({}),
+        })
+        .await
+        .expect("reply1");
+        let r2 = repo
+            .insert(NewMessage {
+                room_id: r,
+                sender_id: other,
+                blocks: vec![Block::text("reply 2")],
+                reply_to: Some(root.id),
+                metadata: serde_json::json!({}),
+            })
+            .await
+            .expect("reply2");
+
+        let s = repo.thread_summary(root.id).await.expect("summary");
+        assert_eq!(s.reply_count, 2, "two replies counted");
+        assert_eq!(s.repliers.len(), 2, "two distinct repliers");
+        assert!(s.repliers.contains(&me) && s.repliers.contains(&other));
+        assert_eq!(s.last_reply_id, Some(r2.id), "newest reply id is the last insert");
+        assert!(s.last_reply_at.is_some());
+
+        // Cleanup: remove messages then the room + participants.
+        sqlx::query("DELETE FROM messages WHERE room_id = $1").bind(r.to_uuid()).execute(&p).await.ok();
+        sqlx::query("DELETE FROM rooms WHERE id = $1").bind(r.to_uuid()).execute(&p).await.ok();
+        sqlx::query("DELETE FROM participants WHERE id = ANY($1)")
+            .bind(vec![me.to_uuid(), other.to_uuid()])
+            .execute(&p)
+            .await
+            .ok();
     }
 
     /// The workspace-wide RAG retrieval (`search_vector_workspace`) must honor the

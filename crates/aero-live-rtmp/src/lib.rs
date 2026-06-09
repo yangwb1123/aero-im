@@ -67,6 +67,73 @@ const MAX_SEGMENT_BUFFER_BYTES: usize = 32 * 1024 * 1024;
 const FLV_TAG_AUDIO: u8 = 0x08;
 const FLV_TAG_VIDEO: u8 = 0x09;
 
+/// Upper bound on the length of a publish stream key we will even look up.
+///
+/// Legitimate keys are short (the generator emits 32 hex chars); a multi-kilobyte
+/// "key" can only be an abusive or malformed publisher. Rejecting oversized keys
+/// up front avoids pushing attacker-controlled blobs into a database query
+/// parameter and into structured logs.
+const MAX_STREAM_KEY_LEN: usize = 256;
+
+/// Why a publish [`stream_key`](ServerSessionEvent::PublishStreamRequested) was
+/// rejected before it ever reached [`StreamRepo::get_by_key`].
+///
+/// RTMP stream keys arrive as arbitrary, attacker-controlled UTF-8 from an
+/// unauthenticated publisher. Validating their *shape* before the database
+/// round-trip prevents log/path injection and pointless lookups for keys that
+/// can never match a legitimately generated one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum StreamKeyRejection {
+    /// The key was empty or contained only whitespace.
+    #[error("stream key is empty")]
+    Empty,
+    /// The key exceeded [`MAX_STREAM_KEY_LEN`] bytes.
+    #[error("stream key exceeds {MAX_STREAM_KEY_LEN} bytes")]
+    TooLong,
+    /// The key contained an ASCII control character (NUL, newline, tab, …),
+    /// which would corrupt logs or downstream protocol framing.
+    #[error("stream key contains a control character")]
+    ControlChar,
+    /// The key contained a path separator or `..` segment. Stream keys index a
+    /// database row, never a filesystem path, so these can only be traversal
+    /// probes.
+    #[error("stream key contains a path-traversal character")]
+    PathTraversal,
+}
+
+/// Validate the *shape* of an incoming publish stream key without touching the
+/// database.
+///
+/// This is intentionally conservative and self-contained: it rejects keys that
+/// can never correspond to a legitimately issued key while accepting any
+/// reasonable printable token. A passing key is still authenticated by the
+/// `get_by_key` lookup — this only filters out abusive or malformed input.
+///
+/// # Errors
+///
+/// Returns the specific [`StreamKeyRejection`] describing the first violation
+/// found. Checks run cheapest-first (length before a full character scan).
+pub fn validate_stream_key(key: &str) -> Result<(), StreamKeyRejection> {
+    if key.len() > MAX_STREAM_KEY_LEN {
+        return Err(StreamKeyRejection::TooLong);
+    }
+    if key.trim().is_empty() {
+        return Err(StreamKeyRejection::Empty);
+    }
+    for ch in key.chars() {
+        if ch.is_control() {
+            return Err(StreamKeyRejection::ControlChar);
+        }
+        if matches!(ch, '/' | '\\') {
+            return Err(StreamKeyRejection::PathTraversal);
+        }
+    }
+    if key.contains("..") {
+        return Err(StreamKeyRejection::PathTraversal);
+    }
+    Ok(())
+}
+
 /// Convenience: spawn the RTMP ingest with default settings on a background task.
 pub fn spawn_rtmp_ingest(
     repo: StreamRepo,
@@ -280,6 +347,33 @@ async fn process_results(
                     mode: _,
                 } => {
                     info!(%app_name, %stream_key, "RTMP publish requested");
+                    if let Err(reason) = validate_stream_key(&stream_key) {
+                        // Malformed/abusive key — reject over RTMP exactly like an
+                        // unknown key, but without a database round-trip. We log the
+                        // byte length rather than the raw key to avoid log injection
+                        // from the (already-rejected) control characters.
+                        warn!(
+                            %reason,
+                            stream_key_len = stream_key.len(),
+                            "rejecting publish: malformed stream key"
+                        );
+                        let more = session
+                            .reject_request(
+                                request_id,
+                                "NetStream.Publish.Start",
+                                "Invalid stream key",
+                            )
+                            .map_err(|e| {
+                                LiveError::Protocol(format!("reject publish: {e:?}"))
+                            })?;
+                        for r in more {
+                            if let ServerSessionResult::OutboundResponse(p) = r {
+                                socket.write_all(&p.bytes).await.map_err(LiveError::from)?;
+                            }
+                        }
+                        outcome = ProcessOutcome::Disconnect;
+                        continue;
+                    }
                     match repo
                         .get_by_key(&stream_key)
                         .await
@@ -565,5 +659,76 @@ mod tests {
         // The README and design doc both reference a ~2s segment cadence; keep
         // them in sync with a test so a future refactor can't silently break it.
         assert_eq!(SEGMENT_DURATION_SECS, 2);
+    }
+
+    #[test]
+    fn validate_stream_key_accepts_generated_shape() {
+        // A 32-char hex token is exactly what `random_key()` emits in
+        // aero-storage; the canonical happy path must pass.
+        assert!(validate_stream_key("0123456789abcdef0123456789abcdef").is_ok());
+        // Custom keys with common URL-safe punctuation are also fine.
+        assert!(validate_stream_key("live-room_42.key").is_ok());
+        // Exactly at the length limit is allowed.
+        let max = "a".repeat(MAX_STREAM_KEY_LEN);
+        assert!(validate_stream_key(&max).is_ok());
+    }
+
+    #[test]
+    fn validate_stream_key_rejects_empty_and_whitespace() {
+        assert_eq!(validate_stream_key(""), Err(StreamKeyRejection::Empty));
+        assert_eq!(validate_stream_key("   \t "), Err(StreamKeyRejection::Empty));
+    }
+
+    #[test]
+    fn validate_stream_key_rejects_too_long_before_scanning() {
+        // One byte over the limit. Length is checked first so an oversized blob
+        // never gets a full character scan.
+        let oversized = "x".repeat(MAX_STREAM_KEY_LEN + 1);
+        assert_eq!(
+            validate_stream_key(&oversized),
+            Err(StreamKeyRejection::TooLong)
+        );
+        // A huge blob that also contains control chars is still classified by
+        // length (cheapest-first ordering), proving the early return.
+        let huge = format!("{}\n", "y".repeat(MAX_STREAM_KEY_LEN * 4));
+        assert_eq!(validate_stream_key(&huge), Err(StreamKeyRejection::TooLong));
+    }
+
+    #[test]
+    fn validate_stream_key_rejects_control_characters() {
+        assert_eq!(
+            validate_stream_key("good\nkey"),
+            Err(StreamKeyRejection::ControlChar)
+        );
+        assert_eq!(
+            validate_stream_key("nul\0byte"),
+            Err(StreamKeyRejection::ControlChar)
+        );
+        // A bare carriage return would let a publisher forge log lines.
+        assert_eq!(
+            validate_stream_key("key\r INFO forged"),
+            Err(StreamKeyRejection::ControlChar)
+        );
+    }
+
+    #[test]
+    fn validate_stream_key_rejects_path_traversal() {
+        assert_eq!(
+            validate_stream_key("../../etc/passwd"),
+            Err(StreamKeyRejection::PathTraversal)
+        );
+        assert_eq!(
+            validate_stream_key("a/b"),
+            Err(StreamKeyRejection::PathTraversal)
+        );
+        assert_eq!(
+            validate_stream_key("windows\\style"),
+            Err(StreamKeyRejection::PathTraversal)
+        );
+        // `..` without a slash is still suspicious and rejected.
+        assert_eq!(
+            validate_stream_key("ab..cd"),
+            Err(StreamKeyRejection::PathTraversal)
+        );
     }
 }

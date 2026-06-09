@@ -55,6 +55,19 @@ const SEQ_SPACE: u64 = 1 << 31;
 /// Maximum valid sequence number (inclusive): 2^31 − 1.
 const SEQ_MAX: u32 = 0x7FFF_FFFF;
 
+/// Upper bound on how many sequence numbers a single NAK loss range may span
+/// before [`ReliabilityState::on_nak`] refuses to walk it.
+///
+/// A NAK reports packets the *receiver* missed, so a legitimate range can never
+/// exceed the in-flight window. SRT's default flow window is 8192 packets; we
+/// allow a generous 64Ki headroom over that and treat anything larger as a
+/// malformed or malicious report. Without this bound a NAK whose `to` endpoint
+/// sits *behind* `from` in the forward 31-bit direction (e.g. `from=10, to=5`)
+/// would make the walk traverse almost the entire 2^31 sequence space — a
+/// remote-triggerable CPU denial of service, since NAK ranges arrive from the
+/// network via [`crate::control::decode_nak_loss_list`].
+const MAX_NAK_RANGE_SPAN: i64 = 1 << 16;
+
 /// Increment a 31-bit sequence number, wrapping at `SEQ_MAX`.
 #[must_use]
 pub fn seq_next(seq: u32) -> u32 {
@@ -325,9 +338,27 @@ impl ReliabilityState {
     /// `from` and `to` are the inclusive endpoints of the reported loss range.
     /// Sequence numbers in `[from, to]` that are still in the send buffer are
     /// added to the loss list for retransmission.
+    ///
+    /// The range is walked forward (`from → to`) through the modular 31-bit
+    /// sequence space. A NAK that arrives from an untrusted peer can carry a
+    /// `to` endpoint that lies *behind* `from` in that forward direction
+    /// (whether through corruption or malice); walking such a range unguarded
+    /// would iterate almost the entire 2^31 space. To stay bounded we ignore
+    /// any range that is not forward-ordered, or that spans more than
+    /// [`MAX_NAK_RANGE_SPAN`] packets (far beyond any legitimate in-flight
+    /// window). A single-packet NAK (`from == to`) always proceeds.
     pub fn on_nak(&mut self, from: u32, to: u32) {
-        let mut seq = from & SEQ_MAX;
+        let from = from & SEQ_MAX;
         let to = to & SEQ_MAX;
+        // `seq_diff` yields the signed forward distance `to - from`. A negative
+        // value means `to` is behind `from` (an inverted / wrapped range we
+        // refuse to walk); a value past the cap is implausibly large. Anything
+        // outside `0..=MAX_NAK_RANGE_SPAN` is dropped.
+        let span = seq_diff(from, to);
+        if !(0..=MAX_NAK_RANGE_SPAN).contains(&span) {
+            return;
+        }
+        let mut seq = from;
         loop {
             if self.send_buf.contains_key(&seq) {
                 // Avoid duplicates in the loss list.
@@ -599,6 +630,82 @@ mod tests {
         state.on_nak(0, 0);
         state.on_nak(0, 0); // duplicate NAK
         assert_eq!(state.loss_list_len(), 1, "no duplicate entries in loss list");
+    }
+
+    #[test]
+    fn on_nak_ignores_inverted_range_without_walking_whole_seq_space() {
+        // A malformed/hostile NAK with `to` *behind* `from` in the forward
+        // direction must be rejected outright — never walked (which would take
+        // ~2^31 iterations and hang the receiver). Because this test completes
+        // promptly, it also acts as a liveness guard against the bound
+        // regressing.
+        let mut state = ReliabilityState::new(0);
+        for _ in 0..16 {
+            state.enqueue(vec![0u8; 4]); // seqs 0..=15 are buffered
+        }
+        // from=10, to=5: seq_diff(10, 5) = -5 (inverted), so it must be ignored.
+        state.on_nak(10, 5);
+        assert_eq!(
+            state.loss_list_len(),
+            0,
+            "inverted NAK range must add nothing to the loss list"
+        );
+    }
+
+    #[test]
+    fn on_nak_ignores_oversized_range() {
+        // A range spanning more than MAX_NAK_RANGE_SPAN packets is implausible
+        // (no legitimate in-flight window is that large) and must be dropped so a
+        // single bogus report can't enqueue a colossal walk.
+        let mut state = ReliabilityState::new(0);
+        state.enqueue(vec![0u8; 4]); // seq 0 buffered
+        let over = u32::try_from(MAX_NAK_RANGE_SPAN + 1).unwrap();
+        state.on_nak(0, over);
+        assert_eq!(
+            state.loss_list_len(),
+            0,
+            "oversized NAK range must be ignored"
+        );
+    }
+
+    #[test]
+    fn on_nak_accepts_max_span_boundary() {
+        // Exactly MAX_NAK_RANGE_SPAN is still walked. We buffer only seq 0, so
+        // the loss list ends up with just that one entry — proving the walk ran,
+        // respected the send buffer, and stayed bounded at the boundary.
+        let mut state = ReliabilityState::new(0);
+        state.enqueue(vec![0u8; 4]); // only seq 0 is buffered
+        let to = u32::try_from(MAX_NAK_RANGE_SPAN).unwrap();
+        state.on_nak(0, to);
+        assert_eq!(
+            state.loss_list_len(),
+            1,
+            "boundary span is accepted; only the buffered seq 0 is enqueued"
+        );
+    }
+
+    #[test]
+    fn on_nak_single_packet_still_works() {
+        // The bound must not regress the common single-packet NAK (from == to).
+        let mut state = ReliabilityState::new(0);
+        state.enqueue(vec![0u8; 4]); // seq 0
+        state.on_nak(0, 0);
+        assert_eq!(state.loss_list_len(), 1, "single-packet NAK still retransmits");
+    }
+
+    #[test]
+    fn on_nak_inverted_range_across_wraparound_is_ignored() {
+        // A small `from` with a large `to` near SEQ_MAX has a negative forward
+        // distance (the range is inverted/wrapped), so it must be rejected
+        // rather than walked the long way round.
+        let mut state = ReliabilityState::new(0);
+        state.enqueue(vec![0u8; 4]); // seq 0
+        state.on_nak(5, SEQ_MAX - 5);
+        assert_eq!(
+            state.loss_list_len(),
+            0,
+            "inverted wrapped NAK range must be ignored"
+        );
     }
 
     // ──────────── Receiver: gap detection → NAK ─────────────

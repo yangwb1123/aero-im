@@ -11,6 +11,11 @@ export class WsClient {
     this.handlers = new Map(); // event -> Set<fn>
     this.pingTimer = null;
     this._reconnectTimer = null;
+    // Newest message id this client has received — the `?since=` reconnect cursor
+    // so a dropped/replaced socket replays messages missed while offline (the
+    // server's backfill protocol, see crates/aero-server/src/ws.rs). In memory
+    // only: a full page reload re-fetches state, so it resets per session.
+    this._lastSeen = null;
   }
 
   on(event, fn) {
@@ -29,13 +34,17 @@ export class WsClient {
   connect(token) {
     this.token = token;
     this.closedByUser = false;
+    this._lastSeen = null; // fresh session → no backfill cursor yet
     this._open();
   }
 
   _open() {
     if (this._reconnectTimer) { clearTimeout(this._reconnectTimer); this._reconnectTimer = null; }
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const url = `${proto}//${location.host}/ws?token=${encodeURIComponent(this.token)}`;
+    let url = `${proto}//${location.host}/ws?token=${encodeURIComponent(this.token)}`;
+    // On reconnect, ask the server to replay everything created after the last
+    // message we saw, so a network blip never silently drops messages.
+    if (this._lastSeen) url += `&since=${encodeURIComponent(this._lastSeen)}`;
     this._emit('status', 'connecting');
     let ws;
     try {
@@ -59,6 +68,12 @@ export class WsClient {
       try { msg = JSON.parse(ev.data); }
       catch { this._emit('error', { code: 'PARSE', msg: 'invalid frame' }); return; }
       this._emit('message', msg);
+      // Track the newest message id for the reconnect `?since=` cursor. ULIDs sort
+      // lexicographically, so a string compare yields the latest; only `message`
+      // frames carry a fresh id (an edit/delete carries an older one, which the
+      // `>` guard ignores).
+      const mid = msg && msg.message && msg.message.id;
+      if (mid && (!this._lastSeen || mid > this._lastSeen)) this._lastSeen = mid;
       if (msg && typeof msg.type === 'string') {
         this._emit(`msg:${msg.type}`, msg);
       }

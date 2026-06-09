@@ -208,15 +208,22 @@ impl AuthService {
     /// owner on success.
     ///
     /// Returns `None` when PAT auth is not wired (no verifier injected), the token
-    /// does not carry the PAT prefix, or it is unknown / revoked / expired. The
-    /// [`AuthUser`](crate::extractor::AuthUser) extractor calls this **after** a
-    /// JWT verification fails, so the JWT path is unchanged when no PAT is present.
+    /// is not a **well-formed** PAT (see [`is_well_formed_pat`]), or it is unknown /
+    /// revoked / expired. The [`AuthUser`](crate::extractor::AuthUser) extractor
+    /// calls this **after** a JWT verification fails, so the JWT path is unchanged
+    /// when no PAT is present.
     ///
-    /// The plaintext is hashed here (via [`aero_storage::pat::hash_pat`]) and only
-    /// the hash is handed to the verifier — the raw secret never reaches storage.
+    /// The structural check happens *before* hashing and the DB lookup, so a
+    /// garbage bearer (`aero_pat_` with an empty / wrong-length / non-hex body, or
+    /// an arbitrarily large blob) is rejected in constant time without burning a
+    /// SHA-256 and a database round-trip — and can never collide with a stored
+    /// hash, since every minted token is exactly this shape (see
+    /// [`aero_storage::pat::generate_pat`]). On a well-formed token the plaintext
+    /// is hashed here (via [`aero_storage::pat::hash_pat`]) and only the hash is
+    /// handed to the verifier — the raw secret never reaches storage.
     pub async fn verify_pat(&self, token: &str) -> Option<aero_common::ParticipantId> {
         let verifier = self.pat_verifier.as_ref()?;
-        if !token.starts_with(aero_storage::pat::PAT_PREFIX) {
+        if !is_well_formed_pat(token) {
             return None;
         }
         let hash = aero_storage::pat::hash_pat(token);
@@ -229,6 +236,36 @@ impl AuthService {
             refresh_token: self.jwt.issue(pid, TokenKind::Refresh)?,
         })
     }
+}
+
+/// Length, in hex characters, of a PAT's random body — 256 bits of entropy
+/// (32 bytes) rendered as lowercase hex by
+/// [`generate_pat`](aero_storage::pat::generate_pat).
+const PAT_BODY_HEX_LEN: usize = 64;
+
+/// Is `token` a structurally well-formed Personal Access Token?
+///
+/// A minted PAT is *exactly* [`PAT_PREFIX`](aero_storage::pat::PAT_PREFIX)
+/// followed by [`PAT_BODY_HEX_LEN`] lowercase hex characters — nothing more,
+/// nothing less. Checking that shape before hashing lets [`verify_pat`] reject a
+/// malformed bearer (empty body, wrong length, uppercase/non-hex characters, or a
+/// huge blob) in constant time, sparing a needless SHA-256 and DB lookup. The
+/// check is purely structural — a well-formed *but unknown* token still returns
+/// `None` from the verifier — so it widens no trust, only narrows wasted work.
+///
+/// Lowercase-only is deliberate: `generate_pat` emits `{:02x}` (lowercase) and
+/// `hash_pat` is case-sensitive over the raw bytes, so an uppercased copy of a
+/// real token would hash differently and never match anyway — rejecting it here
+/// is both correct and cheaper.
+///
+/// [`verify_pat`]: AuthService::verify_pat
+#[must_use]
+fn is_well_formed_pat(token: &str) -> bool {
+    let Some(body) = token.strip_prefix(aero_storage::pat::PAT_PREFIX) else {
+        return false;
+    };
+    body.len() == PAT_BODY_HEX_LEN
+        && body.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 fn validate_email(email: &str) -> Result<()> {
@@ -272,5 +309,47 @@ mod tests {
     fn validate_password_enforces_min_len() {
         assert!(validate_password("short").is_err());
         assert!(validate_password("longenough").is_ok());
+    }
+
+    #[test]
+    fn well_formed_pat_accepts_freshly_minted_tokens() {
+        // Whatever `generate_pat` mints must pass the structural gate, or
+        // `verify_pat` would reject every real token before the DB ever sees it.
+        for _ in 0..16 {
+            let token = aero_storage::pat::generate_pat();
+            assert!(
+                is_well_formed_pat(&token),
+                "generate_pat output must be well-formed: {token}"
+            );
+        }
+    }
+
+    #[test]
+    fn well_formed_pat_rejects_malformed_bodies() {
+        let prefix = aero_storage::pat::PAT_PREFIX;
+        // Missing prefix entirely (e.g. a JWT or random bearer).
+        assert!(!is_well_formed_pat("not-a-pat"));
+        assert!(!is_well_formed_pat(&"a".repeat(PAT_BODY_HEX_LEN)));
+        // Bare prefix with an empty body.
+        assert!(!is_well_formed_pat(prefix));
+        // Body one hex char too short / too long.
+        assert!(!is_well_formed_pat(&format!("{prefix}{}", "a".repeat(PAT_BODY_HEX_LEN - 1))));
+        assert!(!is_well_formed_pat(&format!("{prefix}{}", "a".repeat(PAT_BODY_HEX_LEN + 1))));
+        // Correct length but a non-hex character ('g') in the body.
+        assert!(!is_well_formed_pat(&format!("{prefix}{}", "g".repeat(PAT_BODY_HEX_LEN))));
+        // Correct length and hex digits but uppercase — generate_pat emits
+        // lowercase, and hash_pat is case-sensitive, so this could never match.
+        assert!(!is_well_formed_pat(&format!("{prefix}{}", "A".repeat(PAT_BODY_HEX_LEN))));
+        // A pathologically large blob is rejected on length alone (no hashing).
+        assert!(!is_well_formed_pat(&format!("{prefix}{}", "a".repeat(100_000))));
+    }
+
+    #[test]
+    fn well_formed_pat_accepts_exact_lowercase_hex_body() {
+        let prefix = aero_storage::pat::PAT_PREFIX;
+        // Every lowercase hex digit, padded to the exact body length, is accepted.
+        let body: String = "0123456789abcdef".repeat(PAT_BODY_HEX_LEN / 16);
+        assert_eq!(body.len(), PAT_BODY_HEX_LEN);
+        assert!(is_well_formed_pat(&format!("{prefix}{body}")));
     }
 }

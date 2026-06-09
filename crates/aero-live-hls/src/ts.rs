@@ -36,6 +36,11 @@ const STREAM_TYPE_ADTS_AAC: u8 = 0x0F;
 const STREAM_ID_VIDEO: u8 = 0xE0;
 const STREAM_ID_AUDIO: u8 = 0xC0;
 
+/// Maximum value of the ADTS `aac_frame_length` field (13 bits, ISO/IEC
+/// 13818-7). The whole frame — 7-byte ADTS header plus raw AAC payload —
+/// must fit within this many bytes.
+pub const ADTS_MAX_FRAME_LEN: usize = (1 << 13) - 1; // 8191
+
 /// AAC sampling-frequency-index table from ISO/IEC 14496-3 §1.6.3.4.
 const AAC_SAMPLE_RATES: [u32; 13] = [
     96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350,
@@ -49,6 +54,15 @@ pub enum MuxError {
     AvcConfig(&'static str),
     #[error("aac config: {0}")]
     AacConfig(&'static str),
+    /// An AAC raw frame is too large to be represented in an ADTS header.
+    ///
+    /// The ADTS `aac_frame_length` field is 13 bits wide (ISO/IEC 13818-7),
+    /// so the total frame including the 7-byte header cannot exceed
+    /// [`ADTS_MAX_FRAME_LEN`] bytes. We reject oversized frames instead of
+    /// silently truncating the length field, which would desync every
+    /// downstream AAC decoder for the remainder of the stream.
+    #[error("aac frame: {0} bytes exceeds the 13-bit ADTS frame length limit")]
+    AacFrameTooLarge(usize),
 }
 
 #[derive(Debug, Default, Clone)]
@@ -308,8 +322,15 @@ impl FlvToTsConverter {
             .as_ref()
             .ok_or(MuxError::Flv("AAC raw without seq header"))?;
         // Wrap raw AAC in ADTS.
-        let mut adts = BytesMut::with_capacity(7 + body.len());
         let frame_len = 7 + body.len();
+        // The ADTS `aac_frame_length` field is only 13 bits wide. Encoding a
+        // larger value would silently truncate it (e.g. 8192 -> 0), producing a
+        // header that lies about the frame size and desyncs the decoder for the
+        // rest of the stream. Reject rather than corrupt.
+        if frame_len > ADTS_MAX_FRAME_LEN {
+            return Err(MuxError::AacFrameTooLarge(frame_len));
+        }
+        let mut adts = BytesMut::with_capacity(frame_len);
         let profile_minus_1 = aac.object_type.saturating_sub(1) & 0x03;
         let sri = aac.sample_rate_index & 0x0F;
         let chc = aac.channel_config & 0x07;
@@ -675,6 +696,63 @@ mod tests {
         assert_eq!(read_i24_be(&[0xFF, 0xFF, 0xFF]), -1);
         assert_eq!(read_i24_be(&[0x00, 0x00, 0x01]), 1);
         assert_eq!(read_i24_be(&[0x80, 0x00, 0x00]), -8_388_608);
+    }
+
+    /// Reconstruct the 13-bit `aac_frame_length` field from the three ADTS
+    /// header bytes that carry it, exactly as a decoder would.
+    fn adts_frame_length(adts: &[u8]) -> usize {
+        ((adts[3] as usize & 0x03) << 11)
+            | ((adts[4] as usize) << 3)
+            | ((adts[5] as usize >> 5) & 0x07)
+    }
+
+    #[test]
+    fn aac_frame_length_at_13bit_boundary_is_exact() {
+        let mut c = FlvToTsConverter::new();
+        c.aac = Some(AacCodec {
+            object_type: 2,
+            sample_rate_index: 4,
+            channel_config: 2,
+        });
+        // Largest payload that still fits in the 13-bit ADTS length field.
+        let payload = vec![0u8; ADTS_MAX_FRAME_LEN - 7];
+        c.push_aac_raw(&payload, 0).unwrap();
+        // The first ADTS header lives at the start of the PES payload; locate
+        // the 0xFFF sync word and decode its declared frame length.
+        let sync = c
+            .pending
+            .windows(2)
+            .position(|w| w[0] == 0xFF && (w[1] & 0xF0) == 0xF0)
+            .expect("ADTS sync not found");
+        let header = &c.pending[sync..sync + 6];
+        assert_eq!(
+            adts_frame_length(header),
+            ADTS_MAX_FRAME_LEN,
+            "frame length at the boundary must round-trip exactly"
+        );
+    }
+
+    #[test]
+    fn aac_frame_exceeding_13bit_limit_is_rejected() {
+        let mut c = FlvToTsConverter::new();
+        c.aac = Some(AacCodec {
+            object_type: 2,
+            sample_rate_index: 4,
+            channel_config: 2,
+        });
+        // One byte past the boundary: total frame_len == 8192, which would
+        // truncate to 0 in the 13-bit field if written naively.
+        let payload = vec![0u8; ADTS_MAX_FRAME_LEN - 7 + 1];
+        let err = c.push_aac_raw(&payload, 0).unwrap_err();
+        match err {
+            MuxError::AacFrameTooLarge(n) => assert_eq!(n, ADTS_MAX_FRAME_LEN + 1),
+            other => panic!("expected AacFrameTooLarge, got {other:?}"),
+        }
+        // Nothing should have been written to the pending buffer on rejection.
+        assert!(
+            c.pending.is_empty(),
+            "rejected frame must not emit partial TS bytes"
+        );
     }
 }
 

@@ -44,8 +44,24 @@ pub fn validate_sdp(sdp: &str) -> Result<(), SignalingError> {
 /// { "candidate": "candidate:...", "sdpMid": "0", "sdpMLineIndex": 0 }
 /// ```
 ///
-/// We only require that `candidate` is a non-empty string, and that the
-/// serialized blob fits in [`MAX_CANDIDATE_BYTES`].
+/// Beyond the size cap, this enforces the structural invariants the remote
+/// browser's `new RTCIceCandidate(init)` constructor relies on, so a malformed
+/// candidate is rejected *here* rather than silently relayed and then thrown
+/// away (or throwing a `TypeError`) on the peer:
+///
+/// - `candidate` is a string and the serialized blob fits in
+///   [`MAX_CANDIDATE_BYTES`].
+/// - A **non-empty** `candidate` is an `a=candidate` attribute value, so it must
+///   begin with the `candidate:` prefix (RFC 8839 §5.1). A leading `a=` — which
+///   some clients erroneously include — is tolerated and stripped before the
+///   check. (An *empty* `candidate` is the end-of-candidates sentinel; the IM
+///   relay does not forward those, so it is still rejected here as it always
+///   was.)
+/// - A non-empty candidate must be addressable: at least one of `sdpMid` /
+///   `sdpMLineIndex` must be present and non-null, otherwise the browser
+///   constructor throws.
+/// - When present and non-null, `sdpMid` must be a string and `sdpMLineIndex` a
+///   non-negative integer in the `u16` m-line index range.
 pub fn validate_ice_candidate(candidate: &Value) -> Result<(), SignalingError> {
     let obj = candidate
         .as_object()
@@ -59,6 +75,42 @@ pub fn validate_ice_candidate(candidate: &Value) -> Result<(), SignalingError> {
         .ok_or(SignalingError::InvalidCandidate("'candidate' is not a string"))?;
     if cand_str.is_empty() {
         return Err(SignalingError::InvalidCandidate("'candidate' is empty"));
+    }
+
+    // A non-empty candidate is an `a=candidate:...` attribute value. Browsers
+    // accept the value with or without a leading `a=`; normalize then require
+    // the mandatory `candidate:` prefix so garbage strings never reach a peer.
+    let normalized = cand_str.strip_prefix("a=").unwrap_or(cand_str);
+    if !normalized.starts_with("candidate:") {
+        return Err(SignalingError::InvalidCandidate(
+            "'candidate' must start with 'candidate:'",
+        ));
+    }
+
+    // The candidate must be addressable to an m-section. At least one of
+    // `sdpMid`/`sdpMLineIndex` must be present and non-null, and each, when
+    // given, must have the correct JSON type.
+    let mid = obj.get("sdpMid").filter(|v| !v.is_null());
+    let mline = obj.get("sdpMLineIndex").filter(|v| !v.is_null());
+    if mid.is_none() && mline.is_none() {
+        return Err(SignalingError::InvalidCandidate(
+            "requires 'sdpMid' or 'sdpMLineIndex'",
+        ));
+    }
+    if let Some(mid) = mid {
+        if !mid.is_string() {
+            return Err(SignalingError::InvalidCandidate("'sdpMid' is not a string"));
+        }
+    }
+    if let Some(mline) = mline {
+        // m-line indices are non-negative and bounded by the number of media
+        // sections; `u16` is the relevant range (RFC 8829 / browser behavior).
+        let ok = mline.as_u64().is_some_and(|n| u16::try_from(n).is_ok());
+        if !ok {
+            return Err(SignalingError::InvalidCandidate(
+                "'sdpMLineIndex' must be a non-negative integer in u16 range",
+            ));
+        }
     }
 
     // Serialize once to check the overall envelope size.

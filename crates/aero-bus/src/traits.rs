@@ -14,6 +14,12 @@ pub enum BusError {
     Serde(#[from] serde_json::Error),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    /// The subject is not a publishable NATS subject (empty, contains an empty
+    /// token, whitespace, control characters, or a `*`/`>` wildcard). Surfaced
+    /// before the bytes ever reach the broker so callers get a precise reason
+    /// instead of an opaque publish timeout or a silently misrouted message.
+    #[error("invalid subject {subject:?}: {reason}")]
+    InvalidSubject { subject: String, reason: &'static str },
 }
 
 pub type BusResult<T> = Result<T, BusError>;

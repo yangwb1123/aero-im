@@ -134,7 +134,14 @@ enum ClientFrame {
         sdp: String,
     },
     /// Start watching a live stream (danmaku/gift fan-out + viewer count).
-    WatchStream { stream_id: Ulid },
+    WatchStream {
+        stream_id: Ulid,
+        /// Optional forward catch-up cursor: the last chat-line id the client has
+        /// rendered. Lines strictly newer are replayed on watch, so a re-watch or
+        /// late join doesn't silently miss the danmaku in between.
+        #[serde(default)]
+        since: Option<String>,
+    },
     /// Stop watching a live stream.
     UnwatchStream { stream_id: Ulid },
     /// Post a danmaku line on a stream.
@@ -624,7 +631,7 @@ async fn handle_text(
                 .relay_call_event(room_id, CallEvent::Offer { call_id, from: pid, to, sdp })
                 .await?;
         }
-        ClientFrame::WatchStream { stream_id } => {
+        ClientFrame::WatchStream { stream_id, since } => {
             // Local Hub still tracks watchers for per-process event fan-out...
             state.hub.watch_stream(stream_id, pid);
             // ...while Redis is the cluster-wide source of the viewer COUNT
@@ -633,10 +640,25 @@ async fn handle_text(
             if let Err(e) = state.stream_viewers.join(stream_id, pid).await {
                 warn!(error = ?e, %stream_id, "redis stream-viewer join failed");
             }
-            // Replay a small danmaku backlog so the new watcher has context.
-            if let Ok(lines) = state.live.recent_chat(stream_id, 30).await {
+            // Replay danmaku so the new watcher has context. With a `since` cursor
+            // (re-watch / late join) replay everything strictly newer up to a
+            // bounded window; without it, just a small recent tail.
+            let since_cursor = since.as_deref().and_then(|c| Ulid::from_string(c.trim()).ok());
+            let replay_limit = if since_cursor.is_some() { 200 } else { 30 };
+            if let Ok(lines) = state.live.recent_chat_since(stream_id, since_cursor, replay_limit).await {
                 for line in lines {
                     let frame = ServerFrame::StreamEvent { event: StreamEvent::Chat(line) };
+                    let _ = tx.try_send(Message::Text(
+                        serde_json::to_string(&frame).unwrap_or_default(),
+                    ));
+                }
+            }
+            // Also replay a small recent-gift tail so a late joiner has gift
+            // context too (no cursor: gifts have their own id space, and the
+            // `since` cursor above is danmaku-only).
+            if let Ok(gifts) = state.live.recent_gifts(stream_id, 10).await {
+                for gift in gifts {
+                    let frame = ServerFrame::StreamEvent { event: StreamEvent::Gift(gift) };
                     let _ = tx.try_send(Message::Text(
                         serde_json::to_string(&frame).unwrap_or_default(),
                     ));
@@ -868,10 +890,34 @@ fn same_lang(a: &str, b: &str) -> bool {
 mod tests {
     use super::{
         authoritative_count, backfill_room_ids, parse_resume_cursor, same_lang,
-        BACKFILL_PER_ROOM_LIMIT,
+        BACKFILL_PER_ROOM_LIMIT, ClientFrame,
     };
     use aero_common::{MessageId, ParticipantId, Room, RoomId, RoomKind};
     use ulid::Ulid;
+
+    #[test]
+    fn watch_stream_frame_carries_optional_since_cursor() {
+        // Legacy client (no `since`) → None, so the replay behaviour is unchanged.
+        let without: ClientFrame = serde_json::from_str(
+            r#"{"type":"watch_stream","stream_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV"}"#,
+        )
+        .expect("parse watch_stream without since");
+        match without {
+            ClientFrame::WatchStream { since, .. } => assert!(since.is_none()),
+            _ => panic!("expected WatchStream"),
+        }
+        // With `since` → carried through so the watch handler can replay catch-up.
+        let with: ClientFrame = serde_json::from_str(
+            r#"{"type":"watch_stream","stream_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV","since":"01ARZ3NDEKTSV4RRFFQ69G5FZZ"}"#,
+        )
+        .expect("parse watch_stream with since");
+        match with {
+            ClientFrame::WatchStream { since, .. } => {
+                assert_eq!(since.as_deref(), Some("01ARZ3NDEKTSV4RRFFQ69G5FZZ"));
+            }
+            _ => panic!("expected WatchStream"),
+        }
+    }
 
     #[test]
     fn same_lang_matches_on_primary_subtag() {

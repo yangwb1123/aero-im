@@ -826,6 +826,60 @@ pub struct UserStatus {
     pub updated_at: OffsetDateTime,
 }
 
+impl UserStatus {
+    /// Whether the custom status (`emoji` + `text`) has auto-expired as of `now`.
+    ///
+    /// `expires_at == None` (no expiry) is never expired. Otherwise it is expired
+    /// once `now` has reached or passed `expires_at` (the boundary is inclusive,
+    /// so an instant *equal* to `expires_at` counts as expired). This is the
+    /// canonical, DB-agnostic counterpart to the storage layer's row-level check,
+    /// so any in-memory reader (event payload, cache, test) applies the same rule.
+    #[must_use]
+    pub fn is_custom_status_expired(&self, now: OffsetDateTime) -> bool {
+        matches!(self.expires_at, Some(at) if now >= at)
+    }
+
+    /// Return a normalized copy as a reader should see it at `now`: if the custom
+    /// status has expired, `emoji`, `text`, and `expires_at` are dropped while the
+    /// coarse [`Presence`] preference and `updated_at` are kept (a user who set
+    /// "away until 5pm" stays away after 5pm; only the decoration drops). When not
+    /// expired, the status is returned unchanged.
+    ///
+    /// This owns the contract promised in this type's docs so non-DB code paths do
+    /// not have to re-implement the expiry-clearing rule.
+    #[must_use]
+    pub fn with_expiry_applied(mut self, now: OffsetDateTime) -> Self {
+        if self.is_custom_status_expired(now) {
+            self.emoji = None;
+            self.text = None;
+            self.expires_at = None;
+        }
+        self
+    }
+
+    /// The emoji a reader should see at `now` — `None` once the custom status has
+    /// expired, without allocating a normalized copy.
+    #[must_use]
+    pub fn effective_emoji(&self, now: OffsetDateTime) -> Option<&str> {
+        if self.is_custom_status_expired(now) {
+            None
+        } else {
+            self.emoji.as_deref()
+        }
+    }
+
+    /// The status text a reader should see at `now` — `None` once the custom
+    /// status has expired, without allocating a normalized copy.
+    #[must_use]
+    pub fn effective_text(&self, now: OffsetDateTime) -> Option<&str> {
+        if self.is_custom_status_expired(now) {
+            None
+        } else {
+            self.text.as_deref()
+        }
+    }
+}
+
 // ---------- Tests ----------
 
 #[cfg(test)]
@@ -1005,6 +1059,66 @@ mod tests {
         // Unknown / empty tokens default to Active (never fails a read).
         assert_eq!(Presence::from_str_lenient("bogus"), Presence::Active);
         assert_eq!(Presence::from_str_lenient(""), Presence::Active);
+    }
+
+    #[test]
+    fn user_status_expiry_clears_custom_keeps_presence() {
+        use time::Duration;
+        let set_at = time::OffsetDateTime::UNIX_EPOCH;
+        let expiry = set_at + Duration::hours(1);
+        let status = UserStatus {
+            participant_id: ParticipantId::new(),
+            emoji: Some(":palm_tree:".into()),
+            text: Some("On vacation".into()),
+            presence: Presence::Away,
+            expires_at: Some(expiry),
+            updated_at: set_at,
+        };
+
+        // Before expiry: nothing is cleared.
+        let before = expiry - Duration::seconds(1);
+        assert!(!status.is_custom_status_expired(before));
+        assert_eq!(status.effective_emoji(before), Some(":palm_tree:"));
+        assert_eq!(status.effective_text(before), Some("On vacation"));
+        let normalized_before = status.clone().with_expiry_applied(before);
+        assert_eq!(normalized_before.emoji.as_deref(), Some(":palm_tree:"));
+        assert_eq!(normalized_before.expires_at, Some(expiry));
+
+        // Exactly at the boundary: expired (inclusive), so custom status drops.
+        assert!(status.is_custom_status_expired(expiry));
+
+        // After expiry: emoji/text/expires_at cleared, presence + updated_at kept.
+        let after = expiry + Duration::seconds(1);
+        assert!(status.is_custom_status_expired(after));
+        assert_eq!(status.effective_emoji(after), None);
+        assert_eq!(status.effective_text(after), None);
+        let normalized = status.clone().with_expiry_applied(after);
+        assert_eq!(normalized.emoji, None);
+        assert_eq!(normalized.text, None);
+        assert_eq!(normalized.expires_at, None);
+        assert_eq!(normalized.presence, Presence::Away, "presence is preserved");
+        assert_eq!(normalized.updated_at, set_at, "updated_at is preserved");
+        assert_eq!(normalized.participant_id, status.participant_id);
+    }
+
+    #[test]
+    fn user_status_no_expiry_never_clears() {
+        let status = UserStatus {
+            participant_id: ParticipantId::new(),
+            emoji: Some(":wave:".into()),
+            text: Some("around".into()),
+            presence: Presence::Active,
+            expires_at: None,
+            updated_at: time::OffsetDateTime::UNIX_EPOCH,
+        };
+        // A status with no expiry is never expired, even far in the future.
+        let far_future = time::OffsetDateTime::UNIX_EPOCH + time::Duration::days(3650);
+        assert!(!status.is_custom_status_expired(far_future));
+        assert_eq!(status.effective_emoji(far_future), Some(":wave:"));
+        let same = status.clone().with_expiry_applied(far_future);
+        assert_eq!(same.emoji.as_deref(), Some(":wave:"));
+        assert_eq!(same.text.as_deref(), Some("around"));
+        assert_eq!(same.expires_at, None);
     }
 
     #[test]

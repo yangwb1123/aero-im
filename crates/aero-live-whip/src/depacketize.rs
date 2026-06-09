@@ -19,6 +19,15 @@
 //! (26/27), and FU-B (29). They are surfaced as [`DepacketizeError::Unsupported`]
 //! rather than silently dropped.
 //!
+//! ## Bounded reassembly
+//!
+//! FU-A reassembly accumulates fragment bytes across many RTP packets. Since the
+//! depacketizer is fed directly from untrusted network input, every reassembled
+//! NAL is bounded by [`DEFAULT_MAX_NAL_SIZE`] (configurable via
+//! [`H264Depacketizer::with_max_nal_size`]); a peer that withholds the End
+//! fragment cannot grow the buffer without limit — the reassembly is dropped with
+//! [`DepacketizeError::Oversized`] once the cap is exceeded.
+//!
 //! Output is **Annex-B**: each emitted NAL unit is prefixed with the 4-byte
 //! start code `00 00 00 01`, matching what [`aero_live_hls`]'s TS muxer expects
 //! after its own AVCC→Annex-B conversion (see `aero-live-hls/src/ts.rs`).
@@ -27,6 +36,18 @@ use bytes::{BufMut, BytesMut};
 
 /// 4-byte Annex-B start code prepended to every reassembled NAL unit.
 pub const ANNEX_B_START_CODE: [u8; 4] = [0x00, 0x00, 0x00, 0x01];
+
+/// Default upper bound on a single reassembled NAL unit, in bytes (2 MiB).
+///
+/// FU-A reassembly accumulates fragment bytes across many RTP packets before an
+/// End fragment closes the NAL. Without a cap, a peer that sends a Start
+/// fragment followed by an unbounded run of Middle fragments (and never an End)
+/// would grow the reassembly buffer without limit — a memory-exhaustion denial
+/// of service, since the depacketizer is fed directly from untrusted network
+/// input. 2 MiB
+/// comfortably exceeds any legitimate single H.264 NAL (even a 4K IDR slice is
+/// well under 1 MiB) while bounding the damage a hostile or buggy peer can do.
+pub const DEFAULT_MAX_NAL_SIZE: usize = 2 * 1024 * 1024;
 
 /// NAL unit type carried in the low 5 bits of the first NAL byte.
 const NAL_TYPE_STAP_A: u8 = 24;
@@ -52,6 +73,11 @@ pub enum DepacketizeError {
     /// before the previous fragment ended.
     #[error("FU-A reassembly desync")]
     FragmentDesync,
+    /// A reassembled NAL unit exceeded the configured maximum size. Carries the
+    /// byte count that triggered the limit. The in-progress fragment is dropped
+    /// (the depacketizer resyncs) rather than buffering unboundedly.
+    #[error("reassembled NAL unit exceeds {limit} bytes (reached {reached})")]
+    Oversized { reached: usize, limit: usize },
 }
 
 /// Reassembles Annex-B NAL units from a sequence of RTP H.264 payloads.
@@ -62,10 +88,23 @@ pub enum DepacketizeError {
 ///
 /// The depacketizer is stateful only across FU-A fragments; single-NAL and
 /// STAP-A packets are self-contained.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct H264Depacketizer {
     /// In-progress FU-A reassembly buffer (NAL header byte already written).
     fu_buf: Option<FuReassembly>,
+    /// Upper bound on any single reassembled NAL unit, in bytes. Guards FU-A
+    /// reassembly (and, defensively, single-NAL / STAP-A units) against
+    /// unbounded growth from a hostile or buggy peer.
+    max_nal_size: usize,
+}
+
+impl Default for H264Depacketizer {
+    fn default() -> Self {
+        Self {
+            fu_buf: None,
+            max_nal_size: DEFAULT_MAX_NAL_SIZE,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -80,6 +119,31 @@ impl H264Depacketizer {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Create a depacketizer with an explicit maximum reassembled-NAL size.
+    ///
+    /// Any reassembled NAL unit (FU-A, STAP-A aggregated unit, or single-NAL
+    /// packet) that would exceed `max_nal_size` bytes is rejected with
+    /// [`DepacketizeError::Oversized`] and the in-progress fragment is dropped,
+    /// so a peer cannot exhaust memory by withholding the End fragment. A value
+    /// of `0` is treated as [`DEFAULT_MAX_NAL_SIZE`] (the cap is never disabled).
+    #[must_use]
+    pub fn with_max_nal_size(max_nal_size: usize) -> Self {
+        Self {
+            fu_buf: None,
+            max_nal_size: if max_nal_size == 0 {
+                DEFAULT_MAX_NAL_SIZE
+            } else {
+                max_nal_size
+            },
+        }
+    }
+
+    /// The configured maximum reassembled-NAL size, in bytes.
+    #[must_use]
+    pub fn max_nal_size(&self) -> usize {
+        self.max_nal_size
     }
 
     /// Process one RTP payload. Appends zero or more complete Annex-B NAL units
@@ -99,12 +163,13 @@ impl H264Depacketizer {
             1..=23 => {
                 // Single NAL unit packet — the entire payload is one NAL unit.
                 self.reject_dangling_fragment()?;
+                self.check_nal_size(payload.len())?;
                 append_nal(out, payload);
                 Ok(())
             }
             NAL_TYPE_STAP_A => {
                 self.reject_dangling_fragment()?;
-                Self::depacketize_stap_a(payload, out)
+                self.depacketize_stap_a(payload, out)
             }
             NAL_TYPE_FU_A => self.depacketize_fu_a(payload, out),
             NAL_TYPE_STAP_B | NAL_TYPE_MTAP16 | NAL_TYPE_MTAP24 | NAL_TYPE_FU_B => {
@@ -140,7 +205,19 @@ impl H264Depacketizer {
         Ok(())
     }
 
-    fn depacketize_stap_a(payload: &[u8], out: &mut BytesMut) -> Result<(), DepacketizeError> {
+    /// Reject a NAL unit whose size exceeds the configured cap.
+    #[inline]
+    fn check_nal_size(&self, reached: usize) -> Result<(), DepacketizeError> {
+        if reached > self.max_nal_size {
+            return Err(DepacketizeError::Oversized {
+                reached,
+                limit: self.max_nal_size,
+            });
+        }
+        Ok(())
+    }
+
+    fn depacketize_stap_a(&self, payload: &[u8], out: &mut BytesMut) -> Result<(), DepacketizeError> {
         // RFC 6184 §5.7.1: STAP-A = [STAP-A NAL hdr][ (16-bit size)(NAL unit) ]+
         let mut p = 1usize; // skip the STAP-A header byte
         while p < payload.len() {
@@ -155,6 +232,7 @@ impl H264Depacketizer {
             if p + size > payload.len() {
                 return Err(DepacketizeError::Truncated("stap-a aggregated unit"));
             }
+            self.check_nal_size(size)?;
             append_nal(out, &payload[p..p + size]);
             p += size;
         }
@@ -182,6 +260,8 @@ impl H264Depacketizer {
                 self.fu_buf = None;
                 return Err(DepacketizeError::FragmentDesync);
             }
+            // The reassembled NAL is the header byte plus this fragment so far.
+            self.check_nal_size(frag.len() + 1)?;
             let mut data = BytesMut::with_capacity(frag.len() + 1);
             data.extend_from_slice(frag);
             self.fu_buf = Some(FuReassembly { nal_header, data });
@@ -193,6 +273,15 @@ impl H264Depacketizer {
             if buf.nal_header != nal_header {
                 self.fu_buf = None;
                 return Err(DepacketizeError::FragmentDesync);
+            }
+            // Bound the accumulation *before* extending: a peer that keeps
+            // sending Middle fragments without an End must not grow this buffer
+            // without limit. The +1 accounts for the reconstructed header byte.
+            let reached = buf.data.len() + frag.len() + 1;
+            if reached > self.max_nal_size {
+                let limit = self.max_nal_size;
+                self.fu_buf = None;
+                return Err(DepacketizeError::Oversized { reached, limit });
             }
             buf.data.extend_from_slice(frag);
         }
@@ -412,5 +501,148 @@ mod tests {
         d.push(&[0x7C, 0x45, 0xBB], true, &mut out).unwrap();
         let units = parse_annex_b(&out);
         assert_eq!(units, vec![(5u8, 3usize)]);
+    }
+
+    // ---- FU-A reassembly size cap (memory-exhaustion guard) ----
+
+    #[test]
+    fn default_max_nal_size_is_two_mib() {
+        let d = H264Depacketizer::new();
+        assert_eq!(d.max_nal_size(), DEFAULT_MAX_NAL_SIZE);
+        assert_eq!(DEFAULT_MAX_NAL_SIZE, 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn with_max_nal_size_zero_falls_back_to_default() {
+        let d = H264Depacketizer::with_max_nal_size(0);
+        assert_eq!(
+            d.max_nal_size(),
+            DEFAULT_MAX_NAL_SIZE,
+            "a 0 cap must clamp to the default, never disable the guard"
+        );
+    }
+
+    #[test]
+    fn fu_a_unbounded_middle_fragments_are_capped() {
+        // A peer sends a Start fragment then an endless run of Middle fragments
+        // and never an End. Without the cap, fu_buf.data would grow without
+        // limit. With it, the reassembly is rejected once it exceeds max_nal_size
+        // and the buffer is dropped (resync), bounding memory use.
+        let mut d = H264Depacketizer::with_max_nal_size(16);
+        let mut out = BytesMut::new();
+
+        // Start fragment: FU indicator 0x7C, FU header 0x85 (S=1,E=0,type=5),
+        // body = 5 bytes. Reassembled NAL so far = 1 (header) + 5 = 6 ≤ 16.
+        d.push(&[0x7C, 0x85, 1, 2, 3, 4, 5], false, &mut out).unwrap();
+        assert!(d.is_reassembling());
+
+        // Middle fragment: FU header 0x05 (S=0,E=0,type=5), body = 8 bytes.
+        // Reassembled = 6 + 8 = 14 ≤ 16, still accepted.
+        d.push(&[0x7C, 0x05, 6, 7, 8, 9, 10, 11, 12, 13], false, &mut out)
+            .unwrap();
+        assert!(d.is_reassembling());
+
+        // Another Middle fragment of 8 bytes: would reach 14 + 8 = 22 > 16.
+        let err = d
+            .push(&[0x7C, 0x05, 20, 21, 22, 23, 24, 25, 26, 27], false, &mut out)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            DepacketizeError::Oversized {
+                reached: 22,
+                limit: 16
+            }
+        );
+        // The over-limit reassembly buffer is dropped (resynced), not retained.
+        assert!(!d.is_reassembling(), "buffer dropped on oversize");
+        // Nothing partial was emitted to the output sink.
+        assert!(out.is_empty(), "no partial NAL emitted on overflow");
+    }
+
+    #[test]
+    fn fu_a_oversize_start_fragment_is_rejected() {
+        // Even the very first (Start) fragment is bounded: a single huge Start
+        // fragment must not be buffered if it already exceeds the cap.
+        let mut d = H264Depacketizer::with_max_nal_size(4);
+        let mut out = BytesMut::new();
+        // header + 5-byte body = 6 > 4.
+        let err = d
+            .push(&[0x7C, 0x85, 1, 2, 3, 4, 5], false, &mut out)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            DepacketizeError::Oversized {
+                reached: 6,
+                limit: 4
+            }
+        );
+        assert!(!d.is_reassembling(), "oversize start fragment is not buffered");
+    }
+
+    #[test]
+    fn fu_a_after_oversize_drop_a_fresh_nal_reassembles_cleanly() {
+        // After an oversize abort the depacketizer must be usable again: a new
+        // Start/End pair within the cap reassembles normally.
+        let mut d = H264Depacketizer::with_max_nal_size(8);
+        let mut out = BytesMut::new();
+        // Overflow and drop.
+        let _ = d
+            .push(&[0x7C, 0x85, 1, 2, 3, 4, 5, 6, 7, 8, 9], false, &mut out)
+            .unwrap_err();
+        assert!(!d.is_reassembling());
+        out.clear();
+
+        // A small, in-cap NAL reassembles fine.
+        d.push(&[0x7C, 0x85, 0xAA], false, &mut out).unwrap();
+        d.push(&[0x7C, 0x45, 0xBB], true, &mut out).unwrap();
+        let units = parse_annex_b(&out);
+        assert_eq!(units, vec![(5u8, 3usize)], "fresh NAL after overflow");
+    }
+
+    #[test]
+    fn single_nal_over_cap_is_rejected() {
+        // A single-NAL packet larger than the cap is rejected too.
+        let mut d = H264Depacketizer::with_max_nal_size(4);
+        let mut out = BytesMut::new();
+        let err = d.push(&[0x65, 0xAA, 0xBB, 0xCC, 0xDD], true, &mut out).unwrap_err();
+        assert_eq!(
+            err,
+            DepacketizeError::Oversized {
+                reached: 5,
+                limit: 4
+            }
+        );
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn stap_a_aggregated_unit_over_cap_is_rejected() {
+        // A STAP-A whose aggregated unit exceeds the cap is rejected.
+        let mut d = H264Depacketizer::with_max_nal_size(4);
+        let mut out = BytesMut::new();
+        // STAP-A header 0x78, then size=5 + 5-byte NAL.
+        let mut payload = vec![0x78];
+        payload.extend_from_slice(&5u16.to_be_bytes());
+        payload.extend_from_slice(&[0x67, 0x42, 0x00, 0x1E, 0xAB]);
+        let err = d.push(&payload, false, &mut out).unwrap_err();
+        assert_eq!(
+            err,
+            DepacketizeError::Oversized {
+                reached: 5,
+                limit: 4
+            }
+        );
+    }
+
+    #[test]
+    fn nal_exactly_at_cap_is_accepted() {
+        // Boundary: a NAL whose size equals the cap is fine; only strictly
+        // larger is rejected.
+        let mut d = H264Depacketizer::with_max_nal_size(4);
+        let mut out = BytesMut::new();
+        // header + 3 body = 4 == cap.
+        d.push(&[0x65, 0xAA, 0xBB, 0xCC], true, &mut out).unwrap();
+        let units = parse_annex_b(&out);
+        assert_eq!(units, vec![(5u8, 4usize)]);
     }
 }

@@ -139,6 +139,10 @@ impl ActivityFeedRepo {
         before: Option<ActivityId>,
         limit: i64,
     ) -> Result<Vec<ActivityEntry>, sqlx::Error> {
+        // Defense in depth: the HTTP handler clamps, but the repository must never
+        // stream an unbounded result set if a future/internal caller passes a raw
+        // limit. 200 mirrors the activity handler's MAX_LIMIT.
+        let limit = limit.clamp(1, 200);
         // ULID-backed ids sort by time, and the uuid byte order preserves that
         // ordering, so `id < before` / `id DESC` is a correct newest-first keyset.
         let sql = format!(

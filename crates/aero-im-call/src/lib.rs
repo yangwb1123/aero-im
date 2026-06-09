@@ -211,10 +211,21 @@ impl CallOrchestrator {
     }
 
     /// Leave a group call. Removes the participant from the SFU router.
+    ///
+    /// Returns `true` if this was the **last** participant — i.e. the call is
+    /// now empty and the caller should disband it (end the session row, emit a
+    /// `CallEnd`, and drop any cluster-wide roster entry). Returns `false` if
+    /// other participants remain, or if no [`SfuRouter`] is attached (in which
+    /// case emptiness cannot be tracked here and the caller must decide).
+    ///
+    /// This surfaces the empty-roster signal that [`SfuRouter::remove_peer`]
+    /// already computes; without it, callers have no way to detect that the
+    /// final member dropped and the group call should be torn down.
     #[instrument(skip(self))]
-    pub fn leave_group_call(&self, call_id: CallId, participant: ParticipantId) {
-        if let Some(sfu) = &self.sfu {
-            sfu.remove_peer(call_id, participant);
+    pub fn leave_group_call(&self, call_id: CallId, participant: ParticipantId) -> bool {
+        match &self.sfu {
+            Some(sfu) => sfu.remove_peer(call_id, participant),
+            None => false,
         }
     }
 
@@ -254,9 +265,42 @@ mod tests {
         let p2_before = orch.existing_peers_excluding(call_id, p2);
         assert_eq!(p2_before, vec![p1], "second joiner sees p1");
 
-        // p1 leaves.
-        orch.leave_group_call(call_id, p1);
+        // p1 leaves; p2 remains, so the call is NOT yet empty.
+        let p1_was_last = orch.leave_group_call(call_id, p1);
+        assert!(!p1_was_last, "p1 leaving with p2 still present is not the last leave");
         assert_eq!(sfu.participants(call_id), vec![p2]);
+    }
+
+    #[tokio::test]
+    async fn leave_group_call_reports_last_participant() {
+        let sfu = SfuRouter::new();
+        let (p1, p2) = make_ids();
+        let call_id = CallId::new();
+        let orch = CallOrchestrator::new_for_test(sfu.clone());
+
+        orch.sfu_add(call_id, p1);
+        orch.sfu_add(call_id, p2);
+
+        // Removing a non-last peer must not signal teardown.
+        assert!(!orch.leave_group_call(call_id, p1), "p1 is not the last to leave");
+        // Removing the final peer signals the call is now empty.
+        assert!(orch.leave_group_call(call_id, p2), "p2 is the last to leave");
+        assert!(sfu.participants(call_id).is_empty(), "roster cleared after last leave");
+
+        // A redundant leave on an already-empty / unknown call is not a teardown.
+        assert!(
+            !orch.leave_group_call(call_id, p2),
+            "leaving an already-empty call must not re-signal teardown"
+        );
+    }
+
+    #[tokio::test]
+    async fn leave_group_call_without_sfu_returns_false() {
+        // No SfuRouter attached: emptiness can't be tracked, so never claim
+        // "last participant" (the caller must decide via other state).
+        let orch = CallOrchestrator { calls: stub_repo(), sfu: None };
+        let (p1, _p2) = make_ids();
+        assert!(!orch.leave_group_call(CallId::new(), p1));
     }
 
     #[tokio::test]

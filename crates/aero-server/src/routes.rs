@@ -1375,11 +1375,26 @@ async fn stream_chat_list(
     State(s): State<AppState>,
     _auth: AuthUser,
     Path(id_str): Path<String>,
-    Query(q): Query<LimitQuery>,
+    Query(q): Query<CursorLimitQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let id = parse_stream_id(&id_str)?;
-    let chat = s.live.recent_chat(id, q.limit.unwrap_or(50)).await?;
+    // `since` is a best-effort forward catch-up cursor (the last chat-line id the
+    // client rendered): a malformed value degrades to the recent tail rather than
+    // erroring, matching the reconnect-cursor convention used for room messages.
+    let since = q.since.as_deref().and_then(|c| ulid::Ulid::from_string(c.trim()).ok());
+    let chat = s.live.recent_chat_since(id, since, q.limit.unwrap_or(50)).await?;
     Ok(Json(serde_json::json!({ "chat": chat })))
+}
+
+/// Query for the stream chat/gift list endpoints: a page `limit` plus an optional
+/// `since` forward cursor (the last id the client rendered) for late-joiner
+/// catch-up. Shared by `stream_chat_list` and `stream_gift_list`.
+#[derive(serde::Deserialize)]
+struct CursorLimitQuery {
+    #[serde(default)]
+    limit: Option<i64>,
+    #[serde(default)]
+    since: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1412,10 +1427,13 @@ async fn stream_gift_list(
     State(s): State<AppState>,
     _auth: AuthUser,
     Path(id_str): Path<String>,
-    Query(q): Query<LimitQuery>,
+    Query(q): Query<CursorLimitQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let id = parse_stream_id(&id_str)?;
-    let gifts = s.live.recent_gifts(id, q.limit.unwrap_or(30)).await?;
+    // Best-effort forward catch-up cursor (last gift id rendered); malformed →
+    // recent tail. Symmetric with `stream_chat_list`.
+    let since = q.since.as_deref().and_then(|c| ulid::Ulid::from_string(c.trim()).ok());
+    let gifts = s.live.recent_gifts_since(id, since, q.limit.unwrap_or(30)).await?;
     Ok(Json(serde_json::json!({ "gifts": gifts })))
 }
 

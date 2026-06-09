@@ -122,6 +122,104 @@ mod tests {
         assert!(matches!(err, SignalingError::InvalidCandidate(_)));
     }
 
+    fn ice(candidate: serde_json::Value) -> CallEvent {
+        CallEvent::Ice {
+            call_id: CallId::new(),
+            from: ParticipantId::new(),
+            to: ParticipantId::new(),
+            candidate,
+        }
+    }
+
+    #[test]
+    fn ice_rejects_candidate_without_prefix() {
+        // A non-empty string that is not an `a=candidate` attribute value would
+        // make the peer's RTCIceCandidate constructor throw — reject it here.
+        let err = validate_call_event(&ice(serde_json::json!({
+            "candidate": "garbage 1 udp 2113 192.0.2.1 5000 typ host",
+            "sdpMLineIndex": 0,
+        })))
+        .expect_err("candidate without 'candidate:' prefix must be rejected");
+        assert!(matches!(err, SignalingError::InvalidCandidate(_)));
+    }
+
+    #[test]
+    fn ice_accepts_leading_a_equals_prefix() {
+        // Some clients send the full `a=candidate:...` attribute line; tolerate it.
+        validate_call_event(&ice(serde_json::json!({
+            "candidate": "a=candidate:1 1 udp 2113937151 192.0.2.1 50000 typ host",
+            "sdpMid": "0",
+        })))
+        .expect("a= prefixed candidate should be accepted");
+    }
+
+    #[test]
+    fn ice_rejects_missing_mid_and_mline() {
+        // Per the WebRTC spec a non-empty candidate needs at least one of
+        // sdpMid / sdpMLineIndex; both absent → browser TypeError.
+        let err = validate_call_event(&ice(serde_json::json!({
+            "candidate": "candidate:1 1 udp 2113937151 192.0.2.1 50000 typ host",
+        })))
+        .expect_err("missing both sdpMid and sdpMLineIndex must be rejected");
+        assert!(matches!(err, SignalingError::InvalidCandidate(_)));
+    }
+
+    #[test]
+    fn ice_rejects_both_mid_and_mline_null() {
+        // Explicit nulls are equivalent to absent — still must be rejected.
+        let err = validate_call_event(&ice(serde_json::json!({
+            "candidate": "candidate:1 1 udp 2113937151 192.0.2.1 50000 typ host",
+            "sdpMid": serde_json::Value::Null,
+            "sdpMLineIndex": serde_json::Value::Null,
+        })))
+        .expect_err("both null must be rejected");
+        assert!(matches!(err, SignalingError::InvalidCandidate(_)));
+    }
+
+    #[test]
+    fn ice_accepts_mline_only_with_null_mid() {
+        // A null sdpMid alongside a valid sdpMLineIndex is the common Firefox
+        // shape and must pass.
+        validate_call_event(&ice(serde_json::json!({
+            "candidate": "candidate:1 1 udp 2113937151 192.0.2.1 50000 typ host",
+            "sdpMid": serde_json::Value::Null,
+            "sdpMLineIndex": 0,
+        })))
+        .expect("null mid + valid mline should be accepted");
+    }
+
+    #[test]
+    fn ice_rejects_wrong_typed_mid() {
+        let err = validate_call_event(&ice(serde_json::json!({
+            "candidate": "candidate:1 1 udp 2113937151 192.0.2.1 50000 typ host",
+            "sdpMid": 5,
+        })))
+        .expect_err("numeric sdpMid must be rejected");
+        assert!(matches!(err, SignalingError::InvalidCandidate(_)));
+    }
+
+    #[test]
+    fn ice_rejects_out_of_range_mline() {
+        // Negative and >u16 indices are not valid m-line positions.
+        for bad in [serde_json::json!(-1), serde_json::json!(70000), serde_json::json!(1.5)] {
+            let err = validate_call_event(&ice(serde_json::json!({
+                "candidate": "candidate:1 1 udp 2113937151 192.0.2.1 50000 typ host",
+                "sdpMLineIndex": bad,
+            })))
+            .expect_err("out-of-range sdpMLineIndex must be rejected");
+            assert!(matches!(err, SignalingError::InvalidCandidate(_)));
+        }
+    }
+
+    #[test]
+    fn ice_accepts_mid_string_only() {
+        validate_call_event(&ice(serde_json::json!({
+            "candidate": "candidate:1 1 udp 2113937151 192.0.2.1 50000 typ host",
+            "sdpMid": "audio",
+        })))
+        .expect("string sdpMid alone should be accepted");
+    }
+
     #[test]
     fn validate_call_event_accepts_end() {
         let ev = CallEvent::End {

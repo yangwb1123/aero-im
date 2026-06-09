@@ -126,6 +126,19 @@ impl LiveService {
         Ok(self.live.recent_chat(stream_id, limit.clamp(1, 200)).await?)
     }
 
+    /// Late-joiner catch-up: chat lines strictly newer than `since` (a forward
+    /// cursor — the last id the client rendered), or the bounded recent tail when
+    /// `since` is `None`. Lets a viewer who joins a fast-chat stream pull the lines
+    /// they missed instead of being capped at the last [`Self::recent_chat`] tail.
+    pub async fn recent_chat_since(
+        &self,
+        stream_id: Ulid,
+        since: Option<Ulid>,
+        limit: i64,
+    ) -> Result<Vec<StreamChatLine>> {
+        Ok(self.live.recent_chat_since(stream_id, since, limit.clamp(1, 200)).await?)
+    }
+
     // ---------------------------------------------------------- gifts
 
     /// Send a gift: validate against the catalog + quantity bounds, persist,
@@ -165,6 +178,18 @@ impl LiveService {
 
     pub async fn recent_gifts(&self, stream_id: Ulid, limit: i64) -> Result<Vec<StreamGiftLine>> {
         Ok(self.live.recent_gifts(stream_id, limit.clamp(1, 100)).await?)
+    }
+
+    /// Late-joiner catch-up for gifts: ledger entries strictly newer than `since`,
+    /// or the bounded recent tail when `since` is `None`. Symmetric to
+    /// [`Self::recent_chat_since`].
+    pub async fn recent_gifts_since(
+        &self,
+        stream_id: Ulid,
+        since: Option<Ulid>,
+        limit: i64,
+    ) -> Result<Vec<StreamGiftLine>> {
+        Ok(self.live.recent_gifts_since(stream_id, since, limit.clamp(1, 100)).await?)
     }
 
     pub async fn leaderboard(&self, stream_id: Ulid, limit: i64) -> Result<Vec<GiftLeaderRow>> {

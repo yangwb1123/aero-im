@@ -7,6 +7,47 @@ use tracing::{debug, info, instrument};
 
 use crate::traits::{BusError, BusResult, EventBus, Subscription};
 
+/// Validate that `subject` is a well-formed NATS subject suitable for
+/// *publishing* (a concrete subject — no wildcards).
+///
+/// NATS treats a subject as a list of `.`-separated tokens. The broker rejects
+/// or silently misroutes malformed subjects, and the failure modes are opaque
+/// (publish timeouts, "no responders"). Validating up front converts those into
+/// a precise [`BusError::InvalidSubject`].
+///
+/// Rejected:
+/// - empty subject;
+/// - leading/trailing `.` or any empty token (`im..room`, `im.room.`);
+/// - whitespace or ASCII control characters inside a token;
+/// - the wildcard tokens `*` and `>` — these are subscribe-side patterns and a
+///   message published to them never reaches the intended subscribers.
+fn validate_publish_subject(subject: &str) -> Result<(), BusError> {
+    let invalid = |reason: &'static str| BusError::InvalidSubject {
+        subject: subject.to_owned(),
+        reason,
+    };
+
+    if subject.is_empty() {
+        return Err(invalid("subject is empty"));
+    }
+
+    // `split('.')` always yields at least one element; an empty element means a
+    // leading/trailing dot or a `..` sequence.
+    for token in subject.split('.') {
+        if token.is_empty() {
+            return Err(invalid("contains an empty token (leading, trailing, or doubled '.')"));
+        }
+        if token == "*" || token == ">" {
+            return Err(invalid("contains a wildcard token ('*' or '>'); publish subjects must be concrete"));
+        }
+        if token.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            return Err(invalid("contains whitespace or a control character"));
+        }
+    }
+
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct JetStreamConfig {
     pub url: String,
@@ -134,6 +175,7 @@ impl JetStreamBus {
 impl EventBus for JetStreamBus {
     #[instrument(skip(self, payload), fields(subject = %subject, bytes = payload.len()))]
     async fn publish(&self, subject: &str, payload: bytes::Bytes) -> BusResult<()> {
+        validate_publish_subject(subject)?;
         let ack = self
             .js
             .publish(subject.to_owned(), payload)
@@ -225,5 +267,89 @@ impl Subscription for JsSubscription {
             .ack_with(async_nats::jetstream::AckKind::Nak(None))
             .await
             .map_err(|e| BusError::Nats(e.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{validate_publish_subject, BusError};
+
+    #[test]
+    fn accepts_well_formed_concrete_subjects() {
+        for subject in [
+            "im.room.42",
+            "im.events.message.created",
+            "ai.queue.summarize",
+            "live.stream.abc123",
+            "a",
+            "a.b.c.d.e.f",
+        ] {
+            assert!(
+                validate_publish_subject(subject).is_ok(),
+                "expected {subject:?} to be accepted",
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_empty_subject() {
+        let err = validate_publish_subject("").unwrap_err();
+        assert!(matches!(err, BusError::InvalidSubject { .. }));
+    }
+
+    #[test]
+    fn rejects_empty_tokens() {
+        // Leading dot, trailing dot, and a doubled dot all produce an empty token.
+        for subject in [".im.room.1", "im.room.1.", "im..room.1", "."] {
+            let err = validate_publish_subject(subject).unwrap_err();
+            match err {
+                BusError::InvalidSubject { reason, .. } => {
+                    assert!(reason.contains("empty token"), "subject {subject:?}: {reason}");
+                }
+                other => panic!("subject {subject:?}: unexpected error {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_wildcard_tokens_on_publish() {
+        // `*` and `>` are subscribe-side patterns; publishing to them silently
+        // misroutes, so they must be rejected as a whole token.
+        for subject in ["im.room.*", "im.events.>", "*", ">"] {
+            let err = validate_publish_subject(subject).unwrap_err();
+            match err {
+                BusError::InvalidSubject { reason, .. } => {
+                    assert!(reason.contains("wildcard"), "subject {subject:?}: {reason}");
+                }
+                other => panic!("subject {subject:?}: unexpected error {other:?}"),
+            }
+        }
+        // A literal `*` embedded in a larger token is NOT a wildcard token; NATS
+        // treats wildcards positionally, so only a standalone `*`/`>` is rejected
+        // here. (`a*b` is an unusual-but-legal token.)
+        assert!(validate_publish_subject("im.room.a*b").is_ok());
+    }
+
+    #[test]
+    fn rejects_whitespace_and_control_chars() {
+        for subject in ["im.room. 1", "im.room.\t1", "im room.1", "im.room.1\n"] {
+            let err = validate_publish_subject(subject).unwrap_err();
+            match err {
+                BusError::InvalidSubject { reason, .. } => {
+                    assert!(
+                        reason.contains("whitespace") || reason.contains("control"),
+                        "subject {subject:?}: {reason}",
+                    );
+                }
+                other => panic!("subject {subject:?}: unexpected error {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn error_message_includes_the_offending_subject() {
+        let err = validate_publish_subject("bad subject").unwrap_err();
+        let rendered = err.to_string();
+        assert!(rendered.contains("bad subject"), "rendered: {rendered}");
     }
 }

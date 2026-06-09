@@ -154,6 +154,9 @@ impl BlobRepo {
         owner: ParticipantId,
         limit: i64,
     ) -> Result<Vec<Blob>, sqlx::Error> {
+        // Defense in depth: bound the personal-export listing so a raw caller limit
+        // can't stream an unbounded set (1000 is generous for the export page).
+        let limit = limit.clamp(1, 1000);
         let rows = sqlx::query_as::<_, BlobRow>(
             r"SELECT id, owner_id, kind, name, mime, size, sha256, storage_key, created_at, finalized_at
                FROM blobs

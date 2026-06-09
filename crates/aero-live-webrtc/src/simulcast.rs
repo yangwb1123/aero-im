@@ -232,6 +232,14 @@ impl LayerSelector {
     ///
     /// This method mutates internal state (commits switches, records
     /// keyframe-request flags) as a side-effect.
+    ///
+    /// # Cold-start switch
+    ///
+    /// If a switch is requested *before* any packet has bootstrapped an active
+    /// layer, the first non-target packet seen bootstraps the active layer (and
+    /// is forwarded) so the subscriber renders video immediately instead of
+    /// waiting on a black screen for the target layer's first keyframe. The
+    /// pending switch remains in effect and commits later on the target keyframe.
     pub fn should_forward(&mut self, rid: Rid, is_keyframe: bool) -> ForwardDecision {
         match &mut self.pending {
             None => {
@@ -266,6 +274,19 @@ impl LayerSelector {
                     }
                 } else if self.active_rid == Some(rid) {
                     // Still on the old active layer: keep forwarding until switch.
+                    ForwardDecision::Forward
+                } else if self.active_rid.is_none() {
+                    // Cold start: a switch was requested before any packet
+                    // bootstrapped an active layer (e.g. the subscriber asked for
+                    // "high" quality up front). The target layer has not produced
+                    // a keyframe yet, so committing to it now is impossible — but
+                    // dropping every packet would leave the subscriber on a black
+                    // screen until the target keyframe arrives (potentially
+                    // seconds). Instead, bootstrap on the first non-target layer
+                    // we see so the subscriber gets video immediately; the pending
+                    // switch to the target stays in effect and is committed later
+                    // on the target's keyframe, exactly as in the warm-start path.
+                    self.active_rid = Some(rid);
                     ForwardDecision::Forward
                 } else {
                     // Some third layer we don't care about.
@@ -480,6 +501,98 @@ mod tests {
         // "mid" is neither active nor target
         let d = sel.should_forward(rid("mid"), false);
         assert_eq!(d, ForwardDecision::Drop);
+    }
+
+    #[test]
+    fn cold_start_switch_bootstraps_on_first_non_target_layer() {
+        // A switch is requested *before any packet has arrived* (e.g. the
+        // subscriber asked for "high" up front). The first packet to arrive is on
+        // "low" (which has a ready keyframe); the target "high" has not produced
+        // one yet. We must bootstrap on "low" and forward it — NOT starve the
+        // subscriber on a black screen until the target keyframe appears.
+        let mut sel = LayerSelector::new();
+        assert_eq!(sel.active_rid(), None, "no layer bootstrapped yet");
+
+        // Request switch to "high" while still cold (no active layer).
+        sel.request_switch(rid("high"));
+        assert_eq!(sel.pending_rid(), Some(rid("high")));
+
+        // First-ever packet arrives on "low" (non-target). Before the fix this
+        // returned Drop, leaving the subscriber with nothing.
+        let d = sel.should_forward(rid("low"), false);
+        assert_eq!(
+            d,
+            ForwardDecision::Forward,
+            "cold-start must bootstrap on the first non-target layer"
+        );
+        assert_eq!(sel.active_rid(), Some(rid("low")));
+        // The pending switch to "high" must still be in effect.
+        assert_eq!(sel.pending_rid(), Some(rid("high")));
+    }
+
+    #[test]
+    fn cold_start_switch_still_commits_on_target_keyframe() {
+        // After the cold-start bootstrap, the pending switch must still gate on a
+        // keyframe from the target and commit normally (the upgrade is not lost).
+        let mut sel = LayerSelector::new();
+        sel.request_switch(rid("high"));
+
+        // Bootstrap on "low".
+        assert_eq!(sel.should_forward(rid("low"), false), ForwardDecision::Forward);
+
+        // Subsequent "low" packets keep flowing while we wait for the target.
+        assert_eq!(sel.should_forward(rid("low"), false), ForwardDecision::Forward);
+
+        // Non-keyframe on target → request a keyframe (first time only).
+        assert_eq!(
+            sel.should_forward(rid("high"), false),
+            ForwardDecision::RequestKeyframe
+        );
+
+        // Target keyframe → switch commits.
+        assert_eq!(
+            sel.should_forward(rid("high"), true),
+            ForwardDecision::SwitchAndForward
+        );
+        assert_eq!(sel.active_rid(), Some(rid("high")));
+        assert_eq!(sel.pending_rid(), None);
+
+        // After commit, the old bootstrap layer "low" is dropped.
+        assert_eq!(sel.should_forward(rid("low"), false), ForwardDecision::Drop);
+    }
+
+    #[test]
+    fn cold_start_switch_target_keyframe_first_packet_commits_directly() {
+        // Cold start where the very first packet is a keyframe on the target:
+        // there is no need to bootstrap a lower layer — commit straight away.
+        let mut sel = LayerSelector::new();
+        sel.request_switch(rid("high"));
+
+        let d = sel.should_forward(rid("high"), true);
+        assert_eq!(d, ForwardDecision::SwitchAndForward);
+        assert_eq!(sel.active_rid(), Some(rid("high")));
+        assert_eq!(sel.pending_rid(), None);
+    }
+
+    #[test]
+    fn cold_start_non_keyframe_on_target_does_not_bootstrap() {
+        // If the cold-start packet happens to be on the *target* layer but is a
+        // non-keyframe, we must NOT bootstrap-and-forward it (that would deliver a
+        // mid-GOP frame on the target with no preceding keyframe → decoder
+        // corruption). It must go through the keyframe-gated request path and the
+        // active layer must stay unset.
+        let mut sel = LayerSelector::new();
+        sel.request_switch(rid("high"));
+
+        let d = sel.should_forward(rid("high"), false);
+        assert_eq!(
+            d,
+            ForwardDecision::RequestKeyframe,
+            "non-keyframe on target must request a keyframe, not bootstrap-forward"
+        );
+        // active_rid stays None — we never bootstrapped on a mid-GOP target frame.
+        assert_eq!(sel.active_rid(), None);
+        assert_eq!(sel.pending_rid(), Some(rid("high")));
     }
 
     // ── Seq/ts continuity across switch (via RtpRemapper) ────────────────────
