@@ -91,6 +91,27 @@ pub trait AiBackend: Send + Sync + 'static {
         topic: &str,
         k: usize,
     ) -> Result<Vec<AiExpert>, String>;
+    /// Rank channel candidates the caller isn't in into "channels to join"
+    /// recommendations. `candidates` is the pre-fetched candidate set —
+    /// `(room, name, recent_activity)` triples — and ranking is a pure,
+    /// deterministic aggregation over the activity counts (the no-embeddings
+    /// degrade path). Never errors; empty in ⇒ empty out. Backs
+    /// `GET /api/workspaces/:id/recommendations/channels`.
+    async fn recommend_channels(
+        &self,
+        candidates: Vec<(aero_common::RoomId, String, i64)>,
+        k: usize,
+    ) -> Result<Vec<AiChannelRec>, String>;
+    /// Rank people candidates the caller doesn't already follow into "people to
+    /// follow" recommendations. `candidates` is the pre-filtered
+    /// `(participant, shared_room_count)` set; ranking is a pure deterministic
+    /// aggregation (the shared-channel-count degrade path). Never errors. Backs
+    /// `GET /api/workspaces/:id/recommendations/people`.
+    async fn recommend_people(
+        &self,
+        candidates: Vec<(aero_common::ParticipantId, i64)>,
+        k: usize,
+    ) -> Result<Vec<AiPersonRec>, String>;
     /// Moderate a message body (P5). `Some(reason)` blocks, `None` allows.
     /// Returns `None` when no LLM is configured.
     async fn moderate(&self, text: &str) -> Result<Option<String>, String>;
@@ -139,6 +160,27 @@ pub struct AiExpert {
     pub participant: aero_common::ParticipantId,
     pub score: f32,
     pub citations: Vec<aero_common::MessageId>,
+}
+
+/// One recommended channel returned by [`AiBackend::recommend_channels`] — a
+/// channel the caller isn't in, its display `name`, an affinity `score`, and a
+/// short human-readable `reason`.
+#[derive(Debug, Clone)]
+pub struct AiChannelRec {
+    pub room: aero_common::RoomId,
+    pub name: String,
+    pub score: f32,
+    pub reason: String,
+}
+
+/// One recommended person returned by [`AiBackend::recommend_people`] — a
+/// workspace member the caller doesn't already follow, an affinity `score`, and a
+/// short `reason`.
+#[derive(Debug, Clone)]
+pub struct AiPersonRec {
+    pub participant: aero_common::ParticipantId,
+    pub score: f32,
+    pub reason: String,
 }
 
 #[derive(Clone)]

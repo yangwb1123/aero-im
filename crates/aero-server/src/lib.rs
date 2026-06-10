@@ -152,9 +152,16 @@ pub mod vod_chapters;
 pub mod thread_summarize;
 pub mod digests;
 pub mod find_expert;
+/// AI recommendations: suggested channels & people to follow (member-gated).
+pub mod recommendations;
 
 // ---- Operability: webhook delivery DLQ admin + per-tenant usage reports ----
 pub mod webhook_admin;
 pub mod usage_report;
+
+// ---- Interactive message blocks (Slack Block Kit-lite) ----
+// Record clicks / option-picks on interactive Button/Select blocks (migration
+// 0086); broadcasts RoomEvent::Interaction so the poster's bot/app sees them live.
+pub mod interactions;
 
 pub use state::AppState;

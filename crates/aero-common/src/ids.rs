@@ -327,6 +327,12 @@ define_id!(
     /// with retry/backoff state (pending/delivered/failed/dead).
     WebhookDeliveryId
 );
+define_id!(
+    /// Identifies a single recorded interaction with an interactive message block —
+    /// one row per (message, participant) click/select on a `Button`/`Select`
+    /// [`Block`](crate::Block), so bots/webhooks/apps can collect actionable replies.
+    BlockInteractionId
+);
 
 #[cfg(test)]
 mod tests {

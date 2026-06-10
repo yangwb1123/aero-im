@@ -23,10 +23,11 @@ pub mod workspace;
 
 pub use error::{Error, Result};
 pub use ids::{
-    ActivityId, AnnouncementId, ApprovalId, AuditId, BarrierId, BlobId, BookmarkCollectionId,
-    CanvasId, ChannelBookmarkId, ChannelSectionId, ClipId, CreatorTierId, DigestSubscriptionId,
-    EmojiId, HypeTrainSessionId, InvitationId, JoinRequestId, KeywordAlertId, LegalHoldId,
-    MessageEditId, MessageId, MessageTemplateId, NotificationId, ParticipantId, PatId, PollId,
+    ActivityId, AnnouncementId, ApprovalId, AuditId, BarrierId, BlobId, BlockInteractionId,
+    BookmarkCollectionId, CanvasId, ChannelBookmarkId, ChannelSectionId, ClipId, CreatorTierId,
+    DigestSubscriptionId, EmojiId, HypeTrainSessionId, InvitationId, JoinRequestId, KeywordAlertId,
+    LegalHoldId, MessageEditId, MessageId, MessageTemplateId, NotificationId, ParticipantId, PatId,
+    PollId,
     RaidId, RecurringMessageId, RoomId, SavedSearchId, ScheduledMessageId, ScheduledStreamId,
     ScimTokenId, SessionId, StreamCategoryId, StreamModeratorId, SubscriptionId, TaskId,
     UserGroupId, VodChapterId, VodId, WebhookDeliveryId, WebhookId, WorkspaceId,
@@ -35,10 +36,10 @@ pub use live::{
     gift_by_id, gift_catalog, Gift, GiftLeaderRow, StreamChatLine, StreamEvent, StreamGiftLine,
 };
 pub use model::{
-    Block, Blob, CallEvent, CallId, CallKind, CallMode, CallSession, FileKind, MembershipOp,
-    Message, MessageEnvelope, Notification, NotificationKind, Participant, ParticipantKind, PinOp,
-    PinnedMessage, Poll, PollOp, PollTally, Presence, ReactionOp, ReactionSummary, Reaction,
-    ReadReceipt, Room, RoomEvent, RoomKind, RoomUnread, Span, SpanStyle, Stream, StreamProtocol,
-    StreamStatus, ThreadSummary, UserStatus, Vod,
+    message_has_action, Block, Blob, CallEvent, CallId, CallKind, CallMode, CallSession, FileKind,
+    MembershipOp, Message, MessageEnvelope, Notification, NotificationKind, Participant,
+    ParticipantKind, PinOp, PinnedMessage, Poll, PollOp, PollTally, Presence, ReactionOp,
+    ReactionSummary, Reaction, ReadReceipt, Room, RoomEvent, RoomKind, RoomUnread, SelectOption,
+    Span, SpanStyle, Stream, StreamProtocol, StreamStatus, ThreadSummary, UserStatus, Vod,
 };
 pub use workspace::{Workspace, WorkspaceMember, WorkspaceRole};

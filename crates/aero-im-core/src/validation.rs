@@ -81,7 +81,9 @@ pub fn validate_blocks(blocks: &[Block]) -> Result<(), ValidationError> {
             | Block::Voice { .. }
             | Block::Card { .. }
             | Block::ToolCall { .. }
-            | Block::Thought { .. } => {}
+            | Block::Thought { .. }
+            | Block::Button { .. }
+            | Block::Select { .. } => {}
         }
     }
     Ok(())

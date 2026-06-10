@@ -29,6 +29,6 @@ pub use metrics::CostModel;
 pub use embed::{default_embedder, Embedder, HashEmbedder, VoyageEmbedder, EMBED_DIM};
 pub use error::{AiError, Result};
 pub use rerank::fuse_rankings;
-pub use service::{AiService, AnswerResult};
+pub use service::{AiService, AnswerResult, ChannelRec, PersonRec};
 pub use transcribe::{default_transcriber, StubTranscriber, Transcriber, WhisperTranscriber};
 pub use worker::{AiWorker, WorkerConfig, MAX_ATTEMPTS};

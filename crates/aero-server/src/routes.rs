@@ -320,6 +320,11 @@ pub fn build(state: AppState) -> Router {
         .merge(crate::digests::routes())
         // Find-expert: POST /api/workspaces/:id/find-expert (workspace-member gated).
         .merge(crate::find_expert::routes())
+        // AI recommendations (workspace-member gated): suggested channels & people
+        // to follow by affinity to the caller's own activity.
+        //   GET /api/workspaces/:id/recommendations/channels
+        //   GET /api/workspaces/:id/recommendations/people
+        .merge(crate::recommendations::routes())
         // ---- Per-workspace rate-limit tiers (ROADMAP3 方向五 — 租户公平) ----
         // Owner-only PUT + member-readable GET /api/workspaces/:id/rate-tier.
         // Enforcement call sites live in the high-traffic handlers below
@@ -353,7 +358,13 @@ pub fn build(state: AppState) -> Router {
         .merge(crate::webhook_admin::routes())
         // ---- Operability: per-tenant usage report (admin) ----
         // GET /api/workspaces/:id/admin/usage — messages/AI tokens/blobs/members.
-        .merge(crate::usage_report::routes());
+        .merge(crate::usage_report::routes())
+        // ---- Interactive message blocks (Slack Block Kit-lite, migration 0086) ----
+        // POST /api/messages/:id/interact records a click/option-pick on an
+        // interactive Button/Select block (404 unless the message carries that
+        // action_id), broadcasting RoomEvent::Interaction so the poster's bot/app
+        // sees it live; GET /api/messages/:id/interactions lists them.
+        .merge(crate::interactions::routes());
 
     // Prometheus scrape endpoint (ROADMAP 方向四). Mounted unless disabled; the
     // handler self-gates on an optional bearer token. Left here (not behind the

@@ -197,6 +197,14 @@ enum ServerFrame<'a> {
     /// A participant acknowledged seeing a specific message ("Seen by …"; fans
     /// out to all members so the per-message read indicator stays live).
     MessageSeen { room_id: RoomId, message_id: MessageId, participant: ParticipantId },
+    /// A participant clicked a Button / picked a Select option on an interactive
+    /// message block (fans out to all members so the poster's bot/app sees it live).
+    Interaction {
+        room_id: RoomId,
+        message_id: MessageId,
+        participant: ParticipantId,
+        action_id: String,
+    },
     /// Per-stream interactivity event (danmaku/gift/viewers/status).
     StreamEvent { event: StreamEvent },
     Error { code: &'a str, msg: String },
@@ -1213,6 +1221,9 @@ fn room_event_to_frame_json(event: &RoomEvent, seq: Option<u64>) -> String {
         RoomEvent::Poll { room_id, poll_id, op } => ServerFrame::Poll { room_id, poll_id, op },
         RoomEvent::MessageSeen { room_id, message_id, participant } => {
             ServerFrame::MessageSeen { room_id, message_id, participant }
+        }
+        RoomEvent::Interaction { room_id, message_id, participant, action_id } => {
+            ServerFrame::Interaction { room_id, message_id, participant, action_id }
         }
     };
     stamped_frame_json(&frame, seq)

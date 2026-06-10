@@ -428,6 +428,119 @@ impl RoomRepo {
         Ok(row.and_then(|(d,)| d))
     }
 
+    // ------------------------------------ recommendations (read-only, additive)
+
+    /// Public, non-archived channels in `workspace` the `participant` is NOT
+    /// already a member of, each tagged with a recent-activity count — the
+    /// candidate set for "channels to join" recommendations.
+    ///
+    /// The mirror of [`list_public_channels`](Self::list_public_channels) (same
+    /// `is_private = false AND is_archived = false` discovery boundary) minus the
+    /// channels the caller already belongs to (the `NOT EXISTS` membership
+    /// anti-join). The second column is the number of non-deleted messages posted
+    /// to the channel in the last `recent_days` days — a deterministic activity
+    /// signal the ranker uses as the no-embeddings degrade ordering. Newest
+    /// channel first as a stable secondary order. `recent_days` is floored at `1`.
+    ///
+    /// Read-only: no mutation, no migration — it reads `rooms`, `room_members`
+    /// and `messages` that already exist.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the query.
+    pub async fn list_workspace_channels_not_member(
+        &self,
+        workspace: WorkspaceId,
+        participant: ParticipantId,
+        recent_days: i64,
+    ) -> Result<Vec<(Room, i64)>, sqlx::Error> {
+        let recent_days = recent_days.max(1);
+        let rows = sqlx::query_as::<
+            _,
+            (uuid::Uuid, String, Option<String>, uuid::Uuid, time::OffsetDateTime, i64),
+        >(
+            r"SELECT r.id, r.kind, r.name, r.created_by, r.created_at,
+                     COALESCE(act.cnt, 0) AS activity
+               FROM rooms r
+               LEFT JOIN LATERAL (
+                   SELECT COUNT(*) AS cnt
+                     FROM messages m
+                    WHERE m.room_id = r.id
+                      AND m.deleted_at IS NULL
+                      AND m.created_at >= NOW() - make_interval(days => $3::int)
+               ) act ON true
+              WHERE r.workspace_id = $1
+                AND r.is_private = false
+                AND r.is_archived = false
+                AND NOT EXISTS (
+                    SELECT 1 FROM room_members rm
+                     WHERE rm.room_id = r.id AND rm.participant_id = $2
+                )
+              ORDER BY r.created_at DESC, r.id DESC",
+        )
+        .bind(workspace.to_uuid())
+        .bind(participant.to_uuid())
+        .bind(recent_days)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(id, kind, name, by, at, activity)| {
+                (
+                    Room {
+                        id: RoomId::from_uuid(id),
+                        kind: room_kind_from_str(&kind),
+                        name,
+                        created_by: ParticipantId::from_uuid(by),
+                        created_at: at,
+                    },
+                    activity,
+                )
+            })
+            .collect())
+    }
+
+    /// Workspace members the `caller` shares at least one room with, each with the
+    /// count of rooms shared — the affinity signal for "people to follow"
+    /// recommendations.
+    ///
+    /// For every OTHER member of `workspace`, counts how many rooms (of any kind)
+    /// in `workspace` both the caller and that member belong to. Only members with
+    /// at least one shared room are returned (an `INNER JOIN` on the caller's
+    /// memberships), so a candidate the caller has never co-occupied a room with is
+    /// omitted — the recommender prefers people you already brush against. The
+    /// caller is excluded. Highest shared-count first, ties broken by participant
+    /// id so the order is deterministic.
+    ///
+    /// Read-only: no mutation, no migration — `room_members` + `rooms` only.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the query.
+    pub async fn shared_room_counts_in_workspace(
+        &self,
+        workspace: WorkspaceId,
+        caller: ParticipantId,
+    ) -> Result<Vec<(ParticipantId, i64)>, sqlx::Error> {
+        let rows = sqlx::query_as::<_, (uuid::Uuid, i64)>(
+            r"SELECT other.participant_id, COUNT(*) AS shared
+               FROM room_members mine
+               JOIN rooms r ON r.id = mine.room_id AND r.workspace_id = $2
+               JOIN room_members other ON other.room_id = mine.room_id
+              WHERE mine.participant_id = $1
+                AND other.participant_id <> $1
+              GROUP BY other.participant_id
+              ORDER BY shared DESC, other.participant_id ASC",
+        )
+        .bind(caller.to_uuid())
+        .bind(workspace.to_uuid())
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(pid, shared)| (ParticipantId::from_uuid(pid), shared))
+            .collect())
+    }
+
     /// Remove a participant from a room (used by channel leave). Idempotent: a
     /// no-op when they were not a member.
     pub async fn remove_member(
@@ -607,6 +720,82 @@ mod db_tests {
         assert!(!repo.is_member(room, joiner).await.unwrap());
         repo.remove_member(room, joiner).await.unwrap();
         assert!(!repo.is_member(room, joiner).await.unwrap());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn channels_not_member_excludes_joined_private_and_archived() {
+        let p = pool();
+        let repo = RoomRepo::new(p.clone());
+        let (ws, actor) = fixture(&p).await;
+
+        // A public channel the caller is NOT in (the expected candidate),
+        // a public channel the caller HAS joined (excluded by the anti-join),
+        // a private channel (excluded by discovery boundary),
+        // an archived channel (excluded by discovery boundary).
+        let candidate = insert_channel(&p, ws, actor, false).await;
+        let joined = insert_channel(&p, ws, actor, false).await;
+        let private = insert_channel(&p, ws, actor, true).await;
+        let archived = insert_channel(&p, ws, actor, false).await;
+        repo.set_archived(archived, true).await.unwrap();
+
+        let caller = ParticipantId::new();
+        sqlx::query("INSERT INTO participants (id, kind, display_name) VALUES ($1, 'human', $2)")
+            .bind(caller.to_uuid())
+            .bind(format!("caller-{caller}"))
+            .execute(&p)
+            .await
+            .unwrap();
+        repo.add_member(joined, caller).await.unwrap();
+
+        let listed = repo
+            .list_workspace_channels_not_member(ws, caller, 30)
+            .await
+            .unwrap();
+        let ids: Vec<RoomId> = listed.iter().map(|(r, _)| r.id).collect();
+        assert!(ids.contains(&candidate), "non-member public channel is a candidate");
+        assert!(!ids.contains(&joined), "channel the caller is in is excluded");
+        assert!(!ids.contains(&private), "private channel is excluded");
+        assert!(!ids.contains(&archived), "archived channel is excluded");
+        // Each candidate carries a non-negative activity count.
+        for (_, activity) in &listed {
+            assert!(*activity >= 0);
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn shared_room_counts_excludes_caller_and_counts_overlap() {
+        let p = pool();
+        let repo = RoomRepo::new(p.clone());
+        let (ws, actor) = fixture(&p).await;
+
+        let caller = ParticipantId::new();
+        let buddy = ParticipantId::new();
+        for (id, name) in [(caller, "caller"), (buddy, "buddy")] {
+            sqlx::query(
+                "INSERT INTO participants (id, kind, display_name) VALUES ($1, 'human', $2)",
+            )
+            .bind(id.to_uuid())
+            .bind(format!("{name}-{id}"))
+            .execute(&p)
+            .await
+            .unwrap();
+        }
+
+        // Two channels both the caller and buddy belong to → shared count 2.
+        let c1 = insert_channel(&p, ws, actor, false).await;
+        let c2 = insert_channel(&p, ws, actor, false).await;
+        for room in [c1, c2] {
+            repo.add_member(room, caller).await.unwrap();
+            repo.add_member(room, buddy).await.unwrap();
+        }
+
+        let counts = repo.shared_room_counts_in_workspace(ws, caller).await.unwrap();
+        // The caller never appears as a candidate for following themselves.
+        assert!(!counts.iter().any(|(p, _)| *p == caller), "caller excluded");
+        let buddy_count = counts.iter().find(|(p, _)| *p == buddy).map(|(_, n)| *n);
+        assert_eq!(buddy_count, Some(2), "buddy shares both channels");
     }
 
     #[tokio::test]

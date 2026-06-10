@@ -11,7 +11,7 @@ use aero_common::{MessageId, ParticipantId, RoomId, WorkspaceId};
 use async_trait::async_trait;
 use futures::StreamExt as _;
 
-use crate::state::{AiAnswer, AiBackend, AiExpert};
+use crate::state::{AiAnswer, AiBackend, AiChannelRec, AiExpert, AiPersonRec};
 
 /// Candidate pool breadth aggregated by [`AiService::find_expert`]. Wider than the
 /// returned top-k so a deep-but-relevant author can still surface.
@@ -124,6 +124,42 @@ impl AiBackend for AiServiceAdapter {
                 participant: e.participant,
                 score: e.score,
                 citations: e.citations,
+            })
+            .collect())
+    }
+
+    async fn recommend_channels(
+        &self,
+        candidates: Vec<(RoomId, String, i64)>,
+        k: usize,
+    ) -> Result<Vec<AiChannelRec>, String> {
+        // Pure, deterministic ranking — infallible, so this never errors.
+        Ok(self
+            .inner
+            .recommend_channels(&candidates, k)
+            .into_iter()
+            .map(|c| AiChannelRec {
+                room: c.room,
+                name: c.name,
+                score: c.score,
+                reason: c.reason,
+            })
+            .collect())
+    }
+
+    async fn recommend_people(
+        &self,
+        candidates: Vec<(ParticipantId, i64)>,
+        k: usize,
+    ) -> Result<Vec<AiPersonRec>, String> {
+        Ok(self
+            .inner
+            .recommend_people(&candidates, k)
+            .into_iter()
+            .map(|p| AiPersonRec {
+                participant: p.participant,
+                score: p.score,
+                reason: p.reason,
             })
             .collect())
     }

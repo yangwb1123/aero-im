@@ -51,6 +51,32 @@ pub struct Expert {
     pub citations: Vec<MessageId>,
 }
 
+/// One recommended channel returned by [`AiService::recommend_channels`].
+///
+/// A channel the caller is NOT already in, suggested by affinity to their own
+/// activity. `room` is the channel id; `name` is its display name (or a fallback
+/// when unnamed); `score` is the (normalized) affinity strength, higher = stronger;
+/// and `reason` is a short human-readable "why this channel" string the UI shows.
+#[derive(Debug, Clone)]
+pub struct ChannelRec {
+    pub room: RoomId,
+    pub name: String,
+    pub score: f32,
+    pub reason: String,
+}
+
+/// One recommended person returned by [`AiService::recommend_people`].
+///
+/// A workspace member the caller does NOT already follow (and is not themselves),
+/// suggested by shared-room overlap. `participant` is the candidate; `score` is the
+/// affinity strength; and `reason` is a short "why follow them" string.
+#[derive(Debug, Clone)]
+pub struct PersonRec {
+    pub participant: ParticipantId,
+    pub score: f32,
+    pub reason: String,
+}
+
 /// Composition root for AI features.
 #[derive(Clone)]
 pub struct AiService {
@@ -634,6 +660,54 @@ impl AiService {
         Ok(rank_experts(&hits, k.clamp(1, 50)))
     }
 
+    // ---------- recommendations (suggested channels & people) ----------
+
+    /// Rank channel candidates the caller isn't in into "channels to join"
+    /// recommendations.
+    ///
+    /// `candidates` is the pre-fetched candidate set — each `(room, name, activity)`
+    /// is a non-private, non-archived workspace channel the caller is NOT a member
+    /// of, paired with a recent-activity count
+    /// ([`RoomRepo::list_workspace_channels_not_member`](aero_storage::RoomRepo::list_workspace_channels_not_member)).
+    /// Ranking is a pure aggregation over those counts ([`rank_channels`]) so it is
+    /// deterministic and unit-tested offline: busier channels rank higher, ties
+    /// broken by room id, truncated to top-`k`. This is the no-embeddings degrade
+    /// path — it never calls an LLM and never errors, returning an empty list when
+    /// there are no candidates.
+    ///
+    /// The method lives on the AI service (rather than inline in the handler) so a
+    /// future embeddings-aware ranker — scoring candidate channels by similarity of
+    /// their recent messages to the caller's authored messages — can slot in behind
+    /// the same seam without touching the route.
+    #[must_use]
+    pub fn recommend_channels(
+        &self,
+        candidates: &[(RoomId, String, i64)],
+        k: usize,
+    ) -> Vec<ChannelRec> {
+        rank_channels(candidates, k.clamp(1, 50))
+    }
+
+    /// Rank people candidates the caller doesn't already follow into "people to
+    /// follow" recommendations.
+    ///
+    /// `candidates` is the pre-filtered candidate set — each `(participant, shared)`
+    /// is a workspace member the caller is not (and does not already follow), paired
+    /// with the number of rooms they share with the caller
+    /// ([`RoomRepo::shared_room_counts_in_workspace`](aero_storage::RoomRepo::shared_room_counts_in_workspace)
+    /// minus the already-followed set). Ranking is a pure aggregation
+    /// ([`rank_people`]): more shared rooms ranks higher, ties broken by
+    /// participant id, truncated to top-`k`. Deterministic, never errors, empty in
+    /// → empty out. This is the shared-channel-count degrade path.
+    #[must_use]
+    pub fn recommend_people(
+        &self,
+        candidates: &[(ParticipantId, i64)],
+        k: usize,
+    ) -> Vec<PersonRec> {
+        rank_people(candidates, k.clamp(1, 50))
+    }
+
     // ---------- translation (P3 实时字幕翻译) ----------
 
     /// Translate `text` into `target_lang` (a human label or BCP-47 code).
@@ -825,6 +899,97 @@ fn rank_experts(hits: &[SearchHit], k: usize) -> Vec<Expert> {
     experts
 }
 
+/// Fallback display name for a channel with no `name` set.
+const UNNAMED_CHANNEL: &str = "(未命名频道)";
+
+/// Rank channel candidates by recent activity into "channels to join" recs.
+///
+/// Pure (no I/O), so the ranking is unit-tested offline. Each candidate
+/// `(room, name, activity)` is scored by its `activity` count (recent message
+/// volume): the busiest candidate's count anchors `score = 1.0` and the rest are
+/// scaled linearly against it (so scores live in `[0, 1]` and are comparable across
+/// requests), with a zero-activity field still ranked (score `0`) below any active
+/// channel. Sorted by activity descending, ties broken by room id for a stable
+/// order, then truncated to `k`. An empty candidate list yields an empty result —
+/// never a panic — so the "no candidates" path degrades cleanly.
+#[must_use]
+fn rank_channels(candidates: &[(RoomId, String, i64)], k: usize) -> Vec<ChannelRec> {
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    // Normalize against the busiest candidate so scores are comparable.
+    let max_activity = candidates.iter().map(|(_, _, a)| *a).max().unwrap_or(0).max(0);
+
+    let mut ranked: Vec<(i64, ChannelRec)> = candidates
+        .iter()
+        .map(|(room, name, activity)| {
+            let activity = (*activity).max(0);
+            #[allow(clippy::cast_precision_loss)]
+            let score = if max_activity > 0 {
+                activity as f32 / max_activity as f32
+            } else {
+                0.0
+            };
+            let display = if name.trim().is_empty() {
+                UNNAMED_CHANNEL.to_owned()
+            } else {
+                name.clone()
+            };
+            let reason = if activity > 0 {
+                format!("近期活跃,最近有 {activity} 条消息")
+            } else {
+                "工作区公开频道,你还未加入".to_owned()
+            };
+            (activity, ChannelRec { room: *room, name: display, score, reason })
+        })
+        .collect();
+
+    // Busiest first; ties broken by room id for a deterministic order.
+    ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.room.cmp(&b.1.room)));
+    ranked.truncate(k);
+    ranked.into_iter().map(|(_, rec)| rec).collect()
+}
+
+/// Rank people candidates by shared-room overlap into "people to follow" recs.
+///
+/// Pure (no I/O), so the ranking is unit-tested offline. Each candidate
+/// `(participant, shared)` is scored by `shared` (count of rooms co-occupied with
+/// the caller), normalized against the strongest candidate so scores live in
+/// `[0, 1]`. Sorted by shared count descending, ties broken by participant id for a
+/// stable order, then truncated to `k`. An empty candidate list yields an empty
+/// result. Callers are expected to have already removed the caller themselves and
+/// anyone they already follow before ranking.
+#[must_use]
+fn rank_people(candidates: &[(ParticipantId, i64)], k: usize) -> Vec<PersonRec> {
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    let max_shared = candidates.iter().map(|(_, s)| *s).max().unwrap_or(0).max(0);
+
+    let mut ranked: Vec<(i64, PersonRec)> = candidates
+        .iter()
+        .map(|(participant, shared)| {
+            let shared = (*shared).max(0);
+            #[allow(clippy::cast_precision_loss)]
+            let score = if max_shared > 0 {
+                shared as f32 / max_shared as f32
+            } else {
+                0.0
+            };
+            let reason = if shared > 0 {
+                format!("你们共同加入了 {shared} 个频道")
+            } else {
+                "同工作区成员".to_owned()
+            };
+            (shared, PersonRec { participant: *participant, score, reason })
+        })
+        .collect();
+
+    ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.participant.cmp(&b.1.participant)));
+    ranked.truncate(k);
+    ranked.into_iter().map(|(_, rec)| rec).collect()
+}
+
 /// Last-5-lines fallback summary used when Anthropic is disabled.
 fn heuristic_summary(messages: &[Message]) -> String {
     let tail: Vec<&Message> = messages.iter().rev().take(5).collect();
@@ -991,6 +1156,87 @@ mod tests {
         assert_eq!(r1[0].participant, r2[0].participant);
         let lo = a.min(b);
         assert_eq!(r1[0].participant, lo, "lower id ranks first on a tie");
+    }
+
+    #[test]
+    fn rank_channels_orders_by_activity_desc_and_normalizes() {
+        let busy = RoomId::new();
+        let quiet = RoomId::new();
+        let dead = RoomId::new();
+        let cands = vec![
+            (quiet, "quiet".to_owned(), 2_i64),
+            (busy, "busy".to_owned(), 10_i64),
+            (dead, "dead".to_owned(), 0_i64),
+        ];
+        let ranked = rank_channels(&cands, 10);
+        assert_eq!(ranked.len(), 3);
+        // Busiest first; score normalized to 1.0.
+        assert_eq!(ranked[0].room, busy);
+        assert!((ranked[0].score - 1.0).abs() < 1e-6);
+        assert_eq!(ranked[1].room, quiet);
+        assert!((ranked[1].score - 0.2).abs() < 1e-6);
+        // Zero-activity ranks last with score 0 and the "not joined" reason.
+        assert_eq!(ranked[2].room, dead);
+        assert!((ranked[2].score - 0.0).abs() < 1e-6);
+        assert!(ranked[2].reason.contains("未加入"));
+        assert!(ranked[0].reason.contains("10"), "active reason cites the count");
+    }
+
+    #[test]
+    fn rank_channels_truncates_to_k_and_breaks_ties_by_id() {
+        let a = RoomId::new();
+        let b = RoomId::new();
+        // Equal activity → order broken by room id (ascending), stable.
+        let cands = vec![(a, "a".to_owned(), 5_i64), (b, "b".to_owned(), 5_i64)];
+        let r1 = rank_channels(&cands, 10);
+        let r2 = rank_channels(&cands, 10);
+        assert_eq!(r1[0].room, r2[0].room, "stable across runs");
+        assert_eq!(r1[0].room, a.min(b), "lower id ranks first on a tie");
+        // Truncation to k.
+        assert_eq!(rank_channels(&cands, 1).len(), 1);
+    }
+
+    #[test]
+    fn rank_channels_unnamed_gets_fallback_name() {
+        let room = RoomId::new();
+        let ranked = rank_channels(&[(room, "   ".to_owned(), 1)], 5);
+        assert_eq!(ranked[0].name, UNNAMED_CHANNEL);
+    }
+
+    #[test]
+    fn rank_channels_empty_is_empty() {
+        assert!(rank_channels(&[], 5).is_empty());
+    }
+
+    #[test]
+    fn rank_people_orders_by_shared_overlap_desc() {
+        let close = ParticipantId::new();
+        let acquaintance = ParticipantId::new();
+        let cands = vec![(acquaintance, 1_i64), (close, 4_i64)];
+        let ranked = rank_people(&cands, 10);
+        assert_eq!(ranked.len(), 2);
+        assert_eq!(ranked[0].participant, close);
+        assert!((ranked[0].score - 1.0).abs() < 1e-6);
+        assert!(ranked[0].reason.contains('4'), "reason cites the overlap count");
+        assert_eq!(ranked[1].participant, acquaintance);
+        assert!((ranked[1].score - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rank_people_breaks_ties_by_id_and_truncates() {
+        let a = ParticipantId::new();
+        let b = ParticipantId::new();
+        let cands = vec![(a, 3_i64), (b, 3_i64)];
+        let r1 = rank_people(&cands, 10);
+        let r2 = rank_people(&cands, 10);
+        assert_eq!(r1[0].participant, r2[0].participant, "stable across runs");
+        assert_eq!(r1[0].participant, a.min(b), "lower id ranks first on a tie");
+        assert_eq!(rank_people(&cands, 1).len(), 1, "truncated to k");
+    }
+
+    #[test]
+    fn rank_people_empty_is_empty() {
+        assert!(rank_people(&[], 5).is_empty());
     }
 
     #[test]

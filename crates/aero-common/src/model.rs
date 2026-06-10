@@ -80,11 +80,28 @@ pub enum FileKind {
     Other,
 }
 
+/// One choice in a [`Block::Select`] dropdown: a stable machine `value` recorded
+/// when chosen, plus a human-readable `label` rendered in the menu.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SelectOption {
+    /// The machine value recorded as the interaction's `value` when this option is
+    /// chosen (e.g. `"approve"`).
+    pub value: String,
+    /// The human-readable label shown in the dropdown (e.g. `"Approve request"`).
+    pub label: String,
+}
+
 /// The atomic unit of message content. Inspired by Slack Block Kit but extended for AI.
 ///
 /// A message is `Vec<Block>` — clients render blocks in order. AI agents produce and
 /// consume the same shape, so no translation layer is needed between user input,
 /// stored history, and LLM context windows.
+///
+/// The interactive variants ([`Button`](Block::Button), [`Select`](Block::Select))
+/// let a bot/webhook/app post an *actionable* message: a participant clicks a
+/// button or picks an option and the server records the interaction (see the
+/// `interactions` HTTP surface), broadcasting a
+/// [`RoomEvent::Interaction`](RoomEvent::Interaction) so the poster sees it live.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Block {
@@ -127,6 +144,27 @@ pub enum Block {
         #[serde(default)]
         hidden: bool,
     },
+    /// An interactive button. A `url`-bearing button is a plain link the client
+    /// opens; a `url`-less button is an *action* — clicking it POSTs to the
+    /// interactions endpoint, which records the click against `action_id`. `style`
+    /// is an optional render hint (`primary` | `danger` | `default`).
+    Button {
+        action_id: String,
+        label: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        style: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        url: Option<String>,
+    },
+    /// An interactive single-choice dropdown. Picking an option POSTs to the
+    /// interactions endpoint with the chosen option's `value`, recorded against
+    /// `action_id`. `placeholder` is the prompt shown before a choice is made.
+    Select {
+        action_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        placeholder: Option<String>,
+        options: Vec<SelectOption>,
+    },
 }
 
 impl Block {
@@ -134,17 +172,57 @@ impl Block {
         Self::Text { content: content.into(), spans: Vec::new() }
     }
 
-    /// Returns the plain-text projection used for fulltext indexing and embedding.
-    /// Hidden Thought blocks are excluded.
+    /// Returns the primary plain-text projection used for fulltext indexing and
+    /// embedding. Hidden Thought blocks are excluded. An interactive
+    /// [`Button`](Self::Button) contributes its visible `label` (so a "Approve"
+    /// button is searchable like any other text). A [`Select`](Self::Select)
+    /// dropdown's *option* labels are multiple, so they are surfaced separately via
+    /// [`extra_searchable_text`](Self::extra_searchable_text) (which
+    /// [`Message::searchable_text`](Message::searchable_text) also folds in).
     #[must_use]
     pub fn searchable_text(&self) -> Option<&str> {
         match self {
             Self::Text { content, .. } | Self::Code { content, .. } => Some(content),
             Self::Voice { transcript: Some(t), .. } => Some(t),
             Self::Thought { content, hidden: false } => Some(content),
+            Self::Button { label, .. } => Some(label),
             _ => None,
         }
     }
+
+    /// Additional searchable spans that don't fit the single-`&str`
+    /// [`searchable_text`](Self::searchable_text) shape — today the option labels of
+    /// a [`Select`](Self::Select) dropdown, so the menu's human-readable choices are
+    /// indexed/embedded alongside the rest of a message. Empty for every other
+    /// variant.
+    #[must_use]
+    pub fn extra_searchable_text(&self) -> Vec<&str> {
+        match self {
+            Self::Select { options, .. } => options.iter().map(|o| o.label.as_str()).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The interactive `action_id` this block carries, if it is an interactive
+    /// component (a `Button` or a `Select`); `None` for every static block. Used
+    /// to verify an interaction targets a real component on a message.
+    #[must_use]
+    pub fn action_id(&self) -> Option<&str> {
+        match self {
+            Self::Button { action_id, .. } | Self::Select { action_id, .. } => Some(action_id),
+            _ => None,
+        }
+    }
+}
+
+/// Whether `blocks` contains an interactive [`Block`] (a `Button` or `Select`)
+/// whose `action_id` equals `action_id`. Pure — the server uses it to verify an
+/// inbound interaction actually targets a component on the message before
+/// recording it (otherwise the interaction is a 404). A `url`-only link button
+/// still counts: it has an `action_id` and can be recorded if a client posts one.
+#[must_use]
+pub fn message_has_action(blocks: &[Block], action_id: &str) -> bool {
+    blocks.iter().any(|b| b.action_id() == Some(action_id))
 }
 
 // ---------- Message ----------
@@ -168,12 +246,19 @@ pub struct Message {
 }
 
 impl Message {
-    /// Concatenated searchable text used for embedding/full-text index.
+    /// Concatenated searchable text used for embedding/full-text index. Folds in
+    /// each block's primary [`searchable_text`](Block::searchable_text) plus any
+    /// [`extra_searchable_text`](Block::extra_searchable_text) (e.g. `Select`
+    /// option labels), in block order.
     #[must_use]
     pub fn searchable_text(&self) -> String {
         self.blocks
             .iter()
-            .filter_map(Block::searchable_text)
+            .flat_map(|b| {
+                b.searchable_text()
+                    .into_iter()
+                    .chain(b.extra_searchable_text())
+            })
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -720,6 +805,17 @@ pub enum RoomEvent {
         message_id: MessageId,
         participant: ParticipantId,
     },
+    /// A participant interacted with an interactive [`Block`] (clicked a
+    /// `Button` or picked a `Select` option) on a message. Fans out to the whole
+    /// room so the poster's client — typically a bot/app/webhook integration —
+    /// sees the click live and can react (the durable record lives in
+    /// `block_interactions`). `action_id` identifies which component was hit.
+    Interaction {
+        room_id: RoomId,
+        message_id: MessageId,
+        participant: ParticipantId,
+        action_id: String,
+    },
 }
 
 impl RoomEvent {
@@ -754,7 +850,8 @@ impl RoomEvent {
             | RoomEvent::Pin { room_id, .. }
             | RoomEvent::Membership { room_id, .. }
             | RoomEvent::Poll { room_id, .. }
-            | RoomEvent::MessageSeen { room_id, .. } => Some(*room_id),
+            | RoomEvent::MessageSeen { room_id, .. }
+            | RoomEvent::Interaction { room_id, .. } => Some(*room_id),
             RoomEvent::Call(
                 CallEvent::Invite { room_id, .. }
                 | CallEvent::End { room_id, .. }
@@ -920,6 +1017,184 @@ mod tests {
             Block::ToolCall { tool, .. } => assert_eq!(tool, "search"),
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn block_button_roundtrip() {
+        // An action button (no url) with a style.
+        let b = Block::Button {
+            action_id: "approve".into(),
+            label: "Approve".into(),
+            style: Some("primary".into()),
+            url: None,
+        };
+        let j = serde_json::to_string(&b).unwrap();
+        assert!(j.contains("\"type\":\"button\""));
+        assert!(j.contains("\"action_id\":\"approve\""));
+        // url is None → skipped on the wire.
+        assert!(!j.contains("\"url\""));
+        let back: Block = serde_json::from_str(&j).unwrap();
+        match &back {
+            Block::Button { action_id, label, style, url } => {
+                assert_eq!(action_id, "approve");
+                assert_eq!(label, "Approve");
+                assert_eq!(style.as_deref(), Some("primary"));
+                assert_eq!(url.as_deref(), None);
+            }
+            _ => panic!("wrong variant"),
+        }
+        // A link button (url set, no style) round-trips too.
+        let link = Block::Button {
+            action_id: "docs".into(),
+            label: "Open docs".into(),
+            style: None,
+            url: Some("https://example.com".into()),
+        };
+        let lj = serde_json::to_string(&link).unwrap();
+        let lback: Block = serde_json::from_str(&lj).unwrap();
+        assert!(matches!(
+            lback,
+            Block::Button { url: Some(u), style: None, .. } if u == "https://example.com"
+        ));
+    }
+
+    #[test]
+    fn block_select_roundtrip() {
+        let b = Block::Select {
+            action_id: "priority".into(),
+            placeholder: Some("Pick one".into()),
+            options: vec![
+                SelectOption { value: "lo".into(), label: "Low".into() },
+                SelectOption { value: "hi".into(), label: "High".into() },
+            ],
+        };
+        let j = serde_json::to_string(&b).unwrap();
+        assert!(j.contains("\"type\":\"select\""));
+        let back: Block = serde_json::from_str(&j).unwrap();
+        match &back {
+            Block::Select { action_id, placeholder, options } => {
+                assert_eq!(action_id, "priority");
+                assert_eq!(placeholder.as_deref(), Some("Pick one"));
+                assert_eq!(options.len(), 2);
+                assert_eq!(options[0].value, "lo");
+                assert_eq!(options[1].label, "High");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn interactive_blocks_tolerate_unknown_future_fields() {
+        // A forward-compatible payload: a future server adds fields we don't know.
+        // serde must ignore them rather than fail (default behavior, asserted here
+        // so a future #[serde(deny_unknown_fields)] regression is caught).
+        let button_json = r#"{
+            "type": "button",
+            "action_id": "a1",
+            "label": "Go",
+            "confirm": {"title": "Sure?"},
+            "accessibility_label": "go button"
+        }"#;
+        let b: Block = serde_json::from_str(button_json).unwrap();
+        assert!(matches!(b, Block::Button { action_id, .. } if action_id == "a1"));
+
+        let select_json = r#"{
+            "type": "select",
+            "action_id": "s1",
+            "options": [{"value": "v", "label": "L", "description": "future"}],
+            "max_selected": 3
+        }"#;
+        let s: Block = serde_json::from_str(select_json).unwrap();
+        match s {
+            Block::Select { action_id, options, placeholder } => {
+                assert_eq!(action_id, "s1");
+                assert!(placeholder.is_none());
+                assert_eq!(options.len(), 1);
+                assert_eq!(options[0].value, "v");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn interactive_block_labels_are_searchable() {
+        // Button label + Select option labels both feed the search projection.
+        let msg = Message {
+            id: MessageId::new(),
+            room_id: RoomId::new(),
+            sender_id: ParticipantId::new(),
+            blocks: vec![
+                Block::text("Choose a plan"),
+                Block::Button {
+                    action_id: "buy".into(),
+                    label: "Buy now".into(),
+                    style: None,
+                    url: None,
+                },
+                Block::Select {
+                    action_id: "tier".into(),
+                    placeholder: None,
+                    options: vec![
+                        SelectOption { value: "pro".into(), label: "Pro tier".into() },
+                        SelectOption { value: "ent".into(), label: "Enterprise tier".into() },
+                    ],
+                },
+            ],
+            reply_to: None,
+            metadata: serde_json::Value::Null,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            edited_at: None,
+            deleted_at: None,
+        };
+        let text = msg.searchable_text();
+        assert!(text.contains("Choose a plan"));
+        assert!(text.contains("Buy now"), "button label searchable: {text:?}");
+        assert!(text.contains("Pro tier"), "select option searchable: {text:?}");
+        assert!(text.contains("Enterprise tier"));
+    }
+
+    #[test]
+    fn message_has_action_matches_only_real_components() {
+        let blocks = vec![
+            Block::text("not interactive"),
+            Block::Button {
+                action_id: "click_me".into(),
+                label: "Click".into(),
+                style: None,
+                url: None,
+            },
+            Block::Select {
+                action_id: "pick".into(),
+                placeholder: None,
+                options: vec![SelectOption { value: "a".into(), label: "A".into() }],
+            },
+        ];
+        assert!(message_has_action(&blocks, "click_me"));
+        assert!(message_has_action(&blocks, "pick"));
+        assert!(!message_has_action(&blocks, "missing"));
+        // A plain-text-only message has no actions.
+        assert!(!message_has_action(&[Block::text("hi")], "click_me"));
+        // An empty block list never matches.
+        assert!(!message_has_action(&[], "click_me"));
+    }
+
+    #[test]
+    fn interaction_event_tagged_and_routes_to_room() {
+        let room = RoomId::new();
+        let ev = RoomEvent::Interaction {
+            room_id: room,
+            message_id: MessageId::new(),
+            participant: ParticipantId::new(),
+            action_id: "approve".into(),
+        };
+        // Fans out to the whole room (poster included) — no explicit recipients.
+        assert!(ev.explicit_recipients().is_empty());
+        assert_eq!(ev.room_id(), Some(room));
+        let j = serde_json::to_string(&ev).unwrap();
+        assert!(j.contains("\"kind\":\"interaction\""));
+        assert!(j.contains("\"action_id\":\"approve\""));
+        let back: RoomEvent = serde_json::from_str(&j).unwrap();
+        assert_eq!(back.room_id(), Some(room));
     }
 
     #[test]
