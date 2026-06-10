@@ -38,6 +38,19 @@ pub struct AnswerResult {
     pub citations: Vec<MessageId>,
 }
 
+/// One ranked expert returned by [`AiService::find_expert`].
+///
+/// `participant` is the candidate authority on the topic; `score` is the summed
+/// relevance of their topic-matching messages (higher = stronger signal); and
+/// `citations` are a few of the message ids that drove the score so the UI can
+/// show "why" — exactly like the RAG citation chips.
+#[derive(Debug, Clone)]
+pub struct Expert {
+    pub participant: ParticipantId,
+    pub score: f32,
+    pub citations: Vec<MessageId>,
+}
+
 /// Composition root for AI features.
 #[derive(Clone)]
 pub struct AiService {
@@ -492,6 +505,135 @@ impl AiService {
         Ok(AnswerResult { answer: fallback, citations })
     }
 
+    // ---------- thread-scoped summarization ----------
+
+    /// Summarize a thread — the flat chain of (non-deleted) replies hanging off a
+    /// root message.
+    ///
+    /// Mirrors [`Self::summarize_room`] exactly (same Chinese bullet prompt, same
+    /// LLM primitive, same heuristic fallback) but sources the transcript from
+    /// [`MessageRepo::thread_replies`](aero_storage::MessageRepo::thread_replies)
+    /// (oldest-first) instead of a room's recent window. `max_replies` caps how
+    /// many replies are read (clamped to `[1, 200]`). An empty thread (no replies)
+    /// returns an empty string. Degrades to the deterministic "last 5 lines"
+    /// heuristic when Anthropic is disabled; never errors on a missing key.
+    ///
+    /// # Errors
+    /// Propagates a storage or Anthropic failure when a key IS configured; the
+    /// no-key path is infallible.
+    pub async fn summarize_thread(
+        &self,
+        root: MessageId,
+        max_replies: usize,
+    ) -> Result<String> {
+        // `max_replies` is clamped to [1, 200] so this `as i64` is always safe.
+        #[allow(clippy::cast_possible_wrap)]
+        let limit = max_replies.clamp(1, 200) as i64;
+        // `thread_replies` is already oldest-first (chronological for the LLM).
+        let replies = self.messages.thread_replies(root, None, limit).await?;
+
+        if replies.is_empty() {
+            return Ok(String::new());
+        }
+
+        let transcript = render_transcript(&replies);
+
+        if let Some(client) = &self.anthropic {
+            let system = SUMMARIZE_SYSTEM_PROMPT;
+            let user = format!(
+                "请阅读以下话题串(thread)的回复记录,并按照系统指令给出要点摘要。\n\n回复记录:\n{transcript}"
+            );
+            let msgs = vec![ChatMsg::user(user)];
+            return client.complete(system, &msgs, 600).await;
+        }
+
+        Ok(heuristic_summary(&replies))
+    }
+
+    /// Summarize the most recent activity across EVERY channel the caller belongs
+    /// to within a workspace — the workspace twin of [`Self::summarize_room`].
+    ///
+    /// Pulls the caller's recent cross-room messages over the SAME
+    /// membership/workspace boundary the workspace RAG uses
+    /// ([`MessageRepo::recent_workspace`](aero_storage::MessageRepo::recent_workspace)),
+    /// renders them chronologically, and asks Anthropic for the same Chinese bullet
+    /// summary. `last_n` is clamped to `[1, 200]`. With no messages returns an empty
+    /// string; without Anthropic degrades to the deterministic "last 5 lines"
+    /// heuristic. Backs the scheduled workspace digest.
+    ///
+    /// # Errors
+    /// Propagates a storage or Anthropic failure when a key IS configured; the
+    /// no-key path is infallible.
+    pub async fn summarize_workspace(
+        &self,
+        participant: ParticipantId,
+        workspace: WorkspaceId,
+        last_n: usize,
+    ) -> Result<String> {
+        // `last_n` is clamped to [1, 200] so this `as i64` is always safe.
+        #[allow(clippy::cast_possible_wrap)]
+        let limit = last_n.clamp(1, 200) as i64;
+        let mut recent = self.messages.recent_workspace(participant, workspace, limit).await?;
+        // `recent_workspace` returns newest-first; reverse to chronological.
+        recent.reverse();
+
+        if recent.is_empty() {
+            return Ok(String::new());
+        }
+
+        let transcript = render_transcript(&recent);
+
+        if let Some(client) = &self.anthropic {
+            let system = SUMMARIZE_SYSTEM_PROMPT;
+            let user = format!(
+                "请阅读以下工作区近期聊天记录(跨多个频道),并按照系统指令给出要点摘要。\n\n聊天记录:\n{transcript}"
+            );
+            let msgs = vec![ChatMsg::user(user)];
+            return client.complete(system, &msgs, 600).await;
+        }
+
+        Ok(heuristic_summary(&recent))
+    }
+
+    // ---------- find expert ----------
+
+    /// Rank workspace members by topical authority on `topic`.
+    ///
+    /// Embeds the topic, runs the membership-bounded cross-room vector search
+    /// ([`MessageRepo::search_vector_workspace`](aero_storage::MessageRepo::search_vector_workspace)),
+    /// then aggregates the hits by author: each author's relevance is the SUM of
+    /// their matching messages' similarity scores, and a few of their highest-
+    /// scoring message ids are kept as citations. Returns the top-`k` authors,
+    /// strongest first. NO LLM call — purely retrieval + aggregation, so it never
+    /// errors on a missing Anthropic key (it degrades to whatever the embedder and
+    /// vector index return, which is empty rather than an error when nothing
+    /// matches). `pool` bounds how wide a candidate set is aggregated.
+    ///
+    /// # Errors
+    /// Propagates embedder or storage failures.
+    pub async fn find_expert(
+        &self,
+        participant: ParticipantId,
+        workspace: WorkspaceId,
+        topic: &str,
+        k: usize,
+        pool: usize,
+    ) -> Result<Vec<Expert>> {
+        let topic = topic.trim();
+        if topic.is_empty() {
+            return Err(AiError::Invalid("topic must not be empty".into()));
+        }
+        let query_vec = self.embedder.embed_one(topic).await?;
+        // `pool` bounds the candidate breadth aggregated; clamp to a sane window.
+        #[allow(clippy::cast_possible_wrap)]
+        let pool_limit = pool.clamp(1, 200) as i64;
+        let hits = self
+            .messages
+            .search_vector_workspace(participant, workspace, query_vec, pool_limit)
+            .await?;
+        Ok(rank_experts(&hits, k.clamp(1, 50)))
+    }
+
     // ---------- translation (P3 实时字幕翻译) ----------
 
     /// Translate `text` into `target_lang` (a human label or BCP-47 code).
@@ -629,6 +771,60 @@ fn render_context(hits: &[SearchHit]) -> String {
     out
 }
 
+/// Maximum citation message ids kept per ranked expert.
+const MAX_EXPERT_CITATIONS: usize = 3;
+
+/// Aggregate topic-relevant search hits into a ranked expert list.
+///
+/// Pure (no I/O), so the ranking/aggregation is unit-tested offline. Each hit's
+/// author accrues that hit's `score`; the author's running total is their
+/// relevance, and their highest-scoring message ids (up to [`MAX_EXPERT_CITATIONS`])
+/// are kept as citations. The result is sorted by total score descending, ties
+/// broken deterministically by the participant's id (so the order is stable across
+/// runs), and truncated to `k`. An empty hit list yields an empty result — never a
+/// panic — so the "no embeddings / nothing matched" path degrades to an empty list.
+#[must_use]
+fn rank_experts(hits: &[SearchHit], k: usize) -> Vec<Expert> {
+    use std::collections::HashMap;
+
+    // author -> (summed score, all (score, message id) pairs)
+    let mut agg: HashMap<ParticipantId, (f32, Vec<(f32, MessageId)>)> = HashMap::new();
+    for h in hits {
+        let entry = agg.entry(h.message.sender_id).or_insert((0.0, Vec::new()));
+        entry.0 += h.score;
+        entry.1.push((h.score, h.message.id));
+    }
+
+    let mut experts: Vec<Expert> = agg
+        .into_iter()
+        .map(|(participant, (score, mut scored))| {
+            // Keep this author's strongest-scoring message ids as citations.
+            // Sort by score desc, ties broken by id so the citation set is stable.
+            scored.sort_by(|a, b| {
+                b.0.partial_cmp(&a.0)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.1.cmp(&b.1))
+            });
+            let citations = scored
+                .into_iter()
+                .take(MAX_EXPERT_CITATIONS)
+                .map(|(_, id)| id)
+                .collect();
+            Expert { participant, score, citations }
+        })
+        .collect();
+
+    // Strongest first; ties broken by participant id for a deterministic order.
+    experts.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.participant.cmp(&b.participant))
+    });
+    experts.truncate(k);
+    experts
+}
+
 /// Last-5-lines fallback summary used when Anthropic is disabled.
 fn heuristic_summary(messages: &[Message]) -> String {
     let tail: Vec<&Message> = messages.iter().rev().take(5).collect();
@@ -746,6 +942,55 @@ mod tests {
     #[test]
     fn heuristic_text_digest_empty_when_blank() {
         assert_eq!(heuristic_text_digest("   \n\n  "), "");
+    }
+
+    fn hit(sender: ParticipantId, score: f32) -> SearchHit {
+        let mut m = mk_msg("topic message");
+        m.sender_id = sender;
+        SearchHit { message: m, score }
+    }
+
+    #[test]
+    fn rank_experts_sums_scores_and_ranks_desc() {
+        let alice = ParticipantId::new();
+        let bob = ParticipantId::new();
+        // Bob authored two weak hits (0.3 + 0.3 = 0.6); Alice one strong (0.5).
+        let hits = vec![hit(bob, 0.3), hit(alice, 0.5), hit(bob, 0.3)];
+        let ranked = rank_experts(&hits, 10);
+        assert_eq!(ranked.len(), 2);
+        // Bob's summed 0.6 beats Alice's 0.5.
+        assert_eq!(ranked[0].participant, bob);
+        assert!((ranked[0].score - 0.6).abs() < 1e-6);
+        assert_eq!(ranked[0].citations.len(), 2, "both of bob's hits cited");
+        assert_eq!(ranked[1].participant, alice);
+    }
+
+    #[test]
+    fn rank_experts_caps_citations_and_truncates_to_k() {
+        let alice = ParticipantId::new();
+        // 5 hits from one author — citations cap at MAX_EXPERT_CITATIONS.
+        let hits: Vec<SearchHit> = (0..5).map(|_| hit(alice, 0.2)).collect();
+        let ranked = rank_experts(&hits, 1);
+        assert_eq!(ranked.len(), 1, "truncated to k=1");
+        assert_eq!(ranked[0].citations.len(), MAX_EXPERT_CITATIONS, "citations capped");
+    }
+
+    #[test]
+    fn rank_experts_empty_is_empty() {
+        assert!(rank_experts(&[], 5).is_empty());
+    }
+
+    #[test]
+    fn rank_experts_is_deterministic_on_ties() {
+        let a = ParticipantId::new();
+        let b = ParticipantId::new();
+        // Equal scores → order is broken by participant id (ascending), stable.
+        let hits = vec![hit(a, 0.4), hit(b, 0.4)];
+        let r1 = rank_experts(&hits, 10);
+        let r2 = rank_experts(&hits, 10);
+        assert_eq!(r1[0].participant, r2[0].participant);
+        let lo = a.min(b);
+        assert_eq!(r1[0].participant, lo, "lower id ranks first on a tie");
     }
 
     #[test]

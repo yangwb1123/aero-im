@@ -711,6 +711,15 @@ pub enum RoomEvent {
         poll_id: PollId,
         op: PollOp,
     },
+    /// A participant acknowledged seeing a SPECIFIC message ("Seen by …"). Fans
+    /// out to the whole room so every member's per-message read indicator stays
+    /// live. Distinct from [`RoomEvent::Read`], which moves the per-room unread
+    /// cursor; this carries the individual message a reader has now seen.
+    MessageSeen {
+        room_id: RoomId,
+        message_id: MessageId,
+        participant: ParticipantId,
+    },
 }
 
 impl RoomEvent {
@@ -744,7 +753,8 @@ impl RoomEvent {
             | RoomEvent::Notify { room_id, .. }
             | RoomEvent::Pin { room_id, .. }
             | RoomEvent::Membership { room_id, .. }
-            | RoomEvent::Poll { room_id, .. } => Some(*room_id),
+            | RoomEvent::Poll { room_id, .. }
+            | RoomEvent::MessageSeen { room_id, .. } => Some(*room_id),
             RoomEvent::Call(
                 CallEvent::Invite { room_id, .. }
                 | CallEvent::End { room_id, .. }

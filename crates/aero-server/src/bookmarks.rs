@@ -10,7 +10,7 @@
 use std::str::FromStr;
 
 use aero_auth::AuthUser;
-use aero_common::{Error as AeroError, MessageId};
+use aero_common::{BookmarkCollectionId, Error as AeroError, MessageId};
 use aero_storage::BookmarkRepo;
 use axum::{
     extract::{Path, Query, State},
@@ -89,15 +89,30 @@ async fn unsave_message(
 struct SavedQuery {
     #[serde(default)]
     limit: Option<i64>,
+    /// Optional folder filter: only saved items filed in this collection. Omit
+    /// (or leave empty) for the whole saved list.
+    #[serde(default)]
+    collection_id: Option<String>,
 }
 
 /// `GET /api/saved` — the caller's saved messages, newest-saved first, across all
-/// rooms. Soft-deleted messages are omitted by the repository.
+/// rooms. Soft-deleted messages are omitted by the repository. An optional
+/// `?collection_id=` filters to one bookmark collection (folder); when absent the
+/// whole saved list is returned.
 async fn list_saved(
     State(s): State<AppState>,
     auth: AuthUser,
     Query(q): Query<SavedQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let saved = repo(&s).list(auth.participant_id, q.limit).await?;
+    let collection = match q.collection_id.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+        Some(c) => Some(
+            BookmarkCollectionId::from_str(c)
+                .map_err(|e| AeroError::Invalid(format!("collection id: {e}")))?,
+        ),
+        None => None,
+    };
+    let saved = repo(&s)
+        .list_in_collection(auth.participant_id, collection, q.limit)
+        .await?;
     Ok(Json(serde_json::to_value(saved).map_err(AeroError::from)?))
 }

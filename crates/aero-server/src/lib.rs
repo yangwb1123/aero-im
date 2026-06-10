@@ -134,4 +134,27 @@ pub mod ip_allowlist;
 // ---- ROADMAP3 方向五: per-workspace rate-limit tiers (租户公平) ----
 pub mod ws_rate;
 
+// ---- Collaboration parity batch (Slack/Lark/Teams) ----
+// Per-message read receipts ("Seen by"), bookmark folders/collections, and
+// multi-channel broadcast; scheduled-message editing extends crate::scheduled.
+pub mod bookmark_collections;
+pub mod broadcast;
+pub mod message_receipts;
+
+// ---- Interactive-live / creator parity (migrations 0079-0083) ----
+// Hype train / combo gifts, raids, VOD chapters, stream-moderator role assignment.
+pub mod hype_train;
+pub mod raids;
+pub mod stream_moderators;
+pub mod vod_chapters;
+
+// ---- AI-native cluster: thread summary, scheduled digests, find-expert ----
+pub mod thread_summarize;
+pub mod digests;
+pub mod find_expert;
+
+// ---- Operability: webhook delivery DLQ admin + per-tenant usage reports ----
+pub mod webhook_admin;
+pub mod usage_report;
+
 pub use state::AppState;

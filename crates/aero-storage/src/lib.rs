@@ -10,6 +10,7 @@ pub mod blob;
 pub mod blob_store;
 pub mod s3_blob_store;
 pub mod bookmark;
+pub mod bookmark_collection;
 pub mod cache;
 pub mod channel_section;
 pub mod call;
@@ -29,6 +30,7 @@ pub mod pat;
 pub mod pin;
 pub mod poll;
 pub mod presence;
+pub mod message_receipt;
 pub mod reaction;
 pub mod receipt;
 pub mod room;
@@ -108,11 +110,12 @@ pub mod password_reset;
 
 pub use ai_context::{AiContextStore, MAX_TURNS as AI_CONTEXT_MAX_TURNS};
 pub use ai_job::{AiJob, AiJobKind, AiJobRepo, AiJobStatus};
-pub use audit::{AuditEvent, AuditRepo};
+pub use audit::{events_to_csv, AuditEvent, AuditRepo, AUDIT_CSV_HEADER};
 pub use blob::{BlobRepo, NewBlob};
 pub use blob_store::{BlobStore, BlobStoreError, LocalFsBlobStore};
 pub use s3_blob_store::{blob_store_from_env, blob_store_from_env_checked, S3BlobStore, S3Config};
 pub use bookmark::{BookmarkRepo, SavedMessage};
+pub use bookmark_collection::{BookmarkCollection, BookmarkCollectionRepo};
 pub use cache::{Cache, RedisCache};
 pub use call::CallRepo;
 pub use call_transcript::{CallTranscriptRepo, TranscriptLine};
@@ -136,6 +139,7 @@ pub use pin::PinRepo;
 pub use poll::{PollRepo, VoteError as PollVoteError};
 pub use presence::PresenceStore;
 pub use reaction::ReactionRepo;
+pub use message_receipt::{MessageReader, MessageReceiptRepo};
 pub use receipt::ReceiptRepo;
 pub use room::RoomRepo;
 pub use saved_search::{SavedSearch, SavedSearchRepo};
@@ -258,3 +262,35 @@ pub use ws_rate::WsRateStore;
 // ---- ROADMAP3 方向二 — cross-node group-call routing ----
 pub mod call_route;
 pub use call_route::{CallRouteRegistry, DEFAULT_TTL as CALL_ROUTE_TTL};
+
+// ---- Interactive-live / creator parity (migrations 0079-0083) ----
+// Hype train / combo gifts, raids, VOD chapters, stream-moderator role assignment.
+// (Subscriber-badge for stream chat lives on the existing `live` module: 0082.)
+pub mod hype_train;
+pub mod raid;
+pub mod stream_moderator;
+pub mod vod_chapter;
+pub use hype_train::{
+    apply_contribution, is_expired as hype_train_is_expired, HypeTrainRepo, HypeTrainSession,
+    Escalation, MAX_LEVEL as HYPE_TRAIN_MAX_LEVEL, UNITS_PER_LEVEL as HYPE_TRAIN_UNITS_PER_LEVEL,
+    WINDOW_SECS as HYPE_TRAIN_WINDOW_SECS,
+};
+pub use raid::{Raid, RaidRepo};
+pub use stream_moderator::{StreamModerator, StreamModeratorRepo};
+pub use vod_chapter::{VodChapter, VodChapterRepo};
+
+// ---- AI-native: scheduled / recurring AI digest subscriptions (0084) ----
+pub mod digest_subscription;
+pub use digest_subscription::{
+    next_run_at as digest_next_run_at, validate_frequency as validate_digest_frequency,
+    DigestSubscription, DigestSubscriptionRepo, DigestTarget, FREQ_DAILY, FREQ_WEEKLY,
+};
+
+// ---- Operability: webhook delivery retry/DLQ + per-tenant usage reports ----
+pub mod webhook_delivery;
+pub use webhook_delivery::{
+    backoff_delay, is_dead_at, next_attempt_at, WebhookDelivery, WebhookDeliveryRepo,
+    MAX_ATTEMPTS as WEBHOOK_MAX_ATTEMPTS,
+};
+pub mod usage_report;
+pub use usage_report::{AiKindUsage, UsageReport, UsageReportRepo};

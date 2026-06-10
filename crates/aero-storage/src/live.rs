@@ -23,23 +23,28 @@ impl LiveRepo {
     // -------------------------------------------------------------- chat
 
     /// Persist a danmaku line. Returns the generated id + timestamp so the
-    /// caller can build the broadcast envelope without a re-read.
+    /// caller can build the broadcast envelope without a re-read. `is_subscriber`
+    /// records whether the sender had an active creator subscription to the stream
+    /// owner at post time (Twitch-style subscriber badge, migration 0082); the
+    /// caller computes it via [`SubscriptionRepo::is_subscribed`](crate::SubscriptionRepo).
     pub async fn insert_chat(
         &self,
         stream_id: Ulid,
         sender_id: ParticipantId,
         body: &str,
+        is_subscriber: bool,
     ) -> Result<(Ulid, OffsetDateTime), sqlx::Error> {
         let id = Ulid::new();
         let created_at = OffsetDateTime::now_utc();
         sqlx::query(
-            r#"INSERT INTO stream_chat (id, stream_id, sender_id, body, created_at)
-               VALUES ($1, $2, $3, $4, $5)"#,
+            r#"INSERT INTO stream_chat (id, stream_id, sender_id, body, is_subscriber, created_at)
+               VALUES ($1, $2, $3, $4, $5, $6)"#,
         )
         .bind(Uuid::from_u128(id.0))
         .bind(Uuid::from_u128(stream_id.0))
         .bind(sender_id.to_uuid())
         .bind(body)
+        .bind(is_subscriber)
         .bind(created_at)
         .execute(&self.pool)
         .await?;
@@ -57,7 +62,7 @@ impl LiveRepo {
         let limit = limit.clamp(1, 200);
         let rows = sqlx::query_as::<_, ChatRow>(
             r#"SELECT c.id, c.stream_id, c.sender_id, p.display_name AS sender_name,
-                      c.body, c.created_at
+                      c.body, c.is_subscriber, c.created_at
                FROM stream_chat c
                JOIN participants p ON p.id = c.sender_id
                WHERE c.stream_id = $1
@@ -90,7 +95,7 @@ impl LiveRepo {
         let limit = limit.clamp(1, 200);
         let rows = sqlx::query_as::<_, ChatRow>(
             r#"SELECT c.id, c.stream_id, c.sender_id, p.display_name AS sender_name,
-                      c.body, c.created_at
+                      c.body, c.is_subscriber, c.created_at
                FROM stream_chat c
                JOIN participants p ON p.id = c.sender_id
                WHERE c.stream_id = $1 AND c.id > $2
@@ -231,6 +236,7 @@ struct ChatRow {
     sender_id: Uuid,
     sender_name: String,
     body: String,
+    is_subscriber: bool,
     created_at: OffsetDateTime,
 }
 
@@ -242,6 +248,7 @@ impl From<ChatRow> for StreamChatLine {
             sender_id: ParticipantId::from_uuid(r.sender_id),
             sender_name: r.sender_name,
             body: r.body,
+            is_subscriber: r.is_subscriber,
             created_at: r.created_at,
         }
     }
@@ -327,9 +334,9 @@ mod db_tests {
             .expect("stream");
 
         let sender = ParticipantId::from_uuid(owner);
-        let (l1, _) = repo.insert_chat(stream, sender, "line 1").await.expect("l1");
-        let (l2, _) = repo.insert_chat(stream, sender, "line 2").await.expect("l2");
-        let (l3, _) = repo.insert_chat(stream, sender, "line 3").await.expect("l3");
+        let (l1, _) = repo.insert_chat(stream, sender, "line 1", false).await.expect("l1");
+        let (l2, _) = repo.insert_chat(stream, sender, "line 2", false).await.expect("l2");
+        let (l3, _) = repo.insert_chat(stream, sender, "line 3", true).await.expect("l3");
 
         // since = l1 → only l2, l3, oldest-first.
         let after = repo.recent_chat_since(stream, Some(l1), 50).await.expect("since l1");
@@ -393,6 +400,50 @@ mod db_tests {
 
         let tail = repo.recent_gifts_since(stream, None, 50).await.expect("tail");
         assert_eq!(tail.len(), 2);
+
+        sqlx::query("DELETE FROM streams WHERE id = $1")
+            .bind(uuid::Uuid::from_u128(stream.0))
+            .execute(&p)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM participants WHERE id = $1").bind(owner).execute(&p).await.ok();
+    }
+
+    /// A subscriber's chat line carries `is_subscriber = true`; a non-subscriber's
+    /// carries `false` (migration 0082, the Twitch-style subscriber badge).
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn insert_chat_records_subscriber_flag() {
+        let p = pool();
+        let repo = LiveRepo::new(p.clone());
+
+        let owner = uuid::Uuid::new_v4();
+        sqlx::query("INSERT INTO participants (id, kind, display_name) VALUES ($1,'human',$2)")
+            .bind(owner)
+            .bind(format!("sub-owner-{owner}"))
+            .execute(&p)
+            .await
+            .expect("owner");
+        let stream = ulid::Ulid::new();
+        sqlx::query("INSERT INTO streams (id, owner_id, title, stream_key) VALUES ($1,$2,$3,$4)")
+            .bind(uuid::Uuid::from_u128(stream.0))
+            .bind(owner)
+            .bind("sub-flag-stream")
+            .bind(format!("skey-{stream}"))
+            .execute(&p)
+            .await
+            .expect("stream");
+
+        let sender = ParticipantId::from_uuid(owner);
+        // Non-subscriber then subscriber line.
+        let (l_no, _) = repo.insert_chat(stream, sender, "non-sub", false).await.expect("l_no");
+        let (l_yes, _) = repo.insert_chat(stream, sender, "sub", true).await.expect("l_yes");
+
+        let lines = repo.recent_chat(stream, 50).await.expect("recent");
+        let no = lines.iter().find(|l| l.id == l_no).expect("non-sub line present");
+        let yes = lines.iter().find(|l| l.id == l_yes).expect("sub line present");
+        assert!(!no.is_subscriber, "non-subscriber line flag is false");
+        assert!(yes.is_subscriber, "subscriber line flag is true");
 
         sqlx::query("DELETE FROM streams WHERE id = $1")
             .bind(uuid::Uuid::from_u128(stream.0))

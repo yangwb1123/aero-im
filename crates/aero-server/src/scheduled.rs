@@ -42,7 +42,10 @@ pub fn routes() -> Router<AppState> {
             "/api/rooms/:id/scheduled",
             post(create_scheduled).get(list_scheduled),
         )
-        .route("/api/scheduled/:id", axum::routing::delete(cancel_scheduled))
+        .route(
+            "/api/scheduled/:id",
+            axum::routing::patch(update_scheduled).delete(cancel_scheduled),
+        )
 }
 
 fn parse_room(s: &str) -> Result<RoomId, AeroError> {
@@ -116,6 +119,53 @@ async fn list_scheduled(
         .list_pending_for_sender(auth.participant_id, Some(room))
         .await?;
     Ok(Json(serde_json::to_value(pending).map_err(AeroError::from)?))
+}
+
+#[derive(Deserialize)]
+struct UpdateScheduledReq {
+    blocks: Vec<Block>,
+    #[serde(default)]
+    reply_to: Option<String>,
+    /// New delivery time, RFC 3339. Rejected if in the past (mirroring create).
+    #[serde(with = "time::serde::rfc3339")]
+    scheduled_at: time::OffsetDateTime,
+}
+
+/// `PATCH /api/scheduled/:id` — edit one of the caller's own still-pending
+/// scheduled messages (replace blocks + reply_to + delivery time). Sender-scoped:
+/// a 404 if it isn't the caller's pending message (already delivered/canceled,
+/// someone else's, or unknown). Rejects an empty body or a past `scheduled_at`.
+async fn update_scheduled(
+    State(s): State<AppState>,
+    auth: AuthUser,
+    Path(id_str): Path<String>,
+    Json(req): Json<UpdateScheduledReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let id = ScheduledMessageId::from_str(&id_str)
+        .map_err(|e| AeroError::Invalid(format!("scheduled message id: {e}")))?;
+    if req.blocks.is_empty() {
+        return Err(AeroError::Invalid("blocks must not be empty".into()).into());
+    }
+    if req.scheduled_at <= time::OffsetDateTime::now_utc() {
+        return Err(AeroError::Invalid("scheduled_at must be in the future".into()).into());
+    }
+    let reply_to = match req.reply_to.as_deref() {
+        Some(r) => Some(
+            MessageId::from_str(r).map_err(|e| AeroError::Invalid(format!("reply_to id: {e}")))?,
+        ),
+        None => None,
+    };
+    let updated = repo(&s)
+        .update(id, auth.participant_id, req.scheduled_at, &req.blocks, reply_to)
+        .await?;
+    if !updated {
+        return Err(AeroError::NotFound(format!("scheduled message {id}")).into());
+    }
+    Ok(Json(serde_json::json!({
+        "id": id,
+        "updated": true,
+        "scheduled_at": req.scheduled_at.format(&time::format_description::well_known::Rfc3339).unwrap_or_default(),
+    })))
 }
 
 /// `DELETE /api/scheduled/:id` — cancel one of the caller's own pending

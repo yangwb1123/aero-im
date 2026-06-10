@@ -145,6 +145,47 @@ impl ScheduledRepo {
         Ok(rows.into_iter().map(row_to_model).collect())
     }
 
+    /// Edit one of the caller's own still-pending scheduled messages: replace its
+    /// `blocks`, `reply_to`, and `scheduled_at`. Sender-scoped and gated on the
+    /// row being neither delivered nor canceled, so a user can never edit
+    /// another's message and an already-claimed (delivered) or canceled row is a
+    /// no-op. Returns `true` iff a row was updated. The caller is responsible for
+    /// rejecting a non-empty-blocks / not-in-the-past `scheduled_at` (mirroring
+    /// [`create`](Self::create)).
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the update (including a blocks
+    /// JSON-encode failure).
+    pub async fn update(
+        &self,
+        id: ScheduledMessageId,
+        sender: ParticipantId,
+        scheduled_at: time::OffsetDateTime,
+        blocks: &[Block],
+        reply_to: Option<MessageId>,
+    ) -> Result<bool, sqlx::Error> {
+        let blocks_json =
+            serde_json::to_value(blocks).map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+        let result = sqlx::query(
+            r"UPDATE scheduled_messages
+                 SET blocks = $3,
+                     reply_to = $4,
+                     scheduled_at = $5
+               WHERE id = $1
+                 AND sender_id = $2
+                 AND delivered_at IS NULL
+                 AND canceled_at IS NULL",
+        )
+        .bind(id.to_uuid())
+        .bind(sender.to_uuid())
+        .bind(sqlx::types::Json(blocks_json))
+        .bind(reply_to.map(|m| m.to_uuid()))
+        .bind(scheduled_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     /// Cancel one of the caller's own still-pending scheduled messages. Returns
     /// `true` iff a row was canceled — sender-scoped and only when not already
     /// delivered/canceled, so a user cannot cancel another's message or one that
@@ -329,5 +370,52 @@ mod db_tests {
         // And it is no longer pending for the sender.
         let pending = repo.list_pending_for_sender(sender, None).await.unwrap();
         assert!(!pending.iter().any(|m| m.id == id), "delivered message leaves the pending list");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn scheduled_update_edits_pending_and_noops_after_claim() {
+        let p = pool();
+        let repo = ScheduledRepo::new(p.clone());
+        let (room, sender) = fixture(&p).await;
+
+        let t1 = time::OffsetDateTime::now_utc() + time::Duration::hours(1);
+        let id = repo
+            .create(room, sender, &[Block::text("v1")], None, t1)
+            .await
+            .unwrap();
+
+        // Edit blocks + time; the listing reflects the new values.
+        let t2 = time::OffsetDateTime::now_utc() + time::Duration::hours(3);
+        let new_blocks = vec![Block::text("v2-edited")];
+        assert!(
+            repo.update(id, sender, t2, &new_blocks, None).await.unwrap(),
+            "owner edits a pending message"
+        );
+        let pending = repo.list_pending_for_sender(sender, None).await.unwrap();
+        let edited = pending.iter().find(|m| m.id == id).expect("still pending");
+        assert!(
+            matches!(edited.blocks.first(), Some(Block::Text { content, .. }) if content == "v2-edited"),
+            "blocks reflect the edit"
+        );
+        assert!(edited.scheduled_at > t1, "scheduled_at moved later");
+
+        // A stranger cannot edit it.
+        let stranger = ParticipantId::new();
+        assert!(
+            !repo.update(id, stranger, t2, &new_blocks, None).await.unwrap(),
+            "update is sender-scoped"
+        );
+
+        // Once claimed (delivered), update is a no-op.
+        let claimed = repo
+            .claim_due(time::OffsetDateTime::now_utc() + time::Duration::hours(4), 10)
+            .await
+            .unwrap();
+        assert!(claimed.iter().any(|m| m.id == id), "claimed the now-due message");
+        assert!(
+            !repo.update(id, sender, t2, &new_blocks, None).await.unwrap(),
+            "update of an already-claimed row is a no-op"
+        );
     }
 }

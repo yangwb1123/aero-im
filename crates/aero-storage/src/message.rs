@@ -823,6 +823,41 @@ impl MessageRepo {
         Ok(rows.into_iter().map(SearchHit::from).collect())
     }
 
+    /// Recent (non-deleted) messages across EVERY room the caller belongs to within
+    /// `workspace`, newest first. Same membership/tenant boundary as
+    /// [`Self::search_vector_workspace`] (`JOIN room_members` + `rooms.workspace_id`),
+    /// so a message in a room the caller is not a member of can never be returned.
+    /// Backs the scheduled workspace digest's "what happened lately across my
+    /// channels" summary. `limit` is clamped to `[1, 200]`.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the query.
+    pub async fn recent_workspace(
+        &self,
+        participant: ParticipantId,
+        workspace: WorkspaceId,
+        limit: i64,
+    ) -> Result<Vec<Message>, sqlx::Error> {
+        let limit = limit.clamp(1, 200);
+        let rows = sqlx::query_as::<_, MessageRow>(
+            r"SELECT m.id, m.room_id, m.sender_id, m.blocks, m.reply_to, m.metadata,
+                     m.created_at, m.edited_at, m.deleted_at
+               FROM messages m
+               JOIN room_members rm
+                 ON rm.room_id = m.room_id AND rm.participant_id = $1
+               WHERE m.deleted_at IS NULL
+                 AND m.room_id IN (SELECT id FROM rooms WHERE workspace_id = $3)
+               ORDER BY m.id DESC
+               LIMIT $2",
+        )
+        .bind(participant.to_uuid())
+        .bind(limit)
+        .bind(workspace.to_uuid())
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(Message::from).collect())
+    }
+
     /// Workspace-scoped twin of [`Self::fts_candidates`] — the lexical half of
     /// the workspace-wide RAG rerank. Mirrors [`Self::search_vector_workspace`]'s
     /// membership boundary EXACTLY: `JOIN room_members` scopes hits to rooms the

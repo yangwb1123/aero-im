@@ -61,6 +61,36 @@ pub trait AiBackend: Send + Sync + 'static {
     /// transcript lines into one block). Degrades to a heuristic first-lines digest
     /// when no LLM key is configured; never errors on a missing key.
     async fn summarize_text(&self, text: &str) -> Result<String, String>;
+    /// Summarize a thread — the flat chain of replies hanging off a root message.
+    /// Mirrors [`AiBackend::summarize_room`] but sources the thread's reply chain.
+    /// Degrades to a heuristic when no LLM key is configured; never errors on a
+    /// missing key. Backs `POST /api/messages/:id/thread-summary`.
+    async fn summarize_thread(
+        &self,
+        root: aero_common::MessageId,
+        max_replies: usize,
+    ) -> Result<String, String>;
+    /// Summarize recent activity across every channel the caller belongs to within
+    /// a workspace (the workspace twin of [`AiBackend::summarize_room`]). Backs the
+    /// scheduled workspace digest. Degrades to a heuristic without an LLM key.
+    async fn summarize_workspace(
+        &self,
+        participant: aero_common::ParticipantId,
+        workspace: aero_common::WorkspaceId,
+        last_n: usize,
+    ) -> Result<String, String>;
+    /// Rank workspace members by topical authority on `topic` — embed the topic,
+    /// run the membership-bounded cross-room vector search, aggregate hits by
+    /// author, return the top-`k` experts. Backs `POST /api/workspaces/:id/find-expert`.
+    /// Never errors on a missing LLM key (it is retrieval + aggregation only); an
+    /// empty/lexically-degraded result rather than an error when nothing matches.
+    async fn find_expert(
+        &self,
+        participant: aero_common::ParticipantId,
+        workspace: aero_common::WorkspaceId,
+        topic: &str,
+        k: usize,
+    ) -> Result<Vec<AiExpert>, String>;
     /// Moderate a message body (P5). `Some(reason)` blocks, `None` allows.
     /// Returns `None` when no LLM is configured.
     async fn moderate(&self, text: &str) -> Result<Option<String>, String>;
@@ -98,6 +128,16 @@ pub trait AiBackend: Send + Sync + 'static {
 #[derive(Debug, Clone)]
 pub struct AiAnswer {
     pub answer: String,
+    pub citations: Vec<aero_common::MessageId>,
+}
+
+/// One ranked expert returned by [`AiBackend::find_expert`] — a candidate
+/// authority on a topic, their summed relevance `score`, and a few `citations`
+/// (message ids) backing the ranking.
+#[derive(Debug, Clone)]
+pub struct AiExpert {
+    pub participant: aero_common::ParticipantId,
+    pub score: f32,
     pub citations: Vec<aero_common::MessageId>,
 }
 

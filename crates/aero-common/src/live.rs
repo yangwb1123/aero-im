@@ -69,6 +69,11 @@ pub struct StreamChatLine {
     pub sender_id: ParticipantId,
     pub sender_name: String,
     pub body: String,
+    /// Whether the sender had an active creator subscription to the stream owner
+    /// at post time (Twitch-style subscriber badge). Defaults to `false` for older
+    /// rows / clients that omit it on the wire.
+    #[serde(default)]
+    pub is_subscriber: bool,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
 }
@@ -120,6 +125,26 @@ pub enum StreamEvent {
     Viewers { stream_id: Ulid, count: u32 },
     /// Stream lifecycle transition (went live / ended).
     Status { stream_id: Ulid, status: StreamStatus },
+    /// Hype-train momentum update: a gift advanced (or kept alive) the train.
+    /// `level` is the current escalation level, `contribution` the running total
+    /// of units fed into the train, and `expires_at` the instant the train lapses
+    /// without further contributions (RFC 3339 on the wire). Clients render the
+    /// escalating meter from this (Twitch Hype Train).
+    HypeTrain {
+        stream_id: Ulid,
+        level: u32,
+        contribution: u32,
+        #[serde(with = "time::serde::rfc3339")]
+        expires_at: OffsetDateTime,
+    },
+    /// A raid was launched on this (source) stream: the owner is sending their
+    /// `viewer_count` viewers to `target_stream_id`. Watchers' clients use this to
+    /// redirect to the target stream (Twitch/Kick raid).
+    Raid {
+        stream_id: Ulid,
+        target_stream_id: Ulid,
+        viewer_count: u32,
+    },
 }
 
 impl StreamEvent {
@@ -130,9 +155,10 @@ impl StreamEvent {
         match self {
             StreamEvent::Chat(c) => c.stream_id,
             StreamEvent::Gift(g) => g.stream_id,
-            StreamEvent::Viewers { stream_id, .. } | StreamEvent::Status { stream_id, .. } => {
-                *stream_id
-            }
+            StreamEvent::Viewers { stream_id, .. }
+            | StreamEvent::Status { stream_id, .. }
+            | StreamEvent::HypeTrain { stream_id, .. }
+            | StreamEvent::Raid { stream_id, .. } => *stream_id,
         }
     }
 }
@@ -178,6 +204,7 @@ mod tests {
             sender_id: ParticipantId::new(),
             sender_name: "Ada".into(),
             body: "hi".into(),
+            is_subscriber: false,
             created_at: OffsetDateTime::now_utc(),
         };
         let j = serde_json::to_string(&line).unwrap();

@@ -7,7 +7,7 @@
 //! skipping any message that has since been soft-deleted. Purely additive: a NEW
 //! [`BookmarkRepo`]; no existing repo is touched.
 
-use aero_common::{Block, Message, MessageId, ParticipantId, RoomId};
+use aero_common::{Block, BookmarkCollectionId, Message, MessageId, ParticipantId, RoomId};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use time::OffsetDateTime;
@@ -123,6 +123,43 @@ impl BookmarkRepo {
                LIMIT $2",
         )
         .bind(participant.to_uuid())
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(SavedMessage::from).collect())
+    }
+
+    /// List a user's saved items, optionally restricted to one collection
+    /// (folder). `collection = Some(id)` returns only items filed in that
+    /// collection; `collection = None` returns the WHOLE saved list (every item,
+    /// foldered or not) — the same set as [`list`](Self::list). Same join-out of
+    /// soft-deleted messages, same ordering and `limit` clamping as `list`.
+    /// Always owner-scoped.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the query.
+    pub async fn list_in_collection(
+        &self,
+        participant: ParticipantId,
+        collection: Option<BookmarkCollectionId>,
+        limit: Option<i64>,
+    ) -> Result<Vec<SavedMessage>, sqlx::Error> {
+        let limit = limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
+        let rows = sqlx::query_as::<_, SavedRow>(
+            r"SELECT
+                 b.room_id, b.note, b.created_at AS saved_at,
+                 m.id, m.sender_id, m.blocks, m.reply_to, m.metadata,
+                 m.created_at, m.edited_at, m.deleted_at
+               FROM bookmarks b
+               JOIN messages m ON m.id = b.message_id
+               WHERE b.participant_id = $1
+                 AND m.deleted_at IS NULL
+                 AND ($2::uuid IS NULL OR b.collection_id = $2)
+               ORDER BY b.created_at DESC
+               LIMIT $3",
+        )
+        .bind(participant.to_uuid())
+        .bind(collection.map(|c| c.to_uuid()))
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;

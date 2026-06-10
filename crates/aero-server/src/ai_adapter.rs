@@ -11,7 +11,11 @@ use aero_common::{MessageId, ParticipantId, RoomId, WorkspaceId};
 use async_trait::async_trait;
 use futures::StreamExt as _;
 
-use crate::state::{AiAnswer, AiBackend};
+use crate::state::{AiAnswer, AiBackend, AiExpert};
+
+/// Candidate pool breadth aggregated by [`AiService::find_expert`]. Wider than the
+/// returned top-k so a deep-but-relevant author can still surface.
+const EXPERT_POOL: usize = 60;
 
 pub struct AiServiceAdapter {
     inner: Arc<AiService>,
@@ -77,6 +81,51 @@ impl AiBackend for AiServiceAdapter {
 
     async fn summarize_text(&self, text: &str) -> Result<String, String> {
         self.inner.summarize_text(text).await.map_err(|e| e.to_string())
+    }
+
+    async fn summarize_thread(
+        &self,
+        root: MessageId,
+        max_replies: usize,
+    ) -> Result<String, String> {
+        self.inner
+            .summarize_thread(root, max_replies)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn summarize_workspace(
+        &self,
+        participant: ParticipantId,
+        workspace: WorkspaceId,
+        last_n: usize,
+    ) -> Result<String, String> {
+        self.inner
+            .summarize_workspace(participant, workspace, last_n)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn find_expert(
+        &self,
+        participant: ParticipantId,
+        workspace: WorkspaceId,
+        topic: &str,
+        k: usize,
+    ) -> Result<Vec<AiExpert>, String> {
+        let experts = self
+            .inner
+            .find_expert(participant, workspace, topic, k, EXPERT_POOL)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(experts
+            .into_iter()
+            .map(|e| AiExpert {
+                participant: e.participant,
+                score: e.score,
+                citations: e.citations,
+            })
+            .collect())
     }
 
     async fn moderate(&self, text: &str) -> Result<Option<String>, String> {

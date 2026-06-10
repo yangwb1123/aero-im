@@ -23,7 +23,8 @@ use std::sync::Arc;
 use aero_auth::AuthUser;
 use aero_common::{Block, Error as AeroError, ParticipantKind, RoomEvent, RoomId, WebhookId};
 use aero_storage::{
-    build_delivery, hash_token, generate_secret, generate_token, WebhookRepo, WebhookSender,
+    build_delivery, hash_token, generate_secret, generate_token, WebhookDeliveryRepo, WebhookRepo,
+    WebhookSender,
 };
 use axum::{
     extract::{Path, State},
@@ -285,16 +286,40 @@ fn event_kind(event: &RoomEvent) -> &'static str {
         RoomEvent::Pin { .. } => "pin",
         RoomEvent::Membership { .. } => "membership",
         RoomEvent::Poll { .. } => "poll",
+        RoomEvent::MessageSeen { .. } => "message_seen",
         RoomEvent::Call(_) => "call",
     }
 }
 
+/// A stable correlation handle for an event, recorded as the delivery log's
+/// `event_id` so an admin can tie a delivery row back to its source. Today only
+/// `Message` carries a natural id; other kinds log `None`. Pure.
+#[must_use]
+fn event_correlation_id(event: &RoomEvent) -> Option<String> {
+    match event {
+        RoomEvent::Message(e) => Some(e.message.id.to_string()),
+        _ => None,
+    }
+}
+
+/// Whether an HTTP status counts as a successful delivery (any 2xx). Pure.
+#[must_use]
+fn is_success(status: u16) -> bool {
+    (200..300).contains(&status)
+}
+
 /// Deliver one room event to every active outgoing hook for its room whose filter
-/// matches the event kind. Best-effort: a failed lookup or a non-2xx/transport
-/// error per target is logged and skipped, never propagated. Generic over the
-/// [`WebhookSender`] seam so the fan-out logic is testable with a `FakeSender`.
+/// matches the event kind, recording each attempt in the delivery log so failures
+/// retry with backoff and exhausted ones land in the DLQ.
+///
+/// Per target: record a `pending` row (attempt 1) → send → on 2xx `mark_delivered`,
+/// otherwise `mark_failed_with_backoff` (which parks at `dead` once the cap is
+/// reached). A bookkeeping error (recording the row) is logged and the send is
+/// skipped — we never deliver something we can't track. Generic over the
+/// [`WebhookSender`] seam so the fan-out is testable with a `FakeSender`.
 async fn dispatch_event<S: WebhookSender + ?Sized>(
     repo: &WebhookRepo,
+    deliveries: &WebhookDeliveryRepo,
     sender: &S,
     event: &RoomEvent,
     now: i64,
@@ -313,12 +338,93 @@ async fn dispatch_event<S: WebhookSender + ?Sized>(
     }
     // Sign the SAME JSON the receiver gets, so it can re-verify the signature.
     let body = serde_json::to_value(event).unwrap_or(serde_json::Value::Null);
+    let event_id = event_correlation_id(event);
     for target in targets {
+        // Record the (first) attempt up front so even a crash mid-send leaves a
+        // durable trace; attempts=1 after record_attempt.
+        let delivery_id = match deliveries.record_attempt(target.id, event_id.as_deref()).await {
+            Ok(id) => id,
+            Err(e) => {
+                warn!(error = ?e, %room, kind, hook = %target.id, "webhook dispatch: record failed");
+                continue;
+            }
+        };
         let delivery = build_delivery(&target.url, &target.secret, &body, now);
         match sender.deliver(&delivery).await {
-            Ok(status) if (200..300).contains(&status) => {}
-            Ok(status) => warn!(%room, kind, url = %target.url, status, "webhook delivery non-2xx"),
-            Err(e) => warn!(%room, kind, url = %target.url, error = %e, "webhook delivery failed"),
+            Ok(status) if is_success(status) => {
+                if let Err(e) = deliveries.mark_delivered(delivery_id, i32::from(status)).await {
+                    warn!(error = ?e, %room, kind, "webhook delivery: mark_delivered failed");
+                }
+            }
+            Ok(status) => {
+                warn!(%room, kind, url = %target.url, status, "webhook delivery non-2xx");
+                let _ = deliveries
+                    .mark_failed_with_backoff(
+                        delivery_id,
+                        1,
+                        Some(i32::from(status)),
+                        &format!("HTTP {status}"),
+                    )
+                    .await;
+            }
+            Err(e) => {
+                warn!(%room, kind, url = %target.url, error = %e, "webhook delivery failed");
+                let _ = deliveries
+                    .mark_failed_with_backoff(delivery_id, 1, None, &e)
+                    .await;
+            }
+        }
+    }
+}
+
+/// Re-send one already-claimed delivery (a `pending` row the retry loop bumped
+/// from `failed`). On 2xx `mark_delivered`; otherwise `mark_failed_with_backoff`
+/// with the post-claim `attempts`, which re-parks it at `dead` once the cap is
+/// reached. Best-effort + generic over the sender seam.
+async fn redeliver<S: WebhookSender + ?Sized>(
+    repo: &WebhookRepo,
+    deliveries: &WebhookDeliveryRepo,
+    sender: &S,
+    delivery: &aero_storage::WebhookDelivery,
+    now: i64,
+) {
+    // Resolve the hook's current url+secret; a revoked/deleted hook can't be
+    // re-sent, so mark the attempt failed (it will eventually die out).
+    let Some(target) = (match repo.outgoing_target(delivery.webhook_id).await {
+        Ok(t) => t,
+        Err(e) => {
+            warn!(error = ?e, hook = %delivery.webhook_id, "webhook retry: target lookup failed");
+            return;
+        }
+    }) else {
+        let _ = deliveries
+            .mark_failed_with_backoff(delivery.id, delivery.attempts, None, "hook revoked or deleted")
+            .await;
+        return;
+    };
+    // Re-build a fresh, freshly-signed delivery for `now` (the original body is not
+    // retained; the signature would be stale anyway). We re-send an empty retry
+    // marker body keyed by the recorded event_id so the receiver can correlate.
+    let body = serde_json::json!({ "retry": true, "event_id": delivery.event_id });
+    let built = build_delivery(&target.url, &target.secret, &body, now);
+    match sender.deliver(&built).await {
+        Ok(status) if is_success(status) => {
+            let _ = deliveries.mark_delivered(delivery.id, i32::from(status)).await;
+        }
+        Ok(status) => {
+            let _ = deliveries
+                .mark_failed_with_backoff(
+                    delivery.id,
+                    delivery.attempts,
+                    Some(i32::from(status)),
+                    &format!("HTTP {status}"),
+                )
+                .await;
+        }
+        Err(e) => {
+            let _ = deliveries
+                .mark_failed_with_backoff(delivery.id, delivery.attempts, None, &e)
+                .await;
         }
     }
 }
@@ -344,6 +450,7 @@ pub async fn run_webhook_dispatcher(state: AppState) -> anyhow::Result<()> {
         .await
         .map_err(|e| anyhow::anyhow!("subscribe: {e}"))?;
     let repo = WebhookRepo::new(state.participants.pool().clone());
+    let deliveries = WebhookDeliveryRepo::new(state.pg.clone());
     let sender = aero_storage::ReqwestSender::new();
     info!("webhook dispatcher started");
     while let Some(sub) = stream.next().await {
@@ -351,7 +458,7 @@ pub async fn run_webhook_dispatcher(state: AppState) -> anyhow::Result<()> {
             // Only new messages are dispatched today (see the doc note above).
             if matches!(event, RoomEvent::Message(_)) {
                 let now = time::OffsetDateTime::now_utc().unix_timestamp();
-                dispatch_event(&repo, &sender, &event, now).await;
+                dispatch_event(&repo, &deliveries, &sender, &event, now).await;
             }
         }
         // Broadcast-style consumer: always ack so the cursor advances regardless
@@ -359,6 +466,39 @@ pub async fn run_webhook_dispatcher(state: AppState) -> anyhow::Result<()> {
         let _ = sub.ack().await;
     }
     Ok(())
+}
+
+/// Background retry loop: every `interval_secs`, claim due `failed` deliveries
+/// ([`WebhookDeliveryRepo::claim_due`]) and re-send each via [`redeliver`] — on
+/// success they go `delivered`, otherwise they back off again or, at the cap,
+/// land in the DLQ. Polling-based (no bus subscription) since retries are
+/// time-driven, not event-driven. Started once per process at boot (see the bin
+/// spawn line reported by the integrator); runs until the process exits.
+pub async fn run_webhook_retry_loop(state: AppState, interval_secs: u64) {
+    let repo = WebhookRepo::new(state.participants.pool().clone());
+    let deliveries = WebhookDeliveryRepo::new(state.pg.clone());
+    let sender = aero_storage::ReqwestSender::new();
+    let period = std::time::Duration::from_secs(interval_secs.max(1));
+    info!(interval_secs, "webhook retry loop started");
+    loop {
+        tokio::time::sleep(period).await;
+        let now = time::OffsetDateTime::now_utc();
+        // Claim a bounded batch of due deliveries (claim_due bumps attempts).
+        let due = match deliveries.claim_due(now, 50).await {
+            Ok(d) => d,
+            Err(e) => {
+                warn!(error = ?e, "webhook retry: claim_due failed");
+                continue;
+            }
+        };
+        if due.is_empty() {
+            continue;
+        }
+        let stamp = now.unix_timestamp();
+        for delivery in due {
+            redeliver(&repo, &deliveries, &sender, &delivery, stamp).await;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -462,20 +602,49 @@ mod tests {
         // so the sender is never invoked and no DB query is attempted.
         use aero_common::{CallEvent, CallId};
         let sender = FakeSender::new(200);
-        // A repo whose pool is never queried (we return before touching it).
-        let repo = WebhookRepo::new(
-            sqlx::postgres::PgPoolOptions::new()
-                .connect_lazy("postgres://u:p@localhost/db")
-                .unwrap(),
-        );
+        // Repos whose pools are never queried (we return before touching them).
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://u:p@localhost/db")
+            .unwrap();
+        let repo = WebhookRepo::new(pool.clone());
+        let deliveries = WebhookDeliveryRepo::new(pool);
         let answer = RoomEvent::Call(CallEvent::Answer {
             call_id: CallId::new(),
             from: ParticipantId::new(),
             to: ParticipantId::new(),
             sdp: String::new(),
         });
-        // `Answer` has no room_id ⇒ early return, sender untouched.
-        dispatch_event(&repo, &sender, &answer, 0).await;
+        // `Answer` has no room_id ⇒ early return, sender + delivery log untouched.
+        dispatch_event(&repo, &deliveries, &sender, &answer, 0).await;
         assert!(sender.calls().is_empty());
+    }
+
+    // ----- is_success -----
+
+    #[test]
+    fn is_success_only_for_2xx() {
+        assert!(is_success(200));
+        assert!(is_success(202));
+        assert!(is_success(299));
+        assert!(!is_success(199));
+        assert!(!is_success(300));
+        assert!(!is_success(404));
+        assert!(!is_success(500));
+    }
+
+    // ----- event_correlation_id -----
+
+    #[test]
+    fn correlation_id_is_message_id_for_messages_else_none() {
+        let ev = message_event(RoomId::new());
+        let RoomEvent::Message(env) = &ev else { unreachable!() };
+        assert_eq!(event_correlation_id(&ev), Some(env.message.id.to_string()));
+        // A non-message event carries no natural correlation id.
+        let typing = RoomEvent::Typing {
+            room_id: RoomId::new(),
+            participant: ParticipantId::new(),
+            on: true,
+        };
+        assert_eq!(event_correlation_id(&typing), None);
     }
 }

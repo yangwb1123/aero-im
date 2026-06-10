@@ -194,6 +194,9 @@ enum ServerFrame<'a> {
     /// A poll was created/voted/closed in a room (fans out to all members so the
     /// tally stays live).
     Poll { room_id: RoomId, poll_id: PollId, op: PollOp },
+    /// A participant acknowledged seeing a specific message ("Seen by …"; fans
+    /// out to all members so the per-message read indicator stays live).
+    MessageSeen { room_id: RoomId, message_id: MessageId, participant: ParticipantId },
     /// Per-stream interactivity event (danmaku/gift/viewers/status).
     StreamEvent { event: StreamEvent },
     Error { code: &'a str, msg: String },
@@ -715,10 +718,16 @@ async fn handle_text(
             // subscriber-only) before the line is accepted/broadcast (mirrors the
             // REST `stream_chat_post` guard).
             crate::stream_chat_modes::enforce_chat_modes(state, stream_id, pid).await?;
-            state.live.post_chat(pid, stream_id, body).await?;
+            // Subscriber-badge flag (migration 0082): mirrors the REST guard.
+            let is_sub = state.live.subscriber_flag(stream_id, pid).await;
+            state.live.post_chat(pid, stream_id, body, is_sub).await?;
         }
         ClientFrame::StreamGift { stream_id, gift_id, qty } => {
-            state.live.send_gift(pid, stream_id, &gift_id, qty.unwrap_or(1)).await?;
+            let qty = qty.unwrap_or(1);
+            state.live.send_gift(pid, stream_id, &gift_id, qty).await?;
+            // Feed the gift into the hype train (mirrors the REST gift handler);
+            // best-effort, never fails the send.
+            crate::hype_train::on_gift(state, stream_id, pid, qty).await;
         }
     }
     Ok(())
@@ -1178,6 +1187,9 @@ fn room_event_to_frame_json(event: &RoomEvent, seq: Option<u64>) -> String {
         }
         RoomEvent::Call(call) => ServerFrame::Call { event: call },
         RoomEvent::Poll { room_id, poll_id, op } => ServerFrame::Poll { room_id, poll_id, op },
+        RoomEvent::MessageSeen { room_id, message_id, participant } => {
+            ServerFrame::MessageSeen { room_id, message_id, participant }
+        }
     };
     stamped_frame_json(&frame, seq)
 }

@@ -312,11 +312,48 @@ pub fn build(state: AppState) -> Router {
         // ---- Workspace IP / network allowlist (authorized networks) ----
         // Admin-gated CRUD over a workspace's authorized CIDR ranges.
         .merge(crate::ip_allowlist::routes())
+        // ---- AI-native cluster: thread summary, scheduled digests, find-expert ----
+        // Thread-scoped AI summarization: POST /api/messages/:id/thread-summary.
+        .merge(crate::thread_summarize::routes())
+        // Scheduled/recurring AI digests: POST/GET /api/digests, DELETE /api/digests/:id.
+        // The background dispatcher is spawned in bin/aero-server.rs.
+        .merge(crate::digests::routes())
+        // Find-expert: POST /api/workspaces/:id/find-expert (workspace-member gated).
+        .merge(crate::find_expert::routes())
         // ---- Per-workspace rate-limit tiers (ROADMAP3 方向五 — 租户公平) ----
         // Owner-only PUT + member-readable GET /api/workspaces/:id/rate-tier.
         // Enforcement call sites live in the high-traffic handlers below
         // (room_history / room_search / blob_* / WS SendMessage).
-        .merge(crate::ws_rate::routes());
+        .merge(crate::ws_rate::routes())
+        // ---- Collaboration parity batch (Slack/Lark/Teams) ----
+        // Per-message read receipts ("Seen by …"): mark an individual message
+        // seen + read the reader list. Broadcasts RoomEvent::MessageSeen.
+        .merge(crate::message_receipts::routes())
+        // Bookmark folders/collections: group personal saved items into named,
+        // ordered collections; assign/clear a saved message's collection.
+        .merge(crate::bookmark_collections::routes())
+        // Multi-channel broadcast: post a copy of a message into several rooms at
+        // once (forward fan-out), with per-target success/failure reporting.
+        .merge(crate::broadcast::routes())
+        // ---- Interactive-live / creator parity (migrations 0079-0083) ----
+        // Hype train / combo gifts: escalating momentum the gift path feeds into.
+        // GET the current session; the gift handlers call crate::hype_train::on_gift.
+        .merge(crate::hype_train::routes())
+        // Raids: a source stream's owner sends viewers to a target stream at end,
+        // recorded + broadcast (StreamEvent::Raid) so watchers redirect.
+        .merge(crate::raids::routes())
+        // VOD chapters / markers: owner-added timestamped table-of-contents on a
+        // recording; viewers list them, playback seeks the existing HLS playlist.
+        .merge(crate::vod_chapters::routes())
+        // Stream-moderator role assignment (distinct from chat bans): owner grants
+        // a mod role; a moderator gains the same chat-ban authority as the owner.
+        .merge(crate::stream_moderators::routes())
+        // ---- Operability: outbound-webhook delivery log + DLQ + requeue (admin) ----
+        // GET /api/webhooks/:id/deliveries[/dead], POST /api/webhook-deliveries/:id/requeue.
+        .merge(crate::webhook_admin::routes())
+        // ---- Operability: per-tenant usage report (admin) ----
+        // GET /api/workspaces/:id/admin/usage — messages/AI tokens/blobs/members.
+        .merge(crate::usage_report::routes());
 
     // Prometheus scrape endpoint (ROADMAP 方向四). Mounted unless disabled; the
     // handler self-gates on an optional bearer token. Left here (not behind the
@@ -1473,7 +1510,10 @@ async fn stream_chat_post(
     // Enforce Twitch-style chat modes (slow mode / follower-only / subscriber-only)
     // before the line is accepted/broadcast.
     crate::stream_chat_modes::enforce_chat_modes(&s, id, auth.participant_id).await?;
-    let line = s.live.post_chat(auth.participant_id, id, req.body).await?;
+    // Subscriber-badge flag (migration 0082): resolved at the edge from the
+    // SubscriptionRepo + stream owner; degrades to false on any miss.
+    let is_sub = s.live.subscriber_flag(id, auth.participant_id).await;
+    let line = s.live.post_chat(auth.participant_id, id, req.body, is_sub).await?;
     Ok(Json(serde_json::to_value(line).map_err(AeroError::from)?))
 }
 
@@ -1505,10 +1545,14 @@ async fn stream_gift_send(
     Json(req): Json<GiftSendReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let id = parse_stream_id(&id_str)?;
+    let qty = req.qty.unwrap_or(1);
     let line = s
         .live
-        .send_gift(auth.participant_id, id, &req.gift_id, req.qty.unwrap_or(1))
+        .send_gift(auth.participant_id, id, &req.gift_id, qty)
         .await?;
+    // Feed the gift into the hype train (escalating combo-gift momentum). Runs
+    // only after a successful send; best-effort (never fails the gift).
+    crate::hype_train::on_gift(&s, id, auth.participant_id, qty).await;
     Ok(Json(serde_json::to_value(line).map_err(AeroError::from)?))
 }
 

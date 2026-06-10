@@ -238,9 +238,12 @@ pub struct OutgoingHookSummary {
     pub created_at: time::OffsetDateTime,
 }
 
-/// An active outgoing delivery target (url + signing secret) for dispatch.
+/// An active outgoing delivery target (hook id + url + signing secret) for
+/// dispatch. The `id` lets the dispatcher key each delivery into
+/// `webhook_delivery_log` (retry/DLQ — see [`crate::webhook_delivery`]).
 #[derive(Debug, Clone)]
 pub struct OutgoingTarget {
+    pub id: WebhookId,
     pub url: String,
     pub secret: String,
 }
@@ -429,8 +432,8 @@ impl WebhookRepo {
         room: RoomId,
         event_kind: &str,
     ) -> Result<Vec<OutgoingTarget>, sqlx::Error> {
-        let rows = sqlx::query_as::<_, (String, String)>(
-            r"SELECT url, secret
+        let rows = sqlx::query_as::<_, (uuid::Uuid, String, String)>(
+            r"SELECT id, url, secret
                FROM outgoing_webhooks
                WHERE room_id = $1
                  AND revoked_at IS NULL
@@ -440,7 +443,52 @@ impl WebhookRepo {
         .bind(event_kind)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows.into_iter().map(|(url, secret)| OutgoingTarget { url, secret }).collect())
+        Ok(rows
+            .into_iter()
+            .map(|(id, url, secret)| OutgoingTarget {
+                id: WebhookId::from_uuid(id),
+                url,
+                secret,
+            })
+            .collect())
+    }
+
+    /// Resolve the `room_id` an outgoing webhook belongs to (so an admin route can
+    /// authorize a delivery action via the room's workspace). `None` when the hook
+    /// does not exist.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`].
+    pub async fn outgoing_room(&self, id: WebhookId) -> Result<Option<RoomId>, sqlx::Error> {
+        let row = sqlx::query_as::<_, (uuid::Uuid,)>(
+            r"SELECT room_id FROM outgoing_webhooks WHERE id = $1",
+        )
+        .bind(id.to_uuid())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(room,)| RoomId::from_uuid(room)))
+    }
+
+    /// Resolve a single **active** (non-revoked) outgoing target (url + secret) by
+    /// id, for the retry loop to re-send a logged delivery. `None` when the hook is
+    /// unknown or revoked (a revoked hook is not redelivered).
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`].
+    pub async fn outgoing_target(&self, id: WebhookId) -> Result<Option<OutgoingTarget>, sqlx::Error> {
+        let row = sqlx::query_as::<_, (uuid::Uuid, String, String)>(
+            r"SELECT id, url, secret
+               FROM outgoing_webhooks
+               WHERE id = $1 AND revoked_at IS NULL",
+        )
+        .bind(id.to_uuid())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(id, url, secret)| OutgoingTarget {
+            id: WebhookId::from_uuid(id),
+            url,
+            secret,
+        }))
     }
 
     /// Soft-revoke an outgoing webhook (idempotent). Returns whether a live row

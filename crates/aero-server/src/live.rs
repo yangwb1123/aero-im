@@ -16,7 +16,7 @@ use aero_im_core::{
     AllowAllModerator, KeywordModerator, LocalSeqProvider, ModerationVerdict, Moderator,
     SeqProvider,
 };
-use aero_storage::{LiveRepo, ParticipantRepo, StreamRepo};
+use aero_storage::{LiveRepo, ParticipantRepo, StreamRepo, SubscriptionRepo};
 use tracing::{instrument, warn};
 use ulid::Ulid;
 
@@ -126,12 +126,19 @@ impl LiveService {
     // ---------------------------------------------------------- danmaku
 
     /// Post a danmaku line: validate, moderate, persist, broadcast.
+    ///
+    /// `is_subscriber` is resolved by the HTTP/WS layer (it has the
+    /// [`SubscriptionRepo`](aero_storage::SubscriptionRepo) and the stream owner)
+    /// and recorded on the line so clients render a subscriber badge (migration
+    /// 0082). It is computed at the edge rather than here to keep [`LiveService`]'s
+    /// dependency set unchanged.
     #[instrument(skip(self, body), fields(%stream_id, %sender))]
     pub async fn post_chat(
         &self,
         sender: ParticipantId,
         stream_id: Ulid,
         body: String,
+        is_subscriber: bool,
     ) -> Result<StreamChatLine> {
         let body = body.trim();
         if body.is_empty() {
@@ -145,13 +152,14 @@ impl LiveService {
             return Err(Error::Invalid(reason));
         }
         let sender_name = self.sender_name(sender).await?;
-        let (id, created_at) = self.live.insert_chat(stream_id, sender, body).await?;
+        let (id, created_at) = self.live.insert_chat(stream_id, sender, body, is_subscriber).await?;
         let line = StreamChatLine {
             id,
             stream_id,
             sender_id: sender,
             sender_name,
             body: body.to_owned(),
+            is_subscriber,
             created_at,
         };
         self.publish(&StreamEvent::Chat(line.clone())).await;
@@ -237,6 +245,33 @@ impl LiveService {
     /// Broadcast an updated viewer count (best-effort, fire-and-forget).
     pub async fn publish_viewers(&self, stream_id: Ulid, count: u32) {
         self.publish(&StreamEvent::Viewers { stream_id, count }).await;
+    }
+
+    /// Broadcast an arbitrary [`StreamEvent`] on its stream's subject (seq-stamped
+    /// like every other event). Best-effort, fire-and-forget — the public seam for
+    /// feature modules (hype train, raids) to fan an event out to watchers without
+    /// reaching into the private publish path.
+    pub async fn broadcast(&self, event: &StreamEvent) {
+        self.publish(event).await;
+    }
+
+    /// Resolve whether `sender` should be badged as a subscriber on a chat line in
+    /// `stream_id`: they have an active creator subscription to the stream's owner
+    /// (migration 0082). Best-effort — a missing stream or any storage hiccup
+    /// degrades to `false` (no badge) rather than blocking the post, and a streamer
+    /// is never "their own subscriber". Resolved here (the service holds the
+    /// [`StreamRepo`] + a pool) so both the REST and WS chat paths share one rule.
+    pub async fn subscriber_flag(&self, stream_id: Ulid, sender: ParticipantId) -> bool {
+        let Ok(Some(stream)) = self.streams.get(stream_id).await else {
+            return false;
+        };
+        if stream.owner_id == sender {
+            return false;
+        }
+        SubscriptionRepo::new(self.participants.pool().clone())
+            .is_subscribed(stream.owner_id, sender)
+            .await
+            .unwrap_or(false)
     }
 
     /// End a stream (owner only) and broadcast the lifecycle transition.

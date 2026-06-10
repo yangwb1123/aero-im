@@ -733,6 +733,19 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // ---------- Scheduled AI-digest dispatcher (AI-native) ----------
+    // Polls due digest subscriptions (next_run_at <= now), summarizes the room or
+    // workspace via the AI backend, delivers the summary (room message / activity
+    // feed), then advances next_run_at by its frequency. Exits on the shutdown
+    // token; idles when no AI backend is wired.
+    {
+        let state_clone = state.clone();
+        let cancel = ai_shutdown.clone();
+        tokio::spawn(async move {
+            aero_server::digests::run_digest_dispatcher(state_clone, cancel).await;
+        });
+    }
+
     // ---------- Concurrent-viewer sampler (peak/avg concurrent viewers) ----------
     // Every 30s, sample each live stream's cluster-wide Redis viewer count into
     // stream_viewer_samples so analytics can report peak/avg concurrent viewers.
@@ -804,6 +817,16 @@ async fn main() -> anyhow::Result<()> {
             if let Err(e) = aero_server::webhooks::run_webhook_dispatcher(state_clone).await {
                 tracing::error!(error = ?e, "webhook dispatcher exited");
             }
+        });
+    }
+
+    // ---------- Outgoing webhook retry loop (DLQ-backed) ----------
+    // Polls webhook_delivery_log for due `failed` deliveries and re-sends them with
+    // exponential backoff; exhausted ones land in the DLQ (admin: webhook_admin).
+    {
+        let state_clone = state.clone();
+        tokio::spawn(async move {
+            aero_server::webhooks::run_webhook_retry_loop(state_clone, 30).await;
         });
     }
 

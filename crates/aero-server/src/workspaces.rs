@@ -66,6 +66,8 @@ pub fn routes() -> Router<AppState> {
             axum::routing::patch(change_member_role).delete(remove_member),
         )
         .route("/api/workspaces/:id/audit", get(list_audit))
+        // Filtered audit search (admin) + CSV export (operability).
+        .route("/api/workspaces/:id/audit/export", get(export_audit_csv))
 }
 
 /// Append an audit event without ever failing the caller's request: the trail is
@@ -332,14 +334,85 @@ async fn list_members(
 
 #[derive(Deserialize)]
 struct AuditQuery {
-    /// Keyset cursor: return events strictly older than this audit id.
+    /// Keyset cursor: return events strictly older than this audit id (only used
+    /// when no filter criteria are supplied).
     before: Option<String>,
     /// Page size (clamped server-side).
     limit: Option<i64>,
+    /// Filter: exact action token (e.g. `member.add`).
+    #[serde(default)]
+    action: Option<String>,
+    /// Filter: exact actor participant id.
+    #[serde(default)]
+    actor: Option<String>,
+    /// Filter: exact target string.
+    #[serde(default)]
+    target: Option<String>,
+    /// Filter: inclusive lower time bound (RFC 3339).
+    #[serde(default)]
+    after: Option<String>,
+    /// Filter: inclusive upper time bound (RFC 3339).
+    #[serde(default)]
+    until: Option<String>,
+}
+
+impl AuditQuery {
+    /// Whether any filter criterion was supplied (so the handler picks the
+    /// AND-composed filtered query over the plain keyset walk).
+    fn has_filters(&self) -> bool {
+        self.action.is_some()
+            || self.actor.is_some()
+            || self.target.is_some()
+            || self.after.is_some()
+            || self.until.is_some()
+    }
+}
+
+/// Parse an RFC 3339 timestamp from a query param, mapping a malformed value to a
+/// `400`.
+fn parse_rfc3339(s: &str) -> AeroResult<time::OffsetDateTime> {
+    time::OffsetDateTime::parse(s.trim(), &time::format_description::well_known::Rfc3339)
+        .map_err(|e| AeroError::Invalid(format!("timestamp: {e}")))
+}
+
+/// Resolve the filtered audit events for a query: the AND-composed filtered query
+/// when any criterion is set, else the plain keyset walk. Shared by the JSON
+/// listing and the CSV export so they apply identical filtering.
+async fn resolve_audit_events(
+    s: &AppState,
+    ws: WorkspaceId,
+    q: &AuditQuery,
+) -> AeroResult<Vec<aero_storage::AuditEvent>> {
+    if q.has_filters() {
+        let actor = q.actor.as_deref().map(parse_participant_id).transpose()?;
+        let since = q.after.as_deref().map(parse_rfc3339).transpose()?;
+        let until = q.until.as_deref().map(parse_rfc3339).transpose()?;
+        s.audit
+            .list_for_workspace_filtered(
+                ws,
+                q.action.as_deref(),
+                actor,
+                q.target.as_deref(),
+                since,
+                until,
+                q.limit,
+            )
+            .await
+            .map_err(AeroError::from)
+    } else {
+        let before = q.before.as_deref().map(parse_audit_id).transpose()?;
+        s.audit
+            .list_for_workspace(ws, before, q.limit)
+            .await
+            .map_err(AeroError::from)
+    }
 }
 
 /// `GET /api/workspaces/:id/audit` — admin/owner only: the workspace's audit
-/// trail, newest first, keyset-paginated via `?before=<audit_id>&limit=<n>`.
+/// trail, newest first. Without filter params it is keyset-paginated via
+/// `?before=<audit_id>&limit=<n>`. With any of `?action=&actor=&target=&after=&until=`
+/// it switches to an AND-composed filtered search (operability — audit
+/// search/filter).
 async fn list_audit(
     State(s): State<AppState>,
     auth: AuthUser,
@@ -349,13 +422,35 @@ async fn list_audit(
     let ws = parse_workspace_id(&id_str)?;
     let caller = caller_role(&s.workspaces, ws, auth.participant_id).await?;
     authorize_view_audit(caller)?;
-    let before = q.before.as_deref().map(parse_audit_id).transpose()?;
-    let events = s
-        .audit
-        .list_for_workspace(ws, before, q.limit)
-        .await
-        .map_err(AeroError::from)?;
+    let events = resolve_audit_events(&s, ws, &q).await?;
     Ok(Json(serde_json::to_value(events).map_err(AeroError::from)?))
+}
+
+/// `GET /api/workspaces/:id/audit/export` — admin/owner only: the workspace's
+/// audit trail as a CSV download (`timestamp,actor,action,target,details`),
+/// honoring the same `?action=&actor=&target=&after=&until=&limit=` filters as the
+/// JSON listing (operability — audit export). Emits `text/csv` with a
+/// `Content-Disposition: attachment` so a browser downloads it.
+async fn export_audit_csv(
+    State(s): State<AppState>,
+    auth: AuthUser,
+    Path(id_str): Path<String>,
+    Query(q): Query<AuditQuery>,
+) -> ApiResult<axum::response::Response> {
+    use axum::response::IntoResponse;
+    let ws = parse_workspace_id(&id_str)?;
+    let caller = caller_role(&s.workspaces, ws, auth.participant_id).await?;
+    authorize_view_audit(caller)?;
+    let events = resolve_audit_events(&s, ws, &q).await?;
+    let csv = aero_storage::events_to_csv(&events);
+    let headers = [
+        (axum::http::header::CONTENT_TYPE, "text/csv; charset=utf-8"),
+        (
+            axum::http::header::CONTENT_DISPOSITION,
+            "attachment; filename=\"audit.csv\"",
+        ),
+    ];
+    Ok((headers, csv).into_response())
 }
 
 /// `GET /api/workspaces/:id/export` — **owner-only**: a complete data snapshot

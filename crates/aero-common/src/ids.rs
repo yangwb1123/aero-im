@@ -281,6 +281,52 @@ define_id!(
     /// actor/subject, and a human summary, with no room or message.
     ActivityId
 );
+// ---- Collaboration parity batch ----
+define_id!(
+    /// Identifies a bookmark collection / folder — a per-user named, ordered group
+    /// of saved items (Slack "Saved items" folders). A saved message may belong to
+    /// at most one collection (a nullable `collection_id` on `bookmarks`); deleting
+    /// a collection nulls its items' assignment rather than removing the bookmark.
+    BookmarkCollectionId
+);
+
+// ---- Interactive-live / creator parity (migrations 0079-0083) ----
+define_id!(
+    /// Identifies a hype-train session — an escalating momentum mechanic on a live
+    /// stream where rapid successive gifts build "levels" within a sliding window
+    /// (Twitch Hype Train). At most one `active` session per stream at a time.
+    HypeTrainSessionId
+);
+define_id!(
+    /// Identifies a recorded raid — a creator sending their viewers from a source
+    /// stream to a target stream at the end of a broadcast (Twitch/Kick raid).
+    RaidId
+);
+define_id!(
+    /// Identifies a VOD chapter / marker — a timestamped table-of-contents entry on
+    /// a recording (`start_secs` + title) the creator adds so viewers can jump to a
+    /// section; playback reuses the VOD's HLS playlist with a client-side seek.
+    VodChapterId
+);
+define_id!(
+    /// Identifies a stream-moderator assignment — a participant granted MOD ROLE on
+    /// a stream's danmaku chat (chat-ban/timeout authority), distinct from a
+    /// `stream_bans` row which records a banned chatter.
+    StreamModeratorId
+);
+
+// ---- AI digests + operability ----
+define_id!(
+    /// Identifies a scheduled / recurring AI digest subscription — a participant's
+    /// standing request for a `daily` / `weekly` AI summary of a room or workspace,
+    /// delivered by the digest dispatcher.
+    DigestSubscriptionId
+);
+define_id!(
+    /// Identifies a webhook delivery-log row — one outgoing-webhook delivery attempt
+    /// with retry/backoff state (pending/delivered/failed/dead).
+    WebhookDeliveryId
+);
 
 #[cfg(test)]
 mod tests {

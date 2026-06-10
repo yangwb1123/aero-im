@@ -23,12 +23,13 @@ pub mod workspace;
 
 pub use error::{Error, Result};
 pub use ids::{
-    ActivityId, AnnouncementId, ApprovalId, AuditId, BarrierId, BlobId, CanvasId, ChannelBookmarkId,
-    ChannelSectionId, ClipId, CreatorTierId, EmojiId, InvitationId, JoinRequestId, KeywordAlertId,
-    LegalHoldId, MessageEditId, MessageId, MessageTemplateId, NotificationId, ParticipantId, PatId,
-    PollId, RecurringMessageId, RoomId, SavedSearchId, ScheduledMessageId, ScheduledStreamId,
-    ScimTokenId, SessionId, StreamCategoryId, SubscriptionId, TaskId, UserGroupId, VodId, WebhookId,
-    WorkspaceId,
+    ActivityId, AnnouncementId, ApprovalId, AuditId, BarrierId, BlobId, BookmarkCollectionId,
+    CanvasId, ChannelBookmarkId, ChannelSectionId, ClipId, CreatorTierId, DigestSubscriptionId,
+    EmojiId, HypeTrainSessionId, InvitationId, JoinRequestId, KeywordAlertId, LegalHoldId,
+    MessageEditId, MessageId, MessageTemplateId, NotificationId, ParticipantId, PatId, PollId,
+    RaidId, RecurringMessageId, RoomId, SavedSearchId, ScheduledMessageId, ScheduledStreamId,
+    ScimTokenId, SessionId, StreamCategoryId, StreamModeratorId, SubscriptionId, TaskId,
+    UserGroupId, VodChapterId, VodId, WebhookDeliveryId, WebhookId, WorkspaceId,
 };
 pub use live::{
     gift_by_id, gift_catalog, Gift, GiftLeaderRow, StreamChatLine, StreamEvent, StreamGiftLine,
