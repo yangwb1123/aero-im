@@ -164,7 +164,46 @@ pub fn record_duration(reg: &Registry, kind: AiJobKind, secs: f64) {
     );
 }
 
-/// Record the (estimated) cost of one paid job, labeled by kind.
+/// The `workspace` label value used when a job has no owning workspace.
+///
+/// Per-tenant cost (ROADMAP 方向三 "per-workspace 成本指标 + 看板") attaches a
+/// `workspace` label keyed on the job's workspace UUID. Workspace-less jobs
+/// (legacy rooms, system jobs) collapse to this single sentinel series rather
+/// than spreading across many — see [`charge_cost`] for the cardinality note.
+pub const WORKSPACE_NONE: &str = "none";
+
+/// Charge `micros` to [`names::AI_COST_MICROS_TOTAL`] under both the aggregate
+/// `kind` series AND a per-workspace `{kind,workspace}` series.
+///
+/// Operators want **both** views (方向三 看板): the aggregate per-kind counter
+/// for global cost, and the per-tenant breakdown for chargeback / abuse
+/// attribution. We therefore record the charge twice — once with no `workspace`
+/// label (the original aggregate series, preserved verbatim so existing
+/// dashboards/alerts keep working) and once with the `workspace` label.
+///
+/// **Cardinality:** the per-workspace series is bounded by the number of active
+/// tenants — finite and operator-controlled (not attacker-influenceable in the
+/// way free-text would be). A `None` workspace collapses to the single
+/// [`WORKSPACE_NONE`] sentinel rather than being omitted, so workspace-less spend
+/// is still attributable without inventing a per-job label. The aggregate series
+/// is always present regardless of label cardinality, so even a tenant explosion
+/// never blinds the global cost view.
+fn charge_cost(reg: &Registry, kind: AiJobKind, workspace: Option<uuid::Uuid>, micros: u64) {
+    let kind = kind_label(kind);
+    // Aggregate (per-kind) series — unchanged from before per-workspace labeling,
+    // so operators retain the global cost counter they already alert on.
+    reg.inc_counter_labeled(names::AI_COST_MICROS_TOTAL, micros, &[("kind", kind)]);
+    // Per-workspace breakdown. Build the label value as an owned string so it
+    // outlives the borrow; `None` collapses to the bounded sentinel.
+    let ws = workspace.map_or_else(|| WORKSPACE_NONE.to_string(), |w| w.to_string());
+    reg.inc_counter_labeled(
+        names::AI_COST_MICROS_TOTAL,
+        micros,
+        &[("kind", kind), ("workspace", ws.as_str())],
+    );
+}
+
+/// Record the (estimated) cost of one paid job, labeled by kind + workspace.
 ///
 /// `paid` lets the caller suppress the charge for work that did not actually hit
 /// a paid upstream (e.g. an idempotent embed no-op, or the moderate stub): an
@@ -172,17 +211,23 @@ pub fn record_duration(reg: &Registry, kind: AiJobKind, secs: f64) {
 /// dashboards, but never inflates the cost counter. A zero estimate is a no-op
 /// either way (incrementing a counter by 0 is harmless and keeps the series
 /// present once it has been touched).
-pub fn record_cost(reg: &Registry, model: &CostModel, kind: AiJobKind, paid: bool) {
+///
+/// `workspace` attaches the per-tenant breakdown (方向三); pass the job's
+/// `workspace_id` (`None` for legacy/system jobs → [`WORKSPACE_NONE`]). The
+/// aggregate per-kind series is recorded alongside — see [`charge_cost`].
+pub fn record_cost(
+    reg: &Registry,
+    model: &CostModel,
+    kind: AiJobKind,
+    workspace: Option<uuid::Uuid>,
+    paid: bool,
+) {
     let micros = if paid { model.micros_for(kind) } else { 0 };
-    reg.inc_counter_labeled(
-        names::AI_COST_MICROS_TOTAL,
-        micros,
-        &[("kind", kind_label(kind))],
-    );
+    charge_cost(reg, kind, workspace, micros);
 }
 
 /// Record the REAL cost of one job from actual Anthropic token counts, labeled by
-/// kind, against the same [`names::AI_COST_MICROS_TOTAL`] counter as
+/// kind + workspace, against the same [`names::AI_COST_MICROS_TOTAL`] counter as
 /// [`record_cost`].
 ///
 /// Cost is `model.token_micros(input, output)` — the billing-grounded figure (方向三)
@@ -190,20 +235,18 @@ pub fn record_cost(reg: &Registry, model: &CostModel, kind: AiJobKind, paid: boo
 /// success path whenever the response surfaced usage; it falls back to
 /// [`record_cost`] (the estimate) when usage is absent (e.g. the heuristic
 /// no-Anthropic path). Zero tokens record a zero-valued series so the `kind`
-/// stays visible on dashboards.
+/// stays visible on dashboards. `workspace` attaches the per-tenant breakdown
+/// (see [`charge_cost`]).
 pub fn record_token_cost(
     reg: &Registry,
     model: &CostModel,
     kind: AiJobKind,
+    workspace: Option<uuid::Uuid>,
     input_tokens: u32,
     output_tokens: u32,
 ) {
     let micros = model.token_micros(input_tokens, output_tokens);
-    reg.inc_counter_labeled(
-        names::AI_COST_MICROS_TOTAL,
-        micros,
-        &[("kind", kind_label(kind))],
-    );
+    charge_cost(reg, kind, workspace, micros);
 }
 
 /// Record a job outcome, labeled by kind + outcome.
@@ -309,9 +352,9 @@ mod tests {
     fn record_token_cost_accumulates_real_cost_per_kind() {
         let r = Registry::new();
         let m = CostModel::default();
-        // Two answer calls with real token counts.
-        record_token_cost(&r, &m, AiJobKind::Answer, 1000, 100); // 3000 + 1500 = 4500
-        record_token_cost(&r, &m, AiJobKind::Answer, 2000, 200); // 6000 + 3000 = 9000
+        // Two answer calls with real token counts (no workspace → aggregate only).
+        record_token_cost(&r, &m, AiJobKind::Answer, None, 1000, 100); // 3000 + 1500 = 4500
+        record_token_cost(&r, &m, AiJobKind::Answer, None, 2000, 200); // 6000 + 3000 = 9000
         let out = r.render_prometheus();
         let want = 4500 + 9000;
         assert!(
@@ -326,11 +369,92 @@ mod tests {
     fn record_token_cost_zero_tokens_records_zero_series() {
         let r = Registry::new();
         let m = CostModel::default();
-        record_token_cost(&r, &m, AiJobKind::Summarize, 0, 0);
+        record_token_cost(&r, &m, AiJobKind::Summarize, None, 0, 0);
         let out = r.render_prometheus();
         assert!(
             out.contains(r#"aero_ai_cost_micros_total{kind="summarize"} 0"#),
             "zero-token cost must record a zero series:\n{out}"
+        );
+    }
+
+    #[test]
+    fn record_cost_attaches_per_workspace_label_and_keeps_aggregate() {
+        let r = Registry::new();
+        let m = CostModel::default();
+        let ws_a = uuid::Uuid::from_u128(0x0000_0000_0000_0000_0000_0000_0000_00aa);
+        let ws_b = uuid::Uuid::from_u128(0x0000_0000_0000_0000_0000_0000_0000_00bb);
+        // Two paid answers in workspace A, one in workspace B.
+        record_cost(&r, &m, AiJobKind::Answer, Some(ws_a), true);
+        record_cost(&r, &m, AiJobKind::Answer, Some(ws_a), true);
+        record_cost(&r, &m, AiJobKind::Answer, Some(ws_b), true);
+        let out = r.render_prometheus();
+
+        // Per-workspace breakdown: A charged twice, B once. Labels render sorted
+        // by key, so `{kind,workspace}` (k < w).
+        let two = m.answer_micros * 2;
+        assert!(
+            out.contains(&format!(
+                r#"aero_ai_cost_micros_total{{kind="answer",workspace="{ws_a}"}} {two}"#
+            )),
+            "workspace A cost wrong (want {two}):\n{out}"
+        );
+        assert!(
+            out.contains(&format!(
+                r#"aero_ai_cost_micros_total{{kind="answer",workspace="{ws_b}"}} {}"#,
+                m.answer_micros
+            )),
+            "workspace B cost wrong:\n{out}"
+        );
+        // Aggregate per-kind series is preserved and sums BOTH workspaces.
+        let total = m.answer_micros * 3;
+        assert!(
+            out.contains(&format!(
+                r#"aero_ai_cost_micros_total{{kind="answer"}} {total}"#
+            )),
+            "aggregate cost must sum all workspaces (want {total}):\n{out}"
+        );
+    }
+
+    #[test]
+    fn record_cost_workspaceless_uses_none_sentinel() {
+        let r = Registry::new();
+        let m = CostModel::default();
+        // A workspace-less paid summarize collapses to the bounded sentinel.
+        record_cost(&r, &m, AiJobKind::Summarize, None, true);
+        let out = r.render_prometheus();
+        assert!(
+            out.contains(&format!(
+                r#"aero_ai_cost_micros_total{{kind="summarize",workspace="{WORKSPACE_NONE}"}} {}"#,
+                m.summarize_micros
+            )),
+            "workspace-less cost must use the '{WORKSPACE_NONE}' sentinel:\n{out}"
+        );
+        // Aggregate still recorded.
+        assert!(
+            out.contains(&format!(
+                r#"aero_ai_cost_micros_total{{kind="summarize"}} {}"#,
+                m.summarize_micros
+            )),
+            "aggregate cost missing:\n{out}"
+        );
+    }
+
+    #[test]
+    fn record_token_cost_attaches_per_workspace_label() {
+        let r = Registry::new();
+        let m = CostModel::default();
+        let ws = uuid::Uuid::from_u128(0x0000_0000_0000_0000_0000_0000_0000_0042);
+        record_token_cost(&r, &m, AiJobKind::Answer, Some(ws), 1000, 100); // 4500
+        let out = r.render_prometheus();
+        assert!(
+            out.contains(&format!(
+                r#"aero_ai_cost_micros_total{{kind="answer",workspace="{ws}"}} 4500"#
+            )),
+            "per-workspace real token cost wrong:\n{out}"
+        );
+        assert!(
+            out.contains(r#"aero_ai_cost_micros_total{kind="answer"} 4500"#),
+            "aggregate real token cost wrong:\n{out}"
         );
     }
 
@@ -359,10 +483,10 @@ mod tests {
     fn record_cost_accumulates_per_kind_when_paid() {
         let r = Registry::new();
         let m = CostModel::default();
-        // Two paid answers + one paid summarize.
-        record_cost(&r, &m, AiJobKind::Answer, true);
-        record_cost(&r, &m, AiJobKind::Answer, true);
-        record_cost(&r, &m, AiJobKind::Summarize, true);
+        // Two paid answers + one paid summarize (no workspace → aggregate series).
+        record_cost(&r, &m, AiJobKind::Answer, None, true);
+        record_cost(&r, &m, AiJobKind::Answer, None, true);
+        record_cost(&r, &m, AiJobKind::Summarize, None, true);
         let out = r.render_prometheus();
         let two_answers = m.answer_micros * 2;
         assert!(
@@ -385,14 +509,14 @@ mod tests {
         let r = Registry::new();
         let m = CostModel::default();
         // An idempotent embed no-op: unpaid → zero charge, but the series exists.
-        record_cost(&r, &m, AiJobKind::Embed, false);
+        record_cost(&r, &m, AiJobKind::Embed, None, false);
         let out = r.render_prometheus();
         assert!(
             out.contains(r#"aero_ai_cost_micros_total{kind="embed"} 0"#),
             "unpaid embed must record zero:\n{out}"
         );
         // Now a paid embed adds exactly one unit of the estimate.
-        record_cost(&r, &m, AiJobKind::Embed, true);
+        record_cost(&r, &m, AiJobKind::Embed, None, true);
         let out = r.render_prometheus();
         assert!(
             out.contains(&format!(

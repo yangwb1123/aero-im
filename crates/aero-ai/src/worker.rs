@@ -625,6 +625,9 @@ where
     let id = job.id;
     let kind = job.kind;
     let attempts = job.attempts;
+    // Capture before `job` is moved into `process`; drives the per-workspace cost
+    // label (方向三 per-tenant 成本指标 + 看板). `None` for legacy/system jobs.
+    let workspace_id = job.workspace_id;
 
     // Dead-letter defense in depth: never *spend* on a job already past the cap.
     // The storage layer also dead-letters on fail(), so this is belt-and-braces
@@ -660,11 +663,12 @@ where
                     reg,
                     cost_model,
                     kind,
+                    workspace_id,
                     usage.input_tokens,
                     usage.output_tokens,
                 );
             } else {
-                ai_metrics::record_cost(reg, cost_model, kind, was_paid(kind, &result));
+                ai_metrics::record_cost(reg, cost_model, kind, workspace_id, was_paid(kind, &result));
             }
             ai_metrics::record_outcome(reg, kind, ai_metrics::OUTCOME_SUCCESS);
             if let Err(e) = queue.complete(id, result).await {
@@ -1459,6 +1463,46 @@ mod tests {
                 r#"aero_ai_cost_micros_total{{kind="answer"}} {want}"#
             )),
             "expected real token cost {want}, not the flat estimate:\n{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_one_labels_cost_with_job_workspace() {
+        // The job's workspace_id must flow through to a per-workspace cost series
+        // (方向三 per-tenant 成本指标), while the aggregate per-kind series is kept.
+        let ws = uuid::Uuid::from_u128(0x0000_0000_0000_0000_0000_0000_0000_0099);
+        let mut job = mk_job(AiJobKind::Answer, 1);
+        job.workspace_id = Some(ws);
+        let queue = FakeQueue::with_jobs(vec![job.clone()]);
+        {
+            let mut rows = queue.rows.lock().unwrap();
+            rows[0].status = AiJobStatus::Running;
+        }
+        let proc = FixedResult {
+            value: serde_json::json!({
+                "answer": "42",
+                "usage": { "input_tokens": 1000, "output_tokens": 100 },
+            }),
+        };
+        let reg = test_reg();
+        let cost = CostModel::default();
+
+        run_one(&queue, &proc, job, &reg, &cost).await;
+
+        let want = cost.token_micros(1000, 100); // 4500
+        let out = reg.render_prometheus();
+        assert!(
+            out.contains(&format!(
+                r#"aero_ai_cost_micros_total{{kind="answer",workspace="{ws}"}} {want}"#
+            )),
+            "per-workspace cost not recorded under the job's workspace:\n{out}"
+        );
+        // Aggregate per-kind series still present (operators want both views).
+        assert!(
+            out.contains(&format!(
+                r#"aero_ai_cost_micros_total{{kind="answer"}} {want}"#
+            )),
+            "aggregate cost series must be preserved:\n{out}"
         );
     }
 

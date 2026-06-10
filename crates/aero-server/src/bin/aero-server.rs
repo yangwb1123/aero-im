@@ -10,11 +10,13 @@ use aero_auth::AuthService;
 use aero_bus::{EventBus, JetStreamBus, JetStreamConfig};
 use aero_common::{config::AppConfig, metrics as common_metrics, telemetry};
 use aero_im_core::ImService;
-use aero_live_core::LiveStreamConfig;
+use aero_live_core::{LiveIngest, LiveStreamConfig};
 use aero_live_rtmp::spawn_rtmp_ingest;
 use aero_live_whip::WhipRegistry;
+use aero_live_webrtc::{MediaForwarder, SfuForwarder, SfuRouter};
 use aero_server::{
     ai_adapter::AiServiceAdapter,
+    call_bridge_supervisor::{CallBridgeSupervisor, NodeRtpPullerFactory, UpstreamFactory},
     config::{GatewayConfig, WsConfig},
     hub::Hub,
     live::LiveService,
@@ -27,7 +29,7 @@ use aero_server::{
 };
 use aero_storage::{
     connect_pg, migrate, AiContextStore, AiJobRepo, AuditRepo, BlobRepo, CallRepo, CallRosterStore,
-    KeyPackageRepo, LiveRepo, MessageRepo, MlsGroupRepo, NotificationPrefsRepo,
+    CallRouteRegistry, KeyPackageRepo, LiveRepo, MessageRepo, MlsGroupRepo, NotificationPrefsRepo,
     NotificationRepo, DeactivationRepo, KeywordAlertRepo, MessageEditRepo, ParticipantRepo, PatRepo,
     PinRepo, TotpRepo, PresenceStore, ReactionRepo, ReceiptRepo, RecurringMessageRepo, RedisCache,
     RoomRepo, SeqStore, StreamRepo, StreamRouteRegistry, StreamViewerStore,
@@ -101,6 +103,16 @@ async fn main() -> anyhow::Result<()> {
     let stream_viewers = StreamViewerStore::new(cache.client().clone());
     let call_roster = CallRosterStore::new(cache.client().clone());
     let stream_routes = StreamRouteRegistry::new(cache.client().clone());
+    // Cross-node group-call routing (ROADMAP3 方向二): `call -> {participant ->
+    // hosting node}` in Redis (TTL). The call-route heartbeat below re-arms this
+    // node's entries; the bridge supervisor turns a multi-node census into one
+    // CallBridge pull per peer node. Single-node boot leaves both dormant.
+    let call_routes = CallRouteRegistry::new(cache.client().clone());
+    // Per-process SFU roster + media forwarder. The supervisor fans bridged
+    // remote RTP into this same router/forwarder, so local subscribers receive
+    // cross-node media through the identical forwarding path as local publishers.
+    let sfu_router = SfuRouter::new();
+    let sfu_forwarder: Arc<dyn MediaForwarder> = Arc::new(SfuForwarder::new(sfu_router.clone()));
     // Cluster-wide event sequencer (ROADMAP 第三版 方向一): one Redis INCR
     // counter per NATS subject so every node stamps RoomEvent/StreamEvent
     // publishes from the same per-room/per-stream sequence (clients dedup and
@@ -233,6 +245,50 @@ async fn main() -> anyhow::Result<()> {
         });
     }
     info!(addr = %live_cfg.rtmp_listen, "rtmp ingest listening");
+
+    // ---------- Live ingest (SRT -> HLS) ----------
+    // ROADMAP3 方向二: spawn the SRT (Secure Reliable Transport) listener in
+    // parallel to RTMP, with the SAME best-effort posture — a bind failure logs
+    // a warning and the server keeps booting (a missing SRT listener must never
+    // crash the gateway). `SrtIngest` derives its bind address from
+    // `cfg.rtmp_listen` (SRT = RTMP port + 1 by convention); to honour a
+    // configurable `AERO__LIVE__SRT_LISTEN` we hand it a purpose-built
+    // `LiveStreamConfig` whose `rtmp_listen` is the requested SRT port *minus
+    // one*, so the derivation lands exactly on the configured SRT address while
+    // the HLS root stays shared with RTMP. The real SRT push (ffmpeg/OBS) over
+    // the wire remains the documented infra seam; this wires the listener, which
+    // boot-verifies.
+    let srt_cfg = Arc::new(LiveStreamConfig {
+        hls_dir: live_cfg.hls_dir.clone(),
+        rtmp_listen: srt_backing_rtmp_addr(&live_cfg.rtmp_listen),
+    });
+    let srt_listen = srt_cfg.rtmp_listen.ip().to_string();
+    let srt_port = srt_cfg.rtmp_listen.port().saturating_add(1);
+    {
+        let repo = streams.clone();
+        let srt_cfg = srt_cfg.clone();
+        // Pacing knob (bytes/sec) + optional shared passphrase are env-sourced;
+        // `SrtIngest::new` already reads AERO_SRT_MAX_BANDWIDTH_BYTES_PER_SEC.
+        let mut srt = aero_live_srt::SrtIngest::new();
+        if let Ok(pass) = std::env::var("AERO_SRT_PASSPHRASE") {
+            if !pass.is_empty() {
+                srt = srt.with_passphrase(pass.into_bytes());
+            }
+        }
+        let srt_bandwidth = srt.max_bandwidth();
+        tokio::spawn(async move {
+            // Mirror the RTMP block precisely: a bind/run error is a WARN, never
+            // a panic — the gateway continues serving HTTP/WS/RTMP regardless.
+            if let Err(e) = srt.run(repo, srt_cfg).await {
+                tracing::warn!(error = ?e, "SRT ingest task ended");
+            }
+        });
+        info!(
+            addr = %format!("{srt_listen}:{srt_port}"),
+            max_bandwidth_bytes_per_sec = srt_bandwidth,
+            "srt ingest listening"
+        );
+    }
 
     // ---------- Gateway hardening config ----------
     let gateway_cfg = GatewayConfig::from_env();
@@ -367,6 +423,140 @@ async fn main() -> anyhow::Result<()> {
             });
         }
     }
+
+    // ---------- Cross-node call-bridge supervisor (ROADMAP3 方向二) ----------
+    // Owns the lifecycle of inter-node CallBridge pulls: a group-call join that
+    // yields `CallTopology::BridgeTo(urls)` should call
+    // `supervisor.ensure_bridges(call, &urls)` (one pull per peer node, fanned
+    // into the local SFU), and the last-local-leave / end_call path should call
+    // `supervisor.cancel_call(call)`. The construction of a real node-to-node RTP
+    // upstream is the documented infra seam (`NodeRtpPullerFactory` →
+    // `UpstreamFactory::connect`, mirroring aero-live-whip/cascade.rs): until that
+    // transport is wired, `connect` returns None, so the supervisor registers no
+    // bridges. Single-node boot never produces a `BridgeTo` (no 2nd node in the
+    // call-route registry), so the supervisor stays dormant & safe. It is held in
+    // scope so the SFU router/forwarder it shares with the heartbeat loop stay
+    // alive; the WS/join handler is the future caller of ensure_bridges/cancel_call.
+    let bridge_factory: Arc<dyn UpstreamFactory> = Arc::new(NodeRtpPullerFactory);
+    let call_bridge_supervisor = CallBridgeSupervisor::new(
+        sfu_router.clone(),
+        sfu_forwarder.clone(),
+        bridge_factory,
+    );
+    info!(
+        node = %state.public_base_url,
+        "call-bridge supervisor ready (dormant until cross-node group calls form)"
+    );
+
+    // ---------- Cross-node call-route heartbeat (ROADMAP3 方向二) ----------
+    // The CallRouteRegistry entry for each of this node's call participants is
+    // stamped with a TTL at join and must be re-armed while the participant is
+    // connected, or a call outliving the TTL becomes cross-node-unreachable
+    // (stale bridge targets stop being handed out). Every
+    // AERO_CALL_ROUTE_HEARTBEAT_SECS (default 30) we refresh the TTL for every
+    // (call, participant) this node hosts, sourced from the SFU router roster —
+    // the orchestrator's local source of truth. Gated on call-routes being wired
+    // (Redis present, which it is here); a value of 0 disables the loop. The
+    // loop is harmless when the roster is empty (single-node / no active calls).
+    {
+        let call_route_reg = call_routes.clone();
+        let sfu = sfu_router.clone();
+        let node_url = state.public_base_url.clone();
+        let cancel = ai_shutdown.clone();
+        let secs = std::env::var("AERO_CALL_ROUTE_HEARTBEAT_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(30);
+        if secs == 0 {
+            info!("call-route heartbeat disabled (AERO_CALL_ROUTE_HEARTBEAT_SECS=0)");
+        } else {
+            info!(interval_secs = secs, "call-route heartbeat enabled");
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(secs));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                tick.tick().await; // skip the immediate first tick
+                loop {
+                    tokio::select! {
+                        () = cancel.cancelled() => {
+                            info!("call-route heartbeat: shutdown received, exiting");
+                            break;
+                        }
+                        _ = tick.tick() => {
+                            let roster = sfu.roster_snapshot();
+                            let mut refreshed = 0u32;
+                            for (call, participant) in roster {
+                                match call_route_reg.heartbeat(call, participant, &node_url).await {
+                                    Ok(()) => refreshed += 1,
+                                    Err(e) => warn!(error = ?e, %call, "call-route heartbeat failed"),
+                                }
+                            }
+                            if refreshed > 0 {
+                                tracing::debug!(refreshed, "call-route TTLs refreshed");
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    }
+
+    // ---------- Cross-node stream-route heartbeat (ROADMAP3 方向二) ----------
+    // A live stream's StreamRouteRegistry entry (`stream_id -> ingesting node`)
+    // gets its TTL stamped at publish (whip/rtmp) and was never refreshed — so a
+    // stream longer than the TTL became cross-node-unreachable (sticky-routing
+    // redirects stopped). Every AERO_STREAM_ROUTE_HEARTBEAT_SECS (default 30) we
+    // refresh the TTL for this node's locally-live streams, sourced from
+    // StreamRepo::list_live. Gated on stream-routes being wired (Redis present);
+    // a value of 0 disables the loop.
+    {
+        let routes = state.stream_routes.clone();
+        let stream_repo = state.streams.clone();
+        let node_url = state.public_base_url.clone();
+        let cancel = ai_shutdown.clone();
+        let secs = std::env::var("AERO_STREAM_ROUTE_HEARTBEAT_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(30);
+        if secs == 0 {
+            info!("stream-route heartbeat disabled (AERO_STREAM_ROUTE_HEARTBEAT_SECS=0)");
+        } else {
+            info!(interval_secs = secs, "stream-route heartbeat enabled");
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(secs));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                tick.tick().await; // skip the immediate first tick
+                loop {
+                    tokio::select! {
+                        () = cancel.cancelled() => {
+                            info!("stream-route heartbeat: shutdown received, exiting");
+                            break;
+                        }
+                        _ = tick.tick() => {
+                            match stream_repo.list_live().await {
+                                Ok(live) => {
+                                    let mut refreshed = 0u32;
+                                    for stream in &live {
+                                        match routes.heartbeat(stream.id, &node_url).await {
+                                            Ok(()) => refreshed += 1,
+                                            Err(e) => warn!(error = ?e, stream = %stream.id, "stream-route heartbeat failed"),
+                                        }
+                                    }
+                                    if refreshed > 0 {
+                                        tracing::debug!(refreshed, "stream-route TTLs refreshed");
+                                    }
+                                }
+                                Err(e) => warn!(error = ?e, "stream-route heartbeat: list_live failed"),
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    }
+    // Keep the supervisor alive for the lifetime of the process; the WS/join path
+    // is its future driver (ensure_bridges / cancel_call). Without this binding it
+    // would be dropped immediately and its bridge tasks (when wired) cancelled.
+    let _call_bridge_supervisor = call_bridge_supervisor;
 
     let _ = ai_shutdown; // keep token alive for the worker
 
@@ -825,6 +1015,34 @@ fn build_cors(cfg: &GatewayConfig) -> CorsLayer {
         .allow_origin(AllowOrigin::list(origins))
         .allow_methods(tower_http::cors::Any)
         .allow_headers(tower_http::cors::Any)
+}
+
+/// Resolve the RTMP-shaped backing address that makes [`aero_live_srt::SrtIngest`]
+/// bind to the operator-configured SRT listen address.
+///
+/// `SrtIngest` derives its bind address as `rtmp_listen.port() + 1` over the
+/// RTMP host. To support a configurable `AERO__LIVE__SRT_LISTEN` (`host:port`)
+/// without changing that derivation, we return `(srt_host, srt_port - 1)` so the
+/// `+1` lands exactly on the configured SRT port. When the env var is unset (or
+/// unparsable) we keep the convention: the same host as RTMP, SRT = RTMP + 1
+/// (i.e. the backing address is simply `rtmp_addr` unchanged).
+fn srt_backing_rtmp_addr(rtmp_addr: &SocketAddr) -> SocketAddr {
+    match std::env::var("AERO__LIVE__SRT_LISTEN")
+        .ok()
+        .and_then(|s| s.trim().parse::<SocketAddr>().ok())
+    {
+        Some(srt) => {
+            // Back off one port so SrtIngest's `+1` derivation hits `srt.port()`.
+            // A port of 0 (let-the-OS-choose) can't be back-shifted meaningfully;
+            // fall through to the RTMP-relative default in that case.
+            let backing_port = srt.port().checked_sub(1);
+            match backing_port {
+                Some(p) => SocketAddr::new(srt.ip(), p),
+                None => *rtmp_addr,
+            }
+        }
+        None => *rtmp_addr,
+    }
 }
 
 /// Connect to a startup dependency with bounded exponential backoff (ROADMAP

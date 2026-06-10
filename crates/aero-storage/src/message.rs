@@ -212,6 +212,39 @@ impl MessageRepo {
         Ok(deleted)
     }
 
+    /// Soft-delete a moderation-flagged `id` AND append a `message.moderated`
+    /// audit row to `workspace`'s trail in ONE transaction (ROADMAP 第三版 方向五
+    /// 审计事务化, moderation path): a moderation deletion can never commit while
+    /// its audit row is lost, so every removed message stays independently
+    /// reviewable. The actor is system-initiated (`None`). Mirrors
+    /// [`soft_delete_audited`](Self::soft_delete_audited) but records the
+    /// `message.moderated` action so moderation deletions are distinguishable from
+    /// user-initiated `message.deleted` ones in the audit trail. Returns whether
+    /// the message was actually deleted; an already-deleted/missing message writes
+    /// no audit row (`false`).
+    pub async fn soft_delete_moderated(
+        &self,
+        id: MessageId,
+        workspace: WorkspaceId,
+        detail: serde_json::Value,
+    ) -> Result<bool, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let deleted = Self::soft_delete_in_tx(&mut tx, id).await?;
+        if deleted {
+            crate::audit::AuditRepo::append_in_tx(
+                &mut tx,
+                workspace,
+                None,
+                "message.moderated",
+                Some(&id.to_string()),
+                detail,
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(deleted)
+    }
+
     /// Patch transcripts onto the Voice blocks of a message that don't have
     /// one yet. Called by the transcribe bot — bypasses the sender-only edit
     /// check because the AI is acting on behalf of the system.

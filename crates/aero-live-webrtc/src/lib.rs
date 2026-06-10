@@ -56,10 +56,13 @@ pub use call_bridge::{
     CallUpstream, FakeCallUpstream, LoopbackUpstream,
 };
 pub use codec::{payload_is_keyframe, Codec};
-pub use forward::SfuForwarder;
+pub use forward::{PendingRemb, SfuForwarder};
 pub use peer::{InboundRtp, KeyframeReq, PeerProgress, SfuPeer};
 pub use remap::{ForwardTable, ForwardTarget, RemappedRtp, RtpKey, RtpRemapper};
-pub use rtcp_fb::{BandwidthFeedback, Remb, TwccFeedback, TwccStatus, TwccSummary};
+pub use rtcp_fb::{
+    encode_remb, BandwidthFeedback, PublisherRembAggregator, RembAggregatorConfig, Remb,
+    TwccFeedback, TwccStatus, TwccSummary,
+};
 pub use rtcp_feedback::{KeyframeGate, ParsedFeedback, PendingKeyframeRequest};
 pub use simulcast::{ForwardDecision, LayerKind, LayerSelector, LayerSelectorTable, LayerSet, SimulcastLayer};
 
@@ -174,6 +177,25 @@ impl SfuRouter {
     #[must_use]
     pub fn call_count(&self) -> usize {
         self.inner.read().len()
+    }
+
+    /// Every active call id (those with at least one peer). Used by the server's
+    /// cross-node call-route heartbeat (ROADMAP3 方向二) to enumerate this node's
+    /// locally-hosted calls without a separate tracked set.
+    #[must_use]
+    pub fn calls(&self) -> Vec<CallId> {
+        self.inner.read().keys().copied().collect()
+    }
+
+    /// A flat snapshot of `(call, participant)` for every peer this node hosts,
+    /// across all active calls. The cross-node call-route heartbeat refreshes
+    /// each pair's registry TTL on its interval.
+    #[must_use]
+    pub fn roster_snapshot(&self) -> Vec<(CallId, ParticipantId)> {
+        let r = self.inner.read();
+        r.iter()
+            .flat_map(|(call, state)| state.peers.keys().map(move |p| (*call, *p)))
+            .collect()
     }
 }
 

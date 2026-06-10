@@ -376,4 +376,87 @@ mod db_tests {
         .0;
         assert_eq!(orphaned, 0, "no audit row escaped the rolled-back transaction");
     }
+
+    /// Moderation path of 审计事务化 (方向三 closeout): `soft_delete_moderated`
+    /// commits the soft-delete AND a `message.moderated` audit row together. The
+    /// audit row carries the model reason + content digest and a `None` (system)
+    /// actor; a repeat delete is a no-op that appends NO second row.
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn moderation_delete_and_audit_commit_together() {
+        let p = pool();
+        let (ws, actor) = fixture(&p).await;
+        let id = message_in_workspace(&p, ws, actor).await;
+
+        let msg_repo = crate::message::MessageRepo::new(p.clone());
+        let detail = serde_json::json!({ "reason": "spam", "digest": "buy now" });
+        let deleted = msg_repo
+            .soft_delete_moderated(id, ws, detail)
+            .await
+            .unwrap();
+        assert!(deleted, "first moderation delete deletes");
+
+        let after = msg_repo.get(id).await.unwrap().expect("row still exists");
+        assert!(after.deleted_at.is_some(), "message is soft-deleted");
+
+        let trail = AuditRepo::new(p.clone()).list_for_workspace(ws, None, None).await.unwrap();
+        let rows: Vec<_> = trail
+            .iter()
+            .filter(|e| {
+                e.action == "message.moderated" && e.target.as_deref() == Some(&id.to_string())
+            })
+            .collect();
+        assert_eq!(rows.len(), 1, "exactly one message.moderated row committed with the delete");
+        assert_eq!(rows[0].actor_id, None, "system-initiated → no actor");
+        assert_eq!(rows[0].detail["reason"], "spam");
+        assert_eq!(rows[0].detail["digest"], "buy now");
+
+        // Idempotent repeat: nothing deleted, so nothing audited.
+        let again = msg_repo
+            .soft_delete_moderated(id, ws, serde_json::json!({ "reason": "spam" }))
+            .await
+            .unwrap();
+        assert!(!again, "second moderation delete is a no-op");
+        let trail = AuditRepo::new(p.clone()).list_for_workspace(ws, None, None).await.unwrap();
+        let repeats = trail
+            .iter()
+            .filter(|e| {
+                e.action == "message.moderated" && e.target.as_deref() == Some(&id.to_string())
+            })
+            .count();
+        assert_eq!(repeats, 1, "the no-op repeat appended no second audit row");
+    }
+
+    /// Rollback half of the moderation path: a failing audit INSERT (missing
+    /// workspace → FK violation) must roll the moderation soft-delete back with
+    /// it, so no "moderated but unaudited" / "deleted but unreviewable" state can
+    /// be observed.
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn moderation_failed_audit_rolls_back_delete() {
+        let p = pool();
+        let (ws, actor) = fixture(&p).await;
+        let id = message_in_workspace(&p, ws, actor).await;
+
+        let msg_repo = crate::message::MessageRepo::new(p.clone());
+        let missing_ws = WorkspaceId::new(); // never inserted -> FK violation
+        let err = msg_repo
+            .soft_delete_moderated(id, missing_ws, serde_json::json!({ "reason": "x" }))
+            .await;
+        assert!(err.is_err(), "moderation audit into a missing workspace must fail");
+
+        let after = msg_repo.get(id).await.unwrap().expect("row still exists");
+        assert!(after.deleted_at.is_none(), "moderation soft-delete rolled back with the audit");
+        assert!(!after.blocks.is_empty(), "blocks were not cleared");
+
+        let orphaned: i64 = sqlx::query_as::<_, (i64,)>(
+            "SELECT COUNT(*) FROM audit_events WHERE target = $1 AND action = 'message.moderated'",
+        )
+        .bind(id.to_string())
+        .fetch_one(&p)
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(orphaned, 0, "no moderation audit row escaped the rolled-back transaction");
+    }
 }

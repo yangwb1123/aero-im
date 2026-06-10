@@ -26,7 +26,10 @@ aero-im-core.workspace = true
 aero-ai.workspace = true
 aero-live-core.workspace = true
 aero-live-rtmp.workspace = true
+aero-live-srt.workspace = true
 aero-live-whip.workspace = true
+aero-live-webrtc.workspace = true
+aero-im-call.workspace = true
 aero-signaling.workspace = true
 aero-push.workspace = true
 

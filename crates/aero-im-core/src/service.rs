@@ -1119,8 +1119,24 @@ impl ImService {
     /// broadcast the removal. Unlike [`delete_message`] this bypasses the
     /// sender-only authorization check — the caller is the trusted moderation
     /// pipeline, not a participant. `reason` is logged, not sent to clients.
+    ///
+    /// When `workspace` resolves to a tenant, the delete + a `message.moderated`
+    /// audit row commit (or roll back) together via
+    /// [`MessageRepo::soft_delete_moderated`](aero_storage::MessageRepo::soft_delete_moderated)
+    /// (ROADMAP 第三版 方向五 审计事务化, moderation path): a moderation deletion
+    /// can never succeed while its audit append is lost, so removals stay
+    /// independently reviewable. `reason` + `digest` (a content summary captured
+    /// before the blocks are cleared) are recorded in the audit detail. A legacy
+    /// room with no owning workspace (`None`) keeps the plain (unaudited)
+    /// soft-delete, exactly like the user-delete handler's degraded path.
     #[instrument(skip(self), fields(?message_id, reason))]
-    pub async fn moderate_delete(&self, message_id: MessageId, reason: &str) -> Result<()> {
+    pub async fn moderate_delete(
+        &self,
+        message_id: MessageId,
+        workspace: Option<WorkspaceId>,
+        reason: &str,
+        digest: &str,
+    ) -> Result<()> {
         let existing = self
             .messages
             .get(message_id)
@@ -1129,7 +1145,21 @@ impl ImService {
         if existing.deleted_at.is_some() {
             return Ok(());
         }
-        self.messages.soft_delete(message_id).await?;
+        match workspace {
+            Some(ws) => {
+                let detail = serde_json::json!({
+                    "room_id": existing.room_id,
+                    "reason": reason,
+                    "digest": digest,
+                });
+                self.messages.soft_delete_moderated(message_id, ws, detail).await?;
+            }
+            // Legacy room with no audit trail to write into: keep the original
+            // (non-transactional) delete, mirroring `delete_message`.
+            None => {
+                self.messages.soft_delete(message_id).await?;
+            }
+        }
         warn!(%message_id, reason, "message removed by AI moderation");
         self.publish_room_event(
             existing.room_id,

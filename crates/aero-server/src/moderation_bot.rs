@@ -3,9 +3,10 @@
 //! Subscribes to `im.room.*`; for each new text message it asks the AI backend
 //! to classify the content. Flagged messages are soft-deleted via
 //! [`ImService::moderate_delete`](aero_im_core::ImService::moderate_delete),
-//! which broadcasts a `Deleted` event so every client removes the message, and
-//! the deletion is recorded as a `message.moderated` audit event (room, message
-//! id, model reason, content digest) so it is independently reviewable.
+//! which broadcasts a `Deleted` event so every client removes the message. The
+//! delete and a `message.moderated` audit row (room, message id, model reason,
+//! content digest) commit in ONE transaction (方向五 审计事务化) so a removal can
+//! never succeed unaudited — it is always independently reviewable.
 //!
 //! Opt-in: only runs when an AI backend is configured **and**
 //! `AERO_AI_MODERATION` is set — it can spend one LLM call per message, so it is
@@ -341,44 +342,21 @@ async fn process(
             metrics::inc_counter(AI_MODERATION_FLAGGED_TOTAL, 1);
             // Capture the digest from the queued text — the soft-delete clears
             // the blocks, so this is the reviewable record of what was removed.
+            // The delete + `message.moderated` audit row now commit together
+            // inside `moderate_delete` (transactional, 方向五 审计事务化), so there
+            // is no longer a separate best-effort audit append that could be lost
+            // after a successful delete.
             let digest = content_digest(&job.text);
-            match state.im.moderate_delete(job.message_id, &reason).await {
-                Ok(()) => audit_moderated(state, workspace, &job, &reason, &digest).await,
-                Err(e) => warn!(error = ?e, message_id = %job.message_id, "moderate_delete failed"),
+            if let Err(e) = state
+                .im
+                .moderate_delete(job.message_id, workspace, &reason, &digest)
+                .await
+            {
+                warn!(error = ?e, message_id = %job.message_id, "moderate_delete failed");
             }
         }
         Ok(None) => {}
         Err(e) => warn!(error = %e, message_id = %job.message_id, "ai.moderate failed"),
-    }
-}
-
-/// Best-effort `message.moderated` audit append (mirrors the `message.deleted`
-/// audit in `routes.rs`): records room, message id, the model's reason, and a
-/// content digest so moderation deletions are independently reviewable. The
-/// actor is `None` — the deletion was system-initiated, not a participant's.
-async fn audit_moderated(
-    state: &AppState,
-    workspace: Option<WorkspaceId>,
-    job: &ModerationJob,
-    reason: &str,
-    digest: &str,
-) {
-    let Some(ws) = workspace else {
-        warn!(message_id = %job.message_id, "message.moderated audit skipped: workspace unresolved");
-        return;
-    };
-    let details = serde_json::json!({
-        "room_id": job.room_id,
-        "reason": reason,
-        "digest": digest,
-    });
-    let target = job.message_id.to_string();
-    if let Err(e) = state
-        .audit
-        .append(ws, None, "message.moderated", Some(&target), details)
-        .await
-    {
-        warn!(error = ?e, %ws, "message.moderated audit append failed");
     }
 }
 

@@ -346,6 +346,163 @@ pub fn parse_bandwidth_feedback(buf: &[u8]) -> Vec<BandwidthFeedback> {
     out
 }
 
+// ── Publisher-facing REMB aggregation ─────────────────────────────────────────
+
+/// Tunables for [`PublisherRembAggregator`]. [`RembAggregatorConfig::default`]
+/// matches common SFU practice.
+#[derive(Debug, Clone)]
+pub struct RembAggregatorConfig {
+    /// Floor for the emitted REMB (bps). A publisher should never be asked to
+    /// drop below the lowest viable encoding; this also avoids emitting a
+    /// near-zero REMB when a single subscriber's estimator briefly bottoms out.
+    pub min_bps: u64,
+    /// EWMA weight given to each new aggregate sample (0..1]. Smooths the
+    /// min-across-subscribers target so a transient dip on one subscriber does
+    /// not snap the publisher's encoder down and back up (REMB flapping).
+    pub alpha: f64,
+    /// Relative change (fraction of the last *emitted* value) the smoothed
+    /// aggregate must move before a non-periodic emission fires. 0.10 = 10 %.
+    pub hysteresis: f64,
+}
+
+impl Default for RembAggregatorConfig {
+    fn default() -> Self {
+        Self {
+            min_bps: 100_000,
+            alpha: 0.3,
+            hysteresis: 0.10,
+        }
+    }
+}
+
+/// Per-published-track aggregation of subscriber bandwidth estimates into a
+/// single REMB target for the publisher.
+///
+/// The slowest subscriber bounds the publisher, so the aggregate is the **MIN**
+/// across the current per-subscriber estimates, floored at
+/// [`RembAggregatorConfig::min_bps`] and EWMA-smoothed
+/// ([`RembAggregatorConfig::alpha`]) to avoid flapping. Time is injected
+/// (`now_ms`) — no clock is read here.
+///
+/// Emission is gated by either a hysteresis threshold on the smoothed value
+/// ([`Self::update`]) or a periodic tick ([`Self::tick`]); both return
+/// `Some(bitrate_bps)` only when the publisher should be sent a fresh REMB,
+/// which the SFU then encodes with [`encode_remb`] and relays upstream.
+#[derive(Debug, Clone)]
+pub struct PublisherRembAggregator {
+    cfg: RembAggregatorConfig,
+    /// `subscriber → latest estimate (bps)`. Keyed by an opaque token the
+    /// caller chooses (the SFU uses a participant-derived `u64`).
+    estimates: std::collections::HashMap<u64, u64>,
+    /// EWMA-smoothed aggregate (`None` until the first subscriber estimate).
+    smoothed_bps: Option<f64>,
+    /// Last value actually emitted toward the publisher (`None` until the first
+    /// emission); the hysteresis comparison is against this, not the raw
+    /// aggregate, so emissions are self-rate-limited.
+    last_emitted_bps: Option<u64>,
+}
+
+impl Default for PublisherRembAggregator {
+    fn default() -> Self {
+        Self::new(RembAggregatorConfig::default())
+    }
+}
+
+impl PublisherRembAggregator {
+    /// Create an aggregator with the given tunables.
+    #[must_use]
+    pub fn new(cfg: RembAggregatorConfig) -> Self {
+        Self {
+            cfg,
+            estimates: std::collections::HashMap::new(),
+            smoothed_bps: None,
+            last_emitted_bps: None,
+        }
+    }
+
+    /// Record a subscriber's latest estimate, re-fold the smoothed aggregate,
+    /// and return `Some(bitrate)` when the change crosses the hysteresis
+    /// threshold (i.e. the publisher should be sent a fresh REMB now).
+    ///
+    /// The first ever sample always emits (there is no prior REMB on the wire).
+    pub fn update(&mut self, subscriber: u64, estimate_bps: u64) -> Option<u64> {
+        self.estimates.insert(subscriber, estimate_bps);
+        self.refold();
+        self.maybe_emit()
+    }
+
+    /// Forget a subscriber's estimate (they left / unsubscribed) and re-fold.
+    ///
+    /// Returns `Some(bitrate)` if dropping the slowest subscriber lifts the
+    /// aggregate past the hysteresis threshold (the publisher can speed up).
+    pub fn remove(&mut self, subscriber: u64) -> Option<u64> {
+        self.estimates.remove(&subscriber)?;
+        self.refold();
+        self.maybe_emit()
+    }
+
+    /// Periodic-tick emission: re-emit the current smoothed aggregate
+    /// unconditionally (subject only to having any subscribers), so the
+    /// publisher keeps a live REMB even when subscriber feedback is steady.
+    /// Returns `None` while no subscriber estimate exists yet.
+    pub fn tick(&mut self) -> Option<u64> {
+        let target = self.target_bps()?;
+        self.last_emitted_bps = Some(target);
+        Some(target)
+    }
+
+    /// The current floored, smoothed aggregate target (bps), or `None` when no
+    /// subscriber estimate has been recorded.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    pub fn target_bps(&self) -> Option<u64> {
+        self.smoothed_bps
+            .map(|v| (v.max(0.0) as u64).max(self.cfg.min_bps))
+    }
+
+    /// Number of subscribers currently contributing an estimate.
+    #[must_use]
+    pub fn subscriber_count(&self) -> usize {
+        self.estimates.len()
+    }
+
+    /// Fold the raw MIN-across-subscribers into the EWMA-smoothed aggregate.
+    #[allow(clippy::cast_precision_loss)]
+    fn refold(&mut self) {
+        let Some(raw_min) = self.estimates.values().copied().min() else {
+            // No subscribers left — drop the smoothed history so a future
+            // subscriber starts clean rather than inheriting a stale value.
+            self.smoothed_bps = None;
+            return;
+        };
+        let sample = raw_min as f64;
+        self.smoothed_bps = Some(match self.smoothed_bps {
+            None => sample,
+            Some(prev) => self.cfg.alpha * sample + (1.0 - self.cfg.alpha) * prev,
+        });
+    }
+
+    /// Decide whether the current target warrants an emission under hysteresis.
+    fn maybe_emit(&mut self) -> Option<u64> {
+        let target = self.target_bps()?;
+        let emit = match self.last_emitted_bps {
+            None => true, // first emission: nothing on the wire yet
+            Some(last) => {
+                let delta = target.abs_diff(last);
+                #[allow(clippy::cast_precision_loss)]
+                let rel = delta as f64 / last.max(1) as f64;
+                rel >= self.cfg.hysteresis
+            }
+        };
+        if emit {
+            self.last_emitted_bps = Some(target);
+            Some(target)
+        } else {
+            None
+        }
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -613,5 +770,96 @@ mod tests {
         let mut buf = encode_remb(1, 500_000, &[2]);
         buf[12] = b'X';
         assert!(parse_bandwidth_feedback(&buf).is_empty());
+    }
+
+    // ── PublisherRembAggregator ─────────────────────────────────────────────────
+
+    /// A non-smoothing, no-floor config so tests can assert exact MIN values.
+    fn raw_agg() -> PublisherRembAggregator {
+        PublisherRembAggregator::new(RembAggregatorConfig {
+            min_bps: 1,
+            alpha: 1.0,
+            hysteresis: 0.10,
+        })
+    }
+
+    #[test]
+    fn aggregate_is_min_across_subscribers() {
+        let mut a = raw_agg();
+        // First subscriber: first sample always emits.
+        assert_eq!(a.update(1, 800_000), Some(800_000));
+        // A faster second subscriber does not raise the floor; the slower one
+        // (800k) still bounds the publisher → no change → no emission.
+        assert_eq!(a.update(2, 2_000_000), None);
+        assert_eq!(a.target_bps(), Some(800_000));
+        // The slow subscriber gets even slower → emit the new, lower MIN.
+        assert_eq!(a.update(1, 400_000), Some(400_000));
+    }
+
+    #[test]
+    fn hysteresis_suppresses_small_changes() {
+        let mut a = raw_agg();
+        assert_eq!(a.update(1, 1_000_000), Some(1_000_000));
+        // 5 % drop (< 10 % threshold) → suppressed.
+        assert_eq!(a.update(1, 950_000), None);
+        // Now 12 % below the *last emitted* 1 Mbps → fires.
+        assert_eq!(a.update(1, 880_000), Some(880_000));
+        // Hysteresis is measured against the last emitted value, so a further
+        // small wiggle around 880k is again suppressed.
+        assert_eq!(a.update(1, 860_000), None);
+    }
+
+    #[test]
+    fn floor_clamps_low_aggregate() {
+        let mut a = PublisherRembAggregator::new(RembAggregatorConfig {
+            min_bps: 200_000,
+            alpha: 1.0,
+            hysteresis: 0.10,
+        });
+        // A subscriber estimate below the floor is clamped up to the floor.
+        assert_eq!(a.update(1, 50_000), Some(200_000));
+    }
+
+    #[test]
+    fn ewma_smooths_a_transient_dip() {
+        // Default alpha = 0.3: a one-shot dip moves the aggregate only partway.
+        let mut a = PublisherRembAggregator::default();
+        assert_eq!(a.update(1, 1_000_000), Some(1_000_000)); // first sample taken as-is
+        // Dip to 400k: 0.3×400k + 0.7×1M = 820k — a 18 % drop, past hysteresis.
+        assert_eq!(a.update(1, 400_000), Some(820_000));
+        // Recover to 1M: 0.3×1M + 0.7×820k = 874k — a smoothed +6.6 % move, below
+        // the 10 % threshold, so it is suppressed (no snap-back REMB flap).
+        assert_eq!(a.update(1, 1_000_000), None);
+        assert_eq!(a.target_bps(), Some(874_000));
+        // A second clean sample keeps climbing: 0.3×1M + 0.7×874k = 911.8k,
+        // now +11 % above the last emitted 820k → emits.
+        assert_eq!(a.update(1, 1_000_000), Some(911_800));
+    }
+
+    #[test]
+    fn tick_re_emits_steady_aggregate() {
+        let mut a = raw_agg();
+        assert_eq!(a.tick(), None, "no subscribers yet → nothing to emit");
+        assert_eq!(a.update(1, 600_000), Some(600_000));
+        // Steady feedback would not move the aggregate, but the periodic tick
+        // re-emits the current target so the publisher keeps a live REMB.
+        assert_eq!(a.tick(), Some(600_000));
+        assert_eq!(a.tick(), Some(600_000));
+    }
+
+    #[test]
+    fn removing_slowest_subscriber_lifts_aggregate() {
+        let mut a = raw_agg();
+        assert_eq!(a.update(1, 300_000), Some(300_000)); // slow subscriber
+        assert_eq!(a.update(2, 2_000_000), None); // fast subscriber, MIN unchanged
+        assert_eq!(a.subscriber_count(), 2);
+        // Slow subscriber leaves → MIN jumps to the fast one → emit.
+        assert_eq!(a.remove(1), Some(2_000_000));
+        // Removing an unknown subscriber is a no-op.
+        assert_eq!(a.remove(99), None);
+        // Removing the last subscriber clears the aggregate.
+        assert_eq!(a.remove(2), None);
+        assert_eq!(a.target_bps(), None);
+        assert_eq!(a.subscriber_count(), 0);
     }
 }

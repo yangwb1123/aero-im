@@ -30,6 +30,26 @@
 //!   against per-layer throughput measured from forwarded RTP, and any switch
 //!   goes through the existing keyframe-gated [`LayerSelectorTable`] mechanics.
 //!
+//! ## Adaptive-bitrate feedback loop toward the publisher
+//!
+//! The subscriber side above only *consumes* bandwidth feedback. The other half
+//! of the loop pushes an aggregated REMB back to the **publisher** so an
+//! OBS/ffmpeg/browser encoder can lower its bitrate when the slowest subscriber
+//! is congested. For each published `pub_mid` a [`PublisherRembAggregator`]
+//! folds the per-subscriber [`BandwidthEstimator`] estimates into one target
+//! (MIN across subscribers, floored, EWMA-smoothed). On each subscriber
+//! feedback ([`SfuForwarder::on_subscriber_rtcp_at`]) and on a periodic tick
+//! ([`SfuForwarder::tick_remb_at`]) the aggregator decides — under a 10 %
+//! hysteresis — whether to emit; emissions are enqueued as
+//! [`PendingRemb`]s drained via [`SfuForwarder::poll_remb_requests`].
+//!
+//! **Infra-seam boundary**: the aggregation + [`crate::rtcp_fb::encode_remb`]
+//! ENCODE + ENQUEUE built here is fully unit-tested. The drained
+//! [`PendingRemb`] still has to be written onto the publisher peer's outbound
+//! RTCP stream over real DTLS-SRTP to reach an OBS/browser encoder — that wire
+//! egress is the documented infra seam (mirrors how [`PendingKeyframeRequest`]s
+//! from [`SfuForwarder::poll_keyframe_requests`] are relayed upstream).
+//!
 //! The peer's UDP loop (out of scope) feeds [`SfuForwarder::on_rtp`] from its
 //! [`crate::peer::PeerProgress::Media`] branch and flushes each touched peer's
 //! `poll()` afterwards to emit the resulting datagrams.
@@ -46,10 +66,39 @@ use tracing::trace;
 use crate::bwe::{BandwidthEstimator, LayerSwitchPolicy, ThroughputEwma};
 use crate::peer::{InboundRtp, SfuPeer};
 use crate::remap::{ForwardTable, RtpKey};
-use crate::rtcp_fb::{parse_bandwidth_feedback, BandwidthFeedback};
+use crate::rtcp_fb::{parse_bandwidth_feedback, BandwidthFeedback, PublisherRembAggregator};
 use crate::rtcp_feedback::{parse_keyframe_requests, KeyframeGate, PendingKeyframeRequest};
 use crate::simulcast::{ForwardDecision, LayerKind, LayerSet, LayerSelectorTable};
 use crate::SfuRouter;
+
+/// An aggregated REMB the SFU must relay to a publisher so it can cap its
+/// encoder to what the slowest subscriber can receive.
+///
+/// Drained via [`SfuForwarder::poll_remb_requests`]; the server's UDP loop
+/// encodes it with [`crate::rtcp_fb::encode_remb`] (sender SSRC = the SFU's,
+/// `ssrcs` = the publisher's media SSRC) and writes it onto the publisher
+/// peer's outbound RTCP stream — the documented DTLS-SRTP wire seam.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingRemb {
+    /// Publisher participant the REMB is addressed to.
+    pub publisher: ParticipantId,
+    /// Publisher's track `mid` the REMB caps.
+    pub pub_mid: String,
+    /// Aggregated target bitrate (bps): MIN across subscribers, floored + EWMA.
+    pub bitrate_bps: u64,
+}
+
+/// Derive a stable, process-local `u64` token from a [`ParticipantId`] for
+/// keying [`PublisherRembAggregator`] (which is kept decoupled from
+/// `aero-common` id types). Folds the 128-bit ULID into 64 bits; collisions
+/// within one call's subscriber set are vanishingly unlikely.
+fn subscriber_token(p: ParticipantId) -> u64 {
+    let v = p.as_ulid().0;
+    #[allow(clippy::cast_possible_truncation)]
+    {
+        (v as u64) ^ ((v >> 64) as u64)
+    }
+}
 
 /// Live forwarding state for a single call: the per-call peer set plus the
 /// publisher→subscriber routing/remap table. Cheap to clone (`Arc` inside).
@@ -90,6 +139,13 @@ struct ForwardState {
     /// `(subscriber, pub_mid) → hysteresis state` for bandwidth-driven layer
     /// switching.
     adapt: HashMap<(ParticipantId, String), LayerSwitchPolicy>,
+    /// `pub_mid → publisher-facing REMB aggregator` — folds the subscribing
+    /// peers' current [`BandwidthEstimator`] estimates into one MIN-bounded,
+    /// EWMA-smoothed target for the publisher.
+    remb_agg: HashMap<String, PublisherRembAggregator>,
+    /// Aggregated REMBs queued for the SFU to relay upstream to publishers,
+    /// drained via [`SfuForwarder::poll_remb_requests`].
+    remb_queue: std::collections::VecDeque<PendingRemb>,
 }
 
 impl SfuForwarder {
@@ -115,12 +171,35 @@ impl SfuForwarder {
 
     /// Remove a peer and all routing/remap + simulcast + BWE state
     /// referencing it.
+    ///
+    /// Dropping a subscriber also withdraws its estimate from every
+    /// publisher-facing REMB aggregator; if it was the slowest subscriber the
+    /// aggregate lifts and a fresh higher REMB is enqueued for the publisher.
     pub fn remove_peer(&self, peer: ParticipantId) -> Option<SfuPeer> {
         let mut g = self.inner.lock();
         g.table.unlink_subscriber(peer);
         g.layer_table.unlink_subscriber(peer);
         g.bwe.remove(&peer);
         g.adapt.retain(|(sub, _), _| *sub != peer);
+
+        let token = subscriber_token(peer);
+        let ForwardState {
+            remb_agg,
+            remb_queue,
+            pub_owners,
+            ..
+        } = &mut *g;
+        for (mid, agg) in remb_agg.iter_mut() {
+            if let Some(bitrate_bps) = agg.remove(token) {
+                if let Some(&publisher) = pub_owners.get(mid) {
+                    remb_queue.push_back(PendingRemb {
+                        publisher,
+                        pub_mid: mid.clone(),
+                        bitrate_bps,
+                    });
+                }
+            }
+        }
         g.peers.remove(&peer)
     }
 
@@ -166,6 +245,8 @@ impl SfuForwarder {
         g.pub_owners.remove(pub_mid);
         g.layer_rates.retain(|(mid, _), _| mid != pub_mid);
         g.adapt.retain(|(_, mid), _| mid != pub_mid);
+        g.remb_agg.remove(pub_mid);
+        g.remb_queue.retain(|r| r.pub_mid != pub_mid);
     }
 
     /// Request that `subscriber` receive the best available simulcast layer
@@ -250,7 +331,28 @@ impl SfuForwarder {
                 }
             }
         }
+        let estimate_bps = est.estimate_bps();
         g.adapt_subscriber(subscriber, pub_mid, now, now_ms);
+
+        // Fold this subscriber's fresh estimate into the publisher-facing REMB
+        // aggregate; emit upstream only when it crosses the hysteresis band.
+        // Gated on a registered publisher (so we know who to address) — without
+        // one we cannot build a routed REMB.
+        if let Some(&publisher) = g.pub_owners.get(pub_mid) {
+            let token = subscriber_token(subscriber);
+            let emitted = g
+                .remb_agg
+                .entry(pub_mid.to_owned())
+                .or_default()
+                .update(token, estimate_bps);
+            if let Some(bitrate_bps) = emitted {
+                g.remb_queue.push_back(PendingRemb {
+                    publisher,
+                    pub_mid: pub_mid.to_owned(),
+                    bitrate_bps,
+                });
+            }
+        }
     }
 
     /// The subscriber's current bandwidth estimate (bps), once any REMB/TWCC
@@ -282,6 +384,47 @@ impl SfuForwarder {
     pub fn poll_keyframe_requests(&self) -> Vec<PendingKeyframeRequest> {
         let mut g = self.inner.lock();
         g.keyframe_gate.poll_requests().collect()
+    }
+
+    /// Periodic REMB tick: for every published track with at least one
+    /// subscriber estimate, re-emit the current aggregate target toward the
+    /// publisher so its encoder keeps a live REMB even when subscriber feedback
+    /// is steady (no hysteresis crossing). Call this from the SFU's housekeeping
+    /// timer (e.g. once per second).
+    ///
+    /// The enqueued [`PendingRemb`]s are drained via
+    /// [`Self::poll_remb_requests`]. Tracks with no registered publisher are
+    /// skipped (the REMB could not be routed).
+    pub fn tick_remb(&self) {
+        let mut g = self.inner.lock();
+        let ForwardState {
+            remb_agg,
+            remb_queue,
+            pub_owners,
+            ..
+        } = &mut *g;
+        for (mid, agg) in remb_agg.iter_mut() {
+            if let Some(bitrate_bps) = agg.tick() {
+                if let Some(&publisher) = pub_owners.get(mid) {
+                    remb_queue.push_back(PendingRemb {
+                        publisher,
+                        pub_mid: mid.clone(),
+                        bitrate_bps,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Drain all aggregated REMBs queued for publishers since the last call.
+    ///
+    /// The caller encodes each [`PendingRemb`] with
+    /// [`crate::rtcp_fb::encode_remb`] and writes it onto the publisher peer's
+    /// outbound RTCP stream (the DTLS-SRTP wire egress — the documented infra
+    /// seam), mirroring how [`Self::poll_keyframe_requests`] results are relayed.
+    pub fn poll_remb_requests(&self) -> Vec<PendingRemb> {
+        let mut g = self.inner.lock();
+        g.remb_queue.drain(..).collect()
     }
 
     /// Run a closure with mutable access to one peer, if present. Lets the UDP
@@ -1336,5 +1479,155 @@ mod tests {
         assert_eq!(reqs.len(), 1);
         assert_eq!(reqs[0].publisher, pubr);
         assert_eq!(fwd.subscriber_estimate_bps(sub), Some(300_000));
+    }
+
+    // ── Aggregated REMB emission toward the publisher ─────────────────────────
+
+    /// Like [`bwe_fixture`] but with a second subscriber sharing the same
+    /// published track, so the publisher REMB aggregate has two contributors.
+    fn two_sub_fixture() -> (SfuForwarder, ParticipantId, ParticipantId, ParticipantId) {
+        let (fwd, pubr, sub1) = bwe_fixture();
+        let sub2 = ParticipantId::new();
+        fwd.add_peer(SfuPeer::new(CallId::new(), sub2));
+        fwd.subscribe("v0", sub2, "v0");
+        let _ = fwd.poll_keyframe_requests();
+        (fwd, pubr, sub1, sub2)
+    }
+
+    #[test]
+    fn slowest_subscriber_bounds_publisher_remb() {
+        let (fwd, pubr, sub1, sub2) = two_sub_fixture();
+        let remb_for = |bps| crate::rtcp_fb::encode_remb(1, bps, &[2]);
+
+        // Fast subscriber: a REMB at/above the 600k AIMD initial value leaves the
+        // per-subscriber estimate at 600k (REMB only *clamps* downward). First
+        // contributor → first emission.
+        fwd.on_subscriber_rtcp_at(sub2, "v0", &remb_for(2_000_000), Instant::now(), 0);
+        let r1 = fwd.poll_remb_requests();
+        assert_eq!(r1.len(), 1, "first subscriber estimate emits a REMB");
+        assert_eq!(r1[0].publisher, pubr);
+        assert_eq!(r1[0].pub_mid, "v0");
+        assert_eq!(r1[0].bitrate_bps, 600_000, "fast subscriber bounded by AIMD init");
+
+        // Congested subscriber reports 300 kbps → its estimate clamps to 300k →
+        // the aggregate MIN collapses; the publisher is told to slow toward it.
+        // Smoothed: 0.3×300k + 0.7×600k = 510k (a 15 % drop, past hysteresis).
+        fwd.on_subscriber_rtcp_at(sub1, "v0", &remb_for(300_000), Instant::now(), 0);
+        let r2 = fwd.poll_remb_requests();
+        assert_eq!(r2.len(), 1, "the slower subscriber must bound the publisher");
+        assert_eq!(r2[0].publisher, pubr);
+        assert_eq!(r2[0].bitrate_bps, 510_000);
+        assert!(
+            r2[0].bitrate_bps < 600_000,
+            "REMB must fall toward the congested subscriber"
+        );
+    }
+
+    #[test]
+    fn steady_feedback_does_not_re_emit_remb_hysteresis() {
+        let (fwd, _pubr, sub1, _sub2) = two_sub_fixture();
+        let remb = crate::rtcp_fb::encode_remb(1, 600_000, &[2]);
+
+        // First estimate emits.
+        fwd.on_subscriber_rtcp_at(sub1, "v0", &remb, Instant::now(), 0);
+        assert_eq!(fwd.poll_remb_requests().len(), 1);
+
+        // Identical follow-up feedback: the aggregate does not move past the
+        // 10 % hysteresis band → nothing enqueued.
+        fwd.on_subscriber_rtcp_at(sub1, "v0", &remb, Instant::now(), 100);
+        assert!(
+            fwd.poll_remb_requests().is_empty(),
+            "steady feedback must not flap the publisher REMB"
+        );
+    }
+
+    #[test]
+    fn periodic_tick_re_emits_steady_remb() {
+        let (fwd, pubr, sub1, _sub2) = two_sub_fixture();
+        let remb = crate::rtcp_fb::encode_remb(1, 500_000, &[2]);
+        fwd.on_subscriber_rtcp_at(sub1, "v0", &remb, Instant::now(), 0);
+        let _ = fwd.poll_remb_requests(); // drain the hysteresis emission
+
+        // A subsequent identical sample would be suppressed (hysteresis)…
+        fwd.on_subscriber_rtcp_at(sub1, "v0", &remb, Instant::now(), 100);
+        assert!(fwd.poll_remb_requests().is_empty());
+
+        // …but the periodic housekeeping tick re-emits the live aggregate so the
+        // publisher keeps a current REMB on the wire.
+        fwd.tick_remb();
+        let ticked = fwd.poll_remb_requests();
+        assert_eq!(ticked.len(), 1, "periodic tick must re-emit the aggregate");
+        assert_eq!(ticked[0].publisher, pubr);
+        assert_eq!(ticked[0].pub_mid, "v0");
+        assert_eq!(ticked[0].bitrate_bps, 500_000);
+    }
+
+    #[test]
+    fn tick_without_any_subscriber_estimate_emits_nothing() {
+        // Track registered + subscribed, but no bandwidth feedback yet → the
+        // aggregator has no sample, so the tick produces nothing.
+        let (fwd, _pubr, _sub1, _sub2) = two_sub_fixture();
+        fwd.tick_remb();
+        assert!(fwd.poll_remb_requests().is_empty());
+    }
+
+    #[test]
+    fn remb_emission_requires_registered_publisher() {
+        // No register_publisher_layers for "v9": the estimator still updates,
+        // but without a known publisher the REMB cannot be routed → not queued.
+        let fwd = SfuForwarder::new(SfuRouter::new());
+        let sub = ParticipantId::new();
+        let remb = crate::rtcp_fb::encode_remb(1, 400_000, &[2]);
+        fwd.on_subscriber_rtcp_at(sub, "v9", &remb, Instant::now(), 0);
+        assert_eq!(fwd.subscriber_estimate_bps(sub), Some(400_000));
+        assert!(fwd.poll_remb_requests().is_empty());
+        fwd.tick_remb();
+        assert!(fwd.poll_remb_requests().is_empty());
+    }
+
+    #[test]
+    fn dropping_slowest_subscriber_lifts_publisher_remb() {
+        let (fwd, pubr, sub1, sub2) = two_sub_fixture();
+        let remb_for = |bps| crate::rtcp_fb::encode_remb(1, bps, &[2]);
+
+        // Fast subscriber (estimate 600k via AIMD init), then drive the congested
+        // subscriber's smoothed contribution down toward its 300k estimate with
+        // repeated feedback so the aggregate settles well below 600k.
+        fwd.on_subscriber_rtcp_at(sub2, "v0", &remb_for(2_000_000), Instant::now(), 0);
+        for t in 0..12u64 {
+            fwd.on_subscriber_rtcp_at(sub1, "v0", &remb_for(300_000), Instant::now(), t);
+        }
+        let _ = fwd.poll_remb_requests(); // drain everything queued so far
+        let bounded = fwd.inner.lock().remb_agg["v0"].target_bps().unwrap();
+        assert!(bounded < 400_000, "aggregate settled near the slow subscriber");
+
+        // The congested subscriber leaves → only the fast one remains → the
+        // aggregate lifts past hysteresis and a higher REMB is enqueued.
+        fwd.remove_peer(sub1);
+        let lifted = fwd.poll_remb_requests();
+        assert_eq!(lifted.len(), 1, "removing the slow subscriber must re-emit");
+        assert_eq!(lifted[0].publisher, pubr);
+        assert!(
+            lifted[0].bitrate_bps > bounded,
+            "publisher may speed up once the slow subscriber is gone: {} → {}",
+            bounded,
+            lifted[0].bitrate_bps
+        );
+    }
+
+    #[test]
+    fn unpublish_clears_remb_aggregator_and_queue() {
+        let (fwd, _pubr, sub1, _sub2) = two_sub_fixture();
+        let remb = crate::rtcp_fb::encode_remb(1, 600_000, &[2]);
+        fwd.on_subscriber_rtcp_at(sub1, "v0", &remb, Instant::now(), 0);
+        // Drop the publisher's track without draining the queued REMB.
+        fwd.unpublish("v0");
+        assert!(
+            fwd.poll_remb_requests().is_empty(),
+            "unpublish must purge pending REMBs for the track"
+        );
+        // A subsequent tick has no aggregator to emit from.
+        fwd.tick_remb();
+        assert!(fwd.poll_remb_requests().is_empty());
     }
 }

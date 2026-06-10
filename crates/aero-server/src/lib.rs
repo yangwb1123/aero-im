@@ -1,6 +1,8 @@
 //! HTTP/WS gateway. Composes auth + im-core + bus + storage into Axum routes.
 
 pub mod agent_bot;
+// ROADMAP3 方向二: cross-node call-bridge spawn orchestration (supervisor).
+pub mod call_bridge_supervisor;
 pub mod moderation_bot;
 pub mod transcribe_bot;
 pub mod unfurl_bot;
