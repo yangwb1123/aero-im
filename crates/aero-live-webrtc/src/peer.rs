@@ -32,7 +32,7 @@ use str0m::net::{Protocol, Receive};
 use str0m::rtp::{ExtensionValues, RtpPacket, SeqNo};
 use str0m::{Event, Input, Output, Rtc};
 
-use crate::h264::h264_payload_is_keyframe;
+use crate::codec::{payload_is_keyframe, Codec};
 use crate::SfuError;
 
 /// One forwarded RTP packet lifted out of `str0m`'s [`RtpPacket`] into the
@@ -60,22 +60,29 @@ pub struct InboundRtp {
     pub rid: Option<str0m::media::Rid>,
     /// Whether this packet begins a keyframe (intra frame).
     ///
-    /// Set from [`crate::h264::h264_payload_is_keyframe`] when the RTP payload
-    /// is decoded as H.264 (RFC 6184). Detects single-NAL IDR (type 5),
-    /// SPS (type 7), PPS (type 8), FU-A START fragments of an IDR, and STAP-A
-    /// aggregates that contain any of those NAL types.
+    /// Set via [`crate::codec::payload_is_keyframe`] with the [`Codec`]
+    /// resolved from this peer's negotiated payload-type mapping
+    /// ([`SfuPeer::codec_for_pt`]). Detected codecs:
     ///
-    /// **Limitation**: only H.264 is detected. For VP8, VP9, AV1, or any other
-    /// codec this field is `false` — the SFU has no codec-agnostic way to detect
-    /// intra frames from raw RTP in RTP-forwarding mode.
+    /// - **H.264** (RFC 6184) — single-NAL IDR (type 5), SPS (type 7),
+    ///   PPS (type 8), FU-A START fragments of an IDR, and STAP-A aggregates
+    ///   containing any of those NAL types.
+    /// - **VP8** (RFC 7741) — first packet of the first partition whose
+    ///   payload header has the inverse-key-frame `P` bit clear.
+    /// - **VP9** (draft-ietf-payload-vp9) — frame-begin packets (`B=1`) that
+    ///   are not inter-picture predicted (`P=0`).
+    ///
+    /// **Limitation**: any other codec (AV1, H.265, audio, …) yields `false` —
+    /// the SFU has no payload-descriptor parser for them in RTP-forwarding
+    /// mode, so layer switching / keyframe gating never fires for those tracks.
     pub is_keyframe: bool,
 }
 
 impl InboundRtp {
-    fn from_packet(p: &RtpPacket) -> Self {
-        // Attempt H.264 keyframe detection from the raw payload.  For any other
-        // codec this returns false (see `h264_payload_is_keyframe` docs).
-        let is_keyframe = h264_payload_is_keyframe(&p.payload);
+    fn from_packet(p: &RtpPacket, codec: Codec) -> Self {
+        // Codec-aware keyframe detection from the raw payload; unknown codecs
+        // are never keyframes (see `payload_is_keyframe` docs).
+        let is_keyframe = payload_is_keyframe(codec, &p.payload);
         Self {
             mid: p.header.ext_vals.mid.unwrap_or_else(|| mid_fallback(p)),
             pt: p.header.payload_type,
@@ -222,14 +229,32 @@ impl SfuPeer {
         match self.rtc.poll_output().map_err(|e| SfuError::Rtc(e.to_string()))? {
             Output::Timeout(at) => Ok(PeerProgress::Timeout(at)),
             Output::Transmit(t) => Ok(PeerProgress::Transmit(Box::new(t))),
-            Output::Event(e) => Ok(Self::classify_event(e)),
+            Output::Event(e) => Ok(self.classify_event(e)),
         }
     }
 
-    fn classify_event(event: Event) -> PeerProgress {
+    /// Resolve the [`Codec`] negotiated for payload type `pt` on this peer.
+    ///
+    /// Looks up the `Rtc`'s live codec config — `str0m` rewrites it to the
+    /// remote's payload-type numbering during SDP negotiation, so the mapping
+    /// is correct per-peer even when publishers offer differing pt↔codec
+    /// assignments. Unmatched pts (RTX, unnegotiated, …) resolve to
+    /// [`Codec::Unknown`], which never reports keyframes.
+    #[must_use]
+    pub fn codec_for_pt(&self, pt: Pt) -> Codec {
+        self.rtc
+            .codec_config()
+            .find(|p| p.pt() == pt)
+            .map_or(Codec::Unknown, |p| Codec::from(p.spec().codec))
+    }
+
+    fn classify_event(&self, event: Event) -> PeerProgress {
         match event {
             Event::Connected => PeerProgress::Connected,
-            Event::RtpPacket(p) => PeerProgress::Media(Box::new(InboundRtp::from_packet(&p))),
+            Event::RtpPacket(p) => {
+                let codec = self.codec_for_pt(p.header.payload_type);
+                PeerProgress::Media(Box::new(InboundRtp::from_packet(&p, codec)))
+            }
             Event::KeyframeRequest(kf) => PeerProgress::KeyframeRequest(KeyframeReq {
                 mid: kf.mid,
                 kind: kf.kind,
@@ -320,6 +345,21 @@ mod tests {
         let mut peer = SfuPeer::new(CallId::new(), ParticipantId::new());
         let err = peer.accept_offer("not an sdp").unwrap_err();
         assert!(matches!(err, SfuError::Sdp(_)));
+    }
+
+    #[test]
+    fn codec_for_pt_resolves_default_payload_types() {
+        // str0m 0.19 pre-negotiation defaults: VP8=96 (RTX 97), VP9=98,
+        // Opus=111, first H.264 config=127. Negotiation rewrites these to the
+        // remote's numbering; the lookup path is identical either way.
+        let peer = SfuPeer::new(CallId::new(), ParticipantId::new());
+        assert_eq!(peer.codec_for_pt(Pt::from(96)), Codec::Vp8);
+        assert_eq!(peer.codec_for_pt(Pt::from(98)), Codec::Vp9);
+        assert_eq!(peer.codec_for_pt(Pt::from(127)), Codec::H264);
+        // Audio is not keyframe-detectable.
+        assert_eq!(peer.codec_for_pt(Pt::from(111)), Codec::Unknown);
+        // RTX pts live in `resend`, not as primary params.
+        assert_eq!(peer.codec_for_pt(Pt::from(97)), Codec::Unknown);
     }
 
     #[test]

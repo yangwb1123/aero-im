@@ -17,6 +17,9 @@
 //!   matching outbound `str0m` stream.
 //! - [`remap`] — the **pure**, fully unit-tested routing + RTP header-remap
 //!   bookkeeping (`ForwardTable`, `RtpRemapper`), with no IO dependency.
+//! - [`codec`] — codec-aware keyframe detection ([`Codec`] +
+//!   [`payload_is_keyframe`]) dispatching to the pure payload-descriptor
+//!   parsers in [`h264`], [`vp8`] and [`vp9`].
 //!
 //! ## What's verified vs. pending
 //!
@@ -34,13 +37,17 @@ use aero_common::{CallId, ParticipantId};
 use parking_lot::RwLock;
 use thiserror::Error;
 
+pub mod codec;
 pub mod forward;
 pub mod h264;
 pub mod peer;
 pub mod remap;
 pub mod rtcp_feedback;
 pub mod simulcast;
+pub mod vp8;
+pub mod vp9;
 
+pub use codec::{payload_is_keyframe, Codec};
 pub use forward::SfuForwarder;
 pub use peer::{InboundRtp, KeyframeReq, PeerProgress, SfuPeer};
 pub use remap::{ForwardTable, ForwardTarget, RemappedRtp, RtpKey, RtpRemapper};
