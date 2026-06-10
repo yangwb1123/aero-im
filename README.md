@@ -144,7 +144,11 @@ open http://localhost:3030
 | `ANTHROPIC_MODEL` | 默认 `claude-sonnet-4-6` |
 | `VOYAGE_API_KEY` | 启用 Voyage embeddings(1024 维);否则用确定性 HashEmbedder |
 | `AERO_BLOCKED_WORDS` | 逗号分隔,关键词审核(同步预审) |
-| `AERO_AI_MODERATION` | 置位后启用 AI 异步内容审核(每条消息一次 LLM 调用;需 `ANTHROPIC_API_KEY`) |
+| `AERO_AI_MODERATION` | 置位后启用 AI 异步内容审核(经有界预算化队列;需 `ANTHROPIC_API_KEY`) |
+| `AERO_AI_MODERATION_QUEUE` / `_CONCURRENCY` | 审核队列容量(默认 512)/ 工作者数(默认 2) |
+| `AERO_AI_MODERATION_MAX_PER_WINDOW` / `_PER_WS_WINDOW` / `_WINDOW_SECS` | 审核全局/单租户预算窗口(默认 300 / 60 / 60s;超额跳过并计数) |
+| `AERO_WS_RATE_STANDARD_PER_MIN` / `AERO_WS_RATE_PREMIUM_PER_MIN` | 每工作区限流档位上限(默认 1200 / 6000;`unlimited` 档不限);Redis 故障 fail-open 并计数 |
+| `AERO_SRT_MAX_BANDWIDTH_BYTES_PER_SEC` | SRT 发送带宽上限(默认 1.5 MB/s;RTT/NAK 自适应降速) |
 | `AERO_STUN_URLS` | STUN(默认 stun.l.google.com:19302) |
 | `AERO_TURN_URL` / `AERO_TURN_USERNAME` / `AERO_TURN_PASSWORD` | TURN 凭据(浏览器 ICE 兜底) |
 | `AERO_TURN_SHARED_SECRET` / `AERO_TURN_REALM` / `AERO_TURN_EXTERNAL_IP` | coturn 配置 |
@@ -160,6 +164,7 @@ python3 scripts/ws_smoke.py                       # WS fan-out(2 客户端互发
 python3 scripts/smoke_p2.py                       # P2 全功能:edit/react/read/search/blob/AI/stream/MLS
 python3 scripts/smoke_live.py                     # P11 弹幕/礼物/观看人数 WS 扇出 + 榜单 + 主播下播
 python3 scripts/smoke_captions.py                 # P3 字幕中继:call_caption → 房间 call/op:caption 扇出
+python3 scripts/smoke_roadmap3_wave_c.py          # ROADMAP3:事件 seq/去重、回填截断续拉、多端已读、异步通知、租户限流档位、删除审计事务、重排检索
 ```
 
 > 运行时验证(2026-05-24,真实 PG/Redis/NATS):`smoke_p2` / `smoke_live` /
