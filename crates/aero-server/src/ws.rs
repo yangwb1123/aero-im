@@ -622,6 +622,23 @@ async fn handle_text(
                 .im
                 .relay_call_event(room_id, CallEvent::Join { call_id, room_id, from: pid, kind })
                 .await?;
+            // Additively drive the cross-node orchestrator (ROADMAP4 方向二):
+            // register the participant in the SFU router (so the call-route
+            // heartbeat has a populated roster) + the cluster CallRouteRegistry,
+            // and compute the bridge topology; on a BridgeTo, ensure one bridge
+            // per peer node. Best-effort — a failure never disturbs the working
+            // full-mesh CallEvent path above, and single-node always serves local.
+            match state.call_orchestrator.join_group_call(call_id, room_id, pid, kind).await {
+                Ok(join) => {
+                    if let aero_live_webrtc::CallTopology::BridgeTo(urls) = join.topology {
+                        let spawned = state.call_supervisor.ensure_bridges(call_id, &urls).await;
+                        debug!(%call_id, peers = urls.len(), spawned, "cross-node call bridges ensured");
+                    }
+                }
+                Err(e) => {
+                    warn!(error = ?e, %call_id, "call orchestrator join failed (full-mesh unaffected)");
+                }
+            }
         }
         ClientFrame::CallLeave { call_id, room_id } => {
             state.hub.call_leave(call_id, pid);
@@ -632,6 +649,13 @@ async fn handle_text(
                 .im
                 .relay_call_event(room_id, CallEvent::Leave { call_id, room_id, from: pid })
                 .await?;
+            // Additively unregister from the cross-node orchestrator (ROADMAP4):
+            // drop the SFU + registry mapping; on the last local participant,
+            // cancel this call's bridges. Best-effort.
+            if state.call_orchestrator.leave_group_call(call_id, pid).await {
+                let cancelled = state.call_supervisor.cancel_call(call_id);
+                debug!(%call_id, cancelled, "last local call participant left; bridges cancelled");
+            }
         }
         ClientFrame::CallOffer { call_id, room_id, to, sdp } => {
             state

@@ -185,6 +185,18 @@ pub struct AppState {
     /// nodes (ROADMAP 方向二). The local [`Hub`] still tracks the roster for
     /// per-process mesh delivery.
     pub call_roster: CallRosterStore,
+    /// Cross-node group-call orchestrator (ROADMAP3/4 方向二): on a group-call
+    /// join the WS handler drives this to register the participant in the SFU
+    /// router + cross-node `CallRouteRegistry` and compute the bridge topology;
+    /// on leave it unregisters. Shares the SFU router + registry with the
+    /// call-route heartbeat loop so the heartbeat refreshes real TTLs. The
+    /// full-mesh `CallEvent` signaling path is unchanged — this is additive.
+    pub call_orchestrator: Arc<aero_im_call::CallOrchestrator>,
+    /// Cross-node call-bridge supervisor: on a `CallTopology::BridgeTo` the WS
+    /// handler calls `ensure_bridges`; on last-local-leave, `cancel_call`. The
+    /// real node-to-node RTP transport stays the documented infra seam, so this
+    /// is dormant single-node.
+    pub call_supervisor: Arc<crate::call_bridge_supervisor::CallBridgeSupervisor>,
     /// Cross-node stream routing: `stream_id -> ingesting node's base URL`
     /// (Redis, TTL). Lets a WHEP pull on a node that isn't ingesting the stream
     /// redirect the client to the node that is — sticky routing (ROADMAP 方向二).

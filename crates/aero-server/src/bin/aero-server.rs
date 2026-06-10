@@ -327,6 +327,26 @@ async fn main() -> anyhow::Result<()> {
         "push gateways resolved"
     );
 
+    // ---------- Cross-node group-call orchestrator + bridge supervisor ----------
+    // (ROADMAP3/4 方向二) Built here so they share the SAME SfuRouter +
+    // CallRouteRegistry as the heartbeat loop below. The WS CallJoin/CallLeave
+    // handlers drive these to register participants cross-node, compute bridge
+    // topology, and spawn/cancel bridges. The full-mesh CallEvent signaling is
+    // untouched (additive). Real node-to-node RTP transport is the documented
+    // infra seam (NodeRtpPullerFactory::connect → None), so single-node stays
+    // dormant: BridgeTo never fires (no 2nd node in the registry).
+    let call_orchestrator = Arc::new(
+        aero_im_call::CallOrchestrator::new(calls.clone())
+            .with_sfu(sfu_router.clone())
+            .with_call_routes(Arc::new(call_routes.clone()), public_base_url.clone()),
+    );
+    let bridge_factory: Arc<dyn UpstreamFactory> = Arc::new(NodeRtpPullerFactory);
+    let call_supervisor = Arc::new(CallBridgeSupervisor::new(
+        sfu_router.clone(),
+        sfu_forwarder.clone(),
+        bridge_factory,
+    ));
+
     let state = AppState {
         auth,
         im,
@@ -352,6 +372,8 @@ async fn main() -> anyhow::Result<()> {
         presence,
         stream_viewers,
         call_roster,
+        call_orchestrator: call_orchestrator.clone(),
+        call_supervisor: call_supervisor.clone(),
         stream_routes,
         bus: bus_dyn,
         hub,
@@ -424,28 +446,13 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    // ---------- Cross-node call-bridge supervisor (ROADMAP3 方向二) ----------
-    // Owns the lifecycle of inter-node CallBridge pulls: a group-call join that
-    // yields `CallTopology::BridgeTo(urls)` should call
-    // `supervisor.ensure_bridges(call, &urls)` (one pull per peer node, fanned
-    // into the local SFU), and the last-local-leave / end_call path should call
-    // `supervisor.cancel_call(call)`. The construction of a real node-to-node RTP
-    // upstream is the documented infra seam (`NodeRtpPullerFactory` →
-    // `UpstreamFactory::connect`, mirroring aero-live-whip/cascade.rs): until that
-    // transport is wired, `connect` returns None, so the supervisor registers no
-    // bridges. Single-node boot never produces a `BridgeTo` (no 2nd node in the
-    // call-route registry), so the supervisor stays dormant & safe. It is held in
-    // scope so the SFU router/forwarder it shares with the heartbeat loop stay
-    // alive; the WS/join handler is the future caller of ensure_bridges/cancel_call.
-    let bridge_factory: Arc<dyn UpstreamFactory> = Arc::new(NodeRtpPullerFactory);
-    let call_bridge_supervisor = CallBridgeSupervisor::new(
-        sfu_router.clone(),
-        sfu_forwarder.clone(),
-        bridge_factory,
-    );
+    // The cross-node call-bridge supervisor + orchestrator were constructed above
+    // (before AppState) and wired into `state.call_supervisor`/`call_orchestrator`
+    // so the WS CallJoin/CallLeave handlers drive ensure_bridges/cancel_call. They
+    // share this node's SfuRouter + CallRouteRegistry with the heartbeat loop below.
     info!(
         node = %state.public_base_url,
-        "call-bridge supervisor ready (dormant until cross-node group calls form)"
+        "call-bridge supervisor + orchestrator ready (dormant until cross-node group calls form)"
     );
 
     // ---------- Cross-node call-route heartbeat (ROADMAP3 方向二) ----------
@@ -553,10 +560,9 @@ async fn main() -> anyhow::Result<()> {
             });
         }
     }
-    // Keep the supervisor alive for the lifetime of the process; the WS/join path
-    // is its future driver (ensure_bridges / cancel_call). Without this binding it
-    // would be dropped immediately and its bridge tasks (when wired) cancelled.
-    let _call_bridge_supervisor = call_bridge_supervisor;
+    // The supervisor + orchestrator now live in AppState (state.call_supervisor /
+    // call_orchestrator), driven by the WS CallJoin/CallLeave handlers, so they
+    // stay alive for the process lifetime via the router — no extra binding needed.
 
     let _ = ai_shutdown; // keep token alive for the worker
 
