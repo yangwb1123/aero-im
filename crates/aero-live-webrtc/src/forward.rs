@@ -18,10 +18,17 @@
 //! [`SfuForwarder::poll_keyframe_requests`] and relay them to the appropriate
 //! publisher peer.
 //!
-//! Inbound subscriber RTCP (PLI/FIR) is accepted via
-//! [`SfuForwarder::on_subscriber_rtcp`], which uses
-//! [`crate::rtcp_feedback::parse_keyframe_requests`] to decode the buffer and
-//! routes coalesced keyframe requests upstream to the correct publisher.
+//! Inbound subscriber RTCP is accepted via
+//! [`SfuForwarder::on_subscriber_rtcp`], which decodes the buffer twice:
+//!
+//! - PLI/FIR (via [`crate::rtcp_feedback::parse_keyframe_requests`]) become
+//!   coalesced keyframe requests routed upstream to the correct publisher.
+//! - REMB/TWCC (via [`crate::rtcp_fb::parse_bandwidth_feedback`]) feed that
+//!   subscriber's [`BandwidthEstimator`]; after every bandwidth feedback the
+//!   forwarder re-evaluates the subscriber's simulcast layer choice
+//!   ([`LayerSwitchPolicy`]: down immediately, up after ~2 s of headroom)
+//!   against per-layer throughput measured from forwarded RTP, and any switch
+//!   goes through the existing keyframe-gated [`LayerSelectorTable`] mechanics.
 //!
 //! The peer's UDP loop (out of scope) feeds [`SfuForwarder::on_rtp`] from its
 //! [`crate::peer::PeerProgress::Media`] branch and flushes each touched peer's
@@ -36,8 +43,10 @@ use parking_lot::Mutex;
 use str0m::media::Rid;
 use tracing::trace;
 
+use crate::bwe::{BandwidthEstimator, LayerSwitchPolicy, ThroughputEwma};
 use crate::peer::{InboundRtp, SfuPeer};
 use crate::remap::{ForwardTable, RtpKey};
+use crate::rtcp_fb::{parse_bandwidth_feedback, BandwidthFeedback};
 use crate::rtcp_feedback::{parse_keyframe_requests, KeyframeGate, PendingKeyframeRequest};
 use crate::simulcast::{ForwardDecision, LayerKind, LayerSet, LayerSelectorTable};
 use crate::SfuRouter;
@@ -47,6 +56,9 @@ use crate::SfuRouter;
 #[derive(Clone)]
 pub struct SfuForwarder {
     router: SfuRouter,
+    /// Monotonic epoch used to project wall time into the `now_ms` domain the
+    /// pure BWE components ([`crate::bwe`]) consume.
+    epoch: Instant,
     inner: Arc<Mutex<ForwardState>>,
 }
 
@@ -69,6 +81,15 @@ struct ForwardState {
     /// can be routed to the right publisher without needing the call ID or the
     /// [`SfuRouter`] lock.
     pub_owners: HashMap<String, ParticipantId>,
+    /// `(pub_mid, rid) → measured throughput` — EWMA bytes/sec per simulcast
+    /// layer, fed from every inbound publisher RTP packet carrying a RID.
+    layer_rates: HashMap<(String, Rid), ThroughputEwma>,
+    /// Per-subscriber bandwidth estimators, fed from REMB/TWCC in that
+    /// subscriber's RTCP.
+    bwe: HashMap<ParticipantId, BandwidthEstimator>,
+    /// `(subscriber, pub_mid) → hysteresis state` for bandwidth-driven layer
+    /// switching.
+    adapt: HashMap<(ParticipantId, String), LayerSwitchPolicy>,
 }
 
 impl SfuForwarder {
@@ -76,8 +97,15 @@ impl SfuForwarder {
     pub fn new(router: SfuRouter) -> Self {
         Self {
             router,
+            epoch: Instant::now(),
             inner: Arc::new(Mutex::new(ForwardState::default())),
         }
+    }
+
+    /// Milliseconds since this forwarder was created — the time domain fed to
+    /// the pure BWE components.
+    fn now_ms(&self) -> u64 {
+        u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 
     /// Register a live peer with the forwarder (called once its `Rtc` exists).
@@ -85,11 +113,14 @@ impl SfuForwarder {
         self.inner.lock().peers.insert(peer.id(), peer);
     }
 
-    /// Remove a peer and all routing/remap + simulcast state referencing it.
+    /// Remove a peer and all routing/remap + simulcast + BWE state
+    /// referencing it.
     pub fn remove_peer(&self, peer: ParticipantId) -> Option<SfuPeer> {
         let mut g = self.inner.lock();
         g.table.unlink_subscriber(peer);
         g.layer_table.unlink_subscriber(peer);
+        g.bwe.remove(&peer);
+        g.adapt.retain(|(sub, _), _| *sub != peer);
         g.peers.remove(&peer)
     }
 
@@ -133,6 +164,8 @@ impl SfuForwarder {
         let mut g = self.inner.lock();
         g.table.unlink_publisher_track(pub_mid);
         g.pub_owners.remove(pub_mid);
+        g.layer_rates.retain(|(mid, _), _| mid != pub_mid);
+        g.adapt.retain(|(_, mid), _| mid != pub_mid);
     }
 
     /// Request that `subscriber` receive the best available simulcast layer
@@ -162,8 +195,10 @@ impl SfuForwarder {
         Some(rid)
     }
 
-    /// Accept inbound RTCP from a subscriber and route any PLI/FIR requests
-    /// upstream toward the correct publisher as coalesced keyframe requests.
+    /// Accept inbound RTCP from a subscriber: PLI/FIR become coalesced
+    /// keyframe requests routed to the correct publisher; REMB/TWCC feed the
+    /// subscriber's bandwidth estimator and may trigger a bandwidth-driven
+    /// simulcast layer switch (down immediately, up after stable headroom).
     ///
     /// `subscriber` — the participant that sent the RTCP.
     /// `pub_mid` — the published track the subscriber is watching (the SFU
@@ -171,29 +206,73 @@ impl SfuForwarder {
     ///   routing table before calling here).
     /// `rtcp_buf` — the raw compound RTCP datagram.
     ///
-    /// Enqueued requests are drained via [`Self::poll_keyframe_requests`].
-    pub fn on_subscriber_rtcp(
+    /// Enqueued keyframe requests (from PLI/FIR *and* from any layer switch
+    /// this call decides) are drained via [`Self::poll_keyframe_requests`].
+    pub fn on_subscriber_rtcp(&self, subscriber: ParticipantId, pub_mid: &str, rtcp_buf: &[u8]) {
+        self.on_subscriber_rtcp_at(subscriber, pub_mid, rtcp_buf, Instant::now(), self.now_ms());
+    }
+
+    /// Time-injected body of [`Self::on_subscriber_rtcp`] (`now` drives the
+    /// keyframe coalesce gate, `now_ms` the deterministic BWE domain).
+    fn on_subscriber_rtcp_at(
         &self,
-        _subscriber: ParticipantId,
+        subscriber: ParticipantId,
         pub_mid: &str,
         rtcp_buf: &[u8],
+        now: Instant,
+        now_ms: u64,
     ) {
-        let now = Instant::now();
-        let feedbacks = parse_keyframe_requests(rtcp_buf);
-        if feedbacks.is_empty() {
+        let keyframe_fbs = parse_keyframe_requests(rtcp_buf);
+        let bandwidth_fbs = parse_bandwidth_feedback(rtcp_buf);
+        if keyframe_fbs.is_empty() && bandwidth_fbs.is_empty() {
             return;
         }
         let mut g = self.inner.lock();
-        let Some(&publisher) = g.pub_owners.get(pub_mid) else {
-            return;
-        };
-        for fb in feedbacks {
-            if fb.is_fir() {
-                g.keyframe_gate.on_subscriber_fir(publisher, pub_mid, now);
-            } else {
-                g.keyframe_gate.on_subscriber_pli(publisher, pub_mid, now);
+        if let Some(&publisher) = g.pub_owners.get(pub_mid) {
+            for fb in keyframe_fbs {
+                if fb.is_fir() {
+                    g.keyframe_gate.on_subscriber_fir(publisher, pub_mid, now);
+                } else {
+                    g.keyframe_gate.on_subscriber_pli(publisher, pub_mid, now);
+                }
             }
         }
+        if bandwidth_fbs.is_empty() {
+            return;
+        }
+        let est = g.bwe.entry(subscriber).or_default();
+        for fb in &bandwidth_fbs {
+            match fb {
+                BandwidthFeedback::Remb(r) => est.on_remb(r.bitrate_bps, now_ms),
+                BandwidthFeedback::Twcc(t) => {
+                    let s = t.summary();
+                    est.on_twcc(s.received, s.lost, s.delay_trend_us, now_ms);
+                }
+            }
+        }
+        g.adapt_subscriber(subscriber, pub_mid, now, now_ms);
+    }
+
+    /// The subscriber's current bandwidth estimate (bps), once any REMB/TWCC
+    /// feedback has been received from them.
+    #[must_use]
+    pub fn subscriber_estimate_bps(&self, subscriber: ParticipantId) -> Option<u64> {
+        self.inner
+            .lock()
+            .bwe
+            .get(&subscriber)
+            .map(BandwidthEstimator::estimate_bps)
+    }
+
+    /// The measured EWMA throughput (bps) of one simulcast layer, once at
+    /// least one measurement window has completed.
+    #[must_use]
+    pub fn layer_rate_bps(&self, pub_mid: &str, rid: Rid) -> Option<u64> {
+        self.inner
+            .lock()
+            .layer_rates
+            .get(&(pub_mid.to_owned(), rid))
+            .and_then(ThroughputEwma::rate_bps)
     }
 
     /// Drain all pending keyframe requests accumulated since the last call.
@@ -229,15 +308,38 @@ impl SfuForwarder {
     /// nobody subscribes, or if subscribers haven't negotiated their outbound
     /// stream yet). Peers whose write reports "no such outbound stream" are
     /// skipped — that's normal before a subscriber finishes negotiation.
-    pub fn on_rtp(&self, _publisher: ParticipantId, rtp: &InboundRtp) -> usize {
+    pub fn on_rtp(&self, publisher: ParticipantId, rtp: &InboundRtp) -> usize {
+        self.on_rtp_at(publisher, rtp, Instant::now(), self.now_ms())
+    }
+
+    /// Time-injected body of [`Self::on_rtp`].
+    fn on_rtp_at(
+        &self,
+        _publisher: ParticipantId,
+        rtp: &InboundRtp,
+        now: Instant,
+        now_ms: u64,
+    ) -> usize {
         let pub_mid = rtp.mid.to_string();
         let mut g = self.inner.lock();
+
+        // Per-layer throughput measurement runs before the subscriber loop
+        // (and before the empty-targets early return) so rates exist by the
+        // time the first subscriber's bandwidth feedback consults them.
+        if let Some(rid) = rtp.rid {
+            g.layer_rates
+                .entry((pub_mid.clone(), rid))
+                .or_default()
+                .on_bytes(rtp.payload.len(), now_ms);
+        }
+
         let ForwardState {
             peers,
             table,
             layer_table,
             keyframe_gate,
             pub_owners,
+            ..
         } = &mut *g;
 
         // Snapshot targets first (cheap clone of small Vec) so we can borrow the
@@ -261,7 +363,7 @@ impl SfuForwarder {
                     Some(ForwardDecision::RequestKeyframe) => {
                         // Enqueue a coalesced keyframe request to the publisher.
                         if let Some(&publisher) = pub_owners.get(&pub_mid) {
-                            keyframe_gate.on_layer_switch(publisher, &pub_mid, Instant::now());
+                            keyframe_gate.on_layer_switch(publisher, &pub_mid, now);
                         }
                         continue; // drop this packet for this subscriber
                     }
@@ -311,6 +413,92 @@ impl SfuForwarder {
     #[must_use]
     pub fn peer_count(&self) -> usize {
         self.inner.lock().peers.len()
+    }
+}
+
+impl ForwardState {
+    /// Re-evaluate the bandwidth-driven simulcast layer choice for one
+    /// subscriber after fresh REMB/TWCC feedback.
+    ///
+    /// Builds one candidate per distinct [`LayerKind`] (low→high) — each
+    /// represented by the concrete layer
+    /// [`LayerSet::select`](crate::simulcast::LayerSet::select) would resolve
+    /// that kind to — paired with that layer's measured throughput, then asks
+    /// the subscriber's [`LayerSwitchPolicy`] whether to move. A positive
+    /// decision goes through the existing keyframe-gated
+    /// [`LayerSelectorTable::select_layer`] mechanics and enqueues a coalesced
+    /// keyframe request toward the publisher.
+    fn adapt_subscriber(
+        &mut self,
+        subscriber: ParticipantId,
+        pub_mid: &str,
+        now: Instant,
+        now_ms: u64,
+    ) {
+        let Some(estimate_bps) = self
+            .bwe
+            .get(&subscriber)
+            .map(BandwidthEstimator::estimate_bps)
+        else {
+            return;
+        };
+        let Some(layer_set) = self.layer_table.layer_set(pub_mid) else {
+            return; // non-simulcast track (or publisher not registered yet)
+        };
+        if layer_set.is_empty() {
+            return;
+        }
+
+        // (kind, measured rate) low→high; one entry per distinct kind, keeping
+        // the highest temporal sub-layer (what `select(kind)` resolves to).
+        let mut rates: Vec<(LayerKind, Option<u64>)> = Vec::new();
+        for layer in layer_set.layers() {
+            if rates.last().is_some_and(|(k, _)| *k == layer.kind) {
+                rates.pop();
+            }
+            let rate = self
+                .layer_rates
+                .get(&(pub_mid.to_owned(), layer.rid))
+                .and_then(ThroughputEwma::rate_bps);
+            rates.push((layer.kind, rate));
+        }
+
+        // The layer the subscriber is on (or already heading to mid-switch).
+        let current = self
+            .layer_table
+            .current_rid(subscriber, pub_mid)
+            .and_then(|rid| {
+                layer_set
+                    .layers()
+                    .iter()
+                    .find(|l| l.rid == rid)
+                    .map(|l| l.kind)
+            });
+
+        let policy = self
+            .adapt
+            .entry((subscriber, pub_mid.to_owned()))
+            .or_default();
+        let Some(target) = policy.decide(current, estimate_bps, &rates, now_ms) else {
+            return;
+        };
+
+        if self
+            .layer_table
+            .select_layer(subscriber, pub_mid, target)
+            .is_some()
+        {
+            trace!(
+                %subscriber,
+                pub_mid,
+                ?target,
+                estimate_bps,
+                "bandwidth-driven simulcast layer switch"
+            );
+            if let Some(&publisher) = self.pub_owners.get(pub_mid) {
+                self.keyframe_gate.on_layer_switch(publisher, pub_mid, now);
+            }
+        }
     }
 }
 
@@ -919,5 +1107,234 @@ mod tests {
             crate::simulcast::ForwardDecision::SwitchAndForward,
             "IDR must commit switch"
         );
+    }
+
+    // ── Bandwidth feedback → estimator → adaptive layer switching ─────────────
+
+    use std::time::Duration;
+
+    /// Build a TWCC feedback packet reporting `received` packets with flat
+    /// 1 ms deltas followed by `lost` packets, using run-length chunks.
+    fn twcc_buf(received: u16, lost: u16) -> Vec<u8> {
+        assert!(received <= 0x1FFF && lost <= 0x1FFF, "run-length chunk limit");
+        let mut body = Vec::new();
+        body.extend_from_slice(&1u32.to_be_bytes()); // sender ssrc
+        body.extend_from_slice(&2u32.to_be_bytes()); // media ssrc
+        body.extend_from_slice(&0u16.to_be_bytes()); // base seq
+        body.extend_from_slice(&(received + lost).to_be_bytes());
+        body.extend_from_slice(&[0, 0, 0]); // reference time
+        body.push(0); // fb pkt count
+        if received > 0 {
+            body.extend_from_slice(&(0x2000 | received).to_be_bytes()); // S=1 run
+        }
+        if lost > 0 {
+            body.extend_from_slice(&lost.to_be_bytes()); // S=0 run
+        }
+        // One delta per received packet: 4 × 250 µs = 1 ms, flat trend.
+        body.resize(body.len() + usize::from(received), 4);
+        while (body.len() + 4) % 4 != 0 {
+            body.push(0);
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        let words_less_one = ((body.len() + 4) / 4 - 1) as u16;
+        let mut pkt = vec![0x8F, 0xCD];
+        pkt.extend_from_slice(&words_less_one.to_be_bytes());
+        pkt.extend_from_slice(&body);
+        pkt
+    }
+
+    /// Set up a forwarder with a low/high simulcast publisher and one
+    /// subscriber, drained of the subscription keyframe request.
+    fn bwe_fixture() -> (SfuForwarder, ParticipantId, ParticipantId) {
+        use crate::simulcast::SimulcastLayer;
+        let fwd = SfuForwarder::new(SfuRouter::new());
+        let pubr = ParticipantId::new();
+        let sub = ParticipantId::new();
+        let layers = LayerSet::from_layers(vec![
+            SimulcastLayer::spatial(Rid::from("low"), LayerKind::Low),
+            SimulcastLayer::spatial(Rid::from("high"), LayerKind::High),
+        ]);
+        fwd.register_publisher_layers("v0", pubr, layers);
+        fwd.add_peer(SfuPeer::new(CallId::new(), sub));
+        fwd.subscribe("v0", sub, "v0");
+        let _ = fwd.poll_keyframe_requests();
+        (fwd, pubr, sub)
+    }
+
+    /// Feed RTP on `rid` every 10 ms over `[from_ms, to_ms)` with payloads
+    /// sized to produce `bps` measured throughput.
+    fn feed_layer(fwd: &SfuForwarder, pubr: ParticipantId, rid: &str, bps: u64, from_ms: u64, to_ms: u64) {
+        let bytes_per_pkt = usize::try_from(bps / 8 / 100).expect("fits");
+        let mut seq = u64::from(u32::from_be_bytes([rid.as_bytes()[0], 0, 0, 0])); // distinct seq spaces
+        for t in (from_ms..to_ms).step_by(10) {
+            let mut rtp = inbound_simulcast("v0", seq, 0, rid, false);
+            rtp.payload = vec![0u8; bytes_per_pkt];
+            fwd.on_rtp_at(pubr, &rtp, Instant::now(), t);
+            seq += 1;
+        }
+    }
+
+    #[test]
+    fn remb_feedback_updates_subscriber_estimate() {
+        let (fwd, _pubr, sub) = bwe_fixture();
+        assert_eq!(fwd.subscriber_estimate_bps(sub), None, "no feedback yet");
+        let remb = crate::rtcp_fb::encode_remb(1, 300_000, &[2]);
+        fwd.on_subscriber_rtcp_at(sub, "v0", &remb, Instant::now(), 0);
+        // AIMD starts at 600k; the 300k REMB clamps the estimate.
+        assert_eq!(fwd.subscriber_estimate_bps(sub), Some(300_000));
+    }
+
+    #[test]
+    fn twcc_loss_backs_off_subscriber_estimate() {
+        let (fwd, _pubr, sub) = bwe_fixture();
+        // 50% loss → multiplicative decrease from the 600k initial value.
+        fwd.on_subscriber_rtcp_at(sub, "v0", &twcc_buf(10, 10), Instant::now(), 0);
+        assert_eq!(fwd.subscriber_estimate_bps(sub), Some(510_000), "600k × 0.85");
+    }
+
+    #[test]
+    fn forwarded_rtp_measures_per_layer_throughput() {
+        let (fwd, pubr, _sub) = bwe_fixture();
+        assert_eq!(fwd.layer_rate_bps("v0", Rid::from("high")), None);
+        feed_layer(&fwd, pubr, "high", 2_000_000, 0, 1_000);
+        feed_layer(&fwd, pubr, "low", 200_000, 0, 1_000);
+        let high = fwd.layer_rate_bps("v0", Rid::from("high")).expect("measured");
+        let low = fwd.layer_rate_bps("v0", Rid::from("low")).expect("measured");
+        assert!((1_800_000..=2_200_000).contains(&high), "≈2 Mbps, got {high}");
+        assert!((180_000..=220_000).contains(&low), "≈200 kbps, got {low}");
+    }
+
+    #[test]
+    fn low_remb_triggers_immediate_down_switch() {
+        let (fwd, pubr, sub) = bwe_fixture();
+        // Bootstrap the subscriber on "high" (first packet wins), then measure
+        // both layers: high ≈ 2 Mbps, low ≈ 200 kbps.
+        feed_layer(&fwd, pubr, "high", 2_000_000, 0, 1_000);
+        feed_layer(&fwd, pubr, "low", 200_000, 0, 1_000);
+        {
+            let g = fwd.inner.lock();
+            let sel = g.layer_table.selector_for(sub, "v0").expect("selector");
+            assert_eq!(sel.active_rid(), Some(Rid::from("high")));
+        }
+
+        // Receiver reports only 300 kbps → budget 255k → only "low" fits.
+        // `now` is pushed 10 s out so the keyframe coalesce window (opened by
+        // the subscribe() request) cannot suppress the switch request.
+        let remb = crate::rtcp_fb::encode_remb(1, 300_000, &[2]);
+        let later = Instant::now() + Duration::from_secs(10);
+        fwd.on_subscriber_rtcp_at(sub, "v0", &remb, later, 2_000);
+
+        let g = fwd.inner.lock();
+        let sel = g.layer_table.selector_for(sub, "v0").expect("selector");
+        assert_eq!(
+            sel.pending_rid(),
+            Some(Rid::from("low")),
+            "congestion must trigger an immediate keyframe-gated down-switch"
+        );
+        drop(g);
+        let reqs = fwd.poll_keyframe_requests();
+        assert_eq!(reqs.len(), 1, "down-switch must request a keyframe");
+        assert_eq!(reqs[0].publisher, pubr);
+        assert_eq!(reqs[0].pub_mid, "v0");
+    }
+
+    #[test]
+    fn up_switch_waits_for_stable_headroom_then_fires() {
+        let (fwd, pubr, sub) = bwe_fixture();
+        // Bootstrap on "low"; measure low ≈ 200 kbps and high ≈ 400 kbps so the
+        // initial 600k estimate (budget 510k) already affords "high".
+        feed_layer(&fwd, pubr, "low", 200_000, 0, 1_000);
+        feed_layer(&fwd, pubr, "high", 400_000, 0, 1_000);
+        let later = Instant::now() + Duration::from_secs(10);
+
+        // Clean TWCC at t=2s: headroom noticed, but not stable yet → no switch.
+        fwd.on_subscriber_rtcp_at(sub, "v0", &twcc_buf(20, 0), later, 2_000);
+        fwd.on_subscriber_rtcp_at(sub, "v0", &twcc_buf(20, 0), later, 3_000);
+        {
+            let g = fwd.inner.lock();
+            let sel = g.layer_table.selector_for(sub, "v0").expect("selector");
+            assert_eq!(sel.pending_rid(), None, "up-switch must wait ~2 s");
+            assert_eq!(sel.active_rid(), Some(Rid::from("low")));
+        }
+
+        // 2 s of stable headroom → the up-switch fires (keyframe-gated).
+        fwd.on_subscriber_rtcp_at(sub, "v0", &twcc_buf(20, 0), later, 4_000);
+        {
+            let g = fwd.inner.lock();
+            let sel = g.layer_table.selector_for(sub, "v0").expect("selector");
+            assert_eq!(sel.pending_rid(), Some(Rid::from("high")));
+        }
+        let reqs = fwd.poll_keyframe_requests();
+        assert_eq!(reqs.len(), 1, "up-switch must request a keyframe");
+        assert_eq!(reqs[0].publisher, pubr);
+
+        // The switch itself still commits only on a target-layer keyframe.
+        let mut kf = inbound_simulcast("v0", 999_999, 0, "high", true);
+        kf.payload = vec![0u8; 100];
+        fwd.on_rtp_at(pubr, &kf, Instant::now(), 5_000);
+        let g = fwd.inner.lock();
+        let sel = g.layer_table.selector_for(sub, "v0").expect("selector");
+        assert_eq!(sel.active_rid(), Some(Rid::from("high")));
+        assert_eq!(sel.pending_rid(), None);
+    }
+
+    #[test]
+    fn unmeasured_high_layer_blocks_up_switch() {
+        let (fwd, pubr, sub) = bwe_fixture();
+        // Only "low" ever carried traffic — "high" has no measured rate.
+        feed_layer(&fwd, pubr, "low", 200_000, 0, 1_000);
+        let later = Instant::now() + Duration::from_secs(10);
+        for t in [2_000u64, 3_000, 4_000, 10_000] {
+            fwd.on_subscriber_rtcp_at(sub, "v0", &twcc_buf(20, 0), later, t);
+        }
+        let g = fwd.inner.lock();
+        let sel = g.layer_table.selector_for(sub, "v0").expect("selector");
+        assert_eq!(
+            sel.pending_rid(),
+            None,
+            "cannot verify an unmeasured layer fits → no up-switch"
+        );
+    }
+
+    #[test]
+    fn bandwidth_feedback_without_layers_only_updates_estimator() {
+        // No register_publisher_layers for this mid: estimator updates, no
+        // adaptation (and no panic).
+        let fwd = SfuForwarder::new(SfuRouter::new());
+        let sub = ParticipantId::new();
+        let remb = crate::rtcp_fb::encode_remb(1, 250_000, &[2]);
+        fwd.on_subscriber_rtcp_at(sub, "v9", &remb, Instant::now(), 0);
+        assert_eq!(fwd.subscriber_estimate_bps(sub), Some(250_000));
+        assert!(fwd.poll_keyframe_requests().is_empty());
+    }
+
+    #[test]
+    fn remove_peer_clears_bwe_state() {
+        let (fwd, _pubr, sub) = bwe_fixture();
+        let remb = crate::rtcp_fb::encode_remb(1, 300_000, &[2]);
+        fwd.on_subscriber_rtcp_at(sub, "v0", &remb, Instant::now(), 0);
+        assert!(fwd.subscriber_estimate_bps(sub).is_some());
+        fwd.remove_peer(sub);
+        assert_eq!(fwd.subscriber_estimate_bps(sub), None);
+        let g = fwd.inner.lock();
+        assert!(g.adapt.is_empty(), "hysteresis state must be dropped too");
+    }
+
+    #[test]
+    fn compound_rtcp_serves_both_keyframe_and_bandwidth_paths() {
+        use crate::rtcp_feedback::encode_pli;
+        let (fwd, pubr, sub) = bwe_fixture();
+        let mut buf = vec![0u8; 12];
+        encode_pli(1u32.into(), 2u32.into(), &mut buf);
+        buf.extend_from_slice(&crate::rtcp_fb::encode_remb(1, 300_000, &[2]));
+
+        let later = Instant::now() + Duration::from_secs(10);
+        fwd.on_subscriber_rtcp_at(sub, "v0", &buf, later, 0);
+
+        // PLI → upstream keyframe request; REMB → estimator update.
+        let reqs = fwd.poll_keyframe_requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].publisher, pubr);
+        assert_eq!(fwd.subscriber_estimate_bps(sub), Some(300_000));
     }
 }

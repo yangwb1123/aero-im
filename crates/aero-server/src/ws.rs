@@ -374,6 +374,11 @@ async fn handle_text(
             // re-checks room membership (a distinct, retained check); this adds the
             // workspace-membership dimension. Maps to the WS `error` frame on denial.
             state.im.assert_room_access(pid, room_id).await?;
+            // Tenant fairness (ROADMAP3 方向五): sends are the highest-volume
+            // write path, so they are charged against the room's workspace
+            // budget — after the access check (so non-members cannot drain a
+            // victim's budget), surfacing as a WS `error` frame when over.
+            crate::ws_rate::check_ws_rate_room(state, room_id).await?;
             state.im.send_message(pid, room_id, blocks, reply_to).await?;
         }
         ClientFrame::EditMessage { id, blocks } => {
@@ -646,11 +651,30 @@ async fn handle_text(
             let since_cursor = since.as_deref().and_then(|c| Ulid::from_string(c.trim()).ok());
             let replay_limit = if since_cursor.is_some() { 200 } else { 30 };
             if let Ok(lines) = state.live.recent_chat_since(stream_id, since_cursor, replay_limit).await {
+                let replayed = lines.len();
+                let last_id = lines.last().map(|l| l.id);
                 for line in lines {
                     let frame = ServerFrame::StreamEvent { event: StreamEvent::Chat(line) };
                     let _ = tx.try_send(Message::Text(
                         serde_json::to_string(&frame).unwrap_or_default(),
                     ));
+                }
+                // Truncation signal (ROADMAP 第三版 方向一), cursor catch-up
+                // only (the no-cursor tail is deliberately bounded context, not
+                // a complete replay): a capped catch-up tells the client to
+                // continue via REST `GET /api/streams/:id/chat?since=`.
+                if since_cursor.is_some() {
+                    if let Some(next_since) =
+                        truncation_cursor(replayed, replay_limit, last_id)
+                    {
+                        let frame = serde_json::json!({
+                            "type": "backfill",
+                            "stream_id": stream_id,
+                            "truncated": true,
+                            "next_since": next_since,
+                        });
+                        let _ = tx.try_send(Message::Text(frame.to_string()));
+                    }
                 }
             }
             // Also replay a small recent-gift tail so a late joiner has gift
@@ -713,6 +737,23 @@ const BACKFILL_PER_ROOM_LIMIT: i64 = 200;
 #[must_use]
 fn parse_resume_cursor(raw: Option<&str>) -> Option<MessageId> {
     raw.and_then(|s| MessageId::from_str(s.trim()).ok())
+}
+
+/// Truncation decision for a capped replay (ROADMAP 第三版 方向一): when a
+/// replay returned exactly `limit` rows it may have been cut short, so the
+/// client must be told to continue via the REST `?since=` route from the last
+/// replayed id. Returns that continuation cursor, or `None` when the replay
+/// fit under the cap (or replayed nothing). A full-but-complete page yields one
+/// harmless extra REST round-trip that returns empty — never a missed message.
+/// Pure + total, so it unit-tests without any I/O.
+#[must_use]
+fn truncation_cursor<T: Copy>(replayed: usize, limit: i64, last: Option<T>) -> Option<T> {
+    let replayed = i64::try_from(replayed).unwrap_or(i64::MAX);
+    if replayed >= limit {
+        last
+    } else {
+        None
+    }
 }
 
 /// Pick the authoritative cluster-wide count from the Redis result, falling back
@@ -794,6 +835,8 @@ async fn backfill_since(
                 continue;
             }
         };
+        let room_count = missed.len();
+        let last_id = missed.last().map(|m| m.id);
         for message in missed {
             let frame = ServerFrame::Message { message };
             let json = serde_json::to_string(&frame).unwrap_or_default();
@@ -808,6 +851,28 @@ async fn backfill_since(
                 }
             }
             replayed += 1;
+        }
+        // Truncation signal (ROADMAP 第三版 方向一): a replay that hit the
+        // per-room cap may have left newer messages behind. Tell the client
+        // explicitly so it continues via REST
+        // `GET /api/rooms/:id/messages?since=<next_since>` instead of silently
+        // missing the remainder.
+        if let Some(next_since) = truncation_cursor(room_count, BACKFILL_PER_ROOM_LIMIT, last_id) {
+            let frame = serde_json::json!({
+                "type": "backfill",
+                "room_id": room,
+                "truncated": true,
+                "next_since": next_since,
+            });
+            tokio::select! {
+                biased;
+                () = close.cancelled() => return,
+                res = tx.send(Message::Text(frame.to_string())) => {
+                    if res.is_err() {
+                        return; // receiver gone
+                    }
+                }
+            }
         }
     }
     if replayed > 0 {
@@ -826,8 +891,17 @@ pub async fn run_bus_listener(state: AppState) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("subscribe: {e}"))?;
     info!("bus listener started");
     while let Some(sub) = stream.next().await {
-        match serde_json::from_slice::<RoomEvent>(sub.payload()) {
-            Ok(event) => {
+        // Parse the raw JSON first so the publish-time `"seq"` stamp (ROADMAP
+        // 第三版 方向一) can be lifted off the payload — `RoomEvent`'s serde
+        // deserialization ignores the unknown key, so the stamp must be read
+        // before the typed decode. Legacy unstamped payloads yield `None`.
+        let parsed: serde_json::Result<(RoomEvent, Option<u64>)> =
+            serde_json::from_slice::<serde_json::Value>(sub.payload()).and_then(|value| {
+                let seq = aero_bus::extract_seq(&value);
+                Ok((serde_json::from_value::<RoomEvent>(value)?, seq))
+            });
+        match parsed {
+            Ok((event, seq)) => {
                 let room = event.room_id();
                 let recipients = match event.explicit_recipients() {
                     list if !list.is_empty() => list,
@@ -847,7 +921,7 @@ pub async fn run_bus_listener(state: AppState) -> anyhow::Result<()> {
                 if matches!(event, RoomEvent::Message(_)) {
                     metrics::inc_counter(names::MESSAGES_SENT_TOTAL, 1);
                 }
-                let frame = room_event_to_frame_json(&event);
+                let frame = room_event_to_frame_json(&event, seq);
                 state.hub.fan_out_raw(&recipients, &frame);
                 let _ = sub.ack().await;
             }
@@ -890,7 +964,7 @@ fn same_lang(a: &str, b: &str) -> bool {
 mod tests {
     use super::{
         authoritative_count, backfill_room_ids, parse_resume_cursor, same_lang,
-        BACKFILL_PER_ROOM_LIMIT, ClientFrame,
+        stamped_frame_json, truncation_cursor, BACKFILL_PER_ROOM_LIMIT, ClientFrame, ServerFrame,
     };
     use aero_common::{MessageId, ParticipantId, Room, RoomId, RoomKind};
     use ulid::Ulid;
@@ -985,6 +1059,40 @@ mod tests {
         // the backfill path keys on a time-sortable MessageId/Ulid).
         let _ = Ulid::new();
     }
+
+    #[test]
+    fn truncation_cursor_fires_only_when_replay_hits_the_cap() {
+        let last = MessageId::new();
+        // Under the cap (including zero rows): complete replay, no signal.
+        assert_eq!(truncation_cursor(0, 200, Some(last)), None);
+        assert_eq!(truncation_cursor(199, 200, Some(last)), None);
+        // Exactly at the cap: possibly cut short → continue from the last id.
+        assert_eq!(truncation_cursor(200, 200, Some(last)), Some(last));
+        // Defensive: above the cap still signals (storage clamps, but a future
+        // limit change must fail safe toward "tell the client to continue").
+        assert_eq!(truncation_cursor(201, 200, Some(last)), Some(last));
+        // No last id (empty replay) can never produce a cursor.
+        assert_eq!(truncation_cursor::<MessageId>(200, 200, None), None);
+    }
+
+    #[test]
+    fn stamped_frame_carries_optional_top_level_seq() {
+        let frame = ServerFrame::Typing {
+            room_id: RoomId::new(),
+            participant: ParticipantId::new(),
+            on: true,
+        };
+        // With a seq: stamped as a top-level key next to `type`.
+        let with: serde_json::Value =
+            serde_json::from_str(&stamped_frame_json(&frame, Some(9))).expect("valid json");
+        assert_eq!(with.get("type").and_then(|v| v.as_str()), Some("typing"));
+        assert_eq!(with.get("seq").and_then(serde_json::Value::as_u64), Some(9));
+        // Without: byte-shape identical to the legacy frame (no `seq` key), so
+        // unstamped events pass through unchanged.
+        let without: serde_json::Value =
+            serde_json::from_str(&stamped_frame_json(&frame, None)).expect("valid json");
+        assert!(without.get("seq").is_none());
+    }
 }
 
 /// Background loop that subscribes to `live.stream.*` and pushes each
@@ -1001,12 +1109,19 @@ pub async fn run_live_bus_listener(state: AppState) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("subscribe live: {e}"))?;
     info!("live bus listener started");
     while let Some(sub) = stream.next().await {
-        match serde_json::from_slice::<StreamEvent>(sub.payload()) {
-            Ok(event) => {
+        // Same two-phase decode as `run_bus_listener`: lift the publish-time
+        // `"seq"` stamp off the raw JSON before the typed decode drops it.
+        let parsed: serde_json::Result<(StreamEvent, Option<u64>)> =
+            serde_json::from_slice::<serde_json::Value>(sub.payload()).and_then(|value| {
+                let seq = aero_bus::extract_seq(&value);
+                Ok((serde_json::from_value::<StreamEvent>(value)?, seq))
+            });
+        match parsed {
+            Ok((event, seq)) => {
                 let watchers = state.hub.stream_watchers(event.stream_id());
                 if !watchers.is_empty() {
                     let frame = ServerFrame::StreamEvent { event };
-                    let json = serde_json::to_string(&frame).unwrap_or_default();
+                    let json = stamped_frame_json(&frame, seq);
                     state.hub.fan_out_raw(&watchers, &json);
                 }
                 let _ = sub.ack().await;
@@ -1020,8 +1135,23 @@ pub async fn run_live_bus_listener(state: AppState) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Translate a `RoomEvent` into the JSON wire frame the browser expects.
-fn room_event_to_frame_json(event: &RoomEvent) -> String {
+/// Serialize a server frame, carrying `seq` through as an optional top-level
+/// key (omitted when `None`, so legacy events/clients are byte-identical to
+/// before). The seq lets the browser dedup at-least-once redeliveries and
+/// order events that carry no id of their own (ROADMAP 第三版 方向一).
+fn stamped_frame_json(frame: &ServerFrame<'_>, seq: Option<u64>) -> String {
+    match serde_json::to_value(frame) {
+        Ok(mut value) => {
+            aero_bus::stamp_seq(&mut value, seq);
+            value.to_string()
+        }
+        Err(_) => "{\"type\":\"error\",\"code\":\"serialize\",\"msg\":\"\"}".into(),
+    }
+}
+
+/// Translate a `RoomEvent` into the JSON wire frame the browser expects,
+/// carrying the bus payload's `seq` stamp (if any) onto the frame.
+fn room_event_to_frame_json(event: &RoomEvent, seq: Option<u64>) -> String {
     let frame: ServerFrame<'_> = match event.clone() {
         RoomEvent::Message(env) => ServerFrame::Message { message: env.message },
         RoomEvent::Edited(m) => ServerFrame::Edited { message: m },
@@ -1049,6 +1179,5 @@ fn room_event_to_frame_json(event: &RoomEvent) -> String {
         RoomEvent::Call(call) => ServerFrame::Call { event: call },
         RoomEvent::Poll { room_id, poll_id, op } => ServerFrame::Poll { room_id, poll_id, op },
     };
-    serde_json::to_string(&frame)
-        .unwrap_or_else(|_| "{\"type\":\"error\",\"code\":\"serialize\",\"msg\":\"\"}".into())
+    stamped_frame_json(&frame, seq)
 }

@@ -23,14 +23,15 @@ use aero_server::{
     routes,
     state::AppState,
     ws,
+    ws_rate::WsRateEnforcer,
 };
 use aero_storage::{
     connect_pg, migrate, AiContextStore, AiJobRepo, AuditRepo, BlobRepo, CallRepo, CallRosterStore,
     KeyPackageRepo, LiveRepo, MessageRepo, MlsGroupRepo, NotificationPrefsRepo,
     NotificationRepo, DeactivationRepo, KeywordAlertRepo, MessageEditRepo, ParticipantRepo, PatRepo,
     PinRepo, TotpRepo, PresenceStore, ReactionRepo, ReceiptRepo, RecurringMessageRepo, RedisCache,
-    RoomRepo, StreamRepo, StreamRouteRegistry, StreamViewerStore, ThreadSubscriptionRepo,
-    UserGroupRepo, WorkspaceRepo,
+    RoomRepo, SeqStore, StreamRepo, StreamRouteRegistry, StreamViewerStore,
+    ThreadSubscriptionRepo, UserGroupRepo, WorkspaceRepo, WsRateStore,
 };
 use tokio_util::sync::CancellationToken;
 use anyhow::Context;
@@ -100,6 +101,11 @@ async fn main() -> anyhow::Result<()> {
     let stream_viewers = StreamViewerStore::new(cache.client().clone());
     let call_roster = CallRosterStore::new(cache.client().clone());
     let stream_routes = StreamRouteRegistry::new(cache.client().clone());
+    // Cluster-wide event sequencer (ROADMAP 第三版 方向一): one Redis INCR
+    // counter per NATS subject so every node stamps RoomEvent/StreamEvent
+    // publishes from the same per-room/per-stream sequence (clients dedup and
+    // order on it). Wired into ImService + LiveService below via `with_seq`.
+    let seq_store = Arc::new(SeqStore::new(cache.client().clone()));
 
     // ---------- Blob storage ----------
     // ROADMAP 方向一/方向五: pick the backend from AERO_BLOB_BACKEND. Fail LOUD —
@@ -170,7 +176,9 @@ async fn main() -> anyhow::Result<()> {
         // Wave 14: workspace deactivation gate in assert_room_access.
         .with_deactivations(DeactivationRepo::new(pg.clone()))
         // Wave 24: workspace-wide 2FA enforcement gate in assert_room_access.
-        .with_totp(TotpRepo::new(pg.clone())),
+        .with_totp(TotpRepo::new(pg.clone()))
+        // ROADMAP 第三版 方向一: cluster-correct publish-time event-seq stamp.
+        .with_seq(seq_store.clone()),
     );
 
     // ---------- Live service (danmaku / gifts / viewers) ----------
@@ -179,7 +187,9 @@ async fn main() -> anyhow::Result<()> {
         live_repo,
         participants.clone(),
         bus_dyn.clone(),
-    );
+    )
+    // Same Redis-backed sequencer for `live.stream.{id}` StreamEvent publishes.
+    .with_seq(seq_store);
 
     // ---------- AI service ----------
     // The AiService is always constructed — it falls back to a deterministic local
@@ -296,6 +306,10 @@ async fn main() -> anyhow::Result<()> {
         // forgot-password — fractional refill rates the integer config can't express.
         login_rate_limiter: RateLimiter::with_rate(5.0 / 60.0, 5.0),
         forgot_rate_limiter: RateLimiter::with_rate(3.0 / 3600.0, 3.0),
+        // Per-WORKSPACE ceiling (ROADMAP3 方向五 — 租户公平): cluster-wide Redis
+        // window counter on the shared cache client; tier limits from
+        // AERO_WS_RATE_{STANDARD,PREMIUM}_PER_MIN.
+        ws_rate: WsRateEnforcer::from_env(WsRateStore::new(cache.client().clone())),
         metrics: Arc::new(metrics_cfg.clone()),
         ai: Some(Arc::new(AiServiceAdapter::new(ai_service.clone()))),
         public_base_url,

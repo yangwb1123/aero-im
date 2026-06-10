@@ -102,7 +102,6 @@ async fn handle(
     }
 
     let messages: &MessageRepo = &state.messages;
-    let bus = state.bus.clone();
     let room_id = msg.room_id;
 
     // Append the preview cards to the message's existing blocks and persist. Use
@@ -113,20 +112,13 @@ async fn handle(
 
     match messages.edit(msg.id, new_blocks).await {
         Ok(Some(updated)) => {
-            let event = RoomEvent::Edited(updated);
-            let bytes = match serde_json::to_vec(&event) {
-                Ok(b) => b,
-                Err(e) => {
-                    warn!(error = ?e, "serialize Edited failed");
-                    return Ok(());
-                }
-            };
-            let subject = format!("im.room.{room_id}");
-            if let Err(e) = bus.publish(&subject, bytes.into()).await {
-                warn!(error = ?e, %subject, "publish Edited failed");
-            } else {
-                info!(message_id = %msg.id, "link preview(s) attached");
-            }
+            // Through the stamped seam (ROADMAP3 方向一) so this Edited carries
+            // a `seq` like every hot-path publish; best-effort like before.
+            state
+                .im
+                .broadcast_room_event(room_id, RoomEvent::Edited(updated))
+                .await;
+            info!(message_id = %msg.id, "link preview(s) attached");
         }
         Ok(None) => debug!(message_id = %msg.id, "message missing/deleted during unfurl edit"),
         Err(e) => warn!(error = ?e, message_id = %msg.id, "unfurl edit failed"),

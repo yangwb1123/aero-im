@@ -105,9 +105,11 @@ export const api = {
       body: { participant_id: participantId },
     });
   },
-  listMessages(roomId, { before, limit = 100 } = {}) {
+  // `before` pages backward (history); `since` pages forward (catch-up after a
+  // truncated WS backfill / resync — ROADMAP v3 方向一). Mutually exclusive.
+  listMessages(roomId, { before, since, limit = 100 } = {}) {
     return request('GET', `/api/rooms/${encodeURIComponent(roomId)}/messages`, {
-      query: { before, limit },
+      query: { before, since, limit },
     });
   },
   editMessage(id, blocks) {
@@ -167,8 +169,10 @@ export const api = {
   liveGifts() {
     return request('GET', '/api/live/gifts');
   },
-  streamChatList(id, limit = 50) {
-    return request('GET', `/api/streams/${encodeURIComponent(id)}/chat`, { query: { limit } });
+  // `since` is the forward catch-up cursor (last chat-line id rendered), used to
+  // continue a truncated WS danmaku replay (ROADMAP v3 方向一).
+  streamChatList(id, limit = 50, since = null) {
+    return request('GET', `/api/streams/${encodeURIComponent(id)}/chat`, { query: { limit, since } });
   },
   postStreamChat(id, body) {
     return request('POST', `/api/streams/${encodeURIComponent(id)}/chat`, { body: { body } });

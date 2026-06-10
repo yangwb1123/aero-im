@@ -21,6 +21,8 @@
 //! server consults these before persisting/pushing a notification. Purely
 //! additive: a NEW [`NotificationPrefsRepo`]; no existing repo is touched.
 
+use std::collections::{HashMap, HashSet};
+
 use aero_common::{ParticipantId, RoomId};
 use sqlx::PgPool;
 
@@ -73,6 +75,39 @@ pub fn is_snoozed(snooze_until: Option<time::OffsetDateTime>, now: time::OffsetD
 #[must_use]
 pub fn minute_of_day_utc(at: time::OffsetDateTime) -> i32 {
     i32::from(at.hour()) * 60 + i32::from(at.minute())
+}
+
+/// Whether a notification should be DELIVERED to a recipient given their
+/// (batch-fetched) preferences: NOT snoozed AND NOT suppressed by mute/DND.
+/// The pure composition of [`is_snoozed`] + [`should_suppress`] (over
+/// [`minute_of_day_utc`]) — it reuses those helpers rather than restating
+/// their rules, so fan-out paths that read prefs in bulk decide identically
+/// to the single-recipient path. Fail-open callers that could not load a
+/// recipient's prefs pass `false`/`None`/`None`, which always delivers.
+#[must_use]
+pub fn should_deliver(
+    is_muted: bool,
+    dnd: Option<(i32, i32)>,
+    snooze_until: Option<time::OffsetDateTime>,
+    now: time::OffsetDateTime,
+) -> bool {
+    !is_snoozed(snooze_until, now) && !should_suppress(is_muted, dnd, minute_of_day_utc(now))
+}
+
+/// One participant's `dnd_settings` row as returned by
+/// [`NotificationPrefsRepo::dnd_snooze_many`], decoded with the SAME semantics
+/// as the single-recipient reads: `dnd` is `Some((start, end))` only when both
+/// bounds are set (a partially-set window reads as unset, mirroring
+/// [`get_dnd`](NotificationPrefsRepo::get_dnd)), and `snooze_until` is the raw
+/// nullable instant (callers decide "still active" via [`is_snoozed`], mirroring
+/// [`get_snooze`](NotificationPrefsRepo::get_snooze)). `Default` is the
+/// no-row/no-prefs state: no DND, no snooze.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DndSnooze {
+    /// Daily DND window in minutes-of-day, `None` when unset.
+    pub dnd: Option<(i32, i32)>,
+    /// One-off snooze instant, `None` when unset.
+    pub snooze_until: Option<time::OffsetDateTime>,
 }
 
 #[derive(Clone)]
@@ -135,6 +170,35 @@ impl NotificationPrefsRepo {
         .fetch_one(&self.pool)
         .await?;
         Ok(row.0 > 0)
+    }
+
+    /// Which of `participants` have muted `room`, in ONE round-trip
+    /// (`participant_id = ANY($2)`), as a set for O(1) membership tests. The
+    /// batched counterpart of [`is_muted`](Self::is_muted) for notification
+    /// fan-out (ROADMAP 第三版 方向四 — a large-room `@everyone` previously did
+    /// one mute lookup per recipient). Empty input short-circuits to an empty
+    /// set without touching the database.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the query.
+    pub async fn muted_set(
+        &self,
+        room: RoomId,
+        participants: &[ParticipantId],
+    ) -> Result<HashSet<ParticipantId>, sqlx::Error> {
+        if participants.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let ids: Vec<uuid::Uuid> = participants.iter().map(ParticipantId::to_uuid).collect();
+        let rows = sqlx::query_as::<_, (uuid::Uuid,)>(
+            r"SELECT participant_id FROM channel_mutes
+               WHERE room_id = $1 AND participant_id = ANY($2)",
+        )
+        .bind(room.to_uuid())
+        .bind(&ids)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(p,)| ParticipantId::from_uuid(p)).collect())
     }
 
     /// All rooms `participant` has muted, newest mute first.
@@ -253,6 +317,44 @@ impl NotificationPrefsRepo {
         .await?;
         Ok(row.and_then(|(snooze,)| snooze))
     }
+
+    /// DND window + snooze for many participants in ONE round-trip
+    /// (`participant_id = ANY($1)`) — the batched counterpart of
+    /// [`get_dnd`](Self::get_dnd) + [`get_snooze`](Self::get_snooze) for
+    /// notification fan-out (ROADMAP 第三版 方向四). Participants with no
+    /// `dnd_settings` row are simply absent from the map (callers treat a miss
+    /// as [`DndSnooze::default`]: no DND, no snooze). Empty input
+    /// short-circuits to an empty map without touching the database.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the query.
+    pub async fn dnd_snooze_many(
+        &self,
+        participants: &[ParticipantId],
+    ) -> Result<HashMap<ParticipantId, DndSnooze>, sqlx::Error> {
+        type Row = (uuid::Uuid, Option<i32>, Option<i32>, Option<time::OffsetDateTime>);
+        if participants.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let ids: Vec<uuid::Uuid> = participants.iter().map(ParticipantId::to_uuid).collect();
+        let rows = sqlx::query_as::<_, Row>(
+            r"SELECT participant_id, start_minute, end_minute, snooze_until
+               FROM dnd_settings WHERE participant_id = ANY($1)",
+        )
+        .bind(&ids)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(p, start, end, snooze_until)| {
+                let dnd = match (start, end) {
+                    (Some(s), Some(e)) => Some((s, e)),
+                    _ => None,
+                };
+                (ParticipantId::from_uuid(p), DndSnooze { dnd, snooze_until })
+            })
+            .collect())
+    }
 }
 
 #[cfg(test)]
@@ -344,6 +446,59 @@ mod tests {
         // A snooze already in the past reads as inactive.
         let past = now - time::Duration::hours(1);
         assert!(!is_snoozed(Some(past), now), "elapsed snooze is inactive");
+    }
+
+    #[test]
+    fn should_deliver_composes_snooze_mute_and_dnd() {
+        // 12:00 UTC on a fixed date => now_minute = 720.
+        let now = time::OffsetDateTime::UNIX_EPOCH + time::Duration::hours(12);
+        let future = now + time::Duration::hours(1);
+        let past = now - time::Duration::hours(1);
+
+        // No prefs at all (the fail-open / no-row shape): always delivers.
+        assert!(should_deliver(false, None, None, now));
+
+        // Each suppressor alone blocks delivery.
+        assert!(!should_deliver(true, None, None, now), "muted");
+        assert!(!should_deliver(false, Some((600, 900)), None, now), "inside DND window");
+        assert!(!should_deliver(false, None, Some(future), now), "active snooze");
+
+        // Inactive variants of each do NOT block.
+        assert!(should_deliver(false, Some((900, 1020)), None, now), "outside DND window");
+        assert!(should_deliver(false, None, Some(past), now), "elapsed snooze");
+        assert!(should_deliver(false, None, Some(now), now), "snooze lapses at its instant");
+
+        // Overnight DND window: noon is outside, so it delivers.
+        assert!(should_deliver(false, Some((1320, 480)), None, now));
+
+        // Suppressors are independent: any one of them is enough.
+        assert!(!should_deliver(true, Some((900, 1020)), Some(past), now), "mute wins");
+        assert!(!should_deliver(false, Some((600, 900)), Some(past), now), "DND wins");
+        assert!(!should_deliver(false, Some((900, 1020)), Some(future), now), "snooze wins");
+        assert!(!should_deliver(true, Some((600, 900)), Some(future), now), "all three");
+    }
+
+    /// `should_deliver` must agree with the single-recipient decision the
+    /// service derives from `is_snoozed` + `should_suppress` for EVERY input
+    /// combination — it is a composition, not a reimplementation.
+    #[test]
+    fn should_deliver_matches_helper_composition_exhaustively() {
+        let now = time::OffsetDateTime::UNIX_EPOCH + time::Duration::hours(12);
+        let snoozes = [None, Some(now - time::Duration::hours(1)), Some(now + time::Duration::hours(1))];
+        let dnds = [None, Some((600, 900)), Some((900, 1020)), Some((1320, 480)), Some((0, MINUTES_PER_DAY))];
+        for muted in [false, true] {
+            for dnd in dnds {
+                for snooze in snoozes {
+                    let expected = !is_snoozed(snooze, now)
+                        && !should_suppress(muted, dnd, minute_of_day_utc(now));
+                    assert_eq!(
+                        should_deliver(muted, dnd, snooze, now),
+                        expected,
+                        "muted={muted} dnd={dnd:?} snooze={snooze:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -486,5 +641,73 @@ mod db_tests {
         // Clearing again is idempotent.
         repo.clear_snooze(participant).await.unwrap();
         assert!(repo.get_snooze(participant).await.unwrap().is_none(), "second clear is a no-op");
+    }
+
+    /// The batched fan-out reads must agree with the single-recipient fns for a
+    /// mixed population: muted / DND-only / snoozed / partial-NULL window /
+    /// no-row participants all decode identically either way.
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn notif_prefs_batched_reads_match_single_recipient_fns() {
+        let p = pool();
+        let repo = NotificationPrefsRepo::new(p.clone());
+        let (owner, room) = fixture(&p).await;
+
+        // Extra participants sharing the fixture room (FKs only need the rows).
+        let mut population = vec![owner];
+        for i in 0..5 {
+            let extra = ParticipantId::new();
+            sqlx::query("INSERT INTO participants (id, kind, display_name) VALUES ($1,'human',$2)")
+                .bind(extra.to_uuid())
+                .bind(format!("prefs-batch-{i}-{extra}"))
+                .execute(&p)
+                .await
+                .expect("insert participant");
+            population.push(extra);
+        }
+        let [a, b, c, d, e, f]: [ParticipantId; 6] =
+            population.clone().try_into().expect("six participants");
+
+        // a: muted only. b: DND only. c: muted + snoozed. d: elapsed snooze.
+        // e: partial window (one bound NULL => reads as unset). f: no row at all.
+        let now = time::OffsetDateTime::now_utc();
+        repo.mute(a, room).await.unwrap();
+        repo.set_dnd(b, Some(1320), Some(480)).await.unwrap();
+        repo.mute(c, room).await.unwrap();
+        repo.set_snooze(c, Some(now + time::Duration::hours(2))).await.unwrap();
+        repo.set_snooze(d, Some(now - time::Duration::hours(2))).await.unwrap();
+        sqlx::query(
+            "INSERT INTO dnd_settings (participant_id, start_minute, end_minute, updated_at)
+             VALUES ($1, $2, NULL, now())",
+        )
+        .bind(e.to_uuid())
+        .bind(540)
+        .execute(&p)
+        .await
+        .expect("insert partial DND row");
+        let _ = f; // no prefs rows: must be absent from both batch results.
+
+        let muted = repo.muted_set(room, &population).await.unwrap();
+        let rows = repo.dnd_snooze_many(&population).await.unwrap();
+
+        for who in &population {
+            assert_eq!(
+                muted.contains(who),
+                repo.is_muted(*who, room).await.unwrap(),
+                "muted_set vs is_muted for {who}"
+            );
+            let row = rows.get(who).copied().unwrap_or_default();
+            assert_eq!(row.dnd, repo.get_dnd(*who).await.unwrap(), "dnd_snooze_many vs get_dnd for {who}");
+            assert_eq!(
+                row.snooze_until.map(|t| t.unix_timestamp()),
+                repo.get_snooze(*who).await.unwrap().map(|t| t.unix_timestamp()),
+                "dnd_snooze_many vs get_snooze for {who}"
+            );
+        }
+        assert!(!rows.contains_key(&f), "no dnd_settings row => absent from the map");
+
+        // Empty input short-circuits (no DB round-trip, trivially consistent).
+        assert!(repo.muted_set(room, &[]).await.unwrap().is_empty());
+        assert!(repo.dnd_snooze_many(&[]).await.unwrap().is_empty());
     }
 }

@@ -362,6 +362,19 @@ impl LayerSelectorTable {
         Some(rid)
     }
 
+    /// The layer the subscriber is currently heading to: the pending switch
+    /// target when one is in progress, otherwise the active layer. `None`
+    /// when no selector is registered or nothing has bootstrapped yet.
+    ///
+    /// Bandwidth-driven adaptation compares against this (not just the active
+    /// layer) so a decision made mid-switch doesn't re-request the same target.
+    #[must_use]
+    pub fn current_rid(&self, subscriber: ParticipantId, pub_mid: &str) -> Option<Rid> {
+        self.selectors
+            .get(&(subscriber, pub_mid.to_owned()))
+            .and_then(|sel| sel.pending_rid().or_else(|| sel.active_rid()))
+    }
+
     /// Evaluate a single inbound RTP packet for subscriber.
     ///
     /// Returns `None` when no selector is registered for this pair (non-simulcast
@@ -687,6 +700,36 @@ mod tests {
         let mut table = LayerSelectorTable::new();
         let d = table.decide(sub, "v0", rid("low"), false);
         assert!(d.is_none(), "no selector → forward unconditionally");
+    }
+
+    #[test]
+    fn table_current_rid_reports_pending_then_active() {
+        let sub = ParticipantId::new();
+        let mut table = LayerSelectorTable::new();
+        table.set_layers(
+            "v0",
+            LayerSet::from_layers(vec![
+                SimulcastLayer::spatial(rid("low"), LayerKind::Low),
+                SimulcastLayer::spatial(rid("high"), LayerKind::High),
+            ]),
+        );
+        table.register(sub, "v0");
+        assert_eq!(table.current_rid(sub, "v0"), None, "nothing bootstrapped");
+
+        // Bootstrap on "low".
+        table.decide(sub, "v0", rid("low"), false);
+        assert_eq!(table.current_rid(sub, "v0"), Some(rid("low")));
+
+        // Pending switch takes precedence over the active layer.
+        table.select_layer(sub, "v0", LayerKind::High);
+        assert_eq!(table.current_rid(sub, "v0"), Some(rid("high")));
+
+        // Commit the switch → active is now "high", no pending.
+        table.decide(sub, "v0", rid("high"), true);
+        assert_eq!(table.current_rid(sub, "v0"), Some(rid("high")));
+
+        // Unregistered pair → None.
+        assert_eq!(table.current_rid(ParticipantId::new(), "v0"), None);
     }
 
     #[test]

@@ -32,6 +32,10 @@ const state = {
   // P9.5
   unreadByRoom: new Map(),    // room_id -> count
   replyTo: null,              // { id, sender_id, blocks } when composing a reply
+  // ROADMAP v3 方向一: last-applied edit timestamp per message id, so an older
+  // Edited event redelivered out of order never clobbers a newer edit.
+  lastEditAt: new Map(),      // message_id -> epoch ms of the applied edit
+  resyncInFlight: false,      // collapse bursts of server `resync` frames
   // Call
   call: null,
   gcall: null,               // group (mesh) call: { id, roomId, kind, localStream, peers:Map }
@@ -257,8 +261,80 @@ function hookWs() {
   ws.on('msg:presence', (f) => handlePresence(f));
   ws.on('msg:call', (f) => handleCall(f.event));
   ws.on('msg:stream_event', (f) => handleStreamEvent(f.event));
+  // ROADMAP v3 方向一: the WS reconnect backfill replay hit its per-room (or
+  // per-stream) cap — continue fetching the remainder over REST `?since=`.
+  ws.on('msg:backfill', (f) => handleBackfillTruncated(f));
+  // ROADMAP v3 方向一: the server dropped frames for us while our queue was
+  // full (slow consumer, drop-only mode) — re-pull what we missed over REST.
+  ws.on('msg:resync', () => handleResync());
   ws.on('msg:error', (f) => toast(`服务端:${f.msg || f.code || 'error'}`, 'error'));
   ws.on('msg:pong', () => {});
+}
+
+// Bound on REST catch-up pagination after a truncated backfill, so a client
+// that has been away for a very long time converges in bounded work (anything
+// older is reachable through normal history scroll-back).
+const CATCHUP_MAX_PAGES = 10;
+const CATCHUP_PAGE_SIZE = 100;
+
+// Continue a server-truncated replay over REST. Room frames carry `room_id`
+// (continue via GET /api/rooms/:id/messages?since=); stream danmaku frames
+// carry `stream_id` (continue via GET /api/streams/:id/chat?since=).
+async function handleBackfillTruncated(f) {
+  if (!f || !f.truncated || !f.next_since) return;
+  if (f.room_id) await pullRoomSince(f.room_id, f.next_since, CATCHUP_MAX_PAGES);
+  else if (f.stream_id) await pullStreamChatSince(f.stream_id, f.next_since, CATCHUP_MAX_PAGES);
+}
+
+// Forward-page a room's messages from `since` (exclusive), feeding each one
+// through the normal incoming-message path (id-dedup, unread badges, render).
+// Stops after `maxPages` pages or the first short page (caught up).
+async function pullRoomSince(roomId, since, maxPages) {
+  let cursor = since;
+  for (let page = 0; page < maxPages && cursor; page++) {
+    let list;
+    try { list = await api.listMessages(roomId, { since: cursor, limit: CATCHUP_PAGE_SIZE }); }
+    catch { return; } // best-effort: a failed catch-up page is retried on the next resync
+    const arr = Array.isArray(list) ? list : [];
+    for (const m of arr) handleIncomingMessage(m);
+    if (arr.length < CATCHUP_PAGE_SIZE) return; // short page → fully caught up
+    // ULIDs sort lexicographically: advance to the newest id of this page.
+    cursor = arr.reduce((mx, m) => (m?.id && m.id > mx ? m.id : mx), cursor);
+  }
+}
+
+// Forward-page a stream's danmaku from `since` into its live card.
+async function pullStreamChatSince(streamId, since, maxPages) {
+  const ctrl = state.liveCards.get(streamId);
+  if (!ctrl) return; // card unmounted (room switched) — nothing to render into
+  let cursor = since;
+  const pageSize = 200; // server clamps chat pages to 200
+  for (let page = 0; page < maxPages && cursor; page++) {
+    let r;
+    try { r = await api.streamChatList(streamId, pageSize, cursor); }
+    catch { return; }
+    const lines = Array.isArray(r?.chat) ? r.chat : [];
+    for (const line of lines) ctrl.addChat(line);
+    if (lines.length < pageSize) return;
+    cursor = lines.reduce((mx, l) => (l?.id && l.id > mx ? l.id : mx), cursor);
+  }
+}
+
+// Slow-consumer resync: the server dropped an unknown set of frames for this
+// connection, so re-pull every room we hold local state for from its newest
+// known message forward. Messages are the durable record (edits/reactions are
+// re-fetched lazily per room view); a short page bound keeps this cheap.
+async function handleResync() {
+  if (state.resyncInFlight) return;
+  state.resyncInFlight = true;
+  try {
+    for (const [roomId, arr] of state.messagesByRoom) {
+      const last = arr.length ? arr[arr.length - 1]?.id : null;
+      if (last) await pullRoomSince(roomId, last, 3);
+    }
+  } finally {
+    state.resyncInFlight = false;
+  }
 }
 
 function handleIncomingMessage(m) {
@@ -361,6 +437,13 @@ function handlePin(f) {
 
 function handleEdited(m) {
   if (!m?.id || !m?.room_id) return;
+  // ROADMAP v3 方向一: ignore an edit older than one we already applied (an
+  // at-least-once redelivery or cross-instance replay can arrive out of order;
+  // edits carry no id of their own, so the edit timestamp is the order key).
+  const ts = Date.parse(m.edited_at || '') || 0;
+  const prev = state.lastEditAt.get(m.id) || 0;
+  if (ts && prev && ts < prev) return;
+  if (ts) state.lastEditAt.set(m.id, ts);
   const arr = state.messagesByRoom.get(m.room_id) || [];
   const idx = arr.findIndex((x) => x.id === m.id);
   if (idx >= 0) arr[idx] = m;
@@ -416,6 +499,23 @@ function handleReadReceipt(f) {
   map.set(participant, { last_read_message_id: last_message_id, updated_at: at });
   state.receiptsByRoom.set(room_id, map);
   if (room_id === state.currentRoomId) refreshReadStrips();
+  // Multi-device read convergence (ROADMAP v3 方向一): when *my own* read
+  // receipt arrives (sent from another device — or this one), the room is read
+  // up to `last_message_id`, so recompute its unread badge here too. Without
+  // this, reading a room on device A leaves device B's badge stuck until reload.
+  if (participant === state.me?.id) recomputeUnread(room_id, last_message_id);
+}
+
+// Recompute a room's unread badge from the read cursor: only cached messages
+// strictly newer than `lastReadId` (and not my own) still count. ULIDs sort
+// lexicographically, so string compare is chronological.
+function recomputeUnread(roomId, lastReadId) {
+  const arr = state.messagesByRoom.get(roomId) || [];
+  const n = arr.filter((m) => m?.id && m.id > lastReadId && m.sender_id !== state.me?.id).length;
+  if (n > 0) state.unreadByRoom.set(roomId, n);
+  else state.unreadByRoom.delete(roomId);
+  refreshRoomList();
+  updateTitleBadge();
 }
 
 // Render a tiny avatar strip under each of my messages showing who's read up to it.

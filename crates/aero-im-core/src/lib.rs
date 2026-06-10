@@ -10,14 +10,18 @@
 //! - [`service`] — the [`ImService`] facade (rooms, messages, history).
 //! - [`validation`] — [`Block`](aero_common::Block) limit checks.
 //! - [`events`] — high-level [`ImEvent`] published on `im.events.*`.
+//! - [`seq`] — per-subject event-seq providers for publish-time `"seq"`
+//!   stamping (ROADMAP 第三版 方向一).
 
 mod events;
 mod moderator;
+mod seq;
 mod service;
 mod validation;
 
 pub use events::ImEvent;
 pub use moderator::{AllowAllModerator, KeywordModerator, Moderator, ModerationVerdict};
+pub use seq::{LocalSeqProvider, SeqProvider};
 pub use service::{
     can_access_room, can_create_channel, can_join_public_channel, post_allowed, BusSink, ImService,
 };

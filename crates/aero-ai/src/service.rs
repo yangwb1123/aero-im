@@ -4,9 +4,11 @@
 //! - [`AiService::summarize_room`] — pull recent messages, ask Claude for a
 //!   Chinese bullet summary (the project's UI is Chinese). Falls back to a
 //!   "last 5 lines" heuristic when Anthropic is disabled.
-//! - [`AiService::answer_question`] — embed the question, vector-search the
-//!   room, hand the top-k hits to Claude as context, return answer + citation
-//!   message IDs. Without Anthropic, returns concatenated context as the answer.
+//! - [`AiService::answer_question`] — embed the question, retrieve wide
+//!   vector and FTS candidate pools from the room and RRF-fuse them
+//!   ([`crate::rerank`]), hand the top-k hits to Claude as context, return
+//!   answer + citation message IDs. Without Anthropic, returns concatenated
+//!   context as the answer.
 //!
 //! Everything is plumbed through `Arc` so the same instance can be shared by
 //! the Axum router and the background worker without contention.
@@ -206,12 +208,62 @@ impl AiService {
         Ok(heuristic_text_digest(text))
     }
 
+    // ---------- retrieval (RAG rerank, 方向三) ----------
+
+    /// Retrieve the top-`k` grounding hits for a room-scoped question: a wide
+    /// vector candidate pool fused (Reciprocal Rank Fusion) with FTS candidates
+    /// over the same room boundary, so lexical agreement can promote a hit past
+    /// semantically-near-but-wrong neighbours. An FTS failure degrades to pure
+    /// vector order — it warns but never fails the ask.
+    async fn retrieve_room(&self, room: RoomId, q: &str, k: usize) -> Result<Vec<SearchHit>> {
+        let query_vec = self.embedder.embed_one(q).await?;
+        let vector = self.messages.search_vector(room, query_vec, RETRIEVAL_POOL).await?;
+        let fts = match self.messages.fts_candidates(room, q, RETRIEVAL_POOL).await {
+            Ok(hits) => hits,
+            Err(e) => {
+                tracing::warn!(error = %e, "rag rerank: room FTS candidates failed; using vector order");
+                Vec::new()
+            }
+        };
+        Ok(crate::rerank::fuse_rankings(&vector, &fts, k))
+    }
+
+    /// Workspace-scoped twin of [`Self::retrieve_room`]: both retrievers run
+    /// over the identical `JOIN room_members` / `rooms.workspace_id` boundary,
+    /// so fusion can never widen what either retriever was allowed to see.
+    async fn retrieve_workspace(
+        &self,
+        participant: ParticipantId,
+        workspace: WorkspaceId,
+        q: &str,
+        k: usize,
+    ) -> Result<Vec<SearchHit>> {
+        let query_vec = self.embedder.embed_one(q).await?;
+        let vector = self
+            .messages
+            .search_vector_workspace(participant, workspace, query_vec, RETRIEVAL_POOL)
+            .await?;
+        let fts = match self
+            .messages
+            .fts_candidates_workspace(participant, workspace, q, RETRIEVAL_POOL)
+            .await
+        {
+            Ok(hits) => hits,
+            Err(e) => {
+                tracing::warn!(error = %e, "rag rerank: workspace FTS candidates failed; using vector order");
+                Vec::new()
+            }
+        };
+        Ok(crate::rerank::fuse_rankings(&vector, &fts, k))
+    }
+
     // ---------- question answering ----------
 
     /// Answer a question grounded in a room's history.
     ///
     /// 1. Embed the question via the configured embedder.
-    /// 2. Top-k vector search inside the room.
+    /// 2. Retrieve a wide vector candidate pool inside the room, RRF-fuse it
+    ///    with FTS candidates ([`crate::rerank::fuse_rankings`]), keep top-k.
     /// 3. Ask Anthropic to answer using only the retrieved context; cite the
     ///    message IDs of the hits we passed in.
     ///
@@ -242,12 +294,7 @@ impl AiService {
         if q.is_empty() {
             return Err(AiError::Invalid("question must not be empty".into()));
         }
-        // `k` is clamped to [1, 20] so this `as i64` is always safe.
-        #[allow(clippy::cast_possible_wrap)]
-        let k = k.clamp(1, 20) as i64;
-
-        let query_vec = self.embedder.embed_one(q).await?;
-        let hits: Vec<SearchHit> = self.messages.search_vector(room, query_vec, k).await?;
+        let hits = self.retrieve_room(room, q, k.clamp(1, 20)).await?;
 
         let citations: Vec<MessageId> = hits.iter().map(|h| h.message.id).collect();
         let context = render_context(&hits);
@@ -295,11 +342,7 @@ impl AiService {
         if q.is_empty() {
             return Err(AiError::Invalid("question must not be empty".into()));
         }
-        #[allow(clippy::cast_possible_wrap)]
-        let k = k.clamp(1, 20) as i64;
-
-        let query_vec = self.embedder.embed_one(q).await?;
-        let hits: Vec<SearchHit> = self.messages.search_vector(room, query_vec, k).await?;
+        let hits = self.retrieve_room(room, q, k.clamp(1, 20)).await?;
 
         let citations: Vec<MessageId> = hits.iter().map(|h| h.message.id).collect();
         let context = render_context(&hits);
@@ -350,11 +393,7 @@ impl AiService {
         if q.is_empty() {
             return Err(AiError::Invalid("question must not be empty".into()));
         }
-        #[allow(clippy::cast_possible_wrap)]
-        let k = k.clamp(1, 20) as i64;
-
-        let query_vec = self.embedder.embed_one(q).await?;
-        let hits: Vec<SearchHit> = self.messages.search_vector(room, query_vec, k).await?;
+        let hits = self.retrieve_room(room, q, k.clamp(1, 20)).await?;
         let citations: Vec<MessageId> = hits.iter().map(|h| h.message.id).collect();
         let context = render_context(&hits);
 
@@ -406,12 +445,12 @@ impl AiService {
     /// Answer a question grounded in EVERY room the caller belongs to within a
     /// workspace — the flagship "ask your workspace" RAG flow.
     ///
-    /// Mirrors [`Self::answer_question`] step-for-step (embed the question, top-k
-    /// vector search, ask Anthropic to answer using only the retrieved context and
-    /// cite the message IDs), but retrieves cross-room via
-    /// [`MessageRepo::search_vector_workspace`](aero_storage::MessageRepo::search_vector_workspace),
-    /// whose `JOIN room_members` / `rooms.workspace_id` boundary keeps results to
-    /// rooms the caller is a member of within `workspace`. Without Anthropic it
+    /// Mirrors [`Self::answer_question`] step-for-step (embed the question,
+    /// RRF-fused vector + FTS retrieval, ask Anthropic to answer using only the
+    /// retrieved context and cite the message IDs), but retrieves cross-room via
+    /// [`MessageRepo::search_vector_workspace`](aero_storage::MessageRepo::search_vector_workspace)
+    /// and its FTS twin, whose `JOIN room_members` / `rooms.workspace_id` boundary
+    /// keeps results to rooms the caller is a member of within `workspace`. Without Anthropic it
     /// degrades identically to [`Self::answer_question`]: the joined context block
     /// is returned as the answer so the UI can still surface grounded results.
     ///
@@ -429,15 +468,7 @@ impl AiService {
         if q.is_empty() {
             return Err(AiError::Invalid("question must not be empty".into()));
         }
-        // `k` is clamped to [1, 20] so this `as i64` is always safe.
-        #[allow(clippy::cast_possible_wrap)]
-        let k = k.clamp(1, 20) as i64;
-
-        let query_vec = self.embedder.embed_one(q).await?;
-        let hits: Vec<SearchHit> = self
-            .messages
-            .search_vector_workspace(participant, workspace, query_vec, k)
-            .await?;
+        let hits = self.retrieve_workspace(participant, workspace, q, k.clamp(1, 20)).await?;
 
         let citations: Vec<MessageId> = hits.iter().map(|h| h.message.id).collect();
         let context = render_context(&hits);
@@ -516,6 +547,11 @@ fn parse_moderation_verdict(raw: &str) -> Option<String> {
 }
 
 // ---------- helpers ----------
+
+/// Width of each per-retriever candidate pool fed into the RRF fuser —
+/// deliberately wider than the final top-k (≤20) so lexical agreement deep in
+/// the vector list can still promote a hit into the context window.
+const RETRIEVAL_POOL: i64 = 40;
 
 const SUMMARIZE_SYSTEM_PROMPT: &str = "\
 你是一个对话摘要助手,服务于即时通讯系统。请用中文以无序列表(每条 1-2 行)输出 3-5 条要点摘要,\

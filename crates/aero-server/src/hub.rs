@@ -22,6 +22,7 @@
 //! room / stream / call in the process.
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use aero_common::metrics::{self, names};
@@ -35,6 +36,13 @@ use ulid::Ulid;
 
 use crate::config::WsConfig;
 
+/// The frame enqueued once per loss episode in drop-only mode (ROADMAP 第三版
+/// 方向一: slow-consumer resync). It tells the client "frames were dropped
+/// while your queue was full — re-pull what you missed via the REST `?since=`
+/// path". One per episode, not per dropped frame, so a stalled client costs
+/// one extra frame rather than a flood.
+const RESYNC_FRAME: &str = r#"{"type":"resync"}"#;
+
 /// A handle to one connection's bounded outbound queue plus a kill-switch.
 ///
 /// Cloneable: the Hub keeps a clone to fan-out, while the connection task keeps
@@ -44,6 +52,12 @@ use crate::config::WsConfig;
 pub struct WsSender {
     tx: mpsc::Sender<axum::extract::ws::Message>,
     close: CancellationToken,
+    /// True while this connection is inside a loss episode: at least one frame
+    /// was dropped on a full queue (drop-only mode) and the client has not yet
+    /// been told. Shared across clones (the Hub's fan-out copy sets it; any
+    /// copy observing recovered capacity clears it by enqueueing one
+    /// [`RESYNC_FRAME`]).
+    lossy: Arc<AtomicBool>,
 }
 
 impl WsSender {
@@ -53,7 +67,7 @@ impl WsSender {
         tx: mpsc::Sender<axum::extract::ws::Message>,
         close: CancellationToken,
     ) -> Self {
-        Self { tx, close }
+        Self { tx, close, lossy: Arc::new(AtomicBool::new(false)) }
     }
 
     /// Non-blocking enqueue. Never awaits, so the broadcaster can't be stalled
@@ -289,15 +303,48 @@ impl Hub {
             let mut drop_idx: Vec<usize> = Vec::new();
             for (i, tx) in senders.iter().enumerate() {
                 match tx.try_send(axum::extract::ws::Message::Text(text.to_owned())) {
-                    Ok(()) => {}
+                    Ok(()) => {
+                        // Slow-consumer resync (ROADMAP 第三版 方向一): the queue
+                        // has capacity again — if frames were dropped while it was
+                        // full (drop-only mode), close the loss episode by
+                        // enqueueing exactly ONE resync marker so the client
+                        // re-pulls what it missed via the REST `?since=` path.
+                        if tx.lossy.swap(false, Ordering::Relaxed) {
+                            match tx
+                                .try_send(axum::extract::ws::Message::Text(RESYNC_FRAME.to_owned()))
+                            {
+                                Ok(()) => {
+                                    debug!(%pid, "ws loss episode ended — resync frame enqueued");
+                                }
+                                Err(TrySendError::Full(_)) => {
+                                    // The delivered frame consumed the last slot;
+                                    // the episode stays open and the marker is
+                                    // retried on the next successful delivery.
+                                    tx.lossy.store(true, Ordering::Relaxed);
+                                }
+                                Err(TrySendError::Closed(_)) => {
+                                    // Receiver vanished between the two sends;
+                                    // reap below like any closed handle.
+                                    drop_idx.push(i);
+                                }
+                            }
+                        }
+                    }
                     Err(TrySendError::Full(_)) => {
                         // Slow consumer: drop this frame. Optionally evict.
                         if self.disconnect_on_full {
+                            // No lossy bookkeeping here: disconnect mode already
+                            // self-heals — the evicted client reconnects with its
+                            // `?since=` cursor and the WS backfill replays what
+                            // it missed.
                             tx.close();
                             drop_idx.push(i);
                             debug!(%pid, "ws send queue full — disconnecting laggy client");
                         } else {
-                            debug!(%pid, "ws send queue full — dropping frame");
+                            // Drop-only mode: open (or extend) a loss episode so
+                            // the client is told to resync once capacity returns.
+                            tx.lossy.store(true, Ordering::Relaxed);
+                            debug!(%pid, "ws send queue full — dropping frame (episode open)");
                         }
                     }
                     Err(TrySendError::Closed(_)) => {
@@ -460,6 +507,100 @@ mod tests {
         // Drop-only policy: the connection is NOT torn down or pruned.
         assert!(!close.is_cancelled());
         assert_eq!(hub.conns.get(&pid).map(|e| e.len()), Some(1));
+    }
+
+    /// Drain every immediately-available frame as text.
+    fn drain_text(rx: &mut mpsc::Receiver<axum::extract::ws::Message>) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Ok(axum::extract::ws::Message::Text(t)) = rx.try_recv() {
+            out.push(t);
+        }
+        out
+    }
+
+    #[test]
+    fn loss_episode_emits_exactly_one_resync_once_capacity_returns() {
+        let cfg = WsConfig { send_queue_capacity: 2, disconnect_on_full: false };
+        let hub = Hub::with_ws_config(cfg);
+        let pid = ParticipantId::new();
+        let (tx, mut rx, close) = make_conn(2);
+        hub.register(pid, tx);
+
+        // Fill the queue, then drop two frames → one loss episode opens.
+        hub.fan_out_raw(&[pid], "a");
+        hub.fan_out_raw(&[pid], "b");
+        hub.fan_out_raw(&[pid], "dropped-1");
+        hub.fan_out_raw(&[pid], "dropped-2");
+        assert_eq!(drain_text(&mut rx), vec!["a", "b"], "no resync while still lossy");
+
+        // Capacity is back: the next delivered frame closes the episode with
+        // exactly ONE resync marker (not one per dropped frame).
+        hub.fan_out_raw(&[pid], "c");
+        assert_eq!(
+            drain_text(&mut rx),
+            vec!["c".to_owned(), super::RESYNC_FRAME.to_owned()],
+            "one resync after the episode, ordered after the frame that closed it"
+        );
+
+        // Healthy again: subsequent deliveries carry no further resync.
+        hub.fan_out_raw(&[pid], "d");
+        assert_eq!(drain_text(&mut rx), vec!["d"]);
+
+        // A NEW episode re-arms the marker.
+        hub.fan_out_raw(&[pid], "e");
+        hub.fan_out_raw(&[pid], "f");
+        hub.fan_out_raw(&[pid], "dropped-3");
+        assert_eq!(drain_text(&mut rx), vec!["e", "f"]);
+        hub.fan_out_raw(&[pid], "g");
+        assert_eq!(
+            drain_text(&mut rx),
+            vec!["g".to_owned(), super::RESYNC_FRAME.to_owned()],
+            "each loss episode ends with its own single resync"
+        );
+        // Drop-only mode never tears the connection down.
+        assert!(!close.is_cancelled());
+    }
+
+    #[test]
+    fn resync_retries_when_marker_finds_no_capacity() {
+        // When the frame that closes the episode consumes the LAST slot, the
+        // marker can't be enqueued yet — the episode must stay open and the
+        // marker land after a later delivery instead of being silently lost.
+        let cfg = WsConfig { send_queue_capacity: 2, disconnect_on_full: false };
+        let hub = Hub::with_ws_config(cfg);
+        let pid = ParticipantId::new();
+        let (tx, mut rx, _close) = make_conn(2);
+        hub.register(pid, tx);
+
+        hub.fan_out_raw(&[pid], "a");
+        hub.fan_out_raw(&[pid], "b"); // queue full: [a, b]
+        hub.fan_out_raw(&[pid], "dropped"); // opens the episode
+        // Drain only ONE frame, leaving exactly one free slot.
+        assert!(matches!(rx.try_recv(), Ok(axum::extract::ws::Message::Text(t)) if t == "a"));
+
+        // `c` takes the last slot; the marker finds the queue full → deferred.
+        hub.fan_out_raw(&[pid], "c");
+        assert_eq!(drain_text(&mut rx), vec!["b", "c"], "marker deferred, not lost");
+
+        // Next delivery has room behind it → the deferred marker lands (once).
+        hub.fan_out_raw(&[pid], "d");
+        assert_eq!(drain_text(&mut rx), vec!["d".to_owned(), super::RESYNC_FRAME.to_owned()]);
+    }
+
+    #[test]
+    fn disconnect_mode_does_not_emit_resync() {
+        // disconnect_on_full self-heals via the reconnect `?since=` backfill, so
+        // no resync marker must ever be produced there (the connection is gone).
+        let cfg = WsConfig { send_queue_capacity: 1, disconnect_on_full: true };
+        let hub = Hub::with_ws_config(cfg);
+        let pid = ParticipantId::new();
+        let (tx, mut rx, close) = make_conn(1);
+        hub.register(pid, tx);
+
+        hub.fan_out_raw(&[pid], "a");
+        hub.fan_out_raw(&[pid], "overflow"); // full → evict
+        assert!(close.is_cancelled());
+        assert_eq!(drain_text(&mut rx), vec!["a"], "no resync marker in disconnect mode");
     }
 
     #[test]

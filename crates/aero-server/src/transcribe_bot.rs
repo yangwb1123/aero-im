@@ -66,7 +66,6 @@ async fn handle(state: &AppState, ai: &Arc<AiService>, env: MessageEnvelope) -> 
 
     let store: Arc<dyn BlobStore> = state.blob_store.clone();
     let messages: &MessageRepo = &state.messages;
-    let bus = state.bus.clone();
     let room_id = msg.room_id;
 
     for (blob_id, mime) in targets {
@@ -90,18 +89,12 @@ async fn handle(state: &AppState, ai: &Arc<AiService>, env: MessageEnvelope) -> 
         };
         match messages.update_voice_transcript(msg.id, &transcript).await {
             Ok(Some(updated)) => {
-                let event = RoomEvent::Edited(updated);
-                let bytes = match serde_json::to_vec(&event) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        warn!(error = ?e, "serialize Edited failed");
-                        continue;
-                    }
-                };
-                let subject = format!("im.room.{}", room_id);
-                if let Err(e) = bus.publish(&subject, bytes.into()).await {
-                    warn!(error = ?e, %subject, "publish Edited failed");
-                }
+                // Through the stamped seam (ROADMAP3 方向一) so this Edited
+                // carries a `seq` like every hot-path publish; best-effort.
+                state
+                    .im
+                    .broadcast_room_event(room_id, RoomEvent::Edited(updated))
+                    .await;
                 info!(%blob_id, message_id = %msg.id, "voice transcript applied");
             }
             Ok(None) => debug!(message_id = %msg.id, "message missing during transcript update"),

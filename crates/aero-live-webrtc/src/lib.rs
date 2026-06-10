@@ -37,20 +37,29 @@ use aero_common::{CallId, ParticipantId};
 use parking_lot::RwLock;
 use thiserror::Error;
 
+pub mod bwe;
+pub mod call_bridge;
 pub mod codec;
 pub mod forward;
 pub mod h264;
 pub mod peer;
 pub mod remap;
+pub mod rtcp_fb;
 pub mod rtcp_feedback;
 pub mod simulcast;
 pub mod vp8;
 pub mod vp9;
 
+pub use bwe::{BandwidthEstimator, BweConfig, LayerSwitchPolicy, ThroughputEwma};
+pub use call_bridge::{
+    decide_call_topology, BridgeRtp, CallBridge, CallEgress, CallEgressTap, CallTopology,
+    CallUpstream, FakeCallUpstream, LoopbackUpstream,
+};
 pub use codec::{payload_is_keyframe, Codec};
 pub use forward::SfuForwarder;
 pub use peer::{InboundRtp, KeyframeReq, PeerProgress, SfuPeer};
 pub use remap::{ForwardTable, ForwardTarget, RemappedRtp, RtpKey, RtpRemapper};
+pub use rtcp_fb::{BandwidthFeedback, Remb, TwccFeedback, TwccStatus, TwccSummary};
 pub use rtcp_feedback::{KeyframeGate, ParsedFeedback, PendingKeyframeRequest};
 pub use simulcast::{ForwardDecision, LayerKind, LayerSelector, LayerSelectorTable, LayerSet, SimulcastLayer};
 

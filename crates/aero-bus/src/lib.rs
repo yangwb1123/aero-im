@@ -13,7 +13,9 @@
 //! Implementation is filled in by the storage/bus agent.
 
 pub mod jetstream;
+pub mod seq;
 pub mod traits;
 
 pub use jetstream::{JetStreamBus, JetStreamConfig};
+pub use seq::{extract_seq, stamp_seq, stamped_event_bytes};
 pub use traits::{EventBus, Subscription};

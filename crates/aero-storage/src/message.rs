@@ -5,7 +5,7 @@
 
 use aero_common::{Block, Message, MessageId, ParticipantId, RoomId, WorkspaceId};
 use pgvector::Vector;
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 
 #[derive(Clone)]
 pub struct MessageRepo {
@@ -120,16 +120,28 @@ impl MessageRepo {
     /// deleted. All in one transaction.
     pub async fn soft_delete(&self, id: MessageId) -> Result<bool, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
+        let deleted = Self::soft_delete_in_tx(&mut tx, id).await?;
+        tx.commit().await?;
+        Ok(deleted)
+    }
 
+    /// Transaction-scoped body of [`soft_delete`](Self::soft_delete): the
+    /// delete + guarded blob-GC enqueue run on the caller's transaction, so a
+    /// caller can compose further writes (e.g. an audit row) that commit or
+    /// roll back together with the delete. Returns `false` (without writing
+    /// anything) when the message is already deleted or missing.
+    pub async fn soft_delete_in_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        id: MessageId,
+    ) -> Result<bool, sqlx::Error> {
         // Read + lock the row; capture its blocks so we can extract blob ids.
         let row = sqlx::query_as::<_, (serde_json::Value,)>(
             "SELECT blocks FROM messages WHERE id = $1 AND deleted_at IS NULL FOR UPDATE",
         )
         .bind(id.to_uuid())
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await?;
         let Some((blocks_json,)) = row else {
-            tx.commit().await?;
             return Ok(false);
         };
         let blob_ids = attached_blob_ids(&blocks_json);
@@ -140,7 +152,7 @@ impl MessageRepo {
                WHERE id = $1 AND deleted_at IS NULL"#,
         )
         .bind(id.to_uuid())
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
 
         // Enqueue each attached blob for GC unless another live message still
@@ -155,7 +167,7 @@ impl MessageRepo {
                   )",
             )
             .bind(format!("%{blob}%"))
-            .fetch_one(&mut *tx)
+            .fetch_one(&mut **tx)
             .await?
             .0;
             if !still_referenced {
@@ -163,13 +175,41 @@ impl MessageRepo {
                     r"INSERT INTO blob_gc_queue (blob_id) VALUES ($1) ON CONFLICT (blob_id) DO NOTHING",
                 )
                 .bind(blob.to_uuid())
-                .execute(&mut *tx)
+                .execute(&mut **tx)
                 .await?;
             }
         }
 
-        tx.commit().await?;
         Ok(true)
+    }
+
+    /// Soft-delete `id` AND append a `message.deleted` audit row to `workspace`'s
+    /// trail in ONE transaction (ROADMAP 第三版 方向五 审计事务化): if the audit
+    /// insert fails the delete rolls back too — a message is never silently
+    /// deleted unaudited. Returns whether the message was actually deleted; an
+    /// already-deleted/missing message writes no audit row (`false`).
+    pub async fn soft_delete_audited(
+        &self,
+        id: MessageId,
+        workspace: WorkspaceId,
+        actor: Option<ParticipantId>,
+        detail: serde_json::Value,
+    ) -> Result<bool, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let deleted = Self::soft_delete_in_tx(&mut tx, id).await?;
+        if deleted {
+            crate::audit::AuditRepo::append_in_tx(
+                &mut tx,
+                workspace,
+                actor,
+                "message.deleted",
+                Some(&id.to_string()),
+                detail,
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(deleted)
     }
 
     /// Patch transcripts onto the Voice blocks of a message that don't have
@@ -455,6 +495,59 @@ impl MessageRepo {
         Ok(rows.into_iter().map(SearchHit::from).collect())
     }
 
+    /// FTS-ranked rerank candidates inside a room — the lexical half of the RAG
+    /// Reciprocal-Rank-Fusion rerank (方向三). Mirrors [`Self::search_vector`]'s
+    /// boundary EXACTLY (`room_id` filter + `deleted_at IS NULL`) but ranks by
+    /// `ts_rank` over `websearch_to_tsquery`, retrying with `plainto_tsquery`
+    /// should the database reject the websearch parse. `score` carries the raw
+    /// `ts_rank` value; only the ORDER matters to the fuser. No trigram fallback —
+    /// fuzzy hits would dilute the lexical signal the fusion needs.
+    pub async fn fts_candidates(
+        &self,
+        room: RoomId,
+        query: &str,
+        limit: i64,
+    ) -> Result<Vec<SearchHit>, sqlx::Error> {
+        let limit = limit.clamp(1, 100);
+        match self.fts_candidates_with(room, query, limit, TsQueryFn::Websearch).await {
+            Err(sqlx::Error::Database(_)) => {
+                self.fts_candidates_with(room, query, limit, TsQueryFn::Plain).await
+            }
+            other => other,
+        }
+    }
+
+    async fn fts_candidates_with(
+        &self,
+        room: RoomId,
+        query: &str,
+        limit: i64,
+        parser: TsQueryFn,
+    ) -> Result<Vec<SearchHit>, sqlx::Error> {
+        // `parser` expands to one of two compile-time constant function names,
+        // so the format! is not an injection surface.
+        let sql = format!(
+            r"SELECT
+                 m.id, m.room_id, m.sender_id, m.blocks, m.reply_to, m.metadata,
+                 m.created_at, m.edited_at, m.deleted_at,
+                 ts_rank(m.search_tsv, {f}('simple', $2)) AS score
+               FROM messages m
+               WHERE m.room_id = $1
+                 AND m.deleted_at IS NULL
+                 AND m.search_tsv @@ {f}('simple', $2)
+               ORDER BY score DESC, m.id DESC
+               LIMIT $3",
+            f = parser.sql_name()
+        );
+        let rows = sqlx::query_as::<_, ScoredMessageRow>(&sql)
+            .bind(room.to_uuid())
+            .bind(query)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.into_iter().map(SearchHit::from).collect())
+    }
+
     // ------------------------------------------------------------- THREADS
 
     /// List the (non-deleted) replies hanging off a root message, oldest first,
@@ -697,6 +790,74 @@ impl MessageRepo {
         Ok(rows.into_iter().map(SearchHit::from).collect())
     }
 
+    /// Workspace-scoped twin of [`Self::fts_candidates`] — the lexical half of
+    /// the workspace-wide RAG rerank. Mirrors [`Self::search_vector_workspace`]'s
+    /// membership boundary EXACTLY: `JOIN room_members` scopes hits to rooms the
+    /// caller belongs to and the `rooms.workspace_id` filter scopes to one
+    /// tenant, so a candidate can never leak a room the caller isn't in. Ranked
+    /// by `ts_rank` over `websearch_to_tsquery`, retrying with `plainto_tsquery`
+    /// should the database reject the websearch parse.
+    pub async fn fts_candidates_workspace(
+        &self,
+        participant: ParticipantId,
+        workspace: WorkspaceId,
+        query: &str,
+        limit: i64,
+    ) -> Result<Vec<SearchHit>, sqlx::Error> {
+        let limit = limit.clamp(1, 100);
+        match self
+            .fts_candidates_workspace_with(participant, workspace, query, limit, TsQueryFn::Websearch)
+            .await
+        {
+            Err(sqlx::Error::Database(_)) => {
+                self.fts_candidates_workspace_with(
+                    participant,
+                    workspace,
+                    query,
+                    limit,
+                    TsQueryFn::Plain,
+                )
+                .await
+            }
+            other => other,
+        }
+    }
+
+    async fn fts_candidates_workspace_with(
+        &self,
+        participant: ParticipantId,
+        workspace: WorkspaceId,
+        query: &str,
+        limit: i64,
+        parser: TsQueryFn,
+    ) -> Result<Vec<SearchHit>, sqlx::Error> {
+        // `parser` expands to one of two compile-time constant function names,
+        // so the format! is not an injection surface.
+        let sql = format!(
+            r"SELECT
+                 m.id, m.room_id, m.sender_id, m.blocks, m.reply_to, m.metadata,
+                 m.created_at, m.edited_at, m.deleted_at,
+                 ts_rank(m.search_tsv, {f}('simple', $2)) AS score
+               FROM messages m
+               JOIN room_members rm
+                 ON rm.room_id = m.room_id AND rm.participant_id = $1
+               WHERE m.deleted_at IS NULL
+                 AND m.room_id IN (SELECT id FROM rooms WHERE workspace_id = $4)
+                 AND m.search_tsv @@ {f}('simple', $2)
+               ORDER BY score DESC, m.id DESC
+               LIMIT $3",
+            f = parser.sql_name()
+        );
+        let rows = sqlx::query_as::<_, ScoredMessageRow>(&sql)
+            .bind(participant.to_uuid())
+            .bind(query)
+            .bind(limit)
+            .bind(workspace.to_uuid())
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.into_iter().map(SearchHit::from).collect())
+    }
+
     /// The most recent messages sent by `sender`, capped at [`EXPORT_SENDER_CAP`]
     /// rows, newest first. Used exclusively for personal GDPR export
     /// (`GET /api/me/export`); not suitable for paginated listing.
@@ -771,6 +932,24 @@ fn attached_blob_ids(blocks_json: &serde_json::Value) -> Vec<aero_common::BlobId
 
 /// Maximum rows returned by [`MessageRepo::by_sender`] (personal GDPR export).
 const EXPORT_SENDER_CAP: i64 = 500;
+
+/// Which Postgres tsquery parser the FTS rerank-candidate queries use:
+/// `Websearch` first (forgiving web-style syntax), `Plain` as the retry when
+/// the database rejects the websearch parse.
+#[derive(Clone, Copy)]
+enum TsQueryFn {
+    Websearch,
+    Plain,
+}
+
+impl TsQueryFn {
+    fn sql_name(self) -> &'static str {
+        match self {
+            Self::Websearch => "websearch_to_tsquery",
+            Self::Plain => "plainto_tsquery",
+        }
+    }
+}
 
 /// Clamp a caller-supplied page size into the safe `[1, 200]` window used by
 /// the keyset pagination queries ([`MessageRepo::list_since`]), matching the
@@ -1172,6 +1351,71 @@ mod db_tests {
         assert!(
             !hits.iter().any(|h| h.message.id == in_theirs.id),
             "an embedded message in a room the caller is NOT in never leaks"
+        );
+    }
+
+    /// The FTS rerank-candidate retrieval (`fts_candidates_workspace`) must honor
+    /// the same `JOIN room_members` boundary as the vector variant: with two rooms
+    /// in the SAME workspace but only one joined by the caller, an FTS candidate
+    /// may surface only from the joined room — even when the message in the other
+    /// room contains the identical search token (so ts_rank alone would rank them
+    /// equally).
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn fts_candidates_workspace_is_membership_scoped() {
+        let p = pool();
+        let repo = MessageRepo::new(p.clone());
+        // Both rooms live in the all-zero default workspace, so membership — not
+        // the workspace filter — is the discriminator under test.
+        let ws = WorkspaceId(ulid::Ulid(0));
+
+        let me = participant(&p).await;
+        let other = participant(&p).await;
+
+        let mine = room(&p, me).await;
+        let theirs = room(&p, other).await;
+        join(&p, mine, me).await;
+        join(&p, theirs, other).await; // membership for `other`, not for `me`.
+
+        // A distinctive token present in BOTH rooms' messages.
+        let needle = format!("rrfneedle{}", ParticipantId::new());
+        let in_mine = repo
+            .insert(NewMessage {
+                room_id: mine,
+                sender_id: me,
+                blocks: vec![Block::text(format!("rerank {needle} in my room"))],
+                reply_to: None,
+                metadata: serde_json::json!({}),
+            })
+            .await
+            .expect("insert mine");
+        let in_theirs = repo
+            .insert(NewMessage {
+                room_id: theirs,
+                sender_id: other,
+                blocks: vec![Block::text(format!("rerank {needle} in their room"))],
+                reply_to: None,
+                metadata: serde_json::json!({}),
+            })
+            .await
+            .expect("insert theirs");
+
+        let hits = repo
+            .fts_candidates_workspace(me, ws, &needle, 40)
+            .await
+            .expect("fts candidates");
+
+        assert!(
+            hits.iter().all(|h| h.message.room_id == mine),
+            "every FTS candidate comes from a room the caller belongs to"
+        );
+        assert!(
+            hits.iter().any(|h| h.message.id == in_mine.id),
+            "the matching message in the caller's room is found"
+        );
+        assert!(
+            !hits.iter().any(|h| h.message.id == in_theirs.id),
+            "a matching message in a room the caller is NOT in never leaks"
         );
     }
 

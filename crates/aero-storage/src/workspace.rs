@@ -683,6 +683,51 @@ impl WorkspaceRepo {
         Ok(row.is_some_and(|(r,)| r))
     }
 
+    // ----------------------------------------- tenant fairness: rate tier (0076)
+
+    /// Set the workspace's rate-limit tier token (migration 0076). The caller is
+    /// responsible for validating `tier` against the known set
+    /// (`standard` / `premium` / `unlimited`) before persisting — this method
+    /// writes whatever it is given, mirroring [`set_retention`](Self::set_retention).
+    ///
+    /// Returns `true` if the row existed and was updated, `false` for an unknown
+    /// workspace id.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the update.
+    pub async fn set_rate_tier(
+        &self,
+        workspace: WorkspaceId,
+        tier: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(r"UPDATE workspaces SET rate_tier = $2 WHERE id = $1")
+            .bind(workspace.to_uuid())
+            .bind(tier)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// The workspace's stored rate-tier token, or `None` for an unknown
+    /// workspace. The column is `NOT NULL DEFAULT 'standard'`, so an existing
+    /// workspace always yields `Some`; interpreting the token (including unknown
+    /// values) is the caller's job.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the query.
+    pub async fn rate_tier(
+        &self,
+        workspace: WorkspaceId,
+    ) -> Result<Option<String>, sqlx::Error> {
+        let row = sqlx::query_as::<_, (String,)>(
+            r"SELECT rate_tier FROM workspaces WHERE id = $1",
+        )
+        .bind(workspace.to_uuid())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(t,)| t))
+    }
+
     /// Soft-delete every not-already-deleted message whose room belongs to a
     /// workspace that has a retention policy and whose `created_at` is older than
     /// that workspace's window, as of `now`. Returns the number of messages
@@ -1386,6 +1431,30 @@ mod db_tests {
         assert!(message_state(&p, in_long).await.0.is_none(), "longer override kept the 100-day message");
         // No override inherits the workspace default.
         assert!(message_state(&p, in_inherit).await.0.is_some(), "inherited default swept the 40-day message");
+    }
+
+    // ----- rate tier (0076) -----
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn workspace_rate_tier_defaults_and_updates() {
+        let p = pool();
+        let repo = WorkspaceRepo::new(p.clone());
+        let owner = new_participant(&p).await;
+        let (ws, _room, _msg) = seed_workspace(&repo, &p, owner).await;
+
+        // 0076's column default: every new workspace starts at 'standard'.
+        assert_eq!(repo.rate_tier(ws).await.unwrap().as_deref(), Some("standard"));
+
+        assert!(repo.set_rate_tier(ws, "premium").await.unwrap(), "row updated");
+        assert_eq!(repo.rate_tier(ws).await.unwrap().as_deref(), Some("premium"));
+
+        assert!(repo.set_rate_tier(ws, "unlimited").await.unwrap());
+        assert_eq!(repo.rate_tier(ws).await.unwrap().as_deref(), Some("unlimited"));
+
+        // Unknown workspace: nothing to update, nothing to read.
+        assert!(!repo.set_rate_tier(WorkspaceId::new(), "premium").await.unwrap());
+        assert_eq!(repo.rate_tier(WorkspaceId::new()).await.unwrap(), None);
     }
 
     // ----- single-channel guests (0027) -----

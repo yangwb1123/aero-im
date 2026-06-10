@@ -10,30 +10,42 @@
 //! retransmit buffer into wire bytes and hands them to the sink.  It:
 //!
 //! 1. Calls [`SrtSession::drain_control_packets`] and sends each resulting
-//!    control packet (ACK / NAK / ACKACK) through the sink.
-//! 2. Calls [`ReliabilityState::drain_retransmits`] and re-encodes each
-//!    [`Action::SendData`] as a proper SRT data packet before sending it.
+//!    control packet (ACK / NAK / ACKACK) through the sink (control packets
+//!    are never paced — they are tiny and time-critical).
+//! 2. Moves [`ReliabilityState::drain_retransmits`] output into the session's
+//!    retransmit queue, then drains the data plane — retransmits first, then
+//!    fresh data queued via [`SrtSession::send_data`] — gating **every** data
+//!    packet through the session's [`Pacer`]. A [`Allowance::DeferUntil`]
+//!    verdict holds that packet *and everything behind it* (order is
+//!    preserved) until a later `pump` call whose `now` has reached the defer
+//!    instant; the instant is surfaced via [`SrtSession::next_send_at`].
+//!
+//! Congestion signals reach the pacer through [`SrtSession::handle_control`]:
+//! ACK CIFs carry the peer's RTT / RTT-variance samples, NAK loss lists carry
+//! the retransmit-request counts.
 //!
 //! No I/O primitives, no async, no real socket — fully unit-testable.
 //!
 //! ## Limitations (intentional — see crate docs)
 //!
 //! - No real UDP socket is involved; `pump` talks only to the supplied sink.
-//! - No congestion control or RTT-based pacing.
-//! - Retransmit timing is caller-driven: call `pump` as often as you want
-//!   retransmits to go out (the caller controls the clock via `now`).
-//! - The `now` and `peer_socket_id` parameters mirror those of
-//!   [`SrtSession::drain_control_packets`] so the caller can fake time in tests.
+//! - Send timing is caller-driven: the pacer only computes *when* the next
+//!   packet may go; the caller must call `pump` again at (or after) that
+//!   instant. The caller controls the clock via `now`, so tests fake time.
+//! - The `peer_socket_id` parameter mirrors that of
+//!   [`SrtSession::drain_control_packets`].
 
-// SRT-specific acronyms (ACK, NAK, ACKACK, RTT, …) are domain-standard.
+// SRT-specific acronyms (ACK, NAK, ACKACK, RTT, CIF, …) are domain-standard.
 #![allow(clippy::doc_markdown)]
 
 use std::time::Instant;
 
 use bytes::BytesMut;
 
-use crate::protocol::{PacketKind, SrtHeader, SRT_HEADER_LEN};
-use crate::reliability::Action;
+use crate::control::decode_nak_loss_list;
+use crate::pacing::Allowance;
+use crate::protocol::{ControlType, PacketKind, SrtHeader, SRT_HEADER_LEN};
+use crate::reliability::{seq_diff, Action};
 use crate::SrtSession;
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -70,7 +82,103 @@ impl SrtSink for Vec<Vec<u8>> {
 // pump implementation
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// A decoded SRT ACK CIF (the first three words — the fields this
+/// implementation consumes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AckCif {
+    /// Next expected sequence number (highest contiguous received + 1).
+    pub ack_seq_no: u32,
+    /// Peer's smoothed RTT in microseconds.
+    pub rtt_us: u32,
+    /// Peer's RTT variance in microseconds.
+    pub rttvar_us: u32,
+}
+
+/// Decode the leading words of an ACK CIF (the bytes after the 16-byte SRT
+/// header). Returns `None` if the body is shorter than the three mandatory
+/// words; trailing fields (buffer size, rates) are ignored.
+#[must_use]
+pub fn decode_ack_cif(body: &[u8]) -> Option<AckCif> {
+    if body.len() < 12 {
+        return None;
+    }
+    let word = |i: usize| u32::from_be_bytes([body[i], body[i + 1], body[i + 2], body[i + 3]]);
+    Some(AckCif {
+        ack_seq_no: word(0),
+        rtt_us: word(4),
+        rttvar_us: word(8),
+    })
+}
+
 impl SrtSession {
+    /// Queue a fresh outbound data packet: assigns the next sequence number,
+    /// buffers the payload for retransmission, and holds it for the next
+    /// [`SrtSession::pump`] (which sends it as soon as the pacer allows).
+    ///
+    /// Returns the assigned sequence number.
+    pub fn send_data(&mut self, payload: Vec<u8>) -> u32 {
+        let Action::SendData { seq_no, payload, .. } = self.reliability.enqueue(payload) else {
+            unreachable!("enqueue always returns SendData");
+        };
+        self.fresh_data.push_back((seq_no, payload));
+        seq_no
+    }
+
+    /// Process an inbound SRT control packet (ACK / NAK / ACKACK) from the
+    /// peer, updating the sender-side reliability state and the congestion
+    /// pacer:
+    ///
+    /// - **ACK** — advances the send window, queues the ACKACK reply, and
+    ///   feeds the CIF's RTT / RTT-variance samples to the pacer.
+    /// - **NAK** — schedules the listed packets for retransmission and feeds
+    ///   the lost-packet count to the pacer.
+    /// - **ACKACK** — samples RTT on the receiver-side estimator.
+    ///
+    /// Unknown or unparsable packets are ignored. `now` is injected so tests
+    /// can fake time.
+    pub fn handle_control(&mut self, datagram: &[u8], now: Instant) {
+        let Some(header) = SrtHeader::parse(datagram) else {
+            return;
+        };
+        let PacketKind::Control {
+            control_type,
+            type_specific,
+            ..
+        } = header.kind
+        else {
+            return;
+        };
+        let body = datagram.get(SRT_HEADER_LEN..).unwrap_or(&[]);
+        match control_type {
+            ControlType::Ack => {
+                let Some(cif) = decode_ack_cif(body) else {
+                    return;
+                };
+                self.pacer.on_ack(cif.rtt_us, cif.rttvar_us, now);
+                // type_specific carries the ACK id to echo in the ACKACK.
+                if let Some(action) = self.reliability.on_ack(cif.ack_seq_no, type_specific, now) {
+                    self.pending_actions.push(action);
+                }
+            }
+            ControlType::Nak => {
+                let mut lost: usize = 0;
+                for (from, to) in decode_nak_loss_list(body) {
+                    self.reliability.on_nak(from, to);
+                    // Forward span + 1 = packets requested; inverted ranges
+                    // were already rejected by on_nak, count them as zero.
+                    let span = seq_diff(from, to);
+                    if span >= 0 {
+                        lost = lost.saturating_add(usize::try_from(span).unwrap_or(usize::MAX))
+                            .saturating_add(1);
+                    }
+                }
+                self.pacer.on_nak(lost, now);
+            }
+            ControlType::AckAck => self.reliability.on_ackack(type_specific, now),
+            _ => {}
+        }
+    }
+
     /// Drive all pending outgoing work through `sink`.
     ///
     /// Call this periodically (e.g. from a timer tick or immediately after
@@ -78,20 +186,23 @@ impl SrtSession {
     ///
     /// 1. **Control packets** — every ACK, NAK, or ACKACK that accumulated in
     ///    `pending_actions` since the last `pump` (or `drain_control_packets`).
-    /// 2. **Retransmitted data packets** — every sequence number that appeared
-    ///    in the loss list (populated by received NAK control packets via
-    ///    [`ReliabilityState::on_nak`]) and is still in the send buffer.
+    ///    Never paced.
+    /// 2. **Data packets**, gated through the congestion [`Pacer`]:
+    ///    retransmissions (NAK-triggered, from the loss list) first, then
+    ///    fresh packets queued via [`SrtSession::send_data`]. The first
+    ///    [`Allowance::DeferUntil`] verdict stops the data drain — held
+    ///    packets keep their order and go out on a later `pump` whose `now`
+    ///    has reached the deferral instant ([`SrtSession::next_send_at`]).
     ///
     /// `peer_socket_id` is written into the `dest_socket_id` field of every
-    /// outgoing packet.  `now` is the current [`Instant`]; it is passed through
-    /// to [`SrtSession::drain_control_packets`] (timestamp is currently zero —
-    /// production callers can subtract `connect_time` to get microseconds).
+    /// outgoing packet.  `now` is the current [`Instant`]; it feeds the pacer
+    /// (the caller controls the clock, so tests can fake time).
     ///
     /// Returns the number of packets sent (useful in tests to confirm activity).
     pub fn pump(
         &mut self,
         sink: &mut impl SrtSink,
-        _now: Instant,
+        now: Instant,
         peer_socket_id: u32,
     ) -> usize {
         let mut sent = 0usize;
@@ -100,28 +211,50 @@ impl SrtSession {
         //
         // drain_control_packets takes `pending_actions` and serialises each one
         // via encode_control.  SendData actions are silently dropped there (they
-        // are not control-plane), which is correct: retransmits are handled
-        // below.
+        // are not control-plane), which is correct: data is handled below.
         for pkt in self.drain_control_packets(peer_socket_id) {
             sink.send(&pkt);
             sent += 1;
         }
 
-        // ── 2. Retransmitted data packets ─────────────────────────────────────
+        // ── 2. Data packets, paced ────────────────────────────────────────────
         //
-        // drain_retransmits pops every sequence number from the loss list that
-        // is still in the send buffer and returns Action::SendData{is_retransmit:
-        // true, …}.  We re-encode each one as a minimal SRT data packet.
+        // Newly NAK'd sequence numbers join the retransmit queue, which is
+        // always drained ahead of fresh data (a receiver stalled on a gap
+        // benefits more from the missing packet than from new ones) — but
+        // both spend from the same pacer budget.
         for action in self.reliability.drain_retransmits() {
-            if let Action::SendData {
-                seq_no,
-                payload,
-                is_retransmit,
-            } = action
-            {
-                let pkt = encode_data_packet(seq_no, is_retransmit, peer_socket_id, &payload);
-                sink.send(&pkt);
-                sent += 1;
+            if let Action::SendData { seq_no, payload, .. } = action {
+                self.deferred_retransmits.push_back((seq_no, payload));
+            }
+        }
+
+        self.next_send_at = None;
+        loop {
+            let is_retransmit = !self.deferred_retransmits.is_empty();
+            let queue = if is_retransmit {
+                &mut self.deferred_retransmits
+            } else {
+                &mut self.fresh_data
+            };
+            let Some((seq_no, payload)) = queue.front() else {
+                break;
+            };
+            // Ask the pacer with the wire length (header + payload) so the
+            // packet is only encoded — one allocation — when it may be sent.
+            match self.pacer.allowance(now, SRT_HEADER_LEN + payload.len()) {
+                Allowance::Allow => {
+                    let pkt = encode_data_packet(*seq_no, is_retransmit, peer_socket_id, payload);
+                    sink.send(&pkt);
+                    sent += 1;
+                    queue.pop_front();
+                }
+                Allowance::DeferUntil(at) => {
+                    // Hold this packet and everything behind it: releasing
+                    // later packets first would reorder the stream.
+                    self.next_send_at = Some(at);
+                    break;
+                }
             }
         }
 
@@ -576,5 +709,303 @@ mod tests {
         // Sender receives ACK for all three → send buffer clears.
         sender.on_ack(3, 1, now);
         assert_eq!(sender.send_buffer_len(), 0);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Pacing tests: fake clock (caller-supplied `now`) + recording sink
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /// Payload size that yields exactly one nominal 1500-byte wire packet
+    /// after the 16-byte SRT header is prepended.
+    const MTU_PAYLOAD: usize = 1500 - SRT_HEADER_LEN;
+
+    /// Wire-encode an ACK control packet whose CIF carries the given RTT
+    /// sample (the same bytes a real receiver would put on the wire).
+    fn make_ack_pkt(ack_seq_no: u32, ack_id: u32, rtt_us: u32, rttvar_us: u32) -> Vec<u8> {
+        crate::control::encode_control(
+            &Action::SendAck { ack_seq_no, ack_id },
+            1,
+            0,
+            rtt_us,
+            rttvar_us,
+        )
+        .expect("SendAck encodes to a control packet")
+    }
+
+    /// Wire-encode a NAK control packet reporting the inclusive loss range.
+    fn make_nak_pkt(from: u32, to: u32) -> Vec<u8> {
+        crate::control::encode_control(&Action::SendNak { from, to }, 1, 0, 0, 0)
+            .expect("SendNak encodes to a control packet")
+    }
+
+    /// Sequence numbers of the data packets in `sink`, in send order.
+    fn data_seqs(sink: &RecordingSink) -> Vec<u32> {
+        sink.packets
+            .iter()
+            .filter_map(|p| match SrtHeader::parse(p).map(|h| h.kind) {
+                Some(PacketKind::Data { seq_no, .. }) => Some(seq_no),
+                _ => None,
+            })
+            .collect()
+    }
+
+    // ─── decode_ack_cif ───────────────────────────────────────────────────────
+
+    #[test]
+    fn decode_ack_cif_parses_leading_words_and_rejects_short_bodies() {
+        let pkt = make_ack_pkt(42, 7, 1_000, 250);
+        let cif = decode_ack_cif(&pkt[SRT_HEADER_LEN..]).expect("full CIF must parse");
+        assert_eq!(
+            cif,
+            AckCif {
+                ack_seq_no: 42,
+                rtt_us: 1_000,
+                rttvar_us: 250,
+            }
+        );
+        assert!(
+            decode_ack_cif(&[0u8; 11]).is_none(),
+            "11 bytes is short of the 3 mandatory CIF words"
+        );
+    }
+
+    // ─── send_data bookkeeping ────────────────────────────────────────────────
+
+    /// `send_data` assigns consecutive sequence numbers and keeps payloads in
+    /// the retransmit buffer (so a later NAK can replay them).
+    #[tokio::test]
+    async fn send_data_assigns_consecutive_seqs_and_buffers_for_retransmit() {
+        let (mut session, _dir) = fresh_session().await;
+        assert_eq!(session.send_data(b"a".to_vec()), 0);
+        assert_eq!(session.send_data(b"b".to_vec()), 1);
+        assert_eq!(session.reliability.send_buffer_len(), 2);
+    }
+
+    // ─── steady-state spacing through pump ────────────────────────────────────
+
+    /// At 1500 B/s with 1500-byte wire packets, `pump` must absorb the initial
+    /// 4-MTU bucket as a burst, then release exactly one packet per second —
+    /// in order, with the release instant surfaced via `next_send_at`.
+    #[tokio::test]
+    async fn pump_paces_fresh_data_and_releases_in_order() {
+        let (session, _dir) = fresh_session().await;
+        let mut session = session.with_max_bandwidth(1500);
+        let t0 = Instant::now();
+        for _ in 0..6 {
+            session.send_data(vec![0xAA; MTU_PAYLOAD]);
+        }
+
+        // Bucket capacity is 4 MTUs: the first 4 packets pass as a burst.
+        let mut sink = RecordingSink::default();
+        session.pump(&mut sink, t0, 1);
+        assert_eq!(data_seqs(&sink), vec![0, 1, 2, 3], "initial burst absorbed in order");
+        assert_eq!(
+            session.next_send_at(),
+            Some(t0 + Duration::from_secs(1)),
+            "1500-byte deficit at 1500 B/s = exactly 1 s"
+        );
+
+        // Pumping before the defer instant releases nothing and keeps the
+        // (unchanged) release instant.
+        let mut sink = RecordingSink::default();
+        let sent = session.pump(&mut sink, t0 + Duration::from_millis(500), 1);
+        assert_eq!(sent, 0, "no budget halfway through the deferral");
+        assert_eq!(session.next_send_at(), Some(t0 + Duration::from_secs(1)));
+
+        // At the defer instant exactly one packet's budget has accrued…
+        let mut sink = RecordingSink::default();
+        session.pump(&mut sink, t0 + Duration::from_secs(1), 1);
+        assert_eq!(data_seqs(&sink), vec![4]);
+        assert_eq!(session.next_send_at(), Some(t0 + Duration::from_secs(2)));
+
+        // …and the last packet goes one second later: steady-state spacing.
+        let mut sink = RecordingSink::default();
+        session.pump(&mut sink, t0 + Duration::from_secs(2), 1);
+        assert_eq!(data_seqs(&sink), vec![5]);
+        assert_eq!(session.next_send_at(), None, "queue drained — nothing held back");
+    }
+
+    // ─── NAK-storm slowdown through handle_control ────────────────────────────
+
+    /// A sustained NAK storm fed through `handle_control` must collapse the
+    /// send rate multiplicatively down to the 5% floor and visibly widen the
+    /// spacing `pump` enforces.
+    #[tokio::test]
+    async fn pump_nak_storm_slows_send_rate_and_widens_spacing() {
+        let (session, _dir) = fresh_session().await;
+        let mut session = session.with_max_bandwidth(1500);
+        let t0 = Instant::now();
+        assert_eq!(session.current_send_rate(), 1500);
+
+        // One NAK reporting 10 lost packets (none buffered → no retransmits)
+        // crosses the per-window threshold: one multiplicative decrease.
+        session.handle_control(&make_nak_pkt(100, 109), t0);
+        assert_eq!(session.current_send_rate(), 1275, "1500 × 85% after one NAK burst");
+
+        // One storm per 100 ms rate window → one more decrease each window,
+        // clamping at the 5% floor.
+        for i in 1..40u64 {
+            session.handle_control(&make_nak_pkt(100, 109), t0 + Duration::from_millis(100 * i));
+        }
+        assert_eq!(session.current_send_rate(), 75, "floor = 5% of 1500");
+
+        // Spacing widens to match: probe at the instant of the last storm NAK
+        // (waiting longer would let clean-window recovery lift the rate again
+        // — that path is covered by the pacing unit tests). After the 4-MTU
+        // burst, the next packet is 1500 B / 75 B/s = 20 s out instead of the
+        // 1 s it would be at the configured rate.
+        let t1 = t0 + Duration::from_millis(3900);
+        for _ in 0..5 {
+            session.send_data(vec![0xAA; MTU_PAYLOAD]);
+        }
+        let mut sink = RecordingSink::default();
+        session.pump(&mut sink, t1, 1);
+        assert_eq!(data_seqs(&sink), vec![0, 1, 2, 3]);
+        assert_eq!(
+            session.next_send_at(),
+            Some(t1 + Duration::from_secs(20)),
+            "backed-off rate must stretch the inter-packet gap"
+        );
+    }
+
+    // ─── RTT inflation slowdown through handle_control ────────────────────────
+
+    /// ACK CIFs fed through `handle_control` must drive the pacer (baseline,
+    /// then back-off on inflation), advance the send window, and queue ACKACK
+    /// echoes that the next `pump` delivers.
+    #[tokio::test]
+    async fn handle_control_ack_feeds_rtt_to_pacer_and_advances_the_window() {
+        let (session, _dir) = fresh_session().await;
+        let mut session = session.with_max_bandwidth(1000);
+        let t0 = Instant::now();
+
+        // Buffer two packets, then ACK both (ack_seq_no = next expected = 2).
+        session.send_data(b"one".to_vec());
+        session.send_data(b"two".to_vec());
+        session.handle_control(&make_ack_pkt(2, 7, 20_000, 0), t0); // baseline 20 ms
+        assert_eq!(
+            session.reliability.send_buffer_len(),
+            0,
+            "ACK must free the retransmit buffer"
+        );
+        assert_eq!(
+            session.current_send_rate(),
+            1000,
+            "the first RTT sample only sets the baseline"
+        );
+
+        // 40 ms > 20 ms × 1.25 → congestion: multiplicative decrease.
+        session.handle_control(&make_ack_pkt(2, 8, 40_000, 0), t0 + Duration::from_millis(10));
+        assert_eq!(session.current_send_rate(), 850);
+
+        // Both ACKs queued an ACKACK echo; pump must deliver them in order.
+        let mut sink = RecordingSink::default();
+        session.pump(&mut sink, t0 + Duration::from_millis(10), 1);
+        let ackacks: Vec<u32> = sink
+            .packets
+            .iter()
+            .filter_map(|p| match SrtHeader::parse(p).map(|h| h.kind) {
+                Some(PacketKind::Control {
+                    control_type: ControlType::AckAck,
+                    type_specific,
+                    ..
+                }) => Some(type_specific),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ackacks, vec![7, 8], "each ACK id must be echoed as an ACKACK");
+    }
+
+    // ─── retransmit priority under a shared budget ────────────────────────────
+
+    /// NAK-triggered retransmissions go out ahead of queued fresh data but
+    /// spend from the same pacer budget — with the bucket drained, both wait,
+    /// and as budget accrues the retransmits (R bit set) are released first.
+    #[tokio::test]
+    async fn pump_retransmits_take_priority_but_spend_the_pacer_budget() {
+        let (session, _dir) = fresh_session().await;
+        let mut session = session.with_max_bandwidth(1500);
+        let t0 = Instant::now();
+
+        // Send 4 packets (seq 0..=3), draining the 4-MTU bucket exactly.
+        for _ in 0..4 {
+            session.send_data(vec![0xAA; MTU_PAYLOAD]);
+        }
+        let mut sink = RecordingSink::default();
+        session.pump(&mut sink, t0, 1);
+        assert_eq!(data_seqs(&sink), vec![0, 1, 2, 3]);
+
+        // The peer NAKs seq 0–1 (2 packets: below the back-off threshold, so
+        // the rate stays put) and a fifth fresh packet joins the queue.
+        session.handle_control(&make_nak_pkt(0, 1), t0);
+        session.send_data(vec![0xAA; MTU_PAYLOAD]); // seq 4
+        assert_eq!(session.current_send_rate(), 1500, "2 NAKs must not back off");
+
+        // Budget exhausted: nothing goes out — retransmissions included.
+        let mut sink = RecordingSink::default();
+        assert_eq!(
+            session.pump(&mut sink, t0, 1),
+            0,
+            "retransmits still wait for pacer budget"
+        );
+
+        // As budget accrues (one packet per second) the retransmits go first,
+        // each with the R bit set…
+        for (step, want_seq) in [(1u64, 0u32), (2, 1)] {
+            let mut sink = RecordingSink::default();
+            session.pump(&mut sink, t0 + Duration::from_secs(step), 1);
+            assert_eq!(data_seqs(&sink), vec![want_seq], "retransmits drain in NAK order");
+            let msg_word = sink
+                .packets
+                .iter()
+                .find_map(|p| match SrtHeader::parse(p).map(|h| h.kind) {
+                    Some(PacketKind::Data { msg_word, .. }) => Some(msg_word),
+                    _ => None,
+                })
+                .expect("a data packet was sent");
+            assert_ne!(msg_word & (1 << 2), 0, "retransmit must carry the R bit");
+        }
+
+        // …then the fresh packet (R bit clear) brings up the rear.
+        let mut sink = RecordingSink::default();
+        session.pump(&mut sink, t0 + Duration::from_secs(3), 1);
+        assert_eq!(data_seqs(&sink), vec![4], "fresh data must follow the retransmits");
+        let msg_word = sink
+            .packets
+            .iter()
+            .find_map(|p| match SrtHeader::parse(p).map(|h| h.kind) {
+                Some(PacketKind::Data { msg_word, .. }) => Some(msg_word),
+                _ => None,
+            })
+            .expect("a data packet was sent");
+        assert_eq!(msg_word & (1 << 2), 0, "fresh data must not carry the R bit");
+    }
+
+    // ─── handle_control robustness ────────────────────────────────────────────
+
+    /// Unparsable datagrams, data packets, and truncated CIFs must neither
+    /// move the pacer nor queue control actions.
+    #[tokio::test]
+    async fn handle_control_ignores_malformed_and_irrelevant_packets() {
+        let (session, _dir) = fresh_session().await;
+        let mut session = session.with_max_bandwidth(1000);
+        let t0 = Instant::now();
+
+        session.handle_control(&[], t0); // unparsable
+        session.handle_control(&make_data_pkt(0, KkFlag::Clear, b"x"), t0); // data plane
+        let ack = make_ack_pkt(1, 1, 99_000, 0);
+        session.handle_control(&ack[..SRT_HEADER_LEN + 8], t0); // CIF one word short
+
+        assert_eq!(
+            session.current_send_rate(),
+            1000,
+            "none of the packets above may move the pacer"
+        );
+        let mut sink = RecordingSink::default();
+        assert_eq!(
+            session.pump(&mut sink, t0, 1),
+            0,
+            "and none may queue control actions"
+        );
     }
 }

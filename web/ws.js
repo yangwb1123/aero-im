@@ -2,6 +2,51 @@
 
 const BACKOFF_MS = [1000, 2000, 4000, 8000, 16000, 30000];
 
+// How many recently-seen seqs to remember per room/stream scope. Duplicates
+// from NATS at-least-once redelivery arrive close together, so a small window
+// is plenty; the cap bounds memory for very chatty rooms.
+const SEQ_RECENT_CAP = 256;
+
+// Per-scope event-seq dedup (ROADMAP v3 方向一). The server stamps every
+// bus-delivered frame with a per-room/per-stream monotonic `seq`, minted at
+// publish time — so an at-least-once redelivery (or a multi-instance replay)
+// carries the SAME seq. Dropping a seq we've already applied dedups events
+// that have no id of their own (edits, deletes, reactions, typing…).
+// Gaps are legal (only dedup + relative order matter), and frames without a
+// seq (legacy servers, locally-generated frames, REST backfill) always pass.
+export class SeqGate {
+  constructor() {
+    this.scopes = new Map(); // scope -> { recent:Set<number>, order:number[], high:number }
+  }
+  /** True when the frame should be applied; false for an already-seen seq. */
+  accept(scope, seq) {
+    if (!scope || typeof seq !== 'number' || !Number.isFinite(seq)) return true;
+    let s = this.scopes.get(scope);
+    if (!s) { s = { recent: new Set(), order: [], high: 0 }; this.scopes.set(scope, s); }
+    if (s.recent.has(seq)) return false; // duplicate delivery — drop
+    s.recent.add(seq);
+    s.order.push(seq);
+    if (s.order.length > SEQ_RECENT_CAP) s.recent.delete(s.order.shift());
+    if (seq > s.high) s.high = seq; // highest-applied, for relative ordering
+    return true;
+  }
+  /** Highest seq applied for a scope (0 when none) — lets callers ignore
+   *  events older than something newer they already applied. */
+  high(scope) { return this.scopes.get(scope)?.high || 0; }
+  reset() { this.scopes.clear(); }
+}
+
+// Dedup scope of a server frame: per stream for stream events, per room for
+// room events, a shared bucket for anything else that carries a seq.
+function seqScope(msg) {
+  if (msg.type === 'stream_event') {
+    const sid = msg.event && msg.event.stream_id;
+    return sid ? `s:${sid}` : null;
+  }
+  const rid = msg.room_id || msg.message?.room_id || msg.event?.room_id;
+  return rid ? `r:${rid}` : 'g';
+}
+
 export class WsClient {
   constructor() {
     this.ws = null;
@@ -16,6 +61,9 @@ export class WsClient {
     // server's backfill protocol, see crates/aero-server/src/ws.rs). In memory
     // only: a full page reload re-fetches state, so it resets per session.
     this._lastSeen = null;
+    // Event-seq dedup across the whole connection lifetime (survives reconnects
+    // on purpose: the post-reconnect live stream may redeliver stamped events).
+    this._seqGate = new SeqGate();
   }
 
   on(event, fn) {
@@ -35,6 +83,7 @@ export class WsClient {
     this.token = token;
     this.closedByUser = false;
     this._lastSeen = null; // fresh session → no backfill cursor yet
+    this._seqGate.reset(); // fresh session → forget seen seqs too
     this._open();
   }
 
@@ -67,6 +116,10 @@ export class WsClient {
       let msg;
       try { msg = JSON.parse(ev.data); }
       catch { this._emit('error', { code: 'PARSE', msg: 'invalid frame' }); return; }
+      // Seq dedup (ROADMAP v3 方向一): drop a frame whose per-room/per-stream
+      // seq was already applied (at-least-once redelivery). Frames without a
+      // seq pass through unchanged.
+      if (msg && msg.seq != null && !this._seqGate.accept(seqScope(msg), msg.seq)) return;
       this._emit('message', msg);
       // Track the newest message id for the reconnect `?since=` cursor. ULIDs sort
       // lexicographically, so a string compare yields the latest; only `message`
@@ -172,7 +225,13 @@ export class WsClient {
   }
 
   // ----- live interactivity (P4 弹幕 + 礼物) -----
-  watchStream(streamId) { return this.send({ type: 'watch_stream', stream_id: streamId }); }
+  // `since` (optional): last chat-line id already rendered — the server then
+  // replays only what was missed instead of the default recent tail.
+  watchStream(streamId, since = null) {
+    const frame = { type: 'watch_stream', stream_id: streamId };
+    if (since) frame.since = since;
+    return this.send(frame);
+  }
   unwatchStream(streamId) { return this.send({ type: 'unwatch_stream', stream_id: streamId }); }
   streamChat(streamId, body) {
     return this.send({ type: 'stream_chat', stream_id: streamId, body });

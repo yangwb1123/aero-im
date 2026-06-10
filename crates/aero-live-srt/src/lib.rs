@@ -41,12 +41,15 @@
 //! are collected in [`SrtSession::drain_actions`] but are not automatically
 //! serialised and sent over UDP in [`handle_datagram`] — a production caller
 //! must read those actions and transmit the corresponding SRT control packets.
-//! Congestion control, packet reordering, and retransmission scheduling are
-//! also not wired to the live UDP socket path.
+//! Outbound data packets ARE congestion-scheduled: every send drained by
+//! [`SrtSession::pump`] passes through a [`Pacer`] (token bucket + AIMD rate
+//! control fed by ACK RTT samples and NAK rates — see [`pacing`]). Packet
+//! reordering on the receive path is still not wired.
 
 pub mod control;
 pub mod crypto;
 mod metrics;
+pub mod pacing;
 pub mod protocol;
 pub mod pump;
 pub mod reliability;
@@ -57,8 +60,9 @@ pub use crypto::{
     KkFlag, KmMessage, KmMessageType, KeyUnwrapError, SrtCrypto,
     aes_key_unwrap, aes_key_wrap, pbkdf2_kek,
 };
+pub use pacing::{Allowance, Pacer, DEFAULT_MAX_BANDWIDTH};
 pub use protocol::{Handshake, HandshakeMachine, HsAction, HsState, SrtHeader};
-pub use pump::SrtSink;
+pub use pump::{decode_ack_cif, AckCif, SrtSink};
 pub use reliability::{Action, ReliabilityState, RttEstimator, seq_diff, seq_lt, seq_next};
 pub use segmenter::{MpegTsSegmenter, SegmentEvent, TS_PACKET_SIZE, TS_SYNC_BYTE};
 
@@ -150,6 +154,9 @@ pub struct SrtIngest {
     /// ingest expects the publisher to perform the KMREQ/KMRSP exchange and
     /// will decrypt each data packet before feeding it to the segmenter.
     passphrase: Option<Vec<u8>>,
+    /// Maximum outbound send bandwidth in **bytes/sec**, seeded into every
+    /// established session's [`Pacer`] (retransmits count against it).
+    max_bandwidth: u64,
 }
 
 impl Default for SrtIngest {
@@ -168,18 +175,37 @@ impl SrtIngest {
             listener_socket_id: 0x5254_0001, // "RT\0\x01"
             cookie_seed: random_cookie_seed(),
             passphrase: None,
+            max_bandwidth: max_bandwidth_from_env().unwrap_or(DEFAULT_MAX_BANDWIDTH),
         }
     }
 
     /// Construct with an explicit listener socket id and cookie seed — used by
-    /// tests that need deterministic cookies.
+    /// tests that need deterministic cookies. Skips the env passthrough so
+    /// tests stay hermetic; use [`SrtIngest::with_max_bandwidth`] to vary it.
     #[must_use]
     pub fn with_identity(listener_socket_id: u32, cookie_seed: u32) -> Self {
         Self {
             listener_socket_id,
             cookie_seed,
             passphrase: None,
+            max_bandwidth: DEFAULT_MAX_BANDWIDTH,
         }
+    }
+
+    /// Override the maximum outbound send bandwidth (bytes/sec) applied to
+    /// each session's [`Pacer`]. Defaults to [`DEFAULT_MAX_BANDWIDTH`]
+    /// (12 Mbit/s), or the `AERO_SRT_MAX_BANDWIDTH_BYTES_PER_SEC` environment
+    /// variable when constructed via [`SrtIngest::new`].
+    #[must_use]
+    pub fn with_max_bandwidth(mut self, bytes_per_sec: u64) -> Self {
+        self.max_bandwidth = bytes_per_sec;
+        self
+    }
+
+    /// The configured maximum outbound send bandwidth in bytes/sec.
+    #[must_use]
+    pub fn max_bandwidth(&self) -> u64 {
+        self.max_bandwidth
     }
 
     /// Configure a shared passphrase for AES-CTR decryption.
@@ -207,6 +233,23 @@ impl SrtIngest {
             .parse()
             .map_err(|e| LiveError::Protocol(format!("bad SRT listen addr: {e}")))
     }
+}
+
+/// Read `AERO_SRT_MAX_BANDWIDTH_BYTES_PER_SEC` (bytes/sec for the send
+/// [`Pacer`]); `None` when unset or unparsable. The parse itself lives in
+/// [`parse_max_bandwidth`] so it stays unit-testable without touching the
+/// process environment.
+fn max_bandwidth_from_env() -> Option<u64> {
+    std::env::var("AERO_SRT_MAX_BANDWIDTH_BYTES_PER_SEC")
+        .ok()
+        .as_deref()
+        .and_then(parse_max_bandwidth)
+}
+
+/// Parse a max-bandwidth override: a positive integer number of bytes/sec.
+/// Zero is rejected (it would stall the stream at the pacer floor).
+fn parse_max_bandwidth(s: &str) -> Option<u64> {
+    s.trim().parse::<u64>().ok().filter(|&v| v > 0)
 }
 
 /// Wall-clock seconds, used to mint/validate SYN cookies. Pulled out so the
@@ -326,6 +369,7 @@ async fn handle_datagram(
                         .await
                         .map_err(LiveError::Io)?;
                     let (id, session) = resolve_stream(repo, cfg, &stream_id).await?;
+                    let session = session.with_max_bandwidth(ingest.max_bandwidth);
                     info!(%peer, stream_id = %id, sid = %stream_id, "SRT: handshake complete; streaming");
                     // A new session is live: bump the process-wide gauge. The
                     // matching decrement happens in `finalize_session`, the sole
@@ -355,8 +399,13 @@ async fn handle_datagram(
                 // packets-lost counter via the reliability NAK actions below.
                 metrics::record_datagram(datagram.len());
                 session.feed_packet(datagram).await?;
+            } else if parsed_hdr.is_some() {
+                // ACK / NAK / ACKACK from the peer drive the sender-side
+                // reliability state and feed the congestion pacer (RTT from
+                // the ACK CIF, loss counts from the NAK loss list).
+                session.handle_control(datagram, Instant::now());
             } else {
-                debug!(%peer, "SRT: ignoring non-data control packet on established session");
+                debug!(%peer, "SRT: ignoring unparsable datagram on established session");
             }
             // Flush ACK / NAK / ACKACK control packets back to the sender.
             // Use the incoming packet's dest_socket_id as the peer id (mirrors
@@ -453,6 +502,18 @@ pub struct SrtSession {
     /// `pub(crate)` so the `pump` module can push ACKACK/etc. actions that
     /// arrive outside the normal `feed_packet` path (e.g. from `on_ack`).
     pub(crate) pending_actions: Vec<Action>,
+    /// Congestion-aware send pacer; every outbound data packet drained by
+    /// [`SrtSession::pump`] is gated through it. `pub(crate)` so the `pump`
+    /// module can consult it and feed it ACK/NAK signals.
+    pub(crate) pacer: Pacer,
+    /// NAK-triggered retransmissions awaiting pacer budget, in NAK order.
+    /// Drained by `pump` ahead of `fresh_data` (retransmits have priority).
+    pub(crate) deferred_retransmits: std::collections::VecDeque<(u32, Vec<u8>)>,
+    /// Fresh outbound data packets awaiting pacer budget, in sequence order.
+    pub(crate) fresh_data: std::collections::VecDeque<(u32, Vec<u8>)>,
+    /// When the pacer last deferred: earliest instant the head-of-line data
+    /// packet may be sent. `None` when nothing is held back.
+    pub(crate) next_send_at: Option<Instant>,
 }
 
 impl SrtSession {
@@ -481,7 +542,35 @@ impl SrtSession {
             crypto,
             reliability: ReliabilityState::new(0),
             pending_actions: Vec::new(),
+            pacer: Pacer::new(DEFAULT_MAX_BANDWIDTH),
+            deferred_retransmits: std::collections::VecDeque::new(),
+            fresh_data: std::collections::VecDeque::new(),
+            next_send_at: None,
         }
+    }
+
+    /// Replace the send pacer with one capped at `bytes_per_sec`.
+    ///
+    /// Call at construction time (before any traffic) — the new pacer starts
+    /// from a clean baseline, dropping any accumulated congestion state.
+    #[must_use]
+    pub fn with_max_bandwidth(mut self, bytes_per_sec: u64) -> Self {
+        self.pacer = Pacer::new(bytes_per_sec);
+        self
+    }
+
+    /// The pacer's current (congestion-adjusted) send rate in bytes/sec.
+    #[must_use]
+    pub fn current_send_rate(&self) -> u64 {
+        self.pacer.current_rate()
+    }
+
+    /// Earliest instant the pacer will release the next held data packet, or
+    /// `None` when nothing is held back. Callers can use this to schedule the
+    /// next [`SrtSession::pump`] instead of polling.
+    #[must_use]
+    pub fn next_send_at(&self) -> Option<Instant> {
+        self.next_send_at
     }
 
     /// Install or replace the AES-CTR crypto context.
@@ -1401,6 +1490,43 @@ mod tests {
 
         let plain = SrtIngest::new();
         assert!(plain.passphrase().is_none());
+    }
+
+    // ── max-bandwidth knob (send pacer configuration) ─────────────────────────
+
+    /// The env-override parser accepts positive integers only: zero would
+    /// stall the stream at the pacer floor, and garbage must fall back to the
+    /// default rather than panic.
+    #[test]
+    fn parse_max_bandwidth_accepts_positive_integers_only() {
+        assert_eq!(parse_max_bandwidth("1500000"), Some(1_500_000));
+        assert_eq!(parse_max_bandwidth("  42  "), Some(42), "whitespace is trimmed");
+        assert_eq!(parse_max_bandwidth("0"), None, "zero would stall the stream");
+        assert_eq!(parse_max_bandwidth("-5"), None);
+        assert_eq!(parse_max_bandwidth("12 Mbps"), None);
+        assert_eq!(parse_max_bandwidth(""), None);
+    }
+
+    /// `with_identity` (the hermetic test constructor) defaults to
+    /// [`DEFAULT_MAX_BANDWIDTH`]; `with_max_bandwidth` overrides it.
+    #[test]
+    fn ingest_max_bandwidth_defaults_and_overrides() {
+        let ingest = SrtIngest::with_identity(1, 2);
+        assert_eq!(ingest.max_bandwidth(), DEFAULT_MAX_BANDWIDTH);
+        assert_eq!(ingest.with_max_bandwidth(99).max_bandwidth(), 99);
+    }
+
+    /// `SrtSession::with_max_bandwidth` re-seeds the pacer at the new cap.
+    #[tokio::test]
+    async fn session_with_max_bandwidth_seeds_the_pacer() {
+        let dir = tempfile::tempdir().unwrap();
+        let hls = HlsWriter::new(dir.path().to_path_buf(), SEGMENT_DURATION_SECS)
+            .await
+            .unwrap();
+        let session = SrtSession::new(hls);
+        assert_eq!(session.current_send_rate(), DEFAULT_MAX_BANDWIDTH);
+        let session = session.with_max_bandwidth(64_000);
+        assert_eq!(session.current_send_rate(), 64_000);
     }
 
     // ── drain_control_packets integration tests ──────────────────────────────

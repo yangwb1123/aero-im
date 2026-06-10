@@ -12,7 +12,10 @@ use aero_common::{
     gift_by_id, Block, Error, GiftLeaderRow, ParticipantId, Result, StreamChatLine, StreamEvent,
     StreamGiftLine, StreamStatus,
 };
-use aero_im_core::{AllowAllModerator, KeywordModerator, ModerationVerdict, Moderator};
+use aero_im_core::{
+    AllowAllModerator, KeywordModerator, LocalSeqProvider, ModerationVerdict, Moderator,
+    SeqProvider,
+};
 use aero_storage::{LiveRepo, ParticipantRepo, StreamRepo};
 use tracing::{instrument, warn};
 use ulid::Ulid;
@@ -29,6 +32,12 @@ pub struct LiveService {
     participants: ParticipantRepo,
     bus: Arc<dyn EventBus>,
     moderator: Arc<dyn Moderator>,
+    /// Per-subject event-seq source for publish-time `"seq"` stamping (ROADMAP
+    /// 第三版 方向一), mirroring `ImService`. Defaults to the process-local
+    /// provider; `bin/aero-server.rs` wires the Redis-backed
+    /// [`aero_storage::SeqStore`] via [`with_seq`](Self::with_seq). Per-stream
+    /// monotonic; gaps are legal (dedup + relative order only).
+    seq: Arc<dyn SeqProvider>,
 }
 
 impl LiveService {
@@ -44,7 +53,22 @@ impl LiveService {
             Some(m) => Arc::new(m),
             None => Arc::new(AllowAllModerator),
         };
-        Self { streams, live, participants, bus, moderator }
+        Self {
+            streams,
+            live,
+            participants,
+            bus,
+            moderator,
+            seq: Arc::new(LocalSeqProvider::new()),
+        }
+    }
+
+    /// Inject a custom event-seq provider (cluster-correct Redis `INCR` in the
+    /// server binary). Additive builder mirroring `ImService::with_seq`.
+    #[must_use]
+    pub fn with_seq(mut self, seq: Arc<dyn SeqProvider>) -> Self {
+        self.seq = seq;
+        self
     }
 
     /// NATS subject used for per-stream broadcast.
@@ -55,7 +79,11 @@ impl LiveService {
 
     async fn publish(&self, event: &StreamEvent) {
         let subject = Self::live_subject(event.stream_id());
-        match serde_json::to_vec(event) {
+        // Publish-time seq stamp (ROADMAP 第三版 方向一): minted before the
+        // bytes hit NATS so a redelivery carries the SAME seq (the client dedup
+        // key). `None` degrades to an unstamped event — never blocks fan-out.
+        let seq = self.seq.next_seq(&subject).await;
+        match aero_bus::stamped_event_bytes(event, seq) {
             Ok(bytes) => {
                 if let Err(err) = self.bus.publish(&subject, bytes.into()).await {
                     warn!(?err, %subject, "publish StreamEvent failed");
@@ -63,6 +91,14 @@ impl LiveService {
             }
             Err(err) => warn!(?err, "serialize StreamEvent failed"),
         }
+    }
+
+    /// Announce a go-live transition on the stream's subject (used by the WHIP
+    /// ingest path on the idle/ended→live edge). Funnels through
+    /// [`publish`](Self::publish) so the event is seq-stamped like every other
+    /// `StreamEvent`. Best-effort: failures are logged, never surfaced.
+    pub async fn publish_go_live(&self, stream_id: Ulid) {
+        self.publish(&StreamEvent::Status { stream_id, status: StreamStatus::Live }).await;
     }
 
     /// Ensure a stream exists and has not ended; returns its current status.

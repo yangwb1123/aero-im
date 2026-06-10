@@ -8,7 +8,7 @@ use sha2::Digest as _;
 use aero_auth::{AuthUser, LoginRequest, RegisterRequest};
 use aero_common::{
     BlobId, Error as AeroError, FileKind, MessageId, ParticipantId, Result as AeroResult, RoomId,
-    RoomKind, StreamEvent, StreamProtocol, StreamStatus, WorkspaceId, WorkspaceRole,
+    RoomKind, StreamProtocol, StreamStatus, WorkspaceId, WorkspaceRole,
 };
 use aero_live_whip::{accept_whep_offer, accept_whip_offer, SessionError, WhipError};
 use aero_storage::{blob::NewBlob, stream::NewStream};
@@ -311,7 +311,12 @@ pub fn build(state: AppState) -> Router {
         .merge(crate::stream_meta::routes())
         // ---- Workspace IP / network allowlist (authorized networks) ----
         // Admin-gated CRUD over a workspace's authorized CIDR ranges.
-        .merge(crate::ip_allowlist::routes());
+        .merge(crate::ip_allowlist::routes())
+        // ---- Per-workspace rate-limit tiers (ROADMAP3 方向五 — 租户公平) ----
+        // Owner-only PUT + member-readable GET /api/workspaces/:id/rate-tier.
+        // Enforcement call sites live in the high-traffic handlers below
+        // (room_history / room_search / blob_* / WS SendMessage).
+        .merge(crate::ws_rate::routes());
 
     // Prometheus scrape endpoint (ROADMAP 方向四). Mounted unless disabled; the
     // handler self-gates on an optional bearer token. Left here (not behind the
@@ -730,6 +735,10 @@ async fn room_history(
     // check the forward (`since`) branch used to do, and complements the
     // membership check `ImService::history` does on the backward (`before`) path.
     s.im.assert_room_access(auth.participant_id, room).await?;
+    // Tenant fairness (ROADMAP3 方向五): charge this read against the room's
+    // workspace budget — AFTER the access check so non-members cannot drain a
+    // victim workspace's budget by spamming its room ids.
+    crate::ws_rate::check_ws_rate_room(&s, room).await?;
     let limit = history_limit(q.limit);
     // `before` pages backward, `since` pages forward — combining them is
     // ambiguous, so reject rather than silently pick one.
@@ -811,31 +820,66 @@ async fn delete_message(
 ) -> ApiResult<StatusCode> {
     let id = MessageId::from_str(&id_str)
         .map_err(|e| AeroError::Invalid(format!("message id: {e}")))?;
+    let started = std::time::Instant::now();
 
     // Pre-fetch the message before the delete so the audit trail can record
     // the room AND a content digest (the blocks are cleared by the soft-delete,
     // so this is the only chance to capture "what was deleted").
-    let pre = s.messages.get(id).await.map_err(AeroError::from)?;
-    let room_id = pre.as_ref().map(|m| m.room_id);
-    let digest = pre.as_ref().map(|m| {
-        let text = m.searchable_text();
-        // Char-boundary-safe 120-char summary so the audit row stays compact.
-        text.chars().take(120).collect::<String>()
-    });
+    let Some(pre) = s.messages.get(id).await.map_err(AeroError::from)? else {
+        return Err(AeroError::NotFound(format!("message {id}")).into());
+    };
+    let room_id = pre.room_id;
+    // Char-boundary-safe 120-char summary so the audit row stays compact.
+    let digest: String = pre.searchable_text().chars().take(120).collect();
 
-    s.im.delete_message(auth.participant_id, id).await?;
-
-    // Best-effort audit: resolve workspace and append a `message.deleted` event
-    // carrying the operator, the deleted message id, and its content digest.
-    if let Some(rid) = room_id {
-        let actor = auth.participant_id;
-        let target = id.to_string();
-        if let Ok(Some(ws)) = s.rooms.room_workspace(rid).await {
-            let details = serde_json::json!({ "room_id": rid, "digest": digest });
-            if let Err(e) = s.audit.append(ws, Some(actor), "message.deleted", Some(&target), details).await {
-                tracing::warn!(error = ?e, %ws, "message.deleted audit append failed");
+    match s.rooms.room_workspace(room_id).await.map_err(AeroError::from)? {
+        // Tenant-owned room: transactional delete + audit (ROADMAP 第三版 方向五
+        // 审计事务化) — if the audit row can't be written the delete rolls back
+        // and the client gets a 5xx, never a silently-unaudited delete.
+        Some(ws) => {
+            // Mirrors `ImService::delete_message` authorization exactly:
+            // re-deleting is an idempotent no-op (checked FIRST, so it never
+            // 403s), then only the sender may delete.
+            if pre.deleted_at.is_some() {
+                return Ok(StatusCode::NO_CONTENT);
+            }
+            if pre.sender_id != auth.participant_id {
+                return Err(AeroError::Forbidden("only sender may delete".into()).into());
+            }
+            let detail = serde_json::json!({ "room_id": room_id, "digest": digest });
+            let deleted = s
+                .messages
+                .soft_delete_audited(id, ws, Some(auth.participant_id), detail)
+                .await
+                .map_err(AeroError::from)?;
+            // `false` = lost a race with a concurrent delete — already gone, so
+            // no event/metric replay (the winner emitted them).
+            if deleted {
+                s.im.broadcast_room_event(
+                    room_id,
+                    aero_common::RoomEvent::Deleted {
+                        room_id,
+                        message_id: id,
+                        by: auth.participant_id,
+                    },
+                )
+                .await;
+                aero_common::metrics::inc_counter(
+                    aero_common::metrics::names::MESSAGES_DELETED_TOTAL,
+                    1,
+                );
+                // Metric parity with `ImService::delete_message`, which times
+                // the legacy (non-audited) path under the same label.
+                aero_common::metrics::observe_histogram_labeled(
+                    aero_common::metrics::names::MESSAGE_PROCESSING_DURATION_SECONDS,
+                    started.elapsed().as_secs_f64(),
+                    &[("op", "delete")],
+                );
             }
         }
+        // Legacy room with no owning workspace: there is no audit trail to write
+        // into, so keep the original (service) delete path unchanged.
+        None => s.im.delete_message(auth.participant_id, id).await?,
     }
 
     Ok(StatusCode::NO_CONTENT)
@@ -913,6 +957,9 @@ async fn room_search(
     // Tenant guard (workspace + room membership) — supersedes the prior bare
     // room-membership check before searching the room's messages.
     s.im.assert_room_access(auth.participant_id, room).await?;
+    // Tenant fairness (ROADMAP3 方向五): search is one of the most expensive
+    // per-request PG paths, so it is a charged choke point.
+    crate::ws_rate::check_ws_rate_room(&s, room).await?;
     if req.query.trim().is_empty() {
         return Err(AeroError::Invalid("empty query".into()).into());
     }
@@ -992,6 +1039,10 @@ async fn blob_upload(
     auth: AuthUser,
     mut mp: Multipart,
 ) -> ApiResult<Json<serde_json::Value>> {
+    // Tenant fairness (ROADMAP3 方向五): blobs are owner-scoped (no room in the
+    // URL), so the charge resolves through the uploader's workspace membership.
+    // Checked before the multipart body is read, shedding the bytes early.
+    crate::ws_rate::check_ws_rate_participant(&s, auth.participant_id).await?;
     while let Some(field) = mp.next_field().await.map_err(|e| AeroError::Invalid(e.to_string()))? {
         if field.name() != Some("file") {
             continue;
@@ -1066,6 +1117,9 @@ async fn blob_download(
 ) -> ApiResult<axum::response::Response> {
     let id = BlobId::from_str(&id_str)
         .map_err(|e| AeroError::Invalid(format!("blob id: {e}")))?;
+    // Tenant fairness (ROADMAP3 方向五): charge the download (a PG meta read +
+    // a full blob-store read) against the caller's workspace budget up front.
+    crate::ws_rate::check_ws_rate_participant(&s, auth.participant_id).await?;
     let meta = s
         .blobs
         .get(id)
@@ -1738,16 +1792,9 @@ async fn whip_post(
         // out "went live" notices to the creator's followers (durable activity feed),
         // without touching this ingest hot path. Only on the idle/ended->live edge,
         // so a republish of an already-live stream does not re-notify. Best-effort.
-        let event = StreamEvent::Status { stream_id: stream.id, status: StreamStatus::Live };
-        match serde_json::to_vec(&event) {
-            Ok(bytes) => {
-                let subject = crate::live::LiveService::live_subject(stream.id);
-                if let Err(e) = s.bus.publish(&subject, bytes.into()).await {
-                    tracing::warn!(error=?e, stream=%stream.id, "go-live publish failed");
-                }
-            }
-            Err(e) => tracing::warn!(error=?e, "serialize go-live event failed"),
-        }
+        // Funnels through LiveService so the event carries the publish-time `"seq"`
+        // stamp like every other StreamEvent (ROADMAP 第三版 方向一).
+        s.live.publish_go_live(stream.id).await;
     }
     let mut resp = (
         StatusCode::CREATED,

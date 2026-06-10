@@ -116,7 +116,7 @@ async fn export_job_status(
         if aero_storage::link_is_valid(job.completed_at, now) {
             let expires_at = job
                 .completed_at
-                .map(|c| (c + aero_storage::EXPORT_LINK_TTL))
+                .map(|c| c + aero_storage::EXPORT_LINK_TTL)
                 .and_then(|t| t.format(&time::format_description::well_known::Rfc3339).ok());
             return Ok(Json(serde_json::json!({
                 "status": "done",

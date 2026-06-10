@@ -163,6 +163,11 @@ pub struct AppState {
     /// Forgot-password limiter — 3 / hour / client, throttles email enumeration
     /// and reset-mail spam (ROADMAP 方向三).
     pub forgot_rate_limiter: RateLimiter,
+    /// Per-WORKSPACE request ceiling (ROADMAP3 方向五 — 租户公平): tier limits,
+    /// the cluster-wide Redis window counter, and the room→workspace /
+    /// workspace→tier TTL resolution caches. Enforced at the high-traffic
+    /// choke points via [`crate::ws_rate::check_ws_rate`] and friends.
+    pub ws_rate: crate::ws_rate::WsRateEnforcer,
     /// `/metrics` exposure policy (enable flag + optional scrape token).
     pub metrics: Arc<MetricsConfig>,
     /// Optional — only present when an Anthropic / Voyage API key is configured.

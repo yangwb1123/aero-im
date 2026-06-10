@@ -23,14 +23,22 @@ use aero_storage::{
     WorkspaceRepo,
 };
 use async_trait::async_trait;
+use futures::StreamExt;
 use std::collections::BTreeMap;
-use tracing::{instrument, warn};
+use tracing::{instrument, warn, Instrument};
 
 use crate::events::ImEvent;
 use crate::moderator::{ModerationVerdict, Moderator};
+use crate::seq::{LocalSeqProvider, SeqProvider};
 use crate::validation::validate_blocks;
 
 const EVENTS_SUBJECT: &str = "im.events";
+
+/// Max in-flight per-recipient `Notify` publishes inside the detached
+/// notification-dispatch task. Bounds the NATS pipelining for a large-room
+/// `@everyone` fan-out (ROADMAP 第三版 方向四): concurrent enough to drain 10k
+/// publishes quickly, bounded so one send can't monopolize bus connections.
+const NOTIFY_PUBLISH_CONCURRENCY: usize = 32;
 
 /// Whether a workspace member holding `role` may create a channel (room) in that
 /// workspace. Members and above may; guests may not. Pure decision function so it
@@ -170,6 +178,13 @@ pub struct ImService {
     totp: Option<TotpRepo>,
     bus: Arc<dyn BusSink>,
     moderator: Arc<dyn Moderator>,
+    /// Per-subject event-seq source for publish-time `"seq"` stamping (ROADMAP
+    /// 第三版 方向一). Defaults to the process-local [`LocalSeqProvider`];
+    /// clustered deployments wire the Redis `INCR`-backed
+    /// [`aero_storage::SeqStore`] via [`with_seq`](Self::with_seq) so every node
+    /// draws from one per-room sequence. Per-room monotonic; gaps are legal
+    /// (consumers use seq only for dedup + relative order).
+    seq: Arc<dyn SeqProvider>,
 }
 
 impl ImService {
@@ -213,6 +228,7 @@ impl ImService {
             totp: None,
             bus: bus as Arc<dyn BusSink>,
             moderator,
+            seq: Arc::new(LocalSeqProvider::new()),
         }
     }
 
@@ -220,6 +236,17 @@ impl ImService {
     #[must_use]
     pub fn with_moderator(mut self, moderator: Arc<dyn Moderator>) -> Self {
         self.moderator = moderator;
+        self
+    }
+
+    /// Inject a custom event-seq provider (overrides the process-local default).
+    /// `bin/aero-server.rs` passes the Redis-backed [`aero_storage::SeqStore`]
+    /// here so the publish-time `"seq"` stamp is cluster-correct: two instances
+    /// publishing into the same room never mint the same seq for different
+    /// events. Additive builder mirroring [`with_moderator`](Self::with_moderator).
+    #[must_use]
+    pub fn with_seq(mut self, seq: Arc<dyn SeqProvider>) -> Self {
+        self.seq = seq;
         self
     }
 
@@ -392,6 +419,7 @@ impl ImService {
             totp: None,
             bus,
             moderator: Arc::new(crate::moderator::AllowAllModerator),
+            seq: Arc::new(LocalSeqProvider::new()),
         }
     }
 
@@ -880,8 +908,27 @@ impl ImService {
 
         self.publish_room_event(room, &RoomEvent::Message(envelope)).await;
 
-        // Mention / thread-reply notifications (best-effort; never blocks the send).
-        self.dispatch_notifications(&message, &recipients).await;
+        // Mention / thread-reply notifications, DETACHED from the send path
+        // (ROADMAP 第三版 方向四): a large-room @everyone's prefs reads + per-
+        // recipient Notify publishes must not add to send latency. Safe to
+        // detach because the message is already persisted AND its Message event
+        // published above, and dispatch is best-effort end-to-end (every failure
+        // is warn-only). `ImService` is cheaply Clone (Arc'd repos/bus). Tests
+        // await the handle so inbox state is deterministic after send returns.
+        {
+            let svc = self.clone();
+            let msg = message.clone();
+            let dispatch = tokio::spawn(
+                async move { svc.dispatch_notifications(&msg, &recipients).await }
+                    .in_current_span(),
+            );
+            #[cfg(test)]
+            if let Err(err) = dispatch.await {
+                warn!(?err, "notification dispatch task panicked");
+            }
+            #[cfg(not(test))]
+            drop(dispatch);
+        }
 
         // Best-effort enqueue embed + moderate jobs (AI worker picks them up).
         let searchable = message.searchable_text();
@@ -1380,6 +1427,8 @@ impl ImService {
 
     /// Persist + push mention/thread-reply notifications for a freshly-sent
     /// message. Best-effort: a failure is logged and never blocks the send.
+    /// Runs DETACHED (spawned by [`send_message`](Self::send_message)) so its
+    /// prefs reads and per-recipient Notify publishes stay off the send path.
     /// No-op when the notification inbox isn't wired
     /// ([`with_notifications`](Self::with_notifications)). `members` is the room's
     /// member set — a mention or reply targeting someone outside it (e.g. a stale
@@ -1496,37 +1545,70 @@ impl ImService {
         }
 
         // Filter by mute / DND / snooze, then persist ALL survivors in ONE batch
-        // INSERT (ROADMAP 第三版 方向四 — write amplification). Previously each
-        // recipient was a separate INSERT transaction, so a large-room @everyone
-        // was O(N) PG round-trips on the send path. NB the per-recipient
-        // should_notify reads and the targeted Notify publishes remain O(N) —
-        // batching those prefs reads and moving the live publishes off the hot
-        // path are noted follow-ups; the dominant write cost is collapsed here.
-        let mut notifiable: Vec<(ParticipantId, NotificationKind)> = Vec::with_capacity(targets.len());
-        for (recipient, kind) in targets {
-            if self.should_notify(recipient, room).await {
-                notifiable.push((recipient, kind));
-            }
-        }
+        // INSERT (ROADMAP 第三版 方向四 — write amplification). Prefs are read in
+        // TWO batched queries (`= ANY`) instead of three per recipient, then
+        // applied in memory through the same pure helper composition the
+        // single-recipient `should_notify` uses — a 10k-member @everyone is now
+        // O(1) prefs round-trips instead of O(3N). Fail-open like should_notify:
+        // a failed batch lookup degrades to "no suppression" (warn + notify),
+        // never to a dropped notification.
+        let notifiable: Vec<(ParticipantId, NotificationKind)> = if let Some(prefs) =
+            self.prefs.as_ref()
+        {
+            let ids: Vec<ParticipantId> = targets.keys().copied().collect();
+            let muted = match prefs.muted_set(room, &ids).await {
+                Ok(set) => set,
+                Err(err) => {
+                    warn!(?err, %room, "batch mute lookup failed; not suppressing");
+                    std::collections::HashSet::new()
+                }
+            };
+            let dnd_rows = match prefs.dnd_snooze_many(&ids).await {
+                Ok(rows) => rows,
+                Err(err) => {
+                    warn!(?err, %room, "batch DND/snooze lookup failed; not suppressing");
+                    std::collections::HashMap::new()
+                }
+            };
+            let now = time::OffsetDateTime::now_utc();
+            targets
+                .into_iter()
+                .filter(|(recipient, _)| {
+                    // Absent row == no prefs (DndSnooze::default): always delivers.
+                    let row = dnd_rows.get(recipient).copied().unwrap_or_default();
+                    aero_storage::notification_prefs::should_deliver(
+                        muted.contains(recipient),
+                        row.dnd,
+                        row.snooze_until,
+                        now,
+                    )
+                })
+                .collect()
+        } else {
+            targets.into_iter().collect()
+        };
         if let Err(err) = repo.insert_many(room, message.id, Some(sender), &notifiable).await {
             warn!(?err, %room, count = notifiable.len(), "batch persist notifications failed");
             return;
         }
         // Targeted live hints: one Notify per recipient (the WS layer routes each
-        // to its single recipient via `explicit_recipients`). Best-effort.
-        for (recipient, kind) in notifiable {
-            self.publish_room_event(
-                room,
-                &RoomEvent::Notify {
-                    room_id: room,
-                    message_id: message.id,
-                    mentioned: recipient,
-                    by: sender,
-                    kind,
-                },
-            )
-            .await;
-        }
+        // to its single recipient via `explicit_recipients` — push_bot consumes
+        // them individually), published with bounded concurrency instead of
+        // strictly serially. Best-effort; runs inside the detached dispatch task,
+        // off the send hot path.
+        futures::stream::iter(notifiable.into_iter().map(|(recipient, kind)| {
+            let event = RoomEvent::Notify {
+                room_id: room,
+                message_id: message.id,
+                mentioned: recipient,
+                by: sender,
+                kind,
+            };
+            async move { self.publish_room_event(room, &event).await }
+        }))
+        .buffer_unordered(NOTIFY_PUBLISH_CONCURRENCY)
+        .for_each(|()| std::future::ready(()))
+        .await;
     }
 
     /// Publish a room event to the bus (cross-node fan-out).
@@ -1548,7 +1630,19 @@ impl ImService {
     ///   self-heals via backfill.
     async fn publish_room_event(&self, room: RoomId, event: &RoomEvent) {
         let subject = Self::room_subject(room);
-        if let Err(err) = publish_event(self.bus.as_ref(), &subject, event).await {
+        // Publish-time seq stamp (ROADMAP 第三版 方向一): mint the per-room seq
+        // BEFORE the bytes hit NATS, so an at-least-once redelivery carries the
+        // SAME seq and clients can dedup/order Edited/Deleted/Reaction/Typing
+        // events that have no id of their own. `None` (provider unavailable)
+        // degrades to an unstamped event — never blocks delivery. Existing
+        // consumers deserialize `RoomEvent` with serde, which ignores the
+        // unknown `"seq"` field (no event type uses `deny_unknown_fields`).
+        let seq = self.seq.next_seq(&subject).await;
+        let publish = async {
+            let bytes = aero_bus::stamped_event_bytes(event, seq)?;
+            self.bus.publish_bytes(&subject, bytes.into()).await
+        };
+        if let Err(err) = publish.await {
             warn!(?err, %subject, "publish RoomEvent failed");
             aero_common::metrics::inc_counter(
                 aero_common::metrics::names::NATS_PUBLISH_ERRORS_TOTAL,

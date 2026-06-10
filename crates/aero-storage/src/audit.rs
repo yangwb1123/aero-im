@@ -11,7 +11,7 @@
 
 use aero_common::{AuditId, ParticipantId, WorkspaceId};
 use serde::Serialize;
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 
 /// One recorded administrative action.
 #[derive(Debug, Clone, Serialize)]
@@ -61,6 +61,36 @@ impl AuditRepo {
         target: Option<&str>,
         detail: serde_json::Value,
     ) -> Result<AuditId, sqlx::Error> {
+        Self::append_on(&self.pool, workspace, actor, action, target, detail).await
+    }
+
+    /// Transaction-scoped [`append`](Self::append) (ROADMAP 第三版 方向五
+    /// 审计事务化): the audit INSERT rides the caller's transaction so it
+    /// commits or rolls back atomically with the action being audited.
+    pub async fn append_in_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        workspace: WorkspaceId,
+        actor: Option<ParticipantId>,
+        action: &str,
+        target: Option<&str>,
+        detail: serde_json::Value,
+    ) -> Result<AuditId, sqlx::Error> {
+        Self::append_on(&mut **tx, workspace, actor, action, target, detail).await
+    }
+
+    /// Shared INSERT for [`append`](Self::append) / [`append_in_tx`](Self::append_in_tx),
+    /// generic over the executor (pool vs. open transaction).
+    async fn append_on<'e, E>(
+        executor: E,
+        workspace: WorkspaceId,
+        actor: Option<ParticipantId>,
+        action: &str,
+        target: Option<&str>,
+        detail: serde_json::Value,
+    ) -> Result<AuditId, sqlx::Error>
+    where
+        E: sqlx::Executor<'e, Database = Postgres>,
+    {
         let id = AuditId::new();
         let created_at = time::OffsetDateTime::now_utc();
         sqlx::query(
@@ -74,7 +104,7 @@ impl AuditRepo {
         .bind(target)
         .bind(sqlx::types::Json(detail))
         .bind(created_at)
-        .execute(&self.pool)
+        .execute(executor)
         .await?;
         Ok(id)
     }
@@ -238,5 +268,112 @@ mod db_tests {
             !b_events.iter().any(|e| e.workspace_id == ws_a),
             "workspace A's events never leak into workspace B's trail"
         );
+    }
+
+    // Room + message fixture in `ws`, so the transactional delete+audit tests
+    // have something real to soft-delete.
+    async fn message_in_workspace(
+        p: &PgPool,
+        ws: WorkspaceId,
+        sender: ParticipantId,
+    ) -> aero_common::MessageId {
+        let room = aero_common::RoomId::new();
+        sqlx::query(
+            "INSERT INTO rooms (id, kind, name, created_by, workspace_id) VALUES ($1,'group',$2,$3,$4)",
+        )
+        .bind(room.to_uuid())
+        .bind(format!("audit-tx-room-{room}"))
+        .bind(sender.to_uuid())
+        .bind(ws.to_uuid())
+        .execute(p)
+        .await
+        .expect("insert room");
+        let repo = crate::message::MessageRepo::new(p.clone());
+        repo.insert(crate::message::NewMessage {
+            room_id: room,
+            sender_id: sender,
+            blocks: vec![aero_common::Block::text("to be deleted, audited atomically")],
+            reply_to: None,
+            metadata: serde_json::json!({}),
+        })
+        .await
+        .expect("insert message")
+        .id
+    }
+
+    /// ROADMAP 第三版 方向五 审计事务化: `soft_delete_audited` commits the
+    /// soft-delete AND the `message.deleted` audit row together; a repeat
+    /// delete is a no-op that appends NO second audit row.
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn audit_tx_delete_and_audit_commit_together() {
+        let p = pool();
+        let (ws, actor) = fixture(&p).await;
+        let id = message_in_workspace(&p, ws, actor).await;
+
+        let msg_repo = crate::message::MessageRepo::new(p.clone());
+        let deleted = msg_repo
+            .soft_delete_audited(id, ws, Some(actor), serde_json::json!({ "digest": "x" }))
+            .await
+            .unwrap();
+        assert!(deleted, "first delete deletes");
+
+        let after = msg_repo.get(id).await.unwrap().expect("row still exists");
+        assert!(after.deleted_at.is_some(), "message is soft-deleted");
+
+        let trail = AuditRepo::new(p.clone()).list_for_workspace(ws, None, None).await.unwrap();
+        let audit_rows: Vec<_> = trail
+            .iter()
+            .filter(|e| e.action == "message.deleted" && e.target.as_deref() == Some(&id.to_string()))
+            .collect();
+        assert_eq!(audit_rows.len(), 1, "exactly one audit row committed with the delete");
+        assert_eq!(audit_rows[0].actor_id, Some(actor));
+        assert_eq!(audit_rows[0].detail["digest"], "x");
+
+        // Idempotent repeat: nothing deleted, so nothing audited.
+        let again = msg_repo
+            .soft_delete_audited(id, ws, Some(actor), serde_json::json!({ "digest": "x" }))
+            .await
+            .unwrap();
+        assert!(!again, "second delete is a no-op");
+        let trail = AuditRepo::new(p.clone()).list_for_workspace(ws, None, None).await.unwrap();
+        let repeats = trail
+            .iter()
+            .filter(|e| e.action == "message.deleted" && e.target.as_deref() == Some(&id.to_string()))
+            .count();
+        assert_eq!(repeats, 1, "the no-op repeat appended no second audit row");
+    }
+
+    /// The rollback half of 审计事务化: when the audit INSERT fails (here via
+    /// the `workspace_id` FK — the workspace does not exist), the soft-delete
+    /// must roll back with it. The message stays live and unmodified; no
+    /// "deleted but unaudited" state can be observed.
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn audit_tx_failed_audit_rolls_back_delete() {
+        let p = pool();
+        let (ws, actor) = fixture(&p).await;
+        let id = message_in_workspace(&p, ws, actor).await;
+
+        let msg_repo = crate::message::MessageRepo::new(p.clone());
+        let missing_ws = WorkspaceId::new(); // never inserted -> FK violation
+        let err = msg_repo
+            .soft_delete_audited(id, missing_ws, Some(actor), serde_json::json!({}))
+            .await;
+        assert!(err.is_err(), "audit insert into a missing workspace must fail");
+
+        let after = msg_repo.get(id).await.unwrap().expect("row still exists");
+        assert!(after.deleted_at.is_none(), "soft-delete rolled back with the audit");
+        assert!(!after.blocks.is_empty(), "blocks were not cleared");
+
+        let orphaned: i64 = sqlx::query_as::<_, (i64,)>(
+            "SELECT COUNT(*) FROM audit_events WHERE target = $1",
+        )
+        .bind(id.to_string())
+        .fetch_one(&p)
+        .await
+        .unwrap()
+        .0;
+        assert_eq!(orphaned, 0, "no audit row escaped the rolled-back transaction");
     }
 }

@@ -129,4 +129,7 @@ pub mod stream_chat_modes;
 pub mod stream_meta;
 pub mod ip_allowlist;
 
+// ---- ROADMAP3 方向五: per-workspace rate-limit tiers (租户公平) ----
+pub mod ws_rate;
+
 pub use state::AppState;

@@ -34,6 +34,7 @@ pub mod receipt;
 pub mod room;
 pub mod saved_search;
 pub mod scim;
+pub mod seq;
 pub mod sso;
 pub mod stream;
 pub mod stream_chat_settings;
@@ -142,6 +143,7 @@ pub use saved_search::{SavedSearch, SavedSearchRepo};
 // re-exported at the crate root: the webhook module exports same-named helpers,
 // so SCIM consumers reach these via the `aero_storage::scim::` path instead.
 pub use scim::{ScimRepo, ScimUserRow};
+pub use seq::SeqStore;
 pub use sso::SsoRepo;
 pub use stream::{NewStream, StreamRepo};
 pub use stream_chat_settings::{slow_mode_violation, StreamChatSettings, StreamChatSettingsRepo};
@@ -248,3 +250,11 @@ pub use stream_viewer_sample::{StreamViewerSampleRepo, ViewerStats};
 // ---- Workspace IP / network allowlist (authorized networks) ----
 pub mod ip_allowlist;
 pub use ip_allowlist::{ip_in_cidr, is_allowed, IpAllowEntry, IpAllowlistRepo};
+
+// ---- Per-workspace rate ceiling: Redis fixed-window counter (租户公平) ----
+pub mod ws_rate;
+pub use ws_rate::WsRateStore;
+
+// ---- ROADMAP3 方向二 — cross-node group-call routing ----
+pub mod call_route;
+pub use call_route::{CallRouteRegistry, DEFAULT_TTL as CALL_ROUTE_TTL};

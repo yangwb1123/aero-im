@@ -91,21 +91,18 @@ async fn mark_unread(
     // `last_message_id` to report (the `Read` event's field is non-optional), so
     // that case is intentionally not broadcast.
     if let Some(last) = predecessor {
-        let subject = format!("im.room.{room}");
-        let event = RoomEvent::Read {
-            room_id: room,
-            participant: auth.participant_id,
-            last_message_id: last,
-            at: time::OffsetDateTime::now_utc(),
-        };
-        match serde_json::to_vec(&event) {
-            Ok(bytes) => {
-                if let Err(err) = s.bus.publish(&subject, bytes.into()).await {
-                    tracing::warn!(?err, %subject, "publish mark-unread Read failed");
-                }
-            }
-            Err(err) => tracing::warn!(?err, "serialize mark-unread Read failed"),
-        }
+        // Through the stamped seam (ROADMAP3 方向一) so this Read carries a
+        // `seq` like ImService::mark_read's own broadcast; best-effort.
+        s.im.broadcast_room_event(
+            room,
+            RoomEvent::Read {
+                room_id: room,
+                participant: auth.participant_id,
+                last_message_id: last,
+                at: time::OffsetDateTime::now_utc(),
+            },
+        )
+        .await;
     }
 
     Ok(Json(serde_json::json!({

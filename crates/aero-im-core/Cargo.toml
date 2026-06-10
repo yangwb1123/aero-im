@@ -17,6 +17,9 @@ aero-bus.workspace = true
 tokio.workspace = true
 async-trait.workspace = true
 futures.workspace = true
+# ROADMAP 第三版 方向一: per-subject seq counters for the process-local
+# `LocalSeqProvider` (`DashMap<String, AtomicU64>`).
+dashmap.workspace = true
 
 serde.workspace = true
 serde_json.workspace = true
