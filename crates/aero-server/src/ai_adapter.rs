@@ -11,7 +11,7 @@ use aero_common::{MessageId, ParticipantId, RoomId, WorkspaceId};
 use async_trait::async_trait;
 use futures::StreamExt as _;
 
-use crate::state::{AiAnswer, AiBackend, AiChannelRec, AiExpert, AiPersonRec};
+use crate::state::{AiAnswer, AiBackend, AiChannelRec, AiExpert, AiPersonRec, AiSentiment};
 
 /// Candidate pool breadth aggregated by [`AiService::find_expert`]. Wider than the
 /// returned top-k so a deep-but-relevant author can still surface.
@@ -166,6 +166,30 @@ impl AiBackend for AiServiceAdapter {
 
     async fn moderate(&self, text: &str) -> Result<Option<String>, String> {
         self.inner.moderate(text).await.map_err(|e| e.to_string())
+    }
+
+    async fn generate_thread_title(
+        &self,
+        root: MessageId,
+        max_replies: usize,
+    ) -> Result<String, String> {
+        self.inner
+            .generate_thread_title(root, max_replies)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn score_sentiment(&self, text: &str) -> Result<AiSentiment, String> {
+        let score = self
+            .inner
+            .score_message_sentiment(text)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(AiSentiment {
+            sentiment: score.sentiment.as_str().to_owned(),
+            toxicity: score.toxicity,
+            tone: score.tone,
+        })
     }
 
     async fn answer_question_stream(

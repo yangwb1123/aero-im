@@ -32,7 +32,7 @@ use aero_storage::{
     CallRouteRegistry, KeyPackageRepo, LiveRepo, MessageRepo, MlsGroupRepo, NotificationPrefsRepo,
     NotificationRepo, DeactivationRepo, KeywordAlertRepo, MessageEditRepo, ParticipantRepo, PatRepo,
     PinRepo, TotpRepo, PresenceStore, ReactionRepo, ReceiptRepo, RecurringMessageRepo, RedisCache,
-    RoomRepo, SeqStore, StreamRepo, StreamRouteRegistry, StreamViewerStore,
+    RoomRepo, SeqStore, StreamRepo, StreamRouteRegistry, StreamViewerStore, ThreadMuteRepo,
     ThreadSubscriptionRepo, UserGroupRepo, WorkspaceRepo, WsRateStore,
 };
 use tokio_util::sync::CancellationToken;
@@ -185,6 +185,9 @@ async fn main() -> anyhow::Result<()> {
         .with_keyword_alerts(KeywordAlertRepo::new(pg.clone()))
         // Wave 11: thread-follow notifications (reply → root-message subscribers).
         .with_thread_subs(ThreadSubscriptionRepo::new(pg.clone()))
+        // ROADMAP 第四版: thread MUTING (the inverse — subtract muters from the
+        // reply notification fan-out).
+        .with_thread_mutes(ThreadMuteRepo::new(pg.clone()))
         // Wave 14: workspace deactivation gate in assert_room_access.
         .with_deactivations(DeactivationRepo::new(pg.clone()))
         // Wave 24: workspace-wide 2FA enforcement gate in assert_room_access.

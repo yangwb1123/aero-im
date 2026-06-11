@@ -77,6 +77,68 @@ pub struct PersonRec {
     pub reason: String,
 }
 
+/// Coarse polarity bucket for [`SentimentScore::sentiment`].
+///
+/// Three-way ordinal so the UI can render a single chip (👍 / 😐 / 👎) without
+/// having to interpret a continuous score. Serializes lowercase
+/// (`"negative" | "neutral" | "positive"`) to match the wire shape the HTTP layer
+/// returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Sentiment {
+    Negative,
+    Neutral,
+    Positive,
+}
+
+impl Sentiment {
+    /// The lowercase wire label (`"negative" | "neutral" | "positive"`).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Sentiment::Negative => "negative",
+            Sentiment::Neutral => "neutral",
+            Sentiment::Positive => "positive",
+        }
+    }
+
+    /// Parse a model/heuristic label back into the enum, tolerant of case and
+    /// surrounding whitespace. Anything unrecognized falls back to `Neutral` so a
+    /// stray LLM line never errors the score.
+    #[must_use]
+    pub fn from_label(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "negative" | "neg" => Sentiment::Negative,
+            "positive" | "pos" => Sentiment::Positive,
+            _ => Sentiment::Neutral,
+        }
+    }
+}
+
+/// Result of [`AiService::score_message_sentiment`] — an additive, non-blocking
+/// affect read on a single message.
+///
+/// Distinct from [`AiService::moderate`] (a binary block/allow gate): this never
+/// blocks anything, it just describes tone. `sentiment` is the coarse polarity;
+/// `toxicity` is a `[0.0, 1.0]` likelihood the text is hostile/abusive (higher =
+/// more toxic); and `tone` is a short human-readable label (e.g. `"angry"`,
+/// `"friendly"`, `"neutral"`) suitable for a UI chip.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SentimentScore {
+    pub sentiment: Sentiment,
+    pub toxicity: f32,
+    pub tone: String,
+}
+
+impl SentimentScore {
+    /// The neutral baseline — used for empty text and as the conservative default
+    /// when a model verdict cannot be parsed.
+    #[must_use]
+    pub fn neutral() -> Self {
+        Self { sentiment: Sentiment::Neutral, toxicity: 0.0, tone: "neutral".to_owned() }
+    }
+}
+
 /// Composition root for AI features.
 #[derive(Clone)]
 pub struct AiService {
@@ -576,6 +638,64 @@ impl AiService {
         Ok(heuristic_summary(&replies))
     }
 
+    /// Generate a short (5-10 word) title for a thread, given its root message and
+    /// (oldest-first) reply chain.
+    ///
+    /// Mirrors [`Self::summarize_thread`]'s sourcing — the SAME
+    /// [`MessageRepo::thread_replies`](aero_storage::MessageRepo::thread_replies)
+    /// flat-thread set (deleted replies excluded) — but asks for a concise *title*
+    /// rather than a bullet summary. The root message itself anchors the title (the
+    /// reply chain is supporting context); `max_replies` caps how many replies are
+    /// read (clamped to `[1, 200]`).
+    ///
+    /// With an Anthropic key it prompts for a 5-10 word title. Without a key it
+    /// DEGRADES SAFELY to a deterministic heuristic — the first ~8 words of the root
+    /// message — so the route is verifiable as 200-with-heuristic. A missing root
+    /// returns an empty title; the no-key path is infallible.
+    ///
+    /// # Errors
+    /// Propagates a storage or Anthropic failure when a key IS configured; the
+    /// no-key path never errors on a missing key.
+    pub async fn generate_thread_title(
+        &self,
+        root: MessageId,
+        max_replies: usize,
+    ) -> Result<String> {
+        // Resolve the root message — it anchors the title.
+        let Some(root_msg) = self.messages.get(root).await? else {
+            return Ok(String::new());
+        };
+        let root_text = root_msg.searchable_text();
+
+        // `max_replies` is clamped to [1, 200] so this `as i64` is always safe.
+        #[allow(clippy::cast_possible_wrap)]
+        let limit = max_replies.clamp(1, 200) as i64;
+        // `thread_replies` is already oldest-first (chronological for the LLM).
+        let replies = self.messages.thread_replies(root, None, limit).await?;
+
+        if let Some(client) = &self.anthropic {
+            let mut context = String::new();
+            {
+                use std::fmt::Write as _;
+                let _ = writeln!(context, "根消息: {root_text}");
+                let reply_transcript = render_transcript(&replies);
+                if !reply_transcript.is_empty() {
+                    let _ = write!(context, "\n回复:\n{reply_transcript}");
+                }
+            }
+            let system = THREAD_TITLE_SYSTEM_PROMPT;
+            let user = format!(
+                "请为以下话题串生成一个简短标题(5-10 个词),概括其主旨。\n\n{context}"
+            );
+            let msgs = vec![ChatMsg::user(user)];
+            let title = client.complete(system, &msgs, 60).await?;
+            return Ok(clean_title(&title));
+        }
+
+        // Degrade safely: synthesize a title from the first ~8 words of the root.
+        Ok(heuristic_title(&root_text))
+    }
+
     /// Summarize the most recent activity across EVERY channel the caller belongs
     /// to within a workspace — the workspace twin of [`Self::summarize_room`].
     ///
@@ -750,6 +870,56 @@ impl AiService {
             .await?;
         Ok(parse_moderation_verdict(&verdict))
     }
+
+    /// Score a message's affect: coarse sentiment, a `[0.0, 1.0]` toxicity
+    /// likelihood, and a short tone label.
+    ///
+    /// Additive to the binary [`Self::moderate`] gate — this NEVER blocks, it just
+    /// describes tone for a UI affordance. With an Anthropic key it prompts for a
+    /// structured one-line verdict ([`parse_sentiment_verdict`]). Without a key it
+    /// DEGRADES SAFELY to a deterministic keyword/punctuation heuristic
+    /// ([`heuristic_sentiment`]): ALL-CAPS or insult keywords raise toxicity and an
+    /// angry tone; exclamation/positive words read positive; otherwise neutral with
+    /// low toxicity. Empty text scores neutral. Never errors on a missing key.
+    ///
+    /// # Errors
+    /// Propagates an Anthropic failure when a key IS configured; the no-key path is
+    /// infallible.
+    pub async fn score_message_sentiment(&self, text: &str) -> Result<SentimentScore> {
+        let text = text.trim();
+        if text.is_empty() {
+            return Ok(SentimentScore::neutral());
+        }
+        let Some(client) = &self.anthropic else {
+            return Ok(heuristic_sentiment(text));
+        };
+        let verdict = client
+            .complete(
+                SENTIMENT_SYSTEM_PROMPT,
+                &[ChatMsg::user(format!("待评估内容:\n{text}"))],
+                120,
+            )
+            .await?;
+        // A malformed model line degrades to the heuristic rather than erroring,
+        // so the route always returns a well-formed score.
+        Ok(parse_sentiment_verdict(&verdict).unwrap_or_else(|| heuristic_sentiment(text)))
+    }
+}
+
+/// Parse a sentiment verdict line. Protocol (one line, pipe-separated):
+/// `SENTIMENT|TOXICITY|TONE` — e.g. `negative|0.82|angry`. Returns `None` when the
+/// line cannot be parsed into all three fields so the caller can fall back to the
+/// heuristic. Tolerant of surrounding whitespace and case; toxicity is clamped to
+/// `[0.0, 1.0]`.
+fn parse_sentiment_verdict(raw: &str) -> Option<SentimentScore> {
+    // Take the first non-blank line — models occasionally add a trailing note.
+    let line = raw.lines().map(str::trim).find(|l| !l.is_empty())?;
+    let mut parts = line.splitn(3, '|');
+    let sentiment = Sentiment::from_label(parts.next()?);
+    let toxicity = parts.next()?.trim().parse::<f32>().ok()?.clamp(0.0, 1.0);
+    let tone = parts.next()?.trim();
+    let tone = if tone.is_empty() { sentiment.as_str() } else { tone };
+    Some(SentimentScore { sentiment, toxicity, tone: tone.to_owned() })
 }
 
 /// Parse a moderation verdict line. Protocol: `SAFE` (allow → `None`) or
@@ -803,6 +973,21 @@ const ANSWER_SYSTEM_PROMPT: &str = "\
 - 若上下文不足,直说\"上下文不足以回答\"并说明缺什么。\n\
 - 不要编造未在上下文中出现的事实。\n\
 - 引用证据时使用上下文中给出的消息 ID。";
+
+const THREAD_TITLE_SYSTEM_PROMPT: &str = "\
+你是一个话题串标题生成器,服务于即时通讯系统。请根据给定的根消息与回复,\
+生成一个能概括该话题主旨的简短标题。\n\
+约束:只输出标题本身(5-10 个词),不要加引号、不要加标点结尾、不要解释、不要换行。\
+标题语言与原文一致。";
+
+const SENTIMENT_SYSTEM_PROMPT: &str = "\
+你是一个消息情感与毒性分析器,服务于企业协作 IM。请评估给定文本的情感倾向、\
+毒性(敌意/辱骂/攻击)程度,以及简短语气标签。这只是描述性分析,不拦截任何内容。\n\
+只输出一行,使用竖线分隔三个字段:`情感|毒性|语气`。\n\
+- 情感:取值之一 negative / neutral / positive\n\
+- 毒性:0 到 1 之间的小数,越高越具敌意\n\
+- 语气:一个简短英文或中文词(如 angry、friendly、neutral)\n\
+示例:`negative|0.80|angry`。不要输出其它任何内容。";
 
 /// Render messages as a plain chronological transcript for the LLM.
 ///
@@ -1036,6 +1221,111 @@ fn truncate_for_summary(s: &str, max: usize) -> String {
     format!("{cut}…")
 }
 
+/// Max whitespace-delimited words kept in the heuristic thread title.
+const HEURISTIC_TITLE_WORDS: usize = 8;
+
+/// Heuristic thread title used when Anthropic is disabled — the first up-to-8
+/// whitespace-delimited words of the (single-lined) root message text, trimmed.
+///
+/// Degrades safely: empty/blank root text yields an empty string. CJK text often
+/// has no spaces, so when the first line is a single unbroken word (no internal
+/// whitespace) it is character-truncated to keep the title bounded.
+fn heuristic_title(root_text: &str) -> String {
+    let one_line = root_text.replace('\n', " ");
+    let trimmed = one_line.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let words: Vec<&str> = trimmed.split_whitespace().take(HEURISTIC_TITLE_WORDS).collect();
+    if words.len() <= 1 {
+        // No word boundaries (e.g. CJK) — char-truncate so the title stays bounded.
+        return truncate_for_summary(trimmed, 24);
+    }
+    let title = words.join(" ");
+    // Even with several words, keep an upper bound on length for the UI chip.
+    truncate_for_summary(&title, 80)
+}
+
+/// Strip wrapping quotes / trailing terminal punctuation an LLM sometimes adds to
+/// a one-line title, and collapse to a single trimmed line. Bounds the length.
+fn clean_title(raw: &str) -> String {
+    // Models occasionally add a leading note line; take the first non-blank line.
+    let line = raw.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("").trim();
+    let line = line
+        .trim_matches(|c| c == '"' || c == '\'' || c == '“' || c == '”' || c == '「' || c == '」')
+        .trim_end_matches(['.', '。', '!', '!', '?', '?'])
+        .trim();
+    truncate_for_summary(line, 80)
+}
+
+/// Insult / hostility keyword set for the no-LLM toxicity heuristic. Lowercased,
+/// matched case-insensitively as substrings. Deliberately small and conservative —
+/// this is a degrade path, not a real classifier.
+const TOXIC_KEYWORDS: &[&str] = &[
+    "idiot", "stupid", "shut up", "hate", "kill you", "moron", "loser", "trash",
+    "dumb", "fool", "scum", "滚", "废物", "白痴", "去死", "蠢", "垃圾", "傻",
+];
+
+/// Positive-sentiment keyword set for the no-LLM heuristic. Lowercased, matched
+/// case-insensitively as substrings.
+const POSITIVE_KEYWORDS: &[&str] = &[
+    "thank", "thanks", "great", "awesome", "love", "good job", "well done",
+    "nice", "excellent", "appreciate", "congrats", "happy", "谢谢", "感谢",
+    "太好了", "棒", "赞", "干得好", "厉害", "开心",
+];
+
+/// Deterministic keyword/punctuation sentiment+toxicity heuristic used when
+/// Anthropic is disabled (degrade-safe path).
+///
+/// Rules (checked in priority order):
+/// - An insult/hostility keyword OR ALL-CAPS shouting raises toxicity and reads
+///   `negative` with an `angry` tone (a keyword hit pushes toxicity higher).
+/// - Otherwise a positive keyword reads `positive` (tone `friendly`), toxicity low.
+/// - Otherwise neutral with low toxicity; a lone `!` nudges tone to `excited`.
+///
+/// Pure (no I/O), so the truth-table is unit-tested offline. Blank input scores
+/// neutral.
+#[must_use]
+fn heuristic_sentiment(text: &str) -> SentimentScore {
+    let text = text.trim();
+    if text.is_empty() {
+        return SentimentScore::neutral();
+    }
+    let lower = text.to_lowercase();
+
+    let has_toxic = TOXIC_KEYWORDS.iter().any(|kw| lower.contains(kw));
+    let has_positive = POSITIVE_KEYWORDS.iter().any(|kw| lower.contains(kw));
+
+    // ALL-CAPS shouting: there is at least one ASCII letter and every ASCII letter
+    // is uppercase, with enough letters to be a deliberate shout (not "OK").
+    let ascii_letters: Vec<char> = text.chars().filter(char::is_ascii_alphabetic).collect();
+    let is_shouting =
+        ascii_letters.len() >= 4 && ascii_letters.iter().all(char::is_ascii_uppercase);
+
+    if has_toxic || is_shouting {
+        // Keyword hostility is a stronger signal than mere shouting.
+        let toxicity = if has_toxic { 0.85 } else { 0.6 };
+        return SentimentScore {
+            sentiment: Sentiment::Negative,
+            toxicity,
+            tone: "angry".to_owned(),
+        };
+    }
+
+    if has_positive {
+        return SentimentScore {
+            sentiment: Sentiment::Positive,
+            toxicity: 0.0,
+            tone: "friendly".to_owned(),
+        };
+    }
+
+    // Neutral baseline; a lone exclamation reads as excited (still neutral polarity,
+    // still low toxicity).
+    let tone = if text.contains('!') || text.contains('!') { "excited" } else { "neutral" };
+    SentimentScore { sentiment: Sentiment::Neutral, toxicity: 0.05, tone: tone.to_owned() }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1257,5 +1547,159 @@ mod tests {
         let t = truncate_for_summary(&long, 120);
         assert!(t.ends_with("…"));
         assert_eq!(t.chars().count(), 121);
+    }
+
+    // ---- FEATURE #8: thread auto-titling heuristic ----
+
+    #[test]
+    fn heuristic_title_takes_first_eight_words() {
+        let root = "we should ship the new billing flow before the next release window";
+        let title = heuristic_title(root);
+        assert_eq!(title, "we should ship the new billing flow before");
+        assert_eq!(title.split_whitespace().count(), HEURISTIC_TITLE_WORDS);
+    }
+
+    #[test]
+    fn heuristic_title_keeps_short_root_intact() {
+        assert_eq!(heuristic_title("quick question"), "quick question");
+    }
+
+    #[test]
+    fn heuristic_title_collapses_newlines_and_trims() {
+        assert_eq!(heuristic_title("  hello\nworld  "), "hello world");
+    }
+
+    #[test]
+    fn heuristic_title_empty_when_blank() {
+        assert_eq!(heuristic_title("   \n  "), "");
+    }
+
+    #[test]
+    fn heuristic_title_truncates_unbroken_cjk() {
+        // No whitespace boundaries — char-truncated rather than returned whole.
+        let cjk = "这是一个非常长的没有空格的中文标题需要被截断处理以免标题过长影响显示".to_owned();
+        let title = heuristic_title(&cjk);
+        assert!(title.ends_with('…'), "long unbroken title truncated, got {title}");
+        assert!(title.chars().count() <= 25);
+    }
+
+    #[test]
+    fn clean_title_strips_quotes_and_trailing_punct() {
+        assert_eq!(clean_title("\"Billing flow redesign.\""), "Billing flow redesign");
+        assert_eq!(clean_title("「发布计划讨论。」"), "发布计划讨论");
+        assert_eq!(clean_title("  Roadmap sync!  "), "Roadmap sync");
+    }
+
+    #[test]
+    fn clean_title_takes_first_nonblank_line() {
+        assert_eq!(clean_title("\n\nHere is a title\nignored second line"), "Here is a title");
+    }
+
+    // ---- FEATURE #9: sentiment / toxicity heuristic truth table ----
+
+    #[test]
+    fn heuristic_sentiment_insult_is_negative_high_toxicity() {
+        let s = heuristic_sentiment("you are an idiot and a loser");
+        assert_eq!(s.sentiment, Sentiment::Negative);
+        assert!(s.toxicity >= 0.8, "insult => high toxicity, got {}", s.toxicity);
+        assert_eq!(s.tone, "angry");
+    }
+
+    #[test]
+    fn heuristic_sentiment_cjk_insult_is_negative() {
+        let s = heuristic_sentiment("你就是个废物");
+        assert_eq!(s.sentiment, Sentiment::Negative);
+        assert!(s.toxicity >= 0.8);
+        assert_eq!(s.tone, "angry");
+    }
+
+    #[test]
+    fn heuristic_sentiment_all_caps_is_angry() {
+        let s = heuristic_sentiment("STOP DOING THAT RIGHT NOW");
+        assert_eq!(s.sentiment, Sentiment::Negative);
+        assert!(s.toxicity >= 0.5 && s.toxicity < 0.85, "shout < keyword, got {}", s.toxicity);
+        assert_eq!(s.tone, "angry");
+    }
+
+    #[test]
+    fn heuristic_sentiment_short_caps_not_shouting() {
+        // "OK" / "YES" are too short to be flagged as a deliberate shout.
+        let s = heuristic_sentiment("OK");
+        assert_eq!(s.sentiment, Sentiment::Neutral);
+    }
+
+    #[test]
+    fn heuristic_sentiment_positive_words() {
+        let s = heuristic_sentiment("thanks so much, great job on this!");
+        assert_eq!(s.sentiment, Sentiment::Positive);
+        assert!(s.toxicity < 0.1);
+        assert_eq!(s.tone, "friendly");
+    }
+
+    #[test]
+    fn heuristic_sentiment_cjk_positive() {
+        let s = heuristic_sentiment("太好了,谢谢你");
+        assert_eq!(s.sentiment, Sentiment::Positive);
+        assert_eq!(s.tone, "friendly");
+    }
+
+    #[test]
+    fn heuristic_sentiment_neutral_default() {
+        let s = heuristic_sentiment("the meeting is at 3pm in room 2");
+        assert_eq!(s.sentiment, Sentiment::Neutral);
+        assert!(s.toxicity <= 0.05);
+        assert_eq!(s.tone, "neutral");
+    }
+
+    #[test]
+    fn heuristic_sentiment_lone_exclamation_is_excited() {
+        let s = heuristic_sentiment("the build passed!");
+        assert_eq!(s.sentiment, Sentiment::Neutral);
+        assert_eq!(s.tone, "excited");
+    }
+
+    #[test]
+    fn heuristic_sentiment_blank_is_neutral() {
+        let s = heuristic_sentiment("   ");
+        assert_eq!(s.sentiment, Sentiment::Neutral);
+        assert!(s.toxicity.abs() < 1e-6, "blank text has zero toxicity, got {}", s.toxicity);
+        assert_eq!(s.tone, "neutral");
+    }
+
+    #[test]
+    fn parse_sentiment_verdict_well_formed() {
+        let s = parse_sentiment_verdict("negative|0.82|angry").expect("parses");
+        assert_eq!(s.sentiment, Sentiment::Negative);
+        assert!((s.toxicity - 0.82).abs() < 1e-6);
+        assert_eq!(s.tone, "angry");
+    }
+
+    #[test]
+    fn parse_sentiment_verdict_clamps_and_tolerates_whitespace() {
+        let s = parse_sentiment_verdict("  positive | 1.5 | friendly  \n").expect("parses");
+        assert_eq!(s.sentiment, Sentiment::Positive);
+        assert!((s.toxicity - 1.0).abs() < 1e-6, "toxicity clamped to 1.0");
+        assert_eq!(s.tone, "friendly");
+    }
+
+    #[test]
+    fn parse_sentiment_verdict_rejects_malformed() {
+        assert!(parse_sentiment_verdict("not a verdict").is_none());
+        assert!(parse_sentiment_verdict("negative|not-a-number|angry").is_none());
+        assert!(parse_sentiment_verdict("").is_none());
+    }
+
+    #[test]
+    fn parse_sentiment_verdict_empty_tone_falls_back_to_label() {
+        let s = parse_sentiment_verdict("positive|0.0|").expect("parses");
+        assert_eq!(s.tone, "positive", "empty tone defaults to the sentiment label");
+    }
+
+    #[test]
+    fn sentiment_serializes_lowercase() {
+        let s = SentimentScore { sentiment: Sentiment::Negative, toxicity: 0.5, tone: "angry".into() };
+        let v = serde_json::to_value(&s).unwrap();
+        assert_eq!(v["sentiment"], "negative");
+        assert_eq!(v["tone"], "angry");
     }
 }

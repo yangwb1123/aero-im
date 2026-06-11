@@ -94,6 +94,45 @@ pub fn should_deliver(
     !is_snoozed(snooze_until, now) && !should_suppress(is_muted, dnd, minute_of_day_utc(now))
 }
 
+/// Whether a notification should be DELIVERED to a recipient at the given
+/// per-room notification `level`, for a message that either does (`is_mention`)
+/// or does not target them by mention. The three levels mirror the Slack/Teams
+/// per-channel control (and the `channel_notification_prefs.level` CHECK):
+///
+/// * `"all"` — deliver every message's notification (`true` regardless of
+///   `is_mention`).
+/// * `"mentions"` — deliver only when the recipient is mentioned
+///   (`is_mention`).
+/// * `"none"` — never deliver (`false`).
+///
+/// Any UNRECOGNIZED level fails OPEN to the `"all"` behaviour (`true`), so a
+/// bad/legacy value never silently drops a notification — the same fail-open
+/// stance the rest of this module takes. Pure, so the truth table is
+/// unit-tested offline.
+#[must_use]
+pub fn should_deliver_at_level(level: &str, is_mention: bool) -> bool {
+    match level {
+        "none" => false,
+        "mentions" => is_mention,
+        // "all" and any unrecognized level fall through to deliver-everything.
+        _ => true,
+    }
+}
+
+/// The default per-room notification level when a participant has no explicit
+/// `channel_notification_prefs` row AND has not muted the room: notify on every
+/// message. Mirrors the table's column DEFAULT.
+pub const NOTIFICATION_LEVEL_ALL: &str = "all";
+
+/// The per-room notification level equivalent to a channel mute: never notify.
+/// The dispatcher maps a `channel_mutes` row with no explicit
+/// `channel_notification_prefs` level to this.
+pub const NOTIFICATION_LEVEL_NONE: &str = "none";
+
+/// The per-room notification level that lets only @-mention notifications
+/// through, suppressing the rest.
+pub const NOTIFICATION_LEVEL_MENTIONS: &str = "mentions";
+
 /// One participant's `dnd_settings` row as returned by
 /// [`NotificationPrefsRepo::dnd_snooze_many`], decoded with the SAME semantics
 /// as the single-recipient reads: `dnd` is `Some((start, end))` only when both
@@ -355,6 +394,92 @@ impl NotificationPrefsRepo {
             })
             .collect())
     }
+
+    /// Set `participant`'s per-room notification LEVEL for `room` (one of
+    /// `"all"` / `"mentions"` / `"none"`; the DB CHECK rejects anything else).
+    /// An idempotent upsert keyed on `(participant, room)` that refreshes
+    /// `updated_at`. Distinct from [`mute`](Self::mute): a level is a richer
+    /// three-state control, whereas a mute is the binary equivalent of
+    /// `"none"`. Backs `migrations/0087_channel_notification_prefs.sql`.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the upsert (including a CHECK
+    /// violation when `level` is not one of the three permitted values).
+    pub async fn set_level(
+        &self,
+        participant: ParticipantId,
+        room: RoomId,
+        level: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r"INSERT INTO channel_notification_prefs (participant_id, room_id, level, updated_at)
+               VALUES ($1, $2, $3, now())
+               ON CONFLICT (participant_id, room_id)
+               DO UPDATE SET level = EXCLUDED.level, updated_at = now()",
+        )
+        .bind(participant.to_uuid())
+        .bind(room.to_uuid())
+        .bind(level)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// `participant`'s explicit per-room notification level for `room`, or
+    /// `None` when no row exists (the caller then falls back to the mute-derived
+    /// default). The returned string is one of `"all"` / `"mentions"` /
+    /// `"none"`.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the query.
+    pub async fn get_level(
+        &self,
+        participant: ParticipantId,
+        room: RoomId,
+    ) -> Result<Option<String>, sqlx::Error> {
+        let row = sqlx::query_as::<_, (String,)>(
+            r"SELECT level FROM channel_notification_prefs
+               WHERE participant_id = $1 AND room_id = $2",
+        )
+        .bind(participant.to_uuid())
+        .bind(room.to_uuid())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(level,)| level))
+    }
+
+    /// The explicit notification level for each of `participants` in `room`, in
+    /// ONE round-trip (`room_id = $1 AND participant_id = ANY($2)`) — the batched
+    /// counterpart of [`get_level`](Self::get_level) for notification fan-out.
+    /// Participants with no `channel_notification_prefs` row are simply absent
+    /// from the map (callers derive their effective level from the room's mute
+    /// state instead). Empty input short-circuits to an empty map without
+    /// touching the database.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the query.
+    pub async fn level_map(
+        &self,
+        room: RoomId,
+        participants: &[ParticipantId],
+    ) -> Result<HashMap<ParticipantId, String>, sqlx::Error> {
+        if participants.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let ids: Vec<uuid::Uuid> = participants.iter().map(ParticipantId::to_uuid).collect();
+        let rows = sqlx::query_as::<_, (uuid::Uuid, String)>(
+            r"SELECT participant_id, level FROM channel_notification_prefs
+               WHERE room_id = $1 AND participant_id = ANY($2)",
+        )
+        .bind(room.to_uuid())
+        .bind(&ids)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(p, level)| (ParticipantId::from_uuid(p), level))
+            .collect())
+    }
 }
 
 #[cfg(test)]
@@ -502,6 +627,37 @@ mod tests {
     }
 
     #[test]
+    fn should_deliver_at_level_truth_table() {
+        // "all": every message delivers, mention or not.
+        assert!(should_deliver_at_level("all", true), "all + mention delivers");
+        assert!(should_deliver_at_level("all", false), "all + non-mention delivers");
+
+        // "mentions": only a mention delivers.
+        assert!(should_deliver_at_level("mentions", true), "mentions + mention delivers");
+        assert!(
+            !should_deliver_at_level("mentions", false),
+            "mentions + non-mention is suppressed"
+        );
+
+        // "none": nothing delivers.
+        assert!(!should_deliver_at_level("none", true), "none + mention suppressed");
+        assert!(!should_deliver_at_level("none", false), "none + non-mention suppressed");
+
+        // Unrecognized / legacy level fails OPEN to the "all" behaviour, so a bad
+        // value never silently drops a notification.
+        for bad in ["", "ALL", "always", "garbage"] {
+            assert!(should_deliver_at_level(bad, true), "{bad:?} + mention fails open");
+            assert!(should_deliver_at_level(bad, false), "{bad:?} + non-mention fails open");
+        }
+
+        // The named constants agree with their string spellings.
+        assert!(should_deliver_at_level(NOTIFICATION_LEVEL_ALL, false));
+        assert!(!should_deliver_at_level(NOTIFICATION_LEVEL_NONE, true));
+        assert!(should_deliver_at_level(NOTIFICATION_LEVEL_MENTIONS, true));
+        assert!(!should_deliver_at_level(NOTIFICATION_LEVEL_MENTIONS, false));
+    }
+
+    #[test]
     fn minute_of_day_from_utc_clock() {
         let midnight = time::OffsetDateTime::UNIX_EPOCH; // 1970-01-01 00:00:00 UTC
         assert_eq!(minute_of_day_utc(midnight), 0);
@@ -641,6 +797,66 @@ mod db_tests {
         // Clearing again is idempotent.
         repo.clear_snooze(participant).await.unwrap();
         assert!(repo.get_snooze(participant).await.unwrap().is_none(), "second clear is a no-op");
+    }
+
+    /// Per-room notification LEVEL (0087): set/get round-trips, the upsert
+    /// overwrites, and `level_map` agrees with `get_level` for a mixed
+    /// population (an explicit row vs. no row).
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn notif_prefs_set_get_and_level_map_roundtrip() {
+        let p = pool();
+        let repo = NotificationPrefsRepo::new(p.clone());
+        let (a, room) = fixture(&p).await;
+
+        // No explicit level initially.
+        assert!(repo.get_level(a, room).await.unwrap().is_none(), "no level row initially");
+
+        // Set → round-trips; upsert overwrites in place.
+        repo.set_level(a, room, "mentions").await.unwrap();
+        assert_eq!(repo.get_level(a, room).await.unwrap().as_deref(), Some("mentions"));
+        repo.set_level(a, room, "none").await.unwrap();
+        assert_eq!(repo.get_level(a, room).await.unwrap().as_deref(), Some("none"));
+        repo.set_level(a, room, "all").await.unwrap();
+        assert_eq!(repo.get_level(a, room).await.unwrap().as_deref(), Some("all"));
+
+        // A second participant in the same room with a different (and no) level.
+        let b = ParticipantId::new();
+        sqlx::query("INSERT INTO participants (id, kind, display_name) VALUES ($1,'human',$2)")
+            .bind(b.to_uuid())
+            .bind(format!("prefs-level-b-{b}"))
+            .execute(&p)
+            .await
+            .expect("insert participant");
+        repo.set_level(b, room, "mentions").await.unwrap();
+        let c = ParticipantId::new();
+        sqlx::query("INSERT INTO participants (id, kind, display_name) VALUES ($1,'human',$2)")
+            .bind(c.to_uuid())
+            .bind(format!("prefs-level-c-{c}"))
+            .execute(&p)
+            .await
+            .expect("insert participant");
+        // c has no level row.
+
+        let population = [a, b, c];
+        let map = repo.level_map(room, &population).await.unwrap();
+        for who in population {
+            assert_eq!(
+                map.get(&who).cloned(),
+                repo.get_level(who, room).await.unwrap(),
+                "level_map vs get_level for {who}"
+            );
+        }
+        assert!(!map.contains_key(&c), "no level row => absent from level_map");
+
+        // Empty input short-circuits.
+        assert!(repo.level_map(room, &[]).await.unwrap().is_empty());
+
+        // The DB CHECK rejects an out-of-enum level.
+        assert!(
+            repo.set_level(a, room, "loud").await.is_err(),
+            "an invalid level violates the CHECK constraint"
+        );
     }
 
     /// The batched fan-out reads must agree with the single-recipient fns for a

@@ -21,10 +21,10 @@ use std::str::FromStr;
 
 use aero_auth::AuthUser;
 use aero_common::{Error as AeroError, MessageId};
-use aero_storage::ThreadSubscriptionRepo;
+use aero_storage::{ThreadMuteRepo, ThreadSubscriptionRepo};
 use axum::{
     extract::{Path, State},
-    routing::put,
+    routing::{post, put},
     Json, Router,
 };
 
@@ -42,12 +42,23 @@ pub fn routes() -> Router<AppState> {
             "/api/me/followed-threads",
             axum::routing::get(list_followed_threads),
         )
+        // Thread MUTING (the inverse of follow): stop reply notifications for a
+        // thread, identified by its root message id.
+        .route(
+            "/api/threads/:id/mute",
+            post(mute_thread).delete(unmute_thread),
+        )
 }
 
 /// Build a [`ThreadSubscriptionRepo`] from shared state, over the shared pool.
 /// Cheap (a clone of an `Arc<PgPool>`), keeping this feature self-contained.
 fn repo(s: &AppState) -> ThreadSubscriptionRepo {
     ThreadSubscriptionRepo::new(s.pg.clone())
+}
+
+/// Build a [`ThreadMuteRepo`] from shared state, over the shared pool.
+fn mute_repo(s: &AppState) -> ThreadMuteRepo {
+    ThreadMuteRepo::new(s.pg.clone())
 }
 
 fn parse_message(s: &str) -> Result<MessageId, AeroError> {
@@ -110,4 +121,50 @@ async fn list_followed_threads(
         .await
         .map_err(AeroError::from)?;
     Ok(Json(serde_json::json!({ "threads": threads })))
+}
+
+/// `POST /api/threads/:id/mute` — mute the thread rooted at this message so the
+/// caller STOPS receiving reply notifications for it (the inverse of follow). The
+/// root message's room is resolved and the caller must be able to access it
+/// (workspace + room membership), else `404`/`403`; an unknown message id is
+/// `404`. Idempotent: re-muting is a no-op. The mute suppresses only the
+/// notification — the room broadcast of replies is unaffected. Always reports
+/// `muted: true`.
+async fn mute_thread(
+    State(s): State<AppState>,
+    auth: AuthUser,
+    Path(id_str): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let message = parse_message(&id_str)?;
+    // Resolve the root message's room (reusing the subscription repo's resolver);
+    // an unknown message is a 404, gated like follow_thread.
+    let room = repo(&s)
+        .message_room(message)
+        .await
+        .map_err(AeroError::from)?
+        .ok_or_else(|| AeroError::NotFound(format!("message {message}")))?;
+    s.im.assert_room_access(auth.participant_id, room).await?;
+    mute_repo(&s)
+        .mute(auth.participant_id, message)
+        .await
+        .map_err(AeroError::from)?;
+    Ok(Json(serde_json::json!({ "muted": true })))
+}
+
+/// `DELETE /api/threads/:id/mute` — unmute the thread rooted at this message,
+/// re-enabling reply notifications. Owner-scoped at the SQL layer (only the
+/// caller's own mute is ever touched), so no room-access check is needed;
+/// unmuting a thread that was never muted is a no-op. Always reports
+/// `muted: false`.
+async fn unmute_thread(
+    State(s): State<AppState>,
+    auth: AuthUser,
+    Path(id_str): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let message = parse_message(&id_str)?;
+    mute_repo(&s)
+        .unmute(auth.participant_id, message)
+        .await
+        .map_err(AeroError::from)?;
+    Ok(Json(serde_json::json!({ "muted": false })))
 }

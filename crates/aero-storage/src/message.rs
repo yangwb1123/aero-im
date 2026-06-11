@@ -245,6 +245,87 @@ impl MessageRepo {
         Ok(deleted)
     }
 
+    /// Edit a message AND, in the SAME transaction, capture the prior version
+    /// into `message_edits` and append a `message.edited` audit row to
+    /// `workspace`'s trail (ROADMAP 第四版 — message-edit audit trail). Mirrors
+    /// [`soft_delete_audited`](Self::soft_delete_audited): if EITHER the history
+    /// capture or the audit append fails, the edit rolls back too — a message is
+    /// never edited while its history/audit record is lost. `old_blocks` is the
+    /// verbatim block array the message held BEFORE this edit (the caller has
+    /// already authorized + validated); `detail` is the audit detail JSON
+    /// (`{block_count_before, block_count_after}`). Returns the updated message,
+    /// or `None` when the edit raced with a delete (in which case nothing is
+    /// written — the transaction commits with no rows touched).
+    ///
+    /// `MessageId` is the audit `target`; the actor is the editor.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the capture / edit / audit append; the
+    /// whole transaction rolls back on the first failure.
+    pub async fn edit_audited(
+        &self,
+        id: MessageId,
+        blocks: Vec<Block>,
+        workspace: WorkspaceId,
+        actor: ParticipantId,
+        old_blocks: &serde_json::Value,
+        detail: serde_json::Value,
+    ) -> Result<Option<Message>, sqlx::Error> {
+        let blocks_json =
+            serde_json::to_value(&blocks).map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+        let searchable = searchable_of(&blocks);
+        let edited_at = time::OffsetDateTime::now_utc();
+
+        let mut tx = self.pool.begin().await?;
+
+        // 1) Apply the edit; an already-deleted/missing row yields no update — we
+        //    write nothing else and commit a no-op so the caller sees `None`.
+        let row = sqlx::query_as::<_, MessageRow>(
+            r#"UPDATE messages
+                  SET blocks = $1, searchable_text = $2, edited_at = $3, embedding = NULL
+               WHERE id = $4 AND deleted_at IS NULL
+            RETURNING id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at"#,
+        )
+        .bind(&blocks_json)
+        .bind(&searchable)
+        .bind(edited_at)
+        .bind(id.to_uuid())
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let Some(updated) = row.map(Message::from) else {
+            tx.commit().await?;
+            return Ok(None);
+        };
+
+        // 2) Capture the prior version into `message_edits` (oldest-first by
+        //    recorded_at), riding the same transaction as the edit.
+        sqlx::query(
+            r"INSERT INTO message_edits (id, message_id, editor_id, blocks)
+               VALUES ($1, $2, $3, $4)",
+        )
+        .bind(aero_common::MessageEditId::new().to_uuid())
+        .bind(id.to_uuid())
+        .bind(actor.to_uuid())
+        .bind(old_blocks)
+        .execute(&mut *tx)
+        .await?;
+
+        // 3) Append the `message.edited` audit row, atomic with the edit.
+        crate::audit::AuditRepo::append_in_tx(
+            &mut tx,
+            workspace,
+            Some(actor),
+            "message.edited",
+            Some(&id.to_string()),
+            detail,
+        )
+        .await?;
+
+        tx.commit().await?;
+        Ok(Some(updated))
+    }
+
     /// Patch transcripts onto the Voice blocks of a message that don't have
     /// one yet. Called by the transcribe bot — bypasses the sender-only edit
     /// check because the AI is acting on behalf of the system.
@@ -1534,5 +1615,119 @@ mod db_tests {
             .position(|m| m.id == target)
             .expect("target present in window");
         assert_eq!(pos, 2, "target is dead center with two on each side");
+    }
+
+    /// `edit_audited` applies the edit, captures the prior version into
+    /// `message_edits`, AND appends a `message.edited` audit row — all in one
+    /// transaction. Asserts the audit row has the right action/actor/target/detail
+    /// and that the edit history still surfaces the old blocks.
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn edit_audited_writes_history_and_audit_row() {
+        use crate::audit::AuditRepo;
+        use crate::message_edit::MessageEditRepo;
+
+        let p = pool();
+        let repo = MessageRepo::new(p.clone());
+        let ws = WorkspaceId(ulid::Ulid(0)); // default workspace
+        let me = participant(&p).await;
+        let r = room(&p, me).await;
+
+        // Seed a message with two blocks.
+        let original = repo
+            .insert(NewMessage {
+                room_id: r,
+                sender_id: me,
+                blocks: vec![Block::text("first"), Block::text("second")],
+                reply_to: None,
+                metadata: serde_json::json!({}),
+            })
+            .await
+            .expect("insert");
+
+        // Edit it down to a single block, audited.
+        let old_blocks = serde_json::to_value(&original.blocks).expect("serialize old blocks");
+        let detail = serde_json::json!({
+            "block_count_before": original.blocks.len(),
+            "block_count_after": 1,
+        });
+        let updated = repo
+            .edit_audited(
+                original.id,
+                vec![Block::text("edited body")],
+                ws,
+                me,
+                &old_blocks,
+                detail,
+            )
+            .await
+            .expect("edit_audited")
+            .expect("message still live");
+        assert_eq!(updated.blocks.len(), 1, "edit applied");
+        assert!(updated.edited_at.is_some(), "edited_at stamped");
+
+        // Audit row: exactly one message.edited for this target, right actor/detail.
+        let audit = AuditRepo::new(p.clone());
+        let events = audit
+            .list_for_workspace_filtered(
+                ws,
+                Some("message.edited"),
+                None,
+                Some(&original.id.to_string()),
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("filter audit");
+        let row = events
+            .iter()
+            .find(|e| e.target.as_deref() == Some(&original.id.to_string()))
+            .expect("a message.edited audit row for the edited message");
+        assert_eq!(row.action, "message.edited");
+        assert_eq!(row.actor_id, Some(me), "editor is the audit actor");
+        assert_eq!(row.detail["block_count_before"], 2);
+        assert_eq!(row.detail["block_count_after"], 1);
+
+        // The prior version still surfaces from message_edit_history.
+        let history = MessageEditRepo::new(p.clone())
+            .list_for_message(original.id)
+            .await
+            .expect("history");
+        assert_eq!(history.len(), 1, "one captured prior version");
+        assert_eq!(history[0].editor_id, me);
+        assert_eq!(history[0].blocks, old_blocks, "old blocks captured verbatim");
+
+        // Editing a DELETED message is a no-op (None) and writes nothing extra.
+        repo.soft_delete(original.id).await.expect("soft delete");
+        let none = repo
+            .edit_audited(
+                original.id,
+                vec![Block::text("nope")],
+                ws,
+                me,
+                &old_blocks,
+                serde_json::json!({}),
+            )
+            .await
+            .expect("edit_audited on deleted");
+        assert!(none.is_none(), "editing a deleted message yields None");
+
+        // Cleanup so reruns stay self-contained.
+        sqlx::query("DELETE FROM message_edits WHERE message_id = $1")
+            .bind(original.id.to_uuid())
+            .execute(&p)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM messages WHERE id = $1")
+            .bind(original.id.to_uuid())
+            .execute(&p)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM rooms WHERE id = $1")
+            .bind(r.to_uuid())
+            .execute(&p)
+            .await
+            .ok();
     }
 }

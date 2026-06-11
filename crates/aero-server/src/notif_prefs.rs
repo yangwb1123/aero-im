@@ -29,12 +29,21 @@ pub fn routes() -> Router<AppState> {
             "/api/rooms/:id/mute",
             post(mute_room).delete(unmute_room),
         )
+        .route(
+            "/api/rooms/:id/notification-level",
+            axum::routing::put(set_notification_level).get(get_notification_level),
+        )
         .route("/api/notifications/prefs", get(get_prefs))
         .route(
             "/api/notifications/prefs/dnd",
             axum::routing::put(set_dnd),
         )
 }
+
+/// The three permitted per-room notification levels (the DB CHECK enforces the
+/// same set). Validated at the edge so a bad value is a clean `400` rather than a
+/// constraint violation surfaced as a `500`.
+const NOTIFICATION_LEVELS: [&str; 3] = ["all", "mentions", "none"];
 
 fn repo(s: &AppState) -> NotificationPrefsRepo {
     NotificationPrefsRepo::new(s.pg.clone())
@@ -67,6 +76,62 @@ async fn unmute_room(
     s.im.assert_room_access(auth.participant_id, room).await?;
     let removed = repo(&s).unmute(auth.participant_id, room).await?;
     Ok(Json(serde_json::json!({ "room_id": room, "muted": false, "removed": removed })))
+}
+
+#[derive(Deserialize)]
+struct LevelReq {
+    /// One of `all` / `mentions` / `none`.
+    level: String,
+}
+
+/// `PUT /api/rooms/:id/notification-level` — set the caller's per-room
+/// notification level (`all` | `mentions` | `none`) for a room they belong to.
+/// `all` notifies on every message, `mentions` only on @-mentions, `none` never.
+/// Room-access gated like [`mute_room`]. An unrecognized level is a `400`.
+async fn set_notification_level(
+    State(s): State<AppState>,
+    auth: AuthUser,
+    Path(room_str): Path<String>,
+    Json(req): Json<LevelReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let room = parse_room(&room_str)?;
+    let level = req.level.trim().to_ascii_lowercase();
+    if !NOTIFICATION_LEVELS.contains(&level.as_str()) {
+        return Err(AeroError::Invalid(
+            "level must be one of: all, mentions, none".into(),
+        )
+        .into());
+    }
+    s.im.assert_room_access(auth.participant_id, room).await?;
+    repo(&s).set_level(auth.participant_id, room, &level).await?;
+    Ok(Json(serde_json::json!({ "room_id": room, "level": level })))
+}
+
+/// `GET /api/rooms/:id/notification-level` — the caller's effective per-room
+/// notification level for a room they belong to. Returns the explicit level if
+/// set, else the mute-derived default (`none` when the room is muted, else
+/// `all`). Room-access gated like [`mute_room`].
+async fn get_notification_level(
+    State(s): State<AppState>,
+    auth: AuthUser,
+    Path(room_str): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let room = parse_room(&room_str)?;
+    s.im.assert_room_access(auth.participant_id, room).await?;
+    let r = repo(&s);
+    let explicit = r.get_level(auth.participant_id, room).await?;
+    // Effective level mirrors the dispatcher: explicit row wins; else a muted
+    // room reads as `none`, else `all`.
+    let effective = match explicit.as_deref() {
+        Some(l) => l.to_owned(),
+        None if r.is_muted(auth.participant_id, room).await? => "none".to_owned(),
+        None => "all".to_owned(),
+    };
+    Ok(Json(serde_json::json!({
+        "room_id": room,
+        "level": effective,
+        "explicit": explicit,
+    })))
 }
 
 /// `GET /api/notifications/prefs` — the caller's muted rooms + DND window.

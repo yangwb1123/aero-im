@@ -334,6 +334,33 @@ define_id!(
     BlockInteractionId
 );
 
+// ---- Live / creator economy (migrations 0089-0091) ----
+define_id!(
+    /// Identifies a custom-reward definition a creator offers for channel points — a
+    /// titled, point-priced reward viewers redeem (Twitch Channel Points custom
+    /// reward). Distinct from a [`RedemptionId`], which is one viewer's claim of it.
+    RewardId
+);
+define_id!(
+    /// Identifies a single channel-points redemption — one viewer's claim of a
+    /// [`RewardId`], queued for the creator/mods to fulfill or reject (Twitch reward
+    /// redemption queue entry).
+    RedemptionId
+);
+define_id!(
+    /// Identifies a creator goal / bounty bar — a titled target on a metric
+    /// (`gifts`/`viewers`/`points`) that fills toward `target` as progress accrues
+    /// (Twitch/streamer goal bar). A single progress threshold-cross flips it to
+    /// `reached` exactly once.
+    GoalId
+);
+define_id!(
+    /// Identifies a ban/timeout appeal — a banned viewer's request that a stream's
+    /// creator/mods review and lift their ban. FKs to the `stream_bans` row being
+    /// appealed; approval triggers the existing unban path.
+    BanAppealId
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;

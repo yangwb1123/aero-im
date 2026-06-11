@@ -217,7 +217,53 @@ impl LiveService {
             created_at,
         };
         self.publish(&StreamEvent::Gift(line.clone())).await;
+        // Feed any active `gifts`-metric goal bars on this stream (creator goal bars,
+        // migration 0090). Best-effort: a goal-update failure never fails the gift.
+        self.feed_gift_goals(stream_id, i64::from(qty)).await;
         Ok(line)
+    }
+
+    /// Advance a stream's active `gifts`-metric goal bars by `delta` gift units after
+    /// a gift is recorded, broadcasting [`StreamEvent::GoalProgress`] per advanced
+    /// goal and [`StreamEvent::GoalReached`] on the threshold crossing. Best-effort:
+    /// any storage or broadcast hiccup is swallowed so the gift is never failed by
+    /// goal bookkeeping. Uses the pool [`LiveService`] already holds.
+    async fn feed_gift_goals(&self, stream_id: Ulid, delta: i64) {
+        if delta <= 0 {
+            return;
+        }
+        let repo = aero_storage::GoalRepo::new(self.participants.pool().clone());
+        let goals = match repo.list_active(stream_id).await {
+            Ok(g) => g,
+            Err(err) => {
+                warn!(?err, %stream_id, "list_active goals failed; skipping goal feed");
+                return;
+            }
+        };
+        for goal in goals {
+            if goal.metric_type != "gifts" {
+                continue;
+            }
+            match repo.add_progress(goal.id, delta).await {
+                Ok(Some((current, just_reached))) => {
+                    self.publish(&StreamEvent::GoalProgress {
+                        stream_id,
+                        goal_id: goal.id,
+                        current,
+                        target: goal.target,
+                    })
+                    .await;
+                    if just_reached {
+                        self.publish(&StreamEvent::GoalReached { stream_id, goal_id: goal.id })
+                            .await;
+                    }
+                }
+                // Goal went inactive between the list and the bump, or a storage
+                // error: skip it (best-effort), never failing the gift.
+                Ok(None) => {}
+                Err(err) => warn!(?err, goal_id = %goal.id, "goal add_progress failed"),
+            }
+        }
     }
 
     pub async fn recent_gifts(&self, stream_id: Ulid, limit: i64) -> Result<Vec<StreamGiftLine>> {

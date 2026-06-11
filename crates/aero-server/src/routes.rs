@@ -315,6 +315,10 @@ pub fn build(state: AppState) -> Router {
         // ---- AI-native cluster: thread summary, scheduled digests, find-expert ----
         // Thread-scoped AI summarization: POST /api/messages/:id/thread-summary.
         .merge(crate::thread_summarize::routes())
+        // Thread auto-titling: POST /api/messages/:id/thread-title (degrade-safe).
+        .merge(crate::thread_title::routes())
+        // Per-message sentiment / toxicity scoring: POST /api/messages/:id/sentiment.
+        .merge(crate::message_sentiment::routes())
         // Scheduled/recurring AI digests: POST/GET /api/digests, DELETE /api/digests/:id.
         // The background dispatcher is spawned in bin/aero-server.rs.
         .merge(crate::digests::routes())
@@ -364,7 +368,17 @@ pub fn build(state: AppState) -> Router {
         // interactive Button/Select block (404 unless the message carries that
         // action_id), broadcasting RoomEvent::Interaction so the poster's bot/app
         // sees it live; GET /api/messages/:id/interactions lists them.
-        .merge(crate::interactions::routes());
+        .merge(crate::interactions::routes())
+        // ---- Live / creator economy (migrations 0089-0091) ----
+        // Channel points + custom-reward redemption: creators define point-priced
+        // rewards, viewers redeem (atomic debit), creators fulfill/reject the queue.
+        .merge(crate::channel_points::routes())
+        // Goal / bounty bars: creators set a metric target the broadcast fills toward;
+        // the gift path feeds active gifts-goals + broadcasts GoalProgress/GoalReached.
+        .merge(crate::goals::routes())
+        // Ban/timeout appeals: a banned viewer appeals; a creator/mod approves
+        // (lifting the ban) or denies (keeping it).
+        .merge(crate::ban_appeals::routes());
 
     // Prometheus scrape endpoint (ROADMAP 方向四). Mounted unless disabled; the
     // handler self-gates on an optional bearer token. Left here (not behind the

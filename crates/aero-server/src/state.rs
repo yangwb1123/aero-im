@@ -115,6 +115,22 @@ pub trait AiBackend: Send + Sync + 'static {
     /// Moderate a message body (P5). `Some(reason)` blocks, `None` allows.
     /// Returns `None` when no LLM is configured.
     async fn moderate(&self, text: &str) -> Result<Option<String>, String>;
+    /// Generate a short (5-10 word) title for the thread rooted at `root` — the
+    /// root message anchors the title, the (clamped) reply chain is supporting
+    /// context. Mirrors [`AiBackend::summarize_thread`]'s sourcing. Degrades SAFELY
+    /// without an LLM key to a deterministic first-~8-words-of-the-root heuristic;
+    /// never errors on a missing key. Backs `POST /api/messages/:id/thread-title`.
+    async fn generate_thread_title(
+        &self,
+        root: aero_common::MessageId,
+        max_replies: usize,
+    ) -> Result<String, String>;
+    /// Score a message's affect (additive to the binary [`AiBackend::moderate`]
+    /// gate — this never blocks). Returns a coarse sentiment, a `[0.0, 1.0]`
+    /// toxicity likelihood, and a short tone label. Degrades SAFELY without an LLM
+    /// key to a deterministic keyword/punctuation heuristic; never errors on a
+    /// missing key. Backs `POST /api/messages/:id/sentiment`.
+    async fn score_sentiment(&self, text: &str) -> Result<AiSentiment, String>;
     /// Streaming variant of [`AiBackend::answer_question`].
     ///
     /// Returns `(citations, stream)` so the UI can render source chips before
@@ -181,6 +197,19 @@ pub struct AiPersonRec {
     pub participant: aero_common::ParticipantId,
     pub score: f32,
     pub reason: String,
+}
+
+/// Affect read on a single message returned by [`AiBackend::score_sentiment`].
+///
+/// Additive to moderation (never blocks): `sentiment` is the coarse polarity
+/// (`"negative" | "neutral" | "positive"`), `toxicity` is a `[0.0, 1.0]`
+/// hostility likelihood, and `tone` is a short human-readable label. Serializes
+/// directly as the `POST /api/messages/:id/sentiment` response body.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AiSentiment {
+    pub sentiment: String,
+    pub toxicity: f32,
+    pub tone: String,
 }
 
 #[derive(Clone)]

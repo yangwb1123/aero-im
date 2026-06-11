@@ -113,6 +113,16 @@ pub enum Block {
     Mention {
         participant: ParticipantId,
     },
+    /// A `#channel` mention — a link to a room that ALSO notifies that room's
+    /// members (the channel-scoped analogue of a [`Mention`](Self::Mention),
+    /// which targets one participant). The dispatcher
+    /// (`ImService::dispatch_notifications`) resolves the room's members and
+    /// notifies them. Carries no visible text of its own (the client renders the
+    /// channel name from `room`), so it contributes nothing to the searchable
+    /// projection — mirroring [`Mention`](Self::Mention).
+    ChannelMention {
+        room: RoomId,
+    },
     Code {
         lang: String,
         content: String,

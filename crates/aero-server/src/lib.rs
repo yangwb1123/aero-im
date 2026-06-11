@@ -150,6 +150,10 @@ pub mod vod_chapters;
 
 // ---- AI-native cluster: thread summary, scheduled digests, find-expert ----
 pub mod thread_summarize;
+/// Thread auto-titling: POST /api/messages/:id/thread-title (degrade-safe).
+pub mod thread_title;
+/// Per-message sentiment / toxicity scoring: POST /api/messages/:id/sentiment.
+pub mod message_sentiment;
 pub mod digests;
 pub mod find_expert;
 /// AI recommendations: suggested channels & people to follow (member-gated).
@@ -163,5 +167,11 @@ pub mod usage_report;
 // Record clicks / option-picks on interactive Button/Select blocks (migration
 // 0086); broadcasts RoomEvent::Interaction so the poster's bot/app sees them live.
 pub mod interactions;
+
+// ---- Live / creator economy (migrations 0089-0091) ----
+// Channel points + custom-reward redemption, goal/bounty bars, ban/timeout appeals.
+pub mod channel_points;
+pub mod goals;
+pub mod ban_appeals;
 
 pub use state::AppState;

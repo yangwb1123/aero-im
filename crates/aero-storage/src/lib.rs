@@ -61,6 +61,7 @@ pub mod user_group;
 // Wave 11 (0039-0040 + read-only file index): files tab, stream follow, thread follow.
 pub mod file_index;
 pub mod stream_follow;
+pub mod thread_mute;
 pub mod thread_subscription;
 // Wave 12 (0041-0042 + read-only dm/reaction-detail): dm, recurring msgs, reaction detail, default channels.
 pub mod dm;
@@ -180,6 +181,7 @@ pub use user_group::{normalize_handle, UserGroup, UserGroupRepo};
 // Wave 11 re-exports.
 pub use file_index::{FileIndexRepo, SharedFile};
 pub use stream_follow::StreamFollowRepo;
+pub use thread_mute::ThreadMuteRepo;
 pub use thread_subscription::ThreadSubscriptionRepo;
 // Wave 12 re-exports.
 pub use dm::DmRepo;
@@ -296,3 +298,14 @@ pub use webhook_delivery::{
 };
 pub mod usage_report;
 pub use usage_report::{AiKindUsage, UsageReport, UsageReportRepo};
+
+// ---- Live / creator economy (migrations 0089-0091) ----
+// Channel points + custom-reward redemption, goal/bounty bars, ban/timeout appeals.
+pub mod channel_points;
+pub use channel_points::{
+    is_resolution_status, ChannelPointsRepo, RedeemError, Redemption, Reward,
+};
+pub mod goals;
+pub use goals::{is_valid_metric as is_valid_goal_metric, Goal, GoalRepo};
+pub mod ban_appeals;
+pub use ban_appeals::{AppealError, BanAppeal, BanAppealRepo};

@@ -23,14 +23,14 @@ pub mod workspace;
 
 pub use error::{Error, Result};
 pub use ids::{
-    ActivityId, AnnouncementId, ApprovalId, AuditId, BarrierId, BlobId, BlockInteractionId,
-    BookmarkCollectionId, CanvasId, ChannelBookmarkId, ChannelSectionId, ClipId, CreatorTierId,
-    DigestSubscriptionId, EmojiId, HypeTrainSessionId, InvitationId, JoinRequestId, KeywordAlertId,
-    LegalHoldId, MessageEditId, MessageId, MessageTemplateId, NotificationId, ParticipantId, PatId,
-    PollId,
-    RaidId, RecurringMessageId, RoomId, SavedSearchId, ScheduledMessageId, ScheduledStreamId,
-    ScimTokenId, SessionId, StreamCategoryId, StreamModeratorId, SubscriptionId, TaskId,
-    UserGroupId, VodChapterId, VodId, WebhookDeliveryId, WebhookId, WorkspaceId,
+    ActivityId, AnnouncementId, ApprovalId, AuditId, BanAppealId, BarrierId, BlobId,
+    BlockInteractionId, BookmarkCollectionId, CanvasId, ChannelBookmarkId, ChannelSectionId, ClipId,
+    CreatorTierId, DigestSubscriptionId, EmojiId, GoalId, HypeTrainSessionId, InvitationId,
+    JoinRequestId, KeywordAlertId, LegalHoldId, MessageEditId, MessageId, MessageTemplateId,
+    NotificationId, ParticipantId, PatId, PollId, RaidId, RecurringMessageId, RedemptionId,
+    RewardId, RoomId, SavedSearchId, ScheduledMessageId, ScheduledStreamId, ScimTokenId, SessionId,
+    StreamCategoryId, StreamModeratorId, SubscriptionId, TaskId, UserGroupId, VodChapterId, VodId,
+    WebhookDeliveryId, WebhookId, WorkspaceId,
 };
 pub use live::{
     gift_by_id, gift_catalog, Gift, GiftLeaderRow, StreamChatLine, StreamEvent, StreamGiftLine,

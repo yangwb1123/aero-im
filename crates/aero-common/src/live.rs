@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use ulid::Ulid;
 
-use crate::ids::ParticipantId;
+use crate::ids::{GoalId, ParticipantId, RewardId};
 use crate::model::StreamStatus;
 
 // ---------- Gifts ----------
@@ -145,6 +145,27 @@ pub enum StreamEvent {
         target_stream_id: Ulid,
         viewer_count: u32,
     },
+    /// A viewer redeemed a custom channel-points reward on this stream. The
+    /// creator/mods see the claim land in the redemption queue; watchers may render
+    /// a redemption alert (Twitch Channel Points redemption).
+    PointsRedeemed {
+        stream_id: Ulid,
+        viewer: ParticipantId,
+        reward_id: RewardId,
+    },
+    /// A creator goal / bounty bar advanced: `current` of `target` on the goal's
+    /// metric. Clients animate the fill from this (streamer goal bar). Emitted
+    /// best-effort by the metric-feeding path (e.g. the gift path for gifts goals).
+    GoalProgress {
+        stream_id: Ulid,
+        goal_id: GoalId,
+        current: i64,
+        target: i64,
+    },
+    /// A creator goal reached its target — emitted exactly once on the threshold
+    /// crossing (alongside the final [`StreamEvent::GoalProgress`]). Clients fire the
+    /// "goal complete" celebration from this.
+    GoalReached { stream_id: Ulid, goal_id: GoalId },
 }
 
 impl StreamEvent {
@@ -158,7 +179,10 @@ impl StreamEvent {
             StreamEvent::Viewers { stream_id, .. }
             | StreamEvent::Status { stream_id, .. }
             | StreamEvent::HypeTrain { stream_id, .. }
-            | StreamEvent::Raid { stream_id, .. } => *stream_id,
+            | StreamEvent::Raid { stream_id, .. }
+            | StreamEvent::PointsRedeemed { stream_id, .. }
+            | StreamEvent::GoalProgress { stream_id, .. }
+            | StreamEvent::GoalReached { stream_id, .. } => *stream_id,
         }
     }
 }
@@ -194,6 +218,37 @@ mod tests {
 
         let back: StreamEvent = serde_json::from_str(&j).unwrap();
         assert!(matches!(back, StreamEvent::Viewers { count: 7, .. }));
+    }
+
+    #[test]
+    fn creator_economy_events_tag_and_stream_id() {
+        let sid = Ulid::new();
+
+        let redeemed = StreamEvent::PointsRedeemed {
+            stream_id: sid,
+            viewer: ParticipantId::new(),
+            reward_id: RewardId::new(),
+        };
+        let j = serde_json::to_string(&redeemed).unwrap();
+        assert!(j.contains("\"kind\":\"points_redeemed\""));
+        assert_eq!(redeemed.stream_id(), sid);
+        let back: StreamEvent = serde_json::from_str(&j).unwrap();
+        assert!(matches!(back, StreamEvent::PointsRedeemed { .. }));
+
+        let progress = StreamEvent::GoalProgress {
+            stream_id: sid,
+            goal_id: GoalId::new(),
+            current: 7,
+            target: 100,
+        };
+        let j = serde_json::to_string(&progress).unwrap();
+        assert!(j.contains("\"kind\":\"goal_progress\""));
+        assert_eq!(progress.stream_id(), sid);
+
+        let reached = StreamEvent::GoalReached { stream_id: sid, goal_id: GoalId::new() };
+        let j = serde_json::to_string(&reached).unwrap();
+        assert!(j.contains("\"kind\":\"goal_reached\""));
+        assert_eq!(reached.stream_id(), sid);
     }
 
     #[test]
