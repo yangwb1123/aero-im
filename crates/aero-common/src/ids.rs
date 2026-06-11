@@ -333,6 +333,13 @@ define_id!(
     /// [`Block`](crate::Block), so bots/webhooks/apps can collect actionable replies.
     BlockInteractionId
 );
+define_id!(
+    /// Identifies a user-filed message report — one row in the workspace moderation
+    /// review queue, where a room member flags a message and a workspace admin then
+    /// keeps (dismisses) or removes (soft-deletes) it. Distinct from the AI
+    /// moderation pipeline, which auto-removes async with no human review.
+    MessageReportId
+);
 
 // ---- Live / creator economy (migrations 0089-0091) ----
 define_id!(

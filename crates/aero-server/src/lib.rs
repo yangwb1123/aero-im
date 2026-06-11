@@ -179,4 +179,9 @@ pub mod ban_appeals;
 // the creator LOCKS then RESOLVES (winners paid proportionally) or CANCELS (refund all).
 pub mod predictions;
 
+// User-initiated message reports -> workspace moderation review queue (migration
+// 0093): a room member reports a message, an admin keeps/removes it (removal reuses
+// the existing transactional moderate-delete path).
+pub mod message_reports;
+
 pub use state::AppState;

@@ -383,7 +383,13 @@ pub fn build(state: AppState) -> Router {
         // Creator opens a prediction (2+ outcomes); viewers STAKE channel points on
         // one (atomic ledger debit); the creator LOCKS then RESOLVES (winners paid
         // proportionally from the pool) or CANCELS (refund all). Distinct from polls.
-        .merge(crate::predictions::routes());
+        .merge(crate::predictions::routes())
+        // ---- Message reports -> moderation review queue (migration 0093) ----
+        // POST /api/rooms/:id/messages/:mid/report lets a room member flag a
+        // message; GET /api/workspaces/:id/admin/moderation-queue lists pending
+        // reports (admin-only); POST .../moderation-queue/:rid/review keeps or
+        // removes (removal reuses the existing transactional moderate-delete path).
+        .merge(crate::message_reports::routes());
 
     // Prometheus scrape endpoint (ROADMAP 方向四). Mounted unless disabled; the
     // handler self-gates on an optional bearer token. Left here (not behind the
