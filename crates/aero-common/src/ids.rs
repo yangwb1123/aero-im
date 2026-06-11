@@ -361,6 +361,22 @@ define_id!(
     BanAppealId
 );
 
+// ---- Community predictions / channel betting (migration 0092) ----
+define_id!(
+    /// Identifies a community prediction — a creator-opened bet on a live stream
+    /// (Twitch-style Channel Prediction): a question with 2+ outcomes that viewers
+    /// STAKE channel points on, then the creator LOCKS and RESOLVES to a winning
+    /// outcome, paying winners proportionally from the pool. Distinct from a
+    /// [`PollId`], which is plain voting with no stakes / payouts.
+    PredictionId
+);
+define_id!(
+    /// Identifies one viewer's stake in a prediction — a `prediction_stakes` row
+    /// (the wagered outcome + points, and the payout stamped on settlement). At most
+    /// one stake per viewer per [`PredictionId`].
+    PredictionStakeId
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;

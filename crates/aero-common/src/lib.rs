@@ -27,8 +27,9 @@ pub use ids::{
     BlockInteractionId, BookmarkCollectionId, CanvasId, ChannelBookmarkId, ChannelSectionId, ClipId,
     CreatorTierId, DigestSubscriptionId, EmojiId, GoalId, HypeTrainSessionId, InvitationId,
     JoinRequestId, KeywordAlertId, LegalHoldId, MessageEditId, MessageId, MessageTemplateId,
-    NotificationId, ParticipantId, PatId, PollId, RaidId, RecurringMessageId, RedemptionId,
-    RewardId, RoomId, SavedSearchId, ScheduledMessageId, ScheduledStreamId, ScimTokenId, SessionId,
+    NotificationId, ParticipantId, PatId, PollId, PredictionId, PredictionStakeId, RaidId,
+    RecurringMessageId, RedemptionId, RewardId, RoomId, SavedSearchId, ScheduledMessageId,
+    ScheduledStreamId, ScimTokenId, SessionId,
     StreamCategoryId, StreamModeratorId, SubscriptionId, TaskId, UserGroupId, VodChapterId, VodId,
     WebhookDeliveryId, WebhookId, WorkspaceId,
 };

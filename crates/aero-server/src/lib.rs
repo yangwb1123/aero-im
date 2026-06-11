@@ -174,4 +174,9 @@ pub mod channel_points;
 pub mod goals;
 pub mod ban_appeals;
 
+// ---- Community predictions / channel betting (migration 0092) ----
+// Creator opens a prediction (2+ outcomes); viewers STAKE channel points on one;
+// the creator LOCKS then RESOLVES (winners paid proportionally) or CANCELS (refund all).
+pub mod predictions;
+
 pub use state::AppState;

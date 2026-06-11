@@ -378,7 +378,12 @@ pub fn build(state: AppState) -> Router {
         .merge(crate::goals::routes())
         // Ban/timeout appeals: a banned viewer appeals; a creator/mod approves
         // (lifting the ban) or denies (keeping it).
-        .merge(crate::ban_appeals::routes());
+        .merge(crate::ban_appeals::routes())
+        // ---- Community predictions / channel betting (migration 0092) ----
+        // Creator opens a prediction (2+ outcomes); viewers STAKE channel points on
+        // one (atomic ledger debit); the creator LOCKS then RESOLVES (winners paid
+        // proportionally from the pool) or CANCELS (refund all). Distinct from polls.
+        .merge(crate::predictions::routes());
 
     // Prometheus scrape endpoint (ROADMAP 方向四). Mounted unless disabled; the
     // handler self-gates on an optional bearer token. Left here (not behind the

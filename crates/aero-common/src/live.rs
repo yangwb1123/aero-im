@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use ulid::Ulid;
 
-use crate::ids::{GoalId, ParticipantId, RewardId};
+use crate::ids::{GoalId, ParticipantId, PredictionId, RewardId};
 use crate::model::StreamStatus;
 
 // ---------- Gifts ----------
@@ -166,6 +166,21 @@ pub enum StreamEvent {
     /// crossing (alongside the final [`StreamEvent::GoalProgress`]). Clients fire the
     /// "goal complete" celebration from this.
     GoalReached { stream_id: Ulid, goal_id: GoalId },
+    /// A community prediction opened on this stream: viewers may now STAKE channel
+    /// points on one of its outcomes (Twitch-style Channel Prediction). Clients
+    /// render the betting card from a follow-up fetch of the prediction.
+    PredictionOpened { stream_id: Ulid, prediction_id: PredictionId },
+    /// A community prediction locked: staking is now closed and the creator will
+    /// resolve it. Clients close the betting window from this.
+    PredictionLocked { stream_id: Ulid, prediction_id: PredictionId },
+    /// A community prediction resolved to `winning_outcome_idx`: winners have been
+    /// paid proportionally from the pool (or, if nobody picked the winner, every
+    /// staker was refunded). Clients reveal the outcome + payouts from this.
+    PredictionResolved {
+        stream_id: Ulid,
+        prediction_id: PredictionId,
+        winning_outcome_idx: i32,
+    },
 }
 
 impl StreamEvent {
@@ -182,7 +197,10 @@ impl StreamEvent {
             | StreamEvent::Raid { stream_id, .. }
             | StreamEvent::PointsRedeemed { stream_id, .. }
             | StreamEvent::GoalProgress { stream_id, .. }
-            | StreamEvent::GoalReached { stream_id, .. } => *stream_id,
+            | StreamEvent::GoalReached { stream_id, .. }
+            | StreamEvent::PredictionOpened { stream_id, .. }
+            | StreamEvent::PredictionLocked { stream_id, .. }
+            | StreamEvent::PredictionResolved { stream_id, .. } => *stream_id,
         }
     }
 }
@@ -249,6 +267,44 @@ mod tests {
         let j = serde_json::to_string(&reached).unwrap();
         assert!(j.contains("\"kind\":\"goal_reached\""));
         assert_eq!(reached.stream_id(), sid);
+    }
+
+    #[test]
+    fn prediction_events_tag_and_stream_id() {
+        use crate::ids::PredictionId;
+        let sid = Ulid::new();
+
+        let opened = StreamEvent::PredictionOpened {
+            stream_id: sid,
+            prediction_id: PredictionId::new(),
+        };
+        let j = serde_json::to_string(&opened).unwrap();
+        assert!(j.contains("\"kind\":\"prediction_opened\""));
+        assert_eq!(opened.stream_id(), sid);
+        let back: StreamEvent = serde_json::from_str(&j).unwrap();
+        assert!(matches!(back, StreamEvent::PredictionOpened { .. }));
+
+        let locked = StreamEvent::PredictionLocked {
+            stream_id: sid,
+            prediction_id: PredictionId::new(),
+        };
+        let j = serde_json::to_string(&locked).unwrap();
+        assert!(j.contains("\"kind\":\"prediction_locked\""));
+        assert_eq!(locked.stream_id(), sid);
+
+        let resolved = StreamEvent::PredictionResolved {
+            stream_id: sid,
+            prediction_id: PredictionId::new(),
+            winning_outcome_idx: 1,
+        };
+        let j = serde_json::to_string(&resolved).unwrap();
+        assert!(j.contains("\"kind\":\"prediction_resolved\""));
+        assert_eq!(resolved.stream_id(), sid);
+        let back: StreamEvent = serde_json::from_str(&j).unwrap();
+        assert!(matches!(
+            back,
+            StreamEvent::PredictionResolved { winning_outcome_idx: 1, .. }
+        ));
     }
 
     #[test]

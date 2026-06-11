@@ -309,3 +309,11 @@ pub mod goals;
 pub use goals::{is_valid_metric as is_valid_goal_metric, Goal, GoalRepo};
 pub mod ban_appeals;
 pub use ban_appeals::{AppealError, BanAppeal, BanAppealRepo};
+
+// ---- Community predictions / channel betting (migration 0092) ----
+// Creator opens a prediction (2+ outcomes); viewers STAKE channel points on one;
+// the creator LOCKS then RESOLVES; winners are paid proportionally from the pool.
+pub mod predictions;
+pub use predictions::{
+    Prediction, PredictionOutcome, PredictionRepo, ResolveError, StakeError,
+};
