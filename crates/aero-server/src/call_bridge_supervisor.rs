@@ -35,7 +35,8 @@ use std::sync::Arc;
 
 use aero_common::CallId;
 use aero_live_webrtc::{
-    decode_bridge_frame, BridgeRtp, CallBridge, CallUpstream, MediaForwarder, SfuRouter,
+    decode_bridge_frame, encode_bridge_frame, BridgeRtp, CallBridge, CallEgressTap, CallUpstream,
+    MediaForwarder, SfuRouter,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -190,6 +191,48 @@ impl CallUpstream for UdpRtpUpstream {
             // never tear the bridge down.
             if let Some(pkt) = decode_bridge_frame(&self.buf[..n]) {
                 return Some(pkt);
+            }
+        }
+    }
+}
+
+/// The send side of the node-to-node bridge (ROADMAP 方向五): the node that OWNS
+/// a call's local publishers relays their RTP to subscribed pulling nodes.
+///
+/// Taps a [`CallEgressTap`] (every locally-published packet for the call), frames
+/// each via [`encode_bridge_frame`], and pushes it over plain UDP to every
+/// subscribed puller — the mirror of [`UdpRtpUpstream`]. The set of subscriber
+/// addresses comes from the subscribe control call (the staging wiring); the
+/// tap → encode → send loop here is real and exercised end-to-end over localhost.
+struct UdpRtpEgress {
+    socket: tokio::net::UdpSocket,
+    subscribers: Vec<std::net::SocketAddr>,
+}
+
+impl UdpRtpEgress {
+    /// Bind an ephemeral send socket targeting the given puller `subscribers`.
+    async fn bind(subscribers: Vec<std::net::SocketAddr>) -> std::io::Result<Self> {
+        let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
+        Ok(Self { socket, subscribers })
+    }
+
+    /// Pump every packet from `tap` to all subscribers until the egress closes
+    /// (its last local publisher left) or `cancel` fires. Send errors to one
+    /// subscriber never stop the others or tear the loop down.
+    async fn run(self, mut tap: CallEgressTap, cancel: CancellationToken) {
+        loop {
+            let pkt = tokio::select! {
+                () = cancel.cancelled() => break,
+                p = tap.next_rtp() => match p {
+                    Some(p) => p,
+                    None => break, // egress gone → done
+                },
+            };
+            let frame = encode_bridge_frame(&pkt);
+            for addr in &self.subscribers {
+                if let Err(e) = self.socket.send_to(&frame, addr).await {
+                    debug!(?e, %addr, "call-bridge: egress send failed");
+                }
             }
         }
     }
@@ -587,6 +630,48 @@ mod tests {
         assert_eq!(got, Some(pkt));
         assert_eq!(up.call_id(), up.call);
         assert_eq!(up.node_url(), "http://peer.example");
+    }
+
+    /// FULL node-to-node bridge wire path over localhost (ROADMAP 方向五): the
+    /// egress taps a [`CallEgress`], frames each packet and pushes it; the puller
+    /// receives and decodes it back to the original [`BridgeRtp`]. This exercises
+    /// BOTH halves (send + receive) end-to-end in-process; only the two-real-nodes
+    /// run + the subscribe control call remain for staging.
+    #[tokio::test]
+    async fn egress_to_puller_roundtrips_over_localhost() {
+        use aero_live_webrtc::CallEgress;
+
+        // Puller binds; the egress is told its address (the subscribe step, done
+        // directly here).
+        let mut puller = UdpRtpUpstream::bind(CallId::new(), "http://owner").await.unwrap();
+        let puller_addr = std::net::SocketAddr::new(
+            std::net::Ipv4Addr::LOCALHOST.into(),
+            puller.local_addr().unwrap().port(),
+        );
+
+        let egress = CallEgress::new(CallId::new());
+        let tap = egress.tap();
+        let sender = UdpRtpEgress::bind(vec![puller_addr]).await.unwrap();
+        let cancel = CancellationToken::new();
+        let pump = tokio::spawn(sender.run(tap, cancel.clone()));
+
+        // The owning node publishes a packet on the call's egress.
+        let pkt = BridgeRtp::new(
+            ParticipantId::new(),
+            "video0",
+            Bytes::from_static(&[0x80, 0x60, 0xDE, 0xAD, 0xBE, 0xEF]),
+            true,
+        );
+        egress.publish(pkt.clone());
+
+        // The puller on the other node receives and decodes the identical packet.
+        let got = tokio::time::timeout(std::time::Duration::from_secs(2), puller.next_rtp())
+            .await
+            .expect("puller must yield within 2s");
+        assert_eq!(got, Some(pkt));
+
+        cancel.cancel();
+        let _ = pump.await;
     }
 
     #[tokio::test]
