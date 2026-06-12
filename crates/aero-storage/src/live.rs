@@ -114,6 +114,12 @@ impl LiveRepo {
 
     /// Append a gift to the ledger. `coins` is the already-computed total
     /// (`qty * unit price`).
+    ///
+    /// When `idempotency_key` is `Some`, a retried send with the same
+    /// `(sender, key)` is a no-op that returns the ORIGINAL gift's id/timestamp
+    /// and `inserted = false`, so the caller can skip re-broadcasting and
+    /// re-scoring. A `None` key keeps the legacy always-insert behaviour
+    /// (the partial unique index only covers non-NULL keys).
     pub async fn insert_gift(
         &self,
         stream_id: Ulid,
@@ -121,12 +127,20 @@ impl LiveRepo {
         gift_id: &str,
         qty: u32,
         coins: u64,
-    ) -> Result<(Ulid, OffsetDateTime), sqlx::Error> {
+        idempotency_key: Option<&str>,
+    ) -> Result<(Ulid, OffsetDateTime, bool), sqlx::Error> {
         let id = Ulid::new();
         let created_at = OffsetDateTime::now_utc();
-        sqlx::query(
-            r#"INSERT INTO stream_gifts (id, stream_id, sender_id, gift_id, qty, coins, created_at)
-               VALUES ($1, $2, $3, $4, $5, $6, $7)"#,
+        // ON CONFLICT targets the partial unique index (sender_id, idempotency_key)
+        // WHERE idempotency_key IS NOT NULL, so a NULL key never conflicts and the
+        // insert always proceeds. RETURNING yields no row on a dedup hit.
+        let inserted: Option<(Uuid,)> = sqlx::query_as(
+            r#"INSERT INTO stream_gifts
+                 (id, stream_id, sender_id, gift_id, qty, coins, created_at, idempotency_key)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+               ON CONFLICT (sender_id, idempotency_key) WHERE idempotency_key IS NOT NULL
+               DO NOTHING
+               RETURNING id"#,
         )
         .bind(Uuid::from_u128(id.0))
         .bind(Uuid::from_u128(stream_id.0))
@@ -135,9 +149,22 @@ impl LiveRepo {
         .bind(i32::try_from(qty).unwrap_or(i32::MAX))
         .bind(i64::try_from(coins).unwrap_or(i64::MAX))
         .bind(created_at)
-        .execute(&self.pool)
+        .bind(idempotency_key)
+        .fetch_optional(&self.pool)
         .await?;
-        Ok((id, created_at))
+        if inserted.is_some() {
+            return Ok((id, created_at, true));
+        }
+        // Dedup hit — return the original gift so the caller stays consistent.
+        let (orig_id, orig_at): (Uuid, OffsetDateTime) = sqlx::query_as(
+            r#"SELECT id, created_at FROM stream_gifts
+               WHERE sender_id = $1 AND idempotency_key = $2"#,
+        )
+        .bind(sender_id.to_uuid())
+        .bind(idempotency_key)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok((Ulid(orig_id.as_u128()), orig_at, false))
     }
 
     /// Most-recent gifts, oldest-first.
@@ -388,8 +415,8 @@ mod db_tests {
             .expect("stream");
 
         let sender = ParticipantId::from_uuid(owner);
-        let (g1, _) = repo.insert_gift(stream, sender, "rose", 1, 10).await.expect("g1");
-        let (g2, _) = repo.insert_gift(stream, sender, "rose", 2, 20).await.expect("g2");
+        let (g1, _, _) = repo.insert_gift(stream, sender, "rose", 1, 10, None).await.expect("g1");
+        let (g2, _, _) = repo.insert_gift(stream, sender, "rose", 2, 20, None).await.expect("g2");
 
         let after = repo.recent_gifts_since(stream, Some(g1), 50).await.expect("since g1");
         assert_eq!(after.len(), 1);
@@ -400,6 +427,66 @@ mod db_tests {
 
         let tail = repo.recent_gifts_since(stream, None, 50).await.expect("tail");
         assert_eq!(tail.len(), 2);
+
+        sqlx::query("DELETE FROM streams WHERE id = $1")
+            .bind(uuid::Uuid::from_u128(stream.0))
+            .execute(&p)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM participants WHERE id = $1").bind(owner).execute(&p).await.ok();
+    }
+
+    /// A retried gift carrying the same idempotency key records exactly one ledger
+    /// row and reports `inserted = false` on the retry; a different key or a `None`
+    /// key always inserts. Guards the gift money-path against double-charge on resend.
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn insert_gift_is_idempotent_per_key() {
+        let p = pool();
+        let repo = LiveRepo::new(p.clone());
+
+        let owner = uuid::Uuid::new_v4();
+        sqlx::query("INSERT INTO participants (id, kind, display_name) VALUES ($1,'human',$2)")
+            .bind(owner)
+            .bind(format!("gift-idem-owner-{owner}"))
+            .execute(&p)
+            .await
+            .expect("owner");
+        let stream = ulid::Ulid::new();
+        sqlx::query("INSERT INTO streams (id, owner_id, title, stream_key) VALUES ($1,$2,$3,$4)")
+            .bind(uuid::Uuid::from_u128(stream.0))
+            .bind(owner)
+            .bind("gift-idem-stream")
+            .bind(format!("gikey-{stream}"))
+            .execute(&p)
+            .await
+            .expect("stream");
+        let sender = ParticipantId::from_uuid(owner);
+
+        let (id1, _, inserted1) =
+            repo.insert_gift(stream, sender, "rose", 1, 10, Some("nonce-1")).await.expect("first");
+        assert!(inserted1, "first send with a fresh key inserts");
+
+        let (id2, _, inserted2) =
+            repo.insert_gift(stream, sender, "rose", 1, 10, Some("nonce-1")).await.expect("retry");
+        assert!(!inserted2, "retry with the same key does not insert");
+        assert_eq!(id1, id2, "retry returns the original gift id");
+
+        let count: (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM stream_gifts WHERE sender_id = $1 AND idempotency_key = 'nonce-1'",
+        )
+        .bind(owner)
+        .fetch_one(&p)
+        .await
+        .expect("count");
+        assert_eq!(count.0, 1, "only one gift recorded for the retried key");
+
+        let (_, _, inserted3) =
+            repo.insert_gift(stream, sender, "rose", 1, 10, Some("nonce-2")).await.expect("k2");
+        assert!(inserted3, "a different key inserts a new gift");
+        let (_, _, inserted4) =
+            repo.insert_gift(stream, sender, "rose", 1, 10, None).await.expect("nullkey");
+        assert!(inserted4, "a keyless gift always inserts");
 
         sqlx::query("DELETE FROM streams WHERE id = $1")
             .bind(uuid::Uuid::from_u128(stream.0))

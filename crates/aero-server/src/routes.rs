@@ -1733,17 +1733,28 @@ async fn stream_gift_send(
     State(s): State<AppState>,
     auth: AuthUser,
     Path(id_str): Path<String>,
+    headers: header::HeaderMap,
     Json(req): Json<GiftSendReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let id = parse_stream_id(&id_str)?;
     let qty = req.qty.unwrap_or(1);
-    let line = s
+    // Optional idempotency: a retried POST carrying the same `Idempotency-Key`
+    // records/broadcasts the gift exactly once (money-path double-charge guard).
+    let idem = headers
+        .get("idempotency-key")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let (line, inserted) = s
         .live
-        .send_gift(auth.participant_id, id, &req.gift_id, qty)
+        .send_gift(auth.participant_id, id, &req.gift_id, qty, idem)
         .await?;
     // Feed the gift into the hype train (escalating combo-gift momentum). Runs
-    // only after a successful send; best-effort (never fails the gift).
-    crate::hype_train::on_gift(&s, id, auth.participant_id, qty).await;
+    // only on a fresh send; best-effort (never fails the gift). Skipped on a dedup
+    // hit so a resend can't double-count the train.
+    if inserted {
+        crate::hype_train::on_gift(&s, id, auth.participant_id, qty).await;
+    }
     Ok(Json(serde_json::to_value(line).map_err(AeroError::from)?))
 }
 

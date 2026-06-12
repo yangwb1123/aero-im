@@ -188,13 +188,18 @@ impl LiveService {
     /// Send a gift: validate against the catalog + quantity bounds, persist,
     /// broadcast. The coin total is `qty * unit price`.
     #[instrument(skip(self), fields(%stream_id, %sender, gift_id))]
+    /// Record a gift and (on a fresh send) broadcast + advance goal bars. The
+    /// optional `idempotency_key` makes a retried send a no-op: it returns the
+    /// original gift line and `false` so the caller skips its own side-effects
+    /// (e.g. hype train). A fresh send returns `true`.
     pub async fn send_gift(
         &self,
         sender: ParticipantId,
         stream_id: Ulid,
         gift_id: &str,
         qty: u32,
-    ) -> Result<StreamGiftLine> {
+        idempotency_key: Option<&str>,
+    ) -> Result<(StreamGiftLine, bool)> {
         let gift =
             gift_by_id(gift_id).ok_or_else(|| Error::Invalid(format!("unknown gift: {gift_id}")))?;
         if qty == 0 || qty > MAX_GIFT_QTY {
@@ -203,7 +208,8 @@ impl LiveService {
         self.require_open(stream_id).await?;
         let coins = u64::from(gift.coins) * u64::from(qty);
         let sender_name = self.sender_name(sender).await?;
-        let (id, created_at) = self.live.insert_gift(stream_id, sender, gift_id, qty, coins).await?;
+        let (id, created_at, inserted) =
+            self.live.insert_gift(stream_id, sender, gift_id, qty, coins, idempotency_key).await?;
         let line = StreamGiftLine {
             id,
             stream_id,
@@ -216,11 +222,16 @@ impl LiveService {
             coins,
             created_at,
         };
-        self.publish(&StreamEvent::Gift(line.clone())).await;
-        // Feed any active `gifts`-metric goal bars on this stream (creator goal bars,
-        // migration 0090). Best-effort: a goal-update failure never fails the gift.
-        self.feed_gift_goals(stream_id, i64::from(qty)).await;
-        Ok(line)
+        // On a dedup hit (an idempotency-key retry) the original send already
+        // broadcast and scored, so skip both — and signal `false` so the caller
+        // skips its own side-effects too. A fresh send broadcasts and feeds goals.
+        if inserted {
+            self.publish(&StreamEvent::Gift(line.clone())).await;
+            // Feed any active `gifts`-metric goal bars on this stream (creator goal
+            // bars, migration 0090). Best-effort: a goal-update hiccup never fails the gift.
+            self.feed_gift_goals(stream_id, i64::from(qty)).await;
+        }
+        Ok((line, inserted))
     }
 
     /// Advance a stream's active `gifts`-metric goal bars by `delta` gift units after

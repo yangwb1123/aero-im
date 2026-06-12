@@ -156,6 +156,10 @@ enum ClientFrame {
         gift_id: String,
         #[serde(default)]
         qty: Option<u32>,
+        /// Optional client-supplied idempotency token; a retried send with the
+        /// same `nonce` records/broadcasts the gift exactly once.
+        #[serde(default)]
+        nonce: Option<String>,
     },
     Ping,
 }
@@ -789,12 +793,16 @@ async fn handle_text(
             let is_sub = state.live.subscriber_flag(stream_id, pid).await;
             state.live.post_chat(pid, stream_id, body, is_sub).await?;
         }
-        ClientFrame::StreamGift { stream_id, gift_id, qty } => {
+        ClientFrame::StreamGift { stream_id, gift_id, qty, nonce } => {
             let qty = qty.unwrap_or(1);
-            state.live.send_gift(pid, stream_id, &gift_id, qty).await?;
+            let (_, inserted) =
+                state.live.send_gift(pid, stream_id, &gift_id, qty, nonce.as_deref()).await?;
             // Feed the gift into the hype train (mirrors the REST gift handler);
-            // best-effort, never fails the send.
-            crate::hype_train::on_gift(state, stream_id, pid, qty).await;
+            // best-effort, never fails the send. Skip on an idempotent retry so a
+            // resend can't double-count the train.
+            if inserted {
+                crate::hype_train::on_gift(state, stream_id, pid, qty).await;
+            }
         }
     }
     Ok(())
