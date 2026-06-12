@@ -196,29 +196,70 @@ impl CallUpstream for UdpRtpUpstream {
     }
 }
 
+/// Registry of pulling-node addresses subscribed to each call's bridged RTP
+/// (ROADMAP 方向五). A puller that connects POSTs its receive address to the
+/// owning node's subscribe control endpoint, which records it here; the call's
+/// [`UdpRtpEgress`] resolves its send targets from this registry per packet, so a
+/// puller that subscribes mid-call starts receiving immediately and one that
+/// leaves stops. Cheap to clone (interior `Arc`).
+#[derive(Clone, Default)]
+pub struct BridgeSubscriberRegistry {
+    inner: Arc<Mutex<HashMap<CallId, std::collections::HashSet<std::net::SocketAddr>>>>,
+}
+
+impl BridgeSubscriberRegistry {
+    /// Register `addr` as a puller for `call` (idempotent).
+    pub fn subscribe(&self, call: CallId, addr: std::net::SocketAddr) {
+        self.inner.lock().entry(call).or_default().insert(addr);
+    }
+
+    /// Remove `addr` from `call`'s pullers; drops the call entry when empty.
+    pub fn unsubscribe(&self, call: CallId, addr: std::net::SocketAddr) {
+        let mut map = self.inner.lock();
+        if let Some(set) = map.get_mut(&call) {
+            set.remove(&addr);
+            if set.is_empty() {
+                map.remove(&call);
+            }
+        }
+    }
+
+    /// The current puller addresses for `call` (empty when none).
+    #[must_use]
+    pub fn subscribers(&self, call: CallId) -> Vec<std::net::SocketAddr> {
+        self.inner
+            .lock()
+            .get(&call)
+            .map(|s| s.iter().copied().collect())
+            .unwrap_or_default()
+    }
+}
+
 /// The send side of the node-to-node bridge (ROADMAP 方向五): the node that OWNS
 /// a call's local publishers relays their RTP to subscribed pulling nodes.
 ///
 /// Taps a [`CallEgressTap`] (every locally-published packet for the call), frames
 /// each via [`encode_bridge_frame`], and pushes it over plain UDP to every
-/// subscribed puller — the mirror of [`UdpRtpUpstream`]. The set of subscriber
-/// addresses comes from the subscribe control call (the staging wiring); the
-/// tap → encode → send loop here is real and exercised end-to-end over localhost.
+/// currently-subscribed puller (resolved from a [`BridgeSubscriberRegistry`] per
+/// packet, so subscriptions can change mid-call) — the mirror of
+/// [`UdpRtpUpstream`]. The tap → encode → send loop is real and exercised
+/// end-to-end over localhost.
 struct UdpRtpEgress {
+    call: CallId,
     socket: tokio::net::UdpSocket,
-    subscribers: Vec<std::net::SocketAddr>,
+    registry: BridgeSubscriberRegistry,
 }
 
 impl UdpRtpEgress {
-    /// Bind an ephemeral send socket targeting the given puller `subscribers`.
-    async fn bind(subscribers: Vec<std::net::SocketAddr>) -> std::io::Result<Self> {
+    /// Bind an ephemeral send socket for `call`, resolving targets from `registry`.
+    async fn bind(call: CallId, registry: BridgeSubscriberRegistry) -> std::io::Result<Self> {
         let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
-        Ok(Self { socket, subscribers })
+        Ok(Self { call, socket, registry })
     }
 
-    /// Pump every packet from `tap` to all subscribers until the egress closes
-    /// (its last local publisher left) or `cancel` fires. Send errors to one
-    /// subscriber never stop the others or tear the loop down.
+    /// Pump every packet from `tap` to the call's current subscribers until the
+    /// egress closes (its last local publisher left) or `cancel` fires. A send
+    /// error to one subscriber never stops the others or tears the loop down.
     async fn run(self, mut tap: CallEgressTap, cancel: CancellationToken) {
         loop {
             let pkt = tokio::select! {
@@ -229,7 +270,7 @@ impl UdpRtpEgress {
                 },
             };
             let frame = encode_bridge_frame(&pkt);
-            for addr in &self.subscribers {
+            for addr in self.registry.subscribers(self.call) {
                 if let Err(e) = self.socket.send_to(&frame, addr).await {
                     debug!(?e, %addr, "call-bridge: egress send failed");
                 }
@@ -598,6 +639,30 @@ mod tests {
         assert!(!sup.is_bridged(call, "http://b.example"));
     }
 
+    #[test]
+    fn subscriber_registry_tracks_per_call_addresses() {
+        let reg = BridgeSubscriberRegistry::default();
+        let call = CallId::new();
+        let other = CallId::new();
+        let a: std::net::SocketAddr = "127.0.0.1:5000".parse().unwrap();
+        let b: std::net::SocketAddr = "127.0.0.1:5001".parse().unwrap();
+
+        assert!(reg.subscribers(call).is_empty());
+        reg.subscribe(call, a);
+        reg.subscribe(call, b);
+        reg.subscribe(call, a); // idempotent
+        let mut subs = reg.subscribers(call);
+        subs.sort();
+        assert_eq!(subs, vec![a, b]);
+        // Other calls are independent.
+        assert!(reg.subscribers(other).is_empty());
+        // Unsubscribe removes just that address; emptying drops the call entry.
+        reg.unsubscribe(call, a);
+        assert_eq!(reg.subscribers(call), vec![b]);
+        reg.unsubscribe(call, b);
+        assert!(reg.subscribers(call).is_empty());
+    }
+
     /// The REAL node-to-node UDP puller receives a `bridge_frame`-framed RTP
     /// datagram over localhost and decodes it back into the original
     /// [`BridgeRtp`] (ROADMAP 方向五). This exercises the production receive +
@@ -649,9 +714,14 @@ mod tests {
             puller.local_addr().unwrap().port(),
         );
 
-        let egress = CallEgress::new(CallId::new());
+        let call = CallId::new();
+        let egress = CallEgress::new(call);
         let tap = egress.tap();
-        let sender = UdpRtpEgress::bind(vec![puller_addr]).await.unwrap();
+        // The puller subscribed its address (the subscribe control call, here
+        // exercised directly through the registry).
+        let registry = BridgeSubscriberRegistry::default();
+        registry.subscribe(call, puller_addr);
+        let sender = UdpRtpEgress::bind(call, registry).await.unwrap();
         let cancel = CancellationToken::new();
         let pump = tokio::spawn(sender.run(tap, cancel.clone()));
 
