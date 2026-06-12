@@ -1811,19 +1811,21 @@ impl ImService {
             let mentioned: std::collections::HashSet<ParticipantId> =
                 mentioned_participants(&message.blocks).into_iter().collect();
 
-            // Per-recipient level lookup (individual queries; N is bounded by room
-            // membership, already O(3N) in the existing prefs batch path). Best-effort:
-            // a lookup failure delivers (fail-open, warn).
+            // ONE batch query for every reply-recipient's thread level instead of
+            // an O(R) per-recipient get_level loop (ROADMAP 方向二). Fail-open: a
+            // batch error yields an empty map, so a missing level defaults to
+            // "all" and delivers.
+            let levels = tnp_repo
+                .levels_for(root, &reply_recipients)
+                .await
+                .unwrap_or_else(|err| {
+                    warn!(?err, "thread notification level batch lookup failed; delivering");
+                    std::collections::HashMap::new()
+                });
             let mut to_drop: Vec<ParticipantId> = Vec::new();
             for &recipient in &reply_recipients {
-                let level = match tnp_repo.get_level(recipient, root).await {
-                    Ok(l) => l,
-                    Err(err) => {
-                        warn!(?err, %recipient, "thread notification level lookup failed; delivering");
-                        "all".to_owned()
-                    }
-                };
-                let deliver = match level.as_str() {
+                let level = levels.get(&recipient).map_or("all", String::as_str);
+                let deliver = match level {
                     "none" => false,
                     "mentions" => mentioned.contains(&recipient),
                     _ => true, // "all" or any unknown value: fail-open

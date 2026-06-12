@@ -104,6 +104,40 @@ impl ThreadNotificationPrefsRepo {
             .map(|(m, l)| (MessageId::from_uuid(m), l))
             .collect())
     }
+
+    /// Batch-fetch the notification level for many `participants` on ONE thread
+    /// `root` in a single round-trip — the "many people, one root" axis
+    /// notification dispatch needs (the inverse of [`Self::level_map`], which
+    /// batches one person across many roots). Missing entries default to `"all"`
+    /// (fail-open). Empty input short-circuits without touching the database.
+    /// Index-backed by `(root_message_id, participant_id)` (migration 0124),
+    /// since the table PK leads with `participant_id`. ROADMAP 方向二.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the query.
+    pub async fn levels_for(
+        &self,
+        root: MessageId,
+        participants: &[ParticipantId],
+    ) -> Result<HashMap<ParticipantId, String>, aero_common::Error> {
+        if participants.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let ids: Vec<uuid::Uuid> = participants.iter().map(ParticipantId::to_uuid).collect();
+        let rows = sqlx::query_as::<_, (uuid::Uuid, String)>(
+            r"SELECT participant_id, level FROM thread_notification_prefs
+               WHERE root_message_id = $1 AND participant_id = ANY($2)",
+        )
+        .bind(root.to_uuid())
+        .bind(&ids)
+        .fetch_all(&self.pg)
+        .await
+        .map_err(aero_common::Error::from)?;
+        Ok(rows
+            .into_iter()
+            .map(|(p, l)| (ParticipantId::from_uuid(p), l))
+            .collect())
+    }
 }
 
 #[cfg(test)]
@@ -118,6 +152,32 @@ mod db_tests {
             .max_connections(2)
             .connect_lazy(&url)
             .expect("connect_lazy never fails on a well-formed URL")
+    }
+
+    #[tokio::test]
+    async fn levels_for_empty_input_short_circuits() {
+        // Empty participant list returns empty WITHOUT querying (lazy pool stays
+        // unconnected), so this runs offline.
+        let repo = ThreadNotificationPrefsRepo::new(pool());
+        let got = repo
+            .levels_for(MessageId::new(), &[])
+            .await
+            .expect("empty input must not query");
+        assert!(got.is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn levels_for_returns_only_set_levels() {
+        let repo = ThreadNotificationPrefsRepo::new(pool());
+        let root = MessageId::new();
+        let muted = ParticipantId::new();
+        let defaulted = ParticipantId::new();
+        repo.set_level(muted, root, "none").await.unwrap();
+
+        let map = repo.levels_for(root, &[muted, defaulted]).await.unwrap();
+        assert_eq!(map.get(&muted).map(String::as_str), Some("none"));
+        assert!(!map.contains_key(&defaulted), "no row → absent (caller defaults to all)");
     }
 
     #[tokio::test]
