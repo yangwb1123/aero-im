@@ -137,12 +137,16 @@ impl ParticipantRepo {
     /// anonymise their message content in one transaction.
     ///
     /// Steps (all within the same DB transaction):
-    /// 1. Mark `participants.deleted_at = NOW()` — keeps the row for FK integrity.
-    /// 2. Overwrite every non-deleted message the participant sent with a
+    /// 1. Mark `participants.deleted_at = NOW()` (keeps the row for FK integrity)
+    ///    and tombstone its own PII: `display_name = '[deleted]'`, `avatar_url = NULL`.
+    /// 2. Hard-delete the satellite PII tables (`credentials` — login email + hash,
+    ///    `participant_profiles` — phone/status/pronouns, `sso_identities` — IdP
+    ///    email/subject); nothing references them, so they are removed outright.
+    /// 3. Overwrite every non-deleted message the participant sent with a
     ///    `[deleted]` placeholder, clear `searchable_text`, and null the pgvector
     ///    `embedding` (a semantic vector is re-identifiable) (GDPR Art. 17) —
     ///    EXCEPT messages under an active legal hold (Art. 17(3)(e)).
-    /// 3. Revoke all active `auth_sessions` so existing tokens stop working.
+    /// 4. Revoke all active `auth_sessions` so existing tokens stop working.
     ///
     /// Returns `true` when the account existed and was freshly soft-deleted,
     /// `false` when the participant was not found or was already deleted
@@ -174,11 +178,29 @@ impl ParticipantRepo {
 
         let now = time::OffsetDateTime::now_utc();
 
-        sqlx::query("UPDATE participants SET deleted_at = $1 WHERE id = $2")
-            .bind(now)
-            .bind(participant_id.to_uuid())
-            .execute(&mut *tx)
-            .await?;
+        // Anonymise the participant's own identity (GDPR right-to-erasure). The row
+        // itself is kept (FK integrity for messages/rooms it is referenced by), but
+        // its display_name is tombstoned and avatar_url cleared so no personal name
+        // or photo survives the erasure.
+        sqlx::query(
+            "UPDATE participants SET deleted_at = $1, display_name = '[deleted]', avatar_url = NULL \
+             WHERE id = $2",
+        )
+        .bind(now)
+        .bind(participant_id.to_uuid())
+        .execute(&mut *tx)
+        .await?;
+
+        // Delete the satellite PII tables outright — nothing references them, so a
+        // hard delete fully removes the login email, password hash, profile (phone,
+        // status text, pronouns, …) and any linked SSO identities/emails.
+        for stmt in [
+            "DELETE FROM credentials WHERE participant_id = $1",
+            "DELETE FROM participant_profiles WHERE participant_id = $1",
+            "DELETE FROM sso_identities WHERE participant_id = $1",
+        ] {
+            sqlx::query(stmt).bind(participant_id.to_uuid()).execute(&mut *tx).await?;
+        }
 
         // Anonymise message content (GDPR right-to-erasure). Null the pgvector
         // `embedding` too: a semantic vector of the original text is re-identifiable
@@ -733,5 +755,71 @@ mod db_tests {
             0,
             "deferred erasure is idempotent",
         );
+    }
+
+    /// GDPR erasure must remove the participant's OWN identity PII: tombstone
+    /// display_name + clear avatar_url, and hard-delete credentials (login email +
+    /// hash), the profile (phone/status), and SSO identities. A surviving
+    /// name/email/phone would defeat right-to-erasure.
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn erasure_clears_own_identity_pii() {
+        let p = pool();
+        let participants = ParticipantRepo::new(p.clone());
+
+        let id = ParticipantId::new();
+        sqlx::query(
+            "INSERT INTO participants (id, kind, display_name, avatar_url) \
+             VALUES ($1, 'human', 'Jane Doe', 'https://cdn/jane.png')",
+        )
+        .bind(id.to_uuid())
+        .execute(&p)
+        .await
+        .expect("participant");
+        sqlx::query("INSERT INTO credentials (participant_id, email, password_hash) VALUES ($1,$2,'h')")
+            .bind(id.to_uuid())
+            .bind(format!("jane-{}@example.com", id.to_uuid()))
+            .execute(&p)
+            .await
+            .expect("credentials");
+        sqlx::query(
+            "INSERT INTO participant_profiles (participant_id, phone, status_text) \
+             VALUES ($1, '+1-555-0100', 'on vacation')",
+        )
+        .bind(id.to_uuid())
+        .execute(&p)
+        .await
+        .expect("profile");
+        sqlx::query(
+            "INSERT INTO sso_identities (issuer, subject, participant_id, email) \
+             VALUES ('https://idp', $1, $2, $3)",
+        )
+        .bind(format!("subj-{}", id.to_uuid()))
+        .bind(id.to_uuid())
+        .bind(format!("jane-{}@idp.com", id.to_uuid()))
+        .execute(&p)
+        .await
+        .expect("sso");
+
+        assert!(participants.delete_participant(id).await.expect("erase"));
+
+        let (name, avatar_null): (String, bool) =
+            sqlx::query_as("SELECT display_name, avatar_url IS NULL FROM participants WHERE id = $1")
+                .bind(id.to_uuid())
+                .fetch_one(&p)
+                .await
+                .expect("reload participant");
+        assert_eq!(name, "[deleted]", "display_name must be tombstoned");
+        assert!(avatar_null, "avatar_url must be cleared");
+
+        for table in ["credentials", "participant_profiles", "sso_identities"] {
+            let count: (i64,) =
+                sqlx::query_as(&format!("SELECT count(*) FROM {table} WHERE participant_id = $1"))
+                    .bind(id.to_uuid())
+                    .fetch_one(&p)
+                    .await
+                    .expect("count");
+            assert_eq!(count.0, 0, "{table} PII must be deleted on erasure");
+        }
     }
 }
