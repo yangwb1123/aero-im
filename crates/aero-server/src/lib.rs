@@ -4,6 +4,8 @@ pub mod agent_bot;
 // ROADMAP3 方向二: cross-node call-bridge spawn orchestration (supervisor).
 pub mod call_bridge_subscribe;
 pub mod call_bridge_supervisor;
+// ROADMAP 方向五: per-peer SFU media session (the str0m loop driving on_rtp).
+pub mod sfu_media;
 pub mod moderation_bot;
 pub mod transcribe_bot;
 pub mod unfurl_bot;
