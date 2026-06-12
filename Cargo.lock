@@ -319,6 +319,7 @@ dependencies = [
  "hyper",
  "parking_lot",
  "pretty_assertions",
+ "reqwest",
  "serde",
  "serde_json",
  "sha2 0.10.9",

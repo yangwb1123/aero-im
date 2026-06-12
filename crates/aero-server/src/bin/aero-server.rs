@@ -356,7 +356,17 @@ async fn main() -> anyhow::Result<()> {
             .with_sfu(sfu_router.clone())
             .with_call_routes(Arc::new(call_routes.clone()), public_base_url.clone()),
     );
-    let bridge_factory: Arc<dyn UpstreamFactory> = Arc::new(NodeRtpPullerFactory);
+    // Cross-node call-bridge puller (ROADMAP 方向五): advertises this node's
+    // reachable host (AERO_BRIDGE_ADVERTISE_HOST, default = ingest host) to peers'
+    // subscribe endpoints, authenticated with the shared cluster secret.
+    let bridge_advertise_host = std::env::var("AERO_BRIDGE_ADVERTISE_HOST")
+        .or_else(|_| std::env::var("AERO_INGEST_HOST"))
+        .unwrap_or_else(|_| cfg.server.host.clone());
+    let bridge_secret = std::env::var("AERO_INTERNAL_BRIDGE_SECRET")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    let bridge_factory: Arc<dyn UpstreamFactory> =
+        Arc::new(NodeRtpPullerFactory::new(bridge_advertise_host, bridge_secret));
     let call_supervisor = Arc::new(CallBridgeSupervisor::new(
         sfu_router.clone(),
         sfu_forwarder.clone(),

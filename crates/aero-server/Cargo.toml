@@ -39,6 +39,8 @@ tokio = { workspace = true, features = ["full"] }
 tokio-util = { workspace = true, features = ["rt"] }
 futures.workspace = true
 async-trait.workspace = true
+# Outbound HTTP for the cross-node call-bridge subscribe control call (方向五).
+reqwest.workspace = true
 
 axum.workspace = true
 # Extra tower/tower-http features for the gateway hardening stack:

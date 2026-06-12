@@ -103,36 +103,59 @@ pub trait UpstreamFactory: Send + Sync {
 
 /// The production [`UpstreamFactory`]: the real node-to-node RTP puller.
 ///
-/// [`connect`](UpstreamFactory::connect) binds a UDP socket and returns a real
-/// [`UdpRtpUpstream`] that receives plain-RTP [`bridge_frame`] datagrams from the
-/// owning node and yields them into the local SFU. The receive + decode + fan-in
-/// path is fully exercised (`udp_puller_receives_and_decodes_a_real_frame` drives
-/// it over localhost). The remaining staging step is the peer-side **subscribe**
-/// control call — telling `peer_url`'s egress which address to push to — plus the
-/// two-node end-to-end run, which needs a real second node. Single-node boot
-/// never produces a `BridgeTo`, so this is dormant there regardless.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct NodeRtpPullerFactory;
+/// [`connect`](UpstreamFactory::connect) binds a UDP socket, **announces** its
+/// receive address to the owning node's subscribe endpoint (so that node's
+/// egress starts pushing this call's RTP here), and returns a real
+/// [`UdpRtpUpstream`]. Backend links are trusted, so the media is plain RTP
+/// framed by [`bridge_frame`](aero_live_webrtc::bridge_frame) — DTLS-SRTP is only
+/// on the client leg. The bind → announce → receive → decode → fan-in path is
+/// exercised over localhost (`connect_announces_subscribe_to_the_peer`,
+/// `egress_to_puller_roundtrips_over_localhost`). The remaining staging step is a
+/// real two-node run (a reachable second node + its advertised address); single-
+/// node boot never produces a `BridgeTo`, so this is dormant there.
+#[derive(Clone)]
+pub struct NodeRtpPullerFactory {
+    /// Host other nodes should send this node's bridged RTP to (its reachable
+    /// address; the bound UDP port is appended). From `AERO_BRIDGE_ADVERTISE_HOST`.
+    advertise_host: String,
+    /// Shared cluster secret for the subscribe control call (`Bearer`). `None`
+    /// when unset — the puller still binds and can receive, it just can't announce.
+    secret: Option<String>,
+    /// Reused outbound HTTP client for the subscribe POST.
+    http: reqwest::Client,
+}
+
+impl NodeRtpPullerFactory {
+    /// Build the factory with the address this node advertises to peers and the
+    /// shared cluster secret for the subscribe control call.
+    #[must_use]
+    pub fn new(advertise_host: impl Into<String>, secret: Option<String>) -> Self {
+        Self {
+            advertise_host: advertise_host.into(),
+            secret,
+            http: reqwest::Client::new(),
+        }
+    }
+}
 
 #[async_trait]
 impl UpstreamFactory for NodeRtpPullerFactory {
     async fn connect(&self, call: CallId, peer_url: &str) -> Option<Box<dyn CallUpstream>> {
-        // Backend node-to-node links are trusted (private network), so the media
-        // is PLAIN RTP framed by `bridge_frame` — DTLS-SRTP is only required on
-        // the client-facing leg (ROADMAP 方向五). Bind a UDP socket to receive
-        // this call's bridged RTP from the owning node and hand back a real
-        // puller. The receive + decode + fan-in path is fully exercised (see the
-        // localhost test); the peer-side subscribe — telling `peer_url` where to
-        // push, an HTTP control call — is the remaining staging step, so until a
-        // peer sends, the puller simply idles (and single-node boot never
-        // produces a `BridgeTo`, so this is never even called there).
-        match UdpRtpUpstream::bind(call, peer_url).await {
-            Ok(up) => Some(Box::new(up)),
+        let up = match UdpRtpUpstream::bind(call, peer_url).await {
+            Ok(up) => up,
             Err(e) => {
                 debug!(?e, peer_url, "call-bridge: udp puller bind failed; skipping bridge");
-                None
+                return None;
             }
+        };
+        // Announce where to push this call's RTP. Best-effort: a failed announce
+        // just means no media flows yet (a later join re-attempts) — the puller
+        // still binds and can receive.
+        if let Ok(local) = up.local_addr() {
+            let advertised = format!("{}:{}", self.advertise_host, local.port());
+            subscribe_to_peer(&self.http, peer_url, self.secret.as_deref(), call, &advertised).await;
         }
+        Some(Box::new(up))
     }
 }
 
@@ -160,10 +183,40 @@ impl UdpRtpUpstream {
         Ok(Self { call, node_url: peer_url.to_owned(), socket, buf: vec![0u8; 2048] })
     }
 
-    /// The local address the peer's egress should push frames to (staging wiring).
-    #[cfg(test)]
+    /// The local address whose port the peer's egress should push frames to.
     fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
         self.socket.local_addr()
+    }
+}
+
+/// Announce `addr` as where to push `call`'s bridged RTP by POSTing the owning
+/// node's subscribe control endpoint (ROADMAP 方向五). Best-effort: a failed
+/// announce just means no media flows yet (a later join re-attempts); returns
+/// whether the peer accepted the subscription.
+async fn subscribe_to_peer(
+    http: &reqwest::Client,
+    peer_url: &str,
+    secret: Option<&str>,
+    call: CallId,
+    addr: &str,
+) -> bool {
+    let url = format!("{}/api/internal/call-bridge/subscribe", peer_url.trim_end_matches('/'));
+    let mut req = http
+        .post(&url)
+        .json(&serde_json::json!({ "call_id": call.to_string(), "addr": addr }));
+    if let Some(s) = secret {
+        req = req.bearer_auth(s);
+    }
+    match req.send().await {
+        Ok(resp) if resp.status().is_success() => true,
+        Ok(resp) => {
+            debug!(status = %resp.status(), peer_url, "call-bridge: subscribe rejected");
+            false
+        }
+        Err(e) => {
+            debug!(?e, peer_url, "call-bridge: subscribe POST failed");
+            false
+        }
     }
 }
 
@@ -661,6 +714,62 @@ mod tests {
         assert_eq!(reg.subscribers(call), vec![b]);
         reg.unsubscribe(call, b);
         assert!(reg.subscribers(call).is_empty());
+    }
+
+    /// `connect` binds a puller AND announces its receive address to the owning
+    /// node's subscribe endpoint (ROADMAP 方向五). Drives the real outbound POST
+    /// against a localhost mock peer and asserts the body + auth are correct —
+    /// the full bind → announce path. Only the two-real-nodes run is staging.
+    #[tokio::test]
+    async fn connect_announces_subscribe_to_the_peer() {
+        use axum::{routing::post, Json, Router};
+
+        // Mock owning node: records the subscribe auth header + body.
+        let seen: Arc<Mutex<Option<(Option<String>, serde_json::Value)>>> =
+            Arc::new(Mutex::new(None));
+        let recorder = seen.clone();
+        let app = Router::new().route(
+            "/api/internal/call-bridge/subscribe",
+            post(move |headers: axum::http::HeaderMap, Json(body): Json<serde_json::Value>| {
+                let recorder = recorder.clone();
+                async move {
+                    let auth = headers
+                        .get(axum::http::header::AUTHORIZATION)
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_owned);
+                    *recorder.lock() = Some((auth, body));
+                    axum::http::StatusCode::NO_CONTENT
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer_addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let factory = NodeRtpPullerFactory::new("10.0.0.9", Some("clustersecret".to_owned()));
+        let call = CallId::new();
+        let up = factory.connect(call, &format!("http://{peer_addr}")).await;
+        assert!(up.is_some(), "puller is created even before any media flows");
+
+        // Poll briefly for the async POST to land on the mock peer.
+        let mut got = None;
+        for _ in 0..100 {
+            if let Some(v) = seen.lock().take() {
+                got = Some(v);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let (auth, body) = got.expect("peer must receive a subscribe POST");
+        assert_eq!(auth.as_deref(), Some("Bearer clustersecret"), "shared-secret bearer");
+        assert_eq!(body["call_id"], call.to_string(), "the call id");
+        assert!(
+            body["addr"].as_str().unwrap().starts_with("10.0.0.9:"),
+            "advertised host:port, got {}",
+            body["addr"]
+        );
+
+        server.abort();
     }
 
     /// The REAL node-to-node UDP puller receives a `bridge_frame`-framed RTP
