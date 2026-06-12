@@ -86,6 +86,39 @@ impl WorkspaceMuteRepo {
         Ok(row.0 > 0)
     }
 
+    /// Of `participants`, the subset that has muted `workspace` — resolved in
+    /// ONE index-backed query (`WHERE workspace_id = $1 AND participant_id =
+    /// ANY($2)`), replacing the per-recipient [`Self::is_muted`] loop in
+    /// notification dispatch (ROADMAP 方向二). For a large-room `@everyone` the
+    /// old loop issued one round-trip per recipient and scaled linearly with
+    /// membership. The `(workspace_id, participant_id)` composite index
+    /// (migration 0123) lets this query seek by workspace; the table PK leads
+    /// with `participant_id` and can't serve this shape. An empty input
+    /// short-circuits without touching the database.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the query.
+    pub async fn muted_participants(
+        &self,
+        workspace: WorkspaceId,
+        participants: &[ParticipantId],
+    ) -> Result<std::collections::HashSet<ParticipantId>, aero_common::Error> {
+        if participants.is_empty() {
+            return Ok(std::collections::HashSet::new());
+        }
+        let ids: Vec<uuid::Uuid> = participants.iter().map(|p| p.to_uuid()).collect();
+        let rows = sqlx::query_as::<_, (uuid::Uuid,)>(
+            r"SELECT participant_id FROM workspace_mutes
+               WHERE workspace_id = $1 AND participant_id = ANY($2)",
+        )
+        .bind(workspace.to_uuid())
+        .bind(&ids)
+        .fetch_all(&self.pg)
+        .await
+        .map_err(aero_common::Error::from)?;
+        Ok(rows.into_iter().map(|(p,)| ParticipantId::from_uuid(p)).collect())
+    }
+
     /// All workspace ids `participant` has muted, newest mute first.
     ///
     /// # Errors
@@ -119,6 +152,39 @@ mod db_tests {
             .max_connections(2)
             .connect_lazy(&url)
             .expect("connect_lazy never fails on a well-formed URL")
+    }
+
+    #[tokio::test]
+    async fn muted_participants_empty_input_short_circuits() {
+        // An empty recipient list returns empty WITHOUT touching the database —
+        // the lazy pool is never connected, so this runs offline.
+        let repo = WorkspaceMuteRepo::new(pool());
+        let got = repo
+            .muted_participants(WorkspaceId::new(), &[])
+            .await
+            .expect("empty input must not query");
+        assert!(got.is_empty());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn muted_participants_returns_only_muted_subset() {
+        let p = pool();
+        let repo = WorkspaceMuteRepo::new(p.clone());
+        let ws = WorkspaceId::new();
+        let muted = ParticipantId::new();
+        let unmuted = ParticipantId::new();
+        repo.mute(muted, ws).await.unwrap();
+
+        let set = repo
+            .muted_participants(ws, &[muted, unmuted])
+            .await
+            .unwrap();
+        assert!(set.contains(&muted), "muted participant is in the set");
+        assert!(!set.contains(&unmuted), "unmuted participant is excluded");
+        assert_eq!(set.len(), 1);
+
+        repo.unmute(muted, ws).await.unwrap();
     }
 
     #[tokio::test]

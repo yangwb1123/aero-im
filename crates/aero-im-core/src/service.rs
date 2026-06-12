@@ -1774,17 +1774,17 @@ impl ImService {
                 (self.workspace_mutes.as_ref(), workspace_for_room)
             {
                 let ids: Vec<ParticipantId> = targets.keys().copied().collect();
-                let mut set = std::collections::HashSet::new();
-                for id in &ids {
-                    match ws_mute_repo.is_muted(*id, workspace).await {
-                        Ok(true) => { set.insert(*id); }
-                        Ok(false) => {}
-                        Err(err) => {
-                            warn!(?err, %id, "workspace mute lookup failed; not suppressing");
-                        }
+                // One index-backed batch query instead of N serial is_muted
+                // round-trips (ROADMAP 方向二): a large-room @everyone previously
+                // scaled linearly with membership. Fail-open: a lookup error
+                // suppresses nobody (delivers), matching the prior per-id loop.
+                match ws_mute_repo.muted_participants(workspace, &ids).await {
+                    Ok(set) => set,
+                    Err(err) => {
+                        warn!(?err, "workspace mute batch lookup failed; not suppressing");
+                        std::collections::HashSet::new()
                     }
                 }
-                set
             } else {
                 std::collections::HashSet::new()
             };
