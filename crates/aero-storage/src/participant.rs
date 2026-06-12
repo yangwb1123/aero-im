@@ -235,6 +235,42 @@ impl ParticipantRepo {
         Ok(true)
     }
 
+    /// Complete GDPR erasure for messages that [`delete_participant`] had to skip
+    /// because they sat under a legal hold which has since released.
+    ///
+    /// Re-applies the erasure anonymisation to any message whose sender is already
+    /// soft-deleted, that is no longer under an active legal hold, and that still
+    /// carries identifiable content (text or embedding). Idempotent — already-erased
+    /// rows are excluded by the content predicate, so it is safe to run on a timer.
+    /// Returns the number of messages erased this pass.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the update.
+    pub async fn sweep_deferred_erasure(&self) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query(
+            r#"UPDATE messages m
+               SET blocks          = '[{"type":"text","text":"[deleted]"}]'::jsonb,
+                   searchable_text = '',
+                   embedding       = NULL
+               FROM participants p
+               WHERE m.sender_id = p.id
+                 AND p.deleted_at IS NOT NULL
+                 AND m.deleted_at IS NULL
+                 AND (m.searchable_text <> '' OR m.embedding IS NOT NULL)
+                 AND NOT EXISTS (
+                       SELECT 1 FROM rooms r
+                        JOIN legal_holds lh
+                          ON lh.active
+                         AND (lh.room_id = r.id
+                              OR (lh.room_id IS NULL AND lh.workspace_id = r.workspace_id))
+                        WHERE r.id = m.room_id
+                     )"#,
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
     /// Replace the password hash stored for a participant.
     ///
     /// Returns `true` if the row existed and was updated, `false` when no
@@ -621,5 +657,81 @@ mod db_tests {
 
         assert_eq!(held_text, "preserved under legal hold", "held message must NOT be erased");
         assert_eq!(free_text, "", "unheld message must be erased");
+    }
+
+    /// After a legal hold releases, the deferred-erasure sweep completes erasure of
+    /// a deleted participant's previously-exempt messages. No-op while the hold is
+    /// active; idempotent once done.
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn deferred_sweep_erases_after_hold_release() {
+        let p = pool();
+        let messages = MessageRepo::new(p.clone());
+        let participants = ParticipantRepo::new(p.clone());
+
+        let sender = participant(&p).await;
+        let held_room = room(&p, sender).await;
+        let msg = messages
+            .insert(NewMessage {
+                room_id: held_room,
+                sender_id: sender,
+                blocks: vec![Block::text("held then released")],
+                reply_to: None,
+                metadata: serde_json::json!({}),
+                expires_at: None,
+            })
+            .await
+            .expect("msg");
+
+        let hold_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO legal_holds (id, workspace_id, room_id, reason, created_by) \
+             VALUES ($1, $2, $3, 'hold', $4)",
+        )
+        .bind(hold_id)
+        .bind(WorkspaceId(ulid::Ulid(0)).to_uuid())
+        .bind(held_room.to_uuid())
+        .bind(sender.to_uuid())
+        .execute(&p)
+        .await
+        .expect("hold");
+
+        // Erase the account: the held message is exempt, so it keeps its content,
+        // and the deferred sweep is a no-op while the hold is active.
+        assert!(participants.delete_participant(sender).await.expect("erase"));
+        assert_eq!(
+            participants.sweep_deferred_erasure().await.expect("sweep held"),
+            0,
+            "nothing erased while the hold is active",
+        );
+        let text: String = sqlx::query_scalar("SELECT searchable_text FROM messages WHERE id = $1")
+            .bind(msg.id.to_uuid())
+            .fetch_one(&p)
+            .await
+            .expect("reload");
+        assert_eq!(text, "held then released", "still preserved under active hold");
+
+        // Release the hold → the sweep completes erasure, and is then idempotent.
+        sqlx::query("UPDATE legal_holds SET active = false, released_at = now() WHERE id = $1")
+            .bind(hold_id)
+            .execute(&p)
+            .await
+            .expect("release");
+        assert_eq!(
+            participants.sweep_deferred_erasure().await.expect("sweep released"),
+            1,
+            "one message erased after hold release",
+        );
+        let text: String = sqlx::query_scalar("SELECT searchable_text FROM messages WHERE id = $1")
+            .bind(msg.id.to_uuid())
+            .fetch_one(&p)
+            .await
+            .expect("reload2");
+        assert_eq!(text, "", "erased after hold release");
+        assert_eq!(
+            participants.sweep_deferred_erasure().await.expect("sweep idem"),
+            0,
+            "deferred erasure is idempotent",
+        );
     }
 }

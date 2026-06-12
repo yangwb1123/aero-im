@@ -447,6 +447,7 @@ async fn main() -> anyhow::Result<()> {
         let workspaces = state.workspaces.clone();
         let messages_repo = state.messages.clone();
         let stream_mod_pool = state.pg.clone();
+        let erasure_pool = state.pg.clone();
         // ImService handle so the sweep can fan out RoomEvent::Deleted to live +
         // reconnecting clients (ROADMAP 方向一).
         let sweep_im = state.im.clone();
@@ -522,6 +523,20 @@ async fn main() -> anyhow::Result<()> {
                                 Ok(0) => {}
                                 Ok(n) => info!(swept = n, "expired channel points zeroed"),
                                 Err(e) => warn!(error = ?e, "channel points expiry sweep failed"),
+                            }
+                            // Deferred GDPR erasure (Art. 17): complete erasure for
+                            // messages from already-deleted participants whose legal
+                            // hold has since released — delete_participant exempts
+                            // held messages, so this closes the post-release gap.
+                            match aero_storage::ParticipantRepo::new(erasure_pool.clone())
+                                .sweep_deferred_erasure()
+                                .await
+                            {
+                                Ok(0) => {}
+                                Ok(n) => {
+                                    info!(swept = n, "deferred GDPR erasure completed (released holds)");
+                                }
+                                Err(e) => warn!(error = ?e, "deferred erasure sweep failed"),
                             }
                         }
                     }
