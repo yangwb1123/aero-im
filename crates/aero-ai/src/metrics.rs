@@ -75,7 +75,8 @@ pub fn kind_label(kind: AiJobKind) -> &'static str {
 /// - `Embed` — one Voyage embedding request (cheap).
 /// - `Summarize` / `Answer` — an Anthropic Messages completion (the expensive
 ///   ones; `Answer` also runs retrieval but the LLM call dominates).
-/// - `Moderate` — currently a local stub (no paid call) → zero.
+/// - `Moderate` — a real paid classification call when an Anthropic key is
+///   configured (`was_paid` is true), so it carries a non-zero estimate (方向四).
 #[derive(Debug, Clone, Copy)]
 pub struct CostModel {
     /// Estimated micro-USD for an `Embed` job.
@@ -104,8 +105,13 @@ impl Default for CostModel {
             embed_micros: 20,
             // ~$0.003 per summary completion — Anthropic-scale, coarse.
             summarize_micros: 3_000,
-            // Local stub today: no paid upstream → no estimated spend.
-            moderate_micros: 0,
+            // ~$0.001 per moderation call (方向四): a small classification
+            // completion (~200-token system+content input, short verdict output)
+            // on Sonnet pricing. NOT zero — when a key is configured the worker's
+            // `was_paid(Moderate)` is true (a real Anthropic call was made), so a
+            // 0 estimate made the highest-volume paid path invisible on the cost
+            // dashboard. Real token usage, when surfaced, overrides this estimate.
+            moderate_micros: 1_000,
             // ~$0.005 per answer (retrieval + a larger completion), coarse.
             answer_micros: 5_000,
             // Claude Sonnet 4.6 list price: $3 / 1M input, $15 / 1M output
@@ -290,11 +296,14 @@ mod tests {
         assert_eq!(m.micros_for(AiJobKind::Summarize), m.summarize_micros);
         assert_eq!(m.micros_for(AiJobKind::Moderate), m.moderate_micros);
         assert_eq!(m.micros_for(AiJobKind::Answer), m.answer_micros);
-        // Moderate is a local stub → no estimated spend.
-        assert_eq!(m.micros_for(AiJobKind::Moderate), 0);
+        // Moderate is a real paid call when keyed (方向四) → non-zero estimate,
+        // but a small classification, so below the larger summary/answer kinds.
+        assert!(m.micros_for(AiJobKind::Moderate) > 0);
+        assert!(m.micros_for(AiJobKind::Moderate) < m.micros_for(AiJobKind::Summarize));
         // The LLM kinds dominate the cheap embedding kind.
         assert!(m.micros_for(AiJobKind::Answer) > m.micros_for(AiJobKind::Embed));
         assert!(m.micros_for(AiJobKind::Summarize) > m.micros_for(AiJobKind::Embed));
+        assert!(m.micros_for(AiJobKind::Moderate) > m.micros_for(AiJobKind::Embed));
     }
 
     #[test]
@@ -374,6 +383,27 @@ mod tests {
         assert!(
             out.contains(r#"aero_ai_cost_micros_total{kind="summarize"} 0"#),
             "zero-token cost must record a zero series:\n{out}"
+        );
+    }
+
+    #[test]
+    fn moderate_paid_job_charges_nonzero_cost() {
+        // Regression (方向四): a paid moderation call must NOT record $0 — the
+        // worker charges micros_for(Moderate) when Anthropic was actually called.
+        let m = CostModel::default();
+        assert!(
+            m.micros_for(AiJobKind::Moderate) > 0,
+            "moderation is a real paid call when keyed, not a stub"
+        );
+        let r = Registry::new();
+        record_cost(&r, &m, AiJobKind::Moderate, None, true);
+        let out = r.render_prometheus();
+        assert!(
+            out.contains(&format!(
+                r#"aero_ai_cost_micros_total{{kind="moderate"}} {}"#,
+                m.moderate_micros
+            )),
+            "paid moderation must charge its estimate, not zero:\n{out}"
         );
     }
 
