@@ -25,7 +25,7 @@ use aero_auth::AuthUser;
 use aero_common::{Error as AeroError, Result as AeroResult};
 use aero_storage::{StreamRepo, StreamStatsRepo, StreamViewerSampleRepo, StreamViewerStore};
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     routing::get,
     Json, Router,
 };
@@ -42,7 +42,9 @@ pub const VIEWER_SAMPLE_INTERVAL: Duration = Duration::from_secs(30);
 /// [`crate::routes::build`]; kept separate so the analytics surface lives next to
 /// its own storage repo, additively over the live/stream path.
 pub fn routes() -> Router<AppState> {
-    Router::new().route("/api/streams/:id/analytics", get(stream_analytics))
+    Router::new()
+        .route("/api/streams/:id/analytics", get(stream_analytics))
+        .route("/api/streams/:id/retention-curve", get(retention_curve))
 }
 
 fn parse_stream_id(s: &str) -> AeroResult<Ulid> {
@@ -89,6 +91,45 @@ async fn stream_analytics(
         obj.insert("viewer_samples".into(), serde_json::json!(viewers.samples));
     }
     Ok(Json(body))
+}
+
+#[derive(serde::Deserialize)]
+struct RetentionQuery {
+    /// Width of each retention bucket in seconds (default: 60).
+    #[serde(default = "default_bucket_secs")]
+    bucket_secs: i64,
+}
+
+fn default_bucket_secs() -> i64 {
+    60
+}
+
+/// `GET /api/streams/:id/retention-curve?bucket_secs=60` — viewer retention curve
+/// for the stream: peak-relative retention percentage bucketed by time offset from
+/// the stream start. Owner-only.
+async fn retention_curve(
+    State(s): State<AppState>,
+    auth: AuthUser,
+    Path(id_str): Path<String>,
+    Query(q): Query<RetentionQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let stream_id = parse_stream_id(&id_str)?;
+    let stream = s
+        .streams
+        .get(stream_id)
+        .await
+        .map_err(AeroError::from)?
+        .ok_or_else(|| AeroError::NotFound(format!("stream {stream_id}")))?;
+    if stream.owner_id != auth.participant_id {
+        return Err(
+            AeroError::Forbidden("only the stream owner may view its retention curve".into()).into(),
+        );
+    }
+    let curve = StreamViewerSampleRepo::new(s.pg.clone())
+        .retention_curve(stream_id, q.bucket_secs)
+        .await
+        .map_err(AeroError::from)?;
+    Ok(Json(serde_json::json!({ "curve": curve })))
 }
 
 /// Background sampler: every [`VIEWER_SAMPLE_INTERVAL`], snapshot the live

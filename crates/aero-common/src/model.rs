@@ -113,16 +113,6 @@ pub enum Block {
     Mention {
         participant: ParticipantId,
     },
-    /// A `#channel` mention — a link to a room that ALSO notifies that room's
-    /// members (the channel-scoped analogue of a [`Mention`](Self::Mention),
-    /// which targets one participant). The dispatcher
-    /// (`ImService::dispatch_notifications`) resolves the room's members and
-    /// notifies them. Carries no visible text of its own (the client renders the
-    /// channel name from `room`), so it contributes nothing to the searchable
-    /// projection — mirroring [`Mention`](Self::Mention).
-    ChannelMention {
-        room: RoomId,
-    },
     Code {
         lang: String,
         content: String,
@@ -676,7 +666,7 @@ pub enum CallEvent {
 
 /// A poll created in a room: a question with 2..=10 options, single- or
 /// multi-choice. Members vote; everyone sees the live tally; the creator closes
-/// it. Backs `migrations/0023_polls.sql`.
+/// it. Backs `migrations/0023_polls.sql` + `0096_polls_anonymous.sql`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Poll {
     pub id: PollId,
@@ -687,6 +677,10 @@ pub struct Poll {
     pub options: Vec<String>,
     /// `true` ⇒ a participant may pick several options; `false` ⇒ exactly one.
     pub multi: bool,
+    /// `true` ⇒ voter identities are hidden; only totals are returned. Defaults to
+    /// `false` (public). Set at creation time and cannot be changed afterwards.
+    #[serde(default)]
+    pub anonymous: bool,
     /// Set once the creator closes the poll; `None` while it accepts votes.
     #[serde(default, with = "time::serde::rfc3339::option")]
     pub closed_at: Option<OffsetDateTime>,

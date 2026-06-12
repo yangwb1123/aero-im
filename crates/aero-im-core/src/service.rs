@@ -19,8 +19,8 @@ use aero_common::{PinOp, PinnedMessage};
 use aero_storage::{
     message::NewMessage, AiJobKind, AiJobRepo, CallRepo, DeactivationRepo, KeywordAlertRepo,
     MessageEditRepo, MessageRepo, NotificationPrefsRepo, NotificationRepo, ParticipantRepo, PinRepo,
-    ReactionRepo, ReceiptRepo, RoomRepo, ThreadMuteRepo, ThreadSubscriptionRepo, TotpRepo,
-    UserGroupRepo, WorkspaceRepo,
+    ReactionRepo, ReceiptRepo, RoomRepo, ThreadNotificationPrefsRepo, ThreadSubscriptionRepo,
+    TotpRepo, UserGroupRepo, WorkspaceMuteRepo, WorkspaceRepo,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -166,13 +166,6 @@ pub struct ImService {
     /// [`dispatch_notifications`](Self::dispatch_notifications) notifies everyone
     /// who followed a reply's root message (Wave 11).
     thread_subs: Option<ThreadSubscriptionRepo>,
-    /// Thread-mute store (the inverse of [`thread_subs`](Self::thread_subs)).
-    /// Optional builder ([`with_thread_mutes`](Self::with_thread_mutes)); when
-    /// present, [`dispatch_notifications`](Self::dispatch_notifications)
-    /// SUBTRACTS everyone who muted a reply's root message from the reply
-    /// notification fan-out (the mute suppresses the notification, never the room
-    /// broadcast).
-    thread_mutes: Option<ThreadMuteRepo>,
     /// Workspace deactivation store. Optional builder
     /// ([`with_deactivations`](Self::with_deactivations)); when present,
     /// [`assert_room_access`](Self::assert_room_access) denies a member who has
@@ -183,6 +176,18 @@ pub struct ImService {
     /// [`assert_room_access`](Self::assert_room_access) denies a member of a
     /// `require_2fa` workspace who has not activated TOTP (Wave 24).
     totp: Option<TotpRepo>,
+    /// Per-thread notification level store (ROADMAP6 Lane A). Optional builder
+    /// ([`with_thread_notification_prefs`](Self::with_thread_notification_prefs));
+    /// when present, [`dispatch_notifications`](Self::dispatch_notifications) applies
+    /// the per-thread level (`all`/`mentions`/`none`) to thread reply notifications
+    /// after the thread-mute step.
+    thread_notification_prefs: Option<ThreadNotificationPrefsRepo>,
+    /// Workspace-wide mute store (ROADMAP6 Lane A). Optional builder
+    /// ([`with_workspace_mutes`](Self::with_workspace_mutes)); when present,
+    /// [`dispatch_notifications`](Self::dispatch_notifications) suppresses all
+    /// notifications to participants who have muted the room's workspace (checked
+    /// first, before any room-level suppression).
+    workspace_mutes: Option<WorkspaceMuteRepo>,
     bus: Arc<dyn BusSink>,
     moderator: Arc<dyn Moderator>,
     /// Per-subject event-seq source for publish-time `"seq"` stamping (ROADMAP
@@ -231,9 +236,10 @@ impl ImService {
             message_edits: None,
             keyword_alerts: None,
             thread_subs: None,
-            thread_mutes: None,
             deactivations: None,
             totp: None,
+            thread_notification_prefs: None,
+            workspace_mutes: None,
             bus: bus as Arc<dyn BusSink>,
             moderator,
             seq: Arc::new(LocalSeqProvider::new()),
@@ -336,17 +342,6 @@ impl ImService {
         self
     }
 
-    /// Wire in the thread-mute store, enabling thread-mute suppression in
-    /// [`dispatch_notifications`](Self::dispatch_notifications): everyone who
-    /// muted a reply's root message is SUBTRACTED from the reply notification
-    /// fan-out. Additive builder mirroring [`with_thread_subs`](Self::with_thread_subs);
-    /// without it, no thread is ever muted (the inverse default of thread-follow).
-    #[must_use]
-    pub fn with_thread_mutes(mut self, thread_mutes: ThreadMuteRepo) -> Self {
-        self.thread_mutes = Some(thread_mutes);
-        self
-    }
-
     /// Wire in the workspace-deactivation store, enabling access revocation in
     /// [`assert_room_access`](Self::assert_room_access). Additive builder; without
     /// it, no deactivation check is applied (every member keeps access).
@@ -362,6 +357,29 @@ impl ImService {
     #[must_use]
     pub fn with_totp(mut self, totp: TotpRepo) -> Self {
         self.totp = Some(totp);
+        self
+    }
+
+    /// Wire in the per-thread notification level store (ROADMAP6 Lane A), enabling
+    /// per-thread level suppression (`all`/`mentions`/`none`) in
+    /// [`dispatch_notifications`](Self::dispatch_notifications). Additive builder;
+    /// without it, all thread reply notifications are delivered (fail-open).
+    #[must_use]
+    pub fn with_thread_notification_prefs(
+        mut self,
+        repo: ThreadNotificationPrefsRepo,
+    ) -> Self {
+        self.thread_notification_prefs = Some(repo);
+        self
+    }
+
+    /// Wire in the workspace-wide mute store (ROADMAP6 Lane A), enabling workspace
+    /// mute suppression (checked first, before room-level suppression) in
+    /// [`dispatch_notifications`](Self::dispatch_notifications). Additive builder;
+    /// without it, no workspace-mute suppression is applied.
+    #[must_use]
+    pub fn with_workspace_mutes(mut self, repo: WorkspaceMuteRepo) -> Self {
+        self.workspace_mutes = Some(repo);
         self
     }
 
@@ -434,9 +452,10 @@ impl ImService {
             message_edits: None,
             keyword_alerts: None,
             thread_subs: None,
-            thread_mutes: None,
             deactivations: None,
             totp: None,
+            thread_notification_prefs: None,
+            workspace_mutes: None,
             bus,
             moderator: Arc::new(crate::moderator::AllowAllModerator),
             seq: Arc::new(LocalSeqProvider::new()),
@@ -1030,51 +1049,25 @@ impl ImService {
         }
         validate_blocks(&blocks)?;
 
-        // Serialize the prior version ONCE (used by both the audited and the
-        // legacy paths below). The capture happens BEFORE the overwrite so
-        // `message_edits` accumulates every prior version, oldest-first.
-        let old_blocks = serde_json::to_value(&existing.blocks).ok();
-        // Audit detail: how the block count changed across the edit. Cheap, and
-        // it makes the audit row independently meaningful without re-reading the
-        // message_edits row.
-        let block_count_before = existing.blocks.len();
-        let block_count_after = blocks.len();
-
-        // ROADMAP 第四版 — message-edit audit trail. When the room belongs to a
-        // workspace, the edit + the prior-version capture + a `message.edited`
-        // audit row commit (or roll back) TOGETHER via
-        // `MessageRepo::edit_audited`, mirroring the moderation/delete audit-tx
-        // pattern: an edit can never succeed while its audit append is lost, so
-        // edits stay independently reviewable. A legacy room with no owning
-        // workspace falls back to the original best-effort history.record + plain
-        // edit (exactly like the delete handler's degraded path).
-        let workspace = self.rooms.room_workspace(existing.room_id).await.ok().flatten();
-        let updated = if let (Some(ws), Some(old)) = (workspace, old_blocks.as_ref()) {
-            let detail = serde_json::json!({
-                "block_count_before": block_count_before,
-                "block_count_after": block_count_after,
-            });
-            self.messages
-                .edit_audited(id, blocks, ws, actor, old, detail)
-                .await?
-                .ok_or_else(|| Error::Conflict("edit raced with delete".into()))?
-        } else {
-            // Legacy room (no workspace) OR a prior-blocks serialize failure:
-            // best-effort history capture, then the plain edit.
-            if let Some(history) = self.message_edits.as_ref() {
-                if let Some(old) = old_blocks.as_ref() {
-                    if let Err(err) = history.record(id, actor, old).await {
+        // Archive the version being replaced (best-effort; never blocks the edit).
+        // The capture happens BEFORE the overwrite so `message_edits` accumulates
+        // every prior version, oldest-first by `recorded_at`.
+        if let Some(history) = self.message_edits.as_ref() {
+            match serde_json::to_value(&existing.blocks) {
+                Ok(old_blocks) => {
+                    if let Err(err) = history.record(id, actor, &old_blocks).await {
                         warn!(?err, %id, "record edit history failed");
                     }
-                } else {
-                    warn!(%id, "serialize prior blocks for history failed");
                 }
+                Err(err) => warn!(?err, %id, "serialize prior blocks for history failed"),
             }
-            self.messages
-                .edit(id, blocks)
-                .await?
-                .ok_or_else(|| Error::Conflict("edit raced with delete".into()))?
-        };
+        }
+
+        let updated = self
+            .messages
+            .edit(id, blocks)
+            .await?
+            .ok_or_else(|| Error::Conflict("edit raced with delete".into()))?;
 
         self.publish_room_event(updated.room_id, &RoomEvent::Edited(updated.clone()))
             .await;
@@ -1523,33 +1516,10 @@ impl ImService {
         // overwrite (an explicit mention is the stronger signal).
         let mut targets: BTreeMap<ParticipantId, NotificationKind> = BTreeMap::new();
 
-        // Thread-mute set (ROADMAP 第四版 — the inverse of thread-follow): when
-        // this message is a reply, everyone who MUTED its root message is removed
-        // from the REPLY fan-out (root author + thread subscribers). A mute
-        // suppresses only the notification, never the room broadcast; and an
-        // explicit `@`-mention still notifies a muter (mentions are inserted in
-        // their own loop, below, unaffected by this set). Fail-open: a missing
-        // store or a lookup error leaves the set empty (nobody is suppressed).
-        let thread_muted: std::collections::HashSet<ParticipantId> =
-            if let (Some(mutes_repo), Some(root)) = (self.thread_mutes.as_ref(), message.reply_to) {
-                match mutes_repo.muted_by(root).await {
-                    Ok(set) => set,
-                    Err(err) => {
-                        warn!(?err, %root, "thread muters lookup failed; not suppressing");
-                        std::collections::HashSet::new()
-                    }
-                }
-            } else {
-                std::collections::HashSet::new()
-            };
-
         if let Some(parent_id) = message.reply_to {
             if let Ok(Some(parent)) = self.messages.get(parent_id).await {
                 let author = parent.sender_id;
-                if author != sender
-                    && member_set.contains(&author)
-                    && !thread_muted.contains(&author)
-                {
+                if author != sender && member_set.contains(&author) {
                     targets.insert(author, NotificationKind::Reply);
                 }
             }
@@ -1562,16 +1532,12 @@ impl ImService {
 
         // Thread followers (Wave 11): when this message is a reply, everyone who
         // explicitly followed its root message is notified (∩ room members, never
-        // the sender, never a thread-muter). Reply-kind; `or_insert` so a stronger
-        // direct mention wins.
+        // the sender). Reply-kind; `or_insert` so a stronger direct mention wins.
         if let (Some(subs_repo), Some(root)) = (self.thread_subs.as_ref(), message.reply_to) {
             match subs_repo.subscribers(root).await {
                 Ok(subs) => {
                     for s in subs {
-                        if s != sender
-                            && member_set.contains(&s)
-                            && !thread_muted.contains(&s)
-                        {
+                        if s != sender && member_set.contains(&s) {
                             targets.entry(s).or_insert(NotificationKind::Reply);
                         }
                     }
@@ -1647,74 +1613,82 @@ impl ImService {
             }
         }
 
-        // `#channel` mentions (ROADMAP 第四版 — `Block::ChannelMention`): notify
-        // every MEMBER of each referenced channel that their channel was mentioned.
-        // Unlike `@`-mentions (one participant) or `@everyone` (this room), these
-        // recipients are the OTHER channel's members, so they are NOT filtered by
-        // this room's `member_set`; the durable notification points at this
-        // message (Slack-style "your channel was mentioned"). Mention-kind, added
-        // via `or_insert` so a stronger direct mention/reply is never downgraded;
-        // the sender never notifies themselves. Best-effort: a member lookup error
-        // is logged, not fatal.
-        for mentioned_room in channel_mention_rooms(&message.blocks) {
-            match self.rooms.members(mentioned_room).await {
-                Ok(room_members) => {
-                    for m in room_members {
-                        if m != sender {
-                            targets.entry(m).or_insert(NotificationKind::Mention);
+        // Workspace-wide mute check (ROADMAP6 Lane A): suppress ALL notifications
+        // for participants who have muted this room's workspace. Checked FIRST,
+        // before any room-level mute or DND check. Best-effort: a failed lookup
+        // degrades to "no workspace suppression" (warn + deliver), never a dropped
+        // notification. No-op when the store or workspace id is absent.
+        let workspace_for_room = if self.workspace_mutes.is_some() {
+            self.rooms.room_workspace(room).await.ok().flatten()
+        } else {
+            None
+        };
+        let ws_muted_set: std::collections::HashSet<ParticipantId> =
+            if let (Some(ws_mute_repo), Some(workspace)) =
+                (self.workspace_mutes.as_ref(), workspace_for_room)
+            {
+                let ids: Vec<ParticipantId> = targets.keys().copied().collect();
+                let mut set = std::collections::HashSet::new();
+                for id in &ids {
+                    match ws_mute_repo.is_muted(*id, workspace).await {
+                        Ok(true) => { set.insert(*id); }
+                        Ok(false) => {}
+                        Err(err) => {
+                            warn!(?err, %id, "workspace mute lookup failed; not suppressing");
                         }
                     }
                 }
-                Err(err) => {
-                    warn!(?err, room = %mentioned_room, "channel-mention members lookup failed");
-                }
-            }
-        }
-
-        // Per-room notification LEVEL (ROADMAP 第四版 — 0087): for each surviving
-        // target, resolve an effective level — an explicit
-        // `channel_notification_prefs` row if present, else `none` when the room
-        // is muted, else `all` — and SUPPRESS the recipient when the level forbids
-        // a message of this kind (a `Mention` kind is a mention; `Reply`/`Reaction`
-        // are not). This runs BEFORE the mute/DND/snooze filter below and consumes
-        // the SAME batched `muted_set` read, so it adds at most one extra batched
-        // query (`level_map`). Fail-open: no prefs store, or a lookup error, leaves
-        // every target in place. The decision is the pure
-        // `should_deliver_at_level` helper.
-        if let Some(prefs) = self.prefs.as_ref() {
-            let ids: Vec<ParticipantId> = targets.keys().copied().collect();
-            let levels = match prefs.level_map(room, &ids).await {
-                Ok(map) => map,
-                Err(err) => {
-                    warn!(?err, %room, "batch level lookup failed; not suppressing by level");
-                    std::collections::HashMap::new()
-                }
-            };
-            // Only need the muted fallback when SOME target has no explicit level.
-            let need_mute_fallback = ids.iter().any(|p| !levels.contains_key(p));
-            let muted_for_level = if need_mute_fallback {
-                match prefs.muted_set(room, &ids).await {
-                    Ok(set) => set,
-                    Err(err) => {
-                        warn!(?err, %room, "batch mute lookup (for level) failed; not suppressing");
-                        std::collections::HashSet::new()
-                    }
-                }
+                set
             } else {
                 std::collections::HashSet::new()
             };
-            targets.retain(|recipient, kind| {
-                let is_mention = matches!(kind, NotificationKind::Mention);
-                let level = match levels.get(recipient) {
-                    Some(explicit) => explicit.as_str(),
-                    // No explicit row: a muted room reads as `none`, else `all`.
-                    None if muted_for_level.contains(recipient) => {
-                        aero_storage::notification_prefs::NOTIFICATION_LEVEL_NONE
+        // Remove workspace-muted recipients from the target map immediately so
+        // subsequent steps (room-level mute, thread-level, DND) skip them.
+        targets.retain(|recipient, _| !ws_muted_set.contains(recipient));
+
+        // Thread notification level check (ROADMAP6 Lane A): for thread-reply
+        // notifications, apply the per-recipient per-thread level:
+        //   "all"      — deliver (default when no row).
+        //   "mentions" — deliver only when the recipient is @-mentioned.
+        //   "none"     — drop.
+        // Applied after workspace-mute filtering, before room-level DND/snooze.
+        // Best-effort: a lookup failure delivers (fail-open, warn).
+        if let (Some(tnp_repo), Some(root)) =
+            (self.thread_notification_prefs.as_ref(), message.reply_to)
+        {
+            let reply_recipients: Vec<ParticipantId> = targets
+                .iter()
+                .filter_map(|(p, k)| (*k == NotificationKind::Reply).then_some(*p))
+                .collect();
+
+            // Collect mentioned participant ids for the "mentions" level check.
+            let mentioned: std::collections::HashSet<ParticipantId> =
+                mentioned_participants(&message.blocks).into_iter().collect();
+
+            // Per-recipient level lookup (individual queries; N is bounded by room
+            // membership, already O(3N) in the existing prefs batch path). Best-effort:
+            // a lookup failure delivers (fail-open, warn).
+            let mut to_drop: Vec<ParticipantId> = Vec::new();
+            for &recipient in &reply_recipients {
+                let level = match tnp_repo.get_level(recipient, root).await {
+                    Ok(l) => l,
+                    Err(err) => {
+                        warn!(?err, %recipient, "thread notification level lookup failed; delivering");
+                        "all".to_owned()
                     }
-                    None => aero_storage::notification_prefs::NOTIFICATION_LEVEL_ALL,
                 };
-                aero_storage::notification_prefs::should_deliver_at_level(level, is_mention)
-            });
+                let deliver = match level.as_str() {
+                    "none" => false,
+                    "mentions" => mentioned.contains(&recipient),
+                    _ => true, // "all" or any unknown value: fail-open
+                };
+                if !deliver {
+                    to_drop.push(recipient);
+                }
+            }
+            for recipient in to_drop {
+                targets.remove(&recipient);
+            }
         }
 
         // Filter by mute / DND / snooze, then persist ALL survivors in ONE batch
@@ -1825,24 +1799,6 @@ impl ImService {
     }
 }
 
-/// Extract the distinct rooms `#`-channel-mentioned in a message's blocks
-/// ([`Block::ChannelMention`]), in first-appearance order. Pure helper so
-/// channel-mention parsing is unit-testable without a database or bus. Mirrors
-/// [`mentioned_participants`] but for room targets — the dispatcher resolves each
-/// room's members and notifies them.
-fn channel_mention_rooms(blocks: &[Block]) -> Vec<RoomId> {
-    let mut seen = std::collections::BTreeSet::new();
-    let mut out = Vec::new();
-    for b in blocks {
-        if let Block::ChannelMention { room } = b {
-            if seen.insert(*room) {
-                out.push(*room);
-            }
-        }
-    }
-    out
-}
-
 /// Extract the distinct participants `@`-mentioned in a message's blocks, in
 /// first-appearance order. Pure helper so mention parsing is unit-testable
 /// without a database or bus.
@@ -1938,52 +1894,6 @@ mod tests {
 
         // No mentions => empty.
         assert!(mentioned_participants(&[Block::text("plain")]).is_empty());
-    }
-
-    #[test]
-    fn channel_mention_rooms_dedups_in_order_and_ignores_non_channel_mentions() {
-        let r1 = RoomId::new();
-        let r2 = RoomId::new();
-        let blocks = vec![
-            Block::text("see"),
-            Block::ChannelMention { room: r1 },
-            Block::text("and"),
-            Block::ChannelMention { room: r2 },
-            // duplicate channel mention of r1 is collapsed
-            Block::ChannelMention { room: r1 },
-            // a participant @-mention is NOT a channel mention
-            Block::Mention { participant: ParticipantId::new() },
-        ];
-        let got = channel_mention_rooms(&blocks);
-        assert_eq!(got, vec![r1, r2], "distinct channel mentions, first-appearance order");
-
-        // No channel mentions => empty.
-        assert!(channel_mention_rooms(&[Block::text("plain")]).is_empty());
-        assert!(
-            channel_mention_rooms(&[Block::Mention { participant: ParticipantId::new() }]).is_empty()
-        );
-    }
-
-    #[test]
-    fn channel_mention_contributes_no_searchable_text() {
-        // A ChannelMention has no visible text of its own (mirrors Mention), so it
-        // must not leak into the searchable/embedded projection.
-        let msg = Message {
-            id: MessageId::new(),
-            room_id: RoomId::new(),
-            sender_id: ParticipantId::new(),
-            blocks: vec![
-                Block::text("hello"),
-                Block::ChannelMention { room: RoomId::new() },
-                Block::text("world"),
-            ],
-            reply_to: None,
-            metadata: serde_json::Value::Null,
-            created_at: time::OffsetDateTime::now_utc(),
-            edited_at: None,
-            deleted_at: None,
-        };
-        assert_eq!(msg.searchable_text(), "hello\nworld", "ChannelMention adds no text");
     }
 
     #[test]

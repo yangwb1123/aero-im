@@ -290,6 +290,14 @@ define_id!(
     BookmarkCollectionId
 );
 
+// ---- ROADMAP6 Lane C ----
+define_id!(
+    /// Identifies a clip collection / playlist — a per-user named, ordered group
+    /// of stream clips (YouTube-playlist-style). Items carry a `position` so the
+    /// UI can reorder them; the collection is deleted by its creator.
+    ClipCollectionId
+);
+
 // ---- Interactive-live / creator parity (migrations 0079-0083) ----
 define_id!(
     /// Identifies a hype-train session — an escalating momentum mechanic on a live
@@ -333,6 +341,7 @@ define_id!(
     /// [`Block`](crate::Block), so bots/webhooks/apps can collect actionable replies.
     BlockInteractionId
 );
+
 define_id!(
     /// Identifies a user-filed message report — one row in the workspace moderation
     /// review queue, where a room member flags a message and a workspace admin then

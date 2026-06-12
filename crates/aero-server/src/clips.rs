@@ -43,6 +43,12 @@ pub fn routes() -> Router<AppState> {
             post(create_clip).get(list_clips),
         )
         .route("/api/clips/:cid", get(get_clip).delete(delete_clip))
+        .route("/api/clips/:cid/share", post(share_clip))
+}
+
+/// Public clip route (no auth required) — mounted separately (no auth extractor).
+pub fn public_routes() -> Router<AppState> {
+    Router::new().route("/clips/:slug", get(get_clip_by_slug))
 }
 
 /// Build a [`ClipRepo`] from shared state, over the shared pool.
@@ -178,6 +184,61 @@ async fn delete_clip(
         return Err(AeroError::NotFound(format!("clip {id}")).into());
     }
     Ok(Json(serde_json::json!({ "deleted": true })))
+}
+
+/// `POST /api/clips/:cid/share` — generate (or return existing) a shareable URL
+/// for a clip. The caller must be the clip's creator. Returns
+/// `{share_url, slug}` where `share_url` is `/clips/{slug}`.
+async fn share_clip(
+    State(s): State<AppState>,
+    auth: AuthUser,
+    Path(id_str): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let id = parse_clip(&id_str)?;
+    // Verify the clip exists and the caller is its creator.
+    let clip = repo(&s)
+        .get(id)
+        .await
+        .map_err(AeroError::from)?
+        .ok_or_else(|| AeroError::NotFound(format!("clip {id}")))?;
+    if clip.creator_id != auth.participant_id {
+        return Err(AeroError::Forbidden("only the clip creator may generate a share URL".into()).into());
+    }
+
+    // Generate a slug if none exists yet; if one already exists, re-read.
+    let slug = match repo(&s)
+        .generate_share_slug(id)
+        .await
+        .map_err(AeroError::from)?
+    {
+        Some(s) => s,
+        None => {
+            // Slug already existed — re-read the clip to get it.
+            repo(&s)
+                .get(id)
+                .await
+                .map_err(AeroError::from)?
+                .and_then(|c| c.share_slug)
+                .ok_or_else(|| AeroError::Internal(anyhow::anyhow!("share_slug missing after generate")))?
+        }
+    };
+
+    let share_url = format!("/clips/{slug}");
+    Ok(Json(serde_json::json!({ "share_url": share_url, "slug": slug })))
+}
+
+/// `GET /clips/:slug` — public, no auth required. Returns clip metadata by
+/// its share slug.
+async fn get_clip_by_slug(
+    State(s): State<AppState>,
+    Path(slug): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let clip = repo(&s)
+        .get_by_slug(slug.trim())
+        .await
+        .map_err(AeroError::from)?
+        .ok_or_else(|| AeroError::NotFound(format!("clip with slug {slug}")))?;
+    Ok(Json(serde_json::to_value(clip).map_err(AeroError::from)?))
 }
 
 #[cfg(test)]

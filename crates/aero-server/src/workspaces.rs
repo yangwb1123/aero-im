@@ -27,7 +27,7 @@ use aero_common::{
 };
 use aero_storage::{
     role_can_assign, role_can_invite, role_can_manage_member, role_can_remove,
-    validate_retention_days, WorkspaceRepo,
+    validate_retention_days, WorkspaceMuteRepo, WorkspaceRepo,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -68,6 +68,12 @@ pub fn routes() -> Router<AppState> {
         .route("/api/workspaces/:id/audit", get(list_audit))
         // Filtered audit search (admin) + CSV export (operability).
         .route("/api/workspaces/:id/audit/export", get(export_audit_csv))
+        // Workspace-wide mute (ROADMAP6 Lane A): suppress ALL notifications from a workspace.
+        .route(
+            "/api/workspaces/:id/mute",
+            post(mute_workspace).delete(unmute_workspace),
+        )
+        .route("/api/workspaces/:id/muted", get(workspace_mute_status))
 }
 
 /// Append an audit event without ever failing the caller's request: the trail is
@@ -728,6 +734,75 @@ fn is_valid_slug(slug: &str) -> bool {
         && slug
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+// ---------- Workspace mute (ROADMAP6 Lane A) ----------
+
+fn workspace_mute_repo(s: &AppState) -> WorkspaceMuteRepo {
+    WorkspaceMuteRepo::new(s.pg.clone())
+}
+
+fn parse_workspace_for_mute(s: &str) -> Result<WorkspaceId, AeroError> {
+    WorkspaceId::from_str(s).map_err(|e| AeroError::Invalid(format!("workspace id: {e}")))
+}
+
+/// `POST /api/workspaces/:id/mute` — suppress ALL notifications from every channel
+/// in the workspace. The caller must be a workspace member. Idempotent.
+async fn mute_workspace(
+    State(s): State<AppState>,
+    auth: AuthUser,
+    Path(id_str): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let workspace = parse_workspace_for_mute(&id_str)?;
+    // Verify caller is a workspace member.
+    let ws_repo = WorkspaceRepo::new(s.pg.clone());
+    if ws_repo.member_role(workspace, auth.participant_id).await.map_err(AeroError::from)?.is_none() {
+        return Err(AeroError::Forbidden(format!(
+            "{} is not a member of workspace {}",
+            auth.participant_id, workspace
+        ))
+        .into());
+    }
+    workspace_mute_repo(&s)
+        .mute(auth.participant_id, workspace)
+        .await?;
+    Ok(Json(serde_json::json!({
+        "workspace_id": workspace,
+        "muted": true,
+    })))
+}
+
+/// `DELETE /api/workspaces/:id/mute` — re-enable notifications from a previously
+/// muted workspace. Idempotent: unmuting an un-muted workspace is a no-op.
+async fn unmute_workspace(
+    State(s): State<AppState>,
+    auth: AuthUser,
+    Path(id_str): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let workspace = parse_workspace_for_mute(&id_str)?;
+    workspace_mute_repo(&s)
+        .unmute(auth.participant_id, workspace)
+        .await?;
+    Ok(Json(serde_json::json!({
+        "workspace_id": workspace,
+        "muted": false,
+    })))
+}
+
+/// `GET /api/workspaces/:id/muted` — whether the caller has muted the workspace.
+async fn workspace_mute_status(
+    State(s): State<AppState>,
+    auth: AuthUser,
+    Path(id_str): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let workspace = parse_workspace_for_mute(&id_str)?;
+    let muted = workspace_mute_repo(&s)
+        .is_muted(auth.participant_id, workspace)
+        .await?;
+    Ok(Json(serde_json::json!({
+        "workspace_id": workspace,
+        "muted": muted,
+    })))
 }
 
 #[cfg(test)]

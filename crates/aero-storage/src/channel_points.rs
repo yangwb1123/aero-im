@@ -409,6 +409,45 @@ mod tests {
     }
 }
 
+/// One earn/spend history row — a `points_earn_history` row projection.
+///
+/// `Serialize` so the handler can return it directly as JSON.
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct EarnHistoryRow {
+    pub id: uuid::Uuid,
+    pub delta: i64,
+    pub reason: String,
+    pub created_at: time::OffsetDateTime,
+}
+
+impl ChannelPointsRepo {
+    /// A viewer's earn/spend timeline with a creator, newest first, paginated.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the query.
+    pub async fn list_earn_history(
+        &self,
+        viewer: ParticipantId,
+        creator: ParticipantId,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<EarnHistoryRow>, sqlx::Error> {
+        sqlx::query_as::<_, EarnHistoryRow>(
+            r"SELECT id, delta, reason, created_at
+               FROM points_earn_history
+              WHERE viewer_id = $1 AND creator_id = $2
+              ORDER BY created_at DESC
+              LIMIT $3 OFFSET $4",
+        )
+        .bind(viewer.to_uuid())
+        .bind(creator.to_uuid())
+        .bind(limit.max(1).min(100))
+        .bind(offset.max(0))
+        .fetch_all(&self.pool)
+        .await
+    }
+}
+
 /// PG-gated integration tests (run with a live Postgres + applied migrations):
 ///
 /// ```text

@@ -134,14 +134,12 @@ pub fn build_forward_blocks(
         }),
     });
 
-    // Original content, mentions stripped (forwards must not re-notify
-    // mentionees — including a `#channel` mention, which would otherwise re-ping
-    // the whole referenced channel's members from the forwarded copy).
+    // Original content, mentions stripped (forwards must not re-notify mentionees).
     blocks.extend(
         source
             .blocks
             .iter()
-            .filter(|b| !matches!(b, Block::Mention { .. } | Block::ChannelMention { .. }))
+            .filter(|b| !matches!(b, Block::Mention { .. }))
             .cloned(),
     );
 
@@ -264,29 +262,5 @@ mod tests {
         );
         assert!(matches!(&blocks[1], Block::Text { content, .. } if content == "hey"));
         assert!(matches!(&blocks[2], Block::Text { content, .. } if content == "see this"));
-    }
-
-    /// A `#channel` mention is stripped from the copy too, so forwarding a
-    /// message never re-pings the referenced channel's whole membership.
-    #[test]
-    fn channel_mentions_are_stripped_from_the_copy() {
-        let channel = RoomId::new();
-        let source = sample_source(vec![
-            Block::text("see"),
-            Block::ChannelMention { room: channel },
-            Block::text("for context"),
-        ]);
-
-        let blocks = build_forward_blocks(&source, None, ParticipantId::new());
-
-        // [card, "see", "for context"] — the ChannelMention is gone.
-        assert_eq!(blocks.len(), 3);
-        assert!(matches!(blocks[0], Block::Card { .. }));
-        assert!(
-            !blocks.iter().any(|b| matches!(b, Block::ChannelMention { .. })),
-            "no ChannelMention block should survive a forward"
-        );
-        assert!(matches!(&blocks[1], Block::Text { content, .. } if content == "see"));
-        assert!(matches!(&blocks[2], Block::Text { content, .. } if content == "for context"));
     }
 }

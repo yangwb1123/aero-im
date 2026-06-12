@@ -29,7 +29,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
 use crate::error::ApiResult;
@@ -46,6 +46,10 @@ pub fn routes() -> Router<AppState> {
         .route("/api/rewards/:id/redeem", post(redeem_reward))
         .route("/api/streams/:id/redemption-queue", get(redemption_queue))
         .route("/api/redemptions/:id/resolve", post(resolve_redemption))
+        .route(
+            "/api/creators/:creator_id/points/history",
+            get(earn_history),
+        )
 }
 
 fn parse_stream(s: &str) -> Result<Ulid, AeroError> {
@@ -260,4 +264,36 @@ async fn resolve_redemption(
         .await
         .map_err(AeroError::from)?;
     Ok(Json(serde_json::json!({ "resolved": resolved, "status": status })))
+}
+
+#[derive(Deserialize, Serialize)]
+struct Pagination {
+    #[serde(default = "default_limit")]
+    limit: i64,
+    #[serde(default)]
+    offset: i64,
+}
+
+fn default_limit() -> i64 {
+    20
+}
+
+fn parse_creator(s: &str) -> Result<ParticipantId, AeroError> {
+    ParticipantId::from_str(s.trim()).map_err(|e| AeroError::Invalid(format!("creator id: {e}")))
+}
+
+/// `GET /api/creators/:creator_id/points/history?limit=20&offset=0` — the
+/// authenticated viewer's earn/spend history with the given creator, newest first.
+async fn earn_history(
+    State(s): State<AppState>,
+    auth: AuthUser,
+    Path(creator_id_str): Path<String>,
+    Query(pg): Query<Pagination>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let creator = parse_creator(&creator_id_str)?;
+    let history = repo(&s)
+        .list_earn_history(auth.participant_id, creator, pg.limit, pg.offset)
+        .await
+        .map_err(AeroError::from)?;
+    Ok(Json(serde_json::json!({ "history": history })))
 }

@@ -46,7 +46,7 @@ axum.workspace = true
 #   tower-http `timeout` → TimeoutLayer (per-request wall-clock timeout)
 # Request body bounding uses axum's built-in `DefaultBodyLimit` (no extra feature).
 tower = { workspace = true, features = ["limit"] }
-tower-http = { workspace = true, features = ["timeout"] }
+tower-http = { workspace = true, features = ["timeout", "compression-gzip"] }
 hyper.workspace = true
 
 serde.workspace = true

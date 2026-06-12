@@ -312,6 +312,45 @@ impl SubscriptionRepo {
         Ok(rows.into_iter().map(sub_to_model).collect())
     }
 
+    /// Gift a subscription from `gifter` to `recipient` on `creator`'s channel
+    /// at `tier`, valid for `duration_days` days. There is at most one row per
+    /// (creator, subscriber): a gift upserts the gifter + expiry and
+    /// re-activates the row. The caller is responsible for verifying the tier
+    /// belongs to the creator and rejecting a self-gift.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the upsert.
+    pub async fn gift_subscription(
+        &self,
+        creator: ParticipantId,
+        tier_id: uuid::Uuid,
+        recipient: ParticipantId,
+        gifter: ParticipantId,
+        duration_days: i32,
+    ) -> Result<(), sqlx::Error> {
+        let id = SubscriptionId::new();
+        sqlx::query(
+            r"INSERT INTO creator_subscriptions
+                   (id, creator_id, tier_id, subscriber_id, active, gifter_id, gift_expires_at)
+               VALUES ($1, $2, $3, $4, true, $5, now() + ($6 || ' days')::interval)
+               ON CONFLICT (creator_id, subscriber_id)
+               DO UPDATE SET
+                   active = true,
+                   tier_id = EXCLUDED.tier_id,
+                   gifter_id = EXCLUDED.gifter_id,
+                   gift_expires_at = EXCLUDED.gift_expires_at",
+        )
+        .bind(id.to_uuid())
+        .bind(creator.to_uuid())
+        .bind(tier_id)
+        .bind(recipient.to_uuid())
+        .bind(gifter.to_uuid())
+        .bind(duration_days.to_string())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Whether `subscriber` has an active subscription to `creator`.
     ///
     /// # Errors

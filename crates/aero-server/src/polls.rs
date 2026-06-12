@@ -68,6 +68,11 @@ struct CreatePollReq {
     options: Vec<String>,
     #[serde(default)]
     multi: bool,
+    /// When `true` the voter identities are hidden; only totals are returned in
+    /// the tally. Defaults to `false` (public voting). Cannot be changed after
+    /// creation. Backed by `migrations/0096_polls_anonymous.sql`.
+    #[serde(default)]
+    anonymous: Option<bool>,
 }
 
 /// `POST /api/rooms/:id/polls` — create a poll in a room (member-only). Validates
@@ -101,9 +106,10 @@ async fn create_poll(
         .into());
     }
 
+    let anonymous = req.anonymous.unwrap_or(false);
     let repo = poll_repo(&s);
     let id = repo
-        .create(room, auth.participant_id, question, &options, req.multi)
+        .create_with_opts(room, auth.participant_id, question, &options, req.multi, anonymous)
         .await?;
     s.im
         .broadcast_room_event(room, RoomEvent::Poll { room_id: room, poll_id: id, op: PollOp::Created })
@@ -136,11 +142,15 @@ async fn get_poll(
     let counts = repo.tally(poll_id).await?;
     let total: u32 = counts.iter().copied().fold(0u32, u32::saturating_add);
     let voted = repo.has_voted(poll_id, auth.participant_id).await?;
+    // Anonymous polls suppress voter identity: `voted` is still returned so the
+    // caller knows whether they participated, but `anonymous: true` signals that
+    // no voter lists will ever be returned.
     Ok(Json(serde_json::json!({
         "poll": poll,
         "counts": counts,
         "total": total,
         "voted": voted,
+        "anonymous": poll.anonymous,
     })))
 }
 

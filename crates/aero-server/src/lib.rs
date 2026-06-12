@@ -96,6 +96,8 @@ pub mod workspace_files;
 // ---- Wave 18 ----
 pub mod ai_rewrite;
 pub mod call_history;
+/// Clip collections / playlists.
+pub mod clip_collections;
 pub mod clips;
 pub mod mark_unread;
 pub mod stream_analytics;
@@ -183,5 +185,8 @@ pub mod predictions;
 // 0093): a room member reports a message, an admin keeps/removes it (removal reuses
 // the existing transactional moderate-delete path).
 pub mod message_reports;
+
+/// OpenAPI 3.0 spec endpoint.
+pub mod openapi;
 
 pub use state::AppState;

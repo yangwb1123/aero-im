@@ -32,6 +32,7 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/streams/:id/raid", post(launch_raid))
         .route("/api/streams/:id/raids", get(list_raids))
+        .route("/api/me/raid-analytics", get(raid_analytics))
 }
 
 fn parse_stream(s: &str) -> Result<Ulid, AeroError> {
@@ -102,8 +103,7 @@ async fn launch_raid(
     let count = viewer_count(&s, source).await;
     let id = repo(&s)
         .create(source, target, auth.participant_id, i32::try_from(count).unwrap_or(i32::MAX))
-        .await
-        .map_err(AeroError::from)?;
+        .await?;
 
     // Tell the source stream's watchers to redirect to the target.
     s.live
@@ -135,4 +135,17 @@ async fn list_raids(
         .await
         .map_err(AeroError::from)?;
     Ok(Json(serde_json::json!({ "raids": raids })))
+}
+
+/// `GET /api/me/raid-analytics` — aggregate analytics for the authenticated user's
+/// raids: total raids sent, total/avg/peak viewers carried.
+async fn raid_analytics(
+    State(s): State<AppState>,
+    auth: AuthUser,
+) -> ApiResult<Json<serde_json::Value>> {
+    let analytics = repo(&s)
+        .analytics(auth.participant_id)
+        .await
+        .map_err(AeroError::from)?;
+    Ok(Json(serde_json::to_value(analytics).map_err(AeroError::from)?))
 }

@@ -95,6 +95,95 @@ impl StreamViewerSampleRepo {
     }
 }
 
+/// One point in a stream's viewer retention curve: the offset from the start of
+/// the stream, the average viewer count in that bucket, and the retention
+/// percentage relative to the peak at stream start.
+///
+/// `Serialize` so the handler can return it directly as JSON.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RetentionPoint {
+    /// Offset from stream start in seconds (0 = the opening bucket).
+    pub offset_secs: i64,
+    /// Average concurrent viewers in the bucket.
+    pub viewers: i64,
+    /// Viewers as a percentage of the peak at the start of the stream.
+    pub retention_pct: f64,
+}
+
+impl StreamViewerSampleRepo {
+    /// Build a retention curve for `stream`, grouping samples into
+    /// `bucket_secs`-wide windows (default: 60s) and computing the retention
+    /// percentage relative to the peak viewer count seen in the first bucket.
+    ///
+    /// All samples for the stream are fetched in chronological order and
+    /// grouped in Rust — no complex SQL windowing is required.
+    ///
+    /// Returns an empty `Vec` when the stream has no samples.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the query.
+    pub async fn retention_curve(
+        &self,
+        stream: Ulid,
+        bucket_secs: i64,
+    ) -> Result<Vec<RetentionPoint>, sqlx::Error> {
+        let bucket_secs = bucket_secs.max(1);
+        let sid = Uuid::from_u128(stream.0);
+
+        // Fetch all samples for this stream in chronological order.
+        let rows = sqlx::query_as::<_, (i32, time::OffsetDateTime)>(
+            r"SELECT viewers, sampled_at
+               FROM stream_viewer_samples
+              WHERE stream_id = $1
+              ORDER BY sampled_at ASC",
+        )
+        .bind(sid)
+        .fetch_all(&self.pool)
+        .await?;
+
+        if rows.is_empty() {
+            return Ok(vec![]);
+        }
+
+        // Use the timestamp of the very first sample as the stream start anchor.
+        let start_ts = rows[0].1;
+
+        // Group into bucket_secs-wide windows, computing avg viewers per bucket.
+        // Bucket index = floor((sampled_at - start) / bucket_secs).
+        let mut buckets: std::collections::BTreeMap<i64, (i64, i64)> =
+            std::collections::BTreeMap::new(); // bucket_idx -> (sum, count)
+        for (viewers, sampled_at) in &rows {
+            let offset = ((*sampled_at) - start_ts).whole_seconds().max(0);
+            let bucket_idx = offset / bucket_secs;
+            let entry = buckets.entry(bucket_idx).or_insert((0, 0));
+            entry.0 += i64::from(*viewers);
+            entry.1 += 1;
+        }
+
+        // The peak is the avg viewers in the FIRST bucket (offset 0).
+        let first_avg = {
+            let (sum, cnt) = buckets.get(&0).copied().unwrap_or((0, 1));
+            if cnt == 0 { 1.0 } else { sum as f64 / cnt as f64 }
+        };
+        let peak_viewers = first_avg.max(1.0);
+
+        let curve: Vec<RetentionPoint> = buckets
+            .into_iter()
+            .map(|(bucket_idx, (sum, cnt))| {
+                let avg_viewers = if cnt > 0 { sum / cnt } else { 0 };
+                let retention_pct = avg_viewers as f64 / peak_viewers * 100.0;
+                RetentionPoint {
+                    offset_secs: bucket_idx * bucket_secs,
+                    viewers: avg_viewers,
+                    retention_pct,
+                }
+            })
+            .collect();
+
+        Ok(curve)
+    }
+}
+
 /// PG-gated integration tests (run with a live Postgres + applied migrations):
 ///
 /// ```text

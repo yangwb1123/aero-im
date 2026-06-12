@@ -28,8 +28,8 @@ use aero_auth::AuthUser;
 use aero_common::{Error as AeroError, ParticipantId, PredictionId, StreamEvent};
 use aero_storage::{PredictionRepo, ResolveError, StakeError, StreamRepo};
 use axum::{
-    extract::{Path, State},
-    routing::post,
+    extract::{Path, Query, State},
+    routing::{get, post},
     Json, Router,
 };
 use serde::Deserialize;
@@ -50,6 +50,11 @@ pub fn routes() -> Router<AppState> {
         .route("/api/predictions/:id/lock", post(lock))
         .route("/api/predictions/:id/resolve", post(resolve))
         .route("/api/predictions/:id/cancel", post(cancel))
+        .route("/api/me/prediction-history", get(prediction_history))
+        .route(
+            "/api/streams/:id/prediction-analytics",
+            get(prediction_analytics),
+        )
 }
 
 fn parse_stream(s: &str) -> Result<Ulid, AeroError> {
@@ -312,4 +317,58 @@ async fn cancel(
     require_prediction_creator(&s, prediction, auth.participant_id).await?;
     let cancelled = repo(&s).cancel(prediction).await.map_err(AeroError::from)?;
     Ok(Json(serde_json::json!({ "cancelled": cancelled })))
+}
+
+#[derive(serde::Deserialize)]
+struct Pagination {
+    #[serde(default = "default_limit")]
+    limit: i64,
+    #[serde(default)]
+    offset: i64,
+}
+
+fn default_limit() -> i64 {
+    20
+}
+
+/// `GET /api/me/prediction-history?limit=20&offset=0` — the authenticated viewer's
+/// prediction stake history, newest first.
+async fn prediction_history(
+    State(s): State<AppState>,
+    auth: AuthUser,
+    Query(pg): Query<Pagination>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let history = repo(&s)
+        .list_for_viewer(auth.participant_id, pg.limit, pg.offset)
+        .await
+        .map_err(AeroError::from)?;
+    Ok(Json(serde_json::json!({ "predictions": history })))
+}
+
+/// `GET /api/streams/:id/prediction-analytics` — aggregate analytics for the
+/// stream's predictions (owner-only). Returns total/resolved count, total
+/// channel-points staked, and average participants per prediction.
+async fn prediction_analytics(
+    State(s): State<AppState>,
+    auth: AuthUser,
+    Path(id_str): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let stream = parse_stream(&id_str)?;
+    // Owner-gating: only the stream owner reads their prediction analytics.
+    let row = StreamRepo::new(s.pg.clone())
+        .get(stream)
+        .await
+        .map_err(AeroError::from)?
+        .ok_or_else(|| AeroError::NotFound(format!("stream {stream}")))?;
+    if row.owner_id != auth.participant_id {
+        return Err(
+            AeroError::Forbidden("only the stream owner may view prediction analytics".into())
+                .into(),
+        );
+    }
+    let analytics = repo(&s)
+        .creator_analytics(stream)
+        .await
+        .map_err(AeroError::from)?;
+    Ok(Json(serde_json::to_value(analytics).map_err(AeroError::from)?))
 }

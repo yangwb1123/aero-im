@@ -21,10 +21,10 @@
 use std::str::FromStr;
 
 use aero_auth::AuthUser;
-use aero_common::{Error as AeroError, ParticipantId, Room, RoomId, RoomKind, WorkspaceId};
+use aero_common::{Error as AeroError, ParticipantId, Room, RoomEvent, RoomId, RoomKind, WorkspaceId};
 use aero_storage::GroupDmRepo;
 use axum::{
-    extract::State,
+    extract::{Path, State},
     routing::post,
     Json, Router,
 };
@@ -35,7 +35,13 @@ use crate::state::AppState;
 
 /// All group-DM routes, ready to `.merge` into the gateway router.
 pub fn routes() -> Router<AppState> {
-    Router::new().route("/api/group-dm", post(open_group_dm).get(list_group_dms))
+    Router::new()
+        .route("/api/group-dm", post(open_group_dm).get(list_group_dms))
+        // Group DM naming (ROADMAP6 Lane A): PATCH name/description of a group room.
+        .route(
+            "/api/rooms/:id/name",
+            axum::routing::patch(set_group_dm_name),
+        )
 }
 
 /// The legacy / default workspace (the all-zero `WorkspaceId`) that group DMs are
@@ -178,4 +184,95 @@ async fn list_group_dms(
         .filter(|r| r.kind == RoomKind::Group && r.name.is_none())
         .collect();
     Ok(Json(serde_json::json!({ "rooms": rooms })))
+}
+
+// ---------- Group DM naming (ROADMAP6 Lane A) ----------
+
+#[derive(Deserialize)]
+struct SetGroupDmNameReq {
+    /// New display name for the group DM. Pass `null` to clear it (revert to
+    /// nameless). Optional — absent means "don't change".
+    #[serde(default)]
+    name: Option<Option<String>>,
+    /// New description for the group DM. Pass `null` to clear. Optional.
+    #[serde(default)]
+    description: Option<Option<String>>,
+}
+
+fn parse_room_for_name(s: &str) -> Result<RoomId, AeroError> {
+    RoomId::from_str(s).map_err(|e| AeroError::Invalid(format!("room id: {e}")))
+}
+
+/// `PATCH /api/rooms/:id/name` — update the display name and/or description of a
+/// group-kind room. The room must exist, have `kind = 'group'`, and the caller must
+/// be a member. Both fields are optional; absent fields are left unchanged. Passing
+/// `null` for `name` or `description` clears it (reverts the group DM to nameless).
+///
+/// After a successful update, a `Membership { Join }` event is broadcast so
+/// connected clients refresh the room metadata (no dedicated `RoomUpdated` event
+/// exists yet; membership events already trigger room-list refreshes in clients).
+async fn set_group_dm_name(
+    State(s): State<AppState>,
+    auth: AuthUser,
+    Path(id_str): Path<String>,
+    Json(req): Json<SetGroupDmNameReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let room = parse_room_for_name(&id_str)?;
+
+    // The room must exist and be of kind 'group'.
+    let kind = s
+        .rooms
+        .room_kind(room)
+        .await
+        .map_err(AeroError::from)?
+        .ok_or_else(|| AeroError::NotFound(format!("room {room}")))?;
+
+    if kind != RoomKind::Group {
+        return Err(AeroError::Invalid(
+            "only group-kind rooms support PATCH /name".into(),
+        )
+        .into());
+    }
+
+    // Caller must be a member.
+    if !s.rooms.is_member(room, auth.participant_id).await.map_err(AeroError::from)? {
+        return Err(AeroError::Forbidden(format!(
+            "{} is not a member of room {}",
+            auth.participant_id, room
+        ))
+        .into());
+    }
+
+    // Apply the requested changes — each field is optional.
+    if let Some(name_val) = req.name {
+        // Direct SQL update: no dedicated set_name on RoomRepo (rooms.name is
+        // already nullable TEXT), so we use sqlx::query here per conventions.
+        sqlx::query(r"UPDATE rooms SET name = $2 WHERE id = $1")
+            .bind(room.to_uuid())
+            .bind(name_val.as_deref())
+            .execute(&s.pg)
+            .await
+            .map_err(AeroError::from)?;
+    }
+    if let Some(desc_val) = req.description {
+        s.rooms
+            .set_description(room, desc_val.as_deref())
+            .await
+            .map_err(AeroError::from)?;
+    }
+
+    // Broadcast a metadata-change hint (Membership Join reuses the existing event path;
+    // no dedicated RoomUpdated event exists yet). Best-effort.
+    s.im
+        .broadcast_room_event(
+            room,
+            RoomEvent::Membership {
+                room_id: room,
+                participant: auth.participant_id,
+                op: aero_common::MembershipOp::Join,
+            },
+        )
+        .await;
+
+    Ok(Json(serde_json::json!({ "room_id": room, "updated": true })))
 }

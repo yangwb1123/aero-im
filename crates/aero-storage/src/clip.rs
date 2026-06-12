@@ -43,11 +43,15 @@ pub struct Clip {
     /// When the clip was created (RFC 3339 on the wire).
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: time::OffsetDateTime,
+    /// Optional short slug for the shareable public URL (e.g. `/clips/{slug}`).
+    /// `None` until the creator calls the share endpoint.
+    pub share_slug: Option<String>,
 }
 
 /// The columns a [`Clip`] is built from, in select order. Shared by every query so
 /// the row decoding stays in one place.
-const COLUMNS: &str = "id, stream_id, creator_id, title, start_secs, end_secs, created_at";
+const COLUMNS: &str =
+    "id, stream_id, creator_id, title, start_secs, end_secs, created_at, share_slug";
 
 type Row = (
     uuid::Uuid,
@@ -57,10 +61,11 @@ type Row = (
     i32,
     i32,
     time::OffsetDateTime,
+    Option<String>,
 );
 
 fn row_to_model(r: Row) -> Clip {
-    let (id, stream_id, creator_id, title, start_secs, end_secs, created_at) = r;
+    let (id, stream_id, creator_id, title, start_secs, end_secs, created_at, share_slug) = r;
     Clip {
         id: ClipId::from_uuid(id),
         stream_id: ulid::Ulid(stream_id.as_u128()),
@@ -69,7 +74,32 @@ fn row_to_model(r: Row) -> Clip {
         start_secs,
         end_secs,
         created_at,
+        share_slug,
     }
+}
+
+/// Derive a URL-safe base32 slug from a byte slice. Uses the crockford
+/// base32 alphabet (no padding, lowercase). Returns the first 12 characters
+/// (60 bits), which is sufficient for a human-readable public URL slug while
+/// keeping it short enough to type.
+fn base32_slug(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 32] = b"0123456789abcdefghjkmnpqrstvwxyz";
+    let mut out = String::with_capacity(12);
+    let mut buf: u64 = 0;
+    let mut bits: u32 = 0;
+    for &b in bytes {
+        buf = (buf << 8) | u64::from(b);
+        bits += 8;
+        while bits >= 5 {
+            bits -= 5;
+            let idx = ((buf >> bits) & 0x1f) as usize;
+            out.push(ALPHABET[idx] as char);
+            if out.len() >= 12 {
+                return out;
+            }
+        }
+    }
+    out
 }
 
 /// Repository over the `stream_clips` table (live-stream clips).
@@ -147,6 +177,59 @@ impl ClipRepo {
             .fetch_all(&self.pool)
             .await?;
         Ok(rows.into_iter().map(row_to_model).collect())
+    }
+
+    /// Generate (or return the existing) share slug for a clip, returning the
+    /// slug string. The slug is derived from the first 12 URL-safe base32 chars
+    /// of the clip's UUID bytes. Because the clip id is unique the slug is
+    /// also unique — a conflict can only happen when the row already has one,
+    /// in which case `WHERE share_slug IS NULL` prevents the UPDATE and
+    /// `RETURNING share_slug` returns `None`; the caller then re-reads via
+    /// [`Self::get`] to obtain the existing slug.
+    ///
+    /// Returns `Ok(Some(slug))` when the slug was set (first call) or
+    /// `Ok(None)` when the clip already had a slug (idempotent — the caller
+    /// must re-read to get it).
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the update.
+    pub async fn generate_share_slug(
+        &self,
+        id: ClipId,
+    ) -> Result<Option<String>, sqlx::Error> {
+        // Derive a deterministic slug from the clip's uuid bytes using base32
+        // (RFC 4648 no-pad, lower-case). The first 12 chars cover 60 bits —
+        // enough uniqueness for a human-readable shareable URL.
+        let slug = {
+            let bytes = id.to_uuid().as_bytes().to_vec();
+            base32_slug(&bytes)
+        };
+        let row: Option<(Option<String>,)> = sqlx::query_as(
+            r"UPDATE stream_clips
+                 SET share_slug = $2
+               WHERE id = $1 AND share_slug IS NULL
+               RETURNING share_slug",
+        )
+        .bind(id.to_uuid())
+        .bind(&slug)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.and_then(|(s,)| s))
+    }
+
+    /// Fetch a clip by its share slug. Returns `None` if no clip has that slug.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the query.
+    pub async fn get_by_slug(&self, slug: &str) -> Result<Option<Clip>, sqlx::Error> {
+        let sql = format!(
+            "SELECT {COLUMNS} FROM stream_clips WHERE share_slug = $1"
+        );
+        let row = sqlx::query_as::<_, Row>(&sql)
+            .bind(slug)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(row_to_model))
     }
 
     /// Delete a clip, scoped to its creator. Returns `true` iff a row was removed —

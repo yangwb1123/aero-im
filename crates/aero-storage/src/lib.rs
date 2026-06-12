@@ -62,7 +62,6 @@ pub mod user_group;
 // Wave 11 (0039-0040 + read-only file index): files tab, stream follow, thread follow.
 pub mod file_index;
 pub mod stream_follow;
-pub mod thread_mute;
 pub mod thread_subscription;
 // Wave 12 (0041-0042 + read-only dm/reaction-detail): dm, recurring msgs, reaction detail, default channels.
 pub mod dm;
@@ -99,6 +98,7 @@ pub mod workspace_files;
 
 // ---- Wave 18 ----
 pub mod clip;
+pub mod clip_collections;
 pub mod stream_stats;
 
 // ---- Wave 19 ----
@@ -116,7 +116,6 @@ pub use ai_job::{AiJob, AiJobKind, AiJobRepo, AiJobStatus};
 pub use audit::{events_to_csv, AuditEvent, AuditRepo, AUDIT_CSV_HEADER};
 pub use blob::{BlobRepo, NewBlob};
 pub use block_interaction::{BlockInteraction, BlockInteractionRepo};
-pub use message_reports::{MessageReport, MessageReportRepo};
 pub use blob_store::{BlobStore, BlobStoreError, LocalFsBlobStore};
 pub use s3_blob_store::{blob_store_from_env, blob_store_from_env_checked, S3BlobStore, S3Config};
 pub use bookmark::{BookmarkRepo, SavedMessage};
@@ -135,6 +134,7 @@ pub use invitation::{invitation_is_redeemable, Invitation, InvitationRepo};
 pub use live::LiveRepo;
 pub use live_presence::{CallRosterStore, StreamViewerStore, DEFAULT_TTL as LIVE_PRESENCE_TTL};
 pub use message::{MessageRepo, NewMessage, SearchHit};
+pub use message_reports::{MessageReport, MessageReportRepo};
 pub use mls::{KeyPackageRepo, MlsGroupRepo};
 pub use notification::NotificationRepo;
 pub use notification_prefs::NotificationPrefsRepo;
@@ -183,7 +183,6 @@ pub use user_group::{normalize_handle, UserGroup, UserGroupRepo};
 // Wave 11 re-exports.
 pub use file_index::{FileIndexRepo, SharedFile};
 pub use stream_follow::StreamFollowRepo;
-pub use thread_mute::ThreadMuteRepo;
 pub use thread_subscription::ThreadSubscriptionRepo;
 // Wave 12 re-exports.
 pub use dm::DmRepo;
@@ -224,6 +223,7 @@ pub use workspace_files::{WorkspaceFile, WorkspaceFileRepo};
 
 // ---- Wave 18 re-exports ----
 pub use clip::{Clip, ClipRepo};
+pub use clip_collections::{ClipCollectionRepo, CollectionRow};
 pub use stream_stats::{StreamAnalytics, StreamStatsRepo};
 
 // ---- Wave 19 re-exports ----
@@ -255,7 +255,7 @@ pub use password_history::{PasswordHistoryRepo, HISTORY_DEPTH as PASSWORD_HISTOR
 
 // ---- Concurrent-viewer history sampling (peak/avg concurrent viewers) ----
 pub mod stream_viewer_sample;
-pub use stream_viewer_sample::{StreamViewerSampleRepo, ViewerStats};
+pub use stream_viewer_sample::{RetentionPoint, StreamViewerSampleRepo, ViewerStats};
 
 // ---- Workspace IP / network allowlist (authorized networks) ----
 pub mod ip_allowlist;
@@ -277,11 +277,11 @@ pub mod raid;
 pub mod stream_moderator;
 pub mod vod_chapter;
 pub use hype_train::{
-    apply_contribution, is_expired as hype_train_is_expired, HypeTrainRepo, HypeTrainSession,
-    Escalation, MAX_LEVEL as HYPE_TRAIN_MAX_LEVEL, UNITS_PER_LEVEL as HYPE_TRAIN_UNITS_PER_LEVEL,
-    WINDOW_SECS as HYPE_TRAIN_WINDOW_SECS,
+    apply_contribution, is_expired as hype_train_is_expired, HypeTrainLeaderRow, HypeTrainRepo,
+    HypeTrainSession, Escalation, MAX_LEVEL as HYPE_TRAIN_MAX_LEVEL,
+    UNITS_PER_LEVEL as HYPE_TRAIN_UNITS_PER_LEVEL, WINDOW_SECS as HYPE_TRAIN_WINDOW_SECS,
 };
-pub use raid::{Raid, RaidRepo};
+pub use raid::{Raid, RaidAnalytics, RaidRepo};
 pub use stream_moderator::{StreamModerator, StreamModeratorRepo};
 pub use vod_chapter::{VodChapter, VodChapterRepo};
 
@@ -305,7 +305,7 @@ pub use usage_report::{AiKindUsage, UsageReport, UsageReportRepo};
 // Channel points + custom-reward redemption, goal/bounty bars, ban/timeout appeals.
 pub mod channel_points;
 pub use channel_points::{
-    is_resolution_status, ChannelPointsRepo, RedeemError, Redemption, Reward,
+    is_resolution_status, ChannelPointsRepo, EarnHistoryRow, RedeemError, Redemption, Reward,
 };
 pub mod goals;
 pub use goals::{is_valid_metric as is_valid_goal_metric, Goal, GoalRepo};
@@ -317,5 +317,14 @@ pub use ban_appeals::{AppealError, BanAppeal, BanAppealRepo};
 // the creator LOCKS then RESOLVES; winners are paid proportionally from the pool.
 pub mod predictions;
 pub use predictions::{
-    Prediction, PredictionOutcome, PredictionRepo, ResolveError, StakeError,
+    Prediction, PredictionAnalytics, PredictionOutcome, PredictionRepo, ResolveError, StakeError,
+    ViewerPredictionRow,
 };
+
+// ---- ROADMAP6 Lane A — thread notification prefs + workspace mutes ----
+pub mod thread_notification_prefs;
+pub mod workspace_mutes;
+pub use thread_notification_prefs::ThreadNotificationPrefsRepo;
+pub use workspace_mutes::WorkspaceMuteRepo;
+
+// (ClipCollectionRepo + CollectionRow already re-exported above in Wave 18 re-exports)

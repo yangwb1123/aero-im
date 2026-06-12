@@ -32,8 +32,9 @@ use aero_storage::{
     CallRouteRegistry, KeyPackageRepo, LiveRepo, MessageRepo, MlsGroupRepo, NotificationPrefsRepo,
     NotificationRepo, DeactivationRepo, KeywordAlertRepo, MessageEditRepo, ParticipantRepo, PatRepo,
     PinRepo, TotpRepo, PresenceStore, ReactionRepo, ReceiptRepo, RecurringMessageRepo, RedisCache,
-    RoomRepo, SeqStore, StreamRepo, StreamRouteRegistry, StreamViewerStore, ThreadMuteRepo,
-    ThreadSubscriptionRepo, UserGroupRepo, WorkspaceRepo, WsRateStore,
+    RoomRepo, SeqStore, StreamRepo, StreamRouteRegistry, StreamViewerStore,
+    ThreadNotificationPrefsRepo, ThreadSubscriptionRepo, UserGroupRepo, WorkspaceMuteRepo,
+    WorkspaceRepo, WsRateStore,
 };
 use tokio_util::sync::CancellationToken;
 use anyhow::Context;
@@ -185,13 +186,13 @@ async fn main() -> anyhow::Result<()> {
         .with_keyword_alerts(KeywordAlertRepo::new(pg.clone()))
         // Wave 11: thread-follow notifications (reply → root-message subscribers).
         .with_thread_subs(ThreadSubscriptionRepo::new(pg.clone()))
-        // ROADMAP 第四版: thread MUTING (the inverse — subtract muters from the
-        // reply notification fan-out).
-        .with_thread_mutes(ThreadMuteRepo::new(pg.clone()))
         // Wave 14: workspace deactivation gate in assert_room_access.
         .with_deactivations(DeactivationRepo::new(pg.clone()))
         // Wave 24: workspace-wide 2FA enforcement gate in assert_room_access.
         .with_totp(TotpRepo::new(pg.clone()))
+        // ROADMAP6 Lane A: per-thread notification levels + workspace-wide mute.
+        .with_thread_notification_prefs(ThreadNotificationPrefsRepo::new(pg.clone()))
+        .with_workspace_mutes(WorkspaceMuteRepo::new(pg.clone()))
         // ROADMAP 第三版 方向一: cluster-correct publish-time event-seq stamp.
         .with_seq(seq_store.clone()),
     );
@@ -567,7 +568,10 @@ async fn main() -> anyhow::Result<()> {
     // call_orchestrator), driven by the WS CallJoin/CallLeave handlers, so they
     // stay alive for the process lifetime via the router — no extra binding needed.
 
-    let _ = ai_shutdown; // keep token alive for the worker
+    // ai_shutdown is kept alive here; it will be cancelled by shutdown_signal
+    // when SIGTERM/Ctrl-C arrives (wired into axum::serve below), which in turn
+    // causes every background task that holds a clone to exit.
+    let _ai_shutdown_guard = ai_shutdown.clone();
 
     // ---------- DB pool + live session gauges (ROADMAP 方向四/五) ----------
     // Periodically publish sqlx pool stats so dashboards can alert on pool
@@ -984,12 +988,47 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     // `into_make_service_with_connect_info` exposes the peer address to the
     // rate-limit middleware (for IP keying of unauthenticated requests).
+    //
+    // Graceful shutdown: wait for SIGTERM (unix) or Ctrl-C, then tell the AI
+    // worker and all background tasks to stop via the CancellationToken before
+    // the HTTP server stops accepting new connections. In-flight requests
+    // continue until axum drains them.
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
+    .with_graceful_shutdown(shutdown_signal(ai_shutdown.clone()))
     .await?;
     Ok(())
+}
+
+/// Wait for SIGTERM (unix) or Ctrl-C, log a message, then cancel the
+/// shared [`CancellationToken`] so all background workers exit cleanly.
+async fn shutdown_signal(ai_shutdown: tokio_util::sync::CancellationToken) {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("ctrl-c handler failed")
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("SIGTERM handler failed")
+            .recv()
+            .await
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+
+    tracing::info!("shutdown signal received, starting graceful shutdown");
+    ai_shutdown.cancel(); // signal background tasks (AI worker, heartbeats, etc.)
 }
 
 /// Resolve the mobile push gateways from environment (ROADMAP 方向二).

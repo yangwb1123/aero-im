@@ -11,7 +11,7 @@
 //! cascading FKs) so a raid row outlives a pruned stream, mirroring
 //! [`ClipRepo`](crate::ClipRepo).
 
-use aero_common::{ParticipantId, RaidId};
+use aero_common::{Error as AeroError, ParticipantId, RaidId};
 use serde::Serialize;
 use sqlx::PgPool;
 use ulid::Ulid;
@@ -51,6 +51,17 @@ fn row_to_model(r: Row) -> Raid {
     }
 }
 
+/// Aggregate analytics for raids initiated by a single raider.
+///
+/// `Serialize` so the handler can return it directly as JSON.
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct RaidAnalytics {
+    pub raids_sent: i64,
+    pub total_viewers_carried: i64,
+    pub avg_viewers: i64,
+    pub peak_viewers: i64,
+}
+
 /// Repository over the `raid_history` table.
 ///
 /// Cheap to clone — wraps a [`PgPool`]; feature modules build one inline via
@@ -60,6 +71,9 @@ fn row_to_model(r: Row) -> Raid {
 pub struct RaidRepo {
     pool: PgPool,
 }
+
+/// Minimum seconds between raids for the same raider (the cooldown window).
+pub const RAID_COOLDOWN_SECS: i64 = 60;
 
 impl RaidRepo {
     /// Build a repo over the given pool.
@@ -71,15 +85,35 @@ impl RaidRepo {
     /// `viewer_count` viewers, returning its generated id. The caller has already
     /// checked the raider owns the source stream and that both streams exist.
     ///
+    /// Enforces a [`RAID_COOLDOWN_SECS`] cooldown: if the raider has sent a raid
+    /// within the last minute, returns
+    /// [`AeroError::Forbidden`]`("raid cooldown active")`.
+    ///
     /// # Errors
-    /// Propagates any [`sqlx::Error`] from the insert.
+    /// - [`AeroError::Forbidden`] if the raider is within the cooldown window.
+    /// - Wraps any [`sqlx::Error`] via [`AeroError::Database`].
     pub async fn create(
         &self,
         source: Ulid,
         target: Ulid,
         raider: ParticipantId,
         viewer_count: i32,
-    ) -> Result<RaidId, sqlx::Error> {
+    ) -> Result<RaidId, AeroError> {
+        // Cooldown check: reject if the raider sent a raid within the last minute.
+        let last: Option<time::OffsetDateTime> = sqlx::query_scalar(
+            r"SELECT created_at FROM raid_history WHERE raider_id = $1 ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(raider.to_uuid())
+        .fetch_optional(&self.pool)
+        .await?;
+        if let Some(last_at) = last {
+            let now = time::OffsetDateTime::now_utc();
+            let elapsed = (now - last_at).whole_seconds();
+            if elapsed < RAID_COOLDOWN_SECS {
+                return Err(AeroError::Forbidden("raid cooldown active".into()));
+            }
+        }
+
         let id = RaidId::new();
         sqlx::query(
             r"INSERT INTO raid_history
@@ -94,6 +128,26 @@ impl RaidRepo {
         .execute(&self.pool)
         .await?;
         Ok(id)
+    }
+
+    /// Aggregate analytics for raids the given raider has sent: total count,
+    /// total + average + peak viewers carried.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the query.
+    pub async fn analytics(&self, raider: ParticipantId) -> Result<RaidAnalytics, sqlx::Error> {
+        sqlx::query_as::<_, RaidAnalytics>(
+            r"SELECT
+                COUNT(*)::bigint                           AS raids_sent,
+                COALESCE(SUM(viewer_count), 0)::bigint    AS total_viewers_carried,
+                COALESCE(AVG(viewer_count), 0)::bigint    AS avg_viewers,
+                COALESCE(MAX(viewer_count), 0)::bigint    AS peak_viewers
+               FROM raid_history
+              WHERE raider_id = $1",
+        )
+        .bind(raider.to_uuid())
+        .fetch_one(&self.pool)
+        .await
     }
 
     /// Fetch one raid by id, or `None` if no such row exists.

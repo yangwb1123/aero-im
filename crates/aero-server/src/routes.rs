@@ -14,21 +14,48 @@ use aero_live_whip::{accept_whep_offer, accept_whip_offer, SessionError, WhipErr
 use aero_storage::{blob::NewBlob, stream::NewStream};
 use axum::{
     extract::{Multipart, Path, Query, State},
-    http::{header, StatusCode},
+    http::{header, HeaderValue, Request, StatusCode},
+    middleware::{self, Next},
     response::{
         sse::{Event, KeepAlive, Sse},
-        IntoResponse,
+        IntoResponse, Response,
     },
     routing::{get, post},
     Json, Router,
 };
 use bytes::Bytes;
 use serde::Deserialize;
+use tower_http::compression::CompressionLayer;
 
 use crate::error::ApiResult;
 use crate::metrics;
 use crate::state::AppState;
 use crate::ws;
+
+// ----- Request correlation ID middleware -----
+
+/// Opaque correlation ID propagated through request extensions and echoed in
+/// every response as `x-request-id`.  Handlers and middlewares that need to
+/// surface it can extract it from `req.extensions()`.
+#[derive(Clone)]
+pub struct RequestId(pub String);
+
+/// Middleware: read or generate a `x-request-id` header, attach a
+/// [`RequestId`] extension, and echo the value in the response.
+async fn inject_request_id(mut req: Request<axum::body::Body>, next: Next) -> Response {
+    let id = req
+        .headers()
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    req.extensions_mut().insert(RequestId(id.clone()));
+    let mut res = next.run(req).await;
+    if let Ok(v) = HeaderValue::from_str(&id) {
+        res.headers_mut().insert("x-request-id", v);
+    }
+    res
+}
 
 pub fn build(state: AppState) -> Router {
     let mut router = Router::new()
@@ -315,10 +342,6 @@ pub fn build(state: AppState) -> Router {
         // ---- AI-native cluster: thread summary, scheduled digests, find-expert ----
         // Thread-scoped AI summarization: POST /api/messages/:id/thread-summary.
         .merge(crate::thread_summarize::routes())
-        // Thread auto-titling: POST /api/messages/:id/thread-title (degrade-safe).
-        .merge(crate::thread_title::routes())
-        // Per-message sentiment / toxicity scoring: POST /api/messages/:id/sentiment.
-        .merge(crate::message_sentiment::routes())
         // Scheduled/recurring AI digests: POST/GET /api/digests, DELETE /api/digests/:id.
         // The background dispatcher is spawned in bin/aero-server.rs.
         .merge(crate::digests::routes())
@@ -369,27 +392,19 @@ pub fn build(state: AppState) -> Router {
         // action_id), broadcasting RoomEvent::Interaction so the poster's bot/app
         // sees it live; GET /api/messages/:id/interactions lists them.
         .merge(crate::interactions::routes())
-        // ---- Live / creator economy (migrations 0089-0091) ----
-        // Channel points + custom-reward redemption: creators define point-priced
-        // rewards, viewers redeem (atomic debit), creators fulfill/reject the queue.
-        .merge(crate::channel_points::routes())
-        // Goal / bounty bars: creators set a metric target the broadcast fills toward;
-        // the gift path feeds active gifts-goals + broadcasts GoalProgress/GoalReached.
-        .merge(crate::goals::routes())
-        // Ban/timeout appeals: a banned viewer appeals; a creator/mod approves
-        // (lifting the ban) or denies (keeping it).
-        .merge(crate::ban_appeals::routes())
-        // ---- Community predictions / channel betting (migration 0092) ----
-        // Creator opens a prediction (2+ outcomes); viewers STAKE channel points on
-        // one (atomic ledger debit); the creator LOCKS then RESOLVES (winners paid
-        // proportionally from the pool) or CANCELS (refund all). Distinct from polls.
-        .merge(crate::predictions::routes())
-        // ---- Message reports -> moderation review queue (migration 0093) ----
-        // POST /api/rooms/:id/messages/:mid/report lets a room member flag a
-        // message; GET /api/workspaces/:id/admin/moderation-queue lists pending
-        // reports (admin-only); POST .../moderation-queue/:rid/review keeps or
-        // removes (removal reuses the existing transactional moderate-delete path).
-        .merge(crate::message_reports::routes());
+        // ---- ROADMAP6 Lane C ----
+        // Clip collections / playlists: CRUD for per-user named, ordered groups
+        // of stream clips (YouTube-playlist-style). Fully auth-gated.
+        .merge(crate::clip_collections::router(state.clone()))
+        // Clip share endpoint (POST /api/clips/:cid/share is already in
+        // crate::clips::routes()). Public clip slug route: GET /clips/:slug
+        // has no auth extractor so any user (even unauthenticated) can view
+        // clip metadata via a shared link.
+        .merge(crate::clips::public_routes())
+        // ---- OpenAPI 3.0 spec (public, no auth) ----
+        // GET /api/openapi.json returns the static OpenAPI document so API clients
+        // and documentation generators can introspect the surface without credentials.
+        .merge(crate::openapi::router());
 
     // Prometheus scrape endpoint (ROADMAP 方向四). Mounted unless disabled; the
     // handler self-gates on an optional bearer token. Left here (not behind the
@@ -399,7 +414,16 @@ pub fn build(state: AppState) -> Router {
         router = router.route("/metrics", get(metrics::metrics_handler));
     }
 
-    router.with_state(state)
+    // ---- Request correlation ID + HTTP compression ----
+    // inject_request_id: reads or generates x-request-id, attaches RequestId
+    //   extension, echoes the value in the response header.
+    // CompressionLayer: gzip-compress eligible responses (text/json/html).
+    // Both layers wrap the whole router (including the metrics endpoint) so
+    // every response is correlated and eligible for compression.
+    router
+        .layer(middleware::from_fn(inject_request_id))
+        .layer(CompressionLayer::new())
+        .with_state(state)
 }
 
 /// Probe each backing dependency (PG / Redis / NATS) with a short timeout.

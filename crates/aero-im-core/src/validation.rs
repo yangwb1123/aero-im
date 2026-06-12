@@ -77,7 +77,6 @@ pub fn validate_blocks(blocks: &[Block]) -> Result<(), ValidationError> {
             }
             // Other block variants have no length limits at this layer.
             Block::Mention { .. }
-            | Block::ChannelMention { .. }
             | Block::File { .. }
             | Block::Voice { .. }
             | Block::Card { .. }

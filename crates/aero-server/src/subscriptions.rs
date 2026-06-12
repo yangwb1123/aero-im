@@ -48,6 +48,7 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/api/creators/:id/subscribers", get(list_subscribers))
         .route("/api/me/subscriptions", get(my_subscriptions))
+        .route("/api/creators/:id/gift-subscription", post(gift_subscription))
 }
 
 /// Build a [`SubscriptionRepo`] from shared state, over the shared pool.
@@ -250,4 +251,75 @@ async fn list_subscribers(
         .await
         .map_err(AeroError::from)?;
     Ok(Json(serde_json::json!({ "subscribers": subscribers })))
+}
+
+#[derive(Deserialize)]
+struct GiftSubscriptionReq {
+    /// The participant who will receive the gift.
+    recipient_id: String,
+    /// The tier the recipient will be subscribed at.
+    tier_id: String,
+    /// Duration of the gift in months (converted to days server-side).
+    #[serde(default = "default_months")]
+    months: u32,
+}
+
+fn default_months() -> u32 {
+    1
+}
+
+/// `POST /api/creators/:id/gift-subscription` — the caller (gifter) gifts a
+/// subscription to a recipient on this creator's channel. The tier must belong
+/// to the creator (`400`/`404`). A self-gift (gifter == recipient) is rejected
+/// `400`. No coin deduction is performed; this endpoint records the subscription
+/// only.
+async fn gift_subscription(
+    State(s): State<AppState>,
+    auth: AuthUser,
+    Path(creator_str): Path<String>,
+    Json(req): Json<GiftSubscriptionReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let creator = parse_participant(&creator_str)?;
+    let gifter = auth.participant_id;
+    let recipient = parse_participant(&req.recipient_id)?;
+
+    if gifter == recipient {
+        return Err(AeroError::Invalid("cannot gift a subscription to yourself".into()).into());
+    }
+
+    let tier_id = parse_tier(&req.tier_id)?;
+
+    // The tier must exist and belong to THIS creator.
+    let tier = repo(&s)
+        .get_tier(tier_id)
+        .await
+        .map_err(AeroError::from)?
+        .ok_or_else(|| AeroError::NotFound(format!("tier {tier_id}")))?;
+    if tier.creator_id != creator {
+        return Err(AeroError::Invalid("tier does not belong to this creator".into()).into());
+    }
+
+    let months = req.months.max(1);
+    let duration_days = i32::try_from(months * 30)
+        .unwrap_or(i32::MAX);
+
+    repo(&s)
+        .gift_subscription(
+            creator,
+            tier_id.to_uuid(),
+            recipient,
+            gifter,
+            duration_days,
+        )
+        .await
+        .map_err(AeroError::from)?;
+
+    Ok(Json(serde_json::json!({
+        "creator_id": creator,
+        "recipient_id": recipient,
+        "gifter_id": gifter,
+        "tier_id": tier_id,
+        "months": months,
+        "active": true,
+    })))
 }

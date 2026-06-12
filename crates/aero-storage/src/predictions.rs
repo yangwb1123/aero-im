@@ -574,6 +574,105 @@ impl PredictionRepo {
     }
 }
 
+/// One row in a viewer's prediction history — a join of a `prediction_stakes` row
+/// with the parent `predictions` row.
+///
+/// `Serialize` so the handler can return it directly as JSON.
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct ViewerPredictionRow {
+    pub prediction_id: uuid::Uuid,
+    pub question: String,
+    pub outcome_idx: i32,
+    pub points: i64,
+    pub payout: i64,
+    pub status: String,
+    pub created_at: OffsetDateTime,
+}
+
+/// Aggregate analytics for a creator's predictions on a stream.
+///
+/// `Serialize` so the handler can return it directly as JSON.
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct PredictionAnalytics {
+    pub total_predictions: i64,
+    pub resolved_predictions: i64,
+    pub total_points_staked: i64,
+    pub avg_participants: i64,
+}
+
+impl PredictionRepo {
+    /// Paginated list of a viewer's prediction history (their stakes across all
+    /// predictions), newest stake first.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the query.
+    pub async fn list_for_viewer(
+        &self,
+        viewer: ParticipantId,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<ViewerPredictionRow>, sqlx::Error> {
+        sqlx::query_as::<_, ViewerPredictionRow>(
+            r"SELECT ps.prediction_id,
+                     p.question,
+                     ps.outcome_idx,
+                     ps.points,
+                     COALESCE(ps.payout, 0) AS payout,
+                     p.status,
+                     ps.created_at
+               FROM prediction_stakes ps
+               JOIN predictions p ON p.id = ps.prediction_id
+              WHERE ps.viewer_id = $1
+              ORDER BY ps.created_at DESC
+              LIMIT $2 OFFSET $3",
+        )
+        .bind(viewer.to_uuid())
+        .bind(limit.max(1).min(100))
+        .bind(offset.max(0))
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Aggregate analytics for all predictions on a given stream: total
+    /// predictions created, how many resolved, total channel-points staked
+    /// across all predictions, and average participant count per prediction.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the query.
+    pub async fn creator_analytics(
+        &self,
+        stream_id: Ulid,
+    ) -> Result<PredictionAnalytics, sqlx::Error> {
+        sqlx::query_as::<_, PredictionAnalytics>(
+            r"SELECT
+                COUNT(DISTINCT p.id)::bigint                                  AS total_predictions,
+                COUNT(DISTINCT p.id) FILTER (WHERE p.status = 'resolved')::bigint
+                                                                              AS resolved_predictions,
+                COALESCE(SUM(ps.points), 0)::bigint                           AS total_points_staked,
+                COALESCE(
+                    (SUM(COUNT(ps.id)) OVER () / NULLIF(COUNT(DISTINCT p.id), 0)),
+                    0
+                )::bigint                                                      AS avg_participants
+               FROM predictions p
+               LEFT JOIN prediction_stakes ps ON ps.prediction_id = p.id
+              WHERE p.stream_id = $1
+              GROUP BY ()
+            ",
+        )
+        .bind(Uuid::from_u128(stream_id.0))
+        .fetch_optional(&self.pool)
+        .await
+        .map(|opt| {
+            opt.unwrap_or(PredictionAnalytics {
+                total_predictions: 0,
+                resolved_predictions: 0,
+                total_points_staked: 0,
+                avg_participants: 0,
+            })
+        })
+    }
+}
+
 /// Whether a [`sqlx::Error`] is a Postgres UNIQUE-constraint violation (SQLSTATE
 /// `23505`) — used to map the `(prediction, viewer)` collision to
 /// [`StakeError::AlreadyStaked`].

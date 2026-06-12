@@ -21,12 +21,13 @@ use std::str::FromStr;
 
 use aero_auth::AuthUser;
 use aero_common::{Error as AeroError, MessageId};
-use aero_storage::{ThreadMuteRepo, ThreadSubscriptionRepo};
+use aero_storage::{ThreadNotificationPrefsRepo, ThreadSubscriptionRepo};
 use axum::{
     extract::{Path, State},
-    routing::{post, put},
+    routing::{get, put},
     Json, Router,
 };
+use serde::Deserialize;
 
 use crate::error::ApiResult;
 use crate::state::AppState;
@@ -42,11 +43,15 @@ pub fn routes() -> Router<AppState> {
             "/api/me/followed-threads",
             axum::routing::get(list_followed_threads),
         )
-        // Thread MUTING (the inverse of follow): stop reply notifications for a
-        // thread, identified by its root message id.
+        // Thread notification level (ROADMAP6 Lane A)
         .route(
-            "/api/threads/:id/mute",
-            post(mute_thread).delete(unmute_thread),
+            "/api/messages/:id/thread-notification-level",
+            put(set_thread_notif_level).get(get_thread_notif_level),
+        )
+        // Thread participant roster (ROADMAP6 Lane A)
+        .route(
+            "/api/messages/:id/thread-participants",
+            get(list_thread_participants),
         )
 }
 
@@ -54,11 +59,6 @@ pub fn routes() -> Router<AppState> {
 /// Cheap (a clone of an `Arc<PgPool>`), keeping this feature self-contained.
 fn repo(s: &AppState) -> ThreadSubscriptionRepo {
     ThreadSubscriptionRepo::new(s.pg.clone())
-}
-
-/// Build a [`ThreadMuteRepo`] from shared state, over the shared pool.
-fn mute_repo(s: &AppState) -> ThreadMuteRepo {
-    ThreadMuteRepo::new(s.pg.clone())
 }
 
 fn parse_message(s: &str) -> Result<MessageId, AeroError> {
@@ -123,48 +123,131 @@ async fn list_followed_threads(
     Ok(Json(serde_json::json!({ "threads": threads })))
 }
 
-/// `POST /api/threads/:id/mute` — mute the thread rooted at this message so the
-/// caller STOPS receiving reply notifications for it (the inverse of follow). The
-/// root message's room is resolved and the caller must be able to access it
-/// (workspace + room membership), else `404`/`403`; an unknown message id is
-/// `404`. Idempotent: re-muting is a no-op. The mute suppresses only the
-/// notification — the room broadcast of replies is unaffected. Always reports
-/// `muted: true`.
-async fn mute_thread(
+// ----------------------------------- Thread notification level (ROADMAP6 Lane A)
+
+fn notif_prefs_repo(s: &AppState) -> ThreadNotificationPrefsRepo {
+    ThreadNotificationPrefsRepo::new(s.pg.clone())
+}
+
+#[derive(Deserialize)]
+struct SetThreadNotifLevelReq {
+    level: String,
+}
+
+/// `PUT /api/messages/:id/thread-notification-level` — set the caller's per-thread
+/// notification level for the thread rooted at `:id`. The message must exist and
+/// the caller must have access to its room. Valid levels: `all`, `mentions`, `none`.
+async fn set_thread_notif_level(
     State(s): State<AppState>,
     auth: AuthUser,
     Path(id_str): Path<String>,
+    Json(req): Json<SetThreadNotifLevelReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let message = parse_message(&id_str)?;
-    // Resolve the root message's room (reusing the subscription repo's resolver);
-    // an unknown message is a 404, gated like follow_thread.
+
+    // Validate the level before touching the DB.
+    match req.level.as_str() {
+        "all" | "mentions" | "none" => {}
+        other => {
+            return Err(AeroError::Invalid(format!(
+                "invalid level {:?}; must be 'all', 'mentions', or 'none'",
+                other
+            ))
+            .into())
+        }
+    }
+
+    // Resolve the root message's room; an unknown message is a 404.
     let room = repo(&s)
         .message_room(message)
         .await
         .map_err(AeroError::from)?
         .ok_or_else(|| AeroError::NotFound(format!("message {message}")))?;
+
+    // Room access guard before writing.
     s.im.assert_room_access(auth.participant_id, room).await?;
-    mute_repo(&s)
-        .mute(auth.participant_id, message)
-        .await
-        .map_err(AeroError::from)?;
-    Ok(Json(serde_json::json!({ "muted": true })))
+
+    notif_prefs_repo(&s)
+        .set_level(auth.participant_id, message, &req.level)
+        .await?;
+
+    Ok(Json(serde_json::json!({
+        "root_message_id": message,
+        "level": req.level,
+    })))
 }
 
-/// `DELETE /api/threads/:id/mute` — unmute the thread rooted at this message,
-/// re-enabling reply notifications. Owner-scoped at the SQL layer (only the
-/// caller's own mute is ever touched), so no room-access check is needed;
-/// unmuting a thread that was never muted is a no-op. Always reports
-/// `muted: false`.
-async fn unmute_thread(
+/// `GET /api/messages/:id/thread-notification-level` — return the caller's
+/// per-thread notification level for the thread rooted at `:id`. Defaults to
+/// `"all"` when no preference has been set.
+async fn get_thread_notif_level(
     State(s): State<AppState>,
     auth: AuthUser,
     Path(id_str): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let message = parse_message(&id_str)?;
-    mute_repo(&s)
-        .unmute(auth.participant_id, message)
+
+    // Resolve the room (and assert access) so an unknown message id is a 404.
+    let room = repo(&s)
+        .message_room(message)
+        .await
+        .map_err(AeroError::from)?
+        .ok_or_else(|| AeroError::NotFound(format!("message {message}")))?;
+
+    s.im.assert_room_access(auth.participant_id, room).await?;
+
+    let level = notif_prefs_repo(&s)
+        .get_level(auth.participant_id, message)
+        .await?;
+
+    Ok(Json(serde_json::json!({ "level": level })))
+}
+
+// ----------------------------------- Thread participant roster (ROADMAP6 Lane A)
+
+/// `GET /api/messages/:id/thread-participants` — the distinct participants who have
+/// posted at least one (non-deleted) reply in the thread rooted at `:id`. The
+/// caller must have access to the root message's room. Returns each participant's
+/// `id`, `display_name`, and `avatar_url`.
+async fn list_thread_participants(
+    State(s): State<AppState>,
+    auth: AuthUser,
+    Path(id_str): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let root = parse_message(&id_str)?;
+
+    // Resolve the root message's room; an unknown message id is a 404.
+    let room = repo(&s)
+        .message_room(root)
+        .await
+        .map_err(AeroError::from)?
+        .ok_or_else(|| AeroError::NotFound(format!("message {root}")))?;
+
+    s.im.assert_room_access(auth.participant_id, room).await?;
+
+    // Fetch distinct participant ids from the thread.
+    let participant_ids = s
+        .messages
+        .thread_participants(root)
         .await
         .map_err(AeroError::from)?;
-    Ok(Json(serde_json::json!({ "muted": false })))
+
+    // Join with participant metadata: display_name + avatar_url.
+    let mut participants = Vec::with_capacity(participant_ids.len());
+    for pid in &participant_ids {
+        let p = s
+            .participants
+            .get(*pid)
+            .await
+            .map_err(AeroError::from)?;
+        if let Some(p) = p {
+            participants.push(serde_json::json!({
+                "id": p.id,
+                "display_name": p.display_name,
+                "avatar_url": p.avatar_url,
+            }));
+        }
+    }
+
+    Ok(Json(serde_json::json!({ "participants": participants })))
 }

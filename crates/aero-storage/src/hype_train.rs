@@ -225,6 +225,73 @@ impl HypeTrainRepo {
     }
 }
 
+/// One row in a session's contributor leaderboard — participant + units + rank.
+///
+/// `Serialize` so the handler can return it directly as JSON.
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct HypeTrainLeaderRow {
+    pub participant_id: uuid::Uuid,
+    pub total_units: i64,
+    pub rank: i64,
+}
+
+impl HypeTrainRepo {
+    /// Completed/expired sessions for a stream, newest first, paginated.
+    ///
+    /// Filters to the terminal states (`completed` / `expired`) so callers get
+    /// the historical list and not the currently-active session.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the query.
+    pub async fn list_for_stream(
+        &self,
+        stream: Ulid,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Vec<HypeTrainSession>, sqlx::Error> {
+        let sql = format!(
+            "SELECT {SESSION_COLUMNS}
+               FROM hype_train_sessions
+              WHERE stream_id = $1 AND state IN ('completed', 'expired')
+              ORDER BY started_at DESC
+              LIMIT $2 OFFSET $3"
+        );
+        let rows = sqlx::query_as::<_, SessionRow>(&sql)
+            .bind(Uuid::from_u128(stream.0))
+            .bind(limit.max(1).min(100))
+            .bind(offset.max(0))
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.into_iter().map(row_to_session).collect())
+    }
+
+    /// Top contributors for a single session, ranked by total units
+    /// (RANK OVER ORDER BY SUM(units) DESC), limited to the top `limit` rows.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the query.
+    pub async fn session_leaderboard(
+        &self,
+        session_id: uuid::Uuid,
+        limit: i64,
+    ) -> Result<Vec<HypeTrainLeaderRow>, sqlx::Error> {
+        sqlx::query_as::<_, HypeTrainLeaderRow>(
+            r"SELECT participant_id,
+                     SUM(units)::bigint AS total_units,
+                     RANK() OVER (ORDER BY SUM(units) DESC)::bigint AS rank
+               FROM hype_train_contributions
+              WHERE session_id = $1
+              GROUP BY participant_id
+              ORDER BY total_units DESC
+              LIMIT $2",
+        )
+        .bind(session_id)
+        .bind(limit.max(1).min(100))
+        .fetch_all(&self.pool)
+        .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

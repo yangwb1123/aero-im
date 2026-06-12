@@ -17,12 +17,13 @@ use aero_auth::AuthUser;
 use aero_common::{Error as AeroError, ParticipantId, StreamEvent};
 use aero_storage::HypeTrainRepo;
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     routing::get,
     Json, Router,
 };
 use time::OffsetDateTime;
 use ulid::Ulid;
+use uuid::Uuid;
 
 use crate::error::ApiResult;
 use crate::state::AppState;
@@ -30,7 +31,13 @@ use crate::state::AppState;
 /// Mount the hype-train read route, folded into the main router by
 /// [`crate::routes::build`].
 pub fn routes() -> Router<AppState> {
-    Router::new().route("/api/streams/:id/hype-train", get(get_hype_train))
+    Router::new()
+        .route("/api/streams/:id/hype-train", get(get_hype_train))
+        .route("/api/streams/:id/hype-train/history", get(hype_train_history))
+        .route(
+            "/api/hype-train-sessions/:id/leaderboard",
+            get(session_leaderboard),
+        )
 }
 
 fn parse_stream(s: &str) -> Result<Ulid, AeroError> {
@@ -55,6 +62,67 @@ async fn get_hype_train(
         .await
         .map_err(AeroError::from)?;
     Ok(Json(serde_json::json!({ "hype_train": session })))
+}
+
+/// Parse a session id from the URL path (a UUID string).
+fn parse_session_id(s: &str) -> Result<Uuid, AeroError> {
+    s.trim()
+        .parse::<Uuid>()
+        .map_err(|e| AeroError::Invalid(format!("session id: {e}")))
+}
+
+#[derive(serde::Deserialize)]
+struct Pagination {
+    #[serde(default = "default_limit")]
+    limit: i64,
+    #[serde(default)]
+    offset: i64,
+}
+
+fn default_limit() -> i64 {
+    20
+}
+
+#[derive(serde::Deserialize)]
+struct LeaderboardQuery {
+    #[serde(default = "default_leaderboard_limit")]
+    limit: i64,
+}
+
+fn default_leaderboard_limit() -> i64 {
+    10
+}
+
+/// `GET /api/streams/:id/hype-train/history?limit=20&offset=0` — completed/expired
+/// hype-train sessions for the stream, newest first. Any authenticated viewer may read.
+async fn hype_train_history(
+    State(s): State<AppState>,
+    _auth: AuthUser,
+    Path(id_str): Path<String>,
+    Query(pg): Query<Pagination>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let stream = parse_stream(&id_str)?;
+    let sessions = repo(&s)
+        .list_for_stream(stream, pg.limit, pg.offset)
+        .await
+        .map_err(AeroError::from)?;
+    Ok(Json(serde_json::json!({ "sessions": sessions })))
+}
+
+/// `GET /api/hype-train-sessions/:id/leaderboard?limit=10` — top contributors for a
+/// single hype-train session, ranked by total units contributed.
+async fn session_leaderboard(
+    State(s): State<AppState>,
+    _auth: AuthUser,
+    Path(id_str): Path<String>,
+    Query(q): Query<LeaderboardQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let session_id = parse_session_id(&id_str)?;
+    let leaderboard = repo(&s)
+        .session_leaderboard(session_id, q.limit)
+        .await
+        .map_err(AeroError::from)?;
+    Ok(Json(serde_json::json!({ "leaderboard": leaderboard })))
 }
 
 /// Hook the gift path: feed `qty` units into `stream`'s hype train (started fresh

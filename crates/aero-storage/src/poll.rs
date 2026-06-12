@@ -71,10 +71,25 @@ impl PollRepo {
         options: &[String],
         multi: bool,
     ) -> Result<PollId, sqlx::Error> {
+        self.create_with_opts(room, created_by, question, options, multi, false).await
+    }
+
+    /// Like [`create`](Self::create) but accepts the `anonymous` flag controlling
+    /// whether voter identities are hidden in the tally. Backed by
+    /// `migrations/0096_polls_anonymous.sql`.
+    pub async fn create_with_opts(
+        &self,
+        room: RoomId,
+        created_by: ParticipantId,
+        question: &str,
+        options: &[String],
+        multi: bool,
+        anonymous: bool,
+    ) -> Result<PollId, sqlx::Error> {
         let id = PollId::new();
         sqlx::query(
-            r"INSERT INTO polls (id, room_id, created_by, question, options, multi, created_at)
-               VALUES ($1, $2, $3, $4, $5, $6, now())",
+            r"INSERT INTO polls (id, room_id, created_by, question, options, multi, anonymous, created_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, now())",
         )
         .bind(id.to_uuid())
         .bind(room.to_uuid())
@@ -82,6 +97,7 @@ impl PollRepo {
         .bind(question)
         .bind(sqlx::types::Json(options))
         .bind(multi)
+        .bind(anonymous)
         .execute(&self.pool)
         .await?;
         Ok(id)
@@ -90,7 +106,7 @@ impl PollRepo {
     /// Fetch a poll by id, or `None` if it does not exist.
     pub async fn get(&self, poll: PollId) -> Result<Option<Poll>, sqlx::Error> {
         let row = sqlx::query_as::<_, PollRow>(
-            r"SELECT id, room_id, created_by, question, options, multi, closed_at, created_at
+            r"SELECT id, room_id, created_by, question, options, multi, anonymous, closed_at, created_at
                FROM polls WHERE id = $1",
         )
         .bind(poll.to_uuid())
@@ -235,6 +251,7 @@ struct PollRow {
     question: String,
     options: serde_json::Value,
     multi: bool,
+    anonymous: bool,
     closed_at: Option<time::OffsetDateTime>,
     created_at: time::OffsetDateTime,
 }
@@ -249,6 +266,7 @@ impl From<PollRow> for Poll {
             question: r.question,
             options,
             multi: r.multi,
+            anonymous: r.anonymous,
             closed_at: r.closed_at,
             created_at: r.created_at,
         }
