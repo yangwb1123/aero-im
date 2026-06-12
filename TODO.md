@@ -27,16 +27,19 @@
 
 ## P1 — depth / correctness edges
 
-- [ ] **STOP — legal-hold vs right-to-erasure.** `delete_participant` erases all
-  sender messages unconditionally; messages under an active legal hold should be
-  exempt (or the conflict resolved explicitly). Policy decision required.
-- [ ] End-to-end distributed tracing + SLO surfacing (ROADMAP 第五版 P0-二).
-- [ ] Agentic AI + knowledge-base direction (ROADMAP 第五版 P1).
-- [ ] Data-lifecycle / GDPR-correctness sweep audit (ROADMAP 第五版 P1).
+- [x] ~~**legal-hold vs right-to-erasure.**~~ Fixed 0a4be67 — erasure now exempts
+  messages under an active legal hold (GDPR Art. 17(3)(e)), mirroring the retention
+  sweep. Follow-up: complete erasure on hold-release (needs a deferred-erasure queue).
+- [ ] End-to-end distributed tracing + SLO surfacing (ROADMAP 第五版 P0-二). *Large.*
+- [ ] Agentic AI + knowledge-base direction (ROADMAP 第五版 P1). *Large.*
+- [ ] Data-lifecycle / GDPR-correctness sweep audit (ROADMAP 第五版 P1). Erasure
+  embedding + legal-hold gaps now closed; remaining: deferred-erasure-on-release queue.
 
 ## P2
 
-- [ ] Auth-abuse depth / poison-message DLQ for bus listeners (ROADMAP 第五版 P2).
+- [x] ~~poison-message loop for bus listeners.~~ Fixed 3613b24 — undecodable payloads
+  are ack-dropped (not nacked forever) + `aero_bus_poison_dropped_total` metric.
+- [ ] Auth-abuse depth (ROADMAP 第五版 P2). *Larger; rate-limit + lockout deepening.*
 
 ## Tech debt (see also DECISIONS.md)
 
