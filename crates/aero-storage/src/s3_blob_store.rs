@@ -253,6 +253,18 @@ impl BlobStore for S3BlobStore {
     fn key_for(&self, id: BlobId) -> String {
         format!("s3://{}/{}", self.cfg.bucket, Self::object_key(id))
     }
+
+    /// Reachability probe for readiness (ROADMAP 方向三): a GET on a sentinel key
+    /// that will not exist. `NotFound` means the bucket is reachable and the
+    /// credentials are valid — healthy. Any other error (network / 5xx / 403)
+    /// means the backend is unreachable or misconfigured, so the pod should leave
+    /// rotation. The caller (readiness probe) bounds this with its own timeout.
+    async fn health_check(&self) -> Result<(), BlobStoreError> {
+        match self.send("GET", "blobs/.healthcheck", &[]).await {
+            Ok(_) | Err(BlobStoreError::NotFound) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
 }
 
 // ---------------------------------------------------------- Backend switch

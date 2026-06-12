@@ -33,6 +33,15 @@ pub trait BlobStore: Send + Sync + 'static {
     async fn delete(&self, id: BlobId) -> Result<(), BlobStoreError>;
     /// Returns the storage key without reading anything.
     fn key_for(&self, id: BlobId) -> String;
+
+    /// Cheap reachability probe for readiness gating (ROADMAP 方向三). Defaults to
+    /// `Ok` — a local store backed by a directory created at startup is always
+    /// reachable. Remote backends (S3) override this with a lightweight check so
+    /// an outage pulls the pod from the load-balancer rotation instead of leaving
+    /// it "ready" while every attachment request 5xxs.
+    async fn health_check(&self) -> Result<(), BlobStoreError> {
+        Ok(())
+    }
 }
 
 /// Local-filesystem `BlobStore`.
@@ -103,6 +112,15 @@ mod tests {
         assert!(key.starts_with("local:"));
         let out = store.get(id).await.unwrap();
         assert_eq!(&out[..], b"hello");
+    }
+
+    #[tokio::test]
+    async fn local_fs_health_check_is_ok() {
+        // The local store is always reachable (dir created at construction), so
+        // the default health_check reports healthy — readiness never fails on it.
+        let tmp = tempdir();
+        let store = LocalFsBlobStore::new(&tmp).unwrap();
+        assert!(store.health_check().await.is_ok());
     }
 
     fn tempdir() -> PathBuf {

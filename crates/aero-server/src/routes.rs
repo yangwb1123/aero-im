@@ -519,6 +519,22 @@ async fn probe_deps(s: &AppState) -> (&'static str, &'static str, &'static str) 
     (pg, redis, nats)
 }
 
+/// Probe the blob backend's reachability for readiness gating (ROADMAP 方向三).
+/// The local FS store is always present, so only S3 can be remotely unreachable;
+/// a short timeout means a hung endpoint reads as `"timeout"` (not ready) rather
+/// than stalling the probe.
+async fn probe_blob(s: &AppState) -> &'static str {
+    if s.blob_backend != "s3" {
+        return "ok";
+    }
+    match tokio::time::timeout(std::time::Duration::from_secs(2), s.blob_store.health_check()).await
+    {
+        Ok(Ok(())) => "ok",
+        Ok(Err(_)) => "fail",
+        Err(_) => "timeout",
+    }
+}
+
 /// Legacy combined health endpoint (kept for backward-compat). Always 200; the
 /// body's `status` is `"ok"` only when every dependency probes healthy.
 async fn health(State(s): State<AppState>) -> Json<serde_json::Value> {
@@ -590,7 +606,8 @@ async fn health_ready(State(s): State<AppState>) -> impl IntoResponse {
         );
     }
     let (pg, redis, nats) = probe_deps(&s).await;
-    let deps_ok = pg == "ok" && redis == "ok" && nats == "ok";
+    let blob = probe_blob(&s).await;
+    let deps_ok = pg == "ok" && redis == "ok" && nats == "ok" && blob == "ok";
     let (status, state) = readiness_decision(false, deps_ok);
     (
         status,
@@ -600,6 +617,7 @@ async fn health_ready(State(s): State<AppState>) -> impl IntoResponse {
                 "postgres": pg,
                 "redis": redis,
                 "nats": nats,
+                "blob": blob,
             },
             "version": env!("CARGO_PKG_VERSION"),
         })),
