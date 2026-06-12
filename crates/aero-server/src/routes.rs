@@ -556,17 +556,46 @@ async fn health_live() -> impl IntoResponse {
     )
 }
 
+/// Pure readiness decision, split out so the policy is unit-testable without a
+/// live PG/Redis/NATS. Draining (graceful shutdown in progress) takes
+/// precedence: the pod must leave the LB rotation immediately, regardless of
+/// dependency health. Otherwise ready only when every dependency probed healthy.
+fn readiness_decision(shutting_down: bool, deps_ok: bool) -> (StatusCode, &'static str) {
+    if shutting_down {
+        (StatusCode::SERVICE_UNAVAILABLE, "draining")
+    } else if deps_ok {
+        (StatusCode::OK, "ready")
+    } else {
+        (StatusCode::SERVICE_UNAVAILABLE, "not_ready")
+    }
+}
+
 /// Readiness probe (k8s `readinessProbe`): 200 only when every dependency is
 /// reachable, else 503 so the pod is pulled from the load-balancer rotation
-/// until it recovers (without being restarted).
+/// until it recovers (without being restarted). During graceful shutdown it
+/// returns 503 `"draining"` immediately so the LB stops routing new traffic
+/// before the pod stops accepting (ROADMAP 方向三).
 async fn health_ready(State(s): State<AppState>) -> impl IntoResponse {
+    // Draining short-circuits the dependency probe — once shutdown has begun the
+    // answer is 503 regardless, and skipping the probe avoids needless backend
+    // calls during teardown.
+    if s.shutting_down.load(std::sync::atomic::Ordering::Relaxed) {
+        let (status, state) = readiness_decision(true, false);
+        return (
+            status,
+            Json(serde_json::json!({
+                "status": state,
+                "version": env!("CARGO_PKG_VERSION"),
+            })),
+        );
+    }
     let (pg, redis, nats) = probe_deps(&s).await;
-    let ready = pg == "ok" && redis == "ok" && nats == "ok";
-    let status = if ready { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
+    let deps_ok = pg == "ok" && redis == "ok" && nats == "ok";
+    let (status, state) = readiness_decision(false, deps_ok);
     (
         status,
         Json(serde_json::json!({
-            "status": if ready { "ready" } else { "not_ready" },
+            "status": state,
             "deps": {
                 "postgres": pg,
                 "redis": redis,
@@ -2193,6 +2222,25 @@ mod tests {
         let bytes = axum::body::to_bytes(resp.into_body(), 1 << 16).await.unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["status"], "ok");
+    }
+
+    #[test]
+    fn readiness_decision_draining_takes_precedence() {
+        // Draining → 503 regardless of dependency health.
+        assert_eq!(
+            readiness_decision(true, true),
+            (StatusCode::SERVICE_UNAVAILABLE, "draining")
+        );
+        assert_eq!(
+            readiness_decision(true, false),
+            (StatusCode::SERVICE_UNAVAILABLE, "draining")
+        );
+        // Not draining: ready iff every dependency is healthy.
+        assert_eq!(readiness_decision(false, true), (StatusCode::OK, "ready"));
+        assert_eq!(
+            readiness_decision(false, false),
+            (StatusCode::SERVICE_UNAVAILABLE, "not_ready")
+        );
     }
 
     #[test]

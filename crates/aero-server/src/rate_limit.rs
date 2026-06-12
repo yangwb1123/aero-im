@@ -12,7 +12,7 @@
 
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use aero_common::Error as AeroError;
 use axum::{
@@ -121,6 +121,48 @@ impl RateLimiter {
     pub fn tracked_clients(&self) -> usize {
         self.buckets.len()
     }
+
+    /// Evict idle buckets that have fully refilled, bounding memory (ROADMAP 方向三).
+    ///
+    /// Without this the keyed [`DashMap`] grows without bound under IP-spray —
+    /// a rotating source address mints a permanent bucket on each request — so
+    /// the limiter (a denial-of-service *defence*) becomes a memory-exhaustion
+    /// *vector*. A periodic caller sweeps idle entries.
+    ///
+    /// A bucket is dropped only when it has both refilled back to full
+    /// `capacity` at `now` **and** has been untouched for at least `idle_after`.
+    /// A fully-refilled bucket is byte-for-byte equivalent to one freshly
+    /// created on the next request (both start full), so dropping it cannot
+    /// change any future decision. A still-depleted bucket is always kept —
+    /// discarding one would reset it to full and let a slow abuser slip the
+    /// cap — making eviction **fail-safe toward enforcement**. Returns the
+    /// number of buckets removed.
+    pub fn sweep_idle(&self, now: Instant, idle_after: Duration) -> usize {
+        let before = self.buckets.len();
+        self.buckets.retain(|_, b| {
+            let elapsed = now.saturating_duration_since(b.last);
+            // Effective tokens after refill-to-`now`, capped at capacity.
+            let refilled = (b.tokens + elapsed.as_secs_f64() * self.rate).min(self.capacity);
+            // Keep while still rate-limited (not yet refilled) OR recently active.
+            refilled < self.capacity || elapsed < idle_after
+        });
+        before - self.buckets.len()
+    }
+}
+
+/// Operational endpoints that must **never** be rate-limited: the k8s
+/// liveness/readiness probes and the Prometheus scrape. Sharing the per-IP
+/// bucket with these would let an overload (NAT/ingress collapse many callers
+/// onto one source IP) 429 the *liveness* probe — k8s then kills the **healthy**
+/// pod, amplifying the outage — or the *readiness* probe (pulled from rotation),
+/// or `/metrics` (the dashboard goes blind exactly during the incident).
+/// Exact-match, so a future business route such as `/healthcheck` is never
+/// exempted by accident.
+const OPERATIONAL_PATHS: &[&str] = &["/health", "/health/live", "/health/ready", "/metrics"];
+
+/// Whether `path` is an operational endpoint exempt from rate limiting.
+fn is_operational_path(path: &str) -> bool {
+    OPERATIONAL_PATHS.contains(&path)
 }
 
 /// Auth endpoints that accept credentials — these get a stricter token bucket
@@ -155,6 +197,12 @@ pub async fn layer(
     request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
+    // Operational endpoints (probes, /metrics) bypass rate limiting entirely —
+    // see OPERATIONAL_PATHS. Checked before keying so an IP-flood cannot starve
+    // the liveness probe and get a healthy pod killed.
+    if is_operational_path(request.uri().path()) {
+        return Ok(next.run(request).await);
+    }
     let key = client_key(&state, &headers, connect_info.map(|ci| ci.0));
     let limiter = match request.uri().path() {
         "/api/auth/login" => &state.login_rate_limiter,
@@ -332,6 +380,59 @@ mod tests {
         assert!(!rl.check_at(key.clone(), t0 + Duration::from_secs(600)));
         // 20 minutes ⇒ exactly one token.
         assert!(rl.check_at(key, t0 + Duration::from_secs(1200)));
+    }
+
+    #[test]
+    fn sweep_evicts_only_fully_refilled_idle_buckets() {
+        // Capacity 2, 1 token/sec.
+        let rl = RateLimiter::new(RateLimitConfig { per_second: 1, burst: 2 });
+        let t0 = Instant::now();
+        let a = ip_key(1);
+        let b = ip_key(2);
+        // Both consume one token (now depleted to 1).
+        assert!(rl.check_at(a.clone(), t0));
+        assert!(rl.check_at(b.clone(), t0));
+        assert_eq!(rl.tracked_clients(), 2);
+
+        // Sweep immediately: neither idle (elapsed 0 < 5s) → both kept.
+        assert_eq!(rl.sweep_idle(t0, Duration::from_secs(5)), 0);
+        assert_eq!(rl.tracked_clients(), 2);
+
+        // 10s on: touch `a` so it is freshly active; `b` stays idle since t0 and
+        // would have refilled to capacity.
+        let t1 = t0 + Duration::from_secs(10);
+        assert!(rl.check_at(a.clone(), t1));
+        // `a` just touched (elapsed 0 < 5s) → kept; `b` idle 10s & full → evicted.
+        assert_eq!(rl.sweep_idle(t1, Duration::from_secs(5)), 1);
+        assert_eq!(rl.tracked_clients(), 1);
+    }
+
+    #[test]
+    fn sweep_keeps_depleted_buckets_even_when_idle() {
+        // A still-depleted bucket must survive a sweep — dropping it would reset
+        // it to full and let a slow abuser past the cap.
+        let rl = RateLimiter::with_rate(1.0 / 3600.0, 1.0); // 1/hour, capacity 1
+        let t0 = Instant::now();
+        let k = ip_key(3);
+        assert!(rl.check_at(k.clone(), t0)); // drains the only token
+        // 10 min later: idle past idle_after, but at 1/hour it has NOT refilled.
+        let t1 = t0 + Duration::from_secs(600);
+        assert_eq!(rl.sweep_idle(t1, Duration::from_secs(60)), 0);
+        assert_eq!(rl.tracked_clients(), 1);
+        // The retained bucket still enforces the limit.
+        assert!(!rl.check_at(k, t1));
+    }
+
+    #[test]
+    fn operational_paths_bypass_is_exact() {
+        assert!(is_operational_path("/health"));
+        assert!(is_operational_path("/health/live"));
+        assert!(is_operational_path("/health/ready"));
+        assert!(is_operational_path("/metrics"));
+        // Business routes and near-misses are NOT exempt.
+        assert!(!is_operational_path("/api/messages"));
+        assert!(!is_operational_path("/healthcheck"));
+        assert!(!is_operational_path("/metrics/extra"));
     }
 
     #[test]

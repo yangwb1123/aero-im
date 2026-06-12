@@ -412,6 +412,7 @@ async fn main() -> anyhow::Result<()> {
         topic_history: topic_history_repo,
         thread_read_state: thread_read_state_repo,
         blocks: aero_storage::BlockRepo::new(pg.clone()),
+        shutting_down: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
     // ---------- Message-retention sweep (ROADMAP 方向一 合规) ----------
     // Periodically soft-delete messages whose workspace set a retention window
@@ -1019,6 +1020,46 @@ async fn main() -> anyhow::Result<()> {
         .fallback_service(ServeDir::new(&cfg.server.web_dir))
         .layer(middleware);
 
+    // ---------- Rate-limiter idle-bucket sweep (ROADMAP 方向三) ----------
+    // The per-client token buckets are keyed by participant id or source IP and
+    // never shrink on their own; under IP-spray the map would grow unbounded
+    // (a DoS amplifier). A periodic sweep drops idle, fully-refilled buckets —
+    // which are equivalent to never-seen clients, so eviction is safe. Holds the
+    // shutdown token and exits cleanly on SIGTERM.
+    {
+        let sweep_state = state.clone();
+        let cancel = ai_shutdown.clone();
+        let sweep_secs = std::env::var("AERO_RATE_LIMIT_SWEEP_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(60)
+            .max(1);
+        let idle_secs = std::env::var("AERO_RATE_LIMIT_IDLE_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(600);
+        tokio::spawn(async move {
+            let idle = std::time::Duration::from_secs(idle_secs);
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(sweep_secs));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    () = cancel.cancelled() => break,
+                    _ = tick.tick() => {
+                        let now = std::time::Instant::now();
+                        let evicted = sweep_state.rate_limiter.sweep_idle(now, idle)
+                            + sweep_state.auth_rate_limiter.sweep_idle(now, idle)
+                            + sweep_state.login_rate_limiter.sweep_idle(now, idle)
+                            + sweep_state.forgot_rate_limiter.sweep_idle(now, idle);
+                        if evicted > 0 {
+                            tracing::debug!(evicted, "rate-limiter idle-bucket sweep");
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     let addr: SocketAddr = format!("{}:{}", cfg.server.host, cfg.server.port).parse()?;
     info!(%addr, "listening");
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -1033,14 +1074,34 @@ async fn main() -> anyhow::Result<()> {
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal(ai_shutdown.clone()))
+    .with_graceful_shutdown(shutdown_signal(
+        state.shutting_down.clone(),
+        std::time::Duration::from_secs(
+            std::env::var("AERO_SHUTDOWN_DRAIN_SECS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(5),
+        ),
+        ai_shutdown.clone(),
+    ))
     .await?;
     Ok(())
 }
 
-/// Wait for SIGTERM (unix) or Ctrl-C, log a message, then cancel the
-/// shared [`CancellationToken`] so all background workers exit cleanly.
-async fn shutdown_signal(ai_shutdown: tokio_util::sync::CancellationToken) {
+/// Wait for SIGTERM (unix) or Ctrl-C, flip readiness to draining, wait a grace
+/// period for the load-balancer to stop routing, then cancel the shared
+/// [`CancellationToken`] so all background workers exit cleanly (ROADMAP 方向三).
+///
+/// Order matters for zero-downtime deploys: `shutting_down` is set **before**
+/// the drain sleep so `/health/ready` returns 503 while the pod keeps serving
+/// in-flight traffic; only after the grace period (LB has observed the 503 and
+/// stopped sending new connections) does the function return, which lets axum
+/// stop accepting. `drain == 0` reproduces the previous immediate behaviour.
+async fn shutdown_signal(
+    shutting_down: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    drain: std::time::Duration,
+    ai_shutdown: tokio_util::sync::CancellationToken,
+) {
     let ctrl_c = async {
         tokio::signal::ctrl_c()
             .await
@@ -1064,6 +1125,16 @@ async fn shutdown_signal(ai_shutdown: tokio_util::sync::CancellationToken) {
     }
 
     tracing::info!("shutdown signal received, starting graceful shutdown");
+    // Flip readiness to 503 FIRST so the load-balancer pulls this pod from
+    // rotation, then wait for that to propagate before we stop accepting.
+    shutting_down.store(true, std::sync::atomic::Ordering::Relaxed);
+    if !drain.is_zero() {
+        tracing::info!(
+            drain_secs = drain.as_secs(),
+            "draining: /health/ready now 503, waiting before close"
+        );
+        tokio::time::sleep(drain).await;
+    }
     ai_shutdown.cancel(); // signal background tasks (AI worker, heartbeats, etc.)
 }
 

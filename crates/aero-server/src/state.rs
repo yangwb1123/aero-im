@@ -286,6 +286,13 @@ pub struct AppState {
     /// Forgot-password limiter — 3 / hour / client, throttles email enumeration
     /// and reset-mail spam (ROADMAP 方向三).
     pub forgot_rate_limiter: RateLimiter,
+    /// Set once graceful shutdown begins (SIGTERM/Ctrl-C). While set,
+    /// `/health/ready` returns 503 `"draining"` so the load-balancer pulls this
+    /// pod from rotation BEFORE it stops accepting connections — closing the
+    /// rolling-deploy race where new traffic lands on a tearing-down pod
+    /// (ROADMAP 方向三). `/health/live` stays 200 so the pod is drained, not
+    /// killed.
+    pub shutting_down: Arc<std::sync::atomic::AtomicBool>,
     /// Per-WORKSPACE request ceiling (ROADMAP3 方向五 — 租户公平): tier limits,
     /// the cluster-wide Redis window counter, and the room→workspace /
     /// workspace→tier TTL resolution caches. Enforced at the high-traffic
