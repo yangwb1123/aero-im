@@ -98,6 +98,11 @@ pub mod names {
     /// 30 s. A growing value means the consumer is falling behind — alerts when
     /// the AI worker is throttled or the WS fan-out can't keep up.
     pub const NATS_CONSUMER_PENDING_MESSAGES: &str = "aero_nats_consumer_pending_messages";
+    /// Counter: bus messages dropped because their payload could not be decoded by
+    /// any known schema. These are acked (not nacked) so a permanently-malformed
+    /// payload can't redeliver forever; a non-zero value flags a producer/schema
+    /// mismatch and should alert.
+    pub const BUS_POISON_DROPPED_TOTAL: &str = "aero_bus_poison_dropped_total";
     /// Gauge: AI jobs in `dead` status (exhausted retries). Non-zero means
     /// moderation / summarisation is silently failing; alert at threshold > 0.
     pub const AI_DEAD_LETTER_QUEUE_SIZE: &str = "aero_ai_dlq_size";

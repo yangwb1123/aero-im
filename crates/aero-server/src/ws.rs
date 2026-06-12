@@ -1076,8 +1076,14 @@ async fn handle_room_event_sub(state: &AppState, sub: Box<dyn aero_bus::Subscrip
                 let _ = sub.ack().await;
                 return;
             }
-            warn!(error = ?e, "bad envelope on bus");
-            let _ = sub.nack().await;
+            // Undecodable by any known schema (typed RoomEvent *and* legacy
+            // envelope both failed). That's a deterministic failure on the raw
+            // bytes — redelivery will never succeed — so ACK-drop it rather than
+            // nack, otherwise the durable consumer redelivers this poison message
+            // forever. The counter flags a producer/schema mismatch to alert on.
+            warn!(error = ?e, "bad envelope on bus — dropping (poison)");
+            metrics::inc_counter(names::BUS_POISON_DROPPED_TOTAL, 1);
+            let _ = sub.ack().await;
         }
     }
 }
@@ -1265,8 +1271,11 @@ pub async fn run_live_bus_listener(state: AppState) -> anyhow::Result<()> {
                     let _ = sub.ack().await;
                 }
                 Err(e) => {
-                    warn!(error = ?e, "bad StreamEvent on bus");
-                    let _ = sub.nack().await;
+                    // Poison payload (see run_bus_listener): ack-drop, never nack —
+                    // an undecodable StreamEvent will never decode on redelivery.
+                    warn!(error = ?e, "bad StreamEvent on bus — dropping (poison)");
+                    metrics::inc_counter(names::BUS_POISON_DROPPED_TOTAL, 1);
+                    let _ = sub.ack().await;
                 }
             }
         }
