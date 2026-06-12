@@ -540,17 +540,38 @@ async fn run_loop<Q, P>(
             continue;
         }
 
-        // Charge the GLOBAL budget for exactly the jobs we'll run. Conservative:
-        // free job kinds (e.g. Moderate, idempotent embed no-ops) also count, so the
-        // window is a strict upper bound on paid calls rather than an exact one.
-        let charged = budget.acquire_up_to(u32::try_from(runnable.len()).unwrap_or(u32::MAX));
-        tracing::debug!(claimed = runnable.len(), charged, "ai worker: batch claimed");
+        // Charge the GLOBAL budget per job by its cost WEIGHT (ROADMAP 方向四):
+        // an Answer consumes more of the window than a cheap Embed, so a tenant
+        // can't run a window full of maxed-out completions for the price of
+        // trivial embeds. A job the window can't currently afford is DEFERRED
+        // (not dropped, not failed) to the next window, making the window a true
+        // weighted cost ceiling rather than a flat call count. `try_acquire_n` is
+        // all-or-nothing, so a partially-affordable job is never half-charged.
+        let mut to_run = Vec::with_capacity(runnable.len());
+        for job in runnable {
+            let weight = cost_model.weight_for(job.kind);
+            if budget.try_acquire_n(weight) {
+                to_run.push(job);
+            } else if let Err(e) = queue.defer(job.id, defer_until).await {
+                tracing::warn!(error = %e, job = %job.id, "defer (global budget) failed; running");
+                to_run.push(job);
+            } else {
+                tracing::debug!(job = %job.id, weight, "deferred: global budget window exhausted");
+            }
+        }
+        if to_run.is_empty() {
+            if sleep_or_cancel(IDLE_SLEEP, shutdown).await {
+                return;
+            }
+            continue;
+        }
+        tracing::debug!(running = to_run.len(), "ai worker: batch claimed");
 
         // Queue-depth gauge: reflect the outstanding (claimed, not-yet-terminal)
         // work for this process. It rises with the claimed batch and returns to 0
         // once the batch has drained.
-        ai_metrics::set_queue_depth(reg, runnable.len());
-        process_batch(queue, proc, &sem, runnable, reg, cost_model, shutdown).await;
+        ai_metrics::set_queue_depth(reg, to_run.len());
+        process_batch(queue, proc, &sem, to_run, reg, cost_model, shutdown).await;
         ai_metrics::set_queue_depth(reg, 0);
     }
 }
@@ -753,7 +774,18 @@ mod tests {
 
     /// Default cost model for tests that don't assert on cost.
     fn test_cost() -> CostModel {
-        CostModel::default()
+        // Uniform per-kind cost so the budget-gating tests below stay COUNT-based
+        // (every kind weighs 1 unit); the weighted-enforcement behaviour is
+        // covered separately by `weighted_budget_defers_expensive_jobs` with the
+        // tiered default model.
+        CostModel {
+            embed_micros: 20,
+            summarize_micros: 20,
+            moderate_micros: 20,
+            answer_micros: 20,
+            input_micros_per_mtok: 3_000_000,
+            output_micros_per_mtok: 15_000_000,
+        }
     }
 
     // ---------- existing parse/payload tests ----------
@@ -1311,6 +1343,50 @@ mod tests {
             out.contains("\naero_ai_queue_depth 0\n"),
             "queue depth should settle to 0:\n{out}"
         );
+    }
+
+    #[tokio::test]
+    async fn weighted_budget_defers_expensive_jobs() {
+        // ROADMAP 方向四 enforcement: with the TIERED cost model, an Answer weighs
+        // 5 units. A 5-unit window therefore admits exactly ONE Answer — whereas
+        // a flat call-count budget of 5 would have run both. The second is
+        // deferred (not dropped), proving the window is a weighted COST ceiling.
+        let jobs: Vec<AiJob> =
+            vec![mk_job(AiJobKind::Answer, 1), mk_job(AiJobKind::Answer, 1)];
+        let queue = FakeQueue::with_jobs(jobs);
+        let proc = OkCounter::new();
+        let budget = CostBudget::new(5, Duration::from_secs(3600));
+        let cfg = WorkerConfig {
+            max_concurrency: 4,
+            max_calls_per_window: 5,
+            max_calls_per_window_per_workspace: u32::MAX,
+            budget_window: Duration::from_secs(3600),
+        };
+        let shutdown = CancellationToken::new();
+        // Tiered model (NOT the uniform test_cost): Answer weighs 5 units.
+        let cost = CostModel::default();
+
+        let token = shutdown.clone();
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            token.cancel();
+        });
+        run_loop(&queue, &proc, &budget, &unlimited_keyed(), cfg, &test_reg(), &cost, &shutdown)
+            .await;
+        handle.await.unwrap();
+
+        assert_eq!(
+            proc.ran.load(Ordering::SeqCst),
+            1,
+            "one Answer (weight 5) fills the whole 5-unit window"
+        );
+        assert_eq!(budget.available(), 0, "Answer consumed the full weighted window");
+        assert_eq!(
+            queue.count_status(AiJobStatus::Queued),
+            1,
+            "the second Answer is deferred to a later window, not run or dropped"
+        );
+        assert_eq!(queue.count_status(AiJobStatus::Dead), 0);
     }
 
     #[tokio::test]

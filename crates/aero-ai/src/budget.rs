@@ -62,6 +62,20 @@ impl State {
         grant
     }
 
+    /// Consume exactly `n` units iff that many remain this window (all-or-
+    /// nothing); returns whether granted. Unlike [`Self::acquire_up_to`], a
+    /// partial amount is never consumed — used for weighted charging where an
+    /// unaffordable job must be deferred, not half-charged.
+    fn try_acquire_n(&mut self, now: Instant, window: Duration, max: u32, n: u32) -> bool {
+        self.roll_if_elapsed(now, window);
+        if max.saturating_sub(self.used) >= n {
+            self.used = self.used.saturating_add(n);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Units consumed in the current window, accounting for an elapsed roll-over
     /// (without mutating: a stale window reads as empty).
     fn used_now(&self, now: Instant, window: Duration) -> u32 {
@@ -132,6 +146,19 @@ impl CostBudget {
         let now = self.clock.now();
         let mut st = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         st.acquire_up_to(now, self.window, self.max_per_window, n)
+    }
+
+    /// Atomically consume `n` units iff the current window has at least `n`
+    /// remaining (all-or-nothing); returns whether granted. Used by the worker to
+    /// charge a job's cost WEIGHT and defer the job when the window can't afford
+    /// it (ROADMAP 方向四). `n == 0` is always granted and consumes nothing.
+    pub fn try_acquire_n(&self, n: u32) -> bool {
+        if n == 0 {
+            return true;
+        }
+        let now = self.clock.now();
+        let mut st = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        st.try_acquire_n(now, self.window, self.max_per_window, n)
     }
 
     /// Units remaining in the current window without consuming any.
@@ -374,6 +401,23 @@ mod tests {
         assert_eq!(b.acquire_up_to(10), 2, "clamped to remaining");
         assert_eq!(b.available(), 0);
         assert_eq!(b.acquire_up_to(4), 0, "nothing left this window");
+    }
+
+    #[test]
+    fn try_acquire_n_is_all_or_nothing() {
+        let (b, _clk) = budget_with(5, Duration::from_secs(60));
+        // Affordable amount is consumed in full.
+        assert!(b.try_acquire_n(3));
+        assert_eq!(b.available(), 2);
+        // An amount larger than what remains is REFUSED and consumes nothing —
+        // so a partially-affordable weighted job is deferred, not half-charged.
+        assert!(!b.try_acquire_n(3));
+        assert_eq!(b.available(), 2, "refused request must not consume");
+        // Exactly-remaining is granted; zero is always granted and free.
+        assert!(b.try_acquire_n(2));
+        assert_eq!(b.available(), 0);
+        assert!(b.try_acquire_n(0));
+        assert!(!b.try_acquire_n(1));
     }
 
     #[test]

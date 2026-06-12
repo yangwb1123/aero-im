@@ -143,6 +143,23 @@ impl CostModel {
         }
     }
 
+    /// Relative cost WEIGHT charged to the per-window AI budget for a job of
+    /// `kind` (ROADMAP 方向四). Buckets the per-kind micros estimate into small
+    /// integer tiers so the window becomes a cost-weighted ceiling rather than a
+    /// flat call count: a tenant can no longer run a window full of maxed-out
+    /// completions for the same budget as trivial embeds. Floored at 1 so every
+    /// job costs something. With the default model: Embed=1, Moderate=2,
+    /// Summarize=3, Answer=5.
+    #[must_use]
+    pub fn weight_for(&self, kind: AiJobKind) -> u32 {
+        match self.micros_for(kind) {
+            0..=100 => 1,
+            101..=1_500 => 2,
+            1_501..=4_000 => 3,
+            _ => 5,
+        }
+    }
+
     /// REAL micro-USD cost from actual `(input_tokens, output_tokens)`.
     ///
     /// `cost = input * input_rate / 1M + output * output_rate / 1M`, computed in
@@ -384,6 +401,18 @@ mod tests {
             out.contains(r#"aero_ai_cost_micros_total{kind="summarize"} 0"#),
             "zero-token cost must record a zero series:\n{out}"
         );
+    }
+
+    #[test]
+    fn weight_for_orders_kinds_by_cost_and_floors_at_one() {
+        let m = CostModel::default();
+        // Every kind costs at least one unit, and the expensive completions
+        // outweigh the cheap embed — so the window is a weighted ceiling (方向四).
+        assert!(m.weight_for(AiJobKind::Embed) >= 1);
+        assert!(m.weight_for(AiJobKind::Answer) > m.weight_for(AiJobKind::Embed));
+        assert!(m.weight_for(AiJobKind::Summarize) > m.weight_for(AiJobKind::Embed));
+        assert!(m.weight_for(AiJobKind::Answer) >= m.weight_for(AiJobKind::Summarize));
+        assert!(m.weight_for(AiJobKind::Moderate) >= m.weight_for(AiJobKind::Embed));
     }
 
     #[test]
