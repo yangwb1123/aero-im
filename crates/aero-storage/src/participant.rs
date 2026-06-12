@@ -140,7 +140,8 @@ impl ParticipantRepo {
     /// 1. Mark `participants.deleted_at = NOW()` — keeps the row for FK integrity.
     /// 2. Overwrite every non-deleted message the participant sent with a
     ///    `[deleted]` placeholder, clear `searchable_text`, and null the pgvector
-    ///    `embedding` (a semantic vector is re-identifiable) (GDPR Art. 17).
+    ///    `embedding` (a semantic vector is re-identifiable) (GDPR Art. 17) —
+    ///    EXCEPT messages under an active legal hold (Art. 17(3)(e)).
     /// 3. Revoke all active `auth_sessions` so existing tokens stop working.
     ///
     /// Returns `true` when the account existed and was freshly soft-deleted,
@@ -184,12 +185,28 @@ impl ParticipantRepo {
         // (a nearest-neighbour search reconstructs what was "erased"), so clearing
         // blocks/searchable_text without it leaves erasure incomplete. Mirrors the
         // soft-delete / retention-sweep paths (message.rs:101,154 / workspace.rs:826).
+        //
+        // EXEMPT messages under an active legal hold: GDPR Art. 17(3)(e) — erasure
+        // does not apply to data that must be retained for legal claims. Mirrors the
+        // retention sweep's exemption (workspace.rs:835). A hold covers a specific
+        // room, or (room_id IS NULL) the whole workspace. NOTE: holds that release
+        // *after* erasure leave these messages un-erased — completing erasure on
+        // hold release is a deferred follow-up (would need an erasure queue).
         sqlx::query(
-            r#"UPDATE messages
+            r#"UPDATE messages m
                SET blocks          = '[{"type":"text","text":"[deleted]"}]'::jsonb,
                    searchable_text = '',
                    embedding       = NULL
-               WHERE sender_id = $1 AND deleted_at IS NULL"#,
+               WHERE m.sender_id = $1
+                 AND m.deleted_at IS NULL
+                 AND NOT EXISTS (
+                       SELECT 1 FROM rooms r
+                        JOIN legal_holds lh
+                          ON lh.active
+                         AND (lh.room_id = r.id
+                              OR (lh.room_id IS NULL AND lh.workspace_id = r.workspace_id))
+                        WHERE r.id = m.room_id
+                     )"#,
         )
         .bind(participant_id.to_uuid())
         .execute(&mut *tx)
@@ -535,5 +552,74 @@ mod db_tests {
 
         assert_eq!(searchable, "", "searchable_text cleared by erasure");
         assert!(embedding_is_null, "embedding must be nulled by erasure (re-identifiable)");
+    }
+
+    /// A message in a room under an active legal hold survives GDPR erasure
+    /// (Art. 17(3)(e)); a message in an unheld room is erased. Guards the erasure
+    /// UPDATE's legal-hold exemption (mirrors the retention sweep).
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn erasure_exempts_legal_held_messages() {
+        let p = pool();
+        let messages = MessageRepo::new(p.clone());
+        let participants = ParticipantRepo::new(p.clone());
+
+        let sender = participant(&p).await;
+        let held_room = room(&p, sender).await;
+        let free_room = room(&p, sender).await;
+
+        let held = messages
+            .insert(NewMessage {
+                room_id: held_room,
+                sender_id: sender,
+                blocks: vec![Block::text("preserved under legal hold")],
+                reply_to: None,
+                metadata: serde_json::json!({}),
+                expires_at: None,
+            })
+            .await
+            .expect("held msg");
+        let free = messages
+            .insert(NewMessage {
+                room_id: free_room,
+                sender_id: sender,
+                blocks: vec![Block::text("erase me")],
+                reply_to: None,
+                metadata: serde_json::json!({}),
+                expires_at: None,
+            })
+            .await
+            .expect("free msg");
+
+        // Place an active legal hold over `held_room` (default all-zero workspace).
+        sqlx::query(
+            "INSERT INTO legal_holds (id, workspace_id, room_id, reason, created_by) \
+             VALUES ($1, $2, $3, 'eDiscovery', $4)",
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(WorkspaceId(ulid::Ulid(0)).to_uuid())
+        .bind(held_room.to_uuid())
+        .bind(sender.to_uuid())
+        .execute(&p)
+        .await
+        .expect("place hold");
+
+        assert!(participants.delete_participant(sender).await.expect("erase"));
+
+        let held_text: String =
+            sqlx::query_scalar("SELECT searchable_text FROM messages WHERE id = $1")
+                .bind(held.id.to_uuid())
+                .fetch_one(&p)
+                .await
+                .expect("reload held");
+        let free_text: String =
+            sqlx::query_scalar("SELECT searchable_text FROM messages WHERE id = $1")
+                .bind(free.id.to_uuid())
+                .fetch_one(&p)
+                .await
+                .expect("reload free");
+
+        assert_eq!(held_text, "preserved under legal hold", "held message must NOT be erased");
+        assert_eq!(free_text, "", "unheld message must be erased");
     }
 }
