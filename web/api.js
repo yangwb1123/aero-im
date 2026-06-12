@@ -134,6 +134,14 @@ export const api = {
   listReceipts(roomId) {
     return request('GET', `/api/rooms/${encodeURIComponent(roomId)}/receipts`);
   },
+  // Messages edited or deleted since the RFC3339 `since` instant — the
+  // change-replay companion to listMessages's NEW-message backfill, so a client
+  // that was offline during an edit/delete converges on it (ROADMAP 方向一).
+  roomChanges(roomId, since, { limit = 200 } = {}) {
+    return request('GET', `/api/rooms/${encodeURIComponent(roomId)}/changes`, {
+      query: { since, limit },
+    });
+  },
   search(roomId, { query, limit = 20, mode = 'auto' } = {}) {
     return request('POST', `/api/rooms/${encodeURIComponent(roomId)}/search`, {
       body: { query, limit, mode },

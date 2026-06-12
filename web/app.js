@@ -35,6 +35,7 @@ const state = {
   // ROADMAP v3 方向一: last-applied edit timestamp per message id, so an older
   // Edited event redelivered out of order never clobbers a newer edit.
   lastEditAt: new Map(),      // message_id -> epoch ms of the applied edit
+  lastChangeSync: new Map(),  // room_id -> RFC3339 of the last edit/delete replay sync
   resyncInFlight: false,      // collapse bursts of server `resync` frames
   // Call
   call: null,
@@ -249,7 +250,16 @@ function hookWs() {
     else els.wsDot.classList.add('ws-down');
     els.wsDot.title = `WS: ${s}`;
   });
-  ws.on('open', () => { if (state.currentRoomId) ws.joinRoom(state.currentRoomId); });
+  ws.on('open', () => {
+    if (!state.currentRoomId) return;
+    ws.joinRoom(state.currentRoomId);
+    // Re-watch live streams that survived the disconnect (ROADMAP 方向一): the
+    // server drops a participant's stream subscriptions when the socket closes,
+    // so without this danmaku/gifts/viewer-count die silently after any blip.
+    for (const sid of state.watchedStreams) ws.watchStream(sid);
+    // Replay edits/deletes that happened while we were disconnected.
+    replayChanges(state.currentRoomId);
+  });
   ws.on('msg:message', (f) => handleIncomingMessage(f.message));
   ws.on('msg:edited', (f) => handleEdited(f.message));
   ws.on('msg:deleted', (f) => handleDeleted(f));
@@ -446,9 +456,38 @@ function handleEdited(m) {
   if (ts) state.lastEditAt.set(m.id, ts);
   const arr = state.messagesByRoom.get(m.room_id) || [];
   const idx = arr.findIndex((x) => x.id === m.id);
-  if (idx >= 0) arr[idx] = m;
+  if (idx >= 0) {
+    // Resurrect guard (ROADMAP 方向一): a stale Edited arriving AFTER a Delete
+    // (out-of-order redelivery, or a change-replay that interleaves with the
+    // live stream) must not bring a deleted message back onto the screen.
+    if (arr[idx].deleted_at) return;
+    arr[idx] = m;
+  }
   state.messagesByRoom.set(m.room_id, arr);
   if (m.room_id === state.currentRoomId) replaceNodeForMsg(m.id, m);
+}
+
+/// Apply one change-replay row: a tombstone (populated `deleted_at`) removes the
+/// message, otherwise it is treated as an edit. Reuses the live handlers so the
+/// resurrect guard and out-of-order edit guard apply identically (ROADMAP 方向一).
+function applyChange(m) {
+  if (!m?.id || !m?.room_id) return;
+  if (m.deleted_at) handleDeleted({ room_id: m.room_id, message_id: m.id });
+  else handleEdited(m);
+}
+
+/// On reconnect, replay edits/deletes that landed while we were offline: the
+/// message backfill (`?since=<id>`) only returns NEW messages, never mutations
+/// to messages the client already holds (ROADMAP 方向一). Best-effort.
+async function replayChanges(roomId) {
+  const since = state.lastChangeSync.get(roomId);
+  if (!since) return;
+  // Advance the cursor first so a slow reply can't widen the next window.
+  state.lastChangeSync.set(roomId, new Date().toISOString());
+  try {
+    const changes = await api.roomChanges(roomId, since, { limit: 200 });
+    for (const m of changes || []) applyChange(m);
+  } catch { /* a failed replay just leaves the view as-is until next reconnect */ }
 }
 
 function handleDeleted(f) {
@@ -641,6 +680,9 @@ async function switchRoom(roomId) {
   clearLiveCards(); // unwatch streams from the room we're leaving
   state.currentRoomId = roomId;
   clearUnread(roomId);
+  // Seed the change-replay cursor: on the next reconnect we replay edits/deletes
+  // that landed after this moment (ROADMAP 方向一).
+  state.lastChangeSync.set(roomId, new Date().toISOString());
   setActiveRoomVisual();
   const room = state.rooms.get(roomId);
   els.roomName.textContent = room?.name || `Room ${roomId.slice(0, 6)}…`;
