@@ -283,6 +283,7 @@ fn event_kind(event: &RoomEvent) -> &'static str {
         RoomEvent::Read { .. } => "read",
         RoomEvent::Typing { .. } => "typing",
         RoomEvent::Notify { .. } => "notify",
+        RoomEvent::NotifyBatch { .. } => "notify",
         RoomEvent::Pin { .. } => "pin",
         RoomEvent::Membership { .. } => "membership",
         RoomEvent::Poll { .. } => "poll",

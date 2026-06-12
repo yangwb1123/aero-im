@@ -360,6 +360,16 @@ pub enum NotificationKind {
     Reaction,
 }
 
+/// One recipient of a [`RoomEvent::NotifyBatch`] — who to notify and why.
+/// Server-internal only; the receiving node expands each into an individual
+/// `notify` frame, so a client never sees the other recipients.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NotifyTarget {
+    pub participant: ParticipantId,
+    #[serde(rename = "notify_kind")]
+    pub kind: NotificationKind,
+}
+
 impl NotificationKind {
     /// Lowercase DB/wire token.
     #[must_use]
@@ -778,6 +788,18 @@ pub enum RoomEvent {
         #[serde(rename = "notify_kind")]
         kind: NotificationKind,
     },
+    /// A batch of per-recipient notifications for ONE message, published as a
+    /// SINGLE bus event that the receiving node expands into one targeted
+    /// `Notify`-shaped frame per recipient. Collapses a broadcast `@everyone`
+    /// from O(N) NATS publishes to one (ROADMAP 方向二). Server-internal: never
+    /// delivered to clients verbatim — each recipient still receives an ordinary
+    /// `notify` frame, so no client change is needed and recipients stay private.
+    NotifyBatch {
+        room_id: RoomId,
+        message_id: MessageId,
+        by: ParticipantId,
+        recipients: Vec<NotifyTarget>,
+    },
     /// A message was pinned or unpinned. Fans out to the whole room so every
     /// member's pinned-panel stays in sync.
     Pin {
@@ -832,6 +854,9 @@ impl RoomEvent {
         match self {
             RoomEvent::Message(e) => e.recipients.clone(),
             RoomEvent::Notify { mentioned, .. } => vec![*mentioned],
+            RoomEvent::NotifyBatch { recipients, .. } => {
+                recipients.iter().map(|t| t.participant).collect()
+            }
             RoomEvent::Call(CallEvent::Invite { to, .. }) => to.clone(),
             RoomEvent::Call(
                 CallEvent::Answer { to, .. }
@@ -853,6 +878,7 @@ impl RoomEvent {
             | RoomEvent::Read { room_id, .. }
             | RoomEvent::Typing { room_id, .. }
             | RoomEvent::Notify { room_id, .. }
+            | RoomEvent::NotifyBatch { room_id, .. }
             | RoomEvent::Pin { room_id, .. }
             | RoomEvent::Membership { room_id, .. }
             | RoomEvent::Poll { room_id, .. }
@@ -999,6 +1025,26 @@ impl UserStatus {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn notify_batch_accessors_expose_all_recipients_and_room() {
+        let room = RoomId::new();
+        let a = ParticipantId::new();
+        let b = ParticipantId::new();
+        let ev = RoomEvent::NotifyBatch {
+            room_id: room,
+            message_id: MessageId::new(),
+            by: ParticipantId::new(),
+            recipients: vec![
+                NotifyTarget { participant: a, kind: NotificationKind::Mention },
+                NotifyTarget { participant: b, kind: NotificationKind::Reply },
+            ],
+        };
+        // Fan-out targets every recipient (not just one), and the room resolves —
+        // so the bus listener delivers to all of them (ROADMAP 方向二).
+        assert_eq!(ev.explicit_recipients(), vec![a, b]);
+        assert_eq!(ev.room_id(), Some(room));
+    }
 
     #[test]
     fn block_text_roundtrip() {

@@ -978,6 +978,28 @@ pub async fn run_bus_listener(state: AppState) -> anyhow::Result<()> {
             });
         match parsed {
             Ok((event, seq)) => {
+                // NotifyBatch (ROADMAP 方向二) is published once for the whole
+                // recipient set; expand it here into one targeted `notify` frame
+                // per recipient so each client receives an ordinary frame and
+                // never sees the others. Equivalent to the old per-recipient
+                // Notify publishes, minus the O(N) NATS traffic.
+                if let RoomEvent::NotifyBatch { room_id, message_id, by, recipients } = &event {
+                    for target in recipients {
+                        let frame = room_event_to_frame_json(
+                            &RoomEvent::Notify {
+                                room_id: *room_id,
+                                message_id: *message_id,
+                                mentioned: target.participant,
+                                by: *by,
+                                kind: target.kind,
+                            },
+                            seq,
+                        );
+                        state.hub.fan_out_raw(&[target.participant], &frame);
+                    }
+                    let _ = sub.ack().await;
+                    continue;
+                }
                 let room = event.room_id();
                 let recipients = match event.explicit_recipients() {
                     list if !list.is_empty() => list,
@@ -1245,6 +1267,15 @@ fn room_event_to_frame_json(event: &RoomEvent, seq: Option<u64>) -> String {
         }
         RoomEvent::Notify { room_id, message_id, mentioned, by, kind } => {
             ServerFrame::Notify { room_id, message_id, mentioned, by, notify_kind: kind }
+        }
+        // Unreachable in practice: the bus listener expands NotifyBatch into one
+        // per-recipient Notify frame before calling this. Mapped defensively to
+        // the first recipient's Notify so the conversion stays total.
+        RoomEvent::NotifyBatch { room_id, message_id, by, recipients } => {
+            let (mentioned, notify_kind) = recipients
+                .first()
+                .map_or((by, NotificationKind::Mention), |t| (t.participant, t.kind));
+            ServerFrame::Notify { room_id, message_id, mentioned, by, notify_kind }
         }
         RoomEvent::Pin { room_id, message_id, by, op } => {
             ServerFrame::Pin { room_id, message_id, by, op }

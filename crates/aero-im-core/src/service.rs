@@ -12,7 +12,8 @@ use aero_bus::traits::BusError;
 use aero_bus::EventBus;
 use aero_common::{
     Block, CallEvent, CallId, CallKind, CallMode, CallSession, Error, MembershipOp, Message,
-    MessageEnvelope, MessageId, NotificationKind, ParticipantId, ReactionOp, ReactionSummary,
+    MessageEnvelope, MessageId, NotificationKind, NotifyTarget, ParticipantId, ReactionOp,
+    ReactionSummary,
     ReadReceipt, Result, Room, RoomEvent, RoomId, RoomKind, WorkspaceId, WorkspaceRole,
 };
 use aero_common::{PinOp, PinnedMessage};
@@ -24,7 +25,6 @@ use aero_storage::{
     WorkspaceMuteRepo, WorkspaceNotifDefaultsRepo, WorkspaceRepo,
 };
 use async_trait::async_trait;
-use futures::StreamExt;
 use std::collections::BTreeMap;
 use tracing::{instrument, warn, Instrument};
 
@@ -34,12 +34,6 @@ use crate::seq::{LocalSeqProvider, SeqProvider};
 use crate::validation::validate_blocks;
 
 const EVENTS_SUBJECT: &str = "im.events";
-
-/// Max in-flight per-recipient `Notify` publishes inside the detached
-/// notification-dispatch task. Bounds the NATS pipelining for a large-room
-/// `@everyone` fan-out (ROADMAP 第三版 方向四): concurrent enough to drain 10k
-/// publishes quickly, bounded so one send can't monopolize bus connections.
-const NOTIFY_PUBLISH_CONCURRENCY: usize = 32;
 
 /// Whether a workspace member holding `role` may create a channel (room) in that
 /// workspace. Members and above may; guests may not. Pure decision function so it
@@ -1886,24 +1880,27 @@ impl ImService {
             warn!(?err, %room, count = notifiable.len(), "batch persist notifications failed");
             return;
         }
-        // Targeted live hints: one Notify per recipient (the WS layer routes each
-        // to its single recipient via `explicit_recipients` — push_bot consumes
-        // them individually), published with bounded concurrency instead of
-        // strictly serially. Best-effort; runs inside the detached dispatch task,
-        // off the send hot path.
-        futures::stream::iter(notifiable.into_iter().map(|(recipient, kind)| {
-            let event = RoomEvent::Notify {
-                room_id: room,
-                message_id: message.id,
-                mentioned: recipient,
-                by: sender,
-                kind,
-            };
-            async move { self.publish_room_event(room, &event).await }
-        }))
-        .buffer_unordered(NOTIFY_PUBLISH_CONCURRENCY)
-        .for_each(|()| std::future::ready(()))
-        .await;
+        // Targeted live hints: ONE NotifyBatch for the whole recipient set instead
+        // of N separate publishes (ROADMAP 方向二). The receiving node expands it
+        // into one targeted `notify` frame per recipient, so the WS layer and
+        // push_bot behave exactly as before — collapsing a broadcast @everyone
+        // from O(N) NATS messages to one. Best-effort; off the send hot path.
+        let recipients: Vec<NotifyTarget> = notifiable
+            .into_iter()
+            .map(|(participant, kind)| NotifyTarget { participant, kind })
+            .collect();
+        if !recipients.is_empty() {
+            self.publish_room_event(
+                room,
+                &RoomEvent::NotifyBatch {
+                    room_id: room,
+                    message_id: message.id,
+                    by: sender,
+                    recipients,
+                },
+            )
+            .await;
+        }
     }
 
     /// Publish a room event to the bus (cross-node fan-out).

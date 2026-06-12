@@ -38,7 +38,8 @@ pub use live::{
 };
 pub use model::{
     message_has_action, Block, Blob, CallEvent, CallId, CallKind, CallMode, CallSession, FileKind,
-    MembershipOp, Message, MessageEnvelope, Notification, NotificationKind, Participant,
+    MembershipOp, Message, MessageEnvelope, Notification, NotificationKind, NotifyTarget,
+    Participant,
     ParticipantKind, PinOp, PinnedMessage, Poll, PollOp, PollTally, Presence, ReactionOp,
     ReactionSummary, Reaction, ReadReceipt, Room, RoomEvent, RoomKind, RoomUnread, SelectOption,
     Span, SpanStyle, Stream, StreamProtocol, StreamStatus, ThreadSummary, UserStatus, Vod,

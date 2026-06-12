@@ -44,12 +44,24 @@ pub async fn run(state: AppState) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("push_bot subscribe: {e}"))?;
     info!("push_bot listener started");
     while let Some(sub) = stream.next().await {
-        if let Ok(RoomEvent::Notify { message_id, mentioned, by, kind, .. }) =
-            serde_json::from_slice::<RoomEvent>(sub.payload())
-        {
-            if let Err(e) = handle(&state, message_id, mentioned, by, kind).await {
-                warn!(error = ?e, "push_bot handle failed");
+        match serde_json::from_slice::<RoomEvent>(sub.payload()) {
+            Ok(RoomEvent::Notify { message_id, mentioned, by, kind, .. }) => {
+                if let Err(e) = handle(&state, message_id, mentioned, by, kind).await {
+                    warn!(error = ?e, "push_bot handle failed");
+                }
             }
+            // Batched notify (ROADMAP 方向二): push each recipient individually,
+            // exactly as the old per-recipient Notify events did.
+            Ok(RoomEvent::NotifyBatch { message_id, by, recipients, .. }) => {
+                for target in recipients {
+                    if let Err(e) =
+                        handle(&state, message_id, target.participant, by, target.kind).await
+                    {
+                        warn!(error = ?e, "push_bot handle failed");
+                    }
+                }
+            }
+            _ => {}
         }
         let _ = sub.ack().await;
     }
