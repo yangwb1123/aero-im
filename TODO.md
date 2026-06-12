@@ -32,8 +32,10 @@
   sweep. Follow-up: complete erasure on hold-release (needs a deferred-erasure queue).
 - [ ] End-to-end distributed tracing + SLO surfacing (ROADMAP 第五版 P0-二). *Large.*
 - [ ] Agentic AI + knowledge-base direction (ROADMAP 第五版 P1). *Large.*
-- [ ] Data-lifecycle / GDPR-correctness sweep audit (ROADMAP 第五版 P1). Erasure
-  embedding + legal-hold gaps now closed; remaining: deferred-erasure-on-release queue.
+- [x] ~~Data-lifecycle / GDPR-correctness sweep audit (ROADMAP 第五版 P1).~~ Direction
+  CLOSED: embedding erasure (984bffc) + legal-hold exemption (0a4be67) + deferred-
+  erasure-on-release sweep (219aca5). Erasure is now complete, hold-aware, and
+  eventually-consistent across hold releases.
 
 ## P2
 
