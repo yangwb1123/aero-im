@@ -21,11 +21,10 @@
   mints `Ulid::new()` + bare INSERT with no idempotency key; a retried gift RPC
   double-charges. Needs schema (idempotency-key column / unique constraint) +
   public `Idempotency-Key` header → interface+schema change → confirm before build.
-- [ ] **auto-safe — bus-listener reconnect black hole.** `ws.rs:~969`
-  `run_bus_listener` / `run_live_bus_listener` loop `while let Some(x) =
-  stream.next()`; on a NATS reconnect the subscription stream ends and the loop
-  exits permanently → that process stops fan-out (silent total delivery outage).
-  Wrap in an outer resubscribe/backoff loop. No interface/schema change. **Next round.**
+- [x] ~~**bus-listener reconnect black hole.** `run_bus_listener` /
+  `run_live_bus_listener` returned permanently when the NATS stream ended on a
+  reconnect → silent total fan-out outage.~~ Fixed e5f1fb1 — outer resubscribe loop
+  (1s backoff); durable cursor preserves at-least-once. See DECISIONS.md ADR-003.
 - [x] ~~GDPR erasure left message `embedding` populated (re-identifiable).~~
   Fixed 984bffc — `embedding = NULL` in `delete_participant` + live-verified db-test.
 
@@ -49,3 +48,6 @@
 - **Medium:** dev DB frozen at migration 32 — drift from the 125-migration HEAD
   masks any fresh-deploy schema bug.
 - **Low:** db-tests are `#[ignore]`-only; no automated live-PG lane.
+- **Medium:** no test-AppState harness in aero-server — its 286 lib tests are all
+  pure-function, so background tasks (bus listeners, sweeps) and full route flows
+  have no unit coverage. Blocks e.g. a resubscribe regression test for ADR-003.

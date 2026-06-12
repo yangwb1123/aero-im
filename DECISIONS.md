@@ -43,3 +43,25 @@
   schedule **B** as a follow-up once product confirms the canonical tier model.
   Either way: add a CI job that replays `migrations/*.sql` against a scratch DB so
   the chain is execution-validated, not just compile-embedded.
+
+## ADR-003 — Bus listeners resubscribe across NATS reconnects
+
+- **Date:** 2026-06-13
+- **Status:** ACCEPTED (implemented, commit e5f1fb1)
+- **Decision:** `run_bus_listener` / `run_live_bus_listener` wrap their
+  subscribe + consume loop in an outer `loop` that re-subscribes (1s backoff) when
+  the subscription stream ends or a subscribe fails, instead of returning.
+- **Reason:** The stream ends on a NATS reconnect/drop; the old code returned
+  `Ok(())`, the boot-time task terminated, and nothing re-spawned it — the process
+  silently stopped all room/stream fan-out with no error. A resubscribe loop is the
+  standard durable-consumer pattern.
+- **Impact:** The room listener's durable consumer (`aero-server`) resumes from its
+  committed cursor → at-least-once preserved across reconnects. The live listener is
+  ephemeral by design (broadcast; a few dropped danmaku across a reconnect are
+  immaterial) but its loop now survives. Backoff is non-zero so a hard-down NATS
+  can't spin a tight loop.
+- **Alternatives:** Crash the process on stream-end and rely on an orchestrator to
+  restart (rejected — drops every other in-process listener/session); per-task
+  supervisor that re-spawns (rejected — heavier, same effect as the inline loop).
+- **Test gap:** no regression test — `run_bus_listener` needs a full `AppState` and
+  aero-server has no test-AppState harness (see TODO.md tech debt).
