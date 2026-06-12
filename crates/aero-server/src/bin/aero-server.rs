@@ -227,10 +227,16 @@ async fn main() -> anyhow::Result<()> {
 
     // Spawn the embed/summarize/answer worker.
     let ai_shutdown = CancellationToken::new();
+    // Track every background task so shutdown can DRAIN them with a bounded grace
+    // period instead of dropping them mid-write the instant main() returns
+    // (ROADMAP 方向三). Tasks that honour `ai_shutdown` stop and are awaited
+    // quickly; any that don't are abandoned once the grace elapses, so shutdown
+    // can never hang. `tracker.spawn` is a drop-in for `tokio::spawn`.
+    let tracker = tokio_util::task::TaskTracker::new();
     {
         let svc = ai_service.clone();
         let cancel = ai_shutdown.clone();
-        tokio::spawn(async move {
+        tracker.spawn(async move {
             AiWorker::new(svc).run(cancel).await;
         });
     }
@@ -247,7 +253,7 @@ async fn main() -> anyhow::Result<()> {
     {
         let repo = streams.clone();
         let live_cfg = live_cfg.clone();
-        tokio::spawn(async move {
+        tracker.spawn(async move {
             let handle = spawn_rtmp_ingest(repo, live_cfg);
             if let Err(e) = handle.await {
                 tracing::warn!(error = ?e, "rtmp ingest task ended");
@@ -286,7 +292,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         let srt_bandwidth = srt.max_bandwidth();
-        tokio::spawn(async move {
+        tracker.spawn(async move {
             // Mirror the RTMP block precisely: a bind/run error is a WARN, never
             // a panic — the gateway continues serving HTTP/WS/RTMP regardless.
             if let Err(e) = srt.run(repo, srt_cfg).await {
@@ -437,7 +443,7 @@ async fn main() -> anyhow::Result<()> {
             info!("retention sweep disabled (AERO__SERVER__RETENTION_SWEEP_SECS=0)");
         } else {
             info!(interval_secs = sweep_secs, "retention sweep enabled");
-            tokio::spawn(async move {
+            tracker.spawn(async move {
                 let mut tick =
                     tokio::time::interval(std::time::Duration::from_secs(sweep_secs));
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -540,7 +546,7 @@ async fn main() -> anyhow::Result<()> {
             info!("call-route heartbeat disabled (AERO_CALL_ROUTE_HEARTBEAT_SECS=0)");
         } else {
             info!(interval_secs = secs, "call-route heartbeat enabled");
-            tokio::spawn(async move {
+            tracker.spawn(async move {
                 let mut tick = tokio::time::interval(std::time::Duration::from_secs(secs));
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 tick.tick().await; // skip the immediate first tick
@@ -590,7 +596,7 @@ async fn main() -> anyhow::Result<()> {
             info!("stream-route heartbeat disabled (AERO_STREAM_ROUTE_HEARTBEAT_SECS=0)");
         } else {
             info!(interval_secs = secs, "stream-route heartbeat enabled");
-            tokio::spawn(async move {
+            tracker.spawn(async move {
                 let mut tick = tokio::time::interval(std::time::Duration::from_secs(secs));
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 tick.tick().await; // skip the immediate first tick
@@ -638,7 +644,7 @@ async fn main() -> anyhow::Result<()> {
     {
         let pool = pg.clone();
         let whip_reg = state.whip.clone();
-        tokio::spawn(async move {
+        tracker.spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
@@ -664,7 +670,7 @@ async fn main() -> anyhow::Result<()> {
     // ---------- AI dead-letter queue size gauge (ROADMAP 方向五) ----------
     {
         let dlq_pool = pg.clone();
-        tokio::spawn(async move {
+        tracker.spawn(async move {
             // Emit one gauge series per job kind so an operator can see WHICH AI
             // workflow (moderation vs summarisation vs …) is dead-lettering.
             const KINDS: &[&str] = &["embed", "summarize", "moderate", "answer"];
@@ -692,7 +698,7 @@ async fn main() -> anyhow::Result<()> {
     // can see if the AI worker or WS fan-out is falling behind.
     {
         let js_pending = jetstream.clone();
-        tokio::spawn(async move {
+        tracker.spawn(async move {
             // Pairs of (stream, consumer) to monitor.
             const CONSUMERS: &[(&str, &str)] = &[
                 ("IM_MESSAGES",  "aero-server"),  // WS fan-out
@@ -726,7 +732,7 @@ async fn main() -> anyhow::Result<()> {
     {
         let gc_repo = aero_storage::BlobGcRepo::new(pg.clone());
         let blob_store_gc = state.blob_store.clone();
-        tokio::spawn(async move {
+        tracker.spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
@@ -757,7 +763,7 @@ async fn main() -> anyhow::Result<()> {
     {
         let state_clone = state.clone();
         let cancel = ai_shutdown.clone();
-        tokio::spawn(async move {
+        tracker.spawn(async move {
             aero_server::me_export::run_export_dispatcher(state_clone, cancel, 15).await;
         });
     }
@@ -765,7 +771,7 @@ async fn main() -> anyhow::Result<()> {
     // ---------- Bus listener ----------
     {
         let state_clone = state.clone();
-        tokio::spawn(async move {
+        tracker.spawn(async move {
             if let Err(e) = ws::run_bus_listener(state_clone).await {
                 tracing::error!(error = ?e, "bus listener exited");
             }
@@ -775,7 +781,7 @@ async fn main() -> anyhow::Result<()> {
     // ---------- Live bus listener (danmaku / gifts / viewers) ----------
     {
         let state_clone = state.clone();
-        tokio::spawn(async move {
+        tracker.spawn(async move {
             if let Err(e) = ws::run_live_bus_listener(state_clone).await {
                 tracing::error!(error = ?e, "live bus listener exited");
             }
@@ -788,7 +794,7 @@ async fn main() -> anyhow::Result<()> {
     {
         let state_clone = state.clone();
         let cancel = ai_shutdown.clone();
-        tokio::spawn(async move {
+        tracker.spawn(async move {
             aero_server::scheduled::run_scheduled_dispatcher(state_clone, cancel).await;
         });
     }
@@ -799,7 +805,7 @@ async fn main() -> anyhow::Result<()> {
     {
         let recurring_repo = RecurringMessageRepo::new(state.pg.clone());
         let im_clone = state.im.clone();
-        tokio::spawn(async move {
+        tracker.spawn(async move {
             aero_server::recurring::run_recurring_dispatcher(recurring_repo, im_clone, 30).await;
         });
     }
@@ -812,7 +818,7 @@ async fn main() -> anyhow::Result<()> {
     {
         let state_clone = state.clone();
         let cancel = ai_shutdown.clone();
-        tokio::spawn(async move {
+        tracker.spawn(async move {
             aero_server::digests::run_digest_dispatcher(state_clone, cancel).await;
         });
     }
@@ -824,7 +830,7 @@ async fn main() -> anyhow::Result<()> {
         let pg_sampler = state.pg.clone();
         let viewers = state.stream_viewers.clone();
         let stream_repo = state.streams.clone();
-        tokio::spawn(async move {
+        tracker.spawn(async move {
             aero_server::stream_analytics::run_viewer_sampler(pg_sampler, viewers, stream_repo).await;
         });
     }
@@ -840,7 +846,7 @@ async fn main() -> anyhow::Result<()> {
         let jobs_bf = AiJobRepo::new(pg.clone());
         let rooms_bf = RoomRepo::new(pg.clone());
         let cancel = ai_shutdown.clone();
-        tokio::spawn(async move {
+        tracker.spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(300));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
@@ -884,7 +890,7 @@ async fn main() -> anyhow::Result<()> {
     // webhooks via the real reqwest sender — best-effort, logs non-2xx/transport.
     {
         let state_clone = state.clone();
-        tokio::spawn(async move {
+        tracker.spawn(async move {
             if let Err(e) = aero_server::webhooks::run_webhook_dispatcher(state_clone).await {
                 tracing::error!(error = ?e, "webhook dispatcher exited");
             }
@@ -896,7 +902,7 @@ async fn main() -> anyhow::Result<()> {
     // exponential backoff; exhausted ones land in the DLQ (admin: webhook_admin).
     {
         let state_clone = state.clone();
-        tokio::spawn(async move {
+        tracker.spawn(async move {
             aero_server::webhooks::run_webhook_retry_loop(state_clone, 30).await;
         });
     }
@@ -905,7 +911,7 @@ async fn main() -> anyhow::Result<()> {
     {
         let state_clone = state.clone();
         let ai = ai_service.clone();
-        tokio::spawn(async move {
+        tracker.spawn(async move {
             if let Err(e) = aero_server::agent_bot::run(state_clone, ai).await {
                 tracing::error!(error = ?e, "agent_bot listener exited");
             }
@@ -917,7 +923,7 @@ async fn main() -> anyhow::Result<()> {
     // active out-of-office status, posts their OOO message back once per sender.
     {
         let state_clone = state.clone();
-        tokio::spawn(async move {
+        tracker.spawn(async move {
             if let Err(e) = aero_server::ooo_bot::run(state_clone).await {
                 tracing::error!(error = ?e, "ooo_bot listener exited");
             }
@@ -930,7 +936,7 @@ async fn main() -> anyhow::Result<()> {
     // configured — with push disabled it would be inert anyway.
     if state.push.any_enabled() {
         let state_clone = state.clone();
-        tokio::spawn(async move {
+        tracker.spawn(async move {
             if let Err(e) = aero_server::push_bot::run(state_clone).await {
                 tracing::error!(error = ?e, "push_bot listener exited");
             }
@@ -943,7 +949,7 @@ async fn main() -> anyhow::Result<()> {
     // "stream_live" activity-feed entry to each of the creator's followers.
     {
         let state_clone = state.clone();
-        tokio::spawn(async move {
+        tracker.spawn(async move {
             if let Err(e) = aero_server::golive_bot::run(state_clone).await {
                 tracing::error!(error = ?e, "golive_bot listener exited");
             }
@@ -954,7 +960,7 @@ async fn main() -> anyhow::Result<()> {
     {
         let state_clone = state.clone();
         let ai = ai_service.clone();
-        tokio::spawn(async move {
+        tracker.spawn(async move {
             if let Err(e) = aero_server::transcribe_bot::run(state_clone, ai).await {
                 tracing::error!(error = ?e, "transcribe_bot listener exited");
             }
@@ -964,7 +970,7 @@ async fn main() -> anyhow::Result<()> {
     // ---------- AI content moderation (opt-in: AERO_AI_MODERATION) ----------
     if std::env::var("AERO_AI_MODERATION").is_ok() {
         let state_clone = state.clone();
-        tokio::spawn(async move {
+        tracker.spawn(async move {
             if let Err(e) = aero_server::moderation_bot::run(state_clone).await {
                 tracing::error!(error = ?e, "moderation_bot listener exited");
             }
@@ -978,7 +984,7 @@ async fn main() -> anyhow::Result<()> {
     if std::env::var("AERO_UNFURL").is_ok() {
         let state_clone = state.clone();
         let cache = aero_storage::UnfurlRepo::new(pg.clone());
-        tokio::spawn(async move {
+        tracker.spawn(async move {
             if let Err(e) = aero_server::unfurl_bot::run(state_clone, cache).await {
                 tracing::error!(error = ?e, "unfurl_bot listener exited");
             }
@@ -1059,7 +1065,7 @@ async fn main() -> anyhow::Result<()> {
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(600);
-        tokio::spawn(async move {
+        tracker.spawn(async move {
             let idle = std::time::Duration::from_secs(idle_secs);
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(sweep_secs));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -1106,6 +1112,27 @@ async fn main() -> anyhow::Result<()> {
         ai_shutdown.clone(),
     ))
     .await?;
+
+    // serve() has returned: SIGTERM was handled, in-flight HTTP drained, and
+    // `ai_shutdown` already cancelled inside `shutdown_signal`. Now DRAIN the
+    // background tasks with a bounded grace period (ROADMAP 方向三) — tasks that
+    // honour the token finish their in-flight iteration and are awaited; any that
+    // don't are abandoned once the grace elapses, so shutdown can never hang.
+    tracker.close();
+    let drain = std::time::Duration::from_secs(
+        std::env::var("AERO_TASK_DRAIN_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(10),
+    );
+    if tokio::time::timeout(drain, tracker.wait()).await.is_err() {
+        tracing::warn!(
+            drain_secs = drain.as_secs(),
+            "background task drain timed out; abandoning still-running tasks"
+        );
+    } else {
+        tracing::info!("background tasks drained cleanly");
+    }
     Ok(())
 }
 
