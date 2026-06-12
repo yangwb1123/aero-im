@@ -1921,6 +1921,24 @@ impl ImService {
     ///   retries, re-inserting the already-persisted message. The publish-error
     ///   counter (alertable) is the correct operational signal; the data path
     ///   self-heals via backfill.
+    /// Announce a server-initiated message deletion (retention / ephemeral
+    /// sweep) to a room's live and reconnecting clients. The interactive delete
+    /// path already emits [`RoomEvent::Deleted`]; the periodic sweeps bypassed
+    /// it, leaving burn-after-reading and compliance-deleted messages visibly
+    /// rendered until a manual reload (ROADMAP 方向一). `by` is the nil
+    /// "system" participant, since there is no human actor.
+    pub async fn announce_message_deleted(&self, room: RoomId, message_id: MessageId) {
+        self.publish_room_event(
+            room,
+            &RoomEvent::Deleted {
+                room_id: room,
+                message_id,
+                by: ParticipantId::nil(),
+            },
+        )
+        .await;
+    }
+
     async fn publish_room_event(&self, room: RoomId, event: &RoomEvent) {
         let subject = Self::room_subject(room);
         // Publish-time seq stamp (ROADMAP 第三版 方向一): mint the per-room seq

@@ -41,6 +41,15 @@ macro_rules! define_id {
             pub fn from_uuid(u: uuid::Uuid) -> Self {
                 Self(Ulid(u.as_u128()))
             }
+
+            /// The all-zero id — a stable sentinel for a "system" / "none" actor,
+            /// e.g. the `by` field of a server-initiated deletion (retention /
+            /// ephemeral sweep), which has no human actor. Distinct from
+            /// [`Self::new`], which mints a fresh random id every call.
+            #[must_use]
+            pub fn nil() -> Self {
+                Self(Ulid(0))
+            }
         }
 
         impl Default for $name {
@@ -411,6 +420,15 @@ mod tests {
         let u: uuid::Uuid = id.into();
         let back = MessageId::from_uuid(u);
         assert_eq!(id, back);
+    }
+
+    #[test]
+    fn nil_id_is_stable_zero_and_distinct_from_new() {
+        // Stable across calls (a usable sentinel), zero-valued, and never equal
+        // to a freshly minted random id.
+        assert_eq!(ParticipantId::nil(), ParticipantId::nil());
+        assert_eq!(ParticipantId::nil().to_uuid(), uuid::Uuid::nil());
+        assert_ne!(ParticipantId::nil(), ParticipantId::new());
     }
 
     #[test]

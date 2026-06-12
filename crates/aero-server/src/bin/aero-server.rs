@@ -425,6 +425,9 @@ async fn main() -> anyhow::Result<()> {
         let workspaces = state.workspaces.clone();
         let messages_repo = state.messages.clone();
         let stream_mod_pool = state.pg.clone();
+        // ImService handle so the sweep can fan out RoomEvent::Deleted to live +
+        // reconnecting clients (ROADMAP 方向一).
+        let sweep_im = state.im.clone();
         let cancel = ai_shutdown.clone();
         let sweep_secs = std::env::var("AERO__SERVER__RETENTION_SWEEP_SECS")
             .ok()
@@ -456,8 +459,17 @@ async fn main() -> anyhow::Result<()> {
                                 Err(e) => warn!(error = ?e, "retention sweep failed"),
                             }
                             match messages_repo.sweep_ephemeral().await {
-                                Ok(0) => {}
-                                Ok(n) => info!(swept = n, "ephemeral sweep hard-deleted expired messages"),
+                                Ok(deleted) if deleted.is_empty() => {}
+                                Ok(deleted) => {
+                                    let n = deleted.len();
+                                    // Fan out a Deleted event per swept message so
+                                    // burn-after-reading messages vanish from live
+                                    // and reconnecting clients (ROADMAP 方向一).
+                                    for (message_id, room_id) in deleted {
+                                        sweep_im.announce_message_deleted(room_id, message_id).await;
+                                    }
+                                    info!(swept = n, "ephemeral sweep hard-deleted expired messages");
+                                }
                                 Err(e) => warn!(error = ?e, "ephemeral sweep failed"),
                             }
                             // Temp-ban expiry sweep (migration 0108): hard-delete

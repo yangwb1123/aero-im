@@ -1002,13 +1002,22 @@ impl MessageRepo {
     /// Hard-delete all messages whose `expires_at` is not null and has already
     /// passed. Returns the number of rows deleted. Called by the retention-sweep
     /// background task; errors are logged by the caller, never panicked.
-    pub async fn sweep_ephemeral(&self) -> Result<u64, sqlx::Error> {
-        let rows = sqlx::query(
-            "DELETE FROM messages WHERE expires_at IS NOT NULL AND expires_at < NOW()",
+    /// Hard-delete messages whose `expires_at` has passed, returning the
+    /// `(message_id, room_id)` of each removed row so the caller can fan out a
+    /// [`aero_common::RoomEvent::Deleted`] per message (ROADMAP 方向一):
+    /// burn-after-reading messages must actually disappear from live and
+    /// reconnecting clients, not linger on screen until a manual reload.
+    pub async fn sweep_ephemeral(&self) -> Result<Vec<(MessageId, RoomId)>, sqlx::Error> {
+        let rows: Vec<(uuid::Uuid, uuid::Uuid)> = sqlx::query_as(
+            "DELETE FROM messages WHERE expires_at IS NOT NULL AND expires_at < NOW() \
+             RETURNING id, room_id",
         )
-        .execute(&self.pool)
+        .fetch_all(&self.pool)
         .await?;
-        Ok(rows.rows_affected())
+        Ok(rows
+            .into_iter()
+            .map(|(id, room)| (MessageId::from_uuid(id), RoomId::from_uuid(room)))
+            .collect())
     }
 }
 
@@ -1624,9 +1633,11 @@ mod db_tests {
             .await
             .expect("insert future");
 
-        // sweep_ephemeral must delete exactly 1 row (the expired one).
+        // sweep_ephemeral must delete exactly 1 row (the expired one) and return
+        // its (message_id, room_id) so the caller can announce the deletion.
         let deleted = repo.sweep_ephemeral().await.expect("sweep");
-        assert_eq!(deleted, 1, "exactly one row hard-deleted");
+        assert_eq!(deleted.len(), 1, "exactly one row hard-deleted");
+        assert_eq!(deleted[0].0, expired.id, "returns the expired message id");
 
         // The expired message is gone.
         let gone = repo.get(expired.id).await.expect("get expired");
