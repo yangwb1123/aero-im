@@ -367,10 +367,15 @@ async fn main() -> anyhow::Result<()> {
         .filter(|s| !s.trim().is_empty());
     let bridge_factory: Arc<dyn UpstreamFactory> =
         Arc::new(NodeRtpPullerFactory::new(bridge_advertise_host, bridge_secret));
+    // One subscriber registry shared between the supervisor's egress relays (which
+    // read send targets) and the subscribe endpoint via AppState (which writes).
+    let bridge_subscribers =
+        aero_server::call_bridge_supervisor::BridgeSubscriberRegistry::default();
     let call_supervisor = Arc::new(CallBridgeSupervisor::new(
         sfu_router.clone(),
         sfu_forwarder.clone(),
         bridge_factory,
+        bridge_subscribers.clone(),
     ));
 
     let state = AppState {
@@ -429,7 +434,7 @@ async fn main() -> anyhow::Result<()> {
         thread_read_state: thread_read_state_repo,
         blocks: aero_storage::BlockRepo::new(pg.clone()),
         shutting_down: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        bridge_subscribers: aero_server::call_bridge_supervisor::BridgeSubscriberRegistry::default(),
+        bridge_subscribers,
     };
     // ---------- Message-retention sweep (ROADMAP 方向一 合规) ----------
     // Periodically soft-delete messages whose workspace set a retention window

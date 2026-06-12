@@ -354,10 +354,21 @@ pub struct CallBridgeSupervisor {
     router: SfuRouter,
     forwarder: Arc<dyn MediaForwarder>,
     factory: Arc<dyn UpstreamFactory>,
-    /// `(call, normalized peer_url) -> running bridge task`.
+    /// Puller subscriptions, shared with the subscribe control endpoint; each
+    /// call's egress relay reads its send targets from here (ROADMAP 方向五).
+    subscribers: BridgeSubscriberRegistry,
+    /// `(call, normalized peer_url) -> running bridge task` (the PULL side).
     active: Arc<Mutex<HashMap<(CallId, String), BridgeTask>>>,
+    /// `call -> running egress relay task` (the PUSH side; one per call).
+    egress: Arc<Mutex<HashMap<CallId, EgressTask>>>,
     /// Source of per-task ids (see [`BridgeTask::id`]).
     next_id: Arc<AtomicU64>,
+}
+
+/// One running egress relay task plus its cancellation handle.
+struct EgressTask {
+    cancel: CancellationToken,
+    handle: JoinHandle<()>,
 }
 
 impl CallBridgeSupervisor {
@@ -368,14 +379,58 @@ impl CallBridgeSupervisor {
         router: SfuRouter,
         forwarder: Arc<dyn MediaForwarder>,
         factory: Arc<dyn UpstreamFactory>,
+        subscribers: BridgeSubscriberRegistry,
     ) -> Self {
         Self {
             router,
             forwarder,
             factory,
+            subscribers,
             active: Arc::new(Mutex::new(HashMap::new())),
+            egress: Arc::new(Mutex::new(HashMap::new())),
             next_id: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// Ensure a single running egress relay for `call` (ROADMAP 方向五): it taps
+    /// `tap` — the call's locally-published RTP — and pushes each packet to the
+    /// call's current cross-node subscribers (resolved from the shared registry).
+    /// Idempotent: with a relay already running this is a no-op and the new `tap`
+    /// is dropped. Returns whether a NEW relay was spawned.
+    ///
+    /// The owning node calls this when a local publisher is active in a call that
+    /// has (or gains) remote subscribers; `tap` comes from the call's
+    /// [`CallEgress`](aero_live_webrtc::CallEgress), which the SFU forward path
+    /// feeds. The relay tears down with the call via [`cancel_call`](Self::cancel_call).
+    pub async fn ensure_egress(&self, call: CallId, tap: CallEgressTap) -> bool {
+        if self.egress.lock().contains_key(&call) {
+            return false;
+        }
+        let sender = match UdpRtpEgress::bind(call, self.subscribers.clone()).await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(?e, %call, "call-bridge: egress bind failed");
+                return false;
+            }
+        };
+        let cancel = CancellationToken::new();
+        let handle = tokio::spawn(sender.run(tap, cancel.clone()));
+        let mut map = self.egress.lock();
+        // Race guard: another task may have registered while we bound; if so,
+        // cancel ours rather than double-relaying.
+        if map.contains_key(&call) {
+            cancel.cancel();
+            handle.abort();
+            return false;
+        }
+        map.insert(call, EgressTask { cancel, handle });
+        true
+    }
+
+    /// Whether an egress relay is running for `call`.
+    #[must_use]
+    pub fn has_egress(&self, call: CallId) -> bool {
+        self.egress.lock().contains_key(&call)
     }
 
     /// Number of bridge tasks currently registered for `call`.
@@ -491,6 +546,12 @@ impl CallBridgeSupervisor {
             task.handle.abort();
             debug!(%call, %peer, "call-bridge: torn down");
         }
+        // Tear down the call's egress relay (the push side) too, if any.
+        if let Some(eg) = self.egress.lock().remove(&call) {
+            eg.cancel.cancel();
+            eg.handle.abort();
+            debug!(%call, "call-bridge: egress relay torn down");
+        }
         if n > 0 {
             debug!(%call, count = n, "call-bridge: all bridges for call cancelled");
         }
@@ -588,7 +649,63 @@ mod tests {
     fn supervisor(factory: Arc<dyn UpstreamFactory>) -> (CallBridgeSupervisor, SfuRouter) {
         let router = SfuRouter::new();
         let fwd: Arc<dyn MediaForwarder> = Arc::new(NullForwarder);
-        (CallBridgeSupervisor::new(router.clone(), fwd, factory), router)
+        let sup = CallBridgeSupervisor::new(
+            router.clone(),
+            fwd,
+            factory,
+            BridgeSubscriberRegistry::default(),
+        );
+        (sup, router)
+    }
+
+    /// The PUSH side end-to-end (ROADMAP 方向五): the supervisor spawns a per-call
+    /// egress relay that pushes the call's locally-published RTP to subscribed
+    /// pullers; idempotent; torn down with the call. Only the SFU feeding the
+    /// CallEgress with real browser RTP is staging — here it is published directly.
+    #[tokio::test]
+    async fn ensure_egress_relays_published_rtp_and_tears_down() {
+        use aero_live_webrtc::CallEgress;
+
+        let registry = BridgeSubscriberRegistry::default();
+        let sup = CallBridgeSupervisor::new(
+            SfuRouter::new(),
+            Arc::new(NullForwarder) as Arc<dyn MediaForwarder>,
+            ScriptedFactory::refusing(),
+            registry.clone(),
+        );
+        let call = CallId::new();
+
+        // A puller subscribes its receive address.
+        let mut puller = UdpRtpUpstream::bind(call, "http://owner").await.unwrap();
+        let puller_addr = std::net::SocketAddr::new(
+            std::net::Ipv4Addr::LOCALHOST.into(),
+            puller.local_addr().unwrap().port(),
+        );
+        registry.subscribe(call, puller_addr);
+
+        // The owning node has the call's CallEgress (fed by the SFU forward path;
+        // here published directly) and ensures the relay.
+        let egress = CallEgress::new(call);
+        assert!(sup.ensure_egress(call, egress.tap()).await, "spawns a new egress relay");
+        assert!(sup.has_egress(call));
+        assert!(!sup.ensure_egress(call, egress.tap()).await, "idempotent while running");
+
+        // A published packet is relayed to the subscribed puller.
+        let pkt = BridgeRtp::new(
+            ParticipantId::new(),
+            "video0",
+            Bytes::from_static(&[0x80, 0x60, 0xCA, 0xFE]),
+            true,
+        );
+        egress.publish(pkt.clone());
+        let got = tokio::time::timeout(std::time::Duration::from_secs(2), puller.next_rtp())
+            .await
+            .expect("puller must receive the relayed packet within 2s");
+        assert_eq!(got, Some(pkt));
+
+        // Ending the call tears the relay down.
+        sup.cancel_call(call);
+        assert!(!sup.has_egress(call), "egress relay removed on call end");
     }
 
     #[tokio::test]
@@ -882,7 +999,12 @@ mod tests {
             }
         }
         let factory = Arc::new(OneShot(Mutex::new(Some(LoopbackUpstream::new("http://a.example", tap)))));
-        let sup = CallBridgeSupervisor::new(router.clone(), fwd, factory);
+        let sup = CallBridgeSupervisor::new(
+            router.clone(),
+            fwd,
+            factory,
+            BridgeSubscriberRegistry::default(),
+        );
 
         sup.ensure_bridges(call, &["http://a.example".into()]).await;
         // Let the spawned bridge drain the (already-closed) loopback.
