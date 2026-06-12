@@ -34,7 +34,17 @@ const VOYAGE_DEFAULT_MODEL: &str = "voyage-3";
 #[async_trait]
 pub trait Embedder: Send + Sync {
     /// Embed a single text into a dense vector of length [`Embedder::dim`].
+    /// This is the DOCUMENT/corpus side — used when storing message embeddings.
     async fn embed_one(&self, text: &str) -> Result<Vec<f32>>;
+
+    /// Embed a search QUERY. Some providers (e.g. `voyage-3`) use asymmetric
+    /// query/document embeddings: embedding a user question into the *document*
+    /// space measurably degrades retrieval recall. Defaults to [`Self::embed_one`]
+    /// for role-agnostic embedders (the keyless [`HashEmbedder`] fallback), so
+    /// offline behaviour is unchanged. ROADMAP 方向四.
+    async fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+        self.embed_one(text).await
+    }
 
     /// Vector dimensionality. Stable for the lifetime of the instance.
     fn dim(&self) -> usize;
@@ -76,9 +86,11 @@ impl VoyageEmbedder {
     }
 }
 
-#[async_trait]
-impl Embedder for VoyageEmbedder {
-    async fn embed_one(&self, text: &str) -> Result<Vec<f32>> {
+impl VoyageEmbedder {
+    /// Shared embed call parameterised by voyage's `input_type` ("document" for
+    /// the corpus side, "query" for searches) — the only difference between the
+    /// two roles (ROADMAP 方向四).
+    async fn embed_with(&self, text: &str, input_type: &str) -> Result<Vec<f32>> {
         if text.is_empty() {
             // Voyage rejects empty input — return a deterministic zero vector
             // so the DB column stays populated. Zero-vector cosine similarity
@@ -89,7 +101,7 @@ impl Embedder for VoyageEmbedder {
         let body = VoyageRequest {
             model: &self.model,
             input: vec![text],
-            input_type: Some("document"),
+            input_type: Some(input_type),
         };
         let resp = self
             .http
@@ -123,6 +135,17 @@ impl Embedder for VoyageEmbedder {
             )));
         }
         Ok(first.embedding)
+    }
+}
+
+#[async_trait]
+impl Embedder for VoyageEmbedder {
+    async fn embed_one(&self, text: &str) -> Result<Vec<f32>> {
+        self.embed_with(text, "document").await
+    }
+
+    async fn embed_query(&self, text: &str) -> Result<Vec<f32>> {
+        self.embed_with(text, "query").await
     }
 
     fn dim(&self) -> usize {
@@ -243,6 +266,17 @@ pub fn default_embedder() -> Arc<dyn Embedder + Send + Sync> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn hash_embedder_query_role_matches_document() {
+        // The keyless fallback is role-agnostic: embed_query defaults to
+        // embed_one, so offline retrieval is byte-identical to before (方向四).
+        let e = HashEmbedder::new();
+        let q = e.embed_query("when is the launch").await.unwrap();
+        let d = e.embed_one("when is the launch").await.unwrap();
+        assert_eq!(q, d, "HashEmbedder query == document (no asymmetry offline)");
+        assert_eq!(q.len(), EMBED_DIM);
+    }
 
     #[tokio::test]
     async fn hash_embedder_has_fixed_dim() {

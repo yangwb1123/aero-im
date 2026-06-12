@@ -317,7 +317,7 @@ impl AiService {
     /// semantically-near-but-wrong neighbours. An FTS failure degrades to pure
     /// vector order — it warns but never fails the ask.
     async fn retrieve_room(&self, room: RoomId, q: &str, k: usize) -> Result<Vec<SearchHit>> {
-        let query_vec = self.embedder.embed_one(q).await?;
+        let query_vec = self.embedder.embed_query(q).await?;
         let vector = self.messages.search_vector(room, query_vec, RETRIEVAL_POOL).await?;
         let fts = match self.messages.fts_candidates(room, q, RETRIEVAL_POOL).await {
             Ok(hits) => hits,
@@ -339,7 +339,7 @@ impl AiService {
         q: &str,
         k: usize,
     ) -> Result<Vec<SearchHit>> {
-        let query_vec = self.embedder.embed_one(q).await?;
+        let query_vec = self.embedder.embed_query(q).await?;
         let vector = self
             .messages
             .search_vector_workspace(participant, workspace, query_vec, RETRIEVAL_POOL)
@@ -769,7 +769,7 @@ impl AiService {
         if topic.is_empty() {
             return Err(AiError::Invalid("topic must not be empty".into()));
         }
-        let query_vec = self.embedder.embed_one(topic).await?;
+        let query_vec = self.embedder.embed_query(topic).await?;
         // `pool` bounds the candidate breadth aggregated; clamp to a sane window.
         #[allow(clippy::cast_possible_wrap)]
         let pool_limit = pool.clamp(1, 200) as i64;
