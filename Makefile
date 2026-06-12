@@ -66,6 +66,10 @@ lint: ## clippy
 migrate: ## apply DB migrations
 	cargo run --bin aero-cli -- migrate
 
+.PHONY: migrate-smoke
+migrate-smoke: ## replay every migration on a throwaway DB (fresh-deploy chain check)
+	PSQL="docker exec -i aero-postgres psql -U aero" scripts/migrate_chain_smoke.sh
+
 .PHONY: run
 run: ## run the server (foreground)
 	cargo run --bin aero-server
