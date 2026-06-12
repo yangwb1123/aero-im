@@ -20,10 +20,15 @@
 - **Alternatives:** Leave embedding (rejected — re-identifiable); delete the row
   entirely (rejected — breaks thread/FK integrity, hence the placeholder approach).
 
-## ADR-002 — Reconcile the two tier systems blocking migration 0109 (PENDING)
+## ADR-002 — Reconcile the two tier systems blocking migration 0109 (RESOLVED)
 
 - **Date:** 2026-06-13
-- **Status:** PENDING — needs a product/human decision (blocks fresh deploys).
+- **Status:** ACCEPTED — resolved by option D (drop the dead column), commit 40f8cab.
+  Investigation showed the added column was never referenced by any code or later
+  migration (the subscription-tiers feature CRUDs only the `subscription_tiers`
+  table), so options A/B were moot — the column was simply removed. Full chain now
+  replays clean on a fresh DB (125/125). If a creator_subscriptions→subscription_tiers
+  link is ever needed, add it in a NEW migration as `subscription_tier_id`.
 - **Context:** `0051_creator_subscriptions.sql` created `creator_tiers` +
   `creator_subscriptions.tier_id uuid NOT NULL`. Later, `0109_subscription_tiers.sql`
   introduced a *second* tier table `subscription_tiers` and tried
