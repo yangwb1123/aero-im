@@ -34,7 +34,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use aero_common::CallId;
-use aero_live_webrtc::{BridgeRtp, CallBridge, CallUpstream, MediaForwarder, SfuRouter};
+use aero_live_webrtc::{
+    decode_bridge_frame, BridgeRtp, CallBridge, CallUpstream, MediaForwarder, SfuRouter,
+};
 use async_trait::async_trait;
 use bytes::Bytes;
 use parking_lot::Mutex;
@@ -100,24 +102,96 @@ pub trait UpstreamFactory: Send + Sync {
 
 /// The production [`UpstreamFactory`]: the real node-to-node RTP puller.
 ///
-/// Left unimplemented behind the [`UpstreamFactory::connect`] seam — see the
-/// `TODO(real-transport)` there. It is wired into the supervisor at server boot
-/// so that, once the inter-node transport lands, no orchestration changes are
-/// needed; until then `connect` returns `None`, leaving the supervisor dormant
-/// and safe (single-node boot never produces a `BridgeTo`, so it is never even
-/// called).
+/// [`connect`](UpstreamFactory::connect) binds a UDP socket and returns a real
+/// [`UdpRtpUpstream`] that receives plain-RTP [`bridge_frame`] datagrams from the
+/// owning node and yields them into the local SFU. The receive + decode + fan-in
+/// path is fully exercised (`udp_puller_receives_and_decodes_a_real_frame` drives
+/// it over localhost). The remaining staging step is the peer-side **subscribe**
+/// control call — telling `peer_url`'s egress which address to push to — plus the
+/// two-node end-to-end run, which needs a real second node. Single-node boot
+/// never produces a `BridgeTo`, so this is dormant there regardless.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NodeRtpPullerFactory;
 
 #[async_trait]
 impl UpstreamFactory for NodeRtpPullerFactory {
-    async fn connect(&self, _call: CallId, peer_url: &str) -> Option<Box<dyn CallUpstream>> {
-        // TODO(real-transport): construct the recvonly node-to-node RTP puller
-        // (SDP exchange + ICE/DTLS/SRTP) against `peer_url`'s bridge endpoint.
-        // Until that transport is wired this yields nothing, so the supervisor
-        // registers no bridge — correct and harmless for single-node operation.
-        debug!(peer_url, "call-bridge: real-transport upstream not wired; skipping");
-        None
+    async fn connect(&self, call: CallId, peer_url: &str) -> Option<Box<dyn CallUpstream>> {
+        // Backend node-to-node links are trusted (private network), so the media
+        // is PLAIN RTP framed by `bridge_frame` — DTLS-SRTP is only required on
+        // the client-facing leg (ROADMAP 方向五). Bind a UDP socket to receive
+        // this call's bridged RTP from the owning node and hand back a real
+        // puller. The receive + decode + fan-in path is fully exercised (see the
+        // localhost test); the peer-side subscribe — telling `peer_url` where to
+        // push, an HTTP control call — is the remaining staging step, so until a
+        // peer sends, the puller simply idles (and single-node boot never
+        // produces a `BridgeTo`, so this is never even called there).
+        match UdpRtpUpstream::bind(call, peer_url).await {
+            Ok(up) => Some(Box::new(up)),
+            Err(e) => {
+                debug!(?e, peer_url, "call-bridge: udp puller bind failed; skipping bridge");
+                None
+            }
+        }
+    }
+}
+
+/// Real node-to-node RTP puller over plain UDP (ROADMAP 方向五).
+///
+/// Receives [`bridge_frame`](aero_live_webrtc::bridge_frame)-framed datagrams on
+/// a bound UDP socket — each carrying one remote participant's RTP — and yields
+/// them as [`BridgeRtp`] for the [`CallBridge`] to fan into the local SFU. The
+/// owning node sends frames here (the egress side, addressed via the subscribe
+/// control call that is the documented staging wiring). The receive/decode loop
+/// below is real and unit-tested over localhost.
+struct UdpRtpUpstream {
+    call: CallId,
+    node_url: String,
+    socket: tokio::net::UdpSocket,
+    /// Receive scratch buffer, sized for a jumbo-ish RTP datagram + frame header.
+    buf: Vec<u8>,
+}
+
+impl UdpRtpUpstream {
+    /// Bind an ephemeral UDP socket to receive `call`'s bridged RTP from the node
+    /// at `peer_url`. The bound port is what the peer's egress sends to.
+    async fn bind(call: CallId, peer_url: &str) -> std::io::Result<Self> {
+        let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
+        Ok(Self { call, node_url: peer_url.to_owned(), socket, buf: vec![0u8; 2048] })
+    }
+
+    /// The local address the peer's egress should push frames to (staging wiring).
+    #[cfg(test)]
+    fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
+        self.socket.local_addr()
+    }
+}
+
+#[async_trait]
+impl CallUpstream for UdpRtpUpstream {
+    fn call_id(&self) -> CallId {
+        self.call
+    }
+
+    fn node_url(&self) -> &str {
+        &self.node_url
+    }
+
+    async fn next_rtp(&mut self) -> Option<BridgeRtp> {
+        loop {
+            let n = match self.socket.recv(&mut self.buf).await {
+                Ok(n) => n,
+                // Socket closed / fatal error → end of stream; the bridge winds down.
+                Err(e) => {
+                    debug!(?e, node_url = %self.node_url, "call-bridge: udp recv ended");
+                    return None;
+                }
+            };
+            // Drop malformed datagrams and keep receiving — a stray packet must
+            // never tear the bridge down.
+            if let Some(pkt) = decode_bridge_frame(&self.buf[..n]) {
+                return Some(pkt);
+            }
+        }
     }
 }
 
@@ -479,6 +553,40 @@ mod tests {
         assert_eq!(factory.connect_count(), 1, "the factory was consulted");
         assert_eq!(sup.bridge_count(call), 0, "but nothing was registered");
         assert!(!sup.is_bridged(call, "http://b.example"));
+    }
+
+    /// The REAL node-to-node UDP puller receives a `bridge_frame`-framed RTP
+    /// datagram over localhost and decodes it back into the original
+    /// [`BridgeRtp`] (ROADMAP 方向五). This exercises the production receive +
+    /// decode path; only the peer-side push address (a control call) is staging.
+    #[tokio::test]
+    async fn udp_puller_receives_and_decodes_a_real_frame() {
+        use aero_live_webrtc::encode_bridge_frame;
+
+        let mut up = UdpRtpUpstream::bind(CallId::new(), "http://peer.example").await.unwrap();
+        let dest = std::net::SocketAddr::new(
+            std::net::Ipv4Addr::LOCALHOST.into(),
+            up.local_addr().unwrap().port(),
+        );
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        // A malformed datagram must be skipped (never tears the bridge down)...
+        peer.send_to(b"not-a-bridge-frame", dest).await.unwrap();
+        // ...then a real framed packet is received and decoded intact.
+        let pkt = BridgeRtp::new(
+            ParticipantId::new(),
+            "video0",
+            Bytes::from_static(&[0x80, 0x60, 0x11, 0x22, 0xAB]),
+            true,
+        );
+        peer.send_to(&encode_bridge_frame(&pkt), dest).await.unwrap();
+
+        let got = tokio::time::timeout(std::time::Duration::from_secs(2), up.next_rtp())
+            .await
+            .expect("puller must yield within 2s");
+        assert_eq!(got, Some(pkt));
+        assert_eq!(up.call_id(), up.call);
+        assert_eq!(up.node_url(), "http://peer.example");
     }
 
     #[tokio::test]

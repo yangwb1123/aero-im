@@ -37,9 +37,10 @@ use aero_common::{CallId, ParticipantId};
 use parking_lot::RwLock;
 use thiserror::Error;
 
+pub mod av1;
+pub mod bridge_frame;
 pub mod bwe;
 pub mod call_bridge;
-pub mod av1;
 pub mod codec;
 pub mod forward;
 pub mod h264;
@@ -52,6 +53,7 @@ pub mod simulcast;
 pub mod vp8;
 pub mod vp9;
 
+pub use bridge_frame::{decode_bridge_frame, encode_bridge_frame};
 pub use bwe::{BandwidthEstimator, BweConfig, LayerSwitchPolicy, ThroughputEwma};
 pub use call_bridge::{
     decide_call_topology, BridgeRtp, CallBridge, CallEgress, CallEgressTap, CallTopology,
