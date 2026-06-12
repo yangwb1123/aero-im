@@ -186,7 +186,14 @@ impl Hub {
     }
 
     pub fn unregister(&self, pid: ParticipantId, tx: &WsSender) {
-        if let Some(mut entry) = self.conns.get_mut(&pid) {
+        // Did this close the participant's LAST open socket? Only then may we
+        // tear down their subscriptions. Fan-out routes by participant id (every
+        // socket of `pid` receives), so purging the room/stream/call forward
+        // maps while another socket is still open would silently stop delivery
+        // to that socket — e.g. closing the phone muting the still-open desktop
+        // (ROADMAP 方向一). A missing `conns` entry means no sockets remain, so
+        // teardown is also correct (and idempotent) in that case.
+        let last_socket_closed = if let Some(mut entry) = self.conns.get_mut(&pid) {
             let before = entry.len();
             entry.retain(|s| !s.same_channel(tx));
             // Decrement once per connection actually removed (idempotent if the
@@ -194,25 +201,31 @@ impl Hub {
             for _ in 0..(before - entry.len()) {
                 self.gauge_dec();
             }
-            if entry.is_empty() {
+            let empty = entry.is_empty();
+            if empty {
                 drop(entry);
                 self.conns.remove(&pid);
             }
-        }
-        // Purge this participant from every room/stream/call it joined. Behaviour
-        // is identical to the previous global scan (which removed `pid` from all
-        // maps on each unregister) — but now we visit only `pid`'s *own*
-        // subscriptions via the reverse index, so cost is O(this participant's
-        // footprint) instead of O(total rooms + streams + calls).
-        if let Some((_, subs)) = self.subs.remove(&pid) {
-            for room in &subs.rooms {
-                remove_from_forward(&self.rooms, room, pid);
-            }
-            for stream in &subs.streams {
-                remove_from_forward(&self.stream_watchers, stream, pid);
-            }
-            for call in &subs.calls {
-                remove_from_forward(&self.call_rosters, call, pid);
+            empty
+        } else {
+            true
+        };
+
+        // Purge this participant from every room/stream/call it joined — but only
+        // once the last socket is gone. We visit only `pid`'s *own* subscriptions
+        // via the reverse index, so cost is O(this participant's footprint)
+        // instead of O(total rooms + streams + calls).
+        if last_socket_closed {
+            if let Some((_, subs)) = self.subs.remove(&pid) {
+                for room in &subs.rooms {
+                    remove_from_forward(&self.rooms, room, pid);
+                }
+                for stream in &subs.streams {
+                    remove_from_forward(&self.stream_watchers, stream, pid);
+                }
+                for call in &subs.calls {
+                    remove_from_forward(&self.call_rosters, call, pid);
+                }
             }
         }
         debug!(%pid, "ws unregistered");
@@ -474,6 +487,41 @@ mod tests {
         // Last leaver drops the roster entirely.
         hub.call_leave(call, b);
         assert!(hub.call_members(call).is_empty());
+    }
+
+    #[test]
+    fn unregister_one_of_two_sockets_keeps_subscriptions() {
+        // Multi-device: closing one socket must NOT tear down the participant's
+        // room subscription while another socket is still open (ROADMAP 方向一).
+        let hub = Hub::default();
+        let pid = ParticipantId::new();
+        let room = RoomId::new();
+        let (tx1, _rx1, _c1) = make_conn(8);
+        let (tx2, mut rx2, _c2) = make_conn(8);
+        hub.register(pid, tx1.clone());
+        hub.register(pid, tx2);
+        hub.join_room(room, pid);
+        assert!(hub.rooms.get(&room).is_some_and(|e| e.contains(&pid)));
+
+        // Close the FIRST socket (the "phone").
+        hub.unregister(pid, &tx1);
+        assert_eq!(hub.conns.get(&pid).map(|e| e.len()), Some(1), "one socket remains");
+        assert!(
+            hub.rooms.get(&room).is_some_and(|e| e.contains(&pid)),
+            "the still-open desktop socket must keep its room subscription"
+        );
+        // And the remaining socket still receives room fan-out.
+        hub.fan_out_raw(&[pid], "still-here");
+        assert_eq!(drain_text(&mut rx2), vec!["still-here".to_owned()]);
+
+        // Close the LAST socket → subscription is torn down.
+        let tx2_again = hub.conns.get(&pid).unwrap()[0].clone();
+        hub.unregister(pid, &tx2_again);
+        assert!(hub.conns.get(&pid).is_none(), "no sockets left");
+        assert!(
+            !hub.rooms.get(&room).is_some_and(|e| e.contains(&pid)),
+            "last socket closing tears down the room subscription"
+        );
     }
 
     #[test]
