@@ -21,8 +21,8 @@ use aero_auth::AuthUser;
 use aero_common::{ClipId, Error as AeroError};
 use aero_storage::ClipRepo;
 use axum::{
-    extract::{Path, State},
-    routing::{get, post},
+    extract::{Path, Query, State},
+    routing::{get, post, put},
     Json, Router,
 };
 use serde::Deserialize;
@@ -40,10 +40,13 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route(
             "/api/streams/:id/clips",
-            post(create_clip).get(list_clips),
+            post(create_clip).get(list_clips_by_stream),
         )
         .route("/api/clips/:cid", get(get_clip).delete(delete_clip))
         .route("/api/clips/:cid/share", post(share_clip))
+        .route("/api/clips/:cid/tags", get(list_tags))
+        .route("/api/clips/:cid/tags/:tag", put(add_tag).delete(remove_tag))
+        .route("/api/clips", get(list_clips_by_tag))
 }
 
 /// Public clip route (no auth required) — mounted separately (no auth extractor).
@@ -140,7 +143,7 @@ async fn create_clip(
 
 /// `GET /api/streams/:id/clips` — this stream's clips, newest first. Any
 /// authenticated viewer may list them.
-async fn list_clips(
+async fn list_clips_by_stream(
     State(s): State<AppState>,
     _auth: AuthUser,
     Path(stream_str): Path<String>,
@@ -243,6 +246,114 @@ async fn get_clip_by_slug(
         tracing::warn!(error = ?e, clip = %clip.id, "failed to increment clip view count");
     }
     Ok(Json(serde_json::to_value(clip).map_err(AeroError::from)?))
+}
+
+// Maximum length (in chars) of a clip tag.
+const MAX_TAG_LEN: usize = 64;
+
+fn parse_tag(s: &str) -> Result<String, AeroError> {
+    let t = s.trim().to_lowercase();
+    if t.is_empty() {
+        return Err(AeroError::Invalid("tag must not be empty".into()));
+    }
+    if t.chars().count() > MAX_TAG_LEN {
+        return Err(AeroError::Invalid("tag too long".into()));
+    }
+    Ok(t)
+}
+
+#[derive(serde::Deserialize)]
+struct TagQuery {
+    tag: Option<String>,
+    #[serde(default = "default_tag_limit")]
+    limit: i64,
+}
+
+fn default_tag_limit() -> i64 {
+    50
+}
+
+/// `PUT /api/clips/:cid/tags/:tag` — add a tag to a clip. Clip owner only.
+async fn add_tag(
+    State(s): State<AppState>,
+    auth: AuthUser,
+    Path((cid_str, tag_str)): Path<(String, String)>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let cid = parse_clip(&cid_str)?;
+    let tag = parse_tag(&tag_str)?;
+    let clip = repo(&s)
+        .get(cid)
+        .await
+        .map_err(AeroError::from)?
+        .ok_or_else(|| AeroError::NotFound(format!("clip {cid}")))?;
+    if clip.creator_id != auth.participant_id {
+        return Err(AeroError::Forbidden("only the clip creator may add tags".into()).into());
+    }
+    repo(&s)
+        .add_tag(cid.to_uuid(), &tag)
+        .await
+        .map_err(AeroError::from)?;
+    Ok(Json(serde_json::json!({ "tag": tag, "added": true })))
+}
+
+/// `DELETE /api/clips/:cid/tags/:tag` — remove a tag from a clip. Clip owner only.
+async fn remove_tag(
+    State(s): State<AppState>,
+    auth: AuthUser,
+    Path((cid_str, tag_str)): Path<(String, String)>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let cid = parse_clip(&cid_str)?;
+    let tag = parse_tag(&tag_str)?;
+    let clip = repo(&s)
+        .get(cid)
+        .await
+        .map_err(AeroError::from)?
+        .ok_or_else(|| AeroError::NotFound(format!("clip {cid}")))?;
+    if clip.creator_id != auth.participant_id {
+        return Err(AeroError::Forbidden("only the clip creator may remove tags".into()).into());
+    }
+    repo(&s)
+        .remove_tag(cid.to_uuid(), &tag)
+        .await
+        .map_err(AeroError::from)?;
+    Ok(Json(serde_json::json!({ "tag": tag, "removed": true })))
+}
+
+/// `GET /api/clips/:cid/tags` — list all tags on a clip. Public (authenticated).
+async fn list_tags(
+    State(s): State<AppState>,
+    _auth: AuthUser,
+    Path(cid_str): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let cid = parse_clip(&cid_str)?;
+    let tags = repo(&s)
+        .list_tags(cid.to_uuid())
+        .await
+        .map_err(AeroError::from)?;
+    Ok(Json(serde_json::json!({ "tags": tags })))
+}
+
+/// `GET /api/clips?tag=xxx` — list clip ids bearing a tag, newest-tagged first.
+/// Returns up to `limit` (default 50, max 100) clip ids.
+async fn list_clips_by_tag(
+    State(s): State<AppState>,
+    _auth: AuthUser,
+    Query(q): Query<TagQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let tag = q
+        .tag
+        .as_deref()
+        .map(parse_tag)
+        .transpose()?
+        .unwrap_or_default();
+    if tag.is_empty() {
+        return Ok(Json(serde_json::json!({ "clip_ids": [] })));
+    }
+    let ids = repo(&s)
+        .clips_by_tag(&tag, q.limit)
+        .await
+        .map_err(AeroError::from)?;
+    Ok(Json(serde_json::json!({ "clip_ids": ids })))
 }
 
 #[cfg(test)]

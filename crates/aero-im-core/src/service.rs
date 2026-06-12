@@ -17,10 +17,11 @@ use aero_common::{
 };
 use aero_common::{PinOp, PinnedMessage};
 use aero_storage::{
-    message::NewMessage, AiJobKind, AiJobRepo, BlockRepo, CallRepo, DeactivationRepo,
-    KeywordAlertRepo, MessageEditRepo, MessageRepo, NotificationPrefsRepo, NotificationRepo,
-    ParticipantRepo, PinRepo, ReactionRepo, ReceiptRepo, RoomRepo, ThreadNotificationPrefsRepo,
-    ThreadSubscriptionRepo, TotpRepo, UserGroupRepo, WorkspaceMuteRepo, WorkspaceRepo,
+    message::NewMessage, AiJobKind, AiJobRepo, AutoModRuleRepo, BlockRepo, CallRepo,
+    DeactivationRepo, KeywordAlertRepo, MessageEditRepo, MessageRepo, NotificationPrefsRepo,
+    NotificationRepo, ParticipantRepo, PinRepo, ReactionRepo, ReceiptRepo, RoomRepo,
+    ThreadNotificationPrefsRepo, ThreadSubscriptionRepo, TotpRepo, UserGroupRepo,
+    WorkspaceMuteRepo, WorkspaceRepo,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -193,6 +194,11 @@ pub struct ImService {
     /// [`dispatch_notifications`](Self::dispatch_notifications) suppresses
     /// notifications to recipients who have blocked the sender.
     block_repo: Option<BlockRepo>,
+    /// Auto-moderation rules engine (ROADMAP10 migration 0111). Optional builder
+    /// ([`with_auto_mod_rules`](Self::with_auto_mod_rules)); when present,
+    /// [`send_message`](Self::send_message) enforces workspace-level text rules at
+    /// send time (the `"block"` action rejects the message before persistence).
+    auto_mod_rules: Option<AutoModRuleRepo>,
     bus: Arc<dyn BusSink>,
     moderator: Arc<dyn Moderator>,
     /// Per-subject event-seq source for publish-time `"seq"` stamping (ROADMAP
@@ -246,6 +252,7 @@ impl ImService {
             thread_notification_prefs: None,
             workspace_mutes: None,
             block_repo: None,
+            auto_mod_rules: None,
             bus: bus as Arc<dyn BusSink>,
             moderator,
             seq: Arc::new(LocalSeqProvider::new()),
@@ -399,6 +406,17 @@ impl ImService {
         self
     }
 
+    /// Wire in the auto-moderation rules repo (ROADMAP10), enabling workspace-level
+    /// text-pattern enforcement at send time. When present,
+    /// [`send_message`](Self::send_message) fetches the workspace's rules and rejects
+    /// any message matched by a `"block"` rule. Additive builder; without it, no
+    /// auto-mod rules are applied.
+    #[must_use]
+    pub fn with_auto_mod_rules(mut self, repo: AutoModRuleRepo) -> Self {
+        self.auto_mod_rules = Some(repo);
+        self
+    }
+
     /// Notification suppression seam for per-channel mute + per-user
     /// Do-Not-Disturb + one-off snooze. Returns whether a notification should be
     /// delivered to `recipient` for `room`: `false` when the recipient has MUTED
@@ -473,6 +491,7 @@ impl ImService {
             thread_notification_prefs: None,
             workspace_mutes: None,
             block_repo: None,
+            auto_mod_rules: None,
             bus,
             moderator: Arc::new(crate::moderator::AllowAllModerator),
             seq: Arc::new(LocalSeqProvider::new()),
@@ -941,6 +960,35 @@ impl ImService {
         validate_blocks(&blocks)?;
         if let ModerationVerdict::Block(reason) = self.moderator.check(&blocks) {
             return Err(Error::Invalid(reason));
+        }
+
+        // Workspace-level auto-mod rules check (ROADMAP10 migration 0111).
+        // Fetch rules only when the repo is wired; fail-open on a DB error so a
+        // rules-store glitch never silently blocks legitimate messages.
+        if let Some(rule_repo) = self.auto_mod_rules.as_ref() {
+            if let Ok(Some(workspace)) = self.rooms.room_workspace(room).await {
+                if let Ok(rules) = rule_repo.list_for_workspace(workspace).await {
+                    // Extract plain text from all Text blocks for matching.
+                    let text: String = blocks
+                        .iter()
+                        .filter_map(|b| {
+                            if let Block::Text { content, .. } = b {
+                                Some(content.as_str())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    for rule in &rules {
+                        if rule.action == "block" && rule.matches(&text) {
+                            return Err(Error::Invalid(
+                                "message blocked by auto-moderation rule".into(),
+                            ));
+                        }
+                    }
+                }
+            }
         }
 
         let message = self

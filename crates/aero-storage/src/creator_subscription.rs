@@ -351,6 +351,32 @@ impl SubscriptionRepo {
         Ok(())
     }
 
+    /// Top gifters for a creator's channel — `(gifter_id, gift_count)` pairs ordered
+    /// by gift count descending. Only counts rows where `gifter_id IS NOT NULL` (i.e.
+    /// gifted subscriptions). Useful for a "top gifters" leaderboard UI. `limit` is
+    /// clamped to `[1, 100]`.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the query.
+    pub async fn gift_leaderboard(
+        &self,
+        creator: ParticipantId,
+        limit: i64,
+    ) -> Result<Vec<(uuid::Uuid, i64)>, sqlx::Error> {
+        let limit = limit.clamp(1, 100);
+        let rows: Vec<(uuid::Uuid, i64)> = sqlx::query_as(
+            "SELECT gifter_id, COUNT(*) AS gift_count \
+             FROM creator_subscriptions \
+             WHERE creator_id = $1 AND gifter_id IS NOT NULL \
+             GROUP BY gifter_id ORDER BY gift_count DESC LIMIT $2",
+        )
+        .bind(creator.to_uuid())
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
     /// Whether `subscriber` has an active subscription to `creator`.
     ///
     /// # Errors

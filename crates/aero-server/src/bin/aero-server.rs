@@ -467,6 +467,16 @@ async fn main() -> anyhow::Result<()> {
                                 Ok(n) => info!(swept = n, "expired bans cleaned up"),
                                 Err(e) => warn!(error = ?e, "ban expiry sweep failed"),
                             }
+                            // Channel-points expiry sweep (migration 0113): zero
+                            // balances whose earn_expires_at has passed.
+                            match aero_storage::ChannelPointsRepo::new(stream_mod_pool.clone())
+                                .sweep_expired_points()
+                                .await
+                            {
+                                Ok(0) => {}
+                                Ok(n) => info!(swept = n, "expired channel points zeroed"),
+                                Err(e) => warn!(error = ?e, "channel points expiry sweep failed"),
+                            }
                         }
                     }
                 }

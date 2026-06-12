@@ -197,4 +197,12 @@ pub mod user_blocks;
 /// Extended per-creator subscription tiers (position + benefits JSONB).
 pub mod subscription_tiers;
 
+// ---- ROADMAP10 ----
+/// Auto-moderation rules: workspace admins define text-matching block/warn rules.
+pub mod auto_mod;
+/// User-level report flow: any user can report another; admins resolve reports.
+pub mod user_reports;
+/// Channel-points expiry info endpoint.
+pub mod point_expiry;
+
 pub use state::AppState;

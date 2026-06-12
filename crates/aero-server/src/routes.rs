@@ -407,6 +407,18 @@ pub fn build(state: AppState) -> Router {
         // ---- ROADMAP9 — extended subscription tier levels (migration 0109) ----
         // POST/GET /api/creators/:id/subscription-tiers, DELETE /api/creators/:id/subscription-tiers/:tid
         .merge(crate::subscription_tiers::routes())
+        // ---- ROADMAP10 — date-range search (no migration): handled via ParsedQuery extension in search_advanced.
+        // ---- ROADMAP10 — gifted-sub leaderboard: already in subscriptions::routes().
+        // ---- ROADMAP10 — clip tags (migration 0110): new routes added to clips::routes().
+        // ---- ROADMAP10 — auto-mod rules (migration 0111) ----
+        // POST/GET /api/workspaces/:id/auto-mod-rules, DELETE /api/workspaces/:id/auto-mod-rules/:rid
+        .merge(crate::auto_mod::routes())
+        // ---- ROADMAP10 — user reports (migration 0112) ----
+        // POST /api/users/:id/report, GET/PATCH /api/workspaces/:id/user-reports[/:rid]
+        .merge(crate::user_reports::routes())
+        // ---- ROADMAP10 — channel-points expiry info (migration 0113) ----
+        // GET /api/creators/:id/points/expiry
+        .merge(crate::point_expiry::routes())
         // ---- OpenAPI 3.0 spec (public, no auth) ----
         // GET /api/openapi.json returns the static OpenAPI document so API clients
         // and documentation generators can introspect the surface without credentials.

@@ -342,3 +342,11 @@ pub use user_blocks::BlockRepo;
 // ---- ROADMAP9 — extended subscription tier levels (migration 0109) ----
 pub mod subscription_tier;
 pub use subscription_tier::{SubscriptionTier, SubscriptionTierRepo};
+
+// ---- ROADMAP10 — auto-mod rules engine (migration 0111) ----
+pub mod auto_mod;
+pub use auto_mod::{AutoModRule, AutoModRuleRepo};
+
+// ---- ROADMAP10 — user-level report flow (migration 0112) ----
+pub mod user_report;
+pub use user_report::{UserReport, UserReportRepo};

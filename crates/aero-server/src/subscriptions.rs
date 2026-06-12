@@ -49,6 +49,10 @@ pub fn routes() -> Router<AppState> {
         .route("/api/creators/:id/subscribers", get(list_subscribers))
         .route("/api/me/subscriptions", get(my_subscriptions))
         .route("/api/creators/:id/gift-subscription", post(gift_subscription))
+        .route(
+            "/api/creators/:id/gift-subscription/leaderboard",
+            get(gift_leaderboard),
+        )
 }
 
 /// Build a [`SubscriptionRepo`] from shared state, over the shared pool.
@@ -262,6 +266,28 @@ struct GiftSubscriptionReq {
     /// Duration of the gift in months (converted to days server-side).
     #[serde(default = "default_months")]
     months: u32,
+}
+
+/// `GET /api/creators/:id/gift-subscription/leaderboard` — top gifters for this
+/// creator's channel. Any authenticated user may view the leaderboard.
+/// Returns `{leaderboard: [{gifter_id, count}]}` ordered by gift count desc.
+async fn gift_leaderboard(
+    State(s): State<AppState>,
+    _auth: AuthUser,
+    Path(creator_str): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let creator = parse_participant(&creator_str)?;
+    let rows = repo(&s)
+        .gift_leaderboard(creator, 100)
+        .await
+        .map_err(AeroError::from)?;
+    let leaderboard: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|(gifter_id, count)| {
+            serde_json::json!({ "gifter_id": gifter_id, "count": count })
+        })
+        .collect();
+    Ok(Json(serde_json::json!({ "leaderboard": leaderboard })))
 }
 
 fn default_months() -> u32 {

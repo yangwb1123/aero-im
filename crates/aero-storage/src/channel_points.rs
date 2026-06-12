@@ -448,6 +448,87 @@ impl ChannelPointsRepo {
     }
 }
 
+// ----- Expiry methods (migration 0113) -----
+impl ChannelPointsRepo {
+    /// Zero out any viewer/creator ledger balances whose `earn_expires_at` has
+    /// passed. Returns the number of rows zeroed. Balances are set to `0`
+    /// (not deleted) so the row history is preserved. Called by the retention
+    /// sweep loop in `bin/aero-server.rs`.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the update.
+    pub async fn sweep_expired_points(&self) -> Result<u64, sqlx::Error> {
+        let r = sqlx::query(
+            "UPDATE points_ledger \
+             SET balance = 0 \
+             WHERE earn_expires_at IS NOT NULL \
+             AND earn_expires_at < NOW() \
+             AND balance > 0",
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected())
+    }
+
+    /// Set (or clear) the expiry for a viewer's balance with a creator. Pass
+    /// `days <= 0` to clear (set to `NULL`). The sweep task zeros the balance
+    /// when the timestamp passes.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the update.
+    pub async fn set_expiry(
+        &self,
+        viewer: ParticipantId,
+        creator: ParticipantId,
+        days: i32,
+    ) -> Result<(), sqlx::Error> {
+        if days <= 0 {
+            sqlx::query(
+                "UPDATE points_ledger SET earn_expires_at = NULL \
+                 WHERE viewer_id = $1 AND creator_id = $2",
+            )
+            .bind(viewer.to_uuid())
+            .bind(creator.to_uuid())
+            .execute(&self.pool)
+            .await?;
+        } else {
+            // $1 = days string (for interval concat), $2 = viewer_id, $3 = creator_id.
+            sqlx::query(
+                "UPDATE points_ledger \
+                 SET earn_expires_at = NOW() + ($1 || ' days')::interval \
+                 WHERE viewer_id = $2 AND creator_id = $3",
+            )
+            .bind(days.to_string())
+            .bind(viewer.to_uuid())
+            .bind(creator.to_uuid())
+            .execute(&self.pool)
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// The `earn_expires_at` timestamp for a viewer's balance with a creator.
+    /// Returns `None` when the balance never expires or no ledger row exists.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the query.
+    pub async fn get_expiry(
+        &self,
+        viewer: ParticipantId,
+        creator: ParticipantId,
+    ) -> Result<Option<time::OffsetDateTime>, sqlx::Error> {
+        let row: Option<(Option<time::OffsetDateTime>,)> = sqlx::query_as(
+            "SELECT earn_expires_at FROM points_ledger \
+             WHERE viewer_id = $1 AND creator_id = $2",
+        )
+        .bind(viewer.to_uuid())
+        .bind(creator.to_uuid())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.and_then(|(ts,)| ts))
+    }
+}
+
 /// PG-gated integration tests (run with a live Postgres + applied migrations):
 ///
 /// ```text

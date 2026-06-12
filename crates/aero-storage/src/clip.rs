@@ -267,6 +267,71 @@ impl ClipRepo {
             .await?;
         Ok(result.rows_affected() > 0)
     }
+
+    // ----- Clip tag methods (migration 0110) -----
+
+    /// Add a tag to a clip. The tag is normalised (trimmed + lowercased) before
+    /// storage. Silently no-ops when the `(clip_id, tag)` pair already exists.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the insert.
+    pub async fn add_tag(&self, clip_id: uuid::Uuid, tag: &str) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO clip_tags (clip_id, tag) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+        )
+        .bind(clip_id)
+        .bind(tag.trim().to_lowercase())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Remove a tag from a clip. Silently no-ops when the pair does not exist.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the delete.
+    pub async fn remove_tag(&self, clip_id: uuid::Uuid, tag: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM clip_tags WHERE clip_id = $1 AND tag = $2")
+            .bind(clip_id)
+            .bind(tag.trim().to_lowercase())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// List all tags on a clip, alphabetically.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the query.
+    pub async fn list_tags(&self, clip_id: uuid::Uuid) -> Result<Vec<String>, sqlx::Error> {
+        let rows: Vec<(String,)> =
+            sqlx::query_as("SELECT tag FROM clip_tags WHERE clip_id = $1 ORDER BY tag")
+                .bind(clip_id)
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows.into_iter().map(|(t,)| t).collect())
+    }
+
+    /// List clip ids bearing a tag, newest-tagged first. `limit` is clamped to
+    /// `[1, 100]`.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the query.
+    pub async fn clips_by_tag(
+        &self,
+        tag: &str,
+        limit: i64,
+    ) -> Result<Vec<uuid::Uuid>, sqlx::Error> {
+        let limit = limit.clamp(1, 100);
+        let rows: Vec<(uuid::Uuid,)> = sqlx::query_as(
+            "SELECT clip_id FROM clip_tags WHERE tag = $1 ORDER BY created_at DESC LIMIT $2",
+        )
+        .bind(tag.trim().to_lowercase())
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(id,)| id).collect())
+    }
 }
 
 /// PG-gated integration tests (run with a live Postgres + applied migrations):

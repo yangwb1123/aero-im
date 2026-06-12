@@ -38,6 +38,10 @@ pub struct ParsedQuery {
     pub before: Option<MessageId>,
     /// `after:<msgid>` — only messages newer than this id (`m.id > after`).
     pub after: Option<MessageId>,
+    /// `since:<YYYY-MM-DD>` — only messages created on or after this date (UTC).
+    pub after_ts: Option<time::OffsetDateTime>,
+    /// `until:<YYYY-MM-DD>` — only messages created on or before this date (UTC).
+    pub before_ts: Option<time::OffsetDateTime>,
 }
 
 /// Parse a raw search string into a [`ParsedQuery`].
@@ -72,6 +76,30 @@ pub fn parse_search_query(raw: &str) -> ParsedQuery {
         } else if let Some(v) = token.strip_prefix("after:") {
             if let Ok(id) = MessageId::from_str(v) {
                 parsed.after = Some(id);
+                continue;
+            }
+        } else if let Some(v) = token.strip_prefix("since:") {
+            let dt_str = if v.len() == 10 {
+                format!("{}T00:00:00Z", v)
+            } else {
+                v.to_owned()
+            };
+            if let Ok(dt) =
+                time::OffsetDateTime::parse(&dt_str, &time::format_description::well_known::Rfc3339)
+            {
+                parsed.after_ts = Some(dt);
+                continue;
+            }
+        } else if let Some(v) = token.strip_prefix("until:") {
+            let dt_str = if v.len() == 10 {
+                format!("{}T23:59:59Z", v)
+            } else {
+                v.to_owned()
+            };
+            if let Ok(dt) =
+                time::OffsetDateTime::parse(&dt_str, &time::format_description::well_known::Rfc3339)
+            {
+                parsed.before_ts = Some(dt);
                 continue;
             }
         }
@@ -177,6 +205,8 @@ impl AdvancedSearchRepo {
                  AND ($6::uuid IS NULL OR m.room_id = $6)
                  AND ($7::uuid IS NULL OR m.id < $7)
                  AND ($8::uuid IS NULL OR m.id > $8)
+                 AND ($9::timestamptz IS NULL OR m.created_at >= $9)
+                 AND ($10::timestamptz IS NULL OR m.created_at <= $10)
                  AND (
                    $2 = ''
                    OR m.search_tsv @@ websearch_to_tsquery('simple', $2)
@@ -193,6 +223,8 @@ impl AdvancedSearchRepo {
         .bind(q.in_room.map(|id| id.to_uuid()))
         .bind(q.before.map(|id| id.to_uuid()))
         .bind(q.after.map(|id| id.to_uuid()))
+        .bind(q.after_ts)
+        .bind(q.before_ts)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(SearchHit::from).collect())
@@ -209,7 +241,7 @@ mod tests {
         let pq = parse_search_query(&format!("hello from:@{who} world"));
         assert_eq!(pq.from, Some(who));
         assert_eq!(pq.terms, "hello world");
-        assert!(pq.in_room.is_none() && pq.before.is_none() && pq.after.is_none());
+        assert!(pq.in_room.is_none() && pq.before.is_none() && pq.after.is_none() && pq.after_ts.is_none() && pq.before_ts.is_none());
     }
 
     #[test]
@@ -247,7 +279,24 @@ mod tests {
                 && pq.in_room.is_none()
                 && pq.before.is_none()
                 && pq.after.is_none()
+                && pq.after_ts.is_none()
+                && pq.before_ts.is_none()
         );
+    }
+
+    #[test]
+    fn extracts_since_and_until_date_operators() {
+        let pq = parse_search_query("since:2024-01-15 crash until:2024-02-28");
+        assert!(pq.after_ts.is_some(), "since: should parse a YYYY-MM-DD date");
+        assert!(pq.before_ts.is_some(), "until: should parse a YYYY-MM-DD date");
+        assert_eq!(pq.terms, "crash");
+        // RFC 3339 datetimes also work.
+        let pq2 = parse_search_query("since:2024-01-15T00:00:00Z deploy");
+        assert!(pq2.after_ts.is_some(), "since: should parse an RFC 3339 datetime");
+        assert_eq!(pq2.terms, "deploy");
+        // Malformed date stays as free text.
+        let pq3 = parse_search_query("since:notadate words");
+        assert!(pq3.after_ts.is_none(), "malformed since: stays as free text");
     }
 
     #[test]
