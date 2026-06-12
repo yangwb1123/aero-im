@@ -349,6 +349,38 @@ impl MessageRepo {
     /// by `id` is equivalent to ordering by `(created_at, id)` and the keyset
     /// predicate `id > $cursor` is a stable, index-friendly forward cursor —
     /// the exact mirror of `list_recent`'s `id < $cursor` / `ORDER BY id DESC`.
+    /// Messages in `room` whose content CHANGED after `since` — edits and deletes
+    /// (tombstones included, so `deleted_at IS NULL` is deliberately NOT filtered).
+    /// [`Self::list_since`] only returns NEW messages (`id > cursor`), so a client
+    /// offline during an edit/delete to a message it already holds never learns of
+    /// it; this is the change-replay half (ROADMAP 方向一). Ordered
+    /// oldest-change-first. `GREATEST(edited_at, deleted_at)` is the latest
+    /// mutation instant (it ignores NULLs), so the predicate is equivalent to
+    /// `edited_at > since OR deleted_at > since` and is index-backed by migration
+    /// 0125. The caller applies each row: a populated `deleted_at` means remove,
+    /// otherwise replace.
+    pub async fn changes_since(
+        &self,
+        room: RoomId,
+        since: time::OffsetDateTime,
+        limit: i64,
+    ) -> Result<Vec<Message>, sqlx::Error> {
+        let limit = clamp_page_limit(limit);
+        let rows = sqlx::query_as::<_, MessageRow>(
+            r"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at
+               FROM messages
+               WHERE room_id = $1 AND GREATEST(edited_at, deleted_at) > $2
+               ORDER BY GREATEST(edited_at, deleted_at) ASC
+               LIMIT $3",
+        )
+        .bind(room.to_uuid())
+        .bind(since)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(Message::from).collect())
+    }
+
     pub async fn list_since(
         &self,
         room: RoomId,

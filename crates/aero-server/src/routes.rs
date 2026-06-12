@@ -71,6 +71,7 @@ pub fn build(state: AppState) -> Router {
         .route("/api/rooms", post(create_room).get(list_rooms))
         .route("/api/rooms/:id/members", post(add_member))
         .route("/api/rooms/:id/messages", get(room_history))
+        .route("/api/rooms/:id/changes", get(room_changes))
         .route("/api/rooms/:id/read", post(mark_read))
         .route("/api/rooms/:id/receipts", get(list_receipts))
         .route("/api/rooms/:id/search", post(room_search))
@@ -943,6 +944,44 @@ async fn room_history(
 
     let before = parse_cursor(q.before.as_deref(), "before")?;
     let msgs = s.im.history(auth.participant_id, room, before, limit).await?;
+    Ok(Json(serde_json::to_value(msgs).map_err(AeroError::from)?))
+}
+
+/// Query for the change-replay endpoint: an RFC3339 `since` instant + optional
+/// `limit`.
+#[derive(Deserialize)]
+struct ChangesQuery {
+    since: String,
+    limit: Option<i64>,
+}
+
+/// `GET /api/rooms/:id/changes?since=<rfc3339>` — messages edited or deleted
+/// since `since`, so a client reconnecting after offline edits/deletes can
+/// converge on mutations to messages it already holds (ROADMAP 方向一). The
+/// message backfill (`/messages?since=<id>`) only covers NEW messages; this is
+/// its companion. Tombstones (deleted messages) are included; the client removes
+/// those and replaces the rest.
+async fn room_changes(
+    State(s): State<AppState>,
+    auth: AuthUser,
+    Path(room_str): Path<String>,
+    Query(q): Query<ChangesQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let room = parse_room_id(&room_str)?;
+    // Tenant guard FIRST (membership + deactivation), then charge the read.
+    s.im.assert_room_access(auth.participant_id, room).await?;
+    crate::ws_rate::check_ws_rate_room(&s, room).await?;
+    let since = time::OffsetDateTime::parse(
+        q.since.trim(),
+        &time::format_description::well_known::Rfc3339,
+    )
+    .map_err(|e| AeroError::Invalid(format!("since must be an RFC3339 timestamp: {e}")))?;
+    let limit = history_limit(q.limit);
+    let msgs = s
+        .messages
+        .changes_since(room, since, limit)
+        .await
+        .map_err(AeroError::from)?;
     Ok(Json(serde_json::to_value(msgs).map_err(AeroError::from)?))
 }
 
