@@ -6,23 +6,29 @@
 //! negotiated payload-type mapping, see [`crate::SfuPeer::codec_for_pt`]) and
 //! pass every payload through [`payload_is_keyframe`].
 
+use crate::av1::av1_payload_is_keyframe;
 use crate::h264::h264_payload_is_keyframe;
+use crate::h265::h265_payload_is_keyframe;
 use crate::vp8::vp8_payload_is_keyframe;
 use crate::vp9::vp9_payload_is_keyframe;
 
 /// Video codec of an RTP payload, as far as keyframe detection is concerned.
 ///
 /// `Unknown` covers everything the SFU has no payload-descriptor parser for
-/// (AV1, H.265, audio codecs, RTX, …) — those payloads are never reported as
-/// keyframes, preserving the pre-codec-seam behavior.
+/// (audio codecs, RTX, …) — those payloads are never reported as keyframes,
+/// preserving the pre-codec-seam behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Codec {
     /// H.264 / AVC (RFC 6184 payload format).
     H264,
+    /// H.265 / HEVC (RFC 7798 payload format).
+    H265,
     /// VP8 (RFC 7741 payload format).
     Vp8,
     /// VP9 (draft-ietf-payload-vp9 payload format).
     Vp9,
+    /// AV1 (draft-ietf-payload-av1 aggregation header).
+    Av1,
     /// Unrecognized or unsupported codec — keyframe detection always `false`.
     #[default]
     Unknown,
@@ -32,8 +38,10 @@ impl From<str0m::format::Codec> for Codec {
     fn from(c: str0m::format::Codec) -> Self {
         match c {
             str0m::format::Codec::H264 => Self::H264,
+            str0m::format::Codec::H265 => Self::H265,
             str0m::format::Codec::Vp8 => Self::Vp8,
             str0m::format::Codec::Vp9 => Self::Vp9,
+            str0m::format::Codec::Av1 => Self::Av1,
             _ => Self::Unknown,
         }
     }
@@ -42,16 +50,18 @@ impl From<str0m::format::Codec> for Codec {
 /// Returns `true` when `payload` (raw RTP payload bytes, no RTP header)
 /// begins a keyframe for the given `codec`.
 ///
-/// Dispatches to the per-codec detectors
-/// ([`h264_payload_is_keyframe`], [`vp8_payload_is_keyframe`],
-/// [`vp9_payload_is_keyframe`]); [`Codec::Unknown`] is always `false`.
-/// Malformed or truncated payloads return `false` — never panic.
+/// Dispatches to the per-codec detectors ([`h264_payload_is_keyframe`],
+/// [`h265_payload_is_keyframe`], [`vp8_payload_is_keyframe`],
+/// [`vp9_payload_is_keyframe`], [`av1_payload_is_keyframe`]); [`Codec::Unknown`]
+/// is always `false`. Malformed or truncated payloads return `false` — never panic.
 #[must_use]
 pub fn payload_is_keyframe(codec: Codec, payload: &[u8]) -> bool {
     match codec {
         Codec::H264 => h264_payload_is_keyframe(payload),
+        Codec::H265 => h265_payload_is_keyframe(payload),
         Codec::Vp8 => vp8_payload_is_keyframe(payload),
         Codec::Vp9 => vp9_payload_is_keyframe(payload),
+        Codec::Av1 => av1_payload_is_keyframe(payload),
         Codec::Unknown => false,
     }
 }
@@ -66,6 +76,10 @@ mod tests {
     const VP8_KEY: [u8; 3] = [0x10, 0x00, 0x9D];
     /// VP9 flags P=0/B=1 + one payload byte.
     const VP9_KEY: [u8; 2] = [0x08, 0x86];
+    /// AV1 aggregation header with the N (new coded video sequence) bit set.
+    const AV1_KEY: [u8; 2] = [0x08, 0xAA];
+    /// H.265 single-NAL IDR_W_RADL (type 19) header byte 0 + a payload byte.
+    const H265_KEY: [u8; 2] = [19 << 1, 0x01];
 
     #[test]
     fn dispatches_to_h264() {
@@ -89,8 +103,22 @@ mod tests {
     }
 
     #[test]
+    fn dispatches_to_av1() {
+        assert!(payload_is_keyframe(Codec::Av1, &AV1_KEY));
+        // N bit clear → continuation / inter frame.
+        assert!(!payload_is_keyframe(Codec::Av1, &[0x00, 0xAA]));
+    }
+
+    #[test]
+    fn dispatches_to_h265() {
+        assert!(payload_is_keyframe(Codec::H265, &H265_KEY));
+        // TRAIL_R (type 1) → not an IRAP picture.
+        assert!(!payload_is_keyframe(Codec::H265, &[1 << 1, 0x01]));
+    }
+
+    #[test]
     fn unknown_codec_is_never_keyframe() {
-        for payload in [&H264_IDR[..], &VP8_KEY[..], &VP9_KEY[..], &[][..]] {
+        for payload in [&H264_IDR[..], &VP8_KEY[..], &VP9_KEY[..], &AV1_KEY[..], &H265_KEY[..], &[][..]] {
             assert!(!payload_is_keyframe(Codec::Unknown, payload));
         }
     }
@@ -99,8 +127,9 @@ mod tests {
     fn cross_codec_payloads_do_not_panic() {
         // Feeding the wrong codec's bytes must be safe (result is undefined
         // but must not panic); empty input is false for all codecs.
-        for codec in [Codec::H264, Codec::Vp8, Codec::Vp9, Codec::Unknown] {
-            for payload in [&H264_IDR[..], &VP8_KEY[..], &VP9_KEY[..], &[][..]] {
+        let codecs = [Codec::H264, Codec::H265, Codec::Vp8, Codec::Vp9, Codec::Av1, Codec::Unknown];
+        for codec in codecs {
+            for payload in [&H264_IDR[..], &VP8_KEY[..], &VP9_KEY[..], &AV1_KEY[..], &H265_KEY[..], &[][..]] {
                 let _ = payload_is_keyframe(codec, payload);
             }
             assert!(!payload_is_keyframe(codec, &[]));
@@ -111,10 +140,11 @@ mod tests {
     fn maps_str0m_codecs() {
         use str0m::format::Codec as S;
         assert_eq!(Codec::from(S::H264), Codec::H264);
+        assert_eq!(Codec::from(S::H265), Codec::H265);
         assert_eq!(Codec::from(S::Vp8), Codec::Vp8);
         assert_eq!(Codec::from(S::Vp9), Codec::Vp9);
+        assert_eq!(Codec::from(S::Av1), Codec::Av1);
         assert_eq!(Codec::from(S::Opus), Codec::Unknown);
-        assert_eq!(Codec::from(S::Av1), Codec::Unknown);
         assert_eq!(Codec::from(S::Rtx), Codec::Unknown);
     }
 

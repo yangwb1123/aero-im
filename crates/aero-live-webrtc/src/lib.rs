@@ -39,9 +39,11 @@ use thiserror::Error;
 
 pub mod bwe;
 pub mod call_bridge;
+pub mod av1;
 pub mod codec;
 pub mod forward;
 pub mod h264;
+pub mod h265;
 pub mod peer;
 pub mod remap;
 pub mod rtcp_fb;

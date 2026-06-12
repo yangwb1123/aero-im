@@ -71,10 +71,12 @@ pub struct InboundRtp {
     ///   payload header has the inverse-key-frame `P` bit clear.
     /// - **VP9** (draft-ietf-payload-vp9) — frame-begin packets (`B=1`) that
     ///   are not inter-picture predicted (`P=0`).
+    /// - **AV1** (draft-ietf-payload-av1) — aggregation-header `N` bit set
+    ///   (first packet of a new coded video sequence).
+    /// - **H.265** (RFC 7798) — IRAP NAL types 16–21 (single NAL or FU START).
     ///
-    /// **Limitation**: any other codec (AV1, H.265, audio, …) yields `false` —
-    /// the SFU has no payload-descriptor parser for them in RTP-forwarding
-    /// mode, so layer switching / keyframe gating never fires for those tracks.
+    /// **Limitation**: audio / RTX / any other codec yields `false` — there is
+    /// no intra-frame concept to gate on for those tracks.
     pub is_keyframe: bool,
 }
 
