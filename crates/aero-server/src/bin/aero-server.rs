@@ -454,8 +454,17 @@ async fn main() -> anyhow::Result<()> {
                             let now = time::OffsetDateTime::now_utc();
                             // None = sweep every policied workspace (the global periodic sweep).
                             match workspaces.sweep_expired_messages(now, None).await {
-                                Ok(0) => {}
-                                Ok(n) => info!(swept = n, "retention sweep soft-deleted messages"),
+                                Ok(deleted) if deleted.is_empty() => {}
+                                Ok(deleted) => {
+                                    let n = deleted.len();
+                                    // Fan out a Deleted event per retention-purged
+                                    // message so it leaves live + reconnecting
+                                    // clients' views (ROADMAP 方向一 合规).
+                                    for (message_id, room_id) in deleted {
+                                        sweep_im.announce_message_deleted(room_id, message_id).await;
+                                    }
+                                    info!(swept = n, "retention sweep soft-deleted messages");
+                                }
                                 Err(e) => warn!(error = ?e, "retention sweep failed"),
                             }
                             match messages_repo.sweep_ephemeral().await {

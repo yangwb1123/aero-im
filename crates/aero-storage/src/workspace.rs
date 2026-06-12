@@ -808,13 +808,17 @@ impl WorkspaceRepo {
     /// and the whole batch shares one consistent instant.
     /// Soft-delete messages past their workspace's retention window. `only`
     /// scopes the sweep to a single workspace (`Some`) or every policied
-    /// workspace (`None`, the periodic global sweep). Returns rows swept.
+    /// workspace (`None`, the periodic global sweep). Returns the
+    /// `(message_id, room_id)` of each swept message so the caller can fan out a
+    /// [`aero_common::RoomEvent::Deleted`] — retention-purged messages must
+    /// disappear from live and reconnecting clients, not linger until a manual
+    /// reload (ROADMAP 方向一).
     pub async fn sweep_expired_messages(
         &self,
         now: time::OffsetDateTime,
         only: Option<WorkspaceId>,
-    ) -> Result<u64, sqlx::Error> {
-        let result = sqlx::query(
+    ) -> Result<Vec<(MessageId, RoomId)>, sqlx::Error> {
+        let rows: Vec<(uuid::Uuid, uuid::Uuid)> = sqlx::query_as(
             r"UPDATE messages m
                  SET deleted_at = $1,
                      blocks = '[]'::jsonb,
@@ -833,13 +837,17 @@ impl WorkspaceRepo {
                        WHERE lh.active
                          AND (lh.room_id = r.id
                               OR (lh.room_id IS NULL AND lh.workspace_id = r.workspace_id))
-                    )",
+                    )
+              RETURNING m.id, m.room_id",
         )
         .bind(now)
         .bind(only.map(|w| w.to_uuid()))
-        .execute(&self.pool)
+        .fetch_all(&self.pool)
         .await?;
-        Ok(result.rows_affected())
+        Ok(rows
+            .into_iter()
+            .map(|(id, room)| (MessageId::from_uuid(id), RoomId::from_uuid(room)))
+            .collect())
     }
 }
 
@@ -1340,7 +1348,7 @@ mod db_tests {
         let fresh = insert_message_at(&p, room, owner, now - time::Duration::days(10)).await;
 
         let swept = repo.sweep_expired_messages(now, Some(ws)).await.unwrap();
-        assert_eq!(swept, 1, "exactly the one 40-day-old message is swept");
+        assert_eq!(swept.len(), 1, "exactly the one 40-day-old message is swept");
 
         // The old message now wears the canonical soft-delete shape.
         let (deleted_at, blocks, text) = message_state(&p, old).await;
@@ -1366,7 +1374,7 @@ mod db_tests {
         let ancient = insert_message_at(&p, room, owner, now - time::Duration::days(3650)).await;
 
         let swept = repo.sweep_expired_messages(now, Some(ws)).await.unwrap();
-        assert_eq!(swept, 0, "a policy-less workspace is never swept");
+        assert_eq!(swept.len(), 0, "a policy-less workspace is never swept");
         assert!(message_state(&p, ancient).await.0.is_none(), "10-year message kept");
     }
 
@@ -1389,19 +1397,19 @@ mod db_tests {
         let old_b = insert_message_at(&p, room_b, owner_b, now - time::Duration::days(30)).await;
 
         let first = repo.sweep_expired_messages(now, Some(ws_a)).await.unwrap();
-        assert_eq!(first, 1, "only A's old message is swept; B is untouched");
+        assert_eq!(first.len(), 1, "only A's old message is swept; B is untouched");
         assert!(message_state(&p, old_a).await.0.is_some(), "A's old message swept");
         assert!(message_state(&p, old_b).await.0.is_none(), "B's old message survives");
         // B has no policy: scoping the sweep to B deletes nothing.
         assert_eq!(
-            repo.sweep_expired_messages(now, Some(ws_b)).await.unwrap(),
+            repo.sweep_expired_messages(now, Some(ws_b)).await.unwrap().len(),
             0,
             "unpolicied workspace B is never swept"
         );
 
         // A second sweep finds nothing new (already-deleted rows are excluded).
         let second = repo.sweep_expired_messages(now, Some(ws_a)).await.unwrap();
-        assert_eq!(second, 0, "sweep is idempotent — no double-deletion");
+        assert_eq!(second.len(), 0, "sweep is idempotent — no double-deletion");
     }
 
     #[tokio::test]
@@ -1420,7 +1428,7 @@ mod db_tests {
 
         let now = time::OffsetDateTime::now_utc();
         let old = insert_message_at(&p, room, owner, now - time::Duration::days(365)).await;
-        assert_eq!(repo.sweep_expired_messages(now, Some(ws)).await.unwrap(), 0, "cleared policy = no sweep");
+        assert_eq!(repo.sweep_expired_messages(now, Some(ws)).await.unwrap().len(), 0, "cleared policy = no sweep");
         assert!(message_state(&p, old).await.0.is_none(), "message kept after policy cleared");
     }
 
@@ -1479,7 +1487,7 @@ mod db_tests {
         let in_inherit = insert_message_at(&p, inherit_room, owner, now - time::Duration::days(40)).await;
 
         let swept = repo.sweep_expired_messages(now, Some(ws)).await.unwrap();
-        assert_eq!(swept, 2, "the short-override 10d message and the inherited 40d message");
+        assert_eq!(swept.len(), 2, "the short-override 10d message and the inherited 40d message");
 
         // A shorter override sweeps a message the workspace default would have kept.
         assert!(message_state(&p, in_short).await.0.is_some(), "shorter override swept the 10-day message");
