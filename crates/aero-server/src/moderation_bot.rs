@@ -337,7 +337,23 @@ async fn process(
     }
 
     metrics::inc_counter(AI_MODERATION_CALLS_TOTAL, 1);
-    match ai.moderate(&job.text).await {
+    let verdict = ai.moderate(&job.text).await;
+    // Charge the AI cost of this paid moderation call onto the same
+    // aero_ai_cost_micros_total counter as worker jobs (ROADMAP 方向四) — the
+    // server moderation path previously recorded NO cost, so a flooding tenant's
+    // thousands of paid moderation calls were invisible. Only when a key is
+    // configured (the call actually hit Anthropic); the flat per-kind estimate is
+    // used since the AiBackend trait doesn't surface token usage. Best-effort.
+    if verdict.is_ok() && ai.has_anthropic() {
+        aero_ai::metrics::record_cost(
+            aero_common::metrics::global(),
+            &aero_ai::CostModel::default(),
+            aero_storage::AiJobKind::Moderate,
+            workspace.map(|w| w.to_uuid()),
+            true,
+        );
+    }
+    match verdict {
         Ok(Some(reason)) => {
             metrics::inc_counter(AI_MODERATION_FLAGGED_TOTAL, 1);
             // Capture the digest from the queued text — the soft-delete clears

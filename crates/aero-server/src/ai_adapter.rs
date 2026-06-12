@@ -168,6 +168,10 @@ impl AiBackend for AiServiceAdapter {
         self.inner.moderate(text).await.map_err(|e| e.to_string())
     }
 
+    fn has_anthropic(&self) -> bool {
+        self.inner.has_anthropic()
+    }
+
     async fn generate_thread_title(
         &self,
         root: MessageId,

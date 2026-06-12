@@ -115,6 +115,13 @@ pub trait AiBackend: Send + Sync + 'static {
     /// Moderate a message body (P5). `Some(reason)` blocks, `None` allows.
     /// Returns `None` when no LLM is configured.
     async fn moderate(&self, text: &str) -> Result<Option<String>, String>;
+    /// Whether a real Anthropic key is configured, i.e. whether [`Self::moderate`]
+    /// makes a PAID upstream call. Lets the moderation pipeline charge the
+    /// resulting cost only when a paid call actually happened (ROADMAP 方向四).
+    /// Defaults to `false` so a stub/test backend records no spend.
+    fn has_anthropic(&self) -> bool {
+        false
+    }
     /// Generate a short (5-10 word) title for the thread rooted at `root` — the
     /// root message anchors the title, the (clamped) reply chain is supporting
     /// context. Mirrors [`AiBackend::summarize_thread`]'s sourcing. Degrades SAFELY
