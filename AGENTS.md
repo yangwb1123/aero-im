@@ -11,7 +11,8 @@
 
 - **房间实时** = `RoomEvent`（tagged enum，`tag="kind"`）→ NATS `im.room.{id}` → 进程内 `Hub` → WebSocket；**直播实时** = `StreamEvent` → `live.stream.{id}` → 同链路。
 - **NATS = 跨实例投递的事实源**（subject 上的 durable consumer，seq key 区分 `im.room`/`live.stream` 两命名空间，在 `service.rs` 拼接）；`Hub` 只在本进程内扇出（bounded mpsc）。多开实例即水平扩消息吞吐。
-- **集群级状态走 Redis sorted set**，绝不靠单进程内存：房间 presence、直播观看数（`StreamViewerStore`）、通话 roster（`CallRosterStore`），心跳 + `zremrangebyscore` 驱逐（`live_presence.rs`），多节点一致。**唯一例外**：`aero-live-webrtc` SFU 的 peer roster 是进程内 `Arc<RwLock<HashMap<CallId, CallState>>>`（**非** DashMap、**非** Redis）——单实例设计、无跨节点媒体路由（见范围红线）。
+- **集群级状态走 Redis sorted set**，绝不靠单进程内存：房间 presence、直播观看数（`StreamViewerStore`）、通话 roster（`CallRosterStore`），心跳 + `zremrangebyscore` 驱逐（`live_presence.rs`），多节点一致。**例外**：`aero-live-webrtc` SFU 的 peer roster 是进程内 `Arc<RwLock<HashMap<CallId, CallState>>>`（**非** DashMap、**非** Redis），每节点独立——跨节点媒体不靠它，走 call-bridge（下条）。
+- **跨节点通话媒体 = call-bridge**（已接线、localhost 已测）：节点间是**明文 RTP**（后端可信网，DTLS-SRTP 只在客户端腿）经 `bridge_frame` 编帧 + UDP 收发 + `/api/internal/call-bridge/subscribe`（cluster secret）订阅注册；`SfuMediaSession`（`sfu_media.rs`）驱动 str0m 事件循环，`on_rtp` 把解密 RTP 转发本地订阅者并喂 `CallEgress`→远端。**仅剩 seam**：真实 WebRTC 客户端（浏览器/第二节点）运行时做 ICE/DTLS/SRTP——str0m 实现握手、循环已接线，真实媒体需真实对端（见范围红线⛔）。
 - ⚠️ tagged enum 标签是 `kind`，**variant 内别再有名为 `kind` 的字段**（会撞 `duplicate field kind` panic）。已用 `#[serde(rename=...)]`（均在 `model.rs`）：`CallEvent`→`call_kind`、`RoomEvent::Notify`→`notify_kind`；web 客户端一律 `event.call_kind || event.kind` 兜底旧服务端。
 
 ## crate 地图（依赖自下而上，勿成环）
@@ -30,7 +31,7 @@
 | 直播 | `aero-live-core` | `LiveIngest` trait + `IngestEvent` |
 | 直播 | `aero-live-rtmp`·`-hls` | rml_rtmp 摄入 · `HlsWriter` + `FlvToTsConverter`（真 MPEG-TS mux） |
 | 直播 | `aero-live-whip` | str0m WHIP/WHEP：SDP 应答 + RFC 6184 H.264 解包 + RTP→HLS + NAL 中继 |
-| 直播 | `aero-live-webrtc` | str0m SFU：选择性转发 + seq/ts 重映射 + Simulcast + RTCP(PLI/FIR)（**单实例**） |
+| 直播 | `aero-live-webrtc` | str0m SFU：选择性转发 + seq/ts 重映射 + Simulcast + RTCP(PLI/FIR) + H264/H265/VP8/VP9/AV1 关键帧 + 跨节点 `CallBridge` 中继 |
 | 直播 | `aero-live-srt` | 手写 SRT HSv5 握手 + AES-CTR + Key Wrap(RFC 3394) + ACK/NAK + `MpegTsSegmenter` + 时限 TURN 凭据 |
 | 组合 | `aero-server` | Axum gateway：HTTP + WS + WHIP/WHEP + HLS + RTMP `:1935` + bots + `Hub`；每功能一个 `pub fn routes()` 模块 |
 | 组合 | `web/` | 零依赖 ES2020 SPA（hls.js / RTCPeerConnection / SpeechRecognition CDN） |
@@ -79,8 +80,8 @@ AERO__SERVER__BLOB_DIR=/tmp/aero/blobs AERO__SERVER__HLS_DIR=/tmp/aero/hls \
 | ✅ 已实现 | 应用层功能集，见 README 功能矩阵 | **别重复造**：grep 模块名/迁移确认 |
 | ✅ 真实出站 HTTP、沙箱无真对端 | OIDC JWKS 拉取、出站 Webhook（`webhook.rs` HMAC-SHA256，非 `webhook_delivery.rs`）、unfurl 抓取 | **别当 seam 重造** |
 | 🚫 非目标 | MLS E2E **客户端**（仅 `mls.rs` 不透明字节 scaffold，无 openmls）；**联邦**（零代码零 scaffold，明确出范围）；移动端原生 SDK（Web 优先） | 产品既定决策 |
-| 🧱 设计边界、非待办 | SCIM 仅入站（RFC 7644，IdP 驱动）；SFU **单实例**（roster 进程内，无跨节点媒体路由）；VOD 只管录制元数据/生命周期，切片骑既有 HLS writer | 当边界，别当 TODO |
-| ⛔ 沙箱无法端到端验证 | 浏览器 ICE/DTLS/SRTP 推/拉流、真实 ffmpeg/OBS 推流；`call_bridge_supervisor.rs` 的 `TODO(real-transport)`（节点间 recvonly RTP 未接线） | 写「待真实链路联调」，别写完成 |
+| 🧱 设计边界、非待办 | SCIM 仅入站（RFC 7644，IdP 驱动）；SFU roster 每节点进程内（跨节点媒体经 call-bridge 中继，**已接线**）；VOD 只管录制元数据/生命周期，切片骑既有 HLS writer | 当边界，别当 TODO |
+| ⛔ 沙箱无法端到端验证 | 真实 WebRTC 客户端（浏览器/第二节点）的 ICE/DTLS/SRTP 握手交付真实媒体（str0m 做握手、`SfuMediaSession` 驱动循环已接线，但需真实对端在运行时）；真实 ffmpeg/OBS 推流。**注**：call-bridge 传输/控制面已建+localhost 测，别当未接线重造 | 写「待真实客户端/二节点联调」，别写完成 |
 
 ## 已知坑
 
