@@ -62,7 +62,7 @@ pub struct NatsConfig {
     pub url: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct AuthConfig {
     /// PEM-encoded RSA private key.
     pub jwt_private_key_pem: String,
@@ -77,6 +77,23 @@ pub struct AuthConfig {
     /// Refresh-token lifetime in seconds.
     #[serde(default = "default_refresh_ttl")]
     pub refresh_ttl_secs: u64,
+}
+
+/// Manual `Debug` that **redacts the RSA private key** (ROADMAP 方向三). The
+/// derived impl would print `jwt_private_key_pem` verbatim, so a single stray
+/// `info!(?cfg)` / `debug!(?auth)` anywhere downstream — or a panic that formats
+/// `AppConfig` — would leak the signing key into logs or telemetry. `AppConfig`
+/// transitively derives `Debug`, so this guard travels with it.
+impl std::fmt::Debug for AuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthConfig")
+            .field("jwt_private_key_pem", &"<redacted>")
+            .field("jwt_public_key_pem", &self.jwt_public_key_pem)
+            .field("issuer", &self.issuer)
+            .field("access_ttl_secs", &self.access_ttl_secs)
+            .field("refresh_ttl_secs", &self.refresh_ttl_secs)
+            .finish()
+    }
 }
 
 fn default_issuer() -> String {
@@ -166,6 +183,25 @@ mod tests {
     #[test]
     fn default_trace_sample_rate_is_one() {
         assert!((TelemetryConfig::default().trace_sample_rate - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn auth_config_debug_redacts_private_key() {
+        let cfg = AuthConfig {
+            jwt_private_key_pem: "TOP_SECRET_RSA_PRIVATE_KEY_MATERIAL".into(),
+            jwt_public_key_pem: "public-key-pem".into(),
+            issuer: "aero".into(),
+            access_ttl_secs: 900,
+            refresh_ttl_secs: 86_400,
+        };
+        let dbg = format!("{cfg:?}");
+        assert!(
+            !dbg.contains("TOP_SECRET_RSA_PRIVATE_KEY_MATERIAL"),
+            "private key must never appear in Debug output:\n{dbg}"
+        );
+        assert!(dbg.contains("<redacted>"), "redaction marker present");
+        // Non-secret fields still render for diagnostics.
+        assert!(dbg.contains("aero") && dbg.contains("900"));
     }
 
     #[test]

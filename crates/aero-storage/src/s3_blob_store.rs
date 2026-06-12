@@ -47,13 +47,29 @@ const ALGORITHM: &str = "AWS4-HMAC-SHA256";
 ///
 /// `endpoint` is `None` for real AWS (the host is derived from `bucket`/`region`)
 /// and `Some("http://minio:9000")` for `MinIO` or any custom S3 API.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct S3Config {
     pub bucket: String,
     pub region: String,
     pub endpoint: Option<String>,
     pub access_key: String,
     pub secret_key: String,
+}
+
+/// Manual `Debug` that **redacts the S3 secret key** (ROADMAP 方向三). The
+/// derived impl would print `secret_key` verbatim; redacting it keeps the access
+/// key id (an identifier) visible for diagnostics while a stray `?cfg` log can
+/// never leak the secret.
+impl std::fmt::Debug for S3Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("S3Config")
+            .field("bucket", &self.bucket)
+            .field("region", &self.region)
+            .field("endpoint", &self.endpoint)
+            .field("access_key", &self.access_key)
+            .field("secret_key", &"<redacted>")
+            .finish()
+    }
 }
 
 impl S3Config {
@@ -394,6 +410,25 @@ mod tests {
     /// AWS's published `SigV4` example credentials.
     const EXAMPLE_ACCESS_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
     const EXAMPLE_SECRET_KEY: &str = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY";
+
+    #[test]
+    fn s3_config_debug_redacts_secret_key() {
+        let cfg = S3Config {
+            bucket: "my-bucket".into(),
+            region: "us-east-1".into(),
+            endpoint: None,
+            access_key: EXAMPLE_ACCESS_KEY.into(),
+            secret_key: EXAMPLE_SECRET_KEY.into(),
+        };
+        let dbg = format!("{cfg:?}");
+        assert!(
+            !dbg.contains(EXAMPLE_SECRET_KEY),
+            "secret key must never appear in Debug output:\n{dbg}"
+        );
+        assert!(dbg.contains("<redacted>"), "redaction marker present");
+        // The access key id (an identifier) and bucket stay visible for ops.
+        assert!(dbg.contains(EXAMPLE_ACCESS_KEY) && dbg.contains("my-bucket"));
+    }
 
     /// `hmac`/`sha2` determinism guard: SHA-256 of the empty string is a fixed,
     /// well-known constant (also the `SigV4` hash of an unsigned empty payload).
