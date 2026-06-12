@@ -6,17 +6,14 @@
 
 ## P0 — correctness / deployability (priority #1)
 
-- [ ] **BLOCKER · STOP — migration chain breaks at 0109 on a fresh DB.**
-  `0109_subscription_tiers.sql:12` does a bare `ALTER TABLE creator_subscriptions
-  ADD COLUMN tier_id ...`, but `0051_creator_subscriptions.sql:26` already created
-  `creator_subscriptions.tier_id uuid NOT NULL` and nothing drops/renames it →
-  `ERROR: column "tier_id" already exists`. **A brand-new deployment cannot
-  migrate.** Hidden because the dev DB is frozen at migration 32 (pre-0109), all
-  db-tests are `#[ignore]` (never run a fresh chain in CI), and migrations are only
-  `cargo build`-embedded, never execution-validated. Two tier systems coexist
-  (`creator_tiers` from 0051 vs `subscription_tiers` from 0109). **Needs a product
-  decision** → see DECISIONS.md ADR-002 (replace-and-migrate vs parallel+rename).
-  Owner: human. _Also add a CI job that replays `migrations/*.sql` on a scratch DB._
+- [x] ~~**BLOCKER — migration chain breaks at 0109 on a fresh DB.**~~ Fixed 40f8cab:
+  the colliding `ADD COLUMN tier_id` was dead (no code referenced it), so it was
+  dropped outright (DECISIONS.md ADR-002). Full chain now replays clean (125/125),
+  guarded by `scripts/migrate_chain_smoke.sh` / `make migrate-smoke` (4495215).
+- [x] ~~**db-tests never executed against a full schema.**~~ Swept all crates against
+  a fully-migrated DB: aero-storage had 3 broken fixtures (`body`/`email`/`password_hash`
+  columns that don't exist) — fixed 57c2d45 (195/0); aero-im-core (11) + aero-server
+  (5) were already correct. db-tests now genuinely pass workspace-wide on a fresh DB.
 - [ ] **STOP — gift double-charge (money path).** `aero-storage/src/live.rs:~125`
   mints `Ulid::new()` + bare INSERT with no idempotency key; a retried gift RPC
   double-charges. Needs schema (idempotency-key column / unique constraint) +
@@ -43,11 +40,15 @@
 
 ## Tech debt (see also DECISIONS.md)
 
-- **High:** migrations never execution-validated (root cause of the 0109 blocker) —
-  add a fresh-DB migration smoke to CI.
+- **~~High~~ → mitigated:** migrations never execution-validated (root cause of the
+  0109 blocker). `scripts/migrate_chain_smoke.sh` now replays the chain on a fresh
+  DB; remaining: wire it into an actual CI workflow (no CI runner in this sandbox).
 - **Medium:** dev DB frozen at migration 32 — drift from the 125-migration HEAD
-  masks any fresh-deploy schema bug.
-- **Low:** db-tests are `#[ignore]`-only; no automated live-PG lane.
+  masks any fresh-deploy schema bug. Mitigated for new bugs by the smoke script, but
+  the dev DB itself should be re-provisioned from a clean chain.
+- **Low → mitigated:** db-tests were `#[ignore]`-only and never run; now verified to
+  pass against a fully-migrated DB workspace-wide. Still no *automated* live-PG CI
+  lane (would run `--ignored` against a postgres service).
 - **Medium:** no test-AppState harness in aero-server — its 286 lib tests are all
   pure-function, so background tasks (bus listeners, sweeps) and full route flows
   have no unit coverage. Blocks e.g. a resubscribe regression test for ADR-003.
