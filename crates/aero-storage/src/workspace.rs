@@ -493,7 +493,7 @@ impl WorkspaceRepo {
             // export's chronological contract.
             let probe = EXPORT_MESSAGES_PER_ROOM + 1;
             let mut msg_rows = sqlx::query_as::<_, ExportMessageRow>(
-                r"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at
+                r"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at
                    FROM messages
                    WHERE room_id = $1 AND deleted_at IS NULL
                    ORDER BY id DESC
@@ -868,6 +868,7 @@ struct ExportMessageRow {
     created_at: time::OffsetDateTime,
     edited_at: Option<time::OffsetDateTime>,
     deleted_at: Option<time::OffsetDateTime>,
+    expires_at: Option<time::OffsetDateTime>,
 }
 
 impl From<ExportMessageRow> for Message {
@@ -883,6 +884,7 @@ impl From<ExportMessageRow> for Message {
             created_at: r.created_at,
             edited_at: r.edited_at,
             deleted_at: r.deleted_at,
+            expires_at: r.expires_at,
         }
     }
 }

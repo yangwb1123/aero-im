@@ -552,6 +552,7 @@ mod db_tests {
             blocks: vec![aero_common::Block::text("to be deleted, audited atomically")],
             reply_to: None,
             metadata: serde_json::json!({}),
+            expires_at: None,
         })
         .await
         .expect("insert message")

@@ -98,6 +98,7 @@ struct ScoredRow {
     created_at: time::OffsetDateTime,
     edited_at: Option<time::OffsetDateTime>,
     deleted_at: Option<time::OffsetDateTime>,
+    expires_at: Option<time::OffsetDateTime>,
     score: f32,
 }
 
@@ -115,6 +116,7 @@ impl From<ScoredRow> for SearchHit {
                 created_at: r.created_at,
                 edited_at: r.edited_at,
                 deleted_at: r.deleted_at,
+                expires_at: r.expires_at,
             },
             score: r.score,
         }
@@ -161,7 +163,7 @@ impl AdvancedSearchRepo {
         let rows = sqlx::query_as::<_, ScoredRow>(
             r"SELECT
                  m.id, m.room_id, m.sender_id, m.blocks, m.reply_to, m.metadata,
-                 m.created_at, m.edited_at, m.deleted_at,
+                 m.created_at, m.edited_at, m.deleted_at, m.expires_at,
                  GREATEST(
                    ts_rank(m.search_tsv, websearch_to_tsquery('simple', $2)),
                    similarity(m.searchable_text, $2)
@@ -353,6 +355,7 @@ mod db_tests {
                 blocks: vec![Block::text(format!("alpha {needle} from me"))],
                 reply_to: None,
                 metadata: serde_json::json!({}),
+                expires_at: None,
             })
             .await
             .expect("insert m_me");
@@ -363,6 +366,7 @@ mod db_tests {
                 blocks: vec![Block::text(format!("beta {needle} from other"))],
                 reply_to: None,
                 metadata: serde_json::json!({}),
+                expires_at: None,
             })
             .await
             .expect("insert m_other");
@@ -373,6 +377,7 @@ mod db_tests {
                 blocks: vec![Block::text(format!("gamma {needle} elsewhere"))],
                 reply_to: None,
                 metadata: serde_json::json!({}),
+                expires_at: None,
             })
             .await
             .expect("insert m_elsewhere");

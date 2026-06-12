@@ -282,6 +282,7 @@ mod db_tests {
                 blocks: vec![aero_common::Block::text("reportable")],
                 reply_to: None,
                 metadata: serde_json::Value::Null,
+                expires_at: None,
             })
             .await
             .expect("insert message");

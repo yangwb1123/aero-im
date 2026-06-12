@@ -17,10 +17,10 @@ use aero_common::{
 };
 use aero_common::{PinOp, PinnedMessage};
 use aero_storage::{
-    message::NewMessage, AiJobKind, AiJobRepo, CallRepo, DeactivationRepo, KeywordAlertRepo,
-    MessageEditRepo, MessageRepo, NotificationPrefsRepo, NotificationRepo, ParticipantRepo, PinRepo,
-    ReactionRepo, ReceiptRepo, RoomRepo, ThreadNotificationPrefsRepo, ThreadSubscriptionRepo,
-    TotpRepo, UserGroupRepo, WorkspaceMuteRepo, WorkspaceRepo,
+    message::NewMessage, AiJobKind, AiJobRepo, BlockRepo, CallRepo, DeactivationRepo,
+    KeywordAlertRepo, MessageEditRepo, MessageRepo, NotificationPrefsRepo, NotificationRepo,
+    ParticipantRepo, PinRepo, ReactionRepo, ReceiptRepo, RoomRepo, ThreadNotificationPrefsRepo,
+    ThreadSubscriptionRepo, TotpRepo, UserGroupRepo, WorkspaceMuteRepo, WorkspaceRepo,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -188,6 +188,11 @@ pub struct ImService {
     /// notifications to participants who have muted the room's workspace (checked
     /// first, before any room-level suppression).
     workspace_mutes: Option<WorkspaceMuteRepo>,
+    /// User block store (ROADMAP8). Optional builder
+    /// ([`with_block_repo`](Self::with_block_repo)); when present,
+    /// [`dispatch_notifications`](Self::dispatch_notifications) suppresses
+    /// notifications to recipients who have blocked the sender.
+    block_repo: Option<BlockRepo>,
     bus: Arc<dyn BusSink>,
     moderator: Arc<dyn Moderator>,
     /// Per-subject event-seq source for publish-time `"seq"` stamping (ROADMAP
@@ -240,6 +245,7 @@ impl ImService {
             totp: None,
             thread_notification_prefs: None,
             workspace_mutes: None,
+            block_repo: None,
             bus: bus as Arc<dyn BusSink>,
             moderator,
             seq: Arc::new(LocalSeqProvider::new()),
@@ -383,6 +389,16 @@ impl ImService {
         self
     }
 
+    /// Wire in the user-block store (ROADMAP8), enabling block-based notification
+    /// suppression in [`dispatch_notifications`](Self::dispatch_notifications). When
+    /// present, recipients who have blocked the sender receive no notifications.
+    /// Additive builder; without it, no block suppression is applied.
+    #[must_use]
+    pub fn with_block_repo(mut self, repo: BlockRepo) -> Self {
+        self.block_repo = Some(repo);
+        self
+    }
+
     /// Notification suppression seam for per-channel mute + per-user
     /// Do-Not-Disturb + one-off snooze. Returns whether a notification should be
     /// delivered to `recipient` for `room`: `false` when the recipient has MUTED
@@ -456,6 +472,7 @@ impl ImService {
             totp: None,
             thread_notification_prefs: None,
             workspace_mutes: None,
+            block_repo: None,
             bus,
             moderator: Arc::new(crate::moderator::AllowAllModerator),
             seq: Arc::new(LocalSeqProvider::new()),
@@ -910,6 +927,7 @@ impl ImService {
         room: RoomId,
         blocks: Vec<Block>,
         reply_to: Option<MessageId>,
+        expires_at: Option<time::OffsetDateTime>,
     ) -> Result<Message> {
         let started = std::time::Instant::now();
         if !self.rooms.is_member(room, sender).await? {
@@ -933,6 +951,7 @@ impl ImService {
                 blocks,
                 reply_to,
                 metadata: serde_json::Value::Null,
+                expires_at,
             })
             .await?;
 
@@ -1610,6 +1629,20 @@ impl ImService {
                         }
                     }
                 }
+            }
+        }
+
+        // Block filter (ROADMAP8): remove any recipient who has blocked the sender.
+        // Best-effort: a lookup failure delivers (fail-open, warn). No-op when
+        // the block store is not wired.
+        if let Some(block_repo) = self.block_repo.as_ref() {
+            match block_repo.blockers_of(sender).await {
+                Ok(blockers) => {
+                    let blocker_set: std::collections::HashSet<ParticipantId> =
+                        blockers.into_iter().collect();
+                    targets.retain(|p, _| !blocker_set.contains(p));
+                }
+                Err(err) => warn!(?err, "block repo lookup failed; not suppressing"),
             }
         }
 

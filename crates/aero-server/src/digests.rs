@@ -273,7 +273,7 @@ async fn deliver_one(
     match sub.target {
         DigestTarget::Room(room) => {
             let blocks = vec![Block::text(format!("📰 定时摘要 ({}):\n{summary}", sub.frequency))];
-            if let Err(e) = im.send_message(sub.participant_id, room, blocks, None).await {
+            if let Err(e) = im.send_message(sub.participant_id, room, blocks, None, None).await {
                 tracing::warn!(
                     error = ?e,
                     digest_id = %sub.id,

@@ -401,6 +401,9 @@ pub fn build(state: AppState) -> Router {
         // has no auth extractor so any user (even unauthenticated) can view
         // clip metadata via a shared link.
         .merge(crate::clips::public_routes())
+        // ---- ROADMAP8 — user blocking ----
+        // POST/DELETE /api/users/:user_id/block, GET /api/me/blocks.
+        .merge(crate::user_blocks::router())
         // ---- OpenAPI 3.0 spec (public, no auth) ----
         // GET /api/openapi.json returns the static OpenAPI document so API clients
         // and documentation generators can introspect the surface without credentials.
@@ -1467,7 +1470,7 @@ async fn stream_create(
         };
         if let Err(e) = s
             .im
-            .send_message(auth.participant_id, room, vec![card], None)
+            .send_message(auth.participant_id, room, vec![card], None, None)
             .await
         {
             tracing::warn!(error = ?e, %room, "stream announce message failed");

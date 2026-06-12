@@ -334,3 +334,7 @@ pub mod topic_history;
 pub mod thread_read_state;
 pub use topic_history::TopicHistoryRepo;
 pub use thread_read_state::ThreadReadStateRepo;
+
+// ---- User-level blocking / ignoring (migration 0106) ----
+pub mod user_blocks;
+pub use user_blocks::BlockRepo;

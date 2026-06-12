@@ -1358,6 +1358,7 @@ mod tests {
             created_at: OffsetDateTime::now_utc(),
             edited_at: None,
             deleted_at: None,
+            expires_at: None,
         }
     }
 

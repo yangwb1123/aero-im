@@ -64,6 +64,10 @@ enum ClientFrame {
         blocks: Vec<Block>,
         #[serde(default)]
         reply_to: Option<MessageId>,
+        /// Optional sender-set TTL in seconds. If > 0, the message is
+        /// hard-deleted by the ephemeral sweep once this many seconds elapse.
+        #[serde(default)]
+        expires_after_secs: Option<u64>,
     },
     /// Edit an existing message (sender only).
     EditMessage { id: MessageId, blocks: Vec<Block> },
@@ -379,7 +383,7 @@ async fn handle_text(
             ));
             debug!(%pid, %room_id, "joined room");
         }
-        ClientFrame::SendMessage { room_id, blocks, reply_to } => {
+        ClientFrame::SendMessage { room_id, blocks, reply_to, expires_after_secs } => {
             // Tenant guard: the sender must belong to BOTH the room's workspace and
             // the room before a message is accepted. `ImService::send_message`
             // re-checks room membership (a distinct, retained check); this adds the
@@ -390,7 +394,10 @@ async fn handle_text(
             // budget — after the access check (so non-members cannot drain a
             // victim's budget), surfacing as a WS `error` frame when over.
             crate::ws_rate::check_ws_rate_room(state, room_id).await?;
-            state.im.send_message(pid, room_id, blocks, reply_to).await?;
+            let expires_at = expires_after_secs
+                .filter(|&s| s > 0)
+                .map(|s| time::OffsetDateTime::now_utc() + time::Duration::seconds(s as i64));
+            state.im.send_message(pid, room_id, blocks, reply_to, expires_at).await?;
         }
         ClientFrame::EditMessage { id, blocks } => {
             state.im.edit_message(pid, id, blocks).await?;

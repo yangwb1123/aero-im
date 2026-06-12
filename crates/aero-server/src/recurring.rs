@@ -187,7 +187,7 @@ pub async fn run_recurring_dispatcher(
             };
             if !blocks.is_empty() {
                 if let Err(e) = im
-                    .send_message(msg.sender_id, msg.room_id, blocks, None)
+                    .send_message(msg.sender_id, msg.room_id, blocks, None, None)
                     .await
                 {
                     tracing::warn!(

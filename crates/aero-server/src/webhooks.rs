@@ -125,7 +125,7 @@ async fn incoming_post(
     let blocks = blocks_from_body(body)?;
     // The hook's bot was added to the room at creation, so send_message's
     // membership check passes.
-    s.im.send_message(hook.bot_id, hook.room_id, blocks, None).await?;
+    s.im.send_message(hook.bot_id, hook.room_id, blocks, None, None).await?;
     Ok(StatusCode::ACCEPTED)
 }
 
@@ -519,6 +519,7 @@ mod tests {
             created_at: time::OffsetDateTime::UNIX_EPOCH,
             edited_at: None,
             deleted_at: None,
+            expires_at: None,
         };
         RoomEvent::Message(MessageEnvelope { message: msg, recipients: Vec::new() })
     }

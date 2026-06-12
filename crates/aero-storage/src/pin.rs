@@ -82,7 +82,7 @@ impl PinRepo {
             r"SELECT
                  p.room_id, p.pinned_by, p.created_at AS pinned_at,
                  m.id, m.sender_id, m.blocks, m.reply_to, m.metadata,
-                 m.created_at, m.edited_at, m.deleted_at
+                 m.created_at, m.edited_at, m.deleted_at, m.expires_at
                FROM pins p
                JOIN messages m ON m.id = p.message_id
                WHERE p.room_id = $1 AND m.deleted_at IS NULL
@@ -110,6 +110,7 @@ struct PinnedRow {
     created_at: time::OffsetDateTime,
     edited_at: Option<time::OffsetDateTime>,
     deleted_at: Option<time::OffsetDateTime>,
+    expires_at: Option<time::OffsetDateTime>,
 }
 
 impl From<PinnedRow> for PinnedMessage {
@@ -128,6 +129,7 @@ impl From<PinnedRow> for PinnedMessage {
                 created_at: r.created_at,
                 edited_at: r.edited_at,
                 deleted_at: r.deleted_at,
+                expires_at: r.expires_at,
             },
             pinned_by: ParticipantId::from_uuid(r.pinned_by),
             pinned_at: r.pinned_at,

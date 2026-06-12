@@ -142,6 +142,7 @@ mod db_tests {
             blocks: vec![Block::text(text)],
             reply_to,
             metadata: serde_json::Value::Null,
+            expires_at: None,
         }
     }
 

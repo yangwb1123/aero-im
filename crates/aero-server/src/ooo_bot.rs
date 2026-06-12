@@ -95,7 +95,7 @@ async fn handle(state: &AppState, env: MessageEnvelope) -> anyhow::Result<()> {
     // never replies to itself), then record it so the next message from the same
     // sender is suppressed. Record only after a successful send.
     let blocks = vec![aero_common::Block::text(status.message)];
-    match state.im.send_message(other, room, blocks, None).await {
+    match state.im.send_message(other, room, blocks, None, None).await {
         Ok(_) => {
             if let Err(e) = ooo.record_autoreply(other, sender, room).await {
                 warn!(error = ?e, ooo_user = %other, %sender, "record_autoreply failed");

@@ -19,6 +19,7 @@ pub struct NewMessage {
     pub blocks: Vec<Block>,
     pub reply_to: Option<MessageId>,
     pub metadata: serde_json::Value,
+    pub expires_at: Option<time::OffsetDateTime>,
 }
 
 /// Search result row carrying the message + a relevance score.
@@ -42,8 +43,8 @@ impl MessageRepo {
 
         sqlx::query(
             r#"INSERT INTO messages
-                 (id, room_id, sender_id, blocks, reply_to, metadata, searchable_text, created_at)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)"#,
+                 (id, room_id, sender_id, blocks, reply_to, metadata, searchable_text, created_at, expires_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"#,
         )
         .bind(id.to_uuid())
         .bind(new.room_id.to_uuid())
@@ -53,6 +54,7 @@ impl MessageRepo {
         .bind(&new.metadata)
         .bind(&searchable)
         .bind(created_at)
+        .bind(new.expires_at)
         .execute(&self.pool)
         .await?;
 
@@ -66,13 +68,14 @@ impl MessageRepo {
             created_at,
             edited_at: None,
             deleted_at: None,
+            expires_at: new.expires_at,
         })
     }
 
     /// Fetch a single message by id (including soft-deleted, caller must filter).
     pub async fn get(&self, id: MessageId) -> Result<Option<Message>, sqlx::Error> {
         let row = sqlx::query_as::<_, MessageRow>(
-            r#"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at
+            r#"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at
                FROM messages WHERE id = $1"#,
         )
         .bind(id.to_uuid())
@@ -97,7 +100,7 @@ impl MessageRepo {
             r#"UPDATE messages
                   SET blocks = $1, searchable_text = $2, edited_at = $3, embedding = NULL
                WHERE id = $4 AND deleted_at IS NULL
-            RETURNING id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at"#,
+            RETURNING id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at"#,
         )
         .bind(&blocks_json)
         .bind(&searchable)
@@ -270,7 +273,7 @@ impl MessageRepo {
                  edited_at = NOW(),
                  embedding = NULL
                WHERE id = $1 AND deleted_at IS NULL
-            RETURNING id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at"#,
+            RETURNING id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at"#,
         )
         .bind(id.to_uuid())
         .bind(transcript)
@@ -306,7 +309,7 @@ impl MessageRepo {
         let limit = limit.clamp(1, 200);
         let rows = if let Some(b) = before {
             sqlx::query_as::<_, MessageRow>(
-                r#"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at
+                r#"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at
                    FROM messages
                    WHERE room_id = $1 AND id < $2 AND deleted_at IS NULL
                    ORDER BY id DESC
@@ -319,7 +322,7 @@ impl MessageRepo {
             .await?
         } else {
             sqlx::query_as::<_, MessageRow>(
-                r#"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at
+                r#"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at
                    FROM messages
                    WHERE room_id = $1 AND deleted_at IS NULL
                    ORDER BY id DESC
@@ -354,7 +357,7 @@ impl MessageRepo {
     ) -> Result<Vec<Message>, sqlx::Error> {
         let limit = clamp_page_limit(limit);
         let rows = sqlx::query_as::<_, MessageRow>(
-            r"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at
+            r"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at
                FROM messages
                WHERE room_id = $1 AND id > $2 AND deleted_at IS NULL
                ORDER BY id ASC
@@ -399,7 +402,7 @@ impl MessageRepo {
         let half_window = clamp_half_window(half_window);
 
         let before = sqlx::query_as::<_, MessageRow>(
-            r"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at
+            r"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at
                FROM messages
                WHERE room_id = $1 AND id < $2 AND deleted_at IS NULL
                ORDER BY id DESC
@@ -412,7 +415,7 @@ impl MessageRepo {
         .await?;
 
         let target_row = sqlx::query_as::<_, MessageRow>(
-            r"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at
+            r"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at
                FROM messages
                WHERE room_id = $1 AND id = $2 AND deleted_at IS NULL",
         )
@@ -422,7 +425,7 @@ impl MessageRepo {
         .await?;
 
         let after = sqlx::query_as::<_, MessageRow>(
-            r"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at
+            r"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at
                FROM messages
                WHERE room_id = $1 AND id > $2 AND deleted_at IS NULL
                ORDER BY id ASC
@@ -449,7 +452,7 @@ impl MessageRepo {
     pub async fn list_without_embedding(&self, limit: i64) -> Result<Vec<Message>, sqlx::Error> {
         let limit = limit.clamp(1, 1000);
         let rows = sqlx::query_as::<_, MessageRow>(
-            r#"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at
+            r#"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at
                FROM messages
                WHERE embedding IS NULL
                  AND deleted_at IS NULL
@@ -475,7 +478,7 @@ impl MessageRepo {
         let rows = sqlx::query_as::<_, ScoredMessageRow>(
             r#"SELECT
                  m.id, m.room_id, m.sender_id, m.blocks, m.reply_to, m.metadata,
-                 m.created_at, m.edited_at, m.deleted_at,
+                 m.created_at, m.edited_at, m.deleted_at, m.expires_at,
                  GREATEST(
                    ts_rank(m.search_tsv, websearch_to_tsquery('simple', $2)),
                    similarity(m.searchable_text, $2)
@@ -511,7 +514,7 @@ impl MessageRepo {
         let rows = sqlx::query_as::<_, ScoredMessageRow>(
             r#"SELECT
                  m.id, m.room_id, m.sender_id, m.blocks, m.reply_to, m.metadata,
-                 m.created_at, m.edited_at, m.deleted_at,
+                 m.created_at, m.edited_at, m.deleted_at, m.expires_at,
                  (1 - (m.embedding <=> $2))::real AS score
                FROM messages m
                WHERE m.room_id = $1
@@ -562,7 +565,7 @@ impl MessageRepo {
         let sql = format!(
             r"SELECT
                  m.id, m.room_id, m.sender_id, m.blocks, m.reply_to, m.metadata,
-                 m.created_at, m.edited_at, m.deleted_at,
+                 m.created_at, m.edited_at, m.deleted_at, m.expires_at,
                  ts_rank(m.search_tsv, {f}('simple', $2)) AS score
                FROM messages m
                WHERE m.room_id = $1
@@ -595,7 +598,7 @@ impl MessageRepo {
     ) -> Result<Vec<Message>, sqlx::Error> {
         let limit = clamp_page_limit(limit);
         let rows = sqlx::query_as::<_, MessageRow>(
-            r"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at
+            r"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at
                FROM messages
                WHERE reply_to = $1
                  AND deleted_at IS NULL
@@ -735,7 +738,7 @@ impl MessageRepo {
         let rows = sqlx::query_as::<_, ScoredMessageRow>(
             r#"SELECT
                  m.id, m.room_id, m.sender_id, m.blocks, m.reply_to, m.metadata,
-                 m.created_at, m.edited_at, m.deleted_at,
+                 m.created_at, m.edited_at, m.deleted_at, m.expires_at,
                  GREATEST(
                    ts_rank(m.search_tsv, websearch_to_tsquery('simple', $2)),
                    similarity(m.searchable_text, $2)
@@ -773,7 +776,7 @@ impl MessageRepo {
         let rows = sqlx::query_as::<_, ScoredMessageRow>(
             r#"SELECT
                  m.id, m.room_id, m.sender_id, m.blocks, m.reply_to, m.metadata,
-                 m.created_at, m.edited_at, m.deleted_at,
+                 m.created_at, m.edited_at, m.deleted_at, m.expires_at,
                  GREATEST(
                    ts_rank(m.search_tsv, websearch_to_tsquery('simple', $2)),
                    similarity(m.searchable_text, $2)
@@ -824,7 +827,7 @@ impl MessageRepo {
         let rows = sqlx::query_as::<_, ScoredMessageRow>(
             r"SELECT
                  m.id, m.room_id, m.sender_id, m.blocks, m.reply_to, m.metadata,
-                 m.created_at, m.edited_at, m.deleted_at,
+                 m.created_at, m.edited_at, m.deleted_at, m.expires_at,
                  (1 - (m.embedding <=> $2))::real AS score
                FROM messages m
                JOIN room_members rm
@@ -862,7 +865,7 @@ impl MessageRepo {
         let limit = limit.clamp(1, 200);
         let rows = sqlx::query_as::<_, MessageRow>(
             r"SELECT m.id, m.room_id, m.sender_id, m.blocks, m.reply_to, m.metadata,
-                     m.created_at, m.edited_at, m.deleted_at
+                     m.created_at, m.edited_at, m.deleted_at, m.expires_at
                FROM messages m
                JOIN room_members rm
                  ON rm.room_id = m.room_id AND rm.participant_id = $1
@@ -925,7 +928,7 @@ impl MessageRepo {
         let sql = format!(
             r"SELECT
                  m.id, m.room_id, m.sender_id, m.blocks, m.reply_to, m.metadata,
-                 m.created_at, m.edited_at, m.deleted_at,
+                 m.created_at, m.edited_at, m.deleted_at, m.expires_at,
                  ts_rank(m.search_tsv, {f}('simple', $2)) AS score
                FROM messages m
                JOIN room_members rm
@@ -955,7 +958,7 @@ impl MessageRepo {
         sender: ParticipantId,
     ) -> Result<Vec<Message>, sqlx::Error> {
         let rows = sqlx::query_as::<_, MessageRow>(
-            r"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at
+            r"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at
                FROM messages
                WHERE sender_id = $1 AND deleted_at IS NULL
                ORDER BY created_at DESC, id DESC
@@ -982,7 +985,7 @@ impl MessageRepo {
     ) -> Result<Vec<Message>, sqlx::Error> {
         let after_uuid = after.map(|m| m.to_uuid()).unwrap_or(uuid::Uuid::nil());
         let rows = sqlx::query_as::<_, MessageRow>(
-            r"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at
+            r"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at
                FROM messages
                WHERE sender_id = $1 AND deleted_at IS NULL AND id > $2
                ORDER BY id ASC
@@ -994,6 +997,18 @@ impl MessageRepo {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(Message::from).collect())
+    }
+
+    /// Hard-delete all messages whose `expires_at` is not null and has already
+    /// passed. Returns the number of rows deleted. Called by the retention-sweep
+    /// background task; errors are logged by the caller, never panicked.
+    pub async fn sweep_ephemeral(&self) -> Result<u64, sqlx::Error> {
+        let rows = sqlx::query(
+            "DELETE FROM messages WHERE expires_at IS NOT NULL AND expires_at < NOW()",
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(rows.rows_affected())
     }
 }
 
@@ -1070,6 +1085,7 @@ struct MessageRow {
     created_at: time::OffsetDateTime,
     edited_at: Option<time::OffsetDateTime>,
     deleted_at: Option<time::OffsetDateTime>,
+    expires_at: Option<time::OffsetDateTime>,
 }
 
 impl From<MessageRow> for Message {
@@ -1085,6 +1101,7 @@ impl From<MessageRow> for Message {
             created_at: r.created_at,
             edited_at: r.edited_at,
             deleted_at: r.deleted_at,
+            expires_at: r.expires_at,
         }
     }
 }
@@ -1269,6 +1286,7 @@ mod db_tests {
                 blocks: vec![Block::text(format!("hello {needle} world"))],
                 reply_to: None,
                 metadata: serde_json::json!({}),
+                expires_at: None,
             })
             .await
             .expect("insert mine");
@@ -1278,6 +1296,7 @@ mod db_tests {
             blocks: vec![Block::text(format!("secret {needle} stuff"))],
             reply_to: None,
             metadata: serde_json::json!({}),
+            expires_at: None,
         })
         .await
         .expect("insert theirs");
@@ -1318,6 +1337,7 @@ mod db_tests {
                 blocks: vec![Block::text("root")],
                 reply_to: None,
                 metadata: serde_json::json!({}),
+                expires_at: None,
             })
             .await
             .expect("root");
@@ -1337,6 +1357,7 @@ mod db_tests {
             blocks: vec![Block::text("reply 1")],
             reply_to: Some(root.id),
             metadata: serde_json::json!({}),
+            expires_at: None,
         })
         .await
         .expect("reply1");
@@ -1347,6 +1368,7 @@ mod db_tests {
                 blocks: vec![Block::text("reply 2")],
                 reply_to: Some(root.id),
                 metadata: serde_json::json!({}),
+                expires_at: None,
             })
             .await
             .expect("reply2");
@@ -1400,6 +1422,7 @@ mod db_tests {
                 blocks: vec![Block::text("workspace rag in my room")],
                 reply_to: None,
                 metadata: serde_json::json!({}),
+                expires_at: None,
             })
             .await
             .expect("insert mine");
@@ -1410,6 +1433,7 @@ mod db_tests {
                 blocks: vec![Block::text("workspace rag in their room")],
                 reply_to: None,
                 metadata: serde_json::json!({}),
+                expires_at: None,
             })
             .await
             .expect("insert theirs");
@@ -1475,6 +1499,7 @@ mod db_tests {
                 blocks: vec![Block::text(format!("rerank {needle} in my room"))],
                 reply_to: None,
                 metadata: serde_json::json!({}),
+                expires_at: None,
             })
             .await
             .expect("insert mine");
@@ -1485,6 +1510,7 @@ mod db_tests {
                 blocks: vec![Block::text(format!("rerank {needle} in their room"))],
                 reply_to: None,
                 metadata: serde_json::json!({}),
+                expires_at: None,
             })
             .await
             .expect("insert theirs");
@@ -1533,6 +1559,7 @@ mod db_tests {
                     blocks: vec![Block::text(format!("around msg {i}"))],
                     reply_to: None,
                     metadata: serde_json::json!({}),
+                    expires_at: None,
                 })
                 .await
                 .expect("insert");
@@ -1555,5 +1582,75 @@ mod db_tests {
             .position(|m| m.id == target)
             .expect("target present in window");
         assert_eq!(pos, 2, "target is dead center with two on each side");
+    }
+
+    /// `sweep_ephemeral` hard-deletes only rows whose `expires_at` is in the
+    /// past and leaves future-expiry rows untouched.
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn test_sweep_ephemeral() {
+        let p = pool();
+        let repo = MessageRepo::new(p.clone());
+
+        let me = participant(&p).await;
+        let r = room(&p, me).await;
+        join(&p, r, me).await;
+
+        // Insert an already-expired message (expires_at 1 second in the past).
+        let past = time::OffsetDateTime::now_utc() - time::Duration::seconds(1);
+        let expired = repo
+            .insert(NewMessage {
+                room_id: r,
+                sender_id: me,
+                blocks: vec![Block::text("ephemeral past")],
+                reply_to: None,
+                metadata: serde_json::json!({}),
+                expires_at: Some(past),
+            })
+            .await
+            .expect("insert expired");
+
+        // Insert a message with expires_at 1 hour in the future.
+        let future = time::OffsetDateTime::now_utc() + time::Duration::hours(1);
+        let alive = repo
+            .insert(NewMessage {
+                room_id: r,
+                sender_id: me,
+                blocks: vec![Block::text("ephemeral future")],
+                reply_to: None,
+                metadata: serde_json::json!({}),
+                expires_at: Some(future),
+            })
+            .await
+            .expect("insert future");
+
+        // sweep_ephemeral must delete exactly 1 row (the expired one).
+        let deleted = repo.sweep_ephemeral().await.expect("sweep");
+        assert_eq!(deleted, 1, "exactly one row hard-deleted");
+
+        // The expired message is gone.
+        let gone = repo.get(expired.id).await.expect("get expired");
+        assert!(gone.is_none(), "expired message is hard-deleted");
+
+        // The future message is still present.
+        let present = repo.get(alive.id).await.expect("get alive");
+        assert!(present.is_some(), "future-expiry message still exists");
+
+        // Cleanup.
+        sqlx::query("DELETE FROM messages WHERE room_id = $1")
+            .bind(r.to_uuid())
+            .execute(&p)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM rooms WHERE id = $1")
+            .bind(r.to_uuid())
+            .execute(&p)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM participants WHERE id = $1")
+            .bind(me.to_uuid())
+            .execute(&p)
+            .await
+            .ok();
     }
 }

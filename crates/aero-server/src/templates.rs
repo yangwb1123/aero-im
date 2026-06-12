@@ -163,7 +163,7 @@ async fn send_template(
 
     let message = s
         .im
-        .send_message(auth.participant_id, room, blocks, None)
+        .send_message(auth.participant_id, room, blocks, None, None)
         .await?;
     Ok(Json(serde_json::to_value(message).map_err(AeroError::from)?))
 }

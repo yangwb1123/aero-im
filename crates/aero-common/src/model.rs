@@ -243,6 +243,8 @@ pub struct Message {
     pub edited_at: Option<OffsetDateTime>,
     #[serde(default, with = "time::serde::rfc3339::option")]
     pub deleted_at: Option<OffsetDateTime>,
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub expires_at: Option<OffsetDateTime>,
 }
 
 impl Message {
@@ -1149,6 +1151,7 @@ mod tests {
             created_at: OffsetDateTime::UNIX_EPOCH,
             edited_at: None,
             deleted_at: None,
+            expires_at: None,
         };
         let text = msg.searchable_text();
         assert!(text.contains("Choose a plan"));
@@ -1334,6 +1337,7 @@ mod tests {
             created_at: time::OffsetDateTime::now_utc(),
             edited_at: None,
             deleted_at: None,
+            expires_at: None,
         };
         assert_eq!(m.searchable_text(), "hello\nfn main() {}");
     }

@@ -144,6 +144,7 @@ mod tests {
             created_at: time::OffsetDateTime::UNIX_EPOCH,
             edited_at: None,
             deleted_at: None,
+            expires_at: None,
         }
     }
 

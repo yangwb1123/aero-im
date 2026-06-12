@@ -87,7 +87,7 @@ async fn forward_message(
 
     let message = s
         .im
-        .send_message(auth.participant_id, to_room, blocks, None)
+        .send_message(auth.participant_id, to_room, blocks, None, None)
         .await?;
     Ok(Json(serde_json::to_value(message).map_err(AeroError::from)?))
 }
@@ -162,6 +162,7 @@ mod tests {
             created_at: time::OffsetDateTime::now_utc(),
             edited_at: None,
             deleted_at: None,
+            expires_at: None,
         }
     }
 

@@ -92,7 +92,7 @@ async fn create_room_and_send_message() {
     svc.add_member(alice.id, room.id, bob.id).await.unwrap();
 
     let msg = svc
-        .send_message(alice.id, room.id, vec![Block::text("hi")], None)
+        .send_message(alice.id, room.id, vec![Block::text("hi")], None, None)
         .await
         .unwrap();
     assert_eq!(msg.room_id, room.id);
@@ -131,7 +131,7 @@ async fn non_member_cannot_send_message() {
         .unwrap();
 
     let err = svc
-        .send_message(intruder.id, room.id, vec![Block::text("hi")], None)
+        .send_message(intruder.id, room.id, vec![Block::text("hi")], None, None)
         .await
         .unwrap_err();
     assert!(matches!(err, aero_common::Error::Forbidden(_)));
@@ -167,7 +167,7 @@ async fn send_message_publishes_envelope() {
         .await
         .unwrap();
     let _ = svc
-        .send_message(alice.id, room.id, vec![Block::text("hi")], None)
+        .send_message(alice.id, room.id, vec![Block::text("hi")], None, None)
         .await
         .unwrap();
 

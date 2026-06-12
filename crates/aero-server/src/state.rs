@@ -10,10 +10,10 @@ use aero_live_whip::WhipRegistry;
 
 use crate::live::LiveService;
 use aero_storage::{
-    AiJobRepo, AuditRepo, BlobRepo, BlobStore, CallRepo, CallRosterStore, KeyPackageRepo,
-    MessageRepo, MlsGroupRepo, NotificationRepo, ParticipantRepo, PgPool, PinRepo, PresenceStore,
-    ReactionRepo, ReceiptRepo, RoomRepo, StreamRepo, StreamRouteRegistry, StreamViewerStore,
-    ThreadReadStateRepo, TopicHistoryRepo, WorkspaceRepo,
+    AiJobRepo, AuditRepo, BlockRepo, BlobRepo, BlobStore, CallRepo, CallRosterStore,
+    KeyPackageRepo, MessageRepo, MlsGroupRepo, NotificationRepo, ParticipantRepo, PgPool, PinRepo,
+    PresenceStore, ReactionRepo, ReceiptRepo, RoomRepo, StreamRepo, StreamRouteRegistry,
+    StreamViewerStore, ThreadReadStateRepo, TopicHistoryRepo, WorkspaceRepo,
 };
 use axum::extract::FromRef;
 
@@ -310,6 +310,10 @@ pub struct AppState {
     pub topic_history: TopicHistoryRepo,
     /// Thread-level read state + unread count tracking (ROADMAP7 Lane A).
     pub thread_read_state: ThreadReadStateRepo,
+    /// User-level block / ignore store (migration 0106).
+    /// Block/unblock another participant; gates DM creation and notification
+    /// delivery for blocked senders.
+    pub blocks: BlockRepo,
 }
 
 /// The per-platform mobile push gateways, resolved from env at startup. Each is

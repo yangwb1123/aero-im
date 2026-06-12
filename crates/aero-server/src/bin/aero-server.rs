@@ -195,6 +195,8 @@ async fn main() -> anyhow::Result<()> {
         // ROADMAP6 Lane A: per-thread notification levels + workspace-wide mute.
         .with_thread_notification_prefs(ThreadNotificationPrefsRepo::new(pg.clone()))
         .with_workspace_mutes(WorkspaceMuteRepo::new(pg.clone()))
+        // ROADMAP8: user-block store for notification suppression.
+        .with_block_repo(aero_storage::BlockRepo::new(pg.clone()))
         // ROADMAP 第三版 方向一: cluster-correct publish-time event-seq stamp.
         .with_seq(seq_store.clone()),
     );
@@ -407,6 +409,7 @@ async fn main() -> anyhow::Result<()> {
         push: push_gateways,
         topic_history: topic_history_repo,
         thread_read_state: thread_read_state_repo,
+        blocks: aero_storage::BlockRepo::new(pg.clone()),
     };
     // ---------- Message-retention sweep (ROADMAP 方向一 合规) ----------
     // Periodically soft-delete messages whose workspace set a retention window
@@ -417,6 +420,7 @@ async fn main() -> anyhow::Result<()> {
     // disables the sweep entirely.
     {
         let workspaces = state.workspaces.clone();
+        let messages_repo = state.messages.clone();
         let cancel = ai_shutdown.clone();
         let sweep_secs = std::env::var("AERO__SERVER__RETENTION_SWEEP_SECS")
             .ok()
@@ -446,6 +450,11 @@ async fn main() -> anyhow::Result<()> {
                                 Ok(0) => {}
                                 Ok(n) => info!(swept = n, "retention sweep soft-deleted messages"),
                                 Err(e) => warn!(error = ?e, "retention sweep failed"),
+                            }
+                            match messages_repo.sweep_ephemeral().await {
+                                Ok(0) => {}
+                                Ok(n) => info!(swept = n, "ephemeral sweep hard-deleted expired messages"),
+                                Err(e) => warn!(error = ?e, "ephemeral sweep failed"),
                             }
                         }
                     }

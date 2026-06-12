@@ -297,7 +297,7 @@ async fn run_command(
 
     match render_command(&name, &rest, &author) {
         CommandOutcome::Post(blocks) => {
-            let msg = s.im.send_message(auth.participant_id, room, blocks, None).await?;
+            let msg = s.im.send_message(auth.participant_id, room, blocks, None, None).await?;
             Ok(Json(serde_json::to_value(msg).map_err(AeroError::from)?))
         }
         CommandOutcome::Ephemeral(msg) => Ok(Json(serde_json::json!({ "ephemeral": msg }))),

@@ -104,7 +104,7 @@ async fn handle(state: &AppState, ai: &Arc<AiService>, env: MessageEnvelope) -> 
             });
             blocks.push(Block::Card { schema: "citation".into(), payload });
         }
-        if let Err(e) = im.send_message(bot.id, room, blocks, Some(env.message.id)).await {
+        if let Err(e) = im.send_message(bot.id, room, blocks, Some(env.message.id), None).await {
             warn!(error = ?e, "bot reply send failed");
         } else {
             info!(bot = %bot.id, %room, "bot replied");

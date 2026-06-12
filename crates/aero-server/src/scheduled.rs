@@ -219,7 +219,7 @@ pub async fn run_scheduled_dispatcher(state: AppState, cancel: CancellationToken
                 for msg in due {
                     if let Err(e) = state
                         .im
-                        .send_message(msg.sender_id, msg.room_id, msg.blocks, msg.reply_to)
+                        .send_message(msg.sender_id, msg.room_id, msg.blocks, msg.reply_to, None)
                         .await
                     {
                         tracing::warn!(

@@ -86,6 +86,16 @@ async fn open_dm(
         return Err(AeroError::Forbidden("information barrier".into()).into());
     }
 
+    // Block guard: neither party can open a DM with the other if a block exists
+    // in EITHER direction. Checked after the barrier guard, before find-or-create,
+    // so blocked users cannot reach each other's DM rooms.
+    let me = auth.participant_id;
+    if s.blocks.is_blocked(me, target).await.unwrap_or(false)
+        || s.blocks.is_blocked(target, me).await.unwrap_or(false)
+    {
+        return Err(AeroError::Forbidden("blocked".into()).into());
+    }
+
     let dm = DmRepo::new(s.pg.clone());
     if let Some(room_id) = dm
         .find_direct(auth.participant_id, target)

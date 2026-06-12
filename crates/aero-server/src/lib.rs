@@ -189,4 +189,8 @@ pub mod message_reports;
 /// OpenAPI 3.0 spec endpoint.
 pub mod openapi;
 
+// ---- User-level blocking / ignoring (migration 0106) ----
+/// Block/unblock another participant + list caller's blocks.
+pub mod user_blocks;
+
 pub use state::AppState;

@@ -108,7 +108,7 @@ async fn broadcast_message(
 
         // Same provenance + mention-stripping as a single forward, per target.
         let blocks = build_forward_blocks(&source, req.comment.as_deref(), auth.participant_id);
-        match s.im.send_message(auth.participant_id, target, blocks, None).await {
+        match s.im.send_message(auth.participant_id, target, blocks, None, None).await {
             Ok(_) => sent.push(target),
             Err(e) => {
                 failed.push(serde_json::json!({ "room_id": target, "error": e.to_string() }));
@@ -135,6 +135,7 @@ mod tests {
             created_at: time::OffsetDateTime::now_utc(),
             edited_at: None,
             deleted_at: None,
+            expires_at: None,
         }
     }
 
