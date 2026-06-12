@@ -238,11 +238,12 @@ async fn workspace_reactions(
 /// messages in a room, descending by frequency. Any authenticated caller may read.
 async fn room_reactions(
     State(s): State<AppState>,
-    _auth: AuthUser,
+    auth: AuthUser,
     Path(room_str): Path<String>,
     Query(q): Query<LimitQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let room = parse_room(&room_str)?;
+    s.im.assert_room_access(auth.participant_id, room).await?;
     let limit = q.limit.unwrap_or(DEFAULT_TOP_LIMIT);
     let stats = repo(&s)
         .top_reactions_room(room, limit)
