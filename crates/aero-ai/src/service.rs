@@ -858,17 +858,32 @@ impl AiService {
     /// `AERO_BLOCKED_WORDS` keyword filter in `ImService` remains the only gate).
     /// Conservative by construction: only an explicit `BLOCK` verdict blocks.
     pub async fn moderate(&self, text: &str) -> Result<Option<String>> {
+        self.moderate_with_usage(text).await.map(|(verdict, _usage)| verdict)
+    }
+
+    /// Like [`Self::moderate`] but also returns the real token [`Usage`] of the
+    /// classification call, so the worker can charge BILLED cost instead of a
+    /// flat estimate (ROADMAP 方向四). `usage` is `None` when no paid call was
+    /// made (empty text or no Anthropic key), in which case cost is zero.
+    pub async fn moderate_with_usage(
+        &self,
+        text: &str,
+    ) -> Result<(Option<String>, Option<Usage>)> {
         let text = text.trim();
         if text.is_empty() {
-            return Ok(None);
+            return Ok((None, None));
         }
         let Some(client) = &self.anthropic else {
-            return Ok(None);
+            return Ok((None, None));
         };
-        let verdict = client
-            .complete(MODERATE_SYSTEM_PROMPT, &[ChatMsg::user(format!("待审核内容:\n{text}"))], 120)
+        let (verdict, usage) = client
+            .complete_with_usage(
+                MODERATE_SYSTEM_PROMPT,
+                &[ChatMsg::user(format!("待审核内容:\n{text}"))],
+                120,
+            )
             .await?;
-        Ok(parse_moderation_verdict(&verdict))
+        Ok((parse_moderation_verdict(&verdict), Some(usage)))
     }
 
     /// Score a message's affect: coarse sentiment, a `[0.0, 1.0]` toxicity
@@ -1331,6 +1346,32 @@ mod tests {
     use super::*;
     use aero_common::{Block, ParticipantId};
     use time::OffsetDateTime;
+
+    #[tokio::test]
+    async fn moderate_without_anthropic_makes_no_paid_call_and_no_usage() {
+        // No Anthropic key → moderation makes no paid call, returns no usage
+        // (so the worker charges zero), and never touches the DB: the lazy pool
+        // is never connected because both paths early-return (方向四).
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect_lazy("postgres://aero:aero_dev_pw@localhost:5432/aero")
+            .expect("connect_lazy never fails on a well-formed URL");
+        let svc = AiService::new(
+            None, // no Anthropic key
+            std::sync::Arc::new(crate::embed::HashEmbedder::new()),
+            std::sync::Arc::new(crate::transcribe::StubTranscriber),
+            AiJobRepo::new(pool.clone()),
+            MessageRepo::new(pool.clone()),
+            RoomRepo::new(pool),
+            None,
+        );
+
+        let (verdict, usage) = svc.moderate_with_usage("anything at all").await.unwrap();
+        assert_eq!(verdict, None, "no key → conservative allow");
+        assert!(usage.is_none(), "no key → no billed usage");
+        // Empty text short-circuits before any client lookup too.
+        assert_eq!(svc.moderate("   ").await.unwrap(), None);
+    }
 
     #[test]
     fn moderation_verdict_parsing() {

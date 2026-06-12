@@ -286,10 +286,10 @@ impl AiWorker {
 
     async fn handle_moderate(&self, job: &AiJob) -> Result<serde_json::Value> {
         let p: ModeratePayload = serde_json::from_value(job.payload.clone())?;
-        let verdict = self.svc.moderate(&p.text).await?;
+        let (verdict, usage) = self.svc.moderate_with_usage(&p.text).await?;
         let anthropic = self.svc.has_anthropic();
 
-        if let Some(reason) = verdict {
+        let mut result = if let Some(reason) = verdict {
             // BLOCK: soft-delete the offending message so it stops being visible.
             if let Some(target) = job.target_id {
                 let id = MessageId::from_uuid(target);
@@ -310,17 +310,22 @@ impl AiWorker {
             } else {
                 tracing::warn!(job_id = %job.id, "moderation: BLOCK verdict but no target_id to remove");
             }
-            return Ok(serde_json::json!({
+            serde_json::json!({
                 "verdict": "block",
                 "reason": reason,
                 "anthropic": anthropic,
-            }));
-        }
-
-        Ok(serde_json::json!({
-            "verdict": "safe",
-            "anthropic": anthropic,
-        }))
+            })
+        } else {
+            serde_json::json!({
+                "verdict": "safe",
+                "anthropic": anthropic,
+            })
+        };
+        // Attach the real token usage so the success path charges BILLED cost
+        // (record_token_cost) rather than the flat moderate_micros estimate
+        // whenever Anthropic was actually called (ROADMAP 方向四).
+        attach_usage(&mut result, usage);
+        Ok(result)
     }
 
     async fn handle_answer(&self, job: &AiJob) -> Result<serde_json::Value> {
