@@ -46,12 +46,14 @@ pub struct Clip {
     /// Optional short slug for the shareable public URL (e.g. `/clips/{slug}`).
     /// `None` until the creator calls the share endpoint.
     pub share_slug: Option<String>,
+    /// Number of times this clip has been fetched via the public slug route.
+    pub view_count: i64,
 }
 
 /// The columns a [`Clip`] is built from, in select order. Shared by every query so
 /// the row decoding stays in one place.
 const COLUMNS: &str =
-    "id, stream_id, creator_id, title, start_secs, end_secs, created_at, share_slug";
+    "id, stream_id, creator_id, title, start_secs, end_secs, created_at, share_slug, view_count";
 
 type Row = (
     uuid::Uuid,
@@ -62,10 +64,11 @@ type Row = (
     i32,
     time::OffsetDateTime,
     Option<String>,
+    i64,
 );
 
 fn row_to_model(r: Row) -> Clip {
-    let (id, stream_id, creator_id, title, start_secs, end_secs, created_at, share_slug) = r;
+    let (id, stream_id, creator_id, title, start_secs, end_secs, created_at, share_slug, view_count) = r;
     Clip {
         id: ClipId::from_uuid(id),
         stream_id: ulid::Ulid(stream_id.as_u128()),
@@ -75,6 +78,7 @@ fn row_to_model(r: Row) -> Clip {
         end_secs,
         created_at,
         share_slug,
+        view_count,
     }
 }
 
@@ -215,6 +219,23 @@ impl ClipRepo {
         .fetch_optional(&self.pool)
         .await?;
         Ok(row.and_then(|(s,)| s))
+    }
+
+    /// Atomically increment the view count for a clip by 1.
+    ///
+    /// Called after successfully fetching a clip via its public share slug.
+    /// No-op if the clip id does not exist (the caller has already resolved it).
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the update.
+    pub async fn increment_view_count(&self, id: ClipId) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r"UPDATE stream_clips SET view_count = view_count + 1 WHERE id = $1",
+        )
+        .bind(id.to_uuid())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     /// Fetch a clip by its share slug. Returns `None` if no clip has that slug.

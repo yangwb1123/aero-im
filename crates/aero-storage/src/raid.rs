@@ -30,23 +30,27 @@ pub struct Raid {
     pub raider_id: ParticipantId,
     /// Viewers carried over at the time of the raid.
     pub viewer_count: i32,
+    /// Optional custom message the raider sent to the target channel (e.g. a shoutout).
+    pub message: Option<String>,
     /// When the raid was recorded (RFC 3339 on the wire).
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: time::OffsetDateTime,
 }
 
-const COLUMNS: &str = "id, source_stream, target_stream, raider_id, viewer_count, created_at";
+const COLUMNS: &str =
+    "id, source_stream, target_stream, raider_id, viewer_count, message, created_at";
 
-type Row = (Uuid, Uuid, Uuid, Uuid, i32, time::OffsetDateTime);
+type Row = (Uuid, Uuid, Uuid, Uuid, i32, Option<String>, time::OffsetDateTime);
 
 fn row_to_model(r: Row) -> Raid {
-    let (id, source_stream, target_stream, raider_id, viewer_count, created_at) = r;
+    let (id, source_stream, target_stream, raider_id, viewer_count, message, created_at) = r;
     Raid {
         id: RaidId::from_uuid(id),
         source_stream: Ulid(source_stream.as_u128()),
         target_stream: Ulid(target_stream.as_u128()),
         raider_id: ParticipantId::from_uuid(raider_id),
         viewer_count,
+        message,
         created_at,
     }
 }
@@ -82,8 +86,9 @@ impl RaidRepo {
     }
 
     /// Record a raid from `source` to `target` by `raider`, carrying
-    /// `viewer_count` viewers, returning its generated id. The caller has already
-    /// checked the raider owns the source stream and that both streams exist.
+    /// `viewer_count` viewers, with an optional custom `message`, returning its
+    /// generated id. The caller has already checked the raider owns the source
+    /// stream and that both streams exist.
     ///
     /// Enforces a [`RAID_COOLDOWN_SECS`] cooldown: if the raider has sent a raid
     /// within the last minute, returns
@@ -98,6 +103,7 @@ impl RaidRepo {
         target: Ulid,
         raider: ParticipantId,
         viewer_count: i32,
+        message: Option<&str>,
     ) -> Result<RaidId, AeroError> {
         // Cooldown check: reject if the raider sent a raid within the last minute.
         let last: Option<time::OffsetDateTime> = sqlx::query_scalar(
@@ -117,14 +123,15 @@ impl RaidRepo {
         let id = RaidId::new();
         sqlx::query(
             r"INSERT INTO raid_history
-                  (id, source_stream, target_stream, raider_id, viewer_count)
-               VALUES ($1, $2, $3, $4, $5)",
+                  (id, source_stream, target_stream, raider_id, viewer_count, message)
+               VALUES ($1, $2, $3, $4, $5, $6)",
         )
         .bind(id.to_uuid())
         .bind(Uuid::from_u128(source.0))
         .bind(Uuid::from_u128(target.0))
         .bind(raider.to_uuid())
         .bind(viewer_count.max(0))
+        .bind(message)
         .execute(&self.pool)
         .await?;
         Ok(id)
@@ -242,7 +249,7 @@ mod db_tests {
         let target = Ulid::new();
         let owner = raider(&p).await;
 
-        let id = repo.create(source, target, owner, 42).await.unwrap();
+        let id = repo.create(source, target, owner, 42, Some("Great stream!")).await.unwrap();
 
         let got = repo.get(id).await.unwrap().expect("raid exists");
         assert_eq!(got.id, id);
@@ -250,6 +257,7 @@ mod db_tests {
         assert_eq!(got.target_stream, target);
         assert_eq!(got.raider_id, owner);
         assert_eq!(got.viewer_count, 42);
+        assert_eq!(got.message.as_deref(), Some("Great stream!"));
 
         let by_stream = repo.list_for_stream(source).await.unwrap();
         assert!(by_stream.iter().any(|r| r.id == id), "source's raid log shows it");

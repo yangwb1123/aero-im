@@ -228,7 +228,7 @@ async fn share_clip(
 }
 
 /// `GET /clips/:slug` — public, no auth required. Returns clip metadata by
-/// its share slug.
+/// its share slug. Increments the clip's view count on each successful fetch.
 async fn get_clip_by_slug(
     State(s): State<AppState>,
     Path(slug): Path<String>,
@@ -238,6 +238,10 @@ async fn get_clip_by_slug(
         .await
         .map_err(AeroError::from)?
         .ok_or_else(|| AeroError::NotFound(format!("clip with slug {slug}")))?;
+    // Best-effort view count increment — do not fail the fetch if the update errors.
+    if let Err(e) = repo(&s).increment_view_count(clip.id).await {
+        tracing::warn!(error = ?e, clip = %clip.id, "failed to increment clip view count");
+    }
     Ok(Json(serde_json::to_value(clip).map_err(AeroError::from)?))
 }
 

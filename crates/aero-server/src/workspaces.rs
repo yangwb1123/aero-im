@@ -74,6 +74,8 @@ pub fn routes() -> Router<AppState> {
             post(mute_workspace).delete(unmute_workspace),
         )
         .route("/api/workspaces/:id/muted", get(workspace_mute_status))
+        // Workspace branding (ROADMAP7 Lane C): logo, color scheme, custom domain, description.
+        .route("/api/workspaces/:id/branding", axum::routing::patch(update_branding))
 }
 
 /// Append an audit event without ever failing the caller's request: the trail is
@@ -803,6 +805,80 @@ async fn workspace_mute_status(
         "workspace_id": workspace,
         "muted": muted,
     })))
+}
+
+// ---------- Workspace branding (ROADMAP7 Lane C) ----------
+
+#[derive(Deserialize)]
+struct UpdateBrandingReq {
+    /// URL of the workspace logo. `null` or missing = no change.
+    #[serde(default)]
+    logo_url: Option<String>,
+    /// Color scheme token or hex color (e.g. `"#FF0000"`). `null` or missing = no change.
+    #[serde(default)]
+    color_scheme: Option<String>,
+    /// Custom domain for the workspace. `null` or missing = no change.
+    #[serde(default)]
+    custom_domain: Option<String>,
+    /// Human-readable description. `null` or missing = no change.
+    #[serde(default)]
+    description: Option<String>,
+}
+
+/// `PATCH /api/workspaces/:id/branding` — **admin/owner**: update the workspace's
+/// branding fields (logo URL, color scheme, custom domain, description). Any field
+/// that is absent or `null` in the request body is left unchanged (patch semantics).
+/// Emits a `"workspace.branding_updated"` audit event on success.
+async fn update_branding(
+    State(s): State<AppState>,
+    auth: AuthUser,
+    Path(id_str): Path<String>,
+    Json(req): Json<UpdateBrandingReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let ws = parse_workspace_id(&id_str)?;
+    let caller = caller_role(&s.workspaces, ws, auth.participant_id).await?;
+    // Admin/owner only — branding is a workspace administration action.
+    if !caller.can_administer() {
+        return Err(AeroError::Forbidden("updating workspace branding requires admin".into()).into());
+    }
+
+    let updated = s
+        .workspaces
+        .update_branding(
+            ws,
+            req.logo_url.as_deref(),
+            req.color_scheme.as_deref(),
+            req.custom_domain.as_deref(),
+            req.description.as_deref(),
+        )
+        .await
+        .map_err(AeroError::from)?;
+    if !updated {
+        return Err(AeroError::NotFound("workspace".into()).into());
+    }
+
+    audit(
+        &s,
+        ws,
+        auth.participant_id,
+        "workspace.branding_updated",
+        None,
+        serde_json::json!({
+            "logo_url": req.logo_url,
+            "color_scheme": req.color_scheme,
+            "custom_domain": req.custom_domain,
+            "description": req.description,
+        }),
+    )
+    .await;
+
+    let workspace = s
+        .workspaces
+        .get(ws)
+        .await
+        .map_err(AeroError::from)?
+        .ok_or_else(|| AeroError::NotFound("workspace".into()))?;
+    Ok(Json(serde_json::to_value(workspace).map_err(AeroError::from)?))
 }
 
 #[cfg(test)]

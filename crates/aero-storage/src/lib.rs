@@ -204,8 +204,8 @@ pub use room_role::RoomRoleRepo;
 
 // ---- Wave 16 re-exports ----
 pub use analytics::{
-    AnalyticsRepo, ChannelMessageCount, DayCount, WorkspaceAnalytics, MAX_TIMELINE_DAYS,
-    MAX_TOP_CHANNELS,
+    AnalyticsRepo, ChannelAnalytics, ChannelMessageCount, DayCount, ReactionStat,
+    WorkspaceAnalytics, MAX_TIMELINE_DAYS, MAX_TOP_CHANNELS,
 };
 pub use canvas::{Canvas, CanvasRepo};
 pub use channel_bookmark::{ChannelBookmark, ChannelBookmarkRepo};
@@ -328,3 +328,9 @@ pub use thread_notification_prefs::ThreadNotificationPrefsRepo;
 pub use workspace_mutes::WorkspaceMuteRepo;
 
 // (ClipCollectionRepo + CollectionRow already re-exported above in Wave 18 re-exports)
+
+// ---- ROADMAP7 Lane A — channel topic history + thread read state ----
+pub mod topic_history;
+pub mod thread_read_state;
+pub use topic_history::TopicHistoryRepo;
+pub use thread_read_state::ThreadReadStateRepo;

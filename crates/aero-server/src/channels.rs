@@ -11,7 +11,7 @@ use std::str::FromStr;
 use aero_auth::AuthUser;
 use aero_common::{Error as AeroError, ParticipantId, RoomId, WorkspaceId};
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     routing::{get, post},
     Json, Router,
 };
@@ -32,6 +32,8 @@ pub fn routes() -> Router<AppState> {
             "/api/rooms/:id/post-policy",
             get(get_post_policy).put(set_post_policy),
         )
+        // ROADMAP7 Lane A: channel topic change history.
+        .route("/api/rooms/:id/topic-history", get(list_topic_history))
 }
 
 fn parse_room(s: &str) -> Result<RoomId, AeroError> {
@@ -157,6 +159,21 @@ async fn update_channel(
             if !changed.is_empty() {
                 audit_channel_meta_changed(&s, room, auth.participant_id, changed).await;
             }
+            // Record a topic history entry whenever the topic changed.
+            if before.topic != after.topic {
+                if let Err(e) = s
+                    .topic_history
+                    .record(
+                        auth.participant_id,
+                        room,
+                        before.topic.as_deref(),
+                        after.topic.as_deref(),
+                    )
+                    .await
+                {
+                    tracing::warn!(error = ?e, %room, "topic_history.record failed (best-effort)");
+                }
+            }
         }
     }
     Ok(Json(serde_json::json!({ "updated": true })))
@@ -212,6 +229,34 @@ async fn get_post_policy(
     let room = parse_room(&room_str)?;
     let policy = s.im.room_post_policy(auth.participant_id, room).await?;
     Ok(Json(serde_json::json!({ "policy": policy })))
+}
+
+// --------------------------------------------------- topic history (ROADMAP7 Lane A)
+
+#[derive(Deserialize)]
+struct TopicHistoryQuery {
+    #[serde(default = "default_limit")]
+    limit: i64,
+    #[serde(default)]
+    offset: i64,
+}
+
+fn default_limit() -> i64 {
+    20
+}
+
+/// `GET /api/rooms/:id/topic-history?limit=20&offset=0` — channel topic change
+/// history, newest first. Caller must be able to access the room.
+async fn list_topic_history(
+    State(s): State<AppState>,
+    auth: AuthUser,
+    Path(room_str): Path<String>,
+    Query(q): Query<TopicHistoryQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let room = parse_room(&room_str)?;
+    s.im.assert_room_access(auth.participant_id, room).await?;
+    let entries = s.topic_history.list(room, q.limit.max(1).min(100), q.offset.max(0)).await?;
+    Ok(Json(serde_json::json!({ "history": entries })))
 }
 
 // --------------------------------------------------- metadata change audit trail

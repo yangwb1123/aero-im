@@ -33,8 +33,8 @@ use aero_storage::{
     NotificationRepo, DeactivationRepo, KeywordAlertRepo, MessageEditRepo, ParticipantRepo, PatRepo,
     PinRepo, TotpRepo, PresenceStore, ReactionRepo, ReceiptRepo, RecurringMessageRepo, RedisCache,
     RoomRepo, SeqStore, StreamRepo, StreamRouteRegistry, StreamViewerStore,
-    ThreadNotificationPrefsRepo, ThreadSubscriptionRepo, UserGroupRepo, WorkspaceMuteRepo,
-    WorkspaceRepo, WsRateStore,
+    ThreadNotificationPrefsRepo, ThreadReadStateRepo, ThreadSubscriptionRepo, TopicHistoryRepo,
+    UserGroupRepo, WorkspaceMuteRepo, WorkspaceRepo, WsRateStore,
 };
 use tokio_util::sync::CancellationToken;
 use anyhow::Context;
@@ -97,6 +97,8 @@ async fn main() -> anyhow::Result<()> {
     let key_packages = KeyPackageRepo::new(pg.clone());
     let mls_groups = MlsGroupRepo::new(pg.clone());
     let ai_context = AiContextStore::new(cache.client().clone());
+    let topic_history_repo = TopicHistoryRepo::new(pg.clone());
+    let thread_read_state_repo = ThreadReadStateRepo::new(pg.clone());
     let presence = PresenceStore::new(cache.client().clone());
     // Cross-node live presence (ROADMAP 方向二/五): viewer counts + call rosters
     // live in Redis (sorted-set-with-heartbeat) so multi-node audiences/calls are
@@ -403,6 +405,8 @@ async fn main() -> anyhow::Result<()> {
             .and_then(|s| s.parse().ok())
             .unwrap_or(40000),
         push: push_gateways,
+        topic_history: topic_history_repo,
+        thread_read_state: thread_read_state_repo,
     };
     // ---------- Message-retention sweep (ROADMAP 方向一 合规) ----------
     // Periodically soft-delete messages whose workspace set a retention window

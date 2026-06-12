@@ -109,6 +109,10 @@ impl WorkspaceRepo {
             slug,
             created_by: Some(created_by),
             created_at,
+            logo_url: None,
+            color_scheme: None,
+            custom_domain: None,
+            description: None,
         })
     }
 
@@ -229,9 +233,11 @@ impl WorkspaceRepo {
     ) -> Result<Vec<Workspace>, sqlx::Error> {
         let rows = sqlx::query_as::<
             _,
-            (uuid::Uuid, String, String, Option<uuid::Uuid>, time::OffsetDateTime),
+            (uuid::Uuid, String, String, Option<uuid::Uuid>, time::OffsetDateTime,
+             Option<String>, Option<String>, Option<String>, Option<String>),
         >(
-            r"SELECT w.id, w.name, w.slug, w.created_by, w.created_at
+            r"SELECT w.id, w.name, w.slug, w.created_by, w.created_at,
+                     w.logo_url, w.color_scheme, w.custom_domain, w.description
                FROM workspaces w
                JOIN workspace_members m ON m.workspace_id = w.id
                WHERE m.participant_id = $1
@@ -243,12 +249,16 @@ impl WorkspaceRepo {
 
         Ok(rows
             .into_iter()
-            .map(|(id, name, slug, by, at)| Workspace {
+            .map(|(id, name, slug, by, at, logo_url, color_scheme, custom_domain, description)| Workspace {
                 id: WorkspaceId::from_uuid(id),
                 name,
                 slug,
                 created_by: by.map(ParticipantId::from_uuid),
                 created_at: at,
+                logo_url,
+                color_scheme,
+                custom_domain,
+                description,
             })
             .collect())
     }
@@ -362,20 +372,26 @@ impl WorkspaceRepo {
     pub async fn get(&self, workspace: WorkspaceId) -> Result<Option<Workspace>, sqlx::Error> {
         let row = sqlx::query_as::<
             _,
-            (uuid::Uuid, String, String, Option<uuid::Uuid>, time::OffsetDateTime),
+            (uuid::Uuid, String, String, Option<uuid::Uuid>, time::OffsetDateTime,
+             Option<String>, Option<String>, Option<String>, Option<String>),
         >(
-            r"SELECT id, name, slug, created_by, created_at
+            r"SELECT id, name, slug, created_by, created_at,
+                     logo_url, color_scheme, custom_domain, description
                FROM workspaces WHERE id = $1",
         )
         .bind(workspace.to_uuid())
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(|(id, name, slug, by, at)| Workspace {
+        Ok(row.map(|(id, name, slug, by, at, logo_url, color_scheme, custom_domain, description)| Workspace {
             id: WorkspaceId::from_uuid(id),
             name,
             slug,
             created_by: by.map(ParticipantId::from_uuid),
             created_at: at,
+            logo_url,
+            color_scheme,
+            custom_domain,
+            description,
         }))
     }
 
@@ -401,15 +417,17 @@ impl WorkspaceRepo {
         // Workspace row first — absence short-circuits the whole export.
         let ws_row = sqlx::query_as::<
             _,
-            (uuid::Uuid, String, String, Option<uuid::Uuid>, time::OffsetDateTime),
+            (uuid::Uuid, String, String, Option<uuid::Uuid>, time::OffsetDateTime,
+             Option<String>, Option<String>, Option<String>, Option<String>),
         >(
-            r"SELECT id, name, slug, created_by, created_at
+            r"SELECT id, name, slug, created_by, created_at,
+                     logo_url, color_scheme, custom_domain, description
                FROM workspaces WHERE id = $1",
         )
         .bind(workspace.to_uuid())
         .fetch_optional(&mut *tx)
         .await?;
-        let Some((id, name, slug, created_by, created_at)) = ws_row else {
+        let Some((id, name, slug, created_by, created_at, logo_url, color_scheme, custom_domain, description)) = ws_row else {
             // Nothing to export; commit the (empty) read txn for cleanliness.
             tx.commit().await?;
             return Ok(None);
@@ -420,6 +438,10 @@ impl WorkspaceRepo {
             slug,
             created_by: created_by.map(ParticipantId::from_uuid),
             created_at,
+            logo_url,
+            color_scheme,
+            custom_domain,
+            description,
         };
 
         // Members (oldest joiners first), mirroring `list_members`.
@@ -607,6 +629,40 @@ impl WorkspaceRepo {
             .bind(new_name)
             .execute(&self.pool)
             .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Update workspace branding fields. Only the supplied `Some(…)` values are
+    /// written; `None` leaves the existing column value unchanged (COALESCE patch).
+    ///
+    /// Returns `true` if the workspace row existed and was updated, `false` for an
+    /// unknown workspace id.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the update.
+    pub async fn update_branding(
+        &self,
+        workspace: WorkspaceId,
+        logo_url: Option<&str>,
+        color_scheme: Option<&str>,
+        custom_domain: Option<&str>,
+        description: Option<&str>,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            r"UPDATE workspaces
+                 SET logo_url      = COALESCE($2, logo_url),
+                     color_scheme  = COALESCE($3, color_scheme),
+                     custom_domain = COALESCE($4, custom_domain),
+                     description   = COALESCE($5, description)
+               WHERE id = $1",
+        )
+        .bind(workspace.to_uuid())
+        .bind(logo_url)
+        .bind(color_scheme)
+        .bind(custom_domain)
+        .bind(description)
+        .execute(&self.pool)
+        .await?;
         Ok(result.rows_affected() > 0)
     }
 

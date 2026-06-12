@@ -72,11 +72,15 @@ async fn viewer_count(s: &AppState, stream: Ulid) -> u32 {
 #[derive(Deserialize)]
 struct RaidReq {
     target_stream_id: String,
+    /// Optional custom message to show in the target channel (shoutout text).
+    #[serde(default)]
+    message: Option<String>,
 }
 
 /// `POST /api/streams/:id/raid` — the source stream's owner raids `target_stream_id`,
 /// sending the source's current viewers there. Both streams must exist; records the
 /// raid and broadcasts [`StreamEvent::Raid`] on the SOURCE stream so watchers redirect.
+/// An optional `message` is persisted with the raid record.
 async fn launch_raid(
     State(s): State<AppState>,
     auth: AuthUser,
@@ -101,8 +105,9 @@ async fn launch_raid(
     }
 
     let count = viewer_count(&s, source).await;
+    let msg = req.message.as_deref();
     let id = repo(&s)
-        .create(source, target, auth.participant_id, i32::try_from(count).unwrap_or(i32::MAX))
+        .create(source, target, auth.participant_id, i32::try_from(count).unwrap_or(i32::MAX), msg)
         .await?;
 
     // Tell the source stream's watchers to redirect to the target.
@@ -119,6 +124,7 @@ async fn launch_raid(
         "source_stream": source.to_string(),
         "target_stream": target.to_string(),
         "viewer_count": count,
+        "message": req.message,
     })))
 }
 

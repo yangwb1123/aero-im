@@ -19,7 +19,9 @@
 use std::str::FromStr;
 
 use aero_auth::AuthUser;
-use aero_common::{Error as AeroError, ParticipantId, Result as AeroResult, WorkspaceId, WorkspaceRole};
+use aero_common::{
+    Error as AeroError, ParticipantId, Result as AeroResult, RoomId, WorkspaceId, WorkspaceRole,
+};
 use aero_storage::AnalyticsRepo;
 use axum::{
     extract::{Path, Query, State},
@@ -37,6 +39,15 @@ pub fn routes() -> Router<AppState> {
         .route("/api/workspaces/:id/analytics", get(overview))
         .route("/api/workspaces/:id/analytics/channels", get(top_channels))
         .route("/api/workspaces/:id/analytics/timeline", get(timeline))
+        .route(
+            "/api/workspaces/:id/channels/:room_id/analytics",
+            get(channel_analytics),
+        )
+        .route(
+            "/api/workspaces/:id/analytics/reactions",
+            get(workspace_reactions),
+        )
+        .route("/api/rooms/:id/analytics/reactions", get(room_reactions))
 }
 
 /// Default number of channels the busiest-channels ranking returns when the
@@ -147,6 +158,62 @@ async fn timeline(
         .await
         .map_err(AeroError::from)?;
     Ok(Json(serde_json::json!({ "timeline": series })))
+}
+
+fn parse_room(s: &str) -> Result<RoomId, AeroError> {
+    RoomId::from_str(s.trim()).map_err(|e| AeroError::Invalid(format!("room id: {e}")))
+}
+
+/// `GET /api/workspaces/:id/channels/:room_id/analytics` — per-channel aggregate
+/// stats (total and 30-day message/sender counts). Admin/owner only.
+async fn channel_analytics(
+    State(s): State<AppState>,
+    auth: AuthUser,
+    Path((ws_str, room_str)): Path<(String, String)>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let ws = parse_workspace(&ws_str)?;
+    let room = parse_room(&room_str)?;
+    assert_admin(&s, ws, auth.participant_id).await?;
+    let stats = repo(&s)
+        .channel_analytics(ws, room)
+        .await
+        .map_err(AeroError::from)?;
+    Ok(Json(serde_json::to_value(stats).map_err(AeroError::from)?))
+}
+
+/// `GET /api/workspaces/:id/analytics/reactions?limit=10` — most-used reactions
+/// across all messages in the workspace, descending by frequency. Admin/owner only.
+async fn workspace_reactions(
+    State(s): State<AppState>,
+    auth: AuthUser,
+    Path(ws_str): Path<String>,
+    Query(q): Query<LimitQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let ws = parse_workspace(&ws_str)?;
+    assert_admin(&s, ws, auth.participant_id).await?;
+    let limit = q.limit.unwrap_or(DEFAULT_TOP_LIMIT);
+    let stats = repo(&s)
+        .top_reactions_workspace(ws, limit)
+        .await
+        .map_err(AeroError::from)?;
+    Ok(Json(serde_json::json!({ "reactions": stats })))
+}
+
+/// `GET /api/rooms/:id/analytics/reactions?limit=10` — most-used reactions on
+/// messages in a room, descending by frequency. Any authenticated caller may read.
+async fn room_reactions(
+    State(s): State<AppState>,
+    _auth: AuthUser,
+    Path(room_str): Path<String>,
+    Query(q): Query<LimitQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let room = parse_room(&room_str)?;
+    let limit = q.limit.unwrap_or(DEFAULT_TOP_LIMIT);
+    let stats = repo(&s)
+        .top_reactions_room(room, limit)
+        .await
+        .map_err(AeroError::from)?;
+    Ok(Json(serde_json::json!({ "reactions": stats })))
 }
 
 #[cfg(test)]

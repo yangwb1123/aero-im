@@ -35,6 +35,10 @@ pub fn routes() -> Router<AppState> {
         .route("/api/streams/:id/hype-train", get(get_hype_train))
         .route("/api/streams/:id/hype-train/history", get(hype_train_history))
         .route(
+            "/api/streams/:id/hype-train/leaderboard",
+            get(stream_leaderboard),
+        )
+        .route(
             "/api/hype-train-sessions/:id/leaderboard",
             get(session_leaderboard),
         )
@@ -107,6 +111,23 @@ async fn hype_train_history(
         .await
         .map_err(AeroError::from)?;
     Ok(Json(serde_json::json!({ "sessions": sessions })))
+}
+
+/// `GET /api/streams/:id/hype-train/leaderboard?limit=10` — top contributors across
+/// ALL sessions for the stream, summed and ranked by total units. Any authenticated
+/// viewer may read.
+async fn stream_leaderboard(
+    State(s): State<AppState>,
+    _auth: AuthUser,
+    Path(id_str): Path<String>,
+    Query(q): Query<LeaderboardQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let stream = parse_stream(&id_str)?;
+    let leaderboard = repo(&s)
+        .stream_leaderboard(stream, q.limit)
+        .await
+        .map_err(AeroError::from)?;
+    Ok(Json(serde_json::json!({ "leaderboard": leaderboard })))
 }
 
 /// `GET /api/hype-train-sessions/:id/leaderboard?limit=10` — top contributors for a

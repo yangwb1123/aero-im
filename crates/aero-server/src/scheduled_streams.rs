@@ -19,7 +19,9 @@ use aero_common::{Error as AeroError, RoomId, ScheduledStreamId, WorkspaceId};
 use aero_storage::ScheduledStreamRepo;
 use axum::{
     extract::{Path, State},
-    routing::{delete, post},
+    http::{header, HeaderValue, StatusCode},
+    response::{IntoResponse, Response},
+    routing::{delete, get, post},
     Json, Router,
 };
 use serde::Deserialize;
@@ -37,6 +39,10 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/api/scheduled-streams/:id",
             delete(cancel_scheduled_stream),
+        )
+        .route(
+            "/api/workspaces/:id/streams/schedule.ics",
+            get(workspace_schedule_ics),
         )
 }
 
@@ -164,4 +170,79 @@ async fn cancel_scheduled_stream(
         return Err(AeroError::NotFound(format!("scheduled stream {id}")).into());
     }
     Ok(Json(serde_json::json!({ "canceled": true })))
+}
+
+/// Format a [`time::OffsetDateTime`] as the iCalendar UTC timestamp form:
+/// `YYYYMMDDTHHmmssZ`.
+fn fmt_ics_dt(dt: time::OffsetDateTime) -> String {
+    let dt = dt.to_offset(time::UtcOffset::UTC);
+    format!(
+        "{:04}{:02}{:02}T{:02}{:02}{:02}Z",
+        dt.year(),
+        dt.month() as u8,
+        dt.day(),
+        dt.hour(),
+        dt.minute(),
+        dt.second(),
+    )
+}
+
+/// Escape special characters in iCalendar TEXT values (SUMMARY, DESCRIPTION).
+fn ics_escape(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace(';', "\\;")
+        .replace(',', "\\,")
+        .replace('\n', "\\n")
+}
+
+/// `GET /api/workspaces/:id/streams/schedule.ics` — the workspace's upcoming
+/// scheduled streams serialised as RFC 5545 iCalendar. Members only.
+async fn workspace_schedule_ics(
+    State(s): State<AppState>,
+    auth: AuthUser,
+    Path(ws_str): Path<String>,
+) -> Result<Response, crate::error::ApiError> {
+    let ws = parse_workspace(&ws_str)?;
+    assert_member(&s, ws, auth.participant_id).await?;
+    let streams = repo(&s)
+        .list_upcoming(ws, time::OffsetDateTime::now_utc())
+        .await
+        .map_err(AeroError::from)?;
+
+    let mut ics =
+        String::from("BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Aero//Aero IM//EN\r\n");
+    for stream in &streams {
+        let dtstart = fmt_ics_dt(stream.scheduled_for);
+        // Default duration: 1 hour.
+        let dtend = fmt_ics_dt(stream.scheduled_for + time::Duration::hours(1));
+        ics.push_str("BEGIN:VEVENT\r\n");
+        ics.push_str(&format!("UID:{}@aero\r\n", stream.id));
+        ics.push_str(&format!("SUMMARY:{}\r\n", ics_escape(&stream.title)));
+        ics.push_str(&format!("DTSTART:{dtstart}\r\n"));
+        ics.push_str(&format!("DTEND:{dtend}\r\n"));
+        if let Some(desc) = &stream.description {
+            if !desc.is_empty() {
+                ics.push_str(&format!("DESCRIPTION:{}\r\n", ics_escape(desc)));
+            }
+        }
+        ics.push_str("END:VEVENT\r\n");
+    }
+    ics.push_str("END:VCALENDAR\r\n");
+
+    let response = (
+        StatusCode::OK,
+        [
+            (
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("text/calendar; charset=utf-8"),
+            ),
+            (
+                header::CONTENT_DISPOSITION,
+                HeaderValue::from_static("attachment; filename=\"schedule.ics\""),
+            ),
+        ],
+        ics,
+    )
+        .into_response();
+    Ok(response)
 }

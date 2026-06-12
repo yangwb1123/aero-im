@@ -265,6 +265,34 @@ impl HypeTrainRepo {
         Ok(rows.into_iter().map(row_to_session).collect())
     }
 
+    /// Top contributors across ALL sessions for a stream (stream-wide leaderboard),
+    /// ranked by total units across every session for that stream, limited to `limit`
+    /// rows (clamped `[1, 100]`).
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the query.
+    pub async fn stream_leaderboard(
+        &self,
+        stream_id: Ulid,
+        limit: i64,
+    ) -> Result<Vec<HypeTrainLeaderRow>, sqlx::Error> {
+        sqlx::query_as::<_, HypeTrainLeaderRow>(
+            r"SELECT htc.participant_id,
+                     SUM(htc.units)::bigint AS total_units,
+                     RANK() OVER (ORDER BY SUM(htc.units) DESC)::bigint AS rank
+               FROM hype_train_contributions htc
+               JOIN hype_train_sessions hts ON htc.session_id = hts.id
+              WHERE hts.stream_id = $1
+              GROUP BY htc.participant_id
+              ORDER BY total_units DESC
+              LIMIT $2",
+        )
+        .bind(Uuid::from_u128(stream_id.0))
+        .bind(limit.clamp(1, 100))
+        .fetch_all(&self.pool)
+        .await
+    }
+
     /// Top contributors for a single session, ranked by total units
     /// (RANK OVER ORDER BY SUM(units) DESC), limited to the top `limit` rows.
     ///

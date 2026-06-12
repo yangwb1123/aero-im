@@ -21,10 +21,10 @@ use std::str::FromStr;
 
 use aero_auth::AuthUser;
 use aero_common::{Error as AeroError, MessageId};
-use aero_storage::{ThreadNotificationPrefsRepo, ThreadSubscriptionRepo};
+use aero_storage::{ThreadNotificationPrefsRepo, ThreadReadStateRepo, ThreadSubscriptionRepo};
 use axum::{
     extract::{Path, State},
-    routing::{get, put},
+    routing::{get, post, put},
     Json, Router,
 };
 use serde::Deserialize;
@@ -53,6 +53,9 @@ pub fn routes() -> Router<AppState> {
             "/api/messages/:id/thread-participants",
             get(list_thread_participants),
         )
+        // Thread read state + unread count (ROADMAP7 Lane A)
+        .route("/api/messages/:id/read", post(mark_thread_read))
+        .route("/api/messages/:id/unread-count", get(get_unread_count))
 }
 
 /// Build a [`ThreadSubscriptionRepo`] from shared state, over the shared pool.
@@ -250,4 +253,38 @@ async fn list_thread_participants(
     }
 
     Ok(Json(serde_json::json!({ "participants": participants })))
+}
+
+// ----------------------------------- Thread read state (ROADMAP7 Lane A)
+
+fn read_state_repo(s: &AppState) -> ThreadReadStateRepo {
+    s.thread_read_state.clone()
+}
+
+/// `POST /api/messages/:id/read` — mark the thread rooted at `:id` as read
+/// for the caller. Idempotent: re-marking updates the cursor to now().
+async fn mark_thread_read(
+    State(s): State<AppState>,
+    auth: AuthUser,
+    Path(id_str): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let root = parse_message(&id_str)?;
+    read_state_repo(&s)
+        .mark_read(auth.participant_id, root)
+        .await?;
+    Ok(Json(serde_json::json!({ "read": true })))
+}
+
+/// `GET /api/messages/:id/unread-count` — return the number of replies in the
+/// thread rooted at `:id` that the caller has not yet read.
+async fn get_unread_count(
+    State(s): State<AppState>,
+    auth: AuthUser,
+    Path(id_str): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let root = parse_message(&id_str)?;
+    let count = read_state_repo(&s)
+        .unread_count(auth.participant_id, root)
+        .await?;
+    Ok(Json(serde_json::json!({ "unread": count })))
 }

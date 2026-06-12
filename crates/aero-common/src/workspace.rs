@@ -113,6 +113,14 @@ pub struct Workspace {
     pub created_by: Option<ParticipantId>,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
+    /// Optional URL for the workspace's logo image (branding).
+    pub logo_url: Option<String>,
+    /// Optional color scheme token or hex color (branding).
+    pub color_scheme: Option<String>,
+    /// Optional custom domain for the workspace (branding).
+    pub custom_domain: Option<String>,
+    /// Optional human-readable description of the workspace.
+    pub description: Option<String>,
 }
 
 /// One participant's membership in a workspace.

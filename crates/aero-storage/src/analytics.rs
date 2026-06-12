@@ -18,6 +18,7 @@
 use aero_common::{RoomId, WorkspaceId};
 use serde::Serialize;
 use sqlx::PgPool;
+use uuid::Uuid;
 
 /// Headline aggregate counts for one workspace — the analytics "overview" card.
 ///
@@ -54,6 +55,26 @@ pub struct DayCount {
     /// The day, truncated via `date_trunc('day', …)` and rendered `YYYY-MM-DD`.
     pub day: String,
     /// Number of non-deleted messages created that day.
+    pub count: i64,
+}
+
+/// Per-channel aggregate stats for a single room: total and 30-day message counts
+/// plus distinct sender counts. A storage-layer projection (`Serialize` so a handler
+/// can return it directly as JSON).
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct ChannelAnalytics {
+    pub room_id: Uuid,
+    pub total_messages: i64,
+    pub unique_senders: i64,
+    pub messages_last_30_days: i64,
+    pub active_members_last_30_days: i64,
+}
+
+/// One row of the per-workspace (or per-room) reaction-frequency ranking:
+/// an emoji and how many times it has been used.
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct ReactionStat {
+    pub emoji: String,
     pub count: i64,
 }
 
@@ -204,6 +225,101 @@ impl AnalyticsRepo {
             .into_iter()
             .map(|(day, count)| DayCount { day, count })
             .collect())
+    }
+
+    /// Aggregate stats for a single room (channel) within `workspace`.
+    ///
+    /// Returns total message count, unique senders, and the same two figures
+    /// restricted to the trailing 30 days. All counts exclude soft-deleted rows.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the queries.
+    pub async fn channel_analytics(
+        &self,
+        workspace: WorkspaceId,
+        room: RoomId,
+    ) -> Result<ChannelAnalytics, sqlx::Error> {
+        let row = sqlx::query_as::<_, (i64, i64, i64, i64)>(
+            r"SELECT
+                COUNT(*) FILTER (WHERE deleted_at IS NULL) AS total_messages,
+                COUNT(DISTINCT sender_id) FILTER (WHERE deleted_at IS NULL) AS unique_senders,
+                COUNT(*) FILTER (WHERE deleted_at IS NULL
+                                   AND created_at > now() - interval '30 days') AS messages_last_30_days,
+                COUNT(DISTINCT sender_id) FILTER (WHERE deleted_at IS NULL
+                                                   AND created_at > now() - interval '30 days') AS active_members_last_30_days
+              FROM messages m
+              JOIN rooms r ON r.id = m.room_id
+             WHERE m.room_id = $1
+               AND r.workspace_id = $2",
+        )
+        .bind(room.to_uuid())
+        .bind(workspace.to_uuid())
+        .fetch_one(&self.pool)
+        .await?;
+        let (total_messages, unique_senders, messages_last_30_days, active_members_last_30_days) =
+            row;
+        Ok(ChannelAnalytics {
+            room_id: room.to_uuid(),
+            total_messages,
+            unique_senders,
+            messages_last_30_days,
+            active_members_last_30_days,
+        })
+    }
+
+    /// The most-used reactions across all messages in `workspace`, descending by
+    /// frequency, limited to `limit` rows (clamped to `[1, 100]`).
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the query.
+    pub async fn top_reactions_workspace(
+        &self,
+        workspace: WorkspaceId,
+        limit: i64,
+    ) -> Result<Vec<ReactionStat>, sqlx::Error> {
+        let limit = limit.clamp(1, 100);
+        sqlx::query_as::<_, ReactionStat>(
+            r"SELECT rct.emoji, COUNT(*) AS count
+               FROM reactions rct
+               JOIN messages m ON rct.message_id = m.id
+               JOIN rooms r ON r.id = m.room_id
+              WHERE r.workspace_id = $1
+                AND m.deleted_at IS NULL
+              GROUP BY rct.emoji
+              ORDER BY count DESC, rct.emoji ASC
+              LIMIT $2",
+        )
+        .bind(workspace.to_uuid())
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// The most-used reactions on messages in `room`, descending by frequency,
+    /// limited to `limit` rows (clamped to `[1, 100]`).
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the query.
+    pub async fn top_reactions_room(
+        &self,
+        room: RoomId,
+        limit: i64,
+    ) -> Result<Vec<ReactionStat>, sqlx::Error> {
+        let limit = limit.clamp(1, 100);
+        sqlx::query_as::<_, ReactionStat>(
+            r"SELECT rct.emoji, COUNT(*) AS count
+               FROM reactions rct
+               JOIN messages m ON rct.message_id = m.id
+              WHERE m.room_id = $1
+                AND m.deleted_at IS NULL
+              GROUP BY rct.emoji
+              ORDER BY count DESC, rct.emoji ASC
+              LIMIT $2",
+        )
+        .bind(room.to_uuid())
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
     }
 }
 

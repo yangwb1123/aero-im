@@ -13,7 +13,7 @@ use aero_storage::{
     AiJobRepo, AuditRepo, BlobRepo, BlobStore, CallRepo, CallRosterStore, KeyPackageRepo,
     MessageRepo, MlsGroupRepo, NotificationRepo, ParticipantRepo, PgPool, PinRepo, PresenceStore,
     ReactionRepo, ReceiptRepo, RoomRepo, StreamRepo, StreamRouteRegistry, StreamViewerStore,
-    WorkspaceRepo,
+    ThreadReadStateRepo, TopicHistoryRepo, WorkspaceRepo,
 };
 use axum::extract::FromRef;
 
@@ -306,6 +306,10 @@ pub struct AppState {
     /// corresponding credentials are not configured — the push-dispatch bot
     /// then simply skips that platform (ROADMAP 方向二).
     pub push: PushGateways,
+    /// Channel topic change history (ROADMAP7 Lane A).
+    pub topic_history: TopicHistoryRepo,
+    /// Thread-level read state + unread count tracking (ROADMAP7 Lane A).
+    pub thread_read_state: ThreadReadStateRepo,
 }
 
 /// The per-platform mobile push gateways, resolved from env at startup. Each is
