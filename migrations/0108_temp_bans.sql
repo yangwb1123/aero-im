@@ -1,0 +1,1 @@
+ALTER TABLE stream_bans ADD COLUMN expires_at TIMESTAMPTZ;

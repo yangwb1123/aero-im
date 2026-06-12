@@ -12,7 +12,7 @@ use aero_auth::AuthUser;
 use aero_common::{Error as AeroError, ParticipantId, RoomId, WorkspaceId};
 use axum::{
     extract::{Path, Query, State},
-    routing::{get, post},
+    routing::{get, patch, post},
     Json, Router,
 };
 use serde::Deserialize;
@@ -34,6 +34,8 @@ pub fn routes() -> Router<AppState> {
         )
         // ROADMAP7 Lane A: channel topic change history.
         .route("/api/rooms/:id/topic-history", get(list_topic_history))
+        // ROADMAP9: server-side slowmode enforcement.
+        .route("/api/rooms/:id/slowmode", patch(set_slowmode))
 }
 
 fn parse_room(s: &str) -> Result<RoomId, AeroError> {
@@ -392,6 +394,49 @@ async fn audit_channel_meta_changed(
     {
         tracing::warn!(error = ?e, %workspace, "channel.metadata_changed audit append failed");
     }
+}
+
+// --------------------------------------------------- slowmode (ROADMAP9, migration 0107)
+
+#[derive(Deserialize)]
+struct SlowmodeReq {
+    /// Slowmode interval in seconds. `0` disables slowmode. Clamped to `[0, 21600]`
+    /// (6 hours max, matching Discord's ceiling).
+    seconds: i32,
+}
+
+/// `PATCH /api/rooms/:id/slowmode` — set (or disable with `seconds=0`) the room's
+/// slowmode interval. Caller must be the room creator or a workspace Admin/Owner.
+async fn set_slowmode(
+    State(s): State<AppState>,
+    auth: AuthUser,
+    Path(room_str): Path<String>,
+    Json(req): Json<SlowmodeReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let room = parse_room(&room_str)?;
+    // Authorisation: caller must be the room creator OR a workspace Admin/Owner.
+    let creator = s.rooms.created_by(room).await?;
+    let workspace = s.rooms.room_workspace(room).await?.ok_or_else(|| {
+        AeroError::NotFound("room not found".into())
+    })?;
+    let is_creator = creator == Some(auth.participant_id);
+    let is_admin = s
+        .workspaces
+        .member_role(workspace, auth.participant_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|r| r.can_administer())
+        .unwrap_or(false);
+    if !is_creator && !is_admin {
+        return Err(AeroError::Forbidden(
+            "must be room creator or workspace admin to set slowmode".into(),
+        )
+        .into());
+    }
+    let seconds = req.seconds.clamp(0, 21_600);
+    s.rooms.set_slowmode(room, seconds).await?;
+    Ok(Json(serde_json::json!({ "ok": true, "slowmode_seconds": seconds })))
 }
 
 #[cfg(test)]

@@ -421,6 +421,7 @@ async fn main() -> anyhow::Result<()> {
     {
         let workspaces = state.workspaces.clone();
         let messages_repo = state.messages.clone();
+        let stream_mod_pool = state.pg.clone();
         let cancel = ai_shutdown.clone();
         let sweep_secs = std::env::var("AERO__SERVER__RETENTION_SWEEP_SECS")
             .ok()
@@ -455,6 +456,16 @@ async fn main() -> anyhow::Result<()> {
                                 Ok(0) => {}
                                 Ok(n) => info!(swept = n, "ephemeral sweep hard-deleted expired messages"),
                                 Err(e) => warn!(error = ?e, "ephemeral sweep failed"),
+                            }
+                            // Temp-ban expiry sweep (migration 0108): hard-delete
+                            // stream_bans rows whose expires_at has passed.
+                            match aero_storage::StreamModRepo::new(stream_mod_pool.clone())
+                                .sweep_expired_bans()
+                                .await
+                            {
+                                Ok(0) => {}
+                                Ok(n) => info!(swept = n, "expired bans cleaned up"),
+                                Err(e) => warn!(error = ?e, "ban expiry sweep failed"),
                             }
                         }
                     }

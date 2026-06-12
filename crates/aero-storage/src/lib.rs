@@ -338,3 +338,7 @@ pub use thread_read_state::ThreadReadStateRepo;
 // ---- User-level blocking / ignoring (migration 0106) ----
 pub mod user_blocks;
 pub use user_blocks::BlockRepo;
+
+// ---- ROADMAP9 — extended subscription tier levels (migration 0109) ----
+pub mod subscription_tier;
+pub use subscription_tier::{SubscriptionTier, SubscriptionTierRepo};

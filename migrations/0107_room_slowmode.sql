@@ -1,0 +1,1 @@
+ALTER TABLE rooms ADD COLUMN slowmode_seconds INT NOT NULL DEFAULT 0;

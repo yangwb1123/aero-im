@@ -404,6 +404,9 @@ pub fn build(state: AppState) -> Router {
         // ---- ROADMAP8 — user blocking ----
         // POST/DELETE /api/users/:user_id/block, GET /api/me/blocks.
         .merge(crate::user_blocks::router())
+        // ---- ROADMAP9 — extended subscription tier levels (migration 0109) ----
+        // POST/GET /api/creators/:id/subscription-tiers, DELETE /api/creators/:id/subscription-tiers/:tid
+        .merge(crate::subscription_tiers::routes())
         // ---- OpenAPI 3.0 spec (public, no auth) ----
         // GET /api/openapi.json returns the static OpenAPI document so API clients
         // and documentation generators can introspect the surface without credentials.

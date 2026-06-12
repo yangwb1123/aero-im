@@ -125,6 +125,18 @@ impl StreamModRepo {
         Ok(banned)
     }
 
+    /// Sweep hard-delete ban rows whose `expires_at` has passed (migration 0108).
+    /// Permanent bans (`expires_at IS NULL`) and still-active timeouts are left
+    /// untouched. Returns the number of rows removed.
+    pub async fn sweep_expired_bans(&self) -> Result<u64, sqlx::Error> {
+        let r = sqlx::query(
+            "DELETE FROM stream_bans WHERE expires_at IS NOT NULL AND expires_at < NOW()",
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected())
+    }
+
     /// All bans recorded for a stream (active and expired-timeout rows), newest
     /// first. Always filtered to `stream`.
     pub async fn list_bans(&self, stream: Ulid) -> Result<Vec<StreamBan>, sqlx::Error> {

@@ -394,6 +394,34 @@ async fn handle_text(
             // budget — after the access check (so non-members cannot drain a
             // victim's budget), surfacing as a WS `error` frame when over.
             crate::ws_rate::check_ws_rate_room(state, room_id).await?;
+            // Slowmode enforcement (migration 0107): if the room has a slowmode
+            // interval, reject the send unless enough time has elapsed since the
+            // sender's last message. Checked AFTER access/rate guards so only real
+            // members burn through the interval; `unwrap_or(0)` is fail-open.
+            let slowmode = state.rooms.get_slowmode(room_id).await.unwrap_or(0);
+            if slowmode > 0 {
+                let last_msg: Option<(time::OffsetDateTime,)> = sqlx::query_as(
+                    "SELECT created_at FROM messages \
+                     WHERE room_id = $1 AND sender_id = $2 AND deleted_at IS NULL \
+                     ORDER BY created_at DESC LIMIT 1",
+                )
+                .bind(room_id.to_uuid())
+                .bind(pid.to_uuid())
+                .fetch_optional(&state.pg)
+                .await
+                .unwrap_or(None);
+                if let Some((last_at,)) = last_msg {
+                    let elapsed =
+                        (time::OffsetDateTime::now_utc() - last_at).whole_seconds();
+                    if elapsed < slowmode as i64 {
+                        return Err(aero_common::Error::Invalid(format!(
+                            "slowmode: wait {}s before sending again",
+                            slowmode as i64 - elapsed
+                        ))
+                        .into());
+                    }
+                }
+            }
             let expires_at = expires_after_secs
                 .filter(|&s| s > 0)
                 .map(|s| time::OffsetDateTime::now_utc() + time::Duration::seconds(s as i64));

@@ -193,4 +193,8 @@ pub mod openapi;
 /// Block/unblock another participant + list caller's blocks.
 pub mod user_blocks;
 
+// ---- ROADMAP9 — extended subscription tier levels (migration 0109) ----
+/// Extended per-creator subscription tiers (position + benefits JSONB).
+pub mod subscription_tiers;
+
 pub use state::AppState;

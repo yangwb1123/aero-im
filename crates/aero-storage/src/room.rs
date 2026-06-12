@@ -541,6 +541,31 @@ impl RoomRepo {
             .collect())
     }
 
+    // ------------------------------------------ slowmode (migration 0107)
+
+    /// Set a room's slowmode interval in seconds (`0` disables slowmode).
+    pub async fn set_slowmode(&self, room: RoomId, seconds: i32) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE rooms SET slowmode_seconds = $1 WHERE id = $2")
+            .bind(seconds)
+            .bind(room.to_uuid())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// The room's current slowmode interval in seconds (`0` = disabled), or `0`
+    /// if the room does not exist (fail-open so a glitch never silently blocks
+    /// posting).
+    pub async fn get_slowmode(&self, room: RoomId) -> Result<i32, sqlx::Error> {
+        let row = sqlx::query_as::<_, (i32,)>(
+            "SELECT slowmode_seconds FROM rooms WHERE id = $1",
+        )
+        .bind(room.to_uuid())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(s,)| s).unwrap_or(0))
+    }
+
     /// Remove a participant from a room (used by channel leave). Idempotent: a
     /// no-op when they were not a member.
     pub async fn remove_member(
