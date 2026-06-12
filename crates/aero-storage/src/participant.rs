@@ -139,7 +139,8 @@ impl ParticipantRepo {
     /// Steps (all within the same DB transaction):
     /// 1. Mark `participants.deleted_at = NOW()` — keeps the row for FK integrity.
     /// 2. Overwrite every non-deleted message the participant sent with a
-    ///    `[deleted]` placeholder and clear `searchable_text` (GDPR Art. 17).
+    ///    `[deleted]` placeholder, clear `searchable_text`, and null the pgvector
+    ///    `embedding` (a semantic vector is re-identifiable) (GDPR Art. 17).
     /// 3. Revoke all active `auth_sessions` so existing tokens stop working.
     ///
     /// Returns `true` when the account existed and was freshly soft-deleted,
@@ -178,11 +179,16 @@ impl ParticipantRepo {
             .execute(&mut *tx)
             .await?;
 
-        // Anonymise message content (GDPR right-to-erasure).
+        // Anonymise message content (GDPR right-to-erasure). Null the pgvector
+        // `embedding` too: a semantic vector of the original text is re-identifiable
+        // (a nearest-neighbour search reconstructs what was "erased"), so clearing
+        // blocks/searchable_text without it leaves erasure incomplete. Mirrors the
+        // soft-delete / retention-sweep paths (message.rs:101,154 / workspace.rs:826).
         sqlx::query(
             r#"UPDATE messages
                SET blocks          = '[{"type":"text","text":"[deleted]"}]'::jsonb,
-                   searchable_text = ''
+                   searchable_text = '',
+                   embedding       = NULL
                WHERE sender_id = $1 AND deleted_at IS NULL"#,
         )
         .bind(participant_id.to_uuid())
@@ -441,5 +447,93 @@ impl ParticipantRepo {
                 created_at,
             }
         }))
+    }
+}
+
+#[cfg(test)]
+mod db_tests {
+    use super::ParticipantRepo;
+    use crate::message::{MessageRepo, NewMessage};
+    use aero_common::{Block, ParticipantId, RoomId, WorkspaceId};
+    use sqlx::PgPool;
+
+    fn pool() -> PgPool {
+        let url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://aero:aero_dev_pw@localhost:5432/aero".into());
+        sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect_lazy(&url)
+            .expect("connect_lazy never fails on a well-formed URL")
+    }
+
+    async fn participant(p: &PgPool) -> ParticipantId {
+        let id = ParticipantId::new();
+        sqlx::query("INSERT INTO participants (id, kind, display_name) VALUES ($1, 'human', $2)")
+            .bind(id.to_uuid())
+            .bind(format!("erasure-actor-{id}"))
+            .execute(p)
+            .await
+            .expect("insert participant");
+        id
+    }
+
+    async fn room(p: &PgPool, creator: ParticipantId) -> RoomId {
+        let id = RoomId::new();
+        sqlx::query(
+            "INSERT INTO rooms (id, kind, name, created_by, workspace_id) VALUES ($1,'group',$2,$3,$4)",
+        )
+        .bind(id.to_uuid())
+        .bind(format!("erasure-room-{id}"))
+        .bind(creator.to_uuid())
+        .bind(WorkspaceId(ulid::Ulid(0)).to_uuid())
+        .execute(p)
+        .await
+        .expect("insert room");
+        id
+    }
+
+    /// GDPR right-to-erasure must null the pgvector `embedding` alongside
+    /// blocks/searchable_text — a retained semantic vector is re-identifiable.
+    /// Guards the participant.rs erasure UPDATE against dropping `embedding = NULL`.
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn erasure_nulls_message_embedding() {
+        let p = pool();
+        let messages = MessageRepo::new(p.clone());
+        let participants = ParticipantRepo::new(p.clone());
+
+        let sender = participant(&p).await;
+        let r = room(&p, sender).await;
+
+        let msg = messages
+            .insert(NewMessage {
+                room_id: r,
+                sender_id: sender,
+                blocks: vec![Block::text("a private secret to be erased")],
+                reply_to: None,
+                metadata: serde_json::json!({}),
+                expires_at: None,
+            })
+            .await
+            .expect("insert message");
+
+        // Populate a non-null embedding, mirroring what AiWorker would store.
+        assert!(
+            messages.update_embedding(msg.id, vec![0.25_f32; 1024]).await.expect("set embedding"),
+            "embedding should be set before erasure",
+        );
+
+        assert!(participants.delete_participant(sender).await.expect("erase"));
+
+        let (searchable, embedding_is_null): (String, bool) = sqlx::query_as(
+            "SELECT searchable_text, embedding IS NULL FROM messages WHERE id = $1",
+        )
+        .bind(msg.id.to_uuid())
+        .fetch_one(&p)
+        .await
+        .expect("reload erased message");
+
+        assert_eq!(searchable, "", "searchable_text cleared by erasure");
+        assert!(embedding_is_null, "embedding must be nulled by erasure (re-identifiable)");
     }
 }
