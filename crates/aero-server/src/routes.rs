@@ -430,6 +430,20 @@ pub fn build(state: AppState) -> Router {
         // ---- ROADMAP11 — bulk unread summary (no migration) ----
         // GET /api/me/unread-summary
         .merge(crate::unread_summary::routes())
+        // ---- channel points (mig 0089) ----
+        .merge(crate::channel_points::routes())
+        // ---- ban appeals (mig 0091) ----
+        .merge(crate::ban_appeals::routes())
+        // ---- stream goals (mig 0090) ----
+        .merge(crate::goals::routes())
+        // ---- live predictions (mig 0092) ----
+        .merge(crate::predictions::routes())
+        // ---- message reports / moderation queue (mig 0093) ----
+        .merge(crate::message_reports::routes())
+        // ---- thread title (AI, no migration) ----
+        .merge(crate::thread_title::routes())
+        // ---- message sentiment (AI, no migration) ----
+        .merge(crate::message_sentiment::routes())
         // ---- OpenAPI 3.0 spec (public, no auth) ----
         // GET /api/openapi.json returns the static OpenAPI document so API clients
         // and documentation generators can introspect the surface without credentials.
