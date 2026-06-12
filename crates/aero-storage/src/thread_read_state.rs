@@ -185,8 +185,8 @@ mod db_tests {
         // Root message.
         let root = MessageId::new();
         sqlx::query(
-            "INSERT INTO messages (id, room_id, sender_id, body, created_at)
-             VALUES ($1, $2, $3, 'root msg', now())",
+            "INSERT INTO messages (id, room_id, sender_id, blocks, searchable_text, created_at)
+             VALUES ($1, $2, $3, '[]'::jsonb, 'root msg', now())",
         )
         .bind(root.to_uuid())
         .bind(room_id)
@@ -203,8 +203,8 @@ mod db_tests {
         for i in 0..2 {
             let reply = MessageId::new();
             sqlx::query(
-                "INSERT INTO messages (id, room_id, sender_id, reply_to, body, created_at)
-                 VALUES ($1, $2, $3, $4, $5, now())",
+                "INSERT INTO messages (id, room_id, sender_id, reply_to, blocks, searchable_text, created_at)
+                 VALUES ($1, $2, $3, $4, '[]'::jsonb, $5, now())",
             )
             .bind(reply.to_uuid())
             .bind(room_id)
@@ -248,8 +248,8 @@ mod db_tests {
         let root_b = MessageId::new();
         for root in [root_a, root_b] {
             sqlx::query(
-                "INSERT INTO messages (id, room_id, sender_id, body, created_at)
-                 VALUES ($1, $2, $3, 'root', now())",
+                "INSERT INTO messages (id, room_id, sender_id, blocks, searchable_text, created_at)
+                 VALUES ($1, $2, $3, '[]'::jsonb, 'root', now())",
             )
             .bind(root.to_uuid())
             .bind(room_id)
@@ -262,8 +262,8 @@ mod db_tests {
         // 1 reply in root_a, 3 in root_b.
         let reply_a = MessageId::new();
         sqlx::query(
-            "INSERT INTO messages (id, room_id, sender_id, reply_to, body, created_at)
-             VALUES ($1, $2, $3, $4, 'reply-a', now())",
+            "INSERT INTO messages (id, room_id, sender_id, reply_to, blocks, searchable_text, created_at)
+             VALUES ($1, $2, $3, $4, '[]'::jsonb, 'reply-a', now())",
         )
         .bind(reply_a.to_uuid())
         .bind(room_id)
@@ -276,8 +276,8 @@ mod db_tests {
         for i in 0..3 {
             let reply = MessageId::new();
             sqlx::query(
-                "INSERT INTO messages (id, room_id, sender_id, reply_to, body, created_at)
-                 VALUES ($1, $2, $3, $4, $5, now())",
+                "INSERT INTO messages (id, room_id, sender_id, reply_to, blocks, searchable_text, created_at)
+                 VALUES ($1, $2, $3, $4, '[]'::jsonb, $5, now())",
             )
             .bind(reply.to_uuid())
             .bind(room_id)

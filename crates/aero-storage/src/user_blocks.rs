@@ -141,11 +141,10 @@ mod db_tests {
     /// Seed a minimal `participants` row so FK constraints are satisfied.
     async fn seed_participant(pg: &PgPool, id: ParticipantId) {
         sqlx::query(
-            "INSERT INTO participants (id, email, display_name, password_hash) \
-             VALUES ($1, $2, $3, 'x') ON CONFLICT DO NOTHING",
+            "INSERT INTO participants (id, kind, display_name) \
+             VALUES ($1, 'human', $2) ON CONFLICT DO NOTHING",
         )
         .bind(id.to_uuid())
-        .bind(format!("test-{}@example.com", id.to_uuid()))
         .bind(format!("User {}", id.to_uuid()))
         .execute(pg)
         .await
