@@ -49,6 +49,26 @@
   Either way: add a CI job that replays `migrations/*.sql` against a scratch DB so
   the chain is execution-validated, not just compile-embedded.
 
+## ADR-004 — Optional client idempotency key for gift sends
+
+- **Date:** 2026-06-13
+- **Status:** ACCEPTED (implemented, commit c1abddd, migration 0126)
+- **Decision:** Gift sends accept an optional client-supplied idempotency key (REST
+  `Idempotency-Key` header / WS `stream_gift` frame `nonce`). A partial unique index
+  on `stream_gifts (sender_id, idempotency_key) WHERE idempotency_key IS NOT NULL`
+  dedups; `insert_gift` uses `ON CONFLICT DO NOTHING RETURNING` and returns the
+  original gift + `inserted=false` on a hit; `send_gift` then skips broadcast + goal
+  feed, and signals callers to skip the hype-train feed.
+- **Reason:** A retried gift RPC double-recorded the ledger row, double-advanced
+  goal bars, and re-broadcast — a money-path/leaderboard correctness bug. Client-
+  supplied keys are the standard idempotency mechanism for non-idempotent POSTs.
+- **Impact:** Backward-compatible — a `NULL` key (no header/nonce) keeps the legacy
+  always-insert path, so existing clients and the web SPA are unaffected (they
+  simply don't get dedup protection until they send a key).
+- **Alternatives:** Server-derived dedup window (e.g. hash of sender+gift+qty over N
+  seconds) — rejected: it would wrongly collapse two *intentional* identical gifts.
+  Client keys make intent explicit.
+
 ## ADR-003 — Bus listeners resubscribe across NATS reconnects
 
 - **Date:** 2026-06-13

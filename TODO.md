@@ -14,10 +14,10 @@
   a fully-migrated DB: aero-storage had 3 broken fixtures (`body`/`email`/`password_hash`
   columns that don't exist) — fixed 57c2d45 (195/0); aero-im-core (11) + aero-server
   (5) were already correct. db-tests now genuinely pass workspace-wide on a fresh DB.
-- [ ] **STOP — gift double-charge (money path).** `aero-storage/src/live.rs:~125`
-  mints `Ulid::new()` + bare INSERT with no idempotency key; a retried gift RPC
-  double-charges. Needs schema (idempotency-key column / unique constraint) +
-  public `Idempotency-Key` header → interface+schema change → confirm before build.
+- [x] ~~**gift double-charge (money path).**~~ Fixed c1abddd — optional idempotency
+  key (REST `Idempotency-Key` header / WS `nonce`) + partial unique index (mig 0126);
+  `insert_gift` ON CONFLICT DO NOTHING, `send_gift` skips broadcast/goals/hype-train
+  on a dedup hit. Additive/backward-compatible. Live-verified db-test. ADR-004.
 - [x] ~~**bus-listener reconnect black hole.** `run_bus_listener` /
   `run_live_bus_listener` returned permanently when the NATS stream ended on a
   reconnect → silent total fan-out outage.~~ Fixed e5f1fb1 — outer resubscribe loop
