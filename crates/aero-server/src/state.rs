@@ -328,6 +328,10 @@ pub struct AppState {
     /// Block/unblock another participant; gates DM creation and notification
     /// delivery for blocked senders.
     pub blocks: BlockRepo,
+    /// Cross-node call-bridge subscriber registry (ROADMAP 方向五): which pulling
+    /// nodes want each call's bridged RTP. Written by the internal subscribe
+    /// endpoint, read by each call's egress sender.
+    pub bridge_subscribers: crate::call_bridge_supervisor::BridgeSubscriberRegistry,
 }
 
 /// The per-platform mobile push gateways, resolved from env at startup. Each is

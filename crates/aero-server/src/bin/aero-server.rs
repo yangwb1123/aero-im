@@ -419,6 +419,7 @@ async fn main() -> anyhow::Result<()> {
         thread_read_state: thread_read_state_repo,
         blocks: aero_storage::BlockRepo::new(pg.clone()),
         shutting_down: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        bridge_subscribers: aero_server::call_bridge_supervisor::BridgeSubscriberRegistry::default(),
     };
     // ---------- Message-retention sweep (ROADMAP 方向一 合规) ----------
     // Periodically soft-delete messages whose workspace set a retention window

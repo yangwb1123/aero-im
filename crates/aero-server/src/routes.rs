@@ -431,6 +431,8 @@ pub fn build(state: AppState) -> Router {
         // ---- ROADMAP11 — bulk unread summary (no migration) ----
         // GET /api/me/unread-summary
         .merge(crate::unread_summary::routes())
+        // ---- internal cross-node call-bridge subscribe (方向五, secret-gated) ----
+        .merge(crate::call_bridge_subscribe::routes())
         // ---- channel points (mig 0089) ----
         .merge(crate::channel_points::routes())
         // ---- ban appeals (mig 0091) ----
