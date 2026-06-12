@@ -43,8 +43,9 @@
 //! must read those actions and transmit the corresponding SRT control packets.
 //! Outbound data packets ARE congestion-scheduled: every send drained by
 //! [`SrtSession::pump`] passes through a [`Pacer`] (token bucket + AIMD rate
-//! control fed by ACK RTT samples and NAK rates — see [`pacing`]). Packet
-//! reordering on the receive path is still not wired.
+//! control fed by ACK RTT samples and NAK rates — see [`pacing`]). Receive-side
+//! packet reordering IS wired: data-packet payloads pass through a sequence-aware
+//! [`ReorderBuffer`] before the segmenter (see [`reorder`]).
 
 pub mod control;
 pub mod crypto;
@@ -53,6 +54,7 @@ pub mod pacing;
 pub mod protocol;
 pub mod pump;
 pub mod reliability;
+pub mod reorder;
 pub mod segmenter;
 
 pub use control::{decode_nak_loss_list, encode_control};
@@ -64,6 +66,7 @@ pub use pacing::{Allowance, Pacer, DEFAULT_MAX_BANDWIDTH};
 pub use protocol::{Handshake, HandshakeMachine, HsAction, HsState, SrtHeader};
 pub use pump::{decode_ack_cif, AckCif, SrtSink};
 pub use reliability::{Action, ReliabilityState, RttEstimator, seq_diff, seq_lt, seq_next};
+pub use reorder::ReorderBuffer;
 pub use segmenter::{MpegTsSegmenter, SegmentEvent, TS_PACKET_SIZE, TS_SYNC_BYTE};
 
 use std::collections::HashMap;
@@ -497,6 +500,10 @@ pub struct SrtSession {
     /// `pub(crate)` so the sibling `pump` module can drive retransmits and
     /// read/write the ACK interval in tests without exposing the field publicly.
     pub(crate) reliability: ReliabilityState,
+    /// Receive-side reorder buffer: releases data-packet payloads to the
+    /// segmenter in sequence order, holding out-of-order packets until the gap
+    /// fills (ROADMAP 方向五). In-order packets pass through immediately.
+    reorder: ReorderBuffer,
     /// Pending reliability actions (NAK/ACK/ACKACK) waiting to be drained by
     /// the caller and serialised onto the wire.
     /// `pub(crate)` so the `pump` module can push ACKACK/etc. actions that
@@ -541,6 +548,7 @@ impl SrtSession {
             has_open_segment: false,
             crypto,
             reliability: ReliabilityState::new(0),
+            reorder: ReorderBuffer::default(),
             pending_actions: Vec::new(),
             pacer: Pacer::new(DEFAULT_MAX_BANDWIDTH),
             deferred_retransmits: std::collections::VecDeque::new(),
@@ -687,14 +695,25 @@ impl SrtSession {
         // Decrypt the payload if we have a crypto context and the KK flag says
         // this packet is encrypted.
         let kk = KkFlag::from_msg_word(msg_word);
-        if kk != KkFlag::Clear {
+        let payload = if kk != KkFlag::Clear {
             if let Some(crypto) = &self.crypto {
                 let mut buf = payload_slice.to_vec();
                 crypto.decrypt_packet(seq_no, &mut buf);
-                return self.feed_ts_bytes(&buf).await;
+                buf
+            } else {
+                payload_slice.to_vec()
             }
+        } else {
+            payload_slice.to_vec()
+        };
+
+        // Reorder before the segmenter (ROADMAP 方向五): an in-order packet is fed
+        // immediately; an out-of-order one is held until the gap fills, then the
+        // contiguous run is released. The segmenter needs byte-stream continuity.
+        for chunk in self.reorder.accept(seq_no, payload) {
+            self.feed_ts_bytes(&chunk).await?;
         }
-        self.feed_ts_bytes(payload_slice).await
+        Ok(())
     }
 
     /// Feed a chunk of the inbound MPEG-TS byte stream. Flushes a finished HLS
