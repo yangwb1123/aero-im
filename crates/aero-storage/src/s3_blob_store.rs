@@ -113,9 +113,16 @@ impl S3BlobStore {
     #[must_use]
     pub fn new(cfg: S3Config) -> Self {
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
+            .timeout(S3_REQUEST_TIMEOUT)
             .build()
-            .unwrap_or_default();
+            .unwrap_or_else(|e| {
+                // Building with the configured timeout failed (e.g. TLS backend
+                // init). Don't silently drop the timeout — log it. Each request in
+                // `send` also sets its own per-request timeout, so a hung endpoint
+                // still cannot pin a call even on this fallback client.
+                tracing::warn!(error = %e, "s3: client builder failed; using default client (per-request timeout still applies)");
+                reqwest::Client::new()
+            });
         Self { cfg, client }
     }
 
@@ -164,28 +171,59 @@ impl S3BlobStore {
         payload: &[u8],
     ) -> Result<reqwest::Response, BlobStoreError> {
         let (url, canonical_path) = self.request_url(object_key);
-        let now = OffsetDateTime::now_utc();
-        let signed = sign_request(&self.cfg, method, &self.host(), &canonical_path, payload, now);
+        let http_method: reqwest::Method = method.parse().map_err(io_other)?;
+        // Bounded retry with exponential backoff for transient S3 failures
+        // (network/timeout errors and 5xx/429). PUT (to a fixed object key),
+        // GET and DELETE are all idempotent, so a retry can never duplicate an
+        // effect. ROADMAP 方向三.
+        let mut backoff = std::time::Duration::from_millis(100);
+        let mut last_err: Option<BlobStoreError> = None;
+        for attempt in 1..=S3_MAX_ATTEMPTS {
+            // Re-sign per attempt so `amz_date` is fresh — a delayed retry with a
+            // stale timestamp would be rejected for clock skew.
+            let now = OffsetDateTime::now_utc();
+            let signed =
+                sign_request(&self.cfg, method, &self.host(), &canonical_path, payload, now);
+            let mut req = self
+                .client
+                .request(http_method.clone(), &url)
+                .timeout(S3_REQUEST_TIMEOUT)
+                .header("host", &signed.host)
+                .header("x-amz-date", &signed.amz_date)
+                .header("x-amz-content-sha256", &signed.payload_hash)
+                .header("authorization", &signed.authorization);
+            if method == "PUT" {
+                req = req.body(payload.to_vec());
+            }
 
-        let mut req = self
-            .client
-            .request(method.parse().map_err(io_other)?, &url)
-            .header("host", &signed.host)
-            .header("x-amz-date", &signed.amz_date)
-            .header("x-amz-content-sha256", &signed.payload_hash)
-            .header("authorization", &signed.authorization);
-        if method == "PUT" {
-            req = req.body(payload.to_vec());
+            match req.send().await {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if status == reqwest::StatusCode::NOT_FOUND {
+                        return Err(BlobStoreError::NotFound);
+                    }
+                    if status.is_success() {
+                        return Ok(resp);
+                    }
+                    if is_retryable_status(status) && attempt < S3_MAX_ATTEMPTS {
+                        last_err = Some(io_other(format!("s3: transient status {status}")));
+                    } else {
+                        return Err(io_other(format!("s3: unexpected status {status}")));
+                    }
+                }
+                Err(e) => {
+                    // Network / timeout — transient; retry until attempts run out.
+                    if attempt < S3_MAX_ATTEMPTS {
+                        last_err = Some(io_other(&e));
+                    } else {
+                        return Err(io_other(e));
+                    }
+                }
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = backoff.saturating_mul(2);
         }
-
-        let resp = req.send().await.map_err(io_other)?;
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            return Err(BlobStoreError::NotFound);
-        }
-        if !resp.status().is_success() {
-            return Err(io_other(format!("s3: unexpected status {}", resp.status())));
-        }
-        Ok(resp)
+        Err(last_err.unwrap_or_else(|| io_other("s3: retries exhausted")))
     }
 }
 
@@ -400,6 +438,21 @@ fn io_other<E: std::fmt::Display>(e: E) -> BlobStoreError {
     BlobStoreError::Io(std::io::Error::other(e.to_string()))
 }
 
+/// Per-request timeout applied on every S3 attempt (ROADMAP 方向三). Set on the
+/// `RequestBuilder` itself so it holds even if the client builder fell back to a
+/// default client with no global timeout — a hung endpoint can never pin a call.
+const S3_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Total send attempts (1 initial + 2 retries) for transient S3 failures.
+const S3_MAX_ATTEMPTS: u32 = 3;
+
+/// Whether an S3 HTTP status is a transient failure worth retrying: server-side
+/// errors (5xx) and throttling (429) — both of which AWS explicitly recommends
+/// retrying with backoff. Other 4xx are caller/auth errors that won't improve on
+/// retry, and 404 is handled separately as `NotFound`.
+fn is_retryable_status(status: reqwest::StatusCode) -> bool {
+    status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+}
+
 // -------------------------------------------------------------------- Tests
 
 #[cfg(test)]
@@ -410,6 +463,21 @@ mod tests {
     /// AWS's published `SigV4` example credentials.
     const EXAMPLE_ACCESS_KEY: &str = "AKIAIOSFODNN7EXAMPLE";
     const EXAMPLE_SECRET_KEY: &str = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY";
+
+    #[test]
+    fn retryable_status_covers_5xx_and_429_only() {
+        use reqwest::StatusCode;
+        // Transient → retry.
+        assert!(is_retryable_status(StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(is_retryable_status(StatusCode::BAD_GATEWAY));
+        assert!(is_retryable_status(StatusCode::SERVICE_UNAVAILABLE));
+        assert!(is_retryable_status(StatusCode::TOO_MANY_REQUESTS));
+        // Permanent / caller errors → fail fast.
+        assert!(!is_retryable_status(StatusCode::OK));
+        assert!(!is_retryable_status(StatusCode::FORBIDDEN));
+        assert!(!is_retryable_status(StatusCode::NOT_FOUND));
+        assert!(!is_retryable_status(StatusCode::BAD_REQUEST));
+    }
 
     #[test]
     fn s3_config_debug_redacts_secret_key() {
