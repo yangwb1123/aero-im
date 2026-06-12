@@ -511,6 +511,15 @@ impl MessageRepo {
     ) -> Result<Vec<SearchHit>, sqlx::Error> {
         let limit = limit.clamp(1, 100);
         let v = Vector::from(embedding);
+        let mut tx = self.pool.begin().await?;
+        // Widen the HNSW candidate walk for THIS query (transaction-local) so the
+        // room filter post-selects from a broader candidate set rather than
+        // pgvector's default ef_search=40 — sparse-tenant recall otherwise
+        // collapses (ROADMAP 方向二).
+        sqlx::query("SELECT set_config('hnsw.ef_search', $1, true)")
+            .bind(hnsw_ef_search(limit).to_string())
+            .execute(&mut *tx)
+            .await?;
         let rows = sqlx::query_as::<_, ScoredMessageRow>(
             r#"SELECT
                  m.id, m.room_id, m.sender_id, m.blocks, m.reply_to, m.metadata,
@@ -526,8 +535,9 @@ impl MessageRepo {
         .bind(room.to_uuid())
         .bind(v)
         .bind(limit)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(rows.into_iter().map(SearchHit::from).collect())
     }
 
@@ -824,6 +834,14 @@ impl MessageRepo {
     ) -> Result<Vec<SearchHit>, sqlx::Error> {
         let limit = limit.clamp(1, 100);
         let v = Vector::from(embedding);
+        let mut tx = self.pool.begin().await?;
+        // Transaction-local ef_search widening — mirrors [`Self::search_vector`];
+        // the membership/workspace filter is a post-filter over the HNSW walk, so
+        // a too-narrow default starves recall here too (ROADMAP 方向二).
+        sqlx::query("SELECT set_config('hnsw.ef_search', $1, true)")
+            .bind(hnsw_ef_search(limit).to_string())
+            .execute(&mut *tx)
+            .await?;
         let rows = sqlx::query_as::<_, ScoredMessageRow>(
             r"SELECT
                  m.id, m.room_id, m.sender_id, m.blocks, m.reply_to, m.metadata,
@@ -842,8 +860,9 @@ impl MessageRepo {
         .bind(v)
         .bind(limit)
         .bind(workspace.to_uuid())
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(rows.into_iter().map(SearchHit::from).collect())
     }
 
@@ -1021,6 +1040,23 @@ impl MessageRepo {
     }
 }
 
+/// pgvector HNSW `ef_search` to use for a vector query — the size of the
+/// candidate list the index walk maintains. pgvector's default (40) is too
+/// small once a room/workspace filter discards most of a busy multi-tenant
+/// index's globally-nearest rows, collapsing recall for small/sparse tenants.
+/// We widen it to comfortably exceed the requested `limit`, bounded so a large
+/// limit can't explode latency. Overridable via `AERO_HNSW_EF_SEARCH` (a value
+/// outside `[1, 1000]` is clamped). ROADMAP 方向二.
+fn hnsw_ef_search(limit: i64) -> i64 {
+    if let Ok(v) = std::env::var("AERO_HNSW_EF_SEARCH") {
+        if let Ok(n) = v.parse::<i64>() {
+            return n.clamp(1, 1000);
+        }
+    }
+    // Default: 4× the requested rows, floored at 100, capped at 400.
+    (limit.saturating_mul(4)).clamp(100, 400)
+}
+
 fn searchable_of(blocks: &[Block]) -> String {
     blocks
         .iter()
@@ -1130,9 +1166,19 @@ impl From<ScoredMessageRow> for SearchHit {
 
 #[cfg(test)]
 mod tests {
-    use super::{attached_blob_ids, clamp_half_window, clamp_page_limit};
+    use super::{attached_blob_ids, clamp_half_window, clamp_page_limit, hnsw_ef_search};
     use aero_common::{BlobId, Block, FileKind, MessageId};
     use ulid::Ulid;
+
+    #[test]
+    fn hnsw_ef_search_widens_and_bounds_the_candidate_walk() {
+        // Default policy (no env override): 4× the limit, floored at 100,
+        // capped at 400 — always ≥ pgvector's default 40 so recall widens.
+        assert_eq!(hnsw_ef_search(5), 100, "small limit floored to 100");
+        assert_eq!(hnsw_ef_search(40), 160, "4× in the mid range");
+        assert_eq!(hnsw_ef_search(100), 400, "large limit capped at 400");
+        assert!(hnsw_ef_search(1) >= 40, "never below pgvector's default");
+    }
 
     #[test]
     fn attached_blob_ids_extracts_file_and_voice_blobs_only() {
