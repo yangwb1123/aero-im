@@ -419,6 +419,17 @@ pub fn build(state: AppState) -> Router {
         // ---- ROADMAP10 — channel-points expiry info (migration 0113) ----
         // GET /api/creators/:id/points/expiry
         .merge(crate::point_expiry::routes())
+        // ---- ROADMAP11 — workspace custom emoji UUID-PK variant (migration 0115) ----
+        // POST/GET /api/workspaces/:id/custom-emoji, DELETE /api/workspaces/:id/custom-emoji/:eid
+        .merge(crate::workspace_custom_emoji::routes())
+        // ---- ROADMAP11 — creator verified badge (migration 0116) ----
+        // PATCH /api/admin/participants/:id/verify (admin only)
+        // GET /api/participants/:id/verified (public read)
+        .merge(crate::verified_badge::routes())
+        .merge(crate::verified_badge::get_routes())
+        // ---- ROADMAP11 — bulk unread summary (no migration) ----
+        // GET /api/me/unread-summary
+        .merge(crate::unread_summary::routes())
         // ---- OpenAPI 3.0 spec (public, no auth) ----
         // GET /api/openapi.json returns the static OpenAPI document so API clients
         // and documentation generators can introspect the surface without credentials.

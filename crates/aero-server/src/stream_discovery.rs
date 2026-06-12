@@ -16,23 +16,28 @@
 use std::str::FromStr;
 
 use aero_auth::AuthUser;
-use aero_common::{Error as AeroError, ParticipantId, Result as AeroResult};
+use aero_common::{Error as AeroError, ParticipantId, Result as AeroResult, WorkspaceId};
 use aero_storage::StreamCategoryRepo;
 use axum::{
     extract::{Path, State},
+    http::StatusCode,
     routing::{delete, get, post},
     Json, Router,
 };
+#[allow(unused_imports)]
 use serde::Deserialize;
 use ulid::Ulid;
 
 use crate::error::ApiResult;
 use crate::state::AppState;
 
+/// The all-zero workspace used as the platform-admin anchor (mirrors routes.rs).
+const DEFAULT_WORKSPACE: WorkspaceId = WorkspaceId(ulid::Ulid(0));
+
 /// All stream-discovery routes, ready to `.merge` into the gateway router.
 pub fn routes() -> Router<AppState> {
     Router::new()
-        .route("/api/live/categories", get(list_categories))
+        .route("/api/live/categories", get(list_categories).post(admin_create_category))
         .route("/api/live/categories/:slug/streams", get(category_streams))
         .route(
             "/api/streams/:id/category",
@@ -86,6 +91,39 @@ async fn list_categories(
 ) -> ApiResult<Json<serde_json::Value>> {
     let cats = repo(&s).list_categories().await.map_err(AeroError::from)?;
     Ok(Json(serde_json::json!({ "categories": cats })))
+}
+
+#[derive(Deserialize)]
+struct CreateCategoryReq {
+    name: String,
+    slug: String,
+    #[serde(default)]
+    sort: Option<i32>,
+}
+
+/// `POST /api/live/categories` — admin creates a new stream category.
+/// Requires the caller to be an admin/owner of the default workspace.
+async fn admin_create_category(
+    State(s): State<AppState>,
+    auth: AuthUser,
+    Json(req): Json<CreateCategoryReq>,
+) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
+    // Platform-admin gate.
+    let role = s
+        .workspaces
+        .member_role(DEFAULT_WORKSPACE, auth.participant_id)
+        .await
+        .map_err(AeroError::from)?
+        .ok_or_else(|| AeroError::Forbidden("platform admin required".into()))?;
+    if !role.can_administer() {
+        return Err(AeroError::Forbidden("platform admin required".into()).into());
+    }
+    let sort = req.sort.unwrap_or(100);
+    let cat = repo(&s)
+        .create_category(req.name.trim(), req.slug.trim(), sort)
+        .await
+        .map_err(AeroError::from)?;
+    Ok((StatusCode::CREATED, Json(serde_json::json!({ "category": cat }))))
 }
 
 /// `GET /api/live/categories/:slug/streams` — the live streams filed under the

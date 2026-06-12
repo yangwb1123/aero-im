@@ -205,4 +205,12 @@ pub mod user_reports;
 /// Channel-points expiry info endpoint.
 pub mod point_expiry;
 
+// ---- ROADMAP11 ----
+/// Workspace custom emoji (UUID-PK variant, migration 0115).
+pub mod workspace_custom_emoji;
+/// Creator verified badge: admin grant/revoke (migration 0116).
+pub mod verified_badge;
+/// Bulk unread summary: GET /api/me/unread-summary (no migration).
+pub mod unread_summary;
+
 pub use state::AppState;

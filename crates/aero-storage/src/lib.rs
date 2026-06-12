@@ -350,3 +350,7 @@ pub use auto_mod::{AutoModRule, AutoModRuleRepo};
 // ---- ROADMAP10 — user-level report flow (migration 0112) ----
 pub mod user_report;
 pub use user_report::{UserReport, UserReportRepo};
+
+// ---- ROADMAP11 Feature 2 — workspace custom emoji (migration 0115) ----
+pub mod workspace_emoji;
+pub use workspace_emoji::{WorkspaceEmojiRepo, WorkspaceEmojiRow};

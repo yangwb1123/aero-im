@@ -79,6 +79,31 @@ impl StreamCategoryRepo {
         Ok(rows.into_iter().map(row_to_category).collect())
     }
 
+    /// Create a new category with the given name, slug, and sort order.
+    /// Returns a `UniqueViolation` error if the slug already exists.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the insert, including unique-constraint
+    /// violation when the slug already exists in the catalog.
+    pub async fn create_category(
+        &self,
+        name: &str,
+        slug: &str,
+        sort: i32,
+    ) -> Result<StreamCategory, sqlx::Error> {
+        let sql = format!(
+            "INSERT INTO stream_categories (name, slug, sort) VALUES ($1, $2, $3) \
+             RETURNING {COLUMNS}"
+        );
+        let row = sqlx::query_as::<_, CategoryRow>(&sql)
+            .bind(name)
+            .bind(slug.trim().to_lowercase())
+            .bind(sort)
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row_to_category(row))
+    }
+
     /// Resolve a category by its `slug`, or `None` if no such category exists.
     ///
     /// # Errors

@@ -273,6 +273,26 @@ impl RoomRepo {
         Ok(())
     }
 
+    /// Archive a room, setting `is_archived = TRUE` and recording `archived_at = NOW()`
+    /// (migration 0114). Idempotent: re-archiving an already-archived room is harmless.
+    pub async fn archive(&self, room: RoomId) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE rooms SET is_archived = TRUE, archived_at = NOW() WHERE id = $1")
+            .bind(room.to_uuid())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Un-archive a room, clearing both `is_archived` and `archived_at`
+    /// (migration 0114). Idempotent: un-archiving an active room is harmless.
+    pub async fn unarchive(&self, room: RoomId) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE rooms SET is_archived = FALSE, archived_at = NULL WHERE id = $1")
+            .bind(room.to_uuid())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// Set (or clear, with `None`) a room's short topic line.
     pub async fn set_topic(&self, room: RoomId, topic: Option<&str>) -> Result<(), sqlx::Error> {
         sqlx::query(r"UPDATE rooms SET topic = $2 WHERE id = $1")

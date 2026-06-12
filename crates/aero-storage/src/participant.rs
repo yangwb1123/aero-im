@@ -387,6 +387,36 @@ impl ParticipantRepo {
         }))
     }
 
+    /// Set or clear the verified badge on a participant (migration 0116).
+    ///
+    /// `verified = true` sets `is_verified = TRUE` and records `verified_at = NOW()`.
+    /// `verified = false` clears both columns. Idempotent in both directions.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the update.
+    pub async fn set_verified(
+        &self,
+        participant: ParticipantId,
+        verified: bool,
+    ) -> Result<(), sqlx::Error> {
+        if verified {
+            sqlx::query(
+                "UPDATE participants SET is_verified = TRUE, verified_at = NOW() WHERE id = $1",
+            )
+            .bind(participant.to_uuid())
+            .execute(&self.pool)
+            .await?;
+        } else {
+            sqlx::query(
+                "UPDATE participants SET is_verified = FALSE, verified_at = NULL WHERE id = $1",
+            )
+            .bind(participant.to_uuid())
+            .execute(&self.pool)
+            .await?;
+        }
+        Ok(())
+    }
+
     pub async fn get(&self, id: ParticipantId) -> Result<Option<Participant>, sqlx::Error> {
         let row = sqlx::query_as::<_, (uuid::Uuid, String, String, Option<String>, Option<uuid::Uuid>, time::OffsetDateTime)>(
             r#"SELECT id, kind, display_name, avatar_url, created_by, created_at
