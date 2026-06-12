@@ -956,99 +956,122 @@ async fn backfill_since(
     }
 }
 
+/// Backoff between bus resubscribe attempts after the subscription stream ends
+/// (NATS reconnect/drop) or a subscribe call fails. Short — fan-out is offline
+/// until we reconnect — but non-zero so a hard-down NATS can't spin a tight loop.
+const BUS_RESUBSCRIBE_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Background loop that subscribes to `im.room.*` and pushes each [`RoomEvent`]
-/// into the local Hub. Started once per process at boot.
+/// into the local Hub. Started once per process at boot; runs until the process
+/// exits, resubscribing across NATS reconnects (see [`BUS_RESUBSCRIBE_BACKOFF`]).
 pub async fn run_bus_listener(state: AppState) -> anyhow::Result<()> {
     use aero_bus::EventBus;
     let bus: Arc<dyn EventBus> = state.bus.clone();
-    let mut stream = bus
-        .subscribe("im.room.*", Some("aero-server"))
-        .await
-        .map_err(|e| anyhow::anyhow!("subscribe: {e}"))?;
-    info!("bus listener started");
-    while let Some(sub) = stream.next().await {
-        // Parse the raw JSON first so the publish-time `"seq"` stamp (ROADMAP
-        // 第三版 方向一) can be lifted off the payload — `RoomEvent`'s serde
-        // deserialization ignores the unknown key, so the stamp must be read
-        // before the typed decode. Legacy unstamped payloads yield `None`.
-        let parsed: serde_json::Result<(RoomEvent, Option<u64>)> =
-            serde_json::from_slice::<serde_json::Value>(sub.payload()).and_then(|value| {
-                let seq = aero_bus::extract_seq(&value);
-                Ok((serde_json::from_value::<RoomEvent>(value)?, seq))
-            });
-        match parsed {
-            Ok((event, seq)) => {
-                // NotifyBatch (ROADMAP 方向二) is published once for the whole
-                // recipient set; expand it here into one targeted `notify` frame
-                // per recipient so each client receives an ordinary frame and
-                // never sees the others. Equivalent to the old per-recipient
-                // Notify publishes, minus the O(N) NATS traffic.
-                if let RoomEvent::NotifyBatch { room_id, message_id, by, recipients } = &event {
-                    for target in recipients {
-                        let frame = room_event_to_frame_json(
-                            &RoomEvent::Notify {
-                                room_id: *room_id,
-                                message_id: *message_id,
-                                mentioned: target.participant,
-                                by: *by,
-                                kind: target.kind,
-                            },
-                            seq,
-                        );
-                        state.hub.fan_out_raw(&[target.participant], &frame);
-                    }
-                    let _ = sub.ack().await;
-                    continue;
-                }
-                let room = event.room_id();
-                let recipients = match event.explicit_recipients() {
-                    list if !list.is_empty() => list,
-                    _ => {
-                        if let Some(rid) = room {
-                            state.rooms.members(rid).await.unwrap_or_default()
-                        } else {
-                            Vec::new()
-                        }
-                    }
-                };
-                // Message-throughput counter (ROADMAP 方向四): the bus is the single
-                // source of truth for accepted messages — every chat message (REST
-                // or WS) lands here exactly once before fan-out — so counting only
-                // `Message` events here is the non-double-counting choke point
-                // (other RoomEvent variants are edits/reactions/typing, not new msgs).
-                if matches!(event, RoomEvent::Message(_)) {
-                    metrics::inc_counter(names::MESSAGES_SENT_TOTAL, 1);
-                }
-                let frame = room_event_to_frame_json(&event, seq);
-                state.hub.fan_out_raw(&recipients, &frame);
-                let _ = sub.ack().await;
-            }
+    // Resubscribe loop: a NATS reconnect/drop ends the subscription stream. Without
+    // this outer loop the function would return and the boot-time task would exit,
+    // silently stopping room-event fan-out on this process *forever*. The durable
+    // consumer ("aero-server") resumes from its committed cursor on resubscribe, so
+    // acked events are not re-sent and unacked ones are redelivered (at-least-once).
+    loop {
+        let mut stream = match bus.subscribe("im.room.*", Some("aero-server")).await {
+            Ok(s) => s,
             Err(e) => {
-                // Compatibility: accept the legacy raw MessageEnvelope payload too.
-                if let Ok(env) =
-                    serde_json::from_slice::<aero_common::MessageEnvelope>(sub.payload())
-                {
-                    let recipients = if env.recipients.is_empty() {
-                        state.rooms.members(env.message.room_id).await.unwrap_or_default()
-                    } else {
-                        env.recipients.clone()
-                    };
-                    // Legacy envelope path also carries exactly one new message.
-                    metrics::inc_counter(names::MESSAGES_SENT_TOTAL, 1);
-                    let frame = serde_json::json!({
-                        "type": "message",
-                        "message": env.message,
-                    });
-                    state.hub.fan_out_raw(&recipients, &frame.to_string());
-                    let _ = sub.ack().await;
-                    continue;
-                }
-                warn!(error = ?e, "bad envelope on bus");
-                let _ = sub.nack().await;
+                warn!(error = %e, "im.room.* subscribe failed; retrying");
+                tokio::time::sleep(BUS_RESUBSCRIBE_BACKOFF).await;
+                continue;
             }
+        };
+        info!("bus listener started");
+        while let Some(sub) = stream.next().await {
+            handle_room_event_sub(&state, sub).await;
+        }
+        warn!("im.room.* subscription stream ended; resubscribing");
+        tokio::time::sleep(BUS_RESUBSCRIBE_BACKOFF).await;
+    }
+}
+
+/// Process one `im.room.*` bus message: lift the publish-time `seq` stamp, decode
+/// the [`RoomEvent`] (with a legacy `MessageEnvelope` fallback), fan it out to the
+/// local Hub, and ack — or nack an undecodable payload.
+async fn handle_room_event_sub(state: &AppState, sub: Box<dyn aero_bus::Subscription + Send>) {
+    // Parse the raw JSON first so the publish-time `"seq"` stamp (ROADMAP
+    // 第三版 方向一) can be lifted off the payload — `RoomEvent`'s serde
+    // deserialization ignores the unknown key, so the stamp must be read
+    // before the typed decode. Legacy unstamped payloads yield `None`.
+    let parsed: serde_json::Result<(RoomEvent, Option<u64>)> =
+        serde_json::from_slice::<serde_json::Value>(sub.payload()).and_then(|value| {
+            let seq = aero_bus::extract_seq(&value);
+            Ok((serde_json::from_value::<RoomEvent>(value)?, seq))
+        });
+    match parsed {
+        Ok((event, seq)) => {
+            // NotifyBatch (ROADMAP 方向二) is published once for the whole
+            // recipient set; expand it here into one targeted `notify` frame
+            // per recipient so each client receives an ordinary frame and
+            // never sees the others. Equivalent to the old per-recipient
+            // Notify publishes, minus the O(N) NATS traffic.
+            if let RoomEvent::NotifyBatch { room_id, message_id, by, recipients } = &event {
+                for target in recipients {
+                    let frame = room_event_to_frame_json(
+                        &RoomEvent::Notify {
+                            room_id: *room_id,
+                            message_id: *message_id,
+                            mentioned: target.participant,
+                            by: *by,
+                            kind: target.kind,
+                        },
+                        seq,
+                    );
+                    state.hub.fan_out_raw(&[target.participant], &frame);
+                }
+                let _ = sub.ack().await;
+                return;
+            }
+            let room = event.room_id();
+            let recipients = match event.explicit_recipients() {
+                list if !list.is_empty() => list,
+                _ => {
+                    if let Some(rid) = room {
+                        state.rooms.members(rid).await.unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    }
+                }
+            };
+            // Message-throughput counter (ROADMAP 方向四): the bus is the single
+            // source of truth for accepted messages — every chat message (REST
+            // or WS) lands here exactly once before fan-out — so counting only
+            // `Message` events here is the non-double-counting choke point
+            // (other RoomEvent variants are edits/reactions/typing, not new msgs).
+            if matches!(event, RoomEvent::Message(_)) {
+                metrics::inc_counter(names::MESSAGES_SENT_TOTAL, 1);
+            }
+            let frame = room_event_to_frame_json(&event, seq);
+            state.hub.fan_out_raw(&recipients, &frame);
+            let _ = sub.ack().await;
+        }
+        Err(e) => {
+            // Compatibility: accept the legacy raw MessageEnvelope payload too.
+            if let Ok(env) = serde_json::from_slice::<aero_common::MessageEnvelope>(sub.payload()) {
+                let recipients = if env.recipients.is_empty() {
+                    state.rooms.members(env.message.room_id).await.unwrap_or_default()
+                } else {
+                    env.recipients.clone()
+                };
+                // Legacy envelope path also carries exactly one new message.
+                metrics::inc_counter(names::MESSAGES_SENT_TOTAL, 1);
+                let frame = serde_json::json!({
+                    "type": "message",
+                    "message": env.message,
+                });
+                state.hub.fan_out_raw(&recipients, &frame.to_string());
+                let _ = sub.ack().await;
+                return;
+            }
+            warn!(error = ?e, "bad envelope on bus");
+            let _ = sub.nack().await;
         }
     }
-    Ok(())
 }
 
 /// Loose BCP-47 comparison on the primary subtag, so `en` and `en-US` are the
@@ -1201,36 +1224,47 @@ mod tests {
 pub async fn run_live_bus_listener(state: AppState) -> anyhow::Result<()> {
     use aero_bus::EventBus;
     let bus: Arc<dyn EventBus> = state.bus.clone();
-    let mut stream = bus
-        .subscribe("live.stream.*", None)
-        .await
-        .map_err(|e| anyhow::anyhow!("subscribe live: {e}"))?;
-    info!("live bus listener started");
-    while let Some(sub) = stream.next().await {
-        // Same two-phase decode as `run_bus_listener`: lift the publish-time
-        // `"seq"` stamp off the raw JSON before the typed decode drops it.
-        let parsed: serde_json::Result<(StreamEvent, Option<u64>)> =
-            serde_json::from_slice::<serde_json::Value>(sub.payload()).and_then(|value| {
-                let seq = aero_bus::extract_seq(&value);
-                Ok((serde_json::from_value::<StreamEvent>(value)?, seq))
-            });
-        match parsed {
-            Ok((event, seq)) => {
-                let watchers = state.hub.stream_watchers(event.stream_id());
-                if !watchers.is_empty() {
-                    let frame = ServerFrame::StreamEvent { event };
-                    let json = stamped_frame_json(&frame, seq);
-                    state.hub.fan_out_raw(&watchers, &json);
-                }
-                let _ = sub.ack().await;
-            }
+    // Resubscribe across NATS reconnects — see `run_bus_listener`. The consumer is
+    // ephemeral by design (live interactivity is broadcast; a few dropped danmaku
+    // across a reconnect are immaterial), but the *loop* itself must survive so this
+    // process keeps fanning StreamEvents to its local watchers instead of going dark.
+    loop {
+        let mut stream = match bus.subscribe("live.stream.*", None).await {
+            Ok(s) => s,
             Err(e) => {
-                warn!(error = ?e, "bad StreamEvent on bus");
-                let _ = sub.nack().await;
+                warn!(error = %e, "live.stream.* subscribe failed; retrying");
+                tokio::time::sleep(BUS_RESUBSCRIBE_BACKOFF).await;
+                continue;
+            }
+        };
+        info!("live bus listener started");
+        while let Some(sub) = stream.next().await {
+            // Same two-phase decode as `run_bus_listener`: lift the publish-time
+            // `"seq"` stamp off the raw JSON before the typed decode drops it.
+            let parsed: serde_json::Result<(StreamEvent, Option<u64>)> =
+                serde_json::from_slice::<serde_json::Value>(sub.payload()).and_then(|value| {
+                    let seq = aero_bus::extract_seq(&value);
+                    Ok((serde_json::from_value::<StreamEvent>(value)?, seq))
+                });
+            match parsed {
+                Ok((event, seq)) => {
+                    let watchers = state.hub.stream_watchers(event.stream_id());
+                    if !watchers.is_empty() {
+                        let frame = ServerFrame::StreamEvent { event };
+                        let json = stamped_frame_json(&frame, seq);
+                        state.hub.fan_out_raw(&watchers, &json);
+                    }
+                    let _ = sub.ack().await;
+                }
+                Err(e) => {
+                    warn!(error = ?e, "bad StreamEvent on bus");
+                    let _ = sub.nack().await;
+                }
             }
         }
+        warn!("live.stream.* subscription stream ended; resubscribing");
+        tokio::time::sleep(BUS_RESUBSCRIBE_BACKOFF).await;
     }
-    Ok(())
 }
 
 /// Serialize a server frame, carrying `seq` through as an optional top-level
