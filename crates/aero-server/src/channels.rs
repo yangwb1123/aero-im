@@ -36,6 +36,8 @@ pub fn routes() -> Router<AppState> {
         .route("/api/rooms/:id/topic-history", get(list_topic_history))
         // ROADMAP9: server-side slowmode enforcement.
         .route("/api/rooms/:id/slowmode", patch(set_slowmode))
+        // ROADMAP12: per-room reaction spam limit (admin/moderator only).
+        .route("/api/rooms/:id/reaction-limit", axum::routing::patch(set_reaction_limit))
 }
 
 fn parse_room(s: &str) -> Result<RoomId, AeroError> {
@@ -46,15 +48,28 @@ fn parse_workspace(s: &str) -> Result<WorkspaceId, AeroError> {
     WorkspaceId::from_str(s).map_err(|e| AeroError::Invalid(format!("workspace id: {e}")))
 }
 
+/// Optional query-string parameters for `GET /api/workspaces/:id/channels`.
+#[derive(serde::Deserialize, Default)]
+struct ListChannelsQuery {
+    /// Optional case-insensitive substring name filter (`ILIKE '%q%'`).
+    #[serde(default)]
+    q: Option<String>,
+}
+
 /// `GET /api/workspaces/:id/channels` — the workspace's public, joinable
-/// channels. Caller must be a member of the workspace.
+/// channels. Caller must be a member of the workspace. An optional `?q=` query
+/// parameter performs a case-insensitive substring match on the channel name.
 async fn list_channels(
     State(s): State<AppState>,
     auth: AuthUser,
     Path(id_str): Path<String>,
+    Query(params): Query<ListChannelsQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let ws = parse_workspace(&id_str)?;
-    let channels = s.im.list_workspace_channels(auth.participant_id, ws).await?;
+    let channels = s
+        .im
+        .list_workspace_channels(auth.participant_id, ws, params.q.as_deref())
+        .await?;
     Ok(Json(serde_json::to_value(channels).map_err(AeroError::from)?))
 }
 
@@ -437,6 +452,57 @@ async fn set_slowmode(
     let seconds = req.seconds.clamp(0, 21_600);
     s.rooms.set_slowmode(room, seconds).await?;
     Ok(Json(serde_json::json!({ "ok": true, "slowmode_seconds": seconds })))
+}
+
+// ---------------------------------------- reaction limit (ROADMAP12, migration 0118)
+
+#[derive(Deserialize)]
+struct ReactionLimitReq {
+    /// `null` clears the limit; a positive integer sets the per-user per-message cap.
+    max_reactions_per_user: Option<i32>,
+}
+
+/// `PATCH /api/rooms/:id/reaction-limit` — set (or clear with `null`) the
+/// per-user reaction cap for a room. Caller must be the room creator or a
+/// workspace Admin/Owner.
+async fn set_reaction_limit(
+    State(s): State<AppState>,
+    auth: AuthUser,
+    Path(room_str): Path<String>,
+    Json(req): Json<ReactionLimitReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let room = parse_room(&room_str)?;
+    // Validate: if set, must be positive.
+    if let Some(cap) = req.max_reactions_per_user {
+        if cap < 1 {
+            return Err(AeroError::Invalid("max_reactions_per_user must be a positive integer or null".into()).into());
+        }
+    }
+    // Authorisation: caller must be the room creator OR a workspace Admin/Owner.
+    let creator = s.rooms.created_by(room).await?;
+    let workspace = s.rooms.room_workspace(room).await?.ok_or_else(|| {
+        AeroError::NotFound("room not found".into())
+    })?;
+    let is_creator = creator == Some(auth.participant_id);
+    let is_admin = s
+        .workspaces
+        .member_role(workspace, auth.participant_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|r| r.can_administer())
+        .unwrap_or(false);
+    if !is_creator && !is_admin {
+        return Err(AeroError::Forbidden(
+            "must be room creator or workspace admin to set reaction limit".into(),
+        )
+        .into());
+    }
+    s.rooms.set_max_reactions_per_user(room, req.max_reactions_per_user).await?;
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "max_reactions_per_user": req.max_reactions_per_user
+    })))
 }
 
 #[cfg(test)]

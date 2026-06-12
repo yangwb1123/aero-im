@@ -34,7 +34,7 @@ use aero_storage::{
     PinRepo, TotpRepo, PresenceStore, ReactionRepo, ReceiptRepo, RecurringMessageRepo, RedisCache,
     RoomRepo, SeqStore, StreamRepo, StreamRouteRegistry, StreamViewerStore,
     ThreadNotificationPrefsRepo, ThreadReadStateRepo, ThreadSubscriptionRepo, TopicHistoryRepo,
-    UserGroupRepo, WorkspaceMuteRepo, WorkspaceRepo, WsRateStore,
+    UserGroupRepo, WorkspaceMuteRepo, WorkspaceNotifDefaultsRepo, WorkspaceRepo, WsRateStore,
 };
 use tokio_util::sync::CancellationToken;
 use anyhow::Context;
@@ -197,6 +197,8 @@ async fn main() -> anyhow::Result<()> {
         .with_workspace_mutes(WorkspaceMuteRepo::new(pg.clone()))
         // ROADMAP8: user-block store for notification suppression.
         .with_block_repo(aero_storage::BlockRepo::new(pg.clone()))
+        // ROADMAP12: workspace default notification level for new channel joins.
+        .with_workspace_notif_defaults(WorkspaceNotifDefaultsRepo::new(pg.clone()))
         // ROADMAP 第三版 方向一: cluster-correct publish-time event-seq stamp.
         .with_seq(seq_store.clone()),
     );

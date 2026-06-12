@@ -56,6 +56,46 @@ impl ReactionRepo {
         Ok(ReactionOp::Add)
     }
 
+    /// Count of distinct emoji this `sender` has already added to `message`.
+    /// Used by the reaction-spam-limit gate in `ImService::toggle_reaction`.
+    pub async fn count_by_sender(
+        &self,
+        message: MessageId,
+        sender: ParticipantId,
+    ) -> Result<i64, sqlx::Error> {
+        let (count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(DISTINCT emoji) FROM reactions \
+             WHERE message_id = $1 AND participant_id = $2",
+        )
+        .bind(message.to_uuid())
+        .bind(sender.to_uuid())
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count)
+    }
+
+    /// Whether `sender` has already reacted to `message` with `emoji`.
+    /// Used alongside [`count_by_sender`](Self::count_by_sender) to distinguish
+    /// a Remove (emoji already present) from an Add (new emoji) without calling
+    /// `toggle` first.
+    pub async fn has_reacted(
+        &self,
+        message: MessageId,
+        sender: ParticipantId,
+        emoji: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let (count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM reactions \
+             WHERE message_id = $1 AND participant_id = $2 AND emoji = $3",
+        )
+        .bind(message.to_uuid())
+        .bind(sender.to_uuid())
+        .bind(emoji)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count > 0)
+    }
+
     /// Aggregated reactions for a batch of messages. Returns
     /// `message_id → Vec<ReactionSummary>` in stable emoji order.
     pub async fn summaries_for(

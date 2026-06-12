@@ -354,3 +354,7 @@ pub use user_report::{UserReport, UserReportRepo};
 // ---- ROADMAP11 Feature 2 — workspace custom emoji (migration 0115) ----
 pub mod workspace_emoji;
 pub use workspace_emoji::{WorkspaceEmojiRepo, WorkspaceEmojiRow};
+
+// ---- ROADMAP12 — workspace notification defaults (migration 0119) ----
+pub mod workspace_notif_defaults;
+pub use workspace_notif_defaults::WorkspaceNotifDefaultsRepo;

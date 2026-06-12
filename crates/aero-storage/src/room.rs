@@ -379,17 +379,23 @@ impl RoomRepo {
     /// Public, non-archived channels in a workspace — the discovery listing a
     /// workspace member browses to find joinable channels. Newest first. Uses the
     /// partial index `rooms_public_channels_idx` (migration 0012).
+    ///
+    /// An optional `q` name-filter performs a case-insensitive substring match
+    /// (`ILIKE '%q%'`) on the channel name; `None` returns all channels.
     pub async fn list_public_channels(
         &self,
         workspace: WorkspaceId,
+        q: Option<&str>,
     ) -> Result<Vec<Room>, sqlx::Error> {
         let rows = sqlx::query_as::<_, (uuid::Uuid, String, Option<String>, uuid::Uuid, time::OffsetDateTime)>(
             r"SELECT id, kind, name, created_by, created_at
                FROM rooms
                WHERE workspace_id = $1 AND is_private = false AND is_archived = false
+                 AND ($2::text IS NULL OR name ILIKE '%' || $2 || '%')
                ORDER BY created_at DESC",
         )
         .bind(workspace.to_uuid())
+        .bind(q)
         .fetch_all(&self.pool)
         .await?;
 
@@ -403,6 +409,40 @@ impl RoomRepo {
                 created_at: at,
             })
             .collect())
+    }
+
+    // ----------------------------------------- reaction spam limit (0118)
+
+    /// Fetch the per-room cap on distinct emoji a single user may add to any
+    /// one message (`max_reactions_per_user`, migration 0118). Returns `Ok(None)`
+    /// when the column is `NULL` (no limit) or the room does not exist.
+    pub async fn get_max_reactions_per_user(
+        &self,
+        room: RoomId,
+    ) -> Result<Option<i32>, sqlx::Error> {
+        let row = sqlx::query_as::<_, (Option<i32>,)>(
+            "SELECT max_reactions_per_user FROM rooms WHERE id = $1",
+        )
+        .bind(room.to_uuid())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.and_then(|(v,)| v))
+    }
+
+    /// Set (or clear with `None`) the per-room reaction cap (migration 0118).
+    pub async fn set_max_reactions_per_user(
+        &self,
+        room: RoomId,
+        limit: Option<i32>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE rooms SET max_reactions_per_user = $1 WHERE id = $2",
+        )
+        .bind(limit)
+        .bind(room.to_uuid())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     // ------------------------------------------ per-channel retention (0058)
@@ -734,7 +774,7 @@ mod db_tests {
         let archived = insert_channel(&p, ws, actor, false).await;
         repo.set_archived(archived, true).await.unwrap();
 
-        let listed = repo.list_public_channels(ws).await.unwrap();
+        let listed = repo.list_public_channels(ws, None).await.unwrap();
         let ids: Vec<RoomId> = listed.iter().map(|r| r.id).collect();
         assert!(ids.contains(&public), "public channel is discoverable");
         assert!(!ids.contains(&private), "private channel is hidden");

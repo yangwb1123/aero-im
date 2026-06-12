@@ -21,7 +21,7 @@ use aero_storage::{
     DeactivationRepo, KeywordAlertRepo, MessageEditRepo, MessageRepo, NotificationPrefsRepo,
     NotificationRepo, ParticipantRepo, PinRepo, ReactionRepo, ReceiptRepo, RoomRepo,
     ThreadNotificationPrefsRepo, ThreadSubscriptionRepo, TotpRepo, UserGroupRepo,
-    WorkspaceMuteRepo, WorkspaceRepo,
+    WorkspaceMuteRepo, WorkspaceNotifDefaultsRepo, WorkspaceRepo,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -199,6 +199,12 @@ pub struct ImService {
     /// [`send_message`](Self::send_message) enforces workspace-level text rules at
     /// send time (the `"block"` action rejects the message before persistence).
     auto_mod_rules: Option<AutoModRuleRepo>,
+    /// Workspace-level default notification level store (ROADMAP12 migration 0119).
+    /// Optional builder ([`with_workspace_notif_defaults`](Self::with_workspace_notif_defaults));
+    /// when present, [`join_channel`](Self::join_channel) and
+    /// [`add_member`](Self::add_member) apply the workspace default level to new
+    /// members that have no existing `channel_notification_prefs` row.
+    workspace_notif_defaults: Option<WorkspaceNotifDefaultsRepo>,
     bus: Arc<dyn BusSink>,
     moderator: Arc<dyn Moderator>,
     /// Per-subject event-seq source for publish-time `"seq"` stamping (ROADMAP
@@ -253,6 +259,7 @@ impl ImService {
             workspace_mutes: None,
             block_repo: None,
             auto_mod_rules: None,
+            workspace_notif_defaults: None,
             bus: bus as Arc<dyn BusSink>,
             moderator,
             seq: Arc::new(LocalSeqProvider::new()),
@@ -417,6 +424,17 @@ impl ImService {
         self
     }
 
+    /// Wire in the workspace notification defaults repo (ROADMAP12 migration 0119).
+    /// When present, [`join_channel`](Self::join_channel) applies the workspace
+    /// default notification level to the joining participant if they have no
+    /// existing `channel_notification_prefs` row for that room. Best-effort and
+    /// fail-open: errors here never block the join.
+    #[must_use]
+    pub fn with_workspace_notif_defaults(mut self, repo: WorkspaceNotifDefaultsRepo) -> Self {
+        self.workspace_notif_defaults = Some(repo);
+        self
+    }
+
     /// Notification suppression seam for per-channel mute + per-user
     /// Do-Not-Disturb + one-off snooze. Returns whether a notification should be
     /// delivered to `recipient` for `room`: `false` when the recipient has MUTED
@@ -492,6 +510,7 @@ impl ImService {
             workspace_mutes: None,
             block_repo: None,
             auto_mod_rules: None,
+            workspace_notif_defaults: None,
             bus,
             moderator: Arc::new(crate::moderator::AllowAllModerator),
             seq: Arc::new(LocalSeqProvider::new()),
@@ -795,6 +814,29 @@ impl ImService {
             )));
         }
         self.rooms.add_member(room, actor).await?;
+        // Apply workspace default notification level (ROADMAP12 migration 0119).
+        // Best-effort: any error here is logged and ignored — a notification
+        // pref failure must never block a successful join.
+        if let Some(notif_defaults) = self.workspace_notif_defaults.as_ref() {
+            if let Some(prefs) = self.prefs.as_ref() {
+                match notif_defaults.get(workspace).await {
+                    Ok(Some(ref level)) if level != "all" => {
+                        // Only set if the user has no existing pref for this room.
+                        match prefs.get_level(actor, room).await {
+                            Ok(None) => {
+                                if let Err(err) = prefs.set_level(actor, room, level).await {
+                                    warn!(?err, %actor, %room, "apply workspace notif default failed");
+                                }
+                            }
+                            Ok(Some(_)) => {} // user already has an explicit pref — leave it
+                            Err(err) => warn!(?err, %actor, %room, "get_level for notif default check failed"),
+                        }
+                    }
+                    Ok(_) => {} // no default set, or default is "all" (the system default — no-op)
+                    Err(err) => warn!(?err, %workspace, "fetch workspace notif default failed"),
+                }
+            }
+        }
         self.publish_room_event(
             room,
             &RoomEvent::Membership { room_id: room, participant: actor, op: MembershipOp::Join },
@@ -912,19 +954,21 @@ impl ImService {
     }
 
     /// List the public, joinable channels of a workspace. Requires the actor be a
-    /// member of the workspace.
+    /// member of the workspace. An optional `q` name-filter performs a
+    /// case-insensitive substring match (`ILIKE '%q%'`) on the channel name.
     #[instrument(skip(self), fields(?actor, ?workspace))]
     pub async fn list_workspace_channels(
         &self,
         actor: ParticipantId,
         workspace: WorkspaceId,
+        q: Option<&str>,
     ) -> Result<Vec<Room>> {
         if !self.workspaces()?.is_member(workspace, actor).await? {
             return Err(Error::Forbidden(format!(
                 "{actor} is not a member of workspace {workspace}"
             )));
         }
-        Ok(self.rooms.list_public_channels(workspace).await?)
+        Ok(self.rooms.list_public_channels(workspace, q).await?)
     }
 
     /// Snapshot the current member set of a room (for callee fan-out, etc).
@@ -1322,6 +1366,27 @@ impl ImService {
         }
         if emoji.is_empty() || emoji.len() > 32 {
             return Err(Error::Invalid("emoji length".into()));
+        }
+        // Reaction spam limit (ROADMAP12 migration 0118): if the room has
+        // `max_reactions_per_user` set, enforce it only when adding a NEW emoji.
+        // Toggling an emoji the actor already has is a Remove — always allowed.
+        // Best-effort: a missing room row or lookup error falls through.
+        if let Ok(Some(cap)) = self.rooms.get_max_reactions_per_user(msg.room_id).await {
+            let count = self.reactions.count_by_sender(message_id, actor).await.unwrap_or(0);
+            if count >= cap as i64 {
+                // They are at the cap. Allow only if they're toggling (removing)
+                // an emoji they already added — otherwise it's a new Add → reject.
+                let is_remove = self
+                    .reactions
+                    .has_reacted(message_id, actor, emoji)
+                    .await
+                    .unwrap_or(true); // fail-open: assume remove on error
+                if !is_remove {
+                    return Err(Error::Invalid(format!(
+                        "reaction limit: max {cap} reactions per message"
+                    )));
+                }
+            }
         }
         let op = self.reactions.toggle(message_id, actor, emoji).await?;
         self.publish_room_event(

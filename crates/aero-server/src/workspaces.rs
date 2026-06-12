@@ -27,7 +27,7 @@ use aero_common::{
 };
 use aero_storage::{
     role_can_assign, role_can_invite, role_can_manage_member, role_can_remove,
-    validate_retention_days, WorkspaceMuteRepo, WorkspaceRepo,
+    validate_retention_days, WorkspaceMuteRepo, WorkspaceNotifDefaultsRepo, WorkspaceRepo,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -76,6 +76,11 @@ pub fn routes() -> Router<AppState> {
         .route("/api/workspaces/:id/muted", get(workspace_mute_status))
         // Workspace branding (ROADMAP7 Lane C): logo, color scheme, custom domain, description.
         .route("/api/workspaces/:id/branding", axum::routing::patch(update_branding))
+        // ROADMAP12: workspace default notification level (admin only).
+        .route(
+            "/api/workspaces/:id/notification-defaults",
+            get(get_notif_defaults).put(set_notif_defaults),
+        )
 }
 
 /// Append an audit event without ever failing the caller's request: the trail is
@@ -879,6 +884,54 @@ async fn update_branding(
         .map_err(AeroError::from)?
         .ok_or_else(|| AeroError::NotFound("workspace".into()))?;
     Ok(Json(serde_json::to_value(workspace).map_err(AeroError::from)?))
+}
+
+// ----------------------------------------- notification defaults (ROADMAP12, migration 0119)
+
+#[derive(serde::Deserialize)]
+struct NotifDefaultsReq {
+    /// One of `"all"` / `"mentions"` / `"none"`.
+    default_level: String,
+}
+
+/// `GET /api/workspaces/:id/notification-defaults` — fetch the workspace's
+/// configured default channel notification level. Any workspace member may read
+/// this; it returns `{"default_level": "all"}` when no default is set (system
+/// default).
+async fn get_notif_defaults(
+    State(s): State<AppState>,
+    auth: AuthUser,
+    Path(id_str): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let ws = parse_workspace_id(&id_str)?;
+    // Any workspace member may read the setting.
+    if s.workspaces.member_role(ws, auth.participant_id).await.map_err(AeroError::from)?.is_none() {
+        return Err(AeroError::Forbidden("not a workspace member".into()).into());
+    }
+    let repo = WorkspaceNotifDefaultsRepo::new(s.pg.clone());
+    let level = repo.get(ws).await.map_err(AeroError::from)?.unwrap_or_else(|| "all".to_owned());
+    Ok(Json(serde_json::json!({ "default_level": level })))
+}
+
+/// `PUT /api/workspaces/:id/notification-defaults` — set the workspace default
+/// channel notification level. Admin/Owner only.
+async fn set_notif_defaults(
+    State(s): State<AppState>,
+    auth: AuthUser,
+    Path(id_str): Path<String>,
+    Json(req): Json<NotifDefaultsReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let ws = parse_workspace_id(&id_str)?;
+    let caller = caller_role(&s.workspaces, ws, auth.participant_id).await?;
+    if !caller.can_administer() {
+        return Err(AeroError::Forbidden("setting workspace notification defaults requires admin".into()).into());
+    }
+    if !matches!(req.default_level.as_str(), "all" | "mentions" | "none") {
+        return Err(AeroError::Invalid("default_level must be 'all', 'mentions', or 'none'".into()).into());
+    }
+    let repo = WorkspaceNotifDefaultsRepo::new(s.pg.clone());
+    repo.set(ws, &req.default_level).await.map_err(AeroError::from)?;
+    Ok(Json(serde_json::json!({ "ok": true, "default_level": req.default_level })))
 }
 
 #[cfg(test)]
