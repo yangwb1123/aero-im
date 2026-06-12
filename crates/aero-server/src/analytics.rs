@@ -37,6 +37,9 @@ use crate::state::AppState;
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/workspaces/:id/analytics", get(overview))
+        // summary is a member-accessible alias for the overview numbers plus
+        // 30-day active-user + message counts — no admin required.
+        .route("/api/workspaces/:id/analytics/summary", get(summary))
         .route("/api/workspaces/:id/analytics/channels", get(top_channels))
         .route("/api/workspaces/:id/analytics/timeline", get(timeline))
         .route(
@@ -95,6 +98,38 @@ async fn assert_admin(
         .map_err(AeroError::from)?
         .ok_or_else(|| AeroError::Forbidden("not a workspace member".into()))?;
     authorize_admin(role)
+}
+
+/// Assert the caller is a member (any role) of `workspace`. Used by the
+/// member-accessible summary route so we still gate on membership without the
+/// full admin bar.
+async fn assert_member(
+    s: &AppState,
+    workspace: WorkspaceId,
+    caller: ParticipantId,
+) -> Result<(), AeroError> {
+    s.workspaces
+        .member_role(workspace, caller)
+        .await
+        .map_err(AeroError::from)?
+        .ok_or_else(|| AeroError::Forbidden("not a workspace member".into()))?;
+    Ok(())
+}
+
+/// `GET /api/workspaces/:id/analytics/summary` — workspace analytics summary
+/// open to any workspace member (not just admins). Returns total message count,
+/// active users in the last 30 days, messages in the last 30 days, and total
+/// distinct members. The 30-day window is broader than the existing 7-day
+/// overview so it serves dashboard widgets and activity-heat displays.
+async fn summary(
+    State(s): State<AppState>,
+    auth: AuthUser,
+    Path(ws_str): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let ws = parse_workspace(&ws_str)?;
+    assert_member(&s, ws, auth.participant_id).await?;
+    let stats = repo(&s).workspace_summary(ws).await.map_err(AeroError::from)?;
+    Ok(Json(serde_json::to_value(stats).map_err(AeroError::from)?))
 }
 
 /// `GET /api/workspaces/:id/analytics` — headline aggregate counts (total/last-7d

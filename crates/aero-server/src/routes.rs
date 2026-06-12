@@ -1928,6 +1928,81 @@ async fn whip_post(
         // Funnels through LiveService so the event carries the publish-time `"seq"`
         // stamp like every other StreamEvent (ROADMAP 第三版 方向一).
         s.live.publish_go_live(stream.id).await;
+        // Fire outgoing webhooks for the stream.live event on the stream's room
+        // (if the stream is room-bound). Best-effort: any error is logged and
+        // swallowed so the WHIP ingest path is never delayed.
+        if let Some(room_id) = stream.room_id {
+            let webhook_repo = aero_storage::WebhookRepo::new(s.pg.clone());
+            let delivery_repo = aero_storage::WebhookDeliveryRepo::new(s.pg.clone());
+            match webhook_repo.list_outgoing_for_room_event(room_id, "stream.live").await {
+                Ok(targets) => {
+                    let payload = serde_json::json!({
+                        "kind": "stream.live",
+                        "stream_id": stream.id.to_string(),
+                        "title": stream.title,
+                        "owner_id": stream.owner_id,
+                    });
+                    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+                    let sender = aero_storage::ReqwestSender::new();
+                    for target in targets {
+                        let delivery = aero_storage::build_delivery(
+                            &target.url,
+                            &target.secret,
+                            &payload,
+                            now,
+                        );
+                        let event_id = Some(stream.id.to_string());
+                        match delivery_repo.record_attempt(target.id, event_id.as_deref()).await {
+                            Ok(delivery_id) => {
+                                use aero_storage::WebhookSender;
+                                match sender.deliver(&delivery).await {
+                                    Ok(status) if (200..300).contains(&status) => {
+                                        let _ = delivery_repo
+                                            .mark_delivered(delivery_id, i32::from(status))
+                                            .await;
+                                    }
+                                    Ok(status) => {
+                                        let _ = delivery_repo
+                                            .mark_failed_with_backoff(
+                                                delivery_id,
+                                                1,
+                                                Some(i32::from(status)),
+                                                "non-2xx response",
+                                            )
+                                            .await;
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            error = ?e,
+                                            hook = %target.id,
+                                            "stream.live webhook delivery failed"
+                                        );
+                                        let _ = delivery_repo
+                                            .mark_failed_with_backoff(
+                                                delivery_id,
+                                                1,
+                                                None,
+                                                "transport error",
+                                            )
+                                            .await;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = ?e,
+                                    hook = %target.id,
+                                    "stream.live webhook record_attempt failed"
+                                );
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = ?e, stream = %stream.id, "stream.live webhook lookup failed");
+                }
+            }
+        }
     }
     let mut resp = (
         StatusCode::CREATED,

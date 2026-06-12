@@ -17,7 +17,7 @@
 
 use aero_auth::AuthUser;
 use aero_common::Error as AeroError;
-use aero_storage::TotpRepo;
+use aero_storage::{RecoveryCodeRepo, TotpRepo};
 use axum::{
     extract::State,
     routing::{get, post},
@@ -34,6 +34,14 @@ pub fn routes() -> Router<AppState> {
         .route("/api/me/2fa", get(status_2fa).delete(disable_2fa))
         .route("/api/me/2fa/enroll", post(enroll_2fa))
         .route("/api/me/2fa/verify", post(verify_2fa))
+        // Recovery codes: generate a fresh batch, or use one as a 2FA bypass.
+        .route("/api/me/2fa/recovery-codes", post(generate_recovery_codes))
+        .route("/api/auth/2fa/recover", post(use_recovery_code))
+}
+
+/// Build a [`RecoveryCodeRepo`] from shared state.
+fn recovery_repo(s: &AppState) -> RecoveryCodeRepo {
+    RecoveryCodeRepo::new(s.pg.clone())
 }
 
 /// Issuer label embedded in the `otpauth://` URI (shown by authenticator apps).
@@ -192,4 +200,86 @@ async fn disable_2fa(
         .await
         .map_err(AeroError::from)?;
     Ok(Json(serde_json::json!({ "disabled": true })))
+}
+
+// ─────────────────────────────────────────────────── Recovery codes ──────────
+
+/// `POST /api/me/2fa/recovery-codes` — generate a fresh batch of 8 one-time
+/// recovery codes, replacing any existing unused ones.
+///
+/// Requires the caller's 2FA to be **activated** (a pending enrollment has no
+/// recovery-code use-case). Returns the 8 plaintext codes — shown once, store
+/// them somewhere safe. On success also returns the remaining unused-code count
+/// (always 8 immediately after generation).
+async fn generate_recovery_codes(
+    State(s): State<AppState>,
+    auth: AuthUser,
+) -> ApiResult<Json<serde_json::Value>> {
+    // Only makes sense when 2FA is fully activated.
+    let totp = repo(&s);
+    if !totp
+        .is_activated(auth.participant_id)
+        .await
+        .map_err(AeroError::from)?
+    {
+        return Err(AeroError::Conflict(
+            "2fa must be activated before generating recovery codes".into(),
+        )
+        .into());
+    }
+
+    let codes = recovery_repo(&s)
+        .generate(auth.participant_id)
+        .await
+        .map_err(AeroError::from)?;
+    Ok(Json(serde_json::json!({
+        "codes": codes,
+        "count": codes.len(),
+    })))
+}
+
+#[derive(Deserialize)]
+struct RecoveryReq {
+    /// The 8-character one-time recovery code.
+    recovery_code: String,
+}
+
+/// `POST /api/auth/2fa/recover` — bypass 2FA using a one-time recovery code.
+///
+/// Accepts `{ recovery_code: "XXXXXXXX" }`. If the code matches an unused
+/// entry for `auth.participant_id` it is consumed (marked used) and `{ok:
+/// true}` is returned; otherwise `400 "invalid or already used recovery code"`.
+/// This lets a user log in when they have lost access to their authenticator app
+/// but still have a saved recovery code.
+async fn use_recovery_code(
+    State(s): State<AppState>,
+    auth: AuthUser,
+    Json(req): Json<RecoveryReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let code = req.recovery_code.trim().to_string();
+    if code.is_empty() {
+        return Err(AeroError::Invalid("recovery_code is empty".into()).into());
+    }
+
+    let consumed = recovery_repo(&s)
+        .verify(auth.participant_id, &code)
+        .await
+        .map_err(AeroError::from)?;
+
+    if !consumed {
+        return Err(
+            AeroError::Invalid("invalid or already used recovery code".into()).into(),
+        );
+    }
+
+    // Report the remaining unused count so the client knows how many codes are left.
+    let remaining = recovery_repo(&s)
+        .count_unused(auth.participant_id)
+        .await
+        .map_err(AeroError::from)?;
+
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "remaining_codes": remaining,
+    })))
 }

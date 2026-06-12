@@ -123,6 +123,125 @@ impl TotpRepo {
     }
 }
 
+// ─────────────────────────────────────────── Recovery codes (migration 0122) ──
+
+/// Repository over the `recovery_codes` table.
+///
+/// Backs `migrations/0122_recovery_codes.sql`. Each call to
+/// [`generate`](RecoveryCodeRepo::generate) replaces any existing unused codes
+/// for the participant with a fresh batch of 8 random single-use codes; a
+/// successful [`verify`](RecoveryCodeRepo::verify) call marks the code as used
+/// so it cannot be replayed.
+///
+/// Codes are stored as plaintext random strings — they are high-entropy,
+/// single-use, and the user's TOTP secret is the real credential. A plaintext
+/// store keeps the verify path fast and avoids pulling in a password-hashing
+/// crate for a secondary bypass channel.
+#[derive(Clone)]
+#[must_use]
+pub struct RecoveryCodeRepo {
+    pool: PgPool,
+}
+
+impl RecoveryCodeRepo {
+    /// Build a repo over the given pool.
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+
+    /// Generate a new batch of 8 recovery codes for `participant`, deleting any
+    /// pre-existing unused ones first (at most one active batch at a time).
+    /// Returns the 8 plaintext codes to show the user **once**.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the database.
+    pub async fn generate(
+        &self,
+        participant: ParticipantId,
+    ) -> Result<Vec<String>, sqlx::Error> {
+        // Remove any unused codes from previous generation so there is at most
+        // one active batch.
+        sqlx::query(
+            "DELETE FROM recovery_codes WHERE participant_id = $1 AND used_at IS NULL",
+        )
+        .bind(participant.to_uuid())
+        .execute(&self.pool)
+        .await?;
+
+        let mut codes = Vec::with_capacity(8);
+        for _ in 0..8u8 {
+            // 8 random uppercase hex chars: take the first 8 chars of a UUID's
+            // hex representation (32 chars, no dashes), zero-allocating via
+            // simple string slicing.
+            let raw = uuid::Uuid::new_v4().simple().to_string();
+            let code = raw[..8].to_ascii_uppercase();
+            sqlx::query(
+                "INSERT INTO recovery_codes (participant_id, code) VALUES ($1, $2)",
+            )
+            .bind(participant.to_uuid())
+            .bind(&code)
+            .execute(&self.pool)
+            .await?;
+            codes.push(code);
+        }
+        Ok(codes)
+    }
+
+    /// Verify `code` against `participant`'s unused recovery codes. If a
+    /// matching unused code is found it is marked as used (consumed) and `true`
+    /// is returned; otherwise returns `false` (wrong code or already used).
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the database.
+    pub async fn verify(
+        &self,
+        participant: ParticipantId,
+        code: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let code = code.trim().to_ascii_uppercase();
+        // Fetch the row id of the matching unused code.
+        let row: Option<(uuid::Uuid,)> = sqlx::query_as(
+            "SELECT id FROM recovery_codes \
+             WHERE participant_id = $1 AND code = $2 AND used_at IS NULL",
+        )
+        .bind(participant.to_uuid())
+        .bind(&code)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        match row {
+            Some((id,)) => {
+                sqlx::query(
+                    "UPDATE recovery_codes SET used_at = NOW() WHERE id = $1",
+                )
+                .bind(id)
+                .execute(&self.pool)
+                .await?;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Count how many unused recovery codes `participant` currently has.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the database.
+    pub async fn count_unused(
+        &self,
+        participant: ParticipantId,
+    ) -> Result<i64, sqlx::Error> {
+        let (count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM recovery_codes \
+             WHERE participant_id = $1 AND used_at IS NULL",
+        )
+        .bind(participant.to_uuid())
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count)
+    }
+}
+
 /// PG-gated integration tests (run with a live Postgres + applied migrations):
 ///
 /// ```text

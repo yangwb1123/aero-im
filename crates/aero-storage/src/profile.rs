@@ -36,6 +36,13 @@ pub struct Profile {
     pub phone: Option<String>,
     /// Free-form status text (e.g. "Out of office"), if set.
     pub status_text: Option<String>,
+    /// Emoji shorthand for the custom status (e.g. ":palm_tree:"), if set.
+    /// Added by migration 0121.
+    pub status_emoji: Option<String>,
+    /// Optional auto-expiry for the custom status. `None` means never expires.
+    /// Added by migration 0121.
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub status_expires_at: Option<time::OffsetDateTime>,
     /// When the profile was last upserted (RFC 3339 on the wire).
     #[serde(with = "time::serde::rfc3339")]
     pub updated_at: time::OffsetDateTime,
@@ -43,7 +50,8 @@ pub struct Profile {
 
 /// The columns a [`Profile`] is built from, in select order. Shared by every
 /// query so the row decoding stays in one place.
-const COLUMNS: &str = "participant_id, title, pronouns, timezone, phone, status_text, updated_at";
+const COLUMNS: &str = "participant_id, title, pronouns, timezone, phone, status_text, \
+                        status_emoji, status_expires_at, updated_at";
 
 type Row = (
     uuid::Uuid,
@@ -52,11 +60,14 @@ type Row = (
     Option<String>,
     Option<String>,
     Option<String>,
+    Option<String>,
+    Option<time::OffsetDateTime>,
     time::OffsetDateTime,
 );
 
 fn row_to_model(r: Row) -> Profile {
-    let (participant_id, title, pronouns, timezone, phone, status_text, updated_at) = r;
+    let (participant_id, title, pronouns, timezone, phone, status_text,
+         status_emoji, status_expires_at, updated_at) = r;
     Profile {
         participant_id: ParticipantId::from_uuid(participant_id),
         title,
@@ -64,6 +75,8 @@ fn row_to_model(r: Row) -> Profile {
         timezone,
         phone,
         status_text,
+        status_emoji,
+        status_expires_at,
         updated_at,
     }
 }
@@ -118,6 +131,60 @@ impl ProfileRepo {
         .bind(timezone)
         .bind(phone)
         .bind(status_text)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Update only the core profile fields (title, pronouns, timezone, phone,
+    /// status_text) without touching the emoji / expires_at status columns that
+    /// [`set_status`](Self::set_status) manages. Preserves the new columns on
+    /// conflict so a `PUT /api/me/profile` call does not accidentally wipe a
+    /// status set via `PATCH /api/me/profile/status`.
+    pub async fn upsert_core(
+        &self,
+        participant: ParticipantId,
+        title: Option<&str>,
+        pronouns: Option<&str>,
+        timezone: Option<&str>,
+        phone: Option<&str>,
+        status_text: Option<&str>,
+    ) -> Result<(), sqlx::Error> {
+        // Identical SQL to `upsert` — both only touch the columns in the INSERT
+        // list; the new status_emoji / status_expires_at columns are left at
+        // their current values by the ON CONFLICT DO UPDATE because they are not
+        // in EXCLUDED.
+        self.upsert(participant, title, pronouns, timezone, phone, status_text).await
+    }
+
+    /// Update the custom status fields (`status_text`, `status_emoji`,
+    /// `status_expires_at`) on `participant`'s profile row, creating it if it
+    /// does not yet exist. Touches only the three status columns so the other
+    /// profile fields (title, pronouns, etc.) are preserved.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the upsert.
+    pub async fn set_status(
+        &self,
+        participant: ParticipantId,
+        text: Option<&str>,
+        emoji: Option<&str>,
+        expires_at: Option<time::OffsetDateTime>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r"INSERT INTO participant_profiles
+                  (participant_id, status_text, status_emoji, status_expires_at)
+               VALUES ($1, $2, $3, $4)
+               ON CONFLICT (participant_id) DO UPDATE SET
+                   status_text       = EXCLUDED.status_text,
+                   status_emoji      = EXCLUDED.status_emoji,
+                   status_expires_at = EXCLUDED.status_expires_at,
+                   updated_at        = now()",
+        )
+        .bind(participant.to_uuid())
+        .bind(text)
+        .bind(emoji)
+        .bind(expires_at)
         .execute(&self.pool)
         .await?;
         Ok(())

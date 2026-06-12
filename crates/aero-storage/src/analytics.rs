@@ -78,6 +78,21 @@ pub struct ReactionStat {
     pub count: i64,
 }
 
+/// 30-day workspace activity summary — a member-accessible projection (not
+/// admin-only like [`WorkspaceAnalytics`]). Returned by
+/// `GET /api/workspaces/:id/analytics/summary`.
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkspaceSummary {
+    /// All non-deleted messages across the workspace's rooms (all time).
+    pub total_messages: i64,
+    /// Non-deleted messages created in the trailing 30 days.
+    pub messages_30d: i64,
+    /// Distinct message authors active in the workspace in the trailing 30 days.
+    pub active_users_30d: i64,
+    /// Distinct members enrolled in the workspace.
+    pub total_members: i64,
+}
+
 /// Largest number of channels [`AnalyticsRepo::top_channels`] returns. A caller's
 /// requested `limit` is clamped into `[1, MAX_TOP_CHANNELS]` so an outsized (or
 /// non-positive) request can neither be empty nor unbounded.
@@ -293,6 +308,41 @@ impl AnalyticsRepo {
         .bind(limit)
         .fetch_all(&self.pool)
         .await
+    }
+
+    /// Aggregate summary for `workspace` over a 30-day window, suitable for
+    /// member-facing dashboard widgets. Returns total message count (all time),
+    /// messages in the last 30 days, distinct active message authors in the last
+    /// 30 days, and total distinct workspace members. One round-trip via four
+    /// correlated scalar subqueries, matching the style of [`Self::overview`].
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the query.
+    pub async fn workspace_summary(
+        &self,
+        workspace: WorkspaceId,
+    ) -> Result<WorkspaceSummary, sqlx::Error> {
+        let row = sqlx::query_as::<_, (i64, i64, i64, i64)>(
+            r"SELECT
+                (SELECT COUNT(*) FROM messages m
+                   JOIN rooms r ON r.id = m.room_id
+                  WHERE r.workspace_id = $1 AND m.deleted_at IS NULL) AS total_messages,
+                (SELECT COUNT(*) FROM messages m
+                   JOIN rooms r ON r.id = m.room_id
+                  WHERE r.workspace_id = $1 AND m.deleted_at IS NULL
+                    AND m.created_at >= now() - INTERVAL '30 days') AS messages_30d,
+                (SELECT COUNT(DISTINCT m.sender_id) FROM messages m
+                   JOIN rooms r ON r.id = m.room_id
+                  WHERE r.workspace_id = $1 AND m.deleted_at IS NULL
+                    AND m.created_at >= now() - INTERVAL '30 days') AS active_users_30d,
+                (SELECT COUNT(DISTINCT participant_id) FROM workspace_members
+                  WHERE workspace_id = $1) AS total_members",
+        )
+        .bind(workspace.to_uuid())
+        .fetch_one(&self.pool)
+        .await?;
+        let (total_messages, messages_30d, active_users_30d, total_members) = row;
+        Ok(WorkspaceSummary { total_messages, messages_30d, active_users_30d, total_members })
     }
 
     /// The most-used reactions on messages in `room`, descending by frequency,

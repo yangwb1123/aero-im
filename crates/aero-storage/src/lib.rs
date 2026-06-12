@@ -193,7 +193,7 @@ pub use default_channel::DefaultChannelRepo;
 pub use group_dm::GroupDmRepo;
 pub use join_request::{JoinRequest, JoinRequestRepo};
 // Wave 14 re-exports.
-pub use totp::TotpRepo;
+pub use totp::{TotpRepo, RecoveryCodeRepo};
 pub use deactivation::{DeactivatedMember, DeactivationRepo};
 pub use message_template::{MessageTemplate, MessageTemplateRepo};
 // Wave 15 re-exports. (revoked_token::hash_token is NOT re-exported at the crate
@@ -205,7 +205,7 @@ pub use room_role::RoomRoleRepo;
 // ---- Wave 16 re-exports ----
 pub use analytics::{
     AnalyticsRepo, ChannelAnalytics, ChannelMessageCount, DayCount, ReactionStat,
-    WorkspaceAnalytics, MAX_TIMELINE_DAYS, MAX_TOP_CHANNELS,
+    WorkspaceAnalytics, WorkspaceSummary, MAX_TIMELINE_DAYS, MAX_TOP_CHANNELS,
 };
 pub use canvas::{Canvas, CanvasRepo};
 pub use channel_bookmark::{ChannelBookmark, ChannelBookmarkRepo};

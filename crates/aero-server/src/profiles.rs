@@ -24,6 +24,7 @@ use axum::{
     routing::{get, put},
     Json, Router,
 };
+use time::OffsetDateTime;
 use serde::Deserialize;
 
 use crate::error::ApiResult;
@@ -33,6 +34,7 @@ use crate::state::AppState;
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/me/profile", put(put_my_profile).get(get_my_profile))
+        .route("/api/me/profile/status", axum::routing::patch(patch_profile_status))
         .route("/api/participants/:id/profile", get(get_participant_profile))
 }
 
@@ -161,6 +163,70 @@ async fn get_participant_profile(
         .map_err(AeroError::from)?
         .ok_or_else(|| AeroError::NotFound(format!("profile for {target}")))?;
     Ok(Json(serde_json::to_value(profile).map_err(AeroError::from)?))
+}
+
+/// Maximum lifetime (in minutes) for a profile-level status expiry.
+/// 60 days × 24 h × 60 min = 86 400 minutes.
+const MAX_STATUS_EXPIRES_IN_MINS: i64 = 60 * 24 * 60;
+
+#[derive(Deserialize)]
+struct PatchStatusReq {
+    /// Status text (e.g. "On vacation"). Absent or null clears it.
+    #[serde(default)]
+    status_text: Option<String>,
+    /// Emoji shorthand (e.g. ":palm_tree:"). Absent or null clears it.
+    #[serde(default)]
+    status_emoji: Option<String>,
+    /// Auto-expire after this many minutes from now. Absent or null = never.
+    #[serde(default)]
+    expires_in_mins: Option<i64>,
+}
+
+/// `PATCH /api/me/profile/status` — set (or clear) the profile-level custom
+/// status emoji, text, and optional expiry. The three columns are updated
+/// atomically; other profile fields (title, pronouns, etc.) are untouched.
+async fn patch_profile_status(
+    State(s): State<AppState>,
+    auth: AuthUser,
+    Json(req): Json<PatchStatusReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let text = normalize_field("status_text", req.status_text.as_deref())?;
+    let emoji = normalize_field("status_emoji", req.status_emoji.as_deref())?;
+
+    let expires_at = match req.expires_in_mins {
+        None => None,
+        Some(mins) if (1..=MAX_STATUS_EXPIRES_IN_MINS).contains(&mins) => {
+            Some(OffsetDateTime::now_utc() + time::Duration::minutes(mins))
+        }
+        Some(mins) => {
+            return Err(AeroError::Invalid(format!(
+                "expires_in_mins must be 1..={MAX_STATUS_EXPIRES_IN_MINS}, got {mins}"
+            ))
+            .into())
+        }
+    };
+
+    repo(&s)
+        .set_status(
+            auth.participant_id,
+            text.as_deref(),
+            emoji.as_deref(),
+            expires_at,
+        )
+        .await
+        .map_err(AeroError::from)?;
+
+    // Re-read the full profile row so the response is canonical (includes updated_at).
+    let row = repo(&s).get(auth.participant_id).await.map_err(AeroError::from)?;
+    match row {
+        Some(p) => Ok(Json(serde_json::to_value(p).map_err(AeroError::from)?)),
+        None => Ok(Json(serde_json::json!({
+            "participant_id": auth.participant_id,
+            "status_text": text,
+            "status_emoji": emoji,
+            "status_expires_at": expires_at.map(|t| t.unix_timestamp()),
+        }))),
+    }
 }
 
 #[cfg(test)]
