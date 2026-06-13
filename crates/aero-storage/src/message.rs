@@ -512,14 +512,14 @@ impl MessageRepo {
                  m.id, m.room_id, m.sender_id, m.blocks, m.reply_to, m.metadata,
                  m.created_at, m.edited_at, m.deleted_at, m.expires_at,
                  GREATEST(
-                   ts_rank(m.search_tsv, websearch_to_tsquery('simple', $2)),
+                   ts_rank(m.search_tsv, websearch_to_tsquery('english', $2)),
                    similarity(m.searchable_text, $2)
                  ) AS score
                FROM messages m
                WHERE m.room_id = $1
                  AND m.deleted_at IS NULL
                  AND (
-                   m.search_tsv @@ websearch_to_tsquery('simple', $2)
+                   m.search_tsv @@ websearch_to_tsquery('english', $2)
                    OR m.searchable_text % $2
                  )
                ORDER BY score DESC, m.id DESC
@@ -608,11 +608,11 @@ impl MessageRepo {
             r"SELECT
                  m.id, m.room_id, m.sender_id, m.blocks, m.reply_to, m.metadata,
                  m.created_at, m.edited_at, m.deleted_at, m.expires_at,
-                 ts_rank(m.search_tsv, {f}('simple', $2)) AS score
+                 ts_rank(m.search_tsv, {f}('english', $2)) AS score
                FROM messages m
                WHERE m.room_id = $1
                  AND m.deleted_at IS NULL
-                 AND m.search_tsv @@ {f}('simple', $2)
+                 AND m.search_tsv @@ {f}('english', $2)
                ORDER BY score DESC, m.id DESC
                LIMIT $3",
             f = parser.sql_name()
@@ -782,7 +782,7 @@ impl MessageRepo {
                  m.id, m.room_id, m.sender_id, m.blocks, m.reply_to, m.metadata,
                  m.created_at, m.edited_at, m.deleted_at, m.expires_at,
                  GREATEST(
-                   ts_rank(m.search_tsv, websearch_to_tsquery('simple', $2)),
+                   ts_rank(m.search_tsv, websearch_to_tsquery('english', $2)),
                    similarity(m.searchable_text, $2)
                  ) AS score
                FROM messages m
@@ -790,7 +790,7 @@ impl MessageRepo {
                  ON rm.room_id = m.room_id AND rm.participant_id = $1
                WHERE m.deleted_at IS NULL
                  AND (
-                   m.search_tsv @@ websearch_to_tsquery('simple', $2)
+                   m.search_tsv @@ websearch_to_tsquery('english', $2)
                    OR m.searchable_text % $2
                  )
                ORDER BY score DESC, m.id DESC
@@ -820,7 +820,7 @@ impl MessageRepo {
                  m.id, m.room_id, m.sender_id, m.blocks, m.reply_to, m.metadata,
                  m.created_at, m.edited_at, m.deleted_at, m.expires_at,
                  GREATEST(
-                   ts_rank(m.search_tsv, websearch_to_tsquery('simple', $2)),
+                   ts_rank(m.search_tsv, websearch_to_tsquery('english', $2)),
                    similarity(m.searchable_text, $2)
                  ) AS score
                FROM messages m
@@ -829,7 +829,7 @@ impl MessageRepo {
                WHERE m.deleted_at IS NULL
                  AND m.room_id IN (SELECT id FROM rooms WHERE workspace_id = $4)
                  AND (
-                   m.search_tsv @@ websearch_to_tsquery('simple', $2)
+                   m.search_tsv @@ websearch_to_tsquery('english', $2)
                    OR m.searchable_text % $2
                  )
                ORDER BY score DESC, m.id DESC
@@ -980,13 +980,13 @@ impl MessageRepo {
             r"SELECT
                  m.id, m.room_id, m.sender_id, m.blocks, m.reply_to, m.metadata,
                  m.created_at, m.edited_at, m.deleted_at, m.expires_at,
-                 ts_rank(m.search_tsv, {f}('simple', $2)) AS score
+                 ts_rank(m.search_tsv, {f}('english', $2)) AS score
                FROM messages m
                JOIN room_members rm
                  ON rm.room_id = m.room_id AND rm.participant_id = $1
                WHERE m.deleted_at IS NULL
                  AND m.room_id IN (SELECT id FROM rooms WHERE workspace_id = $4)
-                 AND m.search_tsv @@ {f}('simple', $2)
+                 AND m.search_tsv @@ {f}('english', $2)
                ORDER BY score DESC, m.id DESC
                LIMIT $3",
             f = parser.sql_name()
@@ -1401,6 +1401,42 @@ mod db_tests {
         assert!(
             !hits.iter().any(|h| h.message.room_id == theirs),
             "a message in a room the caller is NOT in never leaks"
+        );
+    }
+
+    /// FTS stems with the `english` config (migration 0128): a message whose text
+    /// contains only the inflected form `deploying` is found by a search for the
+    /// root `deploy`. Under the old `simple` config the tokens are distinct and
+    /// this returns zero hits — so this test is the regression guard for the
+    /// stemmer switch (query side and stored tsvector must agree on `english`).
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn search_stems_inflected_forms_with_english_config() {
+        let p = pool();
+        let repo = MessageRepo::new(p.clone());
+
+        // Fresh caller + room → `search_all_rooms` sees only this one message.
+        let me = participant(&p).await;
+        let r = room(&p, me).await;
+        join(&p, r, me).await;
+
+        let inflected = repo
+            .insert(NewMessage {
+                room_id: r,
+                sender_id: me,
+                blocks: vec![Block::text("deploying the new release tonight")],
+                reply_to: None,
+                metadata: serde_json::json!({}),
+                expires_at: None,
+            })
+            .await
+            .expect("insert inflected");
+
+        // Search the ROOT form, which never appears literally in the message.
+        let hits = repo.search_all_rooms(me, "deploy", 50).await.expect("search");
+        assert!(
+            hits.iter().any(|h| h.message.id == inflected.id),
+            "the english stemmer matches 'deploy' against 'deploying'"
         );
     }
 
