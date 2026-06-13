@@ -61,7 +61,7 @@ impl Default for JetStreamConfig {
     }
 }
 
-/// Maximum JetStream delivery attempts before a message is parked (no further
+/// Maximum `JetStream` delivery attempts before a message is parked (no further
 /// redelivery). A message that fails this many times — because it repeatedly
 /// crashes its consumer *before* ack — is poison; parking it after a bounded
 /// number of tries stops one bad message from crash-looping a node's fan-out
@@ -71,13 +71,17 @@ impl Default for JetStreamConfig {
 /// merely-transient failure is ever discarded.
 const POISON_MAX_DELIVER: i64 = 16;
 
-/// How long the broker waits for an ack before redelivering. Set generously so a
-/// slow-but-healthy consumer (e.g. a moderation/transcribe AI call) is never
-/// redelivered mid-process — which would double-process — while still spacing
-/// out redelivery so a crash-looping message can't spin a tight hot loop.
-/// Together with [`POISON_MAX_DELIVER`] this is a backoff-free, bounded
-/// redelivery DLQ: at most 16 attempts, each ≥60s apart.
-const POISON_ACK_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+/// How long the broker waits for an ack before redelivering. Set generously —
+/// longer than any single consumer's worst-case processing — so a slow-but-
+/// healthy consumer is never redelivered mid-process (which would double-process
+/// it). The pacing case is the transcribe bot, which acks only AFTER its
+/// `ai.transcribe()` call returns (a long voice note → a multi-tens-of-seconds
+/// Whisper round-trip); 120s clears that with margin. (The NATS default when
+/// unset is just 30s.) It still spaces redelivery enough that a crash-looping
+/// message can't spin a tight hot loop. Together with [`POISON_MAX_DELIVER`]
+/// this is a backoff-free, bounded redelivery DLQ: at most 16 attempts, each
+/// ≥120s apart.
+const POISON_ACK_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Build the pull-consumer config with poison-message redelivery bounds.
 ///
