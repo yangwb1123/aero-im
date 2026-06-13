@@ -48,16 +48,17 @@
 
 ## Flagged design questions (need product intent, not autonomous fixes)
 
-- **Blocking enforcement scope.** `is_blocked` is checked ONLY at 1:1-DM-open
-  (`dm.rs:93`). It is NOT enforced in `send_message`, `start_call`, group-DM
-  inclusion, mention/notify fan-out, or reactions — so a block does not retroactively
-  disable a pre-existing DM room (a cached `room_id` still routes calls/messages),
-  nor hide a blocked user's content in shared rooms. If the intended semantics are
-  "block only prevents opening a new DM," this is correct as-is; if it should be a
-  full mute/cloak (no calls, no messages delivered, content hidden), several surfaces
-  need an `is_blocked` gate. **Needs product decision on intended blocking scope.**
-  (Audited-clean this pass: AI/RAG retrieval is membership-guarded across all ask
-  handlers + authz_lint; channel-points/predictions spend is atomic.)
+- **Blocking enforcement scope.** Now enforced at: DM-open (`dm.rs:93`), notification
+  fan-out (suppressed — `service.rs:1745`), and **1:1 calls** (`start_call`, 92a2027).
+  STILL a product decision for the remaining surfaces: a block does NOT reject
+  `send_message` in a pre-existing DM (notifications are suppressed, but the message
+  still lands in the room), nor hide a blocked user's content in SHARED rooms, nor
+  affect group-DM inclusion / mentions / reactions. If "block = can't open new DM +
+  can't call + not notified" is the intended model, this is now complete; if it
+  should be a full mute/cloak (content hidden in shared rooms, message-send rejected),
+  several surfaces still need a gate. **Needs product decision on the remaining scope.**
+  (Audited-clean: AI/RAG retrieval membership-guarded; channel-points spend atomic;
+  me_export caller-scoped; blob-download IDOR-guarded; guest isolation enforced.)
 
 ## Tech debt (see also DECISIONS.md)
 
