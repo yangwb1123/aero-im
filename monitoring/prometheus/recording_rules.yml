@@ -1,0 +1,48 @@
+# Prometheus recording rules for Aero IM (ROADMAP5 方向二: SLO layer).
+#
+# Pre-computes the RED signals + multi-window error ratios that the burn-rate
+# SLO alerts (alert_rules.yml) and the Grafana RED dashboard read. Every series
+# below targets a metric the server actually emits (see
+# crates/aero-common/src/metrics.rs / crates/aero-server/src/metrics.rs):
+#   aero_http_requests_total{method,status}              (counter)
+#   aero_http_request_duration_seconds_bucket{route,le}  (histogram)
+#
+# Load via prometheus.yml `rule_files: [recording_rules.yml, alert_rules.yml]`.
+groups:
+  - name: aero-red-recording
+    interval: 30s
+    rules:
+      # ---- Rate (throughput) ----
+      - record: job:aero_http_requests:rate5m
+        expr: sum(rate(aero_http_requests_total[5m]))
+      - record: job:aero_http_requests_by_status:rate5m
+        expr: sum by (status) (rate(aero_http_requests_total[5m]))
+
+      # ---- Errors (5xx ratio over several windows for multi-window burn) ----
+      - record: job:aero_http_error_ratio:5m
+        expr: |
+          sum(rate(aero_http_requests_total{status=~"5.."}[5m]))
+            / clamp_min(sum(rate(aero_http_requests_total[5m])), 1)
+      - record: job:aero_http_error_ratio:30m
+        expr: |
+          sum(rate(aero_http_requests_total{status=~"5.."}[30m]))
+            / clamp_min(sum(rate(aero_http_requests_total[30m])), 1)
+      - record: job:aero_http_error_ratio:1h
+        expr: |
+          sum(rate(aero_http_requests_total{status=~"5.."}[1h]))
+            / clamp_min(sum(rate(aero_http_requests_total[1h])), 1)
+      - record: job:aero_http_error_ratio:6h
+        expr: |
+          sum(rate(aero_http_requests_total{status=~"5.."}[6h]))
+            / clamp_min(sum(rate(aero_http_requests_total[6h])), 1)
+
+      # ---- Duration (latency percentiles from the histogram) ----
+      - record: job:aero_http_request_duration_seconds:p50_5m
+        expr: histogram_quantile(0.50, sum by (le) (rate(aero_http_request_duration_seconds_bucket[5m])))
+      - record: job:aero_http_request_duration_seconds:p90_5m
+        expr: histogram_quantile(0.90, sum by (le) (rate(aero_http_request_duration_seconds_bucket[5m])))
+      - record: job:aero_http_request_duration_seconds:p99_5m
+        expr: histogram_quantile(0.99, sum by (le) (rate(aero_http_request_duration_seconds_bucket[5m])))
+      # Per-route p99 — `route` is a label on the duration histogram.
+      - record: route:aero_http_request_duration_seconds:p99_5m
+        expr: histogram_quantile(0.99, sum by (le, route) (rate(aero_http_request_duration_seconds_bucket[5m])))

@@ -1,0 +1,25 @@
+# Example Prometheus config for scraping Aero IM and loading the SLO rules.
+# Copy alongside recording_rules.yml + alert_rules.yml and point Prometheus at it.
+#
+# NOTE: `/metrics` is bearer-gated (set `AERO_METRICS_TOKEN` on the server, see
+# crates/aero-server/src/metrics.rs); supply the same token to the scrape job.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 30s
+
+rule_files:
+  - recording_rules.yml
+  - alert_rules.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
+scrape_configs:
+  - job_name: aero-im
+    metrics_path: /metrics
+    # bearer_token_file: /etc/prometheus/aero_metrics_token
+    static_configs:
+      # The server's HTTP port (config.example.toml defaults to 8080).
+      - targets: ["aero-server:8080"]

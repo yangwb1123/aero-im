@@ -1,0 +1,97 @@
+# Prometheus alerting rules for Aero IM (ROADMAP5 方向二: error-budget + ops).
+#
+# Two groups:
+#  1. aero-slo-burn — multi-window, multi-burn-rate error-budget alerts against a
+#     99.9% availability SLO (0.1% budget) on the HTTP RED signal, per the Google
+#     SRE workbook. Reads the recorded `job:aero_http_error_ratio:*` series.
+#  2. aero-operational — direct alerts on the platform's own health signals (the
+#     self-healing / money-path / data-plane gauges the server emits), so the
+#     silent-failure modes this codebase has hit (bus black hole, poison loop,
+#     DLQ growth) page instead of festering.
+#
+# Burn-rate thresholds: budget = 1 - 0.999 = 0.001. An alert fires when the error
+# ratio over BOTH a long and a short window exceeds `burn * budget` (the short
+# window confirms the burn is still happening, avoiding stale long-window pages).
+groups:
+  - name: aero-slo-burn
+    rules:
+      - alert: AeroHttpErrorBudgetFastBurn
+        # 14.4x burn (≈2% of the 30-day budget in 1h) — page now.
+        expr: |
+          job:aero_http_error_ratio:1h > (14.4 * 0.001)
+          and
+          job:aero_http_error_ratio:5m > (14.4 * 0.001)
+        for: 2m
+        labels:
+          severity: page
+          slo: http_availability
+        annotations:
+          summary: "Aero HTTP error budget burning fast (>14.4x)"
+          description: "5xx ratio over 1h and 5m both exceed 14.4x the 99.9% SLO budget."
+
+      - alert: AeroHttpErrorBudgetSlowBurn
+        # 6x burn (≈5% of the budget in 6h) — page.
+        expr: |
+          job:aero_http_error_ratio:6h > (6 * 0.001)
+          and
+          job:aero_http_error_ratio:30m > (6 * 0.001)
+        for: 15m
+        labels:
+          severity: page
+          slo: http_availability
+        annotations:
+          summary: "Aero HTTP error budget burning (>6x)"
+          description: "5xx ratio over 6h and 30m both exceed 6x the 99.9% SLO budget."
+
+      - alert: AeroHttpLatencyP99High
+        expr: job:aero_http_request_duration_seconds:p99_5m > 1
+        for: 10m
+        labels:
+          severity: ticket
+          slo: http_latency
+        annotations:
+          summary: "Aero HTTP p99 latency > 1s"
+          description: "Global p99 request latency has exceeded 1s for 10m."
+
+  - name: aero-operational
+    rules:
+      # The "looks healthy, actually dead" fan-out black hole this session fixed:
+      # a stuck consumer shows as an ever-growing pending backlog.
+      - alert: AeroNatsConsumerBacklogGrowing
+        expr: aero_nats_consumer_pending_messages > 1000
+        for: 10m
+        labels: { severity: page }
+        annotations:
+          summary: "NATS consumer backlog growing ({{ $labels.stream }}/{{ $labels.consumer }})"
+          description: "A durable consumer is falling behind or stuck; >1000 pending for 10m."
+
+      - alert: AeroAiDeadLetterQueueNonEmpty
+        expr: aero_ai_dlq_size > 0
+        for: 5m
+        labels: { severity: ticket }
+        annotations:
+          summary: "AI jobs in dead-letter ({{ $labels.kind }})"
+          description: "Moderation/summarisation/embed jobs have exhausted retries."
+
+      - alert: AeroBusPoisonMessagesDropped
+        expr: increase(aero_bus_poison_dropped_total[15m]) > 0
+        labels: { severity: ticket }
+        annotations:
+          summary: "Undecodable bus messages dropped"
+          description: "A producer/schema mismatch is emitting events no consumer can decode."
+
+      - alert: AeroNatsPublishErrors
+        expr: increase(aero_nats_publish_errors_total[5m]) > 0
+        for: 5m
+        labels: { severity: page }
+        annotations:
+          summary: "NATS publish errors"
+          description: "Event fan-out is failing to publish; room/stream events may be lost."
+
+      - alert: AeroDbPoolSaturated
+        expr: aero_db_pool_in_use / clamp_min(aero_db_pool_size, 1) > 0.9
+        for: 5m
+        labels: { severity: ticket }
+        annotations:
+          summary: "Postgres connection pool >90% saturated"
+          description: "Sustained high pool usage; queries may start queueing."

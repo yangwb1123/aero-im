@@ -1,0 +1,86 @@
+{
+  "title": "Aero IM — RED + Platform Health",
+  "uid": "aero-red",
+  "schemaVersion": 39,
+  "timezone": "",
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {}
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Request rate (req/s)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 0 },
+      "targets": [
+        { "expr": "job:aero_http_requests:rate5m", "legendFormat": "total" },
+        { "expr": "job:aero_http_requests_by_status:rate5m", "legendFormat": "{{status}}" }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Error ratio (5xx, 5m)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "percentunit" }, "overrides": [] },
+      "targets": [
+        { "expr": "job:aero_http_error_ratio:5m", "legendFormat": "5xx ratio" }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Latency p50/p90/p99 (s)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        { "expr": "job:aero_http_request_duration_seconds:p50_5m", "legendFormat": "p50" },
+        { "expr": "job:aero_http_request_duration_seconds:p90_5m", "legendFormat": "p90" },
+        { "expr": "job:aero_http_request_duration_seconds:p99_5m", "legendFormat": "p99" }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "NATS consumer pending",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 8 },
+      "targets": [
+        { "expr": "aero_nats_consumer_pending_messages", "legendFormat": "{{stream}}/{{consumer}}" }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "AI dead-letter queue",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 8 },
+      "targets": [
+        { "expr": "aero_ai_dlq_size", "legendFormat": "{{kind}}" }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "DB pool utilisation",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 8 },
+      "fieldConfig": { "defaults": { "unit": "percentunit" }, "overrides": [] },
+      "targets": [
+        { "expr": "aero_db_pool_in_use / clamp_min(aero_db_pool_size, 1)", "legendFormat": "in use" }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,22 @@
+# Example Alertmanager routing for Aero IM alerts (alert_rules.yml).
+# `severity: page` → an on-call pager; `severity: ticket` → a queue. Wire the
+# receivers to your real PagerDuty/Slack/email integrations.
+route:
+  receiver: default
+  group_by: ["alertname", "slo"]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    - matchers: ['severity="page"']
+      receiver: pager
+      repeat_interval: 1h
+    - matchers: ['severity="ticket"']
+      receiver: tickets
+
+receivers:
+  - name: default
+  - name: pager
+    # pagerduty_configs / webhook_configs go here.
+  - name: tickets
+    # slack_configs / email_configs go here.
