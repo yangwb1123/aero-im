@@ -238,12 +238,12 @@ async fn main() -> anyhow::Result<()> {
     // The AiService is always constructed — it falls back to a deterministic local
     // embedder + heuristic summary when ANTHROPIC_API_KEY / VOYAGE_API_KEY are absent,
     // so the routes never need to gate on env at request time.
-    let ai_service = Arc::new(AiService::from_env(
-        ai_jobs.clone(),
-        messages.clone(),
-        rooms.clone(),
-        Some(ai_context),
-    ));
+    let ai_service = Arc::new(
+        AiService::from_env(ai_jobs.clone(), messages.clone(), rooms.clone(), Some(ai_context))
+            // Lets the agentic answer loop's `read_attachment` tool pull text
+            // attachments (方向三 file RAG).
+            .with_blob_store(blob_store.clone()),
+    );
     info!("AI service constructed");
 
     // Spawn the embed/summarize/answer worker.

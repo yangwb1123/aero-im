@@ -151,6 +151,10 @@ pub struct AiService {
     /// Optional Redis-backed rolling conversation context.
     /// `None` when Redis is not configured or is unavailable at startup.
     context: Option<AiContextStore>,
+    /// Optional blob store, enabling the agentic loop's `read_attachment` tool to
+    /// pull a text attachment's bytes (方向三 file RAG). `None` ⇒ the tool isn't
+    /// offered and the agent works from message text alone.
+    blob_store: Option<Arc<dyn aero_storage::BlobStore>>,
 }
 
 impl AiService {
@@ -163,7 +167,24 @@ impl AiService {
         rooms: RoomRepo,
         context: Option<AiContextStore>,
     ) -> Self {
-        Self { anthropic, embedder, transcriber, ai_jobs, messages, rooms, context }
+        Self {
+            anthropic,
+            embedder,
+            transcriber,
+            ai_jobs,
+            messages,
+            rooms,
+            context,
+            blob_store: None,
+        }
+    }
+
+    /// Attach a blob store so the agentic answer loop can read text attachments
+    /// (方向三). Builder-style; composes with [`Self::new`] / [`Self::from_env`].
+    #[must_use]
+    pub fn with_blob_store(mut self, blob_store: Arc<dyn aero_storage::BlobStore>) -> Self {
+        self.blob_store = Some(blob_store);
+        self
     }
 
     /// Construct from env: Anthropic optional, embedder picks Voyage if configured
@@ -452,12 +473,16 @@ impl AiService {
         let Some(client) = self.anthropic.clone() else {
             return self.answer_question_with_usage(room, q, 8).await;
         };
-        let tool = Arc::new(SearchMessagesTool {
+        let search_tool = Arc::new(SearchMessagesTool {
             svc: Arc::clone(self),
             room,
             seen: std::sync::Mutex::new(Vec::new()),
         });
-        let tools: Vec<Arc<dyn crate::agent::AgentTool>> = vec![tool.clone()];
+        let mut tools: Vec<Arc<dyn crate::agent::AgentTool>> = vec![search_tool.clone()];
+        // Offer attachment reading only when a blob store is wired (方向三 file RAG).
+        if self.blob_store.is_some() {
+            tools.push(Arc::new(ReadAttachmentTool { svc: Arc::clone(self), room }));
+        }
         let outcome = crate::agent::run_agent_loop(
             client.as_ref(),
             &tools,
@@ -470,7 +495,7 @@ impl AiService {
         // Dedup citations in first-seen order.
         let mut deduped = Vec::new();
         {
-            let seen = tool.seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let seen = search_tool.seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let mut set = std::collections::HashSet::new();
             for id in seen.iter() {
                 if set.insert(*id) {
@@ -1089,7 +1114,8 @@ fn render_transcript(messages: &[Message]) -> String {
 /// via the tool before answering, and to cite the ids it relied on.
 const AGENT_SYSTEM_PROMPT: &str = "\
 你是聊天室里的智能助手。回答前,请使用 `search_messages` 工具检索本房间的历史消息以获取依据;\
-必要时可用不同关键词多次检索。只依据检索到的上下文作答,引用所依据消息的 id;若信息不足,如实说明。";
+必要时可用不同关键词多次检索。若某条消息带有文本附件且与问题相关,可用 `read_attachment` 读取其内容。\
+只依据检索到的上下文作答,引用所依据消息的 id;若信息不足,如实说明。";
 
 /// A room-scoped retrieval tool for the agentic answer loop. The model calls it
 /// with a `query`; it runs the same hybrid (vector + FTS) retrieval as the one-shot
@@ -1137,6 +1163,95 @@ impl crate::agent::AgentTool for SearchMessagesTool {
                 }
             }
             Err(e) => format!("error: 检索失败: {e}"),
+        }
+    }
+}
+
+/// Max attachment bytes the agent will pull into context (256 KiB).
+const MAX_ATTACHMENT_BYTES: usize = 256 * 1024;
+
+/// Decode an attachment's bytes as text, or `None` when it isn't readable text:
+/// empty, over `cap`, not valid UTF-8, or "binary" (more than ~1% non-whitespace
+/// control characters). Pure — no MIME needed; the readable/binary call is unit-
+/// tested directly. This is the dependency-free slice of file RAG (text/markdown/
+/// csv/json/source); PDF/Office extraction needs a parser and is out of scope.
+fn extract_text(bytes: &[u8], cap: usize) -> Option<String> {
+    if bytes.is_empty() || bytes.len() > cap {
+        return None;
+    }
+    let s = std::str::from_utf8(bytes).ok()?;
+    let total = s.chars().count().max(1);
+    let control = s
+        .chars()
+        .filter(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
+        .count();
+    if control * 100 > total {
+        return None;
+    }
+    Some(s.to_string())
+}
+
+/// Agentic tool: read a text attachment on a message in this room. Scoped to
+/// `room` and authz-checked (the message must belong to it) so the agent can read
+/// nothing the asker couldn't. Binary / oversized / non-text attachments return an
+/// explanation rather than bytes.
+struct ReadAttachmentTool {
+    svc: Arc<AiService>,
+    room: RoomId,
+}
+
+#[async_trait::async_trait]
+impl crate::agent::AgentTool for ReadAttachmentTool {
+    fn definition(&self) -> crate::anthropic::ToolDef {
+        crate::anthropic::ToolDef {
+            name: "read_attachment".into(),
+            description: "读取本房间某条消息的文本附件内容(纯文本/markdown/csv/json/代码等)。\
+输入消息 id;若该消息无文件附件、或附件为二进制 / 过大则返回说明。"
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "message_id": { "type": "string", "description": "含附件的消息 id" }
+                },
+                "required": ["message_id"]
+            }),
+        }
+    }
+
+    async fn run(&self, input: &serde_json::Value) -> String {
+        let Some(store) = self.svc.blob_store.as_ref() else {
+            return "error: 附件读取未启用".to_string();
+        };
+        let raw = input.get("message_id").and_then(serde_json::Value::as_str).unwrap_or("").trim();
+        let Ok(mid) = raw.parse::<MessageId>() else {
+            return "error: 无效的 message_id".to_string();
+        };
+        // Authz: resolve the message and require it to belong to THIS room.
+        let msg = match self.svc.messages.get(mid).await {
+            Ok(Some(m)) if m.room_id == self.room => m,
+            Ok(Some(_)) => return "error: 该消息不属于当前房间".to_string(),
+            Ok(None) => return "error: 未找到该消息".to_string(),
+            Err(e) => return format!("error: 查询失败: {e}"),
+        };
+        let file = msg.blocks.iter().find_map(|b| match b {
+            aero_common::Block::File { blob_id, name, size, .. } => {
+                Some((*blob_id, name.clone(), *size))
+            }
+            _ => None,
+        });
+        let Some((blob_id, name, size)) = file else {
+            return "（该消息没有文件附件。）".to_string();
+        };
+        if size > MAX_ATTACHMENT_BYTES as u64 {
+            return format!("（附件 '{name}' 过大,未读取。）");
+        }
+        let bytes = match store.get(blob_id).await {
+            Ok(b) => b,
+            Err(e) => return format!("error: 读取附件失败: {e}"),
+        };
+        match extract_text(&bytes, MAX_ATTACHMENT_BYTES) {
+            Some(text) => format!("附件 '{name}' 内容:\n{text}"),
+            None => format!("（附件 '{name}' 不是可读文本(二进制或过大)。）"),
         }
     }
 }
@@ -1462,6 +1577,32 @@ mod tests {
     use super::*;
     use aero_common::{Block, ParticipantId};
     use time::OffsetDateTime;
+
+    #[test]
+    fn extract_text_accepts_utf8_within_cap() {
+        let md = "# Title\n\nsome **markdown** body, csv-ish: a,b,c\n中文也行\n";
+        assert_eq!(extract_text(md.as_bytes(), 64 * 1024).as_deref(), Some(md));
+    }
+
+    #[test]
+    fn extract_text_rejects_empty_oversized_and_binary() {
+        // Empty.
+        assert_eq!(extract_text(b"", 1024), None);
+        // Over the cap.
+        assert_eq!(extract_text(&vec![b'a'; 2048], 1024), None);
+        // Invalid UTF-8 (a lone continuation byte) ⇒ not text.
+        assert_eq!(extract_text(&[0xff, 0xfe, 0x00, 0x01], 1024), None);
+        // Valid UTF-8 but full of NUL control bytes ⇒ treated as binary.
+        assert_eq!(extract_text(&[0u8; 64], 1024), None);
+    }
+
+    #[test]
+    fn extract_text_allows_whitespace_controls() {
+        // Tabs / newlines / carriage returns are normal in text and don't trip the
+        // binary heuristic.
+        let s = "line1\r\n\tindented\nline3\n";
+        assert_eq!(extract_text(s.as_bytes(), 1024).as_deref(), Some(s));
+    }
 
     #[tokio::test]
     async fn moderate_without_anthropic_makes_no_paid_call_and_no_usage() {
