@@ -228,6 +228,9 @@ fn xml_to_text(xml: &[u8]) -> String {
             i += rel + 1;
             // Determine tag kind + local name.
             let is_close = tag.starts_with('/');
+            // A self-closing tag (`<w:t/>`) ends with '/' and has no content; it must
+            // not toggle `in_text` on (else sibling chardata is over-captured).
+            let is_self_closing = tag.ends_with('/');
             let raw = tag.trim_start_matches('/');
             // local name = after optional "prefix:", up to whitespace or '/'.
             let local = raw
@@ -238,7 +241,9 @@ fn xml_to_text(xml: &[u8]) -> String {
                 .next()
                 .unwrap_or("");
             match local {
-                "t" => in_text = !is_close, // open → collect; close → stop
+                // open → collect; close → stop; self-closing `<w:t/>` → no-op (empty).
+                "t" if !is_self_closing => in_text = !is_close,
+                "t" => {}
                 "p" | "br" | "cr" => {
                     if !out.ends_with('\n') {
                         out.push('\n');
@@ -622,6 +627,17 @@ mod tests {
         let xml = br#"<w:p><w:t>a&lt;b &#65;&#x42; &amp; c</w:t></w:p>"#;
         let t = xml_to_text(xml);
         assert!(t.contains("a<b AB & c"), "{t:?}");
+    }
+
+    #[test]
+    fn xml_to_text_self_closing_text_element_does_not_overcapture() {
+        // A self-closing <w:t/> is empty; it must NOT flip into text mode and slurp
+        // the following non-text markup/whitespace as if it were inside <w:t>.
+        let xml = br#"<w:p><w:t/></w:p><w:p><w:r><w:rPr/></w:r><w:t>real</w:t></w:p>"#;
+        let t = xml_to_text(xml);
+        assert!(t.contains("real"), "real text captured: {t:?}");
+        // The <w:rPr/> run-properties element must not appear as captured text.
+        assert!(!t.contains("rPr"), "no markup leaked into text: {t:?}");
     }
 
     #[test]
