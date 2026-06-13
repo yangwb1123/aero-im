@@ -490,6 +490,8 @@ async fn main() -> anyhow::Result<()> {
             .ok().and_then(|s| s.parse::<i64>().ok()).unwrap_or(7);
         let webhook_log_retention_days = std::env::var("AERO__SERVER__WEBHOOK_LOG_RETENTION_DAYS")
             .ok().and_then(|s| s.parse::<i64>().ok()).unwrap_or(30);
+        let search_click_retention_days = std::env::var("AERO__SERVER__SEARCH_CLICK_RETENTION_DAYS")
+            .ok().and_then(|s| s.parse::<i64>().ok()).unwrap_or(90);
         // stream_viewer_samples is a 30s firehose: keep raw briefly, then roll up
         // to per-minute buckets (kept long — the rows are tiny). 0 raw-days
         // disables the rollup sweep entirely.
@@ -633,6 +635,17 @@ async fn main() -> anyhow::Result<()> {
                                     Ok(0) => {}
                                     Ok(n) => info!(swept = n, "terminal webhook deliveries purged"),
                                     Err(e) => warn!(error = ?e, "webhook delivery-log retention sweep failed"),
+                                }
+                            }
+                            if search_click_retention_days > 0 {
+                                let cutoff = now - time::Duration::days(search_click_retention_days);
+                                match aero_storage::SearchFeedbackRepo::new(lifecycle_pool.clone())
+                                    .sweep_before(cutoff)
+                                    .await
+                                {
+                                    Ok(0) => {}
+                                    Ok(n) => info!(swept = n, "old search click events purged"),
+                                    Err(e) => warn!(error = ?e, "search-click retention sweep failed"),
                                 }
                             }
                             // stream_viewer_samples tiered rollup + downsample

@@ -16,17 +16,19 @@
 use std::str::FromStr;
 
 use aero_auth::AuthUser;
-use aero_common::{Error as AeroError, WorkspaceId};
-use aero_storage::{parse_search_query, AdvancedSearchRepo, SearchCursor};
+use aero_common::{Error as AeroError, MessageId, WorkspaceId};
+use aero_storage::{parse_search_query, AdvancedSearchRepo, SearchCursor, SearchFeedbackRepo};
 use axum::{extract::State, routing::post, Json, Router};
 use serde::Deserialize;
 
 use crate::error::ApiResult;
 use crate::state::AppState;
 
-/// The advanced cross-room search route, ready to `.merge` into the gateway router.
+/// The advanced cross-room search routes, ready to `.merge` into the gateway router.
 pub fn routes() -> Router<AppState> {
-    Router::new().route("/api/search/advanced", post(search_advanced))
+    Router::new()
+        .route("/api/search/advanced", post(search_advanced))
+        .route("/api/search/click", post(search_click))
 }
 
 /// Default number of hits returned when the caller omits `limit` (mirrors
@@ -117,4 +119,46 @@ async fn search_advanced(
             })
         }).collect::<Vec<_>>(),
     })))
+}
+
+#[derive(Deserialize)]
+struct SearchClickReq {
+    /// The raw query whose result list was clicked (echoed from the search call).
+    query: String,
+    /// The message id of the clicked result.
+    result_id: String,
+    /// The clicked result's 0-based rank in the list (0 = top hit).
+    rank: i32,
+    /// Optional tenant scope; absent ⇒ [`DEFAULT_WORKSPACE_ID`].
+    #[serde(default)]
+    workspace_id: Option<String>,
+}
+
+/// `POST /api/search/click` — record a search-result click-through, the data
+/// foundation for relevance analytics / learning-to-rank (ROADMAP5 方向三 P2).
+/// Stores the (normalized) query, the opened message, and its rank; aggregates
+/// (CTR / MRR) are computed elsewhere over the log. Best-effort from the client's
+/// view — a malformed result id is the only hard error.
+async fn search_click(
+    State(s): State<AppState>,
+    auth: AuthUser,
+    Json(req): Json<SearchClickReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let result_id = MessageId::from_str(req.result_id.trim())
+        .map_err(|e| AeroError::Invalid(format!("result_id: {e}")))?;
+    let workspace = match req.workspace_id.as_deref() {
+        Some(raw) => WorkspaceId::from_str(raw.trim())
+            .map_err(|e| AeroError::Invalid(format!("workspace id: {e}")))?,
+        None => DEFAULT_WORKSPACE_ID,
+    };
+    // Record the normalized free-text terms (the operators aren't part of the
+    // relevance signal), so CTR aggregates group equivalent queries together.
+    let terms = parse_search_query(&req.query).terms;
+
+    SearchFeedbackRepo::new(s.pg.clone())
+        .record_click(auth.participant_id, workspace, &terms, result_id, req.rank)
+        .await
+        .map_err(AeroError::from)?;
+
+    Ok(Json(serde_json::json!({ "recorded": true })))
 }
