@@ -53,6 +53,22 @@ pub fn can_access_room(is_workspace_member: bool, is_room_member: bool) -> bool 
     is_workspace_member && is_room_member
 }
 
+/// Fingerprint a message's content for the behavioral spam guard's duplicate /
+/// cross-room-blast detection. Identical block content hashes identically within a
+/// process (a non-stable-across-runs `DefaultHasher` is fine — the guard is
+/// per-process and short-window).
+fn spam_content_hash(blocks: &[Block]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    match serde_json::to_string(blocks) {
+        Ok(s) => s.hash(&mut h),
+        // Should never fail for Block; fall back to length so distinct-size
+        // messages still differ.
+        Err(_) => blocks.len().hash(&mut h),
+    }
+    h.finish()
+}
+
 /// Whether a workspace member may join a channel given (a) it is public
 /// (not private) and (b) it is not archived. Both must hold: a private or
 /// archived channel is not openly joinable. Pure decision function, unit-tested
@@ -201,6 +217,11 @@ pub struct ImService {
     workspace_notif_defaults: Option<WorkspaceNotifDefaultsRepo>,
     bus: Arc<dyn BusSink>,
     moderator: Arc<dyn Moderator>,
+    /// Optional behavioral spam/flood guard (ROADMAP5 方向五). When wired,
+    /// [`send_message`](Self::send_message) throttles a sender whose recent send
+    /// behaviour (rate / same-content cross-room blast / duplicates) crosses the
+    /// thresholds. `None` = no behavioural throttling.
+    spam_guard: Option<Arc<crate::SpamGuard>>,
     /// Per-subject event-seq source for publish-time `"seq"` stamping (ROADMAP
     /// 第三版 方向一). Defaults to the process-local [`LocalSeqProvider`];
     /// clustered deployments wire the Redis `INCR`-backed
@@ -256,6 +277,7 @@ impl ImService {
             workspace_notif_defaults: None,
             bus: bus as Arc<dyn BusSink>,
             moderator,
+            spam_guard: None,
             seq: Arc::new(LocalSeqProvider::new()),
         }
     }
@@ -264,6 +286,14 @@ impl ImService {
     #[must_use]
     pub fn with_moderator(mut self, moderator: Arc<dyn Moderator>) -> Self {
         self.moderator = moderator;
+        self
+    }
+
+    /// Wire a behavioral spam/flood guard (ROADMAP5 方向五). Additive — without it
+    /// `send_message` does no behavioural throttling.
+    #[must_use]
+    pub fn with_spam_guard(mut self, guard: Arc<crate::SpamGuard>) -> Self {
+        self.spam_guard = Some(guard);
         self
     }
 
@@ -507,6 +537,7 @@ impl ImService {
             workspace_notif_defaults: None,
             bus,
             moderator: Arc::new(crate::moderator::AllowAllModerator),
+            spam_guard: None,
             seq: Arc::new(LocalSeqProvider::new()),
         }
     }
@@ -998,6 +1029,20 @@ impl ImService {
         validate_blocks(&blocks)?;
         if let ModerationVerdict::Block(reason) = self.moderator.check(&blocks) {
             return Err(Error::Invalid(reason));
+        }
+
+        // Behavioral spam/flood guard (ROADMAP5 方向五): catch a sender blasting
+        // clean-worded content that the content moderator can't see — by rate,
+        // same-content cross-room fan-out, or duplicates over a short window.
+        // Throttled sends are dropped with 429 (the attempt still counts).
+        if let Some(guard) = self.spam_guard.as_ref() {
+            let content_hash = spam_content_hash(&blocks);
+            if let crate::SpamDecision::Throttle(reason) =
+                guard.record(sender, room, content_hash, std::time::Instant::now())
+            {
+                tracing::warn!(%sender, %room, ?reason, "behavioral spam guard throttled a message");
+                return Err(Error::RateLimited);
+            }
         }
 
         // Workspace-level auto-mod rules check (ROADMAP10 migration 0111).

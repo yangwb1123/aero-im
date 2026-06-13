@@ -172,7 +172,7 @@ async fn main() -> anyhow::Result<()> {
     // `with_workspaces` wires the tenant repo so the workspace-scoped methods
     // (`create_room_in_workspace`, `assert_room_access`) have their backing store;
     // without it they return an internal error instead of enforcing tenancy.
-    let im = Arc::new(
+    let mut im_svc =
         ImService::new(
             rooms.clone(),
             messages.clone(),
@@ -206,8 +206,17 @@ async fn main() -> anyhow::Result<()> {
         // ROADMAP12: workspace default notification level for new channel joins.
         .with_workspace_notif_defaults(WorkspaceNotifDefaultsRepo::new(pg.clone()))
         // ROADMAP 第三版 方向一: cluster-correct publish-time event-seq stamp.
-        .with_seq(seq_store.clone()),
-    );
+        .with_seq(seq_store.clone());
+    // ROADMAP5 方向五: opt-in behavioral spam/flood guard (env `AERO_SPAM_GUARD`).
+    // Throttles a sender blasting clean-worded content by rate / same-content
+    // cross-room fan-out / duplicates — patterns the content moderator can't see.
+    if std::env::var("AERO_SPAM_GUARD").is_ok() {
+        im_svc = im_svc.with_spam_guard(Arc::new(aero_im_core::SpamGuard::new(
+            aero_im_core::SpamThresholds::default(),
+        )));
+        info!("behavioral spam guard enabled (AERO_SPAM_GUARD)");
+    }
+    let im = Arc::new(im_svc);
 
     // ---------- Live service (danmaku / gifts / viewers) ----------
     let live = LiveService::new(

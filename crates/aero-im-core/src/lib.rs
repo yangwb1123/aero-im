@@ -17,10 +17,12 @@ mod events;
 mod moderator;
 mod seq;
 mod service;
+mod spam_guard;
 mod validation;
 
 pub use events::ImEvent;
 pub use moderator::{AllowAllModerator, KeywordModerator, Moderator, ModerationVerdict};
+pub use spam_guard::{SpamDecision, SpamGuard, SpamReason, SpamThresholds};
 pub use seq::{LocalSeqProvider, SeqProvider};
 pub use service::{
     can_access_room, can_create_channel, can_join_public_channel, post_allowed, BusSink, ImService,
