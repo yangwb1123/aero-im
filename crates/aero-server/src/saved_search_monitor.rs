@@ -33,6 +33,15 @@ const SEARCH_LIMIT: i64 = 100;
 /// nothing — so turning monitoring on never backfills the entire history.
 /// Best-effort callers ignore the count; it exists for tests/metrics.
 ///
+/// Cursor semantics & a known best-effort edge: the cursor is `created_at`-based.
+/// A message whose inserting transaction sets `created_at` before this run but
+/// COMMITS after the search's MVCC snapshot (a long write transaction) could be
+/// missed when the cursor advances past its timestamp. Chat messages commit
+/// promptly, so this is a rare, accepted limitation of a 5-minute-poll digest —
+/// the match remains findable via the search itself; only the proactive ping is
+/// best-effort. A monotonic-on-commit cursor (message seq) would close it but is
+/// out of scope here.
+///
 /// # Errors
 /// Propagates a [`sqlx::Error`] from any of the underlying repo calls. The caller
 /// (the dispatcher loop) logs and swallows so one bad search never wedges the run.
@@ -42,6 +51,7 @@ pub async fn process_monitored_search(
     saved: &SavedSearchRepo,
     item: &MonitoredSearch,
     now: time::OffsetDateTime,
+    cap: usize,
 ) -> Result<usize, sqlx::Error> {
     // First-ever run: set the baseline cursor and notify nothing.
     let Some(since) = item.last_run_at else {
@@ -49,20 +59,31 @@ pub async fn process_monitored_search(
         return Ok(0);
     };
 
-    let parsed = aero_storage::parse_search_query(&item.query);
+    // Scope the search to messages created after the cursor by injecting `since`
+    // as the query's `after_ts` lower bound (taking the LATER of the cursor and
+    // any `since:` operator the user already wrote). This is what makes the
+    // monitor correct under load: without it the relevance-ordered top-N could be
+    // entirely OLD high-score matches, hiding a genuinely new one behind the cap.
+    // With it, every hit the search returns is already new, so the cap only ever
+    // trims among new matches.
+    let mut parsed = aero_storage::parse_search_query(&item.query);
+    parsed.after_ts = Some(parsed.after_ts.map_or(since, |user| user.max(since)));
     let hits = search_repo
         .search(item.owner, item.workspace, &parsed, SEARCH_LIMIT)
         .await?;
 
-    // Only matches created strictly after the last run are "new". The search
-    // orders by relevance, so sort the new ones oldest-first for a natural inbox
-    // order, then cap.
-    let mut fresh: Vec<_> =
-        hits.into_iter().filter(|h| h.message.created_at > since).collect();
+    // `after_ts` is inclusive (`>= since`); exclude the exact boundary so a
+    // message created at the previous run's instant is never re-notified. Sort
+    // oldest-first so the inbox reads chronologically and the cap (if hit) keeps
+    // the OLDEST unseen — the rest are caught on the next tick (see the cursor
+    // logic below), never silently dropped.
+    let mut fresh: Vec<_> = hits.into_iter().filter(|h| h.message.created_at > since).collect();
     fresh.sort_by_key(|h| h.message.created_at);
 
-    let mut inserted = 0usize;
-    for hit in fresh.into_iter().take(MAX_NOTIFICATIONS_PER_RUN) {
+    let capped = fresh.len() > cap;
+    let to_notify: Vec<_> = fresh.into_iter().take(cap).collect();
+    let mut last_notified_at = None;
+    for hit in &to_notify {
         notifications
             .insert(
                 item.owner,
@@ -72,13 +93,17 @@ pub async fn process_monitored_search(
                 Some(hit.message.sender_id),
             )
             .await?;
-        inserted += 1;
+        last_notified_at = Some(hit.message.created_at);
     }
 
-    // Advance the cursor regardless of how many we notified, so the next tick
-    // only considers messages newer than this run.
-    saved.mark_run(item.id, item.owner, now).await?;
-    Ok(inserted)
+    // Advance the cursor. Normally to `now` (all new matches drained). But when we
+    // hit the per-run cap, advance ONLY to the last message we actually notified —
+    // so the not-yet-notified newer matches are picked up next tick rather than
+    // skipped over. (`now` would jump past them; the un-notified flood would be
+    // lost.) `last_notified_at` is always Some here when `capped`.
+    let cursor = if capped { last_notified_at.unwrap_or(now) } else { now };
+    saved.mark_run(item.id, item.owner, cursor).await?;
+    Ok(to_notify.len())
 }
 
 /// Background loop: every `interval_secs`, process every monitored saved search.
@@ -120,7 +145,16 @@ pub async fn run_saved_search_monitor(
         let now = time::OffsetDateTime::now_utc();
         let mut total = 0usize;
         for item in &monitored {
-            match process_monitored_search(&search_repo, &notifications, &saved, item, now).await {
+            match process_monitored_search(
+                &search_repo,
+                &notifications,
+                &saved,
+                item,
+                now,
+                MAX_NOTIFICATIONS_PER_RUN,
+            )
+            .await
+            {
                 Ok(n) => total += n,
                 Err(e) => {
                     tracing::warn!(error = ?e, saved_search = %item.id, "saved-search monitor: run failed");
@@ -230,7 +264,7 @@ mod db_tests {
             last_run_at: None,
         };
         let now0 = time::OffsetDateTime::now_utc();
-        let n0 = process_monitored_search(&search_repo, &notifications, &saved, &item0, now0)
+        let n0 = process_monitored_search(&search_repo, &notifications, &saved, &item0, now0, 20)
             .await
             .expect("baseline run");
         assert_eq!(n0, 0, "first-ever run only sets the baseline, notifies nothing");
@@ -257,7 +291,7 @@ mod db_tests {
             last_run_at: Some(now0),
         };
         let now1 = now0 + time::Duration::seconds(60);
-        let n1 = process_monitored_search(&search_repo, &notifications, &saved, &item1, now1)
+        let n1 = process_monitored_search(&search_repo, &notifications, &saved, &item1, now1, 20)
             .await
             .expect("delta run");
         assert_eq!(n1, 1, "exactly the one new-since-baseline match notifies");
@@ -279,6 +313,89 @@ mod db_tests {
         sqlx::query("DELETE FROM saved_searches WHERE participant_id = $1").bind(owner.to_uuid()).execute(&p).await.ok();
         for m in [old.id, fresh.id] {
             sqlx::query("DELETE FROM messages WHERE id = $1").bind(m.to_uuid()).execute(&p).await.ok();
+        }
+        sqlx::query("DELETE FROM room_members WHERE room_id = $1").bind(r.to_uuid()).execute(&p).await.ok();
+        sqlx::query("DELETE FROM rooms WHERE id = $1").bind(r.to_uuid()).execute(&p).await.ok();
+        sqlx::query("DELETE FROM participants WHERE id = $1").bind(owner.to_uuid()).execute(&p).await.ok();
+    }
+
+    /// When more new matches exist than the per-run cap, the run notifies `cap` of
+    /// them (oldest-first) and advances the cursor ONLY past those — so the rest
+    /// are picked up on the NEXT run rather than silently skipped. Guards the
+    /// no-data-loss property of the capped path.
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn cap_does_not_silently_drop_matches_drains_over_runs() {
+        let p = pool();
+        let ws = WorkspaceId(ulid::Ulid(0));
+        let search_repo = AdvancedSearchRepo::new(p.clone());
+        let notifications = NotificationRepo::new(p.clone());
+        let saved = SavedSearchRepo::new(p.clone());
+        let msgs = MessageRepo::new(p.clone());
+
+        let owner = participant(&p).await;
+        let r = room(&p, owner, ws).await;
+        let needle = format!("zqcaptoken{}", ParticipantId::new());
+
+        // Baseline cursor: everything below is "new" relative to it.
+        let base = time::OffsetDateTime::now_utc();
+
+        // Insert 3 matching messages with strictly increasing created_at (explicit,
+        // so the oldest-first ordering and cursor math are deterministic).
+        let mut ids = Vec::new();
+        for i in 0..3 {
+            let ts = base + time::Duration::seconds(i64::from(i) + 1);
+            let id = aero_common::MessageId::new();
+            sqlx::query(
+                "INSERT INTO messages (id, room_id, sender_id, blocks, searchable_text, created_at) \
+                 VALUES ($1,$2,$3,$4::jsonb,$5,$6)",
+            )
+            .bind(id.to_uuid())
+            .bind(r.to_uuid())
+            .bind(owner.to_uuid())
+            .bind(serde_json::json!([{ "type": "text", "content": format!("{needle} m{i}") }]).to_string())
+            .bind(format!("{needle} m{i}"))
+            .bind(ts)
+            .execute(&p)
+            .await
+            .expect("insert match");
+            ids.push(id);
+        }
+
+        let sid = saved.create(owner, ws, "cap", &needle).await.expect("create");
+        // Enable monitoring so the re-read via list_monitored() below finds it.
+        saved.set_notify_new(sid, owner, true).await.expect("enable monitoring");
+        let item = MonitoredSearch { id: sid, owner, workspace: ws, query: needle.clone(), last_run_at: Some(base) };
+
+        // Run 1 with cap=2: notifies the 2 OLDEST, cursor advances only to the 2nd.
+        let r1 = process_monitored_search(&search_repo, &notifications, &saved, &item, base + time::Duration::seconds(100), 2)
+            .await
+            .expect("run1");
+        assert_eq!(r1, 2, "first capped run notifies exactly the cap");
+
+        // Re-read the cursor and run again: the 3rd (un-notified) match is caught.
+        let monitored = saved.list_monitored().await.expect("list");
+        let item2 = monitored.into_iter().find(|m| m.id == sid).expect("still monitored");
+        let r2 = process_monitored_search(&search_repo, &notifications, &saved, &item2, base + time::Duration::seconds(200), 2)
+            .await
+            .expect("run2");
+        assert_eq!(r2, 1, "the next run drains the remaining match — none dropped");
+
+        // All 3 matches ended up notified across the two runs (no silent loss).
+        let inbox = notifications.list(owner, None, false, Some(50)).await.expect("inbox");
+        for id in &ids {
+            assert!(
+                inbox.iter().any(|n| n.message_id == *id
+                    && matches!(n.kind, aero_common::NotificationKind::SavedSearch)),
+                "match {id} was eventually notified",
+            );
+        }
+
+        // Cleanup.
+        sqlx::query("DELETE FROM notifications WHERE participant_id = $1").bind(owner.to_uuid()).execute(&p).await.ok();
+        sqlx::query("DELETE FROM saved_searches WHERE participant_id = $1").bind(owner.to_uuid()).execute(&p).await.ok();
+        for id in &ids {
+            sqlx::query("DELETE FROM messages WHERE id = $1").bind(id.to_uuid()).execute(&p).await.ok();
         }
         sqlx::query("DELETE FROM room_members WHERE room_id = $1").bind(r.to_uuid()).execute(&p).await.ok();
         sqlx::query("DELETE FROM rooms WHERE id = $1").bind(r.to_uuid()).execute(&p).await.ok();

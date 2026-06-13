@@ -45,6 +45,11 @@ pub fn routes() -> Router<AppState> {
 /// Default number of hits a saved-search run returns (mirrors [`crate::search`]).
 const RUN_LIMIT: i64 = 20;
 
+/// Per-owner cap on simultaneously-monitored saved searches (ROADMAP5 方向三 cost
+/// guard): each monitored search is a periodic cross-room query, so the standing
+/// set per user is bounded to keep the dispatcher's load proportionate.
+const MAX_MONITORED_PER_OWNER: i64 = 50;
+
 /// Build a [`SavedSearchRepo`] from shared state, over the shared pool.
 fn repo(s: &AppState) -> SavedSearchRepo {
     SavedSearchRepo::new(s.pg.clone())
@@ -136,6 +141,21 @@ async fn set_saved_search_monitor(
     Json(req): Json<MonitorReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let id = parse_saved_search(&id_str)?;
+    // Cap per-owner monitoring (cost guard): a single user can't turn an unbounded
+    // number of standing cross-room queries into periodic dispatcher load. Only
+    // checked when ENABLING — disabling is always allowed.
+    if req.enabled {
+        let active = repo(&s)
+            .count_monitored(auth.participant_id)
+            .await
+            .map_err(AeroError::from)?;
+        if active >= MAX_MONITORED_PER_OWNER {
+            return Err(AeroError::Invalid(format!(
+                "monitoring limit reached ({MAX_MONITORED_PER_OWNER} active saved searches); disable one first"
+            ))
+            .into());
+        }
+    }
     let updated = repo(&s)
         .set_notify_new(id, auth.participant_id, req.enabled)
         .await

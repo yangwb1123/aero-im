@@ -217,6 +217,26 @@ impl SavedSearchRepo {
         Ok(res.rows_affected() > 0)
     }
 
+    /// How many of `participant`'s saved searches currently have monitoring
+    /// enabled. Used to cap per-owner monitoring so a single user can't enable
+    /// thousands of standing cross-room queries and amplify the dispatcher's cost.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the query.
+    pub async fn count_monitored(
+        &self,
+        participant: ParticipantId,
+    ) -> Result<i64, sqlx::Error> {
+        let (n,): (i64,) = sqlx::query_as(
+            r"SELECT COUNT(*) FROM saved_searches
+               WHERE participant_id = $1 AND notify_new",
+        )
+        .bind(participant.to_uuid())
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(n)
+    }
+
     /// Every saved search with monitoring enabled (`notify_new = true`), across all
     /// owners — the work-list for the periodic digest dispatcher. Returns each
     /// search's id, owner, workspace, query, and prior `last_run_at` (the cursor
