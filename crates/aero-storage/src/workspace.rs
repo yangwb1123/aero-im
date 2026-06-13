@@ -653,6 +653,9 @@ impl WorkspaceRepo {
             "keyword_alerts",
             "message_reports",
             "saved_searches",
+            // workspace_id, no FK to workspaces (mig 0133, 第五版 search CTR) —
+            // would orphan analytics rows on workspace delete without this.
+            "search_click_events",
             "user_groups",
             "workspace_announcements",
             "workspace_deactivations",
