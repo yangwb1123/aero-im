@@ -22,9 +22,10 @@ use std::sync::Arc;
 
 use aero_auth::AuthUser;
 use aero_common::{Block, Error as AeroError, ParticipantKind, RoomEvent, RoomId, WebhookId};
+use aero_common::metrics::{self, names};
 use aero_storage::{
-    build_delivery, hash_token, generate_secret, generate_token, WebhookDeliveryRepo, WebhookRepo,
-    WebhookSender,
+    build_delivery, hash_token, generate_secret, generate_token, outcome_of, WebhookDeliveryRepo,
+    WebhookRepo, WebhookSender,
 };
 use axum::{
     extract::{Path, State},
@@ -342,6 +343,13 @@ async fn dispatch_event<S: WebhookSender + ?Sized>(
     let body = serde_json::to_value(event).unwrap_or(serde_json::Value::Null);
     let event_id = event_correlation_id(event);
     for target in targets {
+        // Circuit breaker: skip an endpoint whose breaker is open (it's been
+        // failing) until the cooldown elapses, so a chronically-down receiver isn't
+        // hammered on every event. A skip records no attempt and burns no connection.
+        if target.breaker.is_open_at(now) {
+            metrics::inc_counter(names::WEBHOOK_BREAKER_OPEN_SKIPS_TOTAL, 1);
+            continue;
+        }
         // Record the (first) attempt up front so even a crash mid-send leaves a
         // durable trace; attempts=1 after record_attempt.
         let delivery_id = match deliveries.record_attempt(target.id, event_id.as_deref()).await {
@@ -352,9 +360,10 @@ async fn dispatch_event<S: WebhookSender + ?Sized>(
             }
         };
         let delivery = build_delivery(&target.url, &target.secret, &body, now);
-        match sender.deliver(&delivery).await {
-            Ok(status) if is_success(status) => {
-                if let Err(e) = deliveries.mark_delivered(delivery_id, i32::from(status)).await {
+        let result = sender.deliver(&delivery).await;
+        match &result {
+            Ok(status) if is_success(*status) => {
+                if let Err(e) = deliveries.mark_delivered(delivery_id, i32::from(*status)).await {
                     warn!(error = ?e, %room, kind, "webhook delivery: mark_delivered failed");
                 }
             }
@@ -364,7 +373,7 @@ async fn dispatch_event<S: WebhookSender + ?Sized>(
                     .mark_failed_with_backoff(
                         delivery_id,
                         1,
-                        Some(i32::from(status)),
+                        Some(i32::from(*status)),
                         &format!("HTTP {status}"),
                     )
                     .await;
@@ -372,8 +381,16 @@ async fn dispatch_event<S: WebhookSender + ?Sized>(
             Err(e) => {
                 warn!(%room, kind, url = %target.url, error = %e, "webhook delivery failed");
                 let _ = deliveries
-                    .mark_failed_with_backoff(delivery_id, 1, None, &e)
+                    .mark_failed_with_backoff(delivery_id, 1, None, e)
                     .await;
+            }
+        }
+        // Fold the outcome into this endpoint's breaker; persist only on a change so
+        // a healthy endpoint (0 → 0 failures) writes nothing.
+        let next = target.breaker.after(outcome_of(&result), now);
+        if next != target.breaker {
+            if let Err(e) = repo.record_breaker(target.id, next).await {
+                warn!(error = ?e, hook = %target.id, "webhook breaker: persist failed");
             }
         }
     }
@@ -404,29 +421,48 @@ async fn redeliver<S: WebhookSender + ?Sized>(
             .await;
         return;
     };
+    // Circuit breaker: if the endpoint's breaker is open, defer this retry without
+    // sending (re-park with backoff) so the down receiver isn't hammered by the
+    // retry loop either. Sustained outages still park the delivery at `dead`.
+    if target.breaker.is_open_at(now) {
+        metrics::inc_counter(names::WEBHOOK_BREAKER_OPEN_SKIPS_TOTAL, 1);
+        let _ = deliveries
+            .mark_failed_with_backoff(delivery.id, delivery.attempts, None, "circuit breaker open")
+            .await;
+        return;
+    }
     // Re-build a fresh, freshly-signed delivery for `now` (the original body is not
     // retained; the signature would be stale anyway). We re-send an empty retry
     // marker body keyed by the recorded event_id so the receiver can correlate.
     let body = serde_json::json!({ "retry": true, "event_id": delivery.event_id });
     let built = build_delivery(&target.url, &target.secret, &body, now);
-    match sender.deliver(&built).await {
-        Ok(status) if is_success(status) => {
-            let _ = deliveries.mark_delivered(delivery.id, i32::from(status)).await;
+    let result = sender.deliver(&built).await;
+    match &result {
+        Ok(status) if is_success(*status) => {
+            let _ = deliveries.mark_delivered(delivery.id, i32::from(*status)).await;
         }
         Ok(status) => {
             let _ = deliveries
                 .mark_failed_with_backoff(
                     delivery.id,
                     delivery.attempts,
-                    Some(i32::from(status)),
+                    Some(i32::from(*status)),
                     &format!("HTTP {status}"),
                 )
                 .await;
         }
         Err(e) => {
             let _ = deliveries
-                .mark_failed_with_backoff(delivery.id, delivery.attempts, None, &e)
+                .mark_failed_with_backoff(delivery.id, delivery.attempts, None, e)
                 .await;
+        }
+    }
+    // A retry-loop attempt feeds the breaker too, so a persistently-failing endpoint
+    // stays open instead of being probed every retry tick.
+    let next = target.breaker.after(outcome_of(&result), now);
+    if next != target.breaker {
+        if let Err(e) = repo.record_breaker(target.id, next).await {
+            warn!(error = ?e, hook = %target.id, "webhook breaker: persist failed");
         }
     }
 }

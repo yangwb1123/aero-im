@@ -106,6 +106,11 @@ pub mod names {
     /// Gauge: AI jobs in `dead` status (exhausted retries). Non-zero means
     /// moderation / summarisation is silently failing; alert at threshold > 0.
     pub const AI_DEAD_LETTER_QUEUE_SIZE: &str = "aero_ai_dlq_size";
+    /// Counter: outgoing-webhook deliveries skipped because the endpoint's circuit
+    /// breaker was open (the endpoint has been failing). A sustained non-zero rate
+    /// means a chronically-down receiver — the breaker is shielding us from
+    /// hammering it (ROADMAP5 方向一).
+    pub const WEBHOOK_BREAKER_OPEN_SKIPS_TOTAL: &str = "aero_webhook_breaker_open_skips_total";
 
     // --- Live media ingest ---
     /// Gauge: active WHIP ingest sessions (WebRTC streams currently being ingested).

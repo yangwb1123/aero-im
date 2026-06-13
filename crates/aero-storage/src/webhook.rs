@@ -246,6 +246,116 @@ pub struct OutgoingTarget {
     pub id: WebhookId,
     pub url: String,
     pub secret: String,
+    /// Circuit-breaker state for this endpoint, loaded alongside the target so the
+    /// dispatcher can skip a tripped endpoint without a second query.
+    pub breaker: BreakerState,
+}
+
+// ----------------------------------------------------- Circuit breaker (pure)
+
+/// After this many consecutive failures the breaker opens (stops delivering until
+/// the cooldown elapses).
+pub const BREAKER_FAILURE_THRESHOLD: u32 = 5;
+/// First open lasts this long; each further half-open failure doubles it…
+pub const BREAKER_BASE_COOLDOWN_SECS: i64 = 60;
+/// …capped here so a chronically-dead endpoint is still probed ~hourly.
+pub const BREAKER_MAX_COOLDOWN_SECS: i64 = 3600;
+/// A 429 trips the breaker immediately (before the failure threshold) for at least
+/// this long — the endpoint explicitly asked us to slow down. Honors the *intent*
+/// of `Retry-After` using only the status code the sender already surfaces.
+pub const BREAKER_RATE_LIMIT_COOLDOWN_SECS: i64 = 120;
+
+/// How one delivery attempt looks to the breaker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliveryOutcome {
+    /// Any 2xx.
+    Success,
+    /// A transport error or a non-2xx that isn't 429.
+    Failure,
+    /// The endpoint returned 429 Too Many Requests. `retry_after_secs` is the
+    /// parsed `Retry-After` header when available (the current sender seam returns
+    /// only a status code, so this is `None` today — the logic already honors it).
+    RateLimited { retry_after_secs: Option<i64> },
+}
+
+/// Per-endpoint circuit-breaker state. Pure value type: every transition is a
+/// total function of the prior state, the outcome, and an injected `now`, so the
+/// whole state machine is unit-tested without a clock, DB, or network.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BreakerState {
+    /// Consecutive failures since the last success (reset to 0 on any 2xx).
+    pub failures: u32,
+    /// Unix seconds until which the breaker is open; `None` = closed. While `now`
+    /// is below this the dispatcher skips the endpoint.
+    pub open_until: Option<i64>,
+}
+
+impl BreakerState {
+    /// Is the breaker open at `now` (so the caller should SKIP sending)? Once
+    /// `open_until` has passed the breaker is *half-open*: this returns `false`, so
+    /// the caller sends exactly one probe whose outcome re-opens or closes it.
+    #[must_use]
+    pub fn is_open_at(&self, now: i64) -> bool {
+        matches!(self.open_until, Some(t) if now < t)
+    }
+
+    /// Fold one delivery outcome into the next state. Pure.
+    #[must_use]
+    pub fn after(self, outcome: DeliveryOutcome, now: i64) -> BreakerState {
+        match outcome {
+            // Any success fully closes the breaker.
+            DeliveryOutcome::Success => BreakerState { failures: 0, open_until: None },
+            // 429: back off immediately for the requested (or default) cooldown,
+            // regardless of how few failures preceded it.
+            DeliveryOutcome::RateLimited { retry_after_secs } => {
+                let cooldown = retry_after_secs
+                    .unwrap_or(BREAKER_RATE_LIMIT_COOLDOWN_SECS)
+                    .clamp(1, BREAKER_MAX_COOLDOWN_SECS);
+                BreakerState {
+                    failures: self.failures.saturating_add(1),
+                    open_until: Some(now + cooldown),
+                }
+            }
+            // Generic failure: count it; once we reach the threshold, open with an
+            // exponential cooldown by how far past the threshold we are (capped).
+            DeliveryOutcome::Failure => {
+                let failures = self.failures.saturating_add(1);
+                let open_until = if failures >= BREAKER_FAILURE_THRESHOLD {
+                    let over = (failures - BREAKER_FAILURE_THRESHOLD).min(6);
+                    let cooldown = (BREAKER_BASE_COOLDOWN_SECS << over).min(BREAKER_MAX_COOLDOWN_SECS);
+                    Some(now + cooldown)
+                } else {
+                    // Still below threshold: stay closed; the delivery-log layer's
+                    // own per-delivery backoff handles these early retries.
+                    None
+                };
+                BreakerState { failures, open_until }
+            }
+        }
+    }
+}
+
+/// Map a delivery result (the `WebhookSender::deliver` return) into the breaker's
+/// view of it. `Ok(2xx)` → success, `Ok(429)` → rate-limited, anything else →
+/// failure. Pure, so the classification is unit-tested directly.
+#[must_use]
+pub fn outcome_of(result: &Result<u16, String>) -> DeliveryOutcome {
+    match result {
+        Ok(s) if (200..300).contains(s) => DeliveryOutcome::Success,
+        Ok(429) => DeliveryOutcome::RateLimited { retry_after_secs: None },
+        Ok(_) | Err(_) => DeliveryOutcome::Failure,
+    }
+}
+
+/// Rebuild a [`BreakerState`] from its two stored columns. A negative
+/// `breaker_failures` (impossible under the schema's `DEFAULT 0`, but cheap to
+/// guard) clamps to 0; the timestamp becomes unix seconds.
+#[must_use]
+fn breaker_from_row(failures: i32, open_until: Option<time::OffsetDateTime>) -> BreakerState {
+    BreakerState {
+        failures: u32::try_from(failures).unwrap_or(0),
+        open_until: open_until.map(|t| t.unix_timestamp()),
+    }
 }
 
 /// Decide whether an outgoing hook with `filter` (its `events` array) should fire
@@ -432,8 +542,8 @@ impl WebhookRepo {
         room: RoomId,
         event_kind: &str,
     ) -> Result<Vec<OutgoingTarget>, sqlx::Error> {
-        let rows = sqlx::query_as::<_, (uuid::Uuid, String, String)>(
-            r"SELECT id, url, secret
+        let rows = sqlx::query_as::<_, (uuid::Uuid, String, String, i32, Option<time::OffsetDateTime>)>(
+            r"SELECT id, url, secret, breaker_failures, breaker_open_until
                FROM outgoing_webhooks
                WHERE room_id = $1
                  AND revoked_at IS NULL
@@ -445,10 +555,11 @@ impl WebhookRepo {
         .await?;
         Ok(rows
             .into_iter()
-            .map(|(id, url, secret)| OutgoingTarget {
+            .map(|(id, url, secret, failures, open_until)| OutgoingTarget {
                 id: WebhookId::from_uuid(id),
                 url,
                 secret,
+                breaker: breaker_from_row(failures, open_until),
             })
             .collect())
     }
@@ -476,19 +587,50 @@ impl WebhookRepo {
     /// # Errors
     /// Propagates any [`sqlx::Error`].
     pub async fn outgoing_target(&self, id: WebhookId) -> Result<Option<OutgoingTarget>, sqlx::Error> {
-        let row = sqlx::query_as::<_, (uuid::Uuid, String, String)>(
-            r"SELECT id, url, secret
+        let row = sqlx::query_as::<_, (uuid::Uuid, String, String, i32, Option<time::OffsetDateTime>)>(
+            r"SELECT id, url, secret, breaker_failures, breaker_open_until
                FROM outgoing_webhooks
                WHERE id = $1 AND revoked_at IS NULL",
         )
         .bind(id.to_uuid())
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(|(id, url, secret)| OutgoingTarget {
+        Ok(row.map(|(id, url, secret, failures, open_until)| OutgoingTarget {
             id: WebhookId::from_uuid(id),
             url,
             secret,
+            breaker: breaker_from_row(failures, open_until),
         }))
+    }
+
+    /// Persist a recomputed circuit-breaker state for one endpoint after a
+    /// delivery attempt. `open_until` is `None` when the breaker is closed.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`].
+    pub async fn record_breaker(
+        &self,
+        id: WebhookId,
+        state: BreakerState,
+    ) -> Result<(), sqlx::Error> {
+        let open_until = match state.open_until {
+            Some(secs) => Some(
+                time::OffsetDateTime::from_unix_timestamp(secs)
+                    .map_err(|e| sqlx::Error::Decode(Box::new(e)))?,
+            ),
+            None => None,
+        };
+        sqlx::query(
+            r"UPDATE outgoing_webhooks
+                 SET breaker_failures = $2, breaker_open_until = $3
+               WHERE id = $1",
+        )
+        .bind(id.to_uuid())
+        .bind(i32::try_from(state.failures).unwrap_or(i32::MAX))
+        .bind(open_until)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     /// Soft-revoke an outgoing webhook (idempotent). Returns whether a live row
@@ -629,6 +771,115 @@ mod tests {
         sender.deliver(&d).await.unwrap();
         assert_eq!(sender.calls().len(), 2);
     }
+
+    // ----- Circuit breaker (pure state machine) -----
+
+    #[test]
+    fn outcome_classifies_status_codes() {
+        assert_eq!(outcome_of(&Ok(200)), DeliveryOutcome::Success);
+        assert_eq!(outcome_of(&Ok(204)), DeliveryOutcome::Success);
+        assert_eq!(
+            outcome_of(&Ok(429)),
+            DeliveryOutcome::RateLimited { retry_after_secs: None }
+        );
+        assert_eq!(outcome_of(&Ok(500)), DeliveryOutcome::Failure);
+        assert_eq!(outcome_of(&Ok(404)), DeliveryOutcome::Failure);
+        assert_eq!(outcome_of(&Err("timeout".to_string())), DeliveryOutcome::Failure);
+    }
+
+    #[test]
+    fn breaker_stays_closed_below_threshold() {
+        let mut s = BreakerState::default();
+        // Up to THRESHOLD-1 failures: failures count climbs but the breaker is closed.
+        for n in 1..BREAKER_FAILURE_THRESHOLD {
+            s = s.after(DeliveryOutcome::Failure, 1000);
+            assert_eq!(s.failures, n);
+            assert!(s.open_until.is_none(), "closed below threshold");
+            assert!(!s.is_open_at(1000));
+        }
+    }
+
+    #[test]
+    fn breaker_opens_at_threshold_with_base_cooldown() {
+        let mut s = BreakerState::default();
+        for _ in 0..BREAKER_FAILURE_THRESHOLD {
+            s = s.after(DeliveryOutcome::Failure, 1000);
+        }
+        assert_eq!(s.failures, BREAKER_FAILURE_THRESHOLD);
+        assert_eq!(s.open_until, Some(1000 + BREAKER_BASE_COOLDOWN_SECS));
+        assert!(s.is_open_at(1000), "open right after tripping");
+        assert!(s.is_open_at(1000 + BREAKER_BASE_COOLDOWN_SECS - 1), "still open mid-cooldown");
+        assert!(!s.is_open_at(1000 + BREAKER_BASE_COOLDOWN_SECS), "half-open once elapsed");
+    }
+
+    #[test]
+    fn breaker_cooldown_grows_exponentially_and_caps() {
+        // One step past threshold is exactly 2× the base.
+        let two = BreakerState { failures: BREAKER_FAILURE_THRESHOLD, open_until: None }
+            .after(DeliveryOutcome::Failure, 0);
+        assert_eq!(two.open_until, Some(BREAKER_BASE_COOLDOWN_SECS * 2));
+        // Drive well past the threshold; the cooldown saturates at the max.
+        let mut s = BreakerState::default();
+        for _ in 0..20 {
+            s = s.after(DeliveryOutcome::Failure, 0);
+        }
+        assert_eq!(
+            s.open_until,
+            Some(BREAKER_MAX_COOLDOWN_SECS),
+            "cooldown saturates at the cap"
+        );
+    }
+
+    #[test]
+    fn success_fully_closes_the_breaker() {
+        let open = BreakerState { failures: 9, open_until: Some(5000) };
+        let closed = open.after(DeliveryOutcome::Success, 4000);
+        assert_eq!(closed, BreakerState { failures: 0, open_until: None });
+        assert!(!closed.is_open_at(4000));
+    }
+
+    #[test]
+    fn rate_limited_trips_immediately_before_threshold() {
+        // A single 429 from a healthy endpoint opens the breaker at once (the server
+        // explicitly asked us to slow down) — no need to reach the failure threshold.
+        let s = BreakerState::default().after(
+            DeliveryOutcome::RateLimited { retry_after_secs: None },
+            2000,
+        );
+        assert_eq!(s.failures, 1);
+        assert_eq!(s.open_until, Some(2000 + BREAKER_RATE_LIMIT_COOLDOWN_SECS));
+        assert!(s.is_open_at(2000));
+    }
+
+    #[test]
+    fn rate_limited_honors_retry_after_when_present() {
+        let s = BreakerState::default().after(
+            DeliveryOutcome::RateLimited { retry_after_secs: Some(900) },
+            0,
+        );
+        assert_eq!(s.open_until, Some(900));
+        // A retry-after beyond the cap is clamped.
+        let capped = BreakerState::default().after(
+            DeliveryOutcome::RateLimited { retry_after_secs: Some(99_999) },
+            0,
+        );
+        assert_eq!(capped.open_until, Some(BREAKER_MAX_COOLDOWN_SECS));
+    }
+
+    #[test]
+    fn half_open_probe_failure_reopens_longer() {
+        // Open at threshold (cooldown = base), elapse to half-open, then fail the
+        // probe → re-opens with a longer (2× base) cooldown.
+        let mut s = BreakerState::default();
+        for _ in 0..BREAKER_FAILURE_THRESHOLD {
+            s = s.after(DeliveryOutcome::Failure, 0);
+        }
+        let elapsed = BREAKER_BASE_COOLDOWN_SECS; // half-open boundary
+        assert!(!s.is_open_at(elapsed));
+        let reopened = s.after(DeliveryOutcome::Failure, elapsed);
+        assert_eq!(reopened.open_until, Some(elapsed + BREAKER_BASE_COOLDOWN_SECS * 2));
+        assert!(reopened.is_open_at(elapsed));
+    }
 }
 
 /// PG-gated integration tests (run with a live Postgres + applied migrations):
@@ -761,5 +1012,46 @@ mod db_tests {
         let on_message_after = repo.list_outgoing_for_room_event(room, "message").await.unwrap();
         assert_eq!(on_message_after.len(), 1);
         assert_eq!(on_message_after[0].url, "https://all.test");
+    }
+
+    /// The circuit-breaker columns (0129) round-trip: a fresh hook loads closed
+    /// (0 failures, no open_until); `record_breaker` persists an open state that
+    /// both load paths (`list_outgoing_for_room_event` + `outgoing_target`) read
+    /// back; a subsequent close clears it.
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn webhook_breaker_state_round_trips() {
+        let p = pool();
+        let repo = WebhookRepo::new(p.clone());
+        let (room, actor) = fixture(&p).await;
+
+        let secret = generate_secret();
+        let id = repo
+            .create_outgoing(room, "https://brk.test", &secret, &[], Some("brk"), actor)
+            .await
+            .unwrap();
+
+        // Fresh hook: breaker closed.
+        let fresh = repo.outgoing_target(id).await.unwrap().expect("target");
+        assert_eq!(fresh.breaker, BreakerState::default());
+        assert!(!fresh.breaker.is_open_at(1_000_000));
+
+        // Open it (5 failures, open until t=2_000_000) and read back via BOTH paths.
+        let open = BreakerState { failures: 5, open_until: Some(2_000_000) };
+        repo.record_breaker(id, open).await.unwrap();
+
+        let via_target = repo.outgoing_target(id).await.unwrap().expect("target");
+        assert_eq!(via_target.breaker, open);
+        assert!(via_target.breaker.is_open_at(1_999_999));
+        assert!(!via_target.breaker.is_open_at(2_000_000));
+
+        let via_list = repo.list_outgoing_for_room_event(room, "message").await.unwrap();
+        let hit = via_list.iter().find(|t| t.id == id).expect("listed");
+        assert_eq!(hit.breaker, open);
+
+        // Close it again (success) → both columns reset.
+        repo.record_breaker(id, BreakerState::default()).await.unwrap();
+        let closed = repo.outgoing_target(id).await.unwrap().expect("target");
+        assert_eq!(closed.breaker, BreakerState::default());
     }
 }
