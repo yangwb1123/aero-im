@@ -254,6 +254,20 @@ impl ParticipantRepo {
             "DELETE FROM password_history WHERE participant_id = $1",
             "DELETE FROM mls_key_packages WHERE participant_id = $1",
             "DELETE FROM scim_users WHERE participant_id = $1",
+            // Remaining personal preferences / own-state PII (no cross-user
+            // display depends on these, so deleting them breaks nothing for
+            // others — they are purely the erased user's own settings/history).
+            // Cross-user aggregates (reactions, poll_votes, read receipts on
+            // OTHERS' messages) are deliberately NOT deleted: once the participant
+            // row is tombstoned they are already de-identified, and removing them
+            // would silently rewrite other users' visible counts.
+            "DELETE FROM dnd_settings WHERE participant_id = $1",
+            "DELETE FROM channel_mutes WHERE participant_id = $1",
+            "DELETE FROM bookmarks WHERE participant_id = $1",
+            "DELETE FROM bookmark_collections WHERE participant_id = $1",
+            "DELETE FROM user_status WHERE participant_id = $1",
+            "DELETE FROM thread_read_state WHERE participant_id = $1",
+            "DELETE FROM ooo_auto_replies WHERE sender_id = $1",
         ] {
             sqlx::query(stmt).bind(participant_id.to_uuid()).execute(&mut *tx).await?;
         }
