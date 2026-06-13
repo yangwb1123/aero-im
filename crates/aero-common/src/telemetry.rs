@@ -9,7 +9,7 @@
 //! warning and falls back to stdout-only so telemetry can never take the process
 //! down. Must be called inside a Tokio runtime (the batch exporter spawns a task).
 
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, Layer};
 
 use crate::config::TelemetryConfig;
 
@@ -24,9 +24,25 @@ pub fn init(cfg: &TelemetryConfig, service_name: &'static str) -> TelemetryGuard
     let env_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&cfg.log_level));
 
-    let fmt_layer = tracing_subscriber::fmt::layer()
-        .with_target(true)
-        .with_level(true);
+    // `AERO_LOG_FORMAT=json` switches stdout to newline-delimited JSON that
+    // FLATTENS the current span's fields into each event (ROADMAP5 方向二) — so
+    // `request_id` (set on the per-request `http_request` span) and the active
+    // `trace_id`/`span_id` land in every structured log line, letting an operator
+    // pivot from an `x-request-id` to that request's logs and trace. Any other
+    // value (the default) keeps the human-readable console format for local dev.
+    let json_logs = std::env::var("AERO_LOG_FORMAT")
+        .map(|v| v.eq_ignore_ascii_case("json"))
+        .unwrap_or(false);
+    let fmt_layer = if json_logs {
+        tracing_subscriber::fmt::layer()
+            .json()
+            .with_current_span(true)
+            .with_span_list(false)
+            .with_target(true)
+            .boxed()
+    } else {
+        tracing_subscriber::fmt::layer().with_target(true).with_level(true).boxed()
+    };
 
     let registry = tracing_subscriber::registry().with(env_filter).with(fmt_layer);
 
@@ -110,6 +126,65 @@ pub fn set_span_parent_from_traceparent(span: &tracing::Span, traceparent: &str)
     let mut carrier = std::collections::HashMap::new();
     carrier.insert("traceparent".to_string(), traceparent.to_string());
     span.set_parent(extract_trace_context(&carrier));
+}
+
+#[cfg(test)]
+mod json_log_tests {
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::fmt::MakeWriter;
+
+    /// A `MakeWriter` that appends every log line to a shared buffer, so a test can
+    /// inspect exactly what the formatter wrote.
+    #[derive(Clone, Default)]
+    struct BufWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for BufWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for BufWriter {
+        type Writer = BufWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// The JSON formatter with `with_current_span(true)` FLATTENS the active span's
+    /// fields into each event line — so a `request_id` set on the enclosing
+    /// `http_request` span appears in the structured log, which is the whole point
+    /// of the `AERO_LOG_FORMAT=json` mode (an operator can pivot from an
+    /// `x-request-id` to that request's logs). Verified with a thread-local
+    /// subscriber so it neither needs nor disturbs the global `init`.
+    #[test]
+    fn json_logs_flatten_current_span_request_id() {
+        let buf = BufWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_current_span(true)
+            .with_span_list(false)
+            .with_writer(buf.clone())
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            let span = tracing::info_span!("http_request", request_id = "req-abc-123");
+            let _enter = span.enter();
+            tracing::info!(target: "test", "handled the request");
+        });
+
+        let out = String::from_utf8(buf.0.lock().unwrap().clone()).expect("utf8 log");
+        assert!(out.contains("request_id"), "span field key present in JSON: {out}");
+        assert!(out.contains("req-abc-123"), "span field value present in JSON: {out}");
+        assert!(out.contains("handled the request"), "the event message is present: {out}");
+        // It really is JSON (the event renders as an object with a "fields"/message).
+        assert!(out.trim_start().starts_with('{'), "line is a JSON object: {out}");
+    }
 }
 
 #[cfg(test)]
