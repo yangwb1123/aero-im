@@ -332,12 +332,23 @@ impl AiWorker {
         let p: AnswerPayload = serde_json::from_value(job.payload.clone())?;
         let room = parse_room_id(&p.room_id)?;
         let k = p.k.unwrap_or(8);
-        let (answer, usage) = self.svc.answer_question_with_usage(room, &p.question, k).await?;
+        // Opt-in agentic mode (方向三): the model drives its own room-scoped retrieval
+        // (search → refine → answer) instead of one fixed top-k. Off by default so
+        // the cheaper single-shot path stays the norm; agentic costs extra model turns.
+        let agentic = std::env::var("AERO_AGENTIC_ANSWERS")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let (answer, usage) = if agentic {
+            self.svc.answer_question_agentic(room, &p.question, 4).await?
+        } else {
+            self.svc.answer_question_with_usage(room, &p.question, k).await?
+        };
         let citations: Vec<String> = answer.citations.iter().map(MessageId::to_string).collect();
         let mut result = serde_json::json!({
             "answer": answer.answer,
             "citations": citations,
             "anthropic": self.svc.has_anthropic(),
+            "agentic": agentic,
         });
         attach_usage(&mut result, usage);
         Ok(result)

@@ -421,6 +421,66 @@ impl AiService {
         Ok((AnswerResult { answer: fallback, citations }, None))
     }
 
+    /// Agentic answer (方向三 "能动AI"): instead of one fixed retrieval, give the
+    /// model a room-scoped `search_messages` tool and let it search — possibly
+    /// several times with refined queries — before answering. Citations are the
+    /// (deduplicated) message ids the tool actually surfaced across the loop.
+    ///
+    /// Authz is safe by construction: the only tool is scoped to `room`, which the
+    /// caller is already a member of (the question is asked *in* that room), so the
+    /// agent can reach nothing the asker couldn't already read. Without an Anthropic
+    /// key it falls back to the one-shot [`Self::answer_question_with_usage`].
+    ///
+    /// Takes `Arc<Self>` because the tool holds a handle back to the service to run
+    /// retrieval. `max_iters` is clamped to a small bound so a misbehaving model
+    /// can't loop unboundedly (each iteration is a billed model call).
+    ///
+    /// # Errors
+    /// [`AiError::Invalid`] for an empty question; otherwise propagates model /
+    /// retrieval failures.
+    pub async fn answer_question_agentic(
+        self: &Arc<Self>,
+        room: RoomId,
+        question: &str,
+        max_iters: usize,
+    ) -> Result<(AnswerResult, Option<Usage>)> {
+        let q = question.trim();
+        if q.is_empty() {
+            return Err(AiError::Invalid("question must not be empty".into()));
+        }
+        // No key → no agency; fall back to the grounded one-shot answer.
+        let Some(client) = self.anthropic.clone() else {
+            return self.answer_question_with_usage(room, q, 8).await;
+        };
+        let tool = Arc::new(SearchMessagesTool {
+            svc: Arc::clone(self),
+            room,
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        let tools: Vec<Arc<dyn crate::agent::AgentTool>> = vec![tool.clone()];
+        let outcome = crate::agent::run_agent_loop(
+            client.as_ref(),
+            &tools,
+            AGENT_SYSTEM_PROMPT,
+            q,
+            max_iters.clamp(1, 6),
+            800,
+        )
+        .await?;
+        // Dedup citations in first-seen order.
+        let mut deduped = Vec::new();
+        {
+            let seen = tool.seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut set = std::collections::HashSet::new();
+            for id in seen.iter() {
+                if set.insert(*id) {
+                    deduped.push(*id);
+                }
+            }
+        }
+        Ok((AnswerResult { answer: outcome.answer, citations: deduped }, Some(outcome.usage)))
+    }
+
     /// Streaming variant of [`Self::answer_question`].
     ///
     /// Returns `(citations, stream)` where `citations` is available immediately
@@ -1025,6 +1085,62 @@ fn render_transcript(messages: &[Message]) -> String {
 
 /// Render search hits as a numbered context block with explicit IDs the LLM
 /// can cite. Keeps the score so the model can prefer higher-confidence rows.
+/// System prompt for the agentic answer loop: instruct the model to gather context
+/// via the tool before answering, and to cite the ids it relied on.
+const AGENT_SYSTEM_PROMPT: &str = "\
+你是聊天室里的智能助手。回答前,请使用 `search_messages` 工具检索本房间的历史消息以获取依据;\
+必要时可用不同关键词多次检索。只依据检索到的上下文作答,引用所依据消息的 id;若信息不足,如实说明。";
+
+/// A room-scoped retrieval tool for the agentic answer loop. The model calls it
+/// with a `query`; it runs the same hybrid (vector + FTS) retrieval as the one-shot
+/// path and records every surfaced message id so the caller can build citations.
+/// Scoped to a single `room` the asker already belongs to — no privilege widening.
+struct SearchMessagesTool {
+    svc: Arc<AiService>,
+    room: RoomId,
+    seen: std::sync::Mutex<Vec<MessageId>>,
+}
+
+#[async_trait::async_trait]
+impl crate::agent::AgentTool for SearchMessagesTool {
+    fn definition(&self) -> crate::anthropic::ToolDef {
+        crate::anthropic::ToolDef {
+            name: "search_messages".into(),
+            description: "检索本房间历史消息中与查询最相关的若干条(含消息 id 与相关度)。\
+回答前调用,可用不同关键词多次调用以补全依据。"
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "要检索的内容 / 关键词" }
+                },
+                "required": ["query"]
+            }),
+        }
+    }
+
+    async fn run(&self, input: &serde_json::Value) -> String {
+        let q = input.get("query").and_then(serde_json::Value::as_str).unwrap_or("").trim();
+        if q.is_empty() {
+            return "error: 'query' 不能为空".to_string();
+        }
+        match self.svc.retrieve_room(self.room, q, 6).await {
+            Ok(hits) => {
+                if let Ok(mut seen) = self.seen.lock() {
+                    seen.extend(hits.iter().map(|h| h.message.id));
+                }
+                let ctx = render_context(&hits);
+                if ctx.trim().is_empty() {
+                    "（未检索到相关消息。）".to_string()
+                } else {
+                    ctx
+                }
+            }
+            Err(e) => format!("error: 检索失败: {e}"),
+        }
+    }
+}
+
 fn render_context(hits: &[SearchHit]) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();

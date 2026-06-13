@@ -190,10 +190,57 @@ impl AnthropicClient {
             .into_iter()
             .filter_map(|b| match b {
                 ContentBlock::Text { text } => Some(text),
-                ContentBlock::Other => None,
+                ContentBlock::ToolUse { .. } | ContentBlock::Other => None,
             })
             .collect::<String>();
         Ok((text, usage))
+    }
+
+    /// One turn of a tool-use loop: send the conversation + advertised `tools` and
+    /// return the [`AgentTurn`] (any text + the `tool_use` blocks the model wants
+    /// run). The agent driver ([`crate::agent::run_agent_loop`]) executes the tools
+    /// and calls this again with the results appended.
+    ///
+    /// `messages` are raw Anthropic message objects (`{"role","content"}`) so the
+    /// driver can append assistant `tool_use` turns and user `tool_result` turns
+    /// without a rigid typed model; the driver owns that construction.
+    ///
+    /// # Errors
+    /// `AiError::Invalid` for empty `messages`; `AiError::Http`/`AiError::Anthropic`
+    /// on transport / non-2xx.
+    pub async fn complete_with_tools(
+        &self,
+        system: &str,
+        messages: &[serde_json::Value],
+        tools: &[ToolDef],
+        max_tokens: u32,
+    ) -> Result<AgentTurn> {
+        if messages.is_empty() {
+            return Err(AiError::Invalid("messages must not be empty".into()));
+        }
+        let body = serde_json::json!({
+            "model": self.model,
+            "max_tokens": max_tokens,
+            "system": system,
+            "messages": messages,
+            "tools": tools,
+        });
+        let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
+        let resp = self
+            .http
+            .post(&url)
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", API_VERSION)
+            .header("content-type", "application/json")
+            .json(&body)
+            .send()
+            .await?;
+        let status = resp.status();
+        let raw = resp.text().await?;
+        if !status.is_success() {
+            return Err(AiError::Anthropic { status: status.as_u16(), message: truncate(&raw, 1024) });
+        }
+        parse_agent_turn(&raw)
     }
 
     /// Stream the assistant's reply as text-delta chunks.
@@ -270,6 +317,61 @@ impl AnthropicClient {
     }
 }
 
+// ---------- tool-use (agentic loop) types ----------
+
+/// A tool advertised to the model in the `tools` array. `input_schema` is a JSON
+/// Schema object describing the tool's parameters (the model fills it in).
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolDef {
+    pub name: String,
+    pub description: String,
+    pub input_schema: serde_json::Value,
+}
+
+/// A `tool_use` block the model emitted: run `name` with `input`, then reply with
+/// a `tool_result` echoing `id` so the API can correlate the result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolUse {
+    pub id: String,
+    pub name: String,
+    pub input: serde_json::Value,
+}
+
+/// One assistant turn in a tool-use loop: any text it produced, the tool calls it
+/// wants executed (empty ⇒ it's done answering), and the real token [`Usage`].
+#[derive(Debug, Clone)]
+pub struct AgentTurn {
+    pub text: String,
+    pub tool_uses: Vec<ToolUse>,
+    pub usage: Usage,
+}
+
+impl AgentTurn {
+    /// True when the model requested no tools — the loop stops and uses `text`.
+    #[must_use]
+    pub fn is_final(&self) -> bool {
+        self.tool_uses.is_empty()
+    }
+}
+
+/// Parse a non-streaming Messages response into an [`AgentTurn`], splitting the
+/// content blocks into concatenated text + the ordered `tool_use` calls. Pure, so
+/// the tool-loop parsing is unit-tested against canned JSON without any HTTP.
+fn parse_agent_turn(raw: &str) -> Result<AgentTurn> {
+    let parsed: ResponseBody = serde_json::from_str(raw)?;
+    let usage = parsed.usage.unwrap_or_default();
+    let mut text = String::new();
+    let mut tool_uses = Vec::new();
+    for block in parsed.content {
+        match block {
+            ContentBlock::Text { text: t } => text.push_str(&t),
+            ContentBlock::ToolUse { id, name, input } => tool_uses.push(ToolUse { id, name, input }),
+            ContentBlock::Other => {}
+        }
+    }
+    Ok(AgentTurn { text, tool_uses, usage })
+}
+
 // ---------- wire types ----------
 
 #[derive(Serialize)]
@@ -295,6 +397,9 @@ struct ResponseBody {
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ContentBlock {
     Text { text: String },
+    /// A tool the model wants run — surfaced by [`AnthropicClient::complete_with_tools`]
+    /// for the agentic loop; ignored by the plain-text [`AnthropicClient::complete`] path.
+    ToolUse { id: String, name: String, input: serde_json::Value },
     #[serde(other)]
     Other,
 }
@@ -432,10 +537,61 @@ mod tests {
             .into_iter()
             .filter_map(|b| match b {
                 ContentBlock::Text { text } => Some(text),
-                ContentBlock::Other => None,
+                ContentBlock::ToolUse { .. } | ContentBlock::Other => None,
             })
             .collect::<String>();
         assert_eq!(joined, "Hello world");
+    }
+
+    #[test]
+    fn parse_agent_turn_splits_text_and_tool_calls() {
+        // A real tool-use response: interleaved text + two tool_use blocks.
+        let raw = r#"{
+            "content": [
+                {"type":"text","text":"let me check"},
+                {"type":"tool_use","id":"tu_1","name":"search","input":{"q":"deploys"}},
+                {"type":"tool_use","id":"tu_2","name":"clock","input":{}}
+            ],
+            "stop_reason": "tool_use",
+            "usage": {"input_tokens": 10, "output_tokens": 7}
+        }"#;
+        let turn = parse_agent_turn(raw).unwrap();
+        assert_eq!(turn.text, "let me check");
+        assert!(!turn.is_final(), "tool calls present ⇒ not final");
+        assert_eq!(turn.tool_uses.len(), 2);
+        assert_eq!(turn.tool_uses[0].id, "tu_1");
+        assert_eq!(turn.tool_uses[0].name, "search");
+        assert_eq!(turn.tool_uses[0].input["q"], "deploys");
+        assert_eq!(turn.tool_uses[1].name, "clock");
+        assert_eq!(turn.usage.input_tokens, 10);
+        assert_eq!(turn.usage.output_tokens, 7);
+    }
+
+    #[test]
+    fn parse_agent_turn_text_only_is_final() {
+        let raw = r#"{"content":[{"type":"text","text":"done"}],"stop_reason":"end_turn"}"#;
+        let turn = parse_agent_turn(raw).unwrap();
+        assert!(turn.is_final());
+        assert_eq!(turn.text, "done");
+        assert!(turn.tool_uses.is_empty());
+    }
+
+    #[test]
+    fn tool_def_serializes_to_anthropic_shape() {
+        let def = ToolDef {
+            name: "search_messages".into(),
+            description: "Search the room".into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": { "query": { "type": "string" } },
+                "required": ["query"]
+            }),
+        };
+        let json = serde_json::to_value(&def).unwrap();
+        assert_eq!(json["name"], "search_messages");
+        assert_eq!(json["description"], "Search the room");
+        assert_eq!(json["input_schema"]["type"], "object");
+        assert_eq!(json["input_schema"]["required"][0], "query");
     }
 
     #[test]
