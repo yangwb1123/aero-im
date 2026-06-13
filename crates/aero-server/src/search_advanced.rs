@@ -129,16 +129,18 @@ struct SearchClickReq {
     result_id: String,
     /// The clicked result's 0-based rank in the list (0 = top hit).
     rank: i32,
-    /// Optional tenant scope; absent ⇒ [`DEFAULT_WORKSPACE_ID`].
-    #[serde(default)]
-    workspace_id: Option<String>,
 }
 
 /// `POST /api/search/click` — record a search-result click-through, the data
 /// foundation for relevance analytics / learning-to-rank (ROADMAP5 方向三 P2).
 /// Stores the (normalized) query, the opened message, and its rank; aggregates
-/// (CTR / MRR) are computed elsewhere over the log. Best-effort from the client's
-/// view — a malformed result id is the only hard error.
+/// (CTR / MRR) are computed elsewhere over the log.
+///
+/// Tenancy: the workspace is **derived from the clicked message's room** (after
+/// verifying the caller is a member of that room), NOT taken from the request —
+/// so a caller can only record a click on a result they could actually see, and
+/// cannot poison another workspace's relevance metrics by spoofing a
+/// `workspace_id`. This mirrors the search path's `JOIN room_members` boundary.
 async fn search_click(
     State(s): State<AppState>,
     auth: AuthUser,
@@ -146,11 +148,32 @@ async fn search_click(
 ) -> ApiResult<Json<serde_json::Value>> {
     let result_id = MessageId::from_str(req.result_id.trim())
         .map_err(|e| AeroError::Invalid(format!("result_id: {e}")))?;
-    let workspace = match req.workspace_id.as_deref() {
-        Some(raw) => WorkspaceId::from_str(raw.trim())
-            .map_err(|e| AeroError::Invalid(format!("workspace id: {e}")))?,
-        None => DEFAULT_WORKSPACE_ID,
-    };
+
+    // Resolve the clicked message and verify the caller can see its room. A click
+    // on a result you couldn't have seen is either a stale id or an attempt to
+    // attribute a click to a room/workspace you don't belong to — both rejected.
+    let message = s
+        .messages
+        .get(result_id)
+        .await
+        .map_err(AeroError::from)?
+        .ok_or_else(|| AeroError::NotFound("result message not found".into()))?;
+    if !s
+        .rooms
+        .is_member(message.room_id, auth.participant_id)
+        .await
+        .map_err(AeroError::from)?
+    {
+        return Err(AeroError::Forbidden("not a member of the result's room".into()).into());
+    }
+    // Authoritative workspace: the result's room owns it (unspoofable).
+    let workspace = s
+        .rooms
+        .room_workspace(message.room_id)
+        .await
+        .map_err(AeroError::from)?
+        .unwrap_or(DEFAULT_WORKSPACE_ID);
+
     // Record the normalized free-text terms (the operators aren't part of the
     // relevance signal), so CTR aggregates group equivalent queries together.
     let terms = parse_search_query(&req.query).terms;
