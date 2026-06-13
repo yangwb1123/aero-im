@@ -2010,8 +2010,16 @@ impl ImService {
         // consumers deserialize `RoomEvent` with serde, which ignores the
         // unknown `"seq"` field (no event type uses `deny_unknown_fields`).
         let seq = self.seq.next_seq(&subject).await;
+        // Cross-bus trace continuity (ROADMAP5 方向二): carry the current span's W3C
+        // traceparent on the envelope so the consumer can nest its fan-out under the
+        // producer's trace. Like `seq`, it's a sibling key serde ignores on typed
+        // decode; `None` (no active trace) leaves the event untraced.
+        let traceparent = aero_common::telemetry::current_traceparent();
         let publish = async {
-            let bytes = aero_bus::stamped_event_bytes(event, seq)?;
+            let mut value = serde_json::to_value(event)?;
+            aero_bus::stamp_seq(&mut value, seq);
+            aero_bus::stamp_traceparent(&mut value, traceparent.as_deref());
+            let bytes = serde_json::to_vec(&value)?;
             self.bus.publish_bytes(&subject, bytes.into()).await
         };
         if let Err(err) = publish.await {

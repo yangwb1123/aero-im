@@ -17,5 +17,7 @@ pub mod seq;
 pub mod traits;
 
 pub use jetstream::{JetStreamBus, JetStreamConfig};
-pub use seq::{extract_seq, stamp_seq, stamped_event_bytes};
+pub use seq::{
+    extract_seq, extract_traceparent, stamp_seq, stamp_traceparent, stamped_event_bytes,
+};
 pub use traits::{EventBus, Subscription};

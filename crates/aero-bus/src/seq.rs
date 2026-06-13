@@ -55,6 +55,26 @@ pub fn extract_seq(value: &serde_json::Value) -> Option<u64> {
     value.get("seq").and_then(serde_json::Value::as_u64)
 }
 
+/// Insert a top-level W3C `"traceparent"` key into a JSON object value, so a
+/// consumer can continue the producer's distributed trace across the bus (ROADMAP5
+/// 方向二). Rides the same envelope mechanism as [`stamp_seq`]: a stamped sibling
+/// key that existing serde consumers ignore. No-op when `traceparent` is
+/// `None`/empty or the value is not an object.
+pub fn stamp_traceparent(value: &mut serde_json::Value, traceparent: Option<&str>) {
+    if let (Some(tp), serde_json::Value::Object(map)) = (traceparent, value) {
+        if !tp.is_empty() {
+            map.insert("traceparent".into(), serde_json::Value::from(tp));
+        }
+    }
+}
+
+/// Read the `"traceparent"` stamp off a parsed payload, if present. `None` for
+/// legacy/untraced payloads. Mirrors [`extract_seq`].
+#[must_use]
+pub fn extract_traceparent(value: &serde_json::Value) -> Option<String> {
+    value.get("traceparent").and_then(serde_json::Value::as_str).map(String::from)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -112,5 +132,22 @@ mod tests {
         assert_eq!(extract_seq(&value), None);
         let negative: serde_json::Value = serde_json::json!({ "seq": -3 });
         assert_eq!(extract_seq(&negative), None);
+    }
+
+    #[test]
+    fn traceparent_stamp_round_trips_and_serde_ignores_it() {
+        const TP: &str = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+        let mut value = serde_json::to_value(typing_event()).unwrap();
+        stamp_traceparent(&mut value, Some(TP));
+        assert_eq!(extract_traceparent(&value).as_deref(), Some(TP));
+        // A stamped payload still deserializes — serde ignores the unknown key.
+        let bytes = serde_json::to_vec(&value).unwrap();
+        let back: RoomEvent = serde_json::from_slice(&bytes).expect("round-trip");
+        assert!(matches!(back, RoomEvent::Typing { on: true, .. }));
+        // None / empty are no-ops (legacy/untraced).
+        let mut bare = serde_json::to_value(typing_event()).unwrap();
+        stamp_traceparent(&mut bare, None);
+        stamp_traceparent(&mut bare, Some(""));
+        assert_eq!(extract_traceparent(&bare), None);
     }
 }

@@ -67,20 +67,49 @@ pub fn install_trace_propagator() {
 /// so a downstream process reading those headers can continue the same trace.
 /// A no-op (leaves `carrier` untouched) when no span context is active — e.g. OTLP
 /// export is unconfigured, so producers pay nothing in that mode.
+// The OTel `Injector`/`Extractor` impls are only provided for the default-hasher
+// `HashMap`, so the parameter can't be generalized over `BuildHasher`.
+#[allow(clippy::implicit_hasher)]
 pub fn inject_trace_context(carrier: &mut std::collections::HashMap<String, String>) {
     use tracing_opentelemetry::OpenTelemetrySpanExt;
     let cx = tracing::Span::current().context();
     opentelemetry::global::get_text_map_propagator(|p| p.inject_context(&cx, carrier));
 }
 
+/// The current span's W3C `traceparent` string, if any — convenience over
+/// [`inject_trace_context`] for producers that stamp a single header onto a
+/// payload (e.g. the NATS event envelope). `None` when no trace context is active.
+#[must_use]
+pub fn current_traceparent() -> Option<String> {
+    let mut carrier = std::collections::HashMap::new();
+    inject_trace_context(&mut carrier);
+    carrier.remove("traceparent")
+}
+
 /// Extract a remote W3C trace context from `carrier`. Attach it to a consuming
 /// span via [`OpenTelemetrySpanExt::set_parent`](tracing_opentelemetry::OpenTelemetrySpanExt::set_parent)
 /// so the consumer's work nests under the producer's trace.
+// See `inject_trace_context`: the OTel `Extractor` impl pins the default hasher.
+#[allow(clippy::implicit_hasher)]
 #[must_use]
 pub fn extract_trace_context(
     carrier: &std::collections::HashMap<String, String>,
 ) -> opentelemetry::Context {
     opentelemetry::global::get_text_map_propagator(|p| p.extract(carrier))
+}
+
+/// Parent `span` to a remote W3C `traceparent`, nesting a consumer span under the
+/// producer's trace (so e.g. a NATS-bus consumer's work shows up under the
+/// message-send trace). No-op for an empty/unparseable value. Keeps the
+/// `tracing-opentelemetry` dependency contained to this crate.
+pub fn set_span_parent_from_traceparent(span: &tracing::Span, traceparent: &str) {
+    use tracing_opentelemetry::OpenTelemetrySpanExt;
+    if traceparent.is_empty() {
+        return;
+    }
+    let mut carrier = std::collections::HashMap::new();
+    carrier.insert("traceparent".to_string(), traceparent.to_string());
+    span.set_parent(extract_trace_context(&carrier));
 }
 
 #[cfg(test)]

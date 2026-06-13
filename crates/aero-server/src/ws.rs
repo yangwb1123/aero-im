@@ -969,11 +969,26 @@ async fn backfill_since(
 /// until we reconnect — but non-zero so a hard-down NATS can't spin a tight loop.
 const BUS_RESUBSCRIBE_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// Build a consumer span parented to the W3C `traceparent` stamped on a bus
+/// message's envelope (if any), so a message-send trace links across the NATS
+/// boundary end to end (ROADMAP5 方向二). An untraced/legacy payload — or one with
+/// no active trace context upstream — just yields a fresh span.
+fn bus_consume_span(subject: &'static str, payload: &[u8]) -> tracing::Span {
+    let span = tracing::info_span!("bus.consume", subject);
+    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(payload) {
+        if let Some(tp) = aero_bus::extract_traceparent(&value) {
+            aero_common::telemetry::set_span_parent_from_traceparent(&span, &tp);
+        }
+    }
+    span
+}
+
 /// Background loop that subscribes to `im.room.*` and pushes each [`RoomEvent`]
 /// into the local Hub. Started once per process at boot; runs until the process
 /// exits, resubscribing across NATS reconnects (see [`BUS_RESUBSCRIBE_BACKOFF`]).
 pub async fn run_bus_listener(state: AppState) -> anyhow::Result<()> {
     use aero_bus::EventBus;
+    use tracing::Instrument as _;
     let bus: Arc<dyn EventBus> = state.bus.clone();
     // Resubscribe loop: a NATS reconnect/drop ends the subscription stream. Without
     // this outer loop the function would return and the boot-time task would exit,
@@ -991,7 +1006,11 @@ pub async fn run_bus_listener(state: AppState) -> anyhow::Result<()> {
         };
         info!("bus listener started");
         while let Some(sub) = stream.next().await {
-            handle_room_event_sub(&state, sub).await;
+            // Continue the producer's distributed trace (ROADMAP5 方向二): a span
+            // whose parent is the envelope's W3C traceparent, so this consumer's
+            // fan-out nests under the message-send trace across the NATS boundary.
+            let span = bus_consume_span("im.room", sub.payload());
+            handle_room_event_sub(&state, sub).instrument(span).await;
         }
         warn!("im.room.* subscription stream ended; resubscribing");
         tokio::time::sleep(BUS_RESUBSCRIBE_BACKOFF).await;
