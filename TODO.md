@@ -96,6 +96,23 @@
   vector), low marginal value, quality staging-gated, and a possible privacy
   regression vs the deliberate per-room scoping. **Needs product intent.**
 
+- **Per-tenant `workspace` label on HTTP RED / WS metrics (ROADMAP 第五版 方向二).**
+  ARCHITECTURALLY GATED, not built. `AuthUser` carries only `participant_id`; the
+  JWT has no workspace claim; participants are *global* and the workspace is chosen
+  per-operation (request-body `workspace_id`, resolved inside handlers). So the
+  metrics middleware has no cheap, bounded, correct per-request workspace to label
+  with — it would need a per-request DB lookup in the hot path, a JWT-format change
+  (re-issue all tokens), or threading a resolved-workspace response-extension through
+  every workspace-scoped handler. The per-tenant series that IS achievable cheaply —
+  message throughput — already carries the label (aec3532, opt-in `AERO_PER_TENANT_METRICS`).
+  **Needs an architecture decision on how to surface a per-request tenant dimension.**
+
+Delivered this session (ROADMAP 第五版, branch roadmap-v5-wave2): 方向一 poison DLQ
+broker backstop; 方向四 retention sweeps ×4 + viewer rollup; 方向五 PII-on-send +
+login IP/device history + new-IP detection; 方向三 search total-count + keyset
+pagination + did-you-mean + faceting + click-feedback/CTR + periodic saved-search
+digest; 方向二 JSON structured logs. Tracing/SLO + agentic-AI confirmed already done.
+
 ## Tech debt (see also DECISIONS.md)
 
 - **~~High~~ → mitigated:** migrations never execution-validated (root cause of the
