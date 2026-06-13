@@ -148,19 +148,25 @@ async fn main() -> anyhow::Result<()> {
     // ---------- Auth ----------
     let priv_pem = cfg.auth.jwt_private_key_pem.trim();
     let pub_pem = cfg.auth.jwt_public_key_pem.trim();
-    let auth = AuthService::from_pem(
-        participants.clone(),
+    // Build the JWT codec with a keyring: the active key signs, and any
+    // `jwt_additional_public_keys` are retained as verify-only keys for
+    // zero-downtime key rotation (a token signed by a just-retired key still
+    // verifies until it expires). Each key is addressed by a kid derived from its
+    // public PEM (ROADMAP5 方向五).
+    let jwt_codec = aero_auth::JwtCodec::from_pems(
         priv_pem,
         pub_pem,
+        &cfg.auth.jwt_additional_public_keys,
         cfg.auth.issuer.clone(),
         std::time::Duration::from_secs(cfg.auth.access_ttl_secs),
         std::time::Duration::from_secs(cfg.auth.refresh_ttl_secs),
     )
-    .context("init AuthService")?
-    // Personal Access Tokens (0019): accept an `aero_pat_*` bearer credential on
-    // every AuthUser route, resolved against `pat_tokens`. Without this the
-    // extractor accepts JWTs only.
-    .with_pat_verifier(Arc::new(PatRepo::new(pg.clone())));
+    .context("init JWT codec")?;
+    let auth = AuthService::new(participants.clone(), jwt_codec)
+        // Personal Access Tokens (0019): accept an `aero_pat_*` bearer credential on
+        // every AuthUser route, resolved against `pat_tokens`. Without this the
+        // extractor accepts JWTs only.
+        .with_pat_verifier(Arc::new(PatRepo::new(pg.clone())));
 
     // ---------- IM service ----------
     // `with_workspaces` wires the tenant repo so the workspace-scoped methods

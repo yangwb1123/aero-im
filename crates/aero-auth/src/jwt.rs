@@ -7,13 +7,14 @@
 //!
 //! Keys are RSA PEM strings, loaded once at startup and held inside [`JwtCodec`].
 
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aero_common::{Error, ParticipantId, Result};
 use jsonwebtoken::{
-    decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation,
+    decode, decode_header, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation,
 };
 use serde::{Deserialize, Serialize};
 
@@ -61,6 +62,14 @@ pub struct JwtCodec {
 
 struct Inner {
     encoding: EncodingKey,
+    /// The active signing key's `kid`, stamped on every issued token.
+    kid: String,
+    /// Verification keyring (`kid` -> public key): the active key plus any extra
+    /// verify-only keys, so a token signed by a just-retired key still verifies
+    /// during a rotation overlap.
+    verify_keys: HashMap<String, DecodingKey>,
+    /// The active key's decoder — fallback for tokens with no/unknown `kid`
+    /// (e.g. tokens issued before kid stamping existed).
     decoding: DecodingKey,
     issuer: String,
     access_ttl: Duration,
@@ -79,13 +88,48 @@ impl JwtCodec {
         access_ttl: Duration,
         refresh_ttl: Duration,
     ) -> Result<Self> {
+        Self::from_pems::<&str>(private_pem, public_pem, &[], issuer, access_ttl, refresh_ttl)
+    }
+
+    /// Like [`Self::from_pem`] but also registers extra verify-only public keys
+    /// (PEM) in the keyring, enabling **zero-downtime key rotation**: the active
+    /// key signs (and verifies) while tokens still in flight that were signed by a
+    /// just-retired key keep verifying until they expire. Each key is addressed by
+    /// a `kid` derived from its public PEM, so an operator rotates by promoting a
+    /// new key to active and moving the old public PEM into the extra-verifier set.
+    ///
+    /// # Errors
+    /// Returns [`Error::Internal`] if any PEM (active or extra) is not a valid RSA key.
+    pub fn from_pems<S: AsRef<str>>(
+        private_pem: &str,
+        public_pem: &str,
+        extra_public_pems: &[S],
+        issuer: impl Into<String>,
+        access_ttl: Duration,
+        refresh_ttl: Duration,
+    ) -> Result<Self> {
         let encoding = EncodingKey::from_rsa_pem(private_pem.as_bytes())
             .map_err(|e| Error::Internal(anyhow::anyhow!("invalid RSA private key: {e}")))?;
-        let decoding = DecodingKey::from_rsa_pem(public_pem.as_bytes())
-            .map_err(|e| Error::Internal(anyhow::anyhow!("invalid RSA public key: {e}")))?;
+        let decode_rsa = |pem: &str, label: &str| {
+            DecodingKey::from_rsa_pem(pem.as_bytes())
+                .map_err(|e| Error::Internal(anyhow::anyhow!("invalid {label} RSA public key: {e}")))
+        };
+        let decoding = decode_rsa(public_pem, "active")?;
+        let kid = key_id(public_pem);
+        let mut verify_keys = HashMap::new();
+        verify_keys.insert(kid.clone(), decode_rsa(public_pem, "active")?);
+        for pem in extra_public_pems {
+            let pem = pem.as_ref();
+            if pem.trim().is_empty() {
+                continue;
+            }
+            verify_keys.insert(key_id(pem), decode_rsa(pem, "extra")?);
+        }
         Ok(Self {
             inner: Arc::new(Inner {
                 encoding,
+                kid,
+                verify_keys,
                 decoding,
                 issuer: issuer.into(),
                 access_ttl,
@@ -122,7 +166,9 @@ impl JwtCodec {
             kind,
             jti: uuid::Uuid::new_v4().to_string(),
         };
-        encode(&Header::new(Algorithm::RS256), &claims, &self.inner.encoding)
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some(self.inner.kid.clone());
+        encode(&header, &claims, &self.inner.encoding)
             .map_err(|e| Error::Internal(anyhow::anyhow!("jwt encode failed: {e}")))
     }
 
@@ -135,7 +181,14 @@ impl JwtCodec {
         validation.set_issuer(&[&self.inner.issuer]);
         validation.validate_exp = true;
         // We don't use `aud`; leave it required=false by default.
-        decode::<Claims>(token, &self.inner.decoding, &validation)
+        // Select the verification key by the token's `kid` (key rotation); fall back
+        // to the active key for a token with no `kid` (legacy) or an unknown one.
+        let key = decode_header(token)
+            .ok()
+            .and_then(|h| h.kid)
+            .and_then(|kid| self.inner.verify_keys.get(&kid))
+            .unwrap_or(&self.inner.decoding);
+        decode::<Claims>(token, key, &validation)
             .map(|data| data.claims)
             .map_err(|e| Error::Unauthorized(format!("invalid token: {e}")))
     }
@@ -146,6 +199,16 @@ fn unix_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// A stable, non-secret key identifier derived from a public PEM (SHA-1 of the
+/// trimmed PEM bytes, truncated to 16 hex chars). Used only to *select* a
+/// verification key from the ring — collision-resistance is not security-critical
+/// here (the RSA signature is), so SHA-1 (already a dependency) is sufficient.
+fn key_id(public_pem: &str) -> String {
+    use sha1::{Digest, Sha1};
+    let digest = Sha1::digest(public_pem.trim().as_bytes());
+    digest.iter().take(8).map(|b| format!("{b:02x}")).collect()
 }
 
 #[cfg(test)]
@@ -196,6 +259,43 @@ mod tests {
         let token = c.issue(pid, TokenKind::Refresh).unwrap();
         let claims = c.verify(&token).unwrap();
         assert_eq!(claims.kind, TokenKind::Refresh);
+    }
+
+    /// Zero-downtime key rotation: a token signed by the now-retired key still
+    /// verifies as long as that key is kept as an extra verifier, while the new
+    /// active key signs and verifies fresh tokens. Without the old key in the ring
+    /// the old token is rejected.
+    #[test]
+    fn kid_rotation_verifies_old_tokens_with_retained_verifier() {
+        let (priv_a, pub_a) = keypair();
+        let (priv_b, pub_b) = keypair();
+        let (acc, refr) = (Duration::from_secs(60), Duration::from_secs(600));
+        let pid = ParticipantId::new();
+
+        // Key A active → issue a token; it must be stamped with A's kid.
+        let codec_a = JwtCodec::from_pem(&priv_a, &pub_a, "aero-im", acc, refr).unwrap();
+        let token_a = codec_a.issue(pid, TokenKind::Access).unwrap();
+        let header = jsonwebtoken::decode_header(&token_a).unwrap();
+        assert_eq!(header.kid.as_deref(), Some(key_id(&pub_a).as_str()), "token carries active kid");
+
+        // Rotate: key B active, key A retained as an extra verifier.
+        let codec_b =
+            JwtCodec::from_pems(&priv_b, &pub_b, &[pub_a.clone()], "aero-im", acc, refr).unwrap();
+        assert_eq!(
+            codec_b.verify(&token_a).unwrap().participant_id().unwrap(),
+            pid,
+            "token signed by retired key A still verifies via the keyring",
+        );
+        let token_b = codec_b.issue(pid, TokenKind::Access).unwrap();
+        assert_eq!(
+            codec_b.verify(&token_b).unwrap().participant_id().unwrap(),
+            pid,
+            "token signed by new active key B verifies",
+        );
+
+        // Without A retained, A's token is rejected (its key is gone from the ring).
+        let codec_b_only = JwtCodec::from_pem(&priv_b, &pub_b, "aero-im", acc, refr).unwrap();
+        assert!(codec_b_only.verify(&token_a).is_err(), "retired key removed → old token rejected");
     }
 
     #[test]

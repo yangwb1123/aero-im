@@ -77,6 +77,12 @@ pub struct AuthConfig {
     /// Refresh-token lifetime in seconds.
     #[serde(default = "default_refresh_ttl")]
     pub refresh_ttl_secs: u64,
+    /// Extra PEM-encoded RSA **public** keys kept as verify-only keys for
+    /// zero-downtime JWT key rotation: when the active signing key is rotated, the
+    /// previous public key is listed here so tokens it signed keep verifying until
+    /// they expire. Defaults to empty (no rotation in progress).
+    #[serde(default)]
+    pub jwt_additional_public_keys: Vec<String>,
 }
 
 /// Manual `Debug` that **redacts the RSA private key** (ROADMAP 方向三). The
@@ -92,6 +98,7 @@ impl std::fmt::Debug for AuthConfig {
             .field("issuer", &self.issuer)
             .field("access_ttl_secs", &self.access_ttl_secs)
             .field("refresh_ttl_secs", &self.refresh_ttl_secs)
+            .field("jwt_additional_public_keys", &self.jwt_additional_public_keys.len())
             .finish()
     }
 }
@@ -193,6 +200,7 @@ mod tests {
             issuer: "aero".into(),
             access_ttl_secs: 900,
             refresh_ttl_secs: 86_400,
+            jwt_additional_public_keys: Vec::new(),
         };
         let dbg = format!("{cfg:?}");
         assert!(
