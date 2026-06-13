@@ -72,6 +72,30 @@ impl AiJobRepo {
         Self { pool }
     }
 
+    /// Hard-delete terminal jobs (`done`/`failed`/`dead`) that finished before
+    /// `cutoff` (data-lifecycle retention sweep, ROADMAP5 方向四). `ai_jobs` had
+    /// no completion cleanup, so finished rows accumulated forever. Queued and
+    /// running jobs are never swept. `COALESCE(finished_at, scheduled_at)` ages
+    /// out even a terminal row that predates the `finished_at` column. Returns
+    /// the number of rows deleted.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`].
+    pub async fn sweep_terminal_before(
+        &self,
+        cutoff: time::OffsetDateTime,
+    ) -> Result<u64, sqlx::Error> {
+        let res = sqlx::query(
+            r"DELETE FROM ai_jobs
+               WHERE status IN ('done','failed','dead')
+                 AND COALESCE(finished_at, scheduled_at) < $1",
+        )
+        .bind(cutoff)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
     /// Enqueue a new job. Returns the row id so callers can publish a wakeup on NATS.
     pub async fn enqueue(
         &self,

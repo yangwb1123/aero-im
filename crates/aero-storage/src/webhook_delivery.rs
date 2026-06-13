@@ -152,6 +152,28 @@ impl WebhookDeliveryRepo {
         Self { pool }
     }
 
+    /// Hard-delete terminal delivery-log rows (`delivered`/`dead`) last updated
+    /// before `cutoff` (data-lifecycle retention sweep, ROADMAP5 方向四). The
+    /// log had no retention, so every delivery attempt accumulated forever. Rows
+    /// still in `pending`/`failed` are retryable and never swept. Returns the
+    /// number of rows deleted.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`].
+    pub async fn sweep_terminal_before(
+        &self,
+        cutoff: OffsetDateTime,
+    ) -> Result<u64, sqlx::Error> {
+        let res = sqlx::query(
+            r"DELETE FROM webhook_delivery_log
+               WHERE status IN ('delivered','dead') AND updated_at < $1",
+        )
+        .bind(cutoff)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
     /// Record a brand-new delivery attempt in `pending` state with `attempts = 1`
     /// (the dispatcher records the row as it makes the first send). Returns the
     /// generated id so a subsequent `mark_*` can target it.

@@ -52,6 +52,26 @@ impl AuditRepo {
         Self { pool }
     }
 
+    /// Hard-delete audit events older than `cutoff` (data-lifecycle retention
+    /// sweep, ROADMAP5 方向四). `audit_events` is append-only with no prior
+    /// retention; it only ever shrank when a workspace was hard-deleted (FK
+    /// cascade), so it grew without bound. Audit retention is a compliance
+    /// window — once an event ages past it the row is no longer required and is
+    /// purged to bound the table. Returns the number of rows deleted.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`].
+    pub async fn sweep_before(
+        &self,
+        cutoff: time::OffsetDateTime,
+    ) -> Result<u64, sqlx::Error> {
+        let res = sqlx::query(r"DELETE FROM audit_events WHERE created_at < $1")
+            .bind(cutoff)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected())
+    }
+
     /// Append one audit event, returning its generated id.
     pub async fn append(
         &self,

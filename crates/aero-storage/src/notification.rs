@@ -38,6 +38,29 @@ impl NotificationRepo {
         Self { pool }
     }
 
+    /// Hard-delete already-read notifications older than `cutoff` (data-lifecycle
+    /// retention sweep, ROADMAP5 方向四). `notifications` is append-only with no
+    /// prior retention, so it grew without bound. Only *read* rows are swept — an
+    /// unread mention must still reach the user however old it is — so the sweep
+    /// can never drop a notification the recipient hasn't seen. Returns the number
+    /// of rows deleted.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`].
+    pub async fn sweep_read_before(
+        &self,
+        cutoff: time::OffsetDateTime,
+    ) -> Result<u64, sqlx::Error> {
+        let res = sqlx::query(
+            r"DELETE FROM notifications
+               WHERE read_at IS NOT NULL AND created_at < $1",
+        )
+        .bind(cutoff)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
     /// Append one notification, returning its generated id.
     pub async fn insert(
         &self,

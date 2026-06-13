@@ -469,6 +469,19 @@ async fn main() -> anyhow::Result<()> {
         let messages_repo = state.messages.clone();
         let stream_mod_pool = state.pg.clone();
         let erasure_pool = state.pg.clone();
+        // Data-lifecycle retention for the four append-only tables that had NO
+        // prior retention and grew without bound (ROADMAP5 方向四). Windows in
+        // days, read once; 0 disables that table's sweep. Audit keeps the longest
+        // window (compliance), ai_jobs the shortest (transient queue rows).
+        let lifecycle_pool = state.pg.clone();
+        let notif_retention_days = std::env::var("AERO__SERVER__NOTIFICATION_RETENTION_DAYS")
+            .ok().and_then(|s| s.parse::<i64>().ok()).unwrap_or(90);
+        let audit_retention_days = std::env::var("AERO__SERVER__AUDIT_RETENTION_DAYS")
+            .ok().and_then(|s| s.parse::<i64>().ok()).unwrap_or(365);
+        let ai_job_retention_days = std::env::var("AERO__SERVER__AI_JOB_RETENTION_DAYS")
+            .ok().and_then(|s| s.parse::<i64>().ok()).unwrap_or(7);
+        let webhook_log_retention_days = std::env::var("AERO__SERVER__WEBHOOK_LOG_RETENTION_DAYS")
+            .ok().and_then(|s| s.parse::<i64>().ok()).unwrap_or(30);
         // ImService handle so the sweep can fan out RoomEvent::Deleted to live +
         // reconnecting clients (ROADMAP 方向一).
         let sweep_im = state.im.clone();
@@ -558,6 +571,54 @@ async fn main() -> anyhow::Result<()> {
                                     info!(swept = n, "deferred GDPR erasure completed (released holds)");
                                 }
                                 Err(e) => warn!(error = ?e, "deferred erasure sweep failed"),
+                            }
+                            // Data-lifecycle retention sweeps (ROADMAP5 方向四):
+                            // bound the four append-only tables that previously
+                            // had no retention. Each is best-effort and skipped
+                            // when its window is 0 (disabled).
+                            if notif_retention_days > 0 {
+                                let cutoff = now - time::Duration::days(notif_retention_days);
+                                match aero_storage::NotificationRepo::new(lifecycle_pool.clone())
+                                    .sweep_read_before(cutoff)
+                                    .await
+                                {
+                                    Ok(0) => {}
+                                    Ok(n) => info!(swept = n, "old read notifications purged"),
+                                    Err(e) => warn!(error = ?e, "notification retention sweep failed"),
+                                }
+                            }
+                            if audit_retention_days > 0 {
+                                let cutoff = now - time::Duration::days(audit_retention_days);
+                                match aero_storage::AuditRepo::new(lifecycle_pool.clone())
+                                    .sweep_before(cutoff)
+                                    .await
+                                {
+                                    Ok(0) => {}
+                                    Ok(n) => info!(swept = n, "old audit events purged"),
+                                    Err(e) => warn!(error = ?e, "audit retention sweep failed"),
+                                }
+                            }
+                            if ai_job_retention_days > 0 {
+                                let cutoff = now - time::Duration::days(ai_job_retention_days);
+                                match aero_storage::AiJobRepo::new(lifecycle_pool.clone())
+                                    .sweep_terminal_before(cutoff)
+                                    .await
+                                {
+                                    Ok(0) => {}
+                                    Ok(n) => info!(swept = n, "completed ai_jobs purged"),
+                                    Err(e) => warn!(error = ?e, "ai_job retention sweep failed"),
+                                }
+                            }
+                            if webhook_log_retention_days > 0 {
+                                let cutoff = now - time::Duration::days(webhook_log_retention_days);
+                                match aero_storage::WebhookDeliveryRepo::new(lifecycle_pool.clone())
+                                    .sweep_terminal_before(cutoff)
+                                    .await
+                                {
+                                    Ok(0) => {}
+                                    Ok(n) => info!(swept = n, "terminal webhook deliveries purged"),
+                                    Err(e) => warn!(error = ?e, "webhook delivery-log retention sweep failed"),
+                                }
                             }
                         }
                     }
