@@ -169,14 +169,31 @@ impl WorkspaceRepo {
         workspace: WorkspaceId,
         participant: ParticipantId,
     ) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
         sqlx::query(
             r"DELETE FROM workspace_members
                WHERE workspace_id = $1 AND participant_id = $2",
         )
         .bind(workspace.to_uuid())
         .bind(participant.to_uuid())
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        // Also drop their membership in every room of this workspace. Access is
+        // already denied the moment the workspace_members row is gone
+        // (`assert_room_access` requires BOTH workspace AND room membership, so the
+        // room rows are dormant), but leaving them would silently RESTORE all prior
+        // room access — including private channels — if the participant is ever
+        // re-added to the workspace. Mirrors the workspace-delete cascade.
+        sqlx::query(
+            r"DELETE FROM room_members
+               WHERE participant_id = $2
+                 AND room_id IN (SELECT id FROM rooms WHERE workspace_id = $1)",
+        )
+        .bind(workspace.to_uuid())
+        .bind(participant.to_uuid())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -1609,5 +1626,30 @@ mod db_tests {
         let after = repo.list_guests(ws).await.unwrap();
         assert_eq!(after.len(), 1, "one guest left");
         assert_eq!(after[0].participant_id, guest_b, "guest_b remains");
+    }
+
+    /// Removing a workspace member also strips their room memberships, so re-adding
+    /// them later cannot silently restore access to channels (incl. private ones)
+    /// they were previously in.
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn remove_member_revokes_room_memberships() {
+        let p = pool();
+        let repo = WorkspaceRepo::new(p.clone());
+        let rooms = crate::room::RoomRepo::new(p.clone());
+        let owner = new_participant(&p).await;
+        let (ws, room, _) = seed_workspace(&repo, &p, owner).await;
+
+        let bob = new_participant(&p).await;
+        repo.add_member(ws, bob, WorkspaceRole::Member).await.unwrap();
+        rooms.add_member(room, bob).await.unwrap();
+        assert!(rooms.is_member(room, bob).await.unwrap(), "bob starts as a room member");
+
+        repo.remove_member(ws, bob).await.unwrap();
+        assert!(!repo.is_member(ws, bob).await.unwrap(), "no longer a workspace member");
+        assert!(
+            !rooms.is_member(room, bob).await.unwrap(),
+            "room membership revoked on workspace removal (no restore on re-add)",
+        );
     }
 }
