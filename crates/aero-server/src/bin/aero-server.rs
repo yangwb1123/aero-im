@@ -482,6 +482,13 @@ async fn main() -> anyhow::Result<()> {
             .ok().and_then(|s| s.parse::<i64>().ok()).unwrap_or(7);
         let webhook_log_retention_days = std::env::var("AERO__SERVER__WEBHOOK_LOG_RETENTION_DAYS")
             .ok().and_then(|s| s.parse::<i64>().ok()).unwrap_or(30);
+        // stream_viewer_samples is a 30s firehose: keep raw briefly, then roll up
+        // to per-minute buckets (kept long — the rows are tiny). 0 raw-days
+        // disables the rollup sweep entirely.
+        let viewer_raw_retention_days = std::env::var("AERO__SERVER__VIEWER_RAW_RETENTION_DAYS")
+            .ok().and_then(|s| s.parse::<i32>().ok()).unwrap_or(2);
+        let viewer_rollup_retention_days = std::env::var("AERO__SERVER__VIEWER_ROLLUP_RETENTION_DAYS")
+            .ok().and_then(|s| s.parse::<i32>().ok()).unwrap_or(90);
         // ImService handle so the sweep can fan out RoomEvent::Deleted to live +
         // reconnecting clients (ROADMAP 方向一).
         let sweep_im = state.im.clone();
@@ -618,6 +625,28 @@ async fn main() -> anyhow::Result<()> {
                                     Ok(0) => {}
                                     Ok(n) => info!(swept = n, "terminal webhook deliveries purged"),
                                     Err(e) => warn!(error = ?e, "webhook delivery-log retention sweep failed"),
+                                }
+                            }
+                            // stream_viewer_samples tiered rollup + downsample
+                            // (ROADMAP5 方向四): aggregate the 30s firehose into
+                            // per-minute buckets, drop raw rows past the short
+                            // retention window, prune aged-out rollups.
+                            if viewer_raw_retention_days > 0 {
+                                match aero_storage::StreamViewerSampleRepo::new(lifecycle_pool.clone())
+                                    .rollup_and_downsample(
+                                        viewer_raw_retention_days,
+                                        viewer_rollup_retention_days,
+                                    )
+                                    .await
+                                {
+                                    Ok(o) if o.is_empty() => {}
+                                    Ok(o) => info!(
+                                        rolled_up = o.rolled_up,
+                                        raw_deleted = o.raw_deleted,
+                                        rollups_pruned = o.rollups_pruned,
+                                        "viewer samples rolled up + downsampled"
+                                    ),
+                                    Err(e) => warn!(error = ?e, "viewer rollup+downsample failed"),
                                 }
                             }
                         }

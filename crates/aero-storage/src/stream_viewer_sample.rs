@@ -95,6 +95,103 @@ impl StreamViewerSampleRepo {
     }
 }
 
+/// Outcome of a [`StreamViewerSampleRepo::rollup_and_downsample`] sweep: how many
+/// per-minute rollup rows were written/updated, how many raw 30s samples were
+/// downsampled away, and how many aged-out rollup rows were pruned.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RollupOutcome {
+    /// Per-minute rollup rows inserted or updated this sweep.
+    pub rolled_up: u64,
+    /// Raw 30s samples deleted (downsampled) this sweep.
+    pub raw_deleted: u64,
+    /// Aged-out rollup rows pruned this sweep.
+    pub rollups_pruned: u64,
+}
+
+impl RollupOutcome {
+    /// True when the sweep touched no rows — used to keep the periodic log quiet.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.rolled_up == 0 && self.raw_deleted == 0 && self.rollups_pruned == 0
+    }
+}
+
+impl StreamViewerSampleRepo {
+    /// Roll up raw 30s samples into per-minute buckets, then downsample (drop the
+    /// raw rows past `raw_retention_days`) and prune rollups past
+    /// `rollup_retention_days` (ROADMAP5 方向四). Bounds the otherwise unbounded
+    /// 30s firehose while preserving cheap per-minute aggregate history.
+    ///
+    /// Correctness: step 2 deletes a raw sample only once an `EXISTS` rollup row
+    /// covers its minute, so an aggregate is always preserved before its raw rows
+    /// are dropped. Step 1 only rolls up *complete* minutes (`sampled_at <
+    /// date_trunc('minute', now())`) — the current minute is still filling — and
+    /// is idempotent via the `(stream_id, bucket_start)` `ON CONFLICT`, so it is
+    /// safe to run at any cadence.
+    ///
+    /// Returns a [`RollupOutcome`] with the per-step counts.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`].
+    pub async fn rollup_and_downsample(
+        &self,
+        raw_retention_days: i32,
+        rollup_retention_days: i32,
+    ) -> Result<RollupOutcome, sqlx::Error> {
+        // 1) Aggregate every COMPLETE minute into a per-minute rollup row. The
+        //    ON CONFLICT recomputes the same aggregate from the same raw rows, so
+        //    re-running over a still-present minute is effectively a no-op.
+        let rolled_up = sqlx::query(
+            r"INSERT INTO stream_viewer_rollups
+                  (stream_id, bucket_start, avg_viewers, peak_viewers, sample_count)
+              SELECT stream_id,
+                     date_trunc('minute', sampled_at),
+                     AVG(viewers)::double precision,
+                     MAX(viewers)::int,
+                     COUNT(*)::bigint
+                FROM stream_viewer_samples
+               WHERE sampled_at < date_trunc('minute', now())
+               GROUP BY stream_id, date_trunc('minute', sampled_at)
+              ON CONFLICT (stream_id, bucket_start) DO UPDATE
+                 SET avg_viewers  = EXCLUDED.avg_viewers,
+                     peak_viewers = EXCLUDED.peak_viewers,
+                     sample_count = EXCLUDED.sample_count",
+        )
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+
+        // 2) Downsample: drop raw samples past the retention window — but ONLY
+        //    once their minute is captured in a rollup (the EXISTS guard), so a
+        //    sample is never deleted before its aggregate is preserved.
+        let raw_deleted = sqlx::query(
+            r"DELETE FROM stream_viewer_samples s
+               WHERE s.sampled_at < now() - make_interval(days => $1)
+                 AND EXISTS (
+                     SELECT 1 FROM stream_viewer_rollups r
+                      WHERE r.stream_id = s.stream_id
+                        AND r.bucket_start = date_trunc('minute', s.sampled_at))",
+        )
+        .bind(raw_retention_days)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+
+        // 3) Bound the rollup table itself (per-minute rows are tiny, so the
+        //    window is generous).
+        let rollups_pruned = sqlx::query(
+            r"DELETE FROM stream_viewer_rollups
+               WHERE bucket_start < now() - make_interval(days => $1)",
+        )
+        .bind(rollup_retention_days)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+
+        Ok(RollupOutcome { rolled_up, raw_deleted, rollups_pruned })
+    }
+}
+
 /// One point in a stream's viewer retention curve: the offset from the start of
 /// the stream, the average viewer count in that bucket, and the retention
 /// percentage relative to the peak at stream start.
@@ -230,6 +327,76 @@ mod db_tests {
 
         // Cleanup: remove the throwaway samples (no FK cascade to lean on).
         sqlx::query("DELETE FROM stream_viewer_samples WHERE stream_id = $1")
+            .bind(sid)
+            .execute(&p)
+            .await
+            .ok();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn rollup_aggregates_old_samples_then_downsamples_raw() {
+        let p = pool();
+        let repo = StreamViewerSampleRepo::new(p.clone());
+        let stream = Ulid::new();
+        let sid = Uuid::from_u128(stream.0);
+
+        // Insert three raw samples backdated into the SAME minute, 10 days ago, so
+        // the minute is "complete" (well before now) and past any raw-retention
+        // window we test with. Explicit sampled_at (record() defaults to now()).
+        let old_minute = "now() - interval '10 days'";
+        for v in [4_i32, 12, 8] {
+            sqlx::query(&format!(
+                "INSERT INTO stream_viewer_samples (stream_id, viewers, sampled_at) \
+                 VALUES ($1, $2, date_trunc('minute', {old_minute}))"
+            ))
+            .bind(sid)
+            .bind(v)
+            .execute(&p)
+            .await
+            .expect("insert backdated sample");
+        }
+
+        // Roll up, keep raw for 7 days (these are 10 days old → downsampled),
+        // keep rollups for 90 days (kept).
+        let out = repo
+            .rollup_and_downsample(7, 90)
+            .await
+            .expect("rollup_and_downsample");
+        assert!(out.rolled_up >= 1, "at least this stream's minute rolled up");
+        assert!(out.raw_deleted >= 3, "the 3 backdated raw samples downsampled away");
+
+        // The per-minute rollup must carry the right aggregate: avg (4+12+8)/3=8,
+        // peak 12, count 3.
+        let (avg, peak, count): (f64, i32, i64) = sqlx::query_as(
+            "SELECT avg_viewers, peak_viewers, sample_count \
+               FROM stream_viewer_rollups WHERE stream_id = $1",
+        )
+        .bind(sid)
+        .fetch_one(&p)
+        .await
+        .expect("rollup row exists");
+        assert!((avg - 8.0).abs() < 1e-9, "avg viewers (4+12+8)/3 = 8.0, got {avg}");
+        assert_eq!(peak, 12, "peak viewers");
+        assert_eq!(count, 3, "sample count");
+
+        // The raw rows are gone (downsampled), but the aggregate survives.
+        let raw_left: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM stream_viewer_samples WHERE stream_id = $1",
+        )
+        .bind(sid)
+        .fetch_one(&p)
+        .await
+        .expect("count raw");
+        assert_eq!(raw_left, 0, "all backdated raw samples downsampled");
+
+        // Cleanup both tables.
+        sqlx::query("DELETE FROM stream_viewer_samples WHERE stream_id = $1")
+            .bind(sid)
+            .execute(&p)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM stream_viewer_rollups WHERE stream_id = $1")
             .bind(sid)
             .execute(&p)
             .await

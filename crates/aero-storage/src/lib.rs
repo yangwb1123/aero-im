@@ -258,7 +258,9 @@ pub use password_history::{PasswordHistoryRepo, HISTORY_DEPTH as PASSWORD_HISTOR
 
 // ---- Concurrent-viewer history sampling (peak/avg concurrent viewers) ----
 pub mod stream_viewer_sample;
-pub use stream_viewer_sample::{RetentionPoint, StreamViewerSampleRepo, ViewerStats};
+pub use stream_viewer_sample::{
+    RetentionPoint, RollupOutcome, StreamViewerSampleRepo, ViewerStats,
+};
 
 // ---- Workspace IP / network allowlist (authorized networks) ----
 pub mod ip_allowlist;
