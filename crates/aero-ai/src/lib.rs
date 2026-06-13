@@ -16,6 +16,7 @@
 pub mod agent;
 pub mod anthropic;
 pub mod budget;
+pub mod doc_extract;
 pub mod embed;
 pub mod error;
 pub mod metrics;

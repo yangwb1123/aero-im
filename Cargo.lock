@@ -28,6 +28,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bytes",
+ "flate2",
  "futures",
  "pretty_assertions",
  "reqwest",

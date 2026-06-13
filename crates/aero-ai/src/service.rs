@@ -1170,14 +1170,20 @@ impl crate::agent::AgentTool for SearchMessagesTool {
 /// Max attachment bytes the agent will pull into context (256 KiB).
 const MAX_ATTACHMENT_BYTES: usize = 256 * 1024;
 
-/// Decode an attachment's bytes as text, or `None` when it isn't readable text:
-/// empty, over `cap`, not valid UTF-8, or "binary" (more than ~1% non-whitespace
-/// control characters). Pure — no MIME needed; the readable/binary call is unit-
-/// tested directly. This is the dependency-free slice of file RAG (text/markdown/
-/// csv/json/source); PDF/Office extraction needs a parser and is out of scope.
+/// Decode an attachment's bytes to text. First tries structured-document
+/// extraction (OOXML docx/xlsx/pptx + best-effort PDF, via [`crate::doc_extract`],
+/// detected by magic bytes); otherwise treats the bytes as plain UTF-8 text,
+/// returning `None` for empty / over-`cap` / non-UTF-8 / "binary" (more than ~1%
+/// non-whitespace control chars) inputs. Pure — no MIME needed.
 fn extract_text(bytes: &[u8], cap: usize) -> Option<String> {
     if bytes.is_empty() || bytes.len() > cap {
         return None;
+    }
+    // docx/xlsx/pptx/pdf → extract their text content (dependency-free; see
+    // doc_extract). A recognized-but-unextractable doc falls through to the
+    // plain-text attempt, which will reject it as binary.
+    if let Some(doc) = crate::doc_extract::extract_document_text(bytes) {
+        return Some(doc);
     }
     let s = std::str::from_utf8(bytes).ok()?;
     let total = s.chars().count().max(1);
@@ -1205,8 +1211,9 @@ impl crate::agent::AgentTool for ReadAttachmentTool {
     fn definition(&self) -> crate::anthropic::ToolDef {
         crate::anthropic::ToolDef {
             name: "read_attachment".into(),
-            description: "读取本房间某条消息的文本附件内容(纯文本/markdown/csv/json/代码等)。\
-输入消息 id;若该消息无文件附件、或附件为二进制 / 过大则返回说明。"
+            description: "读取本房间某条消息的附件内容:纯文本/markdown/csv/json/代码,\
+以及 Office 文档(docx/xlsx/pptx)与 PDF 的正文文本。输入消息 id;若该消息无文件附件、\
+或附件为不可提取的二进制 / 过大则返回说明。"
                 .into(),
             input_schema: serde_json::json!({
                 "type": "object",
