@@ -42,6 +42,13 @@ struct RefreshReq {
     refresh_token: String,
 }
 
+/// Grace window after a refresh token is rotated during which re-presenting it is
+/// treated as a benign lost-response retry (plain `401`) rather than a token-theft
+/// replay (which revokes the whole session family). Wide enough to cover a client
+/// retrying a refresh whose response was dropped, short enough that a stolen token
+/// replayed later is still caught.
+const REFRESH_REUSE_GRACE: time::Duration = time::Duration::seconds(10);
+
 /// `POST /api/auth/refresh` — rotate the refresh token and mint a new access
 /// token.
 ///
@@ -60,19 +67,39 @@ async fn refresh(
         return Err(AeroError::Invalid("refresh_token must not be empty".into()).into());
     }
 
-    // Reject a revoked (logged-out or previously rotated) refresh token.
-    let old_hash = hash_token(token);
-    let revoked_repo = RevokedTokenRepo::new(s.pg.clone());
-    if revoked_repo.is_revoked(&old_hash).await.map_err(AeroError::from)? {
-        return Err(AeroError::Unauthorized("refresh token revoked".into()).into());
-    }
-
-    // Verify signature and kind; extract participant. Any failure → 401.
+    // Verify signature and kind FIRST, so the participant can be identified even
+    // for a revoked token (a forged token fails here). Any failure → 401.
     let claims = s.auth.verify(token)?;
     if claims.kind != TokenKind::Refresh {
         return Err(AeroError::Unauthorized("not a refresh token".into()).into());
     }
     let pid = claims.participant_id()?;
+
+    let old_hash = hash_token(token);
+    let revoked_repo = RevokedTokenRepo::new(s.pg.clone());
+    let session_repo = SessionRepo::new(s.pg.clone());
+
+    // A revoked (logged-out or already-rotated) refresh token is rejected. If it was
+    // rotated only moments ago this is almost certainly a benign retry of a refresh
+    // whose response was lost — just 401. But replaying a token rotated longer ago
+    // (past the grace window) is a token-THEFT signal: the legitimate client holds
+    // the newer token, so revoke EVERY session for the participant (attacker AND
+    // victim must re-authenticate) — OWASP refresh-token-rotation reuse detection.
+    if let Some(revoked_at) = revoked_repo.revoked_at(&old_hash).await.map_err(AeroError::from)? {
+        if time::OffsetDateTime::now_utc() - revoked_at > REFRESH_REUSE_GRACE {
+            if let Ok(hashes) = session_repo.revoke_all_for_participant(pid).await {
+                for h in hashes {
+                    let _ = revoked_repo.revoke(&h, Some(pid)).await;
+                }
+            }
+            tracing::warn!(%pid, "refresh-token reuse detected; revoked all sessions");
+            return Err(AeroError::Unauthorized(
+                "refresh token reuse detected; all sessions revoked".into(),
+            )
+            .into());
+        }
+        return Err(AeroError::Unauthorized("refresh token revoked".into()).into());
+    }
 
     // Issue a fresh access + refresh token pair (token rotation).
     let new_tokens = s.auth.issue_for_participant(pid)?;
@@ -84,7 +111,6 @@ async fn refresh(
 
     // Retire the old session row and register the new one (best-effort — the
     // old token is already blacklisted above, so row misses are harmless).
-    let session_repo = SessionRepo::new(s.pg.clone());
     if let Err(e) = session_repo.revoke_by_hash(&old_hash, pid).await {
         tracing::warn!(error = ?e, "failed to retire old session on token rotate");
     }

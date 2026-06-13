@@ -87,6 +87,25 @@ impl RevokedTokenRepo {
                 .await?;
         Ok(row.is_some())
     }
+
+    /// When `token_hash` was revoked, or `None` if it has never been revoked.
+    /// Used by the refresh endpoint to distinguish a benign lost-response retry
+    /// (revoked just now) from a token-theft replay (revoked long ago). The caller
+    /// hashes the plaintext token via [`hash_token`] first.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the query.
+    pub async fn revoked_at(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<time::OffsetDateTime>, sqlx::Error> {
+        let row: Option<(time::OffsetDateTime,)> =
+            sqlx::query_as("SELECT revoked_at FROM revoked_tokens WHERE token_hash = $1")
+                .bind(token_hash)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map(|r| r.0))
+    }
 }
 
 #[cfg(test)]
@@ -164,5 +183,29 @@ mod db_tests {
             .execute(&p)
             .await
             .ok();
+    }
+
+    /// `revoked_at` returns `None` for an unknown hash and a recent timestamp for a
+    /// freshly-revoked one — the grace-window input the refresh endpoint uses to
+    /// distinguish a benign retry from a token-theft replay.
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn revoked_at_reports_none_then_a_recent_timestamp() {
+        let p = pool();
+        let repo = RevokedTokenRepo::new(p.clone());
+        let owner = ParticipantId::new();
+        let h = hash_token(&format!("revoked-at-test-{owner}"));
+
+        assert!(repo.revoked_at(&h).await.unwrap().is_none(), "unknown hash has no revoked_at");
+
+        repo.revoke(&h, Some(owner)).await.unwrap();
+        let at = repo.revoked_at(&h).await.unwrap().expect("revoked_at present after revoke");
+        let age = time::OffsetDateTime::now_utc() - at;
+        assert!(
+            age >= time::Duration::ZERO && age < time::Duration::minutes(5),
+            "revoked_at is a recent timestamp (age = {age})",
+        );
+
+        sqlx::query("DELETE FROM revoked_tokens WHERE token_hash = $1").bind(&h).execute(&p).await.ok();
     }
 }
