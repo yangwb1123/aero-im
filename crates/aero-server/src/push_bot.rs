@@ -38,34 +38,43 @@ const PREVIEW_CHARS: usize = 140;
 /// Returns an error if subscribing to the event bus fails.
 pub async fn run(state: AppState) -> anyhow::Result<()> {
     let bus = state.bus.clone();
-    let mut stream = bus
-        .subscribe("im.room.*", Some("aero-push"))
-        .await
-        .map_err(|e| anyhow::anyhow!("push_bot subscribe: {e}"))?;
-    info!("push_bot listener started");
-    while let Some(sub) = stream.next().await {
-        match serde_json::from_slice::<RoomEvent>(sub.payload()) {
-            Ok(RoomEvent::Notify { message_id, mentioned, by, kind, .. }) => {
-                if let Err(e) = handle(&state, message_id, mentioned, by, kind).await {
-                    warn!(error = ?e, "push_bot handle failed");
-                }
+    // Resubscribe across NATS reconnects (mirrors `ws::run_bus_listener`); durable
+    // consumer "aero-push" resumes from its cursor, every message is acked.
+    loop {
+        let mut stream = match bus.subscribe("im.room.*", Some("aero-push")).await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, "push_bot subscribe failed; retrying");
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                continue;
             }
-            // Batched notify (ROADMAP 方向二): push each recipient individually,
-            // exactly as the old per-recipient Notify events did.
-            Ok(RoomEvent::NotifyBatch { message_id, by, recipients, .. }) => {
-                for target in recipients {
-                    if let Err(e) =
-                        handle(&state, message_id, target.participant, by, target.kind).await
-                    {
+        };
+        info!("push_bot listener started");
+        while let Some(sub) = stream.next().await {
+            match serde_json::from_slice::<RoomEvent>(sub.payload()) {
+                Ok(RoomEvent::Notify { message_id, mentioned, by, kind, .. }) => {
+                    if let Err(e) = handle(&state, message_id, mentioned, by, kind).await {
                         warn!(error = ?e, "push_bot handle failed");
                     }
                 }
+                // Batched notify (ROADMAP 方向二): push each recipient individually,
+                // exactly as the old per-recipient Notify events did.
+                Ok(RoomEvent::NotifyBatch { message_id, by, recipients, .. }) => {
+                    for target in recipients {
+                        if let Err(e) =
+                            handle(&state, message_id, target.participant, by, target.kind).await
+                        {
+                            warn!(error = ?e, "push_bot handle failed");
+                        }
+                    }
+                }
+                _ => {}
             }
-            _ => {}
+            let _ = sub.ack().await;
         }
-        let _ = sub.ack().await;
+        warn!("push_bot subscription stream ended; resubscribing");
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
-    Ok(())
 }
 
 async fn handle(

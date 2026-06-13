@@ -52,20 +52,29 @@ pub async fn run_with(
     fetcher: Arc<dyn Unfurler>,
 ) -> anyhow::Result<()> {
     let bus = state.bus.clone();
-    let mut stream = bus
-        .subscribe("im.room.*", Some("aero-unfurl"))
-        .await
-        .map_err(|e| anyhow::anyhow!("unfurl_bot subscribe: {e}"))?;
-    info!("unfurl_bot listener started");
-    while let Some(sub) = stream.next().await {
-        if let Ok(RoomEvent::Message(env)) = serde_json::from_slice::<RoomEvent>(sub.payload()) {
-            if let Err(e) = handle(&state, &cache, fetcher.as_ref(), env).await {
-                warn!(error = ?e, "unfurl_bot handle failed");
+    // Resubscribe across NATS reconnects (mirrors `ws::run_bus_listener`); durable
+    // consumer "aero-unfurl" resumes from its cursor, every message is acked.
+    loop {
+        let mut stream = match bus.subscribe("im.room.*", Some("aero-unfurl")).await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, "unfurl_bot subscribe failed; retrying");
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                continue;
             }
+        };
+        info!("unfurl_bot listener started");
+        while let Some(sub) = stream.next().await {
+            if let Ok(RoomEvent::Message(env)) = serde_json::from_slice::<RoomEvent>(sub.payload()) {
+                if let Err(e) = handle(&state, &cache, fetcher.as_ref(), env).await {
+                    warn!(error = ?e, "unfurl_bot handle failed");
+                }
+            }
+            let _ = sub.ack().await;
         }
-        let _ = sub.ack().await;
+        warn!("unfurl_bot subscription stream ended; resubscribing");
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
-    Ok(())
 }
 
 async fn handle(

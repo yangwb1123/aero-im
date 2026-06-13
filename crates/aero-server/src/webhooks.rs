@@ -447,27 +447,38 @@ async fn redeliver<S: WebhookSender + ?Sized>(
 pub async fn run_webhook_dispatcher(state: AppState) -> anyhow::Result<()> {
     use aero_bus::EventBus;
     let bus: Arc<dyn EventBus> = state.bus.clone();
-    let mut stream = bus
-        .subscribe("im.room.*", Some("aero-webhooks"))
-        .await
-        .map_err(|e| anyhow::anyhow!("subscribe: {e}"))?;
     let repo = WebhookRepo::new(state.participants.pool().clone());
     let deliveries = WebhookDeliveryRepo::new(state.pg.clone());
     let sender = aero_storage::ReqwestSender::new();
-    info!("webhook dispatcher started");
-    while let Some(sub) = stream.next().await {
-        if let Ok(event) = serde_json::from_slice::<RoomEvent>(sub.payload()) {
-            // Only new messages are dispatched today (see the doc note above).
-            if matches!(event, RoomEvent::Message(_)) {
-                let now = time::OffsetDateTime::now_utc().unix_timestamp();
-                dispatch_event(&repo, &deliveries, &sender, &event, now).await;
+    // Resubscribe across NATS reconnects so a dropped subscription stream never
+    // permanently stops webhook delivery (the same fan-out black-hole fixed for the
+    // WS listeners in `ws.rs`). The durable consumer "aero-webhooks" resumes from
+    // its committed cursor, and every event is acked, so nothing is re-sent.
+    loop {
+        let mut stream = match bus.subscribe("im.room.*", Some("aero-webhooks")).await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, "webhook dispatcher subscribe failed; retrying");
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                continue;
             }
+        };
+        info!("webhook dispatcher started");
+        while let Some(sub) = stream.next().await {
+            if let Ok(event) = serde_json::from_slice::<RoomEvent>(sub.payload()) {
+                // Only new messages are dispatched today (see the doc note above).
+                if matches!(event, RoomEvent::Message(_)) {
+                    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+                    dispatch_event(&repo, &deliveries, &sender, &event, now).await;
+                }
+            }
+            // Broadcast-style consumer: always ack so the cursor advances regardless
+            // of delivery outcome (webhook delivery is best-effort, not a work queue).
+            let _ = sub.ack().await;
         }
-        // Broadcast-style consumer: always ack so the cursor advances regardless
-        // of delivery outcome (webhook delivery is best-effort, not a work queue).
-        let _ = sub.ack().await;
+        warn!("webhook dispatcher subscription stream ended; resubscribing");
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
-    Ok(())
 }
 
 /// Background retry loop: every `interval_secs`, claim due `failed` deliveries

@@ -260,10 +260,6 @@ pub async fn run_with_config(state: AppState, cfg: ModerationConfig) -> anyhow::
     }
 
     let bus = state.bus.clone();
-    let mut stream = bus
-        .subscribe("im.room.*", Some("aero-moderation"))
-        .await
-        .map_err(|e| anyhow::anyhow!("moderation_bot subscribe: {e}"))?;
     info!(
         queue = cfg.queue_capacity,
         concurrency = cfg.concurrency,
@@ -272,29 +268,41 @@ pub async fn run_with_config(state: AppState, cfg: ModerationConfig) -> anyhow::
         window_secs = cfg.window.as_secs(),
         "moderation_bot listener started"
     );
-
-    while let Some(sub) = stream.next().await {
-        if let Ok(RoomEvent::Message(env)) = serde_json::from_slice::<RoomEvent>(sub.payload()) {
-            let text = env.message.searchable_text();
-            if !text.trim().is_empty() {
-                let job = ModerationJob {
-                    message_id: env.message.id,
-                    room_id: env.message.room_id,
-                    text,
-                };
-                let id = job.message_id;
-                if let Err(reason) = try_enqueue(&tx, job) {
-                    record_skip(reason, id);
+    // Resubscribe across NATS reconnects. The worker pool + queue (`tx`) persist
+    // (never dropped) so a dropped subscription stream never permanently stops
+    // moderation. Durable consumer "aero-moderation" resumes from its cursor; every
+    // message is acked (skips are deliberately not redelivered).
+    loop {
+        let mut stream = match bus.subscribe("im.room.*", Some("aero-moderation")).await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, "moderation_bot subscribe failed; retrying");
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                continue;
+            }
+        };
+        while let Some(sub) = stream.next().await {
+            if let Ok(RoomEvent::Message(env)) = serde_json::from_slice::<RoomEvent>(sub.payload()) {
+                let text = env.message.searchable_text();
+                if !text.trim().is_empty() {
+                    let job = ModerationJob {
+                        message_id: env.message.id,
+                        room_id: env.message.room_id,
+                        text,
+                    };
+                    let id = job.message_id;
+                    if let Err(reason) = try_enqueue(&tx, job) {
+                        record_skip(reason, id);
+                    }
                 }
             }
+            // Ack regardless: skipped messages are deliberately not redelivered —
+            // moderation is best-effort screening, not a delivery gate.
+            let _ = sub.ack().await;
         }
-        // Ack regardless: skipped messages are deliberately not redelivered —
-        // moderation is best-effort screening, not a delivery gate.
-        let _ = sub.ack().await;
+        warn!("moderation_bot subscription stream ended; resubscribing");
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
-    // Stream ended: dropping `tx` lets the workers drain the queue and exit.
-    drop(tx);
-    Ok(())
 }
 
 /// One worker: pull jobs off the shared queue until it closes.

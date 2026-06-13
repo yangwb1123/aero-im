@@ -24,23 +24,33 @@ use crate::state::AppState;
 
 pub async fn run(state: AppState, ai: Arc<AiService>) -> anyhow::Result<()> {
     let bus = state.bus.clone();
-    let mut stream = bus
-        .subscribe("im.room.*", Some("aero-bot"))
-        .await
-        .map_err(|e| anyhow::anyhow!("agent_bot subscribe: {e}"))?;
-    info!("agent_bot listener started");
-    while let Some(sub) = stream.next().await {
-        match serde_json::from_slice::<RoomEvent>(sub.payload()) {
-            Ok(RoomEvent::Message(env)) => {
-                if let Err(e) = handle(&state, &ai, env).await {
-                    warn!(error = ?e, "agent_bot handle failed");
-                }
+    // Resubscribe across NATS reconnects so a dropped stream never permanently
+    // stops the bot (mirrors `ws::run_bus_listener`). Durable consumer "aero-bot"
+    // resumes from its committed cursor; every message is acked, so none is replayed.
+    loop {
+        let mut stream = match bus.subscribe("im.room.*", Some("aero-bot")).await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, "agent_bot subscribe failed; retrying");
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                continue;
             }
-            Ok(_) | Err(_) => {}
+        };
+        info!("agent_bot listener started");
+        while let Some(sub) = stream.next().await {
+            match serde_json::from_slice::<RoomEvent>(sub.payload()) {
+                Ok(RoomEvent::Message(env)) => {
+                    if let Err(e) = handle(&state, &ai, env).await {
+                        warn!(error = ?e, "agent_bot handle failed");
+                    }
+                }
+                Ok(_) | Err(_) => {}
+            }
+            let _ = sub.ack().await;
         }
-        let _ = sub.ack().await;
+        warn!("agent_bot subscription stream ended; resubscribing");
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
-    Ok(())
 }
 
 async fn handle(state: &AppState, ai: &Arc<AiService>, env: MessageEnvelope) -> anyhow::Result<()> {

@@ -36,20 +36,29 @@ use crate::state::AppState;
 /// Returns an error if subscribing to the event bus fails.
 pub async fn run(state: AppState) -> anyhow::Result<()> {
     let bus = state.bus.clone();
-    let mut stream = bus
-        .subscribe("im.room.*", Some("aero-ooo"))
-        .await
-        .map_err(|e| anyhow::anyhow!("ooo_bot subscribe: {e}"))?;
-    info!("ooo_bot listener started");
-    while let Some(sub) = stream.next().await {
-        if let Ok(RoomEvent::Message(env)) = serde_json::from_slice::<RoomEvent>(sub.payload()) {
-            if let Err(e) = handle(&state, env).await {
-                warn!(error = ?e, "ooo_bot handle failed");
+    // Resubscribe across NATS reconnects (mirrors `ws::run_bus_listener`); durable
+    // consumer "aero-ooo" resumes from its cursor, every message is acked.
+    loop {
+        let mut stream = match bus.subscribe("im.room.*", Some("aero-ooo")).await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, "ooo_bot subscribe failed; retrying");
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                continue;
             }
+        };
+        info!("ooo_bot listener started");
+        while let Some(sub) = stream.next().await {
+            if let Ok(RoomEvent::Message(env)) = serde_json::from_slice::<RoomEvent>(sub.payload()) {
+                if let Err(e) = handle(&state, env).await {
+                    warn!(error = ?e, "ooo_bot handle failed");
+                }
+            }
+            let _ = sub.ack().await;
         }
-        let _ = sub.ack().await;
+        warn!("ooo_bot subscription stream ended; resubscribing");
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
-    Ok(())
 }
 
 async fn handle(state: &AppState, env: MessageEnvelope) -> anyhow::Result<()> {

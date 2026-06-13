@@ -42,22 +42,31 @@ use crate::state::AppState;
 /// Returns an error if subscribing to the event bus fails.
 pub async fn run(state: AppState) -> anyhow::Result<()> {
     let bus = state.bus.clone();
-    let mut stream = bus
-        .subscribe("live.stream.*", Some("aero-golive"))
-        .await
-        .map_err(|e| anyhow::anyhow!("golive_bot subscribe: {e}"))?;
-    info!("golive_bot listener started");
-    while let Some(sub) = stream.next().await {
-        if let Ok(StreamEvent::Status { stream_id, status: StreamStatus::Live }) =
-            serde_json::from_slice::<StreamEvent>(sub.payload())
-        {
-            if let Err(e) = handle(&state, stream_id).await {
-                warn!(error = ?e, %stream_id, "golive_bot handle failed");
+    // Resubscribe across NATS reconnects (mirrors `ws::run_bus_listener`); durable
+    // consumer "aero-golive" resumes from its cursor, every event is acked.
+    loop {
+        let mut stream = match bus.subscribe("live.stream.*", Some("aero-golive")).await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, "golive_bot subscribe failed; retrying");
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                continue;
             }
+        };
+        info!("golive_bot listener started");
+        while let Some(sub) = stream.next().await {
+            if let Ok(StreamEvent::Status { stream_id, status: StreamStatus::Live }) =
+                serde_json::from_slice::<StreamEvent>(sub.payload())
+            {
+                if let Err(e) = handle(&state, stream_id).await {
+                    warn!(error = ?e, %stream_id, "golive_bot handle failed");
+                }
+            }
+            let _ = sub.ack().await;
         }
-        let _ = sub.ack().await;
+        warn!("golive_bot subscription stream ended; resubscribing");
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
-    Ok(())
 }
 
 /// Fan a single go-live out to the streamer's followers.
