@@ -512,14 +512,14 @@ impl MessageRepo {
                  m.id, m.room_id, m.sender_id, m.blocks, m.reply_to, m.metadata,
                  m.created_at, m.edited_at, m.deleted_at, m.expires_at,
                  GREATEST(
-                   ts_rank(m.search_tsv, websearch_to_tsquery('english', $2)),
+                   ts_rank(m.search_tsv, websearch_to_tsquery('english', f_unaccent($2))),
                    similarity(m.searchable_text, $2)
                  ) AS score
                FROM messages m
                WHERE m.room_id = $1
                  AND m.deleted_at IS NULL
                  AND (
-                   m.search_tsv @@ websearch_to_tsquery('english', $2)
+                   m.search_tsv @@ websearch_to_tsquery('english', f_unaccent($2))
                    OR m.searchable_text % $2
                  )
                ORDER BY score DESC, m.id DESC
@@ -608,11 +608,11 @@ impl MessageRepo {
             r"SELECT
                  m.id, m.room_id, m.sender_id, m.blocks, m.reply_to, m.metadata,
                  m.created_at, m.edited_at, m.deleted_at, m.expires_at,
-                 ts_rank(m.search_tsv, {f}('english', $2)) AS score
+                 ts_rank(m.search_tsv, {f}('english', f_unaccent($2))) AS score
                FROM messages m
                WHERE m.room_id = $1
                  AND m.deleted_at IS NULL
-                 AND m.search_tsv @@ {f}('english', $2)
+                 AND m.search_tsv @@ {f}('english', f_unaccent($2))
                ORDER BY score DESC, m.id DESC
                LIMIT $3",
             f = parser.sql_name()
@@ -782,7 +782,7 @@ impl MessageRepo {
                  m.id, m.room_id, m.sender_id, m.blocks, m.reply_to, m.metadata,
                  m.created_at, m.edited_at, m.deleted_at, m.expires_at,
                  GREATEST(
-                   ts_rank(m.search_tsv, websearch_to_tsquery('english', $2)),
+                   ts_rank(m.search_tsv, websearch_to_tsquery('english', f_unaccent($2))),
                    similarity(m.searchable_text, $2)
                  ) AS score
                FROM messages m
@@ -790,7 +790,7 @@ impl MessageRepo {
                  ON rm.room_id = m.room_id AND rm.participant_id = $1
                WHERE m.deleted_at IS NULL
                  AND (
-                   m.search_tsv @@ websearch_to_tsquery('english', $2)
+                   m.search_tsv @@ websearch_to_tsquery('english', f_unaccent($2))
                    OR m.searchable_text % $2
                  )
                ORDER BY score DESC, m.id DESC
@@ -820,7 +820,7 @@ impl MessageRepo {
                  m.id, m.room_id, m.sender_id, m.blocks, m.reply_to, m.metadata,
                  m.created_at, m.edited_at, m.deleted_at, m.expires_at,
                  GREATEST(
-                   ts_rank(m.search_tsv, websearch_to_tsquery('english', $2)),
+                   ts_rank(m.search_tsv, websearch_to_tsquery('english', f_unaccent($2))),
                    similarity(m.searchable_text, $2)
                  ) AS score
                FROM messages m
@@ -829,7 +829,7 @@ impl MessageRepo {
                WHERE m.deleted_at IS NULL
                  AND m.room_id IN (SELECT id FROM rooms WHERE workspace_id = $4)
                  AND (
-                   m.search_tsv @@ websearch_to_tsquery('english', $2)
+                   m.search_tsv @@ websearch_to_tsquery('english', f_unaccent($2))
                    OR m.searchable_text % $2
                  )
                ORDER BY score DESC, m.id DESC
@@ -980,13 +980,13 @@ impl MessageRepo {
             r"SELECT
                  m.id, m.room_id, m.sender_id, m.blocks, m.reply_to, m.metadata,
                  m.created_at, m.edited_at, m.deleted_at, m.expires_at,
-                 ts_rank(m.search_tsv, {f}('english', $2)) AS score
+                 ts_rank(m.search_tsv, {f}('english', f_unaccent($2))) AS score
                FROM messages m
                JOIN room_members rm
                  ON rm.room_id = m.room_id AND rm.participant_id = $1
                WHERE m.deleted_at IS NULL
                  AND m.room_id IN (SELECT id FROM rooms WHERE workspace_id = $4)
-                 AND m.search_tsv @@ {f}('english', $2)
+                 AND m.search_tsv @@ {f}('english', f_unaccent($2))
                ORDER BY score DESC, m.id DESC
                LIMIT $3",
             f = parser.sql_name()
@@ -1438,6 +1438,44 @@ mod db_tests {
             hits.iter().any(|h| h.message.id == inflected.id),
             "the english stemmer matches 'deploy' against 'deploying'"
         );
+    }
+
+    /// FTS is accent-insensitive (migration 0131 `f_unaccent`): a message written
+    /// with diacritics is found by an unaccented query. Under the bare-`english`
+    /// config the tokens differ and this returns nothing — so this guards the
+    /// unaccent wrapper staying in lock-step on both the stored tsvector and the
+    /// query side.
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn search_is_accent_insensitive() {
+        let p = pool();
+        let repo = MessageRepo::new(p.clone());
+
+        let me = participant(&p).await;
+        let r = room(&p, me).await;
+        join(&p, r, me).await;
+
+        let accented = repo
+            .insert(NewMessage {
+                room_id: r,
+                sender_id: me,
+                blocks: vec![Block::text("réunion au café about the résumé")],
+                reply_to: None,
+                metadata: serde_json::json!({}),
+                expires_at: None,
+            })
+            .await
+            .expect("insert accented");
+
+        // Plain ASCII query matches the diacritic'd message…
+        let hits = repo.search_all_rooms(me, "cafe resume", 50).await.expect("search");
+        assert!(
+            hits.iter().any(|h| h.message.id == accented.id),
+            "unaccented 'cafe resume' matches accented 'café … résumé'"
+        );
+        // …and the reverse (accented query → same message) also holds.
+        let hits_rev = repo.search_all_rooms(me, "café", 50).await.expect("search rev");
+        assert!(hits_rev.iter().any(|h| h.message.id == accented.id), "accented query also matches");
     }
 
     /// `thread_summary` returns reply count, distinct repliers, and the newest
