@@ -141,7 +141,9 @@ impl ParticipantRepo {
     ///    and tombstone its own PII: `display_name = '[deleted]'`, `avatar_url = NULL`.
     /// 2. Hard-delete the satellite PII tables (`credentials` — login email + hash,
     ///    `participant_profiles` — phone/status/pronouns, `sso_identities` — IdP
-    ///    email/subject); nothing references them, so they are removed outright.
+    ///    email/subject) and unsent authored content not in the message ledger
+    ///    (`message_drafts`, `out_of_office` text, `scheduled_messages`); nothing
+    ///    references them, so they are removed outright.
     /// 3. Overwrite every non-deleted message the participant sent with a
     ///    `[deleted]` placeholder, clear `searchable_text`, and null the pgvector
     ///    `embedding` (a semantic vector is re-identifiable) (GDPR Art. 17) —
@@ -191,13 +193,21 @@ impl ParticipantRepo {
         .execute(&mut *tx)
         .await?;
 
-        // Delete the satellite PII tables outright — nothing references them, so a
-        // hard delete fully removes the login email, password hash, profile (phone,
-        // status text, pronouns, …) and any linked SSO identities/emails.
+        // Hard-delete the participant's satellite PII and unsent authored content —
+        // nothing references these tables, so a plain delete fully removes them:
+        //   identity PII: login email + hash (credentials), profile phone/status/
+        //                 pronouns (participant_profiles), linked IdP emails/subjects
+        //                 (sso_identities);
+        //   authored private content not in the message ledger: unsent drafts
+        //                 (message_drafts.blocks), the out-of-office autoreply text,
+        //                 and not-yet-sent scheduled messages (scheduled_messages.blocks).
         for stmt in [
             "DELETE FROM credentials WHERE participant_id = $1",
             "DELETE FROM participant_profiles WHERE participant_id = $1",
             "DELETE FROM sso_identities WHERE participant_id = $1",
+            "DELETE FROM message_drafts WHERE participant_id = $1",
+            "DELETE FROM out_of_office WHERE participant_id = $1",
+            "DELETE FROM scheduled_messages WHERE sender_id = $1",
         ] {
             sqlx::query(stmt).bind(participant_id.to_uuid()).execute(&mut *tx).await?;
         }
@@ -801,6 +811,32 @@ mod db_tests {
         .await
         .expect("sso");
 
+        // Authored private content (drafts / OOO text / unsent scheduled message).
+        let r = room(&p, id).await;
+        sqlx::query(
+            "INSERT INTO message_drafts (participant_id, room_id, blocks) VALUES ($1,$2,'[]'::jsonb)",
+        )
+        .bind(id.to_uuid())
+        .bind(r.to_uuid())
+        .execute(&p)
+        .await
+        .expect("draft");
+        sqlx::query("INSERT INTO out_of_office (participant_id, message) VALUES ($1,'away — call me')")
+            .bind(id.to_uuid())
+            .execute(&p)
+            .await
+            .expect("ooo");
+        sqlx::query(
+            "INSERT INTO scheduled_messages (id, room_id, sender_id, blocks, scheduled_at) \
+             VALUES ($1,$2,$3,'[]'::jsonb, now())",
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(r.to_uuid())
+        .bind(id.to_uuid())
+        .execute(&p)
+        .await
+        .expect("scheduled");
+
         assert!(participants.delete_participant(id).await.expect("erase"));
 
         let (name, avatar_null): (String, bool) =
@@ -812,14 +848,21 @@ mod db_tests {
         assert_eq!(name, "[deleted]", "display_name must be tombstoned");
         assert!(avatar_null, "avatar_url must be cleared");
 
-        for table in ["credentials", "participant_profiles", "sso_identities"] {
+        for (table, col) in [
+            ("credentials", "participant_id"),
+            ("participant_profiles", "participant_id"),
+            ("sso_identities", "participant_id"),
+            ("message_drafts", "participant_id"),
+            ("out_of_office", "participant_id"),
+            ("scheduled_messages", "sender_id"),
+        ] {
             let count: (i64,) =
-                sqlx::query_as(&format!("SELECT count(*) FROM {table} WHERE participant_id = $1"))
+                sqlx::query_as(&format!("SELECT count(*) FROM {table} WHERE {col} = $1"))
                     .bind(id.to_uuid())
                     .fetch_one(&p)
                     .await
                     .expect("count");
-            assert_eq!(count.0, 0, "{table} PII must be deleted on erasure");
+            assert_eq!(count.0, 0, "{table} data must be deleted on erasure");
         }
     }
 }
