@@ -15,6 +15,12 @@ use crate::config::TelemetryConfig;
 
 /// Initializes structured logging and (optionally) OTLP trace export.
 pub fn init(cfg: &TelemetryConfig, service_name: &'static str) -> TelemetryGuard {
+    // Install the W3C TraceContext propagator so inbound HTTP / NATS `traceparent`
+    // headers can be extracted and outbound calls can carry the current context —
+    // the basis for cross-process trace continuity (ROADMAP5 方向二). Harmless when
+    // OTLP export is unconfigured (the active context is then empty).
+    install_trace_propagator();
+
     let env_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&cfg.log_level));
 
@@ -46,6 +52,69 @@ pub fn init(cfg: &TelemetryConfig, service_name: &'static str) -> TelemetryGuard
     } else {
         registry.init();
         TelemetryGuard { provider: None }
+    }
+}
+
+/// Install the global W3C `TraceContext` propagator. Idempotent; called by
+/// [`init`], exposed for tests / alternate setups.
+pub fn install_trace_propagator() {
+    opentelemetry::global::set_text_map_propagator(
+        opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+    );
+}
+
+/// Inject the **current** span's W3C trace context into `carrier` (a header map),
+/// so a downstream process reading those headers can continue the same trace.
+/// A no-op (leaves `carrier` untouched) when no span context is active — e.g. OTLP
+/// export is unconfigured, so producers pay nothing in that mode.
+pub fn inject_trace_context(carrier: &mut std::collections::HashMap<String, String>) {
+    use tracing_opentelemetry::OpenTelemetrySpanExt;
+    let cx = tracing::Span::current().context();
+    opentelemetry::global::get_text_map_propagator(|p| p.inject_context(&cx, carrier));
+}
+
+/// Extract a remote W3C trace context from `carrier`. Attach it to a consuming
+/// span via [`OpenTelemetrySpanExt::set_parent`](tracing_opentelemetry::OpenTelemetrySpanExt::set_parent)
+/// so the consumer's work nests under the producer's trace.
+#[must_use]
+pub fn extract_trace_context(
+    carrier: &std::collections::HashMap<String, String>,
+) -> opentelemetry::Context {
+    opentelemetry::global::get_text_map_propagator(|p| p.extract(carrier))
+}
+
+#[cfg(test)]
+mod trace_propagation_tests {
+    use super::{extract_trace_context, install_trace_propagator};
+    use opentelemetry::trace::{
+        SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId, TraceState,
+    };
+    use std::collections::HashMap;
+
+    /// The W3C trace context survives an inject → header-map → extract round-trip:
+    /// the trace id a producer stamps is the trace id a consumer recovers. This is
+    /// the cross-process propagation primitive (verifiable without a collector —
+    /// the collector only renders the resulting tree).
+    #[test]
+    fn trace_context_round_trips_through_a_carrier() {
+        install_trace_propagator();
+        let trace_id = TraceId::from_bytes([7u8; 16]);
+        let span_id = SpanId::from_bytes([3u8; 8]);
+        let sc = SpanContext::new(trace_id, span_id, TraceFlags::SAMPLED, true, TraceState::default());
+        let cx = opentelemetry::Context::new().with_remote_span_context(sc);
+
+        let mut carrier: HashMap<String, String> = HashMap::new();
+        opentelemetry::global::get_text_map_propagator(|p| {
+            p.inject_context(&cx, &mut carrier);
+        });
+        assert!(carrier.contains_key("traceparent"), "traceparent injected: {carrier:?}");
+
+        let extracted = extract_trace_context(&carrier);
+        assert_eq!(
+            extracted.span().span_context().trace_id(),
+            trace_id,
+            "the producer's trace id is recovered by the consumer",
+        );
     }
 }
 
