@@ -106,6 +106,49 @@ async fn create_room_and_send_message() {
 
 #[tokio::test]
 #[ignore = "requires running Postgres with migrations applied"]
+async fn pii_guard_blocks_message_with_sensitive_data() {
+    let pool = pool();
+    let participants = ParticipantRepo::new(pool.clone());
+    let alice = new_participant(&participants, "alice").await;
+
+    // Wire the PII guard onto the standard service (ROADMAP5 方向五).
+    let svc = service(pool).with_pii_detector(std::sync::Arc::new(crate::PiiDetector::new(
+        crate::PiiConfig::default(),
+    )));
+    let room = svc
+        .create_room(alice.id, RoomKind::Group, Some("pii".into()))
+        .await
+        .unwrap();
+
+    // A message carrying a Luhn-valid card number is rejected as Invalid before
+    // it can reach the FTS index / embeddings / exports.
+    let err = svc
+        .send_message(
+            alice.id,
+            room.id,
+            vec![Block::text("here is my card 4111 1111 1111 1111 thanks")],
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, aero_common::Error::Invalid(_)),
+        "PII message must be blocked, got {err:?}"
+    );
+
+    // A clean message still sends, and nothing was persisted for the blocked one.
+    let ok = svc
+        .send_message(alice.id, room.id, vec![Block::text("ship it at 3pm")], None, None)
+        .await
+        .expect("clean message sends");
+    assert_eq!(ok.room_id, room.id);
+    let history = svc.history(alice.id, room.id, None, 50).await.unwrap();
+    assert_eq!(history.len(), 1, "only the clean message persisted");
+}
+
+#[tokio::test]
+#[ignore = "requires running Postgres with migrations applied"]
 async fn non_member_cannot_send_message() {
     let pool = pool();
     let participants = ParticipantRepo::new(pool.clone());

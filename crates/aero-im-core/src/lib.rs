@@ -15,6 +15,7 @@
 
 mod events;
 mod moderator;
+mod pii_detect;
 mod seq;
 mod service;
 mod spam_guard;
@@ -22,6 +23,7 @@ mod validation;
 
 pub use events::ImEvent;
 pub use moderator::{AllowAllModerator, KeywordModerator, Moderator, ModerationVerdict};
+pub use pii_detect::{detect as detect_pii, PiiConfig, PiiDetector, PiiKind};
 pub use spam_guard::{SpamDecision, SpamGuard, SpamReason, SpamThresholds};
 pub use seq::{LocalSeqProvider, SeqProvider};
 pub use service::{

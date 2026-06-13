@@ -246,6 +246,12 @@ pub struct ImService {
     /// behaviour (rate / same-content cross-room blast / duplicates) crosses the
     /// thresholds. `None` = no behavioural throttling.
     spam_guard: Option<Arc<crate::SpamGuard>>,
+    /// Optional PII detector (ROADMAP5 方向五). When wired,
+    /// [`send_message`](Self::send_message) blocks an outbound message whose text
+    /// carries structurally plausible PII (SSN / Luhn-valid card / email / phone),
+    /// so it never reaches the FTS index, AI embeddings, or exports. `None` = no
+    /// PII screening.
+    pii_detector: Option<Arc<crate::PiiDetector>>,
     /// Per-subject event-seq source for publish-time `"seq"` stamping (ROADMAP
     /// 第三版 方向一). Defaults to the process-local [`LocalSeqProvider`];
     /// clustered deployments wire the Redis `INCR`-backed
@@ -302,6 +308,7 @@ impl ImService {
             bus: bus as Arc<dyn BusSink>,
             moderator,
             spam_guard: None,
+            pii_detector: None,
             seq: Arc::new(LocalSeqProvider::new()),
         }
     }
@@ -318,6 +325,14 @@ impl ImService {
     #[must_use]
     pub fn with_spam_guard(mut self, guard: Arc<crate::SpamGuard>) -> Self {
         self.spam_guard = Some(guard);
+        self
+    }
+
+    /// Wire a PII detector (ROADMAP5 方向五). Additive — without it `send_message`
+    /// does no PII screening.
+    #[must_use]
+    pub fn with_pii_detector(mut self, detector: Arc<crate::PiiDetector>) -> Self {
+        self.pii_detector = Some(detector);
         self
     }
 
@@ -562,6 +577,7 @@ impl ImService {
             bus,
             moderator: Arc::new(crate::moderator::AllowAllModerator),
             spam_guard: None,
+            pii_detector: None,
             seq: Arc::new(LocalSeqProvider::new()),
         }
     }
@@ -1066,6 +1082,28 @@ impl ImService {
             {
                 tracing::warn!(%sender, %room, ?reason, "behavioral spam guard throttled a message");
                 return Err(Error::RateLimited);
+            }
+        }
+
+        // PII guard (ROADMAP5 方向五): block an outbound message carrying
+        // structurally plausible PII (SSN / Luhn-valid card / email / phone) so it
+        // never lands in the FTS index, AI embeddings, or exports. Scans the text
+        // of every text-bearing block (Text / Code / file name / …), not just
+        // Text, since PII can hide in a code snippet or attachment name. Pure +
+        // allocation-light, so it adds no I/O to the send path.
+        if let Some(detector) = self.pii_detector.as_ref() {
+            let text = blocks
+                .iter()
+                .filter_map(aero_common::Block::searchable_text)
+                .collect::<Vec<_>>()
+                .join("\n");
+            let kinds = detector.scan(&text);
+            if !kinds.is_empty() {
+                let tags = kinds.iter().map(|k| k.tag()).collect::<Vec<_>>().join(", ");
+                tracing::warn!(%sender, %room, pii = %tags, "PII guard blocked a message");
+                return Err(Error::Invalid(format!(
+                    "message blocked: it appears to contain sensitive personal information ({tags})"
+                )));
             }
         }
 

@@ -222,6 +222,14 @@ async fn main() -> anyhow::Result<()> {
         )));
         info!("behavioral spam guard enabled (AERO_SPAM_GUARD)");
     }
+    // ROADMAP5 方向五: opt-in PII guard (env `AERO_PII_GUARD`; `AERO_PII_GUARD_PHONE`
+    // additionally enables the noisier phone matcher). Blocks an outbound message
+    // carrying SSN / Luhn-valid card / email / phone so PII never reaches the FTS
+    // index, AI embeddings, or exports.
+    if let Some(detector) = aero_im_core::PiiDetector::from_env() {
+        im_svc = im_svc.with_pii_detector(Arc::new(detector));
+        info!("PII guard enabled (AERO_PII_GUARD)");
+    }
     let im = Arc::new(im_svc);
 
     // ---------- Live service (danmaku / gifts / viewers) ----------
