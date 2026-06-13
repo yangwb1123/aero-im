@@ -43,6 +43,7 @@ pub struct RequestId(pub String);
 /// Middleware: read or generate a `x-request-id` header, attach a
 /// [`RequestId`] extension, and echo the value in the response.
 async fn inject_request_id(mut req: Request<axum::body::Body>, next: Next) -> Response {
+    use tracing::Instrument as _;
     let id = req
         .headers()
         .get("x-request-id")
@@ -50,7 +51,13 @@ async fn inject_request_id(mut req: Request<axum::body::Body>, next: Next) -> Re
         .map(String::from)
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     req.extensions_mut().insert(RequestId(id.clone()));
-    let mut res = next.run(req).await;
+    // Handle the request inside a span carrying `request_id`, so every structured
+    // log line emitted while serving it is tagged with the same id echoed back in
+    // the `x-request-id` response header — ops can pivot from the header to the
+    // logs (ROADMAP5 方向二: log↔request correlation). The default `fmt` formatter
+    // renders active span fields, so no log-format change is needed.
+    let span = tracing::info_span!("http_request", request_id = %id);
+    let mut res = next.run(req).instrument(span).await;
     if let Ok(v) = HeaderValue::from_str(&id) {
         res.headers_mut().insert("x-request-id", v);
     }
