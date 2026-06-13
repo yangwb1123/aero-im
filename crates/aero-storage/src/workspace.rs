@@ -609,8 +609,40 @@ impl WorkspaceRepo {
     pub async fn delete(&self, workspace: WorkspaceId) -> Result<bool, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
 
+        // 0. Several room-scoped tables carry a `room_id` but have NO foreign key to
+        //    `rooms` (historical oversight), so the `DELETE FROM rooms` below does
+        //    NOT cascade to them — they would be ORPHANED, leaving user content
+        //    (drafts, tasks, canvas, OOO replies, …) alive after the tenant is gone.
+        //    Clear them explicitly first, scoped to this workspace's rooms. This is
+        //    the only path that hard-deletes rooms, so it fully closes the gap.
+        //    (`legal_holds` is deliberately excluded — compliance preservation
+        //    records are not auto-destroyed by a tenant delete.)
+        for table in [
+            "message_drafts",
+            "ooo_auto_replies",
+            "recurring_messages",
+            "tasks",
+            "channel_bookmarks",
+            "channel_canvases",
+            "channel_favorites",
+            "channel_notification_prefs",
+            "channel_section_items",
+            "channel_join_requests",
+            "digest_subscriptions",
+            "workspace_default_channels",
+            "scheduled_streams",
+            "stream_recordings",
+        ] {
+            sqlx::query(&format!(
+                "DELETE FROM {table} WHERE room_id IN (SELECT id FROM rooms WHERE workspace_id = $1)"
+            ))
+            .bind(workspace.to_uuid())
+            .execute(&mut *tx)
+            .await?;
+        }
+
         // 1. Remove the workspace's channels first (rooms→workspaces FK has no
-        //    cascade), which cascades to all room-scoped data.
+        //    cascade), which cascades to all room-scoped data with a proper FK.
         sqlx::query(r"DELETE FROM rooms WHERE workspace_id = $1")
             .bind(workspace.to_uuid())
             .execute(&mut *tx)
@@ -1221,6 +1253,14 @@ mod db_tests {
         let repo = WorkspaceRepo::new(p.clone());
         let owner = new_participant(&p).await;
         let (ws, room, msg) = seed_workspace(&repo, &p, owner).await;
+        // A room-scoped row in a NON-FK table (message_drafts) — proves the explicit
+        // cleanup catches tables `DELETE FROM rooms` would otherwise orphan.
+        sqlx::query("INSERT INTO message_drafts (participant_id, room_id, blocks) VALUES ($1,$2,'[]'::jsonb)")
+            .bind(owner.to_uuid())
+            .bind(room.to_uuid())
+            .execute(&p)
+            .await
+            .unwrap();
         // An audit row to prove the cascade reaches audit_events.
         AuditRepo::new(p.clone())
             .append(ws, Some(owner), "workspace.delete", None, serde_json::json!({}))
@@ -1258,6 +1298,14 @@ mod db_tests {
                 .await
                 .unwrap();
         assert_eq!(audit_left, 0, "audit events cascade-deleted with the workspace");
+        // Non-FK room-scoped content (drafts) is explicitly cleaned, not orphaned.
+        let draft_left: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM message_drafts WHERE room_id = $1")
+                .bind(room.to_uuid())
+                .fetch_one(&p)
+                .await
+                .unwrap();
+        assert_eq!(draft_left, 0, "non-FK room-scoped drafts cleaned, not orphaned");
     }
 
     #[tokio::test]
