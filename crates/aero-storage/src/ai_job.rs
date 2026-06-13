@@ -53,6 +53,20 @@ pub struct AiJob {
     pub finished_at: Option<time::OffsetDateTime>,
 }
 
+/// Queue priority for a job kind — **lower runs first**. Moderation gates message
+/// visibility and `answer` has a user waiting, so they preempt the best-effort
+/// `summarize`/`embed` backfill that floods the queue every tick. Pure, so the
+/// lane ordering is unit-tested without a DB.
+#[must_use]
+pub fn priority_for(kind: AiJobKind) -> i16 {
+    match kind {
+        AiJobKind::Moderate => 10,
+        AiJobKind::Answer => 20,
+        AiJobKind::Summarize => 50,
+        AiJobKind::Embed => 100,
+    }
+}
+
 impl AiJobRepo {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
@@ -74,14 +88,15 @@ impl AiJobRepo {
             AiJobKind::Answer => "answer",
         };
         sqlx::query(
-            r#"INSERT INTO ai_jobs (id, kind, target_id, workspace_id, status, payload)
-               VALUES ($1, $2, $3, $4, 'queued', $5)"#,
+            r#"INSERT INTO ai_jobs (id, kind, target_id, workspace_id, status, payload, priority)
+               VALUES ($1, $2, $3, $4, 'queued', $5, $6)"#,
         )
         .bind(uuid::Uuid::from_u128(id.0))
         .bind(kind_s)
         .bind(target_id)
         .bind(workspace_id)
         .bind(&payload)
+        .bind(priority_for(kind))
         .execute(&self.pool)
         .await?;
         Ok(id)
@@ -107,8 +122,8 @@ impl AiJobRepo {
             AiJobKind::Answer => "answer",
         };
         let res = sqlx::query(
-            r#"INSERT INTO ai_jobs (id, kind, target_id, workspace_id, status, payload)
-               SELECT $1, $2, $3, $4, 'queued', $5
+            r#"INSERT INTO ai_jobs (id, kind, target_id, workspace_id, status, payload, priority)
+               SELECT $1, $2, $3, $4, 'queued', $5, $6
                 WHERE NOT EXISTS (
                     SELECT 1 FROM ai_jobs
                      WHERE kind = $2 AND target_id = $3
@@ -120,6 +135,7 @@ impl AiJobRepo {
         .bind(target_id)
         .bind(workspace_id)
         .bind(&payload)
+        .bind(priority_for(kind))
         .execute(&self.pool)
         .await?;
         Ok((res.rows_affected() > 0).then_some(id))
@@ -135,7 +151,7 @@ impl AiJobRepo {
                     SELECT id FROM ai_jobs
                      WHERE status = 'queued'
                        AND scheduled_at <= NOW()
-                     ORDER BY scheduled_at ASC
+                     ORDER BY priority ASC, scheduled_at ASC
                      FOR UPDATE SKIP LOCKED
                      LIMIT $1
                 )
@@ -315,5 +331,86 @@ impl From<AiJobRow> for AiJob {
             started_at: r.started_at,
             finished_at: r.finished_at,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn priority_lanes_order_user_facing_work_ahead_of_backfill() {
+        // Lower = runs first. Moderation gates visibility, answer has a user
+        // waiting; summarize then embed are best-effort backfill.
+        assert!(priority_for(AiJobKind::Moderate) < priority_for(AiJobKind::Answer));
+        assert!(priority_for(AiJobKind::Answer) < priority_for(AiJobKind::Summarize));
+        assert!(priority_for(AiJobKind::Summarize) < priority_for(AiJobKind::Embed));
+        // The schema default (100) matches the lowest lane, so an un-stamped row
+        // sorts with embed backfill rather than ahead of moderation.
+        assert_eq!(priority_for(AiJobKind::Embed), 100);
+    }
+}
+
+/// PG-gated integration tests:
+/// ```text
+/// DATABASE_URL=postgres://aero:aero_dev_pw@localhost:5432/aero \
+///   cargo test -p aero-storage --lib -- --ignored ai_job
+/// ```
+#[cfg(test)]
+mod db_tests {
+    use super::*;
+    use sqlx::postgres::PgPoolOptions;
+
+    fn pool() -> PgPool {
+        let url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://aero:aero_dev_pw@localhost:5432/aero".into());
+        PgPoolOptions::new()
+            .max_connections(2)
+            .connect_lazy(&url)
+            .expect("connect_lazy never fails on a well-formed URL")
+    }
+
+    /// Priority preempts FIFO: an `embed` (backfill) enqueued FIRST — so with an
+    /// earlier `scheduled_at` — is still claimed AFTER a `moderate` enqueued later,
+    /// because moderation owns a higher-priority lane. A unique `workspace_id` tags
+    /// our two rows so unrelated queued jobs in the shared DB don't perturb the
+    /// assertion (claim(1) always takes the global min, and our moderate(10) <
+    /// embed(100), so ours are claimed moderate-then-embed regardless of the rest).
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn claim_prefers_higher_priority_lane_over_fifo() {
+        let p = pool();
+        let repo = AiJobRepo::new(p.clone());
+        let tag = uuid::Uuid::new_v4();
+
+        let embed = repo
+            .enqueue(AiJobKind::Embed, None, Some(tag), serde_json::json!({}))
+            .await
+            .expect("enqueue embed");
+        let moderate = repo
+            .enqueue(AiJobKind::Moderate, None, Some(tag), serde_json::json!({}))
+            .await
+            .expect("enqueue moderate");
+
+        let mut mine = Vec::new();
+        for _ in 0..1000 {
+            let batch = repo.claim(1).await.expect("claim");
+            if batch.is_empty() {
+                break;
+            }
+            for j in batch {
+                if j.workspace_id == Some(tag) {
+                    mine.push(j.id);
+                }
+            }
+            if mine.len() == 2 {
+                break;
+            }
+        }
+        assert_eq!(
+            mine,
+            vec![moderate, embed],
+            "moderate (higher-priority lane) is claimed before the earlier-enqueued embed"
+        );
     }
 }
