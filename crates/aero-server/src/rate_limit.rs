@@ -17,9 +17,9 @@ use std::time::{Duration, Instant};
 use aero_common::Error as AeroError;
 use axum::{
     extract::{ConnectInfo, Request, State},
-    http::HeaderMap,
+    http::{HeaderMap, HeaderValue},
     middleware::Next,
-    response::Response,
+    response::{IntoResponse, Response},
 };
 use dashmap::DashMap;
 
@@ -48,6 +48,21 @@ pub struct RateLimiter {
     rate: f64,
     /// Bucket capacity (burst ceiling).
     capacity: f64,
+}
+
+/// Post-decision snapshot of a client's bucket, used to emit `X-RateLimit-*`
+/// headers (and `Retry-After` on a reject).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RateLimitStatus {
+    /// Whether the request was permitted (a token was consumed).
+    pub allowed: bool,
+    /// The bucket's burst ceiling — `X-RateLimit-Limit`.
+    pub limit: u64,
+    /// Whole tokens left after this request — `X-RateLimit-Remaining`.
+    pub remaining: u64,
+    /// On success, seconds until the bucket refills to full (`X-RateLimit-Reset`);
+    /// on reject, seconds until the next token (`Retry-After`), at least 1.
+    pub reset_secs: u64,
 }
 
 /// Identity a request is rate-limited against.
@@ -92,6 +107,18 @@ impl RateLimiter {
     /// `false` if the bucket is empty and the request should be rejected with
     /// HTTP 429. Time is injected so the policy is deterministically testable.
     pub fn check_at(&self, key: ClientKey, now: Instant) -> bool {
+        self.check_status_at(key, now).allowed
+    }
+
+    /// Like [`check_at`](Self::check_at) but also reports the post-decision bucket
+    /// state, so the HTTP layer can surface `X-RateLimit-*` / `Retry-After`
+    /// headers to clients (letting a well-behaved client back off before it ever
+    /// trips a 429).
+    // `capacity`/`rate` are small positive configured values and `tokens` is
+    // clamped to `[0, capacity]` (and each cast is `.max(0.0)`'d), so the f64→u64
+    // conversions below never wrap or lose sign — the lint can't see those bounds.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    pub fn check_status_at(&self, key: ClientKey, now: Instant) -> RateLimitStatus {
         let mut entry = self
             .buckets
             .entry(key)
@@ -103,17 +130,31 @@ impl RateLimiter {
             bucket.tokens = (bucket.tokens + elapsed * self.rate).min(self.capacity);
             bucket.last = now;
         }
-        if bucket.tokens >= 1.0 {
+        let allowed = bucket.tokens >= 1.0;
+        if allowed {
             bucket.tokens -= 1.0;
-            true
-        } else {
-            false
         }
+        let limit = self.capacity.max(0.0).round() as u64;
+        let remaining = bucket.tokens.max(0.0).floor() as u64;
+        // On success: seconds until the bucket is full again (informational).
+        // On reject: seconds until the next whole token (the Retry-After hint),
+        // at least 1 so a client never busy-retries.
+        let reset_secs = if allowed {
+            ((self.capacity - bucket.tokens) / self.rate).ceil().max(0.0) as u64
+        } else {
+            ((1.0 - bucket.tokens) / self.rate).ceil().max(1.0) as u64
+        };
+        RateLimitStatus { allowed, limit, remaining, reset_secs }
     }
 
     /// Convenience wrapper using the current monotonic clock.
     pub fn check(&self, key: ClientKey) -> bool {
         self.check_at(key, Instant::now())
+    }
+
+    /// [`check_status_at`](Self::check_status_at) at the current monotonic clock.
+    pub fn check_status(&self, key: ClientKey) -> RateLimitStatus {
+        self.check_status_at(key, Instant::now())
     }
 
     /// Number of distinct client buckets currently tracked (for tests / metrics).
@@ -210,13 +251,38 @@ pub async fn layer(
         p if SENSITIVE_AUTH_PATHS.contains(&p) => &state.auth_rate_limiter,
         _ => &state.rate_limiter,
     };
-    if limiter.check(key) {
-        Ok(next.run(request).await)
+    let status = limiter.check_status(key);
+    if status.allowed {
+        let mut response = next.run(request).await;
+        attach_rate_limit_headers(response.headers_mut(), &status);
+        Ok(response)
     } else {
         // Observability (ROADMAP 方向四): count limiter rejections so a 429 spike
         // (abuse / misbehaving client) is visible on the dashboard.
         crate::metrics::record_rate_limit_rejection();
-        Err(ApiError(AeroError::RateLimited))
+        // Build the 429 ourselves (rather than returning `Err`) so the response
+        // carries the X-RateLimit-* + Retry-After headers a client needs to back off.
+        let mut response = ApiError(AeroError::RateLimited).into_response();
+        attach_rate_limit_headers(response.headers_mut(), &status);
+        if let Ok(v) = HeaderValue::from_str(&status.reset_secs.to_string()) {
+            response.headers_mut().insert("retry-after", v);
+        }
+        Ok(response)
+    }
+}
+
+/// Attach the standard `X-RateLimit-Limit` / `-Remaining` / `-Reset` headers from
+/// a [`RateLimitStatus`]. Best-effort: a header value that fails to construct
+/// (never, for decimal integers) is simply skipped.
+fn attach_rate_limit_headers(headers: &mut HeaderMap, status: &RateLimitStatus) {
+    for (name, val) in [
+        ("x-ratelimit-limit", status.limit),
+        ("x-ratelimit-remaining", status.remaining),
+        ("x-ratelimit-reset", status.reset_secs),
+    ] {
+        if let Ok(v) = HeaderValue::from_str(&val.to_string()) {
+            headers.insert(name, v);
+        }
     }
 }
 
@@ -333,6 +399,33 @@ mod tests {
         assert!(SENSITIVE_AUTH_PATHS.contains(&"/api/auth/reset-password"));
         assert!(SENSITIVE_AUTH_PATHS.contains(&"/api/auth/refresh"));
         assert!(!SENSITIVE_AUTH_PATHS.contains(&"/api/messages"));
+    }
+
+    #[test]
+    fn check_status_reports_limit_remaining_and_reset() {
+        // capacity 3, 1 token/sec.
+        let rl = RateLimiter::with_rate(1.0, 3.0);
+        let key = ip_key(21);
+        let t0 = Instant::now();
+
+        // First request: allowed, 2 of 3 left, limit 3.
+        let s1 = rl.check_status_at(key.clone(), t0);
+        assert!(s1.allowed);
+        assert_eq!(s1.limit, 3);
+        assert_eq!(s1.remaining, 2);
+
+        // Drain the bucket: 2nd and 3rd allowed, remaining hits 0.
+        let s2 = rl.check_status_at(key.clone(), t0);
+        assert_eq!(s2.remaining, 1);
+        let s3 = rl.check_status_at(key.clone(), t0);
+        assert_eq!(s3.remaining, 0);
+        assert!(s3.allowed);
+
+        // 4th: rejected, remaining 0, Retry-After ≥ 1s (next token at 1/sec).
+        let s4 = rl.check_status_at(key, t0);
+        assert!(!s4.allowed);
+        assert_eq!(s4.remaining, 0);
+        assert!(s4.reset_secs >= 1, "reject must advertise a non-zero Retry-After");
     }
 
     #[test]
