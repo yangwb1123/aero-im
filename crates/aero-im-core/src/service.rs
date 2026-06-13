@@ -1087,14 +1087,18 @@ impl ImService {
 
         // PII guard (ROADMAP5 方向五): block an outbound message carrying
         // structurally plausible PII (SSN / Luhn-valid card / email / phone) so it
-        // never lands in the FTS index, AI embeddings, or exports. Scans the text
-        // of every text-bearing block (Text / Code / file name / …), not just
-        // Text, since PII can hide in a code snippet or attachment name. Pure +
-        // allocation-light, so it adds no I/O to the send path.
+        // never lands in the FTS index, AI embeddings, or exports. Scans EXACTLY
+        // the text that would be indexed/embedded — each block's primary
+        // `searchable_text` AND its `extra_searchable_text` (e.g. `Select` option
+        // labels) — mirroring `Message::searchable_text` so PII can't hide in a
+        // span the guard skips but the index keeps. Pure + allocation-light, so it
+        // adds no I/O to the send path.
         if let Some(detector) = self.pii_detector.as_ref() {
             let text = blocks
                 .iter()
-                .filter_map(aero_common::Block::searchable_text)
+                .flat_map(|b| {
+                    b.searchable_text().into_iter().chain(b.extra_searchable_text())
+                })
                 .collect::<Vec<_>>()
                 .join("\n");
             let kinds = detector.scan(&text);

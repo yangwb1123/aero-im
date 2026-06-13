@@ -137,7 +137,33 @@ async fn pii_guard_blocks_message_with_sensitive_data() {
         "PII message must be blocked, got {err:?}"
     );
 
-    // A clean message still sends, and nothing was persisted for the blocked one.
+    // PII hidden in a Select option LABEL is also blocked — the guard scans the
+    // same text that lands in the FTS index/embeddings (primary + extra
+    // searchable text), not just Text blocks. Regression guard for the gap where
+    // the scan missed `extra_searchable_text`.
+    let err = svc
+        .send_message(
+            alice.id,
+            room.id,
+            vec![aero_common::Block::Select {
+                action_id: "pick".into(),
+                placeholder: Some("choose".into()),
+                options: vec![aero_common::SelectOption {
+                    value: "a".into(),
+                    label: "card 4111 1111 1111 1111".into(),
+                }],
+            }],
+            None,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, aero_common::Error::Invalid(_)),
+        "PII in a Select option label must be blocked, got {err:?}"
+    );
+
+    // A clean message still sends, and nothing was persisted for the blocked ones.
     let ok = svc
         .send_message(alice.id, room.id, vec![Block::text("ship it at 3pm")], None, None)
         .await
