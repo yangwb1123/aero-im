@@ -21,7 +21,7 @@ use aero_auth::AuthUser;
 use aero_common::{Error as AeroError, ParticipantId, SavedSearchId, WorkspaceId};
 use aero_storage::SavedSearchRepo;
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     routing::{delete, post},
     Json, Router,
 };
@@ -153,14 +153,29 @@ async fn delete_saved_search(
     Ok(Json(serde_json::json!({ "deleted": true })))
 }
 
+/// Query params for [`run_saved_search`].
+#[derive(Deserialize)]
+struct RunQuery {
+    /// When `true`, return only matches created since this saved search was last
+    /// run — the "new since I last looked" delta. Defaults to `false` (all hits).
+    #[serde(default)]
+    only_new: bool,
+}
+
 /// `POST /api/saved-searches/:sid/run` — load the saved query (owner-scoped) and
 /// execute it through the SAME membership-scoped search path [`crate::search`]
 /// uses, restricted to the saved search's workspace. `404` if the saved search
 /// isn't the caller's. The result shape mirrors `POST /api/search`.
+///
+/// `?only_new=true` returns only matches created since the previous run (using
+/// the saved search's `last_run_at` cursor). Note: the delta is applied to the
+/// relevance-ranked top [`RUN_LIMIT`] hits, so it surfaces the newest *relevant*
+/// matches, not an exhaustive change-log.
 async fn run_saved_search(
     State(s): State<AppState>,
     auth: AuthUser,
     Path(id_str): Path<String>,
+    Query(q): Query<RunQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let id = parse_saved_search(&id_str)?;
     let saved = repo(&s)
@@ -173,7 +188,7 @@ async fn run_saved_search(
     // workspace-scoped variant), so results stay bounded to rooms the caller
     // belongs to within the saved search's workspace. The repo's `JOIN
     // room_members` is the security boundary — there is no post-filter.
-    let hits = s
+    let mut hits = s
         .messages
         .search_all_rooms_in_workspace(
             auth.participant_id,
@@ -184,10 +199,27 @@ async fn run_saved_search(
         .await
         .map_err(AeroError::from)?;
 
+    // Stamp this run and capture the previous run's timestamp — the cursor for the
+    // "new since last run" delta (ROADMAP5 方向三).
+    let previous_run_at = repo(&s)
+        .mark_run(id, auth.participant_id, time::OffsetDateTime::now_utc())
+        .await
+        .map_err(AeroError::from)?;
+    if q.only_new {
+        // First-ever run has no cursor — everything is "new", so no filter applies.
+        if let Some(cursor) = previous_run_at {
+            hits.retain(|h| h.message.created_at > cursor);
+        }
+    }
+
+    let previous_run_str =
+        previous_run_at.and_then(|t| t.format(&time::format_description::well_known::Rfc3339).ok());
     Ok(Json(serde_json::json!({
         "saved_search_id": saved.id,
         "name": saved.name,
         "query": saved.query,
+        "only_new": q.only_new,
+        "previous_run_at": previous_run_str,
         "results": hits.into_iter().map(|h| {
             serde_json::json!({
                 "score": h.score,

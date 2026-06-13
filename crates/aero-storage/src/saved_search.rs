@@ -172,6 +172,39 @@ impl SavedSearchRepo {
                 .await?;
         Ok(result.rows_affected() > 0)
     }
+
+    /// Stamp `now` as this saved search's `last_run_at` (owner-scoped) and return
+    /// the PREVIOUS `last_run_at` — the cursor for a "new since I last ran this"
+    /// delta. `None` when it had never been run before (or the row is absent).
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the update.
+    pub async fn mark_run(
+        &self,
+        id: SavedSearchId,
+        participant: ParticipantId,
+        now: time::OffsetDateTime,
+    ) -> Result<Option<time::OffsetDateTime>, sqlx::Error> {
+        // The CTE captures the prior value before the UPDATE overwrites it, so a
+        // single round-trip both advances the cursor and returns the old one.
+        let row: Option<(Option<time::OffsetDateTime>,)> = sqlx::query_as(
+            r"WITH prev AS (
+                  SELECT last_run_at FROM saved_searches
+                   WHERE id = $1 AND participant_id = $2
+              )
+              UPDATE saved_searches s
+                 SET last_run_at = $3
+                FROM prev
+               WHERE s.id = $1 AND s.participant_id = $2
+           RETURNING prev.last_run_at",
+        )
+        .bind(id.to_uuid())
+        .bind(participant.to_uuid())
+        .bind(now)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.and_then(|(prev,)| prev))
+    }
 }
 
 /// PG-gated integration tests (run with a live Postgres + applied migrations):
@@ -262,6 +295,43 @@ mod db_tests {
         );
 
         // Cleanup so reruns stay self-contained.
+        sqlx::query("DELETE FROM saved_searches WHERE participant_id = $1")
+            .bind(owner.to_uuid())
+            .execute(&p)
+            .await
+            .ok();
+    }
+
+    /// `mark_run` returns `None` on the first run (never run before) and the
+    /// previous run's timestamp on the next — the cursor for the new-since delta.
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn mark_run_returns_previous_timestamp() {
+        let p = pool();
+        let repo = SavedSearchRepo::new(p.clone());
+        let ws = default_ws();
+        let owner = owner(&p).await;
+        let id = repo.create(owner, ws, "deploys", "deploy failed").await.unwrap();
+
+        let t1 = time::OffsetDateTime::now_utc();
+        assert!(
+            repo.mark_run(id, owner, t1).await.unwrap().is_none(),
+            "first run has no previous cursor",
+        );
+
+        let t2 = t1 + time::Duration::seconds(30);
+        let prev = repo.mark_run(id, owner, t2).await.unwrap().expect("second run sees the first");
+        assert!(
+            (prev - t1).abs() < time::Duration::seconds(1),
+            "second run returns the first run's timestamp (got {prev}, expected ~{t1})",
+        );
+
+        // A stranger cannot advance another user's cursor (owner-scoped).
+        assert!(
+            repo.mark_run(id, ParticipantId::new(), t2).await.unwrap().is_none(),
+            "stranger's mark_run matches no row",
+        );
+
         sqlx::query("DELETE FROM saved_searches WHERE participant_id = $1")
             .bind(owner.to_uuid())
             .execute(&p)
