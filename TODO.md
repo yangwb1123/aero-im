@@ -33,9 +33,12 @@
 - [ ] End-to-end distributed tracing + SLO surfacing (ROADMAP 第五版 P0-二). *Large.*
 - [ ] Agentic AI + knowledge-base direction (ROADMAP 第五版 P1). *Large.*
 - [x] ~~Data-lifecycle / GDPR-correctness sweep audit (ROADMAP 第五版 P1).~~ Direction
-  CLOSED: embedding erasure (984bffc) + legal-hold exemption (0a4be67) + deferred-
-  erasure-on-release sweep (219aca5). Erasure is now complete, hold-aware, and
-  eventually-consistent across hold releases.
+  CLOSED + went beyond the scan via a completeness audit of `delete_participant`:
+  message embedding (984bffc), legal-hold exemption (0a4be67), deferred-erasure
+  sweep (219aca5), **identity PII** — name/avatar/email/password/phone/profile/SSO
+  (50eaa2c), and **authored content** — drafts/OOO/scheduled (f89ad4d). Erasure is
+  now comprehensive (identity + all authored content), hold-aware, and eventually
+  consistent. Audited-clean: channel-points/predictions spend is atomic (no double-spend).
 
 ## P2
 
