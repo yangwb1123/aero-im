@@ -113,6 +113,33 @@ login IP/device history + new-IP detection; 方向三 search total-count + keyse
 pagination + did-you-mean + faceting + click-feedback/CTR + periodic saved-search
 digest; 方向二 JSON structured logs. Tracing/SLO + agentic-AI confirmed already done.
 
+POST-第五版 security/completeness round (a fresh discovery scan + a systematic
+erasure-completeness audit): fixed a HIGH auth bug — a deleted participant's PAT
+kept authenticating (delete_participant didn't revoke pat_tokens/push_tokens/etc.
+and the auth path never checked deleted_at); completed GDPR erasure for the new
+behavioural tables (search_click_events, login_events) + 7 personal-pref tables;
+fixed a workspace-delete orphan (search_click_events); added X-RateLimit-*/
+Retry-After headers.
+
+INVARIANT for new tables (learned the hard way this session): when you add ANY
+participant-keyed table, wire it into `delete_participant`'s explicit DELETE list
+— a CASCADE FK is NOT enough because erasure TOMBSTONES the participant (UPDATE),
+so the cascade never fires. Likewise wire any workspace_id-keyed table (no FK)
+into `workspace.delete()`'s cleanup loop.
+
+## Documented limitations (real but not cleanly buildable)
+
+- **NotifyBatch duplicate notifications on bus redelivery.** `RoomEvent::NotifyBatch`
+  carries no idempotency token; if the WS consumer crashes before ack, the bus
+  redelivers and the recipients re-expand into duplicate `notifications` rows
+  (only `id` is unique). A naive `(participant_id, message_id, kind)` unique key
+  is WRONG — two people reacting to your message legitimately produce two
+  Reaction notifications for the same (participant, message, kind). The correct
+  fix threads a per-delivery idempotency token (message_id + event seq) through
+  the event and a partial unique index — M+ with a correctness trap, so it's
+  documented rather than shipped. Redelivery is rare (crash-before-ack, bounded
+  by the poison DLQ) and only over-counts the unread badge.
+
 ## Tech debt (see also DECISIONS.md)
 
 - **~~High~~ → mitigated:** migrations never execution-validated (root cause of the
