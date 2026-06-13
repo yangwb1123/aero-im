@@ -12,10 +12,10 @@
 
 use std::sync::Arc;
 
-use aero_common::{Block, RoomKind, WorkspaceRole};
+use aero_common::{Block, CallKind, CallMode, RoomKind, WorkspaceRole};
 use aero_storage::{
-    db::PgPool, AiJobRepo, CallRepo, MessageRepo, ParticipantRepo, ReactionRepo, ReceiptRepo,
-    RoomRepo, WorkspaceRepo,
+    db::PgPool, AiJobRepo, BlockRepo, CallRepo, MessageRepo, ParticipantRepo, ReactionRepo,
+    ReceiptRepo, RoomRepo, WorkspaceRepo,
 };
 
 use crate::service::ImService;
@@ -48,7 +48,9 @@ fn service(pool: PgPool) -> ImService {
         bus,
     )
     // Workspace-scoped methods need the tenancy repo wired in (additive builder).
-    .with_workspaces(WorkspaceRepo::new(pool))
+    .with_workspaces(WorkspaceRepo::new(pool.clone()))
+    // Blocking guard for 1:1 call/DM (no-op unless a block exists).
+    .with_block_repo(BlockRepo::new(pool))
 }
 
 async fn new_participant(participants: &ParticipantRepo, prefix: &str) -> aero_common::Participant {
@@ -412,4 +414,42 @@ async fn rooms_for_in_workspace_is_tenant_scoped() {
         !in_a.iter().any(|r| r.id == room_b.id),
         "workspace A listing must not leak workspace B's room"
     );
+}
+
+/// A 1:1 direct-message call must not connect users who have blocked each other
+/// (either direction), closing the gap where a pre-existing DM could be used to
+/// ring someone after a block (notification suppression can't catch a live call).
+#[tokio::test]
+#[ignore = "requires running Postgres with migrations applied"]
+async fn blocked_user_cannot_call_in_direct_room() {
+    let pool = pool();
+    let participants = ParticipantRepo::new(pool.clone());
+    let blocks = BlockRepo::new(pool.clone());
+    let svc = service(pool.clone());
+
+    let alice = new_participant(&participants, "alice-callblk").await;
+    let bob = new_participant(&participants, "bob-callblk").await;
+
+    let room = svc.create_room(alice.id, RoomKind::Direct, Some("dm".into())).await.unwrap();
+    svc.add_member(alice.id, room.id, bob.id).await.unwrap();
+
+    blocks.block(alice.id, bob.id).await.unwrap();
+
+    // Neither direction may ring the other while the block stands.
+    let err = svc
+        .start_call(bob.id, room.id, CallKind::Audio, CallMode::P2p, "sdp".into())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, aero_common::Error::Forbidden(_)), "blocked → forbidden, got {err:?}");
+    let err2 = svc
+        .start_call(alice.id, room.id, CallKind::Audio, CallMode::P2p, "sdp".into())
+        .await
+        .unwrap_err();
+    assert!(matches!(err2, aero_common::Error::Forbidden(_)));
+
+    // After unblock the call is permitted again (reaches the call machinery).
+    blocks.unblock(alice.id, bob.id).await.unwrap();
+    svc.start_call(bob.id, room.id, CallKind::Audio, CallMode::P2p, "sdp".into())
+        .await
+        .expect("call allowed after unblock");
 }

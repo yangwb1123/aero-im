@@ -1499,6 +1499,23 @@ impl ImService {
         }
         let mut callees = self.rooms.members(room).await?;
         callees.retain(|p| *p != initiator);
+        // Blocking (1:1): a direct-message call must not connect users who have
+        // blocked each other — mirrors the DM-open guard (server `dm.rs`) so a
+        // pre-existing DM can't be used to ring someone after a block, and closes
+        // the gap that notification suppression can't (a call is a live WS event,
+        // not a notification). Group-room calls are unaffected. Best-effort /
+        // fail-open on a lookup error, like the notification block-filter.
+        if let Some(block_repo) = self.block_repo.as_ref() {
+            if self.rooms.room_kind(room).await? == Some(RoomKind::Direct) {
+                for callee in &callees {
+                    let blocked = block_repo.is_blocked(initiator, *callee).await.unwrap_or(false)
+                        || block_repo.is_blocked(*callee, initiator).await.unwrap_or(false);
+                    if blocked {
+                        return Err(Error::Forbidden("blocked".into()));
+                    }
+                }
+            }
+        }
         let call_id = CallId::new();
         let session = self
             .calls
