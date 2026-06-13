@@ -46,6 +46,19 @@
   are ack-dropped (not nacked forever) + `aero_bus_poison_dropped_total` metric.
 - [ ] Auth-abuse depth (ROADMAP 第五版 P2). *Larger; rate-limit + lockout deepening.*
 
+## Flagged design questions (need product intent, not autonomous fixes)
+
+- **Blocking enforcement scope.** `is_blocked` is checked ONLY at 1:1-DM-open
+  (`dm.rs:93`). It is NOT enforced in `send_message`, `start_call`, group-DM
+  inclusion, mention/notify fan-out, or reactions — so a block does not retroactively
+  disable a pre-existing DM room (a cached `room_id` still routes calls/messages),
+  nor hide a blocked user's content in shared rooms. If the intended semantics are
+  "block only prevents opening a new DM," this is correct as-is; if it should be a
+  full mute/cloak (no calls, no messages delivered, content hidden), several surfaces
+  need an `is_blocked` gate. **Needs product decision on intended blocking scope.**
+  (Audited-clean this pass: AI/RAG retrieval is membership-guarded across all ask
+  handlers + authz_lint; channel-points/predictions spend is atomic.)
+
 ## Tech debt (see also DECISIONS.md)
 
 - **~~High~~ → mitigated:** migrations never execution-validated (root cause of the
