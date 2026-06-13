@@ -186,6 +186,10 @@ impl Block {
             Self::Voice { transcript: Some(t), .. } => Some(t),
             Self::Thought { content, hidden: false } => Some(content),
             Self::Button { label, .. } => Some(label),
+            // Index the attachment's file name so a message carrying e.g.
+            // "deploy-runbook.pdf" is findable by name (ROADMAP5 方向三: file search
+            // — voice transcripts are already indexed above; files were the gap).
+            Self::File { name, .. } => Some(name),
             _ => None,
         }
     }
@@ -1386,6 +1390,33 @@ mod tests {
             expires_at: None,
         };
         assert_eq!(m.searchable_text(), "hello\nfn main() {}");
+    }
+
+    #[test]
+    fn file_attachment_name_is_searchable() {
+        let m = Message {
+            id: MessageId::new(),
+            room_id: RoomId::new(),
+            sender_id: ParticipantId::new(),
+            blocks: vec![
+                Block::text("see attached"),
+                Block::File {
+                    blob_id: BlobId::new(),
+                    kind: FileKind::Document,
+                    name: "deploy-runbook.pdf".into(),
+                    size: 4096,
+                },
+            ],
+            reply_to: None,
+            metadata: serde_json::Value::Null,
+            created_at: time::OffsetDateTime::now_utc(),
+            edited_at: None,
+            deleted_at: None,
+            expires_at: None,
+        };
+        let text = m.searchable_text();
+        assert!(text.contains("deploy-runbook.pdf"), "attachment file name is indexed: {text}");
+        assert!(text.contains("see attached"), "surrounding text still indexed");
     }
 
     #[test]
