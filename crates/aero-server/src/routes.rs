@@ -669,6 +669,14 @@ async fn record_session(
 /// headers (`X-Forwarded-For`'s first hop, then `X-Real-IP`). Returns `None` when
 /// neither is present (e.g. a direct connection in dev) — callers treat an absent
 /// IP as "unobservable", never as a security signal.
+///
+/// TRUST ASSUMPTION: this value is only trustworthy when a trusted reverse proxy
+/// **overwrites** `X-Forwarded-For` with the real client address (the standard
+/// cloud-LB / nginx `proxy_set_header` setup). A client can forge the header, so
+/// the IP fed to the new-login-IP signal is *defence-in-depth*, not an authz
+/// input: a forged-known-IP can only suppress a new-IP alert (a false negative),
+/// never grant access. Deploy behind a header-rewriting proxy for the signal to
+/// be reliable.
 fn client_ip(headers: &header::HeaderMap) -> Option<String> {
     headers
         .get("x-forwarded-for")
