@@ -57,6 +57,12 @@ async fn inject_request_id(mut req: Request<axum::body::Body>, next: Next) -> Re
     // logs (ROADMAP5 方向二: log↔request correlation). The default `fmt` formatter
     // renders active span fields, so no log-format change is needed.
     let span = tracing::info_span!("http_request", request_id = %id);
+    // Continue an upstream distributed trace when the caller sends a W3C
+    // `traceparent` header, so a request's span (and everything it publishes onto
+    // the bus) nests under the caller's trace (ROADMAP5 方向二).
+    if let Some(tp) = req.headers().get("traceparent").and_then(|v| v.to_str().ok()) {
+        aero_common::telemetry::set_span_parent_from_traceparent(&span, tp);
+    }
     let mut res = next.run(req).instrument(span).await;
     if let Ok(v) = HeaderValue::from_str(&id) {
         res.headers_mut().insert("x-request-id", v);
