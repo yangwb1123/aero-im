@@ -142,7 +142,15 @@ impl PatRepo {
             r"SELECT participant_id FROM pat_tokens
                WHERE token_hash = $1
                  AND revoked_at IS NULL
-                 AND (expires_at IS NULL OR expires_at > now())",
+                 AND (expires_at IS NULL OR expires_at > now())
+                 -- Defence-in-depth: a PAT must not authenticate a deleted /
+                 -- GDPR-erased participant. Erasure also deletes the token row
+                 -- (participant.rs), but the tombstone is authoritative here so a
+                 -- surviving/raced token still can't grant access.
+                 AND EXISTS (
+                     SELECT 1 FROM participants p
+                      WHERE p.id = pat_tokens.participant_id
+                        AND p.deleted_at IS NULL)",
         )
         .bind(token_hash)
         .fetch_optional(&self.pool)

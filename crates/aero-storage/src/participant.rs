@@ -240,6 +240,20 @@ impl ParticipantRepo {
             //     than hard-deleting it, so the cascade never fires — delete explicitly.
             "DELETE FROM search_click_events WHERE participant_id = $1",
             "DELETE FROM login_events WHERE participant_id = $1",
+            // Auth credentials / identity material. Leaving any of these behind is
+            // worse than a PII leak — a surviving credential keeps AUTHENTICATING a
+            // "deleted" account (refresh sessions are revoked above, but these are
+            // separate long-lived credentials erasure previously missed): a PAT
+            // grants ongoing API access, push tokens keep pushing to the user's
+            // devices, recovery/reset/history material enables account recovery, and
+            // mls_key_packages / scim_users are identity linkage.
+            "DELETE FROM pat_tokens WHERE participant_id = $1",
+            "DELETE FROM push_tokens WHERE participant_id = $1",
+            "DELETE FROM recovery_codes WHERE participant_id = $1",
+            "DELETE FROM password_reset_tokens WHERE participant_id = $1",
+            "DELETE FROM password_history WHERE participant_id = $1",
+            "DELETE FROM mls_key_packages WHERE participant_id = $1",
+            "DELETE FROM scim_users WHERE participant_id = $1",
         ] {
             sqlx::query(stmt).bind(participant_id.to_uuid()).execute(&mut *tx).await?;
         }
@@ -934,5 +948,71 @@ mod db_tests {
                     .expect("count");
             assert_eq!(count.0, 0, "{table} data must be deleted on erasure");
         }
+    }
+
+    /// A deleted participant's Personal Access Token must STOP authenticating —
+    /// the highest-severity erasure gap (a surviving credential = ongoing API
+    /// access for a "deleted" account). Both halves are exercised: erasure deletes
+    /// the token row, AND `PatRepo::verify` rejects a tombstoned owner even if a
+    /// token row somehow survives.
+    #[tokio::test]
+    #[ignore = "requires running Postgres with migrations applied"]
+    async fn erasure_revokes_personal_access_tokens() {
+        let p = pool();
+        let participants = ParticipantRepo::new(p.clone());
+        let pats = crate::PatRepo::new(p.clone());
+
+        let id = ParticipantId::new();
+        sqlx::query("INSERT INTO participants (id, kind, display_name) VALUES ($1,'human','Tokened')")
+            .bind(id.to_uuid())
+            .execute(&p)
+            .await
+            .expect("participant");
+        let hash = format!("pat-hash-{}", id.to_uuid());
+        pats.create(id, &hash, Some("ci"), &[], None).await.expect("create pat");
+
+        // Before erasure the PAT authenticates its owner.
+        assert_eq!(
+            pats.verify(&hash).await.expect("verify ok"),
+            Some(id),
+            "a live PAT authenticates before erasure",
+        );
+
+        assert!(participants.delete_participant(id).await.expect("erase"));
+
+        // After erasure the PAT no longer authenticates (row deleted).
+        assert_eq!(
+            pats.verify(&hash).await.expect("verify after erase"),
+            None,
+            "a deleted participant's PAT must not authenticate",
+        );
+        let remaining: (i64,) =
+            sqlx::query_as("SELECT count(*) FROM pat_tokens WHERE participant_id = $1")
+                .bind(id.to_uuid())
+                .fetch_one(&p)
+                .await
+                .expect("count pats");
+        assert_eq!(remaining.0, 0, "pat_tokens must be erased");
+
+        // Defence-in-depth: even a manually re-inserted token for a tombstoned
+        // participant is rejected by the deleted_at guard in verify().
+        sqlx::query(
+            "INSERT INTO pat_tokens (id, participant_id, token_hash, name, scopes, created_at) \
+             VALUES ($1,$2,$3,'rogue','{}', now())",
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(id.to_uuid())
+        .bind(&hash)
+        .execute(&p)
+        .await
+        .expect("reinsert");
+        assert_eq!(
+            pats.verify(&hash).await.expect("verify rogue"),
+            None,
+            "verify() rejects a token whose owner is tombstoned, even if the row exists",
+        );
+
+        // Cleanup.
+        sqlx::query("DELETE FROM pat_tokens WHERE participant_id = $1").bind(id.to_uuid()).execute(&p).await.ok();
     }
 }
