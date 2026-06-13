@@ -361,19 +361,23 @@ async fn dispatch_event<S: WebhookSender + ?Sized>(
         };
         let delivery = build_delivery(&target.url, &target.secret, &body, now);
         let result = sender.deliver(&delivery).await;
+        // Delivery-log bookkeeping keys on the numeric status (2xx = delivered, else
+        // failed-with-backoff); the breaker (below) reads the same response's
+        // Retry-After.
         match &result {
-            Ok(status) if is_success(*status) => {
-                if let Err(e) = deliveries.mark_delivered(delivery_id, i32::from(*status)).await {
+            Ok(resp) if is_success(resp.status) => {
+                if let Err(e) = deliveries.mark_delivered(delivery_id, i32::from(resp.status)).await {
                     warn!(error = ?e, %room, kind, "webhook delivery: mark_delivered failed");
                 }
             }
-            Ok(status) => {
+            Ok(resp) => {
+                let status = resp.status;
                 warn!(%room, kind, url = %target.url, status, "webhook delivery non-2xx");
                 let _ = deliveries
                     .mark_failed_with_backoff(
                         delivery_id,
                         1,
-                        Some(i32::from(*status)),
+                        Some(i32::from(status)),
                         &format!("HTTP {status}"),
                     )
                     .await;
@@ -437,16 +441,20 @@ async fn redeliver<S: WebhookSender + ?Sized>(
     let body = serde_json::json!({ "retry": true, "event_id": delivery.event_id });
     let built = build_delivery(&target.url, &target.secret, &body, now);
     let result = sender.deliver(&built).await;
+    // Numeric status drives the delivery-log state (2xx = delivered, else
+    // failed-with-backoff); the breaker (below) folds in the same response's
+    // Retry-After.
     match &result {
-        Ok(status) if is_success(*status) => {
-            let _ = deliveries.mark_delivered(delivery.id, i32::from(*status)).await;
+        Ok(resp) if is_success(resp.status) => {
+            let _ = deliveries.mark_delivered(delivery.id, i32::from(resp.status)).await;
         }
-        Ok(status) => {
+        Ok(resp) => {
+            let status = resp.status;
             let _ = deliveries
                 .mark_failed_with_backoff(
                     delivery.id,
                     delivery.attempts,
-                    Some(i32::from(*status)),
+                    Some(i32::from(status)),
                     &format!("HTTP {status}"),
                 )
                 .await;

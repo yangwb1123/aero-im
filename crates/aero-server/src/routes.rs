@@ -2092,17 +2092,19 @@ async fn whip_post(
                             Ok(delivery_id) => {
                                 use aero_storage::WebhookSender;
                                 match sender.deliver(&delivery).await {
-                                    Ok(status) if (200..300).contains(&status) => {
+                                    // Delivery-log bookkeeping keys on the numeric
+                                    // status (this one-off fire has no breaker).
+                                    Ok(resp) if (200..300).contains(&resp.status) => {
                                         let _ = delivery_repo
-                                            .mark_delivered(delivery_id, i32::from(status))
+                                            .mark_delivered(delivery_id, i32::from(resp.status))
                                             .await;
                                     }
-                                    Ok(status) => {
+                                    Ok(resp) => {
                                         let _ = delivery_repo
                                             .mark_failed_with_backoff(
                                                 delivery_id,
                                                 1,
-                                                Some(i32::from(status)),
+                                                Some(i32::from(resp.status)),
                                                 "non-2xx response",
                                             )
                                             .await;

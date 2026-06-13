@@ -124,14 +124,52 @@ pub fn build_delivery(url: &str, secret: &str, event_json: &serde_json::Value, n
     Delivery { url: url.to_string(), headers, body }
 }
 
+/// What one completed round trip tells the caller: the HTTP status code plus the
+/// parsed `Retry-After` cooldown (only meaningful on a 429). Produced by a
+/// [`WebhookSender`] and consumed by the delivery-log bookkeeping (numeric
+/// `status`) and the circuit breaker ([`outcome_of`] reads `retry_after_secs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeliveryResponse {
+    /// The HTTP status code of the completed request.
+    pub status: u16,
+    /// The receiver's `Retry-After` cooldown in whole seconds, when it sent a
+    /// usable integer-seconds value (typically alongside a 429). `None` when the
+    /// header is absent, malformed, negative, or in the HTTP-date form (the latter
+    /// is best-effort only).
+    pub retry_after_secs: Option<i64>,
+}
+
+impl DeliveryResponse {
+    /// A response carrying just a status (no `Retry-After`) — the common case and
+    /// what test doubles / non-429 responses use.
+    #[must_use]
+    pub fn new(status: u16) -> Self {
+        Self { status, retry_after_secs: None }
+    }
+}
+
+/// Parse an HTTP `Retry-After` header value into whole seconds. Only the
+/// delta-seconds form is supported (`"120"` ⇒ `Some(120)`); the HTTP-date form and
+/// any negative/garbage value yield `None` (best-effort — the breaker then falls
+/// back to its default 429 cooldown). Pure, so it's unit-tested directly.
+#[must_use]
+pub fn parse_retry_after(value: &str) -> Option<i64> {
+    // Delta-seconds is a non-negative integer; reject negatives and non-digits.
+    match value.trim().parse::<i64>() {
+        Ok(secs) if secs >= 0 => Some(secs),
+        _ => None,
+    }
+}
+
 /// The injectable HTTP seam: POST a built [`Delivery`], returning the response
-/// status code. The real impl is [`ReqwestSender`]; tests use [`FakeSender`].
+/// status code (and any `Retry-After`). The real impl is [`ReqwestSender`]; tests
+/// use [`FakeSender`].
 #[async_trait::async_trait]
 pub trait WebhookSender: Send + Sync {
-    /// Deliver one request. Returns the HTTP status code on a completed round
+    /// Deliver one request. Returns a [`DeliveryResponse`] on a completed round
     /// trip, or an error string when the request could not be made at all
     /// (DNS/connect/timeout) — the caller logs and moves on (best-effort).
-    async fn deliver(&self, delivery: &Delivery) -> Result<u16, String>;
+    async fn deliver(&self, delivery: &Delivery) -> Result<DeliveryResponse, String>;
 }
 
 /// Real HTTP transport over `reqwest`.
@@ -161,29 +199,52 @@ impl Default for ReqwestSender {
 
 #[async_trait::async_trait]
 impl WebhookSender for ReqwestSender {
-    async fn deliver(&self, delivery: &Delivery) -> Result<u16, String> {
+    async fn deliver(&self, delivery: &Delivery) -> Result<DeliveryResponse, String> {
         let mut req = self.client.post(&delivery.url).body(delivery.body.clone());
         for (k, v) in &delivery.headers {
             req = req.header(k.as_str(), v.as_str());
         }
         let resp = req.send().await.map_err(|e| e.to_string())?;
-        Ok(resp.status().as_u16())
+        let status = resp.status().as_u16();
+        // Read the receiver's Retry-After (integer-seconds form) so the breaker can
+        // honor it exactly on a 429; non-numeric / HTTP-date / negative ⇒ None.
+        let retry_after_secs = resp
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(parse_retry_after);
+        Ok(DeliveryResponse { status, retry_after_secs })
     }
 }
 
-/// Test double: records every [`Delivery`] and returns a canned status. Lets the
-/// delivery path (and `build_delivery`'s signature) be asserted without a server.
+/// Test double: records every [`Delivery`] and returns a canned status (and an
+/// optional canned `Retry-After`). Lets the delivery path (and `build_delivery`'s
+/// signature) be asserted without a server.
 #[derive(Clone)]
 pub struct FakeSender {
     status: u16,
+    /// Canned `Retry-After` seconds returned on every delivery (default `None`).
+    retry_after_secs: Option<i64>,
     calls: std::sync::Arc<std::sync::Mutex<Vec<Delivery>>>,
 }
 
 impl FakeSender {
-    /// A sender that always reports `status` and captures calls.
+    /// A sender that always reports `status` (no `Retry-After`) and captures calls.
     #[must_use]
     pub fn new(status: u16) -> Self {
-        Self { status, calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())) }
+        Self {
+            status,
+            retry_after_secs: None,
+            calls: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        }
+    }
+
+    /// Builder: also report a canned `Retry-After` of `secs` seconds (e.g. paired
+    /// with `new(429)` to exercise the rate-limit path). Consumes and returns self.
+    #[must_use]
+    pub fn with_retry_after(mut self, secs: i64) -> Self {
+        self.retry_after_secs = Some(secs);
+        self
     }
 
     /// Snapshot of every delivery seen so far, in order.
@@ -195,9 +256,9 @@ impl FakeSender {
 
 #[async_trait::async_trait]
 impl WebhookSender for FakeSender {
-    async fn deliver(&self, delivery: &Delivery) -> Result<u16, String> {
+    async fn deliver(&self, delivery: &Delivery) -> Result<DeliveryResponse, String> {
         self.calls.lock().expect("fake-sender mutex not poisoned").push(delivery.clone());
-        Ok(self.status)
+        Ok(DeliveryResponse { status: self.status, retry_after_secs: self.retry_after_secs })
     }
 }
 
@@ -273,8 +334,9 @@ pub enum DeliveryOutcome {
     /// A transport error or a non-2xx that isn't 429.
     Failure,
     /// The endpoint returned 429 Too Many Requests. `retry_after_secs` is the
-    /// parsed `Retry-After` header when available (the current sender seam returns
-    /// only a status code, so this is `None` today — the logic already honors it).
+    /// parsed `Retry-After` header when the receiver sent a usable integer-seconds
+    /// value; `None` falls back to the default 429 cooldown. The breaker keeps the
+    /// endpoint open until exactly `now + retry_after_secs` (clamped).
     RateLimited { retry_after_secs: Option<i64> },
 }
 
@@ -336,13 +398,16 @@ impl BreakerState {
 }
 
 /// Map a delivery result (the `WebhookSender::deliver` return) into the breaker's
-/// view of it. `Ok(2xx)` → success, `Ok(429)` → rate-limited, anything else →
-/// failure. Pure, so the classification is unit-tested directly.
+/// view of it. `Ok(2xx)` → success, `Ok(429)` → rate-limited (carrying the
+/// response's parsed `Retry-After`), anything else → failure. Pure, so the
+/// classification is unit-tested directly.
 #[must_use]
-pub fn outcome_of(result: &Result<u16, String>) -> DeliveryOutcome {
+pub fn outcome_of(result: &Result<DeliveryResponse, String>) -> DeliveryOutcome {
     match result {
-        Ok(s) if (200..300).contains(s) => DeliveryOutcome::Success,
-        Ok(429) => DeliveryOutcome::RateLimited { retry_after_secs: None },
+        Ok(r) if (200..300).contains(&r.status) => DeliveryOutcome::Success,
+        Ok(r) if r.status == 429 => {
+            DeliveryOutcome::RateLimited { retry_after_secs: r.retry_after_secs }
+        }
         Ok(_) | Err(_) => DeliveryOutcome::Failure,
     }
 }
@@ -762,8 +827,10 @@ mod tests {
     async fn fake_sender_captures_calls_and_returns_status() {
         let sender = FakeSender::new(202);
         let d = build_delivery("https://h", "s", &serde_json::json!({ "a": 1 }), 7);
-        let status = sender.deliver(&d).await.unwrap();
-        assert_eq!(status, 202);
+        let resp = sender.deliver(&d).await.unwrap();
+        assert_eq!(resp.status, 202);
+        // No Retry-After by default.
+        assert_eq!(resp.retry_after_secs, None);
         let calls = sender.calls();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0], d);
@@ -772,19 +839,76 @@ mod tests {
         assert_eq!(sender.calls().len(), 2);
     }
 
+    #[tokio::test]
+    async fn fake_sender_can_surface_a_canned_retry_after() {
+        // The builder pairs a 429 with an explicit Retry-After the breaker honors.
+        let sender = FakeSender::new(429).with_retry_after(300);
+        let d = build_delivery("https://h", "s", &serde_json::json!({}), 0);
+        let resp = sender.deliver(&d).await.unwrap();
+        assert_eq!(resp.status, 429);
+        assert_eq!(resp.retry_after_secs, Some(300));
+    }
+
+    // ----- parse_retry_after -----
+
+    #[test]
+    fn parse_retry_after_accepts_delta_seconds_only() {
+        // Integer delta-seconds parse; 0 is valid ("retry immediately").
+        assert_eq!(parse_retry_after("120"), Some(120));
+        assert_eq!(parse_retry_after("0"), Some(0));
+        // Surrounding whitespace is tolerated.
+        assert_eq!(parse_retry_after("  90  "), Some(90));
+        // Negative, garbage, empty, and the HTTP-date form all yield None.
+        assert_eq!(parse_retry_after("-5"), None);
+        assert_eq!(parse_retry_after("soon"), None);
+        assert_eq!(parse_retry_after(""), None);
+        assert_eq!(parse_retry_after("Wed, 21 Oct 2025 07:28:00 GMT"), None);
+    }
+
     // ----- Circuit breaker (pure state machine) -----
 
     #[test]
     fn outcome_classifies_status_codes() {
-        assert_eq!(outcome_of(&Ok(200)), DeliveryOutcome::Success);
-        assert_eq!(outcome_of(&Ok(204)), DeliveryOutcome::Success);
+        assert_eq!(outcome_of(&Ok(DeliveryResponse::new(200))), DeliveryOutcome::Success);
+        assert_eq!(outcome_of(&Ok(DeliveryResponse::new(204))), DeliveryOutcome::Success);
+        // A 429 with no Retry-After ⇒ rate-limited with None (default cooldown).
         assert_eq!(
-            outcome_of(&Ok(429)),
+            outcome_of(&Ok(DeliveryResponse::new(429))),
             DeliveryOutcome::RateLimited { retry_after_secs: None }
         );
-        assert_eq!(outcome_of(&Ok(500)), DeliveryOutcome::Failure);
-        assert_eq!(outcome_of(&Ok(404)), DeliveryOutcome::Failure);
-        assert_eq!(outcome_of(&Err("timeout".to_string())), DeliveryOutcome::Failure);
+        assert_eq!(outcome_of(&Ok(DeliveryResponse::new(500))), DeliveryOutcome::Failure);
+        assert_eq!(outcome_of(&Ok(DeliveryResponse::new(404))), DeliveryOutcome::Failure);
+        assert_eq!(
+            outcome_of(&Err("timeout".to_string())),
+            DeliveryOutcome::Failure
+        );
+    }
+
+    #[test]
+    fn outcome_surfaces_retry_after_on_429() {
+        // A 429 carrying a parsed Retry-After flows straight through to the breaker
+        // outcome, so the cooldown can be honored exactly (not just the default).
+        let resp = DeliveryResponse { status: 429, retry_after_secs: Some(90) };
+        assert_eq!(
+            outcome_of(&Ok(resp)),
+            DeliveryOutcome::RateLimited { retry_after_secs: Some(90) }
+        );
+        // A non-429 ignores any (spurious) Retry-After it might carry.
+        let resp = DeliveryResponse { status: 503, retry_after_secs: Some(90) };
+        assert_eq!(outcome_of(&Ok(resp)), DeliveryOutcome::Failure);
+    }
+
+    #[test]
+    fn breaker_opens_until_exactly_now_plus_retry_after() {
+        // End-to-end of the plumbed value: a 429 with Retry-After: 300 makes the
+        // breaker open until exactly now + 300 (reusing the breaker-test style).
+        let now = 10_000;
+        let resp: Result<DeliveryResponse, String> =
+            Ok(DeliveryResponse { status: 429, retry_after_secs: Some(300) });
+        let s = BreakerState::default().after(outcome_of(&resp), now);
+        assert_eq!(s.open_until, Some(now + 300));
+        assert!(s.is_open_at(now + 299), "still open just before the deadline");
+        assert!(!s.is_open_at(now + 300), "half-open exactly at now + retry_after");
     }
 
     #[test]
