@@ -641,6 +641,32 @@ impl WorkspaceRepo {
             .await?;
         }
 
+        // 0b. Likewise, WORKSPACE-scoped tables that carry a `workspace_id` with NO
+        //     FK to `workspaces` — `DELETE FROM workspaces` (step 2) does NOT cascade
+        //     to them, so they would orphan too. Clear them by workspace_id.
+        //     (`ai_jobs` excluded — transient queue rows on the worker lifecycle, per
+        //     the doc above; `legal_holds` excluded — compliance preservation records.)
+        for table in [
+            "approvals",
+            "channel_sections",
+            "info_barriers",
+            "keyword_alerts",
+            "message_reports",
+            "saved_searches",
+            "user_groups",
+            "workspace_announcements",
+            "workspace_deactivations",
+            "workspace_mutes",
+            "scheduled_streams",
+            "digest_subscriptions",
+            "workspace_default_channels",
+        ] {
+            sqlx::query(&format!("DELETE FROM {table} WHERE workspace_id = $1"))
+                .bind(workspace.to_uuid())
+                .execute(&mut *tx)
+                .await?;
+        }
+
         // 1. Remove the workspace's channels first (rooms→workspaces FK has no
         //    cascade), which cascades to all room-scoped data with a proper FK.
         sqlx::query(r"DELETE FROM rooms WHERE workspace_id = $1")
@@ -1261,6 +1287,16 @@ mod db_tests {
             .execute(&p)
             .await
             .unwrap();
+        // A WORKSPACE-scoped row in a NON-FK table (keyword_alerts).
+        sqlx::query(
+            "INSERT INTO keyword_alerts (id, participant_id, workspace_id, keyword) VALUES ($1,$2,$3,'secret')",
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(owner.to_uuid())
+        .bind(ws.to_uuid())
+        .execute(&p)
+        .await
+        .unwrap();
         // An audit row to prove the cascade reaches audit_events.
         AuditRepo::new(p.clone())
             .append(ws, Some(owner), "workspace.delete", None, serde_json::json!({}))
@@ -1306,6 +1342,14 @@ mod db_tests {
                 .await
                 .unwrap();
         assert_eq!(draft_left, 0, "non-FK room-scoped drafts cleaned, not orphaned");
+        // Non-FK workspace-scoped content (keyword alerts) is cleaned too.
+        let kw_left: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM keyword_alerts WHERE workspace_id = $1")
+                .bind(ws.to_uuid())
+                .fetch_one(&p)
+                .await
+                .unwrap();
+        assert_eq!(kw_left, 0, "non-FK workspace-scoped keyword alerts cleaned, not orphaned");
     }
 
     #[tokio::test]
