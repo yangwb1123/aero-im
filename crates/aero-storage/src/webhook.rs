@@ -362,10 +362,18 @@ impl BreakerState {
     }
 
     /// Fold one delivery outcome into the next state. Pure.
+    ///
+    /// A non-success outcome NEVER shortens an existing open window — the gate keeps
+    /// whichever `open_until` is later (see [`later_gate`]). This makes the fold safe
+    /// to apply on a freshly-opened state: e.g. a concurrent 429 that set a long
+    /// cooldown can't be walked back to a shorter generic-failure cooldown by a
+    /// delivery whose read straddled the 429. (Persistence applies this fold under a
+    /// row lock — see [`WebhookRepo::apply_breaker_outcome`] — so the read+fold+write
+    /// is atomic per endpoint.)
     #[must_use]
     pub fn after(self, outcome: DeliveryOutcome, now: i64) -> BreakerState {
         match outcome {
-            // Any success fully closes the breaker.
+            // Any success fully closes the breaker (a 2xx means the endpoint is up).
             DeliveryOutcome::Success => BreakerState { failures: 0, open_until: None },
             // 429: back off immediately for the requested (or default) cooldown,
             // regardless of how few failures preceded it.
@@ -375,25 +383,36 @@ impl BreakerState {
                     .clamp(1, BREAKER_MAX_COOLDOWN_SECS);
                 BreakerState {
                     failures: self.failures.saturating_add(1),
-                    open_until: Some(now + cooldown),
+                    open_until: later_gate(self.open_until, Some(now + cooldown)),
                 }
             }
             // Generic failure: count it; once we reach the threshold, open with an
             // exponential cooldown by how far past the threshold we are (capped).
             DeliveryOutcome::Failure => {
                 let failures = self.failures.saturating_add(1);
-                let open_until = if failures >= BREAKER_FAILURE_THRESHOLD {
+                let opened = if failures >= BREAKER_FAILURE_THRESHOLD {
                     let over = (failures - BREAKER_FAILURE_THRESHOLD).min(6);
                     let cooldown = (BREAKER_BASE_COOLDOWN_SECS << over).min(BREAKER_MAX_COOLDOWN_SECS);
                     Some(now + cooldown)
                 } else {
-                    // Still below threshold: stay closed; the delivery-log layer's
-                    // own per-delivery backoff handles these early retries.
+                    // Still below threshold: don't open on our own account; the
+                    // delivery-log layer's per-delivery backoff handles early retries.
                     None
                 };
-                BreakerState { failures, open_until }
+                BreakerState { failures, open_until: later_gate(self.open_until, opened) }
             }
         }
+    }
+}
+
+/// The later of two optional gate deadlines (`None` = "no gate", treated as
+/// earliest). Used so a non-success fold never SHORTENS an existing open window.
+#[must_use]
+fn later_gate(a: Option<i64>, b: Option<i64>) -> Option<i64> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(x.max(y)),
+        (Some(x), None) => Some(x),
+        (None, b) => b,
     }
 }
 
@@ -696,6 +715,63 @@ impl WebhookRepo {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Atomically fold one delivery `outcome` into an endpoint's circuit-breaker
+    /// state and persist it, returning the new state.
+    ///
+    /// Unlike a read-then-[`record_breaker`](Self::record_breaker) write, this locks
+    /// the row (`SELECT … FOR UPDATE`) and folds over the CURRENT persisted state, so
+    /// concurrent/batched deliveries to the same endpoint serialize. That closes the
+    /// read-modify-write race: failures can't be undercounted (so the breaker trips
+    /// on time), a stale success can't reset a gate another delivery just opened
+    /// against fresher information, and a stale generic failure can't shorten a 429's
+    /// longer cooldown (the fold itself also never shortens an open window — see
+    /// [`BreakerState::after`]). A `None` row (hook deleted concurrently) is a no-op.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`].
+    pub async fn apply_breaker_outcome(
+        &self,
+        id: WebhookId,
+        outcome: DeliveryOutcome,
+        now: i64,
+    ) -> Result<BreakerState, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query_as::<_, (i32, Option<time::OffsetDateTime>)>(
+            r"SELECT breaker_failures, breaker_open_until
+                 FROM outgoing_webhooks WHERE id = $1 FOR UPDATE",
+        )
+        .bind(id.to_uuid())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((failures, open_until)) = row else {
+            tx.rollback().await?;
+            return Ok(BreakerState::default());
+        };
+        let current = breaker_from_row(failures, open_until);
+        let next = current.after(outcome, now);
+        if next != current {
+            let open_until_ts = match next.open_until {
+                Some(secs) => Some(
+                    time::OffsetDateTime::from_unix_timestamp(secs)
+                        .map_err(|e| sqlx::Error::Decode(Box::new(e)))?,
+                ),
+                None => None,
+            };
+            sqlx::query(
+                r"UPDATE outgoing_webhooks
+                     SET breaker_failures = $2, breaker_open_until = $3
+                   WHERE id = $1",
+            )
+            .bind(id.to_uuid())
+            .bind(i32::try_from(next.failures).unwrap_or(i32::MAX))
+            .bind(open_until_ts)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(next)
     }
 
     /// Soft-revoke an outgoing webhook (idempotent). Returns whether a live row
@@ -1004,6 +1080,27 @@ mod tests {
         assert_eq!(reopened.open_until, Some(elapsed + BREAKER_BASE_COOLDOWN_SECS * 2));
         assert!(reopened.is_open_at(elapsed));
     }
+
+    #[test]
+    fn non_success_fold_never_shortens_an_existing_gate() {
+        // A 429 sets a long cooldown; a (concurrent/stale) generic failure folded on
+        // top must NOT walk it back to the shorter generic cooldown — the receiver's
+        // explicit back-off survives. Guards the concurrency-race fix.
+        let after_429 = BreakerState::default()
+            .after(DeliveryOutcome::RateLimited { retry_after_secs: Some(3000) }, 0);
+        assert_eq!(after_429.open_until, Some(3000));
+        let after_fail = after_429.after(DeliveryOutcome::Failure, 10);
+        assert_eq!(after_fail.open_until, Some(3000), "longer 429 gate preserved, not shortened");
+        assert!(after_fail.is_open_at(2999), "still open for the full 429 window");
+        // Symmetric: a shorter 429 can't shorten a longer existing generic gate.
+        let mut long = BreakerState::default();
+        for _ in 0..(BREAKER_FAILURE_THRESHOLD + 6) {
+            long = long.after(DeliveryOutcome::Failure, 0); // grows to the cap (3600)
+        }
+        assert_eq!(long.open_until, Some(BREAKER_MAX_COOLDOWN_SECS));
+        let after_short_429 = long.after(DeliveryOutcome::RateLimited { retry_after_secs: Some(5) }, 0);
+        assert_eq!(after_short_429.open_until, Some(BREAKER_MAX_COOLDOWN_SECS), "kept the longer gate");
+    }
 }
 
 /// PG-gated integration tests (run with a live Postgres + applied migrations):
@@ -1177,5 +1274,48 @@ mod db_tests {
         repo.record_breaker(id, BreakerState::default()).await.unwrap();
         let closed = repo.outgoing_target(id).await.unwrap().expect("target");
         assert_eq!(closed.breaker, BreakerState::default());
+    }
+
+    /// `apply_breaker_outcome` folds over the CURRENT persisted row (not a passed-in
+    /// snapshot), so repeated failures ACCUMULATE rather than each writing
+    /// `snapshot+1`. This is the property that defeats the read-modify-write lost
+    /// update: N folds advance the counter by N, and a success resets it.
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn apply_breaker_outcome_folds_fresh_state_and_accumulates() {
+        let p = pool();
+        let repo = WebhookRepo::new(p.clone());
+        let (room, actor) = fixture(&p).await;
+        let id = repo
+            .create_outgoing(room, "https://atomic.test", &generate_secret(), &[], Some("a"), actor)
+            .await
+            .unwrap();
+
+        // Fold THRESHOLD generic failures; each reads the fresh row, so the count
+        // climbs 1..=THRESHOLD and the breaker opens exactly at the threshold.
+        let mut last = BreakerState::default();
+        for _ in 0..BREAKER_FAILURE_THRESHOLD {
+            last = repo.apply_breaker_outcome(id, DeliveryOutcome::Failure, 1_000).await.unwrap();
+        }
+        assert_eq!(last.failures, BREAKER_FAILURE_THRESHOLD, "N folds → N failures, not 1");
+        assert!(last.is_open_at(1_000), "opened at the threshold");
+        // The persisted row matches what the fold returned (it actually wrote).
+        let persisted = repo.outgoing_target(id).await.unwrap().expect("target").breaker;
+        assert_eq!(persisted, last);
+
+        // A 429 with a long cooldown, then a generic failure: the longer gate must
+        // survive the failure fold (anti-shortening, now persisted atomically).
+        let rl = repo
+            .apply_breaker_outcome(id, DeliveryOutcome::RateLimited { retry_after_secs: Some(3000) }, 2_000)
+            .await
+            .unwrap();
+        assert_eq!(rl.open_until, Some(2_000 + 3000));
+        let after_fail = repo.apply_breaker_outcome(id, DeliveryOutcome::Failure, 2_010).await.unwrap();
+        assert_eq!(after_fail.open_until, Some(5_000), "429 cooldown not shortened by a later failure");
+
+        // Success closes it.
+        let ok = repo.apply_breaker_outcome(id, DeliveryOutcome::Success, 3_000).await.unwrap();
+        assert_eq!(ok, BreakerState::default());
+        assert_eq!(repo.outgoing_target(id).await.unwrap().expect("t").breaker, BreakerState::default());
     }
 }

@@ -389,13 +389,12 @@ async fn dispatch_event<S: WebhookSender + ?Sized>(
                     .await;
             }
         }
-        // Fold the outcome into this endpoint's breaker; persist only on a change so
-        // a healthy endpoint (0 → 0 failures) writes nothing.
-        let next = target.breaker.after(outcome_of(&result), now);
-        if next != target.breaker {
-            if let Err(e) = repo.record_breaker(target.id, next).await {
-                warn!(error = ?e, hook = %target.id, "webhook breaker: persist failed");
-            }
+        // Fold the outcome into this endpoint's breaker ATOMICALLY (row-locked
+        // read-fold-write), so concurrent/batched deliveries to the same endpoint
+        // can't lose updates — undercount failures, reset a just-opened gate, or
+        // shorten a 429 cooldown. Persists only on a real change internally.
+        if let Err(e) = repo.apply_breaker_outcome(target.id, outcome_of(&result), now).await {
+            warn!(error = ?e, hook = %target.id, "webhook breaker: persist failed");
         }
     }
 }
@@ -465,13 +464,11 @@ async fn redeliver<S: WebhookSender + ?Sized>(
                 .await;
         }
     }
-    // A retry-loop attempt feeds the breaker too, so a persistently-failing endpoint
-    // stays open instead of being probed every retry tick.
-    let next = target.breaker.after(outcome_of(&result), now);
-    if next != target.breaker {
-        if let Err(e) = repo.record_breaker(target.id, next).await {
-            warn!(error = ?e, hook = %target.id, "webhook breaker: persist failed");
-        }
+    // A retry-loop attempt feeds the breaker too (atomically — the retry loop can
+    // process many failed deliveries for the SAME endpoint in one tick, so a
+    // read-fold-write here would otherwise undercount them all to a single +1).
+    if let Err(e) = repo.apply_breaker_outcome(target.id, outcome_of(&result), now).await {
+        warn!(error = ?e, hook = %target.id, "webhook breaker: persist failed");
     }
 }
 
