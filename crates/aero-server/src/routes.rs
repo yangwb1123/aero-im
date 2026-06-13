@@ -79,6 +79,7 @@ pub fn build(state: AppState) -> Router {
         // Auth
         .route("/api/auth/register", post(auth_register))
         .route("/api/auth/login", post(auth_login))
+        .route("/api/auth/login-history", get(auth_login_history))
         .route("/api/me", get(me).patch(update_me))
         // Rooms
         .route("/api/rooms", post(create_room).get(list_rooms))
@@ -664,6 +665,69 @@ async fn record_session(
     }
 }
 
+/// The client's source IP, read from the standard reverse-proxy forwarding
+/// headers (`X-Forwarded-For`'s first hop, then `X-Real-IP`). Returns `None` when
+/// neither is present (e.g. a direct connection in dev) — callers treat an absent
+/// IP as "unobservable", never as a security signal.
+fn client_ip(headers: &header::HeaderMap) -> Option<String> {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        // `X-Forwarded-For: client, proxy1, proxy2` — the client is the first hop.
+        .and_then(|s| s.split(',').next())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            headers.get("x-real-ip").and_then(|v| v.to_str().ok()).map(str::trim)
+        })
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+/// Best-effort: record this successful login in the IP/device history and, when
+/// it comes from an IP this account has never used before (and the account has
+/// prior logins — so a first-ever login isn't flagged), emit a security warning +
+/// audit event (ROADMAP5 方向五). The new-IP signal is the canonical account-
+/// takeover tell; impossible-travel/geo-velocity builds on this same history but
+/// needs a geo-IP database (a deployment seam). Never fails the login.
+async fn record_login_event(
+    s: &AppState,
+    participant: ParticipantId,
+    workspace: Option<aero_common::WorkspaceId>,
+    headers: &header::HeaderMap,
+) {
+    let ip = client_ip(headers);
+    let ua = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok());
+    let repo = aero_storage::LoginEventRepo::new(s.pg.clone());
+
+    // Flag a login from a new IP — but only for an account that already has
+    // history (every IP is "new" on the first-ever login).
+    match (repo.is_known_ip(participant, ip.as_deref()).await, repo.has_any(participant).await) {
+        (Ok(false), Ok(true)) => {
+            tracing::warn!(%participant, ip = ip.as_deref().unwrap_or("?"), "login from a new IP");
+            if let Some(ws) = workspace {
+                let _ = aero_storage::AuditRepo::new(s.pg.clone())
+                    .append(
+                        ws,
+                        Some(participant),
+                        "auth.login.new_ip",
+                        ip.as_deref(),
+                        serde_json::json!({ "ip": ip, "user_agent": ua }),
+                    )
+                    .await;
+            }
+        }
+        (Err(e), _) | (_, Err(e)) => {
+            tracing::warn!(error = ?e, %participant, "new-IP login check failed");
+        }
+        _ => {}
+    }
+
+    if let Err(e) = repo.record(participant, ip.as_deref(), ua).await {
+        tracing::warn!(error = ?e, %participant, "login event record failed");
+    }
+}
+
 async fn auth_register(
     State(s): State<AppState>,
     headers: header::HeaderMap,
@@ -732,11 +796,30 @@ async fn auth_login(
     // Wave 21: record the active session (best-effort; never fails login). Done
     // only after 2FA passes, so a half-completed login leaves no session row.
     record_session(&s, out.participant.id, &out.refresh_token, &headers).await;
+    // ROADMAP5 方向五: record the login in the IP/device history + flag a new-IP
+    // login (best-effort; never fails login). The audit event is scoped to the
+    // default workspace (login is workspace-agnostic — a participant can belong to
+    // several; the all-zero default is where account-level security events land).
+    record_login_event(&s, out.participant.id, Some(DEFAULT_WORKSPACE_ID), &headers).await;
     Ok(Json(serde_json::json!({
         "access_token": out.access_token,
         "refresh_token": out.refresh_token,
         "participant": out.participant,
     })))
+}
+
+/// `GET /api/auth/login-history` — the caller's recent successful logins (IP +
+/// user-agent + time), newest first, for a "recent login activity" view
+/// (ROADMAP5 方向五). Owner-scoped: a participant only ever sees their own.
+async fn auth_login_history(
+    State(s): State<AppState>,
+    auth: AuthUser,
+) -> ApiResult<Json<serde_json::Value>> {
+    let events = aero_storage::LoginEventRepo::new(s.pg.clone())
+        .recent(auth.participant_id, 50)
+        .await
+        .map_err(AeroError::from)?;
+    Ok(Json(serde_json::json!({ "logins": events })))
 }
 
 async fn me(State(s): State<AppState>, auth: AuthUser) -> ApiResult<Json<serde_json::Value>> {
