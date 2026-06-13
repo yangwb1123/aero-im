@@ -61,6 +61,38 @@ impl Default for JetStreamConfig {
     }
 }
 
+/// Maximum JetStream delivery attempts before a message is parked (no further
+/// redelivery). A message that fails this many times — because it repeatedly
+/// crashes its consumer *before* ack — is poison; parking it after a bounded
+/// number of tries stops one bad message from crash-looping a node's fan-out
+/// forever. (Decode-failure poison is already ACK-dropped at the app layer —
+/// see `ws.rs` — so this is specifically the broker-side backstop for the
+/// consumer-crash class the app layer can't observe.) 16 is high enough that no
+/// merely-transient failure is ever discarded.
+const POISON_MAX_DELIVER: i64 = 16;
+
+/// How long the broker waits for an ack before redelivering. Set generously so a
+/// slow-but-healthy consumer (e.g. a moderation/transcribe AI call) is never
+/// redelivered mid-process — which would double-process — while still spacing
+/// out redelivery so a crash-looping message can't spin a tight hot loop.
+/// Together with [`POISON_MAX_DELIVER`] this is a backoff-free, bounded
+/// redelivery DLQ: at most 16 attempts, each ≥60s apart.
+const POISON_ACK_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Build the pull-consumer config with poison-message redelivery bounds.
+///
+/// Extracted (and unit-tested) so the DLQ guarantee — finite `max_deliver`, a
+/// non-zero `ack_wait` spacing — is verifiable without a live NATS server.
+fn poison_safe_pull_config(subject: &str, durable: Option<&str>) -> consumer::pull::Config {
+    consumer::pull::Config {
+        durable_name: durable.map(str::to_owned),
+        filter_subject: subject.to_owned(),
+        max_deliver: POISON_MAX_DELIVER,
+        ack_wait: POISON_ACK_WAIT,
+        ..Default::default()
+    }
+}
+
 pub struct JetStreamBus {
     js: jetstream::Context,
 }
@@ -211,11 +243,7 @@ impl EventBus for JetStreamBus {
             .await
             .map_err(|e| BusError::Nats(e.to_string()))?;
 
-        let cfg = consumer::pull::Config {
-            durable_name: durable.map(str::to_owned),
-            filter_subject: subject.to_owned(),
-            ..Default::default()
-        };
+        let cfg = poison_safe_pull_config(subject, durable);
 
         let consumer = stream
             .create_consumer(cfg)
@@ -272,7 +300,36 @@ impl Subscription for JsSubscription {
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_publish_subject, BusError};
+    use super::{poison_safe_pull_config, validate_publish_subject, BusError, POISON_MAX_DELIVER};
+
+    #[test]
+    fn pull_config_bounds_redelivery_for_poison_messages() {
+        let cfg = poison_safe_pull_config("im.room.1", Some("aero-server"));
+        assert_eq!(cfg.durable_name.as_deref(), Some("aero-server"));
+        assert_eq!(cfg.filter_subject, "im.room.1");
+        // A finite, positive `max_deliver` is the whole point: the JetStream
+        // default is unlimited redelivery, so a message that repeatedly crashes
+        // its consumer before ack would redeliver forever and crash-loop the
+        // node's fan-out. Bounding it parks the poison message instead.
+        assert!(cfg.max_deliver > 0, "max_deliver must bound redelivery, got {}", cfg.max_deliver);
+        assert_eq!(cfg.max_deliver, POISON_MAX_DELIVER);
+        // A non-zero ack_wait spaces out redelivery so a crash-looping message
+        // can't spin a tight hot loop between the bounded attempts.
+        assert!(
+            cfg.ack_wait > std::time::Duration::ZERO,
+            "ack_wait must be non-zero so redelivery is spaced",
+        );
+    }
+
+    #[test]
+    fn pull_config_without_durable_is_ephemeral() {
+        // A `None` durable yields an ephemeral consumer; the redelivery bound
+        // still applies so even an ephemeral fan-out can't poison-loop.
+        let cfg = poison_safe_pull_config("live.stream.x", None);
+        assert!(cfg.durable_name.is_none());
+        assert!(cfg.max_deliver > 0);
+    }
+
 
     #[test]
     fn accepts_well_formed_concrete_subjects() {
