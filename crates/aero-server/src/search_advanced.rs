@@ -54,7 +54,15 @@ struct AdvancedSearchReq {
     /// first page. A malformed cursor is treated as absent (first page).
     #[serde(default)]
     cursor: Option<String>,
+    /// When true, also compute a faceted breakdown (top rooms + senders by hit
+    /// count) under `facets`. Opt-in: it runs two extra GROUP BY queries, so a
+    /// plain paged search doesn't pay for it. Default false.
+    #[serde(default)]
+    facets: bool,
 }
+
+/// How many buckets each facet dimension returns.
+const FACET_TOP: i64 = 10;
 
 /// `POST /api/search/advanced` — full-text search across every room the caller
 /// belongs to, with Slack-style operators AND-ed on. The repository's
@@ -101,6 +109,18 @@ async fn search_advanced(
         Vec::new()
     };
 
+    // Faceted drill-down (opt-in, first page only — facet counts are over the
+    // whole result set, so they don't change page to page).
+    let facets = if req.facets && after.is_none() {
+        Some(
+            repo.facets(auth.participant_id, workspace, &parsed, FACET_TOP)
+                .await
+                .map_err(AeroError::from)?,
+        )
+    } else {
+        None
+    };
+
     Ok(Json(serde_json::json!({
         "query": req.query,
         "parsed": {
@@ -112,6 +132,7 @@ async fn search_advanced(
         "total_count": total,
         "next_cursor": next.map(|c| c.encode()),
         "suggestions": suggestions,
+        "facets": facets,
         "results": hits.into_iter().map(|h| {
             serde_json::json!({
                 "score": h.score,

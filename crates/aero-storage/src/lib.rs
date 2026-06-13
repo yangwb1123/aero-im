@@ -204,7 +204,9 @@ pub use message_template::{MessageTemplate, MessageTemplateRepo};
 // root — it collides with scim/webhook; reach it via aero_storage::revoked_token::.)
 pub use revoked_token::RevokedTokenRepo;
 pub use search_feedback::{CtrStats, SearchFeedbackRepo};
-pub use search_query::{parse_search_query, AdvancedSearchRepo, ParsedQuery, SearchCursor};
+pub use search_query::{
+    parse_search_query, AdvancedSearchRepo, FacetCount, ParsedQuery, SearchCursor, SearchFacets,
+};
 pub use room_role::RoomRoleRepo;
 
 // ---- Wave 16 re-exports ----

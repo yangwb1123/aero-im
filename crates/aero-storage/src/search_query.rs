@@ -15,6 +15,7 @@
 use std::str::FromStr;
 
 use aero_common::{Block, Message, MessageId, ParticipantId, RoomId, WorkspaceId};
+use serde::Serialize;
 use sqlx::PgPool;
 
 use crate::SearchHit;
@@ -321,6 +322,77 @@ impl AdvancedSearchRepo {
         Ok(total)
     }
 
+    /// Faceted breakdown of the matches for `q`: the top rooms and top senders by
+    /// hit count, for the same membership-scoped result set as
+    /// [`count`](Self::count)/[`search_page`](Self::search_page) (identical WHERE
+    /// clause). Lets a client offer "narrow to room X / sender Y" drill-down with
+    /// live counts. `top` caps each facet list (clamped to `[1, 50]`).
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the query.
+    pub async fn facets(
+        &self,
+        participant: ParticipantId,
+        workspace: WorkspaceId,
+        q: &ParsedQuery,
+        top: i64,
+    ) -> Result<SearchFacets, sqlx::Error> {
+        let top = top.clamp(1, 50);
+        let rooms = self.facet_by(participant, workspace, q, FacetDim::Room, top).await?;
+        let senders = self.facet_by(participant, workspace, q, FacetDim::Sender, top).await?;
+        Ok(SearchFacets { rooms, senders })
+    }
+
+    /// One facet dimension's grouped counts. The grouped column is chosen by
+    /// `dim` (interpolated from a fixed allowlist — never user input — so there is
+    /// no injection surface), while every value predicate stays parameter-bound.
+    async fn facet_by(
+        &self,
+        participant: ParticipantId,
+        workspace: WorkspaceId,
+        q: &ParsedQuery,
+        dim: FacetDim,
+        top: i64,
+    ) -> Result<Vec<FacetCount>, sqlx::Error> {
+        let col = dim.column(); // "m.room_id" | "m.sender_id" — fixed, not user input
+        let sql = format!(
+            r"SELECT {col}::text AS value, COUNT(*) AS n
+               FROM messages m
+               JOIN room_members rm
+                 ON rm.room_id = m.room_id AND rm.participant_id = $1
+               WHERE m.deleted_at IS NULL
+                 AND m.room_id IN (SELECT id FROM rooms WHERE workspace_id = $2)
+                 AND ($3::uuid IS NULL OR m.sender_id = $3)
+                 AND ($4::uuid IS NULL OR m.room_id = $4)
+                 AND ($5::uuid IS NULL OR m.id < $5)
+                 AND ($6::uuid IS NULL OR m.id > $6)
+                 AND ($7::timestamptz IS NULL OR m.created_at >= $7)
+                 AND ($8::timestamptz IS NULL OR m.created_at <= $8)
+                 AND (
+                   $9 = ''
+                   OR m.search_tsv @@ websearch_to_tsquery('english', f_unaccent($9))
+                   OR m.searchable_text % $9
+                 )
+               GROUP BY {col}
+               ORDER BY n DESC, value
+               LIMIT $10"
+        );
+        let rows = sqlx::query_as::<_, (String, i64)>(&sql)
+            .bind(participant.to_uuid())
+            .bind(workspace.to_uuid())
+            .bind(q.from.map(|id| id.to_uuid()))
+            .bind(q.in_room.map(|id| id.to_uuid()))
+            .bind(q.before.map(|id| id.to_uuid()))
+            .bind(q.after.map(|id| id.to_uuid()))
+            .bind(q.after_ts)
+            .bind(q.before_ts)
+            .bind(&q.terms)
+            .bind(top)
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows.into_iter().map(|(value, count)| FacetCount { value, count }).collect())
+    }
+
     /// "Did you mean…" suggestions for `term`: distinct words from the caller's
     /// recently-visible messages that are trigram-similar to `term`. Membership-
     /// scoped via the same `JOIN room_members` boundary as search, so a suggestion
@@ -375,6 +447,46 @@ impl AdvancedSearchRepo {
         .await?;
         Ok(rows.into_iter().map(|(w,)| w).collect())
     }
+}
+
+/// A facet dimension — which column [`AdvancedSearchRepo::facets`] groups by.
+/// The mapped column name comes from this fixed enum (never from request data),
+/// so interpolating it into the GROUP BY carries no injection risk.
+#[derive(Debug, Clone, Copy)]
+enum FacetDim {
+    Room,
+    Sender,
+}
+
+impl FacetDim {
+    fn column(self) -> &'static str {
+        match self {
+            FacetDim::Room => "m.room_id",
+            FacetDim::Sender => "m.sender_id",
+        }
+    }
+}
+
+/// One bucket of a faceted breakdown: a dimension value (a room or sender id,
+/// rendered as a string) and how many matches fell into it.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct FacetCount {
+    /// The grouped value — a room id (`facets.rooms`) or sender id
+    /// (`facets.senders`) as its text UUID.
+    pub value: String,
+    /// Number of matching messages in this bucket.
+    pub count: i64,
+}
+
+/// Faceted breakdown of a search result set: the top rooms and top senders by
+/// match count, for drill-down ("narrow to…") UX. `Serialize` so a handler hands
+/// it straight back as JSON.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SearchFacets {
+    /// Top rooms by match count (descending).
+    pub rooms: Vec<FacetCount>,
+    /// Top senders by match count (descending).
+    pub senders: Vec<FacetCount>,
 }
 
 /// An opaque keyset cursor for [`AdvancedSearchRepo::search_page`]: the
@@ -875,6 +987,80 @@ mod db_tests {
             sqlx::query("DELETE FROM rooms WHERE id = $1").bind(rm.to_uuid()).execute(&p).await.ok();
         }
         for who in [me, stranger] {
+            sqlx::query("DELETE FROM participants WHERE id = $1").bind(who.to_uuid()).execute(&p).await.ok();
+        }
+    }
+
+    /// `facets` groups the SAME membership-scoped match set by room and by sender,
+    /// with counts that sum to the total and lists ordered by count — the
+    /// drill-down breakdown. Membership-scoped like search/count.
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn facets_break_down_matches_by_room_and_sender() {
+        let p = pool();
+        let repo = AdvancedSearchRepo::new(p.clone());
+        let msgs = MessageRepo::new(p.clone());
+        let ws = default_ws();
+
+        let me = participant(&p).await;
+        let other = participant(&p).await;
+        let room_a = room(&p, me).await;
+        let room_b = room(&p, me).await;
+        join(&p, room_a, me).await;
+        join(&p, room_b, me).await;
+
+        // needle distribution: room_a gets 3 (2 from me, 1 from other), room_b 1 (me).
+        let needle = format!("zqfacettoken{}", ParticipantId::new());
+        let plan = [(room_a, me), (room_a, me), (room_a, other), (room_b, me)];
+        let mut ids = Vec::new();
+        for (i, (rm, sender)) in plan.iter().enumerate() {
+            let m = msgs
+                .insert(NewMessage {
+                    room_id: *rm,
+                    sender_id: *sender,
+                    blocks: vec![Block::text(format!("{needle} n{i}"))],
+                    reply_to: None,
+                    metadata: serde_json::json!({}),
+                    expires_at: None,
+                })
+                .await
+                .expect("insert");
+            ids.push(m.id);
+        }
+
+        let q = parse_search_query(&needle);
+        let total = repo.count(me, ws, &q).await.expect("count");
+        let facets = repo.facets(me, ws, &q, 10).await.expect("facets");
+
+        // Room facet: room_a=3, room_b=1, ordered by count desc, summing to total.
+        let room_sum: i64 = facets.rooms.iter().map(|f| f.count).sum();
+        assert_eq!(room_sum, total, "room facet counts sum to total");
+        assert_eq!(facets.rooms.first().map(|f| f.count), Some(3), "top room has 3 hits");
+        assert!(
+            facets.rooms.iter().any(|f| f.value == room_a.to_uuid().to_string() && f.count == 3),
+            "room_a has 3 hits, got {:?}",
+            facets.rooms
+        );
+        assert!(facets.rooms.windows(2).all(|w| w[0].count >= w[1].count), "rooms ordered desc");
+
+        // Sender facet: me=3, other=1.
+        let sender_sum: i64 = facets.senders.iter().map(|f| f.count).sum();
+        assert_eq!(sender_sum, total, "sender facet counts sum to total");
+        assert!(
+            facets.senders.iter().any(|f| f.value == me.to_uuid().to_string() && f.count == 3),
+            "sender me has 3 hits, got {:?}",
+            facets.senders
+        );
+
+        // Cleanup.
+        for id in &ids {
+            sqlx::query("DELETE FROM messages WHERE id = $1").bind(id.to_uuid()).execute(&p).await.ok();
+        }
+        for rm in [room_a, room_b] {
+            sqlx::query("DELETE FROM room_members WHERE room_id = $1").bind(rm.to_uuid()).execute(&p).await.ok();
+            sqlx::query("DELETE FROM rooms WHERE id = $1").bind(rm.to_uuid()).execute(&p).await.ok();
+        }
+        for who in [me, other] {
             sqlx::query("DELETE FROM participants WHERE id = $1").bind(who.to_uuid()).execute(&p).await.ok();
         }
     }
