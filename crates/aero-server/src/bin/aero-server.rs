@@ -162,11 +162,17 @@ async fn main() -> anyhow::Result<()> {
         std::time::Duration::from_secs(cfg.auth.refresh_ttl_secs),
     )
     .context("init JWT codec")?;
-    let auth = AuthService::new(participants.clone(), jwt_codec)
+    let mut auth = AuthService::new(participants.clone(), jwt_codec)
         // Personal Access Tokens (0019): accept an `aero_pat_*` bearer credential on
         // every AuthUser route, resolved against `pat_tokens`. Without this the
         // extractor accepts JWTs only.
         .with_pat_verifier(Arc::new(PatRepo::new(pg.clone())));
+    // Per-account login lockout (ROADMAP5 方向五) — opt-in via AERO_LOGIN_LOCKOUT;
+    // off by default (the per-IP rate limit + 2FA remain the baseline).
+    if let Some(throttle) = aero_auth::LoginThrottle::from_env() {
+        tracing::info!("per-account login lockout enabled (AERO_LOGIN_LOCKOUT)");
+        auth = auth.with_login_throttle(Arc::new(throttle));
+    }
 
     // ---------- IM service ----------
     // `with_workspaces` wires the tenant repo so the workspace-scoped methods

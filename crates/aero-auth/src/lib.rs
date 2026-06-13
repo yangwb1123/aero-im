@@ -11,6 +11,7 @@
 
 pub mod extractor;
 pub mod jwt;
+pub mod login_throttle;
 pub mod oidc;
 pub mod password;
 pub mod password_policy;
@@ -19,6 +20,7 @@ pub mod service;
 pub mod totp;
 
 pub use extractor::AuthUser;
+pub use login_throttle::{LockoutConfig, LoginThrottle};
 pub use password_policy::PasswordPolicy;
 pub use jwt::{Claims, JwtCodec, TokenKind};
 pub use oidc::{

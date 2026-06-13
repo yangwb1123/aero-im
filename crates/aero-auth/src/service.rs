@@ -54,6 +54,11 @@ pub struct AuthService {
     /// through this verifier. `None` (the default) means PAT auth is disabled and
     /// only JWTs are accepted — behaviour is then identical to before PATs.
     pat_verifier: Option<SharedPatVerifier>,
+    /// Optional per-account login lockout (ROADMAP5 方向五). `None` (default) =
+    /// disabled; when present, [`Self::login`] rejects locked accounts and records
+    /// each auth failure / success. Shared (`Arc`) so the in-process failure state
+    /// survives `AuthService` clones across handlers.
+    login_throttle: Option<std::sync::Arc<crate::login_throttle::LoginThrottle>>,
 }
 
 impl AuthService {
@@ -65,7 +70,21 @@ impl AuthService {
             repo,
             jwt,
             pat_verifier: None,
+            login_throttle: None,
         }
+    }
+
+    /// Enable per-account login lockout by injecting a shared
+    /// [`LoginThrottle`](crate::login_throttle::LoginThrottle) (typically
+    /// [`LoginThrottle::from_env`](crate::login_throttle::LoginThrottle::from_env)).
+    /// Builder-style, composes with [`Self::new`] / [`Self::from_pem`] at startup.
+    #[must_use]
+    pub fn with_login_throttle(
+        mut self,
+        throttle: std::sync::Arc<crate::login_throttle::LoginThrottle>,
+    ) -> Self {
+        self.login_throttle = Some(throttle);
+        self
     }
 
     /// Enable Personal Access Token authentication by injecting the verifier that
@@ -147,6 +166,32 @@ impl AuthService {
     /// account-existence information.
     #[tracing::instrument(skip(self, req), fields(email = %req.email))]
     pub async fn login(&self, req: LoginRequest) -> Result<RegisterResponse> {
+        // Per-account lockout (opt-in). Reject a locked account before touching the
+        // password hash, and fold the outcome (auth failure vs success) back into
+        // the throttle. Only `Unauthorized` outcomes count as failures — a DB error
+        // is not the user's fault and must not march them toward a lockout.
+        let Some(throttle) = self.login_throttle.clone() else {
+            return self.login_inner(req).await;
+        };
+        let account = req.email.clone();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        if throttle.is_locked(&account, now) {
+            return Err(Error::Unauthorized(
+                "account temporarily locked after repeated failed logins".into(),
+            ));
+        }
+        let result = self.login_inner(req).await;
+        match &result {
+            Ok(_) => throttle.record_success(&account),
+            Err(Error::Unauthorized(_)) => throttle.record_failure(&account, now),
+            Err(_) => {}
+        }
+        result
+    }
+
+    /// The credential check itself, factored out so [`Self::login`] can wrap it with
+    /// the optional lockout bookkeeping.
+    async fn login_inner(&self, req: LoginRequest) -> Result<RegisterResponse> {
         let creds = self
             .repo
             .find_credentials_by_email(&req.email)
