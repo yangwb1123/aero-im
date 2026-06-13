@@ -157,6 +157,7 @@ open http://localhost:3030
 | `AERO_AGENTIC_ANSWERS` | 置位后 AI 问答走「能动」工具循环(模型自驱动房间检索 search→refine→answer);默认关闭(单次检索更省) |
 | `AERO_LOGIN_LOCKOUT` | 置位后启用按账户登录失败锁定(默认关闭;与 per-IP 限流 + 2FA 叠加) |
 | `AERO_LOGIN_LOCKOUT_MAX_FAILURES` / `_WINDOW_SECS` / `_SECS` | 锁定阈值/窗口/锁定时长(默认 5 次 / 300s 窗口 / 900s 锁定) |
+| `AERO_PER_TENANT_METRICS` | 置位后 `aero_messages_sent_total` 额外发一条 `{workspace}` 标签序列(每租户速率);默认关闭(标签基数随租户数增长,需运维自行权衡) |
 
 ## 体验脚本
 

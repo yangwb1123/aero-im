@@ -94,6 +94,30 @@ pub fn post_allowed(policy: &str, is_admin: bool, is_creator: bool) -> bool {
     }
 }
 
+/// Sentinel `workspace` label value for a message whose owning tenant could not
+/// be resolved (legacy room, or a best-effort lookup that errored / missed).
+/// Mirrors `aero_ai::metrics`'s workspace-less label: collapse to one bounded
+/// series rather than dropping the data or inventing an unbounded label.
+const WORKSPACE_NONE: &str = "none";
+
+/// Whether the opt-in per-tenant message-rate metric is enabled, read ONCE from
+/// `AERO_PER_TENANT_METRICS` and cached for the process lifetime. OPT-IN (default
+/// OFF) because a `workspace` label multiplies `aero_messages_sent_total`'s
+/// cardinality by the active-tenant count — a deliberate operator choice. Resolved
+/// at most once so the send hot path never re-reads env (effectively boot-time
+/// config) — ROADMAP5 方向二.
+fn per_tenant_metrics_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("AERO_PER_TENANT_METRICS").is_ok_and(|v| env_truthy(&v)))
+}
+
+/// Whether an env-var value is "truthy": `"1"` or (case-insensitively) `"true"`.
+/// Anything else — empty, `"0"`, `"false"`, `"yes"` — is false.
+#[must_use]
+fn env_truthy(v: &str) -> bool {
+    v == "1" || v.eq_ignore_ascii_case("true")
+}
+
 /// Object-safe view of [`EventBus`] used internally for dependency injection.
 ///
 /// The upstream [`EventBus`] trait declares a generic default method (`publish_json<T>`)
@@ -1168,6 +1192,27 @@ impl ImService {
             1,
             &[("room_type", room_type)],
         );
+        // Opt-in per-tenant breakdown (ROADMAP5 方向二), mirroring the per-workspace
+        // AI-cost series in `aero_ai::metrics`. ADDITIONAL to (never replacing) the
+        // aggregate `room_type` emit above, so existing dashboards keep working. The
+        // gate is a cached env flag (default OFF), so when disabled this is a single
+        // boolean load and we never pay for the workspace lookup. When ON, the
+        // workspace resolve is best-effort — an error/miss collapses to the bounded
+        // `WORKSPACE_NONE` sentinel and NEVER fails the send.
+        if per_tenant_metrics_enabled() {
+            let ws_label = self
+                .rooms
+                .room_workspace(room)
+                .await
+                .ok()
+                .flatten()
+                .map_or_else(|| WORKSPACE_NONE.to_string(), |w| w.to_string());
+            aero_common::metrics::inc_counter_labeled(
+                aero_common::metrics::names::MESSAGES_SENT_TOTAL,
+                1,
+                &[("workspace", ws_label.as_str())],
+            );
+        }
         aero_common::metrics::observe_histogram_labeled(
             aero_common::metrics::names::MESSAGE_PROCESSING_DURATION_SECONDS,
             started.elapsed().as_secs_f64(),
@@ -2263,6 +2308,16 @@ mod tests {
                     "({private}, {archived})"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn env_truthy_accepts_one_and_case_insensitive_true_only() {
+        for v in ["1", "true", "True", "TRUE", "tRuE"] {
+            assert!(env_truthy(v), "{v:?} should be truthy");
+        }
+        for v in ["", "0", "false", "False", "yes", "on", "2", "truee", " true"] {
+            assert!(!env_truthy(v), "{v:?} should NOT be truthy");
         }
     }
 
