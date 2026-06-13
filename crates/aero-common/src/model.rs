@@ -362,6 +362,10 @@ pub enum NotificationKind {
     Reply,
     /// Someone added an emoji reaction to a message the recipient authored.
     Reaction,
+    /// A new message matched one of the recipient's monitored saved searches
+    /// (ROADMAP5 方向三 — periodic saved-search digest).
+    #[serde(rename = "saved_search")]
+    SavedSearch,
 }
 
 /// One recipient of a [`RoomEvent::NotifyBatch`] — who to notify and why.
@@ -382,6 +386,7 @@ impl NotificationKind {
             Self::Mention => "mention",
             Self::Reply => "reply",
             Self::Reaction => "reaction",
+            Self::SavedSearch => "saved_search",
         }
     }
 
@@ -391,6 +396,7 @@ impl NotificationKind {
         match s {
             "reply" => Self::Reply,
             "reaction" => Self::Reaction,
+            "saved_search" => Self::SavedSearch,
             _ => Self::Mention,
         }
     }

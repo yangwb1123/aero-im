@@ -38,6 +38,26 @@ pub struct SavedSearch {
     pub created_at: time::OffsetDateTime,
 }
 
+/// A monitored saved search — the work-item the periodic digest dispatcher
+/// processes (one per `notify_new = true` row). Carries just what the dispatcher
+/// needs to re-run the query and find matches newer than the last run.
+#[derive(Debug, Clone)]
+pub struct MonitoredSearch {
+    /// The saved search's id (the cursor advanced by [`SavedSearchRepo::mark_run`]).
+    pub id: SavedSearchId,
+    /// The owner — the search runs membership-scoped as them, and they receive the
+    /// new-match notifications.
+    pub owner: ParticipantId,
+    /// The tenant the search is scoped to.
+    pub workspace: WorkspaceId,
+    /// The raw query string.
+    pub query: String,
+    /// The previous `last_run_at`; matches with `created_at` after this are "new".
+    /// `None` when never run — the dispatcher then just stamps the baseline
+    /// without notifying (so enabling monitoring doesn't backfill the whole history).
+    pub last_run_at: Option<time::OffsetDateTime>,
+}
+
 /// The columns a [`SavedSearch`] is built from, in select order. Shared by every
 /// query so the row decoding stays in one place.
 const COLUMNS: &str = "id, participant_id, workspace_id, name, query, created_at";
@@ -171,6 +191,62 @@ impl SavedSearchRepo {
                 .execute(&self.pool)
                 .await?;
         Ok(result.rows_affected() > 0)
+    }
+
+    /// Toggle this saved search's `notify_new` monitoring flag (owner-scoped).
+    /// Returns `true` iff a row was updated. When `true`, a background dispatcher
+    /// periodically re-runs the query and notifies the owner of new matches.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the update.
+    pub async fn set_notify_new(
+        &self,
+        id: SavedSearchId,
+        participant: ParticipantId,
+        notify_new: bool,
+    ) -> Result<bool, sqlx::Error> {
+        let res = sqlx::query(
+            r"UPDATE saved_searches SET notify_new = $3
+               WHERE id = $1 AND participant_id = $2",
+        )
+        .bind(id.to_uuid())
+        .bind(participant.to_uuid())
+        .bind(notify_new)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// Every saved search with monitoring enabled (`notify_new = true`), across all
+    /// owners — the work-list for the periodic digest dispatcher. Returns each
+    /// search's id, owner, workspace, query, and prior `last_run_at` (the cursor
+    /// for "matches newer than this"). Not owner-scoped: it is a server-internal
+    /// background scan, not a user-facing read.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the query.
+    pub async fn list_monitored(&self) -> Result<Vec<MonitoredSearch>, sqlx::Error> {
+        let rows = sqlx::query_as::<
+            _,
+            (uuid::Uuid, uuid::Uuid, uuid::Uuid, String, Option<time::OffsetDateTime>),
+        >(
+            r"SELECT id, participant_id, workspace_id, query, last_run_at
+               FROM saved_searches
+              WHERE notify_new
+              ORDER BY id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, owner, workspace, query, last_run_at)| MonitoredSearch {
+                id: SavedSearchId::from_uuid(id),
+                owner: ParticipantId::from_uuid(owner),
+                workspace: WorkspaceId::from_uuid(workspace),
+                query,
+                last_run_at,
+            })
+            .collect())
     }
 
     /// Stamp `now` as this saved search's `last_run_at` (owner-scoped) and return

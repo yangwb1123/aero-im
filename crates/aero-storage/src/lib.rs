@@ -149,7 +149,7 @@ pub use reaction::ReactionRepo;
 pub use message_receipt::{MessageReader, MessageReceiptRepo};
 pub use receipt::ReceiptRepo;
 pub use room::RoomRepo;
-pub use saved_search::{SavedSearch, SavedSearchRepo};
+pub use saved_search::{MonitoredSearch, SavedSearch, SavedSearchRepo};
 // SCIM token helpers (`generate_token`/`hash_token`) are intentionally NOT
 // re-exported at the crate root: the webhook module exports same-named helpers,
 // so SCIM consumers reach these via the `aero_storage::scim::` path instead.

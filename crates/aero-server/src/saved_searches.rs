@@ -39,6 +39,7 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/api/saved-searches/:sid", delete(delete_saved_search))
         .route("/api/saved-searches/:sid/run", post(run_saved_search))
+        .route("/api/saved-searches/:sid/monitor", post(set_saved_search_monitor))
 }
 
 /// Default number of hits a saved-search run returns (mirrors [`crate::search`]).
@@ -116,6 +117,33 @@ async fn create_saved_search(
         .map_err(AeroError::from)?
         .ok_or_else(|| AeroError::NotFound("saved search".into()))?;
     Ok(Json(serde_json::to_value(row).map_err(AeroError::from)?))
+}
+
+#[derive(Deserialize)]
+struct MonitorReq {
+    /// Whether to enable periodic monitoring (notify on new matches).
+    enabled: bool,
+}
+
+/// `POST /api/saved-searches/:sid/monitor` — turn periodic monitoring on/off for
+/// one of the caller's saved searches (ROADMAP5 方向三). When enabled, a
+/// background dispatcher re-runs the query and notifies the owner of new matches.
+/// Owner-scoped: a `404` if it isn't the caller's row.
+async fn set_saved_search_monitor(
+    State(s): State<AppState>,
+    auth: AuthUser,
+    Path(id_str): Path<String>,
+    Json(req): Json<MonitorReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let id = parse_saved_search(&id_str)?;
+    let updated = repo(&s)
+        .set_notify_new(id, auth.participant_id, req.enabled)
+        .await
+        .map_err(AeroError::from)?;
+    if !updated {
+        return Err(AeroError::NotFound(format!("saved search {id}")).into());
+    }
+    Ok(Json(serde_json::json!({ "id": id, "notify_new": req.enabled })))
 }
 
 /// `GET /api/workspaces/:id/saved-searches` — the caller's saved searches in this

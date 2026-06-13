@@ -162,6 +162,7 @@ pub mod thread_title;
 /// Per-message sentiment / toxicity scoring: POST /api/messages/:id/sentiment.
 pub mod message_sentiment;
 pub mod digests;
+pub mod saved_search_monitor;
 pub mod find_expert;
 /// AI recommendations: suggested channels & people to follow (member-gated).
 pub mod recommendations;

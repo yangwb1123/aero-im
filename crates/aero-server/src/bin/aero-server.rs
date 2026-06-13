@@ -999,6 +999,31 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // ---------- Saved-search monitor (ROADMAP5 方向三) ----------
+    // Every AERO__SERVER__SAVED_SEARCH_MONITOR_SECS (default 300; 0 disables),
+    // re-runs each `notify_new` saved search and notifies its owner of matches
+    // newer than the search's last run. Best-effort; exits on the shutdown token.
+    {
+        let monitor_secs = std::env::var("AERO__SERVER__SAVED_SEARCH_MONITOR_SECS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(300);
+        if monitor_secs == 0 {
+            info!("saved-search monitor disabled (AERO__SERVER__SAVED_SEARCH_MONITOR_SECS=0)");
+        } else {
+            let state_clone = state.clone();
+            let cancel = ai_shutdown.clone();
+            tracker.spawn(async move {
+                aero_server::saved_search_monitor::run_saved_search_monitor(
+                    state_clone,
+                    monitor_secs,
+                    cancel,
+                )
+                .await;
+            });
+        }
+    }
+
     // ---------- Concurrent-viewer sampler (peak/avg concurrent viewers) ----------
     // Every 30s, sample each live stream's cluster-wide Redis viewer count into
     // stream_viewer_samples so analytics can report peak/avg concurrent viewers.

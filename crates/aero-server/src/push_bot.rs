@@ -100,6 +100,7 @@ async fn handle(
         NotificationKind::Mention => format!("{sender_name} mentioned you"),
         NotificationKind::Reply => format!("{sender_name} replied"),
         NotificationKind::Reaction => format!("{sender_name} reacted to your message"),
+        NotificationKind::SavedSearch => "New match for your saved search".to_string(),
     };
 
     let payload = PushPayload {
