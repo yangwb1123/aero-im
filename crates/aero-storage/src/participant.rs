@@ -230,6 +230,16 @@ impl ParticipantRepo {
             "DELETE FROM workspace_mutes WHERE participant_id = $1",
             "DELETE FROM digest_subscriptions WHERE participant_id = $1",
             "DELETE FROM user_group_members WHERE participant_id = $1",
+            // Behavioural-history tables added in 第五版 (ROADMAP5 方向三/五). Both
+            // carry re-identifiable PII keyed by participant and must be erased:
+            //   - search_click_events: the user's search query_text + clicked
+            //     results (no FK — it deliberately survives result deletion, so it
+            //     is NOT cascade-cleaned and MUST be deleted explicitly here).
+            //   - login_events: source IPs + user-agents. Its FK is ON DELETE
+            //     CASCADE, but erasure TOMBSTONES the participant row (UPDATE) rather
+            //     than hard-deleting it, so the cascade never fires — delete explicitly.
+            "DELETE FROM search_click_events WHERE participant_id = $1",
+            "DELETE FROM login_events WHERE participant_id = $1",
         ] {
             sqlx::query(stmt).bind(participant_id.to_uuid()).execute(&mut *tx).await?;
         }
@@ -873,6 +883,25 @@ mod db_tests {
         .execute(&p)
         .await
         .expect("saved_search");
+        // Behavioural-history PII added in 第五版 (search queries/clicks + login
+        // IP/device history). Both must be erased; search_click_events has no FK
+        // and login_events' cascade never fires (the participant is tombstoned, not
+        // hard-deleted), so both rely on the explicit DELETEs in delete_participant.
+        sqlx::query(
+            "INSERT INTO search_click_events (participant_id, workspace_id, query_text, result_id, result_rank) \
+             VALUES ($1,$2,'secret search',$3,0)",
+        )
+        .bind(id.to_uuid())
+        .bind(WorkspaceId(ulid::Ulid(0)).to_uuid())
+        .bind(uuid::Uuid::new_v4())
+        .execute(&p)
+        .await
+        .expect("search_click");
+        sqlx::query("INSERT INTO login_events (participant_id, ip, user_agent) VALUES ($1,'203.0.113.7','Firefox')")
+            .bind(id.to_uuid())
+            .execute(&p)
+            .await
+            .expect("login_event");
 
         assert!(participants.delete_participant(id).await.expect("erase"));
 
@@ -894,6 +923,8 @@ mod db_tests {
             ("scheduled_messages", "sender_id"),
             ("totp_secrets", "participant_id"),
             ("saved_searches", "participant_id"),
+            ("search_click_events", "participant_id"),
+            ("login_events", "participant_id"),
         ] {
             let count: (i64,) =
                 sqlx::query_as(&format!("SELECT count(*) FROM {table} WHERE {col} = $1"))
