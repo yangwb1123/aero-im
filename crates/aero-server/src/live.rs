@@ -83,13 +83,29 @@ impl LiveService {
         // bytes hit NATS so a redelivery carries the SAME seq (the client dedup
         // key). `None` degrades to an unstamped event — never blocks fan-out.
         let seq = self.seq.next_seq(&subject).await;
-        match aero_bus::stamped_event_bytes(event, seq) {
-            Ok(bytes) => {
-                if let Err(err) = self.bus.publish(&subject, bytes.into()).await {
-                    warn!(?err, %subject, "publish StreamEvent failed");
+        // Stamp seq + the current span's trace context (ROADMAP5 方向二) onto the
+        // envelope — sibling keys serde ignores on typed decode — so a watcher's
+        // fan-out trace continues the producer's across the NATS boundary.
+        let traceparent = aero_common::telemetry::current_traceparent();
+        let bytes = match serde_json::to_value(event) {
+            Ok(mut value) => {
+                aero_bus::stamp_seq(&mut value, seq);
+                aero_bus::stamp_traceparent(&mut value, traceparent.as_deref());
+                match serde_json::to_vec(&value) {
+                    Ok(b) => b,
+                    Err(err) => {
+                        warn!(?err, "serialize StreamEvent failed");
+                        return;
+                    }
                 }
             }
-            Err(err) => warn!(?err, "serialize StreamEvent failed"),
+            Err(err) => {
+                warn!(?err, "serialize StreamEvent failed");
+                return;
+            }
+        };
+        if let Err(err) = self.bus.publish(&subject, bytes.into()).await {
+            warn!(?err, %subject, "publish StreamEvent failed");
         }
     }
 

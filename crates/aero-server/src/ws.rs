@@ -1249,6 +1249,37 @@ mod tests {
     }
 }
 
+/// Process one `live.stream.*` bus message: lift the `seq` stamp, decode the
+/// [`StreamEvent`], and fan it out to this node's local watchers. Acks always; an
+/// undecodable payload is ack-dropped (poison-safe), never nacked.
+async fn handle_stream_event_sub(state: &AppState, sub: Box<dyn aero_bus::Subscription + Send>) {
+    // Two-phase decode (as `handle_room_event_sub`): lift the publish-time `"seq"`
+    // stamp off the raw JSON before the typed decode drops it.
+    let parsed: serde_json::Result<(StreamEvent, Option<u64>)> =
+        serde_json::from_slice::<serde_json::Value>(sub.payload()).and_then(|value| {
+            let seq = aero_bus::extract_seq(&value);
+            Ok((serde_json::from_value::<StreamEvent>(value)?, seq))
+        });
+    match parsed {
+        Ok((event, seq)) => {
+            let watchers = state.hub.stream_watchers(event.stream_id());
+            if !watchers.is_empty() {
+                let frame = ServerFrame::StreamEvent { event };
+                let json = stamped_frame_json(&frame, seq);
+                state.hub.fan_out_raw(&watchers, &json);
+            }
+            let _ = sub.ack().await;
+        }
+        Err(e) => {
+            // Poison payload (see run_bus_listener): ack-drop, never nack — an
+            // undecodable StreamEvent will never decode on redelivery.
+            warn!(error = ?e, "bad StreamEvent on bus — dropping (poison)");
+            metrics::inc_counter(names::BUS_POISON_DROPPED_TOTAL, 1);
+            let _ = sub.ack().await;
+        }
+    }
+}
+
 /// Background loop that subscribes to `live.stream.*` and pushes each
 /// [`StreamEvent`] to local watchers of that stream. Uses an *ephemeral*
 /// consumer: live interactivity is broadcast (every instance must see every
@@ -1256,6 +1287,7 @@ mod tests {
 /// restart are immaterial. Started once per process at boot.
 pub async fn run_live_bus_listener(state: AppState) -> anyhow::Result<()> {
     use aero_bus::EventBus;
+    use tracing::Instrument as _;
     let bus: Arc<dyn EventBus> = state.bus.clone();
     // Resubscribe across NATS reconnects — see `run_bus_listener`. The consumer is
     // ephemeral by design (live interactivity is broadcast; a few dropped danmaku
@@ -1272,31 +1304,9 @@ pub async fn run_live_bus_listener(state: AppState) -> anyhow::Result<()> {
         };
         info!("live bus listener started");
         while let Some(sub) = stream.next().await {
-            // Same two-phase decode as `run_bus_listener`: lift the publish-time
-            // `"seq"` stamp off the raw JSON before the typed decode drops it.
-            let parsed: serde_json::Result<(StreamEvent, Option<u64>)> =
-                serde_json::from_slice::<serde_json::Value>(sub.payload()).and_then(|value| {
-                    let seq = aero_bus::extract_seq(&value);
-                    Ok((serde_json::from_value::<StreamEvent>(value)?, seq))
-                });
-            match parsed {
-                Ok((event, seq)) => {
-                    let watchers = state.hub.stream_watchers(event.stream_id());
-                    if !watchers.is_empty() {
-                        let frame = ServerFrame::StreamEvent { event };
-                        let json = stamped_frame_json(&frame, seq);
-                        state.hub.fan_out_raw(&watchers, &json);
-                    }
-                    let _ = sub.ack().await;
-                }
-                Err(e) => {
-                    // Poison payload (see run_bus_listener): ack-drop, never nack —
-                    // an undecodable StreamEvent will never decode on redelivery.
-                    warn!(error = ?e, "bad StreamEvent on bus — dropping (poison)");
-                    metrics::inc_counter(names::BUS_POISON_DROPPED_TOTAL, 1);
-                    let _ = sub.ack().await;
-                }
-            }
+            // Continue the producer's trace across the NATS boundary (方向二).
+            let span = bus_consume_span("live.stream", sub.payload());
+            handle_stream_event_sub(&state, sub).instrument(span).await;
         }
         warn!("live.stream.* subscription stream ended; resubscribing");
         tokio::time::sleep(BUS_RESUBSCRIBE_BACKOFF).await;
