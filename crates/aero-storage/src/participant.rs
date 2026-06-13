@@ -201,13 +201,35 @@ impl ParticipantRepo {
         //   authored private content not in the message ledger: unsent drafts
         //                 (message_drafts.blocks), the out-of-office autoreply text,
         //                 and not-yet-sent scheduled messages (scheduled_messages.blocks).
+        //   security: the 2FA secret of the erased account (totp_secrets);
+        //   personal data / settings: saved searches + watched keywords + message
+        //                 templates (user-authored), the activity feed, recurring
+        //                 messages, and per-channel/thread/workspace preferences.
+        // (Deliberately kept: org_reports + revoked_tokens + workspace_deactivations
+        //  are governance/audit records, and auth_sessions are revoked above, not
+        //  deleted. `participants` itself is soft-deleted + tombstoned, not removed.)
         for stmt in [
             "DELETE FROM credentials WHERE participant_id = $1",
             "DELETE FROM participant_profiles WHERE participant_id = $1",
             "DELETE FROM sso_identities WHERE participant_id = $1",
+            "DELETE FROM totp_secrets WHERE participant_id = $1",
             "DELETE FROM message_drafts WHERE participant_id = $1",
             "DELETE FROM out_of_office WHERE participant_id = $1",
             "DELETE FROM scheduled_messages WHERE sender_id = $1",
+            "DELETE FROM recurring_messages WHERE sender_id = $1",
+            "DELETE FROM saved_searches WHERE participant_id = $1",
+            "DELETE FROM keyword_alerts WHERE participant_id = $1",
+            "DELETE FROM message_templates WHERE participant_id = $1",
+            "DELETE FROM activity_feed WHERE participant_id = $1",
+            "DELETE FROM channel_favorites WHERE participant_id = $1",
+            "DELETE FROM channel_notification_prefs WHERE participant_id = $1",
+            "DELETE FROM channel_sections WHERE participant_id = $1",
+            "DELETE FROM thread_mutes WHERE participant_id = $1",
+            "DELETE FROM thread_notification_prefs WHERE participant_id = $1",
+            "DELETE FROM thread_subscriptions WHERE participant_id = $1",
+            "DELETE FROM workspace_mutes WHERE participant_id = $1",
+            "DELETE FROM digest_subscriptions WHERE participant_id = $1",
+            "DELETE FROM user_group_members WHERE participant_id = $1",
         ] {
             sqlx::query(stmt).bind(participant_id.to_uuid()).execute(&mut *tx).await?;
         }
@@ -836,6 +858,21 @@ mod db_tests {
         .execute(&p)
         .await
         .expect("scheduled");
+        sqlx::query("INSERT INTO totp_secrets (participant_id, secret) VALUES ($1,'JBSWY3DPEHPK3PXP')")
+            .bind(id.to_uuid())
+            .execute(&p)
+            .await
+            .expect("totp");
+        sqlx::query(
+            "INSERT INTO saved_searches (id, participant_id, workspace_id, name, query) \
+             VALUES ($1,$2,$3,'mine','secret query')",
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(id.to_uuid())
+        .bind(WorkspaceId(ulid::Ulid(0)).to_uuid())
+        .execute(&p)
+        .await
+        .expect("saved_search");
 
         assert!(participants.delete_participant(id).await.expect("erase"));
 
@@ -855,6 +892,8 @@ mod db_tests {
             ("message_drafts", "participant_id"),
             ("out_of_office", "participant_id"),
             ("scheduled_messages", "sender_id"),
+            ("totp_secrets", "participant_id"),
+            ("saved_searches", "participant_id"),
         ] {
             let count: (i64,) =
                 sqlx::query_as(&format!("SELECT count(*) FROM {table} WHERE {col} = $1"))
