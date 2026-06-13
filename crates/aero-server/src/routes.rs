@@ -1287,6 +1287,16 @@ async fn blob_upload(
         if !is_allowed_mime(&mime) {
             return Err(AeroError::Invalid(format!("unsupported file type: {mime}")).into());
         }
+        // Defence-in-depth: the MIME above is client-claimed, so sniff the actual
+        // bytes — reject executables / HTML / SVG payloads disguised as an allowed
+        // type (stored malware / stored-XSS), and binary types whose content does
+        // not match their declared family.
+        if !crate::content_sniff::is_consistent(&mime, &bytes) {
+            return Err(AeroError::Invalid(format!(
+                "file content does not match its declared type ({mime}), or is a disallowed executable/markup payload"
+            ))
+            .into());
+        }
         let kind = guess_file_kind(&mime);
         let size = bytes.len() as u64;
         let sha256_hex = hex::encode(sha2::Sha256::digest(&bytes));

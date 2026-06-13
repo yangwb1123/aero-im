@@ -14,6 +14,8 @@ pub mod bookmarks;
 pub mod channel_sections;
 pub mod collab;
 pub mod config;
+/// Magic-byte content sniffing for uploaded blobs (reject disguised executables/markup).
+pub mod content_sniff;
 pub mod drafts;
 pub mod emoji;
 pub mod error;
