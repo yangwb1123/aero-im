@@ -21,6 +21,12 @@ use serde_json::{json, Value};
 use crate::anthropic::{AgentTurn, AnthropicClient, ToolDef, ToolUse, Usage};
 use crate::error::Result;
 
+/// Max tools actually executed per model turn. Bounds the per-answer I/O (DB/blob
+/// reads) explicitly instead of relying on `max_tokens` to indirectly limit how
+/// many `tool_use` blocks a turn can carry. Tool calls beyond this still get a
+/// paired (synthetic) `tool_result` so the conversation stays API-valid.
+const MAX_TOOLS_PER_TURN: usize = 8;
+
 /// One tool-aware model turn. Implemented by the real client; mocked in tests.
 #[async_trait]
 pub trait ToolChat: Send + Sync {
@@ -148,12 +154,25 @@ pub async fn run_agent_loop(
         }
 
         // Record the assistant's tool_use turn, then run each tool and feed the
-        // results back as a single user turn.
+        // results back as a single user turn. Real tool execution is bounded to
+        // MAX_TOOLS_PER_TURN per turn so the per-answer I/O cost (DB/blob reads) is
+        // explicit rather than relying on `max_tokens` to indirectly limit how many
+        // tool_use blocks the model can emit. Every tool_use STILL gets a paired
+        // tool_result (the Messages API requires 1:1) — calls past the cap get a
+        // synthetic "not executed" result instead of doing I/O.
         messages.push(assistant_message(&turn));
         let mut result_blocks = Vec::with_capacity(turn.tool_uses.len());
-        for tu in &turn.tool_uses {
-            tool_calls += 1;
-            result_blocks.push(run_one_tool(tools, tu).await);
+        for (i, tu) in turn.tool_uses.iter().enumerate() {
+            if i < MAX_TOOLS_PER_TURN {
+                tool_calls += 1;
+                result_blocks.push(run_one_tool(tools, tu).await);
+            } else {
+                result_blocks.push(json!({
+                    "type": "tool_result",
+                    "tool_use_id": tu.id,
+                    "content": "error: per-turn tool limit reached; not executed",
+                }));
+            }
         }
         messages.push(json!({ "role": "user", "content": result_blocks }));
     }
@@ -326,5 +345,35 @@ mod tests {
         assert!(out.hit_cap, "should report hitting the cap");
         assert_eq!(out.iterations, 2);
         assert_eq!(out.tool_calls, 2);
+    }
+
+    #[tokio::test]
+    async fn per_turn_tool_calls_are_capped_but_all_get_results() {
+        // A single turn asks for MANY more tools than the per-turn cap allows.
+        let n = MAX_TOOLS_PER_TURN + 5;
+        let tool = FakeTool::new("t", "ok");
+        let mut tool_uses = Vec::new();
+        for i in 0..n {
+            tool_uses.push(ToolUse { id: format!("tu_{i}"), name: "t".into(), input: json!({}) });
+        }
+        let chat = MockChat::new(vec![
+            AgentTurn { text: String::new(), tool_uses, usage: Usage::default() },
+            text_turn("done", (1, 1)),
+        ]);
+        let tools: Vec<Arc<dyn AgentTool>> = vec![tool.clone()];
+        let out = run_agent_loop(&chat, &tools, "be helpful", "q", 4, 256).await.unwrap();
+
+        // Only the cap's worth of tools actually executed (real I/O bounded)…
+        assert_eq!(out.tool_calls, MAX_TOOLS_PER_TURN);
+        assert_eq!(tool.calls.lock().unwrap().len(), MAX_TOOLS_PER_TURN);
+        // …but EVERY tool_use got a paired tool_result (Messages API requires 1:1),
+        // so the second model call saw n result blocks and the loop finished.
+        let seen = chat.seen.lock().unwrap();
+        let results = seen[1][2]["content"].as_array().expect("result blocks");
+        assert_eq!(results.len(), n, "one tool_result per tool_use, capped or not");
+        // The over-cap results are synthetic "not executed" markers.
+        let over = results[MAX_TOOLS_PER_TURN]["content"].as_str().unwrap();
+        assert!(over.contains("per-turn tool limit"), "over-cap call is a synthetic skip: {over}");
+        assert_eq!(out.answer, "done");
     }
 }
