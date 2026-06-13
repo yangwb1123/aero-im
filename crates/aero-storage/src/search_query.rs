@@ -187,32 +187,67 @@ impl AdvancedSearchRepo {
         q: &ParsedQuery,
         limit: i64,
     ) -> Result<Vec<SearchHit>, sqlx::Error> {
+        Ok(self.search_page(participant, workspace, q, limit, None).await?.0)
+    }
+
+    /// Keyset-paginated variant of [`search`](Self::search): returns one page plus
+    /// an opaque [`SearchCursor`] for the next page (`None` once the result set is
+    /// exhausted).
+    ///
+    /// Pagination is keyset, not `OFFSET`: pass the previous page's returned
+    /// cursor as `after` to fetch the next page in O(log n + limit) regardless of
+    /// depth. The cursor is the composite `(score, id)` of the last row — because
+    /// `score` (a `ts_rank`/`similarity` float) is **not** unique, a score-only
+    /// cursor would drop or repeat rows at ties, so the `m.id` tiebreaker is part
+    /// of the cursor and the predicate is the lexicographic tuple compare
+    /// `(score, id) < (cursor.score, cursor.id)` — exactly the rows that sort
+    /// after the cursor under `ORDER BY score DESC, id DESC`.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the query.
+    pub async fn search_page(
+        &self,
+        participant: ParticipantId,
+        workspace: WorkspaceId,
+        q: &ParsedQuery,
+        limit: i64,
+        after: Option<SearchCursor>,
+    ) -> Result<(Vec<SearchHit>, Option<SearchCursor>), sqlx::Error> {
         let limit = limit.clamp(1, 100);
+        // The keyset predicate lives in an outer query so it can reference the
+        // computed `score` alias (a WHERE clause can't see a SELECT alias, and
+        // repeating the GREATEST(...) expression would have to stay byte-identical
+        // forever). `$11` NULL ⇒ first page (no cursor).
         let rows = sqlx::query_as::<_, ScoredRow>(
-            r"SELECT
-                 m.id, m.room_id, m.sender_id, m.blocks, m.reply_to, m.metadata,
-                 m.created_at, m.edited_at, m.deleted_at, m.expires_at,
-                 GREATEST(
-                   ts_rank(m.search_tsv, websearch_to_tsquery('english', f_unaccent($2))),
-                   similarity(m.searchable_text, $2)
-                 ) AS score
-               FROM messages m
-               JOIN room_members rm
-                 ON rm.room_id = m.room_id AND rm.participant_id = $1
-               WHERE m.deleted_at IS NULL
-                 AND m.room_id IN (SELECT id FROM rooms WHERE workspace_id = $4)
-                 AND ($5::uuid IS NULL OR m.sender_id = $5)
-                 AND ($6::uuid IS NULL OR m.room_id = $6)
-                 AND ($7::uuid IS NULL OR m.id < $7)
-                 AND ($8::uuid IS NULL OR m.id > $8)
-                 AND ($9::timestamptz IS NULL OR m.created_at >= $9)
-                 AND ($10::timestamptz IS NULL OR m.created_at <= $10)
-                 AND (
-                   $2 = ''
-                   OR m.search_tsv @@ websearch_to_tsquery('english', f_unaccent($2))
-                   OR m.searchable_text % $2
-                 )
-               ORDER BY score DESC, m.id DESC
+            r"SELECT id, room_id, sender_id, blocks, reply_to, metadata,
+                     created_at, edited_at, deleted_at, expires_at, score
+               FROM (
+                 SELECT
+                   m.id, m.room_id, m.sender_id, m.blocks, m.reply_to, m.metadata,
+                   m.created_at, m.edited_at, m.deleted_at, m.expires_at,
+                   GREATEST(
+                     ts_rank(m.search_tsv, websearch_to_tsquery('english', f_unaccent($2))),
+                     similarity(m.searchable_text, $2)
+                   ) AS score
+                 FROM messages m
+                 JOIN room_members rm
+                   ON rm.room_id = m.room_id AND rm.participant_id = $1
+                 WHERE m.deleted_at IS NULL
+                   AND m.room_id IN (SELECT id FROM rooms WHERE workspace_id = $4)
+                   AND ($5::uuid IS NULL OR m.sender_id = $5)
+                   AND ($6::uuid IS NULL OR m.room_id = $6)
+                   AND ($7::uuid IS NULL OR m.id < $7)
+                   AND ($8::uuid IS NULL OR m.id > $8)
+                   AND ($9::timestamptz IS NULL OR m.created_at >= $9)
+                   AND ($10::timestamptz IS NULL OR m.created_at <= $10)
+                   AND (
+                     $2 = ''
+                     OR m.search_tsv @@ websearch_to_tsquery('english', f_unaccent($2))
+                     OR m.searchable_text % $2
+                   )
+               ) sub
+               WHERE ($11::real IS NULL OR (sub.score, sub.id) < ($11, $12::uuid))
+               ORDER BY sub.score DESC, sub.id DESC
                LIMIT $3",
         )
         .bind(participant.to_uuid())
@@ -225,9 +260,151 @@ impl AdvancedSearchRepo {
         .bind(q.after.map(|id| id.to_uuid()))
         .bind(q.after_ts)
         .bind(q.before_ts)
+        .bind(after.map(|c| c.score))
+        .bind(after.map(|c| c.id.to_uuid()))
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows.into_iter().map(SearchHit::from).collect())
+        // A next cursor only when the page came back full — a short page is the
+        // last one. (A full final page yields a cursor whose next fetch is empty,
+        // which is the standard, harmless keyset terminal condition.)
+        let next = if usize::try_from(limit).is_ok_and(|l| rows.len() == l) {
+            rows.last().map(|r| SearchCursor { score: r.score, id: MessageId::from_uuid(r.id) })
+        } else {
+            None
+        };
+        Ok((rows.into_iter().map(SearchHit::from).collect(), next))
+    }
+
+    /// Total number of messages matching `q` for `participant` in `workspace`,
+    /// independent of any page limit. Mirrors [`search_page`](Self::search_page)'s
+    /// WHERE clause exactly (same membership boundary, same filters) so the count
+    /// is consistent with the paged results.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the query.
+    pub async fn count(
+        &self,
+        participant: ParticipantId,
+        workspace: WorkspaceId,
+        q: &ParsedQuery,
+    ) -> Result<i64, sqlx::Error> {
+        let (total,): (i64,) = sqlx::query_as(
+            r"SELECT COUNT(*)
+               FROM messages m
+               JOIN room_members rm
+                 ON rm.room_id = m.room_id AND rm.participant_id = $1
+               WHERE m.deleted_at IS NULL
+                 AND m.room_id IN (SELECT id FROM rooms WHERE workspace_id = $2)
+                 AND ($3::uuid IS NULL OR m.sender_id = $3)
+                 AND ($4::uuid IS NULL OR m.room_id = $4)
+                 AND ($5::uuid IS NULL OR m.id < $5)
+                 AND ($6::uuid IS NULL OR m.id > $6)
+                 AND ($7::timestamptz IS NULL OR m.created_at >= $7)
+                 AND ($8::timestamptz IS NULL OR m.created_at <= $8)
+                 AND (
+                   $9 = ''
+                   OR m.search_tsv @@ websearch_to_tsquery('english', f_unaccent($9))
+                   OR m.searchable_text % $9
+                 )",
+        )
+        .bind(participant.to_uuid())
+        .bind(workspace.to_uuid())
+        .bind(q.from.map(|id| id.to_uuid()))
+        .bind(q.in_room.map(|id| id.to_uuid()))
+        .bind(q.before.map(|id| id.to_uuid()))
+        .bind(q.after.map(|id| id.to_uuid()))
+        .bind(q.after_ts)
+        .bind(q.before_ts)
+        .bind(&q.terms)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(total)
+    }
+
+    /// "Did you mean…" suggestions for `term`: distinct words from the caller's
+    /// recently-visible messages that are trigram-similar to `term`. Membership-
+    /// scoped via the same `JOIN room_members` boundary as search, so a suggestion
+    /// never reveals a word from a room the caller can't see. Intended to be
+    /// called only when a query returned few/zero hits (it scans a bounded recent
+    /// window, not the whole corpus).
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the query.
+    pub async fn suggest_terms(
+        &self,
+        participant: ParticipantId,
+        workspace: WorkspaceId,
+        term: &str,
+        limit: i64,
+    ) -> Result<Vec<String>, sqlx::Error> {
+        let term = term.trim();
+        if term.len() < 3 {
+            return Ok(Vec::new()); // too short to suggest meaningfully
+        }
+        let limit = limit.clamp(1, 20);
+        let rows = sqlx::query_as::<_, (String,)>(
+            r"WITH recent AS (
+                 SELECT lower(m.searchable_text) AS t
+                 FROM messages m
+                 JOIN room_members rm
+                   ON rm.room_id = m.room_id AND rm.participant_id = $1
+                 WHERE m.deleted_at IS NULL
+                   AND m.room_id IN (SELECT id FROM rooms WHERE workspace_id = $2)
+                   AND m.searchable_text <> ''
+                   AND m.created_at > now() - interval '30 days'
+                 ORDER BY m.id DESC
+                 LIMIT 2000
+              ),
+              words AS (
+                 SELECT DISTINCT w AS word
+                 FROM recent, LATERAL regexp_split_to_table(recent.t, '[^a-z0-9]+') AS w
+                 WHERE length(w) BETWEEN 3 AND 30
+              )
+              SELECT word
+              FROM words
+              WHERE word <> lower($3)
+                AND word_similarity($3, word) > 0.4
+              ORDER BY word_similarity($3, word) DESC, word
+              LIMIT $4",
+        )
+        .bind(participant.to_uuid())
+        .bind(workspace.to_uuid())
+        .bind(term)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(w,)| w).collect())
+    }
+}
+
+/// An opaque keyset cursor for [`AdvancedSearchRepo::search_page`]: the
+/// `(score, id)` of the last row on a page. Round-trips through the HTTP layer as
+/// an encoded string so a client can request the next page.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SearchCursor {
+    /// Relevance score of the last returned row (the primary sort key).
+    pub score: f32,
+    /// Id of the last returned row (the tiebreaker that makes the cursor unique).
+    pub id: MessageId,
+}
+
+impl SearchCursor {
+    /// Encode as a compact, URL-safe `"<score-bits-hex>.<message-id>"` string.
+    /// The score is encoded by its raw IEEE-754 bits so it round-trips exactly
+    /// (no decimal-parse drift that could shift the keyset boundary).
+    #[must_use]
+    pub fn encode(&self) -> String {
+        format!("{:08x}.{}", self.score.to_bits(), self.id)
+    }
+
+    /// Decode a cursor produced by [`encode`](Self::encode). Returns `None` for a
+    /// malformed string (treated as "no cursor" / first page by the caller).
+    #[must_use]
+    pub fn decode(s: &str) -> Option<Self> {
+        let (bits_hex, id_str) = s.split_once('.')?;
+        let bits = u32::from_str_radix(bits_hex, 16).ok()?;
+        let id = MessageId::from_str(id_str).ok()?;
+        Some(Self { score: f32::from_bits(bits), id })
     }
 }
 
@@ -319,7 +496,7 @@ mod tests {
 mod db_tests {
     use super::{parse_search_query, AdvancedSearchRepo};
     use crate::{MessageRepo, NewMessage};
-    use aero_common::{Block, ParticipantId, RoomId, WorkspaceId};
+    use aero_common::{Block, MessageId, ParticipantId, RoomId, WorkspaceId};
     use sqlx::PgPool;
 
     fn pool() -> PgPool {
@@ -540,5 +717,165 @@ mod db_tests {
         sqlx::query("DELETE FROM room_members WHERE room_id = $1").bind(r.to_uuid()).execute(&p).await.ok();
         sqlx::query("DELETE FROM rooms WHERE id = $1").bind(r.to_uuid()).execute(&p).await.ok();
         sqlx::query("DELETE FROM participants WHERE id = $1").bind(me.to_uuid()).execute(&p).await.ok();
+    }
+
+    /// `count` returns the full match total regardless of page size, and
+    /// `search_page` walks the whole result set in keyset pages with no overlaps
+    /// and no gaps — including across score ties (every seeded message shares the
+    /// same single needle token, so they rank near-identically, exercising the
+    /// `(score, id)` tiebreaker).
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn count_and_keyset_pagination_cover_every_hit_once() {
+        use super::SearchCursor;
+        let p = pool();
+        let repo = AdvancedSearchRepo::new(p.clone());
+        let msgs = MessageRepo::new(p.clone());
+        let ws = default_ws();
+
+        let me = participant(&p).await;
+        let r = room(&p, me).await;
+        join(&p, r, me).await;
+
+        // Seed 25 messages all carrying one distinctive token.
+        let needle = format!("zpagetoken{}", ParticipantId::new());
+        let mut seeded = Vec::new();
+        for i in 0..25 {
+            let m = msgs
+                .insert(NewMessage {
+                    room_id: r,
+                    sender_id: me,
+                    blocks: vec![Block::text(format!("{needle} item {i}"))],
+                    reply_to: None,
+                    metadata: serde_json::json!({}),
+                    expires_at: None,
+                })
+                .await
+                .expect("insert");
+            seeded.push(m.id);
+        }
+
+        let q = parse_search_query(&needle);
+
+        // count() is page-independent.
+        let total = repo.count(me, ws, &q).await.expect("count");
+        assert_eq!(total, 25, "count reflects all seeded matches");
+
+        // Walk every page of size 10 via the returned cursor, collecting ids.
+        let mut seen: Vec<MessageId> = Vec::new();
+        let mut cursor: Option<SearchCursor> = None;
+        let mut pages = 0;
+        loop {
+            let (hits, next) = repo.search_page(me, ws, &q, 10, cursor).await.expect("page");
+            pages += 1;
+            assert!(pages <= 10, "pagination must terminate");
+            for h in &hits {
+                seen.push(h.message.id);
+            }
+            match next {
+                Some(c) => cursor = Some(c),
+                None => break,
+            }
+        }
+
+        // Every seeded id appears exactly once across all pages (no gaps/overlaps).
+        assert_eq!(seen.len(), 25, "every hit returned exactly once across pages");
+        let mut sorted = seen.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), 25, "no duplicate ids across pages (keyset tiebreak holds)");
+        for id in &seeded {
+            assert!(seen.contains(id), "seeded id {id} appears in some page");
+        }
+
+        // A round-tripped cursor decodes back to the same boundary.
+        let (_first, next) = repo.search_page(me, ws, &q, 10, None).await.expect("first page");
+        let c = next.expect("first page has a next cursor");
+        assert_eq!(SearchCursor::decode(&c.encode()), Some(c), "cursor encode/decode round-trips");
+
+        // Cleanup.
+        for id in &seeded {
+            sqlx::query("DELETE FROM messages WHERE id = $1").bind(id.to_uuid()).execute(&p).await.ok();
+        }
+        sqlx::query("DELETE FROM room_members WHERE room_id = $1").bind(r.to_uuid()).execute(&p).await.ok();
+        sqlx::query("DELETE FROM rooms WHERE id = $1").bind(r.to_uuid()).execute(&p).await.ok();
+        sqlx::query("DELETE FROM participants WHERE id = $1").bind(me.to_uuid()).execute(&p).await.ok();
+    }
+
+    /// `suggest_terms` returns trigram-near words from the caller's own recent
+    /// messages — so a typo'd query can surface a "did you mean" hint — and is
+    /// membership-scoped (never a word from a room the caller can't see).
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn suggest_terms_offers_trigram_near_words_membership_scoped() {
+        let p = pool();
+        let repo = AdvancedSearchRepo::new(p.clone());
+        let msgs = MessageRepo::new(p.clone());
+        let ws = default_ws();
+
+        let me = participant(&p).await;
+        let stranger = participant(&p).await;
+        let mine = room(&p, me).await;
+        let theirs = room(&p, stranger).await;
+        join(&p, mine, me).await;
+        join(&p, theirs, stranger).await; // I am NOT a member of `theirs`.
+
+        // A distinctive, unusual word in MY room.
+        let marker = "zqdeploymentpipeline";
+        let m = msgs
+            .insert(NewMessage {
+                room_id: mine,
+                sender_id: me,
+                blocks: vec![Block::text(format!("the {marker} is green"))],
+                reply_to: None,
+                metadata: serde_json::json!({}),
+                expires_at: None,
+            })
+            .await
+            .expect("insert mine");
+        // A different distinctive word in a room I can't see.
+        let secret = "zqforbiddenkeyword";
+        let m_secret = msgs
+            .insert(NewMessage {
+                room_id: theirs,
+                sender_id: stranger,
+                blocks: vec![Block::text(format!("a {secret} here"))],
+                reply_to: None,
+                metadata: serde_json::json!({}),
+                expires_at: None,
+            })
+            .await
+            .expect("insert theirs");
+
+        // A near-miss of my word suggests it.
+        let sugg = repo
+            .suggest_terms(me, ws, "zqdeploymentpipelin", 5)
+            .await
+            .expect("suggest");
+        assert!(
+            sugg.iter().any(|w| w == marker),
+            "a trigram-near typo surfaces my word, got {sugg:?}"
+        );
+
+        // A near-miss of the forbidden word suggests NOTHING — I'm not in that room.
+        let sugg = repo
+            .suggest_terms(me, ws, "zqforbiddenkeywor", 5)
+            .await
+            .expect("suggest secret");
+        assert!(
+            !sugg.iter().any(|w| w == secret),
+            "membership boundary: a word from a room I can't see is never suggested, got {sugg:?}"
+        );
+
+        // Cleanup.
+        sqlx::query("DELETE FROM messages WHERE id = $1").bind(m.id.to_uuid()).execute(&p).await.ok();
+        sqlx::query("DELETE FROM messages WHERE id = $1").bind(m_secret.id.to_uuid()).execute(&p).await.ok();
+        for rm in [mine, theirs] {
+            sqlx::query("DELETE FROM room_members WHERE room_id = $1").bind(rm.to_uuid()).execute(&p).await.ok();
+            sqlx::query("DELETE FROM rooms WHERE id = $1").bind(rm.to_uuid()).execute(&p).await.ok();
+        }
+        for who in [me, stranger] {
+            sqlx::query("DELETE FROM participants WHERE id = $1").bind(who.to_uuid()).execute(&p).await.ok();
+        }
     }
 }

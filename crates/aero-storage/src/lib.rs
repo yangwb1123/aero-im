@@ -202,7 +202,7 @@ pub use message_template::{MessageTemplate, MessageTemplateRepo};
 // Wave 15 re-exports. (revoked_token::hash_token is NOT re-exported at the crate
 // root — it collides with scim/webhook; reach it via aero_storage::revoked_token::.)
 pub use revoked_token::RevokedTokenRepo;
-pub use search_query::{parse_search_query, AdvancedSearchRepo, ParsedQuery};
+pub use search_query::{parse_search_query, AdvancedSearchRepo, ParsedQuery, SearchCursor};
 pub use room_role::RoomRoleRepo;
 
 // ---- Wave 16 re-exports ----

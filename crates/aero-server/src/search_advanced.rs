@@ -17,7 +17,7 @@ use std::str::FromStr;
 
 use aero_auth::AuthUser;
 use aero_common::{Error as AeroError, WorkspaceId};
-use aero_storage::{parse_search_query, AdvancedSearchRepo};
+use aero_storage::{parse_search_query, AdvancedSearchRepo, SearchCursor};
 use axum::{extract::State, routing::post, Json, Router};
 use serde::Deserialize;
 
@@ -48,6 +48,10 @@ struct AdvancedSearchReq {
     /// Optional page size; absent ⇒ [`DEFAULT_LIMIT`], clamped to `[1, 100]`.
     #[serde(default)]
     limit: Option<i64>,
+    /// Optional keyset cursor from a previous response's `next_cursor`; absent ⇒
+    /// first page. A malformed cursor is treated as absent (first page).
+    #[serde(default)]
+    cursor: Option<String>,
 }
 
 /// `POST /api/search/advanced` — full-text search across every room the caller
@@ -69,11 +73,31 @@ async fn search_advanced(
     };
     let limit = req.limit.unwrap_or(DEFAULT_LIMIT);
     let parsed = parse_search_query(&req.query);
+    // A malformed cursor decodes to None — treat as the first page rather than error.
+    let after = req.cursor.as_deref().and_then(SearchCursor::decode);
 
-    let hits = AdvancedSearchRepo::new(s.pg.clone())
-        .search(auth.participant_id, workspace, &parsed, limit)
+    let repo = AdvancedSearchRepo::new(s.pg.clone());
+    let total = repo
+        .count(auth.participant_id, workspace, &parsed)
         .await
         .map_err(AeroError::from)?;
+    let (hits, next) = repo
+        .search_page(auth.participant_id, workspace, &parsed, limit, after)
+        .await
+        .map_err(AeroError::from)?;
+
+    // "Did you mean…" — only worth surfacing on the first page of an under-
+    // performing single-token query (multi-word typo correction is noisy and
+    // word_similarity works per-word). Best-effort: a suggestion lookup failure
+    // never fails the search.
+    let term = parsed.terms.trim();
+    let suggestions = if after.is_none() && total < 3 && !term.is_empty() && !term.contains(' ') {
+        repo.suggest_terms(auth.participant_id, workspace, term, 5)
+            .await
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
 
     Ok(Json(serde_json::json!({
         "query": req.query,
@@ -83,6 +107,9 @@ async fn search_advanced(
             "before": parsed.before,
             "after": parsed.after,
         },
+        "total_count": total,
+        "next_cursor": next.map(|c| c.encode()),
+        "suggestions": suggestions,
         "results": hits.into_iter().map(|h| {
             serde_json::json!({
                 "score": h.score,
