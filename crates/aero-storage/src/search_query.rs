@@ -193,7 +193,7 @@ impl AdvancedSearchRepo {
                  m.id, m.room_id, m.sender_id, m.blocks, m.reply_to, m.metadata,
                  m.created_at, m.edited_at, m.deleted_at, m.expires_at,
                  GREATEST(
-                   ts_rank(m.search_tsv, websearch_to_tsquery('simple', $2)),
+                   ts_rank(m.search_tsv, websearch_to_tsquery('english', f_unaccent($2))),
                    similarity(m.searchable_text, $2)
                  ) AS score
                FROM messages m
@@ -209,7 +209,7 @@ impl AdvancedSearchRepo {
                  AND ($10::timestamptz IS NULL OR m.created_at <= $10)
                  AND (
                    $2 = ''
-                   OR m.search_tsv @@ websearch_to_tsquery('simple', $2)
+                   OR m.search_tsv @@ websearch_to_tsquery('english', f_unaccent($2))
                    OR m.searchable_text % $2
                  )
                ORDER BY score DESC, m.id DESC
@@ -484,5 +484,61 @@ mod db_tests {
                 .await
                 .ok();
         }
+    }
+
+    /// The advanced-search path stems and folds accents in LOCK-STEP with the
+    /// stored `search_tsv` (migrations 0128 + 0131): a query for the root/unaccented
+    /// form matches an inflected/diacritic'd message. Guards the regression where
+    /// this repo still used `websearch_to_tsquery('simple', …)` against the
+    /// `english`+`f_unaccent` column — which silently dropped stem/accent hits.
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn advanced_search_stems_and_unaccents() {
+        let p = pool();
+        let repo = AdvancedSearchRepo::new(p.clone());
+        let msgs = MessageRepo::new(p.clone());
+        let ws = default_ws();
+
+        let me = participant(&p).await;
+        let r = room(&p, me).await;
+        join(&p, r, me).await;
+
+        // Unique marker so concurrent rows can't satisfy the assertions for us.
+        let marker = format!("zqftsmark{}", ParticipantId::new());
+        let m = msgs
+            .insert(NewMessage {
+                room_id: r,
+                sender_id: me,
+                // 'deploying' (inflected) + 'café' (accented), neither appearing
+                // literally in the queries below.
+                blocks: vec![Block::text(format!("{marker} deploying to the café"))],
+                reply_to: None,
+                metadata: serde_json::json!({}),
+                expires_at: None,
+            })
+            .await
+            .expect("insert m");
+
+        // Root form 'deploy' (stem) — must match 'deploying'.
+        let q = parse_search_query(&format!("{marker} deploy"));
+        let hits = repo.search(me, ws, &q, 50).await.expect("stem search");
+        assert!(
+            hits.iter().any(|h| h.message.id == m.id),
+            "advanced search stems 'deploy' → 'deploying'"
+        );
+
+        // Unaccented 'cafe' — must match 'café'.
+        let q = parse_search_query(&format!("{marker} cafe"));
+        let hits = repo.search(me, ws, &q, 50).await.expect("accent search");
+        assert!(
+            hits.iter().any(|h| h.message.id == m.id),
+            "advanced search folds 'cafe' → 'café'"
+        );
+
+        // Cleanup.
+        sqlx::query("DELETE FROM messages WHERE id = $1").bind(m.id.to_uuid()).execute(&p).await.ok();
+        sqlx::query("DELETE FROM room_members WHERE room_id = $1").bind(r.to_uuid()).execute(&p).await.ok();
+        sqlx::query("DELETE FROM rooms WHERE id = $1").bind(r.to_uuid()).execute(&p).await.ok();
+        sqlx::query("DELETE FROM participants WHERE id = $1").bind(me.to_uuid()).execute(&p).await.ok();
     }
 }
