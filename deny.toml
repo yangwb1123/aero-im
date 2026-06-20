@@ -1,0 +1,61 @@
+# Aero IM — cargo-deny 配置
+# 安装: cargo install cargo-deny
+# 运行: cargo deny check
+
+[advisories]
+# 数据库自动更新，不需要 git 提交
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+# 可以被忽略的已知漏洞（经过评估后）
+# 格式: [advisories.ignore]
+# "RUSTSEC-2024-0001" = { reason = "评估为低风险，依赖无利用路径" }
+
+[bans]
+# 禁止的 crate
+deny = []
+# 允许的 crate 列表（白名单模式）
+# skip = []
+# skip-tree = []
+
+# 多版本禁止（同一 crate 的不同版本同时存在）
+multiple-versions = "deny"
+
+# 所有 crate 必须指定 license
+[licenses]
+unlicensed = "deny"
+# 允许的 license 列表
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT OR Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "0BSD",
+]
+deny = [
+    "GPL-2.0",
+    "GPL-3.0",
+    "AGPL-3.0",
+    "LGPL-3.0",
+    "CC-BY-4.0",
+]
+skip = [
+    { name = "ring", licenses = ["OpenSSL"] },         # 标准加密库
+    { name = "webpki", licenses = ["ISC"] },           # TLS
+    { name = "untrusted", licenses = ["ISC"] },        # webpki 的依赖
+    { name = "sct", licenses = ["ISC", "OpenSSL"] },   # webpki 的依赖
+    { name = "encoding_rs", licenses = ["Apache-2.0", "Unicode-3.0"] },
+    { name = "unicode-ident", licenses = ["Unicode-3.0"] },
+    { name = "unicode-width", licenses = ["Unicode-3.0"] },
+    { name = "unicode-normalization", licenses = ["Unicode-3.0"] },
+    { name = "unicode-bidi", licenses = ["Unicode-3.0"] },
+    { name = "flate2", licenses = ["MIT", "Apache-2.0", "Zlib"] },
+]
+
+[sources]
+# 只允许 crates.io 和 git（限制路径依赖的风险）
+allow-git = true

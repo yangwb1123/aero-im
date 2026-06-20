@@ -9,6 +9,7 @@
 //! * The lower-level [`password`] and [`jwt`] modules are exposed for tests and
 //!   for callers that need fine-grained control.
 
+pub mod bot;
 pub mod extractor;
 pub mod jwt;
 pub mod login_throttle;
@@ -19,6 +20,7 @@ pub mod pat;
 pub mod service;
 pub mod totp;
 
+pub use bot::{BotTokenVerifier, SharedBotVerifier};
 pub use extractor::AuthUser;
 pub use login_throttle::{LockoutConfig, LoginThrottle};
 pub use password_policy::PasswordPolicy;

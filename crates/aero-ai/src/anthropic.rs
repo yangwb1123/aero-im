@@ -52,8 +52,12 @@ impl ChatMsg {
 /// The response JSON carries a top-level `usage` object — these are the actual
 /// billed token counts (not an estimate), used to compute real per-job cost (方向三
 /// AI cost realism). Cache-related token fields the API also returns
-/// (`cache_creation_input_tokens` / `cache_read_input_tokens`) are ignored here:
-/// this client does not use prompt caching, so they are always zero.
+/// (`cache_creation_input_tokens` / `cache_read_input_tokens`) are not surfaced on
+/// this struct — they don't affect the input/output token cost model — but the
+/// client *does* opt into prompt caching by tagging the stable system prefix (and,
+/// in the agentic path, the tool prefix) with `cache_control: {type:"ephemeral"}`,
+/// so repeated requests with a stable prefix bill the cached portion at the
+/// reduced cache-read rate (AI input-cost optimization, P3-4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Usage {
     /// Tokens consumed by the prompt (system + messages).
@@ -158,7 +162,10 @@ impl AnthropicClient {
         let body = RequestBody {
             model: &self.model,
             max_tokens,
-            system,
+            // Prompt caching: tag the stable system prefix so a reused prefix
+            // bills at the cache-read rate (P3-4). Backward-compatible — the
+            // request's meaning is unchanged, only its billing.
+            system: SystemBlock::cached(system),
             messages,
         };
 
@@ -218,12 +225,20 @@ impl AnthropicClient {
         if messages.is_empty() {
             return Err(AiError::Invalid("messages must not be empty".into()));
         }
+        // Prompt caching for the agentic loop (P3-4): tools render before system
+        // in the cache prefix, and across a multi-turn tool-use loop the tool
+        // definitions + system prompt are the large *stable* prefix re-sent on
+        // every turn — exactly what prompt caching is for. Tag the LAST tool so
+        // the whole tools prefix is cached, and tag the system block too; the
+        // varying `messages` come after and are not cached. `cache_control` only
+        // affects billing, never the request's meaning — fully backward-compatible.
+        let tools_value = tools_with_cache_control(tools);
         let body = serde_json::json!({
             "model": self.model,
             "max_tokens": max_tokens,
-            "system": system,
+            "system": SystemBlock::cached(system),
             "messages": messages,
-            "tools": tools,
+            "tools": tools_value,
         });
         let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
         let resp = self
@@ -265,7 +280,9 @@ impl AnthropicClient {
         let body = StreamRequestBody {
             model: self.model.clone(),
             max_tokens,
-            system: system.to_string(),
+            // Prompt caching on the stable system prefix (P3-4); see
+            // [`OwnedSystemBlock`]. Does not change streaming semantics.
+            system: OwnedSystemBlock::cached(system.to_string()),
             messages: messages.to_vec(),
             stream: true,
         };
@@ -372,13 +389,72 @@ fn parse_agent_turn(raw: &str) -> Result<AgentTurn> {
     Ok(AgentTurn { text, tool_uses, usage })
 }
 
+/// Serialize `tools` to JSON and tag the **last** tool definition with
+/// `cache_control: {type:"ephemeral"}` so the API caches the entire (stable) tools
+/// prefix. Tools render first in the cache prefix, so the breakpoint on the last
+/// tool covers all of them. Returns the tools unchanged (just re-serialized) when
+/// the slice is empty. Pure + serialization-only, so it's unit-tested without HTTP.
+fn tools_with_cache_control(tools: &[ToolDef]) -> Vec<serde_json::Value> {
+    let mut values: Vec<serde_json::Value> =
+        tools.iter().map(|t| serde_json::to_value(t).unwrap_or(serde_json::Value::Null)).collect();
+    if let Some(last) = values.last_mut() {
+        if let Some(obj) = last.as_object_mut() {
+            obj.insert(
+                "cache_control".to_string(),
+                serde_json::json!({ "type": "ephemeral" }),
+            );
+        }
+    }
+    values
+}
+
 // ---------- wire types ----------
+
+/// `cache_control` marker — Anthropic prompt caching. Tagging a stable content
+/// block (the system prompt, or the last tool definition) with this makes the API
+/// cache everything up to and including that block; subsequent requests that share
+/// the byte-identical prefix bill the cached span at the reduced cache-read rate
+/// instead of full input price. Purely a cost optimization: it never changes the
+/// request's *semantics*, only how the prefix is billed (AI input-cost, P3-4).
+#[derive(Serialize, Clone, Copy)]
+struct CacheControl {
+    #[serde(rename = "type")]
+    kind: &'static str,
+}
+
+impl CacheControl {
+    /// The 5-minute ephemeral cache — the right tier for a frequently-reused
+    /// stable prefix (our system prompts are constant per task kind).
+    const EPHEMERAL: Self = Self { kind: "ephemeral" };
+}
+
+/// A single `system` content block. The Messages API accepts `system` as either a
+/// plain string OR an array of typed text blocks; `cache_control` can only ride on
+/// the array form, so we always emit the array form with the marker on the (single)
+/// block. A short prefix below the model's cacheable minimum simply isn't cached —
+/// no error, no behavior change — so tagging unconditionally is safe.
+#[derive(Serialize)]
+struct SystemBlock<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    text: &'a str,
+    cache_control: CacheControl,
+}
+
+impl<'a> SystemBlock<'a> {
+    /// Wrap a system prompt as a cache-tagged text block array (length 1).
+    fn cached(text: &'a str) -> [Self; 1] {
+        [Self { kind: "text", text, cache_control: CacheControl::EPHEMERAL }]
+    }
+}
 
 #[derive(Serialize)]
 struct RequestBody<'a> {
     model: &'a str,
     max_tokens: u32,
-    system: &'a str,
+    /// Stable system prefix, emitted as a cache-tagged content-block array so the
+    /// API caches it (prompt caching). See [`SystemBlock`].
+    system: [SystemBlock<'a>; 1],
     messages: &'a [ChatMsg],
 }
 
@@ -404,12 +480,29 @@ enum ContentBlock {
     Other,
 }
 
-/// Streaming request body — identical to [`RequestBody`] plus `"stream": true`.
+/// Owned counterpart of [`SystemBlock`] for the streaming body, which holds its
+/// fields by value. Same wire shape — a cache-tagged text content block.
+#[derive(Serialize)]
+struct OwnedSystemBlock {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    text: String,
+    cache_control: CacheControl,
+}
+
+impl OwnedSystemBlock {
+    fn cached(text: String) -> [Self; 1] {
+        [Self { kind: "text", text, cache_control: CacheControl::EPHEMERAL }]
+    }
+}
+
+/// Streaming request body — identical to [`RequestBody`] plus `"stream": true`,
+/// including the cache-tagged system prefix.
 #[derive(Serialize)]
 struct StreamRequestBody {
     model: String,
     max_tokens: u32,
-    system: String,
+    system: [OwnedSystemBlock; 1],
     messages: Vec<ChatMsg>,
     stream: bool,
 }
@@ -503,17 +596,95 @@ mod tests {
             ChatMsg::assistant("hi"),
             ChatMsg::user("how are you?"),
         ];
-        let body = RequestBody { model: "claude-sonnet-4-6", max_tokens: 256, system: "be terse", messages: &msgs };
+        let body = RequestBody {
+            model: "claude-sonnet-4-6",
+            max_tokens: 256,
+            system: SystemBlock::cached("be terse"),
+            messages: &msgs,
+        };
         let json = serde_json::to_value(&body).unwrap();
         assert_eq!(json["model"], "claude-sonnet-4-6");
         assert_eq!(json["max_tokens"], 256);
-        assert_eq!(json["system"], "be terse");
+        // `system` is now the cache-tagged content-block array form (required to
+        // carry `cache_control`), not a bare string. The text is preserved.
+        let sys = json["system"].as_array().expect("system must be a block array");
+        assert_eq!(sys.len(), 1);
+        assert_eq!(sys[0]["type"], "text");
+        assert_eq!(sys[0]["text"], "be terse");
         let arr = json["messages"].as_array().unwrap();
         assert_eq!(arr.len(), 3);
         assert_eq!(arr[0]["role"], "user");
         assert_eq!(arr[0]["content"], "hello");
         assert_eq!(arr[1]["role"], "assistant");
         assert_eq!(arr[2]["content"], "how are you?");
+    }
+
+    #[test]
+    fn request_body_system_block_carries_prompt_cache_control() {
+        // P3-4: the stable system prefix must be tagged for prompt caching so a
+        // reused prefix bills at the cache-read rate. Assert the serialized body's
+        // system block carries `cache_control: {type:"ephemeral"}`.
+        let msgs = vec![ChatMsg::user("q")];
+        let body = RequestBody {
+            model: "claude-sonnet-4-6",
+            max_tokens: 64,
+            system: SystemBlock::cached("a stable, reusable system prompt"),
+            messages: &msgs,
+        };
+        let json = serde_json::to_value(&body).unwrap();
+        let block = &json["system"][0];
+        assert_eq!(block["cache_control"]["type"], "ephemeral");
+        assert_eq!(block["text"], "a stable, reusable system prompt");
+    }
+
+    #[test]
+    fn stream_request_body_system_block_carries_cache_control() {
+        // The streaming path uses the owned block variant — it must cache too.
+        let body = StreamRequestBody {
+            model: "claude-sonnet-4-6".into(),
+            max_tokens: 64,
+            system: OwnedSystemBlock::cached("stable system".into()),
+            messages: vec![ChatMsg::user("q")],
+            stream: true,
+        };
+        let json = serde_json::to_value(&body).unwrap();
+        assert_eq!(json["stream"], true);
+        let block = &json["system"][0];
+        assert_eq!(block["type"], "text");
+        assert_eq!(block["text"], "stable system");
+        assert_eq!(block["cache_control"]["type"], "ephemeral");
+    }
+
+    #[test]
+    fn tools_cache_control_tags_only_the_last_tool() {
+        // The tools prefix is cached by tagging the LAST tool definition; earlier
+        // tools must stay untagged (one breakpoint covers the whole prefix).
+        let tools = vec![
+            ToolDef {
+                name: "search".into(),
+                description: "search the room".into(),
+                input_schema: serde_json::json!({ "type": "object" }),
+            },
+            ToolDef {
+                name: "clock".into(),
+                description: "current time".into(),
+                input_schema: serde_json::json!({ "type": "object" }),
+            },
+        ];
+        let values = tools_with_cache_control(&tools);
+        assert_eq!(values.len(), 2);
+        // First tool: no cache_control.
+        assert!(values[0].get("cache_control").is_none());
+        assert_eq!(values[0]["name"], "search");
+        // Last tool: cache_control present, original fields preserved.
+        assert_eq!(values[1]["cache_control"]["type"], "ephemeral");
+        assert_eq!(values[1]["name"], "clock");
+        assert_eq!(values[1]["input_schema"]["type"], "object");
+    }
+
+    #[test]
+    fn tools_cache_control_empty_slice_is_noop() {
+        assert!(tools_with_cache_control(&[]).is_empty());
     }
 
     #[test]

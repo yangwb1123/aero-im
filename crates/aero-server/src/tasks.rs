@@ -153,6 +153,7 @@ async fn create_task(
                 room_id: Some(room.to_string()),
                 message_id: None,
                 badge: None,
+                collapse_key: None,
             };
             crate::push_bot::push_to_participant(&s, assignee, &payload).await;
         }

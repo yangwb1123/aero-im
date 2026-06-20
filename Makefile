@@ -61,6 +61,19 @@ fmt: ## rustfmt all crates
 lint: ## clippy
 	cargo clippy --workspace --all-targets -- -D warnings
 
+.PHONY: check-truth
+check-truth: ## 检测「写了但没接线」死代码（孤儿模块 + 零调用 builder）
+	@bash scripts/truth-check.sh
+# 注意：check-truth 暂不折入 check-harness——当前已知 participant_cache /
+# notification_bundle 等孤儿模块会让它红，会阻断本地开发。待这些接线后
+# （见 docs/sprint），再考虑将 check-truth 折入 check-harness 统一门禁。
+
+.PHONY: check-web
+check-web: ## 前端零工具链校验门（JS 语法 + 相对 import 解析，无需 npm）
+	@bash scripts/web-check.sh
+# 注意：check-web 独立成门，不折入 check-harness（与 check-truth 同策略）。
+# 仅需 node（沙箱即可跑，无 npm install）；node 缺失时优雅跳过不阻断。
+
 ##@ Run
 .PHONY: migrate
 migrate: ## apply DB migrations

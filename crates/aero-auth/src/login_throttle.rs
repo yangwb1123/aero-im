@@ -10,13 +10,31 @@
 //! *sole* control — so operators enable it deliberately, alongside the per-IP limit
 //! and 2FA, rather than it being forced on.
 //!
-//! State is in-process (`Mutex<HashMap>`), mirroring the message spam guard: each
-//! node locks independently (sufficient for brute-force defense) with no DB
-//! round-trip on the hot login path. The decision logic is a pure function of the
-//! prior state + an injected `now`, so every transition is unit-tested.
+//! ## Storage backend
+//!
+//! The failure accounting lives behind a [`FailureStore`] seam with two impls:
+//!
+//! * **In-process** (default): `Mutex<HashMap>`, each node locks independently
+//!   with no DB round-trip on the hot login path — sufficient for brute-force
+//!   defense against a single node. The decision logic ([`FailureState`]) is a
+//!   pure function of prior state + an injected `now`, so every transition is
+//!   unit-tested.
+//! * **Redis** (opt-in via `AERO_LOGIN_LOCKOUT_REDIS`): a shared `INCR`/`EXPIRE`
+//!   window counter + a `SETEX` lock key, so a *distributed* attacker spraying the
+//!   same account across nodes is aggregated and locked out cluster-wide rather
+//!   than starting fresh on each node. Strictly **fail-open** — any Redis error
+//!   treats the account as *not* locked and silently drops the failure record, so
+//!   a Redis outage degrades to "no lockout", never to a self-inflicted DoS that
+//!   locks legitimate users out. Uses a TTL-based sliding window (Redis server
+//!   time) rather than the in-process explicit `first_failure_at` window; the two
+//!   are behaviourally equivalent for the threshold semantics that matter here.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, PoisonError};
+
+use async_trait::async_trait;
+use fred::prelude::{KeysInterface, RedisClient};
+use fred::types::Expiration;
 
 /// Lockout policy tunables.
 #[derive(Debug, Clone, Copy)]
@@ -72,27 +90,152 @@ impl FailureState {
     }
 }
 
-/// In-process per-account login throttle.
-pub struct LoginThrottle {
+/// Pluggable failure-accounting backend. Keys arrive already normalized by
+/// [`LoginThrottle::key`]. Implementations MUST be fail-open: a backend error on
+/// `is_locked` returns `false` (never lock a user out because storage hiccuped).
+#[async_trait]
+trait FailureStore: Send + Sync {
+    async fn is_locked(&self, key: &str, now: i64) -> bool;
+    async fn record_failure(&self, key: &str, now: i64);
+    async fn record_success(&self, key: &str);
+}
+
+/// In-process `Mutex<HashMap>` backend (the historical default). No `.await` is
+/// held across the lock, so the async wrapper is `Send`.
+struct InProcessFailureStore {
     states: Mutex<HashMap<String, FailureState>>,
     cfg: LockoutConfig,
 }
 
-impl LoginThrottle {
-    #[must_use]
-    pub fn new(cfg: LockoutConfig) -> Self {
-        Self { states: Mutex::new(HashMap::new()), cfg }
+#[async_trait]
+impl FailureStore for InProcessFailureStore {
+    async fn is_locked(&self, key: &str, now: i64) -> bool {
+        let states = self.states.lock().unwrap_or_else(PoisonError::into_inner);
+        states.get(key).is_some_and(|s| s.is_locked(now))
     }
 
-    /// Build from `AERO_LOGIN_LOCKOUT*` env, or `None` when the feature is off
-    /// (`AERO_LOGIN_LOCKOUT` unset / not truthy). Overrides:
-    /// `AERO_LOGIN_LOCKOUT_MAX_FAILURES`, `_WINDOW_SECS`, `_SECS`.
+    async fn record_failure(&self, key: &str, now: i64) {
+        let mut states = self.states.lock().unwrap_or_else(PoisonError::into_inner);
+        let entry = states.entry(key.to_string()).or_default();
+        *entry = entry.after_failure(now, &self.cfg);
+    }
+
+    async fn record_success(&self, key: &str) {
+        let mut states = self.states.lock().unwrap_or_else(PoisonError::into_inner);
+        states.remove(key);
+    }
+}
+
+/// Redis-backed cross-node backend (opt-in). A `SETEX` lock key gates an account;
+/// an `INCR`+`EXPIRE` window counter aggregates failures cluster-wide. Fail-open.
+struct RedisFailureStore {
+    client: RedisClient,
+    cfg: LockoutConfig,
+}
+
+impl RedisFailureStore {
+    fn lock_key(key: &str) -> String {
+        format!("aero:loginlock:{key}")
+    }
+    fn count_key(key: &str) -> String {
+        format!("aero:loginfail:{key}")
+    }
+
+    /// Atomic-ish failure fold. `INCR` is atomic; the "Nth failure trips the lock"
+    /// check has a tiny benign race (two concurrent Nth failures both set the same
+    /// lock — idempotent). Mirrors the in-process semantics: a failure while locked
+    /// is a no-op, and tripping the lock resets the counter (re-lock needs a fresh
+    /// run after expiry).
+    async fn try_record_failure(&self, key: &str) -> Result<(), fred::error::RedisError> {
+        // Already locked ⇒ no-op (don't extend the window).
+        let locked: i64 = self.client.exists(Self::lock_key(key)).await?;
+        if locked > 0 {
+            return Ok(());
+        }
+        let ckey = Self::count_key(key);
+        let n: i64 = self.client.incr(&ckey).await?;
+        if n == 1 {
+            // First failure of the window: arm the sliding-window TTL.
+            self.client.expire::<(), _>(&ckey, self.cfg.window_secs).await?;
+        }
+        if n >= i64::from(self.cfg.max_failures) {
+            // Trip the lock, reset the counter.
+            self.client
+                .set::<(), _, _>(
+                    Self::lock_key(key),
+                    "1",
+                    Some(Expiration::EX(self.cfg.lockout_secs)),
+                    None,
+                    false,
+                )
+                .await?;
+            let _: i64 = self.client.del(&ckey).await?;
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl FailureStore for RedisFailureStore {
+    async fn is_locked(&self, key: &str, _now: i64) -> bool {
+        // Fail-open: a Redis error means "not locked" — never deny a legitimate
+        // user because the shared store is unreachable.
+        match self.client.exists::<i64, _>(Self::lock_key(key)).await {
+            Ok(n) => n > 0,
+            Err(e) => {
+                tracing::warn!(error = ?e, "login throttle: redis is_locked failed, failing open");
+                false
+            }
+        }
+    }
+
+    async fn record_failure(&self, key: &str, _now: i64) {
+        if let Err(e) = self.try_record_failure(key).await {
+            tracing::warn!(error = ?e, "login throttle: redis record_failure failed, dropping");
+        }
+    }
+
+    async fn record_success(&self, key: &str) {
+        // Best-effort clear; an error here only delays GC of a stale counter.
+        let _: Result<i64, _> = self.client.del(Self::count_key(key)).await;
+        let _: Result<i64, _> = self.client.del(Self::lock_key(key)).await;
+    }
+}
+
+/// Optional per-account login throttle. Holds a pluggable [`FailureStore`]
+/// (in-process by default, Redis when opted in).
+pub struct LoginThrottle {
+    store: Arc<dyn FailureStore>,
+}
+
+impl LoginThrottle {
+    /// In-process throttle (no shared state).
+    #[must_use]
+    pub fn new(cfg: LockoutConfig) -> Self {
+        Self {
+            store: Arc::new(InProcessFailureStore { states: Mutex::new(HashMap::new()), cfg }),
+        }
+    }
+
+    /// Redis-backed throttle (cross-node aggregation).
+    #[must_use]
+    pub fn with_redis(cfg: LockoutConfig, client: RedisClient) -> Self {
+        Self { store: Arc::new(RedisFailureStore { client, cfg }) }
+    }
+
+    /// Build from `AERO_LOGIN_LOCKOUT*` env, in-process backend. `None` when the
+    /// feature is off. Kept for callers without a Redis handle (e.g. tests).
     #[must_use]
     pub fn from_env() -> Option<Self> {
-        let on = std::env::var("AERO_LOGIN_LOCKOUT")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        if !on {
+        Self::from_env_with_redis(None)
+    }
+
+    /// Build from env. When `AERO_LOGIN_LOCKOUT_REDIS` is truthy AND a `client` is
+    /// supplied, uses the cross-node Redis backend; otherwise in-process. `None`
+    /// when `AERO_LOGIN_LOCKOUT` is off.
+    #[must_use]
+    pub fn from_env_with_redis(client: Option<RedisClient>) -> Option<Self> {
+        if !env_truthy("AERO_LOGIN_LOCKOUT") {
             return None;
         }
         let mut cfg = LockoutConfig::default();
@@ -105,7 +248,13 @@ impl LoginThrottle {
         if let Some(v) = env_i64("AERO_LOGIN_LOCKOUT_SECS") {
             cfg.lockout_secs = v.max(1);
         }
-        Some(Self::new(cfg))
+        match (env_truthy("AERO_LOGIN_LOCKOUT_REDIS"), client) {
+            (true, Some(c)) => {
+                tracing::info!("login lockout: cross-node Redis backend (AERO_LOGIN_LOCKOUT_REDIS)");
+                Some(Self::with_redis(cfg, c))
+            }
+            _ => Some(Self::new(cfg)),
+        }
     }
 
     /// Normalize an account key so case / whitespace variants share one bucket
@@ -115,24 +264,25 @@ impl LoginThrottle {
     }
 
     /// Is this account currently locked?
-    #[must_use]
-    pub fn is_locked(&self, account: &str, now: i64) -> bool {
-        let states = self.states.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        states.get(&Self::key(account)).is_some_and(|s| s.is_locked(now))
+    pub async fn is_locked(&self, account: &str, now: i64) -> bool {
+        self.store.is_locked(&Self::key(account), now).await
     }
 
     /// Record a failed login; may trip the lock.
-    pub fn record_failure(&self, account: &str, now: i64) {
-        let mut states = self.states.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let entry = states.entry(Self::key(account)).or_default();
-        *entry = entry.after_failure(now, &self.cfg);
+    pub async fn record_failure(&self, account: &str, now: i64) {
+        self.store.record_failure(&Self::key(account), now).await;
     }
 
     /// Record a successful login; clears any accumulated failures for the account.
-    pub fn record_success(&self, account: &str) {
-        let mut states = self.states.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        states.remove(&Self::key(account));
+    pub async fn record_success(&self, account: &str) {
+        self.store.record_success(&Self::key(account)).await;
     }
+}
+
+fn env_truthy(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
 }
 
 fn env_u32(name: &str) -> Option<u32> {
@@ -205,17 +355,17 @@ mod tests {
         assert!(!s2.is_locked(after));
     }
 
-    #[test]
-    fn throttle_locks_and_success_clears() {
+    #[tokio::test]
+    async fn throttle_locks_and_success_clears() {
         let t = LoginThrottle::new(CFG);
         for now in [0, 1, 2] {
-            assert!(!t.is_locked("User@x.com", now));
-            t.record_failure("user@x.com", now);
+            assert!(!t.is_locked("User@x.com", now).await);
+            t.record_failure("user@x.com", now).await;
         }
         // Case/whitespace-insensitive: the mixed-case lookup sees the lock.
-        assert!(t.is_locked("  User@X.com ", 2), "locked after threshold, key-normalized");
+        assert!(t.is_locked("  User@X.com ", 2).await, "locked after threshold, key-normalized");
         // A success clears the account.
-        t.record_success("user@x.com");
-        assert!(!t.is_locked("user@x.com", 2));
+        t.record_success("user@x.com").await;
+        assert!(!t.is_locked("user@x.com", 2).await);
     }
 }

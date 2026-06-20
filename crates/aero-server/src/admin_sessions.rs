@@ -105,6 +105,20 @@ async fn revoke_sessions(
         .await
         .map_err(AeroError::from)?;
 
+    // Blacklist every revoked refresh-token hash, mirroring the password-change /
+    // delete-account / sign-out-others paths (sessions.rs). Marking `auth_sessions`
+    // alone does NOT stop a refresh: `POST /api/auth/refresh` only consults
+    // `revoked_tokens`, so an offboarded member's in-flight refresh token would keep
+    // minting fresh access tokens until it expired. This closes that gap.
+    let blacklist = aero_storage::revoked_token::RevokedTokenRepo::new(s.pg.clone());
+    for hash in &revoked {
+        if let Err(e) = blacklist.revoke(hash, Some(target)).await {
+            // Best-effort: a blacklist hiccup must not fail a successful
+            // session-revocation, but it IS the security-critical half, so warn loudly.
+            tracing::warn!(error = ?e, %target, "offboarding: failed to blacklist a revoked refresh token");
+        }
+    }
+
     // Best-effort audit append (the trail is observability, not a transactional
     // invariant, so a logging hiccup must not fail a successful offboarding).
     if let Err(e) = s

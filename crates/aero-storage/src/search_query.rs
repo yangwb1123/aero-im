@@ -129,6 +129,7 @@ struct ScoredRow {
     deleted_at: Option<time::OffsetDateTime>,
     expires_at: Option<time::OffsetDateTime>,
     score: f32,
+    headline: Option<String>,
 }
 
 impl From<ScoredRow> for SearchHit {
@@ -148,6 +149,7 @@ impl From<ScoredRow> for SearchHit {
                 expires_at: r.expires_at,
             },
             score: r.score,
+            headline: r.headline,
         }
     }
 }
@@ -221,7 +223,7 @@ impl AdvancedSearchRepo {
         // forever). `$11` NULL ⇒ first page (no cursor).
         let rows = sqlx::query_as::<_, ScoredRow>(
             r"SELECT id, room_id, sender_id, blocks, reply_to, metadata,
-                     created_at, edited_at, deleted_at, expires_at, score
+                     created_at, edited_at, deleted_at, expires_at, score, headline
                FROM (
                  SELECT
                    m.id, m.room_id, m.sender_id, m.blocks, m.reply_to, m.metadata,
@@ -229,7 +231,9 @@ impl AdvancedSearchRepo {
                    GREATEST(
                      ts_rank(m.search_tsv, websearch_to_tsquery('english', f_unaccent($2))),
                      similarity(m.searchable_text, $2)
-                   ) AS score
+                   ) AS score,
+                   ts_headline('english', m.searchable_text, websearch_to_tsquery('english', f_unaccent($2)),
+                     'StartSel=<b>, StopSel=</b>, MaxWords=50, MinWords=15, ShortWord=3') AS headline
                  FROM messages m
                  JOIN room_members rm
                    ON rm.room_id = m.room_id AND rm.participant_id = $1

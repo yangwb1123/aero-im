@@ -190,6 +190,38 @@ impl StreamViewerSampleRepo {
 
         Ok(RollupOutcome { rolled_up, raw_deleted, rollups_pruned })
     }
+
+    /// Maintain the daily `RANGE` partitions of `stream_viewer_samples`
+    /// (migration 0144): create the rolling set of near-future daily partitions
+    /// and drop daily partitions older than `keep_days`.
+    ///
+    /// This just invokes the idempotent server-side function
+    /// `ensure_stream_viewer_sample_partitions(keep_days, ahead)` defined in
+    /// migration 0144, so the create/drop logic lives in one place (SQL) and the
+    /// retention loop only has to call it each cycle. The catch-all `DEFAULT`
+    /// partition guarantees inserts never fail even between maintenance runs, so
+    /// a transiently-failing call is non-fatal (the next tick retries).
+    ///
+    /// `keep_days` MUST be >= the raw-sample retention window passed to
+    /// [`rollup_and_downsample`](Self::rollup_and_downsample) so a partition is
+    /// never dropped while it could still hold un-rolled-up raw samples; `ahead`
+    /// is how many days of future partitions to pre-create (3 is plenty for an
+    /// hourly sweep).
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the function call.
+    pub async fn ensure_partitions(
+        &self,
+        keep_days: i32,
+        ahead: i32,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("SELECT ensure_stream_viewer_sample_partitions($1, $2)")
+            .bind(keep_days)
+            .bind(ahead)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
 }
 
 /// One point in a stream's viewer retention curve: the offset from the start of

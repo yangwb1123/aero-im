@@ -126,6 +126,15 @@ export const api = {
   reactionsBatch(messageIds) {
     return request('POST', '/api/messages/reactions', { body: { message_ids: messageIds } });
   },
+  // Record an interaction with an interactive message block (Button click /
+  // Select choice). `value` is the chosen Select option value (omit for a
+  // value-less button click). Backend verifies the message actually carries a
+  // component with `action_id` (404 otherwise) and broadcasts RoomEvent::Interaction.
+  interactBlock(messageId, actionId, value = null) {
+    const body = { action_id: actionId };
+    if (value != null && value !== '') body.value = value;
+    return request('POST', `/api/messages/${encodeURIComponent(messageId)}/interact`, { body });
+  },
   markRead(roomId, lastMessageId) {
     return request('POST', `/api/rooms/${encodeURIComponent(roomId)}/read`, {
       body: { last_message_id: lastMessageId },
@@ -217,6 +226,21 @@ export const api = {
     return request('GET', `/api/messages/${encodeURIComponent(rootMessageId)}/thread`, {
       query: { after, limit },
     });
+  },
+  // Mute the thread rooted at this message for the caller (stops reply
+  // notification fan-out). Idempotent. Returns `{ root_message_id, muted: true }`.
+  muteThread(rootMessageId) {
+    return request('POST', `/api/threads/${encodeURIComponent(rootMessageId)}/mute`);
+  },
+  // Unmute the thread for the caller. Idempotent. Returns `{ ..., muted: false }`.
+  unmuteThread(rootMessageId) {
+    return request('DELETE', `/api/threads/${encodeURIComponent(rootMessageId)}/mute`);
+  },
+  // Participants who have muted this thread. Returns `{ root_message_id, muters }`.
+  // The backend exposes no per-user "threads I muted" query, so we derive our own
+  // mute state by checking whether our pid is in `muters`.
+  threadMuters(rootMessageId) {
+    return request('GET', `/api/threads/${encodeURIComponent(rootMessageId)}/mutes`);
   },
 
   // ----- notifications + unread (Wave 1) -----

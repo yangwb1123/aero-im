@@ -20,3 +20,8 @@ __pycache__/
 
 # Claude Code agent worktrees
 .claude/
+
+# Refactor baseline artifacts
+.refactor-baseline
+.refactor-log
+.current-violations

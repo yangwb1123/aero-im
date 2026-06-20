@@ -36,6 +36,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use aero_common::metrics::{self, names};
+use aero_common::WorkspaceId;
 use axum::{
     extract::{MatchedPath, Request, State},
     http::{header, HeaderMap, StatusCode},
@@ -51,6 +52,118 @@ const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4";
 /// Not one of the cross-crate [`names`] constants because rate limiting is a
 /// gateway concern; it lives here next to its single emit site.
 pub const RATE_LIMIT_REJECTIONS_TOTAL: &str = "aero_rate_limit_rejections_total";
+
+/// Counter (server-local name): participant-profile cache lookups, labeled by
+/// `result` = `hit` | `miss`. A fresh cache hit avoids a `ParticipantRepo::get`
+/// DB round-trip; a miss falls through to Postgres and backfills the cache
+/// (ROADMAP6 方向四 多级缓存). Hit-ratio = hit / (hit + miss).
+///
+/// Server-local (not a cross-crate [`names`] constant) because the participant
+/// cache is purely a gateway concern. Emitted from
+/// [`crate::participant_cache::ParticipantCache`]'s call sites via
+/// [`record_participant_cache`].
+pub const PARTICIPANT_CACHE_LOOKUPS_TOTAL: &str = "aero_participant_cache_lookups_total";
+
+/// Records one participant-cache lookup outcome. `hit` ⇒ served from the local
+/// TTL cache (no DB); `false` ⇒ a miss that fell through to the repo.
+pub fn record_participant_cache(hit: bool) {
+    let result = if hit { "hit" } else { "miss" };
+    metrics::inc_counter_labeled(PARTICIPANT_CACHE_LOOKUPS_TOTAL, 1, &[("result", result)]);
+}
+
+/// Gauge (server-local name): on-disk size in bytes of a tracked index, labeled
+/// by `index` = the index relation name. The companion observability for the
+/// mig-0136 partial-index slimming: it lets an operator watch the GIN
+/// (`search_tsv`, `searchable_text` trigram), HNSW (`embedding`), and
+/// `messages_room_created_idx` indexes grow over time and spot bloat before a
+/// `REINDEX`/`VACUUM` is overdue.
+///
+/// Cardinality is **bounded**: the label only takes values from
+/// [`tracked_indexes`] (a fixed, code-defined list plus an optional bounded set
+/// from `AERO_METRICS_EXTRA_INDEXES`), never anything attacker-controlled.
+///
+/// Server-local (not a cross-crate [`names`] constant) because index-bloat
+/// sampling is a gateway operational concern; emitted from the periodic sampler
+/// in `bin/boot/metrics_tasks.rs` via [`sample_index_sizes`].
+pub const INDEX_SIZE_BYTES: &str = "aero_index_size_bytes";
+
+/// The default set of indexes the size gauge samples — the hot, bloat-prone
+/// `messages` indexes touched by migration 0136 (partial GIN/HNSW slimming) plus
+/// the room/created lookup index. Kept small and fixed so the `index` label
+/// stays bounded.
+const DEFAULT_TRACKED_INDEXES: &[&str] = &[
+    "messages_search_tsv_gin",   // full-text GIN(search_tsv)
+    "messages_searchable_trgm",  // trigram GIN(searchable_text)
+    "messages_embedding_hnsw",   // vector HNSW(embedding)
+    "messages_room_created_idx", // (room_id, created_at DESC)
+];
+
+/// Returns the bounded list of index names whose on-disk size the periodic
+/// sampler reports as [`INDEX_SIZE_BYTES`].
+///
+/// This is [`DEFAULT_TRACKED_INDEXES`] plus, optionally, a small operator-defined
+/// set from the comma-separated `AERO_METRICS_EXTRA_INDEXES` env var. The extra
+/// set is **capped** (at 8) and de-duplicated so the gauge's `index` label can
+/// never explode the series count, and each entry is trimmed/non-empty.
+#[must_use]
+pub fn tracked_indexes() -> Vec<String> {
+    let mut out: Vec<String> = DEFAULT_TRACKED_INDEXES.iter().map(|s| (*s).to_owned()).collect();
+    if let Ok(extra) = std::env::var("AERO_METRICS_EXTRA_INDEXES") {
+        for name in extra.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            if out.len() >= 12 {
+                break; // hard cardinality cap (4 defaults + up to 8 extra)
+            }
+            let name = name.to_owned();
+            if !out.contains(&name) {
+                out.push(name);
+            }
+        }
+    }
+    out
+}
+
+/// Samples the on-disk size of each [`tracked_indexes`] entry and publishes it to
+/// the [`INDEX_SIZE_BYTES`] gauge (label `index=<name>`).
+///
+/// Resolution uses `to_regclass(<name>)` so a missing index (e.g. a slimmed-down
+/// deploy that never built the HNSW index) resolves to `NULL` and is simply
+/// **skipped**, never erroring. Per-index query failures only `warn!` —
+/// sampling is fail-open and must never crash the sampler loop. Returns the
+/// number of indexes that were resolved and reported.
+pub async fn sample_index_sizes(pool: &sqlx::PgPool) -> usize {
+    let mut reported = 0usize;
+    for index in tracked_indexes() {
+        // `pg_relation_size(to_regclass($1))` → bigint, or NULL when the index
+        // does not exist. `query_scalar::<_, Option<i64>>` yields:
+        //   Ok(Some(Some(bytes)))  → index exists, report it
+        //   Ok(Some(None)) / Ok(None) → index absent, skip
+        //   Err(_)                 → query failed, warn and skip (fail-open)
+        let row: Result<Option<i64>, _> = sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT pg_relation_size(to_regclass($1))",
+        )
+        .bind(&index)
+        .fetch_one(pool)
+        .await;
+        match row {
+            Ok(Some(bytes)) => {
+                #[allow(clippy::cast_precision_loss)]
+                metrics::set_gauge_labeled(
+                    INDEX_SIZE_BYTES,
+                    bytes as f64,
+                    &[("index", index.as_str())],
+                );
+                reported += 1;
+            }
+            Ok(None) => {
+                tracing::debug!(%index, "index size sample skipped: index does not exist");
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, %index, "index size query failed");
+            }
+        }
+    }
+    reported
+}
 
 /// `/metrics` exposure policy, read from the environment.
 #[derive(Debug, Clone)]
@@ -124,12 +237,73 @@ fn bearer_matches(headers: &HeaderMap, expected: &str) -> bool {
     token.len() == expected.len() && token.bytes().zip(expected.bytes()).all(|(a, b)| a == b)
 }
 
+/// Response-extension marker carrying the tenant a request was attributed to, so
+/// the [`http_metrics_layer`] can attach a per-tenant `workspace` label to the
+/// HTTP RED signals **without** any of the architecturally-expensive
+/// alternatives (a `workspace` JWT claim that would force re-issuing every token,
+/// or a DB lookup on the request hot path).
+///
+/// ## How it works (the "response-extension pass-through" path)
+///
+/// A handler that has *already* cheaply resolved the owning workspace (e.g. it
+/// parsed `workspace_id` off the request) stamps the response with this marker
+/// via [`attach_workspace_label`]. The metrics layer, which sees every response,
+/// reads it back with `response.extensions().get::<WorkspaceLabel>()`. Nothing in
+/// the hot path changes for handlers that don't (or can't cheaply) know their
+/// tenant — they simply emit the original, un-`workspace`-labeled series.
+///
+/// ## Cardinality / safety
+///
+/// The `workspace` label is added **only** when (a) the request carried this
+/// marker and (b) [`per_tenant_http_metrics_enabled`] (the `AERO_PER_TENANT_METRICS`
+/// opt-in, default OFF) is on. The label value is a [`WorkspaceId`] rendered as
+/// its ULID — a bounded set (one series per active tenant), never anything
+/// attacker-controlled. With the flag off, or no marker present, the series are
+/// byte-for-byte the same as before this mechanism existed.
+#[derive(Debug, Clone, Copy)]
+pub struct WorkspaceLabel(pub WorkspaceId);
+
+/// Stamp the response with the [`WorkspaceLabel`] for tenant `ws`, so the
+/// [`http_metrics_layer`] can attribute this request's RED metrics to that
+/// workspace. A no-op for metrics when `AERO_PER_TENANT_METRICS` is off (the
+/// layer just ignores the marker), so handlers can call this unconditionally.
+///
+/// Returns the (now-stamped) response, for ergonomic use in a handler tail:
+/// `Ok(attach_workspace_label(Json(v).into_response(), ws))`.
+#[must_use]
+pub fn attach_workspace_label(mut response: Response, ws: WorkspaceId) -> Response {
+    response.extensions_mut().insert(WorkspaceLabel(ws));
+    response
+}
+
+/// Whether per-tenant HTTP metrics are enabled, read ONCE from
+/// `AERO_PER_TENANT_METRICS` and cached for the process lifetime.
+///
+/// OPT-IN (default OFF) because a `workspace` label multiplies the HTTP RED
+/// series' cardinality by the active-tenant count — a deliberate operator
+/// choice. Shares the **same** env switch as the message-throughput per-tenant
+/// metric (`aero_im_core`), so one flag governs all per-tenant breakdowns.
+/// Resolved at most once so the request hot path never re-reads env.
+#[must_use]
+pub fn per_tenant_http_metrics_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("AERO_PER_TENANT_METRICS")
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    })
+}
+
 /// Axum middleware recording HTTP RED metrics for every request.
 ///
 /// Emits, on completion:
 /// * [`names::HTTP_REQUESTS_TOTAL`] labeled `method` + `status`, and
 /// * [`names::HTTP_REQUEST_DURATION_SECONDS`] (a histogram) labeled by the
 ///   matched `route` template.
+///
+/// When [`per_tenant_http_metrics_enabled`] is on AND the response carries a
+/// [`WorkspaceLabel`] (stamped by a handler that cheaply knew its tenant), both
+/// signals additionally carry a bounded `workspace` label. Otherwise the series
+/// are emitted exactly as before — no marker, no extra dimension.
 ///
 /// Placed in the tower stack so it observes *every* response — including ones
 /// short-circuited by inner layers (rate-limit 429s, timeouts) — as long as it
@@ -150,16 +324,38 @@ pub async fn http_metrics_layer(request: Request, next: Next) -> Response {
 
     let status_str = response.status().as_u16().to_string();
 
-    metrics::inc_counter_labeled(
-        names::HTTP_REQUESTS_TOTAL,
-        1,
-        &[("method", method.as_str()), ("status", &status_str)],
-    );
-    metrics::observe_histogram_labeled(
-        names::HTTP_REQUEST_DURATION_SECONDS,
-        elapsed,
-        &[("route", &route)],
-    );
+    // Per-tenant breakdown: only when the operator opted in AND a handler stamped
+    // the response with the resolved tenant. Bounded by active-workspace count;
+    // absent ⇒ the original, un-`workspace`-labeled series (no unbounded label).
+    let workspace = if per_tenant_http_metrics_enabled() {
+        response.extensions().get::<WorkspaceLabel>().map(|w| w.0.to_string())
+    } else {
+        None
+    };
+
+    if let Some(ws) = workspace.as_deref() {
+        metrics::inc_counter_labeled(
+            names::HTTP_REQUESTS_TOTAL,
+            1,
+            &[("method", method.as_str()), ("status", &status_str), ("workspace", ws)],
+        );
+        metrics::observe_histogram_labeled(
+            names::HTTP_REQUEST_DURATION_SECONDS,
+            elapsed,
+            &[("route", &route), ("workspace", ws)],
+        );
+    } else {
+        metrics::inc_counter_labeled(
+            names::HTTP_REQUESTS_TOTAL,
+            1,
+            &[("method", method.as_str()), ("status", &status_str)],
+        );
+        metrics::observe_histogram_labeled(
+            names::HTTP_REQUEST_DURATION_SECONDS,
+            elapsed,
+            &[("route", &route)],
+        );
+    }
     response
 }
 
@@ -206,6 +402,32 @@ mod tests {
         let mut h = HeaderMap::new();
         h.insert(header::AUTHORIZATION, "Token abc".parse().unwrap());
         assert!(!bearer_matches(&h, "abc"));
+    }
+
+    #[test]
+    fn tracked_indexes_includes_the_mig0136_message_indexes() {
+        let idx = tracked_indexes();
+        for expected in [
+            "messages_search_tsv_gin",
+            "messages_searchable_trgm",
+            "messages_embedding_hnsw",
+            "messages_room_created_idx",
+        ] {
+            assert!(idx.iter().any(|i| i == expected), "missing default index {expected}");
+        }
+        // Default list is exactly the four hot message indexes (no env extras here).
+        assert_eq!(idx.len(), 4, "unexpected default tracked-index set: {idx:?}");
+    }
+
+    #[test]
+    fn index_size_gauge_uses_server_local_name() {
+        assert_eq!(INDEX_SIZE_BYTES, "aero_index_size_bytes");
+        // The gauge is auto-created on first `set`; assert it renders with the
+        // bounded `index` label and shows up in the global exposition.
+        metrics::set_gauge_labeled(INDEX_SIZE_BYTES, 4096.0, &[("index", "messages_search_tsv_gin")]);
+        let body = metrics::render_prometheus();
+        assert!(body.contains(INDEX_SIZE_BYTES), "index gauge missing:\n{body}");
+        assert!(body.contains("index=\"messages_search_tsv_gin\""), "index label missing");
     }
 
     #[test]
@@ -289,6 +511,57 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ok.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn attach_workspace_label_stamps_a_bounded_marker() {
+        // The marker carries the tenant id; the layer renders it as the ULID
+        // (a bounded label value, not free-text).
+        let ws = WorkspaceId(ulid::Ulid(0));
+        let resp = attach_workspace_label("ok".into_response(), ws);
+        let got = resp.extensions().get::<WorkspaceLabel>().expect("marker present");
+        assert_eq!(got.0, ws);
+        assert_eq!(got.0.to_string(), ws.to_string());
+    }
+
+    #[test]
+    fn unstamped_response_carries_no_workspace_marker() {
+        // A handler that didn't stamp the marker ⇒ no `workspace` dimension; the
+        // layer falls back to the original series (this is the "no extension ⇒ no
+        // label" / unbounded-safe branch).
+        let resp = "ok".into_response();
+        assert!(resp.extensions().get::<WorkspaceLabel>().is_none());
+    }
+
+    #[test]
+    fn per_tenant_flag_reflects_env() {
+        // The cached reader mirrors the same `AERO_PER_TENANT_METRICS` switch the
+        // message-throughput metric uses. Default (unset in CI) is OFF; assert the
+        // cached value matches whatever the env says at first read.
+        let expected = std::env::var("AERO_PER_TENANT_METRICS")
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+        assert_eq!(per_tenant_http_metrics_enabled(), expected);
+    }
+
+    #[tokio::test]
+    async fn http_metrics_layer_passes_stamped_response_through_unchanged() {
+        // A handler stamps the marker; the layer must still return the response
+        // intact (status + marker) regardless of the env flag's cached value.
+        let ws = WorkspaceId(ulid::Ulid(7));
+        async fn stamped() -> Response {
+            super::attach_workspace_label("ok".into_response(), WorkspaceId(ulid::Ulid(7)))
+        }
+        let app: Router = Router::new()
+            .route("/probe-ws", get(stamped))
+            .layer(axum::middleware::from_fn(http_metrics_layer));
+        let resp = app
+            .oneshot(HttpRequest::builder().uri("/probe-ws").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // The marker survives the layer (it only reads it; never strips it).
+        assert_eq!(resp.extensions().get::<WorkspaceLabel>().map(|w| w.0), Some(ws));
+        assert!(metrics::render_prometheus().contains(names::HTTP_REQUESTS_TOTAL));
     }
 
     #[tokio::test]

@@ -64,7 +64,7 @@ pub fn fuse_rankings(
         .map(|(score, id)| {
             let row = rows[&id];
             #[allow(clippy::cast_possible_truncation)]
-            SearchHit { message: row.message.clone(), score: score as f32 }
+            SearchHit { message: row.message.clone(), score: score as f32, headline: None }
         })
         .collect()
 }
@@ -82,8 +82,8 @@ mod tests {
         SearchHit {
             message: Message {
                 id: MessageId::from_ulid(Ulid::from_parts(ts, 0)),
-                room_id: RoomId::from_uuid(uuid::Uuid::nil()),
-                sender_id: ParticipantId::from_uuid(uuid::Uuid::nil()),
+                room_id: RoomId::new(),
+                sender_id: ParticipantId::new(),
                 blocks: vec![Block::text(format!("msg {ts}"))],
                 reply_to: None,
                 metadata: serde_json::Value::Null,
@@ -93,6 +93,7 @@ mod tests {
                 expires_at: None,
             },
             score,
+            headline: None,
         }
     }
 

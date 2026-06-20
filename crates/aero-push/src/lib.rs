@@ -47,6 +47,14 @@ pub struct PushPayload {
     pub message_id: Option<String>,
     /// iOS app-icon badge count. Ignored by FCM (Android badges are client-driven).
     pub badge: Option<u32>,
+    /// Coalescing key so the OS *replaces* an earlier notification carrying the same
+    /// key rather than stacking a new one (e.g. derive from the room so multiple
+    /// messages to one conversation collapse to a single lock-screen entry).
+    ///
+    /// Maps to FCM's `android.collapse_key` and APNs' `apns-collapse-id` header.
+    /// `None` ⇒ no coalescing (the historical behaviour). APNs caps the id at 64
+    /// bytes; [`apns_collapse_id`] truncates defensively to honour that.
+    pub collapse_key: Option<String>,
 }
 
 /// Failure modes shared by every [`PushGateway`].
@@ -100,11 +108,13 @@ pub trait PushGateway: Send + Sync {
 /// Shape:
 /// ```json
 /// {"message":{"token":"..","notification":{"title":"..","body":".."},
-///  "data":{"room_id":"..","message_id":".."}}}
+///  "data":{"room_id":"..","message_id":".."},"android":{"collapse_key":".."}}}
 /// ```
 /// `data` keys whose source field is `None` are omitted. The `data` object itself
 /// is always present (FCM accepts an empty object); values are strings, as FCM's
-/// data payload is a string-to-string map.
+/// data payload is a string-to-string map. The `android` object — carrying
+/// `collapse_key` — is added only when `payload.collapse_key` is `Some`, so the
+/// historical body is byte-for-byte unchanged when no key is supplied.
 #[must_use]
 pub fn fcm_message_json(token: &str, payload: &PushPayload) -> Value {
     let mut data = serde_json::Map::new();
@@ -114,16 +124,43 @@ pub fn fcm_message_json(token: &str, payload: &PushPayload) -> Value {
     if let Some(message_id) = &payload.message_id {
         data.insert("message_id".into(), Value::String(message_id.clone()));
     }
-    json!({
-        "message": {
-            "token": token,
-            "notification": {
-                "title": payload.title,
-                "body": payload.body,
-            },
-            "data": Value::Object(data),
-        }
-    })
+    let mut message = serde_json::Map::new();
+    message.insert("token".into(), Value::String(token.to_string()));
+    message.insert(
+        "notification".into(),
+        json!({ "title": payload.title, "body": payload.body }),
+    );
+    message.insert("data".into(), Value::Object(data));
+    // Android coalescing: a new push with the same `collapse_key` replaces an
+    // undelivered older one on the device, so a busy room shows one entry not N.
+    if let Some(collapse_key) = &payload.collapse_key {
+        message.insert(
+            "android".into(),
+            json!({ "collapse_key": collapse_key }),
+        );
+    }
+    json!({ "message": Value::Object(message) })
+}
+
+/// APNs caps `apns-collapse-id` at 64 bytes (per Apple's spec).
+const APNS_COLLAPSE_ID_MAX_BYTES: usize = 64;
+
+/// Derive the value for the `apns-collapse-id` header from `payload`, honouring
+/// APNs' 64-byte cap (truncated on a UTF-8 char boundary so the header is always
+/// valid). Returns `None` when the payload carries no collapse key — the caller
+/// then omits the header entirely, preserving the historical request.
+#[must_use]
+pub fn apns_collapse_id(payload: &PushPayload) -> Option<String> {
+    let key = payload.collapse_key.as_ref()?;
+    if key.len() <= APNS_COLLAPSE_ID_MAX_BYTES {
+        return Some(key.clone());
+    }
+    // Truncate to the most bytes that land on a char boundary within the cap.
+    let mut end = APNS_COLLAPSE_ID_MAX_BYTES;
+    while end > 0 && !key.is_char_boundary(end) {
+        end -= 1;
+    }
+    Some(key[..end].to_string())
 }
 
 /// Build the APNs JSON payload for `payload`.
@@ -261,11 +298,17 @@ impl PushGateway for ApnsGateway {
         let url = APNS_SEND_URL.replace("{token}", token);
         let body = apns_payload_json(payload);
 
-        let resp = self
+        let mut req = self
             .http
             .post(&url)
             .header("apns-topic", &self.topic)
-            .header("authorization", format!("bearer {jwt}"))
+            .header("authorization", format!("bearer {jwt}"));
+        // Coalescing: when present, this header makes APNs replace any undelivered
+        // notification already on the device carrying the same id.
+        if let Some(collapse_id) = apns_collapse_id(payload) {
+            req = req.header("apns-collapse-id", collapse_id);
+        }
+        let resp = req
             .json(&body)
             .send()
             .await
@@ -340,6 +383,7 @@ mod tests {
             room_id: Some("room-1".into()),
             message_id: Some("msg-9".into()),
             badge: Some(3),
+            collapse_key: None,
         }
     }
 
@@ -350,6 +394,7 @@ mod tests {
             room_id: None,
             message_id: None,
             badge: None,
+            collapse_key: None,
         }
     }
 
@@ -405,6 +450,43 @@ mod tests {
         let root = json.as_object().unwrap();
         assert!(root.get("room_id").is_none());
         assert!(root.get("message_id").is_none());
+    }
+
+    #[test]
+    fn fcm_message_json_sets_android_collapse_key_when_present() {
+        let payload = PushPayload { collapse_key: Some("room:42".into()), ..full_payload() };
+        let json = fcm_message_json("tok", &payload);
+        assert_eq!(json["message"]["android"]["collapse_key"], "room:42");
+    }
+
+    #[test]
+    fn fcm_message_json_omits_android_when_no_collapse_key() {
+        // Back-compat: no collapse key ⇒ the `android` object is absent entirely,
+        // so the historical FCM body shape is unchanged.
+        let json = fcm_message_json("tok", &full_payload());
+        let message = json["message"].as_object().unwrap();
+        assert!(message.get("android").is_none());
+    }
+
+    #[test]
+    fn apns_collapse_id_returns_key_when_present_and_within_cap() {
+        let payload = PushPayload { collapse_key: Some("room:7".into()), ..bare_payload() };
+        assert_eq!(apns_collapse_id(&payload).as_deref(), Some("room:7"));
+    }
+
+    #[test]
+    fn apns_collapse_id_none_when_no_collapse_key() {
+        assert!(apns_collapse_id(&bare_payload()).is_none());
+    }
+
+    #[test]
+    fn apns_collapse_id_truncates_to_64_bytes_on_char_boundary() {
+        // 100 multibyte chars (3 bytes each) — must truncate without splitting a char.
+        let payload = PushPayload { collapse_key: Some("界".repeat(100)), ..bare_payload() };
+        let id = apns_collapse_id(&payload).expect("some");
+        assert!(id.len() <= APNS_COLLAPSE_ID_MAX_BYTES);
+        // 64 / 3 = 21 whole chars (63 bytes); the 22nd would overflow the cap.
+        assert_eq!(id.chars().count(), 21);
     }
 
     #[test]

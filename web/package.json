@@ -1,0 +1,17 @@
+{
+  "name": "aero-im-web",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Aero IM 原生 ES-module SPA（无构建工具）。本 package.json 仅供「npm 可用时」的完整前端门：ESLint。沙箱主门是 scripts/web-check.sh（node-only，无需 npm install）。",
+  "scripts": {
+    "lint": "eslint .",
+    "//note": "需先 `npm install`（沙箱可能无网，此门不阻断；CI 主门见 scripts/web-check.sh）"
+  },
+  "devDependencies": {
+    "eslint": "^9.0.0",
+    "eslint-plugin-import": "^2.29.0",
+    "eslint-import-resolver-node": "^0.3.9",
+    "globals": "^15.0.0"
+  }
+}

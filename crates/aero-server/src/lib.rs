@@ -1,6 +1,10 @@
 //! HTTP/WS gateway. Composes auth + im-core + bus + storage into Axum routes.
 
 pub mod agent_bot;
+/// User-bot event-subscription dispatcher (方向三): fans bus RoomEvents out to
+/// matching `bot_event_subscriptions` webhooks, reusing the outbound webhook
+/// signing/sender seam.
+pub mod bot_dispatch;
 // ROADMAP3 方向二: cross-node call-bridge spawn orchestration (supervisor).
 pub mod call_bridge_subscribe;
 pub mod call_bridge_supervisor;
@@ -10,6 +14,8 @@ pub mod moderation_bot;
 pub mod transcribe_bot;
 pub mod unfurl_bot;
 pub mod ai_adapter;
+/// ClamAV (`clamd`) INSTREAM anti-virus scanning for uploaded blobs.
+pub mod av_scan;
 pub mod bookmarks;
 pub mod channel_sections;
 pub mod collab;
@@ -25,10 +31,13 @@ pub mod invitations;
 pub mod live;
 pub mod metrics;
 pub mod notif_prefs;
+/// Per-process TTL cache for participant profiles (ROADMAP6 方向四 多级缓存).
+pub mod participant_cache;
 pub mod pat;
 pub mod polls;
 pub mod rate_limit;
 pub mod routes;
+pub mod saml;
 pub mod saved_searches;
 pub mod scim;
 pub mod sso;
@@ -218,5 +227,7 @@ pub mod workspace_custom_emoji;
 pub mod verified_badge;
 /// Bulk unread summary: GET /api/me/unread-summary (no migration).
 pub mod unread_summary;
+/// Report-only PII backfill scan over historical messages (no migration).
+pub mod pii_backfill;
 
 pub use state::AppState;

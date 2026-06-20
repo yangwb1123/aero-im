@@ -72,6 +72,38 @@ impl AuditRepo {
         Ok(res.rows_affected())
     }
 
+    /// Maintain the daily `RANGE` partitions of `audit_events` (migration 0146):
+    /// pre-create the next few days' partitions and DROP daily partitions older
+    /// than `keep_days`.
+    ///
+    /// This just invokes the idempotent server-side function
+    /// `ensure_audit_event_partitions(keep_days, ahead)` defined in migration 0146,
+    /// so the create/drop logic lives in one place (SQL) and the retention loop only
+    /// has to call it each cycle. The catch-all `DEFAULT` partition guarantees
+    /// inserts never fail even between maintenance runs, so a transiently-failing
+    /// call is non-fatal (the next tick retries).
+    ///
+    /// `keep_days` SHOULD match the audit-retention window passed to
+    /// [`sweep_before`](Self::sweep_before): a daily partition is only dropped once
+    /// every row in it is past retention, so dropping the whole partition replaces
+    /// the row-by-row DELETE with a metadata-only reclaim. `ahead` is how many days
+    /// of future partitions to pre-create (3 is plenty for an hourly sweep).
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the function call.
+    pub async fn ensure_partitions(
+        &self,
+        keep_days: i32,
+        ahead: i32,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("SELECT ensure_audit_event_partitions($1, $2)")
+            .bind(keep_days)
+            .bind(ahead)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// Append one audit event, returning its generated id.
     pub async fn append(
         &self,
@@ -736,5 +768,60 @@ mod db_tests {
         .unwrap()
         .0;
         assert_eq!(orphaned, 0, "no moderation audit row escaped the rolled-back transaction");
+    }
+
+    /// `audit_events` is partitioned (migration 0146) and the maintenance call is
+    /// idempotent: calling `ensure_partitions` repeatedly creates the future daily
+    /// partitions once and is a clean no-op thereafter, and an append still routes
+    /// to the right partition (so the parent stays writable). We also confirm the
+    /// parent really is a partitioned table (relkind = 'p') so this test would fail
+    /// if 0146 had not converted it.
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn audit_partition_maintenance_is_idempotent_and_writable() {
+        let p = pool();
+        let repo = AuditRepo::new(p.clone());
+        let (ws, actor) = fixture(&p).await;
+
+        // The parent must be a partitioned table after migration 0146.
+        let relkind: String = sqlx::query_scalar(
+            "SELECT c.relkind::text FROM pg_class c
+              JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE c.relname = 'audit_events' AND n.nspname = 'public'",
+        )
+        .fetch_one(&p)
+        .await
+        .expect("audit_events exists");
+        assert_eq!(relkind, "p", "audit_events is a partitioned (relkind=p) table");
+
+        // First maintenance pass creates yesterday..today+3 daily partitions.
+        repo.ensure_partitions(365, 3).await.expect("first maintenance pass");
+        let count_parts = || async {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM pg_inherits i
+                   JOIN pg_class c ON c.oid = i.inhrelid
+                   JOIN pg_class pp ON pp.oid = i.inhparent
+                  WHERE pp.relname = 'audit_events'
+                    AND c.relname ~ '^audit_events_[0-9]{8}$'",
+            )
+            .fetch_one(&p)
+            .await
+            .unwrap()
+        };
+        let after_first = count_parts().await;
+        assert!(after_first >= 4, "at least yesterday..today+3 daily partitions exist");
+
+        // Re-running is a no-op: the count does not change.
+        repo.ensure_partitions(365, 3).await.expect("second maintenance pass");
+        assert_eq!(count_parts().await, after_first, "idempotent: no new partitions");
+
+        // The parent is still writable and the row is retrievable (routed into a
+        // daily partition by created_at).
+        let id = repo
+            .append(ws, Some(actor), "workspace.create", None, serde_json::json!({}))
+            .await
+            .expect("append into partitioned parent");
+        let events = repo.list_for_workspace(ws, None, Some(10)).await.unwrap();
+        assert!(events.iter().any(|e| e.id == id), "appended row is listed back");
     }
 }

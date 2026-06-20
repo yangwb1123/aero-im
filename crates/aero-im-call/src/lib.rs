@@ -64,12 +64,48 @@ pub enum OrchestratorError {
     #[error("forbidden: {0}")]
     Forbidden(String),
 
+    /// The group call has reached its full-mesh participant ceiling
+    /// ([`max_mesh_participants`]); admitting another *new* member would
+    /// saturate every existing member's browser (see [`MAX_MESH_PARTICIPANTS`]).
+    /// The payload is the cap that was hit.
+    #[error("call full: mesh participant limit ({0}) reached")]
+    CallFull(usize),
+
     /// A database error occurred.
     #[error("database: {0}")]
     Db(#[from] sqlx::Error),
 }
 
 type Result<T> = std::result::Result<T, OrchestratorError>;
+
+/// Default ceiling on the number of participants in a single full-mesh group
+/// call (P1-4 mesh-saturation guard).
+///
+/// Group calls are full-mesh WebRTC: every pair of members holds one P2P
+/// connection, so a call of `N` members has `N·(N-1)/2` connections and each
+/// browser must sustain `N-1` simultaneous upstreams. Real browsers saturate
+/// at roughly 6-8 outbound streams; past that the **whole** call degrades for
+/// everyone already in it (an N² connection avalanche), not just the newest
+/// joiner. We therefore hard-cap mesh membership: once a call holds
+/// [`max_mesh_participants`] distinct members, a *new* member's join is
+/// rejected with [`OrchestratorError::CallFull`] instead of being admitted and
+/// dragging the call down.
+pub const MAX_MESH_PARTICIPANTS: usize = 8;
+
+/// Environment override for [`MAX_MESH_PARTICIPANTS`].
+const MAX_MESH_ENV: &str = "AERO_MAX_CALL_MESH";
+
+/// Resolve the effective mesh cap: `AERO_MAX_CALL_MESH` if set to a positive
+/// integer, otherwise [`MAX_MESH_PARTICIPANTS`]. A `0`/non-numeric value is
+/// ignored (falls back to the default) so a typo can never disable the guard.
+#[must_use]
+pub fn max_mesh_participants() -> usize {
+    std::env::var(MAX_MESH_ENV)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(MAX_MESH_PARTICIPANTS)
+}
 
 /// Cluster view of which nodes host which participants of a group call.
 ///
@@ -300,9 +336,22 @@ impl CallOrchestrator {
     /// [`CallRouteStore`] is attached (best-effort: a registry failure
     /// degrades to [`CallTopology::ServeLocal`] rather than failing the join).
     ///
+    /// ## Full-mesh capacity guard (P1-4)
+    ///
+    /// This is the single authoritative admission point for the mesh. Before
+    /// the joiner is added to the SFU roster, the call's current member count
+    /// is checked against [`max_mesh_participants`]. A member already on the
+    /// roster (a *reconnect* — same [`ParticipantId`]) is **always** re-admitted
+    /// (idempotent, never counted twice). A genuinely new member is rejected
+    /// with [`OrchestratorError::CallFull`] when the roster is already at the
+    /// cap, so the N+1ᵗʰ peer never enters the mesh and never drags the call
+    /// down for everyone already in it.
+    ///
     /// # Errors
     ///
-    /// Returns an error if the DB session creation fails.
+    /// - [`OrchestratorError::CallFull`] if admitting this *new* participant
+    ///   would exceed [`max_mesh_participants`].
+    /// - [`OrchestratorError::Db`] if the DB session creation fails.
     #[instrument(skip(self))]
     pub async fn join_group_call(
         &self,
@@ -311,6 +360,28 @@ impl CallOrchestrator {
         participant: ParticipantId,
         kind: CallKind,
     ) -> Result<GroupJoin> {
+        // Full-mesh admission control: reject a *new* member that would push the
+        // call past the mesh-saturation ceiling, but never reject a reconnect of
+        // a member already on the roster (dedup by ParticipantId). Only the SFU
+        // roster gives a per-call member count; with no SFU attached there is no
+        // mesh to saturate here, so the guard is a no-op (server-side roster
+        // owns admission in that configuration).
+        let existing_peers = if let Some(sfu) = &self.sfu {
+            let roster = sfu.participants(call_id);
+            if Self::cap_rejects(&roster, &participant) {
+                warn!(
+                    %call_id,
+                    current = roster.len(),
+                    cap = max_mesh_participants(),
+                    "rejecting group-call join: full-mesh participant ceiling reached"
+                );
+                return Err(OrchestratorError::CallFull(max_mesh_participants()));
+            }
+            roster.into_iter().filter(|p| *p != participant).collect()
+        } else {
+            Vec::new()
+        };
+
         // Create the session row if this is the very first joiner (idempotent on
         // unique constraint: a subsequent start returns a conflict, which is fine
         // — the first joiner's row is the canonical one).
@@ -329,15 +400,11 @@ impl CallOrchestrator {
             }
         }
 
-        // Add to the SFU router and return existing participants (minus self).
-        let existing_peers = if let Some(sfu) = &self.sfu {
-            let before: Vec<ParticipantId> =
-                sfu.participants(call_id).into_iter().filter(|p| *p != participant).collect();
+        // Capacity check passed — add to the SFU router (idempotent for a
+        // reconnect: re-inserting the same key just refreshes the role).
+        if let Some(sfu) = &self.sfu {
             sfu.add_peer(call_id, participant, PeerRole::Bidirectional);
-            before
-        } else {
-            Vec::new()
-        };
+        }
 
         let topology = self.register_and_decide(call_id, participant).await;
         Ok(GroupJoin { existing_peers, topology })
@@ -370,6 +437,17 @@ impl CallOrchestrator {
                 CallTopology::ServeLocal
             }
         }
+    }
+
+    /// The full-mesh capacity decision (P1-4), factored out so the
+    /// admission gate has a single, testable source of truth.
+    ///
+    /// Returns `true` iff `participant` is a *new* member (not already on
+    /// `roster`) **and** `roster` is already at or above
+    /// [`max_mesh_participants`]. A reconnect (participant already present)
+    /// always returns `false` — it is re-admitted regardless of size.
+    fn cap_rejects(roster: &[ParticipantId], participant: &ParticipantId) -> bool {
+        !roster.contains(participant) && roster.len() >= max_mesh_participants()
     }
 
     /// Leave a group call. Removes the participant from the SFU router and
@@ -422,6 +500,80 @@ mod tests {
 
     fn make_ids() -> (ParticipantId, ParticipantId) {
         (ParticipantId::new(), ParticipantId::new())
+    }
+
+    // ── full-mesh capacity guard (P1-4) ──────────────────────────────────────
+
+    #[test]
+    fn max_mesh_participants_defaults_when_env_unset() {
+        // Default is the compile-time ceiling unless AERO_MAX_CALL_MESH overrides.
+        // (Tests run without the env var set; if a hostile env leaks one in, this
+        // assertion documents the contract rather than guaranteeing the value.)
+        if std::env::var(MAX_MESH_ENV).is_err() {
+            assert_eq!(max_mesh_participants(), MAX_MESH_PARTICIPANTS);
+        }
+        assert_eq!(MAX_MESH_PARTICIPANTS, 8, "documented browser-mesh saturation point");
+    }
+
+    /// Reaching the cap rejects the (N+1)ᵗʰ *new* member, and does so before
+    /// any DB access (so the stub repo is never awaited).
+    #[tokio::test]
+    async fn join_rejects_new_member_at_capacity() {
+        let sfu = SfuRouter::new();
+        let orch = CallOrchestrator::new_for_test(sfu.clone());
+        let call = CallId::new();
+
+        // Fill the roster to exactly the cap with distinct members.
+        let cap = max_mesh_participants();
+        for _ in 0..cap {
+            sfu.add_peer(call, ParticipantId::new(), PeerRole::Bidirectional);
+        }
+        assert_eq!(sfu.participants(call).len(), cap, "roster filled to the cap");
+
+        // A brand-new member is rejected with CallFull (no DB touched).
+        let newcomer = ParticipantId::new();
+        let err = orch
+            .join_group_call(call, RoomId::new(), newcomer, CallKind::Video)
+            .await
+            .expect_err("join past the cap must fail");
+        match err {
+            OrchestratorError::CallFull(reported) => assert_eq!(reported, cap),
+            other => panic!("expected CallFull, got {other:?}"),
+        }
+        // The newcomer was NOT added to the mesh.
+        assert_eq!(sfu.participants(call).len(), cap, "rejected member never entered the roster");
+        assert!(!sfu.participants(call).contains(&newcomer));
+    }
+
+    /// A reconnect of an *existing* member at capacity is admitted, not rejected:
+    /// the capacity gate dedups by ParticipantId and never double-counts.
+    #[tokio::test]
+    async fn join_does_not_reject_reconnecting_member_at_capacity() {
+        let sfu = SfuRouter::new();
+        let orch = CallOrchestrator::new_for_test(sfu.clone());
+        let call = CallId::new();
+
+        // Fill the roster to the cap; remember one member as the "reconnector".
+        let cap = max_mesh_participants();
+        let reconnector = ParticipantId::new();
+        sfu.add_peer(call, reconnector, PeerRole::Bidirectional);
+        for _ in 1..cap {
+            sfu.add_peer(call, ParticipantId::new(), PeerRole::Bidirectional);
+        }
+        assert_eq!(sfu.participants(call).len(), cap, "roster at the cap incl. reconnector");
+
+        // The reconnect must pass the capacity gate (it is already a member). We
+        // exercise the gate decision in isolation — the post-gate path does a DB
+        // write the stub repo can't serve, so assert on the pure decision here.
+        assert!(
+            !orch.would_reject_join(call, reconnector),
+            "an existing member reconnecting must never be rejected by the cap"
+        );
+        // And a genuinely new member at the same cap *is* rejected.
+        assert!(
+            orch.would_reject_join(call, ParticipantId::new()),
+            "a new member at the cap is rejected"
+        );
     }
 
     #[tokio::test]
@@ -669,6 +821,15 @@ mod tests {
             if let Some(sfu) = &self.sfu {
                 sfu.add_peer(call_id, participant, PeerRole::Bidirectional);
             }
+        }
+
+        /// Mirror of `join_group_call`'s capacity gate against the live SFU
+        /// roster, exposed so reconnect-vs-new admission can be asserted without
+        /// the post-gate DB write that the stub repo cannot serve.
+        fn would_reject_join(&self, call_id: CallId, participant: ParticipantId) -> bool {
+            let roster =
+                self.sfu.as_ref().map(|s| s.participants(call_id)).unwrap_or_default();
+            Self::cap_rejects(&roster, &participant)
         }
 
         fn existing_peers_excluding(

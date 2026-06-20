@@ -121,6 +121,33 @@ impl UserGroupRepo {
         Ok(id)
     }
 
+    /// Rename a group — update its human-readable `name` (the `handle`, Aero's
+    /// stable mention key, is intentionally immutable). Scoped to `workspace` so a
+    /// group id from another tenant is a no-op. Returns `true` iff a row changed.
+    ///
+    /// Used by the SCIM Group surface ([`crate::scim`] in `aero-server`) to reflect
+    /// a `displayName` replace onto the backing group; the `@-usergroup` REST
+    /// surface does not currently expose rename, so this is purely additive.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the update.
+    pub async fn rename(
+        &self,
+        id: UserGroupId,
+        workspace: WorkspaceId,
+        name: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            "UPDATE user_groups SET name = $3 WHERE id = $1 AND workspace_id = $2",
+        )
+        .bind(id.to_uuid())
+        .bind(workspace.to_uuid())
+        .bind(name)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     /// Fetch one group by id, or `None` if no such row exists.
     ///
     /// # Errors

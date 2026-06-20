@@ -96,12 +96,22 @@ impl NotificationRepo {
     /// INSERT via `UNNEST`. `room`/`message`/`actor`/`created_at` are constant
     /// across the batch; only `participant` + `kind` vary. Returns the row count.
     /// A no-op (Ok(0)) for an empty `recipients`.
+    ///
+    /// `delivery_id` is the NotifyBatch idempotency token (mig 0137). When
+    /// `Some`, every row carries it and the insert is `ON CONFLICT
+    /// (delivery_id, participant_id) WHERE delivery_id IS NOT NULL DO NOTHING`,
+    /// so a redelivered batch (same deterministic `delivery_id`) re-expanded
+    /// into the same recipients yields zero new rows for anyone already
+    /// notified — matching the partial unique index. When `None`, rows get a
+    /// NULL `delivery_id` and never participate in de-duplication (the legacy
+    /// behaviour, preserved for any caller outside the NotifyBatch path).
     pub async fn insert_many(
         &self,
         room: RoomId,
         message: MessageId,
         actor: Option<ParticipantId>,
         recipients: &[(ParticipantId, NotificationKind)],
+        delivery_id: Option<uuid::Uuid>,
     ) -> Result<u64, sqlx::Error> {
         if recipients.is_empty() {
             return Ok(0);
@@ -111,11 +121,17 @@ impl NotificationRepo {
         let pids: Vec<uuid::Uuid> = recipients.iter().map(|(p, _)| p.to_uuid()).collect();
         let kinds: Vec<String> = recipients.iter().map(|(_, k)| k.as_str().to_owned()).collect();
         let actor_uuid = actor.map(|a| a.to_uuid());
+        // The same `delivery_id` (or NULL) is stamped onto every row of the
+        // batch via the $8 bind (broadcast across the UNNEST rows). The partial
+        // unique index only covers non-NULL delivery_ids, so the ON CONFLICT
+        // target must repeat the index predicate to be inferred.
         let res = sqlx::query(
             r"INSERT INTO notifications
-                 (id, participant_id, room_id, message_id, kind, actor_id, created_at)
-              SELECT u.id, u.pid, $4, $5, u.kind, $6, $7
-                FROM UNNEST($1::uuid[], $2::uuid[], $3::text[]) AS u(id, pid, kind)",
+                 (id, participant_id, room_id, message_id, kind, actor_id, created_at, delivery_id)
+              SELECT u.id, u.pid, $4, $5, u.kind, $6, $7, $8
+                FROM UNNEST($1::uuid[], $2::uuid[], $3::text[]) AS u(id, pid, kind)
+              ON CONFLICT (delivery_id, participant_id) WHERE delivery_id IS NOT NULL
+                 DO NOTHING",
         )
         .bind(&ids)
         .bind(&pids)
@@ -124,6 +140,7 @@ impl NotificationRepo {
         .bind(message.to_uuid())
         .bind(actor_uuid)
         .bind(created_at)
+        .bind(delivery_id)
         .execute(&self.pool)
         .await?;
         Ok(res.rows_affected())
@@ -261,6 +278,8 @@ impl From<NotificationRow> for Notification {
             actor_id: r.actor_id.map(ParticipantId::from_uuid),
             created_at: r.created_at,
             read_at: r.read_at,
+            aggregate_count: Default::default(),
+            importance_score: Default::default(),
         }
     }
 }
@@ -365,6 +384,67 @@ mod db_tests {
         assert_eq!(updated, 1, "exactly the one row flips to read");
         let after = repo.unread_count(recipient).await.unwrap();
         assert_eq!(after, before - 1, "unread count drops by one");
+    }
+
+    /// A NotifyBatch redelivered after a consumer crash re-expands into the same
+    /// recipients with the SAME deterministic `delivery_id`; the partial unique
+    /// index + `ON CONFLICT (delivery_id, participant_id) DO NOTHING` must keep
+    /// exactly one row per (delivery_id, participant) — mig 0137 idempotency.
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn notif_insert_many_dedups_on_delivery_id() {
+        let p = pool();
+        let repo = NotificationRepo::new(p.clone());
+        let (recipient, room, message, actor) = fixture(&p).await;
+        let delivery_id = uuid::Uuid::new_v4();
+        let recipients = [(recipient, NotificationKind::Mention)];
+
+        // First delivery: one row inserted.
+        let first = repo
+            .insert_many(room, message, Some(actor), &recipients, Some(delivery_id))
+            .await
+            .unwrap();
+        assert_eq!(first, 1, "original delivery inserts the recipient");
+
+        // Redelivery with the SAME delivery_id: ON CONFLICT swallows it.
+        let second = repo
+            .insert_many(room, message, Some(actor), &recipients, Some(delivery_id))
+            .await
+            .unwrap();
+        assert_eq!(second, 0, "redelivery inserts zero rows");
+
+        // Exactly one row physically exists for that (delivery_id, participant).
+        let count: (i64,) = sqlx::query_as(
+            "SELECT COUNT(*) FROM notifications
+              WHERE delivery_id = $1 AND participant_id = $2",
+        )
+        .bind(delivery_id)
+        .bind(recipient.to_uuid())
+        .fetch_one(&p)
+        .await
+        .unwrap();
+        assert_eq!(count.0, 1, "exactly one durable row survives the redelivery");
+
+        // A DIFFERENT delivery_id for the same recipient is NOT de-duped (two
+        // distinct batches — e.g. mention then reply of one message — coexist).
+        let other_delivery = uuid::Uuid::new_v4();
+        let third = repo
+            .insert_many(room, message, Some(actor), &recipients, Some(other_delivery))
+            .await
+            .unwrap();
+        assert_eq!(third, 1, "a distinct delivery_id inserts a fresh row");
+
+        // A NULL delivery_id (legacy / non-NotifyBatch caller) never de-dups:
+        // two such inserts both land.
+        let n1 = repo
+            .insert_many(room, message, Some(actor), &recipients, None)
+            .await
+            .unwrap();
+        let n2 = repo
+            .insert_many(room, message, Some(actor), &recipients, None)
+            .await
+            .unwrap();
+        assert_eq!((n1, n2), (1, 1), "NULL delivery_id rows never conflict");
     }
 
     #[tokio::test]

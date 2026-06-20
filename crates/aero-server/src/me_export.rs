@@ -16,6 +16,7 @@ use std::str::FromStr;
 
 use aero_auth::AuthUser;
 use aero_common::{BlobId, Error as AeroError, FileKind};
+use aero_common::MessageId;
 use aero_storage::{BlobRepo, ExportJobRepo, MessageRepo, NewBlob};
 use axum::{
     extract::{Path, State},
@@ -56,7 +57,7 @@ async fn export_me(
     let blob_repo = BlobRepo::new(s.pg.clone());
     let (participant, messages, blobs) = tokio::try_join!(
         s.participants.get(pid),
-        msg_repo.by_sender(pid),
+        msg_repo.by_sender(pid, 10000),
         blob_repo.list_by_owner(pid, 200),
     )
     .map_err(AeroError::from)?;
@@ -203,9 +204,13 @@ async fn build_and_store_archive(
 
     // Keyset-page over ALL the participant's messages (uncapped, oldest-first).
     let mut messages = Vec::new();
-    let mut cursor = None;
+    let mut cursor = Some(MessageId::from_uuid(uuid::Uuid::max()));
     loop {
-        let page = msg_repo.by_sender_paged(participant, cursor, EXPORT_PAGE).await?;
+        let before = match cursor {
+            Some(id) => id,
+            None => break,
+        };
+        let page = msg_repo.by_sender_paged(participant, before, EXPORT_PAGE).await?;
         if page.is_empty() {
             break;
         }

@@ -11,7 +11,7 @@ workspace = true
 
 [[bin]]
 name = "aero-server"
-path = "src/bin/aero-server.rs"
+path = "src/bin/main.rs"
 
 [[bin]]
 name = "aero-cli"
@@ -32,6 +32,8 @@ aero-live-webrtc.workspace = true
 aero-im-call.workspace = true
 aero-signaling.workspace = true
 aero-push.workspace = true
+
+fred.workspace = true
 
 sqlx.workspace = true
 
@@ -65,8 +67,26 @@ parking_lot.workspace = true
 base64 = "0.22"
 sha2 = "0.10"
 hex = "0.4"
+# SAML 2.0 SP (HTTP-Redirect binding): the AuthnRequest is DEFLATE-compressed
+# (RFC 1951, raw — no zlib/gzip header) then base64+url-encoded. `flate2` is
+# already a vetted direct dep in `aero-ai`; `form_urlencoded` ships with the
+# `url` crate family already in the workspace lockfile.
+flate2 = "1"
+form_urlencoded = "1"
 async-nats.workspace = true
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+# Pure-Rust XML-Security suite (XML-DSig verify + exclusive-C14N + XSW guard),
+# `#![forbid(unsafe_code)]`, zero system C deps. Used ONLY behind the opt-in
+# `AERO_SAML_EXPERIMENTAL_VERIFY` env gate (see `crate::saml`). SECURITY: this is
+# a pre-1.0, NOT third-party-audited crate — see the caveat in `saml.rs`.
+bergshamra = "0.5.1"
 
 [dev-dependencies]
 pretty_assertions.workspace = true
+# Adversarial SAML signature tests mint a throwaway RSA keypair + self-signed
+# X.509 cert (rcgen, fed an `rsa`-generated key) and sign a SAML Response with
+# bergshamra, then assert legitimate/tampered/XSW/wrong-cert/unsigned verdicts.
+# All transitively present in the lockfile already; dev-only, never shipped.
+rcgen = "0.14"
+rsa = "0.9"
+rand = "0.8"

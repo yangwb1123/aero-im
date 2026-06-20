@@ -738,54 +738,233 @@ pub fn observe_histogram_labeled(name: &str, value: f64, labels: &[(&str, &str)]
 }
 
 // ---------------------------------------------------------------------------
-// OTLP seam (intentionally not wired — see telemetry.rs for the same rationale)
+// OTLP metrics export (OPT-IN; Prometheus exposition above stays the default)
 // ---------------------------------------------------------------------------
 
-/// OTLP metrics export seam.
+/// Optional OTLP metrics push path.
 ///
-/// Real OTLP export is **intentionally not wired here**. As `telemetry.rs`
-/// already notes, the `opentelemetry-otlp` API churns across point releases and
-/// we refuse to take that compile-breakage risk into the leaf crate that every
-/// other crate depends on. ROADMAP 方向四 wants OTLP eventually; until the API
-/// stabilises, the Prometheus exposition above is the supported scrape path.
+/// The Prometheus exposition above remains the **default and always-supported**
+/// scrape path — nothing here changes that. This module adds an *opt-in*
+/// periodic-push exporter that delivers the OpenTelemetry metrics pipeline to an
+/// OTLP/gRPC collector, mirroring the OTLP **trace** wiring in
+/// [`crate::telemetry`] (same `opentelemetry-otlp` 0.26 pipeline API, same
+/// `tonic` transport, same `opentelemetry_sdk::runtime::Tokio`).
 ///
-/// When ready, a follow-up (in a crate that can absorb the dependency, or behind
-/// a cargo feature on this crate) should:
-/// 1. add `opentelemetry` / `opentelemetry-otlp` / `opentelemetry_sdk`
-///    (versions already pinned in the workspace `[workspace.dependencies]`),
-/// 2. build a `MeterProvider` with a periodic OTLP exporter to
-///    [`OtlpExportConfig::endpoint`],
-/// 3. bridge the [`Registry`] (or emit directly to `OTel` instruments).
+/// # Env gating
+///
+/// [`install_from_env`] only builds the exporter when **both**:
+/// - `AERO_OTLP_METRICS` is truthy (`1`/`true`/`yes`/`on`, case-insensitive), and
+/// - an OTLP endpoint is available — either the explicit `AERO_OTLP_ENDPOINT`
+///   env (single-underscore, matching the trace-config override style) or, as a
+///   fallback, the same `telemetry.otlp_endpoint` already used for traces, which
+///   the caller passes in.
+///
+/// When the gate is off (the default), nothing is installed and Prometheus stays
+/// the only metrics path. The decision itself is factored into the pure,
+/// unit-tested [`resolve_from_env`] so the gating logic is verifiable without a
+/// collector or a Tokio runtime.
+///
+/// # Staging seam
+///
+/// Building the exporter is real and compiles, but actually *delivering* points
+/// requires a live OTLP collector reachable at the endpoint (e.g. an
+/// OpenTelemetry Collector or Jaeger/Tempo at `:4317`). With no collector the
+/// `PeriodicReader` simply logs export failures on its interval — it never takes
+/// the process down — so end-to-end delivery is a staging/prod concern, exactly
+/// like the trace exporter.
 pub mod otlp {
-    /// Configuration for a future OTLP metrics exporter. Present so call sites
-    /// and config plumbing can be written now against a stable shape.
+    /// Default push interval when none is configured (seconds).
+    pub const DEFAULT_INTERVAL_SECS: u64 = 15;
+
+    /// Configuration for the OTLP metrics push exporter.
     #[derive(Debug, Clone)]
     pub struct OtlpExportConfig {
         /// OTLP collector endpoint, e.g. `http://localhost:4317`.
         pub endpoint: String,
         /// Export interval in seconds.
         pub interval_secs: u64,
+        /// Value reported as the `service.name` resource attribute.
+        pub service_name: String,
     }
 
     impl OtlpExportConfig {
-        /// Builds a config from a collector endpoint with a sane default interval.
+        /// Builds a config from a collector endpoint with a sane default interval
+        /// and service name.
         #[must_use]
         pub fn new(endpoint: impl Into<String>) -> Self {
             Self {
                 endpoint: endpoint.into(),
-                interval_secs: 15,
+                interval_secs: DEFAULT_INTERVAL_SECS,
+                service_name: "aero".to_owned(),
+            }
+        }
+
+        /// Overrides the `service.name` resource attribute.
+        #[must_use]
+        pub fn with_service_name(mut self, service_name: impl Into<String>) -> Self {
+            self.service_name = service_name.into();
+            self
+        }
+    }
+
+    /// Held for the process lifetime to keep the push pipeline alive; its `Drop`
+    /// flushes and shuts the meter provider down cleanly (mirrors the trace
+    /// `TelemetryGuard`). Dropping it stops the periodic export.
+    pub struct OtlpMetricsGuard {
+        provider: Option<opentelemetry_sdk::metrics::SdkMeterProvider>,
+    }
+
+    impl std::fmt::Debug for OtlpMetricsGuard {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("OtlpMetricsGuard")
+                .field("installed", &self.provider.is_some())
+                .finish()
+        }
+    }
+
+    impl Drop for OtlpMetricsGuard {
+        fn drop(&mut self) {
+            if let Some(p) = self.provider.take() {
+                // Best-effort final flush; never panic out of Drop.
+                let _ = p.shutdown();
             }
         }
     }
 
-    /// Installs an OTLP metrics exporter.
+    /// Outcome of [`install_from_env`], so the caller can log/branch on whether
+    /// the optional OTLP path actually engaged without unwrapping a guard.
+    #[derive(Debug)]
+    pub enum InstallOutcome {
+        /// `AERO_OTLP_METRICS` was off (or unset) — Prometheus stays the path.
+        Disabled,
+        /// Gate was on but no endpoint could be resolved from env/config.
+        NoEndpoint,
+        /// Exporter installed; hold the guard for the process lifetime.
+        Installed(OtlpMetricsGuard),
+    }
+
+    /// Pure env-resolution: returns `Some(endpoint)` when the OTLP metrics path
+    /// should be installed, `None` otherwise. Splitting this out keeps the gate
+    /// logic unit-testable (no runtime / collector / globals touched).
+    ///
+    /// `get_env` abstracts `std::env::var` so tests can drive it deterministically.
+    /// `config_endpoint` is the trace endpoint already resolved from config
+    /// (`telemetry.otlp_endpoint`), used as a fallback when `AERO_OTLP_ENDPOINT`
+    /// is unset.
+    pub fn resolve_from_env<F>(get_env: F, config_endpoint: Option<&str>) -> Option<String>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        if !get_env("AERO_OTLP_METRICS").is_some_and(|v| is_truthy(&v)) {
+            return None;
+        }
+        // Explicit env wins; otherwise reuse the trace endpoint from config.
+        get_env("AERO_OTLP_ENDPOINT")
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .or_else(|| config_endpoint.map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned))
+    }
+
+    /// Truthy parse for the gate flag: `1`/`true`/`yes`/`on` (case-insensitive).
+    #[must_use]
+    pub fn is_truthy(raw: &str) -> bool {
+        matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    }
+
+    /// Env-gated entry point: build & install the OTLP metrics exporter iff the
+    /// gate is on and an endpoint resolves. Reads `AERO_OTLP_METRICS` /
+    /// `AERO_OTLP_ENDPOINT` from the process env, falling back to `config_endpoint`
+    /// (the trace endpoint from `telemetry.otlp_endpoint`).
+    ///
+    /// Must run inside a Tokio runtime (the `PeriodicReader` spawns the push task).
+    /// Never errors out of the happy path: on exporter-build failure it logs and
+    /// reports [`InstallOutcome::NoEndpoint`]-equivalent disable so telemetry can
+    /// never take the process down.
+    #[must_use]
+    pub fn install_from_env(service_name: &str, config_endpoint: Option<&str>) -> InstallOutcome {
+        let Some(endpoint) = resolve_from_env(
+            |k| std::env::var(k).ok(),
+            config_endpoint,
+        ) else {
+            // Distinguish "gate off" from "gate on but no endpoint" for clearer logs.
+            let gate_on = std::env::var("AERO_OTLP_METRICS").is_ok_and(|v| is_truthy(&v));
+            return if gate_on {
+                InstallOutcome::NoEndpoint
+            } else {
+                InstallOutcome::Disabled
+            };
+        };
+
+        let cfg = OtlpExportConfig::new(endpoint).with_service_name(service_name);
+        match install(&cfg) {
+            Ok(guard) => {
+                tracing::info!(
+                    service = service_name,
+                    endpoint = %cfg_endpoint_for_log(&cfg),
+                    "OTLP metrics export wired (Prometheus exposition still default)"
+                );
+                InstallOutcome::Installed(guard)
+            }
+            Err(e) => {
+                tracing::warn!(error = e, "OTLP metrics export disabled (exporter build failed)");
+                InstallOutcome::NoEndpoint
+            }
+        }
+    }
+
+    // Tiny helper so the log line above never borrows a moved value.
+    fn cfg_endpoint_for_log(cfg: &OtlpExportConfig) -> String {
+        cfg.endpoint.clone()
+    }
+
+    /// Builds and installs a periodic-push OTLP `SdkMeterProvider`, registering it
+    /// as the global OpenTelemetry meter provider and returning a guard that keeps
+    /// it alive (and flushes on drop).
+    ///
+    /// This mirrors [`crate::telemetry::init`]'s trace wiring: the same
+    /// `opentelemetry_otlp::new_pipeline()` builder, a `tonic` exporter pointed at
+    /// `cfg.endpoint`, and `opentelemetry_sdk::runtime::Tokio` driving the periodic
+    /// reader. The Prometheus exposition path is independent and unaffected.
     ///
     /// # Errors
-    /// Always returns `Err` for now: OTLP export is a documented, deliberately
-    /// unwired seam (see the module docs). It returns a `Result` so the eventual
-    /// implementation is a drop-in replacement that does not change call sites.
-    pub fn install(_cfg: &OtlpExportConfig) -> Result<(), &'static str> {
-        Err("OTLP metrics export not yet wired; Prometheus exposition is the supported path (see metrics::otlp docs)")
+    /// Returns the underlying exporter/pipeline build error (e.g. an invalid
+    /// endpoint) as a string. Callers in the boot path prefer [`install_from_env`],
+    /// which downgrades any such error to a logged no-op.
+    pub fn install(cfg: &OtlpExportConfig) -> Result<OtlpMetricsGuard, String> {
+        use opentelemetry::KeyValue;
+        use opentelemetry_otlp::WithExportConfig;
+
+        let interval = std::time::Duration::from_secs(if cfg.interval_secs == 0 {
+            DEFAULT_INTERVAL_SECS
+        } else {
+            cfg.interval_secs
+        });
+
+        let provider = opentelemetry_otlp::new_pipeline()
+            .metrics(opentelemetry_sdk::runtime::Tokio)
+            .with_exporter(
+                opentelemetry_otlp::new_exporter()
+                    .tonic()
+                    .with_endpoint(cfg.endpoint.clone()),
+            )
+            .with_period(interval)
+            .with_resource(opentelemetry_sdk::Resource::new(vec![KeyValue::new(
+                "service.name",
+                cfg.service_name.clone(),
+            )]))
+            .build()
+            .map_err(|e| format!("build OTLP metrics pipeline: {e}"))?;
+
+        // Make this the process-wide meter provider so any OTel instruments
+        // created via `opentelemetry::global::meter(..)` flow to the collector.
+        opentelemetry::global::set_meter_provider(provider.clone());
+
+        Ok(OtlpMetricsGuard {
+            provider: Some(provider),
+        })
     }
 }
 
@@ -962,10 +1141,18 @@ mod tests {
     }
 
     #[test]
-    fn otlp_seam_is_documented_not_wired() {
+    fn otlp_export_is_opt_in_and_off_by_default() {
+        // The config shape is stable; the default interval is the documented one.
         let cfg = otlp::OtlpExportConfig::new("http://localhost:4317");
-        assert_eq!(cfg.interval_secs, 15);
-        assert!(otlp::install(&cfg).is_err());
+        assert_eq!(cfg.interval_secs, otlp::DEFAULT_INTERVAL_SECS);
+
+        // OTLP metrics export is now wired but OPT-IN: with the gate flag absent,
+        // env-resolution yields None so Prometheus exposition stays the path.
+        // (The real `install` builds a Tokio-runtime push pipeline — a staging
+        // seam — so it is exercised via the pure gating tests in `otlp_tests`,
+        // not by spinning a runtime here.)
+        let resolved = otlp::resolve_from_env(|_| None, Some("http://localhost:4317"));
+        assert_eq!(resolved, None, "gate off -> no OTLP install, Prometheus default");
     }
 
     #[test]
@@ -978,5 +1165,87 @@ mod tests {
         assert!(r
             .render_prometheus()
             .contains("\naero_unlabeled_total 1\n"));
+    }
+}
+
+#[cfg(test)]
+mod otlp_tests {
+    use super::otlp::{is_truthy, resolve_from_env, OtlpExportConfig, DEFAULT_INTERVAL_SECS};
+    use std::collections::HashMap;
+
+    /// Build a deterministic `get_env` closure over a fixed map, so the pure
+    /// gating logic can be driven without touching the real process env.
+    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: HashMap<String, String> =
+            pairs.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect();
+        move |k: &str| map.get(k).cloned()
+    }
+
+    #[test]
+    fn truthy_flag_parsing() {
+        for v in ["1", "true", "TRUE", "Yes", "on", " on "] {
+            assert!(is_truthy(v), "{v:?} should be truthy");
+        }
+        for v in ["0", "false", "no", "off", "", "maybe"] {
+            assert!(!is_truthy(v), "{v:?} should be falsey");
+        }
+    }
+
+    #[test]
+    fn gate_off_resolves_to_none_even_with_endpoint() {
+        // Endpoint present but the gate flag is absent -> Prometheus stays the path.
+        let get = env_of(&[("AERO_OTLP_ENDPOINT", "http://collector:4317")]);
+        assert_eq!(resolve_from_env(get, Some("http://cfg:4317")), None);
+
+        // Gate explicitly off also resolves to None.
+        let get = env_of(&[
+            ("AERO_OTLP_METRICS", "false"),
+            ("AERO_OTLP_ENDPOINT", "http://collector:4317"),
+        ]);
+        assert_eq!(resolve_from_env(get, None), None);
+    }
+
+    #[test]
+    fn gate_on_prefers_explicit_env_endpoint() {
+        let get = env_of(&[
+            ("AERO_OTLP_METRICS", "1"),
+            ("AERO_OTLP_ENDPOINT", "  http://explicit:4317  "),
+        ]);
+        // Explicit env wins and is trimmed; config fallback is ignored.
+        assert_eq!(
+            resolve_from_env(get, Some("http://cfg:4317")),
+            Some("http://explicit:4317".to_owned())
+        );
+    }
+
+    #[test]
+    fn gate_on_falls_back_to_config_endpoint() {
+        let get = env_of(&[("AERO_OTLP_METRICS", "true")]);
+        assert_eq!(
+            resolve_from_env(get, Some("http://cfg:4317")),
+            Some("http://cfg:4317".to_owned())
+        );
+    }
+
+    #[test]
+    fn gate_on_but_no_endpoint_resolves_to_none() {
+        // Gate on, but neither explicit env nor config supplies an endpoint.
+        let get = env_of(&[("AERO_OTLP_METRICS", "yes")]);
+        assert_eq!(resolve_from_env(get, None), None);
+
+        // Blank/whitespace endpoints are treated as absent (env and config).
+        let get = env_of(&[("AERO_OTLP_METRICS", "yes"), ("AERO_OTLP_ENDPOINT", "   ")]);
+        assert_eq!(resolve_from_env(get, Some("   ")), None);
+    }
+
+    #[test]
+    fn export_config_builder_defaults_and_overrides() {
+        let cfg = OtlpExportConfig::new("http://localhost:4317");
+        assert_eq!(cfg.endpoint, "http://localhost:4317");
+        assert_eq!(cfg.interval_secs, DEFAULT_INTERVAL_SECS);
+        assert_eq!(cfg.service_name, "aero");
+
+        let cfg = cfg.with_service_name("aero-server");
+        assert_eq!(cfg.service_name, "aero-server");
     }
 }

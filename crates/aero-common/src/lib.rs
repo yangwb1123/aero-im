@@ -14,6 +14,7 @@ pub mod config;
 pub mod error;
 pub mod ids;
 pub mod live;
+pub mod markdown;
 pub mod metrics;
 pub mod mls;
 pub mod model;

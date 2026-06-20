@@ -9,6 +9,7 @@ pub mod audit;
 pub mod blob;
 pub mod blob_store;
 pub mod block_interaction;
+pub mod bot;
 pub mod s3_blob_store;
 pub mod bookmark;
 pub mod bookmark_collection;
@@ -26,6 +27,7 @@ pub mod message;
 pub mod message_reports;
 pub mod mls;
 pub mod notification;
+pub mod notification_bundle;
 pub mod notification_prefs;
 pub mod participant;
 pub mod pat;
@@ -109,6 +111,10 @@ pub mod info_barrier;
 pub mod activity_feed;
 pub mod auth_session;
 pub mod login_event;
+// ROADMAP5 方向五 — persistent failed-login trail (migration 0140). Distinct
+// from `login_event` (successes only): catches slow credential-stuffing that
+// stays under the in-process LoginThrottle and survives restarts / spans nodes.
+pub mod login_failure;
 
 // ---- Wave 22 (Round 8) ----
 pub mod password_reset;
@@ -118,6 +124,7 @@ pub use ai_job::{AiJob, AiJobKind, AiJobRepo, AiJobStatus};
 pub use audit::{events_to_csv, AuditEvent, AuditRepo, AUDIT_CSV_HEADER};
 pub use blob::{BlobRepo, NewBlob};
 pub use block_interaction::{BlockInteraction, BlockInteractionRepo};
+pub use bot::{Bot, BotDelivery, BotEventSubscription, BotRepo, DeliveryStatus, MatchedSubscription};
 pub use blob_store::{BlobStore, BlobStoreError, LocalFsBlobStore};
 pub use s3_blob_store::{blob_store_from_env, blob_store_from_env_checked, S3BlobStore, S3Config};
 pub use bookmark::{BookmarkRepo, SavedMessage};
@@ -139,6 +146,7 @@ pub use message::{MessageRepo, NewMessage, SearchHit};
 pub use message_reports::{MessageReport, MessageReportRepo};
 pub use mls::{KeyPackageRepo, MlsGroupRepo};
 pub use notification::NotificationRepo;
+pub use notification_bundle::{InsertedNotification, NotificationBundleRepo, FlushResult};
 pub use notification_prefs::NotificationPrefsRepo;
 pub use participant::ParticipantRepo;
 pub use pat::{PatRepo, PatSummary};
@@ -241,6 +249,7 @@ pub use info_barrier::{BarrierRepo, InfoBarrier};
 pub use activity_feed::{ActivityEntry, ActivityFeedRepo};
 pub use auth_session::{AuthSession, SessionRepo};
 pub use login_event::{LoginEvent, LoginEventRepo};
+pub use login_failure::{LoginFailure, LoginFailureRepo};
 pub use password_reset::{
     generate_token as generate_reset_token, hash_reset_token, PasswordResetRepo,
     DEFAULT_TTL as RESET_TOKEN_TTL,
@@ -369,3 +378,14 @@ pub use workspace_emoji::{WorkspaceEmojiRepo, WorkspaceEmojiRow};
 // ---- ROADMAP12 — workspace notification defaults (migration 0119) ----
 pub mod workspace_notif_defaults;
 pub use workspace_notif_defaults::WorkspaceNotifDefaultsRepo;
+
+// ---- Per-user thread MUTES — inverse of thread-follow (migration 0088) ----
+pub mod thread_mute;
+pub use thread_mute::ThreadMuteRepo;
+
+// ---- Persistent cross-room AI user profile (持久跨房 AI 用户画像, migration 0145) ----
+// PRIVACY-SENSITIVE: opt-in (off by default), GDPR-erasable (DELETEd explicitly
+// from `delete_participant`), transparent (plain readable fields). See the module
+// docs for the full privacy posture.
+pub mod ai_profile;
+pub use ai_profile::{AiProfile, AiProfileRepo};

@@ -1,0 +1,19 @@
+# Aero IM — LLVM 代码覆盖率配置
+# 安装: cargo install cargo-llvm-cov
+# 运行: make coverage
+
+# 覆盖率目标
+# - 总仓库: ≥ 70%
+# - 核心业务 crate (aero-im-core, aero-ai): ≥ 80%
+# - 工具 crate (aero-common, aero-bus): ≥ 50%
+# - 存储层 (aero-storage): ≥ 60%
+# - 新代码: ≥ 90%（行覆盖率）
+targets:
+  overall: 70
+  crates:
+    aero-im-core: 80
+    aero-ai: 80
+    aero-common: 50
+    aero-bus: 50
+    aero-storage: 60
+    aero-server: 40  # HTTP handler 多，单元测试难度高

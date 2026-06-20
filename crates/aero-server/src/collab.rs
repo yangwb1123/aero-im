@@ -78,6 +78,8 @@ async fn thread(
     };
     let limit = q.limit.unwrap_or(50);
     let summary = s.messages.thread_summary(root).await?;
+    // Pass the computed keyset cursor + page size (the split had dropped both,
+    // silently disabling forward pagination on this endpoint).
     let replies = s.messages.thread_replies(root, after, limit).await?;
     Ok(Json(serde_json::json!({
         "summary": summary,

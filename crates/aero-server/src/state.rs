@@ -229,6 +229,11 @@ pub struct AppState {
     pub pg: PgPool,
     pub live: LiveService,
     pub participants: ParticipantRepo,
+    /// Per-process TTL cache fronting [`ParticipantRepo::get`] on the hot read
+    /// paths (push/notification fan-out, mention resolution). Lookups go through
+    /// `participant_cache.get_or_fetch(pid, &participants)`; profile writes
+    /// (`update_me`) call `participant_cache.invalidate(pid)`. ROADMAP6 方向四.
+    pub participant_cache: crate::participant_cache::ParticipantCache,
     pub rooms: RoomRepo,
     /// Workspace / org (tenant) membership + role store. Backs the
     /// ROADMAP 方向一 management API in [`crate::workspaces`].

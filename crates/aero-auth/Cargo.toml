@@ -45,5 +45,9 @@ reqwest.workspace = true
 # inspect `is_unique_violation()` for friendly Conflict mapping.
 sqlx.workspace = true
 
+# Redis (fred) backs the optional cross-node login-lockout aggregation
+# (`login_throttle::RedisFailureStore`); in-process stays the default.
+fred.workspace = true
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }

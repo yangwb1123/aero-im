@@ -23,11 +23,19 @@ dashmap.workspace = true
 
 serde.workspace = true
 serde_json.workspace = true
+# Deterministic (v5) `delivery_id` derivation for NotifyBatch idempotency
+# (mig 0137): the same message's same notification batch must derive the same
+# UUID on redelivery so `insert_many`'s ON CONFLICT can de-duplicate.
+uuid.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 time.workspace = true
 bytes.workspace = true
+
+# Redis (fred) backs the optional cross-node spam-guard aggregation
+# (`spam_guard::RedisActivityStore`); the in-process DashMap stays the default.
+fred.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync"] }

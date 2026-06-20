@@ -54,7 +54,12 @@ impl ParticipantRepo {
                VALUES ($1, $2, $3, $4)"#,
         )
         .bind(id.to_uuid())
-        .bind(&new.email)
+        // Store the email TRIMMED so it matches the login lookup, which trims +
+        // lowercases its input (routes.rs `auth_login`). `citext` already makes the
+        // column case-insensitive, but NOT whitespace-insensitive — a stored
+        // `" a@x.com"` would never match a trimmed `"a@x.com"` at login → permanent
+        // lockout (same blast radius as the citext bug, different normalization axis).
+        .bind(new.email.trim())
         .bind(&new.password_hash)
         .bind(created_at)
         .execute(&mut *tx)
@@ -75,10 +80,21 @@ impl ParticipantRepo {
         &self,
         email: &str,
     ) -> Result<Option<CredentialRecord>, sqlx::Error> {
+        // `credentials.email` is `citext` (case-insensitive) so e.g. `Foo@x.io`
+        // and `foo@x.io` are one account. BUT sqlx binds `$1` as `text`, and a
+        // `citext = text` comparison degrades to CASE-SENSITIVE (Postgres resolves
+        // it as text equality, not citext). That silently broke login for every
+        // mixed-case email: registration stored it verbatim, but the login route
+        // lowercases the input, so `WHERE email = 'foo@x.io'` never matched the
+        // stored `Foo@x.io` → permanent lockout. Casting `$1::citext` forces the
+        // intended case-insensitive `citext = citext` comparison. (Regression:
+        // smoke_wave23 non-member login with a mixed-case email.)
         let row = sqlx::query_as::<_, (uuid::Uuid, String, String)>(
-            r#"SELECT participant_id, email, password_hash FROM credentials WHERE email = $1"#,
+            r#"SELECT participant_id, email, password_hash FROM credentials WHERE email = $1::citext"#,
         )
-        .bind(email)
+        // Trim to match how the email is normalized on the write path (see
+        // `create_human`): the column is whitespace-SENSITIVE even as `citext`.
+        .bind(email.trim())
         .fetch_optional(&self.pool)
         .await?;
 
@@ -126,7 +142,9 @@ impl ParticipantRepo {
         let rows = sqlx::query(
             "UPDATE credentials SET email = $1 WHERE participant_id = $2",
         )
-        .bind(new_email)
+        // Trim so a changed address stays consistent with the trimmed login lookup
+        // (mirrors `create_human`; `citext` is case- but not whitespace-insensitive).
+        .bind(new_email.trim())
         .bind(participant_id.to_uuid())
         .execute(&self.pool)
         .await?;
@@ -240,6 +258,24 @@ impl ParticipantRepo {
             //     than hard-deleting it, so the cascade never fires — delete explicitly.
             "DELETE FROM search_click_events WHERE participant_id = $1",
             "DELETE FROM login_events WHERE participant_id = $1",
+            // Call-plane PII (P3 voice/video). Both must be deleted explicitly:
+            //   - call_transcripts (0064): verbatim transcribed speech keyed by
+            //     speaker_id, with NO foreign key — the migration deliberately lets a
+            //     transcript outlive the participant, so nothing cascades and the
+            //     re-identifiable speech survives erasure unless deleted here. Scope
+            //     to `speaker_id = $1` so only the erased user's own spoken lines go;
+            //     other speakers' lines in the same call are kept (erase OWN data).
+            //   - call_participants (0002): the user's per-leg membership rows. Its
+            //     participant_id FK is ON DELETE CASCADE, but erasure TOMBSTONES the
+            //     participant row (UPDATE) instead of hard-deleting it, so the cascade
+            //     never fires — delete explicitly (same reasoning as login_events).
+            // call_sessions is deliberately NOT touched: its only participant ref is
+            // `initiator` (an opaque id, already de-identified once the participant
+            // row is tombstoned, exactly like messages.sender_id), it holds no
+            // free-text PII, and the session/recap is a shared call audit record whose
+            // removal would rewrite other participants' history.
+            "DELETE FROM call_transcripts WHERE speaker_id = $1",
+            "DELETE FROM call_participants WHERE participant_id = $1",
             // Auth credentials / identity material. Leaving any of these behind is
             // worse than a PII leak — a surviving credential keeps AUTHENTICATING a
             // "deleted" account (refresh sessions are revoked above, but these are
@@ -268,6 +304,15 @@ impl ParticipantRepo {
             "DELETE FROM user_status WHERE participant_id = $1",
             "DELETE FROM thread_read_state WHERE participant_id = $1",
             "DELETE FROM ooo_auto_replies WHERE sender_id = $1",
+            // Persistent cross-room AI user profile (持久跨房 AI 用户画像, 0145).
+            // Re-identifiable PII derived from the participant's cross-room
+            // messages (extracted topics / preferences / a free-text summary).
+            // Its FK is ON DELETE CASCADE, but erasure TOMBSTONES the participant
+            // row (UPDATE) instead of hard-deleting it, so the cascade never fires
+            // — delete explicitly (project invariant: every participant-keyed PII
+            // table must be wired into erasure; CASCADE is not enough because
+            // erasure is a tombstone, not a hard delete).
+            "DELETE FROM participant_ai_profiles WHERE participant_id = $1",
         ] {
             sqlx::query(stmt).bind(participant_id.to_uuid()).execute(&mut *tx).await?;
         }
@@ -930,6 +975,20 @@ mod db_tests {
             .execute(&p)
             .await
             .expect("login_event");
+        // Persistent cross-room AI user profile (0145): re-identifiable PII keyed
+        // by participant. Its FK is ON DELETE CASCADE but erasure tombstones the
+        // participant (UPDATE), so the cascade never fires — the explicit DELETE in
+        // delete_participant is load-bearing. Reverting that DELETE makes the
+        // participant_ai_profiles assertion below fail.
+        sqlx::query(
+            "INSERT INTO participant_ai_profiles (participant_id, workspace_id, topics, preferences, summary) \
+             VALUES ($1,$2,'[\"secret-topic\"]'::jsonb,'{\"tone\":\"concise\"}'::jsonb,'a private profile')",
+        )
+        .bind(id.to_uuid())
+        .bind(WorkspaceId(ulid::Ulid(0)).to_uuid())
+        .execute(&p)
+        .await
+        .expect("ai_profile");
 
         assert!(participants.delete_participant(id).await.expect("erase"));
 
@@ -953,6 +1012,7 @@ mod db_tests {
             ("saved_searches", "participant_id"),
             ("search_click_events", "participant_id"),
             ("login_events", "participant_id"),
+            ("participant_ai_profiles", "participant_id"),
         ] {
             let count: (i64,) =
                 sqlx::query_as(&format!("SELECT count(*) FROM {table} WHERE {col} = $1"))
@@ -1028,5 +1088,149 @@ mod db_tests {
 
         // Cleanup.
         sqlx::query("DELETE FROM pat_tokens WHERE participant_id = $1").bind(id.to_uuid()).execute(&p).await.ok();
+    }
+
+    /// GDPR erasure must remove the deleted participant's call-plane PII. A
+    /// `call_transcripts` row is verbatim transcribed speech keyed by `speaker_id`
+    /// with NO foreign key (0064), so it survives erasure unless deleted in
+    /// `delete_participant` — and could then be read back via the call-transcript
+    /// API for a "deleted" user. This guards the explicit DELETE: only the erased
+    /// speaker's own lines go (a co-speaker's line in the SAME call is kept), and
+    /// the user's `call_participants` membership row is removed. Reverting the
+    /// DELETEs makes this fail (transcript / membership rows survive).
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn erasure_deletes_call_transcripts_and_membership() {
+        let p = pool();
+        let participants = ParticipantRepo::new(p.clone());
+
+        let speaker = participant(&p).await;
+        let other = participant(&p).await;
+        let r = room(&p, speaker).await;
+
+        // A call session in that room, initiated by `speaker`.
+        let call_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO call_sessions (id, room_id, initiator, kind) \
+             VALUES ($1, $2, $3, 'audio')",
+        )
+        .bind(call_id)
+        .bind(r.to_uuid())
+        .bind(speaker.to_uuid())
+        .execute(&p)
+        .await
+        .expect("call_sessions");
+
+        // Both took part (per-leg membership rows).
+        for (pid, role) in [(speaker, "caller"), (other, "callee")] {
+            sqlx::query(
+                "INSERT INTO call_participants (call_id, participant_id, role) \
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(call_id)
+            .bind(pid.to_uuid())
+            .bind(role)
+            .execute(&p)
+            .await
+            .expect("call_participants");
+        }
+
+        // A spoken line from each — the erased user's is PII to remove, the
+        // co-speaker's must be preserved.
+        for (pid, text) in
+            [(speaker, "my private spoken secret"), (other, "co-speaker line to keep")]
+        {
+            sqlx::query(
+                "INSERT INTO call_transcripts (id, call_id, speaker_id, text) \
+                 VALUES ($1, $2, $3, $4)",
+            )
+            .bind(uuid::Uuid::new_v4())
+            .bind(call_id)
+            .bind(pid.to_uuid())
+            .bind(text)
+            .execute(&p)
+            .await
+            .expect("call_transcripts");
+        }
+
+        assert!(participants.delete_participant(speaker).await.expect("erase"));
+
+        // The erased speaker's verbatim transcript lines are gone.
+        let mine: (i64,) =
+            sqlx::query_as("SELECT count(*) FROM call_transcripts WHERE speaker_id = $1")
+                .bind(speaker.to_uuid())
+                .fetch_one(&p)
+                .await
+                .expect("count own transcripts");
+        assert_eq!(mine.0, 0, "erased speaker's transcript PII must be deleted");
+
+        // The co-speaker's line in the SAME call survives (erase OWN data only).
+        let theirs: (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM call_transcripts WHERE call_id = $1 AND speaker_id = $2",
+        )
+        .bind(call_id)
+        .bind(other.to_uuid())
+        .fetch_one(&p)
+        .await
+        .expect("count other transcripts");
+        assert_eq!(theirs.0, 1, "a co-speaker's transcript line must be preserved");
+
+        // The erased user's call membership row is gone (cascade never fires —
+        // the participant is tombstoned, not hard-deleted).
+        let membership: (i64,) =
+            sqlx::query_as("SELECT count(*) FROM call_participants WHERE participant_id = $1")
+                .bind(speaker.to_uuid())
+                .fetch_one(&p)
+                .await
+                .expect("count membership");
+        assert_eq!(membership.0, 0, "erased participant's call membership must be deleted");
+    }
+
+    /// `credentials.email` is `citext`, so a login must match regardless of case.
+    /// A `citext = text` bind silently compares CASE-SENSITIVELY, which locked
+    /// out every mixed-case email (register stored it verbatim; the login route
+    /// lowercases the input → the lookup never matched). Guards the `$1::citext`
+    /// cast in [`find_credentials_by_email`]. Regression: smoke_wave23.
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn find_credentials_by_email_is_case_insensitive() {
+        let p = pool();
+        let repo = ParticipantRepo::new(p.clone());
+        // Mixed-case local part + unique suffix so reruns don't collide on the
+        // case-insensitive unique index.
+        let suffix = ParticipantId::new();
+        let stored = format!("MixedCase+{suffix}@Example.COM");
+        // Register the email WRAPPED IN WHITESPACE so this also proves the
+        // store-side trim (create_human), not just the lookup-side trim.
+        let created = repo
+            .create_human(super::NewHuman {
+                email: format!("   {stored}\t"),
+                display_name: "Case Test".into(),
+                password_hash: "x".into(),
+            })
+            .await
+            .expect("create_human");
+
+        // Case variants (citext) AND whitespace-wrapped variants (the column is
+        // case- but NOT whitespace-insensitive; create_human + the lookup both trim,
+        // mirroring the login route's `.trim().to_lowercase()` — else a stored
+        // `" a@x "` would never match a trimmed login → permanent lockout).
+        for variant in [
+            stored.clone(),
+            stored.to_lowercase(),
+            stored.to_uppercase(),
+            format!("  {stored}  "),
+            format!("\t{}\n", stored.to_lowercase()),
+        ] {
+            let found = repo
+                .find_credentials_by_email(&variant)
+                .await
+                .expect("lookup")
+                .unwrap_or_else(|| panic!("email lookup must be case/whitespace-insensitive (failed for {variant:?})"));
+            assert_eq!(
+                found.participant_id, created.id,
+                "variant {variant:?} matched the wrong (or no) account",
+            );
+        }
     }
 }

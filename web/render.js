@@ -22,6 +22,58 @@ function el(tag, opts = {}) {
   return n;
 }
 
+// ---------- rich text spans ----------
+// The server annotates a Text block with `spans: [{ start, end, style }]` where
+// `start`/`end` are UTF-8 byte offsets into `content` and `style` is either a
+// string ("bold" | "italic" | "strikethrough" | "code") or `{ link: { href } }`.
+// We slice on byte offsets to stay aligned with the server's parser.
+const _enc = new TextEncoder();
+const _dec = new TextDecoder();
+function sliceByBytes(str, startByte, endByte) {
+  const bytes = _enc.encode(str);
+  const s = Math.max(0, Math.min(startByte | 0, bytes.length));
+  const e = Math.max(s, Math.min(endByte | 0, bytes.length));
+  return _dec.decode(bytes.subarray(s, e));
+}
+function appendTextWithSpans(parent, content, spans) {
+  const ordered = spans
+    .filter((sp) => sp && Number.isFinite(sp.start) && Number.isFinite(sp.end) && sp.end > sp.start)
+    .slice()
+    .sort((a, b) => a.start - b.start);
+  let cursor = 0; // byte offset
+  for (const sp of ordered) {
+    if (sp.start < cursor) continue; // skip overlap; keep it simple + safe
+    if (sp.start > cursor) {
+      const gap = sliceByBytes(content, cursor, sp.start);
+      if (gap) parent.appendChild(el('span', { text: gap }));
+    }
+    const inner = sliceByBytes(content, sp.start, sp.end);
+    parent.appendChild(renderSpan(inner, sp.style));
+    cursor = sp.end;
+  }
+  const tail = sliceByBytes(content, cursor, _enc.encode(content).length);
+  if (tail) parent.appendChild(el('span', { text: tail }));
+}
+function renderSpan(text, style) {
+  // Externally-tagged enum: a link arrives as an object `{ link: { href } }`.
+  if (style && typeof style === 'object' && style.link && typeof style.link.href === 'string') {
+    const href = style.link.href;
+    const safe = /^https?:\/\//i.test(href) ? href : '#';
+    return el('a', {
+      className: 'md-link', text,
+      attrs: { href: safe, target: '_blank', rel: 'noopener noreferrer' },
+    });
+  }
+  const name = typeof style === 'string' ? style : '';
+  switch (name) {
+    case 'bold': return el('strong', { text });
+    case 'italic': return el('em', { text });
+    case 'strikethrough': return el('del', { text });
+    case 'code': return el('code', { className: 'md-code', text });
+    default: return el('span', { text });
+  }
+}
+
 // ---------- avatar ----------
 function hashHue(s) {
   let h = 0;
@@ -65,9 +117,19 @@ function appendBlock(parent, b, ctx = {}) {
   if (!b || typeof b !== 'object') return;
   switch (b.type) {
     case 'text': {
-      const span = el('span');
-      span.textContent = b.content ?? '';
-      parent.appendChild(span);
+      const content = b.content ?? '';
+      const spans = Array.isArray(b.spans) ? b.spans : [];
+      if (!spans.length) {
+        const span = el('span');
+        span.textContent = content;
+        parent.appendChild(span);
+        return;
+      }
+      // Spans carry byte offsets (the server emits UTF-8 `start`/`end`). Render
+      // each formatted run (bold/italic/strike/code/link) wrapped, with plain
+      // gaps in between. Overlapping/out-of-range spans are clamped/skipped so a
+      // malformed frame never throws.
+      appendTextWithSpans(parent, content, spans);
       return;
     }
     case 'code': {
@@ -156,6 +218,74 @@ function appendBlock(parent, b, ctx = {}) {
       const wrap = el('div', { className: 'thought' });
       wrap.appendChild(el('span', { className: 'thought-mark', text: '💭' }));
       wrap.appendChild(el('span', { text: b.content || '' }));
+      parent.appendChild(wrap);
+      return;
+    }
+    // ---- interactive blocks (Slack Block Kit-lite Button / Select) ----
+    // A bot/webhook posts an actionable message; clicking a button / picking an
+    // option records an interaction against the block's `action_id`. We submit
+    // via ctx.onInteract(messageId, action_id, value) — wired by app.js to
+    // `POST /api/messages/:id/interact`. A `url`-bearing Button is a plain link.
+    case 'button': {
+      const label = b.label || '操作';
+      const actionId = b.action_id;
+      const url = typeof b.url === 'string' ? b.url : '';
+      // A link button: open the (validated http(s)) URL in a new tab.
+      const safeUrl = /^https?:\/\//i.test(url) ? url : '';
+      const styleHint = b.style === 'primary' || b.style === 'danger' ? ` block-btn-${b.style}` : '';
+      if (safeUrl) {
+        const a = el('a', {
+          className: 'block-btn block-btn-link' + styleHint,
+          text: label,
+          attrs: { href: safeUrl, target: '_blank', rel: 'noopener noreferrer' },
+        });
+        parent.appendChild(a);
+        return;
+      }
+      // An action button: POST the interaction on click.
+      const btn = el('button', {
+        className: 'block-btn' + styleHint,
+        text: label,
+        attrs: { type: 'button' },
+      });
+      if (actionId) btn.dataset.actionId = actionId;
+      btn.addEventListener('click', () => {
+        if (!actionId || typeof ctx.onInteract !== 'function' || !ctx.messageId) return;
+        btn.disabled = true;
+        Promise.resolve(ctx.onInteract(ctx.messageId, actionId, null))
+          .then(() => { btn.classList.add('block-btn-done'); })
+          .catch(() => { btn.disabled = false; });
+      });
+      parent.appendChild(btn);
+      return;
+    }
+    case 'select': {
+      const actionId = b.action_id;
+      const options = Array.isArray(b.options) ? b.options : [];
+      const wrap = el('div', { className: 'block-select-wrap' });
+      const sel = el('select', { className: 'block-select' });
+      if (actionId) sel.dataset.actionId = actionId;
+      // Placeholder row (disabled, selected) so nothing is auto-submitted.
+      const ph = el('option', {
+        text: b.placeholder || '请选择…',
+        attrs: { value: '', disabled: 'disabled', selected: 'selected' },
+      });
+      sel.appendChild(ph);
+      for (const o of options) {
+        if (!o || typeof o !== 'object') continue;
+        // textContent on <option> + value via attribute → no HTML injection.
+        const opt = el('option', { text: o.label ?? o.value ?? '', attrs: { value: String(o.value ?? '') } });
+        sel.appendChild(opt);
+      }
+      sel.addEventListener('change', () => {
+        const value = sel.value;
+        if (!actionId || !value || typeof ctx.onInteract !== 'function' || !ctx.messageId) return;
+        sel.disabled = true;
+        Promise.resolve(ctx.onInteract(ctx.messageId, actionId, value))
+          .then(() => { sel.disabled = false; wrap.classList.add('block-select-done'); })
+          .catch(() => { sel.disabled = false; });
+      });
+      wrap.appendChild(sel);
       parent.appendChild(wrap);
       return;
     }
@@ -401,7 +531,12 @@ export function renderMessage(m, mePid, participants, opts = {}) {
   if (isDeleted) {
     bubble.appendChild(el('span', { className: 'muted', text: '消息已删除' }));
   } else {
-    bubble.appendChild(buildBlocks(m.blocks, { participants, live: opts.live }));
+    bubble.appendChild(buildBlocks(m.blocks, {
+      participants,
+      live: opts.live,
+      messageId: m.id,
+      onInteract: opts.onInteract,
+    }));
   }
 
   // hover actions row (right-aligned mini buttons for owner; reactions for all)
@@ -413,8 +548,15 @@ export function renderMessage(m, mePid, participants, opts = {}) {
     const btnReply = el('button', { className: 'msg-act', attrs: { title: '回复' } });
     btnReply.textContent = '↩';
     btnReply.dataset.action = 'reply';
+    // Thread-mute toggle: silence reply notifications for the thread rooted at
+    // this message. Reflects current mute state on first hover via a lazy fetch
+    // (see wireMsgActions in app.js). Default glyph is the "not muted" bell.
+    const btnMute = el('button', { className: 'msg-act msg-act-mute', attrs: { title: '静音线程' } });
+    btnMute.textContent = '🔔';
+    btnMute.dataset.action = 'mute-thread';
     actions.appendChild(btnReact);
     actions.appendChild(btnReply);
+    actions.appendChild(btnMute);
     if (isSelf) {
       const btnEdit = el('button', { className: 'msg-act', attrs: { title: '编辑' } });
       btnEdit.textContent = '✏';

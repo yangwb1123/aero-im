@@ -91,11 +91,17 @@ impl StreamCategoryRepo {
         slug: &str,
         sort: i32,
     ) -> Result<StreamCategory, sqlx::Error> {
+        // `stream_categories.id` is `uuid PRIMARY KEY` with NO database default
+        // (the seed rows carry explicit ids), so the INSERT MUST supply one — the
+        // previous query omitted `id` and every call failed with a NOT-NULL
+        // violation, i.e. the admin `POST /api/live/categories` route was 500-broken.
+        let id = StreamCategoryId::new();
         let sql = format!(
-            "INSERT INTO stream_categories (name, slug, sort) VALUES ($1, $2, $3) \
+            "INSERT INTO stream_categories (id, name, slug, sort) VALUES ($1, $2, $3, $4) \
              RETURNING {COLUMNS}"
         );
         let row = sqlx::query_as::<_, CategoryRow>(&sql)
+            .bind(id.to_uuid())
             .bind(name)
             .bind(slug.trim().to_lowercase())
             .bind(sort)
@@ -114,7 +120,12 @@ impl StreamCategoryRepo {
     ) -> Result<Option<StreamCategory>, sqlx::Error> {
         let sql = format!("SELECT {COLUMNS} FROM stream_categories WHERE slug = $1");
         let row = sqlx::query_as::<_, CategoryRow>(&sql)
-            .bind(slug)
+            // Normalize the lookup the SAME way `create_category` normalizes on
+            // write (`slug.trim().to_lowercase()`). The column is plain `text` with
+            // a plain UNIQUE (no `lower()` index), so without this a mixed-case slug
+            // like `Speedruns` is stored as `speedruns` but queried verbatim →
+            // never matches → spurious 404 on category lookup / stream assignment.
+            .bind(slug.trim().to_lowercase())
             .fetch_optional(&self.pool)
             .await?;
         Ok(row.map(row_to_category))
@@ -307,6 +318,32 @@ mod db_tests {
             repo.category_by_slug("does-not-exist").await.unwrap().is_none(),
             "unknown slug resolves to None"
         );
+    }
+
+    /// A category created with a mixed-case slug must be addressable by ANY case
+    /// (and with surrounding whitespace). `create_category` lowercases+trims the
+    /// slug on write, so `category_by_slug` must normalize the SAME way — else a
+    /// `Speedruns` slug stores `speedruns` but a verbatim lookup 404s (the column
+    /// is plain `text` + plain UNIQUE, with no `lower()` index to mask it). Regression.
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn category_by_slug_is_case_and_space_insensitive() {
+        let repo = StreamCategoryRepo::new(pool());
+        // Unique mixed-case slug so reruns don't collide on the UNIQUE(slug) index.
+        let uniq = uuid::Uuid::new_v4().simple().to_string();
+        let slug = format!("MixedCat-{uniq}");
+        let want = slug.to_lowercase();
+        repo.create_category("Mixed Cat", &slug, 999).await.expect("create");
+        for variant in [slug.clone(), slug.to_lowercase(), slug.to_uppercase(), format!("  {slug}  ")] {
+            let got = repo
+                .category_by_slug(&variant)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("category_by_slug must normalize case/space (failed for {variant:?})"));
+            assert_eq!(got.slug, want, "variant {variant:?} resolved the wrong category");
+            assert_eq!(got.name, "Mixed Cat");
+        }
+        sqlx::query("DELETE FROM stream_categories WHERE slug = $1").bind(&want).execute(&pool()).await.ok();
     }
 
     #[tokio::test]

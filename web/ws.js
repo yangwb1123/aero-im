@@ -180,6 +180,14 @@ export class WsClient {
   sendMessage(roomId, blocks, replyTo = null) {
     return this.send({ type: 'send_message', room_id: roomId, blocks, reply_to: replyTo });
   }
+  // Send raw Markdown text; the server parses it into rich Text blocks (with
+  // spans for **bold** / *italic* / `code` / ~~strike~~ / [link](url)) and
+  // broadcasts the resulting message. See the `SendMarkdown` WS frame.
+  sendMarkdown(roomId, markdown, replyTo = null, expiresAfterSecs = null) {
+    const frame = { type: 'send_markdown', room_id: roomId, markdown, reply_to: replyTo };
+    if (expiresAfterSecs != null) frame.expires_after_secs = expiresAfterSecs;
+    return this.send(frame);
+  }
   editMessage(id, blocks) {
     return this.send({ type: 'edit_message', id, blocks });
   }

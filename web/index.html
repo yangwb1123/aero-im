@@ -89,6 +89,7 @@
         </div>
         <div class="room-head-actions">
           <div class="head-tools">
+            <button id="btn-notif" type="button" title="通知收件箱" class="btn-notif">🔔<span id="notif-badge" class="notif-badge" hidden>0</span></button>
             <button id="btn-search" type="button" title="搜索">🔍 搜索</button>
             <button id="btn-ai" type="button" title="问 AI">✨ AI</button>
             <button id="btn-call-audio" type="button" title="发起语音通话">📞</button>
@@ -112,6 +113,10 @@
         <div class="composer-aux">
           <button type="button" id="btn-attach" title="附件">📎</button>
           <button type="button" id="btn-voice" title="按住录音 / 点击开始">🎙</button>
+          <label id="md-toggle-label" title="以 Markdown 发送(**粗体** *斜体* `代码` ~~删除~~ [链接](url))">
+            <input type="checkbox" id="md-toggle" />
+            <span>MD</span>
+          </label>
         </div>
         <textarea
           id="composer-input"
@@ -159,6 +164,18 @@
       </form>
     </div>
   </div>
+
+  <!-- drawer: notification inbox -->
+  <aside id="drawer-notif" class="drawer" hidden>
+    <header class="drawer-head">
+      <h3>通知收件箱</h3>
+      <div style="display:flex;gap:6px;">
+        <button id="btn-notif-read-all" class="btn-ghost" title="全部标记已读">全部已读</button>
+        <button class="btn-icon" data-close-drawer="notif">×</button>
+      </div>
+    </header>
+    <div id="notif-list" class="drawer-body notif-list"></div>
+  </aside>
 
   <!-- drawer: search -->
   <aside id="drawer-search" class="drawer" hidden>
@@ -259,6 +276,7 @@
     <div class="call-controls">
       <button id="call-mute">静音</button>
       <button id="call-cam">关摄像头</button>
+      <button id="call-share" title="共享屏幕">🖥️ 共享屏幕</button>
       <button id="call-cc" title="实时字幕(语音识别)">字幕</button>
       <select id="call-cc-lang" title="把我的话翻译成…">
         <option value="">不翻译</option>
@@ -279,6 +297,7 @@
     <div class="call-controls">
       <button id="gcall-mute">静音</button>
       <button id="gcall-cam">关摄像头</button>
+      <button id="gcall-share" title="共享屏幕">🖥️ 共享屏幕</button>
       <span id="gcall-count" class="gcall-count">1 人</span>
       <button id="gcall-leave" class="end">离开</button>
     </div>

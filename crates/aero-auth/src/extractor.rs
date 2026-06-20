@@ -83,18 +83,27 @@ where
         }
 
         // Primary path: a short-lived access JWT (unchanged behaviour). On
-        // success we're done. On *any* JWT failure we fall through to the PAT
-        // path below — a Personal Access Token is a valid bearer credential too.
+        // success we're done. On *any* JWT failure we fall through to the
+        // opaque-bearer paths below — a Personal Access Token or an open-platform
+        // bot token is a valid bearer credential too.
         let pid = match svc.verify(token) {
             Ok(claims) if claims.kind == crate::jwt::TokenKind::Access => claims
                 .participant_id()
                 .map_err(|_| AuthRejection::new("invalid sub claim"))?,
             // Either not a valid JWT, or a JWT of the wrong kind (e.g. a refresh
-            // token presented as a bearer). Try a PAT before rejecting.
-            _ => svc
-                .verify_pat(token)
-                .await
-                .ok_or_else(|| AuthRejection::new("invalid or expired token"))?,
+            // token presented as a bearer). Try a PAT, then a bot token, before
+            // rejecting. Each `verify_*` self-gates on token shape (PAT bodies and
+            // bot tokens have disjoint prefixes), so the order is safe and at most
+            // one DB lookup actually runs for a given bearer.
+            _ => match svc.verify_pat(token).await {
+                Some(owner) => owner,
+                // 方向三: bot tokens (`bot_…`) authenticate as the bot participant.
+                // The verifier rejects unknown / un-issued / deleted bots.
+                None => svc
+                    .verify_bot_token(token)
+                    .await
+                    .ok_or_else(|| AuthRejection::new("invalid or expired token"))?,
+            },
         };
 
         // Stash the participant id in request extensions so downstream layers

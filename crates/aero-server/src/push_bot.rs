@@ -101,7 +101,14 @@ async fn handle(
         NotificationKind::Reply => format!("{sender_name} replied"),
         NotificationKind::Reaction => format!("{sender_name} reacted to your message"),
         NotificationKind::SavedSearch => "New match for your saved search".to_string(),
+        NotificationKind::AggregateReply => format!("{sender_name} replied (batched)"),
     };
+
+    // Coalesce by room so multiple messages to the same conversation replace one
+    // another on the lock screen (FCM `android.collapse_key` / APNs
+    // `apns-collapse-id`) instead of stacking N separate entries. Derived from the
+    // room id, which is well under the APNs 64-byte cap.
+    let collapse_key = room_id.as_deref().map(collapse_key_for_room);
 
     let payload = PushPayload {
         title,
@@ -109,6 +116,7 @@ async fn handle(
         room_id,
         message_id: Some(message_id.to_string()),
         badge: None,
+        collapse_key,
     };
 
     push_to_participant(state, mentioned, &payload).await;
@@ -172,7 +180,17 @@ pub fn badge_only_payload(badge: u32) -> PushPayload {
         room_id: None,
         message_id: None,
         badge: Some(badge),
+        // Badge refreshes are not room-scoped, so they do not coalesce.
+        collapse_key: None,
     }
+}
+
+/// Derive the stable per-room coalescing key used for both FCM `android.collapse_key`
+/// and APNs `apns-collapse-id`. Same room ⇒ same key ⇒ the OS replaces an older
+/// undelivered notification for that conversation instead of stacking a new one.
+#[must_use]
+fn collapse_key_for_room(room_id: &str) -> String {
+    format!("room:{room_id}")
 }
 
 /// Truncate `text` to [`PREVIEW_CHARS`] on a char boundary, appending an ellipsis
@@ -225,6 +243,27 @@ mod tests {
         assert!(p.body.is_empty());
         assert!(p.room_id.is_none());
         assert!(p.message_id.is_none());
+    }
+
+    #[test]
+    fn collapse_key_is_room_scoped_and_stable() {
+        // Same room ⇒ identical key (so notifications coalesce); different rooms differ.
+        assert_eq!(collapse_key_for_room("abc"), "room:abc");
+        assert_eq!(collapse_key_for_room("abc"), collapse_key_for_room("abc"));
+        assert_ne!(collapse_key_for_room("abc"), collapse_key_for_room("xyz"));
+    }
+
+    #[test]
+    fn room_collapse_key_drives_fcm_and_apns_coalescing() {
+        // The derived key flows into the FCM body and the APNs collapse-id helper,
+        // so both platforms coalesce per-room.
+        let payload = PushPayload {
+            collapse_key: Some(collapse_key_for_room("r5")),
+            ..badge_only_payload(0)
+        };
+        let fcm = aero_push::fcm_message_json("tok", &payload);
+        assert_eq!(fcm["message"]["android"]["collapse_key"], "room:r5");
+        assert_eq!(aero_push::apns_collapse_id(&payload).as_deref(), Some("room:r5"));
     }
 
     #[test]

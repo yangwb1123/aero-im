@@ -12,6 +12,7 @@ use aero_storage::participant::NewHuman;
 use aero_storage::ParticipantRepo;
 use serde::{Deserialize, Serialize};
 
+use crate::bot::SharedBotVerifier;
 use crate::jwt::{Claims, JwtCodec, TokenKind};
 use crate::password;
 use crate::pat::SharedPatVerifier;
@@ -54,6 +55,13 @@ pub struct AuthService {
     /// through this verifier. `None` (the default) means PAT auth is disabled and
     /// only JWTs are accepted — behaviour is then identical to before PATs.
     pat_verifier: Option<SharedPatVerifier>,
+    /// Optional hook for bot-token auth (方向三 — open platform). When present, the
+    /// [`AuthUser`](crate::extractor::AuthUser) extractor accepts a `bot_*` bearer
+    /// token wherever it accepts an access JWT or a PAT, resolving it to the bot's
+    /// participant identity through this verifier. `None` (the default) means bot
+    /// auth is disabled and the extractor's behaviour is identical to before — only
+    /// JWTs and (when wired) PATs are accepted.
+    bot_verifier: Option<SharedBotVerifier>,
     /// Optional per-account login lockout (ROADMAP5 方向五). `None` (default) =
     /// disabled; when present, [`Self::login`] rejects locked accounts and records
     /// each auth failure / success. Shared (`Arc`) so the in-process failure state
@@ -70,6 +78,7 @@ impl AuthService {
             repo,
             jwt,
             pat_verifier: None,
+            bot_verifier: None,
             login_throttle: None,
         }
     }
@@ -100,6 +109,24 @@ impl AuthService {
     #[must_use]
     pub fn with_pat_verifier(mut self, verifier: SharedPatVerifier) -> Self {
         self.pat_verifier = Some(verifier);
+        self
+    }
+
+    /// Enable bot-token authentication (方向三 — open platform) by injecting the
+    /// verifier that resolves an opaque bot token to its bot participant (typically
+    /// an [`aero_storage::BotRepo`], which implements
+    /// [`BotTokenVerifier`](crate::bot::BotTokenVerifier)). Builder-style so it
+    /// composes with [`Self::new`] / [`Self::from_pem`] / [`Self::with_pat_verifier`]
+    /// at startup:
+    ///
+    /// ```ignore
+    /// let auth = AuthService::new(repo.clone(), jwt)
+    ///     .with_pat_verifier(Arc::new(PatRepo::new(pg.clone())))
+    ///     .with_bot_verifier(Arc::new(BotRepo::new(pg.clone())));
+    /// ```
+    #[must_use]
+    pub fn with_bot_verifier(mut self, verifier: SharedBotVerifier) -> Self {
+        self.bot_verifier = Some(verifier);
         self
     }
 
@@ -175,18 +202,39 @@ impl AuthService {
         };
         let account = req.email.clone();
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
-        if throttle.is_locked(&account, now) {
+        if throttle.is_locked(&account, now).await {
             return Err(Error::Unauthorized(
                 "account temporarily locked after repeated failed logins".into(),
             ));
         }
         let result = self.login_inner(req).await;
-        match &result {
-            Ok(_) => throttle.record_success(&account),
-            Err(Error::Unauthorized(_)) => throttle.record_failure(&account, now),
-            Err(_) => {}
+        // Record a FAILURE here for a bad password. SUCCESS is deliberately NOT
+        // recorded yet: a post-password gate (2FA, enforced by the HTTP layer) may
+        // still reject this attempt. Recording success now would clear the failure
+        // counter before 2FA is checked, letting an attacker who holds the password
+        // brute-force the second factor with the lockout permanently reset. The
+        // caller MUST call [`finalize_login`] once all gates have run.
+        if let Err(Error::Unauthorized(_)) = &result {
+            throttle.record_failure(&account, now).await;
         }
         result
+    }
+
+    /// Record the FINAL login outcome on the per-account lockout throttle, AFTER
+    /// every post-password gate (e.g. 2FA) has run. `success = true` clears the
+    /// failure counter; `success = false` records a failure so a wrong second
+    /// factor advances the lockout exactly like a wrong password. No-op when the
+    /// throttle is disabled. See the deferral rationale in [`login`](Self::login).
+    pub async fn finalize_login(&self, account: &str, success: bool) {
+        let Some(throttle) = self.login_throttle.clone() else {
+            return;
+        };
+        if success {
+            throttle.record_success(account).await;
+        } else {
+            let now = time::OffsetDateTime::now_utc().unix_timestamp();
+            throttle.record_failure(account, now).await;
+        }
     }
 
     /// The credential check itself, factored out so [`Self::login`] can wrap it with
@@ -275,6 +323,31 @@ impl AuthService {
         verifier.verify(&hash).await
     }
 
+    /// Attempt to authenticate a *plaintext* bot token (方向三), returning the bot's
+    /// participant id on success.
+    ///
+    /// Returns `None` when bot auth is not wired (no verifier injected), the token
+    /// is not a **well-formed** bot token (the `bot_` prefix — see
+    /// [`is_well_formed_bot_token`]), or it is unknown / un-issued / belongs to a
+    /// deleted bot. The [`AuthUser`](crate::extractor::AuthUser) extractor calls this
+    /// **after** both the JWT and PAT paths fail, so those paths are unchanged when
+    /// no bot token is present.
+    ///
+    /// The prefix check happens *before* the DB lookup, so a bearer that is clearly
+    /// not a bot token (a JWT, a PAT, or random garbage) is rejected without a query.
+    /// Unlike PATs, the plaintext (not a pre-hash) is handed to the verifier: bot
+    /// tokens hash with a different helper than PATs, so the hashing stays on the
+    /// storage side ([`aero_storage::BotRepo::verify_token`]) next to that helper.
+    /// The deleted-bot rejection is enforced there (a `participants.deleted_at IS
+    /// NULL` guard mirroring the PAT verifier), so a deleted bot can never authenticate.
+    pub async fn verify_bot_token(&self, token: &str) -> Option<aero_common::ParticipantId> {
+        let verifier = self.bot_verifier.as_ref()?;
+        if !is_well_formed_bot_token(token) {
+            return None;
+        }
+        verifier.verify(token).await
+    }
+
     fn issue_pair(&self, pid: aero_common::ParticipantId) -> Result<AuthTokens> {
         Ok(AuthTokens {
             access_token: self.jwt.issue(pid, TokenKind::Access)?,
@@ -311,6 +384,32 @@ fn is_well_formed_pat(token: &str) -> bool {
     };
     body.len() == PAT_BODY_HEX_LEN
         && body.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Is `token` a structurally well-formed bot token?
+///
+/// A minted bot token is [`BotRepo::TOKEN_PREFIX`](aero_storage::BotRepo::TOKEN_PREFIX)
+/// (`bot_`) followed by a non-empty body (a UUID v4 — see
+/// [`BotRepo::rotate_token`](aero_storage::BotRepo::rotate_token)). Checking the
+/// prefix before the DB lookup lets [`verify_bot_token`] reject a bearer that is
+/// clearly not a bot token (a JWT, a PAT, or random garbage) without a query. The
+/// check is purely structural — a well-formed *but unknown* token still returns
+/// `None` from the verifier — so it widens no trust, only narrows wasted work.
+///
+/// We deliberately do **not** validate the UUID shape here: bot tokens are looked
+/// up by exact hash, so a malformed body simply fails to match. Keeping the gate to
+/// "has the prefix and a non-empty body" avoids coupling auth to the exact token
+/// format while still cheaply skipping non-bot bearers.
+///
+/// [`verify_bot_token`]: AuthService::verify_bot_token
+#[must_use]
+fn is_well_formed_bot_token(token: &str) -> bool {
+    aero_storage::BotRepo::TOKEN_PREFIX
+        .len()
+        .checked_add(1)
+        .is_some_and(|min_len| {
+            token.starts_with(aero_storage::BotRepo::TOKEN_PREFIX) && token.len() >= min_len
+        })
 }
 
 fn validate_email(email: &str) -> Result<()> {
@@ -387,6 +486,44 @@ mod tests {
         assert!(!is_well_formed_pat(&format!("{prefix}{}", "A".repeat(PAT_BODY_HEX_LEN))));
         // A pathologically large blob is rejected on length alone (no hashing).
         assert!(!is_well_formed_pat(&format!("{prefix}{}", "a".repeat(100_000))));
+    }
+
+    #[test]
+    fn well_formed_bot_token_accepts_minted_shape() {
+        // A token shaped like `BotRepo::rotate_token` mints (`bot_<uuid>`) must
+        // pass the structural gate, or `verify_bot_token` would reject every real
+        // token before the DB ever sees it.
+        let prefix = aero_storage::BotRepo::TOKEN_PREFIX;
+        for _ in 0..16 {
+            let token = format!("{prefix}{}", uuid::Uuid::new_v4());
+            assert!(is_well_formed_bot_token(&token), "must accept: {token}");
+        }
+    }
+
+    #[test]
+    fn well_formed_bot_token_rejects_non_bot_bearers() {
+        let prefix = aero_storage::BotRepo::TOKEN_PREFIX;
+        // No prefix at all (a JWT, random garbage).
+        assert!(!is_well_formed_bot_token("not-a-bot-token"));
+        assert!(!is_well_formed_bot_token(""));
+        // A PAT must NOT be treated as a bot token — disjoint prefixes.
+        assert!(!is_well_formed_bot_token(&aero_storage::pat::generate_pat()));
+        // Bare prefix with an empty body is rejected (needs a non-empty body).
+        assert!(!is_well_formed_bot_token(prefix));
+        // Prefix + a single char body is the minimal acceptable shape.
+        assert!(is_well_formed_bot_token(&format!("{prefix}x")));
+    }
+
+    #[test]
+    fn pat_and_bot_token_gates_are_disjoint() {
+        // A real PAT passes the PAT gate but not the bot gate, and a real bot
+        // token passes the bot gate but not the PAT gate. This disjointness is
+        // what makes the extractor's "try PAT, then bot" ordering safe — a given
+        // bearer self-routes to at most one DB lookup.
+        let pat = aero_storage::pat::generate_pat();
+        let bot = format!("{}{}", aero_storage::BotRepo::TOKEN_PREFIX, uuid::Uuid::new_v4());
+        assert!(is_well_formed_pat(&pat) && !is_well_formed_bot_token(&pat));
+        assert!(is_well_formed_bot_token(&bot) && !is_well_formed_pat(&bot));
     }
 
     #[test]

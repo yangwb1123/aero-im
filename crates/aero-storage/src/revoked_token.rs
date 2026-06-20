@@ -106,6 +106,45 @@ impl RevokedTokenRepo {
                 .await?;
         Ok(row.map(|r| r.0))
     }
+
+    /// Hard-delete revocation entries whose blacklisted token has *already expired
+    /// on its own*, so the blacklist stops growing unboundedly (and `is_revoked`
+    /// stays fast). Returns the number of rows deleted.
+    ///
+    /// # Safety: why deleting these rows cannot resurrect a still-valid token
+    ///
+    /// The table records only `revoked_at` (migration 0047 stores `token_hash`,
+    /// `participant_id`, `revoked_at` — there is no token `expires_at`). We
+    /// therefore reason from the token's *natural TTL* instead:
+    ///
+    /// * A token can only be revoked while it still exists, so for every row
+    ///   `revoked_at >= issued_at` (you cannot log out a token before it was issued).
+    /// * A refresh token's natural lifetime is at most `refresh_ttl_secs`
+    ///   ([`aero_common`]'s `AuthConfig`), i.e. it stops authenticating once
+    ///   `now - issued_at > refresh_ttl_secs`, independent of this blacklist.
+    ///
+    /// The caller passes `cutoff = now - (max_refresh_ttl + safety_margin)`. A row
+    /// with `revoked_at < cutoff` thus has
+    /// `now - issued_at >= now - revoked_at > max_refresh_ttl`, so the underlying
+    /// token has already expired by its own TTL and can no longer authenticate —
+    /// dropping the blacklist entry is a pure no-op for security. Conversely, any
+    /// token that could *still* be valid has `revoked_at >= cutoff` and is kept, so
+    /// a revoked-but-not-yet-expired token can never be un-blacklisted. (The
+    /// caller is responsible for choosing `cutoff` from the deployment's real
+    /// `refresh_ttl_secs` plus a margin for clock skew / TTL config changes.)
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the delete.
+    pub async fn sweep_before(
+        &self,
+        cutoff: time::OffsetDateTime,
+    ) -> Result<u64, sqlx::Error> {
+        let res = sqlx::query(r"DELETE FROM revoked_tokens WHERE revoked_at < $1")
+            .bind(cutoff)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected())
+    }
 }
 
 #[cfg(test)]
@@ -207,5 +246,50 @@ mod db_tests {
         );
 
         sqlx::query("DELETE FROM revoked_tokens WHERE token_hash = $1").bind(&h).execute(&p).await.ok();
+    }
+
+    /// `sweep_before` drops entries whose `revoked_at` predates the cutoff (the
+    /// blacklisted token has already expired by its natural TTL) while keeping
+    /// recently-revoked ones (whose token may still be valid). The "expired" row's
+    /// `revoked_at` is backdated directly so the test is independent of wall clock.
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn sweep_before_drops_expired_keeps_recent() {
+        let p = pool();
+        let repo = RevokedTokenRepo::new(p.clone());
+        let owner = ParticipantId::new();
+
+        // Two distinct revocations: one we'll backdate to look "old" (its token has
+        // since expired) and one freshly revoked (its token might still be valid).
+        let old_h = hash_token(&format!("revoked-sweep-old-{owner}"));
+        let fresh_h = hash_token(&format!("revoked-sweep-fresh-{owner}"));
+        repo.revoke(&old_h, Some(owner)).await.unwrap();
+        repo.revoke(&fresh_h, Some(owner)).await.unwrap();
+
+        // Backdate the "old" row's revoked_at to 30 days ago — well past any sane
+        // refresh-token TTL, so its token can no longer authenticate.
+        sqlx::query("UPDATE revoked_tokens SET revoked_at = now() - interval '30 days' WHERE token_hash = $1")
+            .bind(&old_h)
+            .execute(&p)
+            .await
+            .unwrap();
+
+        // Cutoff = 7 days ago (a conservative max-refresh-TTL window). The old row
+        // is older than the cutoff and is swept; the fresh row is newer and stays.
+        let cutoff = time::OffsetDateTime::now_utc() - time::Duration::days(7);
+        let swept = repo.sweep_before(cutoff).await.unwrap();
+        assert!(swept >= 1, "the backdated (expired) entry is swept, got {swept}");
+
+        // The expired entry is gone; the fresh (possibly-valid) entry is preserved —
+        // a revoked-but-not-yet-expired token is never un-blacklisted.
+        assert!(!repo.is_revoked(&old_h).await.unwrap(), "expired entry swept");
+        assert!(repo.is_revoked(&fresh_h).await.unwrap(), "recent entry kept");
+
+        // Cleanup so reruns stay self-contained.
+        sqlx::query("DELETE FROM revoked_tokens WHERE token_hash = ANY($1)")
+            .bind(vec![old_h, fresh_h])
+            .execute(&p)
+            .await
+            .ok();
     }
 }

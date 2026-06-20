@@ -897,6 +897,271 @@ a=fmtp:96 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f
         assert_eq!(rbuf.next_expected(), 9, "cursor advanced past the gap");
     }
 
+    // =============== Real in-process DTLS-SRTP handshake ===============
+    //
+    // Proves the media plane's transport — the one piece the byte-level tests
+    // above deliberately skip — *without a browser*. We stand up a second str0m
+    // `Rtc` as the **publisher** (offerer) and drive a genuine
+    // ICE → DTLS-SRTP → RTP exchange against the real `WhipSession` (answerer),
+    // pumping str0m's `Output::Transmit` datagrams between the two peers entirely
+    // in memory (no UDP socket). str0m is pure Rust (rust-crypto backend), so the
+    // DTLS handshake, SRTP keying, and SRTP decryption all run for real here.
+    //
+    // What this validates end-to-end:
+    //   1. `WhipSession::accept` ingests the publisher's *real* str0m-generated
+    //      SDP offer and answers it (production code path).
+    //   2. ICE connectivity checks (STUN binding req/resp) complete → Connected.
+    //   3. The DTLS handshake completes and both sides derive SRTP keys.
+    //   4. The publisher SRTP-*encrypts* an H.264 RTP packet; the WhipSession's
+    //      str0m SRTP-*decrypts* it and surfaces it as `Event::RtpPacket`.
+    //
+    // The test lives inside this module so it can touch `WhipSession`'s private
+    // `rtc` field directly — no production API is widened for testability.
+
+    use str0m::format::Codec;
+    use str0m::media::{Direction, MediaKind};
+    use str0m::net::DatagramRecv;
+    use str0m::rtp::{ExtensionValues, SeqNo, Ssrc};
+
+    /// An in-memory peer: a str0m `Rtc` plus the host address other peers reach
+    /// it at, and the wall-clock the test drives it with.
+    struct Pumped {
+        rtc: Rtc,
+        addr: SocketAddr,
+    }
+
+    impl Pumped {
+        /// Drain `poll_output`: collect any `Event`s, hand `Transmit`s to the
+        /// caller (queued for the peer), and return the next requested timeout.
+        fn poll(
+            &mut self,
+            now: Instant,
+            out: &mut Vec<(SocketAddr, SocketAddr, Vec<u8>)>,
+            events: &mut Vec<Event>,
+        ) -> Instant {
+            loop {
+                match self.rtc.poll_output().expect("poll_output") {
+                    Output::Timeout(t) => return t.max(now),
+                    Output::Transmit(t) => {
+                        out.push((t.source, t.destination, t.contents.to_vec()));
+                    }
+                    Output::Event(ev) => events.push(ev),
+                }
+            }
+        }
+    }
+
+    /// Deliver one queued datagram to whichever peer owns its destination addr.
+    fn deliver(
+        peers: &mut [&mut Pumped],
+        now: Instant,
+        src: SocketAddr,
+        dst: SocketAddr,
+        data: &[u8],
+    ) {
+        for p in peers.iter_mut() {
+            if p.addr == dst {
+                let Ok(contents) = DatagramRecv::try_from(data) else {
+                    return; // unparseable framing — drop, mirrors run()
+                };
+                let recv = Receive {
+                    proto: Protocol::Udp,
+                    source: src,
+                    destination: dst,
+                    contents,
+                };
+                p.rtc
+                    .handle_input(Input::Receive(now, recv))
+                    .expect("handle_input receive");
+                return;
+            }
+        }
+    }
+
+    #[test]
+    fn real_dtls_srtp_handshake_and_h264_rtp_forward() {
+        // --- Publisher (offerer) addr + the WhipSession (answerer) ingest addr.
+        let pub_addr: SocketAddr = "1.1.1.1:5000".parse().unwrap();
+        let whip_addr: SocketAddr = "2.2.2.2:6000".parse().unwrap();
+
+        // --- 1) Build the publisher Rtc: RTP mode (matches WhipSession), with a
+        // sendonly H.264 video m-line so str0m negotiates H.264 and gives us a
+        // sender stream to write_rtp on.
+        let now = Instant::now();
+        let mut pubrtc = Rtc::builder().set_rtp_mode(true).build(now);
+        pubrtc.add_local_candidate(Candidate::host(pub_addr, "udp").unwrap());
+
+        let mut change = pubrtc.sdp_api();
+        let mid = change.add_media(MediaKind::Video, Direction::SendOnly, None, None, None);
+        let (offer, pending) = change.apply().expect("offer has changes");
+        let offer_sdp = offer.to_sdp_string();
+
+        // --- 2) Feed the *real* offer through the production accept() path.
+        let (session, answer) =
+            WhipSession::accept(&offer_sdp, "2.2.2.2", 6000).expect("whip accepts offer");
+        // Sanity: H.264 PT was negotiated as video (so RtpPacket routing works).
+        assert!(
+            !session.video_payload_types().is_empty(),
+            "H.264 must be negotiated as video"
+        );
+
+        // The publisher consumes the answer to learn the WhipSession's ICE
+        // candidate + DTLS fingerprint (this is what a browser does with the
+        // HTTP 201 response body).
+        pubrtc
+            .sdp_api()
+            .accept_answer(pending, answer)
+            .expect("publisher accepts answer");
+
+        let mut publisher = Pumped {
+            rtc: pubrtc,
+            addr: pub_addr,
+        };
+        let mut whip = Pumped {
+            rtc: session.rtc,
+            addr: whip_addr,
+        };
+
+        // --- 3) Drive ICE + DTLS by pumping datagrams in memory until both
+        // peers report Connected (ICE complete + DTLS established + SRTP keyed).
+        let mut clock = now;
+        let mut events_pub = Vec::new();
+        let mut events_whip = Vec::new();
+        let mut connected = false;
+        for _ in 0..2000 {
+            let mut queue: Vec<(SocketAddr, SocketAddr, Vec<u8>)> = Vec::new();
+            let t_pub = publisher.poll(clock, &mut queue, &mut events_pub);
+            let t_whip = whip.poll(clock, &mut queue, &mut events_whip);
+
+            for (src, dst, data) in queue.drain(..) {
+                deliver(&mut [&mut publisher, &mut whip], clock, src, dst, &data);
+            }
+
+            if publisher.rtc.is_connected() && whip.rtc.is_connected() {
+                connected = true;
+                break;
+            }
+
+            // Advance the clock to the earliest requested timeout (min 1ms step
+            // so a same-instant timeout still makes progress).
+            let next = t_pub.min(t_whip).max(clock + std::time::Duration::from_millis(1));
+            clock = next;
+            publisher
+                .rtc
+                .handle_input(Input::Timeout(clock))
+                .expect("pub timeout");
+            whip.rtc
+                .handle_input(Input::Timeout(clock))
+                .expect("whip timeout");
+        }
+
+        assert!(
+            connected,
+            "ICE+DTLS must reach Connected on both peers (pub_connected={}, whip_connected={})",
+            publisher.rtc.is_connected(),
+            whip.rtc.is_connected()
+        );
+
+        // --- 4) Publisher SRTP-encrypts and sends one H.264 RTP packet; the
+        // WhipSession must SRTP-decrypt it and surface Event::RtpPacket.
+        let params = publisher
+            .rtc
+            .codec_config()
+            .find(|p| p.spec().codec == Codec::H264)
+            .cloned()
+            .expect("publisher negotiated H.264");
+        let pt = params.pt();
+
+        // Get the publisher's tx stream for this video mid.
+        let ssrc: Ssrc = publisher
+            .rtc
+            .direct_api()
+            .stream_tx_by_mid(mid, None)
+            .expect("publisher has a video tx stream")
+            .ssrc();
+
+        // A single-NAL H.264 RTP payload (0x41 = non-IDR coded slice header).
+        let payload: Vec<u8> = vec![0x41, 0xDE, 0xAD, 0xBE, 0xEF];
+        let seq_no: SeqNo = 1_000u64.into();
+        let rtp_time: u32 = 90_000;
+        let wallclock = clock;
+        publisher
+            .rtc
+            .direct_api()
+            .stream_tx(&ssrc)
+            .expect("tx stream by ssrc")
+            .write_rtp(
+                pt,
+                seq_no,
+                rtp_time,
+                wallclock,
+                true, // marker: terminates the access unit
+                ExtensionValues::default(),
+                false,
+                payload.clone(),
+            )
+            .expect("write_rtp on the publisher");
+
+        // Pump until the WhipSession emits the RtpPacket (or we give up).
+        // RtpPacket is not Clone, so we capture the decrypted fields we assert on
+        // (payload bytes, payload type, marker) into owned values. Same loop
+        // shape as the handshake pump: poll both peers, deliver every queued
+        // datagram, scan the whip side's new events, then advance the clock.
+        let mut got_rtp: Option<(Vec<u8>, Pt, bool)> = None;
+        for _ in 0..4000 {
+            let mut queue: Vec<(SocketAddr, SocketAddr, Vec<u8>)> = Vec::new();
+            let t_pub = publisher.poll(clock, &mut queue, &mut events_pub);
+            let before = events_whip.len();
+            let t_whip = whip.poll(clock, &mut queue, &mut events_whip);
+
+            for (src, dst, data) in queue.drain(..) {
+                deliver(&mut [&mut publisher, &mut whip], clock, src, dst, &data);
+            }
+            // Drain any events the just-delivered datagrams produced.
+            whip.poll(clock, &mut queue, &mut events_whip);
+            publisher.poll(clock, &mut queue, &mut events_pub);
+            for (src, dst, data) in queue.drain(..) {
+                deliver(&mut [&mut publisher, &mut whip], clock, src, dst, &data);
+            }
+
+            for ev in &events_whip[before..] {
+                if let Event::RtpPacket(p) = ev {
+                    got_rtp = Some((
+                        p.payload.clone(),
+                        p.header.payload_type,
+                        p.header.marker,
+                    ));
+                }
+            }
+            if got_rtp.is_some() {
+                break;
+            }
+
+            let next = t_pub.min(t_whip).max(clock + std::time::Duration::from_millis(1));
+            clock = next;
+            publisher
+                .rtc
+                .handle_input(Input::Timeout(clock))
+                .expect("pub timeout");
+            whip.rtc
+                .handle_input(Input::Timeout(clock))
+                .expect("whip timeout");
+        }
+
+        let (got_payload, got_pt, got_marker) = got_rtp.expect(
+            "WhipSession must receive the publisher's H.264 RTP packet (SRTP decrypt succeeded)",
+        );
+        // The decrypted payload must match exactly what the publisher encrypted —
+        // proof the SRTP round-trip (encrypt → DTLS-keyed cipher → decrypt) is real.
+        assert_eq!(
+            &got_payload[..],
+            &payload[..],
+            "decrypted RTP payload must match the sent H.264 NAL"
+        );
+        assert_eq!(got_pt, pt, "payload type preserved");
+        assert!(got_marker, "marker bit preserved across SRTP");
+    }
+
     #[test]
     fn reorder_buffer_handles_seq_wraparound() {
         // Stream starts near u16::MAX. Push 65534, 0 (wrap), 65535 out of order.

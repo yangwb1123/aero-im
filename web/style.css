@@ -498,6 +498,8 @@ input, textarea, select, button { font-family: inherit; }
   font-size: 13px;
 }
 .msg-act:hover { background: var(--bg-3); color: var(--text); }
+/* Thread-mute toggle: dim the bell when this thread is muted for the viewer. */
+.msg-act-mute.muted { opacity: 0.65; }
 
 /* deleted / edited */
 .msg.deleted .msg-bubble { font-style: italic; opacity: .6; }
@@ -608,6 +610,41 @@ input, textarea, select, button { font-family: inherit; }
 }
 .thought-mark { margin-right: 4px; }
 
+/* interactive blocks (Block Kit-lite Button / Select) */
+.block-btn {
+  display: inline-block;
+  margin: 4px 6px 2px 0;
+  padding: 5px 12px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  background: var(--bg-1);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  cursor: pointer;
+  text-decoration: none;
+  line-height: 1.4;
+}
+.block-btn:hover { border-color: var(--brand-1); }
+.block-btn:disabled { opacity: .6; cursor: default; }
+.block-btn-primary { background: var(--brand-1); border-color: var(--brand-1); color: #fff; }
+.block-btn-danger { background: #c0392b; border-color: #c0392b; color: #fff; }
+.block-btn-done { opacity: .7; }
+.block-btn-done::after { content: ' ✓'; }
+.block-select-wrap { margin: 4px 0 2px; }
+.block-select {
+  font-size: 13px;
+  padding: 5px 8px;
+  color: var(--text);
+  background: var(--bg-1);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  max-width: 100%;
+}
+.block-select:hover { border-color: var(--brand-1); }
+.block-select:disabled { opacity: .6; }
+.block-select-done .block-select { border-color: var(--brand-1); }
+
 /* composer extras (attachment + AI buttons) */
 .composer {
   grid-template-columns: auto 1fr auto;
@@ -625,6 +662,31 @@ input, textarea, select, button { font-family: inherit; }
   transition: background .12s ease, color .12s ease;
 }
 .composer-aux button:hover { color: var(--text); background: var(--bg-3); }
+#md-toggle-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0 8px;
+  height: 38px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--text-mute);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  user-select: none;
+}
+#md-toggle-label:hover { color: var(--text); background: var(--bg-3); }
+#md-toggle:checked + span { color: var(--text); }
+/* inline markdown spans inside rendered Text blocks */
+.md-link { color: var(--accent, #5b9dff); text-decoration: underline; }
+.md-code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  background: var(--bg-3);
+  padding: 1px 4px;
+  border-radius: 4px;
+  font-size: .92em;
+}
 .composer-aux button.recording {
   background: rgba(239, 68, 68, .18);
   color: var(--danger);
@@ -745,6 +807,43 @@ input, textarea, select, button { font-family: inherit; }
   cursor: pointer;
 }
 .ai-cite:hover { color: var(--text); }
+
+/* notification inbox */
+.btn-notif { position: relative; }
+.notif-badge {
+  position: absolute;
+  top: -5px; right: -5px;
+  min-width: 16px; height: 16px;
+  padding: 0 4px;
+  border-radius: 999px;
+  background: var(--danger, #ef4444);
+  color: #fff;
+  font-size: 10px; line-height: 16px;
+  text-align: center;
+  font-weight: 700;
+  box-shadow: 0 0 0 2px var(--bg-1);
+}
+.notif-row {
+  background: var(--bg-2);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-bottom: 8px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.notif-row:hover { border-color: #3a4258; }
+.notif-row.notif-unread { background: var(--bg-3); }
+.notif-row.notif-important { border-left: 3px solid var(--brand-1, #6366f1); }
+.notif-row-top { display: flex; align-items: center; gap: 6px; }
+.notif-text { flex: 1; word-break: break-word; }
+.notif-dot {
+  flex: none;
+  width: 8px; height: 8px;
+  border-radius: 999px;
+  background: var(--brand-1, #6366f1);
+}
+.notif-meta { font-size: 11px; margin-top: 4px; }
 
 /* emoji picker */
 .emoji-pop {
