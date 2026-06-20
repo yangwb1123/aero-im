@@ -328,6 +328,18 @@ impl ParticipantRepo {
             "DELETE FROM ban_appeals WHERE appellant_id = $1",
             "DELETE FROM message_reports WHERE reporter_id = $1",
             "DELETE FROM user_reports WHERE reporter_id = $1",
+            // Data-export jobs the user requested (0070). `blob_id` points at a FULL
+            // PII export of their account, and `error` can embed PII — yet the
+            // participant_id FK is ON DELETE CASCADE, which (like login_events) never
+            // fires because erasure tombstones the participant. Delete their own jobs
+            // explicitly. (The archive blob itself is reclaimed by export retention /
+            // blob GC; this removes the job row and its re-identifying linkage.)
+            "DELETE FROM export_jobs WHERE participant_id = $1",
+            // The user's OWN block list (0106) — a personal preference like
+            // dnd_settings / channel_mutes above. Blocks are blocker-private, so
+            // removing the erased user's entries changes nothing for anyone else;
+            // rows where they are the BLOCKED party (others' lists) are kept.
+            "DELETE FROM user_blocks WHERE blocker_id = $1",
         ] {
             sqlx::query(stmt).bind(participant_id.to_uuid()).execute(&mut *tx).await?;
         }

@@ -438,6 +438,27 @@
             .execute(&p)
             .await
             .expect("user_report about id");
+        // export_jobs: the user's own export job (deleted) + another's (kept).
+        for pid in [id.to_uuid(), other.to_uuid()] {
+            sqlx::query("INSERT INTO export_jobs (participant_id) VALUES ($1)")
+                .bind(pid)
+                .execute(&p)
+                .await
+                .expect("export_job");
+        }
+        // user_blocks: a block BY the erased user (deleted) + one ABOUT them (kept).
+        sqlx::query("INSERT INTO user_blocks (blocker_id, blocked_id) VALUES ($1,$2)")
+            .bind(id.to_uuid())
+            .bind(other.to_uuid())
+            .execute(&p)
+            .await
+            .expect("block by id");
+        sqlx::query("INSERT INTO user_blocks (blocker_id, blocked_id) VALUES ($1,$2)")
+            .bind(other.to_uuid())
+            .bind(id.to_uuid())
+            .execute(&p)
+            .await
+            .expect("block about id");
 
         assert!(participants.delete_participant(id).await.expect("erase"));
 
@@ -446,6 +467,8 @@
             ("ban_appeals", "appellant_id"),
             ("message_reports", "reporter_id"),
             ("user_reports", "reporter_id"),
+            ("export_jobs", "participant_id"),
+            ("user_blocks", "blocker_id"),
         ] {
             let c: (i64,) = sqlx::query_as(&format!("SELECT count(*) FROM {table} WHERE {col} = $1"))
                 .bind(id.to_uuid())
@@ -454,11 +477,13 @@
                 .expect("count own");
             assert_eq!(c.0, 0, "{table} authored by the erased user must be deleted");
         }
-        // Rows authored by OTHERS survive — including the report ABOUT the erased user.
+        // Rows authored by OTHERS survive — including reports/blocks ABOUT the erased user.
         for (table, col, val) in [
             ("ban_appeals", "appellant_id", other_appellant),
             ("message_reports", "reporter_id", other.to_uuid()),
             ("user_reports", "reported_id", id.to_uuid()),
+            ("export_jobs", "participant_id", other.to_uuid()),
+            ("user_blocks", "blocked_id", id.to_uuid()),
         ] {
             let c: (i64,) = sqlx::query_as(&format!("SELECT count(*) FROM {table} WHERE {col} = $1"))
                 .bind(val)
