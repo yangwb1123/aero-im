@@ -92,6 +92,14 @@ pub(crate) async fn serve(
                         if evicted > 0 {
                             tracing::debug!(evicted, "rate-limiter idle-bucket sweep");
                         }
+                        // Spam-guard per-sender accounting map (in-process backend):
+                        // same unbounded-growth risk as the rate-limit buckets, so
+                        // evict idle senders on the same cadence. No-op for the Redis
+                        // backend (self-expiring) or when the guard is disabled.
+                        let spam_evicted = sweep_state.im.sweep_spam_guard(now);
+                        if spam_evicted > 0 {
+                            tracing::debug!(evicted = spam_evicted, "spam-guard idle-sender sweep");
+                        }
                     }
                 }
             }

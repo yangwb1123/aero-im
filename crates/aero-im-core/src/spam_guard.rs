@@ -97,6 +97,13 @@ trait ActivityStore: Send + Sync {
         content_hash: u64,
         now: Instant,
     ) -> SpamDecision;
+
+    /// Evict idle senders whose entire event window has aged out. Returns the count
+    /// removed. Default: no-op — the Redis backend self-expires via per-key TTL, so
+    /// only the in-process map needs a manual sweep.
+    fn sweep_idle(&self, _now: Instant) -> usize {
+        0
+    }
 }
 
 /// In-process `DashMap` backend (the historical default). No `.await` is held
@@ -147,6 +154,21 @@ impl ActivityStore for InProcessActivityStore {
             return SpamDecision::Throttle(SpamReason::Fanout);
         }
         SpamDecision::Allow
+    }
+
+    /// Drop senders whose NEWEST recorded event has aged past the window — they
+    /// hold no live events, so without this the `senders` map accumulates one entry
+    /// per distinct sender for the whole process lifetime (an unbounded leak; the
+    /// Redis backend EXPIREs idle keys instead). An evicted sender is recreated
+    /// cheaply on their next send. `retain` holds the shard lock only per-entry.
+    fn sweep_idle(&self, now: Instant) -> usize {
+        let before = self.senders.len();
+        self.senders.retain(|_, act| {
+            act.events
+                .back()
+                .map_or(false, |(t, _, _)| now.duration_since(*t) <= self.thresholds.window)
+        });
+        before.saturating_sub(self.senders.len())
     }
 }
 
@@ -302,6 +324,15 @@ impl SpamGuard {
                 senders: DashMap::new(),
             }),
         }
+    }
+
+    /// Evict idle senders from the in-process accounting map (no-op for the Redis
+    /// backend, which self-expires). MUST be called periodically by a background
+    /// sweep, or the per-sender map grows one entry per distinct sender for the
+    /// process lifetime. Returns the count evicted.
+    #[must_use]
+    pub fn sweep_idle(&self, now: Instant) -> usize {
+        self.store.sweep_idle(now)
     }
 
     /// Redis-backed guard (cross-node aggregation). Opt-in; strictly fail-open.
@@ -510,5 +541,36 @@ mod redis_tests {
             g.record(sender, RoomId::new(), hash, t0).await,
             SpamDecision::Throttle(SpamReason::Fanout)
         );
+    }
+
+    /// `sweep_idle` evicts only senders whose newest event has aged past the window
+    /// (the in-process map otherwise grows one entry per distinct sender forever),
+    /// keeps still-active senders, and is idempotent. Guards the unbounded-growth fix.
+    #[tokio::test]
+    async fn sweep_idle_evicts_only_idle_senders() {
+        // Self-contained (this is the Redis-tests module; the in-process guard()
+        // helper lives in the sibling `tests` module).
+        let g = SpamGuard::new(SpamThresholds {
+            window: std::time::Duration::from_secs(10),
+            max_messages: 5,
+            max_rooms: 3,
+            max_duplicates: 5,
+        });
+        let alice = ParticipantId::new();
+        let bob = ParticipantId::new();
+        let room = RoomId::new();
+        let t0 = Instant::now();
+        g.record(alice, room, 1, t0).await;
+        g.record(bob, room, 2, t0).await;
+        // Both within the window: nothing evicted.
+        assert_eq!(g.sweep_idle(t0 + Duration::from_secs(5)), 0);
+        // Bob sends again, refreshing his window.
+        g.record(bob, room, 3, t0 + Duration::from_secs(8)).await;
+        // At t0+15s: alice's newest event (t0) is 15s old > 10s window → evicted;
+        // bob's (t0+8) is 7s old → kept.
+        assert_eq!(g.sweep_idle(t0 + Duration::from_secs(15)), 1);
+        // At t0+25s bob is idle too → evicted; then idempotent.
+        assert_eq!(g.sweep_idle(t0 + Duration::from_secs(25)), 1);
+        assert_eq!(g.sweep_idle(t0 + Duration::from_secs(30)), 0);
     }
 }

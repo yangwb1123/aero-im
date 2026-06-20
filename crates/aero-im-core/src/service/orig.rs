@@ -339,6 +339,15 @@ impl ImService {
         self.spam_guard = Some(guard);
         self
     }
+
+    /// Periodically evict idle senders from the in-process spam-guard map (no-op
+    /// without a guard, or with the self-expiring Redis backend). The boot rate-limit
+    /// sweep loop calls this so the per-sender accounting map can't grow unbounded
+    /// over the process lifetime. Returns the count evicted.
+    #[must_use]
+    pub fn sweep_spam_guard(&self, now: std::time::Instant) -> usize {
+        self.spam_guard.as_ref().map_or(0, |g| g.sweep_idle(now))
+    }
     /// Wire a PII detector (ROADMAP5 方向五). Additive — without it `send_message`
     /// does no PII screening.
     #[must_use]
