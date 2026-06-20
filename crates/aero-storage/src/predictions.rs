@@ -435,9 +435,16 @@ impl PredictionRepo {
     ) -> Result<Vec<(ParticipantId, i64)>, ResolveError> {
         let mut tx = self.pool.begin().await?;
 
-        // Resolve + gate inside the tx.
+        // Resolve + gate inside the tx. `FOR UPDATE` is REQUIRED, not optional: the
+        // payout below credits winners via an ADDITIVE ledger upsert, so a second
+        // concurrent resolve() that also passes this gate would pay the whole pool
+        // out TWICE (channel-points double-spend). Without the row lock, at READ
+        // COMMITTED both txns read status='locked' before either commits. The lock
+        // serializes them — the loser blocks here until the winner commits, then
+        // re-reads status='resolved' and aborts via the BadState gate below. (The
+        // sibling `lock`/`cancel` already guard their status transition this way.)
         let row = sqlx::query_as::<_, (String,)>(
-            r"SELECT status FROM predictions WHERE id = $1",
+            r"SELECT status FROM predictions WHERE id = $1 FOR UPDATE",
         )
         .bind(prediction.to_uuid())
         .fetch_optional(&mut *tx)

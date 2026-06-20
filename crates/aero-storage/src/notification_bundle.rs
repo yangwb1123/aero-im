@@ -86,15 +86,27 @@ impl NotificationBundleRepo {
     ) -> Result<FlushResult, sqlx::Error> {
         use sqlx::Row;
 
-        // 1. Select all bundles older than deadline, locked for deletion.
+        // Flush MUST be transactional with row locks: it is spawned once PER NODE
+        // (background.rs), so on a multi-node deploy two flushers tick concurrently.
+        // Without locking, both SELECT the same expired bundles and both INSERT the
+        // notifications → every recipient is notified TWICE (and the downstream
+        // NotifyBatch delivery_id is regenerated per flush, so its `ON CONFLICT`
+        // dedup can't collapse the duplicate). `FOR UPDATE SKIP LOCKED` claims each
+        // bundle row for exactly one flusher; the other skips it. The INSERT+DELETE
+        // then commit atomically with the claim.
+        let mut tx = self.pool.begin().await?;
+
+        // 1. Select expired bundles, claimed for THIS flusher only (skip rows another
+        //    node already locked).
         let bundles = sqlx::query_as::<_, BundleRow>(
             r"SELECT id, participant_id, room_id, message_id, kind, actor_id, thread_root
                 FROM notification_bundles
                WHERE created_at < now() - make_interval(secs => $1)
-               ORDER BY participant_id, room_id, thread_root, created_at",
+               ORDER BY participant_id, room_id, thread_root, created_at
+               FOR UPDATE SKIP LOCKED",
         )
         .bind(self.deadline.as_secs() as f64)
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
 
         if bundles.is_empty() {
@@ -146,7 +158,7 @@ impl NotificationBundleRepo {
                 .bind(first.kind.as_str())
                 .bind(actor)
                 .bind(created)
-                .execute(&self.pool)
+                .execute(&mut *tx)
                 .await?;
 
                 inserted.push(InsertedNotification {
@@ -172,7 +184,7 @@ impl NotificationBundleRepo {
                 .bind(actor)
                 .bind(created)
                 .bind(n as i32)
-                .execute(&self.pool)
+                .execute(&mut *tx)
                 .await?;
 
                 inserted.push(InsertedNotification {
@@ -189,13 +201,16 @@ impl NotificationBundleRepo {
             }
         }
 
-        // 4. Delete consumed bundles.
+        // 4. Delete consumed bundles (still inside the tx, so the claim + insert +
+        //    delete commit atomically).
         if !all_ids.is_empty() {
             sqlx::query("DELETE FROM notification_bundles WHERE id = ANY($1)")
                 .bind(&all_ids)
-                .execute(&self.pool)
+                .execute(&mut *tx)
                 .await?;
         }
+
+        tx.commit().await?;
 
         Ok(FlushResult {
             bundles_consumed: all_ids.len() as u64,

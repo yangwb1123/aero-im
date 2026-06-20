@@ -174,9 +174,15 @@ impl WebhookDeliveryRepo {
         Ok(res.rows_affected())
     }
 
-    /// Record a brand-new delivery attempt in `pending` state with `attempts = 1`
-    /// (the dispatcher records the row as it makes the first send). Returns the
-    /// generated id so a subsequent `mark_*` can target it.
+    /// Claim a brand-new delivery attempt in `pending` state with `attempts = 1`
+    /// (the dispatcher records the row as it makes the first send).
+    ///
+    /// IDEMPOTENT on `(webhook_id, event_id)` when `event_id` is set: returns
+    /// `Ok(Some(id))` when THIS call claimed the delivery (proceed to POST), or
+    /// `Ok(None)` when a delivery for that event→endpoint was already recorded —
+    /// i.e. a JetStream redelivery — so the caller MUST skip the duplicate POST.
+    /// A NULL `event_id` is never deduped (no correlation id), so it always claims.
+    /// Backed by the partial unique index from migration 0150.
     ///
     /// # Errors
     /// Propagates any [`sqlx::Error`] (e.g. an unknown `webhook` FK).
@@ -184,19 +190,21 @@ impl WebhookDeliveryRepo {
         &self,
         webhook: WebhookId,
         event_id: Option<&str>,
-    ) -> Result<WebhookDeliveryId, sqlx::Error> {
+    ) -> Result<Option<WebhookDeliveryId>, sqlx::Error> {
         let id = WebhookDeliveryId::new();
-        sqlx::query(
+        let row: Option<(uuid::Uuid,)> = sqlx::query_as(
             r"INSERT INTO webhook_delivery_log
                   (id, webhook_id, event_id, status, attempts, created_at, updated_at)
-               VALUES ($1, $2, $3, 'pending', 1, now(), now())",
+               VALUES ($1, $2, $3, 'pending', 1, now(), now())
+               ON CONFLICT (webhook_id, event_id) WHERE event_id IS NOT NULL DO NOTHING
+               RETURNING id",
         )
         .bind(id.to_uuid())
         .bind(webhook.to_uuid())
         .bind(event_id)
-        .execute(&self.pool)
+        .fetch_optional(&self.pool)
         .await?;
-        Ok(id)
+        Ok(row.map(|_| id))
     }
 
     /// Mark a delivery `delivered` (a 2xx). Clears any pending retry. Idempotent
@@ -552,7 +560,7 @@ mod db_tests {
         let hook = fixture(&p).await;
 
         // Record the first attempt (attempts = 1, pending).
-        let id = repo.record_attempt(hook, Some("evt-1")).await.unwrap();
+        let id = repo.record_attempt(hook, Some("evt-1")).await.unwrap().expect("first claim");
         let row = repo.get(id).await.unwrap().expect("row exists");
         assert_eq!(row.status, "pending");
         assert_eq!(row.attempts, 1);
@@ -603,7 +611,7 @@ mod db_tests {
         let repo = WebhookDeliveryRepo::new(p.clone());
         let hook = fixture(&p).await;
 
-        let id = repo.record_attempt(hook, None).await.unwrap();
+        let id = repo.record_attempt(hook, None).await.unwrap().expect("null event_id always claims");
         repo.mark_delivered(id, 200).await.unwrap();
         let row = repo.get(id).await.unwrap().unwrap();
         assert_eq!(row.status, "delivered");
@@ -614,5 +622,29 @@ mod db_tests {
         assert!(repo.list_dead(hook, None).await.unwrap().iter().all(|d| d.id != id));
         let far = OffsetDateTime::now_utc() + Duration::days(365);
         assert!(repo.claim_due(far, 10).await.unwrap().iter().all(|d| d.id != id));
+    }
+
+    /// JetStream redelivery (or a client retry) of the SAME event to the SAME
+    /// endpoint must NOT trigger a second external POST: `record_attempt` claims
+    /// `(webhook_id, event_id)` once (Some), and a redelivery is deduped (None) so
+    /// the dispatcher skips it. NULL event_id (no correlation id) is never deduped.
+    /// Guards migration 0150's partial unique index + the ON CONFLICT claim.
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn record_attempt_is_idempotent_per_event() {
+        let p = pool();
+        let repo = WebhookDeliveryRepo::new(p.clone());
+        let hook = fixture(&p).await;
+
+        let first = repo.record_attempt(hook, Some("evt-dup")).await.unwrap();
+        assert!(first.is_some(), "first delivery of an event claims");
+        let second = repo.record_attempt(hook, Some("evt-dup")).await.unwrap();
+        assert!(second.is_none(), "redelivery of the same event must NOT claim again (no duplicate POST)");
+        let other = repo.record_attempt(hook, Some("evt-other")).await.unwrap();
+        assert!(other.is_some(), "a different event for the same hook still claims");
+        // NULL event_id carries no correlation id → never deduped.
+        let n1 = repo.record_attempt(hook, None).await.unwrap();
+        let n2 = repo.record_attempt(hook, None).await.unwrap();
+        assert!(n1.is_some() && n2.is_some(), "null event_id always claims (no dedup)");
     }
 }

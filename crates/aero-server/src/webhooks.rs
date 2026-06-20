@@ -350,10 +350,13 @@ async fn dispatch_event<S: WebhookSender + ?Sized>(
             metrics::inc_counter(names::WEBHOOK_BREAKER_OPEN_SKIPS_TOTAL, 1);
             continue;
         }
-        // Record the (first) attempt up front so even a crash mid-send leaves a
-        // durable trace; attempts=1 after record_attempt.
+        // Claim + record the (first) attempt up front so even a crash mid-send
+        // leaves a durable trace. The claim is IDEMPOTENT on (webhook_id, event_id):
+        // `None` means this exact event→endpoint was already delivered (a JetStream
+        // redelivery after a crash-before-ack), so skip the duplicate external POST.
         let delivery_id = match deliveries.record_attempt(target.id, event_id.as_deref()).await {
-            Ok(id) => id,
+            Ok(Some(id)) => id,
+            Ok(None) => continue,
             Err(e) => {
                 warn!(error = ?e, %room, kind, hook = %target.id, "webhook dispatch: record failed");
                 continue;

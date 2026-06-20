@@ -2651,7 +2651,10 @@ async fn whip_post(
                         );
                         let event_id = Some(stream.id.to_string());
                         match delivery_repo.record_attempt(target.id, event_id.as_deref()).await {
-                            Ok(delivery_id) => {
+                            // `None` = this stream.live event was already delivered to
+                            // this endpoint (idempotent claim); skip the duplicate POST.
+                            Ok(None) => {}
+                            Ok(Some(delivery_id)) => {
                                 use aero_storage::WebhookSender;
                                 match sender.deliver(&delivery).await {
                                     // Delivery-log bookkeeping keys on the numeric

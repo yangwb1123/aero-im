@@ -199,28 +199,24 @@ impl RecoveryCodeRepo {
         code: &str,
     ) -> Result<bool, sqlx::Error> {
         let code = code.trim().to_ascii_uppercase();
-        // Fetch the row id of the matching unused code.
-        let row: Option<(uuid::Uuid,)> = sqlx::query_as(
-            "SELECT id FROM recovery_codes \
-             WHERE participant_id = $1 AND code = $2 AND used_at IS NULL",
+        // Consume the one-time code ATOMICALLY: a single conditional UPDATE whose
+        // `used_at IS NULL` guard IS the check. A prior SELECT-then-UPDATE was a
+        // TOCTOU — two concurrent verifications of the same code both saw it unused
+        // and both succeeded, honoring a one-time recovery code twice (MFA bypass).
+        // Now exactly one writer's UPDATE matches the `used_at IS NULL` row; the
+        // other matches no row → `false`. `RETURNING id` distinguishes consumed
+        // (row) from already-used/wrong (no row).
+        let consumed: Option<(uuid::Uuid,)> = sqlx::query_as(
+            "UPDATE recovery_codes SET used_at = NOW() \
+             WHERE participant_id = $1 AND code = $2 AND used_at IS NULL \
+             RETURNING id",
         )
         .bind(participant.to_uuid())
         .bind(&code)
         .fetch_optional(&self.pool)
         .await?;
 
-        match row {
-            Some((id,)) => {
-                sqlx::query(
-                    "UPDATE recovery_codes SET used_at = NOW() WHERE id = $1",
-                )
-                .bind(id)
-                .execute(&self.pool)
-                .await?;
-                Ok(true)
-            }
-            None => Ok(false),
-        }
+        Ok(consumed.is_some())
     }
 
     /// Count how many unused recovery codes `participant` currently has.
