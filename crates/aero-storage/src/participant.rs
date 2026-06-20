@@ -313,6 +313,21 @@ impl ParticipantRepo {
             // table must be wired into erasure; CASCADE is not enough because
             // erasure is a tombstone, not a hard delete).
             "DELETE FROM participant_ai_profiles WHERE participant_id = $1",
+            // Moderation reports / ban appeals AUTHORED BY the erased user. Each row
+            // carries the user's own free-text `reason` / `appeal_reason` PII and is
+            // keyed by them as the author, so scope to the authoring column: only the
+            // erased user's OWN submissions go. Rows ABOUT them (message_reports /
+            // user_reports on `reported_id`, appeals decided by other reviewers) are
+            // kept as other users' moderation/governance records — the same
+            // "erase OWN data, keep cross-user records" stance as reactions/poll_votes.
+            //   - ban_appeals (0091): no FK → never cascades; delete explicitly.
+            //   - message_reports (0093): no FK on reporter_id → never cascades.
+            //   - user_reports (0112): reporter_id FK is ON DELETE CASCADE, but erasure
+            //     TOMBSTONES the participant (UPDATE) so the cascade never fires —
+            //     delete explicitly (same reasoning as login_events / call_participants).
+            "DELETE FROM ban_appeals WHERE appellant_id = $1",
+            "DELETE FROM message_reports WHERE reporter_id = $1",
+            "DELETE FROM user_reports WHERE reporter_id = $1",
         ] {
             sqlx::query(stmt).bind(participant_id.to_uuid()).execute(&mut *tx).await?;
         }

@@ -96,6 +96,19 @@ impl AuthService {
         self
     }
 
+    /// Periodic maintenance hook: evict decision-dead entries from the in-process
+    /// login throttle so its failure map cannot grow unbounded under
+    /// credential-stuffing across many distinct accounts. No-op when the throttle
+    /// is disabled (the default) or Redis-backed (self-expiring). `now` is unix
+    /// seconds. Returns the number of entries removed. Driven from the gateway's
+    /// periodic sweep loop alongside the rate-limiter / spam-guard sweeps.
+    pub async fn sweep_login_throttle(&self, now: i64) -> usize {
+        match &self.login_throttle {
+            Some(t) => t.sweep(now).await,
+            None => 0,
+        }
+    }
+
     /// Enable Personal Access Token authentication by injecting the verifier that
     /// resolves a hashed PAT to its owner (typically an
     /// [`aero_storage::PatRepo`], which implements

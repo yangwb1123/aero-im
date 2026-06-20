@@ -107,6 +107,30 @@ pub(crate) async fn serve(
                         if spam_evicted > 0 {
                             tracing::debug!(evicted = spam_evicted, "spam-guard idle-sender sweep");
                         }
+                        // Slow-mode last-post map (process-static, NOT in AppState, so
+                        // it is unreachable from the limiter sweeps above). Evict only
+                        // entries older than the max slow-mode window — younger ones
+                        // can still gate a post, so MIN_SAFE_SWEEP_IDLE (not the short
+                        // limiter `idle`) is the floor.
+                        let slowmode_evicted = aero_server::stream_chat_modes::sweep_idle(
+                            now,
+                            aero_server::stream_chat_modes::MIN_SAFE_SWEEP_IDLE,
+                        );
+                        if slowmode_evicted > 0 {
+                            tracing::debug!(evicted = slowmode_evicted, "slow-mode last-post sweep");
+                        }
+                        // In-process login-throttle failure map (no-op when the
+                        // throttle is off/Redis-backed). Lives in AuthService, not a
+                        // limiter, and self-determines staleness from its own window/
+                        // lockout config, so it takes a unix-seconds `now`.
+                        let now_unix = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0);
+                        let throttle_evicted = sweep_state.auth.sweep_login_throttle(now_unix).await;
+                        if throttle_evicted > 0 {
+                            tracing::debug!(evicted = throttle_evicted, "login-throttle idle sweep");
+                        }
                     }
                 }
             }

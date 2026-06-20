@@ -382,6 +382,93 @@
         }
     }
 
+    /// GDPR erasure must delete moderation reports / ban appeals AUTHORED BY the
+    /// erased user (their free-text `reason` / `appeal_reason` is PII), while
+    /// keeping rows authored by OTHERS — including reports ABOUT the erased user —
+    /// as other users' governance records. None of the three tables cascades on a
+    /// tombstone erasure (ban_appeals / message_reports have no FK; user_reports'
+    /// `reporter_id` cascade never fires because the participant is tombstoned, not
+    /// hard-deleted), so the explicit DELETEs in `delete_participant` are load-bearing.
+    #[tokio::test]
+    #[ignore = "requires running Postgres with migrations applied"]
+    async fn erasure_clears_authored_moderation_reports() {
+        let p = pool();
+        let participants = ParticipantRepo::new(p.clone());
+        let id = participant(&p).await; // the erased user
+        let other = participant(&p).await; // a different actor / target
+
+        let other_appellant = uuid::Uuid::new_v4();
+        // ban_appeals: the user's own appeal (deleted) + another's (kept).
+        for (appellant, reason) in [(id.to_uuid(), "my appeal"), (other_appellant, "their appeal")] {
+            sqlx::query(
+                "INSERT INTO ban_appeals (id, stream_id, appellant_id, appeal_reason) VALUES ($1,$2,$3,$4)",
+            )
+            .bind(uuid::Uuid::new_v4())
+            .bind(uuid::Uuid::new_v4())
+            .bind(appellant)
+            .bind(reason)
+            .execute(&p)
+            .await
+            .expect("ban_appeal");
+        }
+        // message_reports: the user's own report (deleted) + another's (kept).
+        for reporter in [id.to_uuid(), other.to_uuid()] {
+            sqlx::query(
+                "INSERT INTO message_reports (id, workspace_id, message_id, reporter_id, reason) \
+                 VALUES ($1,$2,$3,$4,'spam')",
+            )
+            .bind(uuid::Uuid::new_v4())
+            .bind(WorkspaceId(ulid::Ulid(0)).to_uuid())
+            .bind(uuid::Uuid::new_v4())
+            .bind(reporter)
+            .execute(&p)
+            .await
+            .expect("message_report");
+        }
+        // user_reports: a report BY the erased user (deleted) + one ABOUT them (kept).
+        sqlx::query("INSERT INTO user_reports (reporter_id, reported_id, reason) VALUES ($1,$2,'rude')")
+            .bind(id.to_uuid())
+            .bind(other.to_uuid())
+            .execute(&p)
+            .await
+            .expect("user_report by id");
+        sqlx::query("INSERT INTO user_reports (reporter_id, reported_id, reason) VALUES ($1,$2,'rude')")
+            .bind(other.to_uuid())
+            .bind(id.to_uuid())
+            .execute(&p)
+            .await
+            .expect("user_report about id");
+
+        assert!(participants.delete_participant(id).await.expect("erase"));
+
+        // The erased user's OWN authored rows are gone.
+        for (table, col) in [
+            ("ban_appeals", "appellant_id"),
+            ("message_reports", "reporter_id"),
+            ("user_reports", "reporter_id"),
+        ] {
+            let c: (i64,) = sqlx::query_as(&format!("SELECT count(*) FROM {table} WHERE {col} = $1"))
+                .bind(id.to_uuid())
+                .fetch_one(&p)
+                .await
+                .expect("count own");
+            assert_eq!(c.0, 0, "{table} authored by the erased user must be deleted");
+        }
+        // Rows authored by OTHERS survive — including the report ABOUT the erased user.
+        for (table, col, val) in [
+            ("ban_appeals", "appellant_id", other_appellant),
+            ("message_reports", "reporter_id", other.to_uuid()),
+            ("user_reports", "reported_id", id.to_uuid()),
+        ] {
+            let c: (i64,) = sqlx::query_as(&format!("SELECT count(*) FROM {table} WHERE {col} = $1"))
+                .bind(val)
+                .fetch_one(&p)
+                .await
+                .expect("count kept");
+            assert_eq!(c.0, 1, "{table} authored by / about others must be kept");
+        }
+    }
+
     /// A deleted participant's Personal Access Token must STOP authenticating —
     /// the highest-severity erasure gap (a surviving credential = ongoing API
     /// access for a "deleted" account). Both halves are exercised: erasure deletes

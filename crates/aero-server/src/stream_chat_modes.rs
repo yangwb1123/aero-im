@@ -27,7 +27,7 @@
 
 use std::str::FromStr;
 use std::sync::LazyLock;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use aero_common::{Error as AeroError, ParticipantId, Result as AeroResult};
 use aero_storage::{
@@ -247,6 +247,37 @@ fn slow_mode_check_and_record(
     Ok(())
 }
 
+/// Evict slow-mode bookkeeping entries older than `idle_after` from the
+/// process-static [`LAST_POST`] map, returning how many were removed.
+///
+/// `LAST_POST` is keyed by `(stream, viewer)` and gains one never-overwritten
+/// entry per distinct viewer that ever posts under slow mode, so without a sweep
+/// it grows unbounded over the process lifetime (it is NOT in `AppState`, so the
+/// gateway's rate-limiter sweep loop cannot reach it). An entry only gates a post
+/// while it is younger than the slow-mode window (≤ [`MAX_SLOW_MODE_SECS`]); once
+/// older, a missing key behaves identically (both ⇒ allowed), so dropping it
+/// cannot change any future decision. Call with `idle_after >= MAX_SLOW_MODE_SECS`
+/// so a still-relevant entry is never evicted (fail-safe toward enforcement,
+/// mirroring [`crate::rate_limit`]'s `sweep_idle`).
+pub fn sweep_idle(now: Instant, idle_after: Duration) -> usize {
+    // Count evictions INSIDE retain rather than diffing len() before/after: this
+    // map is a shared static, so a concurrent post could insert between two len()
+    // reads and make the difference underflow. This counts exactly what this call
+    // dropped, regardless of concurrent inserts.
+    let mut removed = 0usize;
+    LAST_POST.retain(|_, last| {
+        let keep = now.saturating_duration_since(*last) < idle_after;
+        removed += usize::from(!keep);
+        keep
+    });
+    removed
+}
+
+/// The smallest `idle_after` that can never evict an entry still able to gate a
+/// post: the maximum configurable slow-mode window. Exposed so the sweep loop
+/// passes a provably-safe threshold.
+pub const MIN_SAFE_SWEEP_IDLE: Duration = Duration::from_secs(MAX_SLOW_MODE_SECS as u64);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -279,5 +310,33 @@ mod tests {
             slow_mode_check_and_record(s2, a, 30).is_ok(),
             "the same sender in a different stream is independent"
         );
+    }
+
+    #[test]
+    fn sweep_idle_evicts_stale_but_keeps_active_entries() {
+        // Unique keys so this never collides with the other tests sharing the
+        // process-static map. A 60s threshold evicts only entries older than 60s,
+        // so concurrent tests' freshly-recorded entries (≈0s old) always survive.
+        let stale_key = (Ulid::new(), ParticipantId::new());
+        let active_key = (Ulid::new(), ParticipantId::new());
+        let now = Instant::now();
+        let stale = now
+            .checked_sub(Duration::from_secs(120))
+            .expect("instant 120s in the past is representable");
+        LAST_POST.insert(stale_key, stale);
+        LAST_POST.insert(active_key, now);
+
+        let removed = sweep_idle(Instant::now(), Duration::from_secs(60));
+
+        assert!(removed >= 1, "the stale entry must be evicted");
+        assert!(
+            LAST_POST.get(&stale_key).is_none(),
+            "an entry older than idle_after is dropped (a missing key == allowed)"
+        );
+        assert!(
+            LAST_POST.get(&active_key).is_some(),
+            "an entry within the window must survive so it can still gate posts"
+        );
+        LAST_POST.remove(&active_key); // don't leak our own key into other tests
     }
 }

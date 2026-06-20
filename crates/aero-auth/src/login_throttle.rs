@@ -98,6 +98,12 @@ trait FailureStore: Send + Sync {
     async fn is_locked(&self, key: &str, now: i64) -> bool;
     async fn record_failure(&self, key: &str, now: i64);
     async fn record_success(&self, key: &str);
+    /// Evict entries that can no longer affect any decision. Default no-op — the
+    /// Redis backend self-expires via TTL, so only the in-process map needs it.
+    /// Returns the number of entries removed.
+    async fn sweep(&self, _now: i64) -> usize {
+        0
+    }
 }
 
 /// In-process `Mutex<HashMap>` backend (the historical default). No `.await` is
@@ -123,6 +129,22 @@ impl FailureStore for InProcessFailureStore {
     async fn record_success(&self, key: &str) {
         let mut states = self.states.lock().unwrap_or_else(PoisonError::into_inner);
         states.remove(key);
+    }
+
+    async fn sweep(&self, now: i64) -> usize {
+        let mut states = self.states.lock().unwrap_or_else(PoisonError::into_inner);
+        let before = states.len();
+        // Keep an entry only while it can still gate a login: it is currently
+        // locked, OR it holds failures within the live accumulation window. Past
+        // both (lock expired AND window lapsed) it is indistinguishable from an
+        // absent key — `record_failure` would restart from a clean state — so
+        // dropping it changes no future decision. Without this, every failed
+        // attempt against a DISTINCT account (incl. non-existent emails) leaves a
+        // permanent entry only a process restart would clear.
+        states.retain(|_, s| {
+            s.is_locked(now) || (s.count > 0 && now - s.first_failure_at <= self.cfg.window_secs)
+        });
+        before - states.len()
     }
 }
 
@@ -277,6 +299,15 @@ impl LoginThrottle {
     pub async fn record_success(&self, account: &str) {
         self.store.record_success(&Self::key(account)).await;
     }
+
+    /// Evict failure-accounting entries that can no longer lock or accumulate
+    /// (in-process backend only; the Redis backend self-expires via TTL). Returns
+    /// the number removed. Driven periodically so the default in-process map
+    /// cannot grow unbounded under credential-stuffing across many distinct
+    /// accounts. `now` is unix seconds, matching [`Self::record_failure`].
+    pub async fn sweep(&self, now: i64) -> usize {
+        self.store.sweep(now).await
+    }
 }
 
 fn env_truthy(name: &str) -> bool {
@@ -367,5 +398,25 @@ mod tests {
         // A success clears the account.
         t.record_success("user@x.com").await;
         assert!(!t.is_locked("user@x.com", 2).await);
+    }
+
+    #[tokio::test]
+    async fn sweep_evicts_only_decision_dead_entries() {
+        let t = LoginThrottle::new(CFG); // max 3 / window 100 / lockout 600
+        // Account A: one failure (count=1, within window). Account B: locked.
+        t.record_failure("a@x.com", 0).await;
+        for now in [0, 1, 2] {
+            t.record_failure("b@x.com", now).await;
+        }
+        assert!(t.is_locked("b@x.com", 2).await);
+
+        // Within A's window AND B's lockout ⇒ nothing is droppable.
+        assert_eq!(t.sweep(5).await, 0, "live entries are kept");
+        assert!(t.is_locked("b@x.com", 5).await, "lock survives a sweep");
+
+        // Past A's window AND B's lockout ⇒ both entries are now decision-dead.
+        let later = CFG.window_secs + CFG.lockout_secs + 10;
+        assert_eq!(t.sweep(later).await, 2, "stale entries are evicted");
+        assert!(!t.is_locked("b@x.com", later).await);
     }
 }
