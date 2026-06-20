@@ -1,762 +1,763 @@
-use super::*;
+//! Tests for the SRT crate root, split out of lib.rs (1200-line HARD limit).
 
-fn sample_config() -> TurnConfig {
-    TurnConfig {
-        listening_port: 3478,
-        realm: "aero.local".into(),
-        static_auth_secret: "north-star-shared-secret".into(),
-        external_ip: Some("203.0.113.7".into()),
-        min_port: 49152,
-        max_port: 65535,
-            headline: None,
+    use super::*;
+
+    fn sample_config() -> TurnConfig {
+        TurnConfig {
+            listening_port: 3478,
+            realm: "aero.local".into(),
+            static_auth_secret: "north-star-shared-secret".into(),
+            external_ip: Some("203.0.113.7".into()),
+            min_port: 49152,
+            max_port: 65535,
+        }
     }
-}
 
-// ------------------------- TURN render -------------------------
+    // ------------------------- TURN render -------------------------
 
-#[test]
-fn turn_config_renders_required_lines() {
-    let c = sample_config();
-    let body = c.render();
-    assert!(body.contains("listening-port=3478"));
-    assert!(body.contains("realm=aero.local"));
-    assert!(body.contains("use-auth-secret"));
-    assert!(body.contains("static-auth-secret=north-star-shared-secret"));
-    assert!(body.contains("external-ip=203.0.113.7"));
-    assert!(body.contains("fingerprint"));
-}
-
-#[test]
-fn turn_config_skips_external_ip_when_absent() {
-    let mut c = sample_config();
-    c.external_ip = None;
-    assert!(!c.render().contains("external-ip="));
-}
-
-// ------------------ HMAC-SHA1 known-answer tests ------------------
-
-#[test]
-fn hmac_sha1_matches_rfc2202_case2() {
-    // RFC 2202 §3 test case 2: a *published* HMAC-SHA1 vector, proving our
-    // HMAC is correct against the standard — not merely self-consistent.
-    //   key  = "Jefe"
-    //   data = "what do ya want for nothing?"
-    //   HMAC = 0xeffcdf6ae5eb2fa2d27416d5f184df9c259a7c79
-    // Independently base64-encoded (openssl) → "7/zfauXrL6LSdBbV8YTfnCWafHk=".
-    let got = hmac_sha1_base64(b"Jefe", b"what do ya want for nothing?");
-    assert_eq!(got, "7/zfauXrL6LSdBbV8YTfnCWafHk=");
-}
-
-#[test]
-fn hmac_sha1_matches_rfc2202_case1() {
-    // RFC 2202 §3 test case 1: key = 20 × 0x0b, data = "Hi There".
-    //   HMAC = 0xb617318655057264e28bc0b6fb378c8ef146be00
-    let key = [0x0bu8; 20];
-    let got = hmac_sha1_base64(&key, b"Hi There");
-    // base64 of the published digest above.
-    assert_eq!(got, "thcxhlUFcmTii8C2+zeMjvFGvgA=");
-}
-
-#[test]
-fn ephemeral_credential_is_deterministic_and_matches_reference() {
-    // Hand-computed reference, independently produced by BOTH
-    //   printf '%s' '1700000000:alice' | openssl dgst -sha1 \
-    //       -hmac 'north-star-shared-secret' -binary | openssl base64
-    // and Python's `hmac.new(secret, user, hashlib.sha1)`:
-    //   secret   = "north-star-shared-secret"
-    //   username = "1700000000:alice"
-    //   password = base64(HMAC_SHA1(secret, username))
-    //            = "WqY9HToCTDh6T15lNQzfpjD2pIo="
-    let c = sample_config();
-    let (username, password) =
-        c.ephemeral_credential("alice", Duration::from_secs(0), 1_700_000_000);
-    assert_eq!(username, "1700000000:alice");
-    assert_eq!(password, "WqY9HToCTDh6T15lNQzfpjD2pIo=");
-}
-
-#[test]
-fn ttl_is_added_to_now_for_the_expiry() {
-    let c = sample_config();
-    // now=1_700_000_000, ttl=600 → expiry 1_700_000_600.
-    let (username, _) =
-        c.ephemeral_credential("bob", Duration::from_secs(600), 1_700_000_000);
-    assert_eq!(username, "1700000600:bob");
-}
-
-#[test]
-fn same_inputs_yield_same_password_different_secret_differs() {
-    let c = sample_config();
-    let (_, p1) = c.ephemeral_credential("alice", Duration::from_secs(60), 100);
-    let (_, p2) = c.ephemeral_credential("alice", Duration::from_secs(60), 100);
-    assert_eq!(p1, p2, "deterministic for identical inputs");
-
-    let mut c2 = c.clone();
-    c2.static_auth_secret = "different-secret".into();
-    let (_, p3) = c2.ephemeral_credential("alice", Duration::from_secs(60), 100);
-    assert_ne!(p1, p3, "credential is bound to the shared secret");
-}
-
-#[test]
-fn ice_server_shape_and_url() {
-    let c = sample_config();
-    let ice = c.ice_server("turn.example.com", "carol", Duration::from_secs(300), 1_700_000_000);
-    assert_eq!(ice.urls, "turn:turn.example.com:3478");
-    assert_eq!(ice.username, "1700000300:carol");
-    // credential must equal the standalone HMAC of the username.
-    let expected =
-        hmac_sha1_base64(c.static_auth_secret.as_bytes(), ice.username.as_bytes());
-    assert_eq!(ice.credential, expected);
-}
-
-#[test]
-fn ice_server_serializes_to_browser_json() {
-    let c = sample_config();
-    let ice = c.ice_server("turn.example.com", "dave", Duration::from_secs(60), 0);
-    let json = serde_json::to_string(&ice).unwrap();
-    // Browser RTCPeerConnection expects exactly these keys.
-    assert!(json.contains("\"urls\":\"turn:turn.example.com:3478\""));
-    assert!(json.contains("\"username\":\"60:dave\""));
-    assert!(json.contains("\"credential\":"));
-}
-
-// ----------------------------- SRT -----------------------------
-
-#[test]
-fn ingest_is_send_sync() {
-    fn assert_send_sync<T: Send + Sync>() {}
-    assert_send_sync::<SrtIngest>();
-}
-
-#[test]
-fn srt_listen_addr_is_rtmp_port_plus_one() {
-    let cfg = LiveStreamConfig::local_dev(); // rtmp 0.0.0.0:1935
-    let addr = SrtIngest::listen_addr(&cfg).unwrap();
-    assert_eq!(addr.port(), 1936);
-    assert_eq!(addr.ip(), cfg.rtmp_listen.ip());
-}
-
-// ---- data-plane glue: SRT header stripping & SHUTDOWN detection ----
-
-#[test]
-fn data_payload_strips_srt_header_and_yields_ts_bytes() {
-    // A data packet wrapping an MPEG-TS payload: 16-byte SRT header + body.
-    let header = SrtHeader {
-        kind: PacketKind::Data {
-            seq_no: 5,
-            msg_word: 0,
-        },
-        timestamp: 0,
-        dest_socket_id: 1,
-    };
-    let mut pkt = bytes::BytesMut::new();
-    header.write_to(&mut pkt);
-    let body = [0x47u8, 0x40, 0x00, 0x10, 0xDE, 0xAD]; // looks like a TS chunk
-    pkt.extend_from_slice(&body);
-    let payload = data_payload(&pkt).expect("data packet yields a payload");
-    assert_eq!(payload, &body, "payload is everything after the 16B header");
-}
-
-#[test]
-fn data_payload_rejects_control_packets() {
-    let ka = SrtHeader {
-        kind: PacketKind::Control {
-            control_type: ControlType::KeepAlive,
-            subtype: 0,
-            type_specific: 0,
-        },
-        timestamp: 0,
-        dest_socket_id: 1,
-    };
-    assert!(data_payload(&ka.to_bytes()).is_none(), "control has no TS payload");
-    // Truncated datagram → None, never a panic.
-    assert!(data_payload(&[0u8; 4]).is_none());
-}
-
-#[test]
-fn is_shutdown_detects_only_shutdown_control() {
-    let shutdown = SrtHeader {
-        kind: PacketKind::Control {
-            control_type: ControlType::Shutdown,
-            subtype: 0,
-            type_specific: 0,
-        },
-        timestamp: 0,
-        dest_socket_id: 1,
-    };
-    assert!(is_shutdown(&shutdown.to_bytes()));
-
-    let ka = SrtHeader {
-        kind: PacketKind::Control {
-            control_type: ControlType::KeepAlive,
-            subtype: 0,
-            type_specific: 0,
-        },
-        timestamp: 0,
-        dest_socket_id: 1,
-    };
-    assert!(!is_shutdown(&ka.to_bytes()), "keep-alive is not shutdown");
-    assert!(!is_shutdown(&[0u8; 4]), "short datagram is not shutdown");
-}
-
-#[test]
-fn segment_duration_matches_rtmp() {
-    // RTMP uses a 2s cadence; keep SRT in lockstep so players see a
-    // consistent target duration regardless of ingest protocol.
-    assert_eq!(SEGMENT_DURATION_SECS, 2);
-}
-
-#[test]
-fn segment_duration_constants_agree() {
-    // The u32 and f32 forms must not drift apart. Use an epsilon comparison
-    // (clippy flags `==`/`!=` on floats, not ordering) against the integer.
-    let diff = (SEGMENT_DURATION_SECS_F32 - f32::from(u8::try_from(SEGMENT_DURATION_SECS).unwrap())).abs();
-    assert!(diff < f32::EPSILON, "f32 and u32 segment durations diverged");
-}
-
-// ---- SrtSession integration (segmenter → HLS writer on disk) ----
-
-/// Minimal 188-byte payload-only TS packet with the given PID/PUSI.
-fn ts_packet(pid: u16, pusi: bool, payload: &[u8]) -> Vec<u8> {
-    let mut pkt = vec![0xFFu8; TS_PACKET_SIZE];
-    pkt[0] = TS_SYNC_BYTE;
-    pkt[1] = (u8::from(pusi) << 6) | u8::try_from((pid >> 8) & 0x1F).unwrap();
-    pkt[2] = u8::try_from(pid & 0xFF).unwrap();
-    pkt[3] = 0x10; // afc=01 (payload only)
-    let n = payload.len().min(TS_PACKET_SIZE - 4);
-    pkt[4..4 + n].copy_from_slice(&payload[..n]);
-    pkt
-}
-
-/// A video PES carrying NAL units of the given types (4-byte start codes).
-fn video_pes(nal_types: &[u8]) -> Vec<u8> {
-    let mut es = Vec::new();
-    for &t in nal_types {
-        es.extend_from_slice(&[0x00, 0x00, 0x00, 0x01, t & 0x1F, 0xAA]);
+    #[test]
+    fn turn_config_renders_required_lines() {
+        let c = sample_config();
+        let body = c.render();
+        assert!(body.contains("listening-port=3478"));
+        assert!(body.contains("realm=aero.local"));
+        assert!(body.contains("use-auth-secret"));
+        assert!(body.contains("static-auth-secret=north-star-shared-secret"));
+        assert!(body.contains("external-ip=203.0.113.7"));
+        assert!(body.contains("fingerprint"));
     }
-    let mut pes = vec![0x00, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x80, 0x00, 0x00];
-    pes.extend_from_slice(&es);
-    pes
-}
 
-/// A 1-byte PAT advertising PMT PID 0x1000 / PMT advertising video PID 0x100.
-/// Reuses the segmenter's own parser, so we only need plausible PSI here.
-fn pat() -> Vec<u8> {
-    // pointer(0) table_id(0) B0 len.. tsid version sec last prog=1 pmt_pid
-    let mut s = vec![0x00, 0x00, 0xB0, 0x0D, 0x00, 0x01, 0xC1, 0x00, 0x00];
-    s.extend_from_slice(&1u16.to_be_bytes());
-    s.extend_from_slice(&(0xE000u16 | 0x1000).to_be_bytes());
-    s.extend_from_slice(&[0, 0, 0, 0]); // CRC (ignored)
-    s
-}
+    #[test]
+    fn turn_config_skips_external_ip_when_absent() {
+        let mut c = sample_config();
+        c.external_ip = None;
+        assert!(!c.render().contains("external-ip="));
+    }
 
-fn pmt() -> Vec<u8> {
-    let mut s = vec![0x00, 0x02, 0xB0, 0x12, 0x00, 0x01, 0xC1, 0x00, 0x00];
-    s.extend_from_slice(&(0xE000u16 | 0x0100).to_be_bytes()); // PCR PID
-    s.extend_from_slice(&0xF000u16.to_be_bytes()); // program_info_length=0
-    s.push(0x1B); // H.264
-    s.extend_from_slice(&(0xE000u16 | 0x0100).to_be_bytes());
-    s.extend_from_slice(&0xF000u16.to_be_bytes());
-    s.extend_from_slice(&[0, 0, 0, 0]); // CRC
-    s
-}
+    // ------------------ HMAC-SHA1 known-answer tests ------------------
 
-#[tokio::test]
-async fn srt_session_writes_hls_segments_at_keyframes() {
-    let dir = tempfile::tempdir().unwrap();
-    let hls = HlsWriter::new(dir.path().to_path_buf(), SEGMENT_DURATION_SECS)
-        .await
-        .unwrap();
-    let mut session = SrtSession::new(hls);
+    #[test]
+    fn hmac_sha1_matches_rfc2202_case2() {
+        // RFC 2202 §3 test case 2: a *published* HMAC-SHA1 vector, proving our
+        // HMAC is correct against the standard — not merely self-consistent.
+        //   key  = "Jefe"
+        //   data = "what do ya want for nothing?"
+        //   HMAC = 0xeffcdf6ae5eb2fa2d27416d5f184df9c259a7c79
+        // Independently base64-encoded (openssl) → "7/zfauXrL6LSdBbV8YTfnCWafHk=".
+        let got = hmac_sha1_base64(b"Jefe", b"what do ya want for nothing?");
+        assert_eq!(got, "7/zfauXrL6LSdBbV8YTfnCWafHk=");
+    }
 
-    // Feed PSI then two keyframes separated by an inter frame. The second
-    // keyframe should close the first segment.
-    session.feed(&ts_packet(0x0000, true, &pat())).await.unwrap();
-    session.feed(&ts_packet(0x1000, true, &pmt())).await.unwrap();
-    session
-        .feed(&ts_packet(0x0100, true, &video_pes(&[5])))
-        .await
-        .unwrap();
-    session
-        .feed(&ts_packet(0x0100, true, &video_pes(&[1])))
-        .await
-        .unwrap();
-    // Second keyframe → cut → first segment (0.ts) is flushed to disk.
-    session
-        .feed(&ts_packet(0x0100, true, &video_pes(&[5])))
-        .await
-        .unwrap();
-    assert!(dir.path().join("0.ts").exists(), "first segment written");
+    #[test]
+    fn hmac_sha1_matches_rfc2202_case1() {
+        // RFC 2202 §3 test case 1: key = 20 × 0x0b, data = "Hi There".
+        //   HMAC = 0xb617318655057264e28bc0b6fb378c8ef146be00
+        let key = [0x0bu8; 20];
+        let got = hmac_sha1_base64(&key, b"Hi There");
+        // base64 of the published digest above.
+        assert_eq!(got, "thcxhlUFcmTii8C2+zeMjvFGvgA=");
+    }
 
-    // Finish flushes the trailing open segment and finalizes the manifest.
-    session.finish().await.unwrap();
-    assert!(dir.path().join("1.ts").exists(), "trailing segment written");
-    let manifest = std::fs::read_to_string(dir.path().join("index.m3u8")).unwrap();
-    assert!(manifest.contains("#EXT-X-ENDLIST"), "manifest finalized");
-    assert!(manifest.contains("0.ts"));
-    assert!(!session.has_open_segment());
-}
+    #[test]
+    fn ephemeral_credential_is_deterministic_and_matches_reference() {
+        // Hand-computed reference, independently produced by BOTH
+        //   printf '%s' '1700000000:alice' | openssl dgst -sha1 \
+        //       -hmac 'north-star-shared-secret' -binary | openssl base64
+        // and Python's `hmac.new(secret, user, hashlib.sha1)`:
+        //   secret   = "north-star-shared-secret"
+        //   username = "1700000000:alice"
+        //   password = base64(HMAC_SHA1(secret, username))
+        //            = "WqY9HToCTDh6T15lNQzfpjD2pIo="
+        let c = sample_config();
+        let (username, password) =
+            c.ephemeral_credential("alice", Duration::from_secs(0), 1_700_000_000);
+        assert_eq!(username, "1700000000:alice");
+        assert_eq!(password, "WqY9HToCTDh6T15lNQzfpjD2pIo=");
+    }
 
-#[tokio::test]
-async fn srt_session_finish_is_idempotent_and_finalizes() {
-    let dir = tempfile::tempdir().unwrap();
-    let hls = HlsWriter::new(dir.path().to_path_buf(), SEGMENT_DURATION_SECS)
-        .await
-        .unwrap();
-    let mut session = SrtSession::new(hls);
-    session.feed(&ts_packet(0x0000, true, &pat())).await.unwrap();
-    session.feed(&ts_packet(0x1000, true, &pmt())).await.unwrap();
-    session
-        .feed(&ts_packet(0x0100, true, &video_pes(&[5])))
-        .await
-        .unwrap();
-    session.finish().await.unwrap();
-    // A second finish must not error (HlsWriter::finish is idempotent).
-    session.finish().await.unwrap();
-}
+    #[test]
+    fn ttl_is_added_to_now_for_the_expiry() {
+        let c = sample_config();
+        // now=1_700_000_000, ttl=600 → expiry 1_700_000_600.
+        let (username, _) =
+            c.ephemeral_credential("bob", Duration::from_secs(600), 1_700_000_000);
+        assert_eq!(username, "1700000600:bob");
+    }
 
-// ── Crypto integration tests ────────────────────────────────────────────
+    #[test]
+    fn same_inputs_yield_same_password_different_secret_differs() {
+        let c = sample_config();
+        let (_, p1) = c.ephemeral_credential("alice", Duration::from_secs(60), 100);
+        let (_, p2) = c.ephemeral_credential("alice", Duration::from_secs(60), 100);
+        assert_eq!(p1, p2, "deterministic for identical inputs");
 
-/// Build a full SRT data packet (header + payload) with the given `seq_no`,
-/// KK flag, and payload bytes.
-fn make_data_packet(seq_no: u32, kk: KkFlag, payload: &[u8]) -> Vec<u8> {
-    let msg_word = kk.set_in_msg_word(0);
-    let header = SrtHeader {
-        kind: PacketKind::Data { seq_no, msg_word },
-        timestamp: 0,
-        dest_socket_id: 1,
-    };
-    let mut pkt = bytes::BytesMut::new();
-    header.write_to(&mut pkt);
-    pkt.extend_from_slice(payload);
-    pkt.to_vec()
-}
+        let mut c2 = c.clone();
+        c2.static_auth_secret = "different-secret".into();
+        let (_, p3) = c2.ephemeral_credential("alice", Duration::from_secs(60), 100);
+        assert_ne!(p1, p3, "credential is bound to the shared secret");
+    }
 
-/// An ingest configured with a passphrase must decrypt an AES-CTR-encrypted
-/// data packet so the plaintext TS bytes reach the segmenter.
-///
-/// The test builds a TS payload, encrypts it with the same `SrtCrypto`
-/// instance, packages it in a data packet with `KkFlag::EvenKey`, feeds it
-/// to a session that has that crypto installed, and verifies the
-/// segmenter sees the original plaintext (i.e. the TS sync byte 0x47).
-#[tokio::test]
-async fn encrypted_data_packet_is_decrypted_before_segmenter() {
-    // Set up a known passphrase, salt, and SEK so we can produce a
-    // matching ciphertext on the test (sender) side.
-    let passphrase = b"test-passphrase";
-    let salt = [0xBBu8; 16];
-    let sek = [0xCCu8; 16];
+    #[test]
+    fn ice_server_shape_and_url() {
+        let c = sample_config();
+        let ice = c.ice_server("turn.example.com", "carol", Duration::from_secs(300), 1_700_000_000);
+        assert_eq!(ice.urls, "turn:turn.example.com:3478");
+        assert_eq!(ice.username, "1700000300:carol");
+        // credential must equal the standalone HMAC of the username.
+        let expected =
+            hmac_sha1_base64(c.static_auth_secret.as_bytes(), ice.username.as_bytes());
+        assert_eq!(ice.credential, expected);
+    }
 
-    let crypto = SrtCrypto::from_passphrase(passphrase, &salt, sek);
+    #[test]
+    fn ice_server_serializes_to_browser_json() {
+        let c = sample_config();
+        let ice = c.ice_server("turn.example.com", "dave", Duration::from_secs(60), 0);
+        let json = serde_json::to_string(&ice).unwrap();
+        // Browser RTCPeerConnection expects exactly these keys.
+        assert!(json.contains("\"urls\":\"turn:turn.example.com:3478\""));
+        assert!(json.contains("\"username\":\"60:dave\""));
+        assert!(json.contains("\"credential\":"));
+    }
 
-    // Build a TS payload (minimal PAT-like bytes starting with 0x47).
-    let mut ts_payload = ts_packet(0x0000, true, &pat());
-    let original = ts_payload.clone();
+    // ----------------------------- SRT -----------------------------
 
-    // Encrypt the payload as the sender would (seq_no = 1, even key).
-    let seq_no = 1u32;
-    crypto.encrypt_packet(seq_no, &mut ts_payload);
-    assert_ne!(ts_payload, original, "ciphertext must differ from plaintext");
+    #[test]
+    fn ingest_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<SrtIngest>();
+    }
 
-    // Package as an SRT data packet with KK=EvenKey.
-    let pkt = make_data_packet(seq_no, KkFlag::EvenKey, &ts_payload);
+    #[test]
+    fn srt_listen_addr_is_rtmp_port_plus_one() {
+        let cfg = LiveStreamConfig::local_dev(); // rtmp 0.0.0.0:1935
+        let addr = SrtIngest::listen_addr(&cfg).unwrap();
+        assert_eq!(addr.port(), 1936);
+        assert_eq!(addr.ip(), cfg.rtmp_listen.ip());
+    }
 
-    // Open a session with the same crypto context installed.
-    let dir = tempfile::tempdir().unwrap();
-    let hls = HlsWriter::new(dir.path().to_path_buf(), SEGMENT_DURATION_SECS)
-        .await
-        .unwrap();
-    let mut session = SrtSession::with_crypto(
-        hls,
-        Some(SrtCrypto::from_passphrase(passphrase, &salt, sek)),
-    );
+    // ---- data-plane glue: SRT header stripping & SHUTDOWN detection ----
 
-    // Feed the encrypted packet — the session must decrypt it first.
-    session.feed_packet(&pkt).await.unwrap();
+    #[test]
+    fn data_payload_strips_srt_header_and_yields_ts_bytes() {
+        // A data packet wrapping an MPEG-TS payload: 16-byte SRT header + body.
+        let header = SrtHeader {
+            kind: PacketKind::Data {
+                seq_no: 5,
+                msg_word: 0,
+            },
+            timestamp: 0,
+            dest_socket_id: 1,
+        };
+        let mut pkt = bytes::BytesMut::new();
+        header.write_to(&mut pkt);
+        let body = [0x47u8, 0x40, 0x00, 0x10, 0xDE, 0xAD]; // looks like a TS chunk
+        pkt.extend_from_slice(&body);
+        let payload = data_payload(&pkt).expect("data packet yields a payload");
+        assert_eq!(payload, &body, "payload is everything after the 16B header");
+    }
 
-    // The segmenter received the plaintext.  Verify by feeding the
-    // original plaintext through a plain session and confirming both
-    // sessions end up with the same segmenter state (non-empty buffer).
-    assert!(
-        session.segmenter.has_segment_data(),
-        "segmenter must have buffered data after decryption"
-    );
-}
+    #[test]
+    fn data_payload_rejects_control_packets() {
+        let ka = SrtHeader {
+            kind: PacketKind::Control {
+                control_type: ControlType::KeepAlive,
+                subtype: 0,
+                type_specific: 0,
+            },
+            timestamp: 0,
+            dest_socket_id: 1,
+        };
+        assert!(data_payload(&ka.to_bytes()).is_none(), "control has no TS payload");
+        // Truncated datagram → None, never a panic.
+        assert!(data_payload(&[0u8; 4]).is_none());
+    }
 
-/// Clear (unencrypted) data packets must pass through unchanged even when
-/// a crypto context is installed.
-#[tokio::test]
-async fn clear_data_packet_passes_through_unchanged() {
-    let passphrase = b"any-passphrase";
-    let salt = [0x11u8; 16];
-    let sek = [0x22u8; 16];
+    #[test]
+    fn is_shutdown_detects_only_shutdown_control() {
+        let shutdown = SrtHeader {
+            kind: PacketKind::Control {
+                control_type: ControlType::Shutdown,
+                subtype: 0,
+                type_specific: 0,
+            },
+            timestamp: 0,
+            dest_socket_id: 1,
+        };
+        assert!(is_shutdown(&shutdown.to_bytes()));
 
-    let ts_payload = ts_packet(0x0000, true, &pat());
-    // KK = Clear → packet is NOT encrypted.
-    let pkt = make_data_packet(0, KkFlag::Clear, &ts_payload);
+        let ka = SrtHeader {
+            kind: PacketKind::Control {
+                control_type: ControlType::KeepAlive,
+                subtype: 0,
+                type_specific: 0,
+            },
+            timestamp: 0,
+            dest_socket_id: 1,
+        };
+        assert!(!is_shutdown(&ka.to_bytes()), "keep-alive is not shutdown");
+        assert!(!is_shutdown(&[0u8; 4]), "short datagram is not shutdown");
+    }
 
-    let dir = tempfile::tempdir().unwrap();
-    let hls = HlsWriter::new(dir.path().to_path_buf(), SEGMENT_DURATION_SECS)
-        .await
-        .unwrap();
-    let mut session = SrtSession::with_crypto(
-        hls,
-        Some(SrtCrypto::from_passphrase(passphrase, &salt, sek)),
-    );
+    #[test]
+    fn segment_duration_matches_rtmp() {
+        // RTMP uses a 2s cadence; keep SRT in lockstep so players see a
+        // consistent target duration regardless of ingest protocol.
+        assert_eq!(SEGMENT_DURATION_SECS, 2);
+    }
 
-    // Feed the clear packet — even with a crypto context installed, clear
-    // packets must not be decrypted (that would corrupt the data).
-    session.feed_packet(&pkt).await.unwrap();
-    assert!(
-        session.segmenter.has_segment_data(),
-        "clear packet must reach segmenter even when crypto is installed"
-    );
-}
+    #[test]
+    fn segment_duration_constants_agree() {
+        // The u32 and f32 forms must not drift apart. Use an epsilon comparison
+        // (clippy flags `==`/`!=` on floats, not ordering) against the integer.
+        let diff = (SEGMENT_DURATION_SECS_F32 - f32::from(u8::try_from(SEGMENT_DURATION_SECS).unwrap())).abs();
+        assert!(diff < f32::EPSILON, "f32 and u32 segment durations diverged");
+    }
 
-/// A KMREQ→KMRSP exchange must establish a usable session key: after
-/// `apply_km_message`, the session can decrypt a packet that was encrypted
-/// with the same passphrase.
-#[tokio::test]
-async fn kmreq_kmrsp_exchange_establishes_session_key() {
-    let passphrase = b"shared-secret";
-    let salt = [0xA5u8; 16];
-    let sek = [0x3Cu8; 16];
+    // ---- SrtSession integration (segmenter → HLS writer on disk) ----
 
-    // Sender side: build a KMREQ message.
-    let sender_crypto = SrtCrypto::from_passphrase(passphrase, &salt, sek);
-    let km = sender_crypto.build_km_message(passphrase);
+    /// Minimal 188-byte payload-only TS packet with the given PID/PUSI.
+    fn ts_packet(pid: u16, pusi: bool, payload: &[u8]) -> Vec<u8> {
+        let mut pkt = vec![0xFFu8; TS_PACKET_SIZE];
+        pkt[0] = TS_SYNC_BYTE;
+        pkt[1] = (u8::from(pusi) << 6) | u8::try_from((pid >> 8) & 0x1F).unwrap();
+        pkt[2] = u8::try_from(pid & 0xFF).unwrap();
+        pkt[3] = 0x10; // afc=01 (payload only)
+        let n = payload.len().min(TS_PACKET_SIZE - 4);
+        pkt[4..4 + n].copy_from_slice(&payload[..n]);
+        pkt
+    }
 
-    // Receiver side: apply the KMREQ to derive the same session key.
-    let dir = tempfile::tempdir().unwrap();
-    let hls = HlsWriter::new(dir.path().to_path_buf(), SEGMENT_DURATION_SECS)
-        .await
-        .unwrap();
-    let mut session = SrtSession::new(hls);
+    /// A video PES carrying NAL units of the given types (4-byte start codes).
+    fn video_pes(nal_types: &[u8]) -> Vec<u8> {
+        let mut es = Vec::new();
+        for &t in nal_types {
+            es.extend_from_slice(&[0x00, 0x00, 0x00, 0x01, t & 0x1F, 0xAA]);
+        }
+        let mut pes = vec![0x00, 0x00, 0x01, 0xE0, 0x00, 0x00, 0x80, 0x00, 0x00];
+        pes.extend_from_slice(&es);
+        pes
+    }
 
-    // Before applying the KM message, the session has no crypto.
-    assert!(
-        session.crypto.is_none(),
-        "fresh session starts without a crypto context"
-    );
+    /// A 1-byte PAT advertising PMT PID 0x1000 / PMT advertising video PID 0x100.
+    /// Reuses the segmenter's own parser, so we only need plausible PSI here.
+    fn pat() -> Vec<u8> {
+        // pointer(0) table_id(0) B0 len.. tsid version sec last prog=1 pmt_pid
+        let mut s = vec![0x00, 0x00, 0xB0, 0x0D, 0x00, 0x01, 0xC1, 0x00, 0x00];
+        s.extend_from_slice(&1u16.to_be_bytes());
+        s.extend_from_slice(&(0xE000u16 | 0x1000).to_be_bytes());
+        s.extend_from_slice(&[0, 0, 0, 0]); // CRC (ignored)
+        s
+    }
 
-    session
-        .apply_km_message(&km, passphrase)
-        .expect("apply_km_message must succeed with the correct passphrase");
+    fn pmt() -> Vec<u8> {
+        let mut s = vec![0x00, 0x02, 0xB0, 0x12, 0x00, 0x01, 0xC1, 0x00, 0x00];
+        s.extend_from_slice(&(0xE000u16 | 0x0100).to_be_bytes()); // PCR PID
+        s.extend_from_slice(&0xF000u16.to_be_bytes()); // program_info_length=0
+        s.push(0x1B); // H.264
+        s.extend_from_slice(&(0xE000u16 | 0x0100).to_be_bytes());
+        s.extend_from_slice(&0xF000u16.to_be_bytes());
+        s.extend_from_slice(&[0, 0, 0, 0]); // CRC
+        s
+    }
 
-    assert!(
-        session.crypto.is_some(),
-        "session must have a crypto context after applying the KM message"
-    );
+    #[tokio::test]
+    async fn srt_session_writes_hls_segments_at_keyframes() {
+        let dir = tempfile::tempdir().unwrap();
+        let hls = HlsWriter::new(dir.path().to_path_buf(), SEGMENT_DURATION_SECS)
+            .await
+            .unwrap();
+        let mut session = SrtSession::new(hls);
 
-    // Verify the installed SEK matches the sender's.
-    let installed_sek = session.crypto.as_ref().unwrap().sek();
-    assert_eq!(
-        installed_sek, &sek,
-        "receiver must derive the same SEK as the sender"
-    );
+        // Feed PSI then two keyframes separated by an inter frame. The second
+        // keyframe should close the first segment.
+        session.feed(&ts_packet(0x0000, true, &pat())).await.unwrap();
+        session.feed(&ts_packet(0x1000, true, &pmt())).await.unwrap();
+        session
+            .feed(&ts_packet(0x0100, true, &video_pes(&[5])))
+            .await
+            .unwrap();
+        session
+            .feed(&ts_packet(0x0100, true, &video_pes(&[1])))
+            .await
+            .unwrap();
+        // Second keyframe → cut → first segment (0.ts) is flushed to disk.
+        session
+            .feed(&ts_packet(0x0100, true, &video_pes(&[5])))
+            .await
+            .unwrap();
+        assert!(dir.path().join("0.ts").exists(), "first segment written");
 
-    // Prove it can decrypt: encrypt a packet with the sender's crypto then
-    // feed it to the session.
-    let mut ts_payload = ts_packet(0x0000, true, &pat());
-    let seq_no = 5u32;
-    sender_crypto.encrypt_packet(seq_no, &mut ts_payload);
-    let pkt = make_data_packet(seq_no, KkFlag::EvenKey, &ts_payload);
-    session.feed_packet(&pkt).await.unwrap();
-    assert!(
-        session.segmenter.has_segment_data(),
-        "session must successfully decrypt and buffer the TS packet"
-    );
-}
+        // Finish flushes the trailing open segment and finalizes the manifest.
+        session.finish().await.unwrap();
+        assert!(dir.path().join("1.ts").exists(), "trailing segment written");
+        let manifest = std::fs::read_to_string(dir.path().join("index.m3u8")).unwrap();
+        assert!(manifest.contains("#EXT-X-ENDLIST"), "manifest finalized");
+        assert!(manifest.contains("0.ts"));
+        assert!(!session.has_open_segment());
+    }
 
-/// Applying a KMREQ with the wrong passphrase must fail.
-#[test]
-fn apply_km_message_fails_with_wrong_passphrase() {
-    let salt = [0u8; 16];
-    let sek = [1u8; 16];
-    let sender = SrtCrypto::from_passphrase(b"correct", &salt, sek);
-    let km = sender.build_km_message(b"correct");
+    #[tokio::test]
+    async fn srt_session_finish_is_idempotent_and_finalizes() {
+        let dir = tempfile::tempdir().unwrap();
+        let hls = HlsWriter::new(dir.path().to_path_buf(), SEGMENT_DURATION_SECS)
+            .await
+            .unwrap();
+        let mut session = SrtSession::new(hls);
+        session.feed(&ts_packet(0x0000, true, &pat())).await.unwrap();
+        session.feed(&ts_packet(0x1000, true, &pmt())).await.unwrap();
+        session
+            .feed(&ts_packet(0x0100, true, &video_pes(&[5])))
+            .await
+            .unwrap();
+        session.finish().await.unwrap();
+        // A second finish must not error (HlsWriter::finish is idempotent).
+        session.finish().await.unwrap();
+    }
 
-    // A standalone check (no async needed here).
-    let result = SrtCrypto::from_km_message(&km, b"wrong");
-    assert!(result.is_err(), "wrong passphrase must not unwrap the SEK");
-}
+    // ── Crypto integration tests ────────────────────────────────────────────
 
-// ── Reliability integration tests ───────────────────────────────────────
+    /// Build a full SRT data packet (header + payload) with the given `seq_no`,
+    /// KK flag, and payload bytes.
+    fn make_data_packet(seq_no: u32, kk: KkFlag, payload: &[u8]) -> Vec<u8> {
+        let msg_word = kk.set_in_msg_word(0);
+        let header = SrtHeader {
+            kind: PacketKind::Data { seq_no, msg_word },
+            timestamp: 0,
+            dest_socket_id: 1,
+        };
+        let mut pkt = bytes::BytesMut::new();
+        header.write_to(&mut pkt);
+        pkt.extend_from_slice(payload);
+        pkt.to_vec()
+    }
 
-/// In-order delivery (consecutive sequence numbers) must emit ACKs via the
-/// periodic ACK timer; no NAKs should be produced.
-#[tokio::test]
-async fn in_order_delivery_emits_ack_not_nak() {
-    use std::time::Duration as StdDuration;
+    /// An ingest configured with a passphrase must decrypt an AES-CTR-encrypted
+    /// data packet so the plaintext TS bytes reach the segmenter.
+    ///
+    /// The test builds a TS payload, encrypts it with the same `SrtCrypto`
+    /// instance, packages it in a data packet with `KkFlag::EvenKey`, feeds it
+    /// to a session that has that crypto installed, and verifies the
+    /// segmenter sees the original plaintext (i.e. the TS sync byte 0x47).
+    #[tokio::test]
+    async fn encrypted_data_packet_is_decrypted_before_segmenter() {
+        // Set up a known passphrase, salt, and SEK so we can produce a
+        // matching ciphertext on the test (sender) side.
+        let passphrase = b"test-passphrase";
+        let salt = [0xBBu8; 16];
+        let sek = [0xCCu8; 16];
 
-    let dir = tempfile::tempdir().unwrap();
-    let hls = HlsWriter::new(dir.path().to_path_buf(), SEGMENT_DURATION_SECS)
-        .await
-        .unwrap();
-    let mut session = SrtSession::new(hls);
+        let crypto = SrtCrypto::from_passphrase(passphrase, &salt, sek);
 
-    // Set a very short ACK interval so the timer fires during the test.
-    session.reliability.set_ack_interval(StdDuration::from_nanos(1));
+        // Build a TS payload (minimal PAT-like bytes starting with 0x47).
+        let mut ts_payload = ts_packet(0x0000, true, &pat());
+        let original = ts_payload.clone();
 
-    let ts_bytes = ts_packet(0x0000, true, &pat());
+        // Encrypt the payload as the sender would (seq_no = 1, even key).
+        let seq_no = 1u32;
+        crypto.encrypt_packet(seq_no, &mut ts_payload);
+        assert_ne!(ts_payload, original, "ciphertext must differ from plaintext");
 
-    // Feed three consecutive packets — no gap, so no NAK expected.
-    for seq_no in 0u32..3 {
-        let pkt = make_data_packet(seq_no, KkFlag::Clear, &ts_bytes);
+        // Package as an SRT data packet with KK=EvenKey.
+        let pkt = make_data_packet(seq_no, KkFlag::EvenKey, &ts_payload);
+
+        // Open a session with the same crypto context installed.
+        let dir = tempfile::tempdir().unwrap();
+        let hls = HlsWriter::new(dir.path().to_path_buf(), SEGMENT_DURATION_SECS)
+            .await
+            .unwrap();
+        let mut session = SrtSession::with_crypto(
+            hls,
+            Some(SrtCrypto::from_passphrase(passphrase, &salt, sek)),
+        );
+
+        // Feed the encrypted packet — the session must decrypt it first.
         session.feed_packet(&pkt).await.unwrap();
+
+        // The segmenter received the plaintext.  Verify by feeding the
+        // original plaintext through a plain session and confirming both
+        // sessions end up with the same segmenter state (non-empty buffer).
+        assert!(
+            session.segmenter.has_segment_data(),
+            "segmenter must have buffered data after decryption"
+        );
     }
 
-    let actions = session.drain_actions();
+    /// Clear (unencrypted) data packets must pass through unchanged even when
+    /// a crypto context is installed.
+    #[tokio::test]
+    async fn clear_data_packet_passes_through_unchanged() {
+        let passphrase = b"any-passphrase";
+        let salt = [0x11u8; 16];
+        let sek = [0x22u8; 16];
 
-    // No NAKs must appear.
-    assert!(
-        actions.iter().all(|a| !matches!(a, Action::SendNak { .. })),
-        "no NAK expected for consecutive packets; got actions: {actions:?}"
-    );
-    // At least one ACK must have been emitted (the timer fires quickly).
-    assert!(
-        actions.iter().any(|a| matches!(a, Action::SendAck { .. })),
-        "at least one ACK expected; got actions: {actions:?}"
-    );
-}
+        let ts_payload = ts_packet(0x0000, true, &pat());
+        // KK = Clear → packet is NOT encrypted.
+        let pkt = make_data_packet(0, KkFlag::Clear, &ts_payload);
 
-/// A gap in the received sequence space must cause the session to emit a
-/// NAK for exactly the missing range.
-#[tokio::test]
-async fn sequence_gap_drives_nak_emission() {
-    let dir = tempfile::tempdir().unwrap();
-    let hls = HlsWriter::new(dir.path().to_path_buf(), SEGMENT_DURATION_SECS)
-        .await
-        .unwrap();
-    let mut session = SrtSession::new(hls);
+        let dir = tempfile::tempdir().unwrap();
+        let hls = HlsWriter::new(dir.path().to_path_buf(), SEGMENT_DURATION_SECS)
+            .await
+            .unwrap();
+        let mut session = SrtSession::with_crypto(
+            hls,
+            Some(SrtCrypto::from_passphrase(passphrase, &salt, sek)),
+        );
 
-    let ts_bytes = ts_packet(0x0000, true, &pat());
-
-    // Feed packet 0 (no gap).
-    let pkt0 = make_data_packet(0, KkFlag::Clear, &ts_bytes);
-    session.feed_packet(&pkt0).await.unwrap();
-    let _ = session.drain_actions(); // clear first-packet actions
-
-    // Feed packet 3 — skipping 1 and 2.  The reliability layer must emit a
-    // NAK for the range [1, 2].
-    let pkt3 = make_data_packet(3, KkFlag::Clear, &ts_bytes);
-    session.feed_packet(&pkt3).await.unwrap();
-
-    let actions = session.drain_actions();
-    let nak = actions
-        .iter()
-        .find(|a| matches!(a, Action::SendNak { .. }));
-    assert!(nak.is_some(), "NAK must be emitted for the gap [1, 2]");
-    assert_eq!(
-        nak.unwrap(),
-        &Action::SendNak { from: 1, to: 2 },
-        "NAK must cover exactly the missing range"
-    );
-}
-
-/// `SrtIngest::with_passphrase` and `passphrase()` accessor work correctly.
-#[test]
-fn ingest_passphrase_roundtrip() {
-    let ingest = SrtIngest::new().with_passphrase(b"mysecret".to_vec());
-    assert_eq!(ingest.passphrase(), Some(b"mysecret".as_ref()));
-
-    let plain = SrtIngest::new();
-    assert!(plain.passphrase().is_none());
-}
-
-// ── max-bandwidth knob (send pacer configuration) ─────────────────────────
-
-/// The env-override parser accepts positive integers only: zero would
-/// stall the stream at the pacer floor, and garbage must fall back to the
-/// default rather than panic.
-#[test]
-fn parse_max_bandwidth_accepts_positive_integers_only() {
-    assert_eq!(parse_max_bandwidth("1500000"), Some(1_500_000));
-    assert_eq!(parse_max_bandwidth("  42  "), Some(42), "whitespace is trimmed");
-    assert_eq!(parse_max_bandwidth("0"), None, "zero would stall the stream");
-    assert_eq!(parse_max_bandwidth("-5"), None);
-    assert_eq!(parse_max_bandwidth("12 Mbps"), None);
-    assert_eq!(parse_max_bandwidth(""), None);
-}
-
-/// `with_identity` (the hermetic test constructor) defaults to
-/// [`DEFAULT_MAX_BANDWIDTH`]; `with_max_bandwidth` overrides it.
-#[test]
-fn ingest_max_bandwidth_defaults_and_overrides() {
-    let ingest = SrtIngest::with_identity(1, 2);
-    assert_eq!(ingest.max_bandwidth(), DEFAULT_MAX_BANDWIDTH);
-    assert_eq!(ingest.with_max_bandwidth(99).max_bandwidth(), 99);
-}
-
-/// `SrtSession::with_max_bandwidth` re-seeds the pacer at the new cap.
-#[tokio::test]
-async fn session_with_max_bandwidth_seeds_the_pacer() {
-    let dir = tempfile::tempdir().unwrap();
-    let hls = HlsWriter::new(dir.path().to_path_buf(), SEGMENT_DURATION_SECS)
-        .await
-        .unwrap();
-    let session = SrtSession::new(hls);
-    assert_eq!(session.current_send_rate(), DEFAULT_MAX_BANDWIDTH);
-    let session = session.with_max_bandwidth(64_000);
-    assert_eq!(session.current_send_rate(), 64_000);
-}
-
-// ── drain_control_packets integration tests ──────────────────────────────
-
-/// In-order delivery produces ACK control packets via `drain_control_packets`,
-/// and none of them are NAK packets.
-#[tokio::test]
-async fn drain_control_packets_in_order_yields_ack_not_nak() {
-    use std::time::Duration as StdDuration;
-    use protocol::{ControlType, PacketKind};
-
-    let dir = tempfile::tempdir().unwrap();
-    let hls = HlsWriter::new(dir.path().to_path_buf(), SEGMENT_DURATION_SECS)
-        .await
-        .unwrap();
-    let mut session = SrtSession::new(hls);
-    // Fire the ACK timer immediately.
-    session.reliability.set_ack_interval(StdDuration::from_nanos(1));
-
-    let ts_bytes = ts_packet(0x0000, true, &pat());
-    let peer_socket_id = 0xBEEF_1234u32;
-
-    // Feed three consecutive packets.
-    for seq_no in 0u32..3 {
-        let pkt = make_data_packet(seq_no, KkFlag::Clear, &ts_bytes);
+        // Feed the clear packet — even with a crypto context installed, clear
+        // packets must not be decrypted (that would corrupt the data).
         session.feed_packet(&pkt).await.unwrap();
+        assert!(
+            session.segmenter.has_segment_data(),
+            "clear packet must reach segmenter even when crypto is installed"
+        );
     }
 
-    let ctrl_pkts = session.drain_control_packets(peer_socket_id);
-    assert!(
-        !ctrl_pkts.is_empty(),
-        "drain_control_packets must return at least one packet for in-order delivery"
-    );
+    /// A KMREQ→KMRSP exchange must establish a usable session key: after
+    /// `apply_km_message`, the session can decrypt a packet that was encrypted
+    /// with the same passphrase.
+    #[tokio::test]
+    async fn kmreq_kmrsp_exchange_establishes_session_key() {
+        let passphrase = b"shared-secret";
+        let salt = [0xA5u8; 16];
+        let sek = [0x3Cu8; 16];
 
-    // Every packet must be a valid SRT header addressed to the peer.
-    for pkt in &ctrl_pkts {
-        let hdr = SrtHeader::parse(pkt).expect("must be a valid SRT header");
-        assert!(hdr.is_control(), "every returned packet must be a control packet");
+        // Sender side: build a KMREQ message.
+        let sender_crypto = SrtCrypto::from_passphrase(passphrase, &salt, sek);
+        let km = sender_crypto.build_km_message(passphrase);
+
+        // Receiver side: apply the KMREQ to derive the same session key.
+        let dir = tempfile::tempdir().unwrap();
+        let hls = HlsWriter::new(dir.path().to_path_buf(), SEGMENT_DURATION_SECS)
+            .await
+            .unwrap();
+        let mut session = SrtSession::new(hls);
+
+        // Before applying the KM message, the session has no crypto.
+        assert!(
+            session.crypto.is_none(),
+            "fresh session starts without a crypto context"
+        );
+
+        session
+            .apply_km_message(&km, passphrase)
+            .expect("apply_km_message must succeed with the correct passphrase");
+
+        assert!(
+            session.crypto.is_some(),
+            "session must have a crypto context after applying the KM message"
+        );
+
+        // Verify the installed SEK matches the sender's.
+        let installed_sek = session.crypto.as_ref().unwrap().sek();
+        assert_eq!(
+            installed_sek, &sek,
+            "receiver must derive the same SEK as the sender"
+        );
+
+        // Prove it can decrypt: encrypt a packet with the sender's crypto then
+        // feed it to the session.
+        let mut ts_payload = ts_packet(0x0000, true, &pat());
+        let seq_no = 5u32;
+        sender_crypto.encrypt_packet(seq_no, &mut ts_payload);
+        let pkt = make_data_packet(seq_no, KkFlag::EvenKey, &ts_payload);
+        session.feed_packet(&pkt).await.unwrap();
+        assert!(
+            session.segmenter.has_segment_data(),
+            "session must successfully decrypt and buffer the TS packet"
+        );
+    }
+
+    /// Applying a KMREQ with the wrong passphrase must fail.
+    #[test]
+    fn apply_km_message_fails_with_wrong_passphrase() {
+        let salt = [0u8; 16];
+        let sek = [1u8; 16];
+        let sender = SrtCrypto::from_passphrase(b"correct", &salt, sek);
+        let km = sender.build_km_message(b"correct");
+
+        // A standalone check (no async needed here).
+        let result = SrtCrypto::from_km_message(&km, b"wrong");
+        assert!(result.is_err(), "wrong passphrase must not unwrap the SEK");
+    }
+
+    // ── Reliability integration tests ───────────────────────────────────────
+
+    /// In-order delivery (consecutive sequence numbers) must emit ACKs via the
+    /// periodic ACK timer; no NAKs should be produced.
+    #[tokio::test]
+    async fn in_order_delivery_emits_ack_not_nak() {
+        use std::time::Duration as StdDuration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let hls = HlsWriter::new(dir.path().to_path_buf(), SEGMENT_DURATION_SECS)
+            .await
+            .unwrap();
+        let mut session = SrtSession::new(hls);
+
+        // Set a very short ACK interval so the timer fires during the test.
+        session.reliability.set_ack_interval(StdDuration::from_nanos(1));
+
+        let ts_bytes = ts_packet(0x0000, true, &pat());
+
+        // Feed three consecutive packets — no gap, so no NAK expected.
+        for seq_no in 0u32..3 {
+            let pkt = make_data_packet(seq_no, KkFlag::Clear, &ts_bytes);
+            session.feed_packet(&pkt).await.unwrap();
+        }
+
+        let actions = session.drain_actions();
+
+        // No NAKs must appear.
+        assert!(
+            actions.iter().all(|a| !matches!(a, Action::SendNak { .. })),
+            "no NAK expected for consecutive packets; got actions: {actions:?}"
+        );
+        // At least one ACK must have been emitted (the timer fires quickly).
+        assert!(
+            actions.iter().any(|a| matches!(a, Action::SendAck { .. })),
+            "at least one ACK expected; got actions: {actions:?}"
+        );
+    }
+
+    /// A gap in the received sequence space must cause the session to emit a
+    /// NAK for exactly the missing range.
+    #[tokio::test]
+    async fn sequence_gap_drives_nak_emission() {
+        let dir = tempfile::tempdir().unwrap();
+        let hls = HlsWriter::new(dir.path().to_path_buf(), SEGMENT_DURATION_SECS)
+            .await
+            .unwrap();
+        let mut session = SrtSession::new(hls);
+
+        let ts_bytes = ts_packet(0x0000, true, &pat());
+
+        // Feed packet 0 (no gap).
+        let pkt0 = make_data_packet(0, KkFlag::Clear, &ts_bytes);
+        session.feed_packet(&pkt0).await.unwrap();
+        let _ = session.drain_actions(); // clear first-packet actions
+
+        // Feed packet 3 — skipping 1 and 2.  The reliability layer must emit a
+        // NAK for the range [1, 2].
+        let pkt3 = make_data_packet(3, KkFlag::Clear, &ts_bytes);
+        session.feed_packet(&pkt3).await.unwrap();
+
+        let actions = session.drain_actions();
+        let nak = actions
+            .iter()
+            .find(|a| matches!(a, Action::SendNak { .. }));
+        assert!(nak.is_some(), "NAK must be emitted for the gap [1, 2]");
+        assert_eq!(
+            nak.unwrap(),
+            &Action::SendNak { from: 1, to: 2 },
+            "NAK must cover exactly the missing range"
+        );
+    }
+
+    /// `SrtIngest::with_passphrase` and `passphrase()` accessor work correctly.
+    #[test]
+    fn ingest_passphrase_roundtrip() {
+        let ingest = SrtIngest::new().with_passphrase(b"mysecret".to_vec());
+        assert_eq!(ingest.passphrase(), Some(b"mysecret".as_ref()));
+
+        let plain = SrtIngest::new();
+        assert!(plain.passphrase().is_none());
+    }
+
+    // ── max-bandwidth knob (send pacer configuration) ─────────────────────────
+
+    /// The env-override parser accepts positive integers only: zero would
+    /// stall the stream at the pacer floor, and garbage must fall back to the
+    /// default rather than panic.
+    #[test]
+    fn parse_max_bandwidth_accepts_positive_integers_only() {
+        assert_eq!(parse_max_bandwidth("1500000"), Some(1_500_000));
+        assert_eq!(parse_max_bandwidth("  42  "), Some(42), "whitespace is trimmed");
+        assert_eq!(parse_max_bandwidth("0"), None, "zero would stall the stream");
+        assert_eq!(parse_max_bandwidth("-5"), None);
+        assert_eq!(parse_max_bandwidth("12 Mbps"), None);
+        assert_eq!(parse_max_bandwidth(""), None);
+    }
+
+    /// `with_identity` (the hermetic test constructor) defaults to
+    /// [`DEFAULT_MAX_BANDWIDTH`]; `with_max_bandwidth` overrides it.
+    #[test]
+    fn ingest_max_bandwidth_defaults_and_overrides() {
+        let ingest = SrtIngest::with_identity(1, 2);
+        assert_eq!(ingest.max_bandwidth(), DEFAULT_MAX_BANDWIDTH);
+        assert_eq!(ingest.with_max_bandwidth(99).max_bandwidth(), 99);
+    }
+
+    /// `SrtSession::with_max_bandwidth` re-seeds the pacer at the new cap.
+    #[tokio::test]
+    async fn session_with_max_bandwidth_seeds_the_pacer() {
+        let dir = tempfile::tempdir().unwrap();
+        let hls = HlsWriter::new(dir.path().to_path_buf(), SEGMENT_DURATION_SECS)
+            .await
+            .unwrap();
+        let session = SrtSession::new(hls);
+        assert_eq!(session.current_send_rate(), DEFAULT_MAX_BANDWIDTH);
+        let session = session.with_max_bandwidth(64_000);
+        assert_eq!(session.current_send_rate(), 64_000);
+    }
+
+    // ── drain_control_packets integration tests ──────────────────────────────
+
+    /// In-order delivery produces ACK control packets via `drain_control_packets`,
+    /// and none of them are NAK packets.
+    #[tokio::test]
+    async fn drain_control_packets_in_order_yields_ack_not_nak() {
+        use std::time::Duration as StdDuration;
+        use protocol::{ControlType, PacketKind};
+
+        let dir = tempfile::tempdir().unwrap();
+        let hls = HlsWriter::new(dir.path().to_path_buf(), SEGMENT_DURATION_SECS)
+            .await
+            .unwrap();
+        let mut session = SrtSession::new(hls);
+        // Fire the ACK timer immediately.
+        session.reliability.set_ack_interval(StdDuration::from_nanos(1));
+
+        let ts_bytes = ts_packet(0x0000, true, &pat());
+        let peer_socket_id = 0xBEEF_1234u32;
+
+        // Feed three consecutive packets.
+        for seq_no in 0u32..3 {
+            let pkt = make_data_packet(seq_no, KkFlag::Clear, &ts_bytes);
+            session.feed_packet(&pkt).await.unwrap();
+        }
+
+        let ctrl_pkts = session.drain_control_packets(peer_socket_id);
+        assert!(
+            !ctrl_pkts.is_empty(),
+            "drain_control_packets must return at least one packet for in-order delivery"
+        );
+
+        // Every packet must be a valid SRT header addressed to the peer.
+        for pkt in &ctrl_pkts {
+            let hdr = SrtHeader::parse(pkt).expect("must be a valid SRT header");
+            assert!(hdr.is_control(), "every returned packet must be a control packet");
+            assert_eq!(hdr.dest_socket_id, peer_socket_id);
+        }
+
+        // At least one must be an ACK.
+        let has_ack = ctrl_pkts.iter().any(|pkt| {
+            SrtHeader::parse(pkt).is_some_and(|h| {
+                matches!(
+                    h.kind,
+                    PacketKind::Control {
+                        control_type: ControlType::Ack,
+                        ..
+                    }
+                )
+            })
+        });
+        assert!(has_ack, "at least one ACK control packet expected");
+
+        // None must be a NAK.
+        let has_nak = ctrl_pkts.iter().any(|pkt| {
+            SrtHeader::parse(pkt).is_some_and(|h| {
+                matches!(
+                    h.kind,
+                    PacketKind::Control {
+                        control_type: ControlType::Nak,
+                        ..
+                    }
+                )
+            })
+        });
+        assert!(!has_nak, "no NAK expected for consecutive packets");
+    }
+
+    /// A sequence gap drives `drain_control_packets` to yield a NAK packet
+    /// whose decoded loss list covers the exact missing range.
+    #[tokio::test]
+    async fn drain_control_packets_gap_yields_nak_with_correct_loss_list() {
+        use protocol::{ControlType, PacketKind, SRT_HEADER_LEN};
+
+        let dir = tempfile::tempdir().unwrap();
+        let hls = HlsWriter::new(dir.path().to_path_buf(), SEGMENT_DURATION_SECS)
+            .await
+            .unwrap();
+        let mut session = SrtSession::new(hls);
+
+        let ts_bytes = ts_packet(0x0000, true, &pat());
+        let peer_socket_id = 0xCAFE_BABEu32;
+
+        // Feed packet 0.
+        let pkt0 = make_data_packet(0, KkFlag::Clear, &ts_bytes);
+        session.feed_packet(&pkt0).await.unwrap();
+        // Drain to reset the pending-action queue.
+        let _ = session.drain_control_packets(peer_socket_id);
+
+        // Feed packet 3, skipping 1 and 2 → gap [1, 2].
+        let pkt3 = make_data_packet(3, KkFlag::Clear, &ts_bytes);
+        session.feed_packet(&pkt3).await.unwrap();
+
+        let ctrl_pkts = session.drain_control_packets(peer_socket_id);
+
+        // Find the NAK packet.
+        let nak_pkt = ctrl_pkts.iter().find(|pkt| {
+            SrtHeader::parse(pkt).is_some_and(|h| {
+                matches!(
+                    h.kind,
+                    PacketKind::Control {
+                        control_type: ControlType::Nak,
+                        ..
+                    }
+                )
+            })
+        });
+        assert!(nak_pkt.is_some(), "NAK control packet must be emitted for the gap [1, 2]");
+
+        let nak_pkt = nak_pkt.unwrap();
+        let hdr = SrtHeader::parse(nak_pkt).unwrap();
         assert_eq!(hdr.dest_socket_id, peer_socket_id);
+
+        // Decode the loss list from the NAK CIF body.
+        let body = &nak_pkt[SRT_HEADER_LEN..];
+        let ranges = decode_nak_loss_list(body);
+
+        // The gap [1, 2] must appear as a range (from=1, to=2).
+        assert_eq!(
+            ranges,
+            vec![(1, 2)],
+            "NAK loss list must cover exactly the missing range [1, 2]"
+        );
     }
 
-    // At least one must be an ACK.
-    let has_ack = ctrl_pkts.iter().any(|pkt| {
-        SrtHeader::parse(pkt).is_some_and(|h| {
-            matches!(
-                h.kind,
-                PacketKind::Control {
-                    control_type: ControlType::Ack,
-                    ..
-                }
-            )
-        })
-    });
-    assert!(has_ack, "at least one ACK control packet expected");
+    /// `drain_control_packets` must leave the pending-actions queue empty, so a
+    /// second call returns nothing (no double-send).
+    #[tokio::test]
+    async fn drain_control_packets_is_consuming() {
+        use std::time::Duration as StdDuration;
 
-    // None must be a NAK.
-    let has_nak = ctrl_pkts.iter().any(|pkt| {
-        SrtHeader::parse(pkt).is_some_and(|h| {
-            matches!(
-                h.kind,
-                PacketKind::Control {
-                    control_type: ControlType::Nak,
-                    ..
-                }
-            )
-        })
-    });
-    assert!(!has_nak, "no NAK expected for consecutive packets");
-}
+        let dir = tempfile::tempdir().unwrap();
+        let hls = HlsWriter::new(dir.path().to_path_buf(), SEGMENT_DURATION_SECS)
+            .await
+            .unwrap();
+        let mut session = SrtSession::new(hls);
+        // Use a tiny ACK interval so the timer fires on the second packet.
+        session.reliability.set_ack_interval(StdDuration::from_nanos(1));
 
-/// A sequence gap drives `drain_control_packets` to yield a NAK packet
-/// whose decoded loss list covers the exact missing range.
-#[tokio::test]
-async fn drain_control_packets_gap_yields_nak_with_correct_loss_list() {
-    use protocol::{ControlType, PacketKind, SRT_HEADER_LEN};
+        let ts_bytes = ts_packet(0x0000, true, &pat());
 
-    let dir = tempfile::tempdir().unwrap();
-    let hls = HlsWriter::new(dir.path().to_path_buf(), SEGMENT_DURATION_SECS)
-        .await
-        .unwrap();
-    let mut session = SrtSession::new(hls);
+        // First packet — sets the timer but doesn't fire it yet.
+        let pkt0 = make_data_packet(0, KkFlag::Clear, &ts_bytes);
+        session.feed_packet(&pkt0).await.unwrap();
 
-    let ts_bytes = ts_packet(0x0000, true, &pat());
-    let peer_socket_id = 0xCAFE_BABEu32;
+        // Second packet — fires the ACK timer (interval = 1 ns, definitely elapsed).
+        let pkt1 = make_data_packet(1, KkFlag::Clear, &ts_bytes);
+        session.feed_packet(&pkt1).await.unwrap();
 
-    // Feed packet 0.
-    let pkt0 = make_data_packet(0, KkFlag::Clear, &ts_bytes);
-    session.feed_packet(&pkt0).await.unwrap();
-    // Drain to reset the pending-action queue.
-    let _ = session.drain_control_packets(peer_socket_id);
+        // First drain must return packets (at least one ACK).
+        let first = session.drain_control_packets(0);
+        assert!(!first.is_empty(), "first drain must return at least one packet");
 
-    // Feed packet 3, skipping 1 and 2 → gap [1, 2].
-    let pkt3 = make_data_packet(3, KkFlag::Clear, &ts_bytes);
-    session.feed_packet(&pkt3).await.unwrap();
-
-    let ctrl_pkts = session.drain_control_packets(peer_socket_id);
-
-    // Find the NAK packet.
-    let nak_pkt = ctrl_pkts.iter().find(|pkt| {
-        SrtHeader::parse(pkt).is_some_and(|h| {
-            matches!(
-                h.kind,
-                PacketKind::Control {
-                    control_type: ControlType::Nak,
-                    ..
-                }
-            )
-        })
-    });
-    assert!(nak_pkt.is_some(), "NAK control packet must be emitted for the gap [1, 2]");
-
-    let nak_pkt = nak_pkt.unwrap();
-    let hdr = SrtHeader::parse(nak_pkt).unwrap();
-    assert_eq!(hdr.dest_socket_id, peer_socket_id);
-
-    // Decode the loss list from the NAK CIF body.
-    let body = &nak_pkt[SRT_HEADER_LEN..];
-    let ranges = decode_nak_loss_list(body);
-
-    // The gap [1, 2] must appear as a range (from=1, to=2).
-    assert_eq!(
-        ranges,
-        vec![(1, 2)],
-        "NAK loss list must cover exactly the missing range [1, 2]"
-    );
-}
-
-/// `drain_control_packets` must leave the pending-actions queue empty, so a
-/// second call returns nothing (no double-send).
-#[tokio::test]
-async fn drain_control_packets_is_consuming() {
-    use std::time::Duration as StdDuration;
-
-    let dir = tempfile::tempdir().unwrap();
-    let hls = HlsWriter::new(dir.path().to_path_buf(), SEGMENT_DURATION_SECS)
-        .await
-        .unwrap();
-    let mut session = SrtSession::new(hls);
-    // Use a tiny ACK interval so the timer fires on the second packet.
-    session.reliability.set_ack_interval(StdDuration::from_nanos(1));
-
-    let ts_bytes = ts_packet(0x0000, true, &pat());
-
-    // First packet — sets the timer but doesn't fire it yet.
-    let pkt0 = make_data_packet(0, KkFlag::Clear, &ts_bytes);
-    session.feed_packet(&pkt0).await.unwrap();
-
-    // Second packet — fires the ACK timer (interval = 1 ns, definitely elapsed).
-    let pkt1 = make_data_packet(1, KkFlag::Clear, &ts_bytes);
-    session.feed_packet(&pkt1).await.unwrap();
-
-    // First drain must return packets (at least one ACK).
-    let first = session.drain_control_packets(0);
-    assert!(!first.is_empty(), "first drain must return at least one packet");
-
-    // Second drain must be empty — actions consumed.
-    let second = session.drain_control_packets(0);
-    assert!(
-        second.is_empty(),
-        "second drain must return nothing; actions already consumed"
-    );
-}
+        // Second drain must be empty — actions consumed.
+        let second = session.drain_control_packets(0);
+        assert!(
+            second.is_empty(),
+            "second drain must return nothing; actions already consumed"
+        );
+    }
