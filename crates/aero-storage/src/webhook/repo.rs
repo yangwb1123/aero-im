@@ -246,6 +246,22 @@ impl WebhookRepo {
         Ok(row.map(|(room,)| RoomId::from_uuid(room)))
     }
 
+    /// Resolve the `room_id` an **inbound** webhook belongs to (so a management
+    /// route can authorize a revoke via the room's access, mirroring
+    /// [`Self::outgoing_room`]). `None` when the hook does not exist.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`].
+    pub async fn incoming_room(&self, id: WebhookId) -> Result<Option<RoomId>, sqlx::Error> {
+        let row = sqlx::query_as::<_, (uuid::Uuid,)>(
+            r"SELECT room_id FROM incoming_webhooks WHERE id = $1",
+        )
+        .bind(id.to_uuid())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(room,)| RoomId::from_uuid(room)))
+    }
+
     /// Resolve a single **active** (non-revoked) outgoing target (url + secret) by
     /// id, for the retry loop to re-send a logged delivery. `None` when the hook is
     /// unknown or revoked (a revoked hook is not redelivered).

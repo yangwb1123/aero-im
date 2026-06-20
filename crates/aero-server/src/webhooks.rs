@@ -248,24 +248,47 @@ async fn list_webhooks(
 }
 
 /// `DELETE /api/webhooks/incoming/:id` — revoke an inbound webhook (idempotent).
+///
+/// The path carries only the GLOBAL webhook id, so authorization resolves the
+/// hook's owning room and asserts the caller's access to it (mirroring
+/// `create_incoming` / `list_webhooks`). Without this any authenticated user
+/// could revoke another room's hook by id (IDOR). An unknown id is `404`.
 async fn revoke_incoming(
     State(s): State<AppState>,
-    _auth: AuthUser,
+    auth: AuthUser,
     Path(id_str): Path<String>,
 ) -> ApiResult<StatusCode> {
     let id = parse_webhook(&id_str)?;
-    repo(&s).revoke_incoming(id).await.map_err(AeroError::from)?;
+    let r = repo(&s);
+    let room = r
+        .incoming_room(id)
+        .await
+        .map_err(AeroError::from)?
+        .ok_or_else(|| AeroError::NotFound("webhook".into()))?;
+    s.im.assert_room_access(auth.participant_id, room).await?;
+    r.revoke_incoming(id).await.map_err(AeroError::from)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 /// `DELETE /api/webhooks/outgoing/:id` — revoke an outbound webhook (idempotent).
+///
+/// Same authorization as [`revoke_incoming`]: resolve the hook's owning room
+/// (via [`WebhookRepo::outgoing_room`]) and assert caller access before revoking,
+/// so a webhook id alone can't break another room's integration. `404` if unknown.
 async fn revoke_outgoing(
     State(s): State<AppState>,
-    _auth: AuthUser,
+    auth: AuthUser,
     Path(id_str): Path<String>,
 ) -> ApiResult<StatusCode> {
     let id = parse_webhook(&id_str)?;
-    repo(&s).revoke_outgoing(id).await.map_err(AeroError::from)?;
+    let r = repo(&s);
+    let room = r
+        .outgoing_room(id)
+        .await
+        .map_err(AeroError::from)?
+        .ok_or_else(|| AeroError::NotFound("webhook".into()))?;
+    s.im.assert_room_access(auth.participant_id, room).await?;
+    r.revoke_outgoing(id).await.map_err(AeroError::from)?;
     Ok(StatusCode::NO_CONTENT)
 }
 
