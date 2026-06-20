@@ -38,6 +38,12 @@ use ulid::Ulid;
 use crate::error::ApiResult;
 use crate::state::AppState;
 
+/// Upper bound on prediction outcomes per request. Without it `outcomes` is
+/// bounded only by the body-size limit, so one create could insert a huge number
+/// of outcome rows (write amplification). Mirrors the poll `MAX_OPTIONS` cap; a
+/// real prediction has a handful of outcomes. Returns 400 when exceeded.
+const MAX_OUTCOMES: usize = 24;
+
 /// Mount the prediction routes, folded into the main router by
 /// [`crate::routes::build`].
 pub fn routes() -> Router<AppState> {
@@ -174,6 +180,12 @@ async fn create_prediction(
         .collect();
     if outcomes.len() < 2 {
         return Err(AeroError::Invalid("a prediction requires at least 2 outcomes".into()).into());
+    }
+    if outcomes.len() > MAX_OUTCOMES {
+        return Err(AeroError::Invalid(format!(
+            "a prediction may have at most {MAX_OUTCOMES} outcomes"
+        ))
+        .into());
     }
 
     let pred = repo(&s)
