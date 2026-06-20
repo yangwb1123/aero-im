@@ -38,6 +38,20 @@ pub trait AiBackend: Send + Sync + 'static {
         question: &str,
         k: usize,
     ) -> Result<AiAnswer, String>;
+    /// Agentic tool-use answer: a multi-turn Anthropic loop with the message-search
+    /// + attachment-read tools (degrades to the one-shot grounded answer without an
+    /// LLM key). Reachable from `POST /api/ai/ask {"agentic":true}` (gated by
+    /// `AERO_AGENTIC_ANSWERS`). Default delegates to the one-shot answer, so a
+    /// backend with no agent loop (e.g. a test mock) still works; the real
+    /// `AiServiceAdapter` overrides it with `AiService::answer_question_agentic`.
+    async fn answer_question_agentic(
+        &self,
+        room: aero_common::RoomId,
+        question: &str,
+        _max_iters: usize,
+    ) -> Result<AiAnswer, String> {
+        self.answer_question(room, question, 8).await
+    }
     /// Answer a question across EVERY room the caller belongs to in a workspace
     /// (the "ask your workspace" RAG flow). Retrieval is membership- and
     /// workspace-bounded; degrades without an LLM key exactly like

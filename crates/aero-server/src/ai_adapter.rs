@@ -53,6 +53,25 @@ impl AiBackend for AiServiceAdapter {
         })
     }
 
+    async fn answer_question_agentic(
+        &self,
+        room: RoomId,
+        question: &str,
+        max_iters: usize,
+    ) -> Result<AiAnswer, String> {
+        // `self.inner` is the concrete `Arc<AiService>`, so it can invoke the
+        // `&Arc<Self>`-receiver agent loop that the trait object alone cannot reach.
+        let (result, _usage) = self
+            .inner
+            .answer_question_agentic(room, question, max_iters)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(AiAnswer {
+            answer: result.answer,
+            citations: result.citations.into_iter().collect::<Vec<MessageId>>(),
+        })
+    }
+
     async fn answer_question_workspace(
         &self,
         participant: ParticipantId,

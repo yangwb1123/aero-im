@@ -1769,6 +1769,11 @@ struct AiAskReq {
     question: String,
     #[serde(default)]
     k: Option<usize>,
+    /// Opt into the agentic tool-use loop (multi-turn Anthropic with search +
+    /// attachment-read tools) instead of one-shot RAG. Additionally gated by the
+    /// `AERO_AGENTIC_ANSWERS` env, since the loop costs more model calls.
+    #[serde(default)]
+    agentic: Option<bool>,
 }
 
 async fn ai_ask(
@@ -1781,15 +1786,20 @@ async fn ai_ask(
     s.im.assert_room_access(auth.participant_id, room).await?;
     let k = req.k.unwrap_or(8);
     let ai = s.ai.as_ref().ok_or_else(|| AeroError::Upstream("AI not configured".into()))?;
-    // NOTE: the agentic tool-use loop (AiService::answer_question_agentic) is NOT
-    // wired here — `s.ai` is an `Arc<dyn AiBackend>` and that method lives on the
-    // concrete `AiService` with a `&Arc<Self>` receiver, so it can't be dispatched
-    // through the trait object. Reaching it needs an architectural change (expose it
-    // on AiBackend, or hold the concrete Arc<AiService> in AppState). Tracked.
-    let answer = ai
-        .answer_question(room, &req.question, k)
-        .await
-        .map_err(|e| AeroError::Upstream(format!("ai: {e}")))?;
+    // Agentic answer is now reachable via AiBackend::answer_question_agentic (the
+    // adapter dispatches to the concrete AiService's agent loop). Opt-in: client
+    // flag + operator env, since it's costlier; otherwise one-shot RAG. Previously
+    // the agent loop was dead in the running app (only the worker could reach it,
+    // and nothing enqueued an Answer job).
+    let answer = if req.agentic.unwrap_or(false) && std::env::var("AERO_AGENTIC_ANSWERS").is_ok() {
+        ai.answer_question_agentic(room, &req.question, 4)
+            .await
+            .map_err(|e| AeroError::Upstream(format!("ai: {e}")))?
+    } else {
+        ai.answer_question(room, &req.question, k)
+            .await
+            .map_err(|e| AeroError::Upstream(format!("ai: {e}")))?
+    };
     Ok(Json(serde_json::json!({
         "answer": answer.answer,
         "citations": answer.citations,
