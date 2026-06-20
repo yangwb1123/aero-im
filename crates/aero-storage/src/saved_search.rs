@@ -217,6 +217,53 @@ impl SavedSearchRepo {
         Ok(res.rows_affected() > 0)
     }
 
+    /// Enable/disable monitoring with the per-owner cap enforced ATOMICALLY. A
+    /// `pg_advisory_xact_lock` on the owner serializes concurrent enables, so the
+    /// count-check and update can't both slip past the cap (the bare
+    /// `count_monitored`-then-`set_notify_new` path could). Returns: `Ok(None)` =
+    /// rejected by the cap (enabling only); `Ok(Some(true))` = updated;
+    /// `Ok(Some(false))` = no matching saved search. `max_monitored` is ignored when
+    /// disabling.
+    pub async fn set_notify_new_capped(
+        &self,
+        id: SavedSearchId,
+        participant: ParticipantId,
+        notify_new: bool,
+        max_monitored: i64,
+    ) -> Result<Option<bool>, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(participant.to_uuid().to_string())
+            .execute(&mut *tx)
+            .await?;
+
+        if notify_new {
+            let (n,): (i64,) = sqlx::query_as(
+                r"SELECT COUNT(*) FROM saved_searches
+                   WHERE participant_id = $1 AND notify_new",
+            )
+            .bind(participant.to_uuid())
+            .fetch_one(&mut *tx)
+            .await?;
+            if n >= max_monitored {
+                tx.commit().await?;
+                return Ok(None);
+            }
+        }
+
+        let res = sqlx::query(
+            r"UPDATE saved_searches SET notify_new = $3
+               WHERE id = $1 AND participant_id = $2",
+        )
+        .bind(id.to_uuid())
+        .bind(participant.to_uuid())
+        .bind(notify_new)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(Some(res.rows_affected() > 0))
+    }
+
     /// How many of `participant`'s saved searches currently have monitoring
     /// enabled. Used to cap per-owner monitoring so a single user can't enable
     /// thousands of standing cross-room queries and amplify the dispatcher's cost.

@@ -142,26 +142,24 @@ async fn set_saved_search_monitor(
 ) -> ApiResult<Json<serde_json::Value>> {
     let id = parse_saved_search(&id_str)?;
     // Cap per-owner monitoring (cost guard): a single user can't turn an unbounded
-    // number of standing cross-room queries into periodic dispatcher load. Only
-    // checked when ENABLING — disabling is always allowed.
-    if req.enabled {
-        let active = repo(&s)
-            .count_monitored(auth.participant_id)
-            .await
-            .map_err(AeroError::from)?;
-        if active >= MAX_MONITORED_PER_OWNER {
+    // number of standing cross-room queries into periodic dispatcher load. The cap
+    // is enforced ATOMICALLY (advisory-locked count-check + update in one tx) so two
+    // concurrent enables can't both slip past it. Disabling is always allowed.
+    match repo(&s)
+        .set_notify_new_capped(id, auth.participant_id, req.enabled, MAX_MONITORED_PER_OWNER)
+        .await
+        .map_err(AeroError::from)?
+    {
+        None => {
             return Err(AeroError::Invalid(format!(
                 "monitoring limit reached ({MAX_MONITORED_PER_OWNER} active saved searches); disable one first"
             ))
             .into());
         }
-    }
-    let updated = repo(&s)
-        .set_notify_new(id, auth.participant_id, req.enabled)
-        .await
-        .map_err(AeroError::from)?;
-    if !updated {
-        return Err(AeroError::NotFound(format!("saved search {id}")).into());
+        Some(false) => {
+            return Err(AeroError::NotFound(format!("saved search {id}")).into());
+        }
+        Some(true) => {}
     }
     Ok(Json(serde_json::json!({ "id": id, "notify_new": req.enabled })))
 }

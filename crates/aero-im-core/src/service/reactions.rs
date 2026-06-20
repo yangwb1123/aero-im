@@ -39,28 +39,27 @@ impl ImService {
         if emoji.is_empty() || emoji.len() > 32 {
             return Err(Error::Invalid("emoji length".into()));
         }
-        // Reaction spam limit (ROADMAP12 migration 0118): if the room has
-        // `max_reactions_per_user` set, enforce it only when adding a NEW emoji.
-        // Toggling an emoji the actor already has is a Remove — always allowed.
-        // Best-effort: a missing room row or lookup error falls through.
-        if let Ok(Some(cap)) = self.rooms.get_max_reactions_per_user(msg.room_id).await {
-            let count = self.reactions.count_by_sender(message_id, actor).await.unwrap_or(0);
-            if count >= cap as i64 {
-                // They are at the cap. Allow only if they're toggling (removing)
-                // an emoji they already added — otherwise it's a new Add → reject.
-                let is_remove = self
-                    .reactions
-                    .has_reacted(message_id, actor, emoji)
-                    .await
-                    .unwrap_or(true); // fail-open: assume remove on error
-                if !is_remove {
-                    return Err(Error::Invalid(format!(
-                        "reaction limit: max {cap} reactions per message"
-                    )));
-                }
+        // Reaction spam limit (ROADMAP12 migration 0118): the per-user distinct-emoji
+        // cap is enforced ATOMICALLY inside `toggle_capped` (advisory-locked on
+        // (message, participant)), so two concurrent new-emoji Adds can't both pass a
+        // check-then-insert race. A Remove is always allowed; `None` cap = unlimited.
+        // Best-effort cap lookup: a missing room row / lookup error → no cap.
+        let cap = self
+            .rooms
+            .get_max_reactions_per_user(msg.room_id)
+            .await
+            .ok()
+            .flatten()
+            .map(i64::from);
+        let op = match self.reactions.toggle_capped(message_id, actor, emoji, cap).await? {
+            Some(op) => op,
+            None => {
+                return Err(Error::Invalid(format!(
+                    "reaction limit: max {} reactions per message",
+                    cap.unwrap_or(0)
+                )));
             }
-        }
-        let op = self.reactions.toggle(message_id, actor, emoji).await?;
+        };
         self.publish_room_event(
             msg.room_id,
             &RoomEvent::Reaction {

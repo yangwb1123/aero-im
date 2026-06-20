@@ -56,6 +56,72 @@ impl ReactionRepo {
         Ok(ReactionOp::Add)
     }
 
+    /// Atomically toggle a reaction, enforcing an optional per-`(message,
+    /// participant)` distinct-emoji cap. A `pg_advisory_xact_lock` keyed on
+    /// `(message, participant)` serializes concurrent toggles by the SAME user on
+    /// the SAME message, so the count-check and the insert are race-free — two
+    /// concurrent new-emoji Adds can no longer both slip past the cap (the bare
+    /// `count_by_sender`-then-`toggle` path could). Returns `Ok(None)` when a new
+    /// Add is rejected by the cap; `Ok(Some(op))` for the toggle that happened.
+    pub async fn toggle_capped(
+        &self,
+        message: MessageId,
+        participant: ParticipantId,
+        emoji: &str,
+        max_distinct: Option<i64>,
+    ) -> Result<Option<ReactionOp>, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        // Transaction-scoped advisory lock (auto-released at commit/rollback). The
+        // key hashes (message, participant) into a bigint; a hash collision only
+        // adds harmless cross-key contention, never a correctness problem.
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!("{}:{}", message.to_uuid(), participant.to_uuid()))
+            .execute(&mut *tx)
+            .await?;
+
+        let removed = sqlx::query(
+            r#"DELETE FROM reactions
+               WHERE message_id = $1 AND participant_id = $2 AND emoji = $3"#,
+        )
+        .bind(message.to_uuid())
+        .bind(participant.to_uuid())
+        .bind(emoji)
+        .execute(&mut *tx)
+        .await?;
+        if removed.rows_affected() > 0 {
+            tx.commit().await?;
+            return Ok(Some(ReactionOp::Remove));
+        }
+
+        // It's a new Add — enforce the distinct-emoji cap INSIDE the lock.
+        if let Some(cap) = max_distinct {
+            let (count,): (i64,) = sqlx::query_as(
+                "SELECT COUNT(DISTINCT emoji) FROM reactions \
+                 WHERE message_id = $1 AND participant_id = $2",
+            )
+            .bind(message.to_uuid())
+            .bind(participant.to_uuid())
+            .fetch_one(&mut *tx)
+            .await?;
+            if count >= cap {
+                tx.commit().await?;
+                return Ok(None);
+            }
+        }
+
+        sqlx::query(
+            r#"INSERT INTO reactions (message_id, participant_id, emoji)
+               VALUES ($1, $2, $3) ON CONFLICT DO NOTHING"#,
+        )
+        .bind(message.to_uuid())
+        .bind(participant.to_uuid())
+        .bind(emoji)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(Some(ReactionOp::Add))
+    }
+
     /// Count of distinct emoji this `sender` has already added to `message`.
     /// Used by the reaction-spam-limit gate in `ImService::toggle_reaction`.
     pub async fn count_by_sender(
@@ -234,5 +300,62 @@ mod db_tests {
             .execute(&p)
             .await
             .ok();
+    }
+
+    /// `toggle_capped` enforces the per-(message, participant) distinct-emoji cap
+    /// atomically: Adds up to the cap succeed; the next NEW emoji is rejected
+    /// (`None`); a Remove is always allowed and frees a slot. Guards the
+    /// advisory-locked count-check that closes the count-then-insert race.
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn toggle_capped_enforces_distinct_emoji_cap() {
+        use aero_common::{ParticipantId, ReactionOp};
+        let p = pool();
+        let repo = ReactionRepo::new(p.clone());
+
+        let sender = uuid::Uuid::new_v4();
+        sqlx::query("INSERT INTO participants (id, kind, display_name) VALUES ($1,'human',$2)")
+            .bind(sender)
+            .bind(format!("cap-sender-{sender}"))
+            .execute(&p)
+            .await
+            .expect("sender");
+        let room = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO rooms (id, kind, name, created_by, workspace_id)
+             VALUES ($1,'group',$2,$3,'00000000-0000-0000-0000-000000000000')",
+        )
+        .bind(room)
+        .bind("cap-room")
+        .bind(sender)
+        .execute(&p)
+        .await
+        .expect("room");
+        let msg = uuid::Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO messages (id, room_id, sender_id, blocks, metadata)
+             VALUES ($1,$2,$3,'[]'::jsonb,'{}'::jsonb)",
+        )
+        .bind(msg)
+        .bind(room)
+        .bind(sender)
+        .execute(&p)
+        .await
+        .expect("message");
+
+        let m = MessageId::from_uuid(msg);
+        let s = ParticipantId::from_uuid(sender);
+        let cap = Some(2_i64);
+        assert_eq!(repo.toggle_capped(m, s, "🎉", cap).await.unwrap(), Some(ReactionOp::Add));
+        assert_eq!(repo.toggle_capped(m, s, "🚀", cap).await.unwrap(), Some(ReactionOp::Add));
+        // Third distinct emoji exceeds the cap → rejected.
+        assert_eq!(repo.toggle_capped(m, s, "🔥", cap).await.unwrap(), None);
+        // Remove is always allowed and frees a slot.
+        assert_eq!(repo.toggle_capped(m, s, "🎉", cap).await.unwrap(), Some(ReactionOp::Remove));
+        assert_eq!(repo.toggle_capped(m, s, "🔥", cap).await.unwrap(), Some(ReactionOp::Add));
+        // No cap = unlimited.
+        assert_eq!(repo.toggle_capped(m, s, "💯", None).await.unwrap(), Some(ReactionOp::Add));
+
+        sqlx::query("DELETE FROM participants WHERE id = $1").bind(sender).execute(&p).await.ok();
     }
 }

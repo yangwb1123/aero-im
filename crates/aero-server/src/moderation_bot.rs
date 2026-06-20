@@ -272,6 +272,17 @@ pub async fn run_with_config(state: AppState, cfg: ModerationConfig) -> anyhow::
     // (never dropped) so a dropped subscription stream never permanently stops
     // moderation. Durable consumer "aero-moderation" resumes from its cursor; every
     // message is acked (skips are deliberately not redelivered).
+    //
+    // In-process idempotency for JetStream at-least-once REDELIVERY: the same message
+    // re-delivered (e.g. an ack timeout while this process is alive) would be
+    // re-screened — a SECOND paid `ai.moderate()` call + a second cost-counter
+    // increment + a duplicate `message.moderated` audit row. A bounded recently-seen
+    // set skips the re-screen. (It does not survive a process restart; the per-call
+    // budget admission gate bounds that residual double-charge.)
+    const DEDUP_CAP: usize = 8192;
+    let mut seen: std::collections::HashSet<aero_common::MessageId> = std::collections::HashSet::new();
+    let mut seen_order: std::collections::VecDeque<aero_common::MessageId> =
+        std::collections::VecDeque::new();
     loop {
         let mut stream = match bus.subscribe("im.room.*", Some("aero-moderation")).await {
             Ok(s) => s,
@@ -291,8 +302,20 @@ pub async fn run_with_config(state: AppState, cfg: ModerationConfig) -> anyhow::
                         text,
                     };
                     let id = job.message_id;
-                    if let Err(reason) = try_enqueue(&tx, job) {
-                        record_skip(reason, id);
+                    if seen.contains(&id) {
+                        // Redelivery of an already-screened message — skip the
+                        // duplicate paid moderation call (and its cost/audit double).
+                    } else {
+                        if seen_order.len() >= DEDUP_CAP {
+                            if let Some(old) = seen_order.pop_front() {
+                                seen.remove(&old);
+                            }
+                        }
+                        seen.insert(id);
+                        seen_order.push_back(id);
+                        if let Err(reason) = try_enqueue(&tx, job) {
+                            record_skip(reason, id);
+                        }
                     }
                 }
             }
