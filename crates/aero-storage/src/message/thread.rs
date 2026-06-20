@@ -104,10 +104,16 @@ impl MessageRepo {
         &self,
         root: MessageId,
     ) -> Result<Vec<ParticipantId>, sqlx::Error> {
+        // LIMIT bounds both this result and the caller's per-id display-name
+        // fan-out (one `participants.get` each): an unbounded roster would let a
+        // thread with very many distinct repliers turn one request into that many
+        // lookups. A roster is a UI affordance, so 500 distinct participants is far
+        // beyond what any view renders.
         let rows = sqlx::query_as::<_, (uuid::Uuid,)>(
             r#"SELECT DISTINCT sender_id
                FROM messages
-               WHERE reply_to = $1 AND deleted_at IS NULL"#,
+               WHERE reply_to = $1 AND deleted_at IS NULL
+               LIMIT 500"#,
         )
         .bind(root.to_uuid())
         .fetch_all(&self.pool)

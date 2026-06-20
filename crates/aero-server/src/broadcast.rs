@@ -43,6 +43,13 @@ fn parse_room(s: &str) -> Result<RoomId, AeroError> {
     RoomId::from_str(s).map_err(|e| AeroError::Invalid(format!("room id: {e}")))
 }
 
+/// Hard cap on broadcast fan-out per request. Without it `room_ids` is bounded
+/// only by the body-size limit (~1M ULIDs fit in 33 MiB), and each target costs
+/// an `assert_room_access` round-trip — so one request could force ~1M DB
+/// lookups. A real user broadcasts to a handful of rooms; beyond this, split the
+/// call. Returns 400 when exceeded.
+const MAX_BROADCAST_TARGETS: usize = 100;
+
 #[derive(Deserialize)]
 struct BroadcastReq {
     /// Destination rooms to post a copy of the message into.
@@ -80,6 +87,13 @@ async fn broadcast_message(
 
     if req.room_ids.is_empty() {
         return Err(AeroError::Invalid("room_ids must not be empty".into()).into());
+    }
+    if req.room_ids.len() > MAX_BROADCAST_TARGETS {
+        return Err(AeroError::Invalid(format!(
+            "too many targets: {} (max {MAX_BROADCAST_TARGETS} per broadcast)",
+            req.room_ids.len()
+        ))
+        .into());
     }
 
     // De-duplicate while preserving order: a repeated target shouldn't post twice.
