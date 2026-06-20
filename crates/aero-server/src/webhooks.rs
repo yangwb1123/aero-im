@@ -362,7 +362,14 @@ async fn dispatch_event<S: WebhookSender + ?Sized>(
                 continue;
             }
         };
-        let delivery = build_delivery(&target.url, &target.secret, &body, now);
+        let mut delivery = build_delivery(&target.url, &target.secret, &body, now);
+        // Propagate the W3C trace context on HTTP EGRESS so a receiver continues the
+        // same distributed trace (build_delivery stays pure — the ambient span is
+        // read here at the send site, not inside it). Inbound + the NATS bus already
+        // propagate; this closes the outbound-HTTP leg.
+        if let Some(tp) = aero_common::telemetry::current_traceparent() {
+            delivery.headers.push(("traceparent".to_string(), tp));
+        }
         let result = sender.deliver(&delivery).await;
         // Delivery-log bookkeeping keys on the numeric status (2xx = delivered, else
         // failed-with-backoff); the breaker (below) reads the same response's

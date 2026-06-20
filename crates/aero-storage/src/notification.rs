@@ -74,8 +74,8 @@ impl NotificationRepo {
         let created_at = time::OffsetDateTime::now_utc();
         sqlx::query(
             r"INSERT INTO notifications
-                 (id, participant_id, room_id, message_id, kind, actor_id, created_at)
-               VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                 (id, participant_id, room_id, message_id, kind, actor_id, created_at, importance_score)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
         )
         .bind(id.to_uuid())
         .bind(participant.to_uuid())
@@ -84,6 +84,9 @@ impl NotificationRepo {
         .bind(kind.as_str())
         .bind(actor.map(|p| p.to_uuid()))
         .bind(created_at)
+        // Compute the heuristic importance at insert (the column otherwise keeps
+        // the static 0.5 default — `importance_for` was dead code).
+        .bind(aero_common::model::importance_for(&kind))
         .execute(&self.pool)
         .await?;
         Ok(id)
@@ -120,6 +123,9 @@ impl NotificationRepo {
         let ids: Vec<uuid::Uuid> = recipients.iter().map(|_| NotificationId::new().to_uuid()).collect();
         let pids: Vec<uuid::Uuid> = recipients.iter().map(|(p, _)| p.to_uuid()).collect();
         let kinds: Vec<String> = recipients.iter().map(|(_, k)| k.as_str().to_owned()).collect();
+        // Per-row importance from the kind (parallel to the UNNEST arrays below) —
+        // otherwise every batched row keeps the static 0.5 default.
+        let imps: Vec<f32> = recipients.iter().map(|(_, k)| aero_common::model::importance_for(k)).collect();
         let actor_uuid = actor.map(|a| a.to_uuid());
         // The same `delivery_id` (or NULL) is stamped onto every row of the
         // batch via the $8 bind (broadcast across the UNNEST rows). The partial
@@ -127,9 +133,9 @@ impl NotificationRepo {
         // target must repeat the index predicate to be inferred.
         let res = sqlx::query(
             r"INSERT INTO notifications
-                 (id, participant_id, room_id, message_id, kind, actor_id, created_at, delivery_id)
-              SELECT u.id, u.pid, $4, $5, u.kind, $6, $7, $8
-                FROM UNNEST($1::uuid[], $2::uuid[], $3::text[]) AS u(id, pid, kind)
+                 (id, participant_id, room_id, message_id, kind, actor_id, created_at, delivery_id, importance_score)
+              SELECT u.id, u.pid, $4, $5, u.kind, $6, $7, $8, u.imp
+                FROM UNNEST($1::uuid[], $2::uuid[], $3::text[], $9::real[]) AS u(id, pid, kind, imp)
               ON CONFLICT (delivery_id, participant_id) WHERE delivery_id IS NOT NULL
                  DO NOTHING",
         )
@@ -141,6 +147,7 @@ impl NotificationRepo {
         .bind(actor_uuid)
         .bind(created_at)
         .bind(delivery_id)
+        .bind(&imps)
         .execute(&self.pool)
         .await?;
         Ok(res.rows_affected())
@@ -160,7 +167,8 @@ impl NotificationRepo {
     ) -> Result<Vec<Notification>, sqlx::Error> {
         let limit = clamp_limit(limit);
         let rows = sqlx::query_as::<_, NotificationRow>(
-            r"SELECT id, participant_id, room_id, message_id, kind, actor_id, created_at, read_at
+            r"SELECT id, participant_id, room_id, message_id, kind, actor_id, created_at, read_at,
+                      aggregate_count, importance_score
                FROM notifications
                WHERE participant_id = $1
                  AND ($2::uuid IS NULL OR id < $2)
@@ -265,6 +273,8 @@ struct NotificationRow {
     actor_id: Option<uuid::Uuid>,
     created_at: time::OffsetDateTime,
     read_at: Option<time::OffsetDateTime>,
+    aggregate_count: Option<i32>,
+    importance_score: f32,
 }
 
 impl From<NotificationRow> for Notification {
@@ -278,8 +288,12 @@ impl From<NotificationRow> for Notification {
             actor_id: r.actor_id.map(ParticipantId::from_uuid),
             created_at: r.created_at,
             read_at: r.read_at,
-            aggregate_count: Default::default(),
-            importance_score: Default::default(),
+            // Surface the columns the read SELECT now fetches (the bundle flush
+            // writes aggregate_count; migration 0139 + the insert path write
+            // importance_score). These were hardcoded to defaults, so the
+            // aggregation/importance feature never reached GET /api/notifications.
+            aggregate_count: r.aggregate_count.map(|n| u32::try_from(n).unwrap_or(0)),
+            importance_score: r.importance_score,
         }
     }
 }
@@ -465,5 +479,29 @@ mod db_tests {
         assert_eq!(updated, 0, "cross-user mark-read is a no-op");
         let still = repo.list(recipient, None, true, Some(10)).await.unwrap();
         assert!(still.iter().any(|n| n.id == id), "still unread for the owner");
+    }
+
+    /// `importance_score` is COMPUTED at insert (per kind) and SURFACED by `list`
+    /// — previously the read SELECT dropped the column and the insert never bound
+    /// it, so every notification reported 0.5/null. Guards both halves of the fix.
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn list_surfaces_computed_importance_per_kind() {
+        use aero_common::NotificationKind;
+        let p = pool();
+        let repo = NotificationRepo::new(p.clone());
+        let (recipient, room, message, actor) = fixture(&p).await;
+
+        // A Mention scores 1.0; a Reaction scores 0.3 (per importance_for).
+        repo.insert(recipient, room, message, NotificationKind::Mention, Some(actor)).await.unwrap();
+        repo.insert(recipient, room, message, NotificationKind::Reaction, Some(actor)).await.unwrap();
+
+        let list = repo.list(recipient, None, false, Some(10)).await.unwrap();
+        let mention = list.iter().find(|n| n.kind == NotificationKind::Mention).expect("mention present");
+        let reaction = list.iter().find(|n| n.kind == NotificationKind::Reaction).expect("reaction present");
+        assert!((mention.importance_score - 1.0).abs() < 1e-6, "mention importance computed + surfaced, got {}", mention.importance_score);
+        assert!((reaction.importance_score - 0.3).abs() < 1e-6, "reaction importance computed + surfaced, got {}", reaction.importance_score);
+        // Non-aggregate notifications surface aggregate_count = None (not a hardcoded default).
+        assert!(mention.aggregate_count.is_none());
     }
 }

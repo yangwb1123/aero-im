@@ -1781,6 +1781,11 @@ async fn ai_ask(
     s.im.assert_room_access(auth.participant_id, room).await?;
     let k = req.k.unwrap_or(8);
     let ai = s.ai.as_ref().ok_or_else(|| AeroError::Upstream("AI not configured".into()))?;
+    // NOTE: the agentic tool-use loop (AiService::answer_question_agentic) is NOT
+    // wired here — `s.ai` is an `Arc<dyn AiBackend>` and that method lives on the
+    // concrete `AiService` with a `&Arc<Self>` receiver, so it can't be dispatched
+    // through the trait object. Reaching it needs an architectural change (expose it
+    // on AiBackend, or hold the concrete Arc<AiService> in AppState). Tracked.
     let answer = ai
         .answer_question(room, &req.question, k)
         .await
