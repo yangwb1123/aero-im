@@ -27,10 +27,10 @@ use ulid::Ulid;
 use crate::error::ApiResult;
 use crate::state::AppState;
 
-/// Maximum stream-title length. Mirrors the `stream_create` body (no explicit
-/// cap there, but a stream card embeds the title); keep edits bounded so a
-/// renamed title stays renderable everywhere the original was.
-const MAX_TITLE_LEN: usize = 200;
+/// Maximum stream-title length. Enforced on BOTH create (`stream_create`) and
+/// edit so a title stays renderable everywhere a stream card embeds it, and the
+/// two paths can never disagree (create accepting a title edit would reject).
+pub(crate) const MAX_TITLE_LEN: usize = 200;
 
 /// Stream-metadata routes, ready to `.merge` into the gateway router.
 pub fn routes() -> Router<AppState> {
@@ -49,11 +49,12 @@ struct UpdateMetaReq {
 
 /// Validate and normalize a requested title: trim, reject empty, reject over-long.
 /// Pure, so the edge validation is unit-tested offline (no database needed).
+/// Shared by the create path (`routes::stream_create`) so both enforce the cap.
 ///
 /// # Errors
 /// [`AeroError::Invalid`] when the trimmed title is empty or exceeds
 /// [`MAX_TITLE_LEN`].
-fn validate_title(raw: &str) -> AeroResult<String> {
+pub(crate) fn validate_title(raw: &str) -> AeroResult<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err(AeroError::Invalid("title must not be empty".into()));

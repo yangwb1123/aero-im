@@ -995,12 +995,21 @@ async fn create_room(
 ) -> ApiResult<Response> {
     let kind = parse_room_kind(&req.kind)?;
     let workspace = resolve_workspace_id(req.workspace_id.as_deref())?;
+    // Normalize the name like create_workspace: trim, treat blank as "no name"
+    // (DM/group rooms are legitimately unnamed), and cap length so a malformed or
+    // multi-megabyte name can't be persisted + rendered. `rooms.name` is nullable.
+    let name = req.name.as_deref().map(str::trim).filter(|n| !n.is_empty());
+    if let Some(n) = name {
+        if n.chars().count() > 128 {
+            return Err(AeroError::Invalid("room name too long (max 128 chars)".into()).into());
+        }
+    }
     // Tenant choke point: verifies workspace membership + channel-create privilege
     // and persists `rooms.workspace_id` (fixes the NOT-NULL room-create regression
     // the old `create_room` hit after migration 0006).
     let room = s
         .im
-        .create_room_in_workspace(auth.participant_id, workspace, kind, req.name)
+        .create_room_in_workspace(auth.participant_id, workspace, kind, name.map(str::to_owned))
         .await?;
     let body = Json(serde_json::to_value(room).map_err(AeroError::from)?).into_response();
     // Per-tenant HTTP metrics (response-extension pass-through): we already
@@ -1914,12 +1923,15 @@ async fn stream_create(
         .as_deref()
         .map(parse_room_id)
         .transpose()?;
+    // Validate the title on create too (trim/empty/≤200), so it can never persist a
+    // value the owner-only edit path (PATCH /api/streams/:id) would reject.
+    let title = crate::stream_meta::validate_title(&req.title)?;
     let stream = s
         .streams
         .create(NewStream {
             owner_id: auth.participant_id,
             room_id,
-            title: req.title.clone(),
+            title,
             protocol: proto,
             stream_key: None,
         })
@@ -2156,6 +2168,21 @@ fn strip_scheme(url: &str) -> String {
 
 // ----- Agents -----
 
+/// Trim + validate a bot/agent name: reject empty/whitespace-only and cap at 64
+/// chars, matching the human `display_name` rule (update_me) so a bot can't be
+/// created with a blank or multi-megabyte name that renders broken everywhere a
+/// participant name is shown. Returns the normalized name.
+fn validate_bot_name(raw: &str) -> Result<String, AeroError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(AeroError::Invalid("name must not be empty".into()));
+    }
+    if trimmed.chars().count() > 64 {
+        return Err(AeroError::Invalid("name too long (max 64 chars)".into()));
+    }
+    Ok(trimmed.to_owned())
+}
+
 #[derive(Deserialize)]
 struct CreateAgentReq {
     display_name: String,
@@ -2174,9 +2201,10 @@ async fn create_agent(
         "agent" => aero_common::ParticipantKind::Agent,
         _ => aero_common::ParticipantKind::Bot,
     };
+    let display_name = validate_bot_name(&req.display_name)?;
     let bot = s
         .participants
-        .create_bot(&req.display_name, kind, Some(auth.participant_id), req.avatar_url.as_deref())
+        .create_bot(&display_name, kind, Some(auth.participant_id), req.avatar_url.as_deref())
         .await
         .map_err(AeroError::from)?;
     Ok(Json(serde_json::to_value(bot).map_err(AeroError::from)?))
@@ -2200,9 +2228,10 @@ async fn bot_create(
     Json(req): Json<CreateBotReq>,
 ) -> ApiResult<Response> {
     let workspace = req.workspace_id.as_ref().and_then(|w| aero_common::WorkspaceId::from_str(w).ok());
+    let name = validate_bot_name(&req.name)?;
     let repo = aero_storage::BotRepo::new(s.pg.clone());
     let bot_id = repo
-        .create(auth.participant_id, &req.name, req.icon_url.as_deref(), workspace)
+        .create(auth.participant_id, &name, req.icon_url.as_deref(), workspace)
         .await
         .map_err(AeroError::from)?;
     let token = repo
@@ -2213,7 +2242,7 @@ async fn bot_create(
     let body = Json(serde_json::json!({
         "bot_id": bot_id,
         "token": token,
-        "name": req.name,
+        "name": name,
     }))
     .into_response();
     // Per-tenant HTTP metrics: stamp the resolved tenant when the request named

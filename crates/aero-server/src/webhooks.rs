@@ -260,13 +260,21 @@ async fn revoke_incoming(
 ) -> ApiResult<StatusCode> {
     let id = parse_webhook(&id_str)?;
     let r = repo(&s);
-    let room = r
-        .incoming_room(id)
+    let (room, bot) = r
+        .incoming_room_and_bot(id)
         .await
         .map_err(AeroError::from)?
         .ok_or_else(|| AeroError::NotFound("webhook".into()))?;
     s.im.assert_room_access(auth.participant_id, room).await?;
     r.revoke_incoming(id).await.map_err(AeroError::from)?;
+    // Cross-feature cleanup: the dedicated bot created for this hook
+    // (`create_incoming`) should leave the room once the hook is revoked — it has
+    // no credential and can no longer post, so a lingering member row is just stale
+    // state. Idempotent (DELETE ... WHERE) and best-effort: a cleanup miss must not
+    // fail the revoke the caller already authorized.
+    if let Err(e) = s.rooms.remove_member(room, bot).await {
+        tracing::warn!(error = ?e, %room, %bot, "revoke_incoming: webhook bot room-cleanup failed");
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
