@@ -43,7 +43,9 @@ while read -r f; do
         echo "  ⚠️  WARN (JS): $f ($lines 行) — 建议拆分"
         warnings=$((warnings + 1))
     fi
-done < <(find web -name '*.js')
+# Exclude vendored deps: node_modules is third-party and not subject to our
+# size governance (matches scripts/web-check.sh, which already prunes it).
+done < <(find web -name '*.js' -not -path '*/node_modules/*')
 
 echo "---"
 echo "结果: $violations 违规, $warnings 警告"
