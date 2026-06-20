@@ -1,7 +1,7 @@
 //! RTMP and SRT ingest spawning.
 use std::sync::Arc;
 use tokio_util::task::TaskTracker;
-use aero_live_core::{LiveIngest, LiveStreamConfig};
+use aero_live_core::{GoLiveHook, LiveIngest, LiveStreamConfig};
 use aero_live_rtmp::spawn_rtmp_ingest;
 use tracing::info;
 
@@ -34,10 +34,14 @@ pub(crate) fn spawn(
     tracker: &TaskTracker,
     streams: aero_storage::StreamRepo,
     cfg: IngestConfig,
+    // Best-effort go-live notification hook (publishes the follower fan-out event).
+    // Wired from `AppState.live` so RTMP/SRT notify followers like WHIP does.
+    go_live: Option<GoLiveHook>,
 ) -> Arc<LiveStreamConfig> {
     let live_cfg = Arc::new(LiveStreamConfig {
         hls_dir: cfg.hls_dir.clone(),
         rtmp_listen: cfg.rtmp,
+        go_live: go_live.clone(),
     });
 
     // RTMP
@@ -62,6 +66,7 @@ pub(crate) fn spawn(
         let srt_cfg = Arc::new(LiveStreamConfig {
             hls_dir: cfg.hls_dir,
             rtmp_listen: cfg.srt,
+            go_live,
         });
         let mut srt = aero_live_srt::SrtIngest::new();
         if let Ok(pass) = std::env::var("AERO_SRT_PASSPHRASE") {

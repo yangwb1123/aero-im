@@ -93,7 +93,10 @@ pub fn build(state: AppState) -> Router {
         .route("/api/rooms/:id/receipts", get(list_receipts))
         .route("/api/rooms/:id/search", post(room_search))
         // Messages
-        .route("/api/messages/:id", axum::routing::patch(edit_message).delete(delete_message))
+        .route(
+            "/api/messages/:id",
+            axum::routing::get(get_message).patch(edit_message).delete(delete_message),
+        )
         .route("/api/messages/:id/reactions", post(toggle_reaction))
         .route("/api/messages/reactions", post(reactions_batch))
         // Thread mute (mig 0088): mute/unmute the thread rooted at this message so
@@ -1234,6 +1237,27 @@ async fn list_receipts(
 #[derive(Deserialize)]
 struct EditMessageReq {
     blocks: Vec<aero_common::Block>,
+}
+
+/// `GET /api/messages/:id` — fetch a single (non-deleted) message, gated on the
+/// caller's access to its room. Backs deep-links/permalinks and matches the
+/// operation the OpenAPI spec advertises. 404 when the message is missing or
+/// soft-deleted; 403 when the caller can't see its room.
+async fn get_message(
+    State(s): State<AppState>,
+    auth: AuthUser,
+    Path(id_str): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let id = MessageId::from_str(&id_str)
+        .map_err(|e| AeroError::Invalid(format!("message id: {e}")))?;
+    let m = s
+        .messages
+        .get(id)
+        .await?
+        .filter(|m| m.deleted_at.is_none())
+        .ok_or_else(|| AeroError::NotFound(format!("message {id}")))?;
+    s.im.assert_room_access(auth.participant_id, m.room_id).await?;
+    Ok(Json(serde_json::to_value(m).map_err(AeroError::from)?))
 }
 
 async fn edit_message(

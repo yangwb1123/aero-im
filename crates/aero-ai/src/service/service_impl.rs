@@ -567,7 +567,7 @@ impl AiService {
             // focus/tone. Default OFF → `prefix` is `None` and the prompt is
             // byte-identical to before; a profile read failure is swallowed (it must
             // never fail the answer). Retrieval/citations are untouched.
-            let system = match self.profile_personalization_prefix(participant).await {
+            let system = match self.profile_personalization_prefix(participant, workspace).await {
                 Ok(Some(prefix)) => format!("{prefix}\n\n{ANSWER_SYSTEM_PROMPT}"),
                 Ok(None) => ANSWER_SYSTEM_PROMPT.to_owned(),
                 Err(e) => {

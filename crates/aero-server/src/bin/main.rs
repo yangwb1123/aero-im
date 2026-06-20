@@ -99,7 +99,22 @@ async fn main() -> anyhow::Result<()> {
 
     // ---------- Ingest (RTMP + SRT) ----------
     let ingest_cfg = boot::ingest_config(&cfg);
-    let _live_cfg = boot::spawn_ingest(&tracker, repos.streams.clone(), ingest_cfg);
+    // Wire the go-live follower-notification hook from the LiveService bus so RTMP/
+    // SRT publishers notify followers exactly like WHIP does (which publishes the
+    // event inline). Best-effort: the publish is fire-and-forget per go-live.
+    let go_live_hook: aero_live_core::GoLiveHook = {
+        let live = services.live.clone();
+        Arc::new(move |stream_id| {
+            let live = live.clone();
+            tokio::spawn(async move { live.publish_go_live(stream_id).await });
+        })
+    };
+    let _live_cfg = boot::spawn_ingest(
+        &tracker,
+        repos.streams.clone(),
+        ingest_cfg,
+        Some(go_live_hook),
+    );
 
     // ---------- Orchestration ----------
     let public_base_url = std::env::var("AERO_PUBLIC_BASE_URL")

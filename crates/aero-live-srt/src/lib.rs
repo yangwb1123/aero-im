@@ -801,6 +801,11 @@ pub async fn resolve_stream(
     repo.mark_live(stream.id, &hls_url)
         .await
         .map_err(LiveError::Database)?;
+    // Best-effort follower notification (same bus-free hook as RTMP); WHIP
+    // publishes the go-live event directly.
+    if let Some(hook) = &cfg.go_live {
+        hook(stream.id);
+    }
 
     let dir = hls_path_for(&cfg.hls_dir, stream.id);
     let hls = HlsWriter::new(dir, SEGMENT_DURATION_SECS)

@@ -12,14 +12,34 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
+/// Best-effort callback fired right after a stream is marked live. Decoupled from
+/// the event bus so this crate needn't depend on `aero-bus`: the server wires a
+/// closure that publishes the go-live event the follower-notification bot fans
+/// out. Without it, RTMP/SRT go-lives would mark the stream live but never notify
+/// followers (only WHIP, which has the bus, did).
+pub type GoLiveHook = Arc<dyn Fn(Ulid) + Send + Sync>;
+
 /// Runtime configuration shared between all live-ingest backends.
 ///
 /// `hls_dir` is the root under which `{stream_id}/index.m3u8` directories live;
 /// `rtmp_listen` is what the RTMP backend binds to.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct LiveStreamConfig {
     pub hls_dir: PathBuf,
     pub rtmp_listen: SocketAddr,
+    /// Fired (best-effort) when a stream goes live, after `mark_live`. `None` in
+    /// tests / standalone use ⇒ no follower notification.
+    pub go_live: Option<GoLiveHook>,
+}
+
+impl std::fmt::Debug for LiveStreamConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LiveStreamConfig")
+            .field("hls_dir", &self.hls_dir)
+            .field("rtmp_listen", &self.rtmp_listen)
+            .field("go_live", &self.go_live.as_ref().map(|_| "<hook>"))
+            .finish()
+    }
 }
 
 impl LiveStreamConfig {
@@ -31,6 +51,7 @@ impl LiveStreamConfig {
             rtmp_listen: "0.0.0.0:1935"
                 .parse()
                 .expect("hard-coded RTMP default address parses"),
+            go_live: None,
         }
     }
 

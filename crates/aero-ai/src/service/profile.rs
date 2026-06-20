@@ -217,6 +217,7 @@ impl AiService {
     pub async fn profile_personalization_prefix(
         &self,
         participant: ParticipantId,
+        workspace: WorkspaceId,
     ) -> Result<Option<String>> {
         if !cross_room_profile_enabled() {
             return Ok(None);
@@ -224,7 +225,20 @@ impl AiService {
         let Some(store) = self.ai_profiles.as_ref() else {
             return Ok(None);
         };
-        let Some(profile) = store.get(participant).await? else {
+        // Populate on first read: the extraction (write) path has no other trigger,
+        // so without this the opt-in profile table stays empty and personalization
+        // never engages despite the flag being on. Best-effort — `extract_and_store`
+        // re-checks the same opt-in/store gates, returns `None` cheaply when the
+        // participant has no own messages (no LLM call), and a failure/empty result
+        // just yields no prefix this turn (never fails the answer).
+        let profile = match store.get(participant).await? {
+            Some(p) => Some(p),
+            None => self
+                .extract_and_store_profile(participant, workspace)
+                .await
+                .unwrap_or(None),
+        };
+        let Some(profile) = profile else {
             return Ok(None);
         };
         Ok(render_personalization_prefix(&profile))

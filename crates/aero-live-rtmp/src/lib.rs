@@ -384,6 +384,12 @@ async fn process_results(
                             repo.mark_live(stream.id, &hls_url)
                                 .await
                                 .map_err(LiveError::Database)?;
+                            // Best-effort follower notification: WHIP publishes the
+                            // go-live event directly; RTMP carries only this bus-free
+                            // hook (wired by the server) so followers are notified too.
+                            if let Some(hook) = &cfg.go_live {
+                                hook(stream.id);
+                            }
 
                             let dir = hls_path_for(&cfg.hls_dir, stream.id);
                             let hls = HlsWriter::new(dir, SEGMENT_DURATION_SECS as u32)

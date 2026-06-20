@@ -14,14 +14,13 @@
 //! seam that lets THIS out-of-band listener react without touching the ingest hot
 //! path (exactly like [`crate::ooo_bot`] and [`crate::unfurl_bot`]).
 //!
-//! COVERAGE NOTE: only the WHIP ingest currently publishes the go-live event. The
-//! RTMP ([`aero_live_rtmp`]) and SRT (`aero-live-srt`) ingests call
-//! `StreamRepo::mark_live` but carry only a `StreamRepo` (no `EventBus`) — their
-//! `LiveIngest::run` signature has no bus to publish on — so a stream that goes
-//! live over RTMP/SRT does NOT yet notify followers. To extend coverage, thread an
-//! `Arc<dyn EventBus>` through those ingests and publish the same
-//! `StreamEvent::Status { stream_id, status: Live }` to `live.stream.{id}` after
-//! `mark_live`; this bot then fans it out unchanged.
+//! COVERAGE: all three ingest protocols notify followers. WHIP publishes the
+//! go-live event inline (it has the `EventBus`); RTMP ([`aero_live_rtmp`]) and SRT
+//! (`aero-live-srt`) carry a bus-free best-effort [`LiveStreamConfig::go_live`]
+//! hook (wired in `boot::ingest` from `AppState.live`) that publishes the same
+//! `StreamEvent::Status { stream_id, status: Live }` to `live.stream.{id}` right
+//! after `mark_live` — so this bot fans them all out identically.
+//! [`LiveStreamConfig::go_live`]: aero_live_core::LiveStreamConfig::go_live
 //!
 //! Best-effort throughout: a non-go-live event, an unknown stream, or a failed
 //! insert is logged-and-skipped — it never aborts the listener. A queue-group
