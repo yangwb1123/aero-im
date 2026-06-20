@@ -115,6 +115,28 @@ impl PollRepo {
         Ok(row.map(Poll::from))
     }
 
+    /// Polls in a room, newest first (capped). `open_only` restricts to polls
+    /// still accepting votes (`closed_at IS NULL`). Backs the room poll list so a
+    /// client can enumerate polls instead of needing each poll id out of band.
+    pub async fn list_for_room(
+        &self,
+        room: RoomId,
+        open_only: bool,
+    ) -> Result<Vec<Poll>, sqlx::Error> {
+        let rows = sqlx::query_as::<_, PollRow>(
+            r"SELECT id, room_id, created_by, question, options, multi, anonymous, closed_at, created_at
+               FROM polls
+              WHERE room_id = $1 AND ($2 = false OR closed_at IS NULL)
+              ORDER BY id DESC
+              LIMIT 100",
+        )
+        .bind(room.to_uuid())
+        .bind(open_only)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(Poll::from).collect())
+    }
+
     /// The room a poll belongs to, or `None` if the poll does not exist. Used by
     /// the server to resolve the room for the access check before a vote.
     pub async fn room_of(&self, poll: PollId) -> Result<Option<RoomId>, sqlx::Error> {
@@ -180,49 +202,54 @@ impl PollRepo {
         option_idx: usize,
         multi: bool,
     ) -> Result<(), VoteError> {
-        // Re-read the poll under the call to honor closed-state + bounds against
-        // the authoritative row (the caller's `multi` is only an optimization).
+        // Pre-read for fast-fail bounds (needs the option count). The closed-state
+        // that actually gates the insert is re-checked UNDER a row lock below — this
+        // read is only an optimization + an out-of-range guard.
         let p = self.get(poll).await?.ok_or(VoteError::NotFound)?;
-        if p.is_closed() {
-            return Err(VoteError::Closed);
-        }
         if !option_in_range(option_idx, p.options.len()) {
             return Err(VoteError::OutOfRange);
         }
         let idx = i32::try_from(option_idx).map_err(|_| VoteError::OutOfRange)?;
 
-        if multi {
-            // Multi-choice: add this option for the participant (idempotent).
-            sqlx::query(
-                r"INSERT INTO poll_votes (poll_id, participant_id, option_idx, created_at)
-                   VALUES ($1, $2, $3, now())
-                   ON CONFLICT (poll_id, participant_id, option_idx) DO NOTHING",
-            )
-            .bind(poll.to_uuid())
-            .bind(participant.to_uuid())
-            .bind(idx)
-            .execute(&self.pool)
-            .await?;
-        } else {
+        // Lock the poll row for the duration of the insert so a concurrent close()
+        // (which UPDATEs the same row, taking the same lock) serializes with us. The
+        // closed-state observed here, under the lock, is authoritative — a stale
+        // pre-read would otherwise let a ballot land in a poll that closed in the
+        // gap between the read and the insert (TOCTOU).
+        let mut tx = self.pool.begin().await?;
+        let closed_at = sqlx::query_scalar::<_, Option<time::OffsetDateTime>>(
+            r"SELECT closed_at FROM polls WHERE id = $1 FOR UPDATE",
+        )
+        .bind(poll.to_uuid())
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(VoteError::NotFound)?;
+        if closed_at.is_some() {
+            return Err(VoteError::Closed);
+        }
+
+        if !multi {
             // Single-choice: a participant has exactly one vote. Replace any prior
-            // choice atomically so a concurrent re-vote can't leave two rows.
-            let mut tx = self.pool.begin().await?;
+            // choice so a re-vote can't leave two rows.
             sqlx::query(r"DELETE FROM poll_votes WHERE poll_id = $1 AND participant_id = $2")
                 .bind(poll.to_uuid())
                 .bind(participant.to_uuid())
                 .execute(&mut *tx)
                 .await?;
-            sqlx::query(
-                r"INSERT INTO poll_votes (poll_id, participant_id, option_idx, created_at)
-                   VALUES ($1, $2, $3, now())",
-            )
-            .bind(poll.to_uuid())
-            .bind(participant.to_uuid())
-            .bind(idx)
-            .execute(&mut *tx)
-            .await?;
-            tx.commit().await?;
         }
+        // Insert the (new) choice. ON CONFLICT keeps multi-choice idempotent; for
+        // single-choice the prior row was just deleted, so the clause is a no-op.
+        sqlx::query(
+            r"INSERT INTO poll_votes (poll_id, participant_id, option_idx, created_at)
+               VALUES ($1, $2, $3, now())
+               ON CONFLICT (poll_id, participant_id, option_idx) DO NOTHING",
+        )
+        .bind(poll.to_uuid())
+        .bind(participant.to_uuid())
+        .bind(idx)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
         Ok(())
     }
 

@@ -190,7 +190,24 @@ def main():
         fail(f"multi tally mismatch: {get3.get('counts')}")
     ok("multi-choice anonymous poll get confirms anonymity + counts")
 
-    print("\n\033[1;32m✅ anonymous polls smoke PASSED (anonymity enforced, tallies correct, close gates re-voting)\033[0m")
+    # ========== LIST POLLS IN ROOM (GET /api/rooms/:id/polls) ==========
+    say("bob lists ALL polls in the room")
+    all_polls = req("GET", f"/api/rooms/{Room}/polls", token=B, expect=200)
+    ids = {p["id"] for p in all_polls}
+    if not {Poll1, Poll2, Poll3}.issubset(ids):
+        fail(f"room poll list missing some polls: got {[i[:8] for i in ids]}")
+    ok(f"all 3 polls listed ({len(all_polls)} total)")
+
+    say("list only OPEN polls (?open=true): closed ones excluded")
+    open_polls = req("GET", f"/api/rooms/{Room}/polls?open=true", token=B, expect=200)
+    open_ids = {p["id"] for p in open_polls}
+    if Poll3 not in open_ids:
+        fail(f"open poll {Poll3[:8]} missing from open list")
+    if Poll1 in open_ids or Poll2 in open_ids:
+        fail(f"closed polls leaked into open list: {[i[:8] for i in open_ids]}")
+    ok(f"open filter correct: {len(open_polls)} open, closed polls excluded")
+
+    print("\n\033[1;32m✅ anonymous polls smoke PASSED (anonymity enforced, tallies correct, close gates re-voting, room list)\033[0m")
 
 
 if __name__ == "__main__":

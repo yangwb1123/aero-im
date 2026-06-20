@@ -19,7 +19,7 @@ use aero_common::{Error as AeroError, PollId, PollOp, RoomEvent, RoomId};
 use aero_storage::poll::{option_count_valid, VoteError, MAX_OPTIONS, MIN_OPTIONS};
 use aero_storage::PollRepo;
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     routing::{get, post},
     Json, Router,
 };
@@ -31,10 +31,32 @@ use crate::state::AppState;
 /// All poll routes, ready to `.merge` into the gateway router.
 pub fn routes() -> Router<AppState> {
     Router::new()
-        .route("/api/rooms/:id/polls", post(create_poll))
+        .route("/api/rooms/:id/polls", post(create_poll).get(list_polls))
         .route("/api/polls/:id", get(get_poll))
         .route("/api/polls/:id/vote", post(vote_poll))
         .route("/api/polls/:id/close", post(close_poll))
+}
+
+#[derive(Deserialize)]
+struct ListPollsQuery {
+    /// `?open=true` restricts to polls still accepting votes.
+    #[serde(default)]
+    open: bool,
+}
+
+/// `GET /api/rooms/:id/polls` — list the room's polls, newest first (`?open=true`
+/// for only those still accepting votes). Room-access gated like `create_poll`.
+/// Returns poll metadata only; clients fetch a live tally via `GET /api/polls/:id`.
+async fn list_polls(
+    State(s): State<AppState>,
+    auth: AuthUser,
+    Path(room_str): Path<String>,
+    Query(q): Query<ListPollsQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let room = parse_room(&room_str)?;
+    s.im.assert_room_access(auth.participant_id, room).await?;
+    let polls = poll_repo(&s).list_for_room(room, q.open).await?;
+    Ok(Json(serde_json::to_value(polls).map_err(AeroError::from)?))
 }
 
 fn parse_room(s: &str) -> Result<RoomId, AeroError> {

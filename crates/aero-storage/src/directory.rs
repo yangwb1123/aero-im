@@ -122,7 +122,12 @@ impl DirectoryRepo {
                FROM participants p
                JOIN workspace_members wm ON wm.participant_id = p.id
                LEFT JOIN participant_profiles pp ON pp.participant_id = p.id
-              WHERE wm.workspace_id = $1"
+              -- Exclude GDPR-tombstoned accounts: erasure soft-deletes the
+              -- participant (UPDATE deleted_at + display_name='[deleted]') but does
+              -- not remove the workspace_members row (the FK cascade never fires on a
+              -- tombstone), so without this filter '[deleted]' rows leak into the
+              -- directory. Mirrors ParticipantRepo::search.
+              WHERE wm.workspace_id = $1 AND p.deleted_at IS NULL"
         );
         let mut idx = 2;
         if query.is_some() {
@@ -275,5 +280,42 @@ mod db_tests {
 
         cleanup(&p, eng).await;
         cleanup(&p, designer).await;
+    }
+
+    /// A GDPR-erased member must NOT appear in the directory. Erasure tombstones
+    /// the participant (UPDATE deleted_at, display_name='[deleted]') and leaves the
+    /// workspace_members row intact (the FK cascade never fires on a tombstone), so
+    /// only the query's `deleted_at IS NULL` filter keeps the '[deleted]' row out.
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn search_excludes_gdpr_tombstoned_member() {
+        let p = pool();
+        let repo = DirectoryRepo::new(p.clone());
+        let ws = default_ws();
+        let tag = format!("dir-del-{}", ParticipantId::new());
+        let active = member_with_title(&p, &format!("Active {tag}"), &format!("Eng {tag}")).await;
+        let erased = member_with_title(&p, &format!("Erased {tag}"), &format!("Eng {tag}")).await;
+
+        // Erase via the canonical GDPR path (UPDATE tombstone, not a hard delete).
+        crate::ParticipantRepo::new(p.clone())
+            .delete_participant(erased)
+            .await
+            .expect("erase");
+
+        // Baseline: the active member is still reachable by name.
+        let by_name = repo.search(ws, Some(&format!("Active {tag}")), None, 50, 0).await.unwrap();
+        assert!(by_name.iter().any(|e| e.participant_id == active), "active member is listed");
+
+        // The erased member must be absent from an UNFILTERED listing (its name is
+        // now '[deleted]', so only the deleted_at filter — not the name — excludes it).
+        let all = repo.search(ws, None, None, 200, 0).await.unwrap();
+        assert!(all.iter().any(|e| e.participant_id == active), "active member in full listing");
+        assert!(
+            !all.iter().any(|e| e.participant_id == erased),
+            "a GDPR-tombstoned member must NOT leak into the directory"
+        );
+
+        cleanup(&p, active).await;
+        cleanup(&p, erased).await;
     }
 }
