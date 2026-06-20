@@ -111,6 +111,7 @@ function hookWs() {
   ws.on('msg:notify', (f) => handleNotify(f));
   ws.on('msg:pin', (f) => handlePin(f));
   ws.on('msg:presence', (f) => handlePresence(f));
+  ws.on('msg:membership', (f) => handleMembership(f));
   ws.on('msg:call', (f) => handleCall(f.event));
   ws.on('msg:stream_event', (f) => handleStreamEvent(f.event));
   // ROADMAP v3 方向一: the WS reconnect backfill replay hit its per-room (or
@@ -493,6 +494,14 @@ function handlePresence(frame) {
   els.onlineList.replaceChildren();
   for (const pid of ids) els.onlineList.appendChild(renderOnlineItem(pid, state.participants.get(pid)));
   els.onlineCount.textContent = String(ids.length);
+}
+
+// Member joined/left the current channel (`RoomEvent::Membership`, fanned to all
+// members). Presence isn't re-broadcast on a membership change, so re-join to pull a
+// fresh Presence frame (idempotent; the WS join never re-fires Membership → no loop).
+function handleMembership(frame) {
+  if (frame.room_id !== state.currentRoomId) return;
+  ws.joinRoom(state.currentRoomId);
 }
 
 // ---------- room list / switch ----------
