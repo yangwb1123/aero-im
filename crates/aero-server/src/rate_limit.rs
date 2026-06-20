@@ -309,8 +309,9 @@ fn bearer_participant(state: &AppState, headers: &HeaderMap) -> Option<aero_comm
 }
 
 /// Resolve the client IP: first hop of `X-Forwarded-For` if present, else the
-/// transport peer, else an unspecified address (so keying still works).
-fn client_ip(headers: &HeaderMap, peer: Option<std::net::SocketAddr>) -> IpAddr {
+/// transport peer, else an unspecified address (so keying still works). Shared with
+/// the IP-allowlist enforcement middleware so both honour XFF identically.
+pub(crate) fn client_ip(headers: &HeaderMap, peer: Option<std::net::SocketAddr>) -> IpAddr {
     if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
         if let Some(first) = xff.split(',').next() {
             if let Ok(ip) = first.trim().parse::<IpAddr>() {

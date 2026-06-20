@@ -55,6 +55,13 @@ pub(crate) async fn serve(
             state.clone(),
             rate_limit::layer,
         ))
+        // IP-allowlist enforcement: 403 a client whose IP is outside a workspace's
+        // configured allowlist on its `/api/workspaces/:id/*` routes (after the
+        // rate-limit layer, so a flood is throttled before it hits the cidrs query).
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            aero_server::ip_allowlist::enforce_layer,
+        ))
         .option_layer(timeout_layer)
         .layer(DefaultBodyLimit::max(gateway_cfg.max_body_bytes));
 
