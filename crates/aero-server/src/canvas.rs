@@ -18,9 +18,9 @@ use std::str::FromStr;
 
 use aero_auth::AuthUser;
 use aero_common::{CanvasId, Error as AeroError, RoomId};
-use aero_storage::{Canvas, CanvasRepo};
+use aero_storage::{Canvas, CanvasOpRepo, CanvasRepo};
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     routing::get,
     Json, Router,
 };
@@ -40,6 +40,12 @@ pub fn routes() -> Router<AppState> {
             "/api/canvases/:cid",
             get(get_canvas).put(update_canvas).delete(delete_canvas),
         )
+        // ROADMAP 方向五·③: append-only collaborative op log. POST appends one
+        // incremental edit op; GET fetches the ordered delta after `?since=`.
+        .route(
+            "/api/canvases/:cid/ops",
+            get(list_ops).post(append_op),
+        )
 }
 
 /// Max length of a canvas title, validated at the edge (`400` when exceeded).
@@ -49,6 +55,21 @@ const MAX_TITLE_LEN: usize = 512;
 fn repo(s: &AppState) -> CanvasRepo {
     CanvasRepo::new(s.pg.clone())
 }
+
+/// Build a [`CanvasOpRepo`] (the collaborative op log) over the shared pool.
+fn op_repo(s: &AppState) -> CanvasOpRepo {
+    CanvasOpRepo::new(s.pg.clone())
+}
+
+/// Max serialized size of a single canvas op. An op is one incremental edit
+/// (insert/delete/format); an unbounded blob would be a memory / amplification
+/// vector against the shared op log, so anything larger is `400`.
+const MAX_OP_BYTES: usize = 64 * 1024;
+/// Default / hard ceiling on ops returned per delta fetch — the same
+/// bounded-page discipline as message backfill, so a long log can't dump
+/// unboundedly over one request (the client pages via `?since=`).
+const DEFAULT_OPS_LIMIT: i64 = 500;
+const MAX_OPS_LIMIT: i64 = 1000;
 
 fn parse_room(s: &str) -> Result<RoomId, AeroError> {
     RoomId::from_str(s.trim()).map_err(|e| AeroError::Invalid(format!("room id: {e}")))
@@ -241,4 +262,77 @@ async fn delete_canvas(
         return Err(AeroError::NotFound(format!("canvas {id}")).into());
     }
     Ok(Json(serde_json::json!({ "deleted": true })))
+}
+
+#[derive(Deserialize)]
+struct AppendOpReq {
+    /// The incremental edit op — a JSON object (insert/delete/format/…). Stored
+    /// verbatim; the server orders but never interprets it.
+    op: serde_json::Value,
+}
+
+/// `POST /api/canvases/:cid/ops` — append one collaborative edit op to the
+/// canvas's log (方向五·③). Room-access gated (any member may edit). The op must
+/// be a JSON object within [`MAX_OP_BYTES`]. Returns the persisted op with its
+/// assigned per-canvas `seq`, so the client can advance its local cursor.
+async fn append_op(
+    State(s): State<AppState>,
+    auth: AuthUser,
+    Path(id_str): Path<String>,
+    Json(req): Json<AppendOpReq>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let id = parse_canvas(&id_str)?;
+    // Existence (404) + membership (403) before recording anything.
+    load_with_access(&s, id, auth.participant_id).await?;
+    if !req.op.is_object() {
+        return Err(AeroError::Invalid("op must be a JSON object".into()).into());
+    }
+    let encoded = serde_json::to_string(&req.op).map_err(AeroError::from)?;
+    if encoded.len() > MAX_OP_BYTES {
+        return Err(AeroError::Invalid("op too large".into()).into());
+    }
+    let op = op_repo(&s)
+        .append(id, auth.participant_id, &req.op)
+        .await
+        .map_err(AeroError::from)?
+        // Unreachable in practice (load_with_access just proved existence), but a
+        // delete racing between the check and the append yields None → 404.
+        .ok_or_else(|| AeroError::NotFound(format!("canvas {id}")))?;
+    Ok(Json(serde_json::to_value(op).map_err(AeroError::from)?))
+}
+
+#[derive(Deserialize)]
+struct OpsQuery {
+    /// Return ops strictly after this seq (the client's last-seen position).
+    /// Absent ⇒ 0 (the whole log).
+    #[serde(default)]
+    since: Option<i64>,
+    /// Page size, clamped to [1, [`MAX_OPS_LIMIT`]]. Absent ⇒ [`DEFAULT_OPS_LIMIT`].
+    #[serde(default)]
+    limit: Option<i64>,
+}
+
+/// `GET /api/canvases/:cid/ops?since=&limit=` — the ordered op delta after
+/// `since` (方向五·③), the catch-up a reconnecting/late editor reduces to rebuild
+/// state. Room-access gated. Bounded page; the client continues from the last
+/// returned `seq`.
+async fn list_ops(
+    State(s): State<AppState>,
+    auth: AuthUser,
+    Path(id_str): Path<String>,
+    Query(q): Query<OpsQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let id = parse_canvas(&id_str)?;
+    load_with_access(&s, id, auth.participant_id).await?;
+    let since = q.since.unwrap_or(0).max(0);
+    let limit = q.limit.unwrap_or(DEFAULT_OPS_LIMIT).clamp(1, MAX_OPS_LIMIT);
+    let ops = op_repo(&s)
+        .ops_since(id, since, limit)
+        .await
+        .map_err(AeroError::from)?;
+    Ok(Json(serde_json::json!({
+        "canvas_id": id,
+        "since": since,
+        "ops": ops,
+    })))
 }

@@ -88,6 +88,7 @@ pub mod room_role;
 // ---- Wave 16 ----
 pub mod analytics;
 pub mod canvas;
+pub mod canvas_op;
 pub mod channel_bookmark;
 pub mod creator_subscription;
 pub mod directory;
@@ -228,6 +229,7 @@ pub use analytics::{
     WorkspaceAnalytics, WorkspaceSummary, MAX_TIMELINE_DAYS, MAX_TOP_CHANNELS,
 };
 pub use canvas::{Canvas, CanvasRepo};
+pub use canvas_op::{CanvasOp, CanvasOpRepo};
 pub use channel_bookmark::{ChannelBookmark, ChannelBookmarkRepo};
 pub use creator_subscription::{CreatorSubscription, CreatorTier, SubscriptionRepo};
 pub use directory::{DirectoryEntry, DirectoryRepo};
