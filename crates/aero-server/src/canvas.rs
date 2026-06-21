@@ -171,6 +171,11 @@ struct UpdateCanvasReq {
     /// New document body (a JSON array of blocks); absent ⇒ keep the current one.
     #[serde(default)]
     blocks: Option<serde_json::Value>,
+    /// Optimistic-concurrency guard (方向五): the `version` the client last read.
+    /// When present, the edit is rejected with `409` if another editor has since
+    /// bumped the version (no silent lost update). Absent ⇒ last-write-wins (legacy).
+    #[serde(default)]
+    expected_version: Option<i64>,
 }
 
 /// `PUT /api/canvases/:cid` — edit a canvas (collaborative: any room member may
@@ -198,11 +203,19 @@ async fn update_canvas(
     };
 
     let updated = repo(&s)
-        .update(id, &title, &blocks)
+        .update(id, &title, &blocks, req.expected_version)
         .await
         .map_err(AeroError::from)?;
-    if !updated {
-        // Lost a race with a concurrent delete.
+    if updated.is_none() {
+        // No row matched. With an expected_version, that means a concurrent editor
+        // bumped the version → reject (409) so the caller reloads + retries rather
+        // than silently clobbering the other edit. Without one, the row was deleted.
+        if req.expected_version.is_some() {
+            return Err(AeroError::Conflict(
+                "canvas was modified concurrently; reload and retry".into(),
+            )
+            .into());
+        }
         return Err(AeroError::NotFound(format!("canvas {id}")).into());
     }
     let row = repo(&s)

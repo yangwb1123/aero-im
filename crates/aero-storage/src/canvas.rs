@@ -42,11 +42,14 @@ pub struct Canvas {
     /// When the canvas was last edited (RFC 3339 on the wire).
     #[serde(with = "time::serde::rfc3339")]
     pub updated_at: time::OffsetDateTime,
+    /// Monotonic edit version for optimistic concurrency (bumped on every update).
+    /// A client echoes this on a PUT to detect a concurrent edit (方向五).
+    pub version: i64,
 }
 
 /// The columns a [`Canvas`] is built from, in select order. Shared by every query
 /// so the row decoding stays in one place.
-const COLUMNS: &str = "id, room_id, author_id, title, blocks, created_at, updated_at";
+const COLUMNS: &str = "id, room_id, author_id, title, blocks, created_at, updated_at, version";
 
 type Row = (
     uuid::Uuid,
@@ -56,10 +59,11 @@ type Row = (
     serde_json::Value,
     time::OffsetDateTime,
     time::OffsetDateTime,
+    i64,
 );
 
 fn row_to_model(r: Row) -> Canvas {
-    let (id, room_id, author_id, title, blocks, created_at, updated_at) = r;
+    let (id, room_id, author_id, title, blocks, created_at, updated_at, version) = r;
     Canvas {
         id: CanvasId::from_uuid(id),
         room_id: RoomId::from_uuid(room_id),
@@ -68,6 +72,7 @@ fn row_to_model(r: Row) -> Canvas {
         blocks,
         created_at,
         updated_at,
+        version,
     }
 }
 
@@ -152,23 +157,35 @@ impl CanvasRepo {
     ///
     /// # Errors
     /// Propagates any [`sqlx::Error`] from the update.
+    /// Edit a canvas, bumping its `version`. When `expected_version` is `Some`, the
+    /// update only applies if the row is still at that version — optimistic
+    /// concurrency: a concurrent edit (version moved on) matches no row. `None`
+    /// skips the check (last-write-wins, the legacy behaviour). Returns the NEW
+    /// version on success, or `None` when no row matched (unknown/deleted id, or a
+    /// stale `expected_version`); the caller distinguishes the two.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`].
     pub async fn update(
         &self,
         id: CanvasId,
         title: &str,
         blocks: &serde_json::Value,
-    ) -> Result<bool, sqlx::Error> {
-        let result = sqlx::query(
+        expected_version: Option<i64>,
+    ) -> Result<Option<i64>, sqlx::Error> {
+        let new_version: Option<i64> = sqlx::query_scalar(
             r"UPDATE channel_canvases
-                 SET title = $2, blocks = $3, updated_at = now()
-               WHERE id = $1",
+                 SET title = $2, blocks = $3, updated_at = now(), version = version + 1
+               WHERE id = $1 AND ($4::bigint IS NULL OR version = $4)
+               RETURNING version",
         )
         .bind(id.to_uuid())
         .bind(title)
         .bind(blocks)
-        .execute(&self.pool)
+        .bind(expected_version)
+        .fetch_optional(&self.pool)
         .await?;
-        Ok(result.rows_affected() > 0)
+        Ok(new_version)
     }
 
     /// Delete a canvas by id. Returns `true` iff a row was removed — a second
@@ -243,18 +260,23 @@ mod db_tests {
             "another room's list does not show it"
         );
 
-        // update replaces title + blocks and bumps updated_at.
+        // update (no version check) replaces title + blocks, bumps updated_at +
+        // version (new rows start at 0 ⇒ first edit is version 1).
         let new_blocks = serde_json::json!([{ "type": "text", "text": "shipped" }]);
-        assert!(repo.update(id, "Q3 Plan (final)", &new_blocks).await.unwrap());
+        assert_eq!(repo.update(id, "Q3 Plan (final)", &new_blocks, None).await.unwrap(), Some(1));
         let after = repo.get(id).await.unwrap().expect("still present");
         assert_eq!(after.title, "Q3 Plan (final)");
         assert_eq!(after.blocks, new_blocks);
+        assert_eq!(after.version, 1, "version bumped");
         assert!(after.updated_at >= got.updated_at, "updated_at moved forward");
 
-        // delete: first removes, second is a no-op; unknown id is false too.
+        // delete: first removes, second is a no-op; unknown id is None too.
         assert!(repo.delete(id).await.unwrap(), "first delete removes");
         assert!(!repo.delete(id).await.unwrap(), "second delete is a no-op");
-        assert!(!repo.update(id, "x", &new_blocks).await.unwrap(), "update on gone id is false");
+        assert!(
+            repo.update(id, "x", &new_blocks, None).await.unwrap().is_none(),
+            "update on a gone id matches no row"
+        );
         assert!(repo.get(id).await.unwrap().is_none(), "deleted canvas is gone");
 
         // Cleanup so reruns stay self-contained.
@@ -268,5 +290,38 @@ mod db_tests {
             .execute(&p)
             .await
             .ok();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn update_with_stale_version_is_rejected() {
+        let p = pool();
+        let repo = CanvasRepo::new(p.clone());
+        let room = RoomId::new();
+        let author = author(&p).await;
+
+        let id = repo.create(room, author, "Doc", &serde_json::json!([])).await.unwrap();
+        let v0 = repo.get(id).await.unwrap().unwrap().version; // 0
+
+        // Editor A updates from v0 → succeeds, version → 1.
+        let a = serde_json::json!([{ "type": "text", "text": "A" }]);
+        assert_eq!(repo.update(id, "Doc", &a, Some(v0)).await.unwrap(), Some(1));
+
+        // Editor B also read v0 and now tries to update → STALE version matches no
+        // row (concurrent-edit conflict) → A's edit is NOT silently clobbered.
+        let b = serde_json::json!([{ "type": "text", "text": "B" }]);
+        assert!(
+            repo.update(id, "Doc", &b, Some(v0)).await.unwrap().is_none(),
+            "a stale expected_version must be rejected — no silent overwrite"
+        );
+        let after = repo.get(id).await.unwrap().unwrap();
+        assert_eq!(after.blocks, a, "A's content survived the conflicting write");
+        assert_eq!(after.version, 1);
+
+        // B re-reads (now v1) and retries → succeeds, version → 2.
+        assert_eq!(repo.update(id, "Doc", &b, Some(1)).await.unwrap(), Some(2));
+
+        sqlx::query("DELETE FROM channel_canvases WHERE room_id = $1").bind(room.to_uuid()).execute(&p).await.ok();
+        sqlx::query("DELETE FROM participants WHERE id = $1").bind(author.to_uuid()).execute(&p).await.ok();
     }
 }
