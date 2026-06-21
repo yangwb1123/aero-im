@@ -88,11 +88,12 @@ async fn handle(state: &AppState, stream_id: ulid::Ulid) -> anyhow::Result<()> {
     let summary = format!("{} is live", stream.title);
     let mut delivered = 0u64;
     for follower in followers {
-        match feed
-            .insert(follower, "stream_live", Some(owner), Some(stream_id), &summary)
-            .await
-        {
-            Ok(_) => delivered += 1,
+        // Idempotent per (follower, stream_id): an at-least-once NATS redelivery of
+        // this go-live event re-runs the fan-out, but the ON CONFLICT DO NOTHING
+        // makes the replay a no-op rather than a duplicate "X is live" entry.
+        match feed.insert_go_live(follower, Some(owner), stream_id, &summary).await {
+            Ok(Some(_)) => delivered += 1,
+            Ok(None) => {} // already delivered (redelivery) — no duplicate
             Err(e) => warn!(error = ?e, %follower, %stream_id, "golive_bot insert failed"),
         }
     }

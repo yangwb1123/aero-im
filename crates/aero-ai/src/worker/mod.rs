@@ -339,9 +339,13 @@ impl AiWorker {
                         tracing::debug!(message_id = %id, "moderation: message already deleted");
                     }
                     Err(e) => {
-                        // Non-fatal: the verdict is still persisted; operator can
-                        // manually review via the audit log.
-                        tracing::warn!(error = %e, message_id = %id, "moderation: soft_delete failed");
+                        // Removing blocked content is safety-critical: do NOT report
+                        // the job a success with the message still visible. Propagate
+                        // so the queue retries (bounded → DLQ). Re-moderation on retry
+                        // re-charges, but transient delete failures are rare and
+                        // leaving flagged content up is the worse outcome.
+                        tracing::warn!(error = %e, message_id = %id, "moderation: soft_delete failed; retrying job");
+                        return Err(e.into());
                     }
                 }
             } else {

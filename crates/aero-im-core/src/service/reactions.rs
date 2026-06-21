@@ -20,6 +20,21 @@ impl ImService {
         Ok(self.reactions.summaries_for(message_ids).await?)
     }
 
+    /// Batch reactions scoped to what `viewer` may see — only messages in rooms
+    /// they belong to (the storage `JOIN room_members` is the boundary). Use this
+    /// for any caller-facing batch lookup so reaction counts / reactor ids never
+    /// leak across rooms.
+    ///
+    /// # Errors
+    /// Propagates any storage error.
+    pub async fn reactions_for_accessible(
+        &self,
+        viewer: ParticipantId,
+        message_ids: &[MessageId],
+    ) -> Result<BTreeMap<MessageId, Vec<ReactionSummary>>> {
+        Ok(self.reactions.summaries_for_accessible(viewer, message_ids).await?)
+    }
+
     /// Toggle a reaction on a message. Caller must be a member of the message's room.
     #[instrument(skip(self), fields(?actor, ?message_id, emoji))]
     pub async fn toggle_reaction(

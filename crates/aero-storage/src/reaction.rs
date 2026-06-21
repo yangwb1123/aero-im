@@ -193,6 +193,51 @@ impl ReactionRepo {
         .fetch_all(&self.pool)
         .await?;
 
+        Ok(Self::group_summaries(rows))
+    }
+
+    /// Like [`summaries_for`](Self::summaries_for) but ONLY for messages in rooms
+    /// `viewer` is a member of — the `JOIN room_members` is the security boundary
+    /// (mirrors `MessageRepo::search_all_rooms`), so a batch request can never
+    /// surface reaction counts or reactor ids for a room the caller isn't in.
+    /// Inaccessible message ids are silently dropped from the result.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`].
+    pub async fn summaries_for_accessible(
+        &self,
+        viewer: ParticipantId,
+        message_ids: &[MessageId],
+    ) -> Result<BTreeMap<MessageId, Vec<ReactionSummary>>, sqlx::Error> {
+        if message_ids.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let uuids: Vec<uuid::Uuid> = message_ids.iter().map(MessageId::to_uuid).collect();
+        let rows = sqlx::query_as::<_, (uuid::Uuid, String, i64, Vec<uuid::Uuid>)>(
+            r#"SELECT r.message_id,
+                      r.emoji,
+                      COUNT(*) AS count,
+                      (array_agg(r.participant_id ORDER BY r.created_at ASC))[1:$2] AS reactors
+               FROM reactions r
+               JOIN messages m      ON m.id = r.message_id
+               JOIN room_members rm ON rm.room_id = m.room_id AND rm.participant_id = $3
+               WHERE r.message_id = ANY($1)
+               GROUP BY r.message_id, r.emoji
+               ORDER BY r.message_id, MIN(r.created_at) ASC"#,
+        )
+        .bind(&uuids)
+        .bind(MAX_REACTORS_PREVIEW)
+        .bind(viewer.to_uuid())
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(Self::group_summaries(rows))
+    }
+
+    /// Fold aggregate `(message_id, emoji, count, reactors)` rows into the
+    /// per-message summary map (shared by the scoped + unscoped queries).
+    fn group_summaries(
+        rows: Vec<(uuid::Uuid, String, i64, Vec<uuid::Uuid>)>,
+    ) -> BTreeMap<MessageId, Vec<ReactionSummary>> {
         let mut out: BTreeMap<MessageId, Vec<ReactionSummary>> = BTreeMap::new();
         for (mid, emoji, count, reactors) in rows {
             out.entry(MessageId::from_uuid(mid)).or_default().push(ReactionSummary {
@@ -201,7 +246,7 @@ impl ReactionRepo {
                 participants: reactors.into_iter().map(ParticipantId::from_uuid).collect(),
             });
         }
-        Ok(out)
+        out
     }
 }
 
@@ -300,6 +345,68 @@ mod db_tests {
             .execute(&p)
             .await
             .ok();
+    }
+
+    /// `summaries_for_accessible` only returns reactions for messages in rooms the
+    /// viewer belongs to — a batch can't leak counts/reactor ids cross-room (IDOR).
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn summaries_for_accessible_is_membership_scoped() {
+        use aero_common::ParticipantId;
+        let p = pool();
+        let repo = ReactionRepo::new(p.clone());
+
+        let viewer = ParticipantId::new();
+        let sender = ParticipantId::new();
+        for id in [viewer, sender] {
+            sqlx::query("INSERT INTO participants (id, kind, display_name) VALUES ($1,'human',$2)")
+                .bind(id.to_uuid())
+                .bind(format!("acc-{id}"))
+                .execute(&p)
+                .await
+                .expect("participant");
+        }
+        // Room A: viewer IS a member. Room B: viewer is NOT.
+        let mk_room_msg = |room: uuid::Uuid, msg: uuid::Uuid| {
+            let p = p.clone();
+            async move {
+                sqlx::query(
+                    "INSERT INTO rooms (id, kind, name, created_by, workspace_id)
+                     VALUES ($1,'group','r',$2,'00000000-0000-0000-0000-000000000000')",
+                )
+                .bind(room).bind(sender.to_uuid()).execute(&p).await.expect("room");
+                sqlx::query(
+                    "INSERT INTO messages (id, room_id, sender_id, blocks, metadata)
+                     VALUES ($1,$2,$3,'[]'::jsonb,'{}'::jsonb)",
+                )
+                .bind(msg).bind(room).bind(sender.to_uuid()).execute(&p).await.expect("msg");
+                sqlx::query("INSERT INTO reactions (message_id, participant_id, emoji) VALUES ($1,$2,'👍')")
+                    .bind(msg).bind(sender.to_uuid()).execute(&p).await.expect("reaction");
+            }
+        };
+        let (room_a, msg_a) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let (room_b, msg_b) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        mk_room_msg(room_a, msg_a).await;
+        mk_room_msg(room_b, msg_b).await;
+        // Viewer joins ONLY room A.
+        sqlx::query("INSERT INTO room_members (room_id, participant_id, role) VALUES ($1,$2,'member')")
+            .bind(room_a).bind(viewer.to_uuid()).execute(&p).await.expect("join A");
+
+        let (mid_a, mid_b) = (MessageId::from_uuid(msg_a), MessageId::from_uuid(msg_b));
+        let out = repo.summaries_for_accessible(viewer, &[mid_a, mid_b]).await.expect("scoped");
+        assert!(out.contains_key(&mid_a), "viewer sees room-A reactions");
+        assert!(!out.contains_key(&mid_b), "room-B reactions are NOT leaked to a non-member");
+
+        // The unscoped variant would have leaked both — proving the scoping matters.
+        let unscoped = repo.summaries_for(&[mid_a, mid_b]).await.expect("unscoped");
+        assert!(unscoped.contains_key(&mid_b), "unscoped sees both (the IDOR the scoped form closes)");
+
+        for r in [room_a, room_b] {
+            sqlx::query("DELETE FROM reactions WHERE message_id IN (SELECT id FROM messages WHERE room_id=$1)").bind(r).execute(&p).await.ok();
+            sqlx::query("DELETE FROM messages WHERE room_id = $1").bind(r).execute(&p).await.ok();
+            sqlx::query("DELETE FROM rooms WHERE id = $1").bind(r).execute(&p).await.ok();
+        }
+        sqlx::query("DELETE FROM participants WHERE id = $1 OR id = $2").bind(viewer.to_uuid()).bind(sender.to_uuid()).execute(&p).await.ok();
     }
 
     /// `toggle_capped` enforces the per-(message, participant) distinct-emoji cap

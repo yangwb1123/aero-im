@@ -1399,7 +1399,7 @@ const MAX_REACTIONS_BATCH: usize = 256;
 
 async fn reactions_batch(
     State(s): State<AppState>,
-    _auth: AuthUser,
+    auth: AuthUser,
     Json(req): Json<ReactionsBatchReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     if req.message_ids.len() > MAX_REACTIONS_BATCH {
@@ -1415,7 +1415,11 @@ async fn reactions_batch(
         .map(|s| MessageId::from_str(s))
         .collect::<std::result::Result<_, _>>()
         .map_err(|e| AeroError::Invalid(format!("message id: {e}")))?;
-    let summaries = s.im.reactions_for(&ids).await?;
+    // Membership-scoped: only reactions on messages in rooms the caller belongs to
+    // (the storage JOIN room_members is the boundary). A message id the caller
+    // can't access is silently absent — no cross-room reaction-count / reactor-id
+    // leak (IDOR).
+    let summaries = s.im.reactions_for_accessible(auth.participant_id, &ids).await?;
     let summaries_json: serde_json::Map<String, serde_json::Value> = summaries
         .into_iter()
         .map(|(mid, list)| {

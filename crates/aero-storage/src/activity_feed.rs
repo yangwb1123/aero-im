@@ -126,6 +126,43 @@ impl ActivityFeedRepo {
         Ok(id)
     }
 
+    /// Idempotent go-live fan-out insert: at most one `stream_live` row per
+    /// `(participant, subject=stream_id)`. On an at-least-once NATS redelivery the
+    /// fan-out repeats, so this `ON CONFLICT DO NOTHING` (against the partial unique
+    /// index `activity_feed_stream_live_uniq`, migration 0156) makes the replay a
+    /// no-op. Returns `Some(id)` when a row was newly inserted, `None` when a
+    /// duplicate was skipped. A genuine later broadcast has a fresh `stream_id` and
+    /// is unaffected.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`].
+    pub async fn insert_go_live(
+        &self,
+        participant: ParticipantId,
+        actor: Option<ParticipantId>,
+        stream_id: Ulid,
+        summary: &str,
+    ) -> Result<Option<ActivityId>, sqlx::Error> {
+        let id = ActivityId::new();
+        let row = sqlx::query_scalar::<_, uuid::Uuid>(
+            r"INSERT INTO activity_feed
+                  (id, participant_id, kind, actor_id, subject_id, summary)
+               VALUES ($1, $2, 'stream_live', $3, $4, $5)
+               ON CONFLICT (participant_id, subject_id)
+                   WHERE kind = 'stream_live' AND subject_id IS NOT NULL
+               DO NOTHING
+               RETURNING id",
+        )
+        .bind(id.to_uuid())
+        .bind(participant.to_uuid())
+        .bind(actor.map(|a| a.to_uuid()))
+        .bind(uuid::Uuid::from_u128(stream_id.0))
+        .bind(summary)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(ActivityId::from_uuid))
+    }
+
     /// List `participant`'s feed, newest first. Recipient-scoped — only the
     /// caller's own rows are returned. `before` is an exclusive keyset cursor: pass
     /// the oldest id from the previous page to fetch the next, or `None` for the
@@ -243,19 +280,21 @@ mod db_tests {
         let me = mk_participant(&p).await;
         let actor = mk_participant(&p).await;
         let other = mk_participant(&p).await;
-        let subject = Ulid::new();
+        // Distinct subjects per broadcast — the partial unique index (mig 0156)
+        // forbids two `stream_live` rows for the same (participant, subject).
+        let (subj_a, subj_b, subj_c) = (Ulid::new(), Ulid::new(), Ulid::new());
 
         // Insert three entries for `me` (oldest → newest).
         let a = repo
-            .insert(me, "stream_live", Some(actor), Some(subject), "first is live")
+            .insert(me, "stream_live", Some(actor), Some(subj_a), "first is live")
             .await
             .unwrap();
         let b = repo
-            .insert(me, "stream_live", Some(actor), Some(subject), "second is live")
+            .insert(me, "stream_live", Some(actor), Some(subj_b), "second is live")
             .await
             .unwrap();
         let c = repo
-            .insert(me, "stream_live", Some(actor), Some(subject), "third is live")
+            .insert(me, "stream_live", Some(actor), Some(subj_c), "third is live")
             .await
             .unwrap();
         // An entry for someone else must never leak into `me`'s feed.
@@ -269,7 +308,7 @@ mod db_tests {
         assert_eq!(listed[0].id, c, "newest first");
         assert_eq!(listed[2].id, a, "oldest last");
         assert_eq!(listed[0].actor_id, Some(actor));
-        assert_eq!(listed[0].subject_id, Some(subject));
+        assert_eq!(listed[0].subject_id, Some(subj_c), "newest entry's subject");
         assert!(listed.iter().all(|e| e.read_at.is_none()), "all start unread");
 
         // Keyset pagination: `before = c` skips the newest.
@@ -301,6 +340,37 @@ mod db_tests {
         sqlx::query("DELETE FROM activity_feed WHERE participant_id = $1 OR participant_id = $2")
             .bind(me.to_uuid())
             .bind(other.to_uuid())
+            .execute(&p)
+            .await
+            .ok();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn insert_go_live_is_idempotent_per_stream() {
+        // A NATS redelivery re-runs the go-live fan-out; insert_go_live must make
+        // the replay a no-op (no duplicate feed entry), while a different broadcast
+        // (fresh stream_id) still notifies.
+        let p = pool();
+        let repo = ActivityFeedRepo::new(p.clone());
+        let me = mk_participant(&p).await;
+        let owner = mk_participant(&p).await;
+        let stream = Ulid::new();
+
+        let first = repo.insert_go_live(me, Some(owner), stream, "live!").await.unwrap();
+        assert!(first.is_some(), "first delivery inserts");
+        // Redelivery of the SAME broadcast → deduped (None), no second row.
+        let dup = repo.insert_go_live(me, Some(owner), stream, "live!").await.unwrap();
+        assert!(dup.is_none(), "redelivery of the same stream is a no-op");
+        assert_eq!(repo.unread_count(me).await.unwrap(), 1, "exactly one feed entry");
+
+        // A genuinely new broadcast (fresh stream_id) still notifies.
+        let next = repo.insert_go_live(me, Some(owner), Ulid::new(), "live again!").await.unwrap();
+        assert!(next.is_some(), "a new broadcast is not blocked by the dedup");
+        assert_eq!(repo.unread_count(me).await.unwrap(), 2);
+
+        sqlx::query("DELETE FROM activity_feed WHERE participant_id = $1")
+            .bind(me.to_uuid())
             .execute(&p)
             .await
             .ok();
