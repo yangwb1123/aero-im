@@ -503,7 +503,13 @@ impl AiService {
             );
             messages.push(ChatMsg::user(user_msg));
 
-            let answer = client.complete(ANSWER_SYSTEM_PROMPT, &messages, 800).await?;
+            // Model-tier routing (方向一·1): classify difficulty from the query +
+            // grounding, route to the tier's model. Opt-in/default-OFF ⇒ `None` ⇒
+            // the client's default model (unchanged unless a tier env is set).
+            let model = crate::tier::tier_model(crate::tier::classify_tier(q, hits.len()));
+            let answer = client
+                .complete_model(model.as_deref(), ANSWER_SYSTEM_PROMPT, &messages, 800)
+                .await?;
 
             // Persist new Q&A turns; log but never fail on Redis errors.
             // Store the raw question/answer (not the prompt with RAG context)
@@ -578,7 +584,11 @@ impl AiService {
             let user = format!(
                 "问题: {q}\n\n相关聊天上下文(每段已附 ID,引用时使用):\n{context}\n\n请基于上述上下文作答,若信息不足请说明。"
             );
-            let answer = client.complete(&system, &[ChatMsg::user(user)], 800).await?;
+            // Model-tier routing (方向一·1) — same opt-in/default-OFF contract.
+            let model = crate::tier::tier_model(crate::tier::classify_tier(q, hits.len()));
+            let answer = client
+                .complete_model(model.as_deref(), &system, &[ChatMsg::user(user)], 800)
+                .await?;
             return Ok(AnswerResult { answer, citations });
         }
 

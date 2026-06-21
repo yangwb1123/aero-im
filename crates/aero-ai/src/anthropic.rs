@@ -155,12 +155,39 @@ impl AnthropicClient {
         messages: &[ChatMsg],
         max_tokens: u32,
     ) -> Result<(String, Usage)> {
+        self.complete_with_usage_model(None, system, messages, max_tokens).await
+    }
+
+    /// Text-only completion routed to a specific `model` when given (model-tier
+    /// routing, ROADMAP 方向一·1). `None` ⇒ the client's default model, so existing
+    /// callers behave identically.
+    pub async fn complete_model(
+        &self,
+        model: Option<&str>,
+        system: &str,
+        messages: &[ChatMsg],
+        max_tokens: u32,
+    ) -> Result<String> {
+        self.complete_with_usage_model(model, system, messages, max_tokens)
+            .await
+            .map(|(text, _usage)| text)
+    }
+
+    /// [`Self::complete_with_usage`] with an optional per-request model override.
+    /// `model = None` uses [`Self::model`] (unchanged billing/behaviour).
+    pub async fn complete_with_usage_model(
+        &self,
+        model: Option<&str>,
+        system: &str,
+        messages: &[ChatMsg],
+        max_tokens: u32,
+    ) -> Result<(String, Usage)> {
         if messages.is_empty() {
             return Err(AiError::Invalid("messages must not be empty".into()));
         }
 
         let body = RequestBody {
-            model: &self.model,
+            model: model.unwrap_or(&self.model),
             max_tokens,
             // Prompt caching: tag the stable system prefix so a reused prefix
             // bills at the cache-read rate (P3-4). Backward-compatible — the

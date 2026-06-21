@@ -22,6 +22,7 @@ pub mod error;
 pub mod metrics;
 pub mod rerank;
 pub mod service;
+pub mod tier;
 pub mod transcribe;
 pub mod worker;
 
@@ -33,5 +34,6 @@ pub use embed::{default_embedder, Embedder, HashEmbedder, VoyageEmbedder, EMBED_
 pub use error::{AiError, Result};
 pub use rerank::fuse_rankings;
 pub use service::{AiService, AnswerResult, ChannelRec, PersonRec, Sentiment, SentimentScore};
+pub use tier::{classify_tier, tier_model, AiTier};
 pub use transcribe::{default_transcriber, StubTranscriber, Transcriber, WhisperTranscriber};
 pub use worker::{AiWorker, WorkerConfig, MAX_ATTEMPTS};
