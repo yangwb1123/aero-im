@@ -12,7 +12,7 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aero_common::{ParticipantId, RoomId};
-use fred::prelude::{KeysInterface, RedisClient, SortedSetsInterface};
+use fred::prelude::{Expiration, KeysInterface, RedisClient, SortedSetsInterface};
 
 /// Maximum turns retained per session (5 Q&A pairs = 10 messages).
 pub const MAX_TURNS: i64 = 10;
@@ -34,6 +34,53 @@ impl AiContextStore {
 
     fn key(participant: ParticipantId, room: RoomId) -> String {
         format!("ai:ctx:{participant}:{room}")
+    }
+
+    /// Answer-cache key: ROOM-scoped (every member has the same room access, so a
+    /// shared cached answer can never leak across tenants/permissions) and keyed by
+    /// a sha-256 of the pre-normalized query (deterministic across nodes, bounded
+    /// length, raw question text kept out of the Redis key).
+    fn answer_cache_key(room: RoomId, query_norm: &str) -> String {
+        format!("ai:ans:{room}:{}", crate::revoked_token::hash_token(query_norm))
+    }
+
+    /// Look up a cached answer (serialized `AnswerResult` JSON) for a room + a
+    /// pre-normalized query. `None` ⇒ miss. ROADMAP 方向一·3.
+    ///
+    /// # Errors
+    /// Propagates Redis errors; the caller logs + falls through to a live answer.
+    pub async fn cache_answer_get(
+        &self,
+        room: RoomId,
+        query_norm: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let v: Option<String> = self.client.get(Self::answer_cache_key(room, query_norm)).await?;
+        Ok(v)
+    }
+
+    /// Cache an answer for `ttl_secs`. Short TTL bounds staleness vs a referenced
+    /// message edited/deleted after caching (a fuller design would invalidate on
+    /// the room's `Edited`/`Deleted` events); the room scope guarantees isolation.
+    ///
+    /// # Errors
+    /// Propagates Redis errors; the caller logs + continues (cache is best-effort).
+    pub async fn cache_answer_put(
+        &self,
+        room: RoomId,
+        query_norm: &str,
+        value: &str,
+        ttl_secs: i64,
+    ) -> anyhow::Result<()> {
+        self.client
+            .set::<(), _, _>(
+                Self::answer_cache_key(room, query_norm),
+                value,
+                Some(Expiration::EX(ttl_secs.max(1))),
+                None,
+                false,
+            )
+            .await?;
+        Ok(())
     }
 
     /// Append one turn (role + text) to the session, then trim to the last
@@ -174,5 +221,38 @@ mod tests {
             b = microsecond_score();
         }
         assert!(b > a);
+    }
+
+    async fn redis() -> RedisClient {
+        use fred::prelude::ClientLike;
+        let url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".into());
+        let c = RedisClient::new(fred::types::RedisConfig::from_url(&url).unwrap(), None, None, None);
+        c.connect();
+        c.wait_for_connect().await.unwrap();
+        c
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Redis"]
+    async fn answer_cache_roundtrip_and_room_isolation() {
+        let store = AiContextStore::new(redis().await);
+        let room_a = RoomId::new();
+        let room_b = RoomId::new();
+        let q = "部署在哪台机器";
+        let val = r#"{"answer":"node-7","citations":[]}"#;
+
+        // Miss before put.
+        assert!(store.cache_answer_get(room_a, q).await.unwrap().is_none());
+
+        // Put in room A → hit in room A, but a MISS in room B (room isolation = no
+        // cross-tenant leak, the cache's safety guarantee).
+        store.cache_answer_put(room_a, q, val, 60).await.unwrap();
+        assert_eq!(store.cache_answer_get(room_a, q).await.unwrap().as_deref(), Some(val));
+        assert!(
+            store.cache_answer_get(room_b, q).await.unwrap().is_none(),
+            "a cached answer must NOT leak across rooms"
+        );
+        // A different query in the same room is also a miss.
+        assert!(store.cache_answer_get(room_a, "完全不同的问题").await.unwrap().is_none());
     }
 }

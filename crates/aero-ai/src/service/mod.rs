@@ -28,7 +28,7 @@ pub(crate) use service_impl::parse_sentiment_verdict;
 /// `answer` is human-readable text suitable for direct display. `citations`
 /// references the underlying messages so the UI can render "source" chips
 /// linking back into the conversation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AnswerResult {
     pub answer: String,
     pub citations: Vec<MessageId>,

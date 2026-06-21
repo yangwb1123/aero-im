@@ -12,6 +12,17 @@ use serde_json::Value;
 use super::{AiService, AnswerResult, ChannelRec, Expert, PersonRec, Sentiment, SentimentScore};
 use super::tools::*;
 
+/// Answer-cache TTL (seconds) from `AERO_AI_ANSWER_CACHE_TTL_SECS`. `None` (unset
+/// or ≤0) ⇒ the cache is OFF (default), so the answer path behaves identically
+/// until an operator opts in. A short TTL is recommended (it bounds staleness vs a
+/// referenced message edited/deleted after caching).
+fn answer_cache_ttl() -> Option<i64> {
+    std::env::var("AERO_AI_ANSWER_CACHE_TTL_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|&t| t > 0)
+}
+
 impl AiService {
     pub fn new(
         anthropic: Option<Arc<AnthropicClient>>,
@@ -317,6 +328,20 @@ impl AiService {
         if q.is_empty() {
             return Err(AiError::Invalid("question must not be empty".into()));
         }
+        // Answer cache (方向一·3, opt-in via AERO_AI_ANSWER_CACHE_TTL_SECS, default
+        // OFF). Room-scoped + normalized-query keyed; a hit skips retrieval AND the
+        // LLM call → returns `None` usage (the cost saving). Best-effort: any cache
+        // error falls through to a live answer. Only the stateless room path is
+        // cached (this fn) — never the per-participant conversational `ask_with_context`.
+        let cache_ttl = answer_cache_ttl();
+        let qnorm = q.to_lowercase();
+        if let (Some(_), Some(ctx)) = (cache_ttl, &self.context) {
+            if let Ok(Some(json)) = ctx.cache_answer_get(room, &qnorm).await {
+                if let Ok(cached) = serde_json::from_str::<AnswerResult>(&json) {
+                    return Ok((cached, None));
+                }
+            }
+        }
         let hits = self.retrieve_room(room, q, k.clamp(1, 20)).await?;
 
         let citations: Vec<MessageId> = hits.iter().map(|h| h.message.id).collect();
@@ -329,7 +354,14 @@ impl AiService {
             );
             let (answer, usage) =
                 client.complete_with_usage(system, &[ChatMsg::user(user)], 800).await?;
-            return Ok((AnswerResult { answer, citations }, Some(usage)));
+            let result = AnswerResult { answer, citations };
+            // Cache the fresh answer (best-effort) for subsequent identical asks.
+            if let (Some(ttl), Some(ctx)) = (cache_ttl, &self.context) {
+                if let Ok(json) = serde_json::to_string(&result) {
+                    let _ = ctx.cache_answer_put(room, &qnorm, &json, ttl).await;
+                }
+            }
+            return Ok((result, Some(usage)));
         }
 
         // No Anthropic — return the raw context so the UI can still surface
