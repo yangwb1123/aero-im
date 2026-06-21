@@ -339,6 +339,19 @@ pub fn events_to_csv(events: &[AuditEvent]) -> String {
     out
 }
 
+/// HMAC-SHA256 of an audit CSV export, hex-encoded — a tamper-evident signature
+/// (ROADMAP 方向五: immutable/tamper-evident audit). A verifier holding the same
+/// `key` recomputes this over the downloaded CSV; any mismatch proves the export
+/// was altered. Pure, so the sign↔verify contract is unit-tested without a DB.
+#[must_use]
+pub fn sign_csv(csv: &str, key: &[u8]) -> String {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    let mut mac = <Hmac<Sha256>>::new_from_slice(key).expect("HMAC accepts any key length");
+    mac.update(csv.as_bytes());
+    hex::encode(mac.finalize().into_bytes())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -412,6 +425,21 @@ mod tests {
     fn events_to_csv_empty_is_header_only() {
         let csv = events_to_csv(&[]);
         assert_eq!(csv, format!("{AUDIT_CSV_HEADER}\n"));
+    }
+
+    #[test]
+    fn sign_csv_is_deterministic_and_tamper_evident() {
+        let key = b"audit-signing-key";
+        let csv = "timestamp,actor,action,target,details\n2026-01-01T00:00:00Z,,workspace.create,,{}\n";
+        let sig = sign_csv(csv, key);
+        // 64-char lowercase-hex SHA-256 digest, deterministic for the same input.
+        assert_eq!(sig.len(), 64);
+        assert_eq!(sign_csv(csv, key), sig, "same csv+key ⇒ same signature");
+        // Any tamper to the CSV changes the signature (one altered byte).
+        let tampered = csv.replacen("workspace.create", "workspace.delete", 1);
+        assert_ne!(sign_csv(&tampered, key), sig, "altered csv ⇒ different signature");
+        // A different key changes the signature.
+        assert_ne!(sign_csv(csv, b"other-key"), sig, "different key ⇒ different signature");
     }
 }
 

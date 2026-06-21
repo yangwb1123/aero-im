@@ -456,13 +456,25 @@ async fn export_audit_csv(
     authorize_view_audit(caller)?;
     let events = resolve_audit_events(&s, ws, &q).await?;
     let csv = aero_storage::events_to_csv(&events);
-    let headers = [
-        (axum::http::header::CONTENT_TYPE, "text/csv; charset=utf-8"),
-        (
-            axum::http::header::CONTENT_DISPOSITION,
-            "attachment; filename=\"audit.csv\"",
-        ),
-    ];
+    use axum::http::{header, HeaderMap, HeaderName, HeaderValue};
+    let mut headers = HeaderMap::new();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/csv; charset=utf-8"));
+    headers.insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_static("attachment; filename=\"audit.csv\""),
+    );
+    // Tamper-evident signature (ROADMAP 方向五, opt-in via AERO_AUDIT_SIGNING_KEY):
+    // an offline verifier recomputes HMAC-SHA256 over the downloaded CSV with the
+    // same key to prove the export was not altered. Unset key ⇒ no header (current
+    // behaviour). The CSV body is left pure so spreadsheet tools parse it unchanged.
+    if let Ok(key) = std::env::var("AERO_AUDIT_SIGNING_KEY") {
+        if !key.is_empty() {
+            let sig = aero_storage::audit::sign_csv(&csv, key.as_bytes());
+            if let Ok(v) = HeaderValue::from_str(&format!("sha256={sig}")) {
+                headers.insert(HeaderName::from_static("x-audit-signature"), v);
+            }
+        }
+    }
     Ok((headers, csv).into_response())
 }
 
