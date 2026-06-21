@@ -137,6 +137,7 @@ pub mod me_export;
 pub mod push_tokens;
 pub mod push_bot;
 pub mod ai_dlq;
+pub mod ai_usage;
 pub mod admin_sessions;
 
 // ---- Wave 16 Round 9 ----

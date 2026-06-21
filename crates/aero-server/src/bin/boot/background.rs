@@ -32,6 +32,21 @@ pub(crate) fn spawn_all(
         });
     }
 
+    // AI usage-ledger drain (ROADMAP 方向一·2): install the process-global usage
+    // sink and batch-persist paid AI charges (worker queue + moderation bot — both
+    // converge at `charge_cost`) off the charge hot path. Bounded channel: a burst
+    // that outruns the drain drops rows (best-effort billing record; the aggregate
+    // metrics counter stays the alerting source of truth).
+    {
+        let (tx, rx) = tokio::sync::mpsc::channel(4096);
+        aero_ai::metrics::set_usage_sink(tx);
+        let repo = aero_storage::AiUsageRepo::new(state.pg.clone());
+        let cancel = ai_shutdown.clone();
+        tracker.spawn(async move {
+            aero_server::ai_usage::run_usage_ledger_drain(repo, rx, cancel).await;
+        });
+    }
+
     // Scheduled-message dispatcher
     {
         let s = state.clone();

@@ -154,6 +154,7 @@ pub fn build(state: AppState) -> Router {
         // Workspace / Org management (ROADMAP 方向一 — multi-tenant foundation).
         // Defined alongside their RBAC guards in `crate::workspaces`.
         .merge(crate::workspaces::routes())
+        .merge(crate::ai_usage::routes())
         .merge(crate::collab::routes())
         // Channel management (public/private, join/leave, archive, topic/desc).
         .merge(crate::channels::routes())
