@@ -69,17 +69,24 @@ async fn search_all(
     }
     let limit = clamp_search_limit(req.limit);
 
+    // ROADMAP 方向四: cross-room search is the heaviest read in the gateway (FTS +
+    // trigram scans with a `JOIN room_members`) and the most replica-friendly —
+    // mild replication lag (a message searchable a few ms late) is acceptable, and
+    // it is NOT a read-your-writes path (unlike `list_since` reconnect backfill,
+    // which must stay on the primary). So route it to the READ pool: the replica
+    // when one is configured, else the primary unchanged (`pg_read == pg`). The
+    // `JOIN room_members` security boundary is identical on either pool.
+    let messages = aero_storage::MessageRepo::new(s.pg_read.clone());
     let hits = match req.workspace_id.as_deref() {
         Some(raw) => {
             let ws = WorkspaceId::from_str(raw.trim())
                 .map_err(|e| AeroError::Invalid(format!("workspace id: {e}")))?;
-            s.messages
+            messages
                 .search_all_rooms_in_workspace(auth.participant_id, ws, &req.query, limit)
                 .await
                 .map_err(AeroError::from)?
         }
-        None => s
-            .messages
+        None => messages
             .search_all_rooms(auth.participant_id, &req.query, limit)
             .await
             .map_err(AeroError::from)?,

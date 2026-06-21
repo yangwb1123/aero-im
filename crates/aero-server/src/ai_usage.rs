@@ -113,7 +113,11 @@ async fn ai_usage(
 
     let since_secs = q.since_secs.unwrap_or(30 * 24 * 3600).clamp(1, 366 * 24 * 3600);
     let since = time::OffsetDateTime::now_utc() - time::Duration::seconds(since_secs);
-    let by_kind = AiUsageRepo::new(s.pg.clone())
+    // ROADMAP 方向四: a per-kind aggregate over the whole ledger window — heavy,
+    // read-only, staleness-tolerant (a chargeback dashboard tolerates a few ms of
+    // replication lag). Route to the READ pool (replica when configured, else the
+    // primary), like the analytics dashboard.
+    let by_kind = AiUsageRepo::new(s.pg_read.clone())
         .summary_since(ws.to_uuid(), since)
         .await
         .map_err(AeroError::from)?;
