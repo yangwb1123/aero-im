@@ -131,7 +131,7 @@ pub fn build(state: AppState) -> Router {
         .route("/api/streams/:id/leaderboard", get(stream_leaderboard))
         // WHIP / WHEP — body is SDP text, response is SDP text
         .route("/whip/:stream_key", post(whip_post))
-        .route("/whip/resource/:stream_id", axum::routing::delete(whip_delete))
+        .route("/whip/resource/:stream_key", axum::routing::delete(whip_delete))
         .route("/whep/:stream_id", post(whep_post))
         // Agents / Bots (Bot/Agent participants + Bot SDK registration)
         .route("/api/agents", post(create_agent))
@@ -2650,15 +2650,37 @@ struct UpsertGroupReq {
 
 async fn mls_upsert_group(
     State(s): State<AppState>,
-    _auth: AuthUser,
+    auth: AuthUser,
     Json(req): Json<UpsertGroupReq>,
 ) -> ApiResult<axum::http::StatusCode> {
     let group_id = aero_common::mls::MlsGroupId::new(b64_decode(&req.group_id_b64)?);
     let state_bytes = b64_decode(&req.state_b64)?;
-    let room_id = req.room_id.as_deref().map(parse_room_id).transpose()?;
+    let req_room = req.room_id.as_deref().map(parse_room_id).transpose()?;
+
+    // Authorization: an MLS group is bound to a room and only its members may read
+    // or write its state. For an EXISTING group authorize against its CURRENT room
+    // (so an attacker can't overwrite a victim's group by claiming a room they
+    // happen to belong to); for a NEW group, the requested room. A room-less group
+    // can't be authorized, so it is rejected (fail closed).
+    let existing = s.mls_groups.get(&group_id).await.map_err(AeroError::from)?;
+    let room = match &existing {
+        Some(g) => g.room_id,
+        None => req_room,
+    }
+    .ok_or_else(|| AeroError::Forbidden("mls group must be room-bound".into()))?;
+    s.im.assert_room_access(auth.participant_id, room).await?;
+    // An existing group may not be moved to a different room.
+    if let Some(g) = &existing {
+        if req_room.is_some() && req_room != g.room_id {
+            return Err(
+                AeroError::Forbidden("cannot reassign an mls group to another room".into()).into(),
+            );
+        }
+    }
+
     let g = aero_common::mls::MlsGroupState {
         group_id,
-        room_id,
+        room_id: Some(room),
         ciphersuite: req.ciphersuite,
         epoch: req.epoch,
         state: state_bytes,
@@ -2670,7 +2692,7 @@ async fn mls_upsert_group(
 
 async fn mls_get_group(
     State(s): State<AppState>,
-    _auth: AuthUser,
+    auth: AuthUser,
     Path(gid_str): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let gid_bytes = b64_decode(&gid_str)?;
@@ -2681,6 +2703,11 @@ async fn mls_get_group(
         .await
         .map_err(AeroError::from)?
         .ok_or_else(|| AeroError::NotFound("group".into()))?;
+    // Only members of the group's room may read its (encrypted) state + metadata.
+    let room = g
+        .room_id
+        .ok_or_else(|| AeroError::Forbidden("mls group not room-bound".into()))?;
+    s.im.assert_room_access(auth.participant_id, room).await?;
     Ok(Json(serde_json::json!({
         "group_id_b64": b64_encode(g.group_id.as_bytes()),
         "room_id": g.room_id,
@@ -2821,7 +2848,10 @@ async fn whip_post(
         .into_response();
     resp.headers_mut().insert(
         header::LOCATION,
-        HeaderValue::from_str(&format!("/whip/resource/{}", stream.id))
+        // The WHIP resource is addressed by the publisher's stream KEY (the secret
+        // ingest credential), NOT the public stream id — so only the publisher can
+        // tear the session down (see whip_delete).
+        HeaderValue::from_str(&format!("/whip/resource/{}", stream.stream_key))
             .unwrap_or_else(|_| HeaderValue::from_static("/whip/resource")),
     );
     Ok(resp)
@@ -2829,15 +2859,23 @@ async fn whip_post(
 
 async fn whip_delete(
     State(s): State<AppState>,
-    Path(stream_id_str): Path<String>,
+    Path(stream_key): Path<String>,
 ) -> ApiResult<StatusCode> {
-    let stream_id = ulid::Ulid::from_str(&stream_id_str)
-        .map_err(|e| AeroError::Invalid(format!("stream id: {e}")))?;
-    s.whip.remove(stream_id);
-    if let Err(e) = s.stream_routes.unpublish(stream_id).await {
-        tracing::warn!(error=?e, stream=%stream_id, "stream route unpublish failed");
+    // Identify the resource by the publisher's stream KEY, not the public stream
+    // id: the id appears in HLS/WHEP playback URLs, so keying the teardown on it
+    // let ANYONE end any live stream (DoS). Possession of the key — the same secret
+    // that authorized publishing — authorizes ending it.
+    let stream = s
+        .streams
+        .get_by_key(&stream_key)
+        .await
+        .map_err(AeroError::from)?
+        .ok_or_else(|| AeroError::NotFound("stream".into()))?;
+    s.whip.remove(stream.id);
+    if let Err(e) = s.stream_routes.unpublish(stream.id).await {
+        tracing::warn!(error=?e, stream=%stream.id, "stream route unpublish failed");
     }
-    if let Err(e) = s.streams.mark_ended(stream_id).await {
+    if let Err(e) = s.streams.mark_ended(stream.id).await {
         tracing::warn!(error=?e, "mark ended failed");
     }
     Ok(StatusCode::NO_CONTENT)

@@ -200,6 +200,83 @@ struct CreateOutgoingReq {
     label: Option<String>,
 }
 
+/// True if `ip` is one the webhook dispatcher must never be pointed at — loopback,
+/// private (RFC1918 / ULA), link-local (incl. the `169.254.169.254` cloud-metadata
+/// address), unspecified, broadcast or multicast.
+fn webhook_ip_is_blocked(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_multicast()
+                || v4.octets()[0] == 0
+        }
+        IpAddr::V6(v6) => {
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return webhook_ip_is_blocked(IpAddr::V4(mapped));
+            }
+            if v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() {
+                return true;
+            }
+            let head = v6.segments()[0];
+            (head & 0xfe00) == 0xfc00 // ULA fc00::/7
+                || (head & 0xffc0) == 0xfe80 // link-local fe80::/10
+        }
+    }
+}
+
+/// Reject a webhook URL whose host is, or resolves to, a non-public address
+/// (SSRF). Resolves the host and checks EVERY returned address; an unresolvable
+/// host, or one that resolves to nothing, is also rejected.
+async fn assert_webhook_url_safe(url: &str) -> Result<(), AeroError> {
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .ok_or_else(|| AeroError::Invalid("url must be http(s)".into()))?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    // Drop any userinfo (`user:pass@host`).
+    let host_port = authority.rsplit('@').next().unwrap_or(authority);
+    // Split host:port, handling bracketed IPv6 literals `[::1]:443`.
+    let (host, port) = if let Some(rest) = host_port.strip_prefix('[') {
+        let (h, p) = rest.split_once(']').unwrap_or((rest, ""));
+        (h.to_string(), p.trim_start_matches(':').parse::<u16>().unwrap_or(443))
+    } else if let Some((h, p)) = host_port.rsplit_once(':') {
+        (h.to_string(), p.parse::<u16>().unwrap_or(443))
+    } else {
+        (host_port.to_string(), 443)
+    };
+    if host.is_empty() {
+        return Err(AeroError::Invalid("webhook url has no host".into()));
+    }
+    let lower = host.to_ascii_lowercase();
+    if lower == "localhost"
+        || lower.ends_with(".localhost")
+        || lower.ends_with(".local")
+        || lower == "metadata.google.internal"
+    {
+        return Err(AeroError::Invalid("webhook url host is not allowed".into()));
+    }
+    // Resolve and check every address it maps to.
+    let addrs = tokio::net::lookup_host((host.as_str(), port))
+        .await
+        .map_err(|_| AeroError::Invalid("webhook url host does not resolve".into()))?;
+    let mut saw_any = false;
+    for addr in addrs {
+        saw_any = true;
+        if webhook_ip_is_blocked(addr.ip()) {
+            return Err(AeroError::Invalid("webhook url resolves to a non-public address".into()));
+        }
+    }
+    if !saw_any {
+        return Err(AeroError::Invalid("webhook url host does not resolve".into()));
+    }
+    Ok(())
+}
+
 /// `POST /api/rooms/:id/webhooks/outgoing` — register an outbound webhook for the
 /// room. Generates a per-hook signing `secret` and returns `{ id, secret }` (the
 /// secret is shown once; the receiver uses it to verify `X-Aero-Signature`).
@@ -216,6 +293,13 @@ async fn create_outgoing(
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         return Err(AeroError::Invalid("url must be http(s)".into()).into());
     }
+    // SSRF guard: a workspace admin sets this URL but the SERVER fetches it on
+    // every matching event, so a destination resolving to loopback / private /
+    // link-local (incl. the cloud metadata IP 169.254.169.254) would turn the
+    // dispatcher into a server-side-request-forgery primitive against internal
+    // infrastructure. Reject those at creation. (Resolve-at-delivery pinning to
+    // also defeat DNS rebinding is a follow-up; this blocks the direct cases.)
+    assert_webhook_url_safe(url).await?;
     let events = req.events.unwrap_or_default();
     let secret = generate_secret();
     let id = repo(&s)
@@ -609,6 +693,42 @@ mod tests {
     use super::*;
     use aero_common::{Message, MessageEnvelope, MessageId, ParticipantId};
     use aero_storage::FakeSender;
+
+    #[test]
+    fn webhook_ip_block_list_rejects_internal_allows_public() {
+        use std::net::IpAddr;
+        let blocked = [
+            "127.0.0.1", "10.1.2.3", "172.16.0.1", "192.168.1.1",
+            "169.254.169.254", // cloud metadata
+            "0.0.0.0", "::1", "fe80::1", "fc00::1", "::ffff:127.0.0.1",
+        ];
+        for ip in blocked {
+            assert!(
+                webhook_ip_is_blocked(ip.parse::<IpAddr>().unwrap()),
+                "{ip} must be blocked"
+            );
+        }
+        let allowed = ["8.8.8.8", "1.1.1.1", "93.184.216.34", "2606:4700:4700::1111"];
+        for ip in allowed {
+            assert!(
+                !webhook_ip_is_blocked(ip.parse::<IpAddr>().unwrap()),
+                "{ip} must be allowed"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn webhook_url_safety_rejects_loopback_and_localhost() {
+        // Literal internal IPs + localhost names are rejected without needing DNS.
+        assert!(assert_webhook_url_safe("http://127.0.0.1:8080/x").await.is_err());
+        assert!(assert_webhook_url_safe("http://169.254.169.254/latest/meta-data/").await.is_err());
+        assert!(assert_webhook_url_safe("http://[::1]:443/").await.is_err());
+        assert!(assert_webhook_url_safe("http://localhost/hook").await.is_err());
+        assert!(assert_webhook_url_safe("http://user:pass@10.0.0.5/hook").await.is_err());
+        assert!(assert_webhook_url_safe("https://internal.local/hook").await.is_err());
+        // A public literal IP passes the address check.
+        assert!(assert_webhook_url_safe("https://8.8.8.8/hook").await.is_ok());
+    }
 
     fn message_event(room: RoomId) -> RoomEvent {
         let msg = Message {
