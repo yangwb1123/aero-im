@@ -475,11 +475,17 @@ async fn delete_me(
             .map_err(AeroError::from)?;
     }
 
-    // Hard-delete; FK cascades remove credentials, room_members, etc.
+    // GDPR erasure: tombstones the participant (UPDATE deleted_at + '[deleted]'
+    // name) and explicitly deletes its PII tables — NOT a hard delete, so FK
+    // cascades never fire (the erasure routine deletes them explicitly).
     participants
         .delete_participant(auth.participant_id)
         .await
         .map_err(AeroError::from)?;
+    // Invalidate the participant cache so OTHER users' next read resolves the
+    // '[deleted]' tombstone immediately instead of a stale cached name for up to
+    // the 60s TTL — same invalidate-on-write contract update_me honors.
+    s.participant_cache.invalidate(&auth.participant_id);
 
     Ok(StatusCode::NO_CONTENT)
 }

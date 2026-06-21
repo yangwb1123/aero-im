@@ -60,10 +60,13 @@ async fn room_online(
         Ok(members) if !members.is_empty() => members,
         _ => s.hub.room_members_online(room),
     };
-    // Fetch display names in one pass over the in-memory participant cache.
+    // Fetch display names through the in-memory participant cache (this is a hot,
+    // pollable read path): `get_or_fetch` serves repeat lookups from the 60s TTL
+    // cache instead of a per-participant DB round-trip, matching the cached call
+    // site in `ws_impl/frame.rs`. A genuine miss still backfills from the repo.
     let mut members = Vec::with_capacity(ids.len());
     for pid in ids {
-        if let Ok(Some(p)) = s.participants.get(pid).await {
+        if let Ok(Some(p)) = s.participant_cache.get_or_fetch(pid, &s.participants).await {
             members.push(serde_json::json!({
                 "id": pid,
                 "display_name": p.display_name,

@@ -456,7 +456,15 @@ async fn redeliver<S: WebhookSender + ?Sized>(
     let Some(target) = (match repo.outgoing_target(delivery.webhook_id).await {
         Ok(t) => t,
         Err(e) => {
-            warn!(error = ?e, hook = %delivery.webhook_id, "webhook retry: target lookup failed");
+            // `claim_due` already flipped this row failed→pending, so a bare return
+            // would strand it in 'pending' forever (claim_due only re-claims
+            // 'failed', the sweep only deletes 'delivered'/'dead', requeue only
+            // touches 'dead'). Re-park it as failed-with-backoff so the transient
+            // lookup error is retried like any other failure instead of zombifying.
+            warn!(error = ?e, hook = %delivery.webhook_id, "webhook retry: target lookup failed; re-parking");
+            let _ = deliveries
+                .mark_failed_with_backoff(delivery.id, delivery.attempts, None, "target lookup failed")
+                .await;
             return;
         }
     }) else {
