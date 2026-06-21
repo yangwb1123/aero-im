@@ -65,10 +65,22 @@ impl AuditRepo {
         &self,
         cutoff: time::OffsetDateTime,
     ) -> Result<u64, sqlx::Error> {
-        let res = sqlx::query(r"DELETE FROM audit_events WHERE created_at < $1")
-            .bind(cutoff)
-            .execute(&self.pool)
-            .await?;
+        // Legal-hold immutability (方向五·②): never purge audit events for a
+        // workspace under an active hold — the trail is evidence for the held
+        // data, so it must outlive retention while the hold stands (mirrors the
+        // message sweep's `NOT EXISTS legal_holds`; the partition-DROP half is
+        // guarded in `ensure_audit_event_partitions`, migration 0154).
+        let res = sqlx::query(
+            r"DELETE FROM audit_events ae
+              WHERE ae.created_at < $1
+                AND NOT EXISTS (
+                      SELECT 1 FROM legal_holds lh
+                       WHERE lh.active AND lh.workspace_id = ae.workspace_id
+                )",
+        )
+        .bind(cutoff)
+        .execute(&self.pool)
+        .await?;
         Ok(res.rows_affected())
     }
 
@@ -851,5 +863,67 @@ mod db_tests {
             .expect("append into partitioned parent");
         let events = repo.list_for_workspace(ws, None, Some(10)).await.unwrap();
         assert!(events.iter().any(|e| e.id == id), "appended row is listed back");
+    }
+
+    /// Legal-hold immutability (方向五·②): the retention DELETE sweep must NOT
+    /// purge audit events for a workspace under an active hold, while an unheld
+    /// workspace's stale events are still reclaimed. (The partition-DROP half is
+    /// guarded in `ensure_audit_event_partitions`, migration 0154.)
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn sweep_before_preserves_legally_held_workspace() {
+        let p = pool();
+        let repo = AuditRepo::new(p.clone());
+        let (ws_free, _) = fixture(&p).await;
+        let (ws_held, actor_held) = fixture(&p).await;
+
+        // A workspace-wide active hold over ws_held (room_id NULL = whole tenant).
+        sqlx::query(
+            "INSERT INTO legal_holds (id, workspace_id, room_id, reason, created_by, active)
+             VALUES ($1, $2, NULL, 'ediscovery', $3, true)",
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(ws_held.to_uuid())
+        .bind(actor_held.to_uuid())
+        .execute(&p)
+        .await
+        .expect("insert hold");
+
+        // A 400-day-old audit event in EACH workspace, inserted directly so we
+        // control created_at (append() stamps now()). Old rows route to the
+        // DEFAULT partition.
+        for ws in [ws_free, ws_held] {
+            sqlx::query(
+                "INSERT INTO audit_events (id, workspace_id, actor_id, action, target, detail, created_at)
+                 VALUES ($1, $2, NULL, 'old.event', NULL, '{}'::jsonb, now() - interval '400 days')",
+            )
+            .bind(uuid::Uuid::new_v4())
+            .bind(ws.to_uuid())
+            .execute(&p)
+            .await
+            .expect("insert old audit event");
+        }
+
+        // Sweep everything older than 30 days.
+        let cutoff = time::OffsetDateTime::now_utc() - time::Duration::days(30);
+        repo.sweep_before(cutoff).await.expect("sweep");
+
+        // ws_free's stale event is gone; ws_held's survives the hold.
+        let free_old = repo
+            .list_for_workspace(ws_free, None, Some(10))
+            .await
+            .unwrap();
+        assert!(
+            !free_old.iter().any(|e| e.action == "old.event"),
+            "unheld workspace's stale audit event was reclaimed"
+        );
+        let held_old = repo
+            .list_for_workspace(ws_held, None, Some(10))
+            .await
+            .unwrap();
+        assert!(
+            held_old.iter().any(|e| e.action == "old.event"),
+            "held workspace's audit event survived retention while the hold stands"
+        );
     }
 }
