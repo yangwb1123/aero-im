@@ -116,6 +116,62 @@ mod db_tests {
 
     #[tokio::test]
     #[ignore = "requires live Postgres"]
+    async fn expired_ephemeral_is_hidden_from_reads_before_sweep() {
+        // An ephemeral message past its TTL must be invisible to reads the instant
+        // it lapses — NOT only after the periodic sweep hard-deletes it (which can
+        // be up to an hour later). Read-side `expires_at > now()` filtering enforces
+        // that without running the sweep.
+        let p = pool();
+        let u = participant(&p).await;
+        let r = room(&p, u).await;
+        let repo = MessageRepo::new(p.clone());
+
+        let normal = insert_msg(&p, r, u).await;
+        // An already-expired ephemeral (expires_at 1 minute in the PAST), inserted
+        // directly; the sweep has NOT run.
+        let expired = MessageId::new();
+        sqlx::query(
+            "INSERT INTO messages (id, room_id, sender_id, blocks, expires_at)
+             VALUES ($1,$2,$3,'[]'::jsonb, now() - interval '1 minute')",
+        )
+        .bind(expired.to_uuid())
+        .bind(r.to_uuid())
+        .bind(u.to_uuid())
+        .execute(&p)
+        .await
+        .expect("insert expired ephemeral");
+        // A still-live ephemeral (expires in the future) must remain visible.
+        let live = MessageId::new();
+        sqlx::query(
+            "INSERT INTO messages (id, room_id, sender_id, blocks, expires_at)
+             VALUES ($1,$2,$3,'[]'::jsonb, now() + interval '1 hour')",
+        )
+        .bind(live.to_uuid())
+        .bind(r.to_uuid())
+        .bind(u.to_uuid())
+        .execute(&p)
+        .await
+        .expect("insert live ephemeral");
+
+        let ids: Vec<_> = repo.list_recent(r, None, 50).await.unwrap().into_iter().map(|m| m.id).collect();
+        assert!(ids.contains(&normal), "normal message visible");
+        assert!(ids.contains(&live), "unexpired ephemeral visible");
+        assert!(!ids.contains(&expired), "EXPIRED ephemeral hidden from reads before the sweep");
+
+        // The same holds for the reconnect-backfill path (list_since).
+        let since: Vec<_> = repo
+            .list_since(r, MessageId::from_uuid(uuid::Uuid::nil()), 50)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        assert!(!since.contains(&expired), "expired ephemeral not replayed on backfill");
+        assert!(since.contains(&live), "live ephemeral replayed");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
     async fn messages_around_has_more_reflects_either_side() {
         // Few messages BEFORE the target, many AFTER: `has_more` must be true
         // (the after-side window truncated) — the bug only checked the before side

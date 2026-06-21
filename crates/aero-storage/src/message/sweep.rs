@@ -7,11 +7,14 @@ use aero_common::{MessageId, RoomId};
 use super::MessageRepo;
 
 impl MessageRepo {
-    /// Delete expired ephemeral messages (those with `expires_at < NOW()`) and
-    /// return their (id, room_id) pairs so the caller can emit Deleted frames.
+    /// Delete expired ephemeral messages (those with `expires_at <= NOW()`) and
+    /// return their (id, room_id) pairs so the caller can emit Deleted frames. The
+    /// read queries (`query.rs` / `search.rs`) ALSO filter `expires_at > now()`, so
+    /// an expired message is invisible the instant it lapses; this sweep is the
+    /// eventual hard-delete that reclaims the row + announces the Deleted event.
     pub async fn sweep_ephemeral(&self) -> Result<Vec<(MessageId, RoomId)>, sqlx::Error> {
         let rows: Vec<(uuid::Uuid, uuid::Uuid)> = sqlx::query_as(
-            "DELETE FROM messages WHERE expires_at IS NOT NULL AND expires_at < NOW() \
+            "DELETE FROM messages WHERE expires_at IS NOT NULL AND expires_at <= NOW() \
              RETURNING id, room_id",
         )
         .fetch_all(&self.pool)

@@ -27,7 +27,7 @@ impl MessageRepo {
                  ) AS score
                FROM messages m
                WHERE m.room_id = $1
-                 AND m.deleted_at IS NULL
+                 AND m.deleted_at IS NULL AND (m.expires_at IS NULL OR m.expires_at > now())
                  AND (
                    m.search_tsv @@ websearch_to_tsquery('english', f_unaccent($2))
                    OR m.searchable_text % $2
@@ -64,7 +64,7 @@ impl MessageRepo {
                  (1 - (m.embedding <=> $2))::real AS score
                FROM messages m
                WHERE m.room_id = $1
-                 AND m.deleted_at IS NULL
+                 AND m.deleted_at IS NULL AND (m.expires_at IS NULL OR m.expires_at > now())
                  AND m.embedding IS NOT NULL
                ORDER BY m.embedding <=> $2
                LIMIT $3"#,
@@ -107,7 +107,7 @@ impl MessageRepo {
                  ) AS score
                FROM messages m
                WHERE m.room_id = $1
-                 AND m.deleted_at IS NULL
+                 AND m.deleted_at IS NULL AND (m.expires_at IS NULL OR m.expires_at > now())
                  AND (
                    m.search_tsv @@ websearch_to_tsquery('english', f_unaccent($3))
                    OR m.searchable_text % $3
@@ -144,7 +144,7 @@ impl MessageRepo {
                FROM messages m
                JOIN room_members rm ON rm.room_id = m.room_id
                WHERE rm.participant_id = $1
-                 AND m.deleted_at IS NULL
+                 AND m.deleted_at IS NULL AND (m.expires_at IS NULL OR m.expires_at > now())
                  AND (
                    m.search_tsv @@ websearch_to_tsquery('english', f_unaccent($2))
                    OR m.searchable_text % $2
@@ -182,7 +182,7 @@ impl MessageRepo {
                JOIN room_members rm ON rm.room_id = m.room_id
                WHERE rm.participant_id = $1
                  AND r.workspace_id = $4
-                 AND m.deleted_at IS NULL
+                 AND m.deleted_at IS NULL AND (m.expires_at IS NULL OR m.expires_at > now())
                  AND (
                    m.search_tsv @@ websearch_to_tsquery('english', f_unaccent($2))
                    OR m.searchable_text % $2
@@ -224,7 +224,7 @@ impl MessageRepo {
                JOIN room_members rm ON rm.room_id = m.room_id
                WHERE rm.participant_id = $1
                  AND r.workspace_id = $4
-                 AND m.deleted_at IS NULL
+                 AND m.deleted_at IS NULL AND (m.expires_at IS NULL OR m.expires_at > now())
                  AND m.embedding IS NOT NULL
                ORDER BY m.embedding <=> $2
                LIMIT $3"#,
@@ -273,7 +273,7 @@ impl MessageRepo {
                JOIN room_members rm ON rm.room_id = m.room_id
                WHERE rm.participant_id = $1
                  AND r.workspace_id = $5
-                 AND m.deleted_at IS NULL
+                 AND m.deleted_at IS NULL AND (m.expires_at IS NULL OR m.expires_at > now())
                  AND (
                    m.search_tsv @@ websearch_to_tsquery('english', f_unaccent($3))
                    OR m.searchable_text % $3

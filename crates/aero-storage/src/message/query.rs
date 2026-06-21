@@ -20,7 +20,7 @@ impl MessageRepo {
             sqlx::query_as::<_, MessageRow>(
                 r#"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at
                    FROM messages
-                   WHERE room_id = $1 AND id < $2 AND deleted_at IS NULL
+                   WHERE room_id = $1 AND id < $2 AND deleted_at IS NULL AND (expires_at IS NULL OR expires_at > now())
                    ORDER BY id DESC
                    LIMIT $3"#,
             )
@@ -33,7 +33,7 @@ impl MessageRepo {
             sqlx::query_as::<_, MessageRow>(
                 r#"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at
                    FROM messages
-                   WHERE room_id = $1 AND deleted_at IS NULL
+                   WHERE room_id = $1 AND deleted_at IS NULL AND (expires_at IS NULL OR expires_at > now())
                    ORDER BY id DESC
                    LIMIT $2"#,
             )
@@ -97,7 +97,7 @@ impl MessageRepo {
             sqlx::query_as(
                 r#"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at
                    FROM messages
-                   WHERE room_id = $1 AND id > $2 AND deleted_at IS NULL
+                   WHERE room_id = $1 AND id > $2 AND deleted_at IS NULL AND (expires_at IS NULL OR expires_at > now())
                    ORDER BY id
                    LIMIT $3"#,
             )
@@ -110,7 +110,7 @@ impl MessageRepo {
             sqlx::query_as(
                 r#"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at
                    FROM messages
-                   WHERE id > $1 AND deleted_at IS NULL
+                   WHERE id > $1 AND deleted_at IS NULL AND (expires_at IS NULL OR expires_at > now())
                    ORDER BY id
                    LIMIT $2"#,
             )
@@ -142,6 +142,7 @@ impl MessageRepo {
             r#"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at
                FROM messages
                WHERE room_id = $1 AND id > $2
+                 AND (expires_at IS NULL OR expires_at > now())
                ORDER BY id
                LIMIT $3"#,
         )
@@ -164,7 +165,7 @@ impl MessageRepo {
         let before: Vec<MessageRow> = sqlx::query_as(
             r#"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at
                FROM messages
-               WHERE room_id = $1 AND id < $2 AND deleted_at IS NULL
+               WHERE room_id = $1 AND id < $2 AND deleted_at IS NULL AND (expires_at IS NULL OR expires_at > now())
                ORDER BY id DESC
                LIMIT $3"#,
         )
@@ -179,7 +180,7 @@ impl MessageRepo {
         let target: Option<MessageRow> = sqlx::query_as(
             r#"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at
                FROM messages
-               WHERE room_id = $1 AND id = $2 AND deleted_at IS NULL"#,
+               WHERE room_id = $1 AND id = $2 AND deleted_at IS NULL AND (expires_at IS NULL OR expires_at > now())"#,
         )
         .bind(room.to_uuid())
         .bind(around.to_uuid())
@@ -188,7 +189,7 @@ impl MessageRepo {
         let after: Vec<MessageRow> = sqlx::query_as(
             r#"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at
                FROM messages
-               WHERE room_id = $1 AND id > $2 AND deleted_at IS NULL
+               WHERE room_id = $1 AND id > $2 AND deleted_at IS NULL AND (expires_at IS NULL OR expires_at > now())
                ORDER BY id
                LIMIT $3"#,
         )
@@ -222,7 +223,7 @@ impl MessageRepo {
             // message.rs→message/ split dropped this term; restored.
             r#"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at
                FROM messages
-               WHERE embedding IS NULL AND deleted_at IS NULL AND searchable_text <> ''
+               WHERE embedding IS NULL AND deleted_at IS NULL AND (expires_at IS NULL OR expires_at > now()) AND searchable_text <> ''
                ORDER BY created_at ASC
                LIMIT $1"#,
         )
@@ -242,7 +243,7 @@ impl MessageRepo {
         let rows = sqlx::query_as::<_, MessageRow>(
             r#"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at
                FROM messages
-               WHERE sender_id = $1 AND deleted_at IS NULL
+               WHERE sender_id = $1 AND deleted_at IS NULL AND (expires_at IS NULL OR expires_at > now())
                ORDER BY id DESC
                LIMIT $2"#,
         )
@@ -294,6 +295,7 @@ impl MessageRepo {
                JOIN rooms r ON r.id = m.room_id
                JOIN room_members rm ON rm.room_id = m.room_id AND rm.participant_id = $1
                WHERE m.deleted_at IS NULL
+                 AND (m.expires_at IS NULL OR m.expires_at > now())
                  AND r.workspace_id = $2
                ORDER BY m.id DESC
                LIMIT $3"#,
