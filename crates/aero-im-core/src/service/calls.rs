@@ -81,6 +81,21 @@ impl ImService {
         if !self.rooms.is_member(room, caller).await? {
             return Err(Error::Forbidden("not a room member".into()));
         }
+        // The recipient of a directed signaling event (Answer/Ice/Offer) is
+        // client-supplied. A call peer is necessarily a room member, so reject a
+        // `to` outside the room — otherwise a member could aim signaling (or a fake
+        // offer) at an arbitrary participant who isn't in this call's room.
+        let directed_to = match &event {
+            CallEvent::Answer { to, .. }
+            | CallEvent::Ice { to, .. }
+            | CallEvent::Offer { to, .. } => Some(*to),
+            _ => None,
+        };
+        if let Some(to) = directed_to {
+            if !self.rooms.is_member(room, to).await? {
+                return Err(Error::Forbidden("recipient not a room member".into()));
+            }
+        }
         if let CallEvent::End { call_id, reason, .. } = &event {
             if let Err(err) = self.calls.end(*call_id, reason).await {
                 warn!(?err, %call_id, "persist call end failed");

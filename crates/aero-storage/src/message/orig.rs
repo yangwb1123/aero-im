@@ -116,6 +116,34 @@ mod db_tests {
 
     #[tokio::test]
     #[ignore = "requires live Postgres"]
+    async fn messages_around_has_more_reflects_either_side() {
+        // Few messages BEFORE the target, many AFTER: `has_more` must be true
+        // (the after-side window truncated) — the bug only checked the before side
+        // and would report false, hiding the unloaded newer messages.
+        let p = pool();
+        let u = participant(&p).await;
+        let r = room(&p, u).await;
+        let repo = MessageRepo::new(p.clone());
+
+        insert_msg(&p, r, u).await; // 1 before
+        let target = insert_msg(&p, r, u).await;
+        for _ in 0..5 {
+            insert_msg(&p, r, u).await; // 5 after
+        }
+
+        let (rows, has_more) = repo.messages_around(r, target, 3).await.expect("around");
+        assert!(has_more, "after-side truncation (5 > window 3) must set has_more");
+        // before(1, capped at 3) + target(1) + after(3, capped) = 5 rows returned.
+        assert_eq!(rows.len(), 5, "1 before + target + 3 after (capped): {}", rows.len());
+        assert!(rows.iter().any(|m| m.id == target), "the target itself is included");
+
+        // A tight window where neither side truncates → has_more false.
+        let (_rows2, has_more2) = repo.messages_around(r, target, 100).await.expect("around2");
+        assert!(!has_more2, "neither side truncated with a generous window");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
     async fn message_id_ordering_is_chronological() {
         let p = pool();
         let u = participant(&p).await;

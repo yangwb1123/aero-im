@@ -166,7 +166,49 @@ impl HypeTrainRepo {
         now: OffsetDateTime,
     ) -> Result<HypeTrainSession, sqlx::Error> {
         let expires = now + Duration::seconds(WINDOW_SECS);
-        let session = if let Some(existing) = self.current(stream, now).await? {
+        let mut tx = self.pool.begin().await?;
+
+        // Serialize all contributions for this stream within the transaction. The
+        // read (current level/contribution) → escalate → write sequence below is
+        // otherwise a classic read-modify-write race: two concurrent gifts read the
+        // same base, both write the same absolute total, and one is silently lost
+        // (and two simultaneous first-gifts could even start two active trains). A
+        // per-stream advisory xact lock makes the whole sequence atomic; it
+        // releases on commit/rollback.
+        #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+        let lock_key = stream.0 as u64 as i64; // low 64 bits of the stream ULID
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(lock_key)
+            .execute(&mut *tx)
+            .await?;
+
+        // Read the active train inside the lock (a lapsed one is flipped to
+        // `expired` and treated as none, so a fresh train starts) — the same lazy
+        // expiry `current()` does, but transactional.
+        let active_sql = format!(
+            "SELECT {SESSION_COLUMNS}
+               FROM hype_train_sessions
+              WHERE stream_id = $1 AND state = 'active'
+              ORDER BY started_at DESC
+              LIMIT 1"
+        );
+        let existing = sqlx::query_as::<_, SessionRow>(&active_sql)
+            .bind(Uuid::from_u128(stream.0))
+            .fetch_optional(&mut *tx)
+            .await?
+            .map(row_to_session);
+        let active = match existing {
+            Some(s) if is_expired(s.expires_at, now) => {
+                sqlx::query("UPDATE hype_train_sessions SET state = 'expired' WHERE id = $1")
+                    .bind(s.id.to_uuid())
+                    .execute(&mut *tx)
+                    .await?;
+                None
+            }
+            other => other,
+        };
+
+        let session = if let Some(existing) = active {
             // Advance the running active train: bump level/contribution and slide
             // the window forward.
             let base = u32::try_from(existing.contribution.max(0)).unwrap_or(0);
@@ -182,7 +224,7 @@ impl HypeTrainRepo {
                 .bind(i32::try_from(esc.level).unwrap_or(i32::MAX))
                 .bind(i32::try_from(esc.contribution).unwrap_or(i32::MAX))
                 .bind(expires)
-                .fetch_one(&self.pool)
+                .fetch_one(&mut *tx)
                 .await?;
             row_to_session(row)
         } else {
@@ -202,12 +244,12 @@ impl HypeTrainRepo {
                 .bind(i32::try_from(esc.contribution).unwrap_or(i32::MAX))
                 .bind(now)
                 .bind(expires)
-                .fetch_one(&self.pool)
+                .fetch_one(&mut *tx)
                 .await?;
             row_to_session(row)
         };
 
-        // Upsert the participant's contribution within this session.
+        // Upsert the participant's contribution within this session (same tx).
         sqlx::query(
             r"INSERT INTO hype_train_contributions (session_id, participant_id, units, updated_at)
                VALUES ($1, $2, $3, now())
@@ -218,9 +260,10 @@ impl HypeTrainRepo {
         .bind(session.id.to_uuid())
         .bind(participant.to_uuid())
         .bind(i32::try_from(units).unwrap_or(i32::MAX))
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
 
+        tx.commit().await?;
         Ok(session)
     }
 }
@@ -430,6 +473,68 @@ mod db_tests {
         assert_eq!(s3.level, 1);
 
         // Cleanup (contributions cascade with their sessions).
+        sqlx::query("DELETE FROM hype_train_sessions WHERE stream_id = $1")
+            .bind(Uuid::from_u128(stream.0))
+            .execute(&p)
+            .await
+            .ok();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn concurrent_contributions_do_not_lose_updates() {
+        // A pool with enough connections that the concurrent calls genuinely
+        // contend (a 2-conn cap would mask the race by serializing at the pool).
+        let url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://aero:aero_dev_pw@localhost:5432/aero".into());
+        let p = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(12)
+            .connect_lazy(&url)
+            .expect("pool");
+        let stream = Ulid::new();
+        let now = OffsetDateTime::now_utc();
+
+        // Seed an active train (contribution = 1) so every concurrent call takes
+        // the read-modify-write UPDATE path — the one with the lost-update race.
+        HypeTrainRepo::new(p.clone())
+            .add_contribution(stream, participant(&p).await, 1, now)
+            .await
+            .unwrap();
+
+        const N: usize = 10;
+        const UNITS: u32 = 2;
+        let mut parts = Vec::new();
+        for _ in 0..N {
+            parts.push(participant(&p).await);
+        }
+        let mut handles = Vec::new();
+        for pid in parts {
+            let pool = p.clone();
+            handles.push(tokio::spawn(async move {
+                HypeTrainRepo::new(pool)
+                    .add_contribution(stream, pid, UNITS, now)
+                    .await
+                    .unwrap();
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        // Every concurrent contribution must be counted: 1 (seed) + N*UNITS. Under
+        // the old non-serialized read-modify-write this would be < expected (lost
+        // updates); the per-stream advisory lock makes it exact.
+        let cur = HypeTrainRepo::new(p.clone())
+            .current(stream, now)
+            .await
+            .unwrap()
+            .expect("active");
+        let expected = 1 + (i32::try_from(N).unwrap()) * (i32::try_from(UNITS).unwrap());
+        assert_eq!(
+            cur.contribution, expected,
+            "all {N} concurrent contributions counted — no lost update"
+        );
+
         sqlx::query("DELETE FROM hype_train_sessions WHERE stream_id = $1")
             .bind(Uuid::from_u128(stream.0))
             .execute(&p)

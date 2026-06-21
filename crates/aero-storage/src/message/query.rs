@@ -197,8 +197,14 @@ impl MessageRepo {
         .bind(half_window)
         .fetch_all(&self.pool)
         .await?;
+        // `has_more` must reflect EITHER side hitting its window cap, not just the
+        // older (`before`) side: a target with few older but many newer messages
+        // truncates `after`, and signalling only on `before` would tell the client
+        // "nothing more" while newer messages stay unloaded. Capture both lengths
+        // before the rows are consumed below.
+        let has_more =
+            before.len() >= half_window as usize || after.len() >= half_window as usize;
         let mut all: Vec<Message> = before.into_iter().map(Message::from).collect();
-        let has_more = all.len() >= half_window as usize;
         all.reverse();
         all.extend(target.into_iter().map(Message::from));
         all.extend(after.into_iter().map(Message::from));
