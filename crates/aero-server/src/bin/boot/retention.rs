@@ -23,6 +23,10 @@ pub(crate) fn spawn(
         .ok().and_then(|s| s.parse::<i64>().ok()).unwrap_or(365);
     let ai_job_retention_days = std::env::var("AERO__SERVER__AI_JOB_RETENTION_DAYS")
         .ok().and_then(|s| s.parse::<i64>().ok()).unwrap_or(7);
+    // AI usage ledger: a billing record, so kept far longer than ai_jobs (default
+    // ~400 days = 13 months). Bounds the ledger's otherwise-unbounded growth.
+    let ai_usage_retention_days = std::env::var("AERO__SERVER__AI_USAGE_RETENTION_DAYS")
+        .ok().and_then(|s| s.parse::<i64>().ok()).unwrap_or(400);
     let webhook_log_retention_days = std::env::var("AERO__SERVER__WEBHOOK_LOG_RETENTION_DAYS")
         .ok().and_then(|s| s.parse::<i64>().ok()).unwrap_or(30);
     let search_click_retention_days = std::env::var("AERO__SERVER__SEARCH_CLICK_RETENTION_DAYS")
@@ -85,6 +89,7 @@ pub(crate) fn spawn(
                     sweep_audit(&lifecycle_pool, audit_retention_days, now).await;
                     sweep_audit_partitions(&lifecycle_pool, audit_retention_days).await;
                     sweep_ai_jobs(&lifecycle_pool, ai_job_retention_days, now).await;
+                    sweep_ai_usage(&lifecycle_pool, ai_usage_retention_days, now).await;
                     sweep_webhook_logs(&lifecycle_pool, webhook_log_retention_days, now).await;
                     sweep_search_clicks(&lifecycle_pool, search_click_retention_days, now).await;
                     sweep_login_events(&lifecycle_pool, login_event_retention_days, now).await;
@@ -208,6 +213,16 @@ async fn sweep_ai_jobs(pool: &sqlx::PgPool, days: i64, now: time::OffsetDateTime
         Ok(0) => {}
         Ok(n) => info!(swept = n, "completed ai_jobs purged"),
         Err(e) => warn!(error = ?e, "ai_job retention sweep failed"),
+    }
+}
+
+async fn sweep_ai_usage(pool: &sqlx::PgPool, days: i64, now: time::OffsetDateTime) {
+    if days == 0 { return; }
+    let cutoff = now - time::Duration::days(days);
+    match aero_storage::AiUsageRepo::new(pool.clone()).sweep_older_than(cutoff).await {
+        Ok(0) => {}
+        Ok(n) => info!(swept = n, "stale ai_usage_ledger rows purged"),
+        Err(e) => warn!(error = ?e, "ai_usage retention sweep failed"),
     }
 }
 

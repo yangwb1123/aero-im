@@ -92,6 +92,23 @@ impl AiUsageRepo {
             .map(|(kind, calls, cost_micros)| UsageByKind { kind, calls, cost_micros })
             .collect())
     }
+
+    /// Delete ledger rows older than `cutoff` (retention sweep). The ledger gains a
+    /// row per paid AI charge forever, so a periodic sweep bounds its growth (same
+    /// unbounded-growth guard as the other lifecycle tables). Returns rows removed.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`].
+    pub async fn sweep_older_than(
+        &self,
+        cutoff: time::OffsetDateTime,
+    ) -> Result<u64, sqlx::Error> {
+        let res = sqlx::query("DELETE FROM ai_usage_ledger WHERE created_at < $1")
+            .bind(cutoff)
+            .execute(&self.pool)
+            .await?;
+        Ok(res.rows_affected())
+    }
 }
 
 #[cfg(test)]
@@ -140,5 +157,36 @@ mod db_tests {
 
         // An empty batch is a harmless no-op.
         assert_eq!(repo.insert_batch(&[]).await.expect("empty"), 0);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn sweep_older_than_purges_only_stale_rows() {
+        let p = pool();
+        let repo = AiUsageRepo::new(p.clone());
+        let old_ws = Uuid::new_v4();
+        // A 400-day-old row (explicit created_at). A 30-day cutoff catches it but
+        // never any fresh row (so concurrent tests' rows are untouched).
+        sqlx::query(
+            "INSERT INTO ai_usage_ledger (workspace_id, kind, cost_micros, created_at)
+             VALUES ($1, 'answer', 100, now() - interval '400 days')",
+        )
+        .bind(old_ws)
+        .execute(&p)
+        .await
+        .expect("insert old row");
+        // A fresh row for the same workspace must SURVIVE the sweep.
+        repo.insert_batch(&[UsageRow { workspace_id: Some(old_ws), kind: "embed".into(), cost_micros: 5 }])
+            .await
+            .expect("fresh row");
+
+        let cutoff = time::OffsetDateTime::now_utc() - time::Duration::days(30);
+        let removed = repo.sweep_older_than(cutoff).await.expect("sweep");
+        assert!(removed >= 1, "the 400-day-old row is purged");
+
+        // Only the fresh embed row remains for this workspace.
+        let sum = repo.summary_since(old_ws, time::OffsetDateTime::UNIX_EPOCH).await.expect("summary");
+        assert_eq!(sum.len(), 1, "stale answer row gone, fresh embed kept: {sum:?}");
+        assert_eq!(sum[0].kind, "embed");
     }
 }
