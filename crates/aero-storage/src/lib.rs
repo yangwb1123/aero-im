@@ -17,6 +17,7 @@ pub mod bookmark_collection;
 pub mod cache;
 pub mod channel_section;
 pub mod call;
+pub mod delivery_cursor;
 pub mod call_transcript;
 pub mod db;
 pub mod draft;
@@ -158,6 +159,7 @@ pub use presence::PresenceStore;
 pub use reaction::ReactionRepo;
 pub use message_receipt::{MessageReader, MessageReceiptRepo};
 pub use receipt::ReceiptRepo;
+pub use delivery_cursor::{DeliveryCursor, DeliveryCursorRepo};
 pub use room::RoomRepo;
 pub use saved_search::{MonitoredSearch, SavedSearch, SavedSearchRepo};
 // SCIM token helpers (`generate_token`/`hash_token`) are intentionally NOT

@@ -89,6 +89,22 @@ pub(super) async fn handle_text(
         ClientFrame::MarkRead { room_id, last_message_id } => {
             state.im.mark_read(pid, room_id, last_message_id).await?;
         }
+        ClientFrame::DeliveryAck { room_id, message_id, seq } => {
+            // Advance the per-room DELIVERY cursor (ROADMAP 方向三·A). Gate on
+            // membership exactly like the sibling `MarkRead` (no forged cursor for
+            // a non-member room). Then off the hot path and best-effort: a persist
+            // failure is logged, never propagated — an unacked cursor just means
+            // the next reconnect replays a little more (additive, never wrong).
+            if state.rooms.is_member(room_id, pid).await.unwrap_or(false) {
+                if let Err(e) = state
+                    .delivery_cursors
+                    .advance(pid, room_id, message_id, seq)
+                    .await
+                {
+                    tracing::warn!(error = ?e, %pid, %room_id, "delivery_ack persist failed");
+                }
+            }
+        }
         ClientFrame::Typing { room_id, on } => {
             state.im.typing(pid, room_id, on).await?;
         }

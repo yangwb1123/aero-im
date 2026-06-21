@@ -53,6 +53,15 @@ pub struct WsParams {
     /// Defaults to false (full per-message replay).
     #[serde(default)]
     summarize: Option<bool>,
+    /// Opt-in per-room delivery-cursor backfill (ROADMAP 方向三·A). When truthy
+    /// (`1`/`true`/`yes`) AND no explicit `since` is given, the server resumes each
+    /// room from this participant's persisted DELIVERY cursor (multi-device-shared)
+    /// instead of a single global cursor. Ignored when `since` is present (explicit
+    /// wins, for back-compat). A free-form string (not `Option<bool>`) so a `1`
+    /// from a client is lenient — like `since` — rather than 400-ing the whole
+    /// upgrade. Absent/empty ⇒ off.
+    #[serde(default)]
+    cursors: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -99,6 +108,13 @@ pub(crate) enum ClientFrame {
     React { message_id: MessageId, emoji: String },
     /// Mark a room read up to the given message.
     MarkRead { room_id: RoomId, last_message_id: MessageId },
+    /// Acknowledge durable receipt of a message (ROADMAP 方向三·A). Distinct from
+    /// `MarkRead` (visual "seen"): this advances the per-room DELIVERY cursor — the
+    /// Last-Known-Good point reconnect resumes each room from. Monotonic on `seq`
+    /// (the per-subject bus seq the client already dedupes on), so redelivery and
+    /// racing multi-device ACKs are harmless. Best-effort: a failed persist never
+    /// tears down the socket.
+    DeliveryAck { room_id: RoomId, message_id: MessageId, seq: i64 },
     /// Best-effort typing indicator.
     Typing { room_id: RoomId, on: bool },
     /// Start a call (1:1 or group).
@@ -262,7 +278,11 @@ pub async fn handler(
     // backfill) rather than rejecting the upgrade. See module-level protocol docs.
     let since = parse_resume_cursor(p.since.as_deref());
     let summarize = p.summarize.unwrap_or(false);
-    ws.on_upgrade(move |socket| run_socket(socket, state, pid, since, summarize))
+    let use_cursors = matches!(
+        p.cursors.as_deref().map(str::trim),
+        Some("1" | "true" | "yes" | "on")
+    );
+    ws.on_upgrade(move |socket| run_socket(socket, state, pid, since, summarize, use_cursors))
 }
 #[instrument(skip(socket, state, since), fields(%pid))]
 async fn run_socket(
@@ -271,6 +291,7 @@ async fn run_socket(
     pid: ParticipantId,
     since: Option<MessageId>,
     summarize: bool,
+    use_cursors: bool,
 ) {
     let (mut sender, mut receiver) = socket.split();
     // Bounded outbound queue: a slow/stalled client can never make the
@@ -307,6 +328,10 @@ async fn run_socket(
     // ahead of any new live frames). Best-effort: failures never abort the conn.
     if let Some(cursor) = since {
         backfill_since(&state, pid, cursor, &tx, &close, summarize).await;
+    } else if use_cursors {
+        // No explicit `since`: resume each room from its persisted delivery cursor
+        // (ROADMAP 方向三·A, multi-device-shared per-room catch-up).
+        backfill_from_cursors(&state, pid, &tx, &close, summarize).await;
     }
     loop {
         tokio::select! {
@@ -456,102 +481,185 @@ async fn backfill_since(
     };
     let mut replayed = 0usize;
     for room in backfill_room_ids(&rooms) {
-        // Fetch one PAST the replay cap: a full `cap + 1` page is the reliable
-        // "there is more behind the cap" signal that drives the truncation frame
-        // below (and keeps the burst bounded — a long offline gap must not dump
-        // thousands of rows over the socket; the client pulls the remainder via
-        // REST). list_since now HONOURS this limit (it previously hardcoded 500).
-        let missed = match state
-            .messages
-            .list_since(room, cursor, BACKFILL_PER_ROOM_LIMIT + 1)
-            .await
-        {
-            Ok(m) => m,
-            Err(e) => {
-                warn!(error = ?e, %room, "reconnect backfill: list_since failed");
-                continue;
-            }
-        };
-        let room_count = missed.len();
-        // Per-room replay cap. The full per-message replay below stops at
-        // BACKFILL_PER_ROOM_LIMIT and the client pulls the remainder via REST.
-        // CRITICAL: the truncation cursor must be the last *replayed* id, not the
-        // last *missed* id — otherwise the REST continuation (`id > since`) starts
-        // past the whole gap and returns nothing (regression: list_since once
-        // replayed everything yet still signalled truncation pointing at the tail
-        // → smoke_roadmap3_wave_c REST-continuation returned 0).
-        let cap = usize::try_from(BACKFILL_PER_ROOM_LIMIT).unwrap_or(usize::MAX);
-        let next_since: Option<MessageId> = if summarize {
-            // Summarized backfill: one room-level summary stands in for the whole
-            // gap (not a per-message burst), so it is not subject to the cap.
-            let last_id = missed.last().map(|m| m.id);
-            let participants: std::collections::BTreeSet<ParticipantId> =
-                missed.iter().map(|m| m.sender_id).collect();
-            let snippet = missed.last().map(|m| {
-                let text = m.searchable_text();
-                let truncated: String = text.chars().take(120).collect();
-                if text.chars().count() > 120 { format!("{truncated}…") } else { truncated }
-            }).unwrap_or_default();
-            let frame = serde_json::json!({
-                "type": "backfill_summary",
-                "room_id": room,
-                "total": room_count,
-                "participant_count": participants.len(),
-                "snippet": snippet,
-            });
-            tokio::select! {
-                () = close.cancelled() => return,
-                res = tx.send(Message::Text(frame.to_string())) => {
-                    if res.is_err() { return; }
-                }
-            }
-            // Still track replayed count for the debug log.
-            replayed += room_count;
-            truncation_cursor(room_count, BACKFILL_PER_ROOM_LIMIT, last_id)
-        } else {
-            // Full per-message replay (legacy behaviour), capped at the per-room
-            // limit; `last_replayed` tracks the gap boundary for the cursor.
-            let mut last_replayed = None;
-            for message in missed.into_iter().take(cap) {
-                last_replayed = Some(message.id);
-                let frame = ServerFrame::Message { message };
-                let json = serde_json::to_string(&frame).unwrap_or_default();
-                tokio::select! {
-                        () = close.cancelled() => return,
-                    res = tx.send(Message::Text(json)) => {
-                        if res.is_err() {
-                            return; // receiver gone
-                        }
-                    }
-                }
-                replayed += 1;
-            }
-            // Signal truncation only when the gap genuinely exceeded the cap; the
-            // cursor is the last replayed id so REST resumes exactly at the gap.
-            if room_count > cap { last_replayed } else { None }
-        };
-        // Truncation signal (ROADMAP 第三版 方向一): newer messages were left
-        // behind, so tell the client to continue via REST
-        // `GET /api/rooms/:id/messages?since=<next_since>` instead of silently
-        // missing the remainder.
-        if let Some(next_since) = next_since {
-            let frame = serde_json::json!({
-                "type": "backfill",
-                "room_id": room,
-                "truncated": true,
-                "next_since": next_since,
-            });
-            tokio::select! {
-                () = close.cancelled() => return,
-                res = tx.send(Message::Text(frame.to_string())) => {
-                    if res.is_err() { return; }
-                }
-            }
+        // Every room replays from the SAME global `cursor` (legacy `?since=`).
+        match replay_room_since(state, room, cursor, tx, close, summarize).await {
+            Ok(n) => replayed += n,
+            Err(()) => return, // connection gone mid-replay
         }
     }
     if replayed > 0 {
         debug!(%pid, replayed, "reconnect backfill replayed missed messages");
     }
+}
+
+/// Per-room reconnect backfill from each room's persisted DELIVERY cursor
+/// (ROADMAP 方向三·A · opt-in `?cursors=1`). Unlike [`backfill_since`] — which
+/// replays every room from one global id — this resumes each room from exactly
+/// what *this participant has ACKed receiving there*, so a second device sharing
+/// the (participant, room) cursor only sees genuinely-new messages (no per-device
+/// re-replay), and rooms the client is already caught up on send nothing.
+///
+/// Rooms whose cursor exists but where the participant is no longer a member are
+/// skipped (a stale cursor for a left room must never replay). Best-effort: a
+/// failed cursor/room lookup logs and returns.
+async fn backfill_from_cursors(
+    state: &AppState,
+    pid: ParticipantId,
+    tx: &mpsc::Sender<Message>,
+    close: &CancellationToken,
+    summarize: bool,
+) {
+    let cursors = match state.delivery_cursors.cursors_for(pid).await {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(error = ?e, %pid, "reconnect backfill: list delivery cursors failed");
+            return;
+        }
+    };
+    if cursors.is_empty() {
+        return;
+    }
+    // Current membership: a cursor for a room the participant has since left must
+    // not replay (membership can change between disconnect and reconnect).
+    let member_rooms: std::collections::HashSet<RoomId> = match state.rooms.rooms_for(pid).await {
+        Ok(rs) => backfill_room_ids(&rs).into_iter().collect(),
+        Err(e) => {
+            warn!(error = ?e, %pid, "reconnect backfill: list rooms failed");
+            return;
+        }
+    };
+    let mut replayed = 0usize;
+    for cur in cursors {
+        if !member_rooms.contains(&cur.room_id) {
+            continue;
+        }
+        match replay_room_since(
+            state,
+            cur.room_id,
+            cur.last_delivered_message_id,
+            tx,
+            close,
+            summarize,
+        )
+        .await
+        {
+            Ok(n) => replayed += n,
+            Err(()) => return,
+        }
+    }
+    if replayed > 0 {
+        debug!(%pid, replayed, "reconnect backfill (per-room cursors) replayed missed messages");
+    }
+}
+
+/// Replay one room's messages newer than `cursor`, oldest-first. Returns the
+/// number of frames replayed, or `Err(())` when the connection went away
+/// mid-replay (the caller must stop the whole backfill). A per-room query error
+/// is logged and yields `Ok(0)` (skip this room, keep going) — best-effort, never
+/// aborting on a single bad room. Shared by [`backfill_since`] (one global cursor
+/// for every room) and [`backfill_from_cursors`] (per-room delivery cursors).
+async fn replay_room_since(
+    state: &AppState,
+    room: RoomId,
+    cursor: MessageId,
+    tx: &mpsc::Sender<Message>,
+    close: &CancellationToken,
+    summarize: bool,
+) -> Result<usize, ()> {
+    // Fetch one PAST the replay cap: a full `cap + 1` page is the reliable
+    // "there is more behind the cap" signal that drives the truncation frame
+    // below (and keeps the burst bounded — a long offline gap must not dump
+    // thousands of rows over the socket; the client pulls the remainder via
+    // REST). list_since HONOURS this limit (it previously hardcoded 500).
+    let missed = match state
+        .messages
+        .list_since(room, cursor, BACKFILL_PER_ROOM_LIMIT + 1)
+        .await
+    {
+        Ok(m) => m,
+        Err(e) => {
+            warn!(error = ?e, %room, "reconnect backfill: list_since failed");
+            return Ok(0);
+        }
+    };
+    let room_count = missed.len();
+    let mut replayed = 0usize;
+    // Per-room replay cap. The full per-message replay below stops at
+    // BACKFILL_PER_ROOM_LIMIT and the client pulls the remainder via REST.
+    // CRITICAL: the truncation cursor must be the last *replayed* id, not the
+    // last *missed* id — otherwise the REST continuation (`id > since`) starts
+    // past the whole gap and returns nothing (regression: list_since once
+    // replayed everything yet still signalled truncation pointing at the tail
+    // → smoke_roadmap3_wave_c REST-continuation returned 0).
+    let cap = usize::try_from(BACKFILL_PER_ROOM_LIMIT).unwrap_or(usize::MAX);
+    let next_since: Option<MessageId> = if summarize {
+        // Summarized backfill: one room-level summary stands in for the whole
+        // gap (not a per-message burst), so it is not subject to the cap.
+        let last_id = missed.last().map(|m| m.id);
+        let participants: std::collections::BTreeSet<ParticipantId> =
+            missed.iter().map(|m| m.sender_id).collect();
+        let snippet = missed.last().map(|m| {
+            let text = m.searchable_text();
+            let truncated: String = text.chars().take(120).collect();
+            if text.chars().count() > 120 { format!("{truncated}…") } else { truncated }
+        }).unwrap_or_default();
+        let frame = serde_json::json!({
+            "type": "backfill_summary",
+            "room_id": room,
+            "total": room_count,
+            "participant_count": participants.len(),
+            "snippet": snippet,
+        });
+        tokio::select! {
+            () = close.cancelled() => return Err(()),
+            res = tx.send(Message::Text(frame.to_string())) => {
+                if res.is_err() { return Err(()); }
+            }
+        }
+        // Still track replayed count for the debug log.
+        replayed += room_count;
+        truncation_cursor(room_count, BACKFILL_PER_ROOM_LIMIT, last_id)
+    } else {
+        // Full per-message replay (legacy behaviour), capped at the per-room
+        // limit; `last_replayed` tracks the gap boundary for the cursor.
+        let mut last_replayed = None;
+        for message in missed.into_iter().take(cap) {
+            last_replayed = Some(message.id);
+            let frame = ServerFrame::Message { message };
+            let json = serde_json::to_string(&frame).unwrap_or_default();
+            tokio::select! {
+                    () = close.cancelled() => return Err(()),
+                res = tx.send(Message::Text(json)) => {
+                    if res.is_err() {
+                        return Err(()); // receiver gone
+                    }
+                }
+            }
+            replayed += 1;
+        }
+        // Signal truncation only when the gap genuinely exceeded the cap; the
+        // cursor is the last replayed id so REST resumes exactly at the gap.
+        if room_count > cap { last_replayed } else { None }
+    };
+    // Truncation signal (ROADMAP 第三版 方向一): newer messages were left
+    // behind, so tell the client to continue via REST
+    // `GET /api/rooms/:id/messages?since=<next_since>` instead of silently
+    // missing the remainder.
+    if let Some(next_since) = next_since {
+        let frame = serde_json::json!({
+            "type": "backfill",
+            "room_id": room,
+            "truncated": true,
+            "next_since": next_since,
+        });
+        tokio::select! {
+            () = close.cancelled() => return Err(()),
+            res = tx.send(Message::Text(frame.to_string())) => {
+                if res.is_err() { return Err(()); }
+            }
+        }
+    }
+    Ok(replayed)
 }
 /// Loose BCP-47 comparison on the primary subtag, so `en` and `en-US` are the
 /// same language and the server skips a no-op translation.

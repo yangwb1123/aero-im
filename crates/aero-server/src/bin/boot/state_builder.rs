@@ -61,6 +61,7 @@ pub(crate) fn build(d: StateDeps) -> AppState {
     let auth_rate = d.gateway_cfg.auth_rate_limit;
 
     let pg_for_blocks = d.pg.clone();
+    let pg_for_cursors = d.pg.clone();
     let redis_for_ws_rate = d.redis_client.clone();
     AppState {
         auth: d.auth,
@@ -79,6 +80,7 @@ pub(crate) fn build(d: StateDeps) -> AppState {
         notifications: d.notifications,
         pins: d.pins,
         receipts: d.receipts,
+        delivery_cursors: aero_storage::DeliveryCursorRepo::new(pg_for_cursors),
         reactions: d.reactions,
         calls: d.calls,
         ai_jobs: d.ai_jobs,

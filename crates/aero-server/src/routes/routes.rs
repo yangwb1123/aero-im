@@ -91,6 +91,7 @@ pub fn build(state: AppState) -> Router {
         .route("/api/rooms/:id/changes", get(room_changes))
         .route("/api/rooms/:id/read", post(mark_read))
         .route("/api/rooms/:id/receipts", get(list_receipts))
+        .route("/api/rooms/:id/delivery-cursor", get(get_delivery_cursor))
         .route("/api/rooms/:id/search", post(room_search))
         // Messages
         .route(
@@ -1231,6 +1232,26 @@ async fn list_receipts(
     s.im.assert_room_access(auth.participant_id, room).await?;
     let rs = s.im.receipts_for(room).await?;
     Ok(Json(serde_json::to_value(rs).map_err(AeroError::from)?))
+}
+
+/// `GET /api/rooms/:id/delivery-cursor` — the caller's persisted DELIVERY cursor
+/// for this room (ROADMAP 方向三·A): the Last-Known-Good `(message_id, seq)` the
+/// client has ACKed receiving. Lets a client fetch its LKG over REST (e.g. an
+/// offline-first client priming before opening the socket). Returns `null` when
+/// the caller has never ACKed in the room. Member-gated via `assert_room_access`.
+async fn get_delivery_cursor(
+    State(s): State<AppState>,
+    auth: AuthUser,
+    Path(room_str): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let room = parse_room_id(&room_str)?;
+    s.im.assert_room_access(auth.participant_id, room).await?;
+    let cur = s
+        .delivery_cursors
+        .get(auth.participant_id, room)
+        .await
+        .map_err(AeroError::from)?;
+    Ok(Json(serde_json::to_value(cur).map_err(AeroError::from)?))
 }
 
 // ----- Messages -----

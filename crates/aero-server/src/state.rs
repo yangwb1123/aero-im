@@ -11,7 +11,8 @@ use aero_live_whip::WhipRegistry;
 use crate::live::LiveService;
 use aero_storage::{
     AiJobRepo, AuditRepo, BlockRepo, BlobRepo, BlobStore, CallRepo, CallRosterStore,
-    KeyPackageRepo, MessageRepo, MlsGroupRepo, NotificationRepo, ParticipantRepo, PgPool, PinRepo,
+    DeliveryCursorRepo, KeyPackageRepo, MessageRepo, MlsGroupRepo, NotificationRepo,
+    ParticipantRepo, PgPool, PinRepo,
     PresenceStore, ReactionRepo, ReceiptRepo, RoomRepo, StreamRepo, StreamRouteRegistry,
     StreamViewerStore, ThreadReadStateRepo, TopicHistoryRepo, WorkspaceRepo,
 };
@@ -263,6 +264,11 @@ pub struct AppState {
     /// Pinned-messages store (per-room).
     pub pins: PinRepo,
     pub receipts: ReceiptRepo,
+    /// Per-(participant, room) persistent DELIVERY cursor (ROADMAP 方向三·A): the
+    /// client-ACKed Last-Known-Good delivery point driving per-room reconnect
+    /// catch-up + multi-device convergence. Distinct from `receipts` (the *seen*
+    /// cursor for unread badges).
+    pub delivery_cursors: DeliveryCursorRepo,
     pub reactions: ReactionRepo,
     pub calls: CallRepo,
     pub ai_jobs: AiJobRepo,
