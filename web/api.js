@@ -221,6 +221,33 @@ export const api = {
     return request('POST', '/api/agents', { body: { display_name, kind, avatar_url } });
   },
 
+  // ----- polls -----
+  // List a room's polls (newest first). `open=true` → only those still open.
+  listPolls(roomId, { open = false } = {}) {
+    return request('GET', `/api/rooms/${encodeURIComponent(roomId)}/polls`, {
+      query: { open: open ? 'true' : undefined },
+    });
+  },
+  createPoll(roomId, { question, options, multi = false, anonymous = false }) {
+    return request('POST', `/api/rooms/${encodeURIComponent(roomId)}/polls`, {
+      body: { question, options, multi, anonymous },
+    });
+  },
+  // The poll + live tally: { poll, counts, total, voted, anonymous }.
+  getPoll(pollId) {
+    return request('GET', `/api/polls/${encodeURIComponent(pollId)}`);
+  },
+  // Vote: pass `optionIdx` (single-choice) OR `optionIdxs` (multi-choice).
+  votePoll(pollId, { optionIdx, optionIdxs }) {
+    const body = {};
+    if (optionIdxs !== undefined) body.option_idxs = optionIdxs;
+    else if (optionIdx !== undefined) body.option_idx = optionIdx;
+    return request('POST', `/api/polls/${encodeURIComponent(pollId)}/vote`, { body });
+  },
+  closePoll(pollId) {
+    return request('POST', `/api/polls/${encodeURIComponent(pollId)}/close`);
+  },
+
   // ----- threads (Wave 1) -----
   thread(rootMessageId, { after, limit = 50 } = {}) {
     return request('GET', `/api/messages/${encodeURIComponent(rootMessageId)}/thread`, {

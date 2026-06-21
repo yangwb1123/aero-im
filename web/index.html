@@ -92,6 +92,7 @@
             <button id="btn-notif" type="button" title="通知收件箱" class="btn-notif">🔔<span id="notif-badge" class="notif-badge" hidden>0</span></button>
             <button id="btn-search" type="button" title="搜索">🔍 搜索</button>
             <button id="btn-ai" type="button" title="问 AI">✨ AI</button>
+            <button id="btn-polls" type="button" title="投票">📊 投票</button>
             <button id="btn-call-audio" type="button" title="发起语音通话">📞</button>
             <button id="btn-call-video" type="button" title="发起视频通话">📹</button>
             <button id="btn-call-group" type="button" title="发起群视频通话(mesh)">👥</button>
@@ -162,6 +163,37 @@
           <button type="submit" class="btn-primary">创建</button>
         </footer>
       </form>
+    </div>
+  </div>
+
+  <!-- modal: room polls (list + vote + create) -->
+  <div id="modal-polls" class="modal" hidden>
+    <div class="modal-card">
+      <header class="modal-head">
+        <h3>投票</h3>
+        <button class="btn-icon" data-close>×</button>
+      </header>
+      <div class="modal-body">
+        <div id="polls-list" class="polls-list"></div>
+        <details id="poll-create-wrap" class="poll-create">
+          <summary>+ 新建投票</summary>
+          <form id="form-new-poll">
+            <label>
+              <span>问题</span>
+              <input type="text" name="question" maxlength="500" placeholder="例如:今晚发布哪个版本?" required />
+            </label>
+            <label>
+              <span>选项(每行一个,2–10 个)</span>
+              <textarea name="options" rows="4" placeholder="选项 A&#10;选项 B"></textarea>
+            </label>
+            <label class="poll-check"><input type="checkbox" name="multi" /> 允许多选</label>
+            <label class="poll-check"><input type="checkbox" name="anonymous" /> 匿名投票</label>
+            <footer class="modal-foot">
+              <button type="submit" class="btn-primary">创建投票</button>
+            </footer>
+          </form>
+        </details>
+      </div>
     </div>
   </div>
 
@@ -348,5 +380,6 @@
   </div>
 
   <script type="module" src="app.js"></script>
+  <script type="module" src="polls.js"></script>
 </body>
 </html>
