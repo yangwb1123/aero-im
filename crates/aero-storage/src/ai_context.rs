@@ -12,7 +12,7 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aero_common::{ParticipantId, RoomId};
-use fred::prelude::{Expiration, KeysInterface, RedisClient, SortedSetsInterface};
+use fred::prelude::{Expiration, KeysInterface, RedisClient, SetsInterface, SortedSetsInterface};
 
 /// Maximum turns retained per session (5 Q&A pairs = 10 messages).
 pub const MAX_TURNS: i64 = 10;
@@ -44,6 +44,12 @@ impl AiContextStore {
         format!("ai:ans:{room}:{}", crate::revoked_token::hash_token(query_norm))
     }
 
+    /// Per-room index of live answer-cache keys, so the whole room can be
+    /// invalidated on an `Edited`/`Deleted` event without a SCAN.
+    fn answer_keys_set(room: RoomId) -> String {
+        format!("ai:ans:keys:{room}")
+    }
+
     /// Look up a cached answer (serialized `AnswerResult` JSON) for a room + a
     /// pre-normalized query. `None` ⇒ miss. ROADMAP 方向一·3.
     ///
@@ -58,9 +64,11 @@ impl AiContextStore {
         Ok(v)
     }
 
-    /// Cache an answer for `ttl_secs`. Short TTL bounds staleness vs a referenced
-    /// message edited/deleted after caching (a fuller design would invalidate on
-    /// the room's `Edited`/`Deleted` events); the room scope guarantees isolation.
+    /// Cache an answer for `ttl_secs`, and index its key under the room so an
+    /// `Edited`/`Deleted` event can invalidate the whole room
+    /// ([`cache_answer_invalidate_room`](Self::cache_answer_invalidate_room)). The
+    /// TTL still bounds staleness as a backstop; the room scope guarantees
+    /// isolation.
     ///
     /// # Errors
     /// Propagates Redis errors; the caller logs + continues (cache is best-effort).
@@ -71,16 +79,43 @@ impl AiContextStore {
         value: &str,
         ttl_secs: i64,
     ) -> anyhow::Result<()> {
+        let key = Self::answer_cache_key(room, query_norm);
         self.client
             .set::<(), _, _>(
-                Self::answer_cache_key(room, query_norm),
+                &key,
                 value,
                 Some(Expiration::EX(ttl_secs.max(1))),
                 None,
                 false,
             )
             .await?;
+        // Track the key in the per-room index so the room can be invalidated
+        // without a SCAN. The index outlives its entries (a stale ref is harmless:
+        // a later DEL of an already-expired key is a no-op); refresh its TTL past
+        // the entry's so it never expires while a live answer remains.
+        let idx = Self::answer_keys_set(room);
+        self.client.sadd::<(), _, _>(&idx, key).await?;
+        self.client.expire::<(), _>(&idx, ttl_secs.max(1) + 3600).await?;
         Ok(())
+    }
+
+    /// Invalidate every cached answer for `room` — called on the room's
+    /// `Edited`/`Deleted` events so a cached answer can never cite a since-edited
+    /// or -deleted message (ROADMAP 方向一·3 staleness edge case). Reads the
+    /// per-room key index ([`answer_keys_set`](Self::answer_keys_set)) and deletes
+    /// the entries plus the index. Returns the number of cache entries removed.
+    ///
+    /// # Errors
+    /// Propagates Redis errors; the caller logs + continues (best-effort).
+    pub async fn cache_answer_invalidate_room(&self, room: RoomId) -> anyhow::Result<u64> {
+        let idx = Self::answer_keys_set(room);
+        let keys: Vec<String> = self.client.smembers(&idx).await?;
+        if keys.is_empty() {
+            return Ok(0);
+        }
+        let removed: i64 = self.client.del(keys).await?;
+        let _: () = self.client.del(&idx).await?;
+        Ok(u64::try_from(removed).unwrap_or(0))
     }
 
     /// Append one turn (role + text) to the session, then trim to the last
@@ -254,5 +289,34 @@ mod tests {
         );
         // A different query in the same room is also a miss.
         assert!(store.cache_answer_get(room_a, "完全不同的问题").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Redis"]
+    async fn invalidate_room_clears_all_answers_for_that_room_only() {
+        let store = AiContextStore::new(redis().await);
+        let room_a = RoomId::new();
+        let room_b = RoomId::new();
+        let val = r#"{"answer":"x","citations":[]}"#;
+
+        // Two cached answers in room A, one in room B.
+        store.cache_answer_put(room_a, "q1", val, 300).await.unwrap();
+        store.cache_answer_put(room_a, "q2", val, 300).await.unwrap();
+        store.cache_answer_put(room_b, "q1", val, 300).await.unwrap();
+
+        // Invalidating room A removes BOTH its entries (an Edited/Deleted in A),
+        // and reports the count; room B is untouched.
+        let removed = store.cache_answer_invalidate_room(room_a).await.unwrap();
+        assert_eq!(removed, 2, "both room-A answers were invalidated");
+        assert!(store.cache_answer_get(room_a, "q1").await.unwrap().is_none());
+        assert!(store.cache_answer_get(room_a, "q2").await.unwrap().is_none());
+        assert_eq!(
+            store.cache_answer_get(room_b, "q1").await.unwrap().as_deref(),
+            Some(val),
+            "another room's cache is not touched by an invalidation"
+        );
+
+        // Invalidating again (now empty index) is a clean zero-count no-op.
+        assert_eq!(store.cache_answer_invalidate_room(room_a).await.unwrap(), 0);
     }
 }

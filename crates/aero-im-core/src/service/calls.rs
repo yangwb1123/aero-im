@@ -65,7 +65,22 @@ impl ImService {
 
     /// Forward an answer/ICE/end signaling event to the targeted participant(s).
     /// `room` is required for routing on the per-room subject.
-    pub async fn relay_call_event(&self, room: RoomId, event: CallEvent) -> Result<()> {
+    ///
+    /// `caller` is the authenticated sender (the JWT-verified participant, NOT a
+    /// field from the client payload). Every call relay funnels through here, so
+    /// this single membership guard closes the IDOR where a non-member could spoof
+    /// a `room_id` and inject signaling (or a forged `End`/`Caption`) into a room
+    /// they don't belong to — mirroring the `is_member` guard `start_call` already
+    /// enforces.
+    pub async fn relay_call_event(
+        &self,
+        caller: ParticipantId,
+        room: RoomId,
+        event: CallEvent,
+    ) -> Result<()> {
+        if !self.rooms.is_member(room, caller).await? {
+            return Err(Error::Forbidden("not a room member".into()));
+        }
         if let CallEvent::End { call_id, reason, .. } = &event {
             if let Err(err) = self.calls.end(*call_id, reason).await {
                 warn!(?err, %call_id, "persist call end failed");

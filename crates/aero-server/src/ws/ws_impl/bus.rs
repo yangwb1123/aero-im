@@ -110,6 +110,20 @@ async fn handle_room_event_sub(state: &AppState, sub: Box<dyn aero_bus::Subscrip
             if matches!(event, RoomEvent::Message(_)) {
                 metrics::inc_counter(names::MESSAGES_SENT_TOTAL, 1);
             }
+            // AI answer-cache staleness (ROADMAP 方向一·3): an edited or deleted
+            // message must not survive in a cached AI answer. The bus is the one
+            // chokepoint every Edited/Deleted (REST, WS, moderation) funnels
+            // through, so invalidate the room's answer cache here. Best-effort, and
+            // only when an AI backend is configured so non-AI deployments pay
+            // nothing (an empty key-index is a no-op regardless).
+            if state.ai.is_some() && matches!(event, RoomEvent::Edited(_) | RoomEvent::Deleted { .. }) {
+                if let Some(rid) = room {
+                    let store = aero_storage::AiContextStore::new(state.redis_client.clone());
+                    if let Err(e) = store.cache_answer_invalidate_room(rid).await {
+                        tracing::warn!(error = ?e, room = %rid, "answer-cache invalidation failed");
+                    }
+                }
+            }
             let frame = frame::room_event_to_frame_json(&event, seq);
             state.hub.fan_out_raw(&recipients, &frame);
             let _ = sub.ack().await;

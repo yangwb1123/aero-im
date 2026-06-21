@@ -142,6 +142,7 @@ pub(super) async fn handle_text(
             state
                 .im
                 .relay_call_event(
+                    pid,
                     room_id,
                     CallEvent::Answer { call_id, from: pid, to, sdp },
                 )
@@ -169,6 +170,7 @@ pub(super) async fn handle_text(
             state
                 .im
                 .relay_call_event(
+                    pid,
                     room_id,
                     CallEvent::Ice { call_id, from: pid, to, candidate },
                 )
@@ -178,6 +180,7 @@ pub(super) async fn handle_text(
             state
                 .im
                 .relay_call_event(
+                    pid,
                     room_id,
                     CallEvent::End {
                         call_id,
@@ -278,6 +281,13 @@ pub(super) async fn handle_text(
             if text.is_empty() {
                 return Ok(());
             }
+            // Membership guard BEFORE any side effect: unlike the other relays
+            // (gated centrally in relay_call_event), CallCaption persists a durable
+            // transcript line first, so a non-member spoofing room_id could corrupt
+            // a call's transcript / post-call recap before the relay rejects.
+            if !state.rooms.is_member(room_id, pid).await? {
+                return Ok(());
+            }
             // Translate only *final* lines, only when a distinct target language
             // is set and an AI backend is available. Interim lines relay verbatim
             // to keep latency low.
@@ -310,6 +320,7 @@ pub(super) async fn handle_text(
             state
                 .im
                 .relay_call_event(
+                    pid,
                     room_id,
                     CallEvent::Caption {
                         call_id,
@@ -391,6 +402,7 @@ pub(super) async fn handle_text(
             state
                 .im
                 .relay_call_event(
+                    pid,
                     room_id,
                     CallEvent::Roster { call_id, to: pid, members: existing, kind },
                 )
@@ -398,7 +410,7 @@ pub(super) async fn handle_text(
             // Tell the room a new peer joined.
             state
                 .im
-                .relay_call_event(room_id, CallEvent::Join { call_id, room_id, from: pid, kind })
+                .relay_call_event(pid, room_id, CallEvent::Join { call_id, room_id, from: pid, kind })
                 .await?;
             // The orchestrator already registered the participant in the SFU
             // router + cluster CallRouteRegistry above; here we only act on the
@@ -418,7 +430,7 @@ pub(super) async fn handle_text(
             }
             state
                 .im
-                .relay_call_event(room_id, CallEvent::Leave { call_id, room_id, from: pid })
+                .relay_call_event(pid, room_id, CallEvent::Leave { call_id, room_id, from: pid })
                 .await?;
             // Additively unregister from the cross-node orchestrator (ROADMAP4):
             // drop the SFU + registry mapping; on the last local participant,
@@ -442,7 +454,7 @@ pub(super) async fn handle_text(
             }
             state
                 .im
-                .relay_call_event(room_id, CallEvent::Offer { call_id, from: pid, to, sdp })
+                .relay_call_event(pid, room_id, CallEvent::Offer { call_id, from: pid, to, sdp })
                 .await?;
         }
         ClientFrame::WatchStream { stream_id, since } => {

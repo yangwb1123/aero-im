@@ -1392,11 +1392,23 @@ struct ReactionsBatchReq {
     message_ids: Vec<String>,
 }
 
+/// Max message ids one reactions-batch request may resolve. The gateway body cap
+/// bounds the request loosely; this is the explicit per-request ceiling so a
+/// single call can't fan into an arbitrarily large `ANY($1)` scan.
+const MAX_REACTIONS_BATCH: usize = 256;
+
 async fn reactions_batch(
     State(s): State<AppState>,
     _auth: AuthUser,
     Json(req): Json<ReactionsBatchReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    if req.message_ids.len() > MAX_REACTIONS_BATCH {
+        return Err(AeroError::Invalid(format!(
+            "too many message_ids: {} (max {MAX_REACTIONS_BATCH})",
+            req.message_ids.len()
+        ))
+        .into());
+    }
     let ids: Vec<MessageId> = req
         .message_ids
         .iter()

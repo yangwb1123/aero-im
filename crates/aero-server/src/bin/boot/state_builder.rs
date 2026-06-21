@@ -104,6 +104,7 @@ pub(crate) fn build(d: StateDeps) -> AppState {
         login_rate_limiter: RateLimiter::with_rate(5.0 / 60.0, 5.0),
         forgot_rate_limiter: RateLimiter::with_rate(3.0 / 3600.0, 3.0),
         ws_rate: WsRateEnforcer::from_env(WsRateStore::new(redis_for_ws_rate)),
+        redis_client: d.redis_client.clone(),
         metrics: d.metrics,
         ai: d.ai_service.map(|s| Arc::new(aero_server::ai_adapter::AiServiceAdapter::new(s)) as Arc<dyn aero_server::state::AiBackend>),
         public_base_url: d.public_base_url,

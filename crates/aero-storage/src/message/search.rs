@@ -223,7 +223,7 @@ impl MessageRepo {
                JOIN rooms r ON r.id = m.room_id
                JOIN room_members rm ON rm.room_id = m.room_id
                WHERE rm.participant_id = $1
-                 AND r.workspace_id = $5
+                 AND r.workspace_id = $4
                  AND m.deleted_at IS NULL
                  AND m.embedding IS NOT NULL
                ORDER BY m.embedding <=> $2

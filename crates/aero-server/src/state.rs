@@ -333,6 +333,10 @@ pub struct AppState {
     /// workspace→tier TTL resolution caches. Enforced at the high-traffic
     /// choke points via [`crate::ws_rate::check_ws_rate`] and friends.
     pub ws_rate: crate::ws_rate::WsRateEnforcer,
+    /// Raw shared Redis handle, for the few cross-cutting consumers that need ad-hoc
+    /// Redis access outside a dedicated store (e.g. the bus consumer invalidating
+    /// the AI answer cache on `Edited`/`Deleted`).
+    pub redis_client: fred::prelude::RedisClient,
     /// `/metrics` exposure policy (enable flag + optional scrape token).
     pub metrics: Arc<MetricsConfig>,
     /// Optional — only present when an Anthropic / Voyage API key is configured.
