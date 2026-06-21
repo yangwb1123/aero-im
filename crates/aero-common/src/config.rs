@@ -46,6 +46,11 @@ pub struct DatabaseConfig {
     pub url: String,
     #[serde(default = "default_pool_max")]
     pub max_connections: u32,
+    /// Optional read-replica DSN (ROADMAP 方向四). When set, read-only queries are
+    /// routed here to offload the primary; absent ⇒ reads use the primary pool
+    /// (single-pool, unchanged behaviour). Set via `AERO__DATABASE__REPLICA_URL`.
+    #[serde(default)]
+    pub replica_url: Option<String>,
 }
 
 fn default_pool_max() -> u32 {

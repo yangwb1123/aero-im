@@ -150,6 +150,7 @@ async fn main() -> anyhow::Result<()> {
         live: services.live,
         ai_service: Some(services.ai_service.clone()),
         pg: persistence.pg.clone(),
+        pg_read: persistence.pg_read.clone(),
         redis_client: persistence.cache.client().clone(),
         bus: persistence.bus_dyn,
         hub,

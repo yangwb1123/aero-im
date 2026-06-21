@@ -15,6 +15,7 @@ pub(crate) struct StateDeps {
     pub(crate) live: aero_server::live::LiveService,
     pub(crate) ai_service: Option<Arc<aero_ai::AiService>>,
     pub(crate) pg: sqlx::PgPool,
+    pub(crate) pg_read: sqlx::PgPool,
     pub(crate) redis_client: fred::prelude::RedisClient,
     pub(crate) bus: Arc<dyn aero_bus::EventBus>,
     pub(crate) hub: Hub,
@@ -65,6 +66,7 @@ pub(crate) fn build(d: StateDeps) -> AppState {
         auth: d.auth,
         im: d.im,
         pg: d.pg,
+        pg_read: d.pg_read,
         live: d.live,
         participants: d.participants,
         // ROADMAP6 方向四: per-process TTL cache fronting ParticipantRepo::get on

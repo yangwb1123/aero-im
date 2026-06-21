@@ -12,6 +12,9 @@ use crate::boot::connect_with_retry;
 /// All persistence connections established at boot.
 pub(crate) struct Persistence {
     pub(crate) pg: sqlx::PgPool,
+    /// Read pool: the replica when `database.replica_url` is set, else a clone of
+    /// `pg` (ROADMAP 方向四). Read-only handlers use this to offload the primary.
+    pub(crate) pg_read: sqlx::PgPool,
     pub(crate) cache: RedisCache,
     pub(crate) jetstream: Arc<JetStreamBus>,
     pub(crate) bus_dyn: Arc<dyn EventBus>,
@@ -30,6 +33,22 @@ pub(crate) async fn connect(
     .await?;
     aero_storage::migrate(&pg).await.context("run migrations")?;
     info!("postgres migrated");
+
+    // Optional read replica (ROADMAP 方向四): read-only handlers route here to take
+    // load off the primary. Absent ⇒ a clone of the primary pool, so single-pool
+    // deployments are byte-identical. Migrations run on the PRIMARY only — the
+    // replica is read-only and receives the schema via replication.
+    let pg_read = match cfg.database.replica_url.as_deref().filter(|u| !u.is_empty()) {
+        Some(url) => {
+            let r = connect_with_retry("postgres-replica", connect_attempts, || {
+                aero_storage::connect_pg(url, cfg.database.max_connections)
+            })
+            .await?;
+            info!("postgres read replica connected");
+            r
+        }
+        None => pg.clone(),
+    };
 
     // ---------- Redis ----------
     let cache = connect_with_retry("redis", connect_attempts, || {
@@ -57,6 +76,7 @@ pub(crate) async fn connect(
 
     Ok(Persistence {
         pg,
+        pg_read,
         cache,
         jetstream,
         bus_dyn,

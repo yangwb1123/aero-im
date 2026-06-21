@@ -241,6 +241,9 @@ pub struct AppState {
     /// inline (`XRepo::new(state.pg.clone())`) without threading a new field
     /// through `AppState` for every addition — repos are cheap `Arc<PgPool>` wrappers.
     pub pg: PgPool,
+    /// Read pool (ROADMAP 方向四): the replica when configured, else a clone of
+    /// `pg`. Read-only handlers (e.g. analytics) use this to offload the primary.
+    pub pg_read: PgPool,
     pub live: LiveService,
     pub participants: ParticipantRepo,
     /// Per-process TTL cache fronting [`ParticipantRepo::get`] on the hot read

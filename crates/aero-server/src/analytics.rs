@@ -59,9 +59,11 @@ const DEFAULT_TOP_LIMIT: i64 = 10;
 /// Default timeline window (in days) when the client omits `?days=`.
 const DEFAULT_TIMELINE_DAYS: i64 = 14;
 
-/// Build an [`AnalyticsRepo`] from shared state, over the shared pool.
+/// Build an [`AnalyticsRepo`] over the READ pool (ROADMAP 方向四): analytics is
+/// read-only aggregation — the heaviest, most-replica-friendly queries — so it
+/// routes to the replica when one is configured (else the primary, unchanged).
 fn repo(s: &AppState) -> AnalyticsRepo {
-    AnalyticsRepo::new(s.pg.clone())
+    AnalyticsRepo::new(s.pg_read.clone())
 }
 
 fn parse_workspace(s: &str) -> Result<WorkspaceId, AeroError> {
