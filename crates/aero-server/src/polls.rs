@@ -281,5 +281,46 @@ async fn close_poll(
             RoomEvent::Poll { room_id: poll.room_id, poll_id, op: PollOp::Closed },
         )
         .await;
+    // ROADMAP 集成三: poll-close → auto-create approval (best-effort, non-blocking).
+    // When the poll belongs to a workspace, create an approval addressed to the poll
+    // creator with the results summary, so the creator can decide on next steps.
+    let ws = s.rooms.room_workspace(poll.room_id).await.ok().flatten();
+    if let Some(workspace_id) = ws {
+        let tally = poll_repo(&s).tally(poll_id).await.unwrap_or_default();
+        let total_votes: u32 = tally.iter().sum();
+        if total_votes > 0 {
+            let detail_lines: Vec<String> = poll
+                .options
+                .iter()
+                .enumerate()
+                .map(|(i, opt)| {
+                    let pct = if total_votes > 0 {
+                        (tally.get(i).copied().unwrap_or(0) as f64 / total_votes as f64 * 100.0) as u32
+                    } else {
+                        0
+                    };
+                    format!("  {pct}% — {opt}")
+                })
+                .collect();
+            let details = format!(
+                "Poll \"{}\" has closed with {total_votes} vote(s):\n{}",
+                poll.question,
+                detail_lines.join("\n"),
+            );
+            let approval_id = aero_storage::ApprovalRepo::new(s.pg.clone())
+                .create(
+                    workspace_id,
+                    auth.participant_id,   // requester = poll creator
+                    auth.participant_id,   // approver = also poll creator (self-approve)
+                    &format!("Poll results: {}", poll.question),
+                    Some(&details),
+                )
+                .await;
+            match approval_id {
+                Ok(_) => tracing::info!(%poll_id, "auto-created approval from poll close"),
+                Err(e) => tracing::warn!(error = ?e, %poll_id, "auto-create approval from poll failed"),
+            }
+        }
+    }
     Ok(Json(serde_json::json!({ "poll_id": poll_id, "closed": true })))
 }

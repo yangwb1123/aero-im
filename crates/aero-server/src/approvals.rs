@@ -228,12 +228,50 @@ async fn decide(
         // non-approver can't probe which approvals exist.
         return Err(AeroError::NotFound(format!("approval {id}")).into());
     }
-    let row = repo(s)
+    // Fetch the full approval row for the response and for the post-decision hook.
+    let appr = repo(s)
         .get(id)
         .await
         .map_err(AeroError::from)?
         .ok_or_else(|| AeroError::NotFound(format!("approval {id}")))?;
-    Ok(Json(serde_json::to_value(row).map_err(AeroError::from)?))
+
+    // ROADMAP 集成三: approval-approved → auto-create task (best-effort, non-blocking).
+    // When an approval is approved, create a task in the requester's first room in the
+    // approval's own workspace, so the approved action is tracked and actionable.
+    // Workspace-scoped lookup (not the bare `rooms_for`) — the requester may belong to
+    // rooms in more than one workspace, and picking an unscoped "first room" could leak
+    // the task into an unrelated tenant.
+    if status == "approved" {
+        let rooms = s
+            .rooms
+            .rooms_for_in_workspace(appr.requester_id, appr.workspace_id)
+            .await
+            .map_err(|e| {
+                tracing::warn!(error = ?e, "failed to look up requester rooms for task creation");
+                AeroError::Internal(anyhow::anyhow!("room lookup"))
+            })?;
+        if let Some(first_room) = rooms.first() {
+            let task_title = format!("[Approved] {}", appr.title);
+            let task_id = aero_storage::TaskRepo::new(s.pg.clone())
+                .create(
+                    first_room.id,
+                    appr.requester_id,
+                    &task_title,
+                    Some(appr.requester_id),
+                    None,
+                    None,
+                )
+                .await;
+            match task_id {
+                Ok(_) => tracing::info!(%id, "auto-created task from approval approval"),
+                Err(e) => tracing::warn!(error = ?e, %id, "auto-create task from approval failed"),
+            }
+        } else {
+            tracing::warn!(requester = %appr.requester_id, "no room found for task creation from approval");
+        }
+    }
+
+    Ok(Json(serde_json::to_value(&appr).map_err(AeroError::from)?))
 }
 
 /// `POST /api/approvals/:aid/approve` — the named approver approves the request

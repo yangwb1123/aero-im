@@ -717,16 +717,29 @@ where
         fail_job(queue, id, "exceeded MAX_ATTEMPTS").await;
         return;
     }
-
     // Time the actual processing — the histogram covers the work whether it
     // succeeds or fails (a slow failure is still a latency signal).
     let started = Instant::now();
-    let outcome = proc.process(job).await;
-    ai_metrics::record_duration(reg, kind, started.elapsed().as_secs_f64());
 
-    let disposition = match outcome {
-        Ok(result) => Disposition::Done(result),
-        Err(e) => Disposition::Failed(e.to_string()),
+    // Process-level timeout (9th analysis 方向五): a stuck Anthropic request
+    // must not occupy a semaphore permit forever. When the timeout fires the
+    // job is marked `failed` (not `dead`) so a retry can claim it next tick.
+    const JOB_TIMEOUT: Duration = Duration::from_secs(120);
+    let disposition = match tokio::time::timeout(JOB_TIMEOUT, proc.process(job)).await {
+        Ok(result) => {
+            ai_metrics::record_duration(reg, kind, started.elapsed().as_secs_f64());
+            match result {
+                Ok(result) => Disposition::Done(result),
+                Err(e) => Disposition::Failed(e.to_string()),
+            }
+        }
+        Err(_elapsed) => {
+            ai_metrics::record_duration(reg, kind, JOB_TIMEOUT.as_secs_f64());
+            tracing::warn!(job_id = %id, kind = ?kind, "ai worker: job timed out after 120s");
+            ai_metrics::record_outcome(reg, kind, ai_metrics::OUTCOME_FAILURE);
+            fail_job(queue, id, "timed out after 120s").await;
+            return;
+        }
     };
 
     match disposition {

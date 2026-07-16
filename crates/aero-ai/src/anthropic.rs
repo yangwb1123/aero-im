@@ -175,6 +175,10 @@ impl AnthropicClient {
 
     /// [`Self::complete_with_usage`] with an optional per-request model override.
     /// `model = None` uses [`Self::model`] (unchanged billing/behaviour).
+    ///
+    /// Retries on retryable HTTP statuses (429, 5xx) with exponential backoff
+    /// (1s, then 2s) across up to 3 attempts total. Non-retryable errors (4xx
+    /// except 429) are returned immediately. Analysis 9th §1 — AI API retry.
     pub async fn complete_with_usage_model(
         &self,
         model: Option<&str>,
@@ -189,23 +193,49 @@ impl AnthropicClient {
         let body = RequestBody {
             model: model.unwrap_or(&self.model),
             max_tokens,
-            // Prompt caching: tag the stable system prefix so a reused prefix
-            // bills at the cache-read rate (P3-4). Backward-compatible — the
-            // request's meaning is unchanged, only its billing.
             system: SystemBlock::cached(system),
             messages,
         };
 
         let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
-        let resp = self
-            .http
-            .post(&url)
-            .header("x-api-key", &self.api_key)
-            .header("anthropic-version", API_VERSION)
-            .header("content-type", "application/json")
-            .json(&body)
-            .send()
-            .await?;
+
+        // Retry loop: retryable HTTP statuses get exponential backoff.
+        let max_attempts = 3;
+        let mut attempt = 0;
+        let resp = loop {
+            attempt += 1;
+            let r = self
+                .http
+                .post(&url)
+                .header("x-api-key", &self.api_key)
+                .header("anthropic-version", API_VERSION)
+                .header("content-type", "application/json")
+                .json(&body)
+                .send()
+                .await;
+
+            match r {
+                Ok(resp) => {
+                    let status = resp.status();
+                    if status.is_success() || attempt >= max_attempts || !is_retryable(status) {
+                        break resp; // deliver to caller (success or final error)
+                    }
+                    // Retryable: wait with backoff then loop.
+                    let delay = Duration::from_secs(1 << (attempt - 1)); // 1s, 2s, 4s
+                    tracing::debug!(status = %status, attempt, delay = ?delay, "anthropic retry");
+                    tokio::time::sleep(delay).await;
+                }
+                Err(e) => {
+                    if attempt >= max_attempts {
+                        return Err(AiError::Http(e.to_string()));
+                    }
+                    // Transport error: retry after backoff.
+                    let delay = Duration::from_secs(1 << (attempt - 1));
+                    tracing::debug!(error = %e, attempt, delay = ?delay, "anthropic transport retry");
+                    tokio::time::sleep(delay).await;
+                }
+            }
+        };
 
         let status = resp.status();
         let raw = resp.text().await?;
@@ -600,6 +630,16 @@ fn extract_text_delta(block: &str) -> Option<String> {
     Some(delta.get("text")?.as_str()?.to_string())
 }
 
+/// Whether an HTTP status code is eligible for retry with backoff.
+/// 429 (rate limit) and 5xx (server error) are retryable — the same request
+/// may succeed on a later attempt. Other 4xx codes are client errors and
+/// should fail immediately.
+#[must_use]
+fn is_retryable(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+}
+
+/// Truncate a string to `max` chars on a char boundary. Never panics.
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
