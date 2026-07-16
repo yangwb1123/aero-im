@@ -106,9 +106,9 @@
 | 状态 | 任务 | 预估 |
 |------|------|------|
 | [x] | Redis 热键分片（presence/viewers 256 分片，live_presence.rs + presence.rs） | L |
-| [x]（准备阶段） | 消息表自动分区 — shadow 表 + 回填/维护函数（mig 0148） | XL |
+| [x]（准备 + cutover 脚本均已验证，执行本身留给维护窗口） | 消息表自动分区 — shadow 表 + 回填/维护函数（mig 0148）+ 已验证的 cutover 脚本（`docs/runbooks/messages-cutover.sql`） | XL |
 
-消息表分区的**实际 cutover**（PK 重写、6 张子表 7 个入向 FK 改指、索引重建）是一次性、破坏性的维护窗口操作，`0148` 迁移本身已明确将其排除在自动迁移链之外（见迁移文件头注释 + `docs/runbooks/messages-partitioning.md`）——这是刻意的部署期操作，不是 sandbox 里能"实现"的代码任务，维持 `[ ]` 未完成但已有完整可执行的迁移前置准备。
+复核 `docs/runbooks/messages-partitioning.md` §5a 的 6 月验证记录时发现：迁移 `0157`（本 sprint 新增的 `messages.version` 乐观锁列）晚于 `0148` 建好 shadow 表，而 `LIKE messages INCLUDING DEFAULTS` 是建表那一刻的快照、不会自动跟进后续新列——`messages_partitioned` 和 `backfill_messages_partition` 因此从未携带 `version`。若不修，真正执行 cutover 会让每条曾被编辑过的消息 version 静默重置为默认值 1，导致客户端记住的 `expected_version` 永久失配、编辑一律 409。已修复（`migrations/0158_messages_partition_shadow_version_column.sql` + 更新 `messages-cutover.sql` 的最终同步列表)，并在全新 throwaway DB（158 条迁移链，不是共享 `aero` DB）上端到端重新验证：种入一条 version=5（模拟 4 次真实编辑）的消息 → 回填 → 跑 cutover 脚本 → 确认 cutover 后 version 仍为 5（未被重置），以及 6 月记录的全部检查项（行数对齐、8 条 FK 校验通过、7 张子表 0 孤儿、级联删除、FTS、分区裁剪）在当前 schema 下依然全部通过。**实际执行仍需真实维护窗口 + product/ops 批准 + 已测试的备份**——这是刻意的部署期操作，不是（也不应该是）sandbox 里能单方面"执行"的代码任务；但"脚本本身是否正确"这一层已经完整验证，不再是未验证的假设。
 
 ### P2: 直播媒体面生产接线（仍未完成 — 需要真实 WebRTC/媒体基础设施）
 
