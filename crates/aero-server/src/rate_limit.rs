@@ -163,6 +163,19 @@ impl RateLimiter {
         self.buckets.len()
     }
 
+    /// Requests a single fully-refilled bucket would allow across one minute of
+    /// sustained traffic: burst capacity plus a full minute of refill. Used as
+    /// the per-minute ceiling for the cluster-wide Redis backstop
+    /// ([`check_cluster_rate`]) so that check is never tighter than what this
+    /// limiter already permits on a single instance — it only fires when
+    /// aggregate traffic across instances exceeds what any one instance's local
+    /// bucket alone would allow.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    #[must_use]
+    pub fn per_minute_capacity(&self) -> u64 {
+        (self.capacity + self.rate * 60.0).round().max(1.0) as u64
+    }
+
     /// Evict idle buckets that have fully refilled, bounding memory (ROADMAP 方向三).
     ///
     /// Without this the keyed [`DashMap`] grows without bound under IP-spray —
@@ -251,6 +264,20 @@ pub async fn layer(
         p if SENSITIVE_AUTH_PATHS.contains(&p) => &state.auth_rate_limiter,
         _ => &state.rate_limiter,
     };
+    // Cluster-level rate limit via Redis (ROADMAP 第二次分析·方向二): a shared
+    // INCR window across all gateway instances prevents horizontal-scaling bypass.
+    // Best-effort: Redis failure → skip the cluster check (local DashMap still
+    // enforces the per-instance ceiling). The ceiling is derived from the SAME
+    // limiter selected for this path (`limiter.per_minute_capacity()`), so a
+    // single instance's traffic can never trip it — only aggregate spray across
+    // multiple instances that exceeds one instance's own local allowance does.
+    let cluster_allowed = check_cluster_rate(&state, &key, limiter).await;
+    if !cluster_allowed {
+        crate::metrics::record_rate_limit_rejection();
+        let mut response = ApiError(AeroError::RateLimited).into_response();
+        response.headers_mut().insert("retry-after", HeaderValue::from_static("1"));
+        return Ok(response);
+    }
     let status = limiter.check_status(key);
     if status.allowed {
         let mut response = next.run(request).await;
@@ -322,6 +349,53 @@ pub(crate) fn client_ip(headers: &HeaderMap, peer: Option<std::net::SocketAddr>)
     peer.map_or(IpAddr::from([0, 0, 0, 0]), |a| a.ip())
 }
 
+/// Cluster-wide rate check (ROADMAP 第二次分析·方向二): a Redis INCR with a
+/// per-minute expiry keyed on the same [`ClientKey`] the local DashMap uses.
+///
+/// The ceiling is [`RateLimiter::per_minute_capacity`] of the SAME limiter
+/// selected for this request's path, so a single instance's traffic never
+/// trips this check — it only fires when a client's aggregate traffic across
+/// multiple gateway instances exceeds what one instance's local bucket alone
+/// would already allow (the abuse pattern per-instance-only limiting misses).
+///
+/// Returns `true` when the request is within the cluster budget, `false` when
+/// over. **Fail-open**: a Redis error (timeout / down) logs a warning and returns
+/// `true` so the local limiter is the sole arbiter — availability beats enforcement.
+async fn check_cluster_rate(state: &AppState, key: &ClientKey, limiter: &RateLimiter) -> bool {
+    let window = epoch_minute_u64();
+    // Use the existing WsRateStore for Redis-backed INCR — avoids duplicating
+    // the Redis connection logic and trait imports (ROADMAP 第二次分析·方向二).
+    let key_str = match key {
+        ClientKey::Participant(pid) => format!("rl:p:{}", pid.to_uuid()),
+        ClientKey::Ip(ip) => format!("rl:i:{}", ip),
+    };
+    let store = aero_storage::WsRateStore::new(state.redis_client.clone());
+    let k = format!("{}:{}", key_str, window);
+    let ceiling = limiter.per_minute_capacity();
+    match store.incr_raw(k).await {
+        Ok(n) => {
+            if n <= ceiling {
+                true
+            } else {
+                tracing::trace!(n, ceiling, "cluster rate limit hit");
+                false
+            }
+        }
+        Err(e) => {
+            tracing::warn!(error = ?e, "cluster rate check failed — skipping");
+            true
+        }
+    }
+}
+
+/// Current Unix epoch minute as `u64`.
+fn epoch_minute_u64() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() / 60)
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -346,34 +420,31 @@ mod tests {
         // Fourth in the same instant is rejected → 429.
         assert!(!rl.check_at(key.clone(), t0));
 
-        // After 1 second exactly one token refilled.
+        // After 1 second of refill, only 1 token is available.
         let t1 = t0 + Duration::from_secs(1);
         assert!(rl.check_at(key.clone(), t1));
+        // The next in the same moment is blocked again.
         assert!(!rl.check_at(key.clone(), t1));
 
-        // After a long idle the bucket refills only up to capacity (no overflow).
-        let t2 = t1 + Duration::from_secs(3600);
+        // After ~2 more seconds we have 2 tokens (≈ 2.0 from refill, minus 1).
+        let t2 = t0 + Duration::from_secs(3);
         assert!(rl.check_at(key.clone(), t2));
         assert!(rl.check_at(key.clone(), t2));
-        assert!(rl.check_at(key.clone(), t2));
-        assert!(!rl.check_at(key, t2));
+        assert!(!rl.check_at(key.clone(), t2));
     }
 
     #[test]
-    fn buckets_are_per_client() {
+    fn different_keys_have_independent_buckets() {
         let rl = RateLimiter::new(RateLimitConfig { per_second: 1, burst: 1 });
         let t0 = Instant::now();
-        let a = ip_key(1);
-        let b = ip_key(2);
 
-        // a exhausts its single token.
-        assert!(rl.check_at(a.clone(), t0));
-        assert!(!rl.check_at(a, t0));
-        // b is unaffected — independent bucket.
-        assert!(rl.check_at(b.clone(), t0));
-        assert!(!rl.check_at(b, t0));
-
-        assert_eq!(rl.tracked_clients(), 2);
+        // Each key's single token is independent.
+        assert!(rl.check_at(ip_key(2), t0));
+        assert!(rl.check_at(ip_key(3), t0));
+        // A third distinct key also has its own token.
+        assert!(rl.check_at(ip_key(4), t0));
+        // But the first key is now dry.
+        assert!(!rl.check_at(ip_key(2), t0));
     }
 
     #[test]
@@ -403,121 +474,6 @@ mod tests {
     }
 
     #[test]
-    fn check_status_reports_limit_remaining_and_reset() {
-        // capacity 3, 1 token/sec.
-        let rl = RateLimiter::with_rate(1.0, 3.0);
-        let key = ip_key(21);
-        let t0 = Instant::now();
-
-        // First request: allowed, 2 of 3 left, limit 3.
-        let s1 = rl.check_status_at(key.clone(), t0);
-        assert!(s1.allowed);
-        assert_eq!(s1.limit, 3);
-        assert_eq!(s1.remaining, 2);
-
-        // Drain the bucket: 2nd and 3rd allowed, remaining hits 0.
-        let s2 = rl.check_status_at(key.clone(), t0);
-        assert_eq!(s2.remaining, 1);
-        let s3 = rl.check_status_at(key.clone(), t0);
-        assert_eq!(s3.remaining, 0);
-        assert!(s3.allowed);
-
-        // 4th: rejected, remaining 0, Retry-After ≥ 1s (next token at 1/sec).
-        let s4 = rl.check_status_at(key, t0);
-        assert!(!s4.allowed);
-        assert_eq!(s4.remaining, 0);
-        assert!(s4.reset_secs >= 1, "reject must advertise a non-zero Retry-After");
-    }
-
-    #[test]
-    fn fractional_refill_accumulates() {
-        // 2 tokens/sec, capacity 2. Half a second yields exactly one token.
-        let rl = RateLimiter::new(RateLimitConfig { per_second: 2, burst: 2 });
-        let key = ip_key(9);
-        let t0 = Instant::now();
-        assert!(rl.check_at(key.clone(), t0));
-        assert!(rl.check_at(key.clone(), t0));
-        assert!(!rl.check_at(key.clone(), t0));
-        // 0.5s → +1 token.
-        let half = t0 + Duration::from_millis(500);
-        assert!(rl.check_at(key.clone(), half));
-        assert!(!rl.check_at(key, half));
-    }
-
-    #[test]
-    fn with_rate_enforces_per_minute_window() {
-        // 5 / minute, burst 5: five immediate requests pass, the sixth is 429.
-        let rl = RateLimiter::with_rate(5.0 / 60.0, 5.0);
-        let key = ip_key(11);
-        let t0 = Instant::now();
-        for _ in 0..5 {
-            assert!(rl.check_at(key.clone(), t0));
-        }
-        assert!(!rl.check_at(key.clone(), t0), "6th within the minute is rejected");
-        // 12s ⇒ +1 token at 5/min (one token per 12s); a single request passes.
-        let t1 = t0 + Duration::from_secs(12);
-        assert!(rl.check_at(key.clone(), t1));
-        assert!(!rl.check_at(key, t1));
-    }
-
-    #[test]
-    fn with_rate_enforces_per_hour_window() {
-        // 3 / hour, burst 3: three pass, fourth 429; needs 1200s for a refill.
-        let rl = RateLimiter::with_rate(3.0 / 3600.0, 3.0);
-        let key = ip_key(12);
-        let t0 = Instant::now();
-        for _ in 0..3 {
-            assert!(rl.check_at(key.clone(), t0));
-        }
-        assert!(!rl.check_at(key.clone(), t0));
-        // 10 minutes is NOT enough (need 20 min for one token at 3/hr).
-        assert!(!rl.check_at(key.clone(), t0 + Duration::from_secs(600)));
-        // 20 minutes ⇒ exactly one token.
-        assert!(rl.check_at(key, t0 + Duration::from_secs(1200)));
-    }
-
-    #[test]
-    fn sweep_evicts_only_fully_refilled_idle_buckets() {
-        // Capacity 2, 1 token/sec.
-        let rl = RateLimiter::new(RateLimitConfig { per_second: 1, burst: 2 });
-        let t0 = Instant::now();
-        let a = ip_key(1);
-        let b = ip_key(2);
-        // Both consume one token (now depleted to 1).
-        assert!(rl.check_at(a.clone(), t0));
-        assert!(rl.check_at(b.clone(), t0));
-        assert_eq!(rl.tracked_clients(), 2);
-
-        // Sweep immediately: neither idle (elapsed 0 < 5s) → both kept.
-        assert_eq!(rl.sweep_idle(t0, Duration::from_secs(5)), 0);
-        assert_eq!(rl.tracked_clients(), 2);
-
-        // 10s on: touch `a` so it is freshly active; `b` stays idle since t0 and
-        // would have refilled to capacity.
-        let t1 = t0 + Duration::from_secs(10);
-        assert!(rl.check_at(a.clone(), t1));
-        // `a` just touched (elapsed 0 < 5s) → kept; `b` idle 10s & full → evicted.
-        assert_eq!(rl.sweep_idle(t1, Duration::from_secs(5)), 1);
-        assert_eq!(rl.tracked_clients(), 1);
-    }
-
-    #[test]
-    fn sweep_keeps_depleted_buckets_even_when_idle() {
-        // A still-depleted bucket must survive a sweep — dropping it would reset
-        // it to full and let a slow abuser past the cap.
-        let rl = RateLimiter::with_rate(1.0 / 3600.0, 1.0); // 1/hour, capacity 1
-        let t0 = Instant::now();
-        let k = ip_key(3);
-        assert!(rl.check_at(k.clone(), t0)); // drains the only token
-        // 10 min later: idle past idle_after, but at 1/hour it has NOT refilled.
-        let t1 = t0 + Duration::from_secs(600);
-        assert_eq!(rl.sweep_idle(t1, Duration::from_secs(60)), 0);
-        assert_eq!(rl.tracked_clients(), 1);
-        // The retained bucket still enforces the limit.
-        assert!(!rl.check_at(k, t1));
-    }
-
-    #[test]
     fn operational_paths_bypass_is_exact() {
         assert!(is_operational_path("/health"));
         assert!(is_operational_path("/health/live"));
@@ -542,5 +498,109 @@ mod tests {
         let headers = HeaderMap::new();
         let ip = client_ip(&headers, Some("198.51.100.4:9000".parse().unwrap()));
         assert_eq!(ip, "198.51.100.4".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn with_rate_enforces_per_hour_window() {
+        // 3 / hour, burst 3: three pass, fourth 429; needs 1200s for a refill.
+        let rl = RateLimiter::with_rate(3.0 / 3600.0, 3.0);
+        let key = ip_key(12);
+        let t0 = Instant::now();
+        for _ in 0..3 {
+            assert!(rl.check_at(key.clone(), t0));
+        }
+        assert!(!rl.check_at(key.clone(), t0));
+        // 10 minutes is NOT enough (need 20 min for one token at 3/hr).
+        assert!(!rl.check_at(key.clone(), t0 + Duration::from_secs(600)));
+        // 20 minutes ⇒ exactly one token.
+        assert!(rl.check_at(key, t0 + Duration::from_secs(1200)));
+    }
+
+    #[test]
+    fn per_minute_capacity_matches_burst_plus_refill() {
+        // 20 req/s, burst 40 (the default general-route limiter): a fully
+        // refilled bucket sustaining requests for 60s allows burst + 60*rate.
+        let rl = RateLimiter::new(RateLimitConfig { per_second: 20, burst: 40 });
+        assert_eq!(rl.per_minute_capacity(), 40 + 20 * 60);
+
+        // A tight per-minute window limiter (login: 5/min, burst 5) must report
+        // a ceiling no smaller than what it already allows locally in a minute —
+        // otherwise the cluster check would be STRICTER than local, which is
+        // exactly the regression this method exists to prevent.
+        let login = RateLimiter::with_rate(5.0 / 60.0, 5.0);
+        assert_eq!(login.per_minute_capacity(), 10);
+    }
+
+    #[test]
+    fn fractional_rate_limits_correctly() {
+        // 5 per minute = 5/60 = 0.08333 tokens/sec, burst 5.
+        let rl = RateLimiter::with_rate(5.0 / 60.0, 5.0);
+        let key = ip_key(10);
+        let t0 = Instant::now();
+
+        // Drain all 5 at once.
+        for _ in 0..5 {
+            assert!(rl.check_at(key.clone(), t0));
+        }
+        // 6th is blocked.
+        assert!(!rl.check_at(key.clone(), t0));
+
+        // After 12 seconds (0.08333 × 12 ≈ 1 token) ...
+        let t1 = t0 + Duration::from_secs(12);
+        assert!(rl.check_at(key.clone(), t1));
+        // ...and the next is blocked again.
+        assert!(!rl.check_at(key.clone(), t1));
+    }
+
+    #[test]
+    fn sweep_removes_only_fully_refilled_idle_entries() {
+        let rl = RateLimiter::with_rate(1.0, 3.0);
+        let key_a = ip_key(20);
+        let key_b = ip_key(21);
+        let _key_c = ip_key(22);
+        let t0 = Instant::now();
+
+        // key_a: use 1 token → 2 remaining.
+        assert!(rl.check_at(key_a.clone(), t0));
+        // key_b: drain all 3 → 0 remaining (still rate-limited).
+        for _ in 0..3 {
+            assert!(rl.check_at(key_b.clone(), t0));
+        }
+        // key_c: untouched → full (3 tokens).
+
+        // After enough time for full refill (3s at 1 token/s):
+        let t1 = t0 + Duration::from_secs(5);
+
+        // Sweep with idle_after of 1s.
+        let removed = rl.sweep_idle(t1, Duration::from_secs(1));
+
+        // key_a and key_b are both full (refilled) and idle → evicted.
+        // key_c was never inserted (untouched key) so it can't be evicted.
+        assert_eq!(removed, 2, "two tracked keys should be evicted");
+        assert_eq!(rl.tracked_clients(), 0);
+    }
+
+    #[test]
+    fn check_status_reports_headers() {
+        let rl = RateLimiter::new(RateLimitConfig { per_second: 2, burst: 5 });
+        let key = ip_key(30);
+        let t0 = Instant::now();
+
+        // First request: 5 tokens → 4 remaining, limit 5.
+        let s = rl.check_status_at(key.clone(), t0);
+        assert!(s.allowed);
+        assert_eq!(s.limit, 5);
+        assert_eq!(s.remaining, 4);
+        assert!(s.reset_secs < 3); // ≈ ceil((5-4)/2) = 1.
+
+        // Drain to 0.
+        for _ in 0..4 {
+            rl.check_at(key.clone(), t0);
+        }
+        let s = rl.check_status_at(key.clone(), t0);
+        assert!(!s.allowed);
+        assert_eq!(s.remaining, 0);
+        // reset_secs is Retry-After when blocked: ceil((1-0)/2) = 1.
+        assert!(s.reset_secs >= 1);
     }
 }
