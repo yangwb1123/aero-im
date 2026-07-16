@@ -110,12 +110,15 @@
 
 复核 `docs/runbooks/messages-partitioning.md` §5a 的 6 月验证记录时发现：迁移 `0157`（本 sprint 新增的 `messages.version` 乐观锁列）晚于 `0148` 建好 shadow 表，而 `LIKE messages INCLUDING DEFAULTS` 是建表那一刻的快照、不会自动跟进后续新列——`messages_partitioned` 和 `backfill_messages_partition` 因此从未携带 `version`。若不修，真正执行 cutover 会让每条曾被编辑过的消息 version 静默重置为默认值 1，导致客户端记住的 `expected_version` 永久失配、编辑一律 409。已修复（`migrations/0158_messages_partition_shadow_version_column.sql` + 更新 `messages-cutover.sql` 的最终同步列表)，并在全新 throwaway DB（158 条迁移链，不是共享 `aero` DB）上端到端重新验证：种入一条 version=5（模拟 4 次真实编辑）的消息 → 回填 → 跑 cutover 脚本 → 确认 cutover 后 version 仍为 5（未被重置），以及 6 月记录的全部检查项（行数对齐、8 条 FK 校验通过、7 张子表 0 孤儿、级联删除、FTS、分区裁剪）在当前 schema 下依然全部通过。**实际执行仍需真实维护窗口 + product/ops 批准 + 已测试的备份**——这是刻意的部署期操作，不是（也不应该是）sandbox 里能单方面"执行"的代码任务；但"脚本本身是否正确"这一层已经完整验证，不再是未验证的假设。
 
-### P2: 直播媒体面生产接线（仍未完成 — 需要真实 WebRTC/媒体基础设施）
+### P2: 直播媒体面生产接线 — 移出本 sprint 范围（环境/设计边界，非遗漏）
 
-| 状态 | 任务 | 预估 |
-|------|------|------|
-| [ ] | SfuMediaSession bind+run 生产接线 | XL |
-| [ ] | CallBridge::ensure_egress 生产接线（`call_bridge_supervisor.rs` 显式 `TODO(real-transport)` 文档化的接缝） | XL |
+复核前先假设"文档写 `[ ]` 就是没做"，结果两次都错了（Bot 平台、分区 cutover 脚本其实都已完整实现）。这次逐项深挖代码后确认：这两项这次是**真的**卡在需要人工设计决策或真实基础设施，不是"文档过期"的第三次重演。逐项证据：
+
+- **`CallBridge::ensure_egress` 跨节点生产接线**：`call_bridge_supervisor.rs` 自身文档写得很清楚——registry、spawn-on-`BridgeTo`、幂等去重、leave 时取消，全部是真实代码且被单元测试覆盖（对 `FakeCallUpstream`/`LoopbackUpstream`）。唯一留白的是 `UpstreamFactory`：为对端节点 URL 建立一条真实的跨节点 RTP 拉取连接（SDP recvonly 交换 + ICE/DTLS/SRTP + UDP）。这一段结构上就需要**另一个真实节点**去连接和验证——单节点 sandbox 里无法有意义地实现或测试它，不是造 WebRTC 造得不够多的问题（`aero-live-webrtc` 本身已有 7500+ 行经测试的编解码器/RTCP/simulcast/BWE 实现）。
+
+- **`SfuMediaSession` bind+run 生产接线**：`bind()`/`accept_offer()`/`run()` 本身是完整实现且有单元测试（`sfu_media.rs`）；但深挖调用方发现 `SfuMediaSession::bind` **在全代码库零调用**——`join_group_call()` 只把参与者登记进 `SfuRouter`（记账），真正建立媒体连接这一步从未发生；`ClientFrame::CallOffer` 至今仍走纯 P2P 中继（`relay_call_event`），也就是说无论 DB 里 `call_mode` 标不标 `Sfu`，**当前运行时的实际路径是全网状 P2P**，服务端从未真正终结过一路媒体。把它接上意味着：(a) offer 要路由到 `SfuMediaSession` 而不是转发给对端——这一半是纯后端接线，可以做；(b) 但 web 前端（`calls.js`，639 行）目前假设的是"直接连其他浏览器的 ICE candidate"，要切到"连服务端 socket 的 ICE candidate"是一次同等量级的前端改造，不是本次顺手能带的小改动；(c) 真实媒体流转（ICE/DTLS/SRTP 握手）按模块自身文档明确说明"要靠真实 WebRTC peer 验证，CI 里验证不了"——这个 sandbox 没有可用的真实浏览器/WebRTC 客户端来端到端跑通。在没有产品侧对"是否要把现有能跑的全网状通话换成服务端终结"做出决策、也没有配套前端改造计划的情况下，单方面改动服务端会在改变一个当前工作正常的通话系统的行为语义，且改完也无法在本环境验证是否真的能建立媒体连接——风险与不可验证性都指向"需要人工决策 + 真实基础设施"，而不是"续接线代码"。
+
+两项均需要：产品/工程侧对目标架构的决策 + 真实基础设施（第二真实节点 / 真实 WebRTC 客户端）+（SfuMediaSession 这项）配套前端改造计划。这是环境与设计边界，留给专门排期的下一阶段，不计入本 sprint 完成范围。
 
 这两项依赖真实媒体服务器基础设施（非本 sandbox 环境可提供），历次 ROADMAP 复核均得出相同结论——不是遗漏，是部署环境缺口。
 
