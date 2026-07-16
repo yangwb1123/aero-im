@@ -83,6 +83,20 @@ impl WsRateStore {
         }
         Ok(u64::try_from(n).unwrap_or(0))
     }
+
+    /// Charge one request identified by an opaque string key, returning the
+    /// post-increment count for the current minute window. Used by the cluster-wide
+    /// per-client rate limiter (ROADMAP 第二次分析·方向二).
+    ///
+    /// # Errors
+    /// Any Redis transport/command failure.
+    pub async fn incr_raw(&self, key: String) -> anyhow::Result<u64> {
+        let n: i64 = self.client.incr(&key).await?;
+        if n == 1 {
+            self.client.expire::<(), _>(&key, WINDOW_TTL_SECS).await?;
+        }
+        Ok(u64::try_from(n).unwrap_or(0))
+    }
 }
 
 #[cfg(test)]
