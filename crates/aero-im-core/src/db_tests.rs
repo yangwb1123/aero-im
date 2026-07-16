@@ -522,3 +522,76 @@ async fn blocked_user_cannot_call_in_direct_room() {
         .await
         .expect("call allowed after unblock");
 }
+
+/// Optimistic-lock edit (migration 0157): a client that supplies the version
+/// it last read gets a real lost-update guard — an edit against a stale
+/// `expected_version` is rejected with `Conflict` (409) rather than silently
+/// overwriting a newer edit, and the version visible to clients increments by
+/// exactly one per successful edit.
+#[tokio::test]
+#[ignore = "requires running Postgres with migrations applied"]
+async fn edit_message_with_stale_expected_version_conflicts() {
+    let pool = pool();
+    let participants = ParticipantRepo::new(pool.clone());
+    let svc = service(pool.clone());
+
+    let alice = new_participant(&participants, "alice-verlock").await;
+    let room = svc.create_room(alice.id, RoomKind::Group, Some("verlock".into())).await.unwrap();
+
+    let msg = svc
+        .send_message(alice.id, room.id, vec![Block::text("v1")], None, None)
+        .await
+        .unwrap();
+    assert_eq!(msg.version, 1, "a freshly sent message starts at version 1");
+
+    // First edit, correctly supplying the version just read: succeeds and
+    // bumps the version exactly once.
+    let edited = svc
+        .edit_message(alice.id, msg.id, vec![Block::text("v2")], Some(msg.version))
+        .await
+        .unwrap();
+    assert_eq!(edited.version, 2);
+
+    // Second edit racing against the SAME stale version (as if a second
+    // client had loaded the message before the first edit landed): rejected.
+    let err = svc
+        .edit_message(alice.id, msg.id, vec![Block::text("v3-stale")], Some(msg.version))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, aero_common::Error::Conflict(_)), "stale version → Conflict, got {err:?}");
+
+    // The message itself is unchanged by the rejected edit.
+    let current = svc.messages.get(msg.id).await.unwrap().unwrap();
+    assert_eq!(current.version, 2);
+    assert_eq!(current.searchable_text(), "v2");
+
+    // A retry with the now-current version succeeds.
+    let edited2 = svc
+        .edit_message(alice.id, msg.id, vec![Block::text("v3")], Some(edited.version))
+        .await
+        .unwrap();
+    assert_eq!(edited2.version, 3);
+}
+
+/// A caller that omits `expected_version` (not yet updated to the versioned
+/// contract) keeps working exactly as before versioning existed: the edit
+/// always succeeds against whatever the current version is, and the returned
+/// message still reports an incremented version for callers that DO check it.
+#[tokio::test]
+#[ignore = "requires running Postgres with migrations applied"]
+async fn edit_message_without_expected_version_is_unprotected_but_succeeds() {
+    let pool = pool();
+    let participants = ParticipantRepo::new(pool.clone());
+    let svc = service(pool.clone());
+
+    let alice = new_participant(&participants, "alice-verlegacy").await;
+    let room = svc.create_room(alice.id, RoomKind::Group, Some("verlegacy".into())).await.unwrap();
+
+    let msg = svc
+        .send_message(alice.id, room.id, vec![Block::text("v1")], None, None)
+        .await
+        .unwrap();
+
+    let edited = svc.edit_message(alice.id, msg.id, vec![Block::text("v2")], None).await.unwrap();
+    assert_eq!(edited.version, 2, "legacy no-version edits still succeed and bump the counter");
+}

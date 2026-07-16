@@ -100,8 +100,15 @@ pub(crate) enum ClientFrame {
         #[serde(default)]
         expires_after_secs: Option<u64>,
     },
-    /// Edit an existing message (sender only).
-    EditMessage { id: MessageId, blocks: Vec<Block> },
+    /// Edit an existing message (sender only). `expected_version` is the
+    /// optimistic-lock check (migration 0157) — see `EditMessageReq` in
+    /// `routes.rs` for the equivalent REST contract.
+    EditMessage {
+        id: MessageId,
+        blocks: Vec<Block>,
+        #[serde(default)]
+        expected_version: Option<i32>,
+    },
     /// Soft-delete a message.
     DeleteMessage { id: MessageId },
     /// Toggle a reaction.
@@ -371,10 +378,12 @@ async fn run_socket(
     }
     // Cluster-wide presence (ROADMAP 方向一): drop this participant from every
     // room's Redis presence set BEFORE the hub purges its local reverse index.
-    // Best-effort — crashed clients also age out via the heartbeat TTL.
+    // Retry transient Redis failures so a brief timeout doesn't leave a ghost
+    // online status until the heartbeat TTL expires. Crashed clients (no graceful
+    // disconnect) also age out via the heartbeat TTL, so this is additive safety.
     for room in state.hub.rooms_of(pid) {
-        if let Err(e) = state.presence.leave(room, pid).await {
-            warn!(error = ?e, %room, %pid, "redis room-presence leave failed");
+        if let Err(e) = retry_leave(&state.presence, room, pid).await {
+            warn!(error = ?e, %room, %pid, "redis room-presence leave failed after retries — TTL will clear");
         }
     }
     let registered = WsSender::new(tx, close.clone());
@@ -383,6 +392,30 @@ async fn run_socket(
     outgoing.abort();
     info!(%pid, "ws closed");
 }
+
+/// Retry `presence.leave()` up to 3 times with 100ms backoff to survive
+/// transient Redis failures (timeout / connection drop). Returns the last
+/// error when all attempts fail; the heartbeat TTL still cleans up eventually.
+async fn retry_leave(
+    presence: &aero_storage::PresenceStore,
+    room: aero_common::RoomId,
+    pid: aero_common::ParticipantId,
+) -> Result<(), anyhow::Error> {
+    let mut last_err = None;
+    for attempt in 1..=3 {
+        match presence.leave(room, pid).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last_err = Some(e);
+                if attempt < 3 {
+                    tokio::time::sleep(std::time::Duration::from_millis(100 * attempt as u64)).await;
+                }
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("presence leave exhausted retries")))
+}
+
 /// Per-room cap on reconnect backfill replay, so a client that has been away for
 /// a long time can't make a single connection replay an unbounded history (it
 /// can keep paging via the REST `?since=` route). Matches the keyset page window

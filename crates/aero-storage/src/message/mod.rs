@@ -110,6 +110,7 @@ pub(crate) struct ScoredMessageRow {
     edited_at: Option<time::OffsetDateTime>,
     deleted_at: Option<time::OffsetDateTime>,
     expires_at: Option<time::OffsetDateTime>,
+    version: i32,
 }
 
 /// Row type for `list_recent` / `list_since` etc. — maps directly to `messages` columns.
@@ -125,6 +126,7 @@ pub(crate) struct MessageRow {
     pub(crate) edited_at: Option<time::OffsetDateTime>,
     pub(crate) deleted_at: Option<time::OffsetDateTime>,
     pub(crate) expires_at: Option<time::OffsetDateTime>,
+    pub(crate) version: i32,
 }
 
 #[allow(deprecated)]
@@ -142,6 +144,7 @@ impl From<ScoredMessageRow> for SearchHit {
                 edited_at: r.edited_at,
                 deleted_at: r.deleted_at,
                 expires_at: r.expires_at,
+                version: r.version,
             },
             score: 0.0,
             headline: None,
@@ -162,6 +165,7 @@ impl From<MessageRow> for Message {
             edited_at: r.edited_at,
             deleted_at: r.deleted_at,
             expires_at: r.expires_at,
+            version: r.version,
         }
     }
 }

@@ -46,13 +46,14 @@ impl MessageRepo {
             edited_at: None,
             deleted_at: None,
             expires_at: new.expires_at,
+            version: 1,
         })
     }
 
     /// Fetch a single message by id (including soft-deleted, caller must filter).
     pub async fn get(&self, id: MessageId) -> Result<Option<Message>, sqlx::Error> {
         let row = sqlx::query_as::<_, MessageRow>(
-            r#"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at
+            r#"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at, version
                FROM messages WHERE id = $1"#,
         )
         .bind(id.to_uuid())
@@ -79,31 +80,68 @@ impl MessageRepo {
         Ok(row.map_or(false, |(present,)| present))
     }
 
-    /// Update message blocks. Caller has already checked authorization.
-    /// Returns the updated message (or `None` if the row was deleted/missing).
+    /// Update message blocks with optimistic locking (migration 0157).
+    /// Caller has already checked authorization.
+    /// `expected_version` is the version the caller read — the UPDATE atomically
+    /// increments it. Returns `Err(Conflict)` when another writer got there first.
+    /// Returns `Ok(None)` when the row is missing/soft-deleted.
     pub async fn edit(
         &self,
         id: MessageId,
         blocks: Vec<Block>,
-    ) -> Result<Option<Message>, sqlx::Error> {
-        let blocks_json = serde_json::to_value(&blocks)
-            .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+        expected_version: i32,
+    ) -> Result<Option<Message>, aero_common::Error> {
+        let blocks_json = serde_json::to_value(&blocks)?;
         let searchable = searchable_of(&blocks);
         let edited_at = time::OffsetDateTime::now_utc();
 
         let row = sqlx::query_as::<_, MessageRow>(
             r#"UPDATE messages
-                  SET blocks = $1, searchable_text = $2, edited_at = $3, embedding = NULL
-               WHERE id = $4 AND deleted_at IS NULL
-            RETURNING id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at"#,
+                  SET blocks = $1, searchable_text = $2, edited_at = $3, embedding = NULL,
+                      version = version + 1
+               WHERE id = $4 AND deleted_at IS NULL AND version = $5
+            RETURNING id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at, version"#,
         )
         .bind(&blocks_json)
         .bind(&searchable)
         .bind(edited_at)
         .bind(id.to_uuid())
+        .bind(expected_version)
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(Message::from))
+
+        match row {
+            Some(r) => Ok(Some(r.into())),
+            // Two possibilities: message is missing/deleted, or version mismatch.
+            // Check existence to distinguish.
+            None => {
+                let exists = sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS(SELECT 1 FROM messages WHERE id = $1 AND deleted_at IS NULL)"
+                )
+                .bind(id.to_uuid())
+                .fetch_one(&self.pool)
+                .await?;
+                if exists {
+                    Err(aero_common::Error::Conflict(
+                        "message was edited concurrently; reload and retry".into(),
+                    ))
+                } else {
+                    Ok(None)
+                }
+            }
+        }
+    }
+
+    /// Read the current version of a non-deleted message. Returns `None` when
+    /// the message is missing or soft-deleted. Used by callers to obtain the
+    /// expected_version for [`edit`](Self::edit).
+    pub async fn get_version(&self, id: MessageId) -> Result<Option<i32>, sqlx::Error> {
+        sqlx::query_scalar::<_, i32>(
+            "SELECT version FROM messages WHERE id = $1 AND deleted_at IS NULL"
+        )
+        .bind(id.to_uuid())
+        .fetch_optional(&self.pool)
+        .await
     }
 
     /// Soft-delete a message. Caller has already checked authorization.
@@ -268,7 +306,7 @@ impl MessageRepo {
                  edited_at = NOW(),
                  embedding = NULL
                WHERE id = $1 AND deleted_at IS NULL
-            RETURNING id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at"#,
+            RETURNING id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at, version"#,
         )
         .bind(id.to_uuid())
         .bind(transcript)

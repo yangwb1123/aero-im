@@ -77,8 +77,8 @@ pub(super) async fn handle_text(
             send_blocks_frame(state, pid, room_id, blocks, reply_to, expires_after_secs)
                 .await?;
         }
-        ClientFrame::EditMessage { id, blocks } => {
-            state.im.edit_message(pid, id, blocks).await?;
+        ClientFrame::EditMessage { id, blocks, expected_version } => {
+            state.im.edit_message(pid, id, blocks, expected_version).await?;
         }
         ClientFrame::DeleteMessage { id } => {
             state.im.delete_message(pid, id).await?;

@@ -18,7 +18,7 @@ impl MessageRepo {
         let limit = limit.clamp(1, 200);
         let rows = if let Some(b) = before {
             sqlx::query_as::<_, MessageRow>(
-                r#"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at
+                r#"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at, version
                    FROM messages
                    WHERE room_id = $1 AND id < $2 AND deleted_at IS NULL AND (expires_at IS NULL OR expires_at > now())
                    ORDER BY id DESC
@@ -31,7 +31,7 @@ impl MessageRepo {
             .await?
         } else {
             sqlx::query_as::<_, MessageRow>(
-                r#"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at
+                r#"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at, version
                    FROM messages
                    WHERE room_id = $1 AND deleted_at IS NULL AND (expires_at IS NULL OR expires_at > now())
                    ORDER BY id DESC
@@ -67,7 +67,7 @@ impl MessageRepo {
     ) -> Result<Vec<Message>, sqlx::Error> {
         let limit = limit.clamp(1, 200);
         let rows: Vec<MessageRow> = sqlx::query_as(
-            r#"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at
+            r#"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at, version
                FROM messages
                WHERE room_id = $1 AND GREATEST(edited_at, deleted_at) > $2
                ORDER BY GREATEST(edited_at, deleted_at) ASC
@@ -95,7 +95,7 @@ impl MessageRepo {
         let limit = limit.clamp(1, 200);
         let rows: Vec<MessageRow> = if let Some(r) = room {
             sqlx::query_as(
-                r#"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at
+                r#"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at, version
                    FROM messages
                    WHERE room_id = $1 AND id > $2 AND deleted_at IS NULL AND (expires_at IS NULL OR expires_at > now())
                    ORDER BY id
@@ -108,7 +108,7 @@ impl MessageRepo {
             .await?
         } else {
             sqlx::query_as(
-                r#"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at
+                r#"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at, version
                    FROM messages
                    WHERE id > $1 AND deleted_at IS NULL AND (expires_at IS NULL OR expires_at > now())
                    ORDER BY id
@@ -139,7 +139,7 @@ impl MessageRepo {
         limit: i64,
     ) -> Result<Vec<Message>, sqlx::Error> {
         let rows: Vec<MessageRow> = sqlx::query_as(
-            r#"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at
+            r#"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at, version
                FROM messages
                WHERE room_id = $1 AND id > $2
                  AND (expires_at IS NULL OR expires_at > now())
@@ -163,7 +163,7 @@ impl MessageRepo {
     ) -> Result<(Vec<Message>, bool), sqlx::Error> {
         let half_window = half_window.clamp(1, 100);
         let before: Vec<MessageRow> = sqlx::query_as(
-            r#"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at
+            r#"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at, version
                FROM messages
                WHERE room_id = $1 AND id < $2 AND deleted_at IS NULL AND (expires_at IS NULL OR expires_at > now())
                ORDER BY id DESC
@@ -178,7 +178,7 @@ impl MessageRepo {
         // fetched only the before/after windows and dropped this, so the permalink
         // "jump to message" context omitted its own target. Restored.
         let target: Option<MessageRow> = sqlx::query_as(
-            r#"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at
+            r#"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at, version
                FROM messages
                WHERE room_id = $1 AND id = $2 AND deleted_at IS NULL AND (expires_at IS NULL OR expires_at > now())"#,
         )
@@ -187,7 +187,7 @@ impl MessageRepo {
         .fetch_optional(&self.pool)
         .await?;
         let after: Vec<MessageRow> = sqlx::query_as(
-            r#"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at
+            r#"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at, version
                FROM messages
                WHERE room_id = $1 AND id > $2 AND deleted_at IS NULL AND (expires_at IS NULL OR expires_at > now())
                ORDER BY id
@@ -221,7 +221,7 @@ impl MessageRepo {
             // embedding, so without this filter the 300s backfill loop re-selects and
             // re-enqueues it every cycle forever — perpetual embedding-API spend. The
             // message.rs→message/ split dropped this term; restored.
-            r#"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at
+            r#"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at, version
                FROM messages
                WHERE embedding IS NULL AND deleted_at IS NULL AND (expires_at IS NULL OR expires_at > now()) AND searchable_text <> ''
                ORDER BY created_at ASC
@@ -241,7 +241,7 @@ impl MessageRepo {
     ) -> Result<Vec<Message>, sqlx::Error> {
         let limit = limit.clamp(1, crate::message::orig::EXPORT_SENDER_CAP);
         let rows = sqlx::query_as::<_, MessageRow>(
-            r#"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at
+            r#"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at, version
                FROM messages
                WHERE sender_id = $1 AND deleted_at IS NULL AND (expires_at IS NULL OR expires_at > now())
                ORDER BY id DESC
@@ -264,7 +264,7 @@ impl MessageRepo {
     ) -> Result<Vec<Message>, sqlx::Error> {
         let limit = limit.clamp(1, 500);
         let rows = sqlx::query_as::<_, MessageRow>(
-            r#"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at
+            r#"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at, version
                FROM messages
                WHERE sender_id = $1 AND id < $2
                ORDER BY id DESC
@@ -290,7 +290,7 @@ impl MessageRepo {
         let limit = limit.clamp(1, 200);
         let rows = sqlx::query_as::<_, MessageRow>(
             r#"SELECT m.id, m.room_id, m.sender_id, m.blocks, m.reply_to, m.metadata,
-                     m.created_at, m.edited_at, m.deleted_at, m.expires_at
+                     m.created_at, m.edited_at, m.deleted_at, m.expires_at, m.version
                FROM messages m
                JOIN rooms r ON r.id = m.room_id
                JOIN room_members rm ON rm.room_id = m.room_id AND rm.participant_id = $1

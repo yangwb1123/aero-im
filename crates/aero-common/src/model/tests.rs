@@ -176,6 +176,7 @@
             edited_at: None,
             deleted_at: None,
             expires_at: None,
+            version: 1,
         };
         let text = msg.searchable_text();
         assert!(text.contains("Choose a plan"));
@@ -362,6 +363,7 @@
             edited_at: None,
             deleted_at: None,
             expires_at: None,
+            version: 1,
         };
         assert_eq!(m.searchable_text(), "hello\nfn main() {}");
     }
@@ -387,6 +389,7 @@
             edited_at: None,
             deleted_at: None,
             expires_at: None,
+            version: 1,
         };
         let text = m.searchable_text();
         assert!(text.contains("deploy-runbook.pdf"), "attachment file name is indexed: {text}");

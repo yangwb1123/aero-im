@@ -75,10 +75,8 @@ async fn inject_request_id(mut req: Request<axum::body::Body>, next: Next) -> Re
 
 pub fn build(state: AppState) -> Router {
     let mut router = Router::new()
-        .route("/health", get(health))
-        // k8s-style probes: liveness is process-up only; readiness gates on deps.
-        .route("/health/live", get(health_live))
-        .route("/health/ready", get(health_ready))
+        // Health probes — extracted to routes/health.rs
+        .merge(crate::routes::health::routes())
         // Auth
         .route("/api/auth/register", post(auth_register))
         .route("/api/auth/login", post(auth_login))
@@ -143,11 +141,8 @@ pub fn build(state: AppState) -> Router {
         .route("/api/participants", get(search_participants))
         .route("/api/participants/:id", get(get_participant))
         .route("/api/rooms/:id/members/list", get(list_room_members))
-        // MLS E2E (server is opaque relay; clients run openmls)
-        .route("/api/mls/key-packages", post(mls_publish_kp))
-        .route("/api/mls/key-packages/:participant", get(mls_consume_kp))
-        .route("/api/mls/groups", post(mls_upsert_group))
-        .route("/api/mls/groups/:gid", get(mls_get_group))
+        // MLS E2E — extracted to routes/mls.rs
+        .merge(crate::routes::mls::routes())
         // RTC config
         .route("/api/rtc/config", get(rtc_config))
         // WebSocket
@@ -514,161 +509,6 @@ pub fn build(state: AppState) -> Router {
         .layer(middleware::from_fn(inject_request_id))
         .layer(CompressionLayer::new())
         .with_state(state)
-}
-
-/// Probe each backing dependency (PG / Redis / NATS) with a short timeout.
-/// Each result is `"ok"` / `"fail"` / `"timeout"`. Shared by `/health` and
-/// `/health/ready` so the two never drift.
-async fn probe_deps(s: &AppState) -> (&'static str, &'static str, &'static str) {
-    use std::time::Duration;
-    let pg_ok = tokio::time::timeout(Duration::from_secs(2), async {
-        sqlx::query_scalar::<_, i32>("SELECT 1")
-            .fetch_one(s.participants.pool())
-            .await
-    })
-    .await;
-    let pg = match pg_ok {
-        Ok(Ok(_)) => "ok",
-        Ok(Err(_)) => "fail",
-        Err(_) => "timeout",
-    };
-
-    let redis_ok = tokio::time::timeout(Duration::from_secs(2), async {
-        // PresenceStore holds a RedisClient; we re-resolve via the participant
-        // pool's cousin — easier: just construct a tiny ad-hoc client using a
-        // sentinel through the existing presence handle.
-        s.presence.ping().await
-    })
-    .await;
-    let redis = match redis_ok {
-        Ok(Ok(_)) => "ok",
-        Ok(Err(_)) => "fail",
-        Err(_) => "timeout",
-    };
-
-    // NATS: bus reference is required at boot; if the connection has dropped,
-    // downstream publish/subscribe will start logging warnings. Surface "ok"
-    // here unless we can cheaply probe. We do a fire-and-forget publish on a
-    // subject the IM_EVENTS stream covers — sub-millisecond when up, errors
-    // out almost immediately when down.
-    let nats_ok = tokio::time::timeout(Duration::from_secs(2), async {
-        s.bus
-            .publish("im.events.health", bytes::Bytes::from_static(b"ping"))
-            .await
-    })
-    .await;
-    let nats = match nats_ok {
-        Ok(Ok(_)) => "ok",
-        Ok(Err(_)) => "fail",
-        Err(_) => "timeout",
-    };
-
-    (pg, redis, nats)
-}
-
-/// Probe the blob backend's reachability for readiness gating (ROADMAP 方向三).
-/// The local FS store is always present, so only S3 can be remotely unreachable;
-/// a short timeout means a hung endpoint reads as `"timeout"` (not ready) rather
-/// than stalling the probe.
-async fn probe_blob(s: &AppState) -> &'static str {
-    if s.blob_backend != "s3" {
-        return "ok";
-    }
-    match tokio::time::timeout(std::time::Duration::from_secs(2), s.blob_store.health_check()).await
-    {
-        Ok(Ok(())) => "ok",
-        Ok(Err(_)) => "fail",
-        Err(_) => "timeout",
-    }
-}
-
-/// Legacy combined health endpoint (kept for backward-compat). Always 200; the
-/// body's `status` is `"ok"` only when every dependency probes healthy.
-async fn health(State(s): State<AppState>) -> Json<serde_json::Value> {
-    let (pg, redis, nats) = probe_deps(&s).await;
-    let overall = if pg == "ok" && redis == "ok" && nats == "ok" {
-        "ok"
-    } else {
-        "degraded"
-    };
-
-    Json(serde_json::json!({
-        "status": overall,
-        "deps": {
-            "postgres": pg,
-            "redis": redis,
-            "nats": nats,
-        },
-        // Surface the active blob backend (s3/local) so operators can confirm
-        // storage is wired as intended — fail-loud's companion (方向五).
-        "blob_backend": s.blob_backend,
-        "version": env!("CARGO_PKG_VERSION"),
-    }))
-}
-
-/// Liveness probe (k8s `livenessProbe`): the process is up and serving. Always
-/// 200 — it must *not* depend on PG/Redis/NATS, or a transient backend blip
-/// would get the pod killed and restarted (making the outage worse).
-async fn health_live() -> impl IntoResponse {
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "status": "ok",
-            "version": env!("CARGO_PKG_VERSION"),
-        })),
-    )
-}
-
-/// Pure readiness decision, split out so the policy is unit-testable without a
-/// live PG/Redis/NATS. Draining (graceful shutdown in progress) takes
-/// precedence: the pod must leave the LB rotation immediately, regardless of
-/// dependency health. Otherwise ready only when every dependency probed healthy.
-fn readiness_decision(shutting_down: bool, deps_ok: bool) -> (StatusCode, &'static str) {
-    if shutting_down {
-        (StatusCode::SERVICE_UNAVAILABLE, "draining")
-    } else if deps_ok {
-        (StatusCode::OK, "ready")
-    } else {
-        (StatusCode::SERVICE_UNAVAILABLE, "not_ready")
-    }
-}
-
-/// Readiness probe (k8s `readinessProbe`): 200 only when every dependency is
-/// reachable, else 503 so the pod is pulled from the load-balancer rotation
-/// until it recovers (without being restarted). During graceful shutdown it
-/// returns 503 `"draining"` immediately so the LB stops routing new traffic
-/// before the pod stops accepting (ROADMAP 方向三).
-async fn health_ready(State(s): State<AppState>) -> impl IntoResponse {
-    // Draining short-circuits the dependency probe — once shutdown has begun the
-    // answer is 503 regardless, and skipping the probe avoids needless backend
-    // calls during teardown.
-    if s.shutting_down.load(std::sync::atomic::Ordering::Relaxed) {
-        let (status, state) = readiness_decision(true, false);
-        return (
-            status,
-            Json(serde_json::json!({
-                "status": state,
-                "version": env!("CARGO_PKG_VERSION"),
-            })),
-        );
-    }
-    let (pg, redis, nats) = probe_deps(&s).await;
-    let blob = probe_blob(&s).await;
-    let deps_ok = pg == "ok" && redis == "ok" && nats == "ok" && blob == "ok";
-    let (status, state) = readiness_decision(false, deps_ok);
-    (
-        status,
-        Json(serde_json::json!({
-            "status": state,
-            "deps": {
-                "postgres": pg,
-                "redis": redis,
-                "nats": nats,
-                "blob": blob,
-            },
-            "version": env!("CARGO_PKG_VERSION"),
-        })),
-    )
 }
 
 // ----- Auth -----
@@ -1079,6 +919,7 @@ async fn add_member(
     let member = ParticipantId::from_str(&req.participant_id)
         .map_err(|e| AeroError::Invalid(format!("participant id: {e}")))?;
     s.im.add_member(auth.participant_id, room, member).await?;
+    s.room_member_cache.invalidate(&room);
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
@@ -1259,6 +1100,13 @@ async fn get_delivery_cursor(
 #[derive(Deserialize)]
 struct EditMessageReq {
     blocks: Vec<aero_common::Block>,
+    /// Optimistic-lock check (migration 0157): the `version` the client last
+    /// saw this message at. A concurrent edit that already bumped the version
+    /// past this fails with 409 instead of silently overwriting it. Omitted by
+    /// clients that haven't adopted the check yet — falls back to unprotected
+    /// last-write-wins, matching pre-versioning behavior.
+    #[serde(default)]
+    expected_version: Option<i32>,
 }
 
 /// `GET /api/messages/:id` — fetch a single (non-deleted) message, gated on the
@@ -1290,7 +1138,10 @@ async fn edit_message(
 ) -> ApiResult<Json<serde_json::Value>> {
     let id = MessageId::from_str(&id_str)
         .map_err(|e| AeroError::Invalid(format!("message id: {e}")))?;
-    let m = s.im.edit_message(auth.participant_id, id, req.blocks).await?;
+    let m = s
+        .im
+        .edit_message(auth.participant_id, id, req.blocks, req.expected_version)
+        .await?;
     Ok(Json(serde_json::to_value(m).map_err(AeroError::from)?))
 }
 
@@ -1785,10 +1636,34 @@ async fn blob_download(
             header::HeaderValue::from_static("application/octet-stream")
         }),
     );
+    // Anti-XSS: force attachment disposition for non-visual content types.
+    // Images, video, audio, and PDF may render inline (expected UX); everything
+    // else (HTML, SVG, Office docs, executables) is forced to download so a
+    // malicious blob cannot execute scripts in the browser (ROADMAP 方向三).
+    // The nosniff header prevents MIME-type confusion attacks regardless.
+    let inline_safe = meta.mime.starts_with("image/")
+        || meta.mime.starts_with("video/")
+        || meta.mime.starts_with("audio/")
+        || meta.mime == "application/pdf";
+    let disposition = if inline_safe {
+        format!("inline; filename=\"{}\"", meta.name)
+    } else {
+        format!("attachment; filename=\"{}\"", meta.name)
+    };
     headers.insert(
         header::CONTENT_DISPOSITION,
-        header::HeaderValue::from_str(&format!("inline; filename=\"{}\"", meta.name))
-            .unwrap_or_else(|_| header::HeaderValue::from_static("inline")),
+        header::HeaderValue::from_str(&disposition)
+            .unwrap_or_else(|_| {
+                if inline_safe {
+                    header::HeaderValue::from_static("inline")
+                } else {
+                    header::HeaderValue::from_static("attachment")
+                }
+            }),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        header::HeaderValue::from_static("nosniff"),
     );
     Ok(resp)
 }
@@ -2573,149 +2448,6 @@ async fn list_room_members(
         }
     }
     Ok(Json(serde_json::to_value(out).map_err(AeroError::from)?))
-}
-
-// ----- MLS (P8) — opaque-bytes relay -----
-
-#[derive(Deserialize)]
-struct PublishKpReq {
-    ciphersuite: String,
-    /// Base64-encoded KeyPackage bytes.
-    payload_b64: String,
-}
-
-fn b64_decode(s: &str) -> Result<Vec<u8>, AeroError> {
-    use base64::Engine;
-    base64::engine::general_purpose::STANDARD
-        .decode(s)
-        .map_err(|e| AeroError::Invalid(format!("base64: {e}")))
-}
-fn b64_encode(b: &[u8]) -> String {
-    use base64::Engine;
-    base64::engine::general_purpose::STANDARD.encode(b)
-}
-
-async fn mls_publish_kp(
-    State(s): State<AppState>,
-    auth: AuthUser,
-    Json(req): Json<PublishKpReq>,
-) -> ApiResult<Json<serde_json::Value>> {
-    let payload = b64_decode(&req.payload_b64)?;
-    if payload.len() > 16 * 1024 {
-        return Err(AeroError::Invalid("KeyPackage too large".into()).into());
-    }
-    let kp = s
-        .key_packages
-        .publish(auth.participant_id, &req.ciphersuite, payload)
-        .await
-        .map_err(AeroError::from)?;
-    Ok(Json(serde_json::json!({
-        "id": kp.id,
-        "ciphersuite": kp.ciphersuite,
-        "created_at": kp.created_at,
-    })))
-}
-
-async fn mls_consume_kp(
-    State(s): State<AppState>,
-    _auth: AuthUser,
-    Path(pid_str): Path<String>,
-) -> ApiResult<Json<serde_json::Value>> {
-    let target = ParticipantId::from_str(&pid_str)
-        .map_err(|e| AeroError::Invalid(format!("participant id: {e}")))?;
-    let kp = s
-        .key_packages
-        .consume_one(target)
-        .await
-        .map_err(AeroError::from)?
-        .ok_or_else(|| AeroError::NotFound("no fresh KeyPackages".into()))?;
-    Ok(Json(serde_json::json!({
-        "id": kp.id,
-        "participant_id": kp.participant_id,
-        "ciphersuite": kp.ciphersuite,
-        "payload_b64": b64_encode(&kp.payload),
-        "created_at": kp.created_at,
-    })))
-}
-
-#[derive(Deserialize)]
-struct UpsertGroupReq {
-    group_id_b64: String,
-    ciphersuite: String,
-    epoch: u64,
-    state_b64: String,
-    #[serde(default)]
-    room_id: Option<String>,
-}
-
-async fn mls_upsert_group(
-    State(s): State<AppState>,
-    auth: AuthUser,
-    Json(req): Json<UpsertGroupReq>,
-) -> ApiResult<axum::http::StatusCode> {
-    let group_id = aero_common::mls::MlsGroupId::new(b64_decode(&req.group_id_b64)?);
-    let state_bytes = b64_decode(&req.state_b64)?;
-    let req_room = req.room_id.as_deref().map(parse_room_id).transpose()?;
-
-    // Authorization: an MLS group is bound to a room and only its members may read
-    // or write its state. For an EXISTING group authorize against its CURRENT room
-    // (so an attacker can't overwrite a victim's group by claiming a room they
-    // happen to belong to); for a NEW group, the requested room. A room-less group
-    // can't be authorized, so it is rejected (fail closed).
-    let existing = s.mls_groups.get(&group_id).await.map_err(AeroError::from)?;
-    let room = match &existing {
-        Some(g) => g.room_id,
-        None => req_room,
-    }
-    .ok_or_else(|| AeroError::Forbidden("mls group must be room-bound".into()))?;
-    s.im.assert_room_access(auth.participant_id, room).await?;
-    // An existing group may not be moved to a different room.
-    if let Some(g) = &existing {
-        if req_room.is_some() && req_room != g.room_id {
-            return Err(
-                AeroError::Forbidden("cannot reassign an mls group to another room".into()).into(),
-            );
-        }
-    }
-
-    let g = aero_common::mls::MlsGroupState {
-        group_id,
-        room_id: Some(room),
-        ciphersuite: req.ciphersuite,
-        epoch: req.epoch,
-        state: state_bytes,
-        updated_at: time::OffsetDateTime::now_utc(),
-    };
-    s.mls_groups.upsert(&g).await.map_err(AeroError::from)?;
-    Ok(axum::http::StatusCode::NO_CONTENT)
-}
-
-async fn mls_get_group(
-    State(s): State<AppState>,
-    auth: AuthUser,
-    Path(gid_str): Path<String>,
-) -> ApiResult<Json<serde_json::Value>> {
-    let gid_bytes = b64_decode(&gid_str)?;
-    let gid = aero_common::mls::MlsGroupId::new(gid_bytes);
-    let g = s
-        .mls_groups
-        .get(&gid)
-        .await
-        .map_err(AeroError::from)?
-        .ok_or_else(|| AeroError::NotFound("group".into()))?;
-    // Only members of the group's room may read its (encrypted) state + metadata.
-    let room = g
-        .room_id
-        .ok_or_else(|| AeroError::Forbidden("mls group not room-bound".into()))?;
-    s.im.assert_room_access(auth.participant_id, room).await?;
-    Ok(Json(serde_json::json!({
-        "group_id_b64": b64_encode(g.group_id.as_bytes()),
-        "room_id": g.room_id,
-        "ciphersuite": g.ciphersuite,
-        "epoch": g.epoch,
-        "state_b64": b64_encode(&g.state),
-        "updated_at": g.updated_at,
-    })))
 }
 
 // ----- WHIP / WHEP -----

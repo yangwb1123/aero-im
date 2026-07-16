@@ -307,6 +307,7 @@ mod tests {
             edited_at: None,
             deleted_at: None,
             expires_at: None,
+            version: 1,
         };
         RoomEvent::Message(MessageEnvelope { message: msg, recipients: Vec::new() })
     }

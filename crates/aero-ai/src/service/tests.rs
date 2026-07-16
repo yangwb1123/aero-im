@@ -81,6 +81,7 @@ fn mk_msg(text: &str) -> Message {
         edited_at: None,
         deleted_at: None,
         expires_at: None,
+        version: 1,
     }
 }
 

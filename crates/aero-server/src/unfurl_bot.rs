@@ -119,7 +119,20 @@ async fn handle(
     let mut new_blocks = msg.blocks.clone();
     new_blocks.extend(cards);
 
-    match messages.edit(msg.id, new_blocks).await {
+    // Optimistic lock: fetch the current version before editing (migration 0157).
+    let version = match messages.get_version(msg.id).await {
+        Ok(Some(v)) => v,
+        Ok(None) => {
+            debug!(msg_id = %msg.id, "unfurl skip: message deleted concurrently");
+            return Ok(());
+        }
+        Err(_) => {
+            warn!(msg_id = %msg.id, "unfurl: failed to read version, skipping");
+            return Ok(());
+        }
+    };
+
+    match messages.edit(msg.id, new_blocks, version).await {
         Ok(Some(updated)) => {
             // Through the stamped seam (ROADMAP3 方向一) so this Edited carries
             // a `seq` like every hot-path publish; best-effort like before.

@@ -115,7 +115,7 @@ impl BookmarkRepo {
             r"SELECT
                  b.room_id, b.note, b.created_at AS saved_at,
                  m.id, m.sender_id, m.blocks, m.reply_to, m.metadata,
-                 m.created_at, m.edited_at, m.deleted_at, m.expires_at
+                 m.created_at, m.edited_at, m.deleted_at, m.expires_at, m.version
                FROM bookmarks b
                JOIN messages m ON m.id = b.message_id
                WHERE b.participant_id = $1 AND m.deleted_at IS NULL
@@ -149,7 +149,7 @@ impl BookmarkRepo {
             r"SELECT
                  b.room_id, b.note, b.created_at AS saved_at,
                  m.id, m.sender_id, m.blocks, m.reply_to, m.metadata,
-                 m.created_at, m.edited_at, m.deleted_at, m.expires_at
+                 m.created_at, m.edited_at, m.deleted_at, m.expires_at, m.version
                FROM bookmarks b
                JOIN messages m ON m.id = b.message_id
                WHERE b.participant_id = $1
@@ -181,6 +181,7 @@ struct SavedRow {
     edited_at: Option<time::OffsetDateTime>,
     deleted_at: Option<time::OffsetDateTime>,
     expires_at: Option<time::OffsetDateTime>,
+    version: i32,
 }
 
 impl From<SavedRow> for SavedMessage {
@@ -200,6 +201,7 @@ impl From<SavedRow> for SavedMessage {
                 edited_at: r.edited_at,
                 deleted_at: r.deleted_at,
                 expires_at: r.expires_at,
+                version: r.version,
             },
             note: r.note,
             saved_at: r.saved_at,

@@ -161,12 +161,23 @@ impl ImService {
     }
 
     /// Edit a message. Only the sender may edit; soft-deleted messages refuse.
+    ///
+    /// `expected_version` is the optimistic-lock check (migration 0157): pass
+    /// the version the client last saw a message at (from a prior `GET`/list/
+    /// search response's `Message.version`) and a concurrent edit that already
+    /// bumped the version fails with `Error::Conflict` (409) instead of
+    /// silently overwriting it. `None` (a caller that hasn't been updated to
+    /// send one, or doesn't have a prior read to base it on) falls back to the
+    /// pre-migration behavior: the current version is read and used as-is,
+    /// which only protects against edits racing within the same instant and
+    /// does not detect a genuine read-then-overwrite race.
     #[instrument(skip(self, blocks), fields(?actor, ?id))]
     pub async fn edit_message(
         &self,
         actor: ParticipantId,
         id: MessageId,
         blocks: Vec<Block>,
+        expected_version: Option<i32>,
     ) -> Result<Message> {
         let started = std::time::Instant::now();
         let existing = self.messages.get(id).await?
@@ -187,8 +198,17 @@ impl ImService {
             }
         }
 
-        let updated = self.messages.edit(id, blocks).await?
-            .ok_or_else(|| Error::Conflict("edit raced with delete".into()))?;
+        // Optimistic-lock version (migration 0157): use the client-supplied
+        // expectation when present (the real lost-update guard); otherwise fall
+        // back to reading the current version, matching pre-versioning behavior.
+        let version = match expected_version {
+            Some(v) => v,
+            None => self.messages.get_version(id).await?
+                .ok_or_else(|| Error::NotFound(format!("message {id} disappeared before edit")))?,
+        };
+
+        let updated = self.messages.edit(id, blocks, version).await?
+            .ok_or_else(|| Error::Conflict("version mismatch or edit raced with delete".into()))?;
 
         self.publish_room_event(updated.room_id, &RoomEvent::Edited(updated.clone())).await;
 

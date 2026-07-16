@@ -28,7 +28,7 @@ impl MessageRepo {
     ) -> Result<Vec<Message>, sqlx::Error> {
         let limit = limit.clamp(1, 200);
         let rows = sqlx::query_as::<_, MessageRow>(
-            r#"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at
+            r#"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at, version
                FROM messages
                WHERE reply_to = $1
                  AND deleted_at IS NULL

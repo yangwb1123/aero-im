@@ -30,6 +30,19 @@ pub struct Message {
     pub deleted_at: Option<OffsetDateTime>,
     #[serde(default, with = "time::serde::rfc3339::option")]
     pub expires_at: Option<OffsetDateTime>,
+    /// Optimistic-lock counter (migration 0157): starts at 1, incremented on
+    /// every edit. Clients that want lost-update protection round-trip the
+    /// value they last saw as `expected_version` on their next edit request;
+    /// a mismatch means someone else edited first and the edit is rejected
+    /// with 409 instead of silently overwriting. `#[serde(default = "..")]`
+    /// so a hand-built or pre-migration `Message` JSON without this field
+    /// still deserializes (treated as never-yet-edited).
+    #[serde(default = "default_message_version")]
+    pub version: i32,
+}
+
+fn default_message_version() -> i32 {
+    1
 }
 
 impl Message {
