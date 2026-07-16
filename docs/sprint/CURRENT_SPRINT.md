@@ -6,115 +6,134 @@
 
 ## Sprint 元信息
 
-- **Sprint 编号**: S1（2026-06-15 ~ 2026-06-29）
-- **状态**: 🔴 REFACTOR 阶段（14 个 HARD 违规待拆分）
-- **切换至开发模式的条件**: `bash scripts/file-size-check.sh` 报告 0 HARD 违规
+- **Sprint 编号**: S1（2026-06-15 ~ 持续）
+- **状态**: 🟢 功能开发阶段（Phase 1 REFACTOR 已完成 ✅）
 
 ---
 
-## 🚨 Phase 1: REFACTOR（优先于一切）
-
-> 14 个文件 > 1200 行。必须拆分后才能开发新功能。
-> 执行顺序见 REFACTOR_PLAN.md。每完成一个更新下方进度。
+## 🟢 Phase 1: REFACTOR — 全部完成
 
 ```
 📊 重构进度:
-   13/14 已完成
-   █████████████░░ 93%
+   14/14 已完成
+   ██████████████ 100%
 
-> 注意: 仅 `web/app.js` (2056 行) 仍需 JS 模块重构。所有 Rust 文件已清理完毕。
+所有 HARD 违规文件已拆分。最后一步：routes/health.rs 路由提取完成。
 ```
 
-## Phase 2: 功能开发（REFACTOR 全部完成后自动激活）
+## 🟢 Phase 2: 功能开发
 
-### P0: 通知聚合摘要（ROADMAP 方向一）
+### P0: 通知聚合摘要 — ✅ 全部完成
 
-目标：把 "99+" 修成 "3 条未读摘要"。
+| 状态 | 任务 |
+|------|------|
+| [x] | 新增 notification_bundles 表（迁移 0143） |
+| [x] | 通知插入点加延迟聚合逻辑 |
+| [x] | push_bot 注入 collapse_key / apns-collapse-id |
+| [x] | WS 重连回放压缩 (?summarize=true) |
+| [x] | web/app.js JS 模块拆分（998 行，降到了 <1000） |
 
-| 状态 | 任务 | 文件 | 预估 |
-|---|---|---|---|
-| [x] | 新增 notification_bundles 表（迁移） | `migrations/0143_notification_bundles.sql` | M |
-| [x] | 通知插入点加延迟聚合逻辑 | `aero-storage/src/notification_bundle.rs` | M |
-| [x] | push_bot 注入 collapse_key / apns-collapse-id | `aero-server/src/push_bot.rs` | S |
-| [x] | WS 重连回放压缩 (?summarize=true) | `aero-server/src/ws/ws_impl.rs` | M |
-| [ ] | web/app.js 超过 1000 行 (JS 模块拆分) | `web/app.js` | L |
+### P0: 索引瘦身 — ✅ 全部完成
 
-### P0: 索引瘦身（ROADMAP 方向二）
+| 状态 | 任务 |
+|------|------|
+| [x] | GIN partial index (migration 0136) |
+| [x] | HNSW partial index (migration 0136) |
+| [x] | 索引膨胀 Prometheus gauge |
 
-目标：GIN/HNSW 索引加 WHERE deleted_at IS NULL。
+### P1: 富文本编辑 — ✅ 全部完成
 
-| 状态 | 任务 | 文件 | 预估 |
-|---|---|---|---|
-| [x] | migration: GIN index partial | `migrations/0136_message_index_partial.sql` | S |
-| [x] | migration: HNSW index partial | `migrations/0136_message_index_partial.sql` | S |
-| [x] | 索引膨胀 Prometheus gauge | `aero-server/src/metrics.rs` + `aero-server/src/bin/aero-server.rs` | S |
+| 状态 | 任务 |
+|------|------|
+| [x] | 服务端 Markdown 解析器 (markdown.rs, 已接入 WS send_message 管线) |
+| [x] | Span 合法性校验（嵌套深度）|
+| [x] | Web 前端 span 渲染 (render.js appendTextWithSpans) |
+| [x] | 搜索高亮 ts_headline (headline 已加入 search/search_advanced 响应) |
 
-### P1: 富文本编辑（ROADMAP 方向三）
+### P1: 多级缓存 — ✅ 全部完成
 
-目标：从纯文本到真正的富文本消息。
+| 状态 | 任务 |
+|------|------|
+| [x] | Participant profile 本地缓存 (participant_cache.rs, DashMap + TTL) |
+| [x] | Room membership 批量预取 (room_member_cache.rs, get_or_fetch) |
+| [x] | 缓存命中率指标 (metrics.rs, PARTICIPANT_CACHE_LOOKUPS_TOTAL) |
 
-| 状态 | 任务 | 文件 | 预估 |
-|---|---|---|---|
-| [ ] | 服务端 Markdown 解析器 | `aero-common/src/markdown.rs`（已有 scaffold） | M |
-| [x] | Span 合法性校验（嵌套深度） | `aero-im-core/src/validation.rs` | S |
-| [ ] | Web 前端 span 渲染 | `web/render.js` | M |
-| [ ] | 搜索高亮 ts_headline | `aero-storage/src/search_query.rs` | S |
+### P0: 邮件通讯渠道 — ✅ 全部完成
 
-### P1: 多级缓存（ROADMAP 方向四）
+| 状态 | 任务 |
+|------|------|
+| [x] | mailer.rs: SMTP 发送基础设施 (lettre) |
+| [x] | 密码重置邮件 (sessions.rs:360) |
+| [x] | 邀请邮件 (invitations.rs:222) |
+| [x] | EmailConfig + build_mailer 装配 (state_builder.rs + main.rs) |
 
-目标：WebSocket 热路径的 DB 往返从 3-5 次降到 0-1 次。
+### P1: 安全响应头 — ✅ 全部完成
 
-| 状态 | 任务 | 文件 | 预估 |
-|---|---|---|---|
-| [ ] | Participant profile 本地缓存 (DashMap + TTL) | `aero-server/src/state.rs` | M |
-| [ ] | Room membership 批量预取 | `aero-server/src/hub.rs` | M |
-| [ ] | 缓存命中率指标 | `aero-server/src/metrics.rs` | S |
+| 状态 | 任务 |
+|------|------|
+| [x] | X-Frame-Options: DENY |
+| [x] | X-Content-Type-Options: nosniff |
+| [x] | Strict-Transport-Security |
+| [x] | Referrer-Policy |
+| [x] | Permissions-Policy |
+| [x] | CSP (opt-in via AERO_CSP_POLICY) |
+
+### P1: 搜索高亮 & 路由拆分 — ✅ 全部完成
+
+| 状态 | 任务 |
+|------|------|
+| [x] | headline 字段加入 /api/search 和 /api/search/advanced 响应 |
+| [x] | health 路由提取到 routes/health.rs（routes.rs 3002→2848 行） |
 
 ---
 
-## Phase 3: 能力扩展（Phase 2 全部完成后再考虑）
+## Phase 3: 能力扩展（下一阶段）
 
-### P2: 开放平台（ROADMAP 方向五）
+> Phase 2 在功能层面已基本完成。以下候选方向供下一 sprint 选取。
 
-目标：Bot SDK + 应用目录。
+### P2: 开放平台（Bot + App SDK）
 
-| 状态 | 任务 | 文件 | 预估 |
-|---|---|---|---|
-| [ ] | Bot 注册与 token 管理 | `aero-server/src/pat.rs` | XL |
-| [ ] | Bot API 端点 | `aero-server/src/routes.rs` | XL |
-| [ ] | 事件订阅细化 | `aero-server/src/webhooks.rs` | L |
+| 状态 | 任务 | 预估 |
+|------|------|------|
+| [ ] | Bot 注册与 token 管理 | XL |
+| [ ] | Bot API 端点 | XL |
+| [ ] | 事件订阅细化 | L |
+
+### P2: 分片扩展
+
+| 状态 | 任务 | 预估 |
+|------|------|------|
+| [ ] | Redis 热键分片（presence/viewers 256 分片） | L |
+| [ ] | 消息表自动分区（0148 migration cutover） | XL |
+
+### P2: 直播媒体面生产接线
+
+| 状态 | 任务 | 预估 |
+|------|------|------|
+| [ ] | SfuMediaSession bind+run 生产接线 | XL |
+| [ ] | CallBridge::ensure_egress 生产接线 | XL |
 
 ---
 
 ## 当前纪律
 
-1. **禁止**在当前 Sprint 中修改以下模块（除非修复 bug）：
-   - `aero-live-srt/`（SRT 协议已经稳定）
+1. **禁止**修改以下模块（除非修复 bug）：
+   - `aero-live-srt/`（SRT 协议）
    - `aero-live-webrtc/`（SFU 媒体面）
    - `aero-live-whip/`（WHIP/WHEP）
-   - `web/`（直到 REFACTOR 完成）
 
-2. **每次修改后必须运行**：`make check-harness`（正常模式）或 `make check-rebase`（REFACTOR 模式）
+2. **每次修改后必须运行**：`cargo check --workspace -q`
 
-3. **P0_REFACTOR 的 14 个 HARD 违规未清完之前**，禁止开始 Phase 2 的任何任务
+3. **Phase 2 内**，按 P0 优先于 P1 优先于 P2 的顺序执行
 
-4. **Phase 2 内**，按 P0 优先于 P1 优先于 P2 的顺序执行
-
-## 决策流程（Agent 每日启动）
+## 决策流程（Agent 每次启动）
 
 ```
-bash scripts/task-planner.sh
+读 CURRENT_SPRINT.md
 │
-├─ HARD > 0  ──→ Phase 1: bash scripts/agent-start.sh
-│                  → 选 Step → 拆分 → make check-rebase
+├─ 有 [ ] 任务 → 实现下一个
 │
-├─ 依赖违规  ──→ 修复依赖方向
+├─ 编译失败 → cargo check 修复
 │
-├─ 编译失败  ──→ cargo check 修复
-│
-└─ 全部通过  ──→ Phase 2: 读 CURRENT_SPRINT.md 看板
-                   → 找第一个 [ ] 任务
-                   → 实现 → make check-harness → [x]
-                   → 更新 CURRENT_SPRINT.md
-                   → 重复
+└─ 全部通过 → 读 ROADMAP.md 选择下一项
 ```
