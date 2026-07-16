@@ -103,7 +103,7 @@
 
 | 状态 | 任务 | 预估 |
 |------|------|------|
-| [ ] | Redis 热键分片（presence/viewers 256 分片） | L |
+| [x] | Redis 热键分片（presence/viewers 256 分片，live_presence.rs + presence.rs） | L |
 | [ ] | 消息表自动分区（0148 migration cutover） | XL |
 
 ### P2: 直播媒体面生产接线
