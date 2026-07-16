@@ -136,6 +136,7 @@ async fn search_advanced(
         "results": hits.into_iter().map(|h| {
             serde_json::json!({
                 "score": h.score,
+                "headline": h.headline,
                 "message": h.message,
             })
         }).collect::<Vec<_>>(),
