@@ -91,27 +91,33 @@
 
 > Phase 2 在功能层面已基本完成。以下候选方向供下一 sprint 选取。
 
-### P2: 开放平台（Bot + App SDK）
+### P2: 开放平台（Bot + App SDK）— ✅ 已完成（本 sprint 复核发现早前已建好，未在此文档同步）
 
-| 状态 | 任务 | 预估 |
+| 状态 | 任务 | 备注 |
 |------|------|------|
-| [ ] | Bot 注册与 token 管理 | XL |
-| [ ] | Bot API 端点 | XL |
-| [ ] | 事件订阅细化 | L |
+| [x] | Bot 注册与 token 管理 | `bots`/`bot_event_subscriptions` 表（mig 0141/0142），`aero-storage/src/bot.rs::BotRepo`，`POST /api/bots` + `POST /api/bots/:id/token` |
+| [x] | Bot API 端点 | routes.rs `bot_create`/`bot_list`/`bot_rotate_token`/`bot_list_subscriptions`/`bot_create_subscription`/`bot_delete_subscription`/`bot_list_deliveries`，均 `ensure_bot_owner` 所有权校验 |
+| [x] | 事件订阅细化 | `subscribe`/`list_subscriptions`/`delete_subscription`/`subscriptions_for_event`，JSONB `filters`（room/workspace/action_id），`bot_dispatch.rs` 按订阅分发，投递日志见 mig 0147 |
+
+复核时发现并修复一个真实 SSRF 漏洞：`bot_create_subscription` 此前对用户提供的 `webhook_url` **零校验**，而 `bot_dispatch.rs` 会对其发起服务端 HTTP 请求——任意已认证用户都可以注册 bot 并订阅一个指向内网/云元数据地址的 webhook。已接入与房间级 outgoing webhook 相同的 `assert_webhook_url_safe` 防护并现场验证（loopback/元数据地址 400，公网 URL / 无 URL 均成功）。
 
 ### P2: 分片扩展
 
 | 状态 | 任务 | 预估 |
 |------|------|------|
 | [x] | Redis 热键分片（presence/viewers 256 分片，live_presence.rs + presence.rs） | L |
-| [ ] | 消息表自动分区（0148 migration cutover） | XL |
+| [x]（准备阶段） | 消息表自动分区 — shadow 表 + 回填/维护函数（mig 0148） | XL |
 
-### P2: 直播媒体面生产接线
+消息表分区的**实际 cutover**（PK 重写、6 张子表 7 个入向 FK 改指、索引重建）是一次性、破坏性的维护窗口操作，`0148` 迁移本身已明确将其排除在自动迁移链之外（见迁移文件头注释 + `docs/runbooks/messages-partitioning.md`）——这是刻意的部署期操作，不是 sandbox 里能"实现"的代码任务，维持 `[ ]` 未完成但已有完整可执行的迁移前置准备。
+
+### P2: 直播媒体面生产接线（仍未完成 — 需要真实 WebRTC/媒体基础设施）
 
 | 状态 | 任务 | 预估 |
 |------|------|------|
 | [ ] | SfuMediaSession bind+run 生产接线 | XL |
-| [ ] | CallBridge::ensure_egress 生产接线 | XL |
+| [ ] | CallBridge::ensure_egress 生产接线（`call_bridge_supervisor.rs` 显式 `TODO(real-transport)` 文档化的接缝） | XL |
+
+这两项依赖真实媒体服务器基础设施（非本 sandbox 环境可提供），历次 ROADMAP 复核均得出相同结论——不是遗漏，是部署环境缺口。
 
 ---
 
