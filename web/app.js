@@ -31,6 +31,7 @@ import { maybeShowMentionMenu, moveMention, pickMention, closeMentionMenu, isMen
 import { initModalForms } from './modals.js';
 import { initAuthUi } from './auth_ui.js';
 import { initChrome } from './chrome.js';
+import { installUnhandledRejectionReporting } from './error_reporting.js';
 
 // ---------- view switching ----------
 function showAuth() { els.viewAuth.hidden = false; els.viewChat.hidden = true; }
@@ -964,7 +965,6 @@ initModalForms({ forceReauth, refreshRoomList, switchRoom });
 initAuthUi({ enterChat, showAuth });
 initChrome();
 
-
 // ---------- calls ----------
 // 1:1 + captions + group-mesh call logic now lives in calls.js. The control
 // buttons were wired at module-load time originally; preserve that by attaching
@@ -981,6 +981,8 @@ function forceReauth() {
 }
 
 // ---------- bootstrap ----------
+installUnhandledRejectionReporting(toast);
+
 (async function bootstrap() {
   const t = auth.getToken();
   if (!t) { showAuth(); return; }

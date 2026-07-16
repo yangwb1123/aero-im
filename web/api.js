@@ -30,6 +30,11 @@ export class ApiError extends Error {
   }
 }
 
+/// Fetch timeout: if the server doesn't respond within 30s the promise rejects
+/// with a network-like error so the caller sees a clear timeout message instead
+/// of hanging indefinitely.
+const REQUEST_TIMEOUT = 30_000;
+
 async function request(method, path, { body, query, withAuth = true, raw = false } = {}) {
   const headers = { 'Accept': 'application/json' };
   if (body !== undefined) headers['Content-Type'] = 'application/json';
@@ -52,11 +57,20 @@ async function request(method, path, { body, query, withAuth = true, raw = false
     if (raw && body !== undefined) {
       delete headers['Content-Type']; // let browser set multipart boundary
     }
-    resp = await fetch(url, {
-      method,
-      headers,
-      body: raw ? body : body !== undefined ? JSON.stringify(body) : undefined,
-    });
+    // AbortController-based timeout: if fetch hangs past REQUEST_TIMEOUT ms,
+    // the signal fires and fetch rejects with an AbortError.
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT);
+    try {
+      resp = await fetch(url, {
+        method,
+        headers,
+        body: raw ? body : body !== undefined ? JSON.stringify(body) : undefined,
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timer);
+    }
   } catch (e) {
     throw new ApiError(0, null, `网络错误:${e.message}`);
   }
