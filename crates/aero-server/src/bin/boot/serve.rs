@@ -7,6 +7,7 @@ use tower::ServiceBuilder;
 use tower_http::{
     cors::{AllowOrigin, CorsLayer},
     services::ServeDir,
+    set_header::SetResponseHeaderLayer,
     timeout::TimeoutLayer,
     trace::TraceLayer,
 };
@@ -50,6 +51,47 @@ pub(crate) async fn serve(
         .layer(TraceLayer::new_for_http())
         .layer(axum::middleware::from_fn(server_metrics::http_metrics_layer))
         .layer(cors)
+        // Security response headers (ROADMAP 第四次分析·方向三):
+        //   X-Frame-Options DENY           → prevent clickjacking
+        //   X-Content-Type-Options nosniff  → prevent MIME-type sniffing
+        //   Strict-Transport-Security       → force HTTPS (production)
+        //   Referrer-Policy                 → reasonable privacy default
+        //   Permissions-Policy              → restrict sensitive browser APIs
+        .layer(SetResponseHeaderLayer::overriding(
+            axum::http::header::X_FRAME_OPTIONS,
+            axum::http::HeaderValue::from_static("DENY"),
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            axum::http::header::X_CONTENT_TYPE_OPTIONS,
+            axum::http::HeaderValue::from_static("nosniff"),
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            axum::http::header::STRICT_TRANSPORT_SECURITY,
+            axum::http::HeaderValue::from_static("max-age=31536000; includeSubDomains"),
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            axum::http::header::REFERRER_POLICY,
+            axum::http::HeaderValue::from_static("strict-origin-when-cross-origin"),
+        ))
+        .layer(SetResponseHeaderLayer::overriding(
+            axum::http::HeaderName::from_static("permissions-policy"),
+            axum::http::HeaderValue::from_static("camera=(), microphone=(), geolocation=()"),
+        ))
+        // Content-Security-Policy (ROADMAP 第四次分析·方向三): opt-in via
+        // `AERO_CSP_POLICY` env var. Not set by default because the correct
+        // policy depends on the deployment's CDN dependencies. Example for the
+        // bundled web app (which loads hls.js from jsdelivr):
+        //   default-src 'self'; script-src 'self' https://cdn.jsdelivr.net;
+        //   style-src 'self' 'unsafe-inline'; img-src 'self' data:;
+        //   connect-src 'self' ws: wss:
+        .option_layer(
+            std::env::var("AERO_CSP_POLICY").ok().map(|policy| {
+                SetResponseHeaderLayer::overriding(
+                    axum::http::header::CONTENT_SECURITY_POLICY,
+                    axum::http::HeaderValue::from_str(&policy).expect("AERO_CSP_POLICY is not a valid header value"),
+                )
+            }),
+        )
         .option_layer(concurrency_layer)
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),

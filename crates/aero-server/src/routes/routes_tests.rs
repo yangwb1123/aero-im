@@ -4,47 +4,11 @@
     use axum::body::Body;
     use axum::http::Request as HttpRequest;
     use tower::ServiceExt as _; // `oneshot`
-    
-    /// The liveness handler takes no state, so it mounts on a state-free router
-    /// and is fully testable offline (it must never touch PG/Redis/NATS).
-    #[tokio::test]
-    async fn health_live_returns_200_without_dependencies() {
-        let app: Router = Router::new().route("/health/live", get(health_live));
-        let resp = app
-            .oneshot(
-                HttpRequest::builder()
-                    .uri("/health/live")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-    
-        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 16).await.unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(v["status"], "ok");
-    }
-    
-    #[test]
-    fn readiness_decision_draining_takes_precedence() {
-        // Draining → 503 regardless of dependency health.
-        assert_eq!(
-            readiness_decision(true, true),
-            (StatusCode::SERVICE_UNAVAILABLE, "draining")
-        );
-        assert_eq!(
-            readiness_decision(true, false),
-            (StatusCode::SERVICE_UNAVAILABLE, "draining")
-        );
-        // Not draining: ready iff every dependency is healthy.
-        assert_eq!(readiness_decision(false, true), (StatusCode::OK, "ready"));
-        assert_eq!(
-            readiness_decision(false, false),
-            (StatusCode::SERVICE_UNAVAILABLE, "not_ready")
-        );
-    }
-    
+
+    // Health/readiness tests live in `routes::health` now (REFACTOR_PLAN.md Step
+    // 7 split) — `health_live` and `readiness_decision` are private to that
+    // module and no longer reachable from here.
+
     #[test]
     fn history_limit_defaults_and_clamps() {
         // Absent ⇒ the documented default page size.
