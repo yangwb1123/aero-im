@@ -309,13 +309,27 @@ impl Hub {
     /// the message is dropped (slow-consumer policy) and, when configured, the
     /// connection is disconnected and pruned. Closed connections are pruned too.
     pub fn fan_out_raw(&self, recipients: &[ParticipantId], text: &str) {
+        Self::fan_out_arc_inner(self, recipients, Arc::from(text.to_owned()));
+    }
+
+    /// Like [`fan_out_raw`] but takes a pre-built `Arc<String>` so the caller
+    /// pays the serialization/ownership cost exactly once; the fan-out loop
+    /// shares the text via cheap Arc clones (ROADMAP 第二次分析·方向五).
+    pub fn fan_out_arc(&self, recipients: &[ParticipantId], text: Arc<String>) {
+        Self::fan_out_arc_inner(self, recipients, text);
+    }
+
+    /// Shared implementation for both `fan_out_raw` and `fan_out_arc`.
+    fn fan_out_arc_inner(&self, recipients: &[ParticipantId], text: Arc<String>) {
         for pid in recipients {
             // `get_mut` so we can prune dead/laggy senders in place. The write
             // guard is scoped to this one participant's entry.
-            let Some(mut senders) = self.conns.get_mut(pid) else { continue };
+            let Some(mut senders) = self.conns.get_mut(pid) else {
+                continue;
+            };
             let mut drop_idx: Vec<usize> = Vec::new();
             for (i, tx) in senders.iter().enumerate() {
-                match tx.try_send(axum::extract::ws::Message::Text(text.to_owned())) {
+                match tx.try_send(axum::extract::ws::Message::Text((*text).clone())) {
                     Ok(()) => {
                         // Slow-consumer resync (ROADMAP 第三版 方向一): the queue
                         // has capacity again — if frames were dropped while it was

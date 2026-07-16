@@ -16,6 +16,7 @@ pub struct AppConfig {
     pub nats: NatsConfig,
     pub auth: AuthConfig,
     pub telemetry: TelemetryConfig,
+    pub email: Option<EmailConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -154,6 +155,43 @@ fn default_trace_sample_rate() -> f64 {
 /// Clamp an arbitrary sampling ratio into the valid `[0.0, 1.0]` range.
 fn clamp_sample_rate(rate: f64) -> f64 {
     rate.clamp(0.0, 1.0)
+}
+
+/// SMTP configuration for transactional email (password reset, invitation).
+/// When absent (`AERO__EMAIL__*` envs not set), email features fall back to
+/// log-only mode (token printed in server logs for development).
+#[derive(Clone, Deserialize)]
+pub struct EmailConfig {
+    /// SMTP relay hostname.
+    pub host: String,
+    /// SMTP relay port (default 587 for STARTTLS, 465 for TLS).
+    #[serde(default = "default_smtp_port")]
+    pub port: u16,
+    /// Username for SMTP AUTH.
+    pub username: String,
+    /// Password for SMTP AUTH (redacted in Debug).
+    pub password: String,
+    /// "From" address for outgoing mail.
+    pub from: String,
+    /// Use STARTTLS (default true; set false for implicit-TLS port 465).
+    #[serde(default = "default_smtp_starttls")]
+    pub starttls: bool,
+}
+
+fn default_smtp_port() -> u16 { 587 }
+fn default_smtp_starttls() -> bool { true }
+
+impl std::fmt::Debug for EmailConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EmailConfig")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("username", &self.username)
+            .field("password", &"<redacted>")
+            .field("from", &self.from)
+            .field("starttls", &self.starttls)
+            .finish()
+    }
 }
 
 impl TelemetryConfig {

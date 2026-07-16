@@ -252,6 +252,14 @@ pub struct AppState {
     /// `participant_cache.get_or_fetch(pid, &participants)`; profile writes
     /// (`update_me`) call `participant_cache.invalidate(pid)`. ROADMAP6 方向四.
     pub participant_cache: crate::participant_cache::ParticipantCache,
+    /// Per-process TTL cache for room membership lists (ROADMAP6 方向四).
+    /// Fronts `RoomRepo::members()` on the hot fan-out paths in the bus
+    /// listener. Membership writes (add/remove member) invalidate the cached
+    /// entry so the next fan-out re-fetches from the DB.
+    pub room_member_cache: crate::room_member_cache::RoomMemberCache,
+    /// Transactional email sender (password reset, invitation). `None` when
+    /// SMTP is not configured — in that mode reset tokens are only logged.
+    pub mailer: Option<crate::mailer::Mailer>,
     pub rooms: RoomRepo,
     /// Workspace / org (tenant) membership + role store. Backs the
     /// ROADMAP 方向一 management API in [`crate::workspaces`].

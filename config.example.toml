@@ -37,3 +37,14 @@ refresh_ttl_secs = 604800        # 7 days
 [telemetry]
 otlp_endpoint = "http://localhost:4317"
 log_level = "info,aero=debug"
+
+# SMTP / transactional email (password reset, workspace invitations).
+# When absent, reset tokens are logged (development mode).
+# Configure via env vars AERO__EMAIL__HOST / _PORT / _USERNAME / _PASSWORD / _FROM / _STARTTLS.
+# [email]
+# host = "smtp.example.com"
+# port = 587
+# username = "avc@example.com"
+# password = "smtp-password"
+# from = "noreply@example.com"
+# starttls = true

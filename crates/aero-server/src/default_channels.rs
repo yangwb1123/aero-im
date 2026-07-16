@@ -58,6 +58,7 @@ pub async fn auto_join_defaults(s: &AppState, workspace: WorkspaceId, participan
         if let Err(err) = s.rooms.add_member(room, participant).await {
             tracing::warn!(error = ?err, %room, %participant, "auto-join default channel failed");
         }
+        s.room_member_cache.invalidate(&room);
     }
 }
 

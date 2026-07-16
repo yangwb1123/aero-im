@@ -356,12 +356,16 @@ async fn forgot_password(
         {
             tracing::warn!("failed to store reset token for {email}: {e}");
         } else {
-            // In production this would dispatch an email with the token.
-            tracing::info!(
-                email = %email,
-                token = %token,
-                "password reset token issued (log-only; wire an email sender for production)"
-            );
+            // Send email when SMTP is configured; fall back to log-only.
+            if let Some(ref mailer) = s.mailer {
+                mailer.send_password_reset(&email, &token).await;
+            } else {
+                tracing::info!(
+                    email = %email,
+                    token = %token,
+                    "password reset token issued (log-only; configure AERO__EMAIL__* for production)"
+                );
+            }
         }
     }
     Ok(Json(serde_json::json!({

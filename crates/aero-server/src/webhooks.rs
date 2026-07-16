@@ -168,6 +168,7 @@ async fn create_incoming(
         .map_err(AeroError::from)?;
     // Add the bot to the room so `send_message(bot, room, ...)` passes.
     s.rooms.add_member(room, bot.id).await.map_err(AeroError::from)?;
+    s.room_member_cache.invalidate(&room);
 
     let token = generate_token();
     let id = repo(&s)
@@ -359,6 +360,7 @@ async fn revoke_incoming(
     if let Err(e) = s.rooms.remove_member(room, bot).await {
         tracing::warn!(error = ?e, %room, %bot, "revoke_incoming: webhook bot room-cleanup failed");
     }
+    s.room_member_cache.invalidate(&room);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -742,6 +744,7 @@ mod tests {
             edited_at: None,
             deleted_at: None,
             expires_at: None,
+            version: 1,
         };
         RoomEvent::Message(MessageEnvelope { message: msg, recipients: Vec::new() })
     }

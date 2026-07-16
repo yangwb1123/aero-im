@@ -191,6 +191,7 @@ async fn main() -> anyhow::Result<()> {
         thread_read_state: repos.thread_read_state,
         blob_store: persistence.blob_store,
         blob_backend: Box::leak(persistence.blob_backend.into_boxed_str()),
+        mailer: aero_server::mailer::build_mailer(cfg.email.as_ref()),
     });
 
     // ---------- Background tasks ----------

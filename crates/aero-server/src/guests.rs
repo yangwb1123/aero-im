@@ -157,6 +157,7 @@ async fn add_guest(
     //    sanctioned admin path; the ImService guard that denies guests is for
     //    *other* channels, not this initial placement).
     s.rooms.add_member(room, target).await.map_err(AeroError::from)?;
+    s.room_member_cache.invalidate(&room);
     // 2. Flag them as a guest workspace member (idempotent upsert).
     s.workspaces.add_guest_member(ws, target).await.map_err(AeroError::from)?;
 

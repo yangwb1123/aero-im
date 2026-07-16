@@ -216,6 +216,18 @@ async fn create_invitation(
     }
 
     let invite_url = format!("{}/invite/{}", s.public_base_url.trim_end_matches('/'), token);
+    // Email the invitation link when SMTP is configured and a recipient
+    // address was provided. Best-effort: the admin already received the
+    // invite URL in the API response and can share it manually.
+    if let (Some(ref mailer), Some(ref invite_email)) = (s.mailer, email) {
+        // Best-effort: the workspace name is displayed in the email, but
+        // failing to fetch it is non-fatal — the email still delivers.
+        let ws_name = match s.workspaces.get(ws).await {
+            Ok(Some(w)) => w.name,
+            _ => "your team's workspace".into(),
+        };
+        mailer.send_invitation(invite_email, &invite_url, &ws_name).await;
+    }
     Ok(Json(serde_json::json!({
         "id": id,
         // Shown exactly once — only the hash is persisted server-side.

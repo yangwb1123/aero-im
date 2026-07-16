@@ -81,6 +81,7 @@ async fn join_channel(
 ) -> ApiResult<Json<serde_json::Value>> {
     let room = parse_room(&room_str)?;
     s.im.join_channel(auth.participant_id, room).await?;
+    s.room_member_cache.invalidate(&room);
     Ok(Json(serde_json::json!({ "joined": true })))
 }
 
@@ -92,6 +93,7 @@ async fn leave_channel(
 ) -> ApiResult<Json<serde_json::Value>> {
     let room = parse_room(&room_str)?;
     s.im.leave_channel(auth.participant_id, room).await?;
+    s.room_member_cache.invalidate(&room);
     Ok(Json(serde_json::json!({ "left": true })))
 }
 

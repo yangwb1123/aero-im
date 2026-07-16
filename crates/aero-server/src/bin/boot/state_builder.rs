@@ -54,6 +54,9 @@ pub(crate) struct StateDeps {
     // From persistence
     pub(crate) blob_store: Arc<dyn aero_storage::BlobStore>,
     pub(crate) blob_backend: &'static str,
+    /// Transactional email sender (password reset, invitation).
+    /// `None` when SMTP is not configured (log-only fallback).
+    pub(crate) mailer: Option<aero_server::mailer::Mailer>,
 }
 
 pub(crate) fn build(d: StateDeps) -> AppState {
@@ -73,6 +76,10 @@ pub(crate) fn build(d: StateDeps) -> AppState {
         // ROADMAP6 方向四: per-process TTL cache fronting ParticipantRepo::get on
         // the hot read paths. Default 60s TTL; invalidated on profile writes.
         participant_cache: aero_server::participant_cache::ParticipantCache::with_default_ttl(),
+        // ROADMAP6 方向四: per-process TTL cache fronting RoomRepo::members on the
+        // bus-listener fan-out hot path. Default 60s TTL; invalidated on membership
+        // changes (add_member / remove_member).
+        room_member_cache: aero_server::room_member_cache::RoomMemberCache::with_default_ttl(),
         rooms: d.rooms,
         workspaces: d.workspaces,
         audit: d.audit,
@@ -117,5 +124,6 @@ pub(crate) fn build(d: StateDeps) -> AppState {
         blocks: aero_storage::BlockRepo::new(pg_for_blocks),
         shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         bridge_subscribers: d.bridge_subscribers,
+        mailer: d.mailer,
     }
 }

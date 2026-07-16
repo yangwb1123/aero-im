@@ -29,10 +29,14 @@ pub mod guests;
 pub mod hub;
 pub mod invitations;
 pub mod live;
+/// Minimal transactional email sender (password reset, invitation).
+pub mod mailer;
 pub mod metrics;
 pub mod notif_prefs;
 /// Per-process TTL cache for participant profiles (ROADMAP6 方向四 多级缓存).
 pub mod participant_cache;
+/// Per-process TTL cache for room membership lists (ROADMAP6 方向四 多级缓存).
+pub mod room_member_cache;
 pub mod pat;
 pub mod polls;
 pub mod rate_limit;
