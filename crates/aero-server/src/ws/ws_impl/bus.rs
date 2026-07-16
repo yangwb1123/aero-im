@@ -3,6 +3,7 @@
 //! decoded event into the local Hub; behaviour unchanged.
 use super::*;
 use crate::ws::frame;
+use futures::StreamExt;
 
 /// Backoff between bus resubscribe attempts after the subscription stream ends
 /// (NATS reconnect/drop) or a subscribe call fails. Short — fan-out is offline
@@ -54,26 +55,33 @@ pub async fn run_bus_listener(state: AppState) -> anyhow::Result<()> {
         tokio::time::sleep(BUS_RESUBSCRIBE_BACKOFF).await;
     }
 }
-/// Process one `im.room.*` bus message: lift the publish-time `seq` stamp, decode
-/// the [`RoomEvent`] (with a legacy `MessageEnvelope` fallback), fan it out to the
-/// local Hub, and ack — or nack an undecodable payload.
+
+/// Process one `im.room.*` bus message: lift the `seq` stamp, decode the typed
+/// [`RoomEvent`], expand recipients (via cache), and fan out to the local Hub.
 async fn handle_room_event_sub(state: &AppState, sub: Box<dyn aero_bus::Subscription + Send>) {
-    // Parse the raw JSON first so the publish-time `"seq"` stamp (ROADMAP
-    // 第三版 方向一) can be lifted off the payload — `RoomEvent`'s serde
-    // deserialization ignores the unknown key, so the stamp must be read
-    // before the typed decode. Legacy unstamped payloads yield `None`.
-    let parsed: serde_json::Result<(RoomEvent, Option<u64>)> =
+    use aero_common::RoomEvent;
+    // Two-phase decode: lift the publish-time `"seq"` stamp off the raw JSON
+    // *before* the typed `Deserialize` of the RoomEvent drops unknown keys.
+    let parsed: Result<(RoomEvent, Option<u64>), _> =
         serde_json::from_slice::<serde_json::Value>(sub.payload()).and_then(|value| {
             let seq = aero_bus::extract_seq(&value);
             Ok((serde_json::from_value::<RoomEvent>(value)?, seq))
         });
     match parsed {
         Ok((event, seq)) => {
-            // NotifyBatch (ROADMAP 方向二) is published once for the whole
-            // recipient set; expand it here into one targeted `notify` frame
-            // per recipient so each client receives an ordinary frame and
-            // never sees the others. Equivalent to the old per-recipient
-            // Notify publishes, minus the O(N) NATS traffic.
+            // NotifyBatch is published once for the whole recipient set; expand it
+            // here into one targeted `notify` frame per recipient so each client
+            // receives an ordinary frame carrying ITS OWN participant/kind and never
+            // sees the rest of the batch. This must stay a special case:
+            // `frame::room_event_to_frame_json` collapses a NotifyBatch into a
+            // single frame built from `recipients.first()` alone (it has no way to
+            // address per-recipient JSON from inside a shared frame string), so
+            // reusing the generic single-frame fan-out below for this variant would
+            // send every recipient a frame addressed to whichever participant
+            // happens to be first in the batch — everyone else's notification
+            // silently mismatches their own id and gets dropped/misattributed
+            // client-side. Equivalent to the old per-recipient Notify publishes,
+            // minus the O(N) NATS traffic.
             if let RoomEvent::NotifyBatch { room_id, message_id, by, delivery_id: _, recipients } = &event {
                 for target in recipients {
                     let frame = frame::room_event_to_frame_json(
@@ -91,32 +99,42 @@ async fn handle_room_event_sub(state: &AppState, sub: Box<dyn aero_bus::Subscrip
                 let _ = sub.ack().await;
                 return;
             }
+            // Every other RoomEvent variant: explicit recipients when the event
+            // carries them, otherwise the room's full member list from the
+            // cache-backed RoomMemberCache (ROADMAP6 方向四).
             let room = event.room_id();
-            let recipients = match event.explicit_recipients() {
-                list if !list.is_empty() => list,
+            let recipients: Arc<[ParticipantId]> = match event.explicit_recipients() {
+                list if !list.is_empty() => list.into(),
                 _ => {
                     if let Some(rid) = room {
-                        state.rooms.members(rid).await.unwrap_or_default()
+                        state
+                            .room_member_cache
+                            .get_or_fetch(rid, &state.rooms)
+                            .await
+                            .unwrap_or_default()
                     } else {
-                        Vec::new()
+                        Arc::new([])
                     }
                 }
             };
-            // Message-throughput counter (ROADMAP 方向四): the bus is the single
-            // source of truth for accepted messages — every chat message (REST
-            // or WS) lands here exactly once before fan-out — so counting only
-            // `Message` events here is the non-double-counting choke point
-            // (other RoomEvent variants are edits/reactions/typing, not new msgs).
-            if matches!(event, RoomEvent::Message(_)) {
-                metrics::inc_counter(names::MESSAGES_SENT_TOTAL, 1);
-            }
+            // Note: the RoomEvent path below deliberately avoids counting
+            // MESSAGES_SENT_TOTAL — that counter lives in the `send_message`
+            // path (`aero-im-core/src/service/messages.rs`), where room_type
+            // and optional workspace labels are available. Counting here would
+            // DOUBLE-COUNT for the RoomEvent path because every message already
+            // flows through send_message → publish_room_event → bus listener.
+            // However, the LEGACY envelope fallback (further below) does count
+            // because legacy-format messages bypass `send_message` entirely and
+            // therefore are never counted upstream.
             // AI answer-cache staleness (ROADMAP 方向一·3): an edited or deleted
             // message must not survive in a cached AI answer. The bus is the one
             // chokepoint every Edited/Deleted (REST, WS, moderation) funnels
             // through, so invalidate the room's answer cache here. Best-effort, and
             // only when an AI backend is configured so non-AI deployments pay
             // nothing (an empty key-index is a no-op regardless).
-            if state.ai.is_some() && matches!(event, RoomEvent::Edited(_) | RoomEvent::Deleted { .. }) {
+            if state.ai.is_some()
+                && matches!(event, RoomEvent::Edited(_) | RoomEvent::Deleted { .. })
+            {
                 if let Some(rid) = room {
                     let store = aero_storage::AiContextStore::new(state.redis_client.clone());
                     if let Err(e) = store.cache_answer_invalidate_room(rid).await {
@@ -125,16 +143,22 @@ async fn handle_room_event_sub(state: &AppState, sub: Box<dyn aero_bus::Subscrip
                 }
             }
             let frame = frame::room_event_to_frame_json(&event, seq);
-            state.hub.fan_out_raw(&recipients, &frame);
+            state.hub.fan_out_raw(&*recipients, &frame);
             let _ = sub.ack().await;
         }
         Err(e) => {
             // Compatibility: accept the legacy raw MessageEnvelope payload too.
-            if let Ok(env) = serde_json::from_slice::<aero_common::MessageEnvelope>(sub.payload()) {
-                let recipients = if env.recipients.is_empty() {
-                    state.rooms.members(env.message.room_id).await.unwrap_or_default()
+            if let Ok(env) =
+                serde_json::from_slice::<aero_common::MessageEnvelope>(sub.payload())
+            {
+                let recipients: Arc<[ParticipantId]> = if env.recipients.is_empty() {
+                    state
+                        .room_member_cache
+                        .get_or_fetch(env.message.room_id, &state.rooms)
+                        .await
+                        .unwrap_or_default()
                 } else {
-                    env.recipients.clone()
+                    env.recipients.clone().into()
                 };
                 // Legacy envelope path also carries exactly one new message.
                 metrics::inc_counter(names::MESSAGES_SENT_TOTAL, 1);
@@ -142,16 +166,16 @@ async fn handle_room_event_sub(state: &AppState, sub: Box<dyn aero_bus::Subscrip
                     "type": "message",
                     "message": env.message,
                 });
-                state.hub.fan_out_raw(&recipients, &frame.to_string());
+                state.hub.fan_out_raw(&*recipients, &frame.to_string());
                 let _ = sub.ack().await;
                 return;
             }
             // Undecodable by any known schema (typed RoomEvent *and* legacy
             // envelope both failed). That's a deterministic failure on the raw
-            // bytes — redelivery will never succeed — so ACK-drop it rather than
+            // bytes -- redelivery will never succeed -- so ACK-drop it rather than
             // nack, otherwise the durable consumer redelivers this poison message
             // forever. The counter flags a producer/schema mismatch to alert on.
-            warn!(error = ?e, "bad envelope on bus — dropping (poison)");
+            warn!(error = ?e, "bad envelope on bus -- dropping (poison)");
             metrics::inc_counter(names::BUS_POISON_DROPPED_TOTAL, 1);
             let _ = sub.ack().await;
         }
@@ -187,27 +211,20 @@ async fn handle_stream_event_sub(state: &AppState, sub: Box<dyn aero_bus::Subscr
             let _ = sub.ack().await;
         }
         Err(e) => {
-            // Poison payload (see run_bus_listener): ack-drop, never nack — an
-            // undecodable StreamEvent will never decode on redelivery.
-            warn!(error = ?e, "bad StreamEvent on bus — dropping (poison)");
+            warn!(error = ?e, "bad stream event on bus -- dropping (poison)");
             metrics::inc_counter(names::BUS_POISON_DROPPED_TOTAL, 1);
             let _ = sub.ack().await;
         }
     }
 }
-/// Background loop that subscribes to `live.stream.*` and pushes each
-/// [`StreamEvent`] to local watchers of that stream. Uses an *ephemeral*
-/// consumer: live interactivity is broadcast (every instance must see every
-/// event to fan out to its own watchers) and a few dropped danmaku across a
-/// restart are immaterial. Started once per process at boot.
+
+/// Background loop that subscribes to `live.stream.*` (ephemeral consumer) and
+/// pushes each [`StreamEvent`] into the local Hub. Started once per process at
+/// boot; runs until the process exits, resubscribing across NATS reconnects.
 pub async fn run_live_bus_listener(state: AppState) -> anyhow::Result<()> {
     use aero_bus::EventBus;
     use tracing::Instrument as _;
     let bus: Arc<dyn EventBus> = state.bus.clone();
-    // Resubscribe across NATS reconnects — see `run_bus_listener`. The consumer is
-    // ephemeral by design (live interactivity is broadcast; a few dropped danmaku
-    // across a reconnect are immaterial), but the *loop* itself must survive so this
-    // process keeps fanning StreamEvents to its local watchers instead of going dark.
     loop {
         let mut stream = match bus.subscribe("live.stream.*", None).await {
             Ok(s) => s,
@@ -219,7 +236,6 @@ pub async fn run_live_bus_listener(state: AppState) -> anyhow::Result<()> {
         };
         info!("live bus listener started");
         while let Some(sub) = stream.next().await {
-            // Continue the producer's trace across the NATS boundary (方向二).
             let span = bus_consume_span("live.stream", sub.payload());
             handle_stream_event_sub(&state, sub).instrument(span).await;
         }
