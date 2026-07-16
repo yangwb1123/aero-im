@@ -349,6 +349,51 @@ tables → run `backfill_messages_partition` to `rows_copied = 0` → run
 The throwaway database **and its container were dropped** after verification; the
 shared `aero` DB and the `migrations/` chain were never touched.
 
+## 5b. Re-verification after the `version` schema-drift fix (throwaway DB, 2026-07-16)
+
+Migration `0157` added a `version` column to `messages` (optimistic-lock edit
+counter) **after** `0148` had already run `LIKE messages INCLUDING DEFAULTS` to
+build `messages_partitioned` — `LIKE` is a one-time snapshot, not a live mirror,
+so the shadow table and `backfill_messages_partition` silently never carried
+`version`. Left as found, a real cutover would have reset every previously-edited
+message's version to the column default (1), permanently breaking optimistic-lock
+checks for any client that remembered a higher version. Found by rescanning this
+runbook's own June record against the current schema, *before* attempting a real
+cutover. Fixed in `migrations/0158_messages_partition_shadow_version_column.sql`
+(adds the column to the shadow + reissues `backfill_messages_partition` to carry
+it) and `messages-cutover.sql`'s final-sync (now reconciles `version` alongside
+the existing MLS columns).
+
+Re-ran the full §5a procedure on a fresh throwaway DB (`pgvector/pgvector:pg17`,
+isolated container, **not** the shared `aero` DB) against the current 158-migration
+chain, with one addition: message A was seeded at `version = 5` (simulating 4
+prior edits) instead of the column default, specifically to exercise the fix.
+Procedure: replay all 158 migrations → seed 4 messages (A at version 5, spanning
+3 months) + 1 reply + one row in each of the 7 child tables → `ensure_messages_partitions(12)`
+→ `backfill_messages_partition` to `rows_copied = 0` → run the updated
+`messages-cutover.sql` → verify. Results:
+
+- **`version` preserved through backfill** — `messages_partitioned` showed
+  `version = 5` for message A immediately after the (fixed) backfill function
+  ran, not the column default of 1.
+- **`version` preserved through cutover** — after the swap, `SELECT id, version
+  FROM messages` still showed `version = 5` for message A. This is the specific
+  regression the fix targets, and it held.
+- **Every §5a check re-confirmed on the current chain**: row parity (4 = 4),
+  `messages` relkind = `p` / `messages_old` = `r`, all 8 inbound FK constraints
+  present and `convalidated = t`, 0 orphans across all 7 children, FTS match on
+  `search_tsv`, partition pruning present in `EXPLAIN` (`Append` over per-month
+  partitions), cascade delete verified (deleted the reply first — `reply_to` is
+  `NO ACTION`, not `CASCADE`, unchanged from the pre-partition schema and
+  correctly still enforced — then deleted message A and confirmed all 7 children
+  dropped to 0).
+
+The throwaway database was dropped after verification; the shared `aero` DB and
+the `migrations/` chain were never touched. **The cutover script is now verified
+current** against the schema as of migration 0158 — a future column addition to
+`messages` will reintroduce the same class of gap unless this runbook and
+`messages-cutover.sql`'s final-sync column list are updated alongside it.
+
 ---
 
 ## 6. Rollback

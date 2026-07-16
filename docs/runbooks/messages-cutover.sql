@@ -12,12 +12,16 @@
 --    this. See migrations/0148_messages_partition_shadow.sql.
 --
 --  This exact script was END-TO-END VERIFIED on a throwaway database
---  (aero_cutover_verify, a brand-new pgvector:pg17 instance, NOT the shared aero
---  DB) on 2026-06-19: full 148-migration chain → seed → backfill → THIS script →
---  parity / 8-FK integrity / FTS+keyset+reply_to query checks all PASS. See the
---  runbook §5a for the recorded output. Production execution still requires its
---  own window + backup; "verified" means the SQL is correct, not that the window
---  is optional.
+--  (a brand-new pgvector:pg17 instance, NOT the shared aero DB), most recently on
+--  2026-07-16 against the current 158-migration chain (see runbook §5b — the
+--  0157 `version` column schema-drift gap found and fixed there), and originally
+--  on 2026-06-19 against the 148-migration chain (runbook §5a): full chain
+--  replay → seed → backfill → THIS script → parity / 8-FK integrity /
+--  FTS+keyset+reply_to+version query checks all PASS. Production execution still
+--  requires its own window + backup; "verified" means the SQL is correct as of
+--  the migration chain noted above, not that the window is optional — and not
+--  that a LATER schema change to `messages` can't reintroduce the same class of
+--  gap (see runbook §5b's closing note).
 -- ===========================================================================
 --
 -- ─── DESIGN DECISION: how the 8 inbound FKs are repointed ───────────────────
@@ -70,8 +74,15 @@
 --   3. A tested backup restore exists. on-call + DBA present. writes gated.
 --   4. ⚠️ MLS GAP: the shipped backfill function lists only 12 columns and OMITS
 --      mls_group_id / mls_epoch / mls_payload. The FINAL in-window sync below
---      therefore copies the FULL 15-column set so encrypted MLS payloads are NOT
+--      therefore copies the FULL 16-column set so encrypted MLS payloads are NOT
 --      lost. (Do NOT rely on the pre-window backfill alone for MLS rows.)
+--   5. `version` (migration 0157, added AFTER 0148 shipped the shadow table) is
+--      carried by the backfill function as of migration 0158 — but the FINAL
+--      sync below ALSO reconciles it (same reasoning as the MLS columns): any
+--      row backfilled before 0158 shipped, or edited between the pre-window
+--      backfill and this window, must not have its version silently reset to
+--      the shadow's column DEFAULT (1), or the client's remembered
+--      `expected_version` would permanently mismatch post-cutover.
 -- ===========================================================================
 
 \set ON_ERROR_STOP on
@@ -109,17 +120,17 @@ BEGIN
 END
 $catchup$;
 
--- Full-column reconciliation (covers MLS + any edit/delete since backfill).
+-- Full-column reconciliation (covers MLS + version + any edit/delete since backfill).
 -- search_tsv is generated on the target, so it is intentionally NOT projected.
 INSERT INTO messages_partitioned (
     id, room_id, sender_id, blocks, reply_to, metadata, embedding,
     created_at, edited_at, deleted_at, searchable_text,
-    mls_group_id, mls_epoch, mls_payload, expires_at
+    mls_group_id, mls_epoch, mls_payload, expires_at, version
 )
 SELECT
     id, room_id, sender_id, blocks, reply_to, metadata, embedding,
     created_at, edited_at, deleted_at, searchable_text,
-    mls_group_id, mls_epoch, mls_payload, expires_at
+    mls_group_id, mls_epoch, mls_payload, expires_at, version
 FROM messages
 ON CONFLICT (id, created_at) DO UPDATE SET
     blocks          = EXCLUDED.blocks,
@@ -132,6 +143,7 @@ ON CONFLICT (id, created_at) DO UPDATE SET
     mls_epoch       = EXCLUDED.mls_epoch,
     mls_payload     = EXCLUDED.mls_payload,
     expires_at      = EXCLUDED.expires_at,
+    version         = EXCLUDED.version,
     reply_to        = EXCLUDED.reply_to;
 
 -- Hard parity gate: abort the cutover if the shadow is not row-for-row complete.
