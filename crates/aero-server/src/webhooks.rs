@@ -233,7 +233,12 @@ fn webhook_ip_is_blocked(ip: std::net::IpAddr) -> bool {
 /// Reject a webhook URL whose host is, or resolves to, a non-public address
 /// (SSRF). Resolves the host and checks EVERY returned address; an unresolvable
 /// host, or one that resolves to nothing, is also rejected.
-async fn assert_webhook_url_safe(url: &str) -> Result<(), AeroError> {
+///
+/// `pub(crate)`: also used by the bot-subscription webhook_url gate
+/// (`routes.rs::bot_create_subscription`) — bot dispatch (`bot_dispatch.rs`)
+/// POSTs to a subscription's `webhook_url` exactly like the room-level outgoing
+/// webhook dispatcher does, so it needs the same SSRF guard.
+pub(crate) async fn assert_webhook_url_safe(url: &str) -> Result<(), AeroError> {
     let rest = url
         .strip_prefix("http://")
         .or_else(|| url.strip_prefix("https://"))

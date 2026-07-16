@@ -2318,6 +2318,17 @@ async fn bot_create_subscription(
     let bot_id = ParticipantId::from_str(&id_str)
         .map_err(|e| AeroError::Invalid(format!("bot id: {e}")))?;
     ensure_bot_owner(&s.pg, bot_id, auth.participant_id).await?;
+    // SSRF guard: `webhook_url` is fetched by the SERVER (bot_dispatch.rs) on every
+    // matching event, so — exactly like the room-level outgoing webhook gate — a
+    // destination resolving to loopback/private/link-local (incl. the cloud
+    // metadata IP) must be rejected at creation. `None` (WS-delivered bot) skips
+    // the check entirely; there's no URL to validate.
+    if let Some(url) = req.webhook_url.as_deref() {
+        if !(url.starts_with("http://") || url.starts_with("https://")) {
+            return Err(AeroError::Invalid("webhook_url must be http(s)".into()).into());
+        }
+        crate::webhooks::assert_webhook_url_safe(url).await?;
+    }
     let repo = aero_storage::BotRepo::new(s.pg.clone());
     let sub_id = repo
         .subscribe(bot_id, &req.event_type, req.filters.as_ref(), req.webhook_url.as_deref())
