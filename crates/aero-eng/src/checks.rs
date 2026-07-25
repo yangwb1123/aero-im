@@ -602,4 +602,95 @@ aero-common.workspace = true
         let outcome = check_deps(root);
         assert!(outcome.is_error(), "leaf → storage should be illegal: {outcome}");
     }
+
+    #[test]
+    fn check_workspace_members_ok_for_all_crates() {
+        let dir = tmp_dir();
+        let root = dir.path();
+        // Create workspace Cargo.toml
+        write_cargo(&root.join("Cargo.toml"), r#"
+[workspace]
+members = ["crates/aero-foo", "crates/aero-bar"]
+"#);
+        std::fs::create_dir_all(root.join("crates/aero-foo/src")).unwrap();
+        std::fs::create_dir_all(root.join("crates/aero-bar/src")).unwrap();
+        let outcome = check_workspace_members(root);
+        assert!(outcome.is_ok(), "all members present: {outcome}");
+    }
+
+    #[test]
+    fn check_workspace_members_fails_on_missing() {
+        let dir = tmp_dir();
+        let root = dir.path();
+        write_cargo(&root.join("Cargo.toml"), r#"
+[workspace]
+members = ["crates/aero-foo", "crates/aero-missing"]
+"#);
+        std::fs::create_dir_all(root.join("crates/aero-foo/src")).unwrap();
+        let outcome = check_workspace_members(root);
+        assert!(outcome.is_error(), "missing member should fail: {outcome}");
+    }
+
+    #[test]
+    fn check_crate_metadata_ok_for_workspace_crates() {
+        let dir = tmp_dir();
+        let root = dir.path();
+        write_cargo(&root.join("Cargo.toml"), r#"
+[workspace]
+members = ["crates/aero-foo"]
+"#);
+        std::fs::create_dir_all(root.join("crates/aero-foo/src")).unwrap();
+        write_cargo(&root.join("crates/aero-foo/Cargo.toml"), r#"
+[package]
+name = "aero-foo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+"#);
+        let outcome = check_crate_metadata(root);
+        assert!(outcome.is_ok(), "metadata ok: {outcome}");
+    }
+
+    #[test]
+    fn check_crate_metadata_fails_on_missing_field() {
+        let dir = tmp_dir();
+        let root = dir.path();
+        write_cargo(&root.join("Cargo.toml"), r#"
+[workspace]
+members = ["crates/aero-foo"]
+"#);
+        std::fs::create_dir_all(root.join("crates/aero-foo/src")).unwrap();
+        write_cargo(&root.join("crates/aero-foo/Cargo.toml"), r#"
+[package]
+name = "aero-foo"
+version = "0.1.0"
+"#);
+        let outcome = check_crate_metadata(root);
+        assert!(outcome.is_error(), "missing workspace fields: {outcome}");
+    }
+
+    #[test]
+    fn check_todos_finds_nothing_in_clean_code() {
+        let dir = tmp_dir();
+        let root = dir.path();
+        let crates = root.join("crates/aero-foo/src");
+        std::fs::create_dir_all(&crates).unwrap();
+        std::fs::write(crates.join("lib.rs"), "// clean code\npub fn hello() {}\n").unwrap();
+        let outcome = check_todos(root);
+        assert!(outcome.is_ok(), "no TODOs: {outcome}");
+    }
+
+    #[test]
+    fn check_todos_finds_todo_comment() {
+        let dir = tmp_dir();
+        let root = dir.path();
+        let crates = root.join("crates/aero-foo/src");
+        std::fs::create_dir_all(&crates).unwrap();
+        std::fs::write(crates.join("lib.rs"), "// TODO: implement this later\npub fn maybe() {}\n").unwrap();
+        let outcome = check_todos(root);
+        assert!(!outcome.is_ok(), "should find TODO: {outcome}");
+        if let Some(d) = outcome.detail() {
+            assert!(d["total"] == 1, "should find exactly 1 TODO");
+        }
+    }
 }
