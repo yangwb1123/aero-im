@@ -79,4 +79,22 @@ mod tests {
         let o = run_cmd("this-command-does-not-exist-12345", &[], Duration::from_secs(5)).await;
         assert!(o.is_error(), "nonexistent command should error: {o}");
     }
+
+    #[tokio::test]
+    async fn run_cmd_with_args_passes_them() {
+        let o = run_cmd("echo", &["hello", "world"], Duration::from_secs(5)).await;
+        assert!(o.is_ok());
+    }
+
+    #[tokio::test]
+    async fn run_cmd_timeout_yields_error() {
+        let o = run_cmd("sleep", &["10"], Duration::from_millis(50)).await;
+        assert!(o.is_error(), "sleep should time out: {o}");
+    }
+
+    #[tokio::test]
+    async fn run_cmd_empty_command_fails() {
+        let o = run_cmd("", &[], Duration::from_secs(1)).await;
+        assert!(o.is_error(), "empty command should fail: {o}");
+    }
 }
