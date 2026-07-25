@@ -112,4 +112,43 @@ mod tests {
         let cfg = EngineeringConfig::load(Path::new("/nonexistent/path"));
         assert_eq!(cfg.filesize.rust_warn, 800);
     }
+
+    #[test]
+    fn filesize_config_clamps_appropriately() {
+        let cfg = EngineeringConfig::default();
+        assert!(cfg.filesize.rust_hard > cfg.filesize.rust_warn);
+        assert!(cfg.filesize.routes_hard > cfg.filesize.rust_hard);
+    }
+
+    #[test]
+    fn config_round_trip_via_toml() {
+        let toml_str = r#"
+[filesize]
+rust_warn = 500
+rust_hard = 1000
+[complexity]
+warn = 10
+hard = 25
+"#;
+        let cfg: EngineeringConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.filesize.rust_warn, 500);
+        assert_eq!(cfg.filesize.rust_hard, 1000);
+        assert_eq!(cfg.complexity.warn, 10);
+        assert_eq!(cfg.complexity.hard, 25);
+        // Default check config when not specified
+        assert!(cfg.check.clippy);
+    }
+
+    #[test]
+    fn config_defaults_for_missing_sections() {
+        let toml_str = r#"[filesize]
+rust_warn = 300
+"#;
+        let cfg: EngineeringConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(cfg.filesize.rust_warn, 300);
+        // Defaults for unspecified fields
+        assert_eq!(cfg.filesize.rust_hard, 1200);
+        assert_eq!(cfg.complexity.warn, 12);
+        assert!(cfg.check.clippy);
+    }
 }
