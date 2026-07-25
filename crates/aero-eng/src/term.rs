@@ -130,6 +130,18 @@ impl Spinner {
     }
 }
 
+/// Format an Outcome as a machine-readable JSON string for CI integration.
+pub fn format_json_output(name: &str, o: &crate::outcome::Outcome) -> String {
+    serde_json::json!({
+        "command": name,
+        "exit_code": o.exit_code(),
+        "severity": format!("{:?}", o.severity()),
+        "message": o.message(),
+        "duration_ms": o.duration().as_secs_f64() * 1000.0,
+        "detail": o.detail(),
+    }).to_string()
+}
+
 /// Ensure newline after spinner output.
 impl Drop for Spinner {
     fn drop(&mut self) {
@@ -188,5 +200,22 @@ mod tests {
         s.tick();
         s.tick();
         s.done("complete");
+    }
+
+    #[test]
+    fn format_json_output_contains_exit_code() {
+        let o = crate::outcome::Outcome::ok("all good");
+        let json = format_json_output("test", &o);
+        assert!(json.contains("\"exit_code\""));
+        assert!(json.contains("\"all good\""));
+    }
+
+    #[test]
+    fn format_json_output_with_detail() {
+        let detail = serde_json::json!({"checked": 100});
+        let o = crate::outcome::Outcome::ok("done").with_detail(detail);
+        let json = format_json_output("check", &o);
+        assert!(json.contains("\"checked\""));
+        assert!(json.contains("100"));
     }
 }
