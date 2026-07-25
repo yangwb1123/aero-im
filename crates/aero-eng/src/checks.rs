@@ -410,6 +410,22 @@ fn scan_todos(dir: &Path, todos: &mut Vec<serde_json::Value>) {
     }
 }
 
+/// Check that every workspace crate has a README.md file.
+#[must_use]
+pub fn check_readme(root: &Path) -> Outcome {
+    let members = parse_workspace_members(&std::fs::read_to_string(&root.join("Cargo.toml")).unwrap_or_default());
+    let mut missing: Vec<String> = Vec::new();
+    for m in &members {
+        let readme = root.join("crates").join(m).join("README.md");
+        if !readme.exists() { missing.push(m.clone()); }
+    }
+    if missing.is_empty() {
+        Outcome::ok(format!("✓ README: all {} crates have README.md", members.len()))
+    } else {
+        Outcome::warning(0, format!("! README: {} crates missing README.md: {}", missing.len(), missing.join(", ")))
+    }
+}
+
 /// Verify that all workspace crates use workspace-standardized metadata
 /// (version, edition, license all use `workspace = true`).
 #[must_use]
