@@ -405,6 +405,7 @@ pub(super) fn member_values_from(value: &serde_json::Value) -> Vec<String> {
 /// `members[value eq "<id>"]` remove — plus a `replace` of `displayName`.
 /// Unknown ops/paths are skipped (a documented seam). Pure (no I/O).
 #[must_use]
+#[allow(private_interfaces)]
 pub fn parse_group_patch_ops(ops: &[GroupPatchOp]) -> Vec<GroupPatchAction> {
     let mut actions = Vec::new();
     for op in ops {

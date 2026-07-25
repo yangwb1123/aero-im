@@ -1,4 +1,5 @@
 //! Boot orchestration for the aero-server binary.
+#![allow(unused_imports)]
 //!
 //! Splits the monolithic `main()` into focused modules:
 //! - `persistence` — PG, Redis, NATS, blob, bus

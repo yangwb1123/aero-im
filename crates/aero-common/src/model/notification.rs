@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-use crate::ids::{BlobId, MessageId, NotificationId, ParticipantId, PollId, RoomId};
+use crate::ids::{MessageId, NotificationId, ParticipantId, RoomId};
 
 // ---------- Notifications (mentions & thread replies) ----------
 

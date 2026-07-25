@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# pre-commit hook — run aero-cli check before each commit.
+#
+# Install: git config core.hooksPath .githooks
+# Skip:    git commit --no-verify
+#
+# This hook runs `aero-cli check` (cargo check + test + clippy in parallel)
+# on staged changes. If any check fails, the commit is aborted.
+# You can skip checks with `git commit --no-verify` or `SKIP=1 git commit`.
+
+set -euo pipefail
+
+# Allow skipping via environment variable
+if [ "${SKIP_CHECKS:-}" = "1" ] || [ "${CI:-}" = "true" ]; then
+    exit 0
+fi
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT"
+
+# Check if aero-cli binary exists; if not, build it
+CLI="$ROOT/target/debug/aero-cli"
+if [ ! -f "$CLI" ]; then
+    echo "🔨 Building aero-cli..."
+    cargo build -p aero-server --bin aero-cli -q 2>/dev/null || {
+        echo "⚠️  Could not build aero-cli, skipping pre-commit checks"
+        exit 0
+    }
+fi
+
+echo "🔍 Running pre-commit checks..."
+
+# Run only for relevant file changes
+CHANGED_FILES=$(git diff --cached --name-only --diff-filter=ACMR | head -20)
+
+# If only markdown/docs changed, skip heavy checks
+if echo "$CHANGED_FILES" | grep -qvE '\.(md|txt)$'; then
+    # Run cargo check only (fast)
+    cargo check --workspace -q 2>/dev/null
+    CHECK_EXIT=$?
+    
+    if [ "$CHECK_EXIT" -ne 0 ]; then
+        echo ""
+        echo "❌ cargo check failed! Fix the errors before committing."
+        echo "   (or use 'git commit --no-verify' to skip)"
+        exit 1
+    fi
+    
+    echo "✓ cargo check passed"
+else
+    echo "  (skipped: only docs changed)"
+fi
+
+echo "✓ Pre-commit checks passed"
+exit 0

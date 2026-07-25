@@ -2,6 +2,8 @@
 //!
 //! Layered loading: defaults → `config.toml` (if present) → environment variables (`AERO_*`).
 
+use std::collections::HashMap;
+
 use figment::{
     providers::{Env, Format, Toml},
     Figment,
@@ -17,6 +19,20 @@ pub struct AppConfig {
     pub auth: AuthConfig,
     pub telemetry: TelemetryConfig,
     pub email: Option<EmailConfig>,
+    /// Optional per-region storage backends for data residency.
+    /// Key is region code (e.g. "eu-central-1"), value is the S3 config.
+    #[serde(default)]
+    pub storage_regions: Option<HashMap<String, StorageRegionConfig>>,
+}
+
+/// Configuration for a single storage region (data residency).
+#[derive(Debug, Clone, Deserialize)]
+pub struct StorageRegionConfig {
+    pub endpoint: Option<String>,
+    pub bucket: String,
+    pub region: String,
+    pub access_key: String,
+    pub secret_key: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]

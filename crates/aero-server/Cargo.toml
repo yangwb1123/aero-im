@@ -19,6 +19,7 @@ path = "src/bin/aero-cli.rs"
 
 [dependencies]
 aero-common.workspace = true
+aero-eng.workspace = true
 aero-bus.workspace = true
 aero-storage.workspace = true
 aero-auth.workspace = true

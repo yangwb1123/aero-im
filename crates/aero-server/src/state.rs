@@ -13,8 +13,8 @@ use aero_storage::{
     AiJobRepo, AuditRepo, BlockRepo, BlobRepo, BlobStore, CallRepo, CallRosterStore,
     DeliveryCursorRepo, KeyPackageRepo, MessageRepo, MlsGroupRepo, NotificationRepo,
     ParticipantRepo, PgPool, PinRepo,
-    PresenceStore, ReactionRepo, ReceiptRepo, RoomRepo, StreamRepo, StreamRouteRegistry,
-    StreamViewerStore, ThreadReadStateRepo, TopicHistoryRepo, WorkspaceRepo,
+    PresenceStore, ReactionRepo, ReceiptRepo, RegionRouter, RoomRepo, StreamRepo,
+    StreamRouteRegistry, StreamViewerStore, ThreadReadStateRepo, TopicHistoryRepo, WorkspaceRepo,
 };
 use axum::extract::FromRef;
 
@@ -282,6 +282,9 @@ pub struct AppState {
     pub ai_jobs: AiJobRepo,
     pub blobs: BlobRepo,
     pub blob_store: Arc<dyn BlobStore>,
+    /// Regional blob store router for data residency (ROADMAP 方向五·1).
+    /// Routes blob operations to region-specific backends by workspace region.
+    pub region_router: RegionRouter,
     /// Active blob backend label (`"s3"` / `"local"`), surfaced on `/health` so
     /// operators can confirm storage is wired as intended (ROADMAP 第三版 方向五).
     pub blob_backend: &'static str,

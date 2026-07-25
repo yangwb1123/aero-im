@@ -3,6 +3,7 @@
 // attachments, search drawer, AI drawer, 1:1 calls, live streaming.
 
 import { api, auth, ApiError } from './api.js';
+import { onNewMessage } from './smart_replies.js';
 import {
   renderMessage,
   renderRoomItem,
@@ -218,6 +219,10 @@ function handleIncomingMessage(m) {
     appendMessageEl(renderMsgWithReactions(m), { scroll: true });
     hideEmptyIfNeeded();
     maybeMarkRead(m);
+    // Show smart reply suggestions for other people's messages
+    if (!isMine && els.msgList.lastElementChild) {
+      onNewMessage(m.room_id, m.id, els.msgList.lastElementChild);
+    }
   } else {
     bumpUnread(m.room_id);
     if (!isMine) notify(m);

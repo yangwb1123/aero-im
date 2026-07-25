@@ -5,9 +5,8 @@
 //! so messages can flow through the system without lossy transformations.
 
 use serde::{Deserialize, Serialize};
-use time::OffsetDateTime;
 
-use crate::ids::{BlobId, MessageId, NotificationId, ParticipantId, PollId, RoomId};
+use crate::ids::{BlobId, ParticipantId};
 
 // ---------- Block model ----------
 

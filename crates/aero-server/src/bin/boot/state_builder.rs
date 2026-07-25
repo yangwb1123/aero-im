@@ -54,6 +54,8 @@ pub(crate) struct StateDeps {
     // From persistence
     pub(crate) blob_store: Arc<dyn aero_storage::BlobStore>,
     pub(crate) blob_backend: &'static str,
+    /// Regional blob store router for data residency.
+    pub(crate) region_router: aero_storage::RegionRouter,
     /// Transactional email sender (password reset, invitation).
     /// `None` when SMTP is not configured (log-only fallback).
     pub(crate) mailer: Option<aero_server::mailer::Mailer>,
@@ -94,6 +96,7 @@ pub(crate) fn build(d: StateDeps) -> AppState {
         blobs: d.blobs,
         blob_store: d.blob_store,
         blob_backend: d.blob_backend,
+        region_router: d.region_router,
         streams: d.streams,
         key_packages: d.key_packages,
         mls_groups: d.mls_groups,

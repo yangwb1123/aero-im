@@ -8,7 +8,7 @@
 //! Call rosters carry far fewer participants, so they stay as single keys.
 
 use aero_common::{CallId, ParticipantId};
-use fred::prelude::{KeysInterface, RedisClient, SortedSetsInterface};
+use fred::prelude::{RedisClient, SortedSetsInterface};
 use fred::types::Ordering;
 use futures::future;
 use std::str::FromStr;

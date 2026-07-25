@@ -189,9 +189,13 @@ async fn main() -> anyhow::Result<()> {
         stream_routes: repos.stream_routes,
         topic_history: repos.topic_history,
         thread_read_state: repos.thread_read_state,
-        blob_store: persistence.blob_store,
+        blob_store: persistence.blob_store.clone(),
         blob_backend: Box::leak(persistence.blob_backend.into_boxed_str()),
         mailer: aero_server::mailer::build_mailer(cfg.email.as_ref()),
+        region_router: build_region_router(
+            persistence.blob_store.clone(),
+            cfg.storage_regions.as_ref(),
+        ),
     });
 
     // ---------- Background tasks ----------
@@ -221,4 +225,26 @@ async fn main() -> anyhow::Result<()> {
     }
 
     boot::serve::serve(state, cfg.clone(), gateway_cfg.clone(), ai_shutdown, hls_dir, tracker).await
+}
+
+/// Build the [`RegionRouter`] from config's `storage_regions` section.
+fn build_region_router(
+    default: std::sync::Arc<dyn aero_storage::BlobStore>,
+    config: Option<&std::collections::HashMap<String, aero_common::config::StorageRegionConfig>>,
+) -> aero_storage::RegionRouter {
+    let mut regions = std::collections::HashMap::new();
+    if let Some(cfgs) = config {
+        for (code, sr) in cfgs {
+            let s3cfg = aero_storage::S3Config {
+                bucket: sr.bucket.clone(),
+                region: sr.region.clone(),
+                endpoint: sr.endpoint.clone(),
+                access_key: sr.access_key.clone(),
+                secret_key: sr.secret_key.clone(),
+            };
+            regions.insert(code.clone(), s3cfg);
+        }
+    }
+    aero_storage::RegionRouter::new(default, regions)
+        .expect("build region router from config")
 }

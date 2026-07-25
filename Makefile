@@ -62,17 +62,43 @@ lint: ## clippy
 	cargo clippy --workspace --all-targets -- -D warnings
 
 .PHONY: check-truth
-check-truth: ## 检测「写了但没接线」死代码（孤儿模块 + 零调用 builder）
+check-truth: ## 检测死代码（孤儿模块 + 零调用 builder）
 	@bash scripts/truth-check.sh
-# 注意：check-truth 暂不折入 check-harness——当前已知 participant_cache /
-# notification_bundle 等孤儿模块会让它红，会阻断本地开发。待这些接线后
-# （见 docs/sprint），再考虑将 check-truth 折入 check-harness 统一门禁。
 
 .PHONY: check-web
-check-web: ## 前端零工具链校验门（JS 语法 + 相对 import 解析，无需 npm）
+check-web: ## 前端完整性校验
 	@bash scripts/web-check.sh
-# 注意：check-web 独立成门，不折入 check-harness（与 check-truth 同策略）。
-# 仅需 node（沙箱即可跑，无 npm install）；node 缺失时优雅跳过不阻断。
+
+##@ Aero CLI
+.PHONY: gate
+gate: ## Run all gates via aero-cli
+	cargo run --bin aero-cli -- gate all
+
+.PHONY: doctor
+doctor: ## Environment diagnostics
+	cargo run --bin aero-cli -- doctor
+
+.PHONY: skill-list
+skill-list: ## List available skills
+	cargo run --bin aero-cli -- skill list
+
+.PHONY: ci
+ci: cargo-run --bin aero-cli -- check
+	cargo run --bin aero-cli -- gate all
+
+.PHONY: dev
+dev: ## Start development environment
+	cargo run --bin aero-cli -- dev
+
+.PHONY: completion
+completion: ## Generate shell completion
+	cargo run --bin aero-cli -- completion bash
+
+##@ Git Hooks
+.PHONY: install-hooks
+install-hooks: ## Install git pre-commit hooks
+	git config core.hooksPath .githooks
+	@echo "✓ Git hooks installed (pre-commit: aero-cli check before each commit)"
 
 ##@ Run
 .PHONY: migrate

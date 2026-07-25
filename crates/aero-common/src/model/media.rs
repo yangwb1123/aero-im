@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-use crate::ids::{BlobId, MessageId, NotificationId, ParticipantId, PollId, RoomId};
+use crate::ids::{ParticipantId, PollId, RoomId};
 
 // ---------- Live streams (P4/P5) ----------
 

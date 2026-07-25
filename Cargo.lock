@@ -92,6 +92,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "aero-cli"
+version = "0.1.0"
+dependencies = [
+ "aero-eng",
+ "async-trait",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "aero-common"
 version = "0.1.0"
 dependencies = [
@@ -116,6 +126,21 @@ dependencies = [
  "ulid",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "aero-eng"
+version = "0.1.0"
+dependencies = [
+ "aero-common",
+ "anyhow",
+ "async-trait",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "time",
+ "tokio",
+ "toml",
 ]
 
 [[package]]
@@ -301,6 +326,7 @@ dependencies = [
  "aero-auth",
  "aero-bus",
  "aero-common",
+ "aero-eng",
  "aero-im-call",
  "aero-im-core",
  "aero-live-core",

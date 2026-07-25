@@ -7,8 +7,7 @@
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-use crate::ids::{BlobId, MessageId, NotificationId, ParticipantId, PollId, RoomId};
-use super::block::FileKind;
+use crate::ids::{MessageId, ParticipantId, PollId, RoomId};
 use super::message::Message;
 use super::message::MembershipOp;
 use super::message::MessageEnvelope;

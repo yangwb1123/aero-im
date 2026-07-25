@@ -1,23 +1,23 @@
-# Aero IM — CI/CD 管线配置模板
-# 注意：当前无 CI runner，此配置作为"就位准备"。
-# 当 CI runner 接入后，取消注释对应区块即可启用。
-
+# Aero IM CI — uses aero-cli for unified gate running
 name: Aero IM CI
-
 on:
-  push:
-    branches: [main, 'release/*']
-  pull_request:
-    branches: [main]
-
+  push: { branches: [main, 'release/*'] }
+  pull_request: { branches: [main] }
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
 jobs:
-  ## --- Layer 3: Harness Engineering ---
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - run: cargo build --workspace
+
   check:
-    name: Harness — cargo check + clippy
+    name: cargo check + clippy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -26,86 +26,29 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
   test:
-    name: Harness — cargo test
+    name: cargo test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
       - run: cargo test --workspace --lib
 
-  size-check:
-    name: Harness — file size check
+  gates:
+    name: Engineering gates via aero-cli
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: bash scripts/file-size-check.sh
-
-  truth-check:
-    name: Harness — truth check（写了但没接线 死代码检测）
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: bash scripts/truth-check.sh
-
-  web-check:
-    name: Harness — web check（前端 JS 语法 + import 解析，零工具链）
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
       - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-      - run: bash scripts/web-check.sh
+        with: { node-version: '20' }
+      - run: cargo build -p aero-server --bin aero-cli
+      - run: ./target/debug/aero-cli gate all
 
-  dependency-check:
-    name: Harness — dependency direction audit
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: bash scripts/dependency-check.sh
-
-  ## --- Layer 4: Evaluation Engineering ---
-  security-audit:
-    name: Eval — cargo deny
+  security:
+    name: cargo deny
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
       - run: cargo install cargo-deny
       - run: cargo deny check
-
-  # coverage:
-  #   name: Eval — code coverage
-  #   runs-on: ubuntu-latest
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - uses: actions-rust-lang/setup-rust-toolchain@v1
-  #     - run: cargo install cargo-llvm-cov
-  #     - run: cargo llvm-cov --workspace --lib --lcov --output-path lcov.info
-  #     - uses: codecov/codecov-action@v4
-  #       with:
-  #         file: lcov.info
-
-  # integration-test:
-  #   name: Eval — integration tests (PG required)
-  #   runs-on: ubuntu-latest
-  #   services:
-  #     postgres:
-  #       image: postgres:17
-  #       env:
-  #         POSTGRES_PASSWORD: aero
-  #       options: >-
-  #         --health-cmd pg_isready
-  #         --health-interval 10s
-  #         --health-timeout 5s
-  #         --health-retries 5
-  #     redis:
-  #       image: redis:7
-  #     nats:
-  #       image: nats:latest
-  #   steps:
-  #     - uses: actions/checkout@v4
-  #     - uses: actions-rust-lang/setup-rust-toolchain@v1
-  #     - run: cargo test --workspace -- --include-ignored
-  #       env:
-  #         DATABASE_URL: postgres://postgres:aero@localhost:5432/postgres

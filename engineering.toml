@@ -1,0 +1,23 @@
+# Aero IM — engineering thresholds and check configuration.
+# Read by `aero-cli check` commands. All values are defaults;
+# override per-deployment as needed.
+
+[filesize]
+# Rust source: warn above this line count, hard-fail above hard_limit
+rust_warn = 800
+rust_hard = 1200
+# routes.rs has its own higher exemption
+routes_hard = 3000
+# JavaScript (web/): warn above this
+js_warn = 1000
+
+[complexity]
+# Cyclomatic complexity per function; warn above warn, hard-fail above hard
+warn = 12
+hard = 20
+
+[check]
+# Whether to run cargo clippy as part of `aero-cli check`
+clippy = true
+# Whether to run the full cargo test suite
+full_test = true

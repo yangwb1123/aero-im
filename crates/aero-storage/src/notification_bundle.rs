@@ -84,7 +84,7 @@ impl NotificationBundleRepo {
     pub async fn flush(
         &self,
     ) -> Result<FlushResult, sqlx::Error> {
-        use sqlx::Row;
+        
 
         // Flush MUST be transactional with row locks: it is spawned once PER NODE
         // (background.rs), so on a multi-node deploy two flushers tick concurrently.

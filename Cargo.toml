@@ -17,6 +17,8 @@ members = [
     "crates/aero-ai",
     "crates/aero-push",
     "crates/aero-server",
+    "crates/aero-eng",
+    "crates/aero-cli",
 ]
 
 [workspace.package]
@@ -47,6 +49,7 @@ unnecessary_wraps = "allow"
 # Internal
 aero-common     = { path = "crates/aero-common" }
 aero-bus        = { path = "crates/aero-bus" }
+aero-eng        = { path = "crates/aero-eng" }
 aero-storage    = { path = "crates/aero-storage" }
 aero-auth       = { path = "crates/aero-auth" }
 aero-signaling  = { path = "crates/aero-signaling" }
