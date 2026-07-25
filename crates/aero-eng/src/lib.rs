@@ -1,18 +1,40 @@
-//! Aero Engineering CLI — trait-based command framework (Phase 1).
+//! Aero Engineering CLI — trait-based command framework.
 //!
-//! Provides the [`Command`] trait, [`CommandRegistry`] for auto-discovery,
-//! and shared context/result types. Commands are registered via
-//! [`register_command!`] macro at compile time.
+//! Provides the [`Command`] trait, [`CommandRegistry`], [`Outcome`], and
+//! utility modules for building engineering CLI tools in Rust.
+//!
+//! # Quick Start
+//!
+//! ```rust
+//! use aero_eng::{Command, CommandRegistry, ExecutionContext, Outcome};
+//! use async_trait::async_trait;
+//!
+//! struct HelloCmd;
+//! #[async_trait]
+//! impl Command for HelloCmd {
+//!     fn name(&self) -> &'static str { "hello" }
+//!     fn description(&self) -> &'static str { "Say hello" }
+//!     async fn execute(&self, _: &ExecutionContext, _: &[String]) -> Outcome {
+//!         Outcome::ok("Hello, world!")
+//!     }
+//! }
+//!
+//! # async fn example() {
+//! let reg = CommandRegistry::new().add(Box::new(HelloCmd));
+//! let result = reg.execute("hello", &["hello".into()]).await;
+//! assert!(result.is_ok());
+//! # }
+//! ```
 //!
 //! ## Architecture
 //!
-//! Each command is a unit struct implementing [`Command`]. The
-//! [`CommandRegistry::collect`] scans all registered commands and builds a
-//! dispatch table. The binary's `main()` calls [`dispatch`] or iterates the
-//! registry for help output.
+//! Each command is a unit struct implementing [`Command`]. Commands are
+//! registered in a [`CommandRegistry`] and dispatched by name.
+//! [`Outcome`] provides structured result reporting with severity levels
+//! and automatic merging.
 //!
-//! Inspired by snaplink's `cli.py` engineering CLI, adapted to Rust's trait
-//! system for type safety, parallelism, and zero runtime dependencies.
+//! Inspired by snaplink's `cli.py`, adapted to Rust's type system for
+//! compile-time safety, parallelism, and zero runtime dependencies.
 
 use std::path::PathBuf;
 
