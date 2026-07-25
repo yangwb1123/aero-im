@@ -141,7 +141,7 @@ c!(Network_, "network", "Network diagnostics: ping, dns, port", |_ctx, args| {
 });
 
 c!(Bench_, "bench", "Run performance benchmarks", |ctx, _args| {
-    use aero_eng::{term, checks::{check_filesize, check_deps}, outcome::Outcome as O};
+    use aero_eng::{term, checks::{check_filesize, check_deps, check_workspace_members, check_todos, check_crate_metadata}, outcome::Outcome as O};
     use std::time::Instant;
     println!("{}", term::header("📊 Aero Benchmarks\n"));
     
@@ -173,10 +173,34 @@ c!(Bench_, "bench", "Run performance benchmarks", |ctx, _args| {
     let t3 = start.elapsed();
     sp.done(&format!("{:.1}ms/run", t3.as_secs_f64() * 1000.0 / 50.0));
 
-    println!("\n{} {}", term::header("Results:"), term::fmt_duration((t1 + t2 + t3).as_secs_f64()));
+    // 4. check_workspace_members benchmark
+    let mut sp = term::Spinner::new("check_workspace_members"); sp.tick();
+    let start = Instant::now();
+    for _ in 0..100 { let _ = check_workspace_members(&ctx.root); }
+    let t4 = start.elapsed();
+    sp.done(&format!("{:.1}ms/run", t4.as_secs_f64() * 1000.0 / 100.0));
+
+    // 5. check_todos benchmark
+    let mut sp = term::Spinner::new("check_todos"); sp.tick();
+    let start = Instant::now();
+    for _ in 0..50 { let _ = check_todos(&ctx.root); }
+    let t5 = start.elapsed();
+    sp.done(&format!("{:.1}ms/run", t5.as_secs_f64() * 1000.0 / 50.0));
+
+    // 6. check_crate_metadata benchmark
+    let mut sp = term::Spinner::new("check_crate_metadata"); sp.tick();
+    let start = Instant::now();
+    for _ in 0..100 { let _ = check_crate_metadata(&ctx.root); }
+    let t6 = start.elapsed();
+    sp.done(&format!("{:.1}ms/run", t6.as_secs_f64() * 1000.0 / 100.0));
+
+    println!("\n{} {}", term::header("Results:"), term::fmt_duration((t1 + t2 + t3 + t4 + t5 + t6).as_secs_f64()));
     println!("  {:<30} {:>10}", "Outcome::merge (100k)", term::fmt_duration(t1.as_secs_f64()));
     println!("  {:<30} {:>10}", "check_filesize x50", term::fmt_duration(t2.as_secs_f64()));
     println!("  {:<30} {:>10}", "check_deps x50", term::fmt_duration(t3.as_secs_f64()));
+    println!("  {:<30} {:>10}", "check_workspace_members x100", term::fmt_duration(t4.as_secs_f64()));
+    println!("  {:<30} {:>10}", "check_todos x50", term::fmt_duration(t5.as_secs_f64()));
+    println!("  {:<30} {:>10}", "check_crate_metadata x100", term::fmt_duration(t6.as_secs_f64()));
     Outcome::ok("bench complete")
 });
 
