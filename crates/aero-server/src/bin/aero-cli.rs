@@ -111,7 +111,7 @@ c!(Gate_, "gate", "Run gates (shell + native)", |ctx, args| {
     let file = |n: &str| -> String { sd.join(n).to_string_lossy().to_string() };
     async fn bash(p: String, t: u64) -> Outcome { aero_eng::run::run_cmd("bash", &[&p], std::time::Duration::from_secs(t)).await }
     match sub {
-        "list" => Outcome::ok("filesize truth web deps complexity filesize-native deps-native workspace-members todos all"),
+        "list" => Outcome::ok("filesize truth web deps complexity filesize-native deps-native workspace-members todos metadata all"),
         "filesize" => bash(file("file-size-check.sh"),60).await, "truth" => bash(file("truth-check.sh"),60).await,
         "web" => bash(file("web-check.sh"),60).await, "deps" => bash(file("dependency-check.sh"),60).await,
         "complexity" => bash(file("complexity-check.sh"),60).await, "all" => bash(file("file-size-check.sh"),120).await,
@@ -119,6 +119,7 @@ c!(Gate_, "gate", "Run gates (shell + native)", |ctx, args| {
         "deps-native" => { let o = aero_eng::checks::check_deps(&ctx.root); if let Some(d) = o.detail() { println!("{}", serde_json::to_string_pretty(&d).unwrap()); } o }
         "workspace-members" => { let o = aero_eng::checks::check_workspace_members(&ctx.root); if let Some(d) = o.detail() { println!("{}", serde_json::to_string_pretty(&d).unwrap()); } o }
         "todos" => { let o = aero_eng::checks::check_todos(&ctx.root); if let Some(d) = o.detail() { println!("{}", serde_json::to_string_pretty(&d).unwrap()); } o }
+        "metadata" => { let o = aero_eng::checks::check_crate_metadata(&ctx.root); println!("{}", o.message()); o }
         _ => Outcome::error("unknown")
     }
 });

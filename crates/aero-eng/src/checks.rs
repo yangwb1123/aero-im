@@ -410,6 +410,31 @@ fn scan_todos(dir: &Path, todos: &mut Vec<serde_json::Value>) {
     }
 }
 
+/// Verify that all workspace crates use workspace-standardized metadata
+/// (version, edition, license all use `workspace = true`).
+#[must_use]
+pub fn check_crate_metadata(root: &Path) -> Outcome {
+    let cargo = root.join("Cargo.toml");
+    let members = parse_workspace_members(&std::fs::read_to_string(&cargo).unwrap_or_default());
+    let mut violations = Vec::new();
+    for member in &members {
+        let path = root.join("crates").join(member).join("Cargo.toml");
+        if !path.exists() { continue; }
+        let content = std::fs::read_to_string(&path).unwrap_or_default();
+        for field in &["version", "edition", "license"] {
+            let expected = format!("{field}.workspace = true");
+            if !content.contains(&expected) {
+                violations.push(format!("{member}: missing '{expected}'"));
+            }
+        }
+    }
+    if violations.is_empty() {
+        Outcome::ok(format!("✓ metadata: {} crates all use workspace standards", members.len()))
+    } else {
+        Outcome::error(format!("✗ metadata: {} violations: {}", violations.len(), violations.join("; ")))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
