@@ -85,3 +85,39 @@ impl From<Outcome> for CommandResult {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Outcome;
+
+    #[test]
+    fn ok_result() {
+        let cr = CommandResult::ok("test", Duration::ZERO);
+        assert_eq!(cr.exit_code, 0);
+    }
+
+    #[test]
+    fn err_result() {
+        let cr = CommandResult::err("test", Duration::ZERO, "reason");
+        assert_eq!(cr.exit_code, 1);
+    }
+
+    #[test]
+    fn skip_result() {
+        let cr = CommandResult::skip("test", Duration::ZERO, "reason");
+        assert_eq!(cr.exit_code, 2);
+    }
+
+    #[test]
+    fn from_outcome_ok() {
+        let cr: CommandResult = Outcome::ok("good").into();
+        assert_eq!(cr.exit_code, 0);
+    }
+
+    #[test]
+    fn from_outcome_error() {
+        let cr: CommandResult = Outcome::error("bad").into();
+        assert_eq!(cr.exit_code, 1);
+    }
+}

@@ -8,6 +8,10 @@ use async_trait::async_trait;
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("aero-eng v{}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     let cmd = args.get(1).map(String::as_str).unwrap_or("help");
     let ctx = ExecutionContext::new(std::env::current_dir().unwrap_or_default());
     let mut reg = CommandRegistry::new();
