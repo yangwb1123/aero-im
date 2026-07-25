@@ -29,3 +29,24 @@ impl ExecutionContext {
 
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn context_creates_with_default_config() {
+        let ctx = ExecutionContext::new(PathBuf::from("/nonexistent"));
+        assert_eq!(ctx.root, Path::new("/nonexistent"));
+        assert!(!ctx.verbose);
+        // Default config values
+        assert_eq!(ctx.eng_config.filesize.rust_warn, 800);
+    }
+
+    #[test]
+    fn context_root_is_accessible() {
+        let ctx = ExecutionContext::new(PathBuf::from("/tmp"));
+        assert_eq!(ctx.root.to_string_lossy(), "/tmp");
+    }
+}
+
