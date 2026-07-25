@@ -339,6 +339,77 @@ fn parse_deps(content: &str) -> Vec<String> {
     deps
 }
 
+/// Validate that all workspace member directories exist on disk.
+/// Catches stale workspace members after crate renames or deletions.
+#[must_use]
+pub fn check_workspace_members(root: &Path) -> Outcome {
+    let cargo = root.join("Cargo.toml");
+    let content = match std::fs::read_to_string(&cargo) {
+        Ok(c) => c,
+        Err(e) => return Outcome::error(format!("read Cargo.toml: {e}")),
+    };
+    let members = parse_workspace_members(&content);
+    let mut missing = Vec::new();
+    for member in &members {
+        let dir = root.join("crates").join(member);
+        if !dir.exists() {
+            missing.push(member.clone());
+        }
+    }
+    if missing.is_empty() {
+        Outcome::ok(format!("✓ workspace: {} members all present", members.len()))
+    } else {
+        Outcome::error(format!("✗ workspace: {} missing members: {}", missing.len(), missing.join(", ")))
+    }
+}
+
+/// Scan Rust source files for TODO/FIXME/HACK comments.
+/// Returns warnings for each occurrence, not errors (these are reminders, not bugs).
+#[must_use]
+pub fn check_todos(root: &Path) -> Outcome {
+    let mut todos = Vec::new();
+    let crates_dir = root.join("crates");
+    if crates_dir.exists() {
+        scan_todos(&crates_dir, &mut todos);
+    }
+    if todos.is_empty() {
+        Outcome::ok("✓ no TODO/FIXME/HACK comments found")
+    } else {
+        let detail = serde_json::json!({
+            "total": todos.len(),
+            "items": todos,
+        });
+        Outcome::warning(0, format!("! {} TODO/FIXME/HACK comments found", todos.len()))
+            .with_detail(detail)
+    }
+}
+
+/// Recursively scan a directory for Rust files containing TODO/FIXME/HACK.
+fn scan_todos(dir: &Path, todos: &mut Vec<serde_json::Value>) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            if name.starts_with('.') || name == "target" || name == "node_modules" { continue; }
+            scan_todos(&path, todos);
+        } else if path.extension().map_or(false, |e| e == "rs") {
+            if let Ok(content) = std::fs::read_to_string(&path) {
+                for (i, line) in content.lines().enumerate() {
+                    let trimmed = line.trim();
+                    if trimmed.starts_with("// TODO") || trimmed.starts_with("// FIXME") || trimmed.starts_with("// HACK") {
+                        todos.push(serde_json::json!({
+                            "file": path.to_string_lossy(),
+                            "line": i + 1,
+                            "text": trimmed,
+                        }));
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
