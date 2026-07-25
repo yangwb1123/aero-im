@@ -178,3 +178,68 @@ macro_rules! register_command {
         // static REGISTER: fn() -> Box<dyn Command> = || Box::new(<$ty>::default());
     };
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::command::Command;
+    use crate::context::ExecutionContext;
+    use crate::outcome::Outcome;
+    use async_trait::async_trait;
+
+    struct TestCmd;
+    #[async_trait]
+    impl Command for TestCmd {
+        fn name(&self) -> &'static str { "test-cmd" }
+        fn description(&self) -> &'static str { "A test command" }
+        async fn execute(&self, _ctx: &ExecutionContext, _args: &[String]) -> Outcome {
+            Outcome::ok("test ok")
+        }
+    }
+
+    struct FailCmd;
+    #[async_trait]
+    impl Command for FailCmd {
+        fn name(&self) -> &'static str { "fail-cmd" }
+        fn description(&self) -> &'static str { "A failing command" }
+        async fn execute(&self, _ctx: &ExecutionContext, _args: &[String]) -> Outcome {
+            Outcome::error("fail")
+        }
+    }
+
+    #[tokio::test]
+    async fn registry_execute_found_command() {
+        let mut reg = CommandRegistry::new();
+        reg = reg.add(Box::new(TestCmd));
+        let result = reg.execute("test-cmd", &["test-cmd".into()]).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().command, "test-cmd");
+    }
+
+    #[tokio::test]
+    async fn registry_execute_unknown_returns_err() {
+        let reg = CommandRegistry::new();
+        let result = reg.execute("unknown", &["unknown".into()]).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn registry_execute_with_multiple_commands() {
+        let mut reg = CommandRegistry::new();
+        reg = reg.add(Box::new(TestCmd)).add(Box::new(FailCmd));
+        let ok_result = reg.execute("test-cmd", &["test-cmd".into()]).await;
+        assert!(ok_result.is_ok());
+        let fail_result = reg.execute("fail-cmd", &["fail-cmd".into()]).await;
+        assert!(fail_result.is_err());
+    }
+
+    #[tokio::test]
+    async fn registry_len_tracks_commands() {
+        let mut reg = CommandRegistry::new();
+        assert_eq!(reg.len(), 0);
+        reg = reg.add(Box::new(TestCmd));
+        assert_eq!(reg.len(), 1);
+        reg = reg.add(Box::new(FailCmd));
+        assert_eq!(reg.len(), 2);
+    }
+}
