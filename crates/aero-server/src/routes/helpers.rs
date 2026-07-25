@@ -1,10 +1,9 @@
 
-use std::{collections::HashMap, str::FromStr};
+use std::str::FromStr;
 
 use aero_common::{
     Error as AeroError, MessageId, Result as AeroResult, RoomId, RoomKind,
 };
-use aero_storage::SearchHit;
 
 // ----- helpers -----
 

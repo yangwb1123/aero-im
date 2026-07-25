@@ -313,8 +313,6 @@ mod tests {
 
     #[test]
     fn severity_ordering_is_consistent() {
-        // Verify rank function matches expected severity hierarchy
-        // Use the internal rank function directly (not PartialOrd)
         fn rank(s: Severity) -> u8 {
             match s {
                 Severity::Ok => 0,
@@ -326,5 +324,83 @@ mod tests {
         assert!(rank(Severity::Ok) < rank(Severity::Warning));
         assert!(rank(Severity::Warning) < rank(Severity::Skip));
         assert!(rank(Severity::Skip) < rank(Severity::Error));
+    }
+
+    // ---- Property-based tests (manual fuzz) ----
+
+    /// Merge invariants tested with exhaustive combinations.
+    #[test]
+    fn prop_merge_exhaustive_severity_combinations() {
+        let cases = vec![
+            (vec![Severity::Ok, Severity::Ok], Severity::Ok),
+            (vec![Severity::Ok, Severity::Warning], Severity::Warning),
+            (vec![Severity::Warning, Severity::Ok], Severity::Warning),
+            (vec![Severity::Ok, Severity::Skip], Severity::Skip),
+            (vec![Severity::Skip, Severity::Ok], Severity::Skip),
+            (vec![Severity::Ok, Severity::Error], Severity::Error),
+            (vec![Severity::Error, Severity::Ok], Severity::Error),
+            (vec![Severity::Warning, Severity::Skip], Severity::Skip),
+            (vec![Severity::Skip, Severity::Warning], Severity::Skip),
+            (vec![Severity::Warning, Severity::Error], Severity::Error),
+            (vec![Severity::Error, Severity::Warning], Severity::Error),
+            (vec![Severity::Skip, Severity::Error], Severity::Error),
+            (vec![Severity::Error, Severity::Skip], Severity::Error),
+            (vec![Severity::Warning, Severity::Warning], Severity::Warning),
+            (vec![Severity::Skip, Severity::Skip], Severity::Skip),
+            (vec![Severity::Error, Severity::Error], Severity::Error),
+        ];
+        for (input, expected) in &cases {
+            let outcomes: Vec<Outcome> = input.iter().map(|s| match s {
+                Severity::Ok => Outcome::ok(""),
+                Severity::Warning => Outcome::warning(1, ""),
+                Severity::Skip => Outcome::skip(""),
+                Severity::Error => Outcome::error(""),
+            }).collect();
+            let merged = Outcome::merge(&outcomes);
+            assert_eq!(merged.severity(), *expected, "merge {:?} should give {:?}", input, expected);
+        }
+    }
+
+    /// Merge duration is sum of individual durations (tested with random values).
+    #[test]
+    fn prop_merge_random_durations() {
+        use std::time::Duration;
+        // Test 100 random duration combinations
+        for _ in 0..100 {
+            let n = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() % 10) as usize + 1;
+            let mut total = 0u64;
+            let mut outcomes = Vec::new();
+            for _ in 0..n {
+                let d = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() % 1000) as u64;
+                total += d;
+                outcomes.push(Outcome::ok("").with_duration(Duration::from_micros(d)));
+            }
+            let merged = Outcome::merge(&outcomes);
+            assert_eq!(merged.duration().as_micros() as u64, total, "duration sum mismatch");
+        }
+    }
+
+    /// Merge of many outcomes (1000 elements) does not crash.
+    #[test]
+    fn prop_merge_large_input() {
+        let mut outcomes = Vec::with_capacity(1000);
+        for i in 0..1000 {
+            outcomes.push(if i % 3 == 0 { Outcome::ok(&i.to_string()) }
+                else if i % 3 == 1 { Outcome::warning(i, &i.to_string()) }
+                else { Outcome::error(&i.to_string()) });
+        }
+        let merged = Outcome::merge(&outcomes);
+        // Should not crash, should have some severity
+        assert!(merged.severity() == Severity::Error || merged.severity() == Severity::Warning);
+        // Message should contain at least some of the inputs
+        assert!(merged.message().len() > 0);
+    }
+
+    /// Empty merge returns Ok with zero duration.
+    #[test]
+    fn prop_merge_empty() {
+        let merged = Outcome::merge(&[]);
+        assert!(merged.is_ok());
+        assert_eq!(merged.duration(), Duration::ZERO);
     }
 }

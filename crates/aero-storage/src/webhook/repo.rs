@@ -20,6 +20,7 @@
 //!
 //! Purely additive: a NEW [`WebhookRepo`]; no existing repo is touched.
 
+#![allow(unused_imports)]
 use aero_common::{ParticipantId, RoomId, WebhookId};
 use hmac::{Hmac, Mac};
 use rand::RngCore;
@@ -27,7 +28,6 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 
-type HmacSha256 = Hmac<Sha256>;
 use super::breaker::*;
 use super::crypto::*;
 use super::delivery::*;

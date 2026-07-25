@@ -1,3 +1,4 @@
+#![allow(unused_imports)]
 use std::sync::{Arc, Mutex};
 
 use aero_common::{Block, Message, MessageId, ParticipantId, RoomId, WorkspaceId};

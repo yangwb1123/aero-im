@@ -22,12 +22,12 @@ use std::sync::Arc;
 use aero_common::metrics::{self, names};
 use aero_common::{
     Block, CallEvent, CallId, CallKind, CallMode, MembershipOp, MessageId, NotificationKind,
-    ParticipantId, PinOp, PollId, PollOp, ReactionOp, RoomEvent, RoomId, StreamEvent,
+    ParticipantId, PinOp, PollId, PollOp, ReactionOp, RoomId, StreamEvent,
 };
 use ulid::Ulid;
 use axum::{
     extract::{
-        ws::{Message, WebSocket, WebSocketUpgrade},
+        ws::{Message, WebSocketUpgrade},
         Query, State,
     },
     response::IntoResponse,

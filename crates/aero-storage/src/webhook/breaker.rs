@@ -20,6 +20,7 @@
 //!
 //! Purely additive: a NEW [`WebhookRepo`]; no existing repo is touched.
 
+#![allow(unused_imports)]
 use aero_common::{ParticipantId, RoomId, WebhookId};
 use hmac::{Hmac, Mac};
 use rand::RngCore;
@@ -29,7 +30,6 @@ use sqlx::PgPool;
 
 use super::delivery::DeliveryResponse;
 
-type HmacSha256 = Hmac<Sha256>;
 // ----------------------------------------------------- Circuit breaker (pure)
 
 /// After this many consecutive failures the breaker opens (stops delivering until

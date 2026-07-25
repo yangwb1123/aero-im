@@ -9,8 +9,7 @@ use aero_auth::{AuthUser, LoginRequest, RegisterRequest};
 use uuid::Uuid;
 
 use aero_common::{
-    BlobId, Error as AeroError, FileKind, MessageId, ParticipantId, Result as AeroResult, RoomId,
-    RoomKind, StreamProtocol, StreamStatus, WorkspaceId, WorkspaceRole,
+    BlobId, Error as AeroError, FileKind, MessageId, ParticipantId, Result as AeroResult, StreamProtocol, StreamStatus, WorkspaceId, WorkspaceRole,
 };
 use aero_live_whip::{accept_whep_offer, accept_whip_offer, SessionError, WhipError};
 use aero_storage::{blob::NewBlob, stream::NewStream};

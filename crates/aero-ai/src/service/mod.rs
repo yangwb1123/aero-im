@@ -3,6 +3,7 @@
 //! Split from monolithic `service.rs` (2011 lines) as part of REFACTOR_PLAN.md
 //! Step 3. The main `impl AiService` blocks live in sub-modules.
 
+#![allow(unused_imports)]
 use std::sync::Arc;
 
 use aero_common::{Message, MessageId, ParticipantId, RoomId};

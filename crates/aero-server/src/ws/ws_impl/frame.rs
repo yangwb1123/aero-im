@@ -199,7 +199,7 @@ pub(super) async fn handle_text(
                     // Resolve the caller's name once for the mobile push title;
                     // only needed when a push gateway is actually configured.
                     let push_enabled = state.push.any_enabled();
-                    let initiator_name = if push_enabled {
+                    let _initiator_name = if push_enabled {
                         // ROADMAP6 方向四: resolve the caller's profile through the
                         // per-process TTL cache instead of a raw repo.get — this
                         // display-name read repeats across every missed-call push
