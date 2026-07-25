@@ -709,4 +709,34 @@ version = "0.1.0"
             assert!(d["total"] == 1, "should find exactly 1 TODO");
         }
     }
+
+    #[test]
+    fn check_readme_reports_missing_all() {
+        let dir = tmp_dir();
+        let root = dir.path();
+        write_cargo(&root.join("Cargo.toml"), r#"
+[workspace]
+members = ["crates/aero-foo"]
+"#);
+        std::fs::create_dir_all(root.join("crates/aero-foo/src")).unwrap();
+        // No README.md
+        let outcome = check_readme(root);
+        assert_eq!(outcome.exit_code(), 0, "readme check is warning only: {outcome}");
+        // Should report the missing README
+        assert!(outcome.message().contains("aero-foo"), "should mention missing crate: {}", outcome.message());
+    }
+
+    #[test]
+    fn check_readme_ok_when_present() {
+        let dir = tmp_dir();
+        let root = dir.path();
+        write_cargo(&root.join("Cargo.toml"), r#"
+[workspace]
+members = ["crates/aero-foo"]
+"#);
+        std::fs::create_dir_all(root.join("crates/aero-foo/src")).unwrap();
+        std::fs::write(root.join("crates/aero-foo/README.md"), "# Foo\n").unwrap();
+        let outcome = check_readme(root);
+        assert!(outcome.message().contains("all"), "all present: {}", outcome.message());
+    }
 }
