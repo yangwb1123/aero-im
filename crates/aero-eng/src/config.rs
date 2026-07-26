@@ -151,4 +151,18 @@ rust_warn = 300
         assert_eq!(cfg.complexity.warn, 12);
         assert!(cfg.check.clippy);
     }
+
+    #[test]
+    fn check_config_defaults() {
+        let cfg = EngineeringConfig::default();
+        assert!(cfg.check.clippy);
+        assert!(cfg.check.full_test);
+    }
+
+    #[test]
+    fn filesize_warn_less_than_hard() {
+        let cfg = EngineeringConfig::default();
+        assert!(cfg.filesize.rust_warn < cfg.filesize.rust_hard);
+        assert!(cfg.filesize.rust_hard < cfg.filesize.routes_hard);
+    }
 }

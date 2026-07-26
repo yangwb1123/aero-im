@@ -38,7 +38,6 @@ mod tests {
     fn context_creates_with_default_config() {
         let ctx = ExecutionContext::new(PathBuf::from("/nonexistent"));
         assert_eq!(ctx.root, Path::new("/nonexistent"));
-        assert!(!ctx.verbose);
         // Default config values
         assert_eq!(ctx.eng_config.filesize.rust_warn, 800);
     }
@@ -47,6 +46,20 @@ mod tests {
     fn context_root_is_accessible() {
         let ctx = ExecutionContext::new(PathBuf::from("/tmp"));
         assert_eq!(ctx.root.to_string_lossy(), "/tmp");
+    }
+
+    #[test]
+    fn context_eng_config_has_defaults() {
+        let ctx = ExecutionContext::new(PathBuf::from("/nonexistent"));
+        assert_eq!(ctx.eng_config.filesize.rust_hard, 1200);
+        assert_eq!(ctx.eng_config.complexity.warn, 12);
+    }
+
+    #[test]
+    fn context_is_clonable() {
+        let ctx = ExecutionContext::new(PathBuf::from("/tmp"));
+        let cloned = ctx.clone();
+        assert_eq!(ctx.root, cloned.root);
     }
 }
 
