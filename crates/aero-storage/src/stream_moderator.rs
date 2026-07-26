@@ -38,16 +38,22 @@ pub struct StreamModerator {
 
 const COLUMNS: &str = "id, stream_id, participant_id, created_by, created_at";
 
-type Row = (Uuid, Uuid, Uuid, Uuid, time::OffsetDateTime);
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct Row {
+    id: Uuid,
+    stream_id: Uuid,
+    participant_id: Uuid,
+    created_by: Uuid,
+    created_at: time::OffsetDateTime,
+}
 
 fn row_to_model(r: Row) -> StreamModerator {
-    let (id, stream_id, participant_id, created_by, created_at) = r;
     StreamModerator {
-        id: StreamModeratorId::from_uuid(id),
-        stream_id: Ulid(stream_id.as_u128()),
-        participant_id: ParticipantId::from_uuid(participant_id),
-        created_by: ParticipantId::from_uuid(created_by),
-        created_at,
+        id: StreamModeratorId::from_uuid(r.id),
+        stream_id: Ulid(r.stream_id.as_u128()),
+        participant_id: ParticipantId::from_uuid(r.participant_id),
+        created_by: ParticipantId::from_uuid(r.created_by),
+        created_at: r.created_at,
     }
 }
 
