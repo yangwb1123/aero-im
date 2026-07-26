@@ -41,22 +41,22 @@ pub struct MessageTemplate {
 /// every query so the row decoding stays in one place.
 const COLUMNS: &str = "id, participant_id, name, blocks, created_at";
 
-type Row = (
-    uuid::Uuid,
-    uuid::Uuid,
-    String,
-    serde_json::Value,
-    time::OffsetDateTime,
-);
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct Row {
+    id: uuid::Uuid,
+    participant_id: uuid::Uuid,
+    name: String,
+    blocks: serde_json::Value,
+    created_at: time::OffsetDateTime,
+}
 
 fn row_to_model(r: Row) -> MessageTemplate {
-    let (id, participant_id, name, blocks, created_at) = r;
     MessageTemplate {
-        id: MessageTemplateId::from_uuid(id),
-        participant_id: ParticipantId::from_uuid(participant_id),
-        name,
-        blocks,
-        created_at,
+        id: MessageTemplateId::from_uuid(r.id),
+        participant_id: ParticipantId::from_uuid(r.participant_id),
+        name: r.name,
+        blocks: r.blocks,
+        created_at: r.created_at,
     }
 }
 

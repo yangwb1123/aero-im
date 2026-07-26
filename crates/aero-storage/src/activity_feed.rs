@@ -51,28 +51,28 @@ pub struct ActivityEntry {
 /// query so the row decoding stays in one place.
 const COLUMNS: &str = "id, participant_id, kind, actor_id, subject_id, summary, created_at, read_at";
 
-type Row = (
-    uuid::Uuid,
-    uuid::Uuid,
-    String,
-    Option<uuid::Uuid>,
-    Option<uuid::Uuid>,
-    String,
-    time::OffsetDateTime,
-    Option<time::OffsetDateTime>,
-);
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct Row {
+    id: uuid::Uuid,
+    participant_id: uuid::Uuid,
+    kind: String,
+    actor_id: Option<uuid::Uuid>,
+    subject_id: Option<uuid::Uuid>,
+    summary: String,
+    created_at: time::OffsetDateTime,
+    read_at: Option<time::OffsetDateTime>,
+}
 
 fn row_to_model(r: Row) -> ActivityEntry {
-    let (id, participant_id, kind, actor_id, subject_id, summary, created_at, read_at) = r;
     ActivityEntry {
-        id: ActivityId::from_uuid(id),
-        participant_id: ParticipantId::from_uuid(participant_id),
-        kind,
-        actor_id: actor_id.map(ParticipantId::from_uuid),
-        subject_id: subject_id.map(|u| Ulid(u.as_u128())),
-        summary,
-        created_at,
-        read_at,
+        id: ActivityId::from_uuid(r.id),
+        participant_id: ParticipantId::from_uuid(r.participant_id),
+        kind: r.kind,
+        actor_id: r.actor_id.map(ParticipantId::from_uuid),
+        subject_id: r.subject_id.map(|u| Ulid(u.as_u128())),
+        summary: r.summary,
+        created_at: r.created_at,
+        read_at: r.read_at,
     }
 }
 

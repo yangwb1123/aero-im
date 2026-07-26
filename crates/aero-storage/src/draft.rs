@@ -39,20 +39,20 @@ pub struct Draft {
 /// so the row decoding stays in one place.
 const COLUMNS: &str = "room_id, blocks, reply_to, updated_at";
 
-type Row = (
-    uuid::Uuid,
-    serde_json::Value,
-    Option<uuid::Uuid>,
-    time::OffsetDateTime,
-);
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct Row {
+    room_id: uuid::Uuid,
+    blocks: serde_json::Value,
+    reply_to: Option<uuid::Uuid>,
+    updated_at: time::OffsetDateTime,
+}
 
 fn row_to_model(r: Row) -> Draft {
-    let (room_id, blocks, reply_to, updated_at) = r;
     Draft {
-        room_id: RoomId::from_uuid(room_id),
-        blocks: serde_json::from_value(blocks).unwrap_or_default(),
-        reply_to: reply_to.map(MessageId::from_uuid),
-        updated_at,
+        room_id: RoomId::from_uuid(r.room_id),
+        blocks: serde_json::from_value(r.blocks).unwrap_or_default(),
+        reply_to: r.reply_to.map(MessageId::from_uuid),
+        updated_at: r.updated_at,
     }
 }
 
