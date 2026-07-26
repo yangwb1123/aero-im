@@ -33,6 +33,57 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@v1
       - run: cargo test --workspace --lib
 
+  integration:
+    name: Integration tests (PostgreSQL)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_PASSWORD: aero
+          POSTGRES_USER: aero
+          POSTGRES_DB: aero
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - run: cargo build -p aero-server --bin aero-cli
+      # Create minimal config for aero-cli migrate
+      - run: |
+          cat > config.toml << 'EOF'
+          [server]
+          host = "0.0.0.0"
+          port = 8080
+          web_dir = "./web"
+          [database]
+          url = "postgres://aero:aero@localhost:5432/aero"
+          max_connections = 4
+          [redis]
+          url = "redis://localhost:6379"
+          [nats]
+          url = "nats://localhost:4222"
+          [auth]
+          jwt_private_key_pem = ""
+          jwt_public_key_pem = ""
+          issuer = "aero-ci"
+          access_ttl_secs = 3600
+          refresh_ttl_secs = 604800
+          EOF
+        env:
+          DATABASE_URL: postgres://aero:aero@localhost:5432/aero
+      - run: cargo run --bin aero-cli -- migrate
+        env:
+          DATABASE_URL: postgres://aero:aero@localhost:5432/aero
+      - run: cargo test --workspace -- --include-ignored
+        env:
+          DATABASE_URL: postgres://aero:aero@localhost:5432/aero
+
   gates:
     name: Engineering gates via aero-cli
     runs-on: ubuntu-latest
