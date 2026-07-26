@@ -42,26 +42,31 @@ fn c(text: &str, ansi: &str) -> String {
 }
 
 /// Green checkmark prefix.
+#[must_use]
 pub fn ok(text: impl AsRef<str>) -> String {
     format!("{} {}", c("✓", color::GREEN), text.as_ref())
 }
 
 /// Red cross prefix.
+#[must_use]
 pub fn err(text: impl AsRef<str>) -> String {
     format!("{} {}", c("✗", color::RED), text.as_ref())
 }
 
 /// Yellow warning prefix.
+#[must_use]
 pub fn warn(text: impl AsRef<str>) -> String {
     format!("{} {}", c("!", color::YELLOW), text.as_ref())
 }
 
 /// Blue info prefix.
+#[must_use]
 pub fn info(text: impl AsRef<str>) -> String {
     format!("{} {}", c("▶", color::BLUE), text.as_ref())
 }
 
 /// Bold header.
+#[must_use]
 pub fn header(text: impl AsRef<str>) -> String {
     if is_color() {
         format!("{}{}{}", color::BOLD, text.as_ref(), color::RESET)
@@ -71,6 +76,7 @@ pub fn header(text: impl AsRef<str>) -> String {
 }
 
 /// Format a duration in human-readable form.
+#[must_use]
 pub fn fmt_duration(secs: f64) -> String {
     if secs < 1.0 {
         format!("{:.0}ms", secs * 1000.0)
@@ -84,6 +90,7 @@ pub fn fmt_duration(secs: f64) -> String {
 }
 
 /// Format a summary line with status icon, label, duration, and detail.
+#[must_use]
 pub fn summary_line(icon: &str, label: &str, duration: std::time::Duration, detail: &str) -> String {
     let secs = duration.as_secs_f64();
     let time = fmt_duration(secs);
@@ -131,6 +138,7 @@ impl Spinner {
 }
 
 /// Format an Outcome as a machine-readable JSON string for CI integration.
+#[must_use]
 pub fn format_json_output(name: &str, o: &crate::outcome::Outcome) -> String {
     serde_json::json!({
         "command": name,
