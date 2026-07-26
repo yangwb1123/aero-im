@@ -80,8 +80,6 @@ fn row_to_model(r: Row) -> Announcement {
         created_by: ParticipantId::from_uuid(r.created_by),
         created_at: r.created_at,
         expires_at: r.expires_at,
-        created_at,
-        expires_at,
     }
 }
 
