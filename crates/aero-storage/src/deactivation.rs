@@ -39,20 +39,20 @@ pub struct DeactivatedMember {
 /// every query so the row decoding stays in one place.
 const COLUMNS: &str = "workspace_id, participant_id, deactivated_at, deactivated_by";
 
-#[derive(Debug, Clone, sqlx::FromRow)]
-struct Row {
-    workspace_id: uuid::Uuid,
-    participant_id: uuid::Uuid,
-    deactivated_at: time::OffsetDateTime,
-    deactivated_by: Option<uuid::Uuid>,
-}
+type Row = (
+    uuid::Uuid,
+    uuid::Uuid,
+    time::OffsetDateTime,
+    Option<uuid::Uuid>,
+);
 
 fn row_to_model(r: Row) -> DeactivatedMember {
+    let (workspace_id, participant_id, deactivated_at, deactivated_by) = r;
     DeactivatedMember {
-        workspace_id: WorkspaceId::from_uuid(r.workspace_id),
-        participant_id: ParticipantId::from_uuid(r.participant_id),
-        deactivated_at: r.deactivated_at,
-        deactivated_by: r.deactivated_by.map(ParticipantId::from_uuid),
+        workspace_id: WorkspaceId::from_uuid(workspace_id),
+        participant_id: ParticipantId::from_uuid(participant_id),
+        deactivated_at,
+        deactivated_by: deactivated_by.map(ParticipantId::from_uuid),
     }
 }
 
