@@ -118,9 +118,14 @@ impl NotificationBundleRepo {
         for b in &bundles {
             let key = (b.participant_id, b.room_id, b.thread_root);
             let last = groups.last_mut();
-            let same_group = last.as_ref().map(|g| g.key == key).unwrap_or(false);
-            if same_group {
-                last.unwrap().members.push(b);
+            if let Some(prev) = last {
+                if prev.key == key {
+                    prev.members.push(b);
+                } else {
+                    let mut g = BundleGroup { key, members: Vec::new() };
+                    g.members.push(b);
+                    groups.push(g);
+                }
             } else {
                 let mut g = BundleGroup { key, members: Vec::new() };
                 g.members.push(b);
