@@ -58,43 +58,32 @@ pub struct Approval {
 const COLUMNS: &str = "id, workspace_id, requester_id, approver_id, title, details, status, \
                        decision_note, decided_at, created_at";
 
-type Row = (
-    uuid::Uuid,
-    uuid::Uuid,
-    uuid::Uuid,
-    uuid::Uuid,
-    String,
-    Option<String>,
-    String,
-    Option<String>,
-    Option<time::OffsetDateTime>,
-    time::OffsetDateTime,
-);
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct Row {
+    id: uuid::Uuid,
+    workspace_id: uuid::Uuid,
+    requester_id: uuid::Uuid,
+    approver_id: uuid::Uuid,
+    title: String,
+    details: Option<String>,
+    status: String,
+    decision_note: Option<String>,
+    decided_at: Option<time::OffsetDateTime>,
+    created_at: time::OffsetDateTime,
+}
 
 fn row_to_model(r: Row) -> Approval {
-    let (
-        id,
-        workspace_id,
-        requester_id,
-        approver_id,
-        title,
-        details,
-        status,
-        decision_note,
-        decided_at,
-        created_at,
-    ) = r;
     Approval {
-        id: ApprovalId::from_uuid(id),
-        workspace_id: WorkspaceId::from_uuid(workspace_id),
-        requester_id: ParticipantId::from_uuid(requester_id),
-        approver_id: ParticipantId::from_uuid(approver_id),
-        title,
-        details,
-        status,
-        decision_note,
-        decided_at,
-        created_at,
+        id: ApprovalId::from_uuid(r.id),
+        workspace_id: WorkspaceId::from_uuid(r.workspace_id),
+        requester_id: ParticipantId::from_uuid(r.requester_id),
+        approver_id: ParticipantId::from_uuid(r.approver_id),
+        title: r.title,
+        details: r.details,
+        status: r.status,
+        decision_note: r.decision_note,
+        decided_at: r.decided_at,
+        created_at: r.created_at,
     }
 }
 
