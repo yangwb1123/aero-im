@@ -72,43 +72,32 @@ pub struct Task {
 const COLUMNS: &str =
     "id, room_id, creator_id, assignee_id, title, source_message_id, status, due_at, created_at, updated_at";
 
-type Row = (
-    uuid::Uuid,
-    uuid::Uuid,
-    uuid::Uuid,
-    Option<uuid::Uuid>,
-    String,
-    Option<uuid::Uuid>,
-    String,
-    Option<time::OffsetDateTime>,
-    time::OffsetDateTime,
-    time::OffsetDateTime,
-);
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct Row {
+    id: uuid::Uuid,
+    room_id: uuid::Uuid,
+    creator_id: uuid::Uuid,
+    assignee_id: Option<uuid::Uuid>,
+    title: String,
+    source_message_id: Option<uuid::Uuid>,
+    status: String,
+    due_at: Option<time::OffsetDateTime>,
+    created_at: time::OffsetDateTime,
+    updated_at: time::OffsetDateTime,
+}
 
 fn row_to_model(r: Row) -> Task {
-    let (
-        id,
-        room_id,
-        creator_id,
-        assignee_id,
-        title,
-        source_message_id,
-        status,
-        due_at,
-        created_at,
-        updated_at,
-    ) = r;
     Task {
-        id: TaskId::from_uuid(id),
-        room_id: RoomId::from_uuid(room_id),
-        creator_id: ParticipantId::from_uuid(creator_id),
-        assignee_id: assignee_id.map(ParticipantId::from_uuid),
-        title,
-        source_message_id: source_message_id.map(MessageId::from_uuid),
-        status,
-        due_at,
-        created_at,
-        updated_at,
+        id: TaskId::from_uuid(r.id),
+        room_id: RoomId::from_uuid(r.room_id),
+        creator_id: ParticipantId::from_uuid(r.creator_id),
+        assignee_id: r.assignee_id.map(ParticipantId::from_uuid),
+        title: r.title,
+        source_message_id: r.source_message_id.map(MessageId::from_uuid),
+        status: r.status,
+        due_at: r.due_at,
+        created_at: r.created_at,
+        updated_at: r.updated_at,
     }
 }
 

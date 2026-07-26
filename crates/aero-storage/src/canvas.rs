@@ -51,28 +51,28 @@ pub struct Canvas {
 /// so the row decoding stays in one place.
 const COLUMNS: &str = "id, room_id, author_id, title, blocks, created_at, updated_at, version";
 
-type Row = (
-    uuid::Uuid,
-    uuid::Uuid,
-    uuid::Uuid,
-    String,
-    serde_json::Value,
-    time::OffsetDateTime,
-    time::OffsetDateTime,
-    i64,
-);
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct Row {
+    id: uuid::Uuid,
+    room_id: uuid::Uuid,
+    author_id: uuid::Uuid,
+    title: String,
+    blocks: serde_json::Value,
+    created_at: time::OffsetDateTime,
+    updated_at: time::OffsetDateTime,
+    version: i64,
+}
 
 fn row_to_model(r: Row) -> Canvas {
-    let (id, room_id, author_id, title, blocks, created_at, updated_at, version) = r;
     Canvas {
-        id: CanvasId::from_uuid(id),
-        room_id: RoomId::from_uuid(room_id),
-        author_id: ParticipantId::from_uuid(author_id),
-        title,
-        blocks,
-        created_at,
-        updated_at,
-        version,
+        id: CanvasId::from_uuid(r.id),
+        room_id: RoomId::from_uuid(r.room_id),
+        author_id: ParticipantId::from_uuid(r.author_id),
+        title: r.title,
+        blocks: r.blocks,
+        created_at: r.created_at,
+        updated_at: r.updated_at,
+        version: r.version,
     }
 }
 
