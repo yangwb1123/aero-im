@@ -53,22 +53,22 @@ pub fn normalize_keyword(raw: &str) -> String {
 /// query so the row decoding stays in one place.
 const COLUMNS: &str = "id, participant_id, workspace_id, keyword, created_at";
 
-type Row = (
-    uuid::Uuid,
-    uuid::Uuid,
-    uuid::Uuid,
-    String,
-    time::OffsetDateTime,
-);
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct Row {
+    id: uuid::Uuid,
+    participant_id: uuid::Uuid,
+    workspace_id: uuid::Uuid,
+    keyword: String,
+    created_at: time::OffsetDateTime,
+}
 
 fn row_to_model(r: Row) -> KeywordAlert {
-    let (id, participant_id, workspace_id, keyword, created_at) = r;
     KeywordAlert {
-        id: KeywordAlertId::from_uuid(id),
-        participant_id: ParticipantId::from_uuid(participant_id),
-        workspace_id: WorkspaceId::from_uuid(workspace_id),
-        keyword,
-        created_at,
+        id: KeywordAlertId::from_uuid(r.id),
+        participant_id: ParticipantId::from_uuid(r.participant_id),
+        workspace_id: WorkspaceId::from_uuid(r.workspace_id),
+        keyword: r.keyword,
+        created_at: r.created_at,
     }
 }
 
