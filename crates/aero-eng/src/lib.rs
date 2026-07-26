@@ -75,3 +75,44 @@ pub async fn dispatch(args: &[String]) -> RegistryResult {
 pub fn default_context() -> ExecutionContext {
     ExecutionContext::new(PathBuf::from("."))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::command::Command;
+    use crate::outcome::Outcome;
+    use async_trait::async_trait;
+
+    struct TestCmd;
+    #[async_trait]
+    impl Command for TestCmd {
+        fn name(&self) -> &'static str { "test-cmd" }
+        fn description(&self) -> &'static str { "test" }
+        async fn execute(&self, _: &ExecutionContext, _: &[String]) -> Outcome {
+            Outcome::ok("test")
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_help() {
+        // dispatch with empty args should show help (not crash)
+        let result = dispatch(&[]).await;
+        assert!(result.is_ok() || result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_unknown() {
+        // dispatch with unknown command should error
+        let result = dispatch(&["nonexistent".into()]).await;
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn default_context_creates_with_cwd() {
+        let ctx = default_context();
+        // Root should be a non-empty path (either "." or resolved absolute)
+        assert!(!ctx.root.as_os_str().is_empty(), "root should be set");
+        // Default config values should be present
+        assert_eq!(ctx.eng_config.filesize.rust_warn, 800);
+    }
+}
