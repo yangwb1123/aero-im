@@ -36,24 +36,24 @@ pub struct VodChapter {
 
 const COLUMNS: &str = "id, vod_id, start_secs, title, created_by, created_at";
 
-type Row = (
-    uuid::Uuid,
-    uuid::Uuid,
-    i32,
-    String,
-    uuid::Uuid,
-    time::OffsetDateTime,
-);
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct Row {
+    id: uuid::Uuid,
+    vod_id: uuid::Uuid,
+    start_secs: i32,
+    title: String,
+    created_by: uuid::Uuid,
+    created_at: time::OffsetDateTime,
+}
 
 fn row_to_model(r: Row) -> VodChapter {
-    let (id, vod_id, start_secs, title, created_by, created_at) = r;
     VodChapter {
-        id: VodChapterId::from_uuid(id),
-        vod_id: VodId::from_uuid(vod_id),
-        start_secs,
-        title,
-        created_by: ParticipantId::from_uuid(created_by),
-        created_at,
+        id: VodChapterId::from_uuid(r.id),
+        vod_id: VodId::from_uuid(r.vod_id),
+        start_secs: r.start_secs,
+        title: r.title,
+        created_by: ParticipantId::from_uuid(r.created_by),
+        created_at: r.created_at,
     }
 }
 

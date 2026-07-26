@@ -48,24 +48,24 @@ pub struct InfoBarrier {
 /// query so the row decoding stays in one place.
 const COLUMNS: &str = "id, workspace_id, group_a, group_b, created_by, created_at";
 
-type Row = (
-    uuid::Uuid,
-    uuid::Uuid,
-    uuid::Uuid,
-    uuid::Uuid,
-    uuid::Uuid,
-    time::OffsetDateTime,
-);
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct Row {
+    id: uuid::Uuid,
+    workspace_id: uuid::Uuid,
+    group_a: uuid::Uuid,
+    group_b: uuid::Uuid,
+    created_by: uuid::Uuid,
+    created_at: time::OffsetDateTime,
+}
 
 fn row_to_model(r: Row) -> InfoBarrier {
-    let (id, workspace_id, group_a, group_b, created_by, created_at) = r;
     InfoBarrier {
-        id: BarrierId::from_uuid(id),
-        workspace_id: WorkspaceId::from_uuid(workspace_id),
-        group_a: UserGroupId::from_uuid(group_a),
-        group_b: UserGroupId::from_uuid(group_b),
-        created_by: ParticipantId::from_uuid(created_by),
-        created_at,
+        id: BarrierId::from_uuid(r.id),
+        workspace_id: WorkspaceId::from_uuid(r.workspace_id),
+        group_a: UserGroupId::from_uuid(r.group_a),
+        group_b: UserGroupId::from_uuid(r.group_b),
+        created_by: ParticipantId::from_uuid(r.created_by),
+        created_at: r.created_at,
     }
 }
 

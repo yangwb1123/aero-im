@@ -48,26 +48,26 @@ pub struct BlockInteraction {
 /// every query so the row decoding stays in one place.
 const COLUMNS: &str = "id, message_id, room_id, participant_id, action_id, value, created_at";
 
-type Row = (
-    uuid::Uuid,
-    uuid::Uuid,
-    uuid::Uuid,
-    uuid::Uuid,
-    String,
-    Option<String>,
-    time::OffsetDateTime,
-);
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct Row {
+    id: uuid::Uuid,
+    message_id: uuid::Uuid,
+    room_id: uuid::Uuid,
+    participant_id: uuid::Uuid,
+    action_id: String,
+    value: Option<String>,
+    created_at: time::OffsetDateTime,
+}
 
 fn row_to_model(r: Row) -> BlockInteraction {
-    let (id, message_id, room_id, participant_id, action_id, value, created_at) = r;
     BlockInteraction {
-        id: BlockInteractionId::from_uuid(id),
-        message_id: MessageId::from_uuid(message_id),
-        room_id: RoomId::from_uuid(room_id),
-        participant_id: ParticipantId::from_uuid(participant_id),
-        action_id,
-        value,
-        created_at,
+        id: BlockInteractionId::from_uuid(r.id),
+        message_id: MessageId::from_uuid(r.message_id),
+        room_id: RoomId::from_uuid(r.room_id),
+        participant_id: ParticipantId::from_uuid(r.participant_id),
+        action_id: r.action_id,
+        value: r.value,
+        created_at: r.created_at,
     }
 }
 

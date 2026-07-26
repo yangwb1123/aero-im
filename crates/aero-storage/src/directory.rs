@@ -52,24 +52,24 @@ const COLUMNS: &str = "p.id, p.display_name, p.kind, pp.title, pp.pronouns, pp.t
 /// list endpoints apply so one request can't pull an unbounded result set.
 const MAX_LIMIT: i64 = 200;
 
-type Row = (
-    uuid::Uuid,
-    String,
-    String,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-);
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct Row {
+    id: uuid::Uuid,
+    display_name: String,
+    kind: String,
+    title: Option<String>,
+    pronouns: Option<String>,
+    timezone: Option<String>,
+}
 
 fn row_to_model(r: Row) -> DirectoryEntry {
-    let (id, display_name, kind, title, pronouns, timezone) = r;
     DirectoryEntry {
-        participant_id: ParticipantId::from_uuid(id),
-        display_name,
-        kind,
-        title,
-        pronouns,
-        timezone,
+        participant_id: ParticipantId::from_uuid(r.id),
+        display_name: r.display_name,
+        kind: r.kind,
+        title: r.title,
+        pronouns: r.pronouns,
+        timezone: r.timezone,
     }
 }
 
