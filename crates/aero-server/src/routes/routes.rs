@@ -1689,7 +1689,7 @@ async fn bot_create(
     Json(req): Json<CreateBotReq>,
 ) -> ApiResult<Response> {
     let workspace = req.workspace_id.as_ref().and_then(|w| aero_common::WorkspaceId::from_str(w).ok());
-    let name = validate_bot_name(&req.name)?;
+    let name = crate::routes::agents::validate_bot_name(&req.name)?;
     let repo = aero_storage::BotRepo::new(s.pg.clone());
     let bot_id = repo
         .create(auth.participant_id, &name, req.icon_url.as_deref(), workspace)
