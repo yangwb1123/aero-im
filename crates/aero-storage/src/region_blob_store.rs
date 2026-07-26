@@ -11,7 +11,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::blob_store::{BlobStore, BlobStoreError};
+use crate::blob_store::BlobStoreError;
+
+use crate::blob_store::BlobStore;
 
 /// A regional blob-store router.
 ///
@@ -132,5 +134,48 @@ mod tests {
         assert_eq!(got, Bytes::from("hello"));
         store.delete(id).await.unwrap();
         assert!(matches!(store.get(id).await, Err(BlobStoreError::NotFound)));
+    }
+
+    #[tokio::test]
+    async fn empty_router_returns_default_for_any_region() {
+        let (def, _d) = tmp_store("empty");
+        let router = RegionRouter::new(def.clone(), HashMap::new()).unwrap();
+        assert_eq!(router.region_count(), 0);
+        // Even with a known-looking region code, fallback to default
+        let store = router.select(Some("us-east-1"));
+        assert!(std::ptr::eq(store as *const dyn BlobStore, &*def as *const dyn BlobStore));
+    }
+
+    #[tokio::test]
+    async fn router_health_check_ok_with_default_only() {
+        let (def, _d) = tmp_store("health");
+        let router = RegionRouter::new(def.clone(), HashMap::new()).unwrap();
+        let result = router.health_check().await;
+        assert!(result.is_ok(), "health check should pass: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn round_trip_blob_via_select() {
+        let (def, _d) = tmp_store("roundtrip");
+        let router = RegionRouter::new(def.clone(), HashMap::new()).unwrap();
+        let store = router.select(None);
+        let id = BlobId::new();
+        let data = Bytes::from("round trip test data");
+        store.put(id, data.clone()).await.unwrap();
+        let result = store.get(id).await.unwrap();
+        assert_eq!(result, data);
+        store.delete(id).await.unwrap();
+        assert!(matches!(store.get(id).await, Err(BlobStoreError::NotFound)));
+    }
+
+    #[tokio::test]
+    async fn default_store_is_accessible() {
+        let (def, _d) = tmp_store("default_access");
+        let router = RegionRouter::new(def.clone(), HashMap::new()).unwrap();
+        let store = router.default_store();
+        let id = BlobId::new();
+        store.put(id, Bytes::from("data")).await.unwrap();
+        let got = store.get(id).await.unwrap();
+        assert_eq!(got, Bytes::from("data"));
     }
 }
