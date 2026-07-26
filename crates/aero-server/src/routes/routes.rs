@@ -1,13 +1,9 @@
 //! HTTP route definitions. WS upgrade lives in `ws::handler`.
-
 use std::str::FromStr;
-
 use futures::StreamExt as _;
 use sha2::Digest as _;
-
 use aero_auth::{AuthUser, LoginRequest, RegisterRequest};
 use uuid::Uuid;
-
 use aero_common::{
     BlobId, Error as AeroError, FileKind, MessageId, ParticipantId, Result as AeroResult, StreamProtocol, StreamStatus, WorkspaceId, WorkspaceRole,
 };
@@ -27,22 +23,17 @@ use axum::{
 use bytes::Bytes;
 use serde::Deserialize;
 use tower_http::compression::CompressionLayer;
-
 use crate::error::ApiResult;
 use crate::metrics;
 use crate::routes::helpers::{merge_hits, parse_room_id, parse_room_kind};
 use crate::state::AppState;
 use crate::ws;
 use crate::routes::reads::{self, mark_read, list_receipts};
-
-// ----- Request correlation ID middleware -----
-
 /// Opaque correlation ID propagated through request extensions and echoed in
 /// every response as `x-request-id`.  Handlers and middlewares that need to
 /// surface it can extract it from `req.extensions()`.
 #[derive(Clone)]
 pub struct RequestId(pub String);
-
 /// Middleware: read or generate a `x-request-id` header, attach a
 /// [`RequestId`] extension, and echo the value in the response.
 async fn inject_request_id(mut req: Request<axum::body::Body>, next: Next) -> Response {
@@ -72,7 +63,6 @@ async fn inject_request_id(mut req: Request<axum::body::Body>, next: Next) -> Re
     }
     res
 }
-
 pub fn build(state: AppState) -> Router {
     let mut router = Router::new()
         // Health probes — extracted to routes/health.rs
@@ -219,7 +209,6 @@ pub fn build(state: AppState) -> Router {
         // their channels into named, ordered, PRIVATE folders scoped to a workspace.
         // Pure organizational metadata over existing rooms.
         .merge(crate::channel_sections::routes())
-        // ---- Wave 10 (0033-0038) ----
         // User groups (@-usergroups): workspace-scoped named member sets that can be
         // @-mentioned as one. CRUD + membership; mention fan-out wired in ImService.
         .merge(crate::user_groups::routes())
@@ -239,7 +228,6 @@ pub fn build(state: AppState) -> Router {
         .merge(crate::keyword_alerts::routes())
         // Workspace announcements / banners: admin posts, members read active ones.
         .merge(crate::announcements::routes())
-        // ---- Wave 11 ----
         // Per-channel Files tab: list file/media attachments shared in a room.
         .merge(crate::files::routes())
         // Stream/creator follow: follow a participant; followers are notified on go-live.
