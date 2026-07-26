@@ -97,4 +97,31 @@ mod tests {
         let o = run_cmd("", &[], Duration::from_secs(1)).await;
         assert!(o.is_error(), "empty command should fail: {o}");
     }
+
+    #[tokio::test]
+    async fn run_cmd_with_special_characters() {
+        let o = run_cmd("echo", &["hello", "world", "!"], Duration::from_secs(5)).await;
+        assert!(o.is_ok(), "special chars should work: {o}");
+    }
+
+    #[tokio::test]
+    async fn run_cmd_long_args() {
+        let long_arg = "a".repeat(1000);
+        let o = run_cmd("echo", &[&long_arg], Duration::from_secs(5)).await;
+        assert!(o.is_ok(), "long args should work: {o}");
+    }
+
+    #[tokio::test]
+    async fn run_cmd_unicode() {
+        let o = run_cmd("echo", &["Hello", "世界", "🌍"], Duration::from_secs(5)).await;
+        assert!(o.is_ok(), "unicode should work: {o}");
+    }
+
+    #[tokio::test]
+    async fn cargo_check_returns_without_panicking() {
+        // cargo_check runs against the real workspace
+        let o = crate::run::cargo_check().await;
+        // Should either succeed or fail gracefully - not panic
+        assert!(o.is_ok() || o.is_error(), "cargo check should not panic");
+    }
 }
