@@ -22,7 +22,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
-      - run: cargo check --workspace --all-targets
+      - run: cargo check --workspace --all-targets -D warnings
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
   test:
@@ -80,9 +80,20 @@ jobs:
       - run: cargo run --bin aero-cli -- migrate
         env:
           DATABASE_URL: postgres://aero:aero@localhost:5432/aero
+      # Migration chain smoke test on throwaway database
+      - name: Migration chain smoke test
+        run: |
+          psql -h localhost -U aero -d postgres -c "CREATE DATABASE aero_migrate_smoke OWNER aero;"
+          DATABASE_URL="postgres://aero:aero@localhost:5432/aero_migrate_smoke" cargo run --bin aero-cli -- migrate
+        env:
+          PGPASSWORD: aero
       - run: cargo test --workspace -- --include-ignored
         env:
           DATABASE_URL: postgres://aero:aero@localhost:5432/aero
+      - run: |
+          psql -h localhost -U aero -d postgres -c "DROP DATABASE IF EXISTS aero_migrate_smoke;"
+        env:
+          PGPASSWORD: aero
 
   gates:
     name: Engineering gates via aero-cli

@@ -83,8 +83,13 @@ skill-list: ## List available skills
 	cargo run --bin aero-cli -- skill list
 
 .PHONY: ci
-ci: cargo-run --bin aero-cli -- check
+ci: ## Full CI pipeline: check + gates
+	cargo run --bin aero-cli -- check
 	cargo run --bin aero-cli -- gate all
+
+.PHONY: ci-full
+ci-full: ci ## Full CI + integration tests (requires PostgreSQL)
+	bash scripts/test-integration.sh
 
 .PHONY: dev
 dev: ## Start development environment

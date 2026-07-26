@@ -1,7 +1,6 @@
 // app.js — Aero IM debug client entry point (P2 features wired).
 // Auth, rooms, messages, optimistic rendering, typing, read, reactions,
 // attachments, search drawer, AI drawer, 1:1 calls, live streaming.
-
 import { api, auth, ApiError } from './api.js';
 import { onNewMessage } from './smart_replies.js';
 import {
@@ -33,11 +32,9 @@ import { initModalForms } from './modals.js';
 import { initAuthUi } from './auth_ui.js';
 import { initChrome } from './chrome.js';
 import { installUnhandledRejectionReporting } from './error_reporting.js';
-
 // ---------- view switching ----------
 function showAuth() { els.viewAuth.hidden = false; els.viewChat.hidden = true; }
 function showChat() { els.viewAuth.hidden = true; els.viewChat.hidden = false; }
-
 for (const t of els.tabs) {
   t.addEventListener('click', () => {
     const name = t.dataset.tab;
@@ -45,8 +42,6 @@ for (const t of els.tabs) {
     for (const p of els.tabPanels) p.hidden = p.dataset.tabPanel !== name;
   });
 }
-
-
 function enterChat() {
   showChat();
   const me = state.me;
@@ -74,7 +69,6 @@ function enterChat() {
     if (!document.hidden && state.currentRoomId) clearUnread(state.currentRoomId);
   });
 }
-
 async function refreshRoomsFromServer() {
   try {
     const rooms = await api.listRooms();
