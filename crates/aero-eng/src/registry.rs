@@ -242,4 +242,26 @@ mod tests {
         reg = reg.add(Box::new(FailCmd));
         assert_eq!(reg.len(), 2);
     }
+
+    #[tokio::test]
+    async fn registry_empty_execute_returns_err() {
+        let reg = CommandRegistry::new();
+        let result = reg.execute("anything", &["anything".into()]).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn registry_is_empty_returns_true_for_new() {
+        let reg = CommandRegistry::new();
+        assert!(reg.is_empty());
+        assert_eq!(reg.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn registry_print_help_does_not_panic() {
+        let reg = CommandRegistry::new().add(Box::new(TestCmd));
+        // print_help should not panic
+        reg.print_help();
+        assert!(reg.len() > 0);
+    }
 }
