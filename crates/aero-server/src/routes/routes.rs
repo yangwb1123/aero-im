@@ -133,7 +133,7 @@ pub fn build(state: AppState) -> Router {
         // MLS E2E — extracted to routes/mls.rs
         .merge(crate::routes::mls::routes())
         // RTC config
-        .route("/api/rtc/config", get(rtc_config))
+        .merge(crate::routes::rtc::routes())
         // WebSocket
         .route("/ws", get(ws::handler))
         // Workspace / Org management (ROADMAP 方向一 — multi-tenant foundation).
@@ -2241,34 +2241,6 @@ async fn whep_post(
     )
         .into_response();
     Ok(resp)
-}
-
-// ----- RTC config -----
-
-async fn rtc_config(_auth: AuthUser) -> ApiResult<Json<serde_json::Value>> {
-    Ok(Json(rtc_config_payload()))
-}
-
-fn rtc_config_payload() -> serde_json::Value {
-    let stun = std::env::var("AERO_STUN_URLS")
-        .unwrap_or_else(|_| "stun:stun.l.google.com:19302".into());
-    let urls: Vec<String> = stun.split(',').map(|s| s.trim().to_owned()).collect();
-    let mut ice_servers = vec![serde_json::json!({"urls": urls})];
-    if let (Ok(url), Ok(user), Ok(pass)) = (
-        std::env::var("AERO_TURN_URL"),
-        std::env::var("AERO_TURN_USERNAME"),
-        std::env::var("AERO_TURN_PASSWORD"),
-    ) {
-        ice_servers.push(serde_json::json!({
-            "urls": [url],
-            "username": user,
-            "credential": pass,
-        }));
-    }
-    serde_json::json!({
-        "ice_servers": ice_servers,
-        "ice_transport_policy": "all",
-    })
 }
 
 // ---------- Tests ----------

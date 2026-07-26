@@ -5,6 +5,7 @@
 pub mod routes;
 pub mod ai;
 pub mod live;
+pub mod rtc;
 pub mod health;
 pub mod mls;
 pub mod helpers;
