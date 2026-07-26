@@ -33,6 +33,7 @@ use crate::metrics;
 use crate::routes::helpers::{merge_hits, parse_room_id, parse_room_kind};
 use crate::state::AppState;
 use crate::ws;
+use crate::routes::reads::{self, mark_read, list_receipts};
 
 // ----- Request correlation ID middleware -----
 
@@ -88,7 +89,7 @@ pub fn build(state: AppState) -> Router {
         .route("/api/rooms/:id/changes", get(room_changes))
         .route("/api/rooms/:id/read", post(mark_read))
         .route("/api/rooms/:id/receipts", get(list_receipts))
-        .route("/api/rooms/:id/delivery-cursor", get(get_delivery_cursor))
+        .route("/api/rooms/:id/delivery-cursor", get(crate::routes::reads::get_delivery_cursor))
         .route("/api/rooms/:id/search", post(room_search))
         // Messages
         .route(
@@ -135,6 +136,7 @@ pub fn build(state: AppState) -> Router {
         // RTC config
         .merge(crate::routes::rtc::routes())
         // WebSocket
+        .merge(crate::routes::reads::routes())
         .route("/ws", get(ws::handler))
         // Workspace / Org management (ROADMAP 方向一 — multi-tenant foundation).
         // Defined alongside their RBAC guards in `crate::workspaces`.
@@ -1027,61 +1029,6 @@ async fn room_changes(
         .await
         .map_err(AeroError::from)?;
     Ok(Json(serde_json::to_value(msgs).map_err(AeroError::from)?))
-}
-
-// ----- Read receipts -----
-
-#[derive(Deserialize)]
-struct MarkReadReq {
-    last_message_id: String,
-}
-
-async fn mark_read(
-    State(s): State<AppState>,
-    auth: AuthUser,
-    Path(room_str): Path<String>,
-    Json(req): Json<MarkReadReq>,
-) -> ApiResult<Json<serde_json::Value>> {
-    let room = parse_room_id(&room_str)?;
-    // Tenant guard (workspace + room membership) before recording a receipt.
-    s.im.assert_room_access(auth.participant_id, room).await?;
-    let mid = MessageId::from_str(&req.last_message_id)
-        .map_err(|e| AeroError::Invalid(format!("message id: {e}")))?;
-    let r = s.im.mark_read(auth.participant_id, room, mid).await?;
-    Ok(Json(serde_json::to_value(r).map_err(AeroError::from)?))
-}
-
-async fn list_receipts(
-    State(s): State<AppState>,
-    auth: AuthUser,
-    Path(room_str): Path<String>,
-) -> ApiResult<Json<serde_json::Value>> {
-    let room = parse_room_id(&room_str)?;
-    // Tenant guard (workspace + room membership) — supersedes the prior bare
-    // room-membership check.
-    s.im.assert_room_access(auth.participant_id, room).await?;
-    let rs = s.im.receipts_for(room).await?;
-    Ok(Json(serde_json::to_value(rs).map_err(AeroError::from)?))
-}
-
-/// `GET /api/rooms/:id/delivery-cursor` — the caller's persisted DELIVERY cursor
-/// for this room (ROADMAP 方向三·A): the Last-Known-Good `(message_id, seq)` the
-/// client has ACKed receiving. Lets a client fetch its LKG over REST (e.g. an
-/// offline-first client priming before opening the socket). Returns `null` when
-/// the caller has never ACKed in the room. Member-gated via `assert_room_access`.
-async fn get_delivery_cursor(
-    State(s): State<AppState>,
-    auth: AuthUser,
-    Path(room_str): Path<String>,
-) -> ApiResult<Json<serde_json::Value>> {
-    let room = parse_room_id(&room_str)?;
-    s.im.assert_room_access(auth.participant_id, room).await?;
-    let cur = s
-        .delivery_cursors
-        .get(auth.participant_id, room)
-        .await
-        .map_err(AeroError::from)?;
-    Ok(Json(serde_json::to_value(cur).map_err(AeroError::from)?))
 }
 
 // ----- Messages -----

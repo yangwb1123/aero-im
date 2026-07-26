@@ -7,6 +7,7 @@ pub mod agents;
 pub mod ai;
 pub mod live;
 pub mod rtc;
+pub mod reads;
 pub mod health;
 pub mod mls;
 pub mod helpers;
