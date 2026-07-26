@@ -160,13 +160,13 @@ mod unit_tests {
         let blocks = serde_json::json!([{ "type": "text", "text": "hello" }]);
         let recorded_at = time::OffsetDateTime::now_utc();
 
-        let model = row_to_model((
-            id.to_uuid(),
-            message.to_uuid(),
-            editor.to_uuid(),
-            blocks.clone(),
+        let model = row_to_model(Row {
+            id: id.to_uuid(),
+            message_id: message.to_uuid(),
+            editor_id: editor.to_uuid(),
+            blocks: blocks.clone(),
             recorded_at,
-        ));
+        });
 
         assert_eq!(model.id, id);
         assert_eq!(model.message_id, message);
