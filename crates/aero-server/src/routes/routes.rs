@@ -1,14 +1,18 @@
+#![allow(unused_imports)]
 //! HTTP route definitions. WS upgrade lives in `ws::handler`.
+#[allow(unused_imports)]
 use std::str::FromStr;
-use futures::StreamExt as _;
-use sha2::Digest as _;
+#[allow(unused_imports)]
 use aero_auth::{AuthUser, LoginRequest, RegisterRequest};
+#[allow(unused_imports)]
 use uuid::Uuid;
+#[allow(unused_imports)]
 use aero_common::{
     BlobId, Error as AeroError, FileKind, MessageId, ParticipantId, Result as AeroResult, StreamProtocol, StreamStatus, WorkspaceId, WorkspaceRole,
 };
+#[allow(unused_imports)]
 use aero_live_whip::{accept_whep_offer, accept_whip_offer, SessionError, WhipError};
-use aero_storage::{blob::NewBlob, stream::NewStream};
+#[allow(unused_imports)]
 use axum::{
     extract::{Multipart, Path, Query, State},
     http::{header, HeaderValue, Request, StatusCode},
@@ -20,8 +24,11 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+#[allow(unused_imports)]
 use bytes::Bytes;
+#[allow(unused_imports)]
 use serde::Deserialize;
+#[allow(unused_imports)]
 use tower_http::compression::CompressionLayer;
 use crate::error::ApiResult;
 use crate::metrics;
@@ -37,6 +44,7 @@ pub struct RequestId(pub String);
 /// Middleware: read or generate a `x-request-id` header, attach a
 /// [`RequestId`] extension, and echo the value in the response.
 async fn inject_request_id(mut req: Request<axum::body::Body>, next: Next) -> Response {
+#[allow(unused_imports)]
     use tracing::Instrument as _;
     let id = req
         .headers()

@@ -1,3 +1,4 @@
+#![allow(unused_imports)]
 //! Search route handlers.
 use std::str::FromStr;
 use axum::{extract::{Path, Query, State}, routing::{get, post}, Json, Router};

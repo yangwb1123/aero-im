@@ -1,3 +1,4 @@
+#![allow(unused_imports)]
 //! AI route handlers — summarize, ask, stream, context.
 //!
 //! Extracted from the monolithic `routes.rs` (ROADMAP 方向二: 路由拆分).
