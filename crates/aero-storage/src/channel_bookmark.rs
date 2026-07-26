@@ -49,28 +49,28 @@ pub struct ChannelBookmark {
 /// every query so the row decoding stays in one place.
 const COLUMNS: &str = "id, room_id, title, url, emoji, created_by, position, created_at";
 
-type Row = (
-    uuid::Uuid,
-    uuid::Uuid,
-    String,
-    String,
-    Option<String>,
-    uuid::Uuid,
-    i32,
-    time::OffsetDateTime,
-);
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct Row {
+    id: uuid::Uuid,
+    room_id: uuid::Uuid,
+    title: String,
+    url: String,
+    emoji: Option<String>,
+    created_by: uuid::Uuid,
+    position: i32,
+    created_at: time::OffsetDateTime,
+}
 
 fn row_to_model(r: Row) -> ChannelBookmark {
-    let (id, room_id, title, url, emoji, created_by, position, created_at) = r;
     ChannelBookmark {
-        id: ChannelBookmarkId::from_uuid(id),
-        room_id: RoomId::from_uuid(room_id),
-        title,
-        url,
-        emoji,
-        created_by: ParticipantId::from_uuid(created_by),
-        position,
-        created_at,
+        id: ChannelBookmarkId::from_uuid(r.id),
+        room_id: RoomId::from_uuid(r.room_id),
+        title: r.title,
+        url: r.url,
+        emoji: r.emoji,
+        created_by: ParticipantId::from_uuid(r.created_by),
+        position: r.position,
+        created_at: r.created_at,
     }
 }
 
