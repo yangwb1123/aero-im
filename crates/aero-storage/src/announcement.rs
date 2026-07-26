@@ -78,6 +78,8 @@ fn row_to_model(r: Row) -> Announcement {
         workspace_id: WorkspaceId::from_uuid(r.workspace_id),
         body: r.body,
         created_by: ParticipantId::from_uuid(r.created_by),
+        created_at: r.created_at,
+        expires_at: r.expires_at,
         created_at,
         expires_at,
     }
