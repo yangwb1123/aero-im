@@ -44,22 +44,22 @@ pub struct MessageEdit {
 /// query so the row decoding stays in one place.
 const COLUMNS: &str = "id, message_id, editor_id, blocks, recorded_at";
 
-type Row = (
-    uuid::Uuid,
-    uuid::Uuid,
-    uuid::Uuid,
-    serde_json::Value,
-    time::OffsetDateTime,
-);
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct Row {
+    id: uuid::Uuid,
+    message_id: uuid::Uuid,
+    editor_id: uuid::Uuid,
+    blocks: serde_json::Value,
+    recorded_at: time::OffsetDateTime,
+}
 
 fn row_to_model(r: Row) -> MessageEdit {
-    let (id, message_id, editor_id, blocks, recorded_at) = r;
     MessageEdit {
-        id: MessageEditId::from_uuid(id),
-        message_id: MessageId::from_uuid(message_id),
-        editor_id: ParticipantId::from_uuid(editor_id),
-        blocks,
-        recorded_at,
+        id: MessageEditId::from_uuid(r.id),
+        message_id: MessageId::from_uuid(r.message_id),
+        editor_id: ParticipantId::from_uuid(r.editor_id),
+        blocks: r.blocks,
+        recorded_at: r.recorded_at,
     }
 }
 

@@ -57,26 +57,26 @@ pub struct JoinRequest {
 const COLUMNS: &str =
     "id, room_id, requester_id, status, created_at, decided_at, decided_by";
 
-type Row = (
-    uuid::Uuid,
-    uuid::Uuid,
-    uuid::Uuid,
-    String,
-    time::OffsetDateTime,
-    Option<time::OffsetDateTime>,
-    Option<uuid::Uuid>,
-);
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct Row {
+    id: uuid::Uuid,
+    room_id: uuid::Uuid,
+    requester_id: uuid::Uuid,
+    status: String,
+    created_at: time::OffsetDateTime,
+    decided_at: Option<time::OffsetDateTime>,
+    decided_by: Option<uuid::Uuid>,
+}
 
 fn row_to_model(r: Row) -> JoinRequest {
-    let (id, room_id, requester_id, status, created_at, decided_at, decided_by) = r;
     JoinRequest {
-        id: JoinRequestId::from_uuid(id),
-        room_id: RoomId::from_uuid(room_id),
-        requester_id: ParticipantId::from_uuid(requester_id),
-        status,
-        created_at,
-        decided_at,
-        decided_by: decided_by.map(ParticipantId::from_uuid),
+        id: JoinRequestId::from_uuid(r.id),
+        room_id: RoomId::from_uuid(r.room_id),
+        requester_id: ParticipantId::from_uuid(r.requester_id),
+        status: r.status,
+        created_at: r.created_at,
+        decided_at: r.decided_at,
+        decided_by: r.decided_by.map(ParticipantId::from_uuid),
     }
 }
 

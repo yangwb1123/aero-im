@@ -62,26 +62,26 @@ pub struct AuthSession {
 const COLUMNS: &str =
     "id, participant_id, token_hash, user_agent, created_at, last_seen_at, revoked_at";
 
-type Row = (
-    uuid::Uuid,
-    uuid::Uuid,
-    String,
-    Option<String>,
-    time::OffsetDateTime,
-    time::OffsetDateTime,
-    Option<time::OffsetDateTime>,
-);
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct Row {
+    id: uuid::Uuid,
+    participant_id: uuid::Uuid,
+    token_hash: String,
+    user_agent: Option<String>,
+    created_at: time::OffsetDateTime,
+    last_seen_at: time::OffsetDateTime,
+    revoked_at: Option<time::OffsetDateTime>,
+}
 
 fn row_to_model(r: Row) -> AuthSession {
-    let (id, participant_id, token_hash, user_agent, created_at, last_seen_at, revoked_at) = r;
     AuthSession {
-        id: SessionId::from_uuid(id),
-        participant_id: ParticipantId::from_uuid(participant_id),
-        token_prefix: token_hash.chars().take(PREFIX_LEN).collect(),
-        user_agent,
-        created_at,
-        last_seen_at,
-        revoked_at,
+        id: SessionId::from_uuid(r.id),
+        participant_id: ParticipantId::from_uuid(r.participant_id),
+        token_prefix: r.token_hash.chars().take(PREFIX_LEN).collect(),
+        user_agent: r.user_agent,
+        created_at: r.created_at,
+        last_seen_at: r.last_seen_at,
+        revoked_at: r.revoked_at,
     }
 }
 

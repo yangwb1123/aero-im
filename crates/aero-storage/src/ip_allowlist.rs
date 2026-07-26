@@ -41,22 +41,22 @@ pub struct IpAllowEntry {
 /// query so the row decoding stays in one place.
 const COLUMNS: &str = "id, workspace_id, cidr, note, created_at";
 
-type Row = (
-    uuid::Uuid,
-    uuid::Uuid,
-    String,
-    Option<String>,
-    time::OffsetDateTime,
-);
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct Row {
+    id: uuid::Uuid,
+    workspace_id: uuid::Uuid,
+    cidr: String,
+    note: Option<String>,
+    created_at: time::OffsetDateTime,
+}
 
 fn row_to_model(r: Row) -> IpAllowEntry {
-    let (id, workspace_id, cidr, note, created_at) = r;
     IpAllowEntry {
-        id,
-        workspace_id: WorkspaceId::from_uuid(workspace_id),
-        cidr,
-        note,
-        created_at,
+        id: r.id,
+        workspace_id: WorkspaceId::from_uuid(r.workspace_id),
+        cidr: r.cidr,
+        note: r.note,
+        created_at: r.created_at,
     }
 }
 
