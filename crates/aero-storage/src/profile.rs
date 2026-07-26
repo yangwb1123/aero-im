@@ -53,31 +53,30 @@ pub struct Profile {
 const COLUMNS: &str = "participant_id, title, pronouns, timezone, phone, status_text, \
                         status_emoji, status_expires_at, updated_at";
 
-type Row = (
-    uuid::Uuid,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    Option<time::OffsetDateTime>,
-    time::OffsetDateTime,
-);
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct Row {
+    participant_id: uuid::Uuid,
+    title: Option<String>,
+    pronouns: Option<String>,
+    timezone: Option<String>,
+    phone: Option<String>,
+    status_text: Option<String>,
+    status_emoji: Option<String>,
+    status_expires_at: Option<time::OffsetDateTime>,
+    updated_at: time::OffsetDateTime,
+}
 
 fn row_to_model(r: Row) -> Profile {
-    let (participant_id, title, pronouns, timezone, phone, status_text,
-         status_emoji, status_expires_at, updated_at) = r;
     Profile {
-        participant_id: ParticipantId::from_uuid(participant_id),
-        title,
-        pronouns,
-        timezone,
-        phone,
-        status_text,
-        status_emoji,
-        status_expires_at,
-        updated_at,
+        participant_id: ParticipantId::from_uuid(r.participant_id),
+        title: r.title,
+        pronouns: r.pronouns,
+        timezone: r.timezone,
+        phone: r.phone,
+        status_text: r.status_text,
+        status_emoji: r.status_emoji,
+        status_expires_at: r.status_expires_at,
+        updated_at: r.updated_at,
     }
 }
 
