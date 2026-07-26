@@ -62,22 +62,22 @@ pub struct Announcement {
 /// every query so the row decoding stays in one place.
 const COLUMNS: &str = "id, workspace_id, body, created_by, created_at, expires_at";
 
-type Row = (
-    uuid::Uuid,
-    uuid::Uuid,
-    String,
-    uuid::Uuid,
-    OffsetDateTime,
-    Option<OffsetDateTime>,
-);
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct Row {
+    id: uuid::Uuid,
+    workspace_id: uuid::Uuid,
+    body: String,
+    created_by: uuid::Uuid,
+    created_at: OffsetDateTime,
+    expires_at: Option<OffsetDateTime>,
+}
 
 fn row_to_model(r: Row) -> Announcement {
-    let (id, workspace_id, body, created_by, created_at, expires_at) = r;
     Announcement {
-        id: AnnouncementId::from_uuid(id),
-        workspace_id: WorkspaceId::from_uuid(workspace_id),
-        body,
-        created_by: ParticipantId::from_uuid(created_by),
+        id: AnnouncementId::from_uuid(r.id),
+        workspace_id: WorkspaceId::from_uuid(r.workspace_id),
+        body: r.body,
+        created_by: ParticipantId::from_uuid(r.created_by),
         created_at,
         expires_at,
     }

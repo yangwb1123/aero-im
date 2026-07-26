@@ -62,24 +62,24 @@ pub struct MonitoredSearch {
 /// query so the row decoding stays in one place.
 const COLUMNS: &str = "id, participant_id, workspace_id, name, query, created_at";
 
-type Row = (
-    uuid::Uuid,
-    uuid::Uuid,
-    uuid::Uuid,
-    String,
-    String,
-    time::OffsetDateTime,
-);
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct Row {
+    id: uuid::Uuid,
+    participant_id: uuid::Uuid,
+    workspace_id: uuid::Uuid,
+    name: String,
+    query: String,
+    created_at: time::OffsetDateTime,
+}
 
 fn row_to_model(r: Row) -> SavedSearch {
-    let (id, participant_id, workspace_id, name, query, created_at) = r;
     SavedSearch {
-        id: SavedSearchId::from_uuid(id),
-        participant_id: ParticipantId::from_uuid(participant_id),
-        workspace_id: WorkspaceId::from_uuid(workspace_id),
-        name,
-        query,
-        created_at,
+        id: SavedSearchId::from_uuid(r.id),
+        participant_id: ParticipantId::from_uuid(r.participant_id),
+        workspace_id: WorkspaceId::from_uuid(r.workspace_id),
+        name: r.name,
+        query: r.query,
+        created_at: r.created_at,
     }
 }
 
