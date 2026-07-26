@@ -55,32 +55,31 @@ pub struct Clip {
 const COLUMNS: &str =
     "id, stream_id, creator_id, title, start_secs, end_secs, created_at, share_slug, view_count";
 
-#[derive(Debug, Clone, sqlx::FromRow)]
-struct Row {
-    id: uuid::Uuid,
-    stream_id: uuid::Uuid,
-    creator_id: uuid::Uuid,
-    title: String,
-    start_secs: i32,
-    end_secs: i32,
-    created_at: time::OffsetDateTime,
-    share_slug: Option<String>,
-    view_count: i64,
-}
+type Row = (
+    uuid::Uuid,
+    uuid::Uuid,
+    uuid::Uuid,
+    String,
+    i32,
+    i32,
+    time::OffsetDateTime,
+    Option<String>,
+    i64,
+);
 
 fn row_to_model(r: Row) -> Clip {
+    let (id, stream_id, creator_id, title, start_secs, end_secs, created_at, share_slug, view_count) = r;
     Clip {
-        id: r.id,
-        stream_id: r.stream_id,
-        creator_id: r.creator_id,
-        title: r.title,
-        start_secs: r.start_secs,
-        end_secs: r.end_secs,
-        created_at: r.created_at,
-        share_slug: r.share_slug,
-        view_count: r.view_count,
+        id: ClipId::from_uuid(id),
+        stream_id: ulid::Ulid(stream_id.as_u128()),
+        creator_id: ParticipantId::from_uuid(creator_id),
+        title,
+        start_secs,
+        end_secs,
+        created_at,
+        share_slug,
+        view_count,
     }
-
 }
 
 /// Derive a URL-safe base32 slug from a byte slice. Uses the crockford

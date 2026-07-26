@@ -54,30 +54,29 @@ pub struct LegalHold {
 const COLUMNS: &str =
     "id, workspace_id, room_id, reason, created_by, active, created_at, released_at";
 
-#[derive(Debug, Clone, sqlx::FromRow)]
-struct Row {
-    id: uuid::Uuid,
-    workspace_id: uuid::Uuid,
-    room_id: Option<uuid::Uuid>,
-    reason: String,
-    created_by: uuid::Uuid,
-    active: bool,
-    created_at: time::OffsetDateTime,
-    released_at: Option<time::OffsetDateTime>,
-}
+type Row = (
+    uuid::Uuid,
+    uuid::Uuid,
+    Option<uuid::Uuid>,
+    String,
+    uuid::Uuid,
+    bool,
+    time::OffsetDateTime,
+    Option<time::OffsetDateTime>,
+);
 
 fn row_to_model(r: Row) -> LegalHold {
+    let (id, workspace_id, room_id, reason, created_by, active, created_at, released_at) = r;
     LegalHold {
-        id: r.id,
-        workspace_id: r.workspace_id,
-        room_id: r.room_id,
-        reason: r.reason,
-        created_by: r.created_by,
-        active: r.active,
-        created_at: r.created_at,
-        released_at: r.released_at,
+        id: LegalHoldId::from_uuid(id),
+        workspace_id: WorkspaceId::from_uuid(workspace_id),
+        room_id: room_id.map(RoomId::from_uuid),
+        reason,
+        created_by: ParticipantId::from_uuid(created_by),
+        active,
+        created_at,
+        released_at,
     }
-
 }
 
 /// Repository over the `legal_holds` table (retention exemptions).

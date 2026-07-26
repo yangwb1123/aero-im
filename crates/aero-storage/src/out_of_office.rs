@@ -73,24 +73,23 @@ pub fn within_window(
 /// query so the row decoding stays in one place.
 const COLUMNS: &str = "participant_id, message, starts_at, ends_at, created_at";
 
-#[derive(Debug, Clone, sqlx::FromRow)]
-struct Row {
-    participant_id: uuid::Uuid,
-    message: String,
-    starts_at: Option<time::OffsetDateTime>,
-    ends_at: Option<time::OffsetDateTime>,
-    created_at: time::OffsetDateTime,
-}
+type Row = (
+    uuid::Uuid,
+    String,
+    Option<time::OffsetDateTime>,
+    Option<time::OffsetDateTime>,
+    time::OffsetDateTime,
+);
 
 fn row_to_model(r: Row) -> OutOfOffice {
+    let (participant_id, message, starts_at, ends_at, created_at) = r;
     OutOfOffice {
-        participant_id: r.participant_id,
-        message: r.message,
-        starts_at: r.starts_at,
-        ends_at: r.ends_at,
-        created_at: r.created_at,
+        participant_id: ParticipantId::from_uuid(participant_id),
+        message,
+        starts_at,
+        ends_at,
+        created_at,
     }
-
 }
 
 /// Repository over the `out_of_office` and `ooo_auto_replies` tables.
