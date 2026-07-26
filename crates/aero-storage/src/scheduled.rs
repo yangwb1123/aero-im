@@ -53,31 +53,30 @@ fn clamp_claim(requested: i64) -> i64 {
 const COLUMNS: &str =
     "id, room_id, sender_id, blocks, reply_to, scheduled_at, created_at, delivered_at, canceled_at";
 
-type Row = (
-    uuid::Uuid,
-    uuid::Uuid,
-    uuid::Uuid,
-    serde_json::Value,
-    Option<uuid::Uuid>,
-    time::OffsetDateTime,
-    time::OffsetDateTime,
-    Option<time::OffsetDateTime>,
-    Option<time::OffsetDateTime>,
-);
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct Row {
+    id: uuid::Uuid,
+    room_id: uuid::Uuid,
+    sender_id: uuid::Uuid,
+    blocks: serde_json::Value,
+    reply_to: Option<uuid::Uuid>,
+    scheduled_at: time::OffsetDateTime,
+    created_at: time::OffsetDateTime,
+    delivered_at: Option<time::OffsetDateTime>,
+    canceled_at: Option<time::OffsetDateTime>,
+}
 
 fn row_to_model(r: Row) -> ScheduledMessage {
-    let (id, room_id, sender_id, blocks, reply_to, scheduled_at, created_at, delivered_at, canceled_at) =
-        r;
     ScheduledMessage {
-        id: ScheduledMessageId::from_uuid(id),
-        room_id: RoomId::from_uuid(room_id),
-        sender_id: ParticipantId::from_uuid(sender_id),
-        blocks: serde_json::from_value(blocks).unwrap_or_default(),
-        reply_to: reply_to.map(MessageId::from_uuid),
-        scheduled_at,
-        created_at,
-        delivered_at,
-        canceled_at,
+        id: ScheduledMessageId::from_uuid(r.id),
+        room_id: RoomId::from_uuid(r.room_id),
+        sender_id: ParticipantId::from_uuid(r.sender_id),
+        blocks: serde_json::from_value(r.blocks).unwrap_or_default(),
+        reply_to: r.reply_to.map(MessageId::from_uuid),
+        scheduled_at: r.scheduled_at,
+        created_at: r.created_at,
+        delivered_at: r.delivered_at,
+        canceled_at: r.canceled_at,
     }
 }
 

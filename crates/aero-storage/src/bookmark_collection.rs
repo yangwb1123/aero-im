@@ -25,16 +25,22 @@ pub struct BookmarkCollection {
     pub created_at: OffsetDateTime,
 }
 
-type Row = (uuid::Uuid, uuid::Uuid, String, i32, OffsetDateTime);
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct Row {
+    id: uuid::Uuid,
+    participant_id: uuid::Uuid,
+    name: String,
+    position: i32,
+    created_at: OffsetDateTime,
+}
 
 fn row_to_model(r: Row) -> BookmarkCollection {
-    let (id, participant_id, name, position, created_at) = r;
     BookmarkCollection {
-        id: BookmarkCollectionId::from_uuid(id),
-        participant_id: ParticipantId::from_uuid(participant_id),
-        name,
-        position,
-        created_at,
+        id: BookmarkCollectionId::from_uuid(r.id),
+        participant_id: ParticipantId::from_uuid(r.participant_id),
+        name: r.name,
+        position: r.position,
+        created_at: r.created_at,
     }
 }
 
