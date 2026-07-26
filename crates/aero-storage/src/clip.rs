@@ -55,30 +55,30 @@ pub struct Clip {
 const COLUMNS: &str =
     "id, stream_id, creator_id, title, start_secs, end_secs, created_at, share_slug, view_count";
 
-type Row = (
-    uuid::Uuid,
-    uuid::Uuid,
-    uuid::Uuid,
-    String,
-    i32,
-    i32,
-    time::OffsetDateTime,
-    Option<String>,
-    i64,
-);
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct Row {
+    id: uuid::Uuid,
+    stream_id: uuid::Uuid,
+    creator_id: uuid::Uuid,
+    title: String,
+    start_secs: i32,
+    end_secs: i32,
+    created_at: time::OffsetDateTime,
+    share_slug: Option<String>,
+    view_count: i64,
+}
 
 fn row_to_model(r: Row) -> Clip {
-    let (id, stream_id, creator_id, title, start_secs, end_secs, created_at, share_slug, view_count) = r;
     Clip {
-        id: ClipId::from_uuid(id),
-        stream_id: ulid::Ulid(stream_id.as_u128()),
-        creator_id: ParticipantId::from_uuid(creator_id),
-        title,
-        start_secs,
-        end_secs,
-        created_at,
-        share_slug,
-        view_count,
+        id: ClipId::from_uuid(r.id),
+        stream_id: ulid::Ulid(r.stream_id.as_u128()),
+        creator_id: ParticipantId::from_uuid(r.creator_id),
+        title: r.title,
+        start_secs: r.start_secs,
+        end_secs: r.end_secs,
+        created_at: r.created_at,
+        share_slug: r.share_slug,
+        view_count: r.view_count,
     }
 }
 
