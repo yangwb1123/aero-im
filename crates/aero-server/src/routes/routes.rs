@@ -120,8 +120,8 @@ pub fn build(state: AppState) -> Router {
         .route("/whip/:stream_key", post(whip_post))
         .route("/whip/resource/:stream_key", axum::routing::delete(whip_delete))
         .route("/whep/:stream_id", post(whep_post))
-        // Agents / Bots (Bot/Agent participants + Bot SDK registration)
-        .route("/api/agents", post(create_agent))
+        // Agents / Bots
+        .merge(crate::routes::agents::routes())
         .route("/api/bots", post(bot_create).get(bot_list))
         .route("/api/bots/:id/token", post(bot_rotate_token))
         .route("/api/bots/:id/subscriptions", get(bot_list_subscriptions).post(bot_create_subscription))
@@ -1669,50 +1669,6 @@ fn guess_file_kind(mime: &str) -> FileKind {
     } else {
         FileKind::Other
     }
-}
-
-// ----- Agents -----
-
-/// Trim + validate a bot/agent name: reject empty/whitespace-only and cap at 64
-/// chars, matching the human `display_name` rule (update_me) so a bot can't be
-/// created with a blank or multi-megabyte name that renders broken everywhere a
-/// participant name is shown. Returns the normalized name.
-fn validate_bot_name(raw: &str) -> Result<String, AeroError> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Err(AeroError::Invalid("name must not be empty".into()));
-    }
-    if trimmed.chars().count() > 64 {
-        return Err(AeroError::Invalid("name too long (max 64 chars)".into()));
-    }
-    Ok(trimmed.to_owned())
-}
-
-#[derive(Deserialize)]
-struct CreateAgentReq {
-    display_name: String,
-    #[serde(default)]
-    kind: Option<String>, // "bot" | "agent"
-    #[serde(default)]
-    avatar_url: Option<String>,
-}
-
-async fn create_agent(
-    State(s): State<AppState>,
-    auth: AuthUser,
-    Json(req): Json<CreateAgentReq>,
-) -> ApiResult<Json<serde_json::Value>> {
-    let kind = match req.kind.as_deref().unwrap_or("bot") {
-        "agent" => aero_common::ParticipantKind::Agent,
-        _ => aero_common::ParticipantKind::Bot,
-    };
-    let display_name = validate_bot_name(&req.display_name)?;
-    let bot = s
-        .participants
-        .create_bot(&display_name, kind, Some(auth.participant_id), req.avatar_url.as_deref())
-        .await
-        .map_err(AeroError::from)?;
-    Ok(Json(serde_json::to_value(bot).map_err(AeroError::from)?))
 }
 
 // ---------- Bot SDK (方向三) ----------

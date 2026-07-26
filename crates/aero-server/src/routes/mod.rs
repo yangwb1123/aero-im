@@ -3,6 +3,7 @@
 //! Split from monolithic `routes.rs` (2633 lines) as part of REFACTOR_PLAN.md Step 7.
 
 pub mod routes;
+pub mod agents;
 pub mod ai;
 pub mod live;
 pub mod rtc;
