@@ -126,10 +126,10 @@ c!(Gate_, "gate", "Run gates (shell + native)", |ctx, args| {
         "filesize" => bash(file("file-size-check.sh"),60).await, "truth" => bash(file("truth-check.sh"),60).await,
         "web" => bash(file("web-check.sh"),60).await, "deps" => bash(file("dependency-check.sh"),60).await,
         "complexity" => bash(file("complexity-check.sh"),60).await, "all" => bash(file("file-size-check.sh"),120).await,
-        "filesize-native" => { let o = aero_eng::checks::check_filesize(&ctx.root, &ctx.eng_config); if let Some(d) = o.detail() { println!("{}", serde_json::to_string_pretty(serde_json::to_string_pretty(&d).unwrap()d).unwrap_or_default()); } o }
-        "deps-native" => { let o = aero_eng::checks::check_deps(&ctx.root); if let Some(d) = o.detail() { println!("{}", serde_json::to_string_pretty(serde_json::to_string_pretty(&d).unwrap()d).unwrap_or_default()); } o }
-        "workspace-members" => { let o = aero_eng::checks::check_workspace_members(&ctx.root); if let Some(d) = o.detail() { println!("{}", serde_json::to_string_pretty(serde_json::to_string_pretty(&d).unwrap()d).unwrap_or_default()); } o }
-        "todos" => { let o = aero_eng::checks::check_todos(&ctx.root); if let Some(d) = o.detail() { println!("{}", serde_json::to_string_pretty(serde_json::to_string_pretty(&d).unwrap()d).unwrap_or_default()); } o }
+        "filesize-native" => { let o = aero_eng::checks::check_filesize(&ctx.root, &ctx.eng_config); if let Some(d) = o.detail() { println!("{}", serde_json::to_string_pretty(&d).unwrap_or_default()); } o }
+        "deps-native" => { let o = aero_eng::checks::check_deps(&ctx.root); if let Some(d) = o.detail() { println!("{}", serde_json::to_string_pretty(&d).unwrap_or_default()); } o }
+        "workspace-members" => { let o = aero_eng::checks::check_workspace_members(&ctx.root); if let Some(d) = o.detail() { println!("{}", serde_json::to_string_pretty(&d).unwrap_or_default()); } o }
+        "todos" => { let o = aero_eng::checks::check_todos(&ctx.root); if let Some(d) = o.detail() { println!("{}", serde_json::to_string_pretty(&d).unwrap_or_default()); } o }
         "metadata" => { let o = aero_eng::checks::check_crate_metadata(&ctx.root); println!("{}", o.message()); o }
         "readme" => { let o = aero_eng::checks::check_readme(&ctx.root); println!("{}", o.message()); o }
         _ => Outcome::error("unknown")

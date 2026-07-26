@@ -54,9 +54,9 @@ c!(Gate_, "gate", "Run engineering gates", |ctx, args| {
         "filesize" => b(f("file-size-check.sh"),60).await, "truth" => b(f("truth-check.sh"),60).await,
         "web" => b(f("web-check.sh"),60).await, "deps" => b(f("dependency-check.sh"),60).await,
         "complexity" => b(f("complexity-check.sh"),60).await, "all" => b(f("file-size-check.sh"),120).await,
-        "filesize-native" => { let o = aero_eng::checks::check_filesize(&ctx.root, &ctx.eng_config); if let Some(d) = o.detail() { println!("{}", serde_json::to_string_pretty(serde_json::to_string_pretty(&d).unwrap()d).unwrap_or_default()); } o }
-        "deps-native" => { let o = aero_eng::checks::check_deps(&ctx.root); if let Some(d) = o.detail() { println!("{}", serde_json::to_string_pretty(serde_json::to_string_pretty(&d).unwrap()d).unwrap_or_default()); } o }
-        "workspace-members" => { let o = aero_eng::checks::check_workspace_members(&ctx.root); if let Some(d) = o.detail() { println!("{}", serde_json::to_string_pretty(serde_json::to_string_pretty(&d).unwrap()d).unwrap_or_default()); } o }
+        "filesize-native" => { let o = aero_eng::checks::check_filesize(&ctx.root, &ctx.eng_config); if let Some(d) = o.detail() { println!("{}", serde_json::to_string_pretty(&d).unwrap_or_default()); } o }
+        "deps-native" => { let o = aero_eng::checks::check_deps(&ctx.root); if let Some(d) = o.detail() { println!("{}", serde_json::to_string_pretty(&d).unwrap_or_default()); } o }
+        "workspace-members" => { let o = aero_eng::checks::check_workspace_members(&ctx.root); if let Some(d) = o.detail() { println!("{}", serde_json::to_string_pretty(&d).unwrap_or_default()); } o }
         _ => Outcome::error("unknown")
     }
 });
