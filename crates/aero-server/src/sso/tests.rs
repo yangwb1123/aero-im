@@ -310,3 +310,33 @@ fn browser_config_rejects_http_and_wrong_callback_path() {
     )
     .is_err());
 }
+
+#[test]
+fn login_page_mode_accepts_documented_aliases_and_fails_safe() {
+    assert_eq!(parse_login_page_mode("local"), LoginPageMode::Local);
+    assert_eq!(parse_login_page_mode(" aero "), LoginPageMode::Local);
+    assert_eq!(parse_login_page_mode("hosted"), LoginPageMode::Snaplink);
+    assert_eq!(parse_login_page_mode("SNAPLINK"), LoginPageMode::Snaplink);
+    assert_eq!(parse_login_page_mode(""), LoginPageMode::Both);
+    assert_eq!(parse_login_page_mode("dual"), LoginPageMode::Both);
+    assert_eq!(parse_login_page_mode("unexpected"), LoginPageMode::Both);
+}
+
+#[test]
+fn public_auth_config_never_contains_a_client_secret() {
+    let json = serde_json::to_string(&PublicAuthConfig {
+        login_page: LoginPageMode::Both.as_str(),
+        snaplink: Some(PublicSnaplinkConfig {
+            base_url: "https://sso.example".into(),
+            authorization_endpoint: "https://sso.example/auth/login".into(),
+            token_endpoint: "https://sso.example/token".into(),
+            client_id: "im-demo".into(),
+            redirect_uri: "https://im.example/callback".into(),
+            scope: vec!["openid", "profile", "email"],
+        }),
+    })
+    .unwrap();
+    assert!(json.contains("client_id"));
+    assert!(!json.contains("client_secret"));
+    assert!(!json.contains("jwks"));
+}

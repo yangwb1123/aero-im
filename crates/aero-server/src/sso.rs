@@ -11,6 +11,12 @@
 //! code with PKCE S256, state, and nonce. Short-lived `HttpOnly`/`Secure`
 //! same-site cookies bind all three values to the initiating browser.
 //!
+//! The public `GET /api/auth/config` document also tells the bundled SPA which
+//! login surface to render. `AERO__OIDC__LOGIN_PAGE` accepts `local`,
+//! `snaplink`, or `both`; the default remains `both` for backwards
+//! compatibility. This is presentation policy only — all credential and token
+//! validation still happens server-side.
+//!
 //! ## Configuration & wiring
 //!
 //! OIDC is **off by default**. The handler reads [`OidcConfig::from_env`] per
@@ -81,6 +87,70 @@ const NONCE_COOKIE: &str = "aero_oidc_nonce";
 const CALLBACK_CSP: &str = "default-src 'none'; script-src 'self'; base-uri 'none'; \
     form-action 'none'; frame-ancestors 'none'; connect-src 'none'; img-src 'none'";
 
+/// Which login surface the bundled web client should expose.
+///
+/// `both` preserves the historical UI. `local` keeps the Aero-owned login form
+/// visible (the form delegates credential verification to the Snaplink SDK) and
+/// hides the hosted SSO affordance. `snaplink` shows only the hosted Snaplink
+/// entry point. The value is intentionally read per request so a deployment can
+/// rotate the setting with a normal process restart without adding another
+/// application-state singleton.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum LoginPageMode {
+    Local,
+    Snaplink,
+    Both,
+}
+
+impl LoginPageMode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Snaplink => "snaplink",
+            Self::Both => "both",
+        }
+    }
+}
+
+fn login_page_mode() -> LoginPageMode {
+    let raw = std::env::var("AERO__OIDC__LOGIN_PAGE")
+        .or_else(|_| std::env::var("AERO_LOGIN_PAGE"))
+        .unwrap_or_default();
+    parse_login_page_mode(&raw)
+}
+
+fn parse_login_page_mode(raw: &str) -> LoginPageMode {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "local" | "aero" | "self" => LoginPageMode::Local,
+        "snaplink" | "hosted" => LoginPageMode::Snaplink,
+        "" | "both" | "dual" => LoginPageMode::Both,
+        invalid => {
+            tracing::warn!(value = invalid, "invalid OIDC login-page mode; using both");
+            LoginPageMode::Both
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct PublicSnaplinkConfig {
+    /// Snaplink issuer/base URL used by its generated browser SDK.
+    base_url: String,
+    /// OAuth authorization API. Snaplink's hosted frontend may still be the
+    /// first page rendered by this endpoint.
+    authorization_endpoint: String,
+    token_endpoint: String,
+    client_id: String,
+    redirect_uri: String,
+    scope: Vec<&'static str>,
+}
+
+#[derive(Debug, Serialize)]
+struct PublicAuthConfig {
+    login_page: &'static str,
+    snaplink: Option<PublicSnaplinkConfig>,
+}
+
 /// One live JWKS provider per configured key endpoint. The provider owns the
 /// bounded HTTP client, TTL key cache, and unknown-kid single-flight gate, so it
 /// must outlive any one login request. Keying by the validated endpoint keeps
@@ -107,6 +177,7 @@ pub fn routes() -> Router<AppState> {
             "/api/auth/oidc",
             post(oidc_login).layer(DefaultBodyLimit::max(MAX_OIDC_BODY_BYTES)),
         )
+        .route("/api/auth/config", get(auth_config))
         .route("/api/auth/oidc/start", get(oidc_start))
         .route(CALLBACK_PATH, get(oidc_callback))
 }
@@ -115,6 +186,36 @@ pub fn routes() -> Router<AppState> {
 struct OidcLoginReq {
     /// The raw OIDC ID token (a signed JWT) issued by the external `IdP`.
     id_token: String,
+}
+
+fn public_auth_config() -> PublicAuthConfig {
+    let mode = login_page_mode();
+    let snaplink = (|| {
+        let oidc = OidcConfig::from_env()?;
+        let browser = BrowserOidcConfig::from_env().ok().flatten()?;
+        let issuer = oidc.issuer.trim_end_matches('/');
+        let authorization_endpoint = format!("{issuer}/auth/login");
+        Some(PublicSnaplinkConfig {
+            base_url: issuer.to_owned(),
+            authorization_endpoint,
+            token_endpoint: browser.token_endpoint.to_string(),
+            client_id: browser.client_id,
+            redirect_uri: browser.redirect_uri.to_string(),
+            scope: vec!["openid", "profile", "email"],
+        })
+    })();
+    PublicAuthConfig {
+        login_page: mode.as_str(),
+        snaplink,
+    }
+}
+
+/// `GET /api/auth/config` — the non-secret login policy consumed by the
+/// bundled SPA. Client secrets, JWKS URLs and signing details are deliberately
+/// absent; the SPA only needs the issuer, client id and public redirect target
+/// to select a page or let the Snaplink SDK start an authorization flow.
+async fn auth_config() -> Json<PublicAuthConfig> {
+    Json(public_auth_config())
 }
 
 #[derive(Serialize)]

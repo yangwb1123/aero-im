@@ -18,6 +18,7 @@
         <div class="brand-mark">A</div>
         <h1>Aero IM</h1>
         <p class="muted">debug client · 联调专用</p>
+        <p id="auth-mode-hint" class="muted" hidden></p>
       </header>
 
       <nav class="tabs" role="tablist">
@@ -48,9 +49,12 @@
           />
         </label>
         <button type="submit" class="btn-primary">登录</button>
-        <div class="auth-divider" role="separator"><span>或</span></div>
-        <a class="btn-sso" href="/api/auth/oidc/start">通过 Snaplink SSO 登录</a>
       </form>
+
+      <div id="auth-sso-option" class="auth-sso-option">
+        <div class="auth-divider" role="separator"><span>或</span></div>
+        <a id="btn-sso" class="btn-sso" href="/api/auth/oidc/start">通过 Snaplink SSO 登录</a>
+      </div>
 
       <form id="form-register" class="auth-form" data-tab-panel="register" hidden>
         <label>

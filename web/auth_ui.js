@@ -12,15 +12,39 @@ import { api, auth, ApiError } from './api.js';
 import { state, ws, els, setBusy } from './context.js';
 import { discardPersistedDeliveries } from './delivery.js';
 import { toast } from './render.js';
+import { snaplinkPasswordLogin, SnaplinkMfaRequired } from './snaplink_auth.js';
 
 let enterChat = () => {};
 let showAuth = () => {};
+let authConfig = { login_page: 'both', snaplink: null };
+let loginPageMode = 'both';
+let authConfigReady = Promise.resolve();
 
 export function initAuthUi(deps) {
   if (deps) {
     if (typeof deps.enterChat === 'function') enterChat = deps.enterChat;
     if (typeof deps.showAuth === 'function') showAuth = deps.showAuth;
   }
+
+  if (els.btnSso) {
+    els.btnSso.addEventListener('click', (event) => {
+      // The server owns the confidential browser flow and its HttpOnly PKCE
+      // cookies. The SDK-backed flow is used by the Aero-owned page; this link
+      // intentionally remains a navigation to the hosted Snaplink page for
+      // `both`/`snaplink`.
+      if (loginPageMode !== 'local') return;
+      event.preventDefault();
+    });
+  }
+  // A missing config document must not hide a working legacy login page.
+  authConfigReady = api.authConfig().then((config) => {
+    if (!config || typeof config !== 'object') return;
+    authConfig = config;
+    loginPageMode = ['local', 'snaplink', 'both'].includes(config.login_page)
+      ? config.login_page
+      : 'both';
+    applyLoginPageMode();
+  }).catch(() => {});
 
   els.formLogin.addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -34,13 +58,23 @@ export function initAuthUi(deps) {
     if (!email || !password) return;
     setBusy(els.formLogin, true);
     try {
-      onAuthSuccess(await api.login({ email, password, ...factor }));
+      // Wait for policy resolution so a fast first submit cannot accidentally
+      // use Aero's legacy password endpoint in an SDK-backed deployment.
+      await authConfigReady;
+      const result = loginPageMode !== 'snaplink' && authConfig.snaplink
+        ? await snaplinkPasswordLogin(authConfig, {
+          username: email,
+          password,
+          secondFactor,
+        })
+        : await api.login({ email, password, ...factor });
+      onAuthSuccess(result);
     } catch (err) {
-      if (isTwoFactorError(err)) {
+      if (isTwoFactorError(err) || err instanceof SnaplinkMfaRequired) {
         setBusy(els.formLogin, false);
         els.loginSecondFactor.value = '';
         els.loginSecondFactor.focus();
-        toast('请输入有效的 6 位验证码或一次性恢复码', 'error');
+        toast('请输入 6 位 TOTP 验证码或 Snaplink 恢复码', 'error');
       } else {
         toast(err.message || '登录失败', 'error');
       }
@@ -86,6 +120,32 @@ export function initAuthUi(deps) {
       toast(`本机已退出；服务端会话撤销失败:${err.message}`, 'error');
     }
   });
+}
+
+function applyLoginPageMode() {
+  const local = loginPageMode === 'local';
+  const snaplink = loginPageMode === 'snaplink';
+  const sdkLocal = !snaplink && Boolean(authConfig.snaplink);
+  if (els.authSsoOption) els.authSsoOption.hidden = local;
+  if (els.authModeHint) {
+    els.authModeHint.hidden = !sdkLocal && !snaplink;
+    els.authModeHint.textContent = sdkLocal
+      ? 'Aero 自有登录页面 · 账号由 Snaplink SDK 验证'
+      : '正在使用 Snaplink 托管登录页面';
+  }
+  if (els.authTabs) els.authTabs.hidden = snaplink;
+  if (els.formLogin) els.formLogin.hidden = snaplink;
+  if (els.formRegister) els.formRegister.hidden = snaplink || sdkLocal;
+  if (els.tabs) {
+    for (const tab of els.tabs) {
+      const isRegister = tab.dataset.tab === 'register';
+      tab.hidden = sdkLocal && isRegister;
+      tab.disabled = tab.hidden;
+    }
+  }
+  if (sdkLocal && els.formLogin) {
+    for (const tab of els.tabs || []) tab.classList.toggle('active', tab.dataset.tab === 'login');
+  }
 }
 
 function onAuthSuccess(res) {

@@ -85,6 +85,15 @@ async function request(method, path, { body, query, withAuth = true, raw = false
 }
 
 export const api = {
+  authConfig() {
+    return request('GET', '/api/auth/config', { withAuth: false });
+  },
+  oidcLogin(id_token) {
+    return request('POST', '/api/auth/oidc', {
+      body: { id_token },
+      withAuth: false,
+    });
+  },
   register({ email, password, display_name }) {
     return request('POST', '/api/auth/register', {
       body: { email, password, display_name },

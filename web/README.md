@@ -13,6 +13,8 @@ the `/ws` WebSocket for the realtime stream.
 | `index.html` | Markup. Three-pane chat shell + auth card + modals + toast.    |
 | `style.css`  | Dark theme, brand gradient `#6366f1 → #a855f7`, 8 px radius.   |
 | `api.js`     | `fetch`-based HTTP wrapper. Carries `Authorization: Bearer`.   |
+| `snaplink_sdk.js` | Snaplink SDK browser adapter (`login`/`postLogin`/`postMFAComplete`/`postToken`). |
+| `snaplink_auth.js` | SDK-backed login for the configurable Aero-owned login page. |
 | `ws.js`      | WebSocket client with exponential-backoff reconnect + ping.    |
 | `render.js`  | Safe DOM rendering — escaping, avatars, blocks, toasts.        |
 | `app.js`     | Wiring. State, event handlers, optimistic sends, history.      |
@@ -63,15 +65,21 @@ relative URLs so it stays portable.
 
 ## Usage
 
-1. **Register** on the auth screen (email + display name + password ≥ 6).
-2. After a successful register/login, the access token, refresh token, and
+1. The auth screen follows `GET /api/auth/config`: `both` shows both options,
+   `snaplink` shows the Snaplink hosted page, and `local` keeps Aero's page but
+   validates credentials through the Snaplink SDK. When Snaplink is configured,
+   the Aero-owned form in `both` mode also uses that SDK; registration is then
+   managed by Snaplink and its local registration tab is hidden.
+2. **Register** on the auth screen (email + display name + password ≥ 6) only
+   when the legacy local Aero flow is enabled without Snaplink.
+3. After a successful register/login, the access token, refresh token, and
    participant id are persisted in `localStorage` under
    `aero_token`, `aero_refresh`, `aero_pid`.
-3. **Create a room** via the "+ 新建" button — pick `group` / `channel`
+4. **Create a room** via the "+ 新建" button — pick `group` / `channel`
    / `direct`, optionally name it.
-4. **Add members** with the room header button. Paste a participant ID
+5. **Add members** with the room header button. Paste a participant ID
    (you can register a second user in another browser to grab theirs).
-5. **Send messages** — Enter to send, Shift+Enter for newline.
+6. **Send messages** — Enter to send, Shift+Enter for newline.
 
 WebSocket frames go through `/ws?token=…`. Browsers can't attach custom
 headers to WS, so the JWT rides on the query string — matching the backend
