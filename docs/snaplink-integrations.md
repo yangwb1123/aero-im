@@ -9,11 +9,14 @@
 
 ## 0. 登录页面与 Snaplink SDK
 
-Aero IM 的浏览器接入使用 Snaplink 的 SDK 操作面（`login`、`POST /auth/login`、
-`POST /auth/mfa`、`POST /token`），运行时适配器位于
-[`web/snaplink_sdk.js`](../web/snaplink_sdk.js)，其方法名与 Snaplink 生成的
-TypeScript SDK (`docs/sdks/typescript/client.ts`) 保持一致。Aero 自己只负责把
-Snaplink direct-login 返回的 ID token 换成本项目的会话；不会保存或接收 Snaplink client secret。
+Aero IM 直接使用 Snaplink 生成的 TypeScript SDK：源文件同步到
+[`web/vendor/snaplink_sso_client.ts`](../web/vendor/snaplink_sso_client.ts)，由
+esbuild 生成浏览器可执行的
+[`web/vendor/snaplink_sso_client.js`](../web/vendor/snaplink_sso_client.js)。
+`snaplink_auth.js` 只负责页面状态和 Aero 会话衔接，不重新实现 SDK 的 HTTP
+操作。SDK 的 `login`/`postMFAComplete` 会直接调用 Snaplink 的
+`POST /auth/login`、`POST /auth/mfa`；Aero 只把返回的 ID token 换成本项目会话，
+不会保存或接收 Snaplink client secret。
 
 登录页面由 `GET /api/auth/config` 暴露的非敏感配置控制：
 
@@ -28,7 +31,7 @@ AERO__OIDC__LOGIN_PAGE=snaplink
 AERO__OIDC__LOGIN_PAGE=both
 ```
 
-在 `both` 模式下，若 Snaplink 已配置，Aero 自有表单同样使用 SDK，两个入口都可用；
+在 `both` 模式下，若 Snaplink 已配置，Aero 自有表单同样使用官方 SDK，两个入口都可用；
 只有未配置 Snaplink 时才保留旧的 Aero 用户名/密码注册流程。`local` 模式要求 Snaplink 的 CORS 精确允许 Aero 的来源（例如
 `https://im.ywbsd.site`），因为浏览器 SDK 会直接调用 Snaplink 的 JSON API；
 不得使用 `*` 搭配凭据。`snaplink` 模式走服务端 PKCE/HttpOnly-cookie 流程，

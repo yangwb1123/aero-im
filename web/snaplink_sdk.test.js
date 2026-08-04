@@ -1,8 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { SSOClient, SSOError } from './snaplink_sdk.js';
+import { SSOClient, SSOError } from './vendor/snaplink_sso_client.js';
 
-test('Snaplink SDK adapter preserves generated operation paths and JSON bodies', async () => {
+test('Snaplink generated SDK preserves operation paths and JSON bodies', async () => {
   const calls = [];
   const client = new SSOClient({
     baseUrl: 'https://sso.example.test/',
@@ -21,7 +21,7 @@ test('Snaplink SDK adapter preserves generated operation paths and JSON bodies',
   assert.equal(calls[0].url, 'https://sso.example.test/auth/login');
   assert.equal(calls[0].options.method, 'POST');
   assert.deepEqual(JSON.parse(calls[0].options.body), body);
-  assert.equal(calls[0].options.credentials, 'omit');
+  assert.equal(calls[0].options.credentials, undefined);
 });
 
 test('generated login convenience operation sends a direct password request', async () => {
@@ -51,7 +51,7 @@ test('generated login convenience operation sends a direct password request', as
   });
 });
 
-test('Snaplink SDK adapter turns error responses into SSOError', async () => {
+test('Snaplink generated SDK turns error responses into SSOError', async () => {
   const client = new SSOClient({
     baseUrl: 'https://sso.example.test',
     fetch: async () => new Response(JSON.stringify({

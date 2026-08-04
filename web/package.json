@@ -3,16 +3,18 @@
   "version": "0.0.0",
   "private": true,
   "type": "module",
-  "description": "Aero IM 原生 ES-module SPA（无构建工具）。本 package.json 仅供「npm 可用时」的完整前端门：ESLint。沙箱主门是 scripts/web-check.sh（node-only，无需 npm install）。",
+  "description": "Aero IM 原生 ES-module SPA；运行时零依赖，Snaplink 官方生成 SDK 通过 esbuild 编译。",
   "scripts": {
     "test": "node --test api.test.js canvas.test.js compliance_admin.test.js delivery.test.js delivery_cursor.test.js ws.test.js security_admin.test.js governance_utils.test.js rtc_config.test.js sfu_calls.test.js realtime_events.test.js render_giphy.test.js room_creation.test.js snaplink_sdk.test.js",
+    "build:snaplink-sdk": "esbuild vendor/snaplink_sso_client.ts --bundle --format=esm --platform=browser --target=es2020 --outfile=vendor/snaplink_sso_client.js",
     "lint": "eslint .",
     "//note": "需先 `npm install`（沙箱可能无网，此门不阻断；CI 主门见 scripts/web-check.sh）"
   },
   "devDependencies": {
+    "esbuild": "^0.28.1",
     "eslint": "^9.0.0",
-    "eslint-plugin-import": "^2.29.0",
     "eslint-import-resolver-node": "^0.3.9",
+    "eslint-plugin-import": "^2.29.0",
     "globals": "^15.0.0"
   }
 }

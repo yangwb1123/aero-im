@@ -1,7 +1,7 @@
 // Snaplink SDK-backed login for the configurable Aero-owned login page.
 
 import { api } from './api.js';
-import { SSOClient, SSOError } from './snaplink_sdk.js';
+import { SSOClient, SSOError } from './vendor/snaplink_sso_client.js';
 
 export class SnaplinkMfaRequired extends Error {
   constructor(challenge) {

@@ -13,13 +13,16 @@ the `/ws` WebSocket for the realtime stream.
 | `index.html` | Markup. Three-pane chat shell + auth card + modals + toast.    |
 | `style.css`  | Dark theme, brand gradient `#6366f1 → #a855f7`, 8 px radius.   |
 | `api.js`     | `fetch`-based HTTP wrapper. Carries `Authorization: Bearer`.   |
-| `snaplink_sdk.js` | Snaplink SDK browser adapter (`login`/`postLogin`/`postMFAComplete`/`postToken`). |
-| `snaplink_auth.js` | SDK-backed login for the configurable Aero-owned login page. |
+| `vendor/snaplink_sso_client.ts` | Snaplink's generated TypeScript SDK, synchronized from the Snaplink repository. |
+| `vendor/snaplink_sso_client.js` | Browser build of that generated SDK; never hand-reimplement its operations in the SPA. |
+| `snaplink_auth.js` | Login-page wiring around the official SDK (`login`/`postMFAComplete`). |
 | `ws.js`      | WebSocket client with exponential-backoff reconnect + ping.    |
 | `render.js`  | Safe DOM rendering — escaping, avatars, blocks, toasts.        |
 | `app.js`     | Wiring. State, event handlers, optimistic sends, history.      |
 
-The whole thing is plain ES2020+ modules. No build step. No dependencies.
+The runtime is plain ES2020+ modules. The SPA has no runtime dependency; the
+Snaplink SDK source is generated TypeScript and is compiled once with the
+checked-in `build:snaplink-sdk` command.
 
 ## Running locally
 
