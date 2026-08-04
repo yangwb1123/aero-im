@@ -15,7 +15,7 @@
 
 use aero_common::{ParticipantId, RoomId};
 use fred::prelude::{KeysInterface, RedisClient, SortedSetsInterface};
-use fred::types::Ordering;
+use fred::types::{Ordering, ZRange, ZRangeBound, ZRangeKind};
 use futures::future;
 use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -48,7 +48,8 @@ fn room_shard_key_by_idx(room: RoomId, idx: u64) -> String {
 /// Whole seconds since the UNIX epoch, saturating at 0 for any pre-epoch clock.
 #[must_use]
 pub fn epoch_secs(t: SystemTime) -> f64 {
-    t.duration_since(UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64().trunc())
+    t.duration_since(UNIX_EPOCH)
+        .map_or(0.0, |d| d.as_secs_f64().trunc())
 }
 
 /// The stale-score threshold: a member whose heartbeat is strictly older than
@@ -58,18 +59,26 @@ fn stale_threshold(now_secs: f64, ttl: Duration) -> f64 {
     (now_secs - ttl.as_secs_f64().trunc()).max(0.0)
 }
 
-/// The exclusive `ZREMRANGEBYSCORE` upper-bound argument for `threshold`, i.e.
-/// `(threshold` — evicts every member seen strictly before `threshold`.
+/// The exclusive `ZREMRANGEBYSCORE` upper-bound for `threshold`.
+///
+/// This must be a typed score bound. fred interprets arbitrary strings as
+/// lexicographic ranges and rejects them for `BYSCORE`.
 #[must_use]
-fn stale_max_arg(threshold: f64) -> String {
-    format!("({threshold}")
+fn stale_max_arg(threshold: f64) -> ZRange {
+    ZRange {
+        kind: ZRangeKind::Exclusive,
+        range: ZRangeBound::Score(threshold),
+    }
 }
 
 /// Parse sorted-set members (participant id strings) back into ids, skipping
 /// any that fail to parse rather than failing the whole read.
 #[must_use]
 fn parse_participants(members: &[String]) -> Vec<ParticipantId> {
-    members.iter().filter_map(|m| ParticipantId::from_str(m).ok()).collect()
+    members
+        .iter()
+        .filter_map(|m| ParticipantId::from_str(m).ok())
+        .collect()
 }
 
 /// Cluster-correct room presence, keyed by room id with 256-way sharding.
@@ -83,7 +92,10 @@ impl PresenceStore {
     /// Build a store using [`DEFAULT_TTL`].
     #[must_use]
     pub fn new(client: RedisClient) -> Self {
-        Self { client, ttl: DEFAULT_TTL }
+        Self {
+            client,
+            ttl: DEFAULT_TTL,
+        }
     }
 
     /// Build a store with an explicit heartbeat TTL.
@@ -113,7 +125,14 @@ impl PresenceStore {
         let score = epoch_secs(SystemTime::now());
         let _: i64 = self
             .client
-            .zadd(&key, None, Some(Ordering::GreaterThan), false, false, (score, participant.to_string()))
+            .zadd(
+                &key,
+                None,
+                Some(Ordering::GreaterThan),
+                false,
+                false,
+                (score, participant.to_string()),
+            )
             .await?;
         Ok(())
     }
@@ -140,10 +159,7 @@ impl PresenceStore {
                 let ma = max_arg.clone();
                 async move {
                     // Prune stale entries, then ZCARD.
-                    let _: i64 = client
-                        .zremrangebyscore(&key, 0.0, &ma)
-                        .await
-                        .unwrap_or(0);
+                    let _: i64 = client.zremrangebyscore(&key, 0.0, &ma).await.unwrap_or(0);
                     let n: i64 = client.zcard(&key).await.unwrap_or(0);
                     u64::try_from(n).unwrap_or(0)
                 }
@@ -168,10 +184,7 @@ impl PresenceStore {
                 let ma = max_arg.clone();
                 async move {
                     // Prune stale entries, then fetch all members.
-                    let _: i64 = client
-                        .zremrangebyscore(&key, 0.0, &ma)
-                        .await
-                        .unwrap_or(0);
+                    let _: i64 = client.zremrangebyscore(&key, 0.0, &ma).await.unwrap_or(0);
                     let members: Vec<String> = client
                         .zrange(&key, 0, -1, None, false, None, false)
                         .await
@@ -212,7 +225,9 @@ mod tests {
 
     #[test]
     fn stale_max_arg_is_exclusive_whole_second() {
-        assert_eq!(stale_max_arg(55.0), "(55");
+        let range = stale_max_arg(55.0);
+        assert_eq!(range.kind, ZRangeKind::Exclusive);
+        assert!(matches!(range.range, ZRangeBound::Score(55.0)));
     }
 
     #[test]
@@ -254,5 +269,53 @@ mod tests {
         let k255 = room_shard_key_by_idx(room, 255);
         assert!(k0.ends_with(":shard:0"));
         assert!(k255.ends_with(":shard:255"));
+    }
+}
+
+/// Redis-gated integration test for fred's typed BYSCORE range.
+#[cfg(test)]
+mod redis_tests {
+    use super::*;
+    use fred::prelude::{ClientLike, KeysInterface, RedisClient, SortedSetsInterface};
+
+    async fn client() -> RedisClient {
+        let url =
+            std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".to_owned());
+        let client = RedisClient::new(
+            fred::types::RedisConfig::from_url(&url).unwrap(),
+            None,
+            None,
+            None,
+        );
+        client.connect();
+        client.wait_for_connect().await.unwrap();
+        client
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Redis"]
+    async fn presence_prunes_stale_score_with_fred_typed_bound() {
+        let client = client().await;
+        let room = RoomId::new();
+        let participant = ParticipantId::new();
+        let key = room_shard_key(room, participant);
+        let _: i64 = client
+            .zadd(
+                &key,
+                None,
+                None,
+                false,
+                false,
+                (1.0, participant.to_string()),
+            )
+            .await
+            .unwrap();
+
+        let members = PresenceStore::new(client.clone())
+            .members(room)
+            .await
+            .unwrap();
+        assert!(members.is_empty(), "stale presence member is pruned");
+        let _: i64 = client.del(key).await.unwrap();
     }
 }

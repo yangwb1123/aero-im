@@ -16,23 +16,36 @@ async fn rtc_config(_auth: AuthUser) -> ApiResult<Json<serde_json::Value>> {
 }
 
 fn rtc_config_payload() -> serde_json::Value {
-    let stun = std::env::var("AERO_STUN_URLS")
-        .unwrap_or_else(|_| "stun:stun.l.google.com:19302".into());
-    let urls: Vec<String> = stun.split(',').map(|s| s.trim().to_owned()).collect();
-    let mut ice_servers = vec![serde_json::json!({"urls": urls})];
-    if let (Ok(url), Ok(user), Ok(pass)) = (
-        std::env::var("AERO_TURN_URL"),
-        std::env::var("AERO_TURN_USERNAME"),
-        std::env::var("AERO_TURN_PASSWORD"),
-    ) {
-        ice_servers.push(serde_json::json!({
-            "urls": [url],
-            "username": user,
-            "credential": pass,
-        }));
-    }
+    rtc_config_payload_from(aero_signaling::default_rtc_config_from_env())
+}
+
+fn rtc_config_payload_from(config: aero_signaling::RtcConfig) -> serde_json::Value {
     serde_json::json!({
-        "ice_servers": ice_servers,
-        "ice_transport_policy": "all",
+        "ice_servers": config.ice_servers,
+        "ice_transport_policy": config.ice_transport_policy,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use aero_signaling::{IceServer, RtcConfig};
+
+    use super::rtc_config_payload_from;
+
+    #[test]
+    fn payload_preserves_relay_policy_and_turn_credentials() {
+        let payload = rtc_config_payload_from(RtcConfig {
+            ice_servers: vec![IceServer::turn(
+                "turn:127.0.0.1:3478",
+                "local-user",
+                "local-password",
+            )],
+            ice_transport_policy: "relay".into(),
+        });
+
+        assert_eq!(payload["ice_transport_policy"], "relay");
+        assert_eq!(payload["ice_servers"][0]["urls"][0], "turn:127.0.0.1:3478");
+        assert_eq!(payload["ice_servers"][0]["username"], "local-user");
+        assert_eq!(payload["ice_servers"][0]["credential"], "local-password");
+    }
 }

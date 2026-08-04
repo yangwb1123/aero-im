@@ -127,7 +127,11 @@ mod tests {
         ]);
         assert_eq!(grouped.len(), 2, "one entry per distinct emoji");
         assert_eq!(grouped[0].emoji, "👍");
-        assert_eq!(grouped[0].participants, vec![a, b], "reactors in input order");
+        assert_eq!(
+            grouped[0].participants,
+            vec![a, b],
+            "reactors in input order"
+        );
         assert_eq!(grouped[1].emoji, "🎉");
         assert_eq!(grouped[1].participants, vec![c]);
     }
@@ -169,12 +173,12 @@ mod db_tests {
         id
     }
 
-    /// Create a throwaway channel owned by `creator`, in the default workspace.
+    /// Create a throwaway group room owned by `creator`, in the default workspace.
     async fn mk_room(p: &PgPool, creator: ParticipantId) -> RoomId {
         let id = RoomId::new();
         sqlx::query(
             "INSERT INTO rooms (id, kind, name, created_by, workspace_id) \
-             VALUES ($1, 'channel', $2, $3, '00000000-0000-0000-0000-000000000000')",
+             VALUES ($1, 'group', $2, $3, '00000000-0000-0000-0000-000000000000')",
         )
         .bind(id.to_uuid())
         .bind(format!("reaction-detail-room-{id}"))
@@ -202,13 +206,39 @@ mod db_tests {
     }
 
     async fn react(p: &PgPool, message: MessageId, participant: ParticipantId, emoji: &str) {
-        sqlx::query("INSERT INTO reactions (message_id, participant_id, emoji) VALUES ($1, $2, $3)")
+        let room: uuid::Uuid = sqlx::query_scalar("SELECT room_id FROM messages WHERE id = $1")
             .bind(message.to_uuid())
-            .bind(participant.to_uuid())
-            .bind(emoji)
-            .execute(p)
+            .fetch_one(p)
             .await
-            .expect("insert reaction");
+            .expect("reaction room");
+        sqlx::query(
+            "INSERT INTO workspace_members (workspace_id, participant_id, role)
+             VALUES ('00000000-0000-0000-0000-000000000000', $1, 'member')
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(participant.to_uuid())
+        .execute(p)
+        .await
+        .expect("reaction workspace membership");
+        sqlx::query(
+            "INSERT INTO room_members (room_id, participant_id, role)
+             VALUES ($1, $2, 'member')
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(room)
+        .bind(participant.to_uuid())
+        .execute(p)
+        .await
+        .expect("reaction room membership");
+        sqlx::query(
+            "INSERT INTO reactions (message_id, participant_id, emoji) VALUES ($1, $2, $3)",
+        )
+        .bind(message.to_uuid())
+        .bind(participant.to_uuid())
+        .bind(emoji)
+        .execute(p)
+        .await
+        .expect("insert reaction");
     }
 
     #[tokio::test]

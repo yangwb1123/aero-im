@@ -143,12 +143,11 @@ impl VodChapterRepo {
         id: VodChapterId,
         creator: ParticipantId,
     ) -> Result<bool, sqlx::Error> {
-        let result =
-            sqlx::query("DELETE FROM vod_chapters WHERE id = $1 AND created_by = $2")
-                .bind(id.to_uuid())
-                .bind(creator.to_uuid())
-                .execute(&self.pool)
-                .await?;
+        let result = sqlx::query("DELETE FROM vod_chapters WHERE id = $1 AND created_by = $2")
+            .bind(id.to_uuid())
+            .bind(creator.to_uuid())
+            .execute(&self.pool)
+            .await?;
         Ok(result.rows_affected() > 0)
     }
 }
@@ -233,9 +232,15 @@ mod db_tests {
         assert_eq!(got.vod_id, vod);
 
         // A stranger's delete is a no-op; the creator's succeeds; the second no-op.
-        assert!(!repo.delete(c_mid, stranger).await.unwrap(), "stranger cannot delete");
+        assert!(
+            !repo.delete(c_mid, stranger).await.unwrap(),
+            "stranger cannot delete"
+        );
         assert!(repo.delete(c_mid, owner).await.unwrap(), "creator deletes");
-        assert!(!repo.delete(c_mid, owner).await.unwrap(), "second delete is a no-op");
+        assert!(
+            !repo.delete(c_mid, owner).await.unwrap(),
+            "second delete is a no-op"
+        );
         assert_eq!(repo.list_for_vod(vod).await.unwrap().len(), 2);
 
         // Cleanup (chapters cascade with the recording).

@@ -91,7 +91,12 @@ pub fn fmt_duration(secs: f64) -> String {
 
 /// Format a summary line with status icon, label, duration, and detail.
 #[must_use]
-pub fn summary_line(icon: &str, label: &str, duration: std::time::Duration, detail: &str) -> String {
+pub fn summary_line(
+    icon: &str,
+    label: &str,
+    duration: std::time::Duration,
+    detail: &str,
+) -> String {
     let secs = duration.as_secs_f64();
     let time = fmt_duration(secs);
     format!("{icon} {label:<20} {time:>8}  {detail}")
@@ -108,7 +113,11 @@ pub struct Spinner {
 impl Spinner {
     /// Create a new spinner with the given label.
     pub fn new(label: impl Into<String>) -> Self {
-        Self { chars: ['▖', '▘', '▝', '▗'], i: 0, label: label.into() }
+        Self {
+            chars: ['▖', '▘', '▝', '▗'],
+            i: 0,
+            label: label.into(),
+        }
     }
 
     /// Advance the spinner by one tick and print.
@@ -147,7 +156,8 @@ pub fn format_json_output(name: &str, o: &crate::outcome::Outcome) -> String {
         "message": o.message(),
         "duration_ms": o.duration().as_secs_f64() * 1000.0,
         "detail": o.detail(),
-    }).to_string()
+    })
+    .to_string()
 }
 
 /// Ensure newline after spinner output.

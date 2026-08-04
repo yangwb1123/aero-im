@@ -109,11 +109,13 @@ impl StreamChatSettingsRepo {
         .bind(Uuid::from_u128(stream.0))
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(|(slow_mode_secs, follower_only, subscriber_only)| StreamChatSettings {
-            slow_mode_secs,
-            follower_only,
-            subscriber_only,
-        }))
+        Ok(row.map(
+            |(slow_mode_secs, follower_only, subscriber_only)| StreamChatSettings {
+                slow_mode_secs,
+                follower_only,
+                subscriber_only,
+            },
+        ))
     }
 
     /// Set (upsert) the chat-mode settings for `stream`, refreshing `updated_at`.
@@ -182,7 +184,11 @@ mod tests {
     fn slow_mode_within_window_violates() {
         let now = OffsetDateTime::now_utc();
         // Posted 5s ago, 30s window ⇒ still inside the window ⇒ violation.
-        assert!(slow_mode_violation(Some(now - Duration::seconds(5)), now, 30));
+        assert!(slow_mode_violation(
+            Some(now - Duration::seconds(5)),
+            now,
+            30
+        ));
         // Posted right now ⇒ violation.
         assert!(slow_mode_violation(Some(now), now, 30));
     }
@@ -191,7 +197,11 @@ mod tests {
     fn slow_mode_after_window_allowed() {
         let now = OffsetDateTime::now_utc();
         // Posted 31s ago, 30s window ⇒ window elapsed ⇒ allowed.
-        assert!(!slow_mode_violation(Some(now - Duration::seconds(31)), now, 30));
+        assert!(!slow_mode_violation(
+            Some(now - Duration::seconds(31)),
+            now,
+            30
+        ));
     }
 
     #[test]
@@ -199,7 +209,11 @@ mod tests {
         let now = OffsetDateTime::now_utc();
         // Exactly `secs` seconds elapsed ⇒ next allowed instant == now ⇒ NOT a
         // violation (`now < last + window` is false at equality).
-        assert!(!slow_mode_violation(Some(now - Duration::seconds(30)), now, 30));
+        assert!(!slow_mode_violation(
+            Some(now - Duration::seconds(30)),
+            now,
+            30
+        ));
     }
 }
 
@@ -272,7 +286,11 @@ mod db_tests {
 
         // Second set upserts the same row (still one row, new values).
         repo.set(stream, 0, false, true).await.unwrap();
-        let got = repo.get(stream).await.unwrap().expect("present after re-set");
+        let got = repo
+            .get(stream)
+            .await
+            .unwrap()
+            .expect("present after re-set");
         assert_eq!(got.slow_mode_secs, 0);
         assert!(!got.follower_only);
         assert!(got.subscriber_only);

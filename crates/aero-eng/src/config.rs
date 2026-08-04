@@ -58,7 +58,12 @@ pub struct FilesizeConfig {
 
 impl Default for FilesizeConfig {
     fn default() -> Self {
-        Self { rust_warn: 800, rust_hard: 1200, routes_hard: 3000, js_warn: 1000 }
+        Self {
+            rust_warn: 800,
+            rust_hard: 1200,
+            routes_hard: 3000,
+            js_warn: 1000,
+        }
     }
 }
 
@@ -90,7 +95,10 @@ pub struct CheckConfig {
 
 impl Default for CheckConfig {
     fn default() -> Self {
-        Self { clippy: true, full_test: true }
+        Self {
+            clippy: true,
+            full_test: true,
+        }
     }
 }
 

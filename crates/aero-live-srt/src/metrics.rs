@@ -14,6 +14,8 @@
 //! - `aero_srt_packets_lost_total` (counter) — packets detected missing by the
 //!   receiver-side reliability layer (the span of each emitted NAK loss range).
 //! - `aero_srt_bytes_received_total` (counter) — total inbound datagram bytes.
+//! - `aero_srt_key_rotations_total` (counter) — negotiated SEK switches
+//!   observed on the first packet carrying the newly announced even/odd slot.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -25,6 +27,8 @@ pub(crate) const PACKETS_RECEIVED_TOTAL: &str = "aero_srt_packets_received_total
 pub(crate) const PACKETS_LOST_TOTAL: &str = "aero_srt_packets_lost_total";
 /// Counter: total inbound datagram bytes (full datagram, header included).
 pub(crate) const BYTES_RECEIVED_TOTAL: &str = "aero_srt_bytes_received_total";
+/// Counter: completed post-handshake even/odd SEK switches.
+pub(crate) const KEY_ROTATIONS_TOTAL: &str = "aero_srt_key_rotations_total";
 
 /// Process-wide count of established SRT sessions.
 ///
@@ -97,7 +101,10 @@ fn publish_active_sessions(count: usize) {
 /// Record one accepted inbound SRT data datagram of `bytes` length.
 pub(crate) fn record_datagram(bytes: usize) {
     aero_common::metrics::inc_counter(PACKETS_RECEIVED_TOTAL, 1);
-    aero_common::metrics::inc_counter(BYTES_RECEIVED_TOTAL, u64::try_from(bytes).unwrap_or(u64::MAX));
+    aero_common::metrics::inc_counter(
+        BYTES_RECEIVED_TOTAL,
+        u64::try_from(bytes).unwrap_or(u64::MAX),
+    );
 }
 
 /// Record `count` packets the receiver detected as lost (one NAK loss range).
@@ -105,6 +112,11 @@ pub(crate) fn record_lost(count: u64) {
     if count > 0 {
         aero_common::metrics::inc_counter(PACKETS_LOST_TOTAL, count);
     }
+}
+
+/// Record a completed post-handshake SEK switch.
+pub(crate) fn record_key_rotation() {
+    aero_common::metrics::inc_counter(KEY_ROTATIONS_TOTAL, 1);
 }
 
 #[cfg(test)]
@@ -118,6 +130,7 @@ mod tests {
         assert_eq!(PACKETS_RECEIVED_TOTAL, "aero_srt_packets_received_total");
         assert_eq!(PACKETS_LOST_TOTAL, "aero_srt_packets_lost_total");
         assert_eq!(BYTES_RECEIVED_TOTAL, "aero_srt_bytes_received_total");
+        assert_eq!(KEY_ROTATIONS_TOTAL, "aero_srt_key_rotations_total");
     }
 
     #[test]

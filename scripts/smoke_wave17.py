@@ -70,7 +70,8 @@ def main():
         req("POST", f"/api/workspaces/{W}/members", {"participant_id": pid, "role": "member"},
             token=A, expect=[200, 204])
     R = req("POST", "/api/rooms", {"kind": "channel", "name": f"w17-room-{ts}", "workspace_id": W}, token=A)["id"]
-    ok(f"workspace {W[:8]} + channel {R[:8]} (alice owner; bob, carol members)")
+    req("POST", f"/api/rooms/{R}/members", {"participant_id": Bpid}, token=A, expect=[200, 204])
+    ok(f"workspace {W[:8]} + channel {R[:8]} (alice owner; bob room-member; carol workspace-only)")
 
     # ---------------- Out-of-office + auto-responder bot ----------------
     say("out-of-office: set status, then a DM to bob auto-replies once (out-of-band bot)")
@@ -103,21 +104,22 @@ def main():
 
     # ---------------- Org chart / manager hierarchy ----------------
     say("org chart: self-set manager, reports, reporting chain, self-as-manager 400, admin gate")
-    req("PUT", f"/api/participants/{Bpid}/manager", {"manager_id": Apid}, token=B, expect=[200])
-    req("PUT", f"/api/participants/{Cpid}/manager", {"manager_id": Bpid}, token=C, expect=[200])
-    mgr = req("GET", f"/api/participants/{Bpid}/manager", token=A)
+    org = f"/api/workspaces/{W}/participants"
+    req("PUT", f"{org}/{Bpid}/manager", {"manager_id": Apid}, token=B, expect=[200])
+    req("PUT", f"{org}/{Cpid}/manager", {"manager_id": Bpid}, token=C, expect=[200])
+    mgr = req("GET", f"{org}/{Bpid}/manager", token=A)
     if mgr.get("manager_id") != Apid:
         fail(f"bob's manager wrong: {mgr}")
-    reports = as_list(req("GET", f"/api/participants/{Apid}/reports", token=A), "reports")
+    reports = as_list(req("GET", f"{org}/{Apid}/reports", token=A), "reports")
     if Bpid not in reports:
         fail(f"alice's reports missing bob: {reports}")
-    chain = as_list(req("GET", f"/api/participants/{Cpid}/chain", token=C), "chain")
+    chain = as_list(req("GET", f"{org}/{Cpid}/chain", token=C), "chain")
     if chain[:2] != [Bpid, Apid]:
         fail(f"carol's chain wrong: {chain}")
     # self-as-manager rejected; non-self non-admin rejected
-    req("PUT", f"/api/participants/{Apid}/manager", {"manager_id": Apid}, token=A, expect=[400])
-    req("PUT", f"/api/participants/{Bpid}/manager", {"manager_id": Cpid}, token=A, expect=[403])
-    req("DELETE", f"/api/participants/{Bpid}/manager", token=B, expect=[200])
+    req("PUT", f"{org}/{Apid}/manager", {"manager_id": Apid}, token=A, expect=[400])
+    req("PUT", f"{org}/{Bpid}/manager", {"manager_id": Cpid}, token=C, expect=[403])
+    req("DELETE", f"{org}/{Bpid}/manager", token=B, expect=[200])
     ok(f"manager/reports/chain ok (chain={[x[:6] for x in chain]}); self-mgr 400; non-self 403")
 
     # ---------------- Legal hold / retention exemption ----------------

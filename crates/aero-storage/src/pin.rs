@@ -2,11 +2,11 @@
 //!
 //! Backs `migrations/0011_pins.sql`. A room can pin a small set of important
 //! messages; listing joins back to `messages` so callers render the pinned
-//! content directly. Purely additive: a NEW [`PinRepo`]; no existing repo is
-//! touched.
+//! content directly. Production reads/writes own current room authorization,
+//! message containment and the pin mutation in one transaction.
 
-use aero_common::{Block, Message, MessageId, ParticipantId, PinnedMessage, RoomId};
-use sqlx::PgPool;
+use aero_common::{Block, Error, Message, MessageId, ParticipantId, PinnedMessage, RoomId};
+use sqlx::{PgPool, Postgres, Transaction};
 
 /// Largest number of pins a room listing returns. A room with more than this many
 /// pins is unusual; the cap keeps the panel bounded.
@@ -22,10 +22,92 @@ impl PinRepo {
         Self { pool }
     }
 
-    /// Pin a message in a room. Idempotent: re-pinning an already-pinned message
-    /// keeps the original provenance. Returns `true` if a new pin was created.
-    /// Caller has already checked the actor's room access and that the message
-    /// belongs to the room.
+    /// Pin a live message while current room access and message containment are
+    /// locked through commit.
+    ///
+    /// Re-pinning preserves the original provenance and returns `false`.
+    /// Missing, deleted, expired, or cross-room message ids share one opaque
+    /// not-found result.
+    pub async fn pin_authorized(
+        &self,
+        room: RoomId,
+        message: MessageId,
+        actor: ParticipantId,
+    ) -> Result<bool, Error> {
+        let mut tx = self.pool.begin().await?;
+        assert_effective_room_access_in_tx(&mut tx, room, actor).await?;
+        let Some(locked_message) = lock_message_in_tx(&mut tx, message).await? else {
+            return Err(Error::NotFound(format!("message {message}")));
+        };
+        if locked_message.room_id != room
+            || locked_message.deleted_at.is_some()
+            || locked_message
+                .expires_at
+                .is_some_and(|expires_at| expires_at <= time::OffsetDateTime::now_utc())
+        {
+            return Err(Error::NotFound(format!("message {message}")));
+        }
+
+        let result = sqlx::query(
+            r"INSERT INTO pins (room_id, message_id, pinned_by, created_at)
+               VALUES ($1, $2, $3, now())
+               ON CONFLICT (room_id, message_id) DO NOTHING",
+        )
+        .bind(room.to_uuid())
+        .bind(message.to_uuid())
+        .bind(actor.to_uuid())
+        .execute(&mut *tx)
+        .await?;
+        let created = result.rows_affected() > 0;
+        tx.commit().await?;
+        Ok(created)
+    }
+
+    /// Unpin under current room access. A same-room soft-deleted message remains
+    /// removable so historical projections can be cleaned; a hard-deleted
+    /// message has already cascaded its pin and returns the idempotent `false`.
+    pub async fn unpin_authorized(
+        &self,
+        room: RoomId,
+        message: MessageId,
+        actor: ParticipantId,
+    ) -> Result<bool, Error> {
+        let mut tx = self.pool.begin().await?;
+        assert_effective_room_access_in_tx(&mut tx, room, actor).await?;
+        let Some(locked_message) = lock_message_in_tx(&mut tx, message).await? else {
+            tx.commit().await?;
+            return Ok(false);
+        };
+        if locked_message.room_id != room {
+            return Err(Error::NotFound(format!("message {message}")));
+        }
+
+        let result = sqlx::query(r"DELETE FROM pins WHERE room_id = $1 AND message_id = $2")
+            .bind(room.to_uuid())
+            .bind(message.to_uuid())
+            .execute(&mut *tx)
+            .await?;
+        let removed = result.rows_affected() > 0;
+        tx.commit().await?;
+        Ok(removed)
+    }
+
+    /// List a room's current live pins while effective room access is held
+    /// through the joined message read.
+    pub async fn list_authorized(
+        &self,
+        room: RoomId,
+        actor: ParticipantId,
+    ) -> Result<Vec<PinnedMessage>, Error> {
+        let mut tx = self.pool.begin().await?;
+        assert_effective_room_access_in_tx(&mut tx, room, actor).await?;
+        let pins = list_for_room_in_tx(&mut tx, room).await?;
+        tx.commit().await?;
+        Ok(pins)
+    }
+
+    /// Low-level compatibility seam used only by storage tests.
+    #[cfg(test)]
     pub async fn pin(
         &self,
         room: RoomId,
@@ -45,12 +127,9 @@ impl PinRepo {
         Ok(result.rows_affected() > 0)
     }
 
-    /// Unpin a message. Returns `true` if a pin was removed.
-    pub async fn unpin(
-        &self,
-        room: RoomId,
-        message: MessageId,
-    ) -> Result<bool, sqlx::Error> {
+    /// Low-level compatibility seam used only by storage tests.
+    #[cfg(test)]
+    pub async fn unpin(&self, room: RoomId, message: MessageId) -> Result<bool, sqlx::Error> {
         let result = sqlx::query(r"DELETE FROM pins WHERE room_id = $1 AND message_id = $2")
             .bind(room.to_uuid())
             .bind(message.to_uuid())
@@ -59,12 +138,9 @@ impl PinRepo {
         Ok(result.rows_affected() > 0)
     }
 
-    /// Whether a message is currently pinned in a room.
-    pub async fn is_pinned(
-        &self,
-        room: RoomId,
-        message: MessageId,
-    ) -> Result<bool, sqlx::Error> {
+    /// Low-level compatibility seam used only by storage tests.
+    #[cfg(test)]
+    pub async fn is_pinned(&self, room: RoomId, message: MessageId) -> Result<bool, sqlx::Error> {
         let row = sqlx::query_as::<_, (i64,)>(
             r"SELECT COUNT(*) FROM pins WHERE room_id = $1 AND message_id = $2",
         )
@@ -75,26 +151,91 @@ impl PinRepo {
         Ok(row.0 > 0)
     }
 
-    /// List a room's pins, newest first, each joined to its (non-deleted)
-    /// message. Pins whose message has since been soft-deleted are skipped.
+    /// Low-level compatibility seam used only by storage tests.
+    #[cfg(test)]
     pub async fn list_for_room(&self, room: RoomId) -> Result<Vec<PinnedMessage>, sqlx::Error> {
-        let rows = sqlx::query_as::<_, PinnedRow>(
-            r"SELECT
-                 p.room_id, p.pinned_by, p.created_at AS pinned_at,
-                 m.id, m.sender_id, m.blocks, m.reply_to, m.metadata,
-                 m.created_at, m.edited_at, m.deleted_at, m.expires_at, m.version
-               FROM pins p
-               JOIN messages m ON m.id = p.message_id
-               WHERE p.room_id = $1 AND m.deleted_at IS NULL
-               ORDER BY p.created_at DESC
-               LIMIT $2",
-        )
-        .bind(room.to_uuid())
-        .bind(MAX_PINS)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows.into_iter().map(PinnedMessage::from).collect())
+        let mut tx = self.pool.begin().await?;
+        let pins = list_for_room_in_tx(&mut tx, room).await?;
+        tx.commit().await?;
+        Ok(pins)
     }
+}
+
+struct LockedMessage {
+    room_id: RoomId,
+    deleted_at: Option<time::OffsetDateTime>,
+    expires_at: Option<time::OffsetDateTime>,
+}
+
+async fn assert_effective_room_access_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    room: RoomId,
+    actor: ParticipantId,
+) -> Result<(), Error> {
+    let allowed: bool = sqlx::query_scalar("SELECT aero_effective_room_access($1, $2, NULL)")
+        .bind(room.to_uuid())
+        .bind(actor.to_uuid())
+        .fetch_one(&mut **tx)
+        .await?;
+    if !allowed {
+        return Err(Error::Forbidden("current room access required".into()));
+    }
+    Ok(())
+}
+
+async fn lock_message_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    message: MessageId,
+) -> Result<Option<LockedMessage>, sqlx::Error> {
+    sqlx::query_as::<
+        _,
+        (
+            uuid::Uuid,
+            Option<time::OffsetDateTime>,
+            Option<time::OffsetDateTime>,
+        ),
+    >(
+        "SELECT room_id, deleted_at, expires_at
+           FROM messages
+          WHERE id = $1
+          FOR UPDATE",
+    )
+    .bind(message.to_uuid())
+    .fetch_optional(&mut **tx)
+    .await
+    .map(|row| {
+        row.map(|(room_id, deleted_at, expires_at)| LockedMessage {
+            room_id: RoomId::from_uuid(room_id),
+            deleted_at,
+            expires_at,
+        })
+    })
+}
+
+async fn list_for_room_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    room: RoomId,
+) -> Result<Vec<PinnedMessage>, sqlx::Error> {
+    let rows = sqlx::query_as::<_, PinnedRow>(
+        r"SELECT
+             p.room_id, p.pinned_by, p.created_at AS pinned_at,
+             m.id, m.sender_id, m.blocks, m.reply_to, m.metadata,
+             m.created_at, m.edited_at, m.deleted_at, m.expires_at, m.version
+           FROM pins p
+           JOIN messages m
+             ON m.id = p.message_id
+            AND m.room_id = p.room_id
+           WHERE p.room_id = $1
+             AND m.deleted_at IS NULL
+             AND (m.expires_at IS NULL OR m.expires_at > CURRENT_TIMESTAMP)
+           ORDER BY p.created_at DESC
+           LIMIT $2",
+    )
+    .bind(room.to_uuid())
+    .bind(MAX_PINS)
+    .fetch_all(&mut **tx)
+    .await?;
+    Ok(rows.into_iter().map(PinnedMessage::from).collect())
 }
 
 #[derive(sqlx::FromRow)]
@@ -148,7 +289,7 @@ impl From<PinnedRow> for PinnedMessage {
 #[cfg(test)]
 mod db_tests {
     use super::*;
-    use aero_common::{MessageId, ParticipantId, RoomId};
+    use aero_common::{MessageId, ParticipantId, RoomId, RoomKind};
 
     fn pool() -> PgPool {
         let url = std::env::var("DATABASE_URL")
@@ -167,17 +308,25 @@ mod db_tests {
             .execute(p)
             .await
             .expect("insert participant");
-        let room = RoomId::new();
-        sqlx::query(
-            "INSERT INTO rooms (id, kind, name, created_by, created_at, workspace_id)
-             VALUES ($1,'channel',$2,$3, now(), '00000000-0000-0000-0000-000000000000')",
-        )
-        .bind(room.to_uuid())
-        .bind("pin-room")
-        .bind(actor.to_uuid())
-        .execute(p)
-        .await
-        .expect("insert room");
+        let workspace = crate::WorkspaceRepo::new(p.clone())
+            .create(
+                format!("pin-workspace-{actor}"),
+                format!("pin-workspace-{actor}").to_ascii_lowercase(),
+                actor,
+            )
+            .await
+            .expect("insert workspace")
+            .id;
+        let room = crate::RoomRepo::new(p.clone())
+            .create_in_workspace(
+                workspace,
+                RoomKind::Group,
+                Some(format!("pin-room-{actor}")),
+                actor,
+            )
+            .await
+            .expect("insert room")
+            .id;
         let message = MessageId::new();
         sqlx::query(
             "INSERT INTO messages (id, room_id, sender_id, blocks, searchable_text, created_at)
@@ -199,18 +348,34 @@ mod db_tests {
         let repo = PinRepo::new(p.clone());
         let (room, message, actor) = fixture(&p).await;
 
-        assert!(repo.pin(room, message, actor).await.unwrap(), "first pin created");
-        assert!(!repo.pin(room, message, actor).await.unwrap(), "re-pin is idempotent");
+        assert!(
+            repo.pin_authorized(room, message, actor).await.unwrap(),
+            "first pin created"
+        );
+        assert!(
+            !repo.pin_authorized(room, message, actor).await.unwrap(),
+            "re-pin is idempotent"
+        );
         assert!(repo.is_pinned(room, message).await.unwrap());
 
-        let pins = repo.list_for_room(room).await.unwrap();
+        let pins = repo.list_authorized(room, actor).await.unwrap();
         assert_eq!(pins.len(), 1, "one pin in the room");
         assert_eq!(pins[0].message.id, message);
         assert_eq!(pins[0].pinned_by, actor);
-        assert!(!pins[0].message.blocks.is_empty(), "joined message content present");
+        assert!(
+            !pins[0].message.blocks.is_empty(),
+            "joined message content present"
+        );
 
-        assert!(repo.unpin(room, message).await.unwrap(), "unpin removed it");
+        assert!(
+            repo.unpin_authorized(room, message, actor).await.unwrap(),
+            "unpin removed it"
+        );
         assert!(!repo.is_pinned(room, message).await.unwrap());
-        assert!(repo.list_for_room(room).await.unwrap().is_empty());
+        assert!(repo.list_authorized(room, actor).await.unwrap().is_empty());
     }
 }
+
+#[cfg(test)]
+#[path = "pin/security_tests.rs"]
+mod security_tests;

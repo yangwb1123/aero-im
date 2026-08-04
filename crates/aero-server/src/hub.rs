@@ -23,10 +23,10 @@
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use aero_common::metrics::{self, names};
-use aero_common::{CallId, ParticipantId, RoomId};
+use aero_common::{CallId, ParticipantId, RoomId, SessionId};
 use dashmap::DashMap;
 use serde::Serialize;
 use tokio::sync::mpsc::{self, error::TrySendError};
@@ -42,6 +42,25 @@ use crate::config::WsConfig;
 /// path". One per episode, not per dropped frame, so a stalled client costs
 /// one extra frame rather than a flood.
 const RESYNC_FRAME: &str = r#"{"type":"resync"}"#;
+const PARTICIPANT_LOCK_SHARDS: usize = 64;
+
+/// Fixed stripes serialize lifecycle without another attacker-controlled map.
+struct ParticipantLocks([Mutex<()>; PARTICIPANT_LOCK_SHARDS]);
+
+impl Default for ParticipantLocks {
+    fn default() -> Self {
+        Self(std::array::from_fn(|_| Mutex::new(())))
+    }
+}
+
+impl ParticipantLocks {
+    fn lock(&self, pid: ParticipantId) -> MutexGuard<'_, ()> {
+        let shard = usize::from(pid.as_ulid().to_bytes()[15]) % PARTICIPANT_LOCK_SHARDS;
+        self.0[shard]
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
 
 /// A handle to one connection's bounded outbound queue plus a kill-switch.
 ///
@@ -52,6 +71,10 @@ const RESYNC_FRAME: &str = r#"{"type":"resync"}"#;
 pub struct WsSender {
     tx: mpsc::Sender<axum::extract::ws::Message>,
     close: CancellationToken,
+    /// Stable authenticated session carried by this socket's access JWT.
+    /// Legacy sid-less JWTs retain `None` and can only be closed by a
+    /// participant-wide revocation.
+    session_id: Option<SessionId>,
     /// True while this connection is inside a loss episode: at least one frame
     /// was dropped on a full queue (drop-only mode) and the client has not yet
     /// been told. Shared across clones (the Hub's fan-out copy sets it; any
@@ -63,11 +86,28 @@ pub struct WsSender {
 impl WsSender {
     /// Wrap a bounded sender + its cancellation token.
     #[must_use]
-    pub fn new(
+    pub fn new(tx: mpsc::Sender<axum::extract::ws::Message>, close: CancellationToken) -> Self {
+        Self {
+            tx,
+            close,
+            session_id: None,
+            lossy: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Wrap a bounded sender authenticated as one stable login session.
+    #[must_use]
+    pub fn for_session(
         tx: mpsc::Sender<axum::extract::ws::Message>,
         close: CancellationToken,
+        session_id: SessionId,
     ) -> Self {
-        Self { tx, close, lossy: Arc::new(AtomicBool::new(false)) }
+        Self {
+            tx,
+            close,
+            session_id: Some(session_id),
+            lossy: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     /// Non-blocking enqueue. Never awaits, so the broadcaster can't be stalled
@@ -89,6 +129,11 @@ impl WsSender {
     #[must_use]
     pub fn same_channel(&self, other: &WsSender) -> bool {
         self.tx.same_channel(&other.tx)
+    }
+
+    #[must_use]
+    fn belongs_to_session(&self, session_id: SessionId) -> bool {
+        self.session_id == Some(session_id)
     }
 }
 
@@ -120,6 +165,7 @@ pub struct Hub {
     call_rosters: DashMap<CallId, Vec<ParticipantId>>,
     /// participant → {rooms, streams, calls} reverse index (O(1)-ish unregister)
     subs: DashMap<ParticipantId, ParticipantSubs>,
+    participant_locks: ParticipantLocks,
     /// When a connection's bounded queue is full, also disconnect it (vs. only
     /// dropping the message).
     disconnect_on_full: bool,
@@ -177,6 +223,7 @@ impl Hub {
     }
 
     pub fn register(&self, pid: ParticipantId, tx: WsSender) {
+        let _participant_guard = self.participant_locks.lock(pid);
         self.conns.entry(pid).or_default().push(tx);
         // Connection-count gauge (ROADMAP 方向四): one inc per *connection*, so a
         // multi-device user contributes once per open socket. Paired with the
@@ -185,7 +232,57 @@ impl Hub {
         debug!(%pid, "ws registered");
     }
 
-    pub fn unregister(&self, pid: ParticipantId, tx: &WsSender) {
+    /// Cancel every local socket authenticated under one stable session.
+    ///
+    /// Returns the number of sockets signalled. They remove themselves from the
+    /// registry through [`Self::unregister`] when their connection task wakes.
+    pub fn disconnect_session(&self, pid: ParticipantId, session_id: SessionId) -> usize {
+        self.conns.get(&pid).map_or(0, |connections| {
+            connections
+                .iter()
+                .filter(|sender| sender.belongs_to_session(session_id))
+                .map(|sender| {
+                    sender.close();
+                    1
+                })
+                .sum()
+        })
+    }
+
+    /// Cancel every local socket for `pid`, including legacy sid-less sockets.
+    pub fn disconnect_participant(&self, pid: ParticipantId) -> usize {
+        self.conns.get(&pid).map_or(0, |connections| {
+            connections
+                .iter()
+                .map(|sender| {
+                    sender.close();
+                    1
+                })
+                .sum()
+        })
+    }
+
+    /// Cancel all local sockets except those authenticated under `keep`.
+    ///
+    /// A legacy sid-less connection cannot prove it is the kept session, so it
+    /// is closed fail-safe.
+    pub fn disconnect_other_sessions(&self, pid: ParticipantId, keep: SessionId) -> usize {
+        self.conns.get(&pid).map_or(0, |connections| {
+            connections
+                .iter()
+                .filter(|sender| !sender.belongs_to_session(keep))
+                .map(|sender| {
+                    sender.close();
+                    1
+                })
+                .sum()
+        })
+    }
+
+    /// Remove one socket and return whether it was the participant's last local
+    /// connection.
+    pub fn unregister(&self, pid: ParticipantId, tx: &WsSender) -> bool {
+        let _participant_guard = self.participant_locks.lock(pid);
         // Did this close the participant's LAST open socket? Only then may we
         // tear down their subscriptions. Fan-out routes by participant id (every
         // socket of `pid` receives), so purging the room/stream/call forward
@@ -193,23 +290,17 @@ impl Hub {
         // to that socket — e.g. closing the phone muting the still-open desktop
         // (ROADMAP 方向一). A missing `conns` entry means no sockets remain, so
         // teardown is also correct (and idempotent) in that case.
-        let last_socket_closed = if let Some(mut entry) = self.conns.get_mut(&pid) {
-            let before = entry.len();
-            entry.retain(|s| !s.same_channel(tx));
-            // Decrement once per connection actually removed (idempotent if the
-            // socket was already pruned by the laggy-client path in `fan_out_raw`).
-            for _ in 0..(before - entry.len()) {
-                self.gauge_dec();
-            }
-            let empty = entry.is_empty();
-            if empty {
-                drop(entry);
-                self.conns.remove(&pid);
-            }
-            empty
-        } else {
-            true
-        };
+        let mut removed = 0;
+        self.conns.remove_if_mut(&pid, |_, connections| {
+            let before = connections.len();
+            connections.retain(|sender| !sender.same_channel(tx));
+            removed = before - connections.len();
+            connections.is_empty()
+        });
+        for _ in 0..removed {
+            self.gauge_dec();
+        }
+        let last_socket_closed = !self.conns.contains_key(&pid);
 
         // Purge this participant from every room/stream/call it joined — but only
         // once the last socket is gone. We visit only `pid`'s *own* subscriptions
@@ -229,9 +320,11 @@ impl Hub {
             }
         }
         debug!(%pid, "ws unregistered");
+        last_socket_closed
     }
 
     pub fn join_room(&self, room: RoomId, pid: ParticipantId) {
+        let _participant_guard = self.participant_locks.lock(pid);
         let mut entry = self.rooms.entry(room).or_default();
         if !entry.contains(&pid) {
             entry.push(pid);
@@ -249,7 +342,10 @@ impl Hub {
     /// and disconnect. Empty when the participant has joined no room channels.
     #[must_use]
     pub fn rooms_of(&self, pid: ParticipantId) -> Vec<RoomId> {
-        self.subs.get(&pid).map(|s| s.rooms.iter().copied().collect()).unwrap_or_default()
+        self.subs
+            .get(&pid)
+            .map(|s| s.rooms.iter().copied().collect())
+            .unwrap_or_default()
     }
 
     // ---- live-stream watcher tracking (P4 互动直播) ----
@@ -258,6 +354,7 @@ impl Hub {
     /// (one entry even across multiple devices), so the viewer count reflects
     /// distinct people.
     pub fn watch_stream(&self, stream_id: Ulid, pid: ParticipantId) {
+        let _participant_guard = self.participant_locks.lock(pid);
         let mut entry = self.stream_watchers.entry(stream_id).or_default();
         if !entry.contains(&pid) {
             entry.push(pid);
@@ -267,6 +364,7 @@ impl Hub {
 
     /// Stop watching a stream; drops the watcher set entirely once empty.
     pub fn unwatch_stream(&self, stream_id: Ulid, pid: ParticipantId) {
+        let _participant_guard = self.participant_locks.lock(pid);
         remove_from_forward(&self.stream_watchers, &stream_id, pid);
         if let Some(mut subs) = self.subs.get_mut(&pid) {
             subs.streams.remove(&stream_id);
@@ -281,13 +379,18 @@ impl Hub {
     /// Participants currently watching a stream (this process only).
     #[must_use]
     pub fn stream_watchers(&self, stream_id: Ulid) -> Vec<ParticipantId> {
-        self.stream_watchers.get(&stream_id).map(|e| e.clone()).unwrap_or_default()
+        self.stream_watchers
+            .get(&stream_id)
+            .map(|e| e.clone())
+            .unwrap_or_default()
     }
 
     /// Distinct viewer count for a stream (this process only).
     #[must_use]
     pub fn stream_viewer_count(&self, stream_id: Ulid) -> u32 {
-        self.stream_watchers.get(&stream_id).map_or(0, |e| e.len() as u32)
+        self.stream_watchers
+            .get(&stream_id)
+            .map_or(0, |e| e.len() as u32)
     }
 
     /// Send a JSON-serializable payload to every connection of every recipient.
@@ -322,6 +425,7 @@ impl Hub {
     /// Shared implementation for both `fan_out_raw` and `fan_out_arc`.
     fn fan_out_arc_inner(&self, recipients: &[ParticipantId], text: Arc<String>) {
         for pid in recipients {
+            let _participant_guard = self.participant_locks.lock(*pid);
             // `get_mut` so we can prune dead/laggy senders in place. The write
             // guard is scoped to this one participant's entry.
             let Some(mut senders) = self.conns.get_mut(pid) else {
@@ -329,34 +433,26 @@ impl Hub {
             };
             let mut drop_idx: Vec<usize> = Vec::new();
             for (i, tx) in senders.iter().enumerate() {
-                match tx.try_send(axum::extract::ws::Message::Text((*text).clone())) {
-                    Ok(()) => {
-                        // Slow-consumer resync (ROADMAP 第三版 方向一): the queue
-                        // has capacity again — if frames were dropped while it was
-                        // full (drop-only mode), close the loss episode by
-                        // enqueueing exactly ONE resync marker so the client
-                        // re-pulls what it missed via the REST `?since=` path.
-                        if tx.lossy.swap(false, Ordering::Relaxed) {
-                            match tx
-                                .try_send(axum::extract::ws::Message::Text(RESYNC_FRAME.to_owned()))
-                            {
-                                Ok(()) => {
-                                    debug!(%pid, "ws loss episode ended — resync frame enqueued");
-                                }
-                                Err(TrySendError::Full(_)) => {
-                                    // The delivered frame consumed the last slot;
-                                    // the episode stays open and the marker is
-                                    // retried on the next successful delivery.
-                                    tx.lossy.store(true, Ordering::Relaxed);
-                                }
-                                Err(TrySendError::Closed(_)) => {
-                                    // Receiver vanished between the two sends;
-                                    // reap below like any closed handle.
-                                    drop_idx.push(i);
-                                }
-                            }
+                // A resync marker is a delivery fence, so it must precede the
+                // first post-loss frame. Otherwise that newer message can be
+                // application-ACKed before the async REST catch-up even starts.
+                if tx.lossy.swap(false, Ordering::Relaxed) {
+                    match tx.try_send(axum::extract::ws::Message::Text(RESYNC_FRAME.to_owned())) {
+                        Ok(()) => {
+                            debug!(%pid, "ws loss episode ended — resync fence enqueued");
+                        }
+                        Err(TrySendError::Full(_)) => {
+                            tx.lossy.store(true, Ordering::Relaxed);
+                            continue;
+                        }
+                        Err(TrySendError::Closed(_)) => {
+                            drop_idx.push(i);
+                            continue;
                         }
                     }
+                }
+                match tx.try_send(axum::extract::ws::Message::Text((*text).clone())) {
+                    Ok(()) => {}
                     Err(TrySendError::Full(_)) => {
                         // Slow consumer: drop this frame. Optionally evict.
                         if self.disconnect_on_full {
@@ -394,7 +490,7 @@ impl Hub {
                 let empty = senders.is_empty();
                 drop(senders);
                 if empty {
-                    self.conns.remove(pid);
+                    self.conns.remove_if(pid, |_, value| value.is_empty());
                 }
             }
         }
@@ -405,6 +501,7 @@ impl Hub {
     /// Add a participant to a call roster, returning the members who were
     /// *already* present (whom the joiner must establish a connection to).
     pub fn call_join(&self, call_id: CallId, pid: ParticipantId) -> Vec<ParticipantId> {
+        let _participant_guard = self.participant_locks.lock(pid);
         let mut entry = self.call_rosters.entry(call_id).or_default();
         let existing: Vec<ParticipantId> = entry.iter().copied().filter(|p| *p != pid).collect();
         if !entry.contains(&pid) {
@@ -417,6 +514,7 @@ impl Hub {
 
     /// Remove a participant from a call roster; drops the roster once empty.
     pub fn call_leave(&self, call_id: CallId, pid: ParticipantId) {
+        let _participant_guard = self.participant_locks.lock(pid);
         remove_from_forward(&self.call_rosters, &call_id, pid);
         if let Some(mut subs) = self.subs.get_mut(&pid) {
             subs.calls.remove(&call_id);
@@ -428,10 +526,35 @@ impl Hub {
         }
     }
 
+    /// Drop an ended call's complete local roster and every corresponding
+    /// reverse-index entry. Idempotent for duplicate durable `CallEnd` delivery.
+    pub fn call_end(&self, call_id: CallId) -> Vec<ParticipantId> {
+        let members = self
+            .call_rosters
+            .remove(&call_id)
+            .map_or_else(Vec::new, |(_, members)| members);
+        for participant in &members {
+            let _participant_guard = self.participant_locks.lock(*participant);
+            if let Some(mut subs) = self.subs.get_mut(participant) {
+                subs.calls.remove(&call_id);
+                let empty = subs.is_empty();
+                drop(subs);
+                if empty {
+                    self.subs
+                        .remove_if(participant, |_, value| value.is_empty());
+                }
+            }
+        }
+        members
+    }
+
     /// Current members of a call (this process only).
     #[must_use]
     pub fn call_members(&self, call_id: CallId) -> Vec<ParticipantId> {
-        self.call_rosters.get(&call_id).map(|e| e.clone()).unwrap_or_default()
+        self.call_rosters
+            .get(&call_id)
+            .map(|e| e.clone())
+            .unwrap_or_default()
     }
 }
 
@@ -442,13 +565,10 @@ fn remove_from_forward<K: std::hash::Hash + Eq>(
     key: &K,
     pid: ParticipantId,
 ) {
-    if let Some(mut entry) = map.get_mut(key) {
-        entry.retain(|p| *p != pid);
-        if entry.is_empty() {
-            drop(entry);
-            map.remove(key);
-        }
-    }
+    map.remove_if_mut(key, |_, participants| {
+        participants.retain(|participant| *participant != pid);
+        participants.is_empty()
+    });
 }
 
 #[cfg(test)]
@@ -461,10 +581,31 @@ mod tests {
     /// test can drain / leave it stalled.
     fn make_conn(
         cap: usize,
-    ) -> (WsSender, mpsc::Receiver<axum::extract::ws::Message>, CancellationToken) {
+    ) -> (
+        WsSender,
+        mpsc::Receiver<axum::extract::ws::Message>,
+        CancellationToken,
+    ) {
         let (tx, rx) = mpsc::channel(cap);
         let close = CancellationToken::new();
         (WsSender::new(tx, close.clone()), rx, close)
+    }
+
+    fn make_session_conn(
+        cap: usize,
+        session_id: SessionId,
+    ) -> (
+        WsSender,
+        mpsc::Receiver<axum::extract::ws::Message>,
+        CancellationToken,
+    ) {
+        let (tx, rx) = mpsc::channel(cap);
+        let close = CancellationToken::new();
+        (
+            WsSender::for_session(tx, close.clone(), session_id),
+            rx,
+            close,
+        )
     }
 
     /// Read the unlabeled `aero_ws_connections` gauge value from a *specific*
@@ -504,6 +645,38 @@ mod tests {
     }
 
     #[test]
+    fn call_end_clears_forward_and_reverse_rosters_idempotently() {
+        let hub = Hub::default();
+        let call = CallId::new();
+        let other_call = CallId::new();
+        let a = ParticipantId::new();
+        let b = ParticipantId::new();
+
+        hub.call_join(call, a);
+        hub.call_join(call, b);
+        hub.call_join(other_call, a);
+
+        let mut ended = hub.call_end(call);
+        ended.sort();
+        let mut expected = vec![a, b];
+        expected.sort();
+        assert_eq!(ended, expected);
+        assert!(hub.call_members(call).is_empty());
+        assert_eq!(hub.call_members(other_call), vec![a]);
+        assert!(!hub
+            .subs
+            .get(&a)
+            .expect("other call keeps reverse entry")
+            .calls
+            .contains(&call));
+        assert!(
+            hub.subs.get(&b).is_none(),
+            "participant with no remaining subscriptions is evicted"
+        );
+        assert!(hub.call_end(call).is_empty());
+    }
+
+    #[test]
     fn unregister_one_of_two_sockets_keeps_subscriptions() {
         // Multi-device: closing one socket must NOT tear down the participant's
         // room subscription while another socket is still open (ROADMAP 方向一).
@@ -518,8 +691,12 @@ mod tests {
         assert!(hub.rooms.get(&room).is_some_and(|e| e.contains(&pid)));
 
         // Close the FIRST socket (the "phone").
-        hub.unregister(pid, &tx1);
-        assert_eq!(hub.conns.get(&pid).map(|e| e.len()), Some(1), "one socket remains");
+        assert!(!hub.unregister(pid, &tx1));
+        assert_eq!(
+            hub.conns.get(&pid).map(|e| e.len()),
+            Some(1),
+            "one socket remains"
+        );
         assert!(
             hub.rooms.get(&room).is_some_and(|e| e.contains(&pid)),
             "the still-open desktop socket must keep its room subscription"
@@ -530,12 +707,110 @@ mod tests {
 
         // Close the LAST socket → subscription is torn down.
         let tx2_again = hub.conns.get(&pid).unwrap()[0].clone();
-        hub.unregister(pid, &tx2_again);
+        assert!(hub.unregister(pid, &tx2_again));
         assert!(hub.conns.get(&pid).is_none(), "no sockets left");
         assert!(
             !hub.rooms.get(&room).is_some_and(|e| e.contains(&pid)),
             "last socket closing tears down the room subscription"
         );
+    }
+
+    #[test]
+    fn concurrent_last_unregister_preserves_new_connection_and_subscriptions() {
+        let hub = Arc::new(Hub::default());
+        let pid = ParticipantId::new();
+        let room = RoomId::new();
+        let stream = Ulid::new();
+        let call = CallId::new();
+        let (old_tx, _old_rx, _) = make_conn(8);
+        let (new_tx, _new_rx, _) = make_conn(8);
+        hub.register(pid, old_tx.clone());
+        hub.join_room(room, pid);
+        hub.watch_stream(stream, pid);
+        hub.call_join(call, pid);
+        let guard = hub.participant_locks.lock(pid);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let unregister_hub = Arc::clone(&hub);
+        let unregister_started = started_tx.clone();
+        let unregister = std::thread::spawn(move || {
+            unregister_started.send(()).unwrap();
+            unregister_hub.unregister(pid, &old_tx)
+        });
+        let register_hub = Arc::clone(&hub);
+        let register_tx = new_tx.clone();
+        let register = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            register_hub.register(pid, register_tx);
+            register_hub.join_room(room, pid);
+            register_hub.watch_stream(stream, pid);
+            register_hub.call_join(call, pid);
+        });
+        started_rx.recv().unwrap();
+        started_rx.recv().unwrap();
+        assert_eq!(hub.conns.get(&pid).map(|entry| entry.len()), Some(1));
+        drop(guard);
+        unregister.join().unwrap();
+        register.join().unwrap();
+        let connections = hub.conns.get(&pid).expect("new socket survives");
+        assert_eq!(connections.len(), 1);
+        assert!(connections[0].same_channel(&new_tx));
+        assert_eq!(hub.room_members_online(room), vec![pid]);
+        assert_eq!(hub.stream_watchers(stream), vec![pid]);
+        assert_eq!(hub.call_members(call), vec![pid]);
+        let subscriptions = hub.subs.get(&pid).expect("new subscriptions survive");
+        assert!(subscriptions.rooms.contains(&room));
+        assert!(subscriptions.streams.contains(&stream));
+        assert!(subscriptions.calls.contains(&call));
+    }
+
+    #[test]
+    fn disconnect_session_closes_only_matching_tabs() {
+        let hub = Hub::default();
+        let pid = ParticipantId::new();
+        let other_pid = ParticipantId::new();
+        let target = SessionId::new();
+        let keep = SessionId::new();
+        let (target_a, _rx_a, close_a) = make_session_conn(8, target);
+        let (target_b, _rx_b, close_b) = make_session_conn(8, target);
+        let (kept, _rx_keep, close_keep) = make_session_conn(8, keep);
+        let (legacy, _rx_legacy, close_legacy) = make_conn(8);
+        let (other, _rx_other, close_other) = make_session_conn(8, target);
+
+        hub.register(pid, target_a);
+        hub.register(pid, target_b);
+        hub.register(pid, kept);
+        hub.register(pid, legacy);
+        hub.register(other_pid, other);
+
+        assert_eq!(hub.disconnect_session(pid, target), 2);
+        assert!(close_a.is_cancelled());
+        assert!(close_b.is_cancelled());
+        assert!(!close_keep.is_cancelled());
+        assert!(!close_legacy.is_cancelled());
+        assert!(!close_other.is_cancelled());
+    }
+
+    #[test]
+    fn participant_and_other_session_disconnects_are_fail_safe() {
+        let hub = Hub::default();
+        let pid = ParticipantId::new();
+        let keep = SessionId::new();
+        let revoke = SessionId::new();
+        let (kept, _rx_keep, close_keep) = make_session_conn(8, keep);
+        let (revoked, _rx_revoke, close_revoke) = make_session_conn(8, revoke);
+        let (legacy, _rx_legacy, close_legacy) = make_conn(8);
+
+        hub.register(pid, kept);
+        hub.register(pid, revoked);
+        hub.register(pid, legacy);
+
+        assert_eq!(hub.disconnect_other_sessions(pid, keep), 2);
+        assert!(!close_keep.is_cancelled());
+        assert!(close_revoke.is_cancelled());
+        assert!(close_legacy.is_cancelled());
+
+        assert_eq!(hub.disconnect_participant(pid), 3);
+        assert!(close_keep.is_cancelled());
     }
 
     #[test]
@@ -554,7 +829,10 @@ mod tests {
 
     #[test]
     fn full_queue_drops_frame_when_disconnect_disabled() {
-        let cfg = WsConfig { send_queue_capacity: 2, disconnect_on_full: false };
+        let cfg = WsConfig {
+            send_queue_capacity: 2,
+            disconnect_on_full: false,
+        };
         let hub = Hub::with_ws_config(cfg);
         let pid = ParticipantId::new();
         let (tx, _rx, close) = make_conn(2); // never drained → fills up
@@ -582,7 +860,10 @@ mod tests {
 
     #[test]
     fn loss_episode_emits_exactly_one_resync_once_capacity_returns() {
-        let cfg = WsConfig { send_queue_capacity: 2, disconnect_on_full: false };
+        let cfg = WsConfig {
+            send_queue_capacity: 2,
+            disconnect_on_full: false,
+        };
         let hub = Hub::with_ws_config(cfg);
         let pid = ParticipantId::new();
         let (tx, mut rx, close) = make_conn(2);
@@ -593,15 +874,19 @@ mod tests {
         hub.fan_out_raw(&[pid], "b");
         hub.fan_out_raw(&[pid], "dropped-1");
         hub.fan_out_raw(&[pid], "dropped-2");
-        assert_eq!(drain_text(&mut rx), vec!["a", "b"], "no resync while still lossy");
+        assert_eq!(
+            drain_text(&mut rx),
+            vec!["a", "b"],
+            "no resync while still lossy"
+        );
 
-        // Capacity is back: the next delivered frame closes the episode with
-        // exactly ONE resync marker (not one per dropped frame).
+        // Capacity is back: the marker is a fence before the first post-loss
+        // frame, so that frame cannot be ACKed before catch-up starts.
         hub.fan_out_raw(&[pid], "c");
         assert_eq!(
             drain_text(&mut rx),
-            vec!["c".to_owned(), super::RESYNC_FRAME.to_owned()],
-            "one resync after the episode, ordered after the frame that closed it"
+            vec![super::RESYNC_FRAME.to_owned(), "c".to_owned()],
+            "one resync fence precedes the first post-loss frame"
         );
 
         // Healthy again: subsequent deliveries carry no further resync.
@@ -616,7 +901,7 @@ mod tests {
         hub.fan_out_raw(&[pid], "g");
         assert_eq!(
             drain_text(&mut rx),
-            vec!["g".to_owned(), super::RESYNC_FRAME.to_owned()],
+            vec![super::RESYNC_FRAME.to_owned(), "g".to_owned()],
             "each loss episode ends with its own single resync"
         );
         // Drop-only mode never tears the connection down.
@@ -624,11 +909,13 @@ mod tests {
     }
 
     #[test]
-    fn resync_retries_when_marker_finds_no_capacity() {
-        // When the frame that closes the episode consumes the LAST slot, the
-        // marker can't be enqueued yet — the episode must stay open and the
-        // marker land after a later delivery instead of being silently lost.
-        let cfg = WsConfig { send_queue_capacity: 2, disconnect_on_full: false };
+    fn frame_dropped_behind_last_slot_fence_reopens_loss_episode() {
+        // When the marker consumes the LAST slot, the following live frame must
+        // drop and open a new episode rather than slip ahead of catch-up.
+        let cfg = WsConfig {
+            send_queue_capacity: 2,
+            disconnect_on_full: false,
+        };
         let hub = Hub::with_ws_config(cfg);
         let pid = ParticipantId::new();
         let (tx, mut rx, _close) = make_conn(2);
@@ -637,23 +924,33 @@ mod tests {
         hub.fan_out_raw(&[pid], "a");
         hub.fan_out_raw(&[pid], "b"); // queue full: [a, b]
         hub.fan_out_raw(&[pid], "dropped"); // opens the episode
-        // Drain only ONE frame, leaving exactly one free slot.
+                                            // Drain only ONE frame, leaving exactly one free slot.
         assert!(matches!(rx.try_recv(), Ok(axum::extract::ws::Message::Text(t)) if t == "a"));
 
-        // `c` takes the last slot; the marker finds the queue full → deferred.
+        // The fence takes the last slot; `c` drops and reopens the episode.
         hub.fan_out_raw(&[pid], "c");
-        assert_eq!(drain_text(&mut rx), vec!["b", "c"], "marker deferred, not lost");
+        assert_eq!(
+            drain_text(&mut rx),
+            vec!["b".to_owned(), super::RESYNC_FRAME.to_owned()],
+            "the delivery fence is never ordered behind a post-loss frame"
+        );
 
-        // Next delivery has room behind it → the deferred marker lands (once).
+        // The next delivery receives a fresh fence for `c`'s loss episode.
         hub.fan_out_raw(&[pid], "d");
-        assert_eq!(drain_text(&mut rx), vec!["d".to_owned(), super::RESYNC_FRAME.to_owned()]);
+        assert_eq!(
+            drain_text(&mut rx),
+            vec![super::RESYNC_FRAME.to_owned(), "d".to_owned()]
+        );
     }
 
     #[test]
     fn disconnect_mode_does_not_emit_resync() {
         // disconnect_on_full self-heals via the reconnect `?since=` backfill, so
         // no resync marker must ever be produced there (the connection is gone).
-        let cfg = WsConfig { send_queue_capacity: 1, disconnect_on_full: true };
+        let cfg = WsConfig {
+            send_queue_capacity: 1,
+            disconnect_on_full: true,
+        };
         let hub = Hub::with_ws_config(cfg);
         let pid = ParticipantId::new();
         let (tx, mut rx, close) = make_conn(1);
@@ -662,12 +959,19 @@ mod tests {
         hub.fan_out_raw(&[pid], "a");
         hub.fan_out_raw(&[pid], "overflow"); // full → evict
         assert!(close.is_cancelled());
-        assert_eq!(drain_text(&mut rx), vec!["a"], "no resync marker in disconnect mode");
+        assert_eq!(
+            drain_text(&mut rx),
+            vec!["a"],
+            "no resync marker in disconnect mode"
+        );
     }
 
     #[test]
     fn full_queue_disconnects_and_prunes_laggy_client() {
-        let cfg = WsConfig { send_queue_capacity: 1, disconnect_on_full: true };
+        let cfg = WsConfig {
+            send_queue_capacity: 1,
+            disconnect_on_full: true,
+        };
         let hub = Hub::with_ws_config(cfg);
         let pid = ParticipantId::new();
         let (tx, _rx, close) = make_conn(1); // stalled consumer
@@ -677,8 +981,14 @@ mod tests {
         // Next frame finds the queue full → disconnect + prune.
         hub.fan_out_raw(&[pid], "overflow");
 
-        assert!(close.is_cancelled(), "laggy client should be signalled to close");
-        assert!(hub.conns.get(&pid).is_none(), "laggy connection should be pruned");
+        assert!(
+            close.is_cancelled(),
+            "laggy client should be signalled to close"
+        );
+        assert!(
+            hub.conns.get(&pid).is_none(),
+            "laggy connection should be pruned"
+        );
     }
 
     #[test]
@@ -690,7 +1000,10 @@ mod tests {
         drop(rx); // receiver gone → channel closed
 
         hub.fan_out_raw(&[pid], "anything");
-        assert!(hub.conns.get(&pid).is_none(), "closed connection should be reaped");
+        assert!(
+            hub.conns.get(&pid).is_none(),
+            "closed connection should be reaped"
+        );
     }
 
     #[test]
@@ -825,7 +1138,10 @@ mod tests {
         assert!((ws_gauge_in(&reg) - 1.0).abs() < 1e-9, "register ⇒ +1");
 
         hub.unregister(pid, &tx);
-        assert!((ws_gauge_in(&reg) - 0.0).abs() < 1e-9, "unregister ⇒ back to 0");
+        assert!(
+            (ws_gauge_in(&reg) - 0.0).abs() < 1e-9,
+            "unregister ⇒ back to 0"
+        );
     }
 
     #[test]
@@ -853,7 +1169,10 @@ mod tests {
         // A laggy client pruned by fan_out_raw decrements the gauge once; the
         // socket task's later `unregister` must NOT double-decrement.
         let reg = Arc::new(aero_common::metrics::Registry::new());
-        let cfg = WsConfig { send_queue_capacity: 1, disconnect_on_full: true };
+        let cfg = WsConfig {
+            send_queue_capacity: 1,
+            disconnect_on_full: true,
+        };
         let hub = Hub::with_metrics_registry(cfg, reg.clone());
         let pid = ParticipantId::new();
         let (tx, _rx, _close) = make_conn(1); // stalled consumer
@@ -863,7 +1182,10 @@ mod tests {
 
         hub.fan_out_raw(&[pid], "fills the single slot");
         hub.fan_out_raw(&[pid], "overflow"); // full → evict + prune (gauge -1)
-        assert!((ws_gauge_in(&reg) - 0.0).abs() < 1e-9, "eviction ⇒ back to 0");
+        assert!(
+            (ws_gauge_in(&reg) - 0.0).abs() < 1e-9,
+            "eviction ⇒ back to 0"
+        );
 
         // The connection is already gone; unregister finds nothing to remove and
         // therefore does not decrement again (no negative gauge).

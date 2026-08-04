@@ -14,12 +14,15 @@ use std::sync::Arc;
 
 use aero_common::{Block, CallKind, CallMode, RoomKind, WorkspaceRole};
 use aero_storage::{
-    db::PgPool, AiJobRepo, BlockRepo, CallRepo, MessageRepo, ParticipantRepo, ReactionRepo,
-    ReceiptRepo, RoomRepo, WorkspaceRepo,
+    db::PgPool, AiJobRepo, BlockRepo, CallRepo, DmRepo, GroupDmRepo, MessageRepo, ParticipantRepo,
+    ReactionRepo, ReceiptRepo, RoomRepo, WorkspaceRepo,
 };
 
 use crate::service::ImService;
 use crate::test_util::MockBus;
+
+mod auto_mod_tests;
+mod room_kind_tests;
 
 fn unique_email(prefix: &str) -> String {
     // Avoid pulling in `uuid` directly — IDs already give us ULIDs through `aero-common`.
@@ -54,14 +57,27 @@ fn service(pool: PgPool) -> ImService {
 }
 
 async fn new_participant(participants: &ParticipantRepo, prefix: &str) -> aero_common::Participant {
-    participants
+    let participant = participants
         .create_human(aero_storage::participant::NewHuman {
             email: unique_email(prefix),
             display_name: prefix.into(),
             password_hash: "x".into(),
         })
         .await
-        .unwrap()
+        .unwrap();
+    // Production registration enrolls every participant into the reserved
+    // default workspace before they can create/use legacy rooms. Mirror that
+    // invariant here so tests exercise the canonical room-access boundary
+    // instead of relying on room membership alone.
+    WorkspaceRepo::new(participants.pool().clone())
+        .add_member(
+            aero_common::WorkspaceId::from_uuid(uuid::Uuid::nil()),
+            participant.id,
+            WorkspaceRole::Member,
+        )
+        .await
+        .unwrap();
+    participant
 }
 
 #[tokio::test]
@@ -69,22 +85,8 @@ async fn new_participant(participants: &ParticipantRepo, prefix: &str) -> aero_c
 async fn create_room_and_send_message() {
     let pool = pool();
     let participants = ParticipantRepo::new(pool.clone());
-    let alice = participants
-        .create_human(aero_storage::participant::NewHuman {
-            email: unique_email("alice"),
-            display_name: "Alice".into(),
-            password_hash: "x".into(),
-        })
-        .await
-        .unwrap();
-    let bob = participants
-        .create_human(aero_storage::participant::NewHuman {
-            email: unique_email("bob"),
-            display_name: "Bob".into(),
-            password_hash: "x".into(),
-        })
-        .await
-        .unwrap();
+    let alice = new_participant(&participants, "Alice").await;
+    let bob = new_participant(&participants, "Bob").await;
 
     let svc = service(pool);
     let room = svc
@@ -165,7 +167,13 @@ async fn pii_guard_blocks_message_with_sensitive_data() {
 
     // A clean message still sends, and nothing was persisted for the blocked ones.
     let ok = svc
-        .send_message(alice.id, room.id, vec![Block::text("ship it at 3pm")], None, None)
+        .send_message(
+            alice.id,
+            room.id,
+            vec![Block::text("ship it at 3pm")],
+            None,
+            None,
+        )
         .await
         .expect("clean message sends");
     assert_eq!(ok.room_id, room.id);
@@ -178,22 +186,8 @@ async fn pii_guard_blocks_message_with_sensitive_data() {
 async fn non_member_cannot_send_message() {
     let pool = pool();
     let participants = ParticipantRepo::new(pool.clone());
-    let alice = participants
-        .create_human(aero_storage::participant::NewHuman {
-            email: unique_email("alice"),
-            display_name: "Alice".into(),
-            password_hash: "x".into(),
-        })
-        .await
-        .unwrap();
-    let intruder = participants
-        .create_human(aero_storage::participant::NewHuman {
-            email: unique_email("eve"),
-            display_name: "Eve".into(),
-            password_hash: "x".into(),
-        })
-        .await
-        .unwrap();
+    let alice = new_participant(&participants, "Alice").await;
+    let intruder = new_participant(&participants, "Eve").await;
 
     let svc = service(pool);
     let room = svc
@@ -213,14 +207,7 @@ async fn non_member_cannot_send_message() {
 async fn send_message_publishes_envelope() {
     let pool = pool();
     let participants = ParticipantRepo::new(pool.clone());
-    let alice = participants
-        .create_human(aero_storage::participant::NewHuman {
-            email: unique_email("alice"),
-            display_name: "Alice".into(),
-            password_hash: "x".into(),
-        })
-        .await
-        .unwrap();
+    let alice = new_participant(&participants, "Alice").await;
 
     let bus = Arc::new(MockBus::default());
     let svc = ImService::new(
@@ -230,9 +217,10 @@ async fn send_message_publishes_envelope() {
         ReceiptRepo::new(pool.clone()),
         ReactionRepo::new(pool.clone()),
         CallRepo::new(pool.clone()),
-        AiJobRepo::new(pool),
+        AiJobRepo::new(pool.clone()),
         bus.clone(),
-    );
+    )
+    .with_workspaces(WorkspaceRepo::new(pool));
     let room = svc
         .create_room(alice.id, RoomKind::Group, Some("publish-test".into()))
         .await
@@ -245,7 +233,8 @@ async fn send_message_publishes_envelope() {
     let log = bus.published.lock().unwrap();
     // Expect at least one publish to the per-room subject.
     assert!(
-        log.iter().any(|(s, _)| s == &ImService::room_subject(room.id)),
+        log.iter()
+            .any(|(s, _)| s == &ImService::room_subject(room.id)),
         "no publish on im.room.{room_id}: {log:?}",
         room_id = room.id
     );
@@ -308,7 +297,10 @@ async fn create_room_in_workspace_non_member_forbidden() {
         .create_room_in_workspace(outsider.id, ws.id, RoomKind::Channel, None)
         .await
         .unwrap_err();
-    assert!(matches!(err, aero_common::Error::Forbidden(_)), "got {err:?}");
+    assert!(
+        matches!(err, aero_common::Error::Forbidden(_)),
+        "got {err:?}"
+    );
 }
 
 #[tokio::test]
@@ -334,7 +326,10 @@ async fn create_room_in_workspace_guest_forbidden() {
         .create_room_in_workspace(guest.id, ws.id, RoomKind::Channel, None)
         .await
         .unwrap_err();
-    assert!(matches!(err, aero_common::Error::Forbidden(_)), "got {err:?}");
+    assert!(
+        matches!(err, aero_common::Error::Forbidden(_)),
+        "got {err:?}"
+    );
 }
 
 #[tokio::test]
@@ -386,7 +381,10 @@ async fn assert_room_access_denies_non_room_member_in_same_workspace() {
         .unwrap();
 
     let err = svc.assert_room_access(bob.id, room.id).await.unwrap_err();
-    assert!(matches!(err, aero_common::Error::Forbidden(_)), "got {err:?}");
+    assert!(
+        matches!(err, aero_common::Error::Forbidden(_)),
+        "got {err:?}"
+    );
 }
 
 #[tokio::test]
@@ -401,12 +399,15 @@ async fn assert_room_access_unknown_room_is_not_found() {
         .assert_room_access(alice.id, aero_common::RoomId::new())
         .await
         .unwrap_err();
-    assert!(matches!(err, aero_common::Error::NotFound(_)), "got {err:?}");
+    assert!(
+        matches!(err, aero_common::Error::NotFound(_)),
+        "got {err:?}"
+    );
 }
 
 #[tokio::test]
 #[ignore = "requires running Postgres with migrations applied"]
-async fn update_member_role_upserts_idempotently() {
+async fn update_member_role_updates_existing_members_idempotently() {
     let pool = pool();
     let participants = ParticipantRepo::new(pool.clone());
     let workspaces = WorkspaceRepo::new(pool.clone());
@@ -418,9 +419,19 @@ async fn update_member_role_upserts_idempotently() {
         .await
         .unwrap();
 
-    // Insert path: member did not exist yet.
-    workspaces
+    // The low-level role writer must not resurrect a membership that a
+    // concurrent deprovision removed.
+    assert!(!workspaces
         .update_member_role(ws.id, member.id, WorkspaceRole::Member)
+        .await
+        .unwrap());
+    assert_eq!(
+        workspaces.member_role(ws.id, member.id).await.unwrap(),
+        None
+    );
+
+    workspaces
+        .add_member(ws.id, member.id, WorkspaceRole::Member)
         .await
         .unwrap();
     assert_eq!(
@@ -477,7 +488,10 @@ async fn rooms_for_in_workspace_is_tenant_scoped() {
         .await
         .unwrap();
 
-    let in_a = rooms.rooms_for_in_workspace(alice.id, ws_a.id).await.unwrap();
+    let in_a = rooms
+        .rooms_for_in_workspace(alice.id, ws_a.id)
+        .await
+        .unwrap();
     assert!(in_a.iter().any(|r| r.id == room_a.id));
     assert!(
         !in_a.iter().any(|r| r.id == room_b.id),
@@ -498,29 +512,90 @@ async fn blocked_user_cannot_call_in_direct_room() {
 
     let alice = new_participant(&participants, "alice-callblk").await;
     let bob = new_participant(&participants, "bob-callblk").await;
+    let charlie = new_participant(&participants, "charlie-callblk").await;
+    let dana = new_participant(&participants, "dana-callblk").await;
 
-    let room = svc.create_room(alice.id, RoomKind::Direct, Some("dm".into())).await.unwrap();
-    svc.add_member(alice.id, room.id, bob.id).await.unwrap();
+    let room = DmRepo::new(pool.clone())
+        .find_or_create_in_workspace(
+            aero_common::WorkspaceId::from_uuid(uuid::Uuid::nil()),
+            alice.id,
+            bob.id,
+        )
+        .await
+        .unwrap();
+    let add_error = svc
+        .add_member(alice.id, room.id, charlie.id)
+        .await
+        .expect_err("generic membership cannot append a third direct participant");
+    assert!(matches!(add_error, aero_common::Error::Conflict(_)));
+    let direct_members: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM room_members WHERE room_id = $1")
+            .bind(room.id.to_uuid())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(direct_members, 2);
+    let group_dm = GroupDmRepo::new(pool.clone())
+        .find_or_create_in_workspace(
+            aero_common::WorkspaceId::from_uuid(uuid::Uuid::nil()),
+            &[alice.id, bob.id, charlie.id],
+            alice.id,
+        )
+        .await
+        .unwrap();
+    let group_add_error = svc
+        .add_member(alice.id, group_dm.id, dana.id)
+        .await
+        .expect_err("generic membership cannot mutate a marker-backed group DM");
+    assert!(matches!(group_add_error, aero_common::Error::Conflict(_)));
+    let group_members: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM room_members WHERE room_id = $1")
+            .bind(group_dm.id.to_uuid())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(group_members, 3);
 
     blocks.block(alice.id, bob.id).await.unwrap();
 
     // Neither direction may ring the other while the block stands.
     let err = svc
-        .start_call(bob.id, room.id, CallKind::Audio, CallMode::P2p, "sdp".into())
+        .start_call(
+            bob.id,
+            room.id,
+            CallKind::Audio,
+            CallMode::P2p,
+            "sdp".into(),
+        )
         .await
         .unwrap_err();
-    assert!(matches!(err, aero_common::Error::Forbidden(_)), "blocked → forbidden, got {err:?}");
+    assert!(
+        matches!(err, aero_common::Error::Forbidden(_)),
+        "blocked → forbidden, got {err:?}"
+    );
     let err2 = svc
-        .start_call(alice.id, room.id, CallKind::Audio, CallMode::P2p, "sdp".into())
+        .start_call(
+            alice.id,
+            room.id,
+            CallKind::Audio,
+            CallMode::P2p,
+            "sdp".into(),
+        )
         .await
         .unwrap_err();
     assert!(matches!(err2, aero_common::Error::Forbidden(_)));
 
     // After unblock the call is permitted again (reaches the call machinery).
     blocks.unblock(alice.id, bob.id).await.unwrap();
-    svc.start_call(bob.id, room.id, CallKind::Audio, CallMode::P2p, "sdp".into())
-        .await
-        .expect("call allowed after unblock");
+    svc.start_call(
+        bob.id,
+        room.id,
+        CallKind::Audio,
+        CallMode::P2p,
+        "sdp".into(),
+    )
+    .await
+    .expect("call allowed after unblock");
 }
 
 /// Optimistic-lock edit (migration 0157): a client that supplies the version
@@ -536,7 +611,10 @@ async fn edit_message_with_stale_expected_version_conflicts() {
     let svc = service(pool.clone());
 
     let alice = new_participant(&participants, "alice-verlock").await;
-    let room = svc.create_room(alice.id, RoomKind::Group, Some("verlock".into())).await.unwrap();
+    let room = svc
+        .create_room(alice.id, RoomKind::Group, Some("verlock".into()))
+        .await
+        .unwrap();
 
     let msg = svc
         .send_message(alice.id, room.id, vec![Block::text("v1")], None, None)
@@ -555,10 +633,18 @@ async fn edit_message_with_stale_expected_version_conflicts() {
     // Second edit racing against the SAME stale version (as if a second
     // client had loaded the message before the first edit landed): rejected.
     let err = svc
-        .edit_message(alice.id, msg.id, vec![Block::text("v3-stale")], Some(msg.version))
+        .edit_message(
+            alice.id,
+            msg.id,
+            vec![Block::text("v3-stale")],
+            Some(msg.version),
+        )
         .await
         .unwrap_err();
-    assert!(matches!(err, aero_common::Error::Conflict(_)), "stale version → Conflict, got {err:?}");
+    assert!(
+        matches!(err, aero_common::Error::Conflict(_)),
+        "stale version → Conflict, got {err:?}"
+    );
 
     // The message itself is unchanged by the rejected edit.
     let current = svc.messages.get(msg.id).await.unwrap().unwrap();
@@ -567,7 +653,12 @@ async fn edit_message_with_stale_expected_version_conflicts() {
 
     // A retry with the now-current version succeeds.
     let edited2 = svc
-        .edit_message(alice.id, msg.id, vec![Block::text("v3")], Some(edited.version))
+        .edit_message(
+            alice.id,
+            msg.id,
+            vec![Block::text("v3")],
+            Some(edited.version),
+        )
         .await
         .unwrap();
     assert_eq!(edited2.version, 3);
@@ -585,13 +676,82 @@ async fn edit_message_without_expected_version_is_unprotected_but_succeeds() {
     let svc = service(pool.clone());
 
     let alice = new_participant(&participants, "alice-verlegacy").await;
-    let room = svc.create_room(alice.id, RoomKind::Group, Some("verlegacy".into())).await.unwrap();
+    let room = svc
+        .create_room(alice.id, RoomKind::Group, Some("verlegacy".into()))
+        .await
+        .unwrap();
 
     let msg = svc
         .send_message(alice.id, room.id, vec![Block::text("v1")], None, None)
         .await
         .unwrap();
 
-    let edited = svc.edit_message(alice.id, msg.id, vec![Block::text("v2")], None).await.unwrap();
-    assert_eq!(edited.version, 2, "legacy no-version edits still succeed and bump the counter");
+    let edited = svc
+        .edit_message(alice.id, msg.id, vec![Block::text("v2")], None)
+        .await
+        .unwrap();
+    assert_eq!(
+        edited.version, 2,
+        "legacy no-version edits still succeed and bump the counter"
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires running Postgres with migrations applied"]
+async fn departed_author_cannot_edit_or_delete_by_global_message_id() {
+    let pool = pool();
+    let participants = ParticipantRepo::new(pool.clone());
+    let workspaces = WorkspaceRepo::new(pool.clone());
+    let owner = new_participant(&participants, "departed-author-owner").await;
+    let alice = new_participant(&participants, "departed-author").await;
+    let unique = aero_common::WorkspaceId::new();
+    let workspace = workspaces
+        .create(
+            "Departed author tenant".into(),
+            format!("departed-author-{unique}"),
+            owner.id,
+        )
+        .await
+        .unwrap();
+    workspaces
+        .add_member(workspace.id, alice.id, aero_common::WorkspaceRole::Member)
+        .await
+        .unwrap();
+    let svc = service(pool.clone());
+    let room = svc
+        .create_room_in_workspace(owner.id, workspace.id, RoomKind::Channel, None)
+        .await
+        .unwrap();
+    svc.add_member(owner.id, room.id, alice.id).await.unwrap();
+    let message = svc
+        .send_message(
+            alice.id,
+            room.id,
+            vec![Block::text("tenant secret")],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    RoomRepo::new(pool)
+        .remove_member(room.id, alice.id)
+        .await
+        .unwrap();
+
+    let edit_error = svc
+        .edit_message(
+            alice.id,
+            message.id,
+            vec![Block::text("should not land")],
+            Some(message.version),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(edit_error, aero_common::Error::Forbidden(_)));
+    let delete_error = svc.delete_message(alice.id, message.id).await.unwrap_err();
+    assert!(matches!(delete_error, aero_common::Error::Forbidden(_)));
+    let current = svc.messages.get(message.id).await.unwrap().unwrap();
+    assert!(current.deleted_at.is_none());
+    assert_eq!(current.searchable_text(), "tenant secret");
 }

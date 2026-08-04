@@ -42,9 +42,9 @@
 
 use std::time::Duration;
 
+use aero_common::MessageId;
 use aero_im_core::{PiiDetector, PiiKind};
 use aero_storage::MessageRepo;
-use aero_common::MessageId;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;
 
@@ -94,7 +94,10 @@ pub fn scan_batch(detector: &PiiDetector, items: &[ScanItem]) -> Vec<Finding> {
             if kinds.is_empty() {
                 None
             } else {
-                Some(Finding { message_id: item.id, kinds })
+                Some(Finding {
+                    message_id: item.id,
+                    kinds,
+                })
             }
         })
         .collect()
@@ -151,7 +154,11 @@ pub async fn run_backfill_scan(
     tracing::info!("pii_backfill: starting report-only historical scan");
     loop {
         if cancel.is_cancelled() {
-            tracing::info!(scanned, findings = total_findings, "pii_backfill: cancelled");
+            tracing::info!(
+                scanned,
+                findings = total_findings,
+                "pii_backfill: cancelled"
+            );
             return total_findings;
         }
 
@@ -170,7 +177,10 @@ pub async fn run_backfill_scan(
 
         let items: Vec<ScanItem> = page
             .iter()
-            .map(|m| ScanItem { id: m.id, text: m.searchable_text() })
+            .map(|m| ScanItem {
+                id: m.id,
+                text: m.searchable_text(),
+            })
             .collect();
         let findings = scan_batch(detector, &items);
         for finding in &findings {
@@ -207,11 +217,19 @@ mod tests {
     use aero_im_core::PiiConfig;
 
     fn item(id: MessageId, text: &str) -> ScanItem {
-        ScanItem { id, text: text.to_string() }
+        ScanItem {
+            id,
+            text: text.to_string(),
+        }
     }
 
     fn detector_all() -> PiiDetector {
-        PiiDetector::new(PiiConfig { ssn: true, credit_card: true, email: true, phone: true })
+        PiiDetector::new(PiiConfig {
+            ssn: true,
+            credit_card: true,
+            email: true,
+            phone: true,
+        })
     }
 
     #[test]
@@ -230,9 +248,15 @@ mod tests {
 
         // Clean message is omitted; only the two PII-bearing ones are reported.
         assert_eq!(findings.len(), 2);
-        let ssn = findings.iter().find(|f| f.message_id == m_ssn).expect("ssn finding");
+        let ssn = findings
+            .iter()
+            .find(|f| f.message_id == m_ssn)
+            .expect("ssn finding");
         assert_eq!(ssn.kinds, vec![PiiKind::Ssn]);
-        let card = findings.iter().find(|f| f.message_id == m_card).expect("card finding");
+        let card = findings
+            .iter()
+            .find(|f| f.message_id == m_card)
+            .expect("card finding");
         assert_eq!(card.kinds, vec![PiiKind::CreditCard]);
         assert!(findings.iter().all(|f| f.message_id != m_clean));
     }
@@ -241,8 +265,13 @@ mod tests {
     fn scan_batch_reports_multiple_kinds_per_message() {
         let d = detector_all();
         let id = MessageId::new();
-        let findings =
-            scan_batch(&d, &[item(id, "ssn 123-45-6789 card 4111111111111111 mail a@b.com")]);
+        let findings = scan_batch(
+            &d,
+            &[item(
+                id,
+                "ssn 123-45-6789 card 4111111111111111 mail a@b.com",
+            )],
+        );
         assert_eq!(findings.len(), 1);
         let kinds = &findings[0].kinds;
         assert!(kinds.contains(&PiiKind::Ssn));
@@ -269,8 +298,12 @@ mod tests {
     #[test]
     fn scan_batch_respects_detector_config() {
         // A detector with only email enabled must ignore an SSN-bearing message.
-        let email_only =
-            PiiDetector::new(PiiConfig { ssn: false, credit_card: false, email: true, phone: false });
+        let email_only = PiiDetector::new(PiiConfig {
+            ssn: false,
+            credit_card: false,
+            email: true,
+            phone: false,
+        });
         let id_email = MessageId::new();
         let items = vec![
             item(MessageId::new(), "ssn 123-45-6789"),

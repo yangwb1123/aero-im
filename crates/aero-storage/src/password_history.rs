@@ -23,7 +23,11 @@ impl PasswordHistoryRepo {
 
     /// Record a (replaced) password hash for `participant`, then prune to the
     /// most recent [`HISTORY_DEPTH`] entries so the table can't grow unbounded.
-    pub async fn record(&self, participant: ParticipantId, password_hash: &str) -> Result<(), sqlx::Error> {
+    pub async fn record(
+        &self,
+        participant: ParticipantId,
+        password_hash: &str,
+    ) -> Result<(), sqlx::Error> {
         let mut tx = self.pool.begin().await?;
         sqlx::query("INSERT INTO password_history (participant_id, password_hash) VALUES ($1, $2)")
             .bind(participant.to_uuid())

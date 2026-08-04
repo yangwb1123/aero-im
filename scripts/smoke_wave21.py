@@ -6,9 +6,14 @@ which needs a real WHIP push to drive end-to-end).
 Run against a live foreground server (`AERO_HOST=http://localhost:3030`).
 """
 from __future__ import annotations
-import json, os, sys, time, urllib.error, urllib.request
+import http.client, json, os, sys, time, urllib.error, urllib.parse, urllib.request
 
 HOST = os.environ.get("AERO_HOST", "http://localhost:3030")
+_login_stamp = time.time_ns()
+LOGIN_SOURCE_IP = (
+    f"127.{(_login_stamp >> 16) % 250 + 1}."
+    f"{(_login_stamp >> 8) % 250 + 1}.{_login_stamp % 250 + 1}"
+)
 
 
 def say(m): print(f"\033[1;36m▶ {m}\033[0m")
@@ -53,7 +58,31 @@ def register(tag, ts):
 
 
 def login():
-    r = req("POST", "/api/auth/login", {"email": EMAIL, "password": PASSWORD})
+    parsed = urllib.parse.urlsplit(HOST)
+    connection_type = (
+        http.client.HTTPSConnection
+        if parsed.scheme == "https"
+        else http.client.HTTPConnection
+    )
+    connection = connection_type(
+        parsed.hostname,
+        parsed.port,
+        timeout=10,
+        source_address=(LOGIN_SOURCE_IP, 0),
+    )
+    connection.request(
+        "POST",
+        f"{parsed.path.rstrip('/')}/api/auth/login",
+        body=json.dumps({"email": EMAIL, "password": PASSWORD}).encode(),
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+    )
+    response = connection.getresponse()
+    raw = response.read()
+    status = response.status
+    connection.close()
+    if status != 200:
+        fail(f"login from dedicated source failed: {status} {raw.decode(errors='ignore')[:200]}")
+    r = json.loads(raw)
     return r["access_token"], r["refresh_token"]
 
 
@@ -100,17 +129,19 @@ def main():
     d = req("DELETE", f"/api/auth/sessions/{sid}", token=cur, expect=[200])
     if not d.get("revoked"):
         fail(f"single revoke did not report success: {d}")
-    ok("revoked a single session by id")
+    req("GET", "/api/me", token=cur, expect=[401])
+    activity_access, _activity_refresh = login()
+    ok("revoked a single session by id; its access token stopped working")
 
     # ---------------- Activity feed (CRUD) ----------------
     say("activity feed: list / unread count / mark read (go-live fan-out is db-tested)")
-    feed = req("GET", "/api/activity", token=a3_access)
+    feed = req("GET", "/api/activity", token=activity_access)
     if not isinstance(feed if isinstance(feed, list) else feed.get("entries", feed.get("activity")), list):
         fail(f"activity feed not a list: {feed}")
-    cnt = req("GET", "/api/activity/count", token=a3_access)
+    cnt = req("GET", "/api/activity/count", token=activity_access)
     if "unread" not in cnt:
         fail(f"activity count missing 'unread': {cnt}")
-    mk = req("POST", "/api/activity/read", token=a3_access, expect=[200])
+    mk = req("POST", "/api/activity/read", token=activity_access, expect=[200])
     if "marked" not in mk:
         fail(f"activity read missing 'marked': {mk}")
     ok(f"activity feed reachable (unread={cnt.get('unread')}, list ok, mark-read ok)")

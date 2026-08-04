@@ -1,15 +1,15 @@
 //! Message-retention sweep + data-lifecycle cleanup loops.
-use std::sync::Arc;
-use tokio_util::task::TaskTracker;
-use tokio_util::sync::CancellationToken;
-use aero_storage::{MessageRepo, ParticipantRepo};
 use aero_server::state::AppState;
+use aero_storage::{MessageRepo, ParticipantRepo};
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tracing::{info, warn};
 
 pub(crate) fn spawn(
     tracker: &TaskTracker,
     state: &AppState,
     ai_shutdown: &CancellationToken,
+    refresh_ttl_secs: u64,
 ) {
     let workspaces = state.workspaces.clone();
     let messages_repo = state.messages.clone();
@@ -18,44 +18,128 @@ pub(crate) fn spawn(
     let lifecycle_pool = state.pg.clone();
 
     let notif_retention_days = std::env::var("AERO__SERVER__NOTIFICATION_RETENTION_DAYS")
-        .ok().and_then(|s| s.parse::<i64>().ok()).unwrap_or(90);
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(90);
     let audit_retention_days = std::env::var("AERO__SERVER__AUDIT_RETENTION_DAYS")
-        .ok().and_then(|s| s.parse::<i64>().ok()).unwrap_or(365);
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(365);
     let ai_job_retention_days = std::env::var("AERO__SERVER__AI_JOB_RETENTION_DAYS")
-        .ok().and_then(|s| s.parse::<i64>().ok()).unwrap_or(7);
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(7);
     // AI usage ledger: a billing record, so kept far longer than ai_jobs (default
     // ~400 days = 13 months). Bounds the ledger's otherwise-unbounded growth.
     let ai_usage_retention_days = std::env::var("AERO__SERVER__AI_USAGE_RETENTION_DAYS")
-        .ok().and_then(|s| s.parse::<i64>().ok()).unwrap_or(400);
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(400);
     let webhook_log_retention_days = std::env::var("AERO__SERVER__WEBHOOK_LOG_RETENTION_DAYS")
-        .ok().and_then(|s| s.parse::<i64>().ok()).unwrap_or(30);
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(30);
     let search_click_retention_days = std::env::var("AERO__SERVER__SEARCH_CLICK_RETENTION_DAYS")
-        .ok().and_then(|s| s.parse::<i64>().ok()).unwrap_or(90);
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(90);
     let login_event_retention_days = std::env::var("AERO__SERVER__LOGIN_EVENT_RETENTION_DAYS")
-        .ok().and_then(|s| s.parse::<i64>().ok()).unwrap_or(180);
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(180);
     // Failed-login trail (方向五). Same default window as login_events — the
     // anomaly value is in *recent* failures; older rows are dead weight (and PII).
     let login_failure_retention_days = std::env::var("AERO__SERVER__LOGIN_FAILURE_RETENTION_DAYS")
-        .ok().and_then(|s| s.parse::<i64>().ok()).unwrap_or(180);
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(180);
     let viewer_raw_retention_days = std::env::var("AERO__SERVER__VIEWER_RAW_RETENTION_DAYS")
-        .ok().and_then(|s| s.parse::<i32>().ok()).unwrap_or(2);
+        .ok()
+        .and_then(|s| s.parse::<i32>().ok())
+        .unwrap_or(2);
     let viewer_rollup_retention_days = std::env::var("AERO__SERVER__VIEWER_ROLLUP_RETENTION_DAYS")
-        .ok().and_then(|s| s.parse::<i32>().ok()).unwrap_or(90);
+        .ok()
+        .and_then(|s| s.parse::<i32>().ok())
+        .unwrap_or(90);
     // Notification-bundle staleness window. Bundles are normally consumed within
     // seconds by the flush task, but a crash/disabled-flusher could leave rows
     // behind; this sweep bounds their lifetime (GDPR + unbounded-growth guard).
     // Default 1 day; 0 disables.
     let bundle_retention_days = std::env::var("AERO__SERVER__NOTIFICATION_BUNDLE_RETENTION_DAYS")
-        .ok().and_then(|s| s.parse::<i64>().ok()).unwrap_or(1);
-    // Revoked-token blacklist window (P2-3 unbounded-growth fix). An entry is only
-    // worth keeping until its token expires by its own natural TTL — a 7-day
-    // refresh-token lifetime is the default (`AuthConfig::refresh_ttl_secs`), so a
-    // conservative 8-day window (7d TTL + 1d margin for clock skew / TTL changes)
-    // guarantees we only purge entries whose token can no longer authenticate.
-    // Operators who raise `refresh_ttl_secs` MUST raise this to match. 0 disables.
-    let revoked_token_retention_days = std::env::var("AERO__SERVER__REVOKED_TOKEN_RETENTION_DAYS")
-        .ok().and_then(|s| s.parse::<i64>().ok()).unwrap_or(8);
-    let sweep_im = state.im.clone();
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(1);
+    // Sender idempotency tombstones outlive ordinary reconnect/retry windows so
+    // an old client key cannot create a duplicate after a transient outage.
+    // Zero disables cleanup.
+    let message_send_key_retention_days =
+        std::env::var("AERO__SERVER__MESSAGE_SEND_KEY_RETENTION_DAYS")
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(30)
+            .clamp(0, 3650);
+    // Published outbox rows remain briefly for idempotent-send resolution and
+    // operator diagnosis. Pending rows are never swept by the repository.
+    let configured_event_outbox_days = std::env::var("AERO__SERVER__EVENT_OUTBOX_RETENTION_DAYS")
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(30)
+        .clamp(0, 3650);
+    let event_outbox_retention_days =
+        if configured_event_outbox_days == 0 || message_send_key_retention_days == 0 {
+            0
+        } else {
+            configured_event_outbox_days.max(message_send_key_retention_days)
+        };
+    if configured_event_outbox_days > 0
+        && event_outbox_retention_days != configured_event_outbox_days
+    {
+        warn!(
+            configured_days = configured_event_outbox_days,
+            effective_days = event_outbox_retention_days,
+            message_send_key_retention_days,
+            "event-outbox retention raised to cover sender idempotency keys"
+        );
+    }
+    let message_side_effect_retention_days =
+        std::env::var("AERO__SERVER__MESSAGE_SIDE_EFFECT_RETENTION_DAYS")
+            .ok()
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(30)
+            .clamp(0, 3650);
+    // Completed durable-consumer receipts bound late producer replays outside
+    // NATS's finite duplicate window. Pending producer-outbox rows override this
+    // age in the repository and retain their receipts indefinitely.
+    let consumer_receipt_retention_days =
+        std::env::var("AERO__SERVER__CONSUMER_RECEIPT_RETENTION_DAYS")
+            .ok()
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(30)
+            .clamp(0, 3650);
+    let password_reset_retention_days =
+        std::env::var("AERO__SERVER__PASSWORD_RESET_RETENTION_DAYS")
+            .ok()
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(7)
+            .clamp(0, 3650);
+    // Never let blacklist retention fall below the configured refresh-token TTL
+    // plus a one-day safety margin. This prevents a long-lived token from becoming
+    // valid again merely because an operator raised its TTL without updating the
+    // sweep window. Explicit 0 still disables the sweep (the safest setting).
+    let configured_revoked_days = std::env::var("AERO__SERVER__REVOKED_TOKEN_RETENTION_DAYS")
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(8);
+    let revoked_token_retention_days =
+        effective_revoked_token_retention_days(configured_revoked_days, refresh_ttl_secs);
+    if configured_revoked_days > 0 && revoked_token_retention_days != configured_revoked_days {
+        warn!(
+            configured_days = configured_revoked_days,
+            effective_days = revoked_token_retention_days,
+            refresh_ttl_secs,
+            "revoked-token retention raised to cover refresh-token TTL"
+        );
+    }
     let cancel = ai_shutdown.clone();
     let sweep_secs = std::env::var("AERO__SERVER__RETENTION_SWEEP_SECS")
         .ok()
@@ -80,8 +164,8 @@ pub(crate) fn spawn(
                 }
                 _ = tick.tick() => {
                     let now = time::OffsetDateTime::now_utc();
-                    sweep_messages(&workspaces, &sweep_im, now).await;
-                    sweep_ephemeral(&messages_repo, &sweep_im).await;
+                    sweep_messages(&workspaces, now).await;
+                    sweep_ephemeral(&messages_repo).await;
                     sweep_bans(&stream_mod_pool).await;
                     sweep_channel_points(&stream_mod_pool).await;
                     sweep_deferred_erasure(&erasure_pool).await;
@@ -95,6 +179,31 @@ pub(crate) fn spawn(
                     sweep_login_events(&lifecycle_pool, login_event_retention_days, now).await;
                     sweep_login_failures(&lifecycle_pool, login_failure_retention_days, now).await;
                     sweep_notification_bundles(&lifecycle_pool, bundle_retention_days, now).await;
+                    sweep_message_send_keys(
+                        &lifecycle_pool,
+                        message_send_key_retention_days,
+                        now,
+                    ).await;
+                    sweep_event_outbox(
+                        &lifecycle_pool,
+                        event_outbox_retention_days,
+                        now,
+                    ).await;
+                    sweep_message_side_effects(
+                        &lifecycle_pool,
+                        message_side_effect_retention_days,
+                        now,
+                    ).await;
+                    sweep_consumer_event_receipts(
+                        &lifecycle_pool,
+                        consumer_receipt_retention_days,
+                        now,
+                    ).await;
+                    sweep_password_reset_tokens(
+                        &lifecycle_pool,
+                        password_reset_retention_days,
+                        now,
+                    ).await;
                     sweep_revoked_tokens(&lifecycle_pool, revoked_token_retention_days, now).await;
                     sweep_viewer_samples(&lifecycle_pool, viewer_raw_retention_days, viewer_rollup_retention_days).await;
                     sweep_viewer_partitions(&lifecycle_pool, viewer_raw_retention_days).await;
@@ -104,35 +213,34 @@ pub(crate) fn spawn(
     });
 }
 
-async fn sweep_messages(
-    workspaces: &aero_storage::WorkspaceRepo,
-    sweep_im: &Arc<aero_im_core::ImService>,
-    now: time::OffsetDateTime,
-) {
+fn effective_revoked_token_retention_days(configured_days: i64, refresh_ttl_secs: u64) -> i64 {
+    if configured_days == 0 {
+        return 0;
+    }
+    let ttl_days = refresh_ttl_secs.saturating_add(86_399) / 86_400;
+    let minimum = i64::try_from(ttl_days.saturating_add(1)).unwrap_or(i64::MAX);
+    configured_days.max(minimum)
+}
+
+async fn sweep_messages(workspaces: &aero_storage::WorkspaceRepo, now: time::OffsetDateTime) {
     match workspaces.sweep_expired_messages(now, None).await {
         Ok(deleted) if deleted.is_empty() => {}
         Ok(deleted) => {
             let n = deleted.len();
-            for (message_id, room_id) in deleted {
-                sweep_im.announce_message_deleted(room_id, message_id).await;
-            }
+            // Each tombstone event was appended on the sweep transaction. The
+            // normal outbox relay owns publication/retry after commit.
             info!(swept = n, "retention sweep soft-deleted messages");
         }
         Err(e) => warn!(error = ?e, "retention sweep failed"),
     }
 }
 
-async fn sweep_ephemeral(
-    messages_repo: &MessageRepo,
-    sweep_im: &Arc<aero_im_core::ImService>,
-) {
+async fn sweep_ephemeral(messages_repo: &MessageRepo) {
     match messages_repo.sweep_ephemeral().await {
         Ok(deleted) if deleted.is_empty() => {}
         Ok(deleted) => {
             let n = deleted.len();
-            for (message_id, room_id) in deleted {
-                sweep_im.announce_message_deleted(room_id, message_id).await;
-            }
+            // Hard-delete and tombstone outbox append committed atomically.
             info!(swept = n, "ephemeral sweep hard-deleted expired messages");
         }
         Err(e) => warn!(error = ?e, "ephemeral sweep failed"),
@@ -140,7 +248,10 @@ async fn sweep_ephemeral(
 }
 
 async fn sweep_bans(pool: &sqlx::PgPool) {
-    match aero_storage::StreamModRepo::new(pool.clone()).sweep_expired_bans().await {
+    match aero_storage::StreamModRepo::new(pool.clone())
+        .sweep_expired_bans()
+        .await
+    {
         Ok(0) => {}
         Ok(n) => info!(swept = n, "expired bans cleaned up"),
         Err(e) => warn!(error = ?e, "ban expiry sweep failed"),
@@ -148,7 +259,10 @@ async fn sweep_bans(pool: &sqlx::PgPool) {
 }
 
 async fn sweep_channel_points(pool: &sqlx::PgPool) {
-    match aero_storage::ChannelPointsRepo::new(pool.clone()).sweep_expired_points().await {
+    match aero_storage::ChannelPointsRepo::new(pool.clone())
+        .sweep_expired_points()
+        .await
+    {
         Ok(0) => {}
         Ok(n) => info!(swept = n, "expired channel points zeroed"),
         Err(e) => warn!(error = ?e, "channel points expiry sweep failed"),
@@ -156,17 +270,28 @@ async fn sweep_channel_points(pool: &sqlx::PgPool) {
 }
 
 async fn sweep_deferred_erasure(pool: &sqlx::PgPool) {
-    match ParticipantRepo::new(pool.clone()).sweep_deferred_erasure().await {
+    match ParticipantRepo::new(pool.clone())
+        .sweep_deferred_erasure()
+        .await
+    {
         Ok(0) => {}
-        Ok(n) => info!(swept = n, "deferred GDPR erasure completed (released holds)"),
+        Ok(n) => info!(
+            swept = n,
+            "deferred GDPR erasure completed (released holds)"
+        ),
         Err(e) => warn!(error = ?e, "deferred erasure sweep failed"),
     }
 }
 
 async fn sweep_notifications(pool: &sqlx::PgPool, days: i64, now: time::OffsetDateTime) {
-    if days == 0 { return; }
+    if days == 0 {
+        return;
+    }
     let cutoff = now - time::Duration::days(days);
-    match aero_storage::NotificationRepo::new(pool.clone()).sweep_read_before(cutoff).await {
+    match aero_storage::NotificationRepo::new(pool.clone())
+        .sweep_read_before(cutoff)
+        .await
+    {
         Ok(0) => {}
         Ok(n) => info!(swept = n, "old read notifications purged"),
         Err(e) => warn!(error = ?e, "notification retention sweep failed"),
@@ -174,9 +299,14 @@ async fn sweep_notifications(pool: &sqlx::PgPool, days: i64, now: time::OffsetDa
 }
 
 async fn sweep_audit(pool: &sqlx::PgPool, days: i64, now: time::OffsetDateTime) {
-    if days == 0 { return; }
+    if days == 0 {
+        return;
+    }
     let cutoff = now - time::Duration::days(days);
-    match aero_storage::AuditRepo::new(pool.clone()).sweep_before(cutoff).await {
+    match aero_storage::AuditRepo::new(pool.clone())
+        .sweep_before(cutoff)
+        .await
+    {
         Ok(0) => {}
         Ok(n) => info!(swept = n, "old audit events purged"),
         Err(e) => warn!(error = ?e, "audit retention sweep failed"),
@@ -193,7 +323,9 @@ async fn sweep_audit(pool: &sqlx::PgPool, days: i64, now: time::OffsetDateTime) 
 /// `days == 0` disables audit retention entirely, so partition-dropping is skipped
 /// too (only the safe pre-create of future partitions would otherwise run).
 async fn sweep_audit_partitions(pool: &sqlx::PgPool, days: i64) {
-    if days == 0 { return; }
+    if days == 0 {
+        return;
+    }
     // keep_days mirrors the audit-retention window: a daily partition is only
     // dropped once every row in it is already past `sweep_audit`'s cutoff.
     let keep_days = i32::try_from(days).unwrap_or(i32::MAX);
@@ -207,9 +339,14 @@ async fn sweep_audit_partitions(pool: &sqlx::PgPool, days: i64) {
 }
 
 async fn sweep_ai_jobs(pool: &sqlx::PgPool, days: i64, now: time::OffsetDateTime) {
-    if days == 0 { return; }
+    if days == 0 {
+        return;
+    }
     let cutoff = now - time::Duration::days(days);
-    match aero_storage::AiJobRepo::new(pool.clone()).sweep_terminal_before(cutoff).await {
+    match aero_storage::AiJobRepo::new(pool.clone())
+        .sweep_terminal_before(cutoff)
+        .await
+    {
         Ok(0) => {}
         Ok(n) => info!(swept = n, "completed ai_jobs purged"),
         Err(e) => warn!(error = ?e, "ai_job retention sweep failed"),
@@ -217,9 +354,14 @@ async fn sweep_ai_jobs(pool: &sqlx::PgPool, days: i64, now: time::OffsetDateTime
 }
 
 async fn sweep_ai_usage(pool: &sqlx::PgPool, days: i64, now: time::OffsetDateTime) {
-    if days == 0 { return; }
+    if days == 0 {
+        return;
+    }
     let cutoff = now - time::Duration::days(days);
-    match aero_storage::AiUsageRepo::new(pool.clone()).sweep_older_than(cutoff).await {
+    match aero_storage::AiUsageRepo::new(pool.clone())
+        .sweep_older_than(cutoff)
+        .await
+    {
         Ok(0) => {}
         Ok(n) => info!(swept = n, "stale ai_usage_ledger rows purged"),
         Err(e) => warn!(error = ?e, "ai_usage retention sweep failed"),
@@ -227,9 +369,14 @@ async fn sweep_ai_usage(pool: &sqlx::PgPool, days: i64, now: time::OffsetDateTim
 }
 
 async fn sweep_webhook_logs(pool: &sqlx::PgPool, days: i64, now: time::OffsetDateTime) {
-    if days == 0 { return; }
+    if days == 0 {
+        return;
+    }
     let cutoff = now - time::Duration::days(days);
-    match aero_storage::WebhookDeliveryRepo::new(pool.clone()).sweep_terminal_before(cutoff).await {
+    match aero_storage::WebhookDeliveryRepo::new(pool.clone())
+        .sweep_terminal_before(cutoff)
+        .await
+    {
         Ok(0) => {}
         Ok(n) => info!(swept = n, "terminal webhook deliveries purged"),
         Err(e) => warn!(error = ?e, "webhook delivery-log retention sweep failed"),
@@ -237,9 +384,14 @@ async fn sweep_webhook_logs(pool: &sqlx::PgPool, days: i64, now: time::OffsetDat
 }
 
 async fn sweep_search_clicks(pool: &sqlx::PgPool, days: i64, now: time::OffsetDateTime) {
-    if days == 0 { return; }
+    if days == 0 {
+        return;
+    }
     let cutoff = now - time::Duration::days(days);
-    match aero_storage::SearchFeedbackRepo::new(pool.clone()).sweep_before(cutoff).await {
+    match aero_storage::SearchFeedbackRepo::new(pool.clone())
+        .sweep_before(cutoff)
+        .await
+    {
         Ok(0) => {}
         Ok(n) => info!(swept = n, "old search click events purged"),
         Err(e) => warn!(error = ?e, "search-click retention sweep failed"),
@@ -247,9 +399,14 @@ async fn sweep_search_clicks(pool: &sqlx::PgPool, days: i64, now: time::OffsetDa
 }
 
 async fn sweep_login_events(pool: &sqlx::PgPool, days: i64, now: time::OffsetDateTime) {
-    if days == 0 { return; }
+    if days == 0 {
+        return;
+    }
     let cutoff = now - time::Duration::days(days);
-    match aero_storage::LoginEventRepo::new(pool.clone()).sweep_before(cutoff).await {
+    match aero_storage::LoginEventRepo::new(pool.clone())
+        .sweep_before(cutoff)
+        .await
+    {
         Ok(0) => {}
         Ok(n) => info!(swept = n, "old login events purged"),
         Err(e) => warn!(error = ?e, "login-event retention sweep failed"),
@@ -257,9 +414,14 @@ async fn sweep_login_events(pool: &sqlx::PgPool, days: i64, now: time::OffsetDat
 }
 
 async fn sweep_login_failures(pool: &sqlx::PgPool, days: i64, now: time::OffsetDateTime) {
-    if days == 0 { return; }
+    if days == 0 {
+        return;
+    }
     let cutoff = now - time::Duration::days(days);
-    match aero_storage::LoginFailureRepo::new(pool.clone()).sweep_before(cutoff).await {
+    match aero_storage::LoginFailureRepo::new(pool.clone())
+        .sweep_before(cutoff)
+        .await
+    {
         Ok(0) => {}
         Ok(n) => info!(swept = n, "old login failures purged"),
         Err(e) => warn!(error = ?e, "login-failure retention sweep failed"),
@@ -267,35 +429,126 @@ async fn sweep_login_failures(pool: &sqlx::PgPool, days: i64, now: time::OffsetD
 }
 
 async fn sweep_notification_bundles(pool: &sqlx::PgPool, days: i64, now: time::OffsetDateTime) {
-    if days == 0 { return; }
+    if days == 0 {
+        return;
+    }
     let cutoff = now - time::Duration::days(days);
-    match aero_storage::NotificationBundleRepo::new(pool.clone()).sweep_before(cutoff).await {
+    match aero_storage::NotificationBundleRepo::new(pool.clone())
+        .sweep_before(cutoff)
+        .await
+    {
         Ok(0) => {}
         Ok(n) => info!(swept = n, "stale notification bundles purged"),
         Err(e) => warn!(error = ?e, "notification-bundle retention sweep failed"),
     }
 }
 
+async fn sweep_message_send_keys(pool: &sqlx::PgPool, days: i64, now: time::OffsetDateTime) {
+    if days == 0 {
+        return;
+    }
+    let cutoff = now - time::Duration::days(days);
+    match aero_storage::MessageRepo::new(pool.clone())
+        .sweep_send_keys_before(cutoff)
+        .await
+    {
+        Ok(0) => {}
+        Ok(n) => info!(swept = n, "expired message-send idempotency keys purged"),
+        Err(e) => warn!(error = ?e, "message-send idempotency sweep failed"),
+    }
+}
+
+async fn sweep_event_outbox(pool: &sqlx::PgPool, days: i64, now: time::OffsetDateTime) {
+    if days == 0 {
+        return;
+    }
+    let cutoff = now - time::Duration::days(days);
+    match aero_storage::EventOutboxRepo::new(pool.clone())
+        .sweep_published_before(cutoff)
+        .await
+    {
+        Ok(0) => {}
+        Ok(n) => info!(swept = n, "published message outbox rows purged"),
+        Err(e) => warn!(error = ?e, "message outbox retention sweep failed"),
+    }
+}
+
+async fn sweep_message_side_effects(pool: &sqlx::PgPool, days: i64, now: time::OffsetDateTime) {
+    if days == 0 {
+        return;
+    }
+    let cutoff = now - time::Duration::days(days);
+    match aero_storage::MessageSideEffectRepo::new(pool.clone())
+        .sweep_completed_before(cutoff)
+        .await
+    {
+        Ok(0) => {}
+        Ok(n) => info!(swept = n, "completed message side-effect rows purged"),
+        Err(e) => warn!(error = ?e, "message side-effect retention sweep failed"),
+    }
+}
+
+async fn sweep_consumer_event_receipts(pool: &sqlx::PgPool, days: i64, now: time::OffsetDateTime) {
+    if days == 0 {
+        return;
+    }
+    let cutoff = now - time::Duration::days(days);
+    match aero_storage::ConsumerEventReceiptRepo::new(pool.clone())
+        .sweep_completed_before(cutoff)
+        .await
+    {
+        Ok(0) => {}
+        Ok(n) => info!(swept = n, "completed consumer event receipts purged"),
+        Err(e) => warn!(error = ?e, "consumer event receipt retention sweep failed"),
+    }
+    match aero_storage::ConsumerEventReceiptRepo::new(pool.clone())
+        .sweep_abandoned_processing_before(cutoff)
+        .await
+    {
+        Ok(0) => {}
+        Ok(n) => info!(swept = n, "abandoned consumer event receipt leases purged"),
+        Err(e) => warn!(error = ?e, "abandoned consumer receipt sweep failed"),
+    }
+}
+
+async fn sweep_password_reset_tokens(pool: &sqlx::PgPool, days: i64, now: time::OffsetDateTime) {
+    if days == 0 {
+        return;
+    }
+    let cutoff = now - time::Duration::days(days);
+    match aero_storage::PasswordResetRepo::new(pool.clone())
+        .sweep_terminal_before(cutoff)
+        .await
+    {
+        Ok(0) => {}
+        Ok(n) => info!(swept = n, "password-reset token history purged"),
+        Err(e) => warn!(error = ?e, "password-reset retention sweep failed"),
+    }
+}
+
 async fn sweep_revoked_tokens(pool: &sqlx::PgPool, days: i64, now: time::OffsetDateTime) {
-    if days == 0 { return; }
+    if days == 0 {
+        return;
+    }
     // `cutoff = now - window`; only entries revoked before this — i.e. whose token
     // has already expired by its own natural TTL — are dropped. A token that could
     // still be valid was revoked after `cutoff` and is kept (no security regression;
     // see `RevokedTokenRepo::sweep_before`).
     let cutoff = now - time::Duration::days(days);
-    match aero_storage::RevokedTokenRepo::new(pool.clone()).sweep_before(cutoff).await {
+    match aero_storage::RevokedTokenRepo::new(pool.clone())
+        .sweep_before(cutoff)
+        .await
+    {
         Ok(0) => {}
         Ok(n) => info!(swept = n, "expired revoked-token blacklist entries purged"),
         Err(e) => warn!(error = ?e, "revoked-token retention sweep failed"),
     }
 }
 
-async fn sweep_viewer_samples(
-    pool: &sqlx::PgPool,
-    raw_days: i32,
-    rollup_days: i32,
-) {
-    if raw_days == 0 { return; }
+async fn sweep_viewer_samples(pool: &sqlx::PgPool, raw_days: i32, rollup_days: i32) {
+    if raw_days == 0 {
+        return;
+    }
     match aero_storage::StreamViewerSampleRepo::new(pool.clone())
         .rollup_and_downsample(raw_days, rollup_days)
         .await
@@ -311,6 +564,19 @@ async fn sweep_viewer_samples(
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::effective_revoked_token_retention_days;
+
+    #[test]
+    fn revoked_token_retention_covers_refresh_ttl_and_margin() {
+        assert_eq!(effective_revoked_token_retention_days(8, 86_400), 8);
+        assert_eq!(effective_revoked_token_retention_days(2, 8 * 86_400), 9);
+        assert_eq!(effective_revoked_token_retention_days(1, 86_401), 3);
+        assert_eq!(effective_revoked_token_retention_days(0, u64::MAX), 0);
+    }
+}
+
 /// Maintain the daily `RANGE` partitions of `stream_viewer_samples` (migration
 /// 0144): pre-create the next few days' partitions and drop ones older than the
 /// retention window. `keep_days` is the raw-sample retention plus a margin so a
@@ -320,7 +586,9 @@ async fn sweep_viewer_samples(
 /// The catch-all DEFAULT partition means a transient failure here never blocks
 /// inserts — the next tick simply retries.
 async fn sweep_viewer_partitions(pool: &sqlx::PgPool, raw_days: i32) {
-    if raw_days == 0 { return; }
+    if raw_days == 0 {
+        return;
+    }
     // Keep partitions a few days beyond the raw-retention window: raw rows are
     // deleted by `rollup_and_downsample` at `raw_days`, so a partition is only
     // dropped well after its last row would have been downsampled away.

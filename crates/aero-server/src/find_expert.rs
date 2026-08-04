@@ -5,10 +5,10 @@
 //! members who have said the most relevant things about it. Retrieval is the SAME
 //! membership- and workspace-bounded vector search the workspace ask uses
 //! ([`MessageRepo::search_vector_workspace`](aero_storage::MessageRepo::search_vector_workspace)),
-//! whose `JOIN room_members` is the security boundary — so a candidate can never be
-//! ranked on a message in a room the caller isn't in, nor in another tenant's
-//! channels. The hits are aggregated by author (summed relevance + a few citation
-//! message ids) in the AI service.
+//! whose effective-access joins cover room/workspace membership, account status,
+//! deactivation, and mandatory 2FA — so a candidate cannot be ranked from revoked
+//! or cross-tenant content. The hits are aggregated by author (summed relevance +
+//! a few citation message ids) in the AI service.
 //!
 //! Workspace-member-gated (via the shared
 //! [`WorkspaceRepo`](aero_storage::WorkspaceRepo), mirroring [`crate::workspace_ask`]):
@@ -24,6 +24,7 @@ use aero_auth::AuthUser;
 use aero_common::{Error as AeroError, ParticipantId, WorkspaceId};
 use axum::{
     extract::{Path, State},
+    http::HeaderMap,
     routing::post,
     Json, Router,
 };
@@ -61,7 +62,7 @@ async fn assert_member(
     caller: ParticipantId,
 ) -> Result<(), AeroError> {
     s.workspaces
-        .member_role(workspace, caller)
+        .effective_member_role(workspace, caller)
         .await
         .map_err(AeroError::from)?
         .ok_or_else(|| AeroError::Forbidden("not a workspace member".into()))?;
@@ -87,6 +88,7 @@ struct FindExpertReq {
 async fn find_expert(
     State(s): State<AppState>,
     auth: AuthUser,
+    headers: HeaderMap,
     Path(ws_str): Path<String>,
     Json(req): Json<FindExpertReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
@@ -102,12 +104,17 @@ async fn find_expert(
     // `502` only when no AI backend is wired; with a backend (even key-less) the
     // call runs through the deterministic embedder + vector index and returns a
     // (possibly empty) ranked list rather than erroring.
-    let ai = s
-        .ai
-        .as_ref()
-        .ok_or_else(|| AeroError::Upstream("AI not configured".into()))?;
+    let ai =
+        s.ai.as_ref()
+            .ok_or_else(|| AeroError::Upstream("AI not configured".into()))?;
+    let usage_context = crate::ai_usage::request_usage_context(
+        &headers,
+        auth.participant_id,
+        Some(ws.to_uuid()),
+        &format!("find_expert:{ws}:{k}:{topic}"),
+    );
     let experts = ai
-        .find_expert(auth.participant_id, ws, topic, k)
+        .find_expert_with_usage_context(auth.participant_id, ws, topic, k, usage_context)
         .await
         .map_err(|e| AeroError::Upstream(format!("ai: {e}")))?;
 

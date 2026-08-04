@@ -1,9 +1,7 @@
 //! Live-stream chat moderation HTTP API (ban / timeout viewers from danmaku).
 //!
-//! Additive layer over the new [`aero_storage::StreamModRepo`]. The stream
-//! *owner* (`stream.owner_id == auth.participant_id`) is the moderator: they ban
-//! (permanent) or time-out (a `duration_secs` window) a viewer from posting in
-//! that stream's chat, lift a ban, and list the stream's bans.
+//! Thin input boundary over [`aero_storage::StreamModRepo`]. Owner/moderator
+//! authority is rechecked under the canonical stream lock in storage.
 //!
 //! Enforcement of the ban on the *posting* path lives next to the danmaku
 //! handlers (`stream_chat_post` in [`crate::routes`] and the `StreamChat` WS
@@ -13,7 +11,7 @@
 use std::str::FromStr;
 
 use aero_common::{Error as AeroError, ParticipantId, Result as AeroResult};
-use aero_storage::StreamModRepo;
+use aero_storage::{stream_mod::MAX_BAN_REASON_CHARS, StreamModRepo};
 use axum::{
     extract::{Path, State},
     routing::{get, post},
@@ -46,24 +44,11 @@ fn parse_participant_id(s: &str) -> AeroResult<ParticipantId> {
     ParticipantId::from_str(s).map_err(|e| AeroError::Invalid(format!("participant id: {e}")))
 }
 
-/// Resolve a stream and assert the caller may MODERATE its chat — the stream
-/// OWNER *or* an assigned stream MODERATOR (migration 0083). Used by the
-/// ban/timeout/unban authority so a moderator wields the same power as the owner.
-/// Returns the stream id on success; `NotFound`/`Forbidden` otherwise.
-async fn require_mod(s: &AppState, stream_str: &str, caller: ParticipantId) -> AeroResult<Ulid> {
-    let stream_id = parse_stream_id(stream_str)?;
-    if crate::stream_moderators::may_moderate(s, stream_id, caller).await? {
-        Ok(stream_id)
-    } else {
-        Err(AeroError::Forbidden(
-            "only the stream owner or a moderator may moderate its chat".into(),
-        ))
-    }
-}
-
 fn mod_repo(s: &AppState) -> StreamModRepo {
     StreamModRepo::new(s.participants.pool().clone())
 }
+
+const MAX_TIMEOUT_SECS: u64 = 365 * 24 * 60 * 60;
 
 #[derive(Deserialize)]
 struct BanReq {
@@ -82,9 +67,25 @@ async fn ban_viewer(
     Path(id_str): Path<String>,
     Json(req): Json<BanReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let stream_id = require_mod(&s, &id_str, auth.participant_id).await?;
+    let stream_id = parse_stream_id(&id_str)?;
     let target = parse_participant_id(&req.participant_id)?;
+    let reason = req
+        .reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if reason.is_some_and(|value| value.chars().count() > MAX_BAN_REASON_CHARS) {
+        return Err(AeroError::Invalid(format!(
+            "ban reason exceeds {MAX_BAN_REASON_CHARS} characters"
+        ))
+        .into());
+    }
     let until = match req.duration_secs {
+        Some(secs) if secs > MAX_TIMEOUT_SECS => {
+            return Err(
+                AeroError::Invalid(format!("duration_secs exceeds {MAX_TIMEOUT_SECS}")).into(),
+            );
+        }
         Some(secs) if secs > 0 => {
             let secs = i64::try_from(secs)
                 .map_err(|_| AeroError::Invalid("duration_secs too large".into()))?;
@@ -94,7 +95,7 @@ async fn ban_viewer(
         _ => None,
     };
     mod_repo(&s)
-        .ban(stream_id, target, auth.participant_id, req.reason.as_deref(), until)
+        .ban_authorized(stream_id, target, auth.participant_id, reason, until)
         .await?;
     Ok(Json(serde_json::json!({
         "banned": true,
@@ -115,10 +116,14 @@ async fn unban_viewer(
     Path(id_str): Path<String>,
     Json(req): Json<UnbanReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let stream_id = require_mod(&s, &id_str, auth.participant_id).await?;
+    let stream_id = parse_stream_id(&id_str)?;
     let target = parse_participant_id(&req.participant_id)?;
-    let removed = mod_repo(&s).unban(stream_id, target).await?;
-    Ok(Json(serde_json::json!({ "banned": false, "removed": removed })))
+    let removed = mod_repo(&s)
+        .unban_authorized(stream_id, target, auth.participant_id)
+        .await?;
+    Ok(Json(
+        serde_json::json!({ "banned": false, "removed": removed }),
+    ))
 }
 
 /// `GET /api/streams/:id/bans` — owner lists the stream's bans, newest first.
@@ -127,7 +132,9 @@ async fn list_bans(
     auth: AuthUser,
     Path(id_str): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let stream_id = require_mod(&s, &id_str, auth.participant_id).await?;
-    let bans = mod_repo(&s).list_bans(stream_id).await?;
+    let stream_id = parse_stream_id(&id_str)?;
+    let bans = mod_repo(&s)
+        .list_bans_authorized(stream_id, auth.participant_id)
+        .await?;
     Ok(Json(serde_json::json!({ "bans": bans })))
 }

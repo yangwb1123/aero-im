@@ -66,14 +66,23 @@ async fn save_draft(
     let room = parse_room(&room_str)?;
     // Tenant + room-membership guard before staging a draft for the room.
     s.im.assert_room_access(auth.participant_id, room).await?;
+    aero_im_core::validate_blocks(&req.blocks)?;
     let reply_to = match req.reply_to.as_deref() {
         Some(r) => Some(
             MessageId::from_str(r).map_err(|e| AeroError::Invalid(format!("reply_to id: {e}")))?,
         ),
         None => None,
     };
+    if let Some(parent) = reply_to {
+        if !s.messages.reply_parent_exists_in_room(parent, room).await? {
+            return Err(AeroError::Invalid(
+                "reply_to must reference an existing message in the same room".into(),
+            )
+            .into());
+        }
+    }
     repo(&s)
-        .upsert(auth.participant_id, room, &req.blocks, reply_to)
+        .upsert_authorized(auth.participant_id, room, &req.blocks, reply_to)
         .await?;
     Ok(Json(serde_json::json!({ "saved": true })))
 }
@@ -87,7 +96,7 @@ async fn get_draft(
 ) -> ApiResult<Json<serde_json::Value>> {
     let room = parse_room(&room_str)?;
     s.im.assert_room_access(auth.participant_id, room).await?;
-    let draft = repo(&s).get(auth.participant_id, room).await?;
+    let draft = repo(&s).get_authorized(auth.participant_id, room).await?;
     Ok(Json(serde_json::json!({
         "draft": serde_json::to_value(draft).map_err(AeroError::from)?,
     })))
@@ -103,7 +112,9 @@ async fn delete_draft(
 ) -> ApiResult<Json<serde_json::Value>> {
     let room = parse_room(&room_str)?;
     s.im.assert_room_access(auth.participant_id, room).await?;
-    let deleted = repo(&s).delete(auth.participant_id, room).await?;
+    let deleted = repo(&s)
+        .delete_authorized(auth.participant_id, room)
+        .await?;
     Ok(Json(serde_json::json!({ "deleted": deleted })))
 }
 
@@ -113,7 +124,7 @@ async fn list_drafts(
     State(s): State<AppState>,
     auth: AuthUser,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let drafts = repo(&s).list_for(auth.participant_id).await?;
+    let drafts = repo(&s).list_accessible(auth.participant_id).await?;
     Ok(Json(serde_json::json!({
         "drafts": serde_json::to_value(drafts).map_err(AeroError::from)?,
     })))

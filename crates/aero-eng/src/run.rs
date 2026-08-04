@@ -12,11 +12,7 @@ use crate::outcome::Outcome;
 ///
 /// # Errors
 /// Returns an error outcome if the command fails, times out, or does not exist.
-pub async fn run_cmd(
-    program: &str,
-    args: &[&str],
-    timeout: Duration,
-) -> Outcome {
+pub async fn run_cmd(program: &str, args: &[&str], timeout: Duration) -> Outcome {
     let start = std::time::Instant::now();
     let mut cmd = tokio::process::Command::new(program);
     cmd.args(args);
@@ -46,12 +42,22 @@ pub async fn run_cmd(
 
 /// Run `cargo check --workspace` with a default 5-minute timeout.
 pub async fn cargo_check() -> Outcome {
-    run_cmd("cargo", &["check", "--workspace", "-q"], Duration::from_secs(300)).await
+    run_cmd(
+        "cargo",
+        &["check", "--workspace", "-q"],
+        Duration::from_secs(300),
+    )
+    .await
 }
 
 /// Run `cargo test --workspace --lib` with a default 10-minute timeout.
 pub async fn cargo_test_lib() -> Outcome {
-    run_cmd("cargo", &["test", "--workspace", "--lib"], Duration::from_secs(600)).await
+    run_cmd(
+        "cargo",
+        &["test", "--workspace", "--lib"],
+        Duration::from_secs(600),
+    )
+    .await
 }
 
 /// Run `cargo clippy --workspace --all-targets` with a default 5-minute timeout.
@@ -76,7 +82,12 @@ mod tests {
 
     #[tokio::test]
     async fn run_cmd_nonexistent_fails() {
-        let o = run_cmd("this-command-does-not-exist-12345", &[], Duration::from_secs(5)).await;
+        let o = run_cmd(
+            "this-command-does-not-exist-12345",
+            &[],
+            Duration::from_secs(5),
+        )
+        .await;
         assert!(o.is_error(), "nonexistent command should error: {o}");
     }
 

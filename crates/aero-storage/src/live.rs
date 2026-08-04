@@ -361,22 +361,40 @@ mod db_tests {
             .expect("stream");
 
         let sender = ParticipantId::from_uuid(owner);
-        let (l1, _) = repo.insert_chat(stream, sender, "line 1", false).await.expect("l1");
-        let (l2, _) = repo.insert_chat(stream, sender, "line 2", false).await.expect("l2");
-        let (l3, _) = repo.insert_chat(stream, sender, "line 3", true).await.expect("l3");
+        let (l1, _) = repo
+            .insert_chat(stream, sender, "line 1", false)
+            .await
+            .expect("l1");
+        let (l2, _) = repo
+            .insert_chat(stream, sender, "line 2", false)
+            .await
+            .expect("l2");
+        let (l3, _) = repo
+            .insert_chat(stream, sender, "line 3", true)
+            .await
+            .expect("l3");
 
         // since = l1 → only l2, l3, oldest-first.
-        let after = repo.recent_chat_since(stream, Some(l1), 50).await.expect("since l1");
+        let after = repo
+            .recent_chat_since(stream, Some(l1), 50)
+            .await
+            .expect("since l1");
         assert_eq!(after.len(), 2);
         assert_eq!(after[0].id, l2);
         assert_eq!(after[1].id, l3);
 
         // since = newest → nothing newer.
-        let none_newer = repo.recent_chat_since(stream, Some(l3), 50).await.expect("since l3");
+        let none_newer = repo
+            .recent_chat_since(stream, Some(l3), 50)
+            .await
+            .expect("since l3");
         assert!(none_newer.is_empty(), "no lines after the newest cursor");
 
         // since = None → the bounded tail (all three, oldest-first).
-        let tail = repo.recent_chat_since(stream, None, 50).await.expect("tail");
+        let tail = repo
+            .recent_chat_since(stream, None, 50)
+            .await
+            .expect("tail");
         assert_eq!(tail.len(), 3);
         assert_eq!(tail.first().map(|l| l.id), Some(l1));
 
@@ -386,7 +404,11 @@ mod db_tests {
             .execute(&p)
             .await
             .ok();
-        sqlx::query("DELETE FROM participants WHERE id = $1").bind(owner).execute(&p).await.ok();
+        sqlx::query("DELETE FROM participants WHERE id = $1")
+            .bind(owner)
+            .execute(&p)
+            .await
+            .ok();
     }
 
     /// `recent_gifts_since` mirrors the chat catch-up: only ledger entries newer
@@ -415,17 +437,32 @@ mod db_tests {
             .expect("stream");
 
         let sender = ParticipantId::from_uuid(owner);
-        let (g1, _, _) = repo.insert_gift(stream, sender, "rose", 1, 10, None).await.expect("g1");
-        let (g2, _, _) = repo.insert_gift(stream, sender, "rose", 2, 20, None).await.expect("g2");
+        let (g1, _, _) = repo
+            .insert_gift(stream, sender, "rose", 1, 10, None)
+            .await
+            .expect("g1");
+        let (g2, _, _) = repo
+            .insert_gift(stream, sender, "rose", 2, 20, None)
+            .await
+            .expect("g2");
 
-        let after = repo.recent_gifts_since(stream, Some(g1), 50).await.expect("since g1");
+        let after = repo
+            .recent_gifts_since(stream, Some(g1), 50)
+            .await
+            .expect("since g1");
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].id, g2);
 
-        let none_newer = repo.recent_gifts_since(stream, Some(g2), 50).await.expect("since g2");
+        let none_newer = repo
+            .recent_gifts_since(stream, Some(g2), 50)
+            .await
+            .expect("since g2");
         assert!(none_newer.is_empty(), "no gifts after the newest cursor");
 
-        let tail = repo.recent_gifts_since(stream, None, 50).await.expect("tail");
+        let tail = repo
+            .recent_gifts_since(stream, None, 50)
+            .await
+            .expect("tail");
         assert_eq!(tail.len(), 2);
 
         sqlx::query("DELETE FROM streams WHERE id = $1")
@@ -433,7 +470,11 @@ mod db_tests {
             .execute(&p)
             .await
             .ok();
-        sqlx::query("DELETE FROM participants WHERE id = $1").bind(owner).execute(&p).await.ok();
+        sqlx::query("DELETE FROM participants WHERE id = $1")
+            .bind(owner)
+            .execute(&p)
+            .await
+            .ok();
     }
 
     /// A retried gift carrying the same idempotency key records exactly one ledger
@@ -463,29 +504,36 @@ mod db_tests {
             .expect("stream");
         let sender = ParticipantId::from_uuid(owner);
 
-        let (id1, _, inserted1) =
-            repo.insert_gift(stream, sender, "rose", 1, 10, Some("nonce-1")).await.expect("first");
+        let (id1, _, inserted1) = repo
+            .insert_gift(stream, sender, "rose", 1, 10, Some("nonce-1"))
+            .await
+            .expect("first");
         assert!(inserted1, "first send with a fresh key inserts");
 
-        let (id2, _, inserted2) =
-            repo.insert_gift(stream, sender, "rose", 1, 10, Some("nonce-1")).await.expect("retry");
+        let (id2, _, inserted2) = repo
+            .insert_gift(stream, sender, "rose", 1, 10, Some("nonce-1"))
+            .await
+            .expect("retry");
         assert!(!inserted2, "retry with the same key does not insert");
         assert_eq!(id1, id2, "retry returns the original gift id");
 
-        let count: (i64,) = sqlx::query_as(
-            "SELECT count(*) FROM stream_gifts WHERE sender_id = $1 AND idempotency_key = 'nonce-1'",
-        )
-        .bind(owner)
-        .fetch_one(&p)
-        .await
-        .expect("count");
+        let count: (i64,) =
+            sqlx::query_as("SELECT count(*) FROM stream_gifts WHERE sender_id = $1 AND idempotency_key = 'nonce-1'")
+                .bind(owner)
+                .fetch_one(&p)
+                .await
+                .expect("count");
         assert_eq!(count.0, 1, "only one gift recorded for the retried key");
 
-        let (_, _, inserted3) =
-            repo.insert_gift(stream, sender, "rose", 1, 10, Some("nonce-2")).await.expect("k2");
+        let (_, _, inserted3) = repo
+            .insert_gift(stream, sender, "rose", 1, 10, Some("nonce-2"))
+            .await
+            .expect("k2");
         assert!(inserted3, "a different key inserts a new gift");
-        let (_, _, inserted4) =
-            repo.insert_gift(stream, sender, "rose", 1, 10, None).await.expect("nullkey");
+        let (_, _, inserted4) = repo
+            .insert_gift(stream, sender, "rose", 1, 10, None)
+            .await
+            .expect("nullkey");
         assert!(inserted4, "a keyless gift always inserts");
 
         sqlx::query("DELETE FROM streams WHERE id = $1")
@@ -493,7 +541,11 @@ mod db_tests {
             .execute(&p)
             .await
             .ok();
-        sqlx::query("DELETE FROM participants WHERE id = $1").bind(owner).execute(&p).await.ok();
+        sqlx::query("DELETE FROM participants WHERE id = $1")
+            .bind(owner)
+            .execute(&p)
+            .await
+            .ok();
     }
 
     /// A subscriber's chat line carries `is_subscriber = true`; a non-subscriber's
@@ -523,12 +575,24 @@ mod db_tests {
 
         let sender = ParticipantId::from_uuid(owner);
         // Non-subscriber then subscriber line.
-        let (l_no, _) = repo.insert_chat(stream, sender, "non-sub", false).await.expect("l_no");
-        let (l_yes, _) = repo.insert_chat(stream, sender, "sub", true).await.expect("l_yes");
+        let (l_no, _) = repo
+            .insert_chat(stream, sender, "non-sub", false)
+            .await
+            .expect("l_no");
+        let (l_yes, _) = repo
+            .insert_chat(stream, sender, "sub", true)
+            .await
+            .expect("l_yes");
 
         let lines = repo.recent_chat(stream, 50).await.expect("recent");
-        let no = lines.iter().find(|l| l.id == l_no).expect("non-sub line present");
-        let yes = lines.iter().find(|l| l.id == l_yes).expect("sub line present");
+        let no = lines
+            .iter()
+            .find(|l| l.id == l_no)
+            .expect("non-sub line present");
+        let yes = lines
+            .iter()
+            .find(|l| l.id == l_yes)
+            .expect("sub line present");
         assert!(!no.is_subscriber, "non-subscriber line flag is false");
         assert!(yes.is_subscriber, "subscriber line flag is true");
 
@@ -537,6 +601,10 @@ mod db_tests {
             .execute(&p)
             .await
             .ok();
-        sqlx::query("DELETE FROM participants WHERE id = $1").bind(owner).execute(&p).await.ok();
+        sqlx::query("DELETE FROM participants WHERE id = $1")
+            .bind(owner)
+            .execute(&p)
+            .await
+            .ok();
     }
 }

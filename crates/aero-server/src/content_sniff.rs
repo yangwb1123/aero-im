@@ -47,7 +47,8 @@ pub fn sniff(b: &[u8]) -> Sniffed {
         || b.starts_with(&[0xCE, 0xFA, 0xED, 0xFE])  // Mach-O 32 LE
         || b.starts_with(&[0xCF, 0xFA, 0xED, 0xFE])  // Mach-O 64 LE
         || b.starts_with(&[0xCA, 0xFE, 0xBA, 0xBE])  // Mach-O universal / Java class
-        || b.starts_with(b"#!")                      // shebang script
+        || b.starts_with(b"#!")
+    // shebang script
     {
         return Sniffed::Executable;
     }
@@ -60,7 +61,8 @@ pub fn sniff(b: &[u8]) -> Sniffed {
         || b.starts_with(b"GIF87a") || b.starts_with(b"GIF89a")
         || b.starts_with(b"BM")                           // BMP
         || b.starts_with(&[0x49, 0x49, 0x2A, 0x00])       // TIFF (LE)
-        || b.starts_with(&[0x4D, 0x4D, 0x00, 0x2A])       // TIFF (BE)
+        || b.starts_with(&[0x4D, 0x4D, 0x00, 0x2A])
+    // TIFF (BE)
     {
         return Sniffed::Image;
     }
@@ -112,7 +114,10 @@ fn is_markup(bytes: &[u8]) -> bool {
     if b.starts_with(&[0xEF, 0xBB, 0xBF]) {
         b = &b[3..]; // UTF-8 BOM
     }
-    let start = b.iter().position(|c| !c.is_ascii_whitespace()).unwrap_or(b.len());
+    let start = b
+        .iter()
+        .position(|c| !c.is_ascii_whitespace())
+        .unwrap_or(b.len());
     let b = &b[start..];
     if b.first() != Some(&b'<') {
         return false;
@@ -157,13 +162,22 @@ pub fn is_consistent(claimed: &str, bytes: &[u8]) -> bool {
     }
     match claimed_family(claimed) {
         Some(Sniffed::Image) => {
-            matches!(kind, Sniffed::Image | Sniffed::MediaContainer | Sniffed::Unknown)
+            matches!(
+                kind,
+                Sniffed::Image | Sniffed::MediaContainer | Sniffed::Unknown
+            )
         }
         Some(Sniffed::Video) => {
-            matches!(kind, Sniffed::Video | Sniffed::MediaContainer | Sniffed::Unknown)
+            matches!(
+                kind,
+                Sniffed::Video | Sniffed::MediaContainer | Sniffed::Unknown
+            )
         }
         Some(Sniffed::Audio) => {
-            matches!(kind, Sniffed::Audio | Sniffed::MediaContainer | Sniffed::Unknown)
+            matches!(
+                kind,
+                Sniffed::Audio | Sniffed::MediaContainer | Sniffed::Unknown
+            )
         }
         Some(Sniffed::Pdf) => matches!(kind, Sniffed::Pdf | Sniffed::Unknown),
         Some(Sniffed::Zip) => matches!(kind, Sniffed::Zip | Sniffed::Unknown),
@@ -210,18 +224,42 @@ mod tests {
     #[test]
     fn rejects_disguised_executables_and_markup() {
         // The headline threat: an exe or HTML/SVG labelled as an image.
-        assert!(!is_consistent("image/png", EXE), "exe disguised as png rejected");
-        assert!(!is_consistent("image/png", HTML), "html disguised as png rejected");
-        assert!(!is_consistent("image/svg+xml", SVG), "svg (xss) rejected even when claimed");
-        assert!(!is_consistent("text/plain", EXE), "exe disguised as text rejected");
-        assert!(!is_consistent("application/octet-stream", HTML), "html as octet-stream rejected");
+        assert!(
+            !is_consistent("image/png", EXE),
+            "exe disguised as png rejected"
+        );
+        assert!(
+            !is_consistent("image/png", HTML),
+            "html disguised as png rejected"
+        );
+        assert!(
+            !is_consistent("image/svg+xml", SVG),
+            "svg (xss) rejected even when claimed"
+        );
+        assert!(
+            !is_consistent("text/plain", EXE),
+            "exe disguised as text rejected"
+        );
+        assert!(
+            !is_consistent("application/octet-stream", HTML),
+            "html as octet-stream rejected"
+        );
     }
 
     #[test]
     fn rejects_cross_family_binary_mislabels() {
-        assert!(!is_consistent("image/png", PDF), "pdf labelled png rejected");
-        assert!(!is_consistent("image/png", ZIP), "zip labelled png rejected");
-        assert!(!is_consistent("application/pdf", PNG), "png labelled pdf rejected");
+        assert!(
+            !is_consistent("image/png", PDF),
+            "pdf labelled png rejected"
+        );
+        assert!(
+            !is_consistent("image/png", ZIP),
+            "zip labelled png rejected"
+        );
+        assert!(
+            !is_consistent("application/pdf", PNG),
+            "png labelled pdf rejected"
+        );
     }
 
     #[test]
@@ -229,8 +267,14 @@ mod tests {
         assert!(is_consistent("image/png", PNG));
         assert!(is_consistent("application/pdf", PDF));
         assert!(is_consistent("application/zip", ZIP));
-        assert!(is_consistent("video/mp4", b"\x00\x00\x00\x18ftypisom"), "ftyp ok for video");
-        assert!(is_consistent("image/heic", b"\x00\x00\x00\x18ftypheic"), "ftyp ok for image");
+        assert!(
+            is_consistent("video/mp4", b"\x00\x00\x00\x18ftypisom"),
+            "ftyp ok for video"
+        );
+        assert!(
+            is_consistent("image/heic", b"\x00\x00\x00\x18ftypheic"),
+            "ftyp ok for image"
+        );
         // Unknown signature passes (avoid false-rejecting unfingerprinted formats).
         assert!(is_consistent("image/png", b"\x00\x01\x02 unrecognised"));
         // Text / csv carry no signature requirement.

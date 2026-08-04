@@ -72,7 +72,10 @@ pub fn stamp_traceparent(value: &mut serde_json::Value, traceparent: Option<&str
 /// legacy/untraced payloads. Mirrors [`extract_seq`].
 #[must_use]
 pub fn extract_traceparent(value: &serde_json::Value) -> Option<String> {
-    value.get("traceparent").and_then(serde_json::Value::as_str).map(String::from)
+    value
+        .get("traceparent")
+        .and_then(serde_json::Value::as_str)
+        .map(String::from)
 }
 
 #[cfg(test)]

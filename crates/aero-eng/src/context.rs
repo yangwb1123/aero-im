@@ -24,9 +24,12 @@ impl ExecutionContext {
     #[must_use]
     pub fn new(root: PathBuf) -> Self {
         let eng_config = EngineeringConfig::load(&root);
-        Self { root, verbose: false, eng_config }
+        Self {
+            root,
+            verbose: false,
+            eng_config,
+        }
     }
-
 }
 
 #[cfg(test)]
@@ -62,4 +65,3 @@ mod tests {
         assert_eq!(ctx.root, cloned.root);
     }
 }
-

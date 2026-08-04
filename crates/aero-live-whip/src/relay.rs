@@ -192,8 +192,7 @@ impl NalSource for Subscription {
                 // Nothing buffered right now, or the relay was dropped
                 // (publisher gone). In both cases signal end-of-stream/no-data.
                 Err(
-                    broadcast::error::TryRecvError::Empty
-                    | broadcast::error::TryRecvError::Closed,
+                    broadcast::error::TryRecvError::Empty | broadcast::error::TryRecvError::Closed,
                 ) => return None,
                 // Fell behind: skip the lost AUs and try again immediately.
                 Err(broadcast::error::TryRecvError::Lagged(n)) => {
@@ -387,6 +386,9 @@ mod tests {
 
         // The subscriber should get at least the last AU (no panic on lag).
         let result = sub.next_access_unit();
-        assert!(result.is_some(), "must receive at least one AU after lagging");
+        assert!(
+            result.is_some(),
+            "must receive at least one AU after lagging"
+        );
     }
 }

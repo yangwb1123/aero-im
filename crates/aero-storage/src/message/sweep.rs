@@ -13,15 +13,43 @@ impl MessageRepo {
     /// an expired message is invisible the instant it lapses; this sweep is the
     /// eventual hard-delete that reclaims the row + announces the Deleted event.
     pub async fn sweep_ephemeral(&self) -> Result<Vec<(MessageId, RoomId)>, sqlx::Error> {
-        let rows: Vec<(uuid::Uuid, uuid::Uuid)> = sqlx::query_as(
-            "DELETE FROM messages WHERE expires_at IS NOT NULL AND expires_at <= NOW() \
-             RETURNING id, room_id",
+        let mut tx = self.pool.begin().await?;
+        let rows: Vec<(uuid::Uuid, uuid::Uuid, serde_json::Value)> = sqlx::query_as(
+            r"SELECT id, room_id, blocks
+                FROM messages
+               WHERE expires_at IS NOT NULL
+                 AND expires_at <= now()
+               FOR UPDATE",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
+        let ids = rows.iter().map(|(id, _, _)| *id).collect::<Vec<_>>();
+        if !ids.is_empty() {
+            // Append the tombstones before removing the aggregate rows. Both
+            // operations commit together, and event_outbox intentionally has no
+            // message FK so a delayed relay survives the hard delete.
+            for (message_id, room_id, _) in &rows {
+                Self::append_deleted_event_in_tx(
+                    &mut tx,
+                    MessageId::from_uuid(*message_id),
+                    RoomId::from_uuid(*room_id),
+                )
+                .await?;
+            }
+            sqlx::query("DELETE FROM messages WHERE id = ANY($1)")
+                .bind(&ids)
+                .execute(&mut *tx)
+                .await?;
+            let blobs = rows
+                .iter()
+                .flat_map(|(_, _, blocks)| super::attached_blob_ids(blocks))
+                .collect::<Vec<_>>();
+            Self::enqueue_unreferenced_blobs_in_tx(&mut tx, &blobs).await?;
+        }
+        tx.commit().await?;
         Ok(rows
             .into_iter()
-            .map(|(id, room)| (MessageId::from_uuid(id), RoomId::from_uuid(room)))
+            .map(|(id, room, _)| (MessageId::from_uuid(id), RoomId::from_uuid(room)))
             .collect())
     }
 

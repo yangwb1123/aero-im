@@ -195,29 +195,6 @@ pub fn record_duration(reg: &Registry, kind: AiJobKind, secs: f64) {
 /// than spreading across many — see [`charge_cost`] for the cardinality note.
 pub const WORKSPACE_NONE: &str = "none";
 
-/// One paid AI charge, fanned to the per-tenant usage ledger drain task
-/// (ROADMAP 第六版 · 方向一·2). Distinct from the Prometheus counter (aggregate,
-/// scrape-window) — this carries a single billable event to be persisted.
-#[derive(Debug, Clone)]
-pub struct UsageEvent {
-    pub workspace: Option<uuid::Uuid>,
-    pub kind: &'static str,
-    pub micros: u64,
-}
-
-/// Process-global usage-ledger sink, installed once at boot via [`set_usage_sink`].
-/// [`charge_cost`] fans every paid charge here. Both the ai_jobs worker queue and
-/// the real-time moderation bot charge through `charge_cost`, so this single sink
-/// captures ALL AI spend.
-static USAGE_SINK: std::sync::OnceLock<tokio::sync::mpsc::Sender<UsageEvent>> =
-    std::sync::OnceLock::new();
-
-/// Install the usage-ledger sink (idempotent — a later call is ignored). Wired at
-/// boot to the sender half of the drain task's bounded channel.
-pub fn set_usage_sink(tx: tokio::sync::mpsc::Sender<UsageEvent>) {
-    let _ = USAGE_SINK.set(tx);
-}
-
 /// Charge `micros` to [`names::AI_COST_MICROS_TOTAL`] under both the aggregate
 /// `kind` series AND a per-workspace `{kind,workspace}` series.
 ///
@@ -234,8 +211,21 @@ pub fn set_usage_sink(tx: tokio::sync::mpsc::Sender<UsageEvent>) {
 /// is still attributable without inventing a per-job label. The aggregate series
 /// is always present regardless of label cardinality, so even a tenant explosion
 /// never blinds the global cost view.
-fn charge_cost(reg: &Registry, kind: AiJobKind, workspace: Option<uuid::Uuid>, micros: u64) {
-    let kind = kind_label(kind);
+pub(crate) fn charge_cost(
+    reg: &Registry,
+    kind: AiJobKind,
+    workspace: Option<uuid::Uuid>,
+    micros: u64,
+) {
+    charge_cost_label(reg, kind_label(kind), workspace, micros);
+}
+
+pub(crate) fn charge_cost_label(
+    reg: &Registry,
+    kind: &str,
+    workspace: Option<uuid::Uuid>,
+    micros: u64,
+) {
     // Aggregate (per-kind) series — unchanged from before per-workspace labeling,
     // so operators retain the global cost counter they already alert on.
     reg.inc_counter_labeled(names::AI_COST_MICROS_TOTAL, micros, &[("kind", kind)]);
@@ -247,16 +237,6 @@ fn charge_cost(reg: &Registry, kind: AiJobKind, workspace: Option<uuid::Uuid>, m
         micros,
         &[("kind", kind), ("workspace", ws.as_str())],
     );
-    // Fan paid charges to the durable per-tenant usage ledger (best-effort,
-    // non-blocking try_send — a full/absent sink just drops the row, never blocks
-    // the AI hot path nor the counter). Zero-cost (unpaid/no-op) charges are
-    // skipped: they exist only to keep the metrics series present, not as billable
-    // spend, so the ledger stays a faithful record of actual cost.
-    if micros > 0 {
-        if let Some(tx) = USAGE_SINK.get() {
-            let _ = tx.try_send(UsageEvent { workspace, kind, micros });
-        }
-    }
 }
 
 /// Record the (estimated) cost of one paid job, labeled by kind + workspace.
@@ -422,42 +402,6 @@ mod tests {
             )),
             "real token cost wrong (want {want}):\n{out}"
         );
-    }
-
-    #[tokio::test]
-    async fn paid_charge_fans_to_usage_sink() {
-        // The sink is a process-global OnceLock shared across the test binary, so
-        // filter received events by a UNIQUE workspace to stay robust if a parallel
-        // test also charges. Buffer is generous so a concurrent burst can't evict
-        // ours before we drain.
-        let (tx, mut rx) = tokio::sync::mpsc::channel(256);
-        set_usage_sink(tx); // first setter wins; later set_usage_sink calls are no-ops
-        let r = Registry::new();
-        let m = CostModel::default();
-        let ws = uuid::Uuid::new_v4();
-
-        // A PAID answer charges micros > 0 → fans a ledger event.
-        record_cost(&r, &m, AiJobKind::Answer, Some(ws), true);
-        let mut ours = None;
-        while let Ok(ev) = rx.try_recv() {
-            if ev.workspace == Some(ws) {
-                ours = Some(ev);
-                break;
-            }
-        }
-        let ev = ours.expect("a paid charge fans a usage event for our workspace");
-        assert_eq!(ev.kind, "answer");
-        assert!(ev.micros > 0, "paid charge carries real micros");
-
-        // An UNPAID charge (micros == 0) must fan NOTHING for our workspace.
-        record_cost(&r, &m, AiJobKind::Embed, Some(ws), false);
-        let mut saw_unpaid = false;
-        while let Ok(ev) = rx.try_recv() {
-            if ev.workspace == Some(ws) {
-                saw_unpaid = true;
-            }
-        }
-        assert!(!saw_unpaid, "an unpaid (zero-cost) charge must not fan a ledger event");
     }
 
     #[test]

@@ -15,8 +15,10 @@
 use std::str::FromStr;
 
 use aero_auth::AuthUser;
-use aero_common::{Error as AeroError, PollId, PollOp, RoomEvent, RoomId};
-use aero_storage::poll::{option_count_valid, VoteError, MAX_OPTIONS, MIN_OPTIONS};
+use aero_common::{Error as AeroError, Poll, PollId, PollOp, RoomEvent, RoomId};
+use aero_storage::poll::{
+    option_count_valid, ClosePollError, CreatePollError, VoteError, MAX_OPTIONS, MIN_OPTIONS,
+};
 use aero_storage::PollRepo;
 use axum::{
     extract::{Path, Query, State},
@@ -77,9 +79,53 @@ fn map_vote_error(e: VoteError) -> AeroError {
     match e {
         VoteError::Closed => AeroError::Conflict("poll is closed".into()),
         VoteError::OutOfRange => AeroError::Invalid("option index out of range".into()),
+        VoteError::DuplicateOption => AeroError::Invalid("duplicate option index".into()),
+        VoteError::EmptyBallot => AeroError::Invalid("ballot is empty".into()),
+        VoteError::TooManyOptions => AeroError::Invalid(format!(
+            "ballot may contain at most {MAX_OPTIONS} options and no more than the poll defines"
+        )),
+        VoteError::SingleChoiceMultiple => {
+            AeroError::Invalid("single-choice poll requires exactly one option".into())
+        }
+        VoteError::Forbidden => AeroError::Forbidden("cannot vote in this poll".into()),
         VoteError::NotFound => AeroError::NotFound("poll".into()),
         VoteError::Db(db) => AeroError::from(db),
     }
+}
+
+fn map_close_error(e: ClosePollError) -> AeroError {
+    match e {
+        ClosePollError::NotFound => AeroError::NotFound("poll".into()),
+        ClosePollError::Forbidden => {
+            AeroError::Forbidden("cannot close a poll after room access is revoked".into())
+        }
+        ClosePollError::NotCreator => {
+            AeroError::Forbidden("only the poll creator may close it".into())
+        }
+        ClosePollError::Db(db) => AeroError::from(db),
+    }
+}
+
+fn map_create_error(e: CreatePollError) -> AeroError {
+    match e {
+        CreatePollError::NotFound => AeroError::NotFound("room".into()),
+        CreatePollError::Forbidden => {
+            AeroError::Forbidden("cannot create a poll after room access is revoked".into())
+        }
+        CreatePollError::Db(db) => AeroError::from(db),
+    }
+}
+
+fn poll_detail_response(poll: &Poll, counts: &[u32], voted: bool) -> serde_json::Value {
+    let total = counts.iter().copied().fold(0u32, u32::saturating_add);
+    let anonymous = poll.anonymous;
+    serde_json::json!({
+        "poll": poll,
+        "counts": counts,
+        "total": total,
+        "voted": voted,
+        "anonymous": anonymous,
+    })
 }
 
 // --------------------------------------------------------------- Create
@@ -131,11 +177,25 @@ async fn create_poll(
     let anonymous = req.anonymous.unwrap_or(false);
     let repo = poll_repo(&s);
     let id = repo
-        .create_with_opts(room, auth.participant_id, question, &options, req.multi, anonymous)
-        .await?;
-    s.im
-        .broadcast_room_event(room, RoomEvent::Poll { room_id: room, poll_id: id, op: PollOp::Created })
-        .await;
+        .create_with_opts(
+            room,
+            auth.participant_id,
+            question,
+            &options,
+            req.multi,
+            anonymous,
+        )
+        .await
+        .map_err(map_create_error)?;
+    s.im.broadcast_room_event(
+        room,
+        RoomEvent::Poll {
+            room_id: room,
+            poll_id: id,
+            op: PollOp::Created,
+        },
+    )
+    .await;
 
     let poll = repo
         .get(id)
@@ -159,21 +219,15 @@ async fn get_poll(
         .get(poll_id)
         .await?
         .ok_or_else(|| AeroError::NotFound(format!("poll {poll_id}")))?;
-    s.im.assert_room_access(auth.participant_id, poll.room_id).await?;
+    s.im.assert_room_access(auth.participant_id, poll.room_id)
+        .await?;
 
     let counts = repo.tally(poll_id).await?;
-    let total: u32 = counts.iter().copied().fold(0u32, u32::saturating_add);
     let voted = repo.has_voted(poll_id, auth.participant_id).await?;
     // Anonymous polls suppress voter identity: `voted` is still returned so the
     // caller knows whether they participated, but `anonymous: true` signals that
     // no voter lists will ever be returned.
-    Ok(Json(serde_json::json!({
-        "poll": poll,
-        "counts": counts,
-        "total": total,
-        "voted": voted,
-        "anonymous": poll.anonymous,
-    })))
+    Ok(Json(poll_detail_response(&poll, &counts, voted)))
 }
 
 // ----------------------------------------------------------------- Vote
@@ -205,36 +259,43 @@ async fn vote_poll(
         .get(poll_id)
         .await?
         .ok_or_else(|| AeroError::NotFound(format!("poll {poll_id}")))?;
-    s.im.assert_room_access(auth.participant_id, poll.room_id).await?;
+    s.im.assert_room_access(auth.participant_id, poll.room_id)
+        .await?;
 
     // Collect the chosen indices from whichever field the client supplied. For a
     // single-choice poll, `option_idxs` with more than one entry is ambiguous.
-    let idxs: Vec<usize> = match (poll.multi, req.option_idx, req.option_idxs) {
-        (true, _, Some(list)) if !list.is_empty() => list,
-        // A lone `option_idx` (no list) is one vote, single- or multi-choice.
-        (_, Some(i), None) => vec![i],
-        (false, None, Some(list)) if list.len() == 1 => list,
-        _ => {
-            return Err(AeroError::Invalid(
+    let idxs: Vec<usize> =
+        match (poll.multi, req.option_idx, req.option_idxs) {
+            (true, _, Some(list)) if !list.is_empty() => list,
+            // A lone `option_idx` (no list) is one vote, single- or multi-choice.
+            (_, Some(i), None) => vec![i],
+            (false, None, Some(list)) if list.len() == 1 => list,
+            _ => return Err(AeroError::Invalid(
                 "provide `option_idx` for a single-choice poll or non-empty `option_idxs` for a \
                  multi-choice poll"
                     .into(),
             )
-            .into())
-        }
-    };
+            .into()),
+        };
 
-    for idx in idxs {
-        repo.vote(poll_id, auth.participant_id, idx, poll.multi)
-            .await
-            .map_err(map_vote_error)?;
+    if idxs.len() > MAX_OPTIONS {
+        return Err(AeroError::Invalid(format!(
+            "a ballot may select at most {MAX_OPTIONS} options"
+        ))
+        .into());
     }
-    s.im
-        .broadcast_room_event(
-            poll.room_id,
-            RoomEvent::Poll { room_id: poll.room_id, poll_id, op: PollOp::Voted },
-        )
-        .await;
+    repo.vote_ballot(poll_id, auth.participant_id, poll.room_id, &idxs)
+        .await
+        .map_err(map_vote_error)?;
+    s.im.broadcast_room_event(
+        poll.room_id,
+        RoomEvent::Poll {
+            room_id: poll.room_id,
+            poll_id,
+            op: PollOp::Voted,
+        },
+    )
+    .await;
 
     let counts = repo.tally(poll_id).await?;
     let total: u32 = counts.iter().copied().fold(0u32, u32::saturating_add);
@@ -264,23 +325,29 @@ async fn close_poll(
         .await?
         .ok_or_else(|| AeroError::NotFound(format!("poll {poll_id}")))?;
     // Room access first (a non-member can't even see the poll exists).
-    s.im.assert_room_access(auth.participant_id, poll.room_id).await?;
+    s.im.assert_room_access(auth.participant_id, poll.room_id)
+        .await?;
 
-    let closed = repo.close(poll_id, auth.participant_id).await?;
+    let closed = repo
+        .close_authorized(poll_id, auth.participant_id, poll.room_id)
+        .await
+        .map_err(map_close_error)?;
     if !closed {
-        // Either not the creator, or already closed. Distinguish: an
-        // already-closed poll is idempotent-OK; a non-creator is forbidden.
-        if poll.is_closed() {
-            return Ok(Json(serde_json::json!({ "poll_id": poll_id, "closed": true })));
-        }
-        return Err(AeroError::Forbidden("only the poll creator may close it".into()).into());
+        // The transaction-owned creator check makes `false` unambiguously mean
+        // this creator had already closed the poll.
+        return Ok(Json(
+            serde_json::json!({ "poll_id": poll_id, "closed": true }),
+        ));
     }
-    s.im
-        .broadcast_room_event(
-            poll.room_id,
-            RoomEvent::Poll { room_id: poll.room_id, poll_id, op: PollOp::Closed },
-        )
-        .await;
+    s.im.broadcast_room_event(
+        poll.room_id,
+        RoomEvent::Poll {
+            room_id: poll.room_id,
+            poll_id,
+            op: PollOp::Closed,
+        },
+    )
+    .await;
     // ROADMAP 集成三: poll-close → auto-create approval (best-effort, non-blocking).
     // When the poll belongs to a workspace, create an approval addressed to the poll
     // creator with the results summary, so the creator can decide on next steps.
@@ -295,7 +362,8 @@ async fn close_poll(
                 .enumerate()
                 .map(|(i, opt)| {
                     let pct = if total_votes > 0 {
-                        (tally.get(i).copied().unwrap_or(0) as f64 / total_votes as f64 * 100.0) as u32
+                        (tally.get(i).copied().unwrap_or(0) as f64 / total_votes as f64 * 100.0)
+                            as u32
                     } else {
                         0
                     };
@@ -310,17 +378,49 @@ async fn close_poll(
             let approval_id = aero_storage::ApprovalRepo::new(s.pg.clone())
                 .create(
                     workspace_id,
-                    auth.participant_id,   // requester = poll creator
-                    auth.participant_id,   // approver = also poll creator (self-approve)
+                    auth.participant_id, // requester = poll creator
+                    auth.participant_id, // approver = also poll creator (self-approve)
                     &format!("Poll results: {}", poll.question),
                     Some(&details),
                 )
                 .await;
             match approval_id {
                 Ok(_) => tracing::info!(%poll_id, "auto-created approval from poll close"),
-                Err(e) => tracing::warn!(error = ?e, %poll_id, "auto-create approval from poll failed"),
+                Err(e) => {
+                    tracing::warn!(error = ?e, %poll_id, "auto-create approval from poll failed")
+                }
             }
         }
     }
-    Ok(Json(serde_json::json!({ "poll_id": poll_id, "closed": true })))
+    Ok(Json(
+        serde_json::json!({ "poll_id": poll_id, "closed": true }),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aero_common::ParticipantId;
+
+    #[test]
+    fn anonymous_poll_detail_does_not_expose_voter_identity() {
+        let voter = ParticipantId::new();
+        let poll = Poll {
+            id: PollId::new(),
+            room_id: RoomId::new(),
+            created_by: ParticipantId::new(),
+            question: "anonymous".into(),
+            options: vec!["A".into(), "B".into()],
+            multi: false,
+            anonymous: true,
+            closed_at: None,
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+        };
+
+        let detail = poll_detail_response(&poll, &[1, 0], true);
+        assert_eq!(detail["anonymous"], true);
+        assert_eq!(detail["voted"], true);
+        assert!(detail.get("voters").is_none());
+        assert!(!detail.to_string().contains(&voter.to_string()));
+    }
 }

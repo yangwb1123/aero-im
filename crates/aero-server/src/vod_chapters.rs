@@ -33,8 +33,14 @@ const MAX_TITLE_LEN: usize = 256;
 /// [`crate::routes::build`].
 pub fn routes() -> Router<AppState> {
     Router::new()
-        .route("/api/vods/:id/chapters", post(create_chapter).get(list_chapters))
-        .route("/api/vod-chapters/:cid", axum::routing::delete(delete_chapter))
+        .route(
+            "/api/vods/:id/chapters",
+            post(create_chapter).get(list_chapters),
+        )
+        .route(
+            "/api/vod-chapters/:cid",
+            axum::routing::delete(delete_chapter),
+        )
 }
 
 fn parse_vod(s: &str) -> Result<VodId, AeroError> {

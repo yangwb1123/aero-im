@@ -26,6 +26,8 @@ use std::collections::{HashMap, HashSet};
 use aero_common::{ParticipantId, RoomId};
 use sqlx::PgPool;
 
+mod authorized;
+
 /// Number of minutes in a day — the modulus for a minutes-of-day clock. Public
 /// so callers validating a DND window can bound minutes to `0..MINUTES_PER_DAY`.
 pub const MINUTES_PER_DAY: i32 = 1440;
@@ -162,7 +164,8 @@ impl NotificationPrefsRepo {
 
     /// Mute `room` for `participant`. Idempotent: re-muting keeps the original
     /// `created_at`.
-    pub async fn mute(
+    #[cfg(test)]
+    pub(crate) async fn mute(
         &self,
         participant: ParticipantId,
         room: RoomId,
@@ -181,7 +184,8 @@ impl NotificationPrefsRepo {
 
     /// Unmute `room` for `participant`. Returns `true` if a mute was removed
     /// (idempotent: unmuting a non-muted room is a no-op `false`).
-    pub async fn unmute(
+    #[cfg(test)]
+    pub(crate) async fn unmute(
         &self,
         participant: ParticipantId,
         room: RoomId,
@@ -202,7 +206,11 @@ impl NotificationPrefsRepo {
         room: RoomId,
     ) -> Result<bool, sqlx::Error> {
         let row = sqlx::query_as::<_, (i64,)>(
-            r"SELECT COUNT(*) FROM channel_mutes WHERE participant_id = $1 AND room_id = $2",
+            r"SELECT COUNT(*)
+                FROM channel_mutes
+               WHERE participant_id = $1
+                 AND room_id = $2
+                 AND aero_effective_room_access(room_id, participant_id, NULL)",
         )
         .bind(participant.to_uuid())
         .bind(room.to_uuid())
@@ -231,17 +239,23 @@ impl NotificationPrefsRepo {
         let ids: Vec<uuid::Uuid> = participants.iter().map(ParticipantId::to_uuid).collect();
         let rows = sqlx::query_as::<_, (uuid::Uuid,)>(
             r"SELECT participant_id FROM channel_mutes
-               WHERE room_id = $1 AND participant_id = ANY($2)",
+               WHERE room_id = $1
+                 AND participant_id = ANY($2)
+                 AND aero_effective_room_access(room_id, participant_id, NULL)",
         )
         .bind(room.to_uuid())
         .bind(&ids)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows.into_iter().map(|(p,)| ParticipantId::from_uuid(p)).collect())
+        Ok(rows
+            .into_iter()
+            .map(|(p,)| ParticipantId::from_uuid(p))
+            .collect())
     }
 
     /// All rooms `participant` has muted, newest mute first.
-    pub async fn muted_rooms(
+    #[cfg(test)]
+    pub(crate) async fn muted_rooms(
         &self,
         participant: ParticipantId,
     ) -> Result<Vec<RoomId>, sqlx::Error> {
@@ -371,7 +385,12 @@ impl NotificationPrefsRepo {
         &self,
         participants: &[ParticipantId],
     ) -> Result<HashMap<ParticipantId, DndSnooze>, sqlx::Error> {
-        type Row = (uuid::Uuid, Option<i32>, Option<i32>, Option<time::OffsetDateTime>);
+        type Row = (
+            uuid::Uuid,
+            Option<i32>,
+            Option<i32>,
+            Option<time::OffsetDateTime>,
+        );
         if participants.is_empty() {
             return Ok(HashMap::new());
         }
@@ -398,14 +417,16 @@ impl NotificationPrefsRepo {
     /// Set `participant`'s per-room notification LEVEL for `room` (one of
     /// `"all"` / `"mentions"` / `"none"`; the DB CHECK rejects anything else).
     /// An idempotent upsert keyed on `(participant, room)` that refreshes
-    /// `updated_at`. Distinct from [`mute`](Self::mute): a level is a richer
-    /// three-state control, whereas a mute is the binary equivalent of
-    /// `"none"`. Backs `migrations/0087_channel_notification_prefs.sql`.
+    /// `updated_at`. Distinct from
+    /// [`mute_authorized`](Self::mute_authorized): a level is a richer
+    /// three-state control, whereas a mute is the binary equivalent of `"none"`.
+    /// Backs `migrations/0087_channel_notification_prefs.sql`.
     ///
     /// # Errors
     /// Propagates any [`sqlx::Error`] from the upsert (including a CHECK
     /// violation when `level` is not one of the three permitted values).
-    pub async fn set_level(
+    #[cfg(test)]
+    pub(crate) async fn set_level(
         &self,
         participant: ParticipantId,
         room: RoomId,
@@ -439,7 +460,9 @@ impl NotificationPrefsRepo {
     ) -> Result<Option<String>, sqlx::Error> {
         let row = sqlx::query_as::<_, (String,)>(
             r"SELECT level FROM channel_notification_prefs
-               WHERE participant_id = $1 AND room_id = $2",
+               WHERE participant_id = $1
+                 AND room_id = $2
+                 AND aero_effective_room_access(room_id, participant_id, NULL)",
         )
         .bind(participant.to_uuid())
         .bind(room.to_uuid())
@@ -469,7 +492,9 @@ impl NotificationPrefsRepo {
         let ids: Vec<uuid::Uuid> = participants.iter().map(ParticipantId::to_uuid).collect();
         let rows = sqlx::query_as::<_, (uuid::Uuid, String)>(
             r"SELECT participant_id, level FROM channel_notification_prefs
-               WHERE room_id = $1 AND participant_id = ANY($2)",
+               WHERE room_id = $1
+                 AND participant_id = ANY($2)
+                 AND aero_effective_room_access(room_id, participant_id, NULL)",
         )
         .bind(room.to_uuid())
         .bind(&ids)
@@ -498,7 +523,10 @@ mod tests {
         assert!(!in_dnd_window(539, start, end), "one minute before start");
         assert!(!in_dnd_window(1020, start, end), "end is exclusive");
         assert!(!in_dnd_window(0, start, end), "midnight is outside");
-        assert!(!in_dnd_window(1439, start, end), "last minute of day outside");
+        assert!(
+            !in_dnd_window(1439, start, end),
+            "last minute of day outside"
+        );
     }
 
     #[test]
@@ -513,14 +541,20 @@ mod tests {
         // Outside: daytime gap between end and start.
         assert!(!in_dnd_window(480, start, end), "08:00 end is exclusive");
         assert!(!in_dnd_window(720, start, end), "noon is outside");
-        assert!(!in_dnd_window(1319, start, end), "one minute before start outside");
+        assert!(
+            !in_dnd_window(1319, start, end),
+            "one minute before start outside"
+        );
     }
 
     #[test]
     fn dnd_empty_window_is_never_inside() {
         // start == end is a zero-length window: DND effectively off.
         for now in [0, 540, 720, 1439] {
-            assert!(!in_dnd_window(now, 600, 600), "empty window never matches at {now}");
+            assert!(
+                !in_dnd_window(now, 600, 600),
+                "empty window never matches at {now}"
+            );
         }
     }
 
@@ -528,7 +562,10 @@ mod tests {
     fn dnd_full_day_window_is_always_inside() {
         // [0, 1440): every minute of the day is covered (same-day branch).
         for now in [0, 1, 540, 1439] {
-            assert!(in_dnd_window(now, 0, MINUTES_PER_DAY), "full-day window covers {now}");
+            assert!(
+                in_dnd_window(now, 0, MINUTES_PER_DAY),
+                "full-day window covers {now}"
+            );
         }
     }
 
@@ -544,10 +581,22 @@ mod tests {
         assert!(!should_suppress(false, None, 720));
 
         // Not muted, DND configured: suppressed iff inside the window.
-        assert!(should_suppress(false, Some((540, 1020)), 700), "inside same-day window");
-        assert!(!should_suppress(false, Some((540, 1020)), 100), "outside same-day window");
-        assert!(should_suppress(false, Some((1320, 480)), 0), "inside overnight window");
-        assert!(!should_suppress(false, Some((1320, 480)), 720), "outside overnight window");
+        assert!(
+            should_suppress(false, Some((540, 1020)), 700),
+            "inside same-day window"
+        );
+        assert!(
+            !should_suppress(false, Some((540, 1020)), 100),
+            "outside same-day window"
+        );
+        assert!(
+            should_suppress(false, Some((1320, 480)), 0),
+            "inside overnight window"
+        );
+        assert!(
+            !should_suppress(false, Some((1320, 480)), 720),
+            "outside overnight window"
+        );
     }
 
     #[test]
@@ -563,7 +612,10 @@ mod tests {
             "active one second before it lapses"
         );
         // Boundary is exclusive: at/after the instant it has lapsed.
-        assert!(!is_snoozed(Some(future), future), "lapses exactly at snooze_until");
+        assert!(
+            !is_snoozed(Some(future), future),
+            "lapses exactly at snooze_until"
+        );
         assert!(
             !is_snoozed(Some(future), future + time::Duration::seconds(1)),
             "inactive after it lapses"
@@ -585,22 +637,49 @@ mod tests {
 
         // Each suppressor alone blocks delivery.
         assert!(!should_deliver(true, None, None, now), "muted");
-        assert!(!should_deliver(false, Some((600, 900)), None, now), "inside DND window");
-        assert!(!should_deliver(false, None, Some(future), now), "active snooze");
+        assert!(
+            !should_deliver(false, Some((600, 900)), None, now),
+            "inside DND window"
+        );
+        assert!(
+            !should_deliver(false, None, Some(future), now),
+            "active snooze"
+        );
 
         // Inactive variants of each do NOT block.
-        assert!(should_deliver(false, Some((900, 1020)), None, now), "outside DND window");
-        assert!(should_deliver(false, None, Some(past), now), "elapsed snooze");
-        assert!(should_deliver(false, None, Some(now), now), "snooze lapses at its instant");
+        assert!(
+            should_deliver(false, Some((900, 1020)), None, now),
+            "outside DND window"
+        );
+        assert!(
+            should_deliver(false, None, Some(past), now),
+            "elapsed snooze"
+        );
+        assert!(
+            should_deliver(false, None, Some(now), now),
+            "snooze lapses at its instant"
+        );
 
         // Overnight DND window: noon is outside, so it delivers.
         assert!(should_deliver(false, Some((1320, 480)), None, now));
 
         // Suppressors are independent: any one of them is enough.
-        assert!(!should_deliver(true, Some((900, 1020)), Some(past), now), "mute wins");
-        assert!(!should_deliver(false, Some((600, 900)), Some(past), now), "DND wins");
-        assert!(!should_deliver(false, Some((900, 1020)), Some(future), now), "snooze wins");
-        assert!(!should_deliver(true, Some((600, 900)), Some(future), now), "all three");
+        assert!(
+            !should_deliver(true, Some((900, 1020)), Some(past), now),
+            "mute wins"
+        );
+        assert!(
+            !should_deliver(false, Some((600, 900)), Some(past), now),
+            "DND wins"
+        );
+        assert!(
+            !should_deliver(false, Some((900, 1020)), Some(future), now),
+            "snooze wins"
+        );
+        assert!(
+            !should_deliver(true, Some((600, 900)), Some(future), now),
+            "all three"
+        );
     }
 
     /// `should_deliver` must agree with the single-recipient decision the
@@ -609,8 +688,18 @@ mod tests {
     #[test]
     fn should_deliver_matches_helper_composition_exhaustively() {
         let now = time::OffsetDateTime::UNIX_EPOCH + time::Duration::hours(12);
-        let snoozes = [None, Some(now - time::Duration::hours(1)), Some(now + time::Duration::hours(1))];
-        let dnds = [None, Some((600, 900)), Some((900, 1020)), Some((1320, 480)), Some((0, MINUTES_PER_DAY))];
+        let snoozes = [
+            None,
+            Some(now - time::Duration::hours(1)),
+            Some(now + time::Duration::hours(1)),
+        ];
+        let dnds = [
+            None,
+            Some((600, 900)),
+            Some((900, 1020)),
+            Some((1320, 480)),
+            Some((0, MINUTES_PER_DAY)),
+        ];
         for muted in [false, true] {
             for dnd in dnds {
                 for snooze in snoozes {
@@ -629,25 +718,46 @@ mod tests {
     #[test]
     fn should_deliver_at_level_truth_table() {
         // "all": every message delivers, mention or not.
-        assert!(should_deliver_at_level("all", true), "all + mention delivers");
-        assert!(should_deliver_at_level("all", false), "all + non-mention delivers");
+        assert!(
+            should_deliver_at_level("all", true),
+            "all + mention delivers"
+        );
+        assert!(
+            should_deliver_at_level("all", false),
+            "all + non-mention delivers"
+        );
 
         // "mentions": only a mention delivers.
-        assert!(should_deliver_at_level("mentions", true), "mentions + mention delivers");
+        assert!(
+            should_deliver_at_level("mentions", true),
+            "mentions + mention delivers"
+        );
         assert!(
             !should_deliver_at_level("mentions", false),
             "mentions + non-mention is suppressed"
         );
 
         // "none": nothing delivers.
-        assert!(!should_deliver_at_level("none", true), "none + mention suppressed");
-        assert!(!should_deliver_at_level("none", false), "none + non-mention suppressed");
+        assert!(
+            !should_deliver_at_level("none", true),
+            "none + mention suppressed"
+        );
+        assert!(
+            !should_deliver_at_level("none", false),
+            "none + non-mention suppressed"
+        );
 
         // Unrecognized / legacy level fails OPEN to the "all" behaviour, so a bad
         // value never silently drops a notification.
         for bad in ["", "ALL", "always", "garbage"] {
-            assert!(should_deliver_at_level(bad, true), "{bad:?} + mention fails open");
-            assert!(should_deliver_at_level(bad, false), "{bad:?} + non-mention fails open");
+            assert!(
+                should_deliver_at_level(bad, true),
+                "{bad:?} + mention fails open"
+            );
+            assert!(
+                should_deliver_at_level(bad, false),
+                "{bad:?} + non-mention fails open"
+            );
         }
 
         // The named constants agree with their string spellings.
@@ -679,7 +789,7 @@ mod tests {
 #[cfg(test)]
 mod db_tests {
     use super::*;
-    use aero_common::{ParticipantId, RoomId};
+    use aero_common::{ParticipantId, RoomId, WorkspaceId};
 
     fn pool() -> PgPool {
         let url = std::env::var("DATABASE_URL")
@@ -690,9 +800,38 @@ mod db_tests {
             .expect("connect_lazy never fails on a well-formed URL")
     }
 
-    /// Create a participant + a room (in the default workspace) so the FKs are
-    /// satisfied. Returns (participant, room).
-    async fn fixture(p: &PgPool) -> (ParticipantId, RoomId) {
+    async fn grant_room_access(
+        p: &PgPool,
+        workspace: WorkspaceId,
+        room: RoomId,
+        participant: ParticipantId,
+    ) {
+        let mut tx = p.begin().await.expect("begin prefs membership");
+        sqlx::query(
+            "INSERT INTO workspace_members (workspace_id, participant_id, role)
+             VALUES ($1, $2, 'member')
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(workspace.to_uuid())
+        .bind(participant.to_uuid())
+        .execute(&mut *tx)
+        .await
+        .expect("insert prefs workspace member");
+        sqlx::query(
+            "INSERT INTO room_members (room_id, participant_id, role)
+             VALUES ($1, $2, 'member')
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(room.to_uuid())
+        .bind(participant.to_uuid())
+        .execute(&mut *tx)
+        .await
+        .expect("insert prefs room member");
+        tx.commit().await.expect("commit prefs membership");
+    }
+
+    /// Create an isolated workspace, owner, and room with effective access.
+    async fn fixture(p: &PgPool) -> (ParticipantId, WorkspaceId, RoomId) {
         let participant = ParticipantId::new();
         sqlx::query("INSERT INTO participants (id, kind, display_name) VALUES ($1,'human',$2)")
             .bind(participant.to_uuid())
@@ -700,18 +839,51 @@ mod db_tests {
             .execute(p)
             .await
             .expect("insert participant");
+        let workspace = WorkspaceId::new();
         let room = RoomId::new();
+        let mut tx = p.begin().await.expect("begin prefs fixture");
+        sqlx::query(
+            "INSERT INTO workspaces (id, name, slug, created_by)
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(workspace.to_uuid())
+        .bind(format!("prefs-workspace-{workspace}"))
+        .bind(format!("prefs-{workspace}"))
+        .bind(participant.to_uuid())
+        .execute(&mut *tx)
+        .await
+        .expect("insert prefs workspace");
+        sqlx::query(
+            "INSERT INTO workspace_members (workspace_id, participant_id, role)
+             VALUES ($1, $2, 'owner')",
+        )
+        .bind(workspace.to_uuid())
+        .bind(participant.to_uuid())
+        .execute(&mut *tx)
+        .await
+        .expect("insert prefs workspace owner");
         sqlx::query(
             "INSERT INTO rooms (id, kind, name, created_by, created_at, workspace_id)
-             VALUES ($1,'channel',$2,$3, now(), '00000000-0000-0000-0000-000000000000')",
+             VALUES ($1, 'group', $2, $3, now(), $4)",
         )
         .bind(room.to_uuid())
-        .bind("prefs-room")
+        .bind(format!("prefs-room-{room}"))
         .bind(participant.to_uuid())
-        .execute(p)
+        .bind(workspace.to_uuid())
+        .execute(&mut *tx)
         .await
         .expect("insert room");
-        (participant, room)
+        sqlx::query(
+            "INSERT INTO room_members (room_id, participant_id, role)
+             VALUES ($1, $2, 'member')",
+        )
+        .bind(room.to_uuid())
+        .bind(participant.to_uuid())
+        .execute(&mut *tx)
+        .await
+        .expect("insert prefs room member");
+        tx.commit().await.expect("commit prefs fixture");
+        (participant, workspace, room)
     }
 
     #[tokio::test]
@@ -719,20 +891,35 @@ mod db_tests {
     async fn notif_prefs_mute_is_muted_muted_rooms_unmute_roundtrip() {
         let p = pool();
         let repo = NotificationPrefsRepo::new(p.clone());
-        let (participant, room) = fixture(&p).await;
+        let (participant, _workspace, room) = fixture(&p).await;
 
-        assert!(!repo.is_muted(participant, room).await.unwrap(), "not muted initially");
+        assert!(
+            !repo.is_muted(participant, room).await.unwrap(),
+            "not muted initially"
+        );
 
         repo.mute(participant, room).await.unwrap();
         repo.mute(participant, room).await.unwrap(); // idempotent
-        assert!(repo.is_muted(participant, room).await.unwrap(), "muted after mute");
+        assert!(
+            repo.is_muted(participant, room).await.unwrap(),
+            "muted after mute"
+        );
 
         let muted = repo.muted_rooms(participant).await.unwrap();
         assert!(muted.contains(&room), "muted_rooms lists the room");
 
-        assert!(repo.unmute(participant, room).await.unwrap(), "unmute removed it");
-        assert!(!repo.unmute(participant, room).await.unwrap(), "second unmute is a no-op");
-        assert!(!repo.is_muted(participant, room).await.unwrap(), "not muted after unmute");
+        assert!(
+            repo.unmute(participant, room).await.unwrap(),
+            "unmute removed it"
+        );
+        assert!(
+            !repo.unmute(participant, room).await.unwrap(),
+            "second unmute is a no-op"
+        );
+        assert!(
+            !repo.is_muted(participant, room).await.unwrap(),
+            "not muted after unmute"
+        );
         assert!(!repo.muted_rooms(participant).await.unwrap().contains(&room));
     }
 
@@ -741,20 +928,34 @@ mod db_tests {
     async fn notif_prefs_set_get_and_clear_dnd() {
         let p = pool();
         let repo = NotificationPrefsRepo::new(p.clone());
-        let (participant, _room) = fixture(&p).await;
+        let (participant, _workspace, _room) = fixture(&p).await;
 
-        assert!(repo.get_dnd(participant).await.unwrap().is_none(), "no DND initially");
+        assert!(
+            repo.get_dnd(participant).await.unwrap().is_none(),
+            "no DND initially"
+        );
 
-        repo.set_dnd(participant, Some(1320), Some(480)).await.unwrap();
-        assert_eq!(repo.get_dnd(participant).await.unwrap(), Some((1320, 480)), "overnight window");
+        repo.set_dnd(participant, Some(1320), Some(480))
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.get_dnd(participant).await.unwrap(),
+            Some((1320, 480)),
+            "overnight window"
+        );
 
         // Overwrite with a same-day window (upsert path).
-        repo.set_dnd(participant, Some(540), Some(1020)).await.unwrap();
+        repo.set_dnd(participant, Some(540), Some(1020))
+            .await
+            .unwrap();
         assert_eq!(repo.get_dnd(participant).await.unwrap(), Some((540, 1020)));
 
         // Clear it.
         repo.set_dnd(participant, None, None).await.unwrap();
-        assert!(repo.get_dnd(participant).await.unwrap().is_none(), "DND cleared");
+        assert!(
+            repo.get_dnd(participant).await.unwrap().is_none(),
+            "DND cleared"
+        );
     }
 
     #[tokio::test]
@@ -762,24 +963,36 @@ mod db_tests {
     async fn notif_prefs_set_clear_and_read_snooze() {
         let p = pool();
         let repo = NotificationPrefsRepo::new(p.clone());
-        let (participant, _room) = fixture(&p).await;
+        let (participant, _workspace, _room) = fixture(&p).await;
 
-        assert!(repo.get_snooze(participant).await.unwrap().is_none(), "no snooze initially");
+        assert!(
+            repo.get_snooze(participant).await.unwrap().is_none(),
+            "no snooze initially"
+        );
 
         // Arm a future snooze; it round-trips (compare to whole seconds to dodge
         // any sub-second precision difference on the wire).
         let until = time::OffsetDateTime::now_utc() + time::Duration::hours(2);
         repo.set_snooze(participant, Some(until)).await.unwrap();
-        let got = repo.get_snooze(participant).await.unwrap().expect("snooze set");
+        let got = repo
+            .get_snooze(participant)
+            .await
+            .unwrap()
+            .expect("snooze set");
         assert_eq!(
             got.unix_timestamp(),
             until.unix_timestamp(),
             "snooze_until round-trips"
         );
-        assert!(is_snoozed(Some(got), time::OffsetDateTime::now_utc()), "future snooze is active");
+        assert!(
+            is_snoozed(Some(got), time::OffsetDateTime::now_utc()),
+            "future snooze is active"
+        );
 
         // Setting a DND window must not disturb the snooze (independent columns).
-        repo.set_dnd(participant, Some(540), Some(1020)).await.unwrap();
+        repo.set_dnd(participant, Some(540), Some(1020))
+            .await
+            .unwrap();
         assert!(
             repo.get_snooze(participant).await.unwrap().is_some(),
             "set_dnd leaves snooze intact"
@@ -787,7 +1000,10 @@ mod db_tests {
 
         // Clear the snooze; the DND window must survive.
         repo.clear_snooze(participant).await.unwrap();
-        assert!(repo.get_snooze(participant).await.unwrap().is_none(), "snooze cleared");
+        assert!(
+            repo.get_snooze(participant).await.unwrap().is_none(),
+            "snooze cleared"
+        );
         assert_eq!(
             repo.get_dnd(participant).await.unwrap(),
             Some((540, 1020)),
@@ -796,7 +1012,10 @@ mod db_tests {
 
         // Clearing again is idempotent.
         repo.clear_snooze(participant).await.unwrap();
-        assert!(repo.get_snooze(participant).await.unwrap().is_none(), "second clear is a no-op");
+        assert!(
+            repo.get_snooze(participant).await.unwrap().is_none(),
+            "second clear is a no-op"
+        );
     }
 
     /// Per-room notification LEVEL (0087): set/get round-trips, the upsert
@@ -807,18 +1026,30 @@ mod db_tests {
     async fn notif_prefs_set_get_and_level_map_roundtrip() {
         let p = pool();
         let repo = NotificationPrefsRepo::new(p.clone());
-        let (a, room) = fixture(&p).await;
+        let (a, workspace, room) = fixture(&p).await;
 
         // No explicit level initially.
-        assert!(repo.get_level(a, room).await.unwrap().is_none(), "no level row initially");
+        assert!(
+            repo.get_level(a, room).await.unwrap().is_none(),
+            "no level row initially"
+        );
 
         // Set → round-trips; upsert overwrites in place.
         repo.set_level(a, room, "mentions").await.unwrap();
-        assert_eq!(repo.get_level(a, room).await.unwrap().as_deref(), Some("mentions"));
+        assert_eq!(
+            repo.get_level(a, room).await.unwrap().as_deref(),
+            Some("mentions")
+        );
         repo.set_level(a, room, "none").await.unwrap();
-        assert_eq!(repo.get_level(a, room).await.unwrap().as_deref(), Some("none"));
+        assert_eq!(
+            repo.get_level(a, room).await.unwrap().as_deref(),
+            Some("none")
+        );
         repo.set_level(a, room, "all").await.unwrap();
-        assert_eq!(repo.get_level(a, room).await.unwrap().as_deref(), Some("all"));
+        assert_eq!(
+            repo.get_level(a, room).await.unwrap().as_deref(),
+            Some("all")
+        );
 
         // A second participant in the same room with a different (and no) level.
         let b = ParticipantId::new();
@@ -828,6 +1059,7 @@ mod db_tests {
             .execute(&p)
             .await
             .expect("insert participant");
+        grant_room_access(&p, workspace, room, b).await;
         repo.set_level(b, room, "mentions").await.unwrap();
         let c = ParticipantId::new();
         sqlx::query("INSERT INTO participants (id, kind, display_name) VALUES ($1,'human',$2)")
@@ -836,6 +1068,7 @@ mod db_tests {
             .execute(&p)
             .await
             .expect("insert participant");
+        grant_room_access(&p, workspace, room, c).await;
         // c has no level row.
 
         let population = [a, b, c];
@@ -847,7 +1080,10 @@ mod db_tests {
                 "level_map vs get_level for {who}"
             );
         }
-        assert!(!map.contains_key(&c), "no level row => absent from level_map");
+        assert!(
+            !map.contains_key(&c),
+            "no level row => absent from level_map"
+        );
 
         // Empty input short-circuits.
         assert!(repo.level_map(room, &[]).await.unwrap().is_empty());
@@ -867,7 +1103,7 @@ mod db_tests {
     async fn notif_prefs_batched_reads_match_single_recipient_fns() {
         let p = pool();
         let repo = NotificationPrefsRepo::new(p.clone());
-        let (owner, room) = fixture(&p).await;
+        let (owner, workspace, room) = fixture(&p).await;
 
         // Extra participants sharing the fixture room (FKs only need the rows).
         let mut population = vec![owner];
@@ -879,29 +1115,40 @@ mod db_tests {
                 .execute(&p)
                 .await
                 .expect("insert participant");
+            grant_room_access(&p, workspace, room, extra).await;
             population.push(extra);
         }
-        let [a, b, c, d, e, f]: [ParticipantId; 6] =
-            population.clone().try_into().expect("six participants");
+        let [
+            muted_only,
+            dnd_only,
+            muted_and_snoozed,
+            elapsed_snooze,
+            partial_dnd,
+            no_preferences,
+        ]: [ParticipantId; 6] = population.clone().try_into().expect("six participants");
 
-        // a: muted only. b: DND only. c: muted + snoozed. d: elapsed snooze.
-        // e: partial window (one bound NULL => reads as unset). f: no row at all.
+        // Cover muted-only, DND-only, muted+snoozed, elapsed snooze,
+        // partial-window, and no-row states.
         let now = time::OffsetDateTime::now_utc();
-        repo.mute(a, room).await.unwrap();
-        repo.set_dnd(b, Some(1320), Some(480)).await.unwrap();
-        repo.mute(c, room).await.unwrap();
-        repo.set_snooze(c, Some(now + time::Duration::hours(2))).await.unwrap();
-        repo.set_snooze(d, Some(now - time::Duration::hours(2))).await.unwrap();
+        repo.mute(muted_only, room).await.unwrap();
+        repo.set_dnd(dnd_only, Some(1320), Some(480)).await.unwrap();
+        repo.mute(muted_and_snoozed, room).await.unwrap();
+        repo.set_snooze(muted_and_snoozed, Some(now + time::Duration::hours(2)))
+            .await
+            .unwrap();
+        repo.set_snooze(elapsed_snooze, Some(now - time::Duration::hours(2)))
+            .await
+            .unwrap();
         sqlx::query(
             "INSERT INTO dnd_settings (participant_id, start_minute, end_minute, updated_at)
              VALUES ($1, $2, NULL, now())",
         )
-        .bind(e.to_uuid())
+        .bind(partial_dnd.to_uuid())
         .bind(540)
         .execute(&p)
         .await
         .expect("insert partial DND row");
-        let _ = f; // no prefs rows: must be absent from both batch results.
+        let _ = no_preferences; // No rows: must be absent from both batch results.
 
         let muted = repo.muted_set(room, &population).await.unwrap();
         let rows = repo.dnd_snooze_many(&population).await.unwrap();
@@ -913,14 +1160,24 @@ mod db_tests {
                 "muted_set vs is_muted for {who}"
             );
             let row = rows.get(who).copied().unwrap_or_default();
-            assert_eq!(row.dnd, repo.get_dnd(*who).await.unwrap(), "dnd_snooze_many vs get_dnd for {who}");
             assert_eq!(
-                row.snooze_until.map(|t| t.unix_timestamp()),
-                repo.get_snooze(*who).await.unwrap().map(|t| t.unix_timestamp()),
+                row.dnd,
+                repo.get_dnd(*who).await.unwrap(),
+                "dnd_snooze_many vs get_dnd for {who}"
+            );
+            assert_eq!(
+                row.snooze_until.map(time::OffsetDateTime::unix_timestamp),
+                repo.get_snooze(*who)
+                    .await
+                    .unwrap()
+                    .map(time::OffsetDateTime::unix_timestamp),
                 "dnd_snooze_many vs get_snooze for {who}"
             );
         }
-        assert!(!rows.contains_key(&f), "no dnd_settings row => absent from the map");
+        assert!(
+            !rows.contains_key(&no_preferences),
+            "no dnd_settings row => absent from the map"
+        );
 
         // Empty input short-circuits (no DB round-trip, trivially consistent).
         assert!(repo.muted_set(room, &[]).await.unwrap().is_empty());

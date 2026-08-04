@@ -1,69 +1,46 @@
-//! Bot event-subscription dispatcher (方向三 — 开放平台).
+//! Reliable bot event-subscription delivery.
 //!
-//! User bots can create event subscriptions (`bot_event_subscriptions`, migration
-//! 0142) via the storage [`BotRepo::subscribe`] surface — a `(event_type, filters,
-//! webhook_url)` triple. Until now those rows sat inert: nothing consumed the bus
-//! on their behalf, so a subscribed event was never delivered to the bot's
-//! webhook. This listener closes that gap. It mirrors the built-in bus bots
-//! (`unfurl_bot`, `transcribe_bot`, …): a resubscribe-on-reconnect loop over the
-//! `im.room.*` subject that decodes each [`RoomEvent`], looks up the bot
-//! subscriptions whose `event_type` matches, applies each subscription's optional
-//! `{room_id, workspace_id, action_id}` filter, and POSTs the (signed) event to
-//! every surviving subscription's `webhook_url`.
-//!
-//! ## Reused delivery pipeline
-//!
-//! Delivery reuses the existing outbound webhook seam from [`aero_storage`]: the
-//! event is signed via [`build_delivery`] (HMAC over the exact JSON bytes, the
-//! same `X-Aero-Signature` / `X-Aero-Timestamp` headers the room-scoped outgoing
-//! hooks use) and sent through the [`WebhookSender`] trait ([`ReqwestSender`] in
-//! production, a fake in tests). No new transport, signing, or HTTP code is
-//! introduced here.
-//!
-//! Note the one structural difference from `webhooks::run_webhook_dispatcher`: the
-//! durable *retry / DLQ* machinery (`webhook_delivery_log`) is FK-bound to
-//! `outgoing_webhooks(id)` (migration 0085), so it cannot drive retries for a row
-//! that lives in the *different* `bot_event_subscriptions` table. Bot-webhook
-//! delivery is therefore one-shot (not retried) — like the other built-in bus
-//! bots. But each attempt IS now recorded for observability: a dedicated
-//! `bot_subscription_deliveries` log (migration 0147, FK-bound to
-//! `bot_event_subscriptions(id)`) captures the outcome (`delivered`/`failed`),
-//! HTTP status, and error of every send via [`BotRepo::record_delivery`]. That
-//! record write is fail-open — a non-2xx or transport error is warned and the next
-//! target attempted, and a logging error itself is swallowed; nothing aborts the
-//! listener.
-//!
-//! ## Signing secret
-//!
-//! `bot_event_subscriptions` carries no per-subscription HMAC secret column, so the
-//! delivery is signed with an empty secret. The signature header is still present
-//! and deterministic over the body, preserving the wire shape; a future migration
-//! adding a secret column would be a one-line change at the [`build_delivery`]
-//! call below.
-//!
-//! ## Purity
-//!
-//! Event→type mapping, action-id extraction, and the filter predicate are pure and
-//! unit-tested; the bus I/O + DB lookups are the only impure edges (integration-
-//! tested behind the [`WebhookSender`] seam and `#[ignore]`-gated DB tests).
+//! The durable NATS consumer performs no network I/O. It lifts the producer's
+//! stable `event_id` from the raw JSON, applies subscription filters and tenant
+//! authorization, then atomically commits every `(subscription,event_id)` queue
+//! row together with its consumer receipt. A separate leased worker signs and
+//! sends the exact stored bytes, retrying failures with exponential backoff and
+//! parking exhausted work in a durable DLQ.
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc, time::Duration as StdDuration};
 
-use aero_common::RoomEvent;
-use aero_common::{RoomId, WorkspaceId};
+use aero_common::{metrics, Error as AeroError, ParticipantId, RoomEvent, RoomId, WorkspaceId};
+use aero_im_core::ImService;
+use aero_storage::webhook::build_delivery_from_bytes;
 use aero_storage::{
-    build_delivery, BotRepo, DeliveryStatus, MatchedSubscription, ReqwestSender, RoomRepo,
-    WebhookSender,
+    BotDeliveryOutbox, BotDeliveryOutboxRepo, BotRepo, ConsumerEventReceiptRepo, DeliveryStatus,
+    PgPool, ReqwestSender, RoomRepo, WebhookSender, MAX_BOT_EVENT_CANDIDATES,
 };
-use futures::StreamExt;
+use anyhow::{anyhow, Context};
+use futures::{stream, StreamExt};
+use time::{Duration, OffsetDateTime};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
+use uuid::Uuid;
 
-use crate::state::AppState;
+use crate::{
+    state::AppState,
+    task_shutdown::{self, NextOrCancelled},
+};
 
 /// Durable consumer name — distinct from every other bus listener so the
 /// dispatcher resumes from its own committed cursor and doesn't compete with the
 /// WS / webhook / built-in-bot consumers for one shared cursor.
 const CONSUMER: &str = "aero-bot-dispatch";
+const DELIVERY_LEASE: Duration = Duration::minutes(2);
+const CLAIM_BATCH: i64 = 32;
+const DELIVERY_CONCURRENCY: usize = 8;
+const WORKER_IDLE: StdDuration = StdDuration::from_millis(250);
+const DEFAULT_DELIVERED_RETENTION_DAYS: i64 = 30;
+const DEFAULT_DLQ_RETENTION_DAYS: i64 = 90;
+const DEFAULT_SWEEP_SECS: u64 = 3_600;
+/// Events whose scoped external-bot candidate set exceeded the hard cap.
+pub const BOT_CANDIDATE_TRUNCATIONS_TOTAL: &str = "aero_bot_candidate_truncations_total";
 
 /// The canonical event-type string a bot subscribes to, matching the
 /// `#[serde(tag = "kind", rename_all = "snake_case")]` discriminant on
@@ -78,11 +55,11 @@ fn event_type(event: &RoomEvent) -> &'static str {
         RoomEvent::Reaction { .. } => "reaction",
         RoomEvent::Read { .. } => "read",
         RoomEvent::Typing { .. } => "typing",
-        RoomEvent::Notify { .. } => "notify",
-        RoomEvent::NotifyBatch { .. } => "notify",
+        RoomEvent::Notify { .. } | RoomEvent::NotifyBatch { .. } => "notify",
         RoomEvent::Pin { .. } => "pin",
         RoomEvent::Membership { .. } => "membership",
         RoomEvent::Poll { .. } => "poll",
+        RoomEvent::CanvasOp { .. } => "canvas_op",
         RoomEvent::MessageSeen { .. } => "message_seen",
         RoomEvent::Interaction { .. } => "interaction",
         RoomEvent::Call(_) => "call",
@@ -108,9 +85,10 @@ fn event_action_id(event: &RoomEvent) -> Option<&str> {
 /// `{}` default) constrains nothing. A filter that names a dimension the event
 /// lacks (e.g. `workspace_id` when the event's workspace is unknown, or `action_id`
 /// on a non-interaction event) does NOT match — the subscriber asked to be narrowed
-/// to something this event can't satisfy. A non-object `filters` value (malformed)
-/// is treated as "no filter" so a bad row still delivers rather than silently
-/// black-holing. Pure + total, so it's exhaustively unit-tested without a DB.
+/// to something this event can't satisfy. A non-object `filters` value is
+/// malformed and fails closed; interpreting it as an empty filter would turn a
+/// bad legacy row into a cluster-wide subscription. Pure + total, so it's
+/// exhaustively unit-tested without a DB.
 #[must_use]
 fn filter_matches(
     filters: &serde_json::Value,
@@ -119,17 +97,21 @@ fn filter_matches(
     action_id: Option<&str>,
 ) -> bool {
     let Some(obj) = filters.as_object() else {
-        // `{}` is an object (handled below); a non-object (null/array/scalar) is a
-        // malformed filter — treat as unconstrained.
-        return true;
+        return false;
     };
 
-    if let Some(want) = obj.get("room_id").and_then(|v| v.as_str()) {
+    if let Some(value) = obj.get("room_id") {
+        let Some(want) = value.as_str() else {
+            return false;
+        };
         if want != room_id.to_string() {
             return false;
         }
     }
-    if let Some(want) = obj.get("workspace_id").and_then(|v| v.as_str()) {
+    if let Some(value) = obj.get("workspace_id") {
+        let Some(want) = value.as_str() else {
+            return false;
+        };
         // The subscriber narrowed to a workspace; if we couldn't resolve the
         // event's workspace, we can't honor that, so it does not match.
         match workspace_id {
@@ -137,25 +119,16 @@ fn filter_matches(
             _ => return false,
         }
     }
-    if let Some(want) = obj.get("action_id").and_then(|v| v.as_str()) {
+    if let Some(value) = obj.get("action_id") {
+        let Some(want) = value.as_str() else {
+            return false;
+        };
         match action_id {
             Some(got) if want == got => {}
             _ => return false,
         }
     }
     true
-}
-
-/// Whether any of `subs` carries a `workspace_id` filter — i.e. whether we must pay
-/// for the room→workspace lookup before evaluating the predicate. Pure; lets the
-/// dispatcher skip the DB round-trip entirely on the common (room/action only) case.
-#[must_use]
-fn needs_workspace(subs: &[MatchedSubscription]) -> bool {
-    subs.iter().any(|s| {
-        s.filters
-            .as_object()
-            .is_some_and(|o| o.get("workspace_id").and_then(|v| v.as_str()).is_some())
-    })
 }
 
 /// Run the bot-subscription dispatcher with the real reqwest transport, until the
@@ -165,302 +138,668 @@ fn needs_workspace(subs: &[MatchedSubscription]) -> bool {
 /// Propagates only a fatal setup error; the steady-state loop never returns `Err`
 /// (it resubscribes on bus failures, like the other built-in bots).
 pub async fn run(state: AppState) -> anyhow::Result<()> {
-    run_with(state, Arc::new(ReqwestSender::new())).await
+    run_until_cancelled(state, CancellationToken::new()).await
 }
 
-/// Run the dispatcher with an injected [`WebhookSender`] — the seam tests drive
-/// offline with a `FakeSender`. Real callers use [`run`].
+/// Run with the production transport until `cancel` is triggered.
+pub async fn run_until_cancelled(state: AppState, cancel: CancellationToken) -> anyhow::Result<()> {
+    run_with_until_cancelled(state, Arc::new(ReqwestSender::new()), cancel).await
+}
+
+/// Run the dispatcher with an injected [`WebhookSender`].
 pub async fn run_with(state: AppState, sender: Arc<dyn WebhookSender>) -> anyhow::Result<()> {
+    run_with_until_cancelled(state, sender, CancellationToken::new()).await
+}
+
+/// Run the atomic bus materializer and independent HTTP worker together.
+pub async fn run_with_until_cancelled(
+    state: AppState,
+    sender: Arc<dyn WebhookSender>,
+    cancel: CancellationToken,
+) -> anyhow::Result<()> {
+    let ingest = run_ingest(state.clone(), cancel.clone());
+    let worker = run_delivery_worker(state, sender, cancel);
+    tokio::try_join!(ingest, worker)?;
+    Ok(())
+}
+
+async fn run_ingest(state: AppState, cancel: CancellationToken) -> anyhow::Result<()> {
     let bus = state.bus.clone();
     let bots = BotRepo::new(state.pg.clone());
     let rooms = RoomRepo::new(state.pg.clone());
-    // Resubscribe across NATS reconnects (mirrors `unfurl_bot` / the WS listener);
-    // the durable consumer resumes from its committed cursor and every event is
-    // acked, so nothing is re-delivered after a reconnect.
+    let receipts = ConsumerEventReceiptRepo::new(state.pg.clone());
     loop {
-        let mut stream = match bus.subscribe("im.room.*", Some(CONSUMER)).await {
-            Ok(s) => s,
-            Err(e) => {
+        let subscribed =
+            task_shutdown::subscribe_or_cancelled(&bus, "im.room.*", Some(CONSUMER), &cancel).await;
+        let mut stream = match subscribed {
+            None => return Ok(()),
+            Some(Ok(s)) => s,
+            Some(Err(e)) => {
                 warn!(error = %e, "bot_dispatch subscribe failed; retrying");
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                if task_shutdown::delay_or_cancelled(std::time::Duration::from_secs(1), &cancel)
+                    .await
+                {
+                    return Ok(());
+                }
                 continue;
             }
         };
         info!("bot_dispatch listener started");
-        while let Some(sub) = stream.next().await {
-            // Poison handling: a payload that isn't a RoomEvent is logged at debug
-            // and acked (skipped), never retried — so a single bad frame can't hot-
-            // spin the loop or wedge the cursor.
-            match serde_json::from_slice::<RoomEvent>(sub.payload()) {
-                Ok(event) => dispatch(&bots, &rooms, sender.as_ref(), &event).await,
-                Err(e) => debug!(error = %e, "bot_dispatch: undecodable event payload skipped"),
+        loop {
+            let sub = match task_shutdown::next_or_cancelled(&mut stream, &cancel).await {
+                NextOrCancelled::Item(sub) => sub,
+                NextOrCancelled::Ended => break,
+                NextOrCancelled::Cancelled => return Ok(()),
+            };
+            // Lift producer metadata before typed serde drops unknown envelope
+            // fields. The same immutable bytes are persisted for every retry.
+            let payload = sub.payload().to_vec();
+            let producer_event_id = crate::consumer_event_receipt::extract_event_id(&payload);
+            let event = serde_json::from_slice::<RoomEvent>(&payload);
+            let im = state.im.as_ref();
+            let handler_bots = &bots;
+            let handler_rooms = &rooms;
+            let handler_pool = &state.pg;
+            if producer_event_id.is_none() {
+                debug!("bot_dispatch: legacy event has no producer event_id");
             }
-            // Broadcast-style consumer: always ack so the cursor advances regardless
-            // of delivery outcome (delivery is best-effort, not a work queue).
-            let _ = sub.ack().await;
+            let _ = crate::consumer_event_receipt::process_atomic(
+                &receipts,
+                CONSUMER,
+                sub,
+                |event_id, receipt_attempts| async move {
+                    match event {
+                        Ok(event) => {
+                            materialize_deliveries(
+                                im,
+                                handler_bots,
+                                handler_rooms,
+                                handler_pool,
+                                event_id,
+                                receipt_attempts,
+                                &payload,
+                                &event,
+                            )
+                            .await?;
+                        }
+                        Err(error) => {
+                            debug!(%error, %event_id, "bot_dispatch: undecodable event payload skipped");
+                            complete_receipt_only(
+                                handler_pool,
+                                event_id,
+                                receipt_attempts,
+                            )
+                            .await?;
+                        }
+                    }
+                    Ok(())
+                },
+            )
+            .await;
+        }
+        if cancel.is_cancelled() {
+            return Ok(());
         }
         warn!("bot_dispatch subscription stream ended; resubscribing");
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        if task_shutdown::delay_or_cancelled(std::time::Duration::from_secs(1), &cancel).await {
+            return Ok(());
+        }
     }
 }
 
-/// Fan one decoded event out to every matching bot subscription. No matching
-/// subscription (or a roomless event, e.g. a directed call signal) is a no-op — the
-/// sender is never touched. Best-effort throughout: a subscription lookup failure
-/// is logged and the event is dropped; a per-target send failure is logged and the
-/// next target is still attempted.
-async fn dispatch<S: WebhookSender + ?Sized>(
+/// Resolve the complete fan-out, then commit it together with the receipt.
+#[allow(clippy::too_many_arguments)]
+async fn materialize_deliveries(
+    im: &ImService,
     bots: &BotRepo,
     rooms: &RoomRepo,
-    sender: &S,
+    pool: &PgPool,
+    event_id: Uuid,
+    receipt_attempts: i32,
+    raw_payload: &[u8],
     event: &RoomEvent,
-) {
-    // Roomless events (Answer/Ice/Offer/Roster call signals) carry no room to
-    // filter on; bot subscriptions are room-scoped, so there's nothing to match.
-    let Some(room) = event.room_id() else { return };
+) -> anyhow::Result<usize> {
+    let Some(room) = event.room_id() else {
+        complete_receipt_only(pool, event_id, receipt_attempts).await?;
+        return Ok(0);
+    };
     let kind = event_type(event);
 
-    let subs = match bots.subscriptions_for_event(kind).await {
-        Ok(s) => s,
-        Err(e) => {
-            warn!(error = ?e, %room, kind, "bot_dispatch: subscription lookup failed");
-            return;
-        }
-    };
-    if subs.is_empty() {
-        return;
+    // Resolve scope before querying so PostgreSQL can use the indexed generated
+    // room/workspace projections instead of fetching every tenant's event-type
+    // subscription and filtering the global candidate set in process memory.
+    let workspace = rooms
+        .room_workspace(room)
+        .await
+        .context("resolve event room workspace")?;
+    let (subs, candidates_truncated) = bots
+        .subscriptions_for_event(kind, room, workspace)
+        .await
+        .context("lookup scoped bot event subscriptions")?;
+    if candidates_truncated {
+        metrics::inc_counter(BOT_CANDIDATE_TRUNCATIONS_TOTAL, 1);
+        warn!(
+            event_type = kind,
+            %room,
+            ?workspace,
+            max_candidates = MAX_BOT_EVENT_CANDIDATES,
+            "bot subscription candidate set exceeded hard cap; fan-out truncated"
+        );
     }
 
-    // Resolve the event's workspace only if some subscription filters on it (the
-    // common room/action-only case skips this DB round-trip entirely).
-    let workspace = if needs_workspace(&subs) {
-        match rooms.room_workspace(room).await {
-            Ok(ws) => ws,
-            Err(e) => {
-                warn!(error = ?e, %room, "bot_dispatch: room_workspace lookup failed");
-                None
-            }
-        }
-    } else {
-        None
-    };
     let action_id = event_action_id(event);
-
-    // Sign the SAME JSON bytes the receiver gets, so it can re-verify the signature
-    // (empty secret — see the module note; no per-subscription secret column yet).
-    let body = serde_json::to_value(event).unwrap_or(serde_json::Value::Null);
-    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let mut owner_access = HashMap::<ParticipantId, bool>::new();
+    let mut matches = Vec::new();
 
     for sub in subs {
         if !filter_matches(&sub.filters, room, workspace, action_id) {
             continue;
         }
-        let delivery = build_delivery(&sub.webhook_url, "", &body, now);
-        // Map the round-trip to a (status, http_status, error) triple — both for
-        // structured logging AND for the durable delivery log (migration 0147), so
-        // a previously-invisible bot delivery is now observable. A 2xx is
-        // `delivered`; a non-2xx or a transport-level error is `failed` (the latter
-        // with no http_status). The classification lives in `DeliveryStatus` so the
-        // log and the logs agree.
-        let (status, http_status, error): (DeliveryStatus, Option<u16>, Option<String>) =
-            match sender.deliver(&delivery).await {
-                Ok(resp) if (200..300).contains(&resp.status) => {
-                    debug!(%room, kind, bot = %sub.bot_id, sub = %sub.id, status = resp.status, "bot_dispatch delivered");
-                    (DeliveryStatus::Delivered, Some(resp.status), None)
+        let authorized = if let Some(authorized) = owner_access.get(&sub.owner_id) {
+            *authorized
+        } else {
+            let authorized = match im.assert_room_access(sub.owner_id, room).await {
+                Ok(()) => true,
+                Err(error) if is_access_revoked(&error) => {
+                    debug!(
+                        owner = %sub.owner_id,
+                        bot = %sub.bot_id,
+                        %room,
+                        %error,
+                        "bot_dispatch owner no longer has room access; skipping external delivery"
+                    );
+                    false
                 }
-                Ok(resp) => {
-                    warn!(%room, kind, bot = %sub.bot_id, url = %sub.webhook_url, status = resp.status, "bot_dispatch non-2xx");
-                    (DeliveryStatus::Failed, Some(resp.status), Some(format!("non-2xx: {}", resp.status)))
-                }
-                Err(e) => {
-                    warn!(%room, kind, bot = %sub.bot_id, url = %sub.webhook_url, error = %e, "bot_dispatch delivery failed");
-                    (DeliveryStatus::Failed, None, Some(e))
+                Err(error) => {
+                    return Err(
+                        anyhow::Error::new(error).context("re-authorize bot subscription owner")
+                    );
                 }
             };
-        // Fail-open: a logging failure must never abort delivery to the remaining
-        // subscriptions, so a `record_delivery` error is warned and swallowed.
-        if let Err(e) = bots
-            .record_delivery(sub.id, sub.bot_id, kind, status, http_status, error.as_deref())
+            owner_access.insert(sub.owner_id, authorized);
+            authorized
+        };
+        if !authorized {
+            continue;
+        }
+        matches.push((sub.id, sub.bot_id));
+    }
+
+    let count = matches.len();
+    let mut tx = pool
+        .begin()
+        .await
+        .context("begin bot delivery materialization")?;
+    for (subscription_id, bot_id) in matches {
+        BotDeliveryOutboxRepo::enqueue_in_tx(
+            &mut tx,
+            subscription_id,
+            bot_id,
+            event_id,
+            kind,
+            room,
+            raw_payload,
+        )
+        .await
+        .context("enqueue bot subscription delivery")?;
+    }
+    complete_receipt_in_tx(&mut tx, event_id, receipt_attempts).await?;
+    tx.commit()
+        .await
+        .context("commit bot delivery materialization")?;
+    debug!(%event_id, %room, kind, count, "bot subscription deliveries materialized");
+    Ok(count)
+}
+
+fn is_access_revoked(error: &AeroError) -> bool {
+    matches!(
+        error,
+        AeroError::Forbidden(_) | AeroError::NotFound(_) | AeroError::Unauthorized(_)
+    )
+}
+
+async fn complete_receipt_only(
+    pool: &PgPool,
+    event_id: Uuid,
+    receipt_attempts: i32,
+) -> anyhow::Result<()> {
+    let mut tx = pool.begin().await.context("begin bot receipt completion")?;
+    complete_receipt_in_tx(&mut tx, event_id, receipt_attempts).await?;
+    tx.commit().await.context("commit bot receipt completion")
+}
+
+async fn complete_receipt_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    event_id: Uuid,
+    receipt_attempts: i32,
+) -> anyhow::Result<()> {
+    let completed = ConsumerEventReceiptRepo::complete_in_tx(
+        tx,
+        CONSUMER,
+        event_id,
+        receipt_attempts,
+        OffsetDateTime::now_utc(),
+    )
+    .await
+    .context("complete bot consumer receipt")?;
+    if !completed {
+        return Err(anyhow!("bot consumer receipt fencing token was superseded"));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RetentionConfig {
+    delivered_age: Duration,
+    dlq_age: Duration,
+    interval: StdDuration,
+}
+
+impl RetentionConfig {
+    fn from_env() -> Self {
+        let delivered_days = std::env::var("AERO_BOT_DELIVERY_RETENTION_DAYS").ok();
+        let dlq_days = std::env::var("AERO_BOT_DELIVERY_DLQ_RETENTION_DAYS").ok();
+        let sweep_secs = std::env::var("AERO_BOT_DELIVERY_SWEEP_SECS").ok();
+        Self::from_values(
+            delivered_days.as_deref(),
+            dlq_days.as_deref(),
+            sweep_secs.as_deref(),
+        )
+    }
+
+    fn from_values(
+        delivered_days: Option<&str>,
+        dlq_days: Option<&str>,
+        sweep_secs: Option<&str>,
+    ) -> Self {
+        let delivered_days = delivered_days
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(DEFAULT_DELIVERED_RETENTION_DAYS)
+            .clamp(1, 3_650);
+        let dlq_days = dlq_days
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(DEFAULT_DLQ_RETENTION_DAYS)
+            .clamp(1, 3_650);
+        let sweep_secs = sweep_secs
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_SWEEP_SECS)
+            .clamp(60, 86_400);
+        Self {
+            delivered_age: Duration::days(delivered_days),
+            dlq_age: Duration::days(dlq_days),
+            interval: StdDuration::from_secs(sweep_secs),
+        }
+    }
+
+    fn cutoffs(self, now: OffsetDateTime) -> (OffsetDateTime, OffsetDateTime) {
+        (now - self.delivered_age, now - self.dlq_age)
+    }
+}
+
+async fn run_delivery_worker(
+    state: AppState,
+    sender: Arc<dyn WebhookSender>,
+    cancel: CancellationToken,
+) -> anyhow::Result<()> {
+    let bots = BotRepo::new(state.pg.clone());
+    let outbox = BotDeliveryOutboxRepo::new(state.pg.clone());
+    let retention = RetentionConfig::from_env();
+    let mut next_sweep = tokio::time::Instant::now();
+    info!(
+        delivered_retention_days = retention.delivered_age.whole_days(),
+        dlq_retention_days = retention.dlq_age.whole_days(),
+        sweep_secs = retention.interval.as_secs(),
+        "bot delivery worker started"
+    );
+
+    loop {
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
+
+        if tokio::time::Instant::now() >= next_sweep {
+            let (delivered_cutoff, dlq_cutoff) = retention.cutoffs(OffsetDateTime::now_utc());
+            match outbox
+                .sweep_retention_before(delivered_cutoff, dlq_cutoff)
+                .await
+            {
+                Ok(removed)
+                    if removed.delivered_outbox > 0
+                        || removed.dead_outbox > 0
+                        || removed.attempt_history > 0 =>
+                {
+                    info!(
+                        delivered_outbox = removed.delivered_outbox,
+                        dead_outbox = removed.dead_outbox,
+                        attempt_history = removed.attempt_history,
+                        "swept retained bot delivery rows"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    warn!(?error, "bot delivery retention sweep failed");
+                }
+            }
+            next_sweep = tokio::time::Instant::now() + retention.interval;
+        }
+
+        let rows = match outbox
+            .claim_due(OffsetDateTime::now_utc(), DELIVERY_LEASE, CLAIM_BATCH)
             .await
         {
-            warn!(%room, kind, bot = %sub.bot_id, sub = %sub.id, error = ?e, "bot_dispatch: delivery-log write failed");
+            Ok(rows) => rows,
+            Err(error) => {
+                warn!(?error, "bot delivery claim failed; retrying");
+                if task_shutdown::delay_or_cancelled(StdDuration::from_secs(1), &cancel).await {
+                    return Ok(());
+                }
+                continue;
+            }
+        };
+        if rows.is_empty() {
+            if task_shutdown::delay_or_cancelled(WORKER_IDLE, &cancel).await {
+                return Ok(());
+            }
+            continue;
+        }
+
+        stream::iter(rows)
+            .for_each_concurrent(Some(DELIVERY_CONCURRENCY), |row| {
+                deliver_claimed(
+                    state.im.as_ref(),
+                    &bots,
+                    &outbox,
+                    sender.as_ref(),
+                    &cancel,
+                    row,
+                )
+            })
+            .await;
+    }
+}
+
+async fn deliver_claimed(
+    im: &ImService,
+    bots: &BotRepo,
+    outbox: &BotDeliveryOutboxRepo,
+    sender: &dyn WebhookSender,
+    cancel: &CancellationToken,
+    row: BotDeliveryOutbox,
+) {
+    let Some(claim_token) = row.claim_token else {
+        warn!(delivery = %row.id, "claimed bot delivery has no fencing token");
+        return;
+    };
+
+    if cancel.is_cancelled() {
+        release_interrupted(outbox, &row, claim_token).await;
+        return;
+    }
+
+    let target = match bots.subscription_delivery_target(row.subscription_id).await {
+        Ok(Some(target)) => target,
+        Ok(None) => {
+            park_dead(
+                outbox,
+                &row,
+                claim_token,
+                "subscription target is no longer active",
+            )
+            .await;
+            return;
+        }
+        Err(error) => {
+            repark_failed(
+                outbox,
+                &row,
+                claim_token,
+                None,
+                &format!("subscription target lookup failed: {error}"),
+            )
+            .await;
+            return;
+        }
+    };
+
+    if target.bot_id != row.bot_id {
+        park_dead(
+            outbox,
+            &row,
+            claim_token,
+            "subscription bot identity changed",
+        )
+        .await;
+        return;
+    }
+
+    match im.assert_room_access(target.owner_id, row.room_id).await {
+        Ok(()) => {}
+        Err(error) if is_access_revoked(&error) => {
+            park_dead(
+                outbox,
+                &row,
+                claim_token,
+                &format!("subscription owner access revoked: {error}"),
+            )
+            .await;
+            return;
+        }
+        Err(error) => {
+            repark_failed(
+                outbox,
+                &row,
+                claim_token,
+                None,
+                &format!("subscription owner authorization failed: {error}"),
+            )
+            .await;
+            return;
+        }
+    }
+
+    if cancel.is_cancelled() {
+        release_interrupted(outbox, &row, claim_token).await;
+        return;
+    }
+
+    let headers = [("Content-Type".to_owned(), "application/json".to_owned())];
+    let delivery = build_delivery_from_bytes(
+        &target.webhook_url,
+        &target.webhook_secret,
+        &row.request_body,
+        &headers,
+        OffsetDateTime::now_utc().unix_timestamp(),
+    );
+
+    match sender.deliver(&delivery).await {
+        Ok(response) if (200..300).contains(&response.status) => {
+            record_attempt(
+                bots,
+                &row,
+                DeliveryStatus::Delivered,
+                Some(response.status),
+                None,
+            )
+            .await;
+            match outbox
+                .mark_delivered(
+                    row.id,
+                    claim_token,
+                    OffsetDateTime::now_utc(),
+                    response.status,
+                )
+                .await
+            {
+                Ok(true) => debug!(
+                    delivery = %row.id,
+                    event_id = %row.event_id,
+                    subscription = %row.subscription_id,
+                    status = response.status,
+                    attempts = row.attempts,
+                    "bot subscription delivery completed"
+                ),
+                Ok(false) => warn!(
+                    delivery = %row.id,
+                    %claim_token,
+                    "bot delivery success lost its lease fence"
+                ),
+                Err(error) => warn!(
+                    delivery = %row.id,
+                    %claim_token,
+                    ?error,
+                    "bot delivery succeeded but durable completion failed"
+                ),
+            }
+        }
+        Ok(response) => {
+            let error = format!("non-2xx: {}", response.status);
+            record_attempt(
+                bots,
+                &row,
+                DeliveryStatus::Failed,
+                Some(response.status),
+                Some(&error),
+            )
+            .await;
+            repark_failed(outbox, &row, claim_token, Some(response.status), &error).await;
+        }
+        Err(error) => {
+            record_attempt(bots, &row, DeliveryStatus::Failed, None, Some(&error)).await;
+            repark_failed(outbox, &row, claim_token, None, &error).await;
         }
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use aero_common::{
-        Block, CallEvent, CallId, Message, MessageEnvelope, MessageId, ParticipantId,
-    };
-
-    fn message_event(room: RoomId) -> RoomEvent {
-        let msg = Message {
-            id: MessageId::new(),
-            room_id: room,
-            sender_id: ParticipantId::new(),
-            blocks: vec![Block::text("hi")],
-            reply_to: None,
-            metadata: serde_json::Value::Null,
-            created_at: time::OffsetDateTime::UNIX_EPOCH,
-            edited_at: None,
-            deleted_at: None,
-            expires_at: None,
-            version: 1,
-        };
-        RoomEvent::Message(MessageEnvelope { message: msg, recipients: Vec::new() })
-    }
-
-    // ----- event_type -----
-
-    #[test]
-    fn event_type_matches_wire_discriminant() {
-        let room = RoomId::new();
-        let ev = message_event(room);
-        assert_eq!(event_type(&ev), "message");
-        // The kind string equals the serde tag emitted on the wire — the exact
-        // value a bot stores in `bot_event_subscriptions.event_type`.
-        let json = serde_json::to_value(&ev).unwrap();
-        assert_eq!(json["kind"], event_type(&ev));
-
-        assert_eq!(
-            event_type(&RoomEvent::Interaction {
-                room_id: room,
-                message_id: MessageId::new(),
-                participant: ParticipantId::new(),
-                action_id: "approve".into(),
-            }),
-            "interaction"
+async fn record_attempt(
+    bots: &BotRepo,
+    row: &BotDeliveryOutbox,
+    status: DeliveryStatus,
+    http_status: Option<u16>,
+    error: Option<&str>,
+) {
+    if let Err(log_error) = bots
+        .record_delivery_attempt(
+            row.subscription_id,
+            row.bot_id,
+            &row.event_type,
+            status,
+            http_status,
+            error,
+            row.attempts,
+        )
+        .await
+    {
+        // Observability is deliberately independent from durable settlement.
+        warn!(
+            delivery = %row.id,
+            event_id = %row.event_id,
+            ?log_error,
+            "bot delivery attempt-log write failed"
         );
-        assert_eq!(
-            event_type(&RoomEvent::Typing {
-                room_id: room,
-                participant: ParticipantId::new(),
-                on: true,
-            }),
-            "typing"
-        );
-    }
-
-    // ----- event_action_id -----
-
-    #[test]
-    fn action_id_only_for_interaction() {
-        let room = RoomId::new();
-        let interaction = RoomEvent::Interaction {
-            room_id: room,
-            message_id: MessageId::new(),
-            participant: ParticipantId::new(),
-            action_id: "btn_approve".into(),
-        };
-        assert_eq!(event_action_id(&interaction), Some("btn_approve"));
-        assert_eq!(event_action_id(&message_event(room)), None);
-    }
-
-    // ----- filter_matches -----
-
-    #[test]
-    fn empty_filter_matches_everything() {
-        let room = RoomId::new();
-        // Both the explicit `{}` (column default) and a malformed non-object are
-        // treated as "no constraint".
-        assert!(filter_matches(&serde_json::json!({}), room, None, None));
-        assert!(filter_matches(&serde_json::Value::Null, room, None, None));
-        assert!(filter_matches(&serde_json::json!("garbage"), room, None, None));
-    }
-
-    #[test]
-    fn room_filter_matches_only_its_room() {
-        let room = RoomId::new();
-        let other = RoomId::new();
-        let f = serde_json::json!({ "room_id": room.to_string() });
-        assert!(filter_matches(&f, room, None, None), "same room matches");
-        assert!(!filter_matches(&f, other, None, None), "different room excluded");
-    }
-
-    #[test]
-    fn workspace_filter_requires_resolved_matching_workspace() {
-        let room = RoomId::new();
-        let ws = WorkspaceId::new();
-        let other_ws = WorkspaceId::new();
-        let f = serde_json::json!({ "workspace_id": ws.to_string() });
-        assert!(filter_matches(&f, room, Some(ws), None), "matching ws delivers");
-        assert!(!filter_matches(&f, room, Some(other_ws), None), "other ws excluded");
-        // A workspace filter the dispatcher couldn't resolve must NOT match (we
-        // can't prove the constraint holds).
-        assert!(!filter_matches(&f, room, None, None), "unresolved ws excluded");
-    }
-
-    #[test]
-    fn action_id_filter_gates_interactions() {
-        let room = RoomId::new();
-        let f = serde_json::json!({ "action_id": "approve" });
-        assert!(filter_matches(&f, room, None, Some("approve")), "matching action delivers");
-        assert!(!filter_matches(&f, room, None, Some("reject")), "other action excluded");
-        // No action on the event (non-interaction) can't satisfy an action filter.
-        assert!(!filter_matches(&f, room, None, None), "missing action excluded");
-    }
-
-    #[test]
-    fn multiple_filter_keys_are_anded() {
-        let room = RoomId::new();
-        let ws = WorkspaceId::new();
-        let f = serde_json::json!({
-            "room_id": room.to_string(),
-            "workspace_id": ws.to_string(),
-            "action_id": "go",
-        });
-        // All three satisfied → match.
-        assert!(filter_matches(&f, room, Some(ws), Some("go")));
-        // Any one violated → no match.
-        assert!(!filter_matches(&f, RoomId::new(), Some(ws), Some("go")), "wrong room");
-        assert!(!filter_matches(&f, room, Some(WorkspaceId::new()), Some("go")), "wrong ws");
-        assert!(!filter_matches(&f, room, Some(ws), Some("no")), "wrong action");
-    }
-
-    // ----- needs_workspace -----
-
-    #[test]
-    fn needs_workspace_only_when_a_sub_filters_on_it() {
-        let bot = ParticipantId::new();
-        let mk = |filters: serde_json::Value| MatchedSubscription {
-            id: uuid::Uuid::new_v4(),
-            bot_id: bot,
-            webhook_url: "https://example.test/hook".into(),
-            filters,
-        };
-        // Room-only / empty filters → no workspace lookup required.
-        assert!(!needs_workspace(&[mk(serde_json::json!({}))]));
-        assert!(!needs_workspace(&[mk(serde_json::json!({ "room_id": "r" }))]));
-        // Any workspace_id filter → lookup required.
-        assert!(needs_workspace(&[
-            mk(serde_json::json!({ "room_id": "r" })),
-            mk(serde_json::json!({ "workspace_id": "w" })),
-        ]));
-    }
-
-    // ----- dispatch (no DB / no match short-circuits, behind the sender seam) -----
-
-    #[tokio::test]
-    async fn roomless_event_never_touches_the_sender() {
-        // A roomless call signal (Answer) has no room to scope subscriptions to, so
-        // `dispatch` must early-return before any DB query or send — exercised here
-        // with lazily-connected repos that would error if queried.
-        use aero_storage::FakeSender;
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .connect_lazy("postgres://u:p@localhost/db")
-            .unwrap();
-        let bots = BotRepo::new(pool.clone());
-        let rooms = RoomRepo::new(pool);
-        let sender = FakeSender::new(200);
-        let answer = RoomEvent::Call(CallEvent::Answer {
-            call_id: CallId::new(),
-            from: ParticipantId::new(),
-            to: ParticipantId::new(),
-            sdp: String::new(),
-        });
-        dispatch(&bots, &rooms, &sender, &answer).await;
-        assert!(sender.calls().is_empty(), "no room ⇒ no lookup, no delivery");
     }
 }
+
+async fn repark_failed(
+    outbox: &BotDeliveryOutboxRepo,
+    row: &BotDeliveryOutbox,
+    claim_token: Uuid,
+    http_status: Option<u16>,
+    error: &str,
+) {
+    match outbox
+        .mark_failed(
+            row.id,
+            claim_token,
+            row.attempts,
+            OffsetDateTime::now_utc(),
+            http_status,
+            error,
+        )
+        .await
+    {
+        Ok(Some("dead")) => warn!(
+            delivery = %row.id,
+            event_id = %row.event_id,
+            attempts = row.attempts,
+            error,
+            "bot subscription delivery moved to DLQ"
+        ),
+        Ok(Some(_)) => warn!(
+            delivery = %row.id,
+            event_id = %row.event_id,
+            attempts = row.attempts,
+            error,
+            "bot subscription delivery failed; retry scheduled"
+        ),
+        Ok(None) => warn!(
+            delivery = %row.id,
+            %claim_token,
+            "bot delivery failure lost its lease fence"
+        ),
+        Err(mark_error) => warn!(
+            delivery = %row.id,
+            %claim_token,
+            ?mark_error,
+            error,
+            "bot delivery failure could not be durably re-parked"
+        ),
+    }
+}
+
+async fn park_dead(
+    outbox: &BotDeliveryOutboxRepo,
+    row: &BotDeliveryOutbox,
+    claim_token: Uuid,
+    error: &str,
+) {
+    match outbox
+        .mark_dead(row.id, claim_token, OffsetDateTime::now_utc(), error)
+        .await
+    {
+        Ok(true) => warn!(
+            delivery = %row.id,
+            event_id = %row.event_id,
+            error,
+            "bot subscription delivery parked in DLQ without HTTP"
+        ),
+        Ok(false) => warn!(
+            delivery = %row.id,
+            %claim_token,
+            "bot delivery terminal park lost its lease fence"
+        ),
+        Err(mark_error) => warn!(
+            delivery = %row.id,
+            %claim_token,
+            ?mark_error,
+            "bot delivery could not be parked in DLQ"
+        ),
+    }
+}
+
+async fn release_interrupted(
+    outbox: &BotDeliveryOutboxRepo,
+    row: &BotDeliveryOutbox,
+    claim_token: Uuid,
+) {
+    match outbox
+        .release_claim(row.id, claim_token, OffsetDateTime::now_utc())
+        .await
+    {
+        Ok(true) => debug!(delivery = %row.id, "released unstarted bot delivery during shutdown"),
+        Ok(false) => debug!(
+            delivery = %row.id,
+            %claim_token,
+            "shutdown release lost its lease fence"
+        ),
+        Err(error) => warn!(
+            delivery = %row.id,
+            %claim_token,
+            ?error,
+            "failed to release bot delivery during shutdown; lease recovery will retry it"
+        ),
+    }
+}
+
+#[cfg(test)]
+#[path = "bot_dispatch/tests.rs"]
+mod tests;

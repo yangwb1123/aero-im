@@ -4,12 +4,7 @@
 //! See also `crate::metrics::metrics_handler` for the Prometheus `/metrics`
 //! endpoint.
 
-use axum::{
-    extract::State,
-    http::StatusCode,
-    routing::get,
-    Json, Router,
-};
+use axum::{extract::State, http::StatusCode, routing::get, Json, Router};
 
 use crate::state::AppState;
 
@@ -24,7 +19,7 @@ pub fn routes() -> Router<AppState> {
 /// Probe each backing dependency (PG / Redis / NATS) with a short timeout.
 /// Each result is `"ok"` / `"fail"` / `"timeout"`. Shared by `/health` and
 /// `/health/ready` so the two never drift.
-async fn probe_deps(s: &AppState) -> (&'static str, &'static str, &'static str) {
+async fn probe_deps(s: &AppState) -> (&'static str, &'static str, &'static str, &'static str) {
     use std::time::Duration;
     let pg_ok = tokio::time::timeout(Duration::from_secs(2), async {
         sqlx::query_scalar::<_, i32>("SELECT 1")
@@ -38,10 +33,8 @@ async fn probe_deps(s: &AppState) -> (&'static str, &'static str, &'static str) 
         Err(_) => "timeout",
     };
 
-    let redis_ok = tokio::time::timeout(Duration::from_secs(2), async {
-        s.presence.ping().await
-    })
-    .await;
+    let redis_ok =
+        tokio::time::timeout(Duration::from_secs(2), async { s.presence.ping().await }).await;
     let redis = match redis_ok {
         Ok(Ok(_)) => "ok",
         Ok(Err(_)) => "fail",
@@ -65,18 +58,21 @@ async fn probe_deps(s: &AppState) -> (&'static str, &'static str, &'static str) 
         Err(_) => "timeout",
     };
 
-    (pg, redis, nats)
+    let blob = probe_blob(s).await;
+    (pg, redis, nats, blob)
 }
 
-/// Probe the blob backend's reachability for readiness gating.
-/// The local FS store is always present, so only S3 can be remotely unreachable;
-/// a short timeout means a hung endpoint reads as `"timeout"` (not ready) rather
-/// than stalling the probe.
+/// Probe the default and every configured regional blob backend.
+///
+/// This must run even when the default backend is local: a deployment may pair
+/// local default storage with remote residency buckets. A short timeout turns a
+/// hung regional endpoint into `"timeout"` instead of stalling readiness.
 async fn probe_blob(s: &AppState) -> &'static str {
-    if s.blob_backend != "s3" {
-        return "ok";
-    }
-    match tokio::time::timeout(std::time::Duration::from_secs(2), s.blob_store.health_check()).await
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        s.region_router.health_check(),
+    )
+    .await
     {
         Ok(Ok(())) => "ok",
         Ok(Err(_)) => "fail",
@@ -87,8 +83,8 @@ async fn probe_blob(s: &AppState) -> &'static str {
 /// Legacy combined health endpoint (kept for backward-compat). Always 200; the
 /// body's `status` is `"ok"` only when every dependency probes healthy.
 async fn health(State(s): State<AppState>) -> Json<serde_json::Value> {
-    let (pg, redis, nats) = probe_deps(&s).await;
-    let overall = if pg == "ok" && redis == "ok" && nats == "ok" {
+    let (pg, redis, nats, blob) = probe_deps(&s).await;
+    let overall = if pg == "ok" && redis == "ok" && nats == "ok" && blob == "ok" {
         "ok"
     } else {
         "degraded"
@@ -100,6 +96,7 @@ async fn health(State(s): State<AppState>) -> Json<serde_json::Value> {
             "postgres": pg,
             "redis": redis,
             "nats": nats,
+            "blob": blob,
         },
         // Surface the active blob backend (s3/local) so operators can confirm
         // storage is wired as intended.
@@ -161,8 +158,7 @@ async fn health_ready(State(s): State<AppState>) -> impl axum::response::IntoRes
             })),
         );
     }
-    let (pg, redis, nats) = probe_deps(&s).await;
-    let blob = probe_blob(&s).await;
+    let (pg, redis, nats, blob) = probe_deps(&s).await;
     let deps_ok = pg == "ok" && redis == "ok" && nats == "ok" && blob == "ok";
     let (status, state) = readiness_decision(false, deps_ok);
     (
@@ -203,7 +199,9 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 16).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 16)
+            .await
+            .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["status"], "ok");
     }

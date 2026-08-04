@@ -7,7 +7,7 @@
 //!
 //! Purely additive: a NEW [`WorkspaceNotifDefaultsRepo`]; no existing repo touched.
 
-use aero_common::{Error, WorkspaceId};
+use aero_common::{Error, ParticipantId, WorkspaceId};
 use sqlx::PgPool;
 
 #[derive(Clone)]
@@ -57,6 +57,32 @@ impl WorkspaceNotifDefaultsRepo {
         .execute(&self.pg)
         .await
         .map_err(Error::from)?;
+        Ok(())
+    }
+
+    /// Upsert the default only while `actor` remains an effective Owner/Admin
+    /// under the same workspace lock and transaction as the write.
+    pub async fn set_authorized(
+        &self,
+        workspace: WorkspaceId,
+        level: &str,
+        actor: ParticipantId,
+    ) -> Result<(), Error> {
+        let mut tx = self.pg.begin().await?;
+        crate::workspace::authz::assert_effective_admin_in_tx(&mut tx, workspace, actor).await?;
+        sqlx::query(
+            "INSERT INTO workspace_notification_defaults \
+                 (workspace_id, default_level, updated_at) \
+             VALUES ($1, $2, NOW()) \
+             ON CONFLICT (workspace_id) DO UPDATE \
+                 SET default_level = EXCLUDED.default_level, \
+                     updated_at = NOW()",
+        )
+        .bind(workspace.to_uuid())
+        .bind(level)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
         Ok(())
     }
 }

@@ -38,7 +38,10 @@ pub fn routes() -> Router<AppState> {
             "/api/bookmark-collections/:cid",
             axum::routing::patch(rename_collection).delete(delete_collection),
         )
-        .route("/api/saved/:message_id/collection", put(set_item_collection))
+        .route(
+            "/api/saved/:message_id/collection",
+            put(set_item_collection),
+        )
 }
 
 /// The collections repo over the shared pool, built inline (cheap `PgPool`
@@ -48,8 +51,7 @@ fn repo(s: &AppState) -> BookmarkCollectionRepo {
 }
 
 fn parse_collection(s: &str) -> Result<BookmarkCollectionId, AeroError> {
-    BookmarkCollectionId::from_str(s)
-        .map_err(|e| AeroError::Invalid(format!("collection id: {e}")))
+    BookmarkCollectionId::from_str(s).map_err(|e| AeroError::Invalid(format!("collection id: {e}")))
 }
 
 fn parse_message(s: &str) -> Result<MessageId, AeroError> {
@@ -155,7 +157,12 @@ async fn set_item_collection(
 ) -> ApiResult<Json<serde_json::Value>> {
     let message = parse_message(&msg_str)?;
     let r = repo(&s);
-    if let Some(c) = req.collection_id.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+    if let Some(c) = req
+        .collection_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+    {
         let cid = parse_collection(c)?;
         let assigned = r.assign(auth.participant_id, message, cid).await?;
         if !assigned {
@@ -173,6 +180,8 @@ async fn set_item_collection(
         if !cleared {
             return Err(AeroError::NotFound(format!("saved message {message}")).into());
         }
-        Ok(Json(serde_json::json!({ "collection_id": serde_json::Value::Null })))
+        Ok(Json(
+            serde_json::json!({ "collection_id": serde_json::Value::Null }),
+        ))
     }
 }

@@ -29,10 +29,12 @@ use axum::{
     routing::get,
     Json, Router,
 };
+use tokio_util::sync::CancellationToken;
 use ulid::Ulid;
 
 use crate::error::ApiResult;
 use crate::state::AppState;
+use crate::task_shutdown;
 
 /// Default sampling cadence for [`run_viewer_sampler`]: snapshot every live
 /// stream's concurrent-viewer count once per this interval.
@@ -71,7 +73,9 @@ async fn stream_analytics(
         .map_err(AeroError::from)?
         .ok_or_else(|| AeroError::NotFound(format!("stream {stream_id}")))?;
     if stream.owner_id != auth.participant_id {
-        return Err(AeroError::Forbidden("only the stream owner may view its analytics".into()).into());
+        return Err(
+            AeroError::Forbidden("only the stream owner may view its analytics".into()).into(),
+        );
     }
 
     let stats = StreamStatsRepo::new(s.pg.clone())
@@ -121,9 +125,10 @@ async fn retention_curve(
         .map_err(AeroError::from)?
         .ok_or_else(|| AeroError::NotFound(format!("stream {stream_id}")))?;
     if stream.owner_id != auth.participant_id {
-        return Err(
-            AeroError::Forbidden("only the stream owner may view its retention curve".into()).into(),
-        );
+        return Err(AeroError::Forbidden(
+            "only the stream owner may view its retention curve".into(),
+        )
+        .into());
     }
     let curve = StreamViewerSampleRepo::new(s.pg.clone())
         .retention_curve(stream_id, q.bucket_secs)
@@ -148,6 +153,16 @@ pub async fn run_viewer_sampler(
     viewers: StreamViewerStore,
     stream_repo: StreamRepo,
 ) {
+    run_viewer_sampler_until_cancelled(pg, viewers, stream_repo, CancellationToken::new()).await;
+}
+
+/// Run the concurrent-viewer sampler until `cancel` is triggered.
+pub async fn run_viewer_sampler_until_cancelled(
+    pg: aero_storage::PgPool,
+    viewers: StreamViewerStore,
+    stream_repo: StreamRepo,
+    cancel: CancellationToken,
+) {
     let samples = StreamViewerSampleRepo::new(pg);
     let mut tick = tokio::time::interval(VIEWER_SAMPLE_INTERVAL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -156,7 +171,9 @@ pub async fn run_viewer_sampler(
         "concurrent-viewer sampler started"
     );
     loop {
-        tick.tick().await;
+        if task_shutdown::tick_or_cancelled(&mut tick, &cancel).await {
+            return;
+        }
         let live = match stream_repo.list_live().await {
             Ok(v) => v,
             Err(e) => {
@@ -174,6 +191,9 @@ pub async fn run_viewer_sampler(
                 Err(e) => {
                     tracing::warn!(error = ?e, stream = %stream.id, "viewer sampler: count failed");
                 }
+            }
+            if cancel.is_cancelled() {
+                return;
             }
         }
     }

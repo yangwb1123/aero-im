@@ -27,7 +27,8 @@ use aero_common::{
 };
 use aero_storage::{
     role_can_assign, role_can_invite, role_can_manage_member, role_can_remove,
-    validate_retention_days, WorkspaceMuteRepo, WorkspaceNotifDefaultsRepo, WorkspaceRepo,
+    validate_retention_days, WorkspaceMemberWriteError, WorkspaceMuteRepo,
+    WorkspaceNotifDefaultsRepo, WorkspaceRepo,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -49,7 +50,10 @@ use crate::state::AppState;
 /// live next to the pure authorization logic they enforce.
 pub fn routes() -> Router<AppState> {
     Router::new()
-        .route("/api/workspaces", post(create_workspace).get(list_workspaces))
+        .route(
+            "/api/workspaces",
+            post(create_workspace).get(list_workspaces),
+        )
         // Owner-only erasure (ROADMAP 方向一 合规); GET of a single workspace is
         // intentionally not (yet) offered here — listing is via `/api/workspaces`.
         .route(
@@ -59,8 +63,14 @@ pub fn routes() -> Router<AppState> {
         // Owner-only full-tenant export (GDPR data portability).
         .route("/api/workspaces/:id/export", get(export_workspace))
         // Admin/owner: set or clear the per-workspace message-retention window.
-        .route("/api/workspaces/:id/retention", axum::routing::put(set_retention))
-        .route("/api/workspaces/:id/members", get(list_members).post(add_member))
+        .route(
+            "/api/workspaces/:id/retention",
+            axum::routing::put(set_retention),
+        )
+        .route(
+            "/api/workspaces/:id/members",
+            get(list_members).post(add_member),
+        )
         .route(
             "/api/workspaces/:id/members/:pid",
             axum::routing::patch(change_member_role).delete(remove_member),
@@ -75,7 +85,10 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/api/workspaces/:id/muted", get(workspace_mute_status))
         // Workspace branding (ROADMAP7 Lane C): logo, color scheme, custom domain, description.
-        .route("/api/workspaces/:id/branding", axum::routing::patch(update_branding))
+        .route(
+            "/api/workspaces/:id/branding",
+            axum::routing::patch(update_branding),
+        )
         // ROADMAP12: workspace default notification level (admin only).
         .route(
             "/api/workspaces/:id/notification-defaults",
@@ -94,7 +107,11 @@ async fn audit(
     target: Option<&str>,
     detail: serde_json::Value,
 ) {
-    if let Err(e) = s.audit.append(workspace, Some(actor), action, target, detail).await {
+    if let Err(e) = s
+        .audit
+        .append(workspace, Some(actor), action, target, detail)
+        .await
+    {
         tracing::warn!(error = ?e, %workspace, action, "audit append failed");
     }
 }
@@ -115,7 +132,9 @@ pub fn authorize_invite(caller: WorkspaceRole, target: WorkspaceRole) -> AeroRes
     if role_can_invite(caller) && role_can_assign(caller, target) {
         Ok(())
     } else {
-        Err(AeroError::Forbidden("cannot invite member with that role".into()))
+        Err(AeroError::Forbidden(
+            "cannot invite member with that role".into(),
+        ))
     }
 }
 
@@ -138,7 +157,9 @@ pub fn authorize_role_change(
     if role_can_assign(caller, new_role) && role_can_manage_member(caller, subject) {
         Ok(())
     } else {
-        Err(AeroError::Forbidden("cannot change that member's role".into()))
+        Err(AeroError::Forbidden(
+            "cannot change that member's role".into(),
+        ))
     }
 }
 
@@ -189,6 +210,28 @@ fn parse_audit_id(s: &str) -> AeroResult<AuditId> {
     AuditId::from_str(s).map_err(|e| AeroError::Invalid(format!("audit cursor: {e}")))
 }
 
+fn map_member_write_error(error: WorkspaceMemberWriteError) -> AeroError {
+    match error {
+        WorkspaceMemberWriteError::MemberNotFound => AeroError::NotFound("workspace member".into()),
+        WorkspaceMemberWriteError::NotAuthorized => {
+            AeroError::Forbidden("cannot manage that workspace member".into())
+        }
+        WorkspaceMemberWriteError::InvalidGuestRole => {
+            AeroError::Invalid("single-channel guests must be managed through the guest API".into())
+        }
+        WorkspaceMemberWriteError::OwnerCannotLeave => AeroError::Forbidden(
+            "owner cannot leave; transfer ownership or delete the workspace".into(),
+        ),
+        WorkspaceMemberWriteError::LastOwner => {
+            AeroError::Conflict("transfer ownership before demoting the final owner".into())
+        }
+        WorkspaceMemberWriteError::ChannelOwnerProtected => AeroError::Conflict(
+            "transfer channel ownership before removing this workspace member".into(),
+        ),
+        WorkspaceMemberWriteError::Storage(error) => AeroError::from(error),
+    }
+}
+
 /// May `caller` read the workspace's audit trail? Restricted to admins/owners —
 /// the trail exposes who-did-what across the tenant, so members/guests are denied.
 ///
@@ -214,7 +257,9 @@ pub fn authorize_export(caller: WorkspaceRole) -> AeroResult<()> {
     if caller.can_manage_workspace() {
         Ok(())
     } else {
-        Err(AeroError::Forbidden("workspace export requires owner".into()))
+        Err(AeroError::Forbidden(
+            "workspace export requires owner".into(),
+        ))
     }
 }
 
@@ -229,7 +274,9 @@ pub fn authorize_delete(caller: WorkspaceRole) -> AeroResult<()> {
     if caller.can_manage_workspace() {
         Ok(())
     } else {
-        Err(AeroError::Forbidden("workspace deletion requires owner".into()))
+        Err(AeroError::Forbidden(
+            "workspace deletion requires owner".into(),
+        ))
     }
 }
 
@@ -245,7 +292,9 @@ pub fn authorize_set_retention(caller: WorkspaceRole) -> AeroResult<()> {
     if caller.can_administer() {
         Ok(())
     } else {
-        Err(AeroError::Forbidden("setting retention requires admin".into()))
+        Err(AeroError::Forbidden(
+            "setting retention requires admin".into(),
+        ))
     }
 }
 
@@ -254,7 +303,9 @@ pub fn authorize_rename(caller: WorkspaceRole) -> AeroResult<()> {
     if caller.can_administer() {
         Ok(())
     } else {
-        Err(AeroError::Forbidden("renaming a workspace requires admin".into()))
+        Err(AeroError::Forbidden(
+            "renaming a workspace requires admin".into(),
+        ))
     }
 }
 
@@ -267,7 +318,7 @@ async fn caller_role(
     workspace: WorkspaceId,
     caller: ParticipantId,
 ) -> AeroResult<WorkspaceRole> {
-    repo.member_role(workspace, caller)
+    repo.effective_member_role(workspace, caller)
         .await
         .map_err(AeroError::from)?
         .ok_or_else(|| AeroError::Forbidden("not a workspace member".into()))
@@ -297,10 +348,7 @@ async fn create_workspace(
         return Err(AeroError::Invalid("workspace name too long".into()).into());
     }
     if !is_valid_slug(slug) {
-        return Err(AeroError::Invalid(
-            "slug must be 1-64 chars of [a-z0-9-]".into(),
-        )
-        .into());
+        return Err(AeroError::Invalid("slug must be 1-64 chars of [a-z0-9-]".into()).into());
     }
     let ws = s
         .workspaces
@@ -341,8 +389,14 @@ async fn list_members(
     let ws = parse_workspace_id(&id_str)?;
     // Membership gate: resolving the caller's role rejects non-members with 403.
     caller_role(&s.workspaces, ws, auth.participant_id).await?;
-    let members = s.workspaces.list_members(ws).await.map_err(AeroError::from)?;
-    Ok(Json(serde_json::to_value(members).map_err(AeroError::from)?))
+    let members = s
+        .workspaces
+        .list_members(ws)
+        .await
+        .map_err(AeroError::from)?;
+    Ok(Json(
+        serde_json::to_value(members).map_err(AeroError::from)?,
+    ))
 }
 
 #[derive(Deserialize)]
@@ -458,7 +512,10 @@ async fn export_audit_csv(
     let csv = aero_storage::events_to_csv(&events);
     use axum::http::{header, HeaderMap, HeaderName, HeaderValue};
     let mut headers = HeaderMap::new();
-    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/csv; charset=utf-8"));
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/csv; charset=utf-8"),
+    );
     headers.insert(
         header::CONTENT_DISPOSITION,
         HeaderValue::from_static("attachment; filename=\"audit.csv\""),
@@ -501,8 +558,18 @@ async fn export_workspace(
         .ok_or_else(|| AeroError::NotFound("workspace".into()))?;
     // Record that an export was taken, into the workspace's own audit trail
     // (the export already happened, so this row is not part of the snapshot).
-    audit(&s, ws, auth.participant_id, "workspace.export", None, serde_json::json!({})).await;
-    Ok(Json(serde_json::to_value(snapshot).map_err(AeroError::from)?))
+    audit(
+        &s,
+        ws,
+        auth.participant_id,
+        "workspace.export",
+        None,
+        serde_json::json!({}),
+    )
+    .await;
+    Ok(Json(
+        serde_json::to_value(snapshot).map_err(AeroError::from)?,
+    ))
 }
 
 /// `DELETE /api/workspaces/:id` — **owner-only**: hard-delete the workspace and
@@ -532,23 +599,22 @@ async fn update_workspace(
     Json(req): Json<UpdateWorkspaceReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let ws = parse_workspace_id(&id_str)?;
-    let caller = caller_role(&s.workspaces, ws, auth.participant_id).await?;
-    authorize_rename(caller)?;
 
     let name = req.name.trim().to_owned();
     if name.is_empty() {
         return Err(AeroError::Invalid("name must not be empty".into()).into());
     }
     if name.chars().count() > MAX_NAME_LEN {
-        return Err(AeroError::Invalid(
-            format!("name must be at most {MAX_NAME_LEN} characters"),
-        ).into());
+        return Err(
+            AeroError::Invalid(format!("name must be at most {MAX_NAME_LEN} characters")).into(),
+        );
     }
 
-    let updated = s.workspaces.update_name(ws, &name).await.map_err(AeroError::from)?;
-    if !updated {
-        return Err(AeroError::NotFound("workspace".into()).into());
-    }
+    let workspace = s
+        .workspaces
+        .update_name_authorized(ws, &name, auth.participant_id)
+        .await
+        .map_err(AeroError::from)?;
 
     audit(
         &s,
@@ -560,13 +626,9 @@ async fn update_workspace(
     )
     .await;
 
-    let workspace = s
-        .workspaces
-        .get(ws)
-        .await
-        .map_err(AeroError::from)?
-        .ok_or_else(|| AeroError::NotFound("workspace".into()))?;
-    Ok(Json(serde_json::to_value(workspace).map_err(AeroError::from)?))
+    Ok(Json(
+        serde_json::to_value(workspace).map_err(AeroError::from)?,
+    ))
 }
 
 async fn delete_workspace(
@@ -575,11 +637,11 @@ async fn delete_workspace(
     Path(id_str): Path<String>,
 ) -> ApiResult<StatusCode> {
     let ws = parse_workspace_id(&id_str)?;
-    let caller = caller_role(&s.workspaces, ws, auth.participant_id).await?;
-    authorize_delete(caller)?;
-    // Best-effort audit BEFORE deletion (the row cascade-deletes with the tenant).
-    audit(&s, ws, auth.participant_id, "workspace.delete", None, serde_json::json!({})).await;
-    let deleted = s.workspaces.delete(ws).await.map_err(AeroError::from)?;
+    let deleted = s
+        .workspaces
+        .delete_authorized(ws, auth.participant_id)
+        .await
+        .map_err(AeroError::from)?;
     if !deleted {
         // Raced with another deleter between the role check and the delete.
         return Err(AeroError::NotFound("workspace".into()).into());
@@ -610,13 +672,11 @@ async fn set_retention(
     Json(req): Json<SetRetentionReq>,
 ) -> ApiResult<StatusCode> {
     let ws = parse_workspace_id(&id_str)?;
-    let caller = caller_role(&s.workspaces, ws, auth.participant_id).await?;
-    authorize_set_retention(caller)?;
     // Reject a non-positive window before touching the DB (pure storage rule).
     validate_retention_days(req.days)
         .map_err(|n| AeroError::Invalid(format!("retention days must be >= 1, got {n}")))?;
     s.workspaces
-        .set_retention(ws, req.days)
+        .set_retention_authorized(ws, req.days, auth.participant_id)
         .await
         .map_err(AeroError::from)?;
     audit(
@@ -646,13 +706,11 @@ async fn add_member(
 ) -> ApiResult<StatusCode> {
     let ws = parse_workspace_id(&id_str)?;
     let target = parse_participant_id(&req.participant_id)?;
-    let caller = caller_role(&s.workspaces, ws, auth.participant_id).await?;
-    // Pure RBAC decision: caller may invite *and* may grant the requested role.
-    authorize_invite(caller, req.role)?;
-    s.workspaces
-        .add_member(ws, target, req.role)
+    let inserted = s
+        .workspaces
+        .add_member_authorized(ws, auth.participant_id, target, req.role)
         .await
-        .map_err(AeroError::from)?;
+        .map_err(map_member_write_error)?;
     audit(
         &s,
         ws,
@@ -662,9 +720,11 @@ async fn add_member(
         serde_json::json!({ "role": req.role }),
     )
     .await;
-    // Onboarding: auto-join the new member into this workspace's default channels
-    // (Wave 12). Best-effort — never fails the member-add.
-    crate::default_channels::auto_join_defaults(&s, ws, target).await;
+    // Only a newly-created ordinary membership receives onboarding defaults.
+    // Replays and single-channel guests must never expand room access.
+    if inserted && req.role != WorkspaceRole::Guest {
+        crate::default_channels::auto_join_defaults(&s, ws, target).await;
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -682,24 +742,11 @@ async fn change_member_role(
 ) -> ApiResult<StatusCode> {
     let ws = parse_workspace_id(&id_str)?;
     let subject_id = parse_participant_id(&pid_str)?;
-    let caller = caller_role(&s.workspaces, ws, auth.participant_id).await?;
-    // The subject must already be a member (else there's no role to change).
     let subject_role = s
         .workspaces
-        .member_role(ws, subject_id)
+        .change_member_role_authorized(ws, auth.participant_id, subject_id, req.role)
         .await
-        .map_err(AeroError::from)?
-        .ok_or_else(|| AeroError::NotFound("workspace member".into()))?;
-    // Pure RBAC decision over (caller, new_role, current subject role).
-    authorize_role_change(caller, req.role, subject_role)?;
-    // Single idempotent upsert: `update_member_role` overwrites an existing
-    // member's role atomically, replacing the prior remove-then-add dance (which
-    // briefly dropped the member and risked leaving them removed if the re-add
-    // failed).
-    s.workspaces
-        .update_member_role(ws, subject_id, req.role)
-        .await
-        .map_err(AeroError::from)?;
+        .map_err(map_member_write_error)?;
     audit(
         &s,
         ws,
@@ -720,20 +767,12 @@ async fn remove_member(
 ) -> ApiResult<StatusCode> {
     let ws = parse_workspace_id(&id_str)?;
     let subject_id = parse_participant_id(&pid_str)?;
-    let caller = caller_role(&s.workspaces, ws, auth.participant_id).await?;
     let subject_role = s
         .workspaces
-        .member_role(ws, subject_id)
+        .remove_member_authorized(ws, auth.participant_id, subject_id)
         .await
-        .map_err(AeroError::from)?
-        .ok_or_else(|| AeroError::NotFound("workspace member".into()))?;
+        .map_err(map_member_write_error)?;
     let is_self = subject_id == auth.participant_id;
-    // Pure RBAC decision; self-removal ("leave") has its own owner-orphan rule.
-    authorize_remove(caller, subject_role, is_self)?;
-    s.workspaces
-        .remove_member(ws, subject_id)
-        .await
-        .map_err(AeroError::from)?;
     audit(
         &s,
         ws,
@@ -775,7 +814,12 @@ async fn mute_workspace(
     let workspace = parse_workspace_for_mute(&id_str)?;
     // Verify caller is a workspace member.
     let ws_repo = WorkspaceRepo::new(s.pg.clone());
-    if ws_repo.member_role(workspace, auth.participant_id).await.map_err(AeroError::from)?.is_none() {
+    if ws_repo
+        .effective_member_role(workspace, auth.participant_id)
+        .await
+        .map_err(AeroError::from)?
+        .is_none()
+    {
         return Err(AeroError::Forbidden(format!(
             "{} is not a member of workspace {}",
             auth.participant_id, workspace
@@ -853,26 +897,18 @@ async fn update_branding(
     Json(req): Json<UpdateBrandingReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let ws = parse_workspace_id(&id_str)?;
-    let caller = caller_role(&s.workspaces, ws, auth.participant_id).await?;
-    // Admin/owner only — branding is a workspace administration action.
-    if !caller.can_administer() {
-        return Err(AeroError::Forbidden("updating workspace branding requires admin".into()).into());
-    }
-
-    let updated = s
+    let workspace = s
         .workspaces
-        .update_branding(
+        .update_branding_authorized(
             ws,
             req.logo_url.as_deref(),
             req.color_scheme.as_deref(),
             req.custom_domain.as_deref(),
             req.description.as_deref(),
+            auth.participant_id,
         )
         .await
         .map_err(AeroError::from)?;
-    if !updated {
-        return Err(AeroError::NotFound("workspace".into()).into());
-    }
 
     audit(
         &s,
@@ -889,13 +925,9 @@ async fn update_branding(
     )
     .await;
 
-    let workspace = s
-        .workspaces
-        .get(ws)
-        .await
-        .map_err(AeroError::from)?
-        .ok_or_else(|| AeroError::NotFound("workspace".into()))?;
-    Ok(Json(serde_json::to_value(workspace).map_err(AeroError::from)?))
+    Ok(Json(
+        serde_json::to_value(workspace).map_err(AeroError::from)?,
+    ))
 }
 
 // ----------------------------------------- notification defaults (ROADMAP12, migration 0119)
@@ -917,11 +949,20 @@ async fn get_notif_defaults(
 ) -> ApiResult<Json<serde_json::Value>> {
     let ws = parse_workspace_id(&id_str)?;
     // Any workspace member may read the setting.
-    if s.workspaces.member_role(ws, auth.participant_id).await.map_err(AeroError::from)?.is_none() {
+    if s.workspaces
+        .effective_member_role(ws, auth.participant_id)
+        .await
+        .map_err(AeroError::from)?
+        .is_none()
+    {
         return Err(AeroError::Forbidden("not a workspace member".into()).into());
     }
     let repo = WorkspaceNotifDefaultsRepo::new(s.pg.clone());
-    let level = repo.get(ws).await.map_err(AeroError::from)?.unwrap_or_else(|| "all".to_owned());
+    let level = repo
+        .get(ws)
+        .await
+        .map_err(AeroError::from)?
+        .unwrap_or_else(|| "all".to_owned());
     Ok(Json(serde_json::json!({ "default_level": level })))
 }
 
@@ -934,18 +975,20 @@ async fn set_notif_defaults(
     Json(req): Json<NotifDefaultsReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let ws = parse_workspace_id(&id_str)?;
-    let caller = caller_role(&s.workspaces, ws, auth.participant_id).await?;
-    if !caller.can_administer() {
-        return Err(AeroError::Forbidden("setting workspace notification defaults requires admin".into()).into());
-    }
     if !matches!(req.default_level.as_str(), "all" | "mentions" | "none") {
-        return Err(AeroError::Invalid("default_level must be 'all', 'mentions', or 'none'".into()).into());
+        return Err(AeroError::Invalid(
+            "default_level must be 'all', 'mentions', or 'none'".into(),
+        )
+        .into());
     }
     let repo = WorkspaceNotifDefaultsRepo::new(s.pg.clone());
-    repo.set(ws, &req.default_level).await.map_err(AeroError::from)?;
-    Ok(Json(serde_json::json!({ "ok": true, "default_level": req.default_level })))
+    repo.set_authorized(ws, &req.default_level, auth.participant_id)
+        .await
+        .map_err(AeroError::from)?;
+    Ok(Json(
+        serde_json::json!({ "ok": true, "default_level": req.default_level }),
+    ))
 }
-
 
 #[cfg(test)]
 pub mod tests;

@@ -5,6 +5,7 @@
   "type": "module",
   "description": "Aero IM 原生 ES-module SPA（无构建工具）。本 package.json 仅供「npm 可用时」的完整前端门：ESLint。沙箱主门是 scripts/web-check.sh（node-only，无需 npm install）。",
   "scripts": {
+    "test": "node --test api.test.js canvas.test.js compliance_admin.test.js delivery.test.js delivery_cursor.test.js ws.test.js security_admin.test.js governance_utils.test.js rtc_config.test.js sfu_calls.test.js realtime_events.test.js render_giphy.test.js room_creation.test.js",
     "lint": "eslint .",
     "//note": "需先 `npm install`（沙箱可能无网，此门不阻断；CI 主门见 scripts/web-check.sh）"
   },

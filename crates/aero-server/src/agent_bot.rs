@@ -12,44 +12,76 @@
 use std::sync::Arc;
 
 use aero_ai::AiService;
-use aero_common::{
-    Block, MessageEnvelope, ParticipantId, ParticipantKind, RoomEvent,
-};
+use aero_common::{Block, MessageEnvelope, ParticipantId, ParticipantKind, RoomEvent};
 use aero_im_core::ImService;
-use aero_storage::ParticipantRepo;
-use futures::StreamExt;
+use aero_storage::{ConsumerEventReceiptRepo, ParticipantRepo};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use crate::state::AppState;
+use crate::{
+    state::AppState,
+    task_shutdown::{self, NextOrCancelled},
+};
 
 pub async fn run(state: AppState, ai: Arc<AiService>) -> anyhow::Result<()> {
+    run_until_cancelled(state, ai, CancellationToken::new()).await
+}
+
+/// Run until `cancel` is triggered, finishing and ACKing any event already
+/// received before returning.
+pub async fn run_until_cancelled(
+    state: AppState,
+    ai: Arc<AiService>,
+    cancel: CancellationToken,
+) -> anyhow::Result<()> {
     let bus = state.bus.clone();
+    let receipts = ConsumerEventReceiptRepo::new(state.pg.clone());
     // Resubscribe across NATS reconnects so a dropped stream never permanently
     // stops the bot (mirrors `ws::run_bus_listener`). Durable consumer "aero-bot"
     // resumes from its committed cursor; every message is acked, so none is replayed.
     loop {
-        let mut stream = match bus.subscribe("im.room.*", Some("aero-bot")).await {
-            Ok(s) => s,
-            Err(e) => {
+        let subscribed =
+            task_shutdown::subscribe_or_cancelled(&bus, "im.room.*", Some("aero-bot"), &cancel)
+                .await;
+        let mut stream = match subscribed {
+            None => return Ok(()),
+            Some(Ok(s)) => s,
+            Some(Err(e)) => {
                 warn!(error = %e, "agent_bot subscribe failed; retrying");
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                if task_shutdown::delay_or_cancelled(std::time::Duration::from_secs(1), &cancel)
+                    .await
+                {
+                    return Ok(());
+                }
                 continue;
             }
         };
         info!("agent_bot listener started");
-        while let Some(sub) = stream.next().await {
-            match serde_json::from_slice::<RoomEvent>(sub.payload()) {
-                Ok(RoomEvent::Message(env)) => {
-                    if let Err(e) = handle(&state, &ai, env).await {
-                        warn!(error = ?e, "agent_bot handle failed");
+        loop {
+            let sub = match task_shutdown::next_or_cancelled(&mut stream, &cancel).await {
+                NextOrCancelled::Item(sub) => sub,
+                NextOrCancelled::Ended => break,
+                NextOrCancelled::Cancelled => return Ok(()),
+            };
+            let event = serde_json::from_slice::<RoomEvent>(sub.payload());
+            let handler_state = &state;
+            let handler_ai = &ai;
+            let _ =
+                crate::consumer_event_receipt::process(&receipts, "aero-bot", sub, || async move {
+                    match event {
+                        Ok(RoomEvent::Message(env)) => handle(handler_state, handler_ai, env).await,
+                        Ok(_) | Err(_) => Ok(()),
                     }
-                }
-                Ok(_) | Err(_) => {}
-            }
-            let _ = sub.ack().await;
+                })
+                .await;
+        }
+        if cancel.is_cancelled() {
+            return Ok(());
         }
         warn!("agent_bot subscription stream ended; resubscribing");
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        if task_shutdown::delay_or_cancelled(std::time::Duration::from_secs(1), &cancel).await {
+            return Ok(());
+        }
     }
 }
 
@@ -71,6 +103,11 @@ async fn handle(state: &AppState, ai: &Arc<AiService>, env: MessageEnvelope) -> 
     let im: &Arc<ImService> = &state.im;
     let room = env.message.room_id;
     let sender = env.message.sender_id;
+    let workspace = state
+        .rooms
+        .room_workspace(room)
+        .await?
+        .map(|value| value.to_uuid());
 
     for mention in mentions {
         let bot = match participants.get(mention).await? {
@@ -93,8 +130,17 @@ async fn handle(state: &AppState, ai: &Arc<AiService>, env: MessageEnvelope) -> 
             continue;
         }
 
-        let answer = match ai.answer_question(room, &question, 8).await {
-            Ok(a) => a,
+        let usage_context = aero_ai::usage::UsageContext::for_request(
+            &env.message.id.to_string(),
+            bot.id.to_uuid(),
+            &format!("agent_bot:{room}:{}:{question}", bot.id),
+            workspace,
+        );
+        let answer = match ai
+            .answer_question_with_usage_context(room, &question, 8, usage_context)
+            .await
+        {
+            Ok((answer, _)) => answer,
             Err(e) => {
                 warn!(error = ?e, "ai.answer_question failed");
                 aero_ai::AnswerResult {
@@ -112,9 +158,15 @@ async fn handle(state: &AppState, ai: &Arc<AiService>, env: MessageEnvelope) -> 
                 "title": "引用",
                 "body": answer.citations.iter().map(|m| m.to_string()).collect::<Vec<_>>().join(", "),
             });
-            blocks.push(Block::Card { schema: "citation".into(), payload });
+            blocks.push(Block::Card {
+                schema: "citation".into(),
+                payload,
+            });
         }
-        if let Err(e) = im.send_message(bot.id, room, blocks, Some(env.message.id), None).await {
+        if let Err(e) = im
+            .send_message(bot.id, room, blocks, Some(env.message.id), None)
+            .await
+        {
             warn!(error = ?e, "bot reply send failed");
         } else {
             info!(bot = %bot.id, %room, "bot replied");

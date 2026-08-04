@@ -157,7 +157,11 @@ mod tests {
         assert_eq!(clamp_limit(0), 1, "zero floors to 1");
         assert_eq!(clamp_limit(-5), 1, "negative floors to 1");
         assert_eq!(clamp_limit(50), 50, "in-range passes through");
-        assert_eq!(clamp_limit(MAX_FILES_LIMIT), MAX_FILES_LIMIT, "cap passes through");
+        assert_eq!(
+            clamp_limit(MAX_FILES_LIMIT),
+            MAX_FILES_LIMIT,
+            "cap passes through"
+        );
         assert_eq!(clamp_limit(10_000), MAX_FILES_LIMIT, "over-cap clamps down");
     }
 
@@ -238,12 +242,12 @@ mod db_tests {
         id
     }
 
-    /// Create a throwaway channel room owned by `creator`, in the default workspace.
+    /// Create a throwaway group room owned by `creator`, in the default workspace.
     async fn mk_room(p: &PgPool, creator: ParticipantId) -> RoomId {
         let id = RoomId::new();
         sqlx::query(
             "INSERT INTO rooms (id, kind, name, created_by, workspace_id) \
-             VALUES ($1, 'channel', $2, $3, '00000000-0000-0000-0000-000000000000')",
+             VALUES ($1, 'group', $2, $3, '00000000-0000-0000-0000-000000000000')",
         )
         .bind(id.to_uuid())
         .bind(format!("file-index-room-{id}"))
@@ -256,15 +260,23 @@ mod db_tests {
     }
 
     /// Insert a message with an explicit id and raw `blocks` JSON.
-    async fn mk_message(p: &PgPool, id: MessageId, room: RoomId, sender: ParticipantId, blocks: &str) {
-        sqlx::query("INSERT INTO messages (id, room_id, sender_id, blocks) VALUES ($1, $2, $3, $4::jsonb)")
-            .bind(id.to_uuid())
-            .bind(room.to_uuid())
-            .bind(sender.to_uuid())
-            .bind(blocks)
-            .execute(p)
-            .await
-            .expect("insert message");
+    async fn mk_message(
+        p: &PgPool,
+        id: MessageId,
+        room: RoomId,
+        sender: ParticipantId,
+        blocks: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO messages (id, room_id, sender_id, blocks) VALUES ($1, $2, $3, $4::jsonb)",
+        )
+        .bind(id.to_uuid())
+        .bind(room.to_uuid())
+        .bind(sender.to_uuid())
+        .bind(blocks)
+        .execute(p)
+        .await
+        .expect("insert message");
     }
 
     #[tokio::test]
@@ -333,7 +345,10 @@ mod db_tests {
         assert_eq!(page[0].message_id, older);
         // Paging past the oldest yields nothing.
         assert!(
-            repo.list_for_room(room, Some(older), 50).await.unwrap().is_empty(),
+            repo.list_for_room(room, Some(older), 50)
+                .await
+                .unwrap()
+                .is_empty(),
             "before-oldest yields nothing"
         );
 

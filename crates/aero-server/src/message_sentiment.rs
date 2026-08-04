@@ -24,6 +24,7 @@ use aero_common::{Error as AeroError, MessageId};
 use aero_storage::MessageRepo;
 use axum::{
     extract::{Path, State},
+    http::HeaderMap,
     routing::post,
     Json, Router,
 };
@@ -55,6 +56,7 @@ fn parse_message(s: &str) -> Result<MessageId, AeroError> {
 async fn message_sentiment(
     State(s): State<AppState>,
     auth: AuthUser,
+    headers: HeaderMap,
     Path(id_str): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let id = parse_message(&id_str)?;
@@ -69,18 +71,32 @@ async fn message_sentiment(
         .filter(|m| m.deleted_at.is_none())
         .ok_or_else(|| AeroError::NotFound(format!("message {id}")))?;
     // Workspace + room membership guard (read-only; `ImService` is not mutated).
-    s.im.assert_room_access(auth.participant_id, target.room_id).await?;
+    s.im.assert_room_access(auth.participant_id, target.room_id)
+        .await?;
 
     let text = target.searchable_text();
 
     // Degrade like the other AI routes: `502` when no AI backend is wired; a wired
     // backend scores heuristically when no LLM key is set.
-    let ai = s
-        .ai
-        .as_ref()
-        .ok_or_else(|| AeroError::Upstream("AI not configured".into()))?;
+    let ai =
+        s.ai.as_ref()
+            .ok_or_else(|| AeroError::Upstream("AI not configured".into()))?;
+    let workspace = s
+        .rooms
+        .room_workspace(target.room_id)
+        .await
+        .map_err(AeroError::from)?
+        .map(|value| value.to_uuid());
     let score = ai
-        .score_sentiment(&text)
+        .score_sentiment_with_usage_context(
+            &text,
+            crate::ai_usage::request_usage_context(
+                &headers,
+                auth.participant_id,
+                workspace,
+                &format!("message_sentiment:{id}:{text}"),
+            ),
+        )
         .await
         .map_err(|e| AeroError::Upstream(format!("ai: {e}")))?;
 
@@ -106,7 +122,11 @@ mod db_tests {
 
     async fn pool() -> aero_storage::PgPool {
         let url = std::env::var("DATABASE_URL").expect("DATABASE_URL");
-        PgPoolOptions::new().max_connections(2).connect(&url).await.expect("connect")
+        PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .expect("connect")
     }
 
     // Seed a throwaway participant + room (in the all-zero default workspace) so a
@@ -177,8 +197,16 @@ mod db_tests {
             .await
             .expect("scoring is infallible without a key");
 
-        assert_eq!(score.sentiment, Sentiment::Positive, "positive words read positive");
-        assert!(score.toxicity < 0.1, "positive message is low toxicity, got {}", score.toxicity);
+        assert_eq!(
+            score.sentiment,
+            Sentiment::Positive,
+            "positive words read positive"
+        );
+        assert!(
+            score.toxicity < 0.1,
+            "positive message is low toxicity, got {}",
+            score.toxicity
+        );
         assert!(!score.tone.is_empty(), "tone label is well-formed");
     }
 
@@ -202,7 +230,11 @@ mod db_tests {
             .expect("infallible");
 
         assert_eq!(score.sentiment, Sentiment::Negative);
-        assert!(score.toxicity >= 0.8, "insult => high toxicity, got {}", score.toxicity);
+        assert!(
+            score.toxicity >= 0.8,
+            "insult => high toxicity, got {}",
+            score.toxicity
+        );
         assert_eq!(score.tone, "angry");
     }
 }

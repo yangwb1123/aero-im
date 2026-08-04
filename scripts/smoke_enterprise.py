@@ -105,7 +105,7 @@ def main():
 
     say("webhook: create an outgoing hook")
     out = req("POST", f"/api/rooms/{Wid}/webhooks/outgoing",
-              {"url": "http://127.0.0.1:9/none", "events": ["message"], "label": "ext"}, token=A)
+              {"url": "https://example.com/aero-hook", "events": ["message"], "label": "ext"}, token=A)
     if not out.get("secret"): fail(f"no secret returned: {out}")
     ok("outgoing webhook created (signing secret returned once)")
 

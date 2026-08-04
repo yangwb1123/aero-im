@@ -2,7 +2,8 @@
 //!
 //! Any authenticated user can file a report against another participant. Workspace
 //! admins list pending reports for their workspace and resolve them (mark
-//! `"reviewed"` or `"dismissed"`). Thin handlers over
+//! `"reviewed"` or `"dismissed"`). Tenant binding and mutation-time
+//! authorization are owned by
 //! [`UserReportRepo`](aero_storage::UserReportRepo).
 
 use std::str::FromStr;
@@ -45,14 +46,13 @@ fn parse_participant(s: &str) -> Result<ParticipantId, AeroError> {
 }
 
 fn parse_workspace(s: &str) -> Result<WorkspaceId, AeroError> {
-    WorkspaceId::from_str(s.trim())
-        .map_err(|e| AeroError::Invalid(format!("workspace id: {e}")))
+    WorkspaceId::from_str(s.trim()).map_err(|e| AeroError::Invalid(format!("workspace id: {e}")))
 }
 
 async fn assert_admin(s: &AppState, auth: &AuthUser, workspace: WorkspaceId) -> ApiResult<()> {
     let role = s
         .workspaces
-        .member_role(workspace, auth.participant_id)
+        .effective_member_role(workspace, auth.participant_id)
         .await
         .map_err(AeroError::from)?;
     match role {
@@ -95,7 +95,7 @@ async fn create_report(
         return Err(AeroError::Invalid("reason too long".into()).into());
     }
     let id = repo(&s)
-        .create(auth.participant_id, reported, workspace, reason)
+        .create_authorized(auth.participant_id, reported, workspace, reason)
         .await?;
     Ok(Json(serde_json::json!({
         "created": id.is_some(),
@@ -119,7 +119,7 @@ async fn list_workspace_reports(
     let workspace = parse_workspace(&ws_str)?;
     assert_admin(&s, &auth, workspace).await?;
     let reports = repo(&s)
-        .list_for_workspace(workspace, q.status.as_deref())
+        .list_for_workspace_authorized(workspace, q.status.as_deref(), auth.participant_id)
         .await?;
     Ok(Json(serde_json::json!({ "reports": reports })))
 }
@@ -143,15 +143,45 @@ async fn resolve_report(
     let report_id = Uuid::from_str(rid_str.trim())
         .map_err(|e| AeroError::Invalid(format!("report id: {e}")))?;
     if !matches!(req.status.as_str(), "reviewed" | "dismissed") {
-        return Err(
-            AeroError::Invalid("status must be 'reviewed' or 'dismissed'".into()).into(),
+        return Err(AeroError::Invalid("status must be 'reviewed' or 'dismissed'".into()).into());
+    }
+    repo(&s)
+        .resolve_authorized(report_id, workspace, &req.status, auth.participant_id)
+        .await
+        .map_err(map_report_mutation_error)?;
+    Ok(Json(
+        serde_json::json!({ "resolved": true, "status": req.status }),
+    ))
+}
+
+fn map_report_mutation_error(error: AeroError) -> AeroError {
+    match error {
+        AeroError::Forbidden(_) => {
+            AeroError::Forbidden("current workspace admin access required".into())
+        }
+        AeroError::NotFound(_) => AeroError::NotFound("pending user report".into()),
+        other => other,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::map_report_mutation_error;
+    use aero_common::Error;
+
+    #[test]
+    fn report_mutation_errors_do_not_disclose_scope_details() {
+        let forbidden =
+            map_report_mutation_error(Error::Forbidden("revoked participant detail".into()));
+        assert_eq!(forbidden.status_code(), 403);
+        assert_eq!(
+            forbidden.to_string(),
+            "forbidden: current workspace admin access required"
         );
+
+        let missing =
+            map_report_mutation_error(Error::NotFound("cross-tenant report id detail".into()));
+        assert_eq!(missing.status_code(), 404);
+        assert_eq!(missing.to_string(), "not found: pending user report");
     }
-    let updated = repo(&s)
-        .resolve(report_id, workspace, &req.status)
-        .await?;
-    if !updated {
-        return Err(AeroError::NotFound(format!("pending report {report_id}")).into());
-    }
-    Ok(Json(serde_json::json!({ "resolved": true, "status": req.status })))
 }

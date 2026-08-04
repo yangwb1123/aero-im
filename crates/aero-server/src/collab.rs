@@ -5,13 +5,11 @@
 //! repositories. Mounted via [`routes`] and `.merge`d into the main router,
 //! mirroring [`crate::workspaces`].
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::str::FromStr;
 
 use aero_auth::AuthUser;
-use aero_common::{
-    Error as AeroError, MessageId, NotificationId, RoomId, RoomUnread,
-};
+use aero_common::{Error as AeroError, MessageId, NotificationId, RoomId, RoomUnread};
 use axum::{
     extract::{Path, Query, State},
     routing::{get, post},
@@ -21,6 +19,8 @@ use serde::Deserialize;
 
 use crate::error::ApiResult;
 use crate::state::AppState;
+
+const MAX_NOTIFICATION_IDS_PER_REQUEST: usize = 100;
 
 /// All collaboration routes, ready to `.merge` into the gateway router.
 pub fn routes() -> Router<AppState> {
@@ -34,7 +34,10 @@ pub fn routes() -> Router<AppState> {
         .route("/api/unread", get(list_unread))
         // Pinned messages
         .route("/api/rooms/:id/pins", get(list_pins).post(pin_message))
-        .route("/api/rooms/:id/pins/:message_id", axum::routing::delete(unpin_message))
+        .route(
+            "/api/rooms/:id/pins/:message_id",
+            axum::routing::delete(unpin_message),
+        )
 }
 
 fn parse_room(s: &str) -> Result<RoomId, AeroError> {
@@ -70,7 +73,8 @@ async fn thread(
         .get(root)
         .await?
         .ok_or_else(|| AeroError::NotFound(format!("message {root}")))?;
-    s.im.assert_room_access(auth.participant_id, root_msg.room_id).await?;
+    s.im.assert_room_access(auth.participant_id, root_msg.room_id)
+        .await?;
 
     let after = match q.after.as_deref() {
         Some(c) => Some(parse_message(c)?),
@@ -141,6 +145,25 @@ struct MarkReadReq {
     room_id: Option<String>,
 }
 
+fn parse_notification_ids(raw_ids: &[String]) -> Result<Vec<NotificationId>, AeroError> {
+    if raw_ids.len() > MAX_NOTIFICATION_IDS_PER_REQUEST {
+        return Err(AeroError::Invalid(format!(
+            "ids must contain at most {MAX_NOTIFICATION_IDS_PER_REQUEST} entries"
+        )));
+    }
+
+    let mut seen = HashSet::with_capacity(raw_ids.len());
+    let mut ids = Vec::with_capacity(raw_ids.len());
+    for raw in raw_ids {
+        let id = NotificationId::from_str(raw)
+            .map_err(|e| AeroError::Invalid(format!("notification id: {e}")))?;
+        if seen.insert(id) {
+            ids.push(id);
+        }
+    }
+    Ok(ids)
+}
+
 /// `POST /api/notifications/read` — mark notifications read. Always scoped to the
 /// caller, so they can never flip another user's inbox.
 async fn mark_notifications_read(
@@ -148,19 +171,22 @@ async fn mark_notifications_read(
     auth: AuthUser,
     Json(req): Json<MarkReadReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    if req.ids.len() > MAX_NOTIFICATION_IDS_PER_REQUEST {
+        return Err(AeroError::Invalid(format!(
+            "ids must contain at most {MAX_NOTIFICATION_IDS_PER_REQUEST} entries"
+        ))
+        .into());
+    }
     let updated = if req.all {
         let room = match req.room_id.as_deref() {
             Some(r) => Some(parse_room(r)?),
             None => None,
         };
-        s.notifications.mark_all_read(auth.participant_id, room).await?
+        s.notifications
+            .mark_all_read(auth.participant_id, room)
+            .await?
     } else {
-        let ids: Vec<NotificationId> = req
-            .ids
-            .iter()
-            .map(|s| NotificationId::from_str(s))
-            .collect::<Result<_, _>>()
-            .map_err(|e| AeroError::Invalid(format!("notification id: {e}")))?;
+        let ids = parse_notification_ids(&req.ids)?;
         s.notifications.mark_read(auth.participant_id, &ids).await?
     };
     Ok(Json(serde_json::json!({ "updated": updated })))
@@ -179,12 +205,20 @@ async fn list_unread(
     let mut map: BTreeMap<RoomId, RoomUnread> = BTreeMap::new();
     for (room_id, unread) in msgs {
         map.entry(room_id)
-            .or_insert(RoomUnread { room_id, unread: 0, mentions: 0 })
+            .or_insert(RoomUnread {
+                room_id,
+                unread: 0,
+                mentions: 0,
+            })
             .unread = unread;
     }
     for (room_id, m) in mentions {
         map.entry(room_id)
-            .or_insert(RoomUnread { room_id, unread: 0, mentions: 0 })
+            .or_insert(RoomUnread {
+                room_id,
+                unread: 0,
+                mentions: 0,
+            })
             .mentions = m;
     }
     Ok(Json(map.into_values().collect()))
@@ -218,7 +252,9 @@ async fn pin_message(
     let room = parse_room(&room_str)?;
     let message = parse_message(&req.message_id)?;
     let created = s.im.pin_message(auth.participant_id, room, message).await?;
-    Ok(Json(serde_json::json!({ "pinned": true, "created": created })))
+    Ok(Json(
+        serde_json::json!({ "pinned": true, "created": created }),
+    ))
 }
 
 /// `DELETE /api/rooms/:id/pins/:message_id` — unpin a message.
@@ -229,6 +265,30 @@ async fn unpin_message(
 ) -> ApiResult<Json<serde_json::Value>> {
     let room = parse_room(&room_str)?;
     let message = parse_message(&message_str)?;
-    let removed = s.im.unpin_message(auth.participant_id, room, message).await?;
-    Ok(Json(serde_json::json!({ "pinned": false, "removed": removed })))
+    let removed =
+        s.im.unpin_message(auth.participant_id, room, message)
+            .await?;
+    Ok(Json(
+        serde_json::json!({ "pinned": false, "removed": removed }),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn notification_mark_read_ids_are_bounded_and_deduplicated() {
+        let id = NotificationId::new().to_string();
+        let parsed = parse_notification_ids(&[id.clone(), id]).expect("valid ids");
+        assert_eq!(parsed.len(), 1);
+
+        let oversized = (0..=MAX_NOTIFICATION_IDS_PER_REQUEST)
+            .map(|_| NotificationId::new().to_string())
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            parse_notification_ids(&oversized),
+            Err(AeroError::Invalid(_))
+        ));
+    }
 }

@@ -76,8 +76,12 @@ mod redis_tests {
 
     async fn client() -> RedisClient {
         let url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".into());
-        let c =
-            RedisClient::new(fred::types::RedisConfig::from_url(&url).unwrap(), None, None, None);
+        let c = RedisClient::new(
+            fred::types::RedisConfig::from_url(&url).unwrap(),
+            None,
+            None,
+            None,
+        );
         c.connect();
         c.wait_for_connect().await.unwrap();
         c
@@ -94,7 +98,11 @@ mod redis_tests {
         let a1 = store.next(&a).await.unwrap();
         let a2 = store.next(&a).await.unwrap();
         let a3 = store.next(&a).await.unwrap();
-        assert_eq!((a1, a2, a3), (1, 2, 3), "fresh subject counts from 1, strictly increasing");
+        assert_eq!(
+            (a1, a2, a3),
+            (1, 2, 3),
+            "fresh subject counts from 1, strictly increasing"
+        );
 
         // A different subject has its own counter, unaffected by `a`'s.
         assert_eq!(store.next(&b).await.unwrap(), 1);

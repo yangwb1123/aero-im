@@ -9,8 +9,12 @@ use aero_eng::*;
 struct OkCmd;
 #[async_trait::async_trait]
 impl Command for OkCmd {
-    fn name(&self) -> &'static str { "ok" }
-    fn description(&self) -> &'static str { "Always succeeds" }
+    fn name(&self) -> &'static str {
+        "ok"
+    }
+    fn description(&self) -> &'static str {
+        "Always succeeds"
+    }
     async fn execute(&self, _ctx: &ExecutionContext, _args: &[String]) -> Outcome {
         Outcome::ok("ok done")
     }
@@ -20,8 +24,12 @@ impl Command for OkCmd {
 struct ErrCmd;
 #[async_trait::async_trait]
 impl Command for ErrCmd {
-    fn name(&self) -> &'static str { "fail" }
-    fn description(&self) -> &'static str { "Always fails" }
+    fn name(&self) -> &'static str {
+        "fail"
+    }
+    fn description(&self) -> &'static str {
+        "Always fails"
+    }
     async fn execute(&self, _ctx: &ExecutionContext, _args: &[String]) -> Outcome {
         Outcome::error("fail done")
     }
@@ -31,8 +39,12 @@ impl Command for ErrCmd {
 struct ArgCmd;
 #[async_trait::async_trait]
 impl Command for ArgCmd {
-    fn name(&self) -> &'static str { "arg-test" }
-    fn description(&self) -> &'static str { "Tests argument passing" }
+    fn name(&self) -> &'static str {
+        "arg-test"
+    }
+    fn description(&self) -> &'static str {
+        "Tests argument passing"
+    }
     async fn execute(&self, _ctx: &ExecutionContext, args: &[String]) -> Outcome {
         if args.len() > 2 && args[2] == "hello" {
             Outcome::ok("arg received")
@@ -91,10 +103,23 @@ async fn registry_help_returns_ok() {
 async fn registry_arg_passing_works() {
     let reg = test_registry();
     // With correct arg (args[0]=prog, args[1]=cmd, args[2]=arg)
-    let result = reg.execute("arg-test", &["aero-cli".into(), "arg-test".into(), "hello".into()]).await;
-    assert!(result.is_ok(), "arg-test with hello should succeed: {result:?}");
+    let result = reg
+        .execute(
+            "arg-test",
+            &["aero-cli".into(), "arg-test".into(), "hello".into()],
+        )
+        .await;
+    assert!(
+        result.is_ok(),
+        "arg-test with hello should succeed: {result:?}"
+    );
     // Without correct arg
-    let result = reg.execute("arg-test", &["aero-cli".into(), "arg-test".into(), "wrong".into()]).await;
+    let result = reg
+        .execute(
+            "arg-test",
+            &["aero-cli".into(), "arg-test".into(), "wrong".into()],
+        )
+        .await;
     assert!(result.is_err(), "arg-test with wrong arg should fail");
 }
 
@@ -125,10 +150,7 @@ async fn outcome_merge_worst_wins() {
 
 #[tokio::test]
 async fn outcome_merge_all_errors() {
-    let outcomes = vec![
-        Outcome::error("err1"),
-        Outcome::error("err2"),
-    ];
+    let outcomes = vec![Outcome::error("err1"), Outcome::error("err2")];
     let merged = Outcome::merge(&outcomes);
     assert!(merged.is_error());
 }

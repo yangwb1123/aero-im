@@ -22,12 +22,13 @@ pub mod totp;
 
 pub use bot::{BotTokenVerifier, SharedBotVerifier};
 pub use extractor::AuthUser;
-pub use login_throttle::{LockoutConfig, LoginThrottle};
-pub use password_policy::PasswordPolicy;
 pub use jwt::{Claims, JwtCodec, TokenKind};
+pub use login_throttle::{LockoutConfig, LoginThrottle};
 pub use oidc::{
-    validate_id_token, JwksKeyProvider, KeyProvider, OidcClaims, OidcConfig, OidcError,
-    StaticKeyProvider,
+    validate_client_credentials_token, validate_id_token, validate_jwks_uri,
+    ClientCredentialsClaims, ClientCredentialsTokenConfig, JwksKeyProvider, JwksUriError,
+    KeyProvider, OidcClaims, OidcConfig, OidcError, StaticKeyProvider,
 };
+pub use password_policy::PasswordPolicy;
 pub use pat::{PatVerifier, SharedPatVerifier};
 pub use service::{AuthService, AuthTokens, LoginRequest, RegisterRequest, RegisterResponse};

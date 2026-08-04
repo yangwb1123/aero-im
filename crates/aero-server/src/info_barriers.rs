@@ -3,10 +3,11 @@
 //! Microsoft Purview-style: an admin defines barred PAIRS of user-groups
 //! (migration 0033); members across a barred pair may not DM each other or share a
 //! channel. This module owns the admin-facing CRUD over
-//! [`BarrierRepo`](aero_storage::BarrierRepo); the actual ENFORCEMENT lives at the
-//! conversation-creation seams ([`crate::dm`] / [`crate::group_dm`]), which call
-//! [`BarrierRepo::barred`](aero_storage::BarrierRepo::barred) before creating a
-//! room.
+//! [`BarrierRepo`](aero_storage::BarrierRepo). Enforcement runs both at the
+//! conversation-creation seams ([`crate::dm`] / [`crate::group_dm`]) and inside
+//! user-authored message create/edit transactions. Existing DMs and shared rooms
+//! therefore stop accepting cross-barrier communication as soon as the policy or
+//! relevant user-group membership commits.
 //!
 //! ## Authorization
 //!
@@ -27,7 +28,7 @@ use aero_common::{
     BarrierId, Error as AeroError, ParticipantId, Result as AeroResult, UserGroupId, WorkspaceId,
     WorkspaceRole,
 };
-use aero_storage::{BarrierRepo, UserGroupRepo};
+use aero_storage::BarrierRepo;
 use axum::{
     extract::{Path, State},
     routing::{delete, post},
@@ -76,7 +77,9 @@ pub fn authorize_admin(caller: WorkspaceRole) -> AeroResult<()> {
     if caller.can_administer() {
         Ok(())
     } else {
-        Err(AeroError::Forbidden("information barriers require admin".into()))
+        Err(AeroError::Forbidden(
+            "information barriers require admin".into(),
+        ))
     }
 }
 
@@ -90,7 +93,7 @@ async fn assert_admin(
 ) -> Result<(), AeroError> {
     let role = s
         .workspaces
-        .member_role(workspace, caller)
+        .effective_member_role(workspace, caller)
         .await
         .map_err(AeroError::from)?
         .ok_or_else(|| AeroError::Forbidden("not a workspace member".into()))?;
@@ -115,30 +118,12 @@ async fn create_barrier(
     Json(req): Json<CreateBarrierReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let ws = parse_workspace(&ws_str)?;
-    assert_admin(&s, ws, auth.participant_id).await?;
 
     let group_a = parse_group(&req.group_a, "group_a")?;
     let group_b = parse_group(&req.group_b, "group_b")?;
-    if group_a == group_b {
-        return Err(AeroError::Invalid("a group cannot be barred from itself".into()).into());
-    }
-
-    // Both groups must live in *this* workspace — a barrier can never reference
-    // another tenant's group.
-    let groups = UserGroupRepo::new(s.pg.clone());
-    for (id, field) in [(group_a, "group_a"), (group_b, "group_b")] {
-        let g = groups
-            .get(id)
-            .await
-            .map_err(AeroError::from)?
-            .ok_or_else(|| AeroError::NotFound(format!("{field} in this workspace")))?;
-        if g.workspace_id != ws {
-            return Err(AeroError::NotFound(format!("{field} in this workspace")).into());
-        }
-    }
 
     let id = repo(&s)
-        .create(ws, group_a, group_b, auth.participant_id)
+        .create_authorized(ws, group_a, group_b, auth.participant_id)
         .await
         .map_err(AeroError::from)?;
     // Re-read so the response carries the full, canonical row (created_at etc.).
@@ -172,15 +157,8 @@ async fn delete_barrier(
     Path(id_str): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let id = parse_barrier(&id_str)?;
-    let barrier = repo(&s)
-        .get(id)
-        .await
-        .map_err(AeroError::from)?
-        .ok_or_else(|| AeroError::NotFound(format!("barrier {id}")))?;
-    // Re-check admin on the barrier's OWN workspace (the path carries no workspace).
-    assert_admin(&s, barrier.workspace_id, auth.participant_id).await?;
     let removed = repo(&s)
-        .delete(id, barrier.workspace_id)
+        .delete_authorized(id, auth.participant_id)
         .await
         .map_err(AeroError::from)?;
     if !removed {

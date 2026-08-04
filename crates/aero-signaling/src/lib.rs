@@ -40,6 +40,7 @@ mod tests {
             from: ParticipantId::new(),
             to: vec![ParticipantId::new()],
             kind: CallKind::Audio,
+            mode: aero_common::CallMode::P2p,
             sdp,
         }
     }
@@ -201,7 +202,11 @@ mod tests {
     #[test]
     fn ice_rejects_out_of_range_mline() {
         // Negative and >u16 indices are not valid m-line positions.
-        for bad in [serde_json::json!(-1), serde_json::json!(70000), serde_json::json!(1.5)] {
+        for bad in [
+            serde_json::json!(-1),
+            serde_json::json!(70000),
+            serde_json::json!(1.5),
+        ] {
             let err = validate_call_event(&ice(serde_json::json!({
                 "candidate": "candidate:1 1 udp 2113937151 192.0.2.1 50000 typ host",
                 "sdpMLineIndex": bad,
@@ -290,7 +295,9 @@ mod tests {
         // Lock so concurrent test threads can't trample each other's env.
         use std::sync::Mutex;
         static LOCK: Mutex<()> = Mutex::new(());
-        let _g = LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _g = LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         let keys = [
             "AERO_STUN_URLS",
@@ -321,9 +328,15 @@ mod tests {
         assert_eq!(cfg.ice_servers.len(), 2);
         assert_eq!(
             cfg.ice_servers[0].urls,
-            vec!["stun:a.example:3478".to_owned(), "stun:b.example:3478".to_owned()]
+            vec![
+                "stun:a.example:3478".to_owned(),
+                "stun:b.example:3478".to_owned()
+            ]
         );
-        assert_eq!(cfg.ice_servers[1].urls, vec!["turn:turn.example:3478".to_owned()]);
+        assert_eq!(
+            cfg.ice_servers[1].urls,
+            vec!["turn:turn.example:3478".to_owned()]
+        );
         assert_eq!(cfg.ice_servers[1].username.as_deref(), Some("u"));
         assert_eq!(cfg.ice_servers[1].credential.as_deref(), Some("p"));
         assert_eq!(cfg.ice_transport_policy, "relay");
@@ -347,6 +360,9 @@ mod tests {
         let cfg = RtcConfig::new(vec![IceServer::stun(DEFAULT_STUN_URL)]);
         let json = serde_json::to_value(&cfg).unwrap();
         assert!(json.get("iceServers").is_some());
-        assert_eq!(json.get("iceTransportPolicy").and_then(|v| v.as_str()), Some("all"));
+        assert_eq!(
+            json.get("iceTransportPolicy").and_then(|v| v.as_str()),
+            Some("all")
+        );
     }
 }

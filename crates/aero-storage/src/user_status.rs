@@ -114,10 +114,7 @@ impl UserStatusRepo {
     /// `participant`'s current status, or `None` when they have never set one.
     /// An expired custom status is reported CLEARED (emoji/text `None`) with the
     /// presence preference kept — see the module-level expiry semantics.
-    pub async fn get(
-        &self,
-        participant: ParticipantId,
-    ) -> Result<Option<UserStatus>, sqlx::Error> {
+    pub async fn get(&self, participant: ParticipantId) -> Result<Option<UserStatus>, sqlx::Error> {
         let row = sqlx::query_as::<_, StatusRow>(
             r"SELECT participant_id, emoji, text, presence, expires_at, updated_at
                FROM user_status
@@ -262,16 +259,29 @@ mod db_tests {
         let repo = UserStatusRepo::new(p.clone());
         let participant = fixture(&p).await;
 
-        assert!(repo.get(participant).await.unwrap().is_none(), "no status initially");
+        assert!(
+            repo.get(participant).await.unwrap().is_none(),
+            "no status initially"
+        );
 
         let set = repo
-            .set(participant, Some(":palm_tree:"), Some("On vacation"), "away", None)
+            .set(
+                participant,
+                Some(":palm_tree:"),
+                Some("On vacation"),
+                "away",
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(set.emoji.as_deref(), Some(":palm_tree:"));
         assert_eq!(set.presence, Presence::Away);
 
-        let got = repo.get(participant).await.unwrap().expect("status present");
+        let got = repo
+            .get(participant)
+            .await
+            .unwrap()
+            .expect("status present");
         assert_eq!(got.emoji.as_deref(), Some(":palm_tree:"));
         assert_eq!(got.text.as_deref(), Some("On vacation"));
         assert_eq!(got.presence, Presence::Away);
@@ -283,7 +293,11 @@ mod db_tests {
             .unwrap();
         assert_eq!(reset.emoji.as_deref(), Some(":coffee:"));
         assert!(reset.text.is_none(), "text overwritten to NULL");
-        assert_eq!(reset.presence, Presence::Active, "unknown token normalized to active");
+        assert_eq!(
+            reset.presence,
+            Presence::Active,
+            "unknown token normalized to active"
+        );
 
         // get_many sees the row.
         let many = repo.get_many(&[participant]).await.unwrap();
@@ -291,7 +305,10 @@ mod db_tests {
         assert_eq!(many[0].participant_id, participant);
 
         assert!(repo.clear(participant).await.unwrap(), "clear removed it");
-        assert!(!repo.clear(participant).await.unwrap(), "second clear is a no-op");
+        assert!(
+            !repo.clear(participant).await.unwrap(),
+            "second clear is a no-op"
+        );
         assert!(repo.get(participant).await.unwrap().is_none(), "cleared");
         assert!(repo.get_many(&[participant]).await.unwrap().is_empty());
     }
@@ -305,16 +322,26 @@ mod db_tests {
 
         // Set a status that already expired (expiry in the past), away preference.
         let past = OffsetDateTime::now_utc() - time::Duration::hours(1);
-        repo.set(participant, Some(":palm_tree:"), Some("On vacation"), "away", Some(past))
-            .await
-            .unwrap();
+        repo.set(
+            participant,
+            Some(":palm_tree:"),
+            Some("On vacation"),
+            "away",
+            Some(past),
+        )
+        .await
+        .unwrap();
 
         // Read reports the custom status cleared, presence preference kept.
         let got = repo.get(participant).await.unwrap().expect("row present");
         assert!(got.emoji.is_none(), "expired emoji cleared on read");
         assert!(got.text.is_none(), "expired text cleared on read");
         assert!(got.expires_at.is_none(), "expiry surfaced as cleared");
-        assert_eq!(got.presence, Presence::Away, "presence preference kept past expiry");
+        assert_eq!(
+            got.presence,
+            Presence::Away,
+            "presence preference kept past expiry"
+        );
 
         // get_many applies the same clearing.
         let many = repo.get_many(&[participant]).await.unwrap();

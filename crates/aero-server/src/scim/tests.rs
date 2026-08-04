@@ -3,11 +3,87 @@
 //! `use super::*;` pulls in the schema types and shared helpers from the module
 //! root; the group-only items being tested are imported from `super::groups`.
 
-use super::*;
 use super::groups::{
     member_filter_value, member_values_from, parse_group_patch_ops, slugify_handle, GroupPatch,
     GroupPatchAction, MAX_GROUP_HANDLE_LEN,
 };
+use super::users::{map_user_write_error, validate_identity_issuer};
+use super::*;
+
+#[test]
+fn scim_patch_operations_are_bounded() {
+    assert!(validate_patch_operation_count(MAX_SCIM_PATCH_OPERATIONS).is_ok());
+    assert!(matches!(
+        validate_patch_operation_count(MAX_SCIM_PATCH_OPERATIONS + 1),
+        Err(AeroError::Invalid(_))
+    ));
+}
+
+#[test]
+fn scim_token_quota_maps_to_explicit_conflict() {
+    match map_token_write_error(ScimTokenWriteError::QuotaExceeded) {
+        AeroError::Conflict(message) => {
+            assert!(message.contains("SCIM token quota exceeded"));
+            assert!(message.contains(&MAX_SCIM_TOKENS_PER_WORKSPACE.to_string()));
+        }
+        error => panic!("quota must map to conflict, got {error:?}"),
+    }
+}
+
+#[test]
+fn scim_token_authz_errors_keep_forbidden_and_not_found_statuses() {
+    assert_eq!(
+        map_token_write_error(ScimTokenWriteError::Governance(AeroError::Forbidden(
+            "workspace admin required".into(),
+        )))
+        .status_code(),
+        403
+    );
+    assert_eq!(
+        map_token_write_error(ScimTokenWriteError::Governance(AeroError::NotFound(
+            "workspace".into(),
+        )))
+        .status_code(),
+        404
+    );
+    assert_eq!(
+        map_token_write_error(ScimTokenWriteError::TokenNotFound).status_code(),
+        404
+    );
+}
+
+#[test]
+fn scim_identity_lifecycle_conflicts_map_to_fixed_http_conflicts() {
+    for error in [
+        aero_storage::ScimUserWriteError::IdentityConflict,
+        aero_storage::ScimUserWriteError::IdentityTombstoned,
+        aero_storage::ScimUserWriteError::IdentitySubjectImmutable,
+    ] {
+        let mapped = map_user_write_error(error);
+        assert_eq!(mapped.status_code(), 409);
+        assert!(
+            !mapped.to_string().contains("issuer") && !mapped.to_string().contains("subject"),
+            "route errors must not expose external identity keys"
+        );
+    }
+}
+
+#[test]
+fn scim_identity_issuer_is_exact_and_bounded() {
+    assert!(validate_identity_issuer(&"x".repeat(2 * 1024)).is_ok());
+    for invalid in [
+        "x".repeat(2 * 1024 + 1),
+        " padded".to_owned(),
+        "line\nbreak".to_owned(),
+    ] {
+        assert_eq!(
+            validate_identity_issuer(&invalid)
+                .expect_err("invalid issuer configuration")
+                .status_code(),
+            500
+        );
+    }
+}
 
 // ---------- parse_filter ----------
 
@@ -183,7 +259,10 @@ fn scim_group_roundtrips_camelcase() {
                 value: "01BX5ZZKBKACTAV9WEVGEMMVRZ".to_owned(),
                 display: Some("Alice".to_owned()),
             },
-            ScimGroupMember { value: "01BX5ZZKBKACTAV9WEVGEMMVS0".to_owned(), display: None },
+            ScimGroupMember {
+                value: "01BX5ZZKBKACTAV9WEVGEMMVS0".to_owned(),
+                display: None,
+            },
         ],
         meta: Some(ScimMeta {
             resource_type: "Group".to_owned(),
@@ -233,14 +312,25 @@ fn slugify_handle_makes_a_valid_mention_handle() {
     assert_eq!(slugify_handle(""), "group");
     assert_eq!(slugify_handle("---"), "group");
     // Result is always a valid `[a-z0-9_-]`, 1..=32 handle.
-    for input in ["A Very Very Very Long Group Display Name That Exceeds", "déjà vu", "  "] {
+    for input in [
+        "A Very Very Very Long Group Display Name That Exceeds",
+        "déjà vu",
+        "  ",
+    ] {
         let h = slugify_handle(input);
-        assert!(!h.is_empty() && h.chars().count() <= MAX_GROUP_HANDLE_LEN, "{input:?} -> {h:?}");
         assert!(
-            h.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-'),
+            !h.is_empty() && h.chars().count() <= MAX_GROUP_HANDLE_LEN,
+            "{input:?} -> {h:?}"
+        );
+        assert!(
+            h.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-'),
             "{input:?} -> {h:?} has illegal chars"
         );
-        assert!(!h.ends_with('-') && !h.starts_with('-'), "{input:?} -> {h:?} has edge dash");
+        assert!(
+            !h.ends_with('-') && !h.starts_with('-'),
+            "{input:?} -> {h:?} has edge dash"
+        );
     }
 }
 
@@ -263,7 +353,9 @@ fn group_patch_parses_member_add() {
     }));
     assert_eq!(
         actions,
-        vec![GroupPatchAction::AddMember("01BX5ZZKBKACTAV9WEVGEMMVRZ".to_owned())]
+        vec![GroupPatchAction::AddMember(
+            "01BX5ZZKBKACTAV9WEVGEMMVRZ".to_owned()
+        )]
     );
 }
 
@@ -288,7 +380,10 @@ fn group_patch_parses_member_remove_plain_and_filtered() {
     let filtered = group_ops(serde_json::json!({
         "Operations": [{ "op": "remove", "path": r#"members[value eq "01CCC"]"# }]
     }));
-    assert_eq!(filtered, vec![GroupPatchAction::RemoveMember("01CCC".to_owned())]);
+    assert_eq!(
+        filtered,
+        vec![GroupPatchAction::RemoveMember("01CCC".to_owned())]
+    );
 }
 
 #[test]
@@ -296,7 +391,10 @@ fn group_patch_parses_displayname_replace() {
     let by_path = group_ops(serde_json::json!({
         "Operations": [{ "op": "replace", "path": "displayName", "value": "Renamed" }]
     }));
-    assert_eq!(by_path, vec![GroupPatchAction::SetDisplayName("Renamed".to_owned())]);
+    assert_eq!(
+        by_path,
+        vec![GroupPatchAction::SetDisplayName("Renamed".to_owned())]
+    );
     // Path-less replace carrying the whole resource (Azure sometimes does this).
     let pathless = group_ops(serde_json::json!({
         "Operations": [{
@@ -323,12 +421,18 @@ fn group_patch_skips_unknown_ops_and_paths() {
         ]
     }));
     // Only the well-formed member add survives.
-    assert_eq!(actions, vec![GroupPatchAction::AddMember("01FFF".to_owned())]);
+    assert_eq!(
+        actions,
+        vec![GroupPatchAction::AddMember("01FFF".to_owned())]
+    );
 }
 
 #[test]
 fn member_filter_value_extracts_quoted_id() {
-    assert_eq!(member_filter_value(r#"members[value eq "01GGG"]"#), Some("01GGG".to_owned()));
+    assert_eq!(
+        member_filter_value(r#"members[value eq "01GGG"]"#),
+        Some("01GGG".to_owned())
+    );
     // A non-`value` attribute or malformed filter yields None.
     assert!(member_filter_value(r#"members[display eq "x"]"#).is_none());
     assert!(member_filter_value("members[]").is_none());
@@ -348,5 +452,8 @@ fn member_values_from_handles_array_object_and_string() {
         vec!["c".to_owned()]
     );
     // A bare string.
-    assert_eq!(member_values_from(&serde_json::json!("d")), vec!["d".to_owned()]);
+    assert_eq!(
+        member_values_from(&serde_json::json!("d")),
+        vec!["d".to_owned()]
+    );
 }

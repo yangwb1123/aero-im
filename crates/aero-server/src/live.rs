@@ -5,25 +5,136 @@
 //! `live.stream.{id}` to *stream watchers* (tracked in the Hub) rather than to
 //! room members — a public stream can be watched by anyone.
 
-use std::sync::Arc;
+use std::{
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    sync::Arc,
+};
 
 use aero_bus::EventBus;
+use aero_common::metrics::{self, names};
 use aero_common::{
     gift_by_id, Block, Error, GiftLeaderRow, ParticipantId, Result, StreamChatLine, StreamEvent,
-    StreamGiftLine, StreamStatus,
+    StreamGiftLine, StreamProtocol, StreamStatus,
 };
 use aero_im_core::{
     AllowAllModerator, KeywordModerator, LocalSeqProvider, ModerationVerdict, Moderator,
     SeqProvider,
 };
 use aero_storage::{LiveRepo, ParticipantRepo, StreamRepo, SubscriptionRepo};
+use aero_storage::{StreamGoLiveOutboxRepo, StreamGoLiveOutboxRow};
+use anyhow::{anyhow, Context as _};
 use tracing::{instrument, warn};
 use ulid::Ulid;
+use url::Url;
 
 /// Byte cap on a single danmaku line.
 const MAX_CHAT_BYTES: usize = 500;
 /// Upper bound on a single gift send (a combo, not a single tap).
 const MAX_GIFT_QTY: u32 = 9999;
+
+/// Public ingest URLs rendered by `POST /api/streams`.
+///
+/// RTMP and SRT listen on their own media ports, independently from the HTTP
+/// gateway used by WHIP. A wildcard listen IP is not a connectable destination,
+/// so it is replaced with an explicitly configured media advertise host or the
+/// host from the public HTTP origin.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LiveIngestUrls {
+    rtmp: String,
+    whip: String,
+    srt: String,
+}
+
+impl LiveIngestUrls {
+    /// Resolve public endpoints from the actual media listener addresses.
+    ///
+    /// `advertise_host` is the explicitly configured `AERO_INGEST_HOST`, when
+    /// present. It only replaces wildcard listener IPs; a concrete listener IP
+    /// remains the advertised address.
+    #[must_use]
+    pub fn new(
+        public_base_url: &str,
+        advertise_host: Option<&str>,
+        rtmp_listen: SocketAddr,
+        srt_listen: SocketAddr,
+    ) -> Self {
+        let public_host = public_host(public_base_url);
+        let advertise_host = advertise_host.and_then(usable_host);
+        let rtmp_authority = public_authority(
+            rtmp_listen,
+            advertise_host.as_deref(),
+            public_host.as_deref(),
+        );
+        let srt_authority = public_authority(
+            srt_listen,
+            advertise_host.as_deref(),
+            public_host.as_deref(),
+        );
+
+        Self {
+            rtmp: format!("rtmp://{rtmp_authority}"),
+            whip: public_base_url.trim_end_matches('/').to_owned(),
+            srt: format!("srt://{srt_authority}"),
+        }
+    }
+
+    /// Render the protocol-specific URL containing the stream's secret key.
+    #[must_use]
+    pub fn for_stream(&self, protocol: StreamProtocol, stream_key: &str) -> String {
+        match protocol {
+            StreamProtocol::Rtmp => format!("{}/live/{stream_key}", self.rtmp),
+            StreamProtocol::Whip => format!("{}/whip/{stream_key}", self.whip),
+            StreamProtocol::Srt => format!("{}?streamid={stream_key}", self.srt),
+        }
+    }
+}
+
+fn public_host(public_base_url: &str) -> Option<String> {
+    Url::parse(public_base_url)
+        .ok()
+        .and_then(|url| url.host_str().and_then(usable_host))
+}
+
+fn usable_host(raw: &str) -> Option<String> {
+    let host = raw.trim().trim_start_matches('[').trim_end_matches(']');
+    if host.is_empty() {
+        return None;
+    }
+    if host
+        .parse::<IpAddr>()
+        .is_ok_and(|address| address.is_unspecified())
+    {
+        return None;
+    }
+    Some(host.to_owned())
+}
+
+fn public_authority(
+    listen: SocketAddr,
+    advertise_host: Option<&str>,
+    public_host: Option<&str>,
+) -> String {
+    let host = if listen.ip().is_unspecified() {
+        advertise_host.or(public_host).map_or_else(
+            || match listen.ip() {
+                IpAddr::V4(_) => Ipv4Addr::LOCALHOST.to_string(),
+                IpAddr::V6(_) => Ipv6Addr::LOCALHOST.to_string(),
+            },
+            str::to_owned,
+        )
+    } else {
+        listen.ip().to_string()
+    };
+    format_authority(&host, listen.port())
+}
+
+fn format_authority(host: &str, port: u16) -> String {
+    if host.parse::<Ipv6Addr>().is_ok() {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
 
 #[derive(Clone)]
 pub struct LiveService {
@@ -109,12 +220,41 @@ impl LiveService {
         }
     }
 
-    /// Announce a go-live transition on the stream's subject (used by the WHIP
-    /// ingest path on the idle/ended→live edge). Funnels through
-    /// [`publish`](Self::publish) so the event is seq-stamped like every other
-    /// `StreamEvent`. Best-effort: failures are logged, never surfaced.
-    pub async fn publish_go_live(&self, stream_id: Ulid) {
-        self.publish(&StreamEvent::Status { stream_id, status: StreamStatus::Live }).await;
+    /// Publish one claimed transactional lifecycle row with stable wire bytes.
+    ///
+    /// Unlike interactive live events, errors are surfaced to the `PostgreSQL`
+    /// relay so it can re-park the claim. The per-subject sequence is persisted
+    /// before publication and therefore reused by ambiguous retries.
+    pub(crate) async fn publish_outboxed_go_live(
+        &self,
+        repo: &StreamGoLiveOutboxRepo,
+        row: &StreamGoLiveOutboxRow,
+    ) -> anyhow::Result<()> {
+        let seq = match row.seq {
+            Some(seq) => Some(seq),
+            None => match self.seq.next_seq(&row.subject).await {
+                Some(candidate) => Some(
+                    repo.assign_seq_if_absent(row.id, row.claim_token, candidate)
+                        .await
+                        .context("persist stream.live sequence")?
+                        .ok_or_else(|| {
+                            anyhow!("stream.live claim lost before sequence assignment")
+                        })?,
+                ),
+                None => None,
+            },
+        };
+        let bytes = crate::stream_live_outbox::bus_payload(row, seq)
+            .context("serialize stream.live outbox payload")?;
+        if let Err(error) = self
+            .bus
+            .publish_idempotent(&row.subject, bytes.into(), &row.event_id.to_string())
+            .await
+        {
+            metrics::inc_counter(names::NATS_PUBLISH_ERRORS_TOTAL, 1);
+            return Err(anyhow!(error).context("publish stream.live outbox to NATS"));
+        }
+        Ok(())
     }
 
     /// Ensure a stream exists and has not ended; returns its current status.
@@ -161,14 +301,19 @@ impl LiveService {
             return Err(Error::Invalid("empty chat".into()));
         }
         if body.len() > MAX_CHAT_BYTES {
-            return Err(Error::Invalid(format!("chat exceeds {MAX_CHAT_BYTES} bytes")));
+            return Err(Error::Invalid(format!(
+                "chat exceeds {MAX_CHAT_BYTES} bytes"
+            )));
         }
         self.require_open(stream_id).await?;
         if let ModerationVerdict::Block(reason) = self.moderator.check(&[Block::text(body)]) {
             return Err(Error::Invalid(reason));
         }
         let sender_name = self.sender_name(sender).await?;
-        let (id, created_at) = self.live.insert_chat(stream_id, sender, body, is_subscriber).await?;
+        let (id, created_at) = self
+            .live
+            .insert_chat(stream_id, sender, body, is_subscriber)
+            .await?;
         let line = StreamChatLine {
             id,
             stream_id,
@@ -183,7 +328,10 @@ impl LiveService {
     }
 
     pub async fn recent_chat(&self, stream_id: Ulid, limit: i64) -> Result<Vec<StreamChatLine>> {
-        Ok(self.live.recent_chat(stream_id, limit.clamp(1, 200)).await?)
+        Ok(self
+            .live
+            .recent_chat(stream_id, limit.clamp(1, 200))
+            .await?)
     }
 
     /// Late-joiner catch-up: chat lines strictly newer than `since` (a forward
@@ -196,7 +344,10 @@ impl LiveService {
         since: Option<Ulid>,
         limit: i64,
     ) -> Result<Vec<StreamChatLine>> {
-        Ok(self.live.recent_chat_since(stream_id, since, limit.clamp(1, 200)).await?)
+        Ok(self
+            .live
+            .recent_chat_since(stream_id, since, limit.clamp(1, 200))
+            .await?)
     }
 
     // ---------------------------------------------------------- gifts
@@ -216,16 +367,18 @@ impl LiveService {
         qty: u32,
         idempotency_key: Option<&str>,
     ) -> Result<(StreamGiftLine, bool)> {
-        let gift =
-            gift_by_id(gift_id).ok_or_else(|| Error::Invalid(format!("unknown gift: {gift_id}")))?;
+        let gift = gift_by_id(gift_id)
+            .ok_or_else(|| Error::Invalid(format!("unknown gift: {gift_id}")))?;
         if qty == 0 || qty > MAX_GIFT_QTY {
             return Err(Error::Invalid(format!("qty must be 1..={MAX_GIFT_QTY}")));
         }
         self.require_open(stream_id).await?;
         let coins = u64::from(gift.coins) * u64::from(qty);
         let sender_name = self.sender_name(sender).await?;
-        let (id, created_at, inserted) =
-            self.live.insert_gift(stream_id, sender, gift_id, qty, coins, idempotency_key).await?;
+        let (id, created_at, inserted) = self
+            .live
+            .insert_gift(stream_id, sender, gift_id, qty, coins, idempotency_key)
+            .await?;
         let line = StreamGiftLine {
             id,
             stream_id,
@@ -281,8 +434,11 @@ impl LiveService {
                     })
                     .await;
                     if just_reached {
-                        self.publish(&StreamEvent::GoalReached { stream_id, goal_id: goal.id })
-                            .await;
+                        self.publish(&StreamEvent::GoalReached {
+                            stream_id,
+                            goal_id: goal.id,
+                        })
+                        .await;
                     }
                 }
                 // Goal went inactive between the list and the bump, or a storage
@@ -294,7 +450,10 @@ impl LiveService {
     }
 
     pub async fn recent_gifts(&self, stream_id: Ulid, limit: i64) -> Result<Vec<StreamGiftLine>> {
-        Ok(self.live.recent_gifts(stream_id, limit.clamp(1, 100)).await?)
+        Ok(self
+            .live
+            .recent_gifts(stream_id, limit.clamp(1, 100))
+            .await?)
     }
 
     /// Late-joiner catch-up for gifts: ledger entries strictly newer than `since`,
@@ -306,7 +465,10 @@ impl LiveService {
         since: Option<Ulid>,
         limit: i64,
     ) -> Result<Vec<StreamGiftLine>> {
-        Ok(self.live.recent_gifts_since(stream_id, since, limit.clamp(1, 100)).await?)
+        Ok(self
+            .live
+            .recent_gifts_since(stream_id, since, limit.clamp(1, 100))
+            .await?)
     }
 
     pub async fn leaderboard(&self, stream_id: Ulid, limit: i64) -> Result<Vec<GiftLeaderRow>> {
@@ -317,7 +479,8 @@ impl LiveService {
 
     /// Broadcast an updated viewer count (best-effort, fire-and-forget).
     pub async fn publish_viewers(&self, stream_id: Ulid, count: u32) {
-        self.publish(&StreamEvent::Viewers { stream_id, count }).await;
+        self.publish(&StreamEvent::Viewers { stream_id, count })
+            .await;
     }
 
     /// Broadcast an arbitrary [`StreamEvent`] on its stream's subject (seq-stamped
@@ -359,8 +522,120 @@ impl LiveService {
             return Err(Error::Forbidden("only the stream owner may end it".into()));
         }
         self.streams.mark_ended(stream_id).await?;
-        self.publish(&StreamEvent::Status { stream_id, status: StreamStatus::Ended })
-            .await;
+        self.publish(&StreamEvent::Status {
+            stream_id,
+            status: StreamStatus::Ended,
+        })
+        .await;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn addr(value: &str) -> SocketAddr {
+        value.parse().expect("test socket address")
+    }
+
+    #[test]
+    fn media_urls_use_listener_ports_not_http_port() {
+        let urls = LiveIngestUrls::new(
+            "https://live.example.test:8443",
+            None,
+            addr("0.0.0.0:1935"),
+            addr("0.0.0.0:1936"),
+        );
+
+        assert_eq!(
+            urls.for_stream(StreamProtocol::Rtmp, "secret"),
+            "rtmp://live.example.test:1935/live/secret"
+        );
+        assert_eq!(
+            urls.for_stream(StreamProtocol::Whip, "secret"),
+            "https://live.example.test:8443/whip/secret"
+        );
+        assert_eq!(
+            urls.for_stream(StreamProtocol::Srt, "secret"),
+            "srt://live.example.test:1936?streamid=secret"
+        );
+    }
+
+    #[test]
+    fn explicit_ingest_host_replaces_wildcard_listeners() {
+        let urls = LiveIngestUrls::new(
+            "https://live.example.test",
+            Some("203.0.113.42"),
+            addr("0.0.0.0:11935"),
+            addr("0.0.0.0:11936"),
+        );
+
+        assert_eq!(
+            urls.for_stream(StreamProtocol::Rtmp, "key"),
+            "rtmp://203.0.113.42:11935/live/key"
+        );
+        assert_eq!(
+            urls.for_stream(StreamProtocol::Srt, "key"),
+            "srt://203.0.113.42:11936?streamid=key"
+        );
+    }
+
+    #[test]
+    fn concrete_listener_hosts_are_preserved() {
+        let urls = LiveIngestUrls::new(
+            "https://live.example.test",
+            Some("203.0.113.42"),
+            addr("192.0.2.10:1935"),
+            addr("192.0.2.11:1936"),
+        );
+
+        assert_eq!(
+            urls.for_stream(StreamProtocol::Rtmp, "key"),
+            "rtmp://192.0.2.10:1935/live/key"
+        );
+        assert_eq!(
+            urls.for_stream(StreamProtocol::Srt, "key"),
+            "srt://192.0.2.11:1936?streamid=key"
+        );
+    }
+
+    #[test]
+    fn ipv6_hosts_are_bracketed_with_media_ports() {
+        let urls = LiveIngestUrls::new(
+            "https://[2001:db8::42]:8443",
+            None,
+            addr("[::]:1935"),
+            addr("[::]:1936"),
+        );
+
+        assert_eq!(
+            urls.for_stream(StreamProtocol::Rtmp, "key"),
+            "rtmp://[2001:db8::42]:1935/live/key"
+        );
+        assert_eq!(
+            urls.for_stream(StreamProtocol::Srt, "key"),
+            "srt://[2001:db8::42]:1936?streamid=key"
+        );
+    }
+
+    #[test]
+    fn unusable_public_hosts_fall_back_to_matching_loopback_family() {
+        let ipv4 = LiveIngestUrls::new(
+            "http://0.0.0.0:3030",
+            Some("0.0.0.0"),
+            addr("0.0.0.0:1935"),
+            addr("0.0.0.0:1936"),
+        );
+        let ipv6 = LiveIngestUrls::new("not a URL", None, addr("[::]:1935"), addr("[::]:1936"));
+
+        assert_eq!(
+            ipv4.for_stream(StreamProtocol::Rtmp, "key"),
+            "rtmp://127.0.0.1:1935/live/key"
+        );
+        assert_eq!(
+            ipv6.for_stream(StreamProtocol::Srt, "key"),
+            "srt://[::1]:1936?streamid=key"
+        );
     }
 }

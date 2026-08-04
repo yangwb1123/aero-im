@@ -83,7 +83,8 @@ async fn broadcast_message(
 
     // The caller must be able to SEE the source room. A failure here aborts the
     // whole broadcast (you can't fan out a message you can't see).
-    s.im.assert_room_access(auth.participant_id, source.room_id).await?;
+    s.im.assert_room_access(auth.participant_id, source.room_id)
+        .await?;
 
     if req.room_ids.is_empty() {
         return Err(AeroError::Invalid("room_ids must not be empty".into()).into());
@@ -122,7 +123,11 @@ async fn broadcast_message(
 
         // Same provenance + mention-stripping as a single forward, per target.
         let blocks = build_forward_blocks(&source, req.comment.as_deref(), auth.participant_id);
-        match s.im.send_message(auth.participant_id, target, blocks, None, None).await {
+        match s
+            .im
+            .send_message(auth.participant_id, target, blocks, None, None)
+            .await
+        {
             Ok(_) => sent.push(target),
             Err(e) => {
                 failed.push(serde_json::json!({ "room_id": target, "error": e.to_string() }));
@@ -163,7 +168,9 @@ mod tests {
         let mentioned = ParticipantId::new();
         let source = sample_source(vec![
             Block::text("hello"),
-            Block::Mention { participant: mentioned },
+            Block::Mention {
+                participant: mentioned,
+            },
             Block::text("team"),
         ]);
         let actor = ParticipantId::new();
@@ -174,13 +181,20 @@ mod tests {
             let blocks = build_forward_blocks(&source, Some("fyi"), actor);
             // [comment, card, "hello", "team"] — Mention stripped.
             assert!(matches!(&blocks[0], Block::Text { content, .. } if content == "fyi"));
-            assert!(matches!(blocks[1], Block::Card { .. }), "provenance card present");
+            assert!(
+                matches!(blocks[1], Block::Card { .. }),
+                "provenance card present"
+            );
             assert!(
                 !blocks.iter().any(|b| matches!(b, Block::Mention { .. })),
                 "no Mention survives a broadcast copy"
             );
-            assert!(blocks.iter().any(|b| matches!(b, Block::Text { content, .. } if content == "hello")));
-            assert!(blocks.iter().any(|b| matches!(b, Block::Text { content, .. } if content == "team")));
+            assert!(blocks
+                .iter()
+                .any(|b| matches!(b, Block::Text { content, .. } if content == "hello")));
+            assert!(blocks
+                .iter()
+                .any(|b| matches!(b, Block::Text { content, .. } if content == "team")));
         }
     }
 }

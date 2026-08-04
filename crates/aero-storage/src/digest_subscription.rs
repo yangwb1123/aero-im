@@ -3,9 +3,9 @@
 //! Backs `migrations/0084_digest_subscriptions.sql`. A participant subscribes to a
 //! recurring AI digest of a ROOM or a WORKSPACE on a `daily` / `weekly` cadence.
 //! Each row carries its next firing time in `next_run_at`; the digest dispatcher
-//! polls due rows ([`due`](DigestSubscriptionRepo::due)), summarizes the target via
-//! the AI service, delivers the summary, then advances `next_run_at`
-//! ([`reschedule`](DigestSubscriptionRepo::reschedule)).
+//! leases one occurrence, durably prepares its summary, delivers it idempotently,
+//! and advances `next_run_at` only after a fenced success confirmation. Failed
+//! generation/delivery is re-parked without losing the occurrence.
 //!
 //! Exactly one of `room_id` / `workspace_id` is set (enforced by a table CHECK and
 //! by [`DigestTarget`]). Purely additive: a NEW [`DigestSubscriptionRepo`]; no
@@ -14,7 +14,7 @@
 //! storage-layer projection. The cadence arithmetic is the pure, db-free
 //! [`next_run_at`].
 
-use aero_common::{DigestSubscriptionId, ParticipantId, RoomId, WorkspaceId};
+use aero_common::{ActivityId, DigestSubscriptionId, ParticipantId, RoomId, WorkspaceId};
 use serde::Serialize;
 use sqlx::PgPool;
 
@@ -36,10 +36,7 @@ pub fn validate_frequency(frequency: &str) -> bool {
 /// cadences are `"daily"` (`+1d`) and `"weekly"` (`+7d`); any other string yields
 /// `None`, which callers treat as a validation error.
 #[must_use]
-pub fn next_run_at(
-    frequency: &str,
-    from: time::OffsetDateTime,
-) -> Option<time::OffsetDateTime> {
+pub fn next_run_at(frequency: &str, from: time::OffsetDateTime) -> Option<time::OffsetDateTime> {
     let step = match frequency {
         FREQ_DAILY => time::Duration::days(1),
         FREQ_WEEKLY => time::Duration::days(7),
@@ -103,6 +100,42 @@ pub struct DigestSubscription {
     pub next_run_at: time::OffsetDateTime,
     /// When the subscription was created.
     pub created_at: time::OffsetDateTime,
+    /// Attempts made for the currently due occurrence.
+    pub delivery_attempts: i32,
+    /// Earliest retry time after a transient failure.
+    pub retry_at: Option<time::OffsetDateTime>,
+    /// Last delivery failure, retained for owner visibility.
+    pub last_error: Option<String>,
+    /// Terminal failure timestamp. Dead subscriptions remain listable until
+    /// their owner deletes them.
+    pub dead_at: Option<time::OffsetDateTime>,
+}
+
+/// One leased digest occurrence.
+#[derive(Debug, Clone)]
+pub struct DigestDeliveryClaim {
+    pub subscription: DigestSubscription,
+    pub delivery_key: uuid::Uuid,
+    pub claim_token: uuid::Uuid,
+    pub attempt: i32,
+    pub prepared_summary: Option<String>,
+    pub lease_expires_at: time::OffsetDateTime,
+}
+
+/// Result of a token-fenced digest failure settlement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DigestFailureDisposition {
+    RetryScheduled,
+    Dead,
+    FenceLost,
+}
+
+/// Outcome of the authorization-checked workspace feed insertion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceDigestDelivery {
+    Inserted,
+    AlreadyDelivered,
+    AccessRevoked,
 }
 
 impl Serialize for DigestSubscription {
@@ -115,7 +148,7 @@ impl Serialize for DigestSubscription {
             DigestTarget::Room(r) => (Some(r), None),
             DigestTarget::Workspace(w) => (None, Some(w)),
         };
-        let mut st = serializer.serialize_struct("DigestSubscription", 7)?;
+        let mut st = serializer.serialize_struct("DigestSubscription", 11)?;
         st.serialize_field("id", &self.id)?;
         st.serialize_field("participant_id", &self.participant_id)?;
         st.serialize_field("room_id", &room)?;
@@ -135,14 +168,32 @@ impl Serialize for DigestSubscription {
                 .format(&time::format_description::well_known::Rfc3339)
                 .unwrap_or_default(),
         )?;
+        st.serialize_field("delivery_attempts", &self.delivery_attempts)?;
+        st.serialize_field(
+            "retry_at",
+            &self.retry_at.map(|retry_at| {
+                retry_at
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_default()
+            }),
+        )?;
+        st.serialize_field("last_error", &self.last_error)?;
+        st.serialize_field(
+            "dead_at",
+            &self.dead_at.map(|dead_at| {
+                dead_at
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap_or_default()
+            }),
+        )?;
         st.end()
     }
 }
 
 /// The columns a [`DigestSubscription`] is built from, in select order. Shared by
 /// every query so the row decoding stays in one place.
-const COLUMNS: &str =
-    "id, participant_id, room_id, workspace_id, frequency, next_run_at, created_at";
+const COLUMNS: &str = "id, participant_id, room_id, workspace_id, frequency, next_run_at,
+    created_at, delivery_attempts, retry_at, last_error, dead_at";
 
 type Row = (
     uuid::Uuid,
@@ -152,12 +203,47 @@ type Row = (
     String,
     time::OffsetDateTime,
     time::OffsetDateTime,
+    i32,
+    Option<time::OffsetDateTime>,
+    Option<String>,
+    Option<time::OffsetDateTime>,
 );
+
+#[derive(Debug, sqlx::FromRow)]
+struct ClaimRow {
+    id: uuid::Uuid,
+    participant_id: uuid::Uuid,
+    room_id: Option<uuid::Uuid>,
+    workspace_id: Option<uuid::Uuid>,
+    frequency: String,
+    next_run_at: time::OffsetDateTime,
+    created_at: time::OffsetDateTime,
+    retry_at: Option<time::OffsetDateTime>,
+    last_error: Option<String>,
+    dead_at: Option<time::OffsetDateTime>,
+    delivery_key: uuid::Uuid,
+    claim_token: uuid::Uuid,
+    delivery_attempts: i32,
+    prepared_summary: Option<String>,
+    lease_expires_at: time::OffsetDateTime,
+}
 
 /// Decode a row into a model. Returns `None` only when the stored target violates
 /// the room-XOR-workspace invariant (which the table CHECK forbids).
 fn row_to_model(r: Row) -> Option<DigestSubscription> {
-    let (id, participant_id, room_id, workspace_id, frequency, next_run_at, created_at) = r;
+    let (
+        id,
+        participant_id,
+        room_id,
+        workspace_id,
+        frequency,
+        next_run_at,
+        created_at,
+        delivery_attempts,
+        retry_at,
+        last_error,
+        dead_at,
+    ) = r;
     Some(DigestSubscription {
         id: DigestSubscriptionId::from_uuid(id),
         participant_id: ParticipantId::from_uuid(participant_id),
@@ -165,6 +251,32 @@ fn row_to_model(r: Row) -> Option<DigestSubscription> {
         frequency,
         next_run_at,
         created_at,
+        delivery_attempts,
+        retry_at,
+        last_error,
+        dead_at,
+    })
+}
+
+fn claim_row_to_model(row: ClaimRow) -> Option<DigestDeliveryClaim> {
+    Some(DigestDeliveryClaim {
+        subscription: DigestSubscription {
+            id: DigestSubscriptionId::from_uuid(row.id),
+            participant_id: ParticipantId::from_uuid(row.participant_id),
+            target: DigestTarget::from_columns(row.room_id, row.workspace_id)?,
+            frequency: row.frequency,
+            next_run_at: row.next_run_at,
+            created_at: row.created_at,
+            delivery_attempts: row.delivery_attempts,
+            retry_at: row.retry_at,
+            last_error: row.last_error,
+            dead_at: row.dead_at,
+        },
+        delivery_key: row.delivery_key,
+        claim_token: row.claim_token,
+        attempt: row.delivery_attempts,
+        prepared_summary: row.prepared_summary,
+        lease_expires_at: row.lease_expires_at,
     })
 }
 
@@ -237,9 +349,10 @@ impl DigestSubscriptionRepo {
     }
 
     /// Delete one of the caller's own subscriptions. Returns `true` iff a row was
-    /// removed — owner-scoped (`participant_id` in the `WHERE`), so a caller can
-    /// never delete another user's subscription, and a second delete (or a
-    /// stranger's / unknown id) is a no-op returning `false`.
+    /// removed — owner-scoped (`participant_id` in the `WHERE`) and allowed only
+    /// while no worker owns a lease. Re-parked failures are safe to delete; an
+    /// actively claimed occurrence remains fenced. A second delete (or a
+    /// stranger's / unknown id) returns `false`.
     ///
     /// # Errors
     /// Propagates any [`sqlx::Error`] from the delete.
@@ -249,7 +362,10 @@ impl DigestSubscriptionRepo {
         participant: ParticipantId,
     ) -> Result<bool, sqlx::Error> {
         let result = sqlx::query(
-            r"DELETE FROM digest_subscriptions WHERE id = $1 AND participant_id = $2",
+            "DELETE FROM digest_subscriptions
+              WHERE id = $1
+                AND participant_id = $2
+                AND claim_token IS NULL",
         )
         .bind(id.to_uuid())
         .bind(participant.to_uuid())
@@ -258,44 +374,274 @@ impl DigestSubscriptionRepo {
         Ok(result.rows_affected() > 0)
     }
 
-    /// List the subscriptions now due (`next_run_at <= now`), soonest first. The
-    /// digest dispatcher fires each, then reschedules it.
-    ///
-    /// # Errors
-    /// Propagates any [`sqlx::Error`] from the query.
-    pub async fn due(
+    /// Lease due subscriptions across replicas using `SKIP LOCKED` and the
+    /// default retry bound.
+    pub async fn claim_due(
         &self,
         now: time::OffsetDateTime,
-    ) -> Result<Vec<DigestSubscription>, sqlx::Error> {
-        let sql = format!(
-            "SELECT {COLUMNS}
-               FROM digest_subscriptions
-              WHERE next_run_at <= $1
-              ORDER BY next_run_at ASC, id ASC"
-        );
-        let rows = sqlx::query_as::<_, Row>(&sql)
-            .bind(now)
-            .fetch_all(&self.pool)
-            .await?;
-        Ok(rows.into_iter().filter_map(row_to_model).collect())
+        lease: time::Duration,
+        limit: i64,
+    ) -> Result<Vec<DigestDeliveryClaim>, sqlx::Error> {
+        self.claim_due_with_policy(now, lease, 8, limit).await
     }
 
-    /// Move a subscription's next firing time to `next`. Called by the dispatcher
-    /// after a firing to advance the schedule.
-    ///
-    /// # Errors
-    /// Propagates any [`sqlx::Error`] from the update.
-    pub async fn reschedule(
+    /// Lease due subscriptions and terminalize expired claims that exhausted
+    /// their bounded attempt budget.
+    pub async fn claim_due_with_policy(
+        &self,
+        now: time::OffsetDateTime,
+        lease: time::Duration,
+        max_attempts: i32,
+        limit: i64,
+    ) -> Result<Vec<DigestDeliveryClaim>, sqlx::Error> {
+        let lease_secs = lease.whole_seconds().clamp(1, 3600);
+        let max_attempts = max_attempts.clamp(1, 100);
+        let limit = limit.clamp(1, 500);
+        let rows = sqlx::query_as::<_, ClaimRow>(
+            "WITH exhausted_ids AS (
+                 SELECT id
+                   FROM digest_subscriptions
+                  WHERE dead_at IS NULL
+                    AND claim_token IS NOT NULL
+                    AND lease_expires_at <= $1
+                    AND delivery_attempts >= $4
+                  ORDER BY lease_expires_at, id
+                  FOR UPDATE SKIP LOCKED
+                  LIMIT $2
+             ),
+             exhausted AS (
+                 UPDATE digest_subscriptions AS digest
+                    SET dead_at = $1,
+                        last_error = COALESCE(
+                            digest.last_error,
+                            'delivery lease expired after maximum attempts'
+                        ),
+                        claim_token = NULL,
+                        claimed_at = NULL,
+                        lease_expires_at = NULL,
+                        delivery_key = NULL,
+                        retry_at = NULL,
+                        prepared_summary = NULL
+                   FROM exhausted_ids
+                  WHERE digest.id = exhausted_ids.id
+             ),
+             due AS (
+                 SELECT id
+                   FROM digest_subscriptions
+                  WHERE dead_at IS NULL
+                    AND next_run_at <= $1
+                    AND COALESCE(retry_at, next_run_at) <= $1
+                    AND delivery_attempts < $4
+                    AND (
+                        claim_token IS NULL
+                        OR lease_expires_at <= $1
+                    )
+                  ORDER BY COALESCE(retry_at, next_run_at), next_run_at, id
+                  FOR UPDATE SKIP LOCKED
+                  LIMIT $2
+             )
+             UPDATE digest_subscriptions AS digest
+                SET claim_token = gen_random_uuid(),
+                    claimed_at = $1,
+                    lease_expires_at =
+                        $1 + make_interval(secs => $3::double precision),
+                    delivery_key = COALESCE(digest.delivery_key, gen_random_uuid()),
+                    delivery_attempts = digest.delivery_attempts + 1
+               FROM due
+              WHERE digest.id = due.id
+          RETURNING digest.id,
+                    digest.participant_id,
+                    digest.room_id,
+                    digest.workspace_id,
+                    digest.frequency,
+                    digest.next_run_at,
+                    digest.created_at,
+                    digest.retry_at,
+                    digest.last_error,
+                    digest.dead_at,
+                    digest.delivery_key,
+                    digest.claim_token,
+                    digest.delivery_attempts,
+                    digest.prepared_summary,
+                    digest.lease_expires_at",
+        )
+        .bind(now)
+        .bind(limit)
+        .bind(lease_secs)
+        .bind(max_attempts)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().filter_map(claim_row_to_model).collect())
+    }
+
+    /// Persist the generated summary before any delivery side effect.
+    pub async fn save_prepared_summary(
         &self,
         id: DigestSubscriptionId,
-        next: time::OffsetDateTime,
-    ) -> Result<(), sqlx::Error> {
-        sqlx::query("UPDATE digest_subscriptions SET next_run_at = $2 WHERE id = $1")
-            .bind(id.to_uuid())
-            .bind(next)
-            .execute(&self.pool)
-            .await?;
-        Ok(())
+        claim_token: uuid::Uuid,
+        delivery_key: uuid::Uuid,
+        attempt: i32,
+        summary: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            "UPDATE digest_subscriptions
+                SET prepared_summary = $5
+              WHERE id = $1
+                AND dead_at IS NULL
+                AND claim_token = $2
+                AND delivery_key = $3
+                AND delivery_attempts = $4",
+        )
+        .bind(id.to_uuid())
+        .bind(claim_token)
+        .bind(delivery_key)
+        .bind(attempt)
+        .bind(summary)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Insert a workspace digest activity idempotently for this occurrence.
+    pub async fn insert_workspace_delivery(
+        &self,
+        participant: ParticipantId,
+        workspace: WorkspaceId,
+        delivery_key: uuid::Uuid,
+        summary: &str,
+    ) -> Result<WorkspaceDigestDelivery, sqlx::Error> {
+        let (allowed, inserted): (bool, bool) = sqlx::query_as(
+            "WITH access AS MATERIALIZED (
+                 SELECT aero_effective_workspace_access($5, $2) AS allowed
+             ),
+             inserted AS (
+                 INSERT INTO activity_feed
+                      (id, participant_id, kind, actor_id, subject_id, summary)
+                 SELECT $1, $2, 'digest', NULL, $3, $4
+                   FROM access
+                  WHERE access.allowed
+                 ON CONFLICT (participant_id, subject_id)
+                     WHERE kind = 'digest' AND subject_id IS NOT NULL
+                 DO NOTHING
+                 RETURNING id
+             )
+             SELECT access.allowed, EXISTS(SELECT 1 FROM inserted)
+               FROM access",
+        )
+        .bind(ActivityId::new().to_uuid())
+        .bind(participant.to_uuid())
+        .bind(delivery_key)
+        .bind(summary)
+        .bind(workspace.to_uuid())
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(match (allowed, inserted) {
+            (false, _) => WorkspaceDigestDelivery::AccessRevoked,
+            (true, true) => WorkspaceDigestDelivery::Inserted,
+            (true, false) => WorkspaceDigestDelivery::AlreadyDelivered,
+        })
+    }
+
+    /// Advance only after generation and delivery both succeeded.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn confirm_sent(
+        &self,
+        id: DigestSubscriptionId,
+        claim_token: uuid::Uuid,
+        delivery_key: uuid::Uuid,
+        attempt: i32,
+        next_run: time::OffsetDateTime,
+        sent_at: time::OffsetDateTime,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            "UPDATE digest_subscriptions
+                SET next_run_at = $5,
+                    last_sent_at = $6,
+                    claim_token = NULL,
+                    claimed_at = NULL,
+                    lease_expires_at = NULL,
+                    delivery_key = NULL,
+                    delivery_attempts = 0,
+                    retry_at = NULL,
+                    last_error = NULL,
+                    prepared_summary = NULL,
+                    dead_at = NULL
+              WHERE id = $1
+                AND dead_at IS NULL
+                AND claim_token = $2
+                AND delivery_key = $3
+                AND delivery_attempts = $4",
+        )
+        .bind(id.to_uuid())
+        .bind(claim_token)
+        .bind(delivery_key)
+        .bind(attempt)
+        .bind(next_run)
+        .bind(sent_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    /// Re-park a transient failure without advancing its cadence cursor, or
+    /// retain a visible terminal failure after permanent/exhausted delivery.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_failure(
+        &self,
+        id: DigestSubscriptionId,
+        claim_token: uuid::Uuid,
+        delivery_key: uuid::Uuid,
+        attempt: i32,
+        retry_at: time::OffsetDateTime,
+        error: &str,
+        retryable: bool,
+        max_attempts: i32,
+    ) -> Result<DigestFailureDisposition, sqlx::Error> {
+        let max_attempts = max_attempts.clamp(1, 100);
+        let dead_at: Option<(Option<time::OffsetDateTime>,)> = sqlx::query_as(
+            "UPDATE digest_subscriptions
+                SET claim_token = NULL,
+                    claimed_at = NULL,
+                    lease_expires_at = NULL,
+                    retry_at = CASE
+                        WHEN $7 AND delivery_attempts < $8 THEN $5
+                        ELSE NULL
+                    END,
+                    last_error = left($6, 2048),
+                    dead_at = CASE
+                        WHEN $7 AND delivery_attempts < $8 THEN NULL
+                        ELSE now()
+                    END,
+                    delivery_key = CASE
+                        WHEN $7 AND delivery_attempts < $8 THEN delivery_key
+                        ELSE NULL
+                    END,
+                    prepared_summary = CASE
+                        WHEN $7 AND delivery_attempts < $8 THEN prepared_summary
+                        ELSE NULL
+                    END
+              WHERE id = $1
+                AND dead_at IS NULL
+                AND claim_token = $2
+                AND delivery_key = $3
+                AND delivery_attempts = $4
+          RETURNING dead_at",
+        )
+        .bind(id.to_uuid())
+        .bind(claim_token)
+        .bind(delivery_key)
+        .bind(attempt)
+        .bind(retry_at)
+        .bind(error)
+        .bind(retryable)
+        .bind(max_attempts)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(match dead_at {
+            Some((None,)) => DigestFailureDisposition::RetryScheduled,
+            Some((Some(_),)) => DigestFailureDisposition::Dead,
+            None => DigestFailureDisposition::FenceLost,
+        })
     }
 }
 
@@ -320,8 +666,14 @@ mod tests {
     #[test]
     fn next_run_at_steps_by_frequency() {
         let from = time::OffsetDateTime::UNIX_EPOCH;
-        assert_eq!(next_run_at("daily", from), Some(from + time::Duration::days(1)));
-        assert_eq!(next_run_at("weekly", from), Some(from + time::Duration::days(7)));
+        assert_eq!(
+            next_run_at("daily", from),
+            Some(from + time::Duration::days(1))
+        );
+        assert_eq!(
+            next_run_at("weekly", from),
+            Some(from + time::Duration::days(7))
+        );
         assert_eq!(next_run_at("hourly", from), None);
         assert_eq!(next_run_at("", from), None);
     }
@@ -341,7 +693,10 @@ mod tests {
     fn target_roundtrips_through_columns() {
         let room = RoomId::new();
         let (rc, wc) = DigestTarget::Room(room).columns();
-        assert_eq!(DigestTarget::from_columns(rc, wc), Some(DigestTarget::Room(room)));
+        assert_eq!(
+            DigestTarget::from_columns(rc, wc),
+            Some(DigestTarget::Room(room))
+        );
 
         let ws = WorkspaceId::new();
         let (rc, wc) = DigestTarget::Workspace(ws).columns();
@@ -371,10 +726,17 @@ mod tests {
             frequency: "daily".into(),
             next_run_at: now,
             created_at: now,
+            delivery_attempts: 0,
+            retry_at: None,
+            last_error: None,
+            dead_at: None,
         };
         let v = serde_json::to_value(&sub).expect("serialize");
         assert_eq!(v["room_id"], serde_json::json!(room));
-        assert!(v["workspace_id"].is_null(), "workspace_id absent for a room digest");
+        assert!(
+            v["workspace_id"].is_null(),
+            "workspace_id absent for a room digest"
+        );
         assert_eq!(v["frequency"], "daily");
         assert_eq!(v["next_run_at"], "1970-01-01T00:00:00Z");
 
@@ -386,7 +748,10 @@ mod tests {
         };
         let vw = serde_json::to_value(&sub_ws).expect("serialize");
         assert_eq!(vw["workspace_id"], serde_json::json!(ws));
-        assert!(vw["room_id"].is_null(), "room_id absent for a workspace digest");
+        assert!(
+            vw["room_id"].is_null(),
+            "room_id absent for a workspace digest"
+        );
     }
 }
 
@@ -397,117 +762,5 @@ mod tests {
 ///   cargo test -p aero-storage --lib -- --ignored digest_subscription
 /// ```
 #[cfg(test)]
-mod db_tests {
-    use super::*;
-
-    fn pool() -> PgPool {
-        let url = std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://aero:aero_dev_pw@localhost:5432/aero".into());
-        sqlx::postgres::PgPoolOptions::new()
-            .max_connections(2)
-            .connect_lazy(&url)
-            .expect("connect_lazy never fails on a well-formed URL")
-    }
-
-    /// Create a throwaway participant so the test is self-contained.
-    async fn participant(p: &PgPool) -> ParticipantId {
-        let id = ParticipantId::new();
-        sqlx::query("INSERT INTO participants (id, kind, display_name) VALUES ($1, 'human', $2)")
-            .bind(id.to_uuid())
-            .bind(format!("digest-actor-{id}"))
-            .execute(p)
-            .await
-            .expect("insert participant");
-        id
-    }
-
-    #[tokio::test]
-    #[ignore = "requires live Postgres"]
-    async fn digest_create_due_reschedule_delete() {
-        let p = pool();
-        let repo = DigestSubscriptionRepo::new(p.clone());
-        let owner = participant(&p).await;
-        let room = RoomId::new();
-
-        // Create a room digest whose first run is already in the past → due now.
-        let past = time::OffsetDateTime::now_utc() - time::Duration::minutes(5);
-        let id = repo
-            .create(owner, DigestTarget::Room(room), "daily", past)
-            .await
-            .unwrap();
-
-        // list_for shows it (owner-scoped); a stranger's list does not.
-        let listed = repo.list_for(owner).await.unwrap();
-        assert!(listed.iter().any(|s| s.id == id), "owner list shows it");
-        assert_eq!(
-            listed.iter().find(|s| s.id == id).unwrap().target,
-            DigestTarget::Room(room)
-        );
-        let stranger = participant(&p).await;
-        assert!(
-            !repo.list_for(stranger).await.unwrap().iter().any(|s| s.id == id),
-            "another user's list does not show it"
-        );
-
-        // due() returns it (past next_run_at).
-        let now = time::OffsetDateTime::now_utc();
-        assert!(repo.due(now).await.unwrap().iter().any(|s| s.id == id), "past run is due");
-
-        // reschedule into the future ⇒ no longer due.
-        let next = next_run_at("daily", now).expect("known cadence");
-        repo.reschedule(id, next).await.unwrap();
-        assert!(
-            !repo
-                .due(time::OffsetDateTime::now_utc())
-                .await
-                .unwrap()
-                .iter()
-                .any(|s| s.id == id),
-            "not due after reschedule into the future"
-        );
-
-        // delete: owner-scoped; stranger cannot, owner can, second is a no-op.
-        assert!(!repo.delete(id, stranger).await.unwrap(), "stranger cannot delete");
-        assert!(repo.delete(id, owner).await.unwrap(), "owner deletes");
-        assert!(!repo.delete(id, owner).await.unwrap(), "second delete is a no-op");
-        assert!(
-            !repo.list_for(owner).await.unwrap().iter().any(|s| s.id == id),
-            "deleted subscription leaves the list"
-        );
-
-        // Cleanup participants.
-        for who in [owner, stranger] {
-            sqlx::query("DELETE FROM participants WHERE id = $1")
-                .bind(who.to_uuid())
-                .execute(&p)
-                .await
-                .ok();
-        }
-    }
-
-    #[tokio::test]
-    #[ignore = "requires live Postgres"]
-    async fn digest_workspace_target_persists() {
-        let p = pool();
-        let repo = DigestSubscriptionRepo::new(p.clone());
-        let owner = participant(&p).await;
-        let ws = WorkspaceId::new();
-
-        let first = time::OffsetDateTime::now_utc() + time::Duration::days(1);
-        let id = repo
-            .create(owner, DigestTarget::Workspace(ws), "weekly", first)
-            .await
-            .unwrap();
-        let listed = repo.list_for(owner).await.unwrap();
-        let found = listed.iter().find(|s| s.id == id).expect("present");
-        assert_eq!(found.target, DigestTarget::Workspace(ws));
-        assert_eq!(found.frequency, "weekly");
-
-        repo.delete(id, owner).await.ok();
-        sqlx::query("DELETE FROM participants WHERE id = $1")
-            .bind(owner.to_uuid())
-            .execute(&p)
-            .await
-            .ok();
-    }
-}
+#[path = "digest_subscription/db_tests.rs"]
+mod db_tests;

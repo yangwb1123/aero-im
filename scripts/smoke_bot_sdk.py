@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""Bot SDK CRUD smoke test: create, list, rotate token, subscribe, list subscriptions, delete subscription, list deliveries.
+"""Bot SDK CRUD smoke test: scoped install, token, subscriptions, deliveries, and ownership.
 
-Proves the full lifecycle of bot registration and event subscription management.
+Proves that a workspace-scoped bot is enrolled in its tenant, can be invited to
+a room there, and receives effective room access through its own bearer token.
+It then exercises the full bot registration and subscription-management lifecycle.
 Run against a live server.
 """
 from __future__ import annotations
@@ -48,10 +50,33 @@ def main():
     A = a["access_token"]
     Alice_pid = a["participant"]["id"]
     ok(f"alice registered (participant_id={Alice_pid[:8]})")
+
+    say("alice creates a workspace and channel for the scoped bot")
+    workspace = req(
+        "POST",
+        "/api/workspaces",
+        {"name": f"Bot SDK {ts}", "slug": f"bot-sdk-{ts}"},
+        token=A,
+        expect=200,
+    )
+    workspace_id = workspace["id"]
+    room = req(
+        "POST",
+        "/api/rooms",
+        {"kind": "channel", "name": f"bot-sdk-{ts}", "workspace_id": workspace_id},
+        token=A,
+        expect=200,
+    )
+    room_id = room["id"]
+    ok(f"workspace={workspace_id[:8]} room={room_id[:8]}")
     
-    say("alice creates a bot (POST /api/bots)")
+    say("alice creates a workspace-scoped bot (POST /api/bots)")
     bot_create_resp = req("POST", "/api/bots",
-                          {"name": f"test_bot_{ts}", "icon_url": "https://example.com/bot.png"},
+                          {
+                              "name": f"test_bot_{ts}",
+                              "icon_url": "https://example.com/bot.png",
+                              "workspace_id": workspace_id,
+                          },
                           token=A, expect=200)
     if not bot_create_resp:
         fail("no response from bot create")
@@ -76,9 +101,35 @@ def main():
         fail(f"bot name mismatch: expected test_bot_{ts}, got {bot['name']}")
     if bot["icon_url"] != "https://example.com/bot.png":
         fail(f"bot icon_url mismatch: got {bot.get('icon_url')}")
+    if bot.get("workspace_id") != workspace_id:
+        fail(f"bot workspace mismatch: expected {workspace_id}, got {bot.get('workspace_id')}")
     if not bot.get("has_token"):
         fail("bot should have_token=true after creation")
-    ok(f"bot listed ({len(bots)} total bots); verified owner_id, name, icon_url, has_token")
+    ok(f"bot listed ({len(bots)} total bots); verified owner, workspace, icon, token")
+
+    say("alice invites the bot to a room in its workspace")
+    req(
+        "POST",
+        f"/api/rooms/{room_id}/members",
+        {"participant_id": bot_id},
+        token=A,
+        expect=204,
+    )
+    members = req("GET", f"/api/rooms/{room_id}/members/list", token=A, expect=200)
+    if not any(member.get("id") == bot_id for member in members):
+        fail(f"workspace bot missing from room membership: {members}")
+    ok("workspace membership made the bot eligible for room installation")
+
+    say("bot token receives effective access to its installed room")
+    bot_rooms = req(
+        "GET",
+        f"/api/rooms?workspace_id={workspace_id}",
+        token=token_plaintext,
+        expect=200,
+    )
+    if not any(candidate.get("id") == room_id for candidate in bot_rooms):
+        fail(f"bot token cannot see installed room: {bot_rooms}")
+    ok("bot token authenticated and passed effective workspace + room access")
     
     say("alice rotates the bot's token (POST /api/bots/:id/token)")
     old_token = token_plaintext
@@ -92,7 +143,11 @@ def main():
     
     say("alice creates a bot subscription (POST /api/bots/:id/subscriptions)")
     sub_resp = req("POST", f"/api/bots/{bot_id}/subscriptions",
-                   {"event_type": "message", "filters": {"action_id": "create"}, "webhook_url": "https://example.com/webhook"},
+                   {
+                       "event_type": "message",
+                       "filters": {"room_id": room_id, "action_id": "create"},
+                       "webhook_url": "https://example.com/webhook",
+                   },
                    token=A, expect=200)
     if not sub_resp:
         fail("no response from subscription create")
@@ -117,13 +172,21 @@ def main():
     if sub.get("webhook_url") != "https://example.com/webhook":
         fail(f"subscription webhook_url mismatch: got {sub.get('webhook_url')}")
     filters = sub.get("filters", {})
-    if filters.get("action_id") != "create":
+    if (
+        filters.get("action_id") != "create"
+        or filters.get("room_id") != room_id
+        or filters.get("workspace_id") != workspace_id
+    ):
         fail(f"subscription filters mismatch: got {filters}")
-    ok(f"subscription listed ({len(subs)} total); verified bot_id, event_type, webhook_url, filters")
+    ok(f"subscription listed ({len(subs)} total); verified canonical room/workspace scope")
     
     say("alice adds another subscription (different event_type)")
     sub2_resp = req("POST", f"/api/bots/{bot_id}/subscriptions",
-                    {"event_type": "reaction", "filters": {}, "webhook_url": "https://example.com/webhook2"},
+                    {
+                        "event_type": "reaction",
+                        "filters": {"workspace_id": workspace_id},
+                        "webhook_url": "https://example.com/webhook2",
+                    },
                     token=A, expect=200)
     sub2_id = sub2_resp.get("id")
     if not sub2_id:
@@ -164,21 +227,21 @@ def main():
     B = b["access_token"]
     ok("bob registered")
     
-    say("bob tries to rotate alice's bot token (should 403)")
-    req("POST", f"/api/bots/{bot_id}/token", token=B, expect=403)
-    ok("bob forbidden from rotating alice's bot token (403)")
+    say("bob tries to rotate alice's bot token (owner-scoped 404)")
+    req("POST", f"/api/bots/{bot_id}/token", token=B, expect=404)
+    ok("alice's bot is opaque to bob during token rotation (404)")
     
-    say("bob tries to delete alice's bot subscription (should 403)")
-    req("DELETE", f"/api/bots/{bot_id}/subscriptions/{sub2_id}", token=B, expect=403)
-    ok("bob forbidden from deleting alice's bot subscription (403)")
+    say("bob tries to delete alice's bot subscription (owner-scoped 404)")
+    req("DELETE", f"/api/bots/{bot_id}/subscriptions/{sub2_id}", token=B, expect=404)
+    ok("alice's subscription is opaque to bob during deletion (404)")
     
-    say("bob tries to list alice's bot subscriptions (should 403)")
-    req("GET", f"/api/bots/{bot_id}/subscriptions", token=B, expect=403)
-    ok("bob forbidden from listing alice's bot subscriptions (403)")
+    say("bob tries to list alice's bot subscriptions (owner-scoped 404)")
+    req("GET", f"/api/bots/{bot_id}/subscriptions", token=B, expect=404)
+    ok("alice's subscriptions are opaque to bob during listing (404)")
     
-    say("bob tries to list alice's bot deliveries (should 403)")
-    req("GET", f"/api/bots/{bot_id}/deliveries", token=B, expect=403)
-    ok("bob forbidden from listing alice's bot deliveries (403)")
+    say("bob tries to list alice's bot deliveries (owner-scoped 404)")
+    req("GET", f"/api/bots/{bot_id}/deliveries", token=B, expect=404)
+    ok("alice's deliveries are opaque to bob during listing (404)")
     
     say("bob creates his own bot")
     bob_bot = req("POST", "/api/bots",
@@ -197,7 +260,7 @@ def main():
     
     say("bob creates a subscription on his bot")
     bob_sub = req("POST", f"/api/bots/{bob_bot_id}/subscriptions",
-                  {"event_type": "message", "webhook_url": "https://example.com/bob"},
+                  {"event_type": "message"},
                   token=B, expect=200)
     bob_sub_id = bob_sub.get("id")
     if not bob_sub_id:
@@ -205,10 +268,10 @@ def main():
     ok(f"bob's subscription created (sub_id={bob_sub_id})")
     
     say("alice cannot see bob's subscriptions")
-    req("GET", f"/api/bots/{bob_bot_id}/subscriptions", token=A, expect=403)
-    ok("alice forbidden from listing bob's subscriptions (403)")
+    req("GET", f"/api/bots/{bob_bot_id}/subscriptions", token=A, expect=404)
+    ok("bob's subscriptions are opaque to alice (404)")
     
-    say("full lifecycle complete: create, list, rotate token, subscribe, list subscriptions, delete, verify access control")
+    say("full lifecycle complete: scoped install, effective access, token, subscriptions, and ownership")
     
     print("\n\033[1;32m✅ Bot SDK CRUD smoke test PASSED\033[0m")
 

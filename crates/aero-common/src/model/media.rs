@@ -86,6 +86,12 @@ pub enum CallMode {
     Sfu,
 }
 
+impl Default for CallMode {
+    fn default() -> Self {
+        Self::P2p
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct CallId(pub ulid::Ulid);
@@ -124,6 +130,41 @@ impl std::str::FromStr for CallId {
     }
 }
 
+/// Media kind of one SFU-published track.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SfuMediaKind {
+    Audio,
+    Video,
+}
+
+/// One track a participant publishes into the server SFU.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SfuPublishedTrack {
+    /// Publisher-side SDP media id.
+    pub mid: String,
+    pub media_kind: SfuMediaKind,
+}
+
+/// A publisher and the tracks currently negotiated on its server media leg.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SfuPublisherDescription {
+    pub participant: ParticipantId,
+    pub tracks: Vec<SfuPublishedTrack>,
+}
+
+/// Explicit SFU route requested by one subscriber.
+///
+/// `(publisher, pub_mid)` identifies the source even when every browser uses
+/// common media ids such as `"0"` and `"1"`; `out_mid` is a distinct
+/// sendrecv/recvonly transceiver in the subscriber's own SDP.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct SfuSubscription {
+    pub publisher: ParticipantId,
+    pub pub_mid: String,
+    pub out_mid: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CallSession {
     pub id: CallId,
@@ -152,6 +193,9 @@ pub enum CallEvent {
         // when this enum is flattened into `RoomEvent::Call` on the bus.
         #[serde(rename = "call_kind")]
         kind: CallKind,
+        /// Negotiated topology. Defaults to P2P when decoding legacy events.
+        #[serde(default)]
+        mode: CallMode,
         sdp: String,
     },
     Answer {
@@ -196,12 +240,29 @@ pub enum CallEvent {
         from: ParticipantId,
         #[serde(rename = "call_kind")]
         kind: CallKind,
+        /// Durable `call_participants` incarnation. Newer generations
+        /// supersede delayed leave/publisher events from an older node.
+        #[serde(default)]
+        leg_generation: i64,
+    },
+    /// Server-authored SFU publisher topology update. Every node folds this
+    /// idempotently into its local topology revision, then emits a
+    /// `call_sfu_renegotiate` snapshot to locally-connected call members.
+    SfuPublisher {
+        call_id: CallId,
+        room_id: RoomId,
+        publisher: SfuPublisherDescription,
+        active: bool,
+        #[serde(default)]
+        leg_generation: i64,
     },
     /// Group call: a participant left. Peers tear down the connection to them.
     Leave {
         call_id: CallId,
         room_id: RoomId,
         from: ParticipantId,
+        #[serde(default)]
+        leg_generation: i64,
     },
     /// Group call: server → joiner, listing the members already in the call so
     /// the joiner knows whom to connect to (glare-free: lower id offers).
@@ -211,6 +272,9 @@ pub enum CallEvent {
         members: Vec<ParticipantId>,
         #[serde(rename = "call_kind")]
         kind: CallKind,
+        /// The targeted joiner's durable incarnation.
+        #[serde(default)]
+        leg_generation: i64,
     },
     /// Group call: a per-pair mesh offer (distinct from the 1:1 `Invite`, which
     /// prompts the callee — `Offer` is auto-answered within an active call).

@@ -10,6 +10,12 @@
 /// Message operations: send, edit, delete, moderate-delete.
 pub(crate) mod messages;
 
+/// Transactional message-event outbox relay.
+pub(crate) mod outbox;
+
+/// Durable post-commit notification and AI work.
+pub(crate) mod side_effects;
+
 /// Reaction operations: toggle, list aggregates.
 pub(crate) mod reactions;
 
@@ -40,6 +46,10 @@ pub(crate) mod orig;
 // continues to work unchanged.  This delegates to `orig` for all methods that
 // haven't been extracted yet, and to the extracted sub-modules for the rest.
 pub use events::BusSink;
+pub use messages::SendMessageOutcome;
 pub use orig::{
     can_access_room, can_create_channel, can_join_public_channel, post_allowed, ImService,
 };
+
+#[cfg(test)]
+mod effective_authz_tests;

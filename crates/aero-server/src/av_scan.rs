@@ -221,7 +221,11 @@ pub fn parse_response(raw: &[u8]) -> ScanVerdict {
             .unwrap_or(sig)
             .trim()
             .to_owned();
-        let name = if sig.is_empty() { "unknown-signature".to_owned() } else { sig };
+        let name = if sig.is_empty() {
+            "unknown-signature".to_owned()
+        } else {
+            sig
+        };
         return ScanVerdict::Infected(name);
     }
     // `... ERROR` or any unrecognised reply — surface the line for diagnostics.
@@ -347,7 +351,9 @@ mod tests {
             "EICAR"
         );
         match scanner.scan(eicar.as_bytes()).await {
-            ScanVerdict::Infected(name) => assert!(name.contains("EICAR") || name.contains("Eicar")),
+            ScanVerdict::Infected(name) => {
+                assert!(name.contains("EICAR") || name.contains("Eicar"))
+            }
             other => panic!("expected EICAR to be Infected, got {other:?}"),
         }
         // A benign payload should come back Clean.
@@ -373,7 +379,9 @@ mod tests {
         // A mock clamd: accept one connection, parse the INSTREAM framing exactly
         // as the real daemon would, reassemble the payload, and reply per verdict.
         async fn serve_one(listener: TcpListener) {
-            let Ok((mut sock, _)) = listener.accept().await else { return };
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
             // Command: the null-terminated `zINSTREAM\0` (10 bytes).
             let mut cmd = [0u8; 10];
             if sock.read_exact(&mut cmd).await.is_err() || &cmd != b"zINSTREAM\0" {
@@ -410,7 +418,9 @@ mod tests {
         async fn scan_via_mock(bytes: &[u8]) -> ScanVerdict {
             // Bind before spawning so the connection is accepted from the backlog
             // even if `serve_one` hasn't reached `accept()` yet (no startup race).
-            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock clamd");
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind mock clamd");
             let addr = listener.local_addr().unwrap().to_string();
             tokio::spawn(serve_one(listener));
             ClamdScanner::new(addr).scan(bytes).await
@@ -423,7 +433,10 @@ mod tests {
         }
 
         // (2) Benign payload → Clean.
-        assert_eq!(scan_via_mock(b"perfectly benign bytes").await, ScanVerdict::Clean);
+        assert_eq!(
+            scan_via_mock(b"perfectly benign bytes").await,
+            ScanVerdict::Clean
+        );
 
         // (3) Payload larger than CHUNK_SIZE exercises multi-chunk framing: the
         // marker only reassembles if every length-prefixed chunk is emitted and

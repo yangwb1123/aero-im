@@ -54,9 +54,10 @@ async def main():
     say("setup: alice + bob in a room; both join WS")
     a = req("POST", "/api/auth/register", {"email": f"crA+{ts}@aero.dev", "password": "password_1234", "display_name": "CrA"})
     b = req("POST", "/api/auth/register", {"email": f"crB+{ts}@aero.dev", "password": "password_1234", "display_name": "CrB"})
+    c = req("POST", "/api/auth/register", {"email": f"crC+{ts}@aero.dev", "password": "password_1234", "display_name": "CrC"})
     A, B = a["access_token"], b["access_token"]
+    C = c["access_token"]
     Apid, Bpid = a["participant"]["id"], b["participant"]["id"]
-    Cpid = req("POST", "/api/auth/register", {"email": f"crC+{ts}@aero.dev", "password": "password_1234", "display_name": "CrC"})["participant"]["id"]
     room = req("POST", "/api/rooms", {"kind": "group", "name": f"cr-{ts}"}, token=A)["id"]
     req("POST", f"/api/rooms/{room}/members", {"participant_id": Bpid}, token=A)
     ok(f"room={room[:8]}")
@@ -91,8 +92,7 @@ async def main():
     ok(f"transcript has {len(lines)} line(s); recap generated (len={len(rc['recap'])})")
 
     # non-member (carol) cannot read another call's transcript/recap
-    cl = req("POST", "/api/auth/login", {"email": f"crC+{ts}@aero.dev", "password": "password_1234"})["access_token"]
-    req("GET", f"/api/calls/{call_id}/transcript", token=cl, expect=[403, 404])
+    req("GET", f"/api/calls/{call_id}/transcript", token=C, expect=[403, 404])
     ok("non-member cannot read the call transcript (403/404)")
 
     print("\n\033[1;32m✅ Wave-23 smoke PASSED (call transcript persisted + post-call AI recap; room-gated)\033[0m")

@@ -46,7 +46,11 @@ fn export_is_owner_only_over_all_roles() {
 #[test]
 fn export_non_owner_denials_are_403() {
     // Every non-owner denial is an authorization failure (403), not 400/404.
-    for r in [WorkspaceRole::Guest, WorkspaceRole::Member, WorkspaceRole::Admin] {
+    for r in [
+        WorkspaceRole::Guest,
+        WorkspaceRole::Member,
+        WorkspaceRole::Admin,
+    ] {
         assert_eq!(status_of(&authorize_export(r)), 403, "role {r:?}");
     }
 }
@@ -64,7 +68,11 @@ fn delete_is_owner_only_over_all_roles() {
 
 #[test]
 fn delete_non_owner_denials_are_403() {
-    for r in [WorkspaceRole::Guest, WorkspaceRole::Member, WorkspaceRole::Admin] {
+    for r in [
+        WorkspaceRole::Guest,
+        WorkspaceRole::Member,
+        WorkspaceRole::Admin,
+    ] {
         assert_eq!(status_of(&authorize_delete(r)), 403, "role {r:?}");
     }
 }
@@ -153,17 +161,32 @@ fn invite_only_admins_and_owners_can_invite_at_all() {
 
 #[test]
 fn invite_admin_can_grant_up_to_admin_but_not_owner() {
-    assert!(allowed(&authorize_invite(WorkspaceRole::Admin, WorkspaceRole::Guest)));
-    assert!(allowed(&authorize_invite(WorkspaceRole::Admin, WorkspaceRole::Member)));
-    assert!(allowed(&authorize_invite(WorkspaceRole::Admin, WorkspaceRole::Admin)));
+    assert!(allowed(&authorize_invite(
+        WorkspaceRole::Admin,
+        WorkspaceRole::Guest
+    )));
+    assert!(allowed(&authorize_invite(
+        WorkspaceRole::Admin,
+        WorkspaceRole::Member
+    )));
+    assert!(allowed(&authorize_invite(
+        WorkspaceRole::Admin,
+        WorkspaceRole::Admin
+    )));
     // No privilege escalation: an admin cannot mint an owner.
-    assert!(!allowed(&authorize_invite(WorkspaceRole::Admin, WorkspaceRole::Owner)));
+    assert!(!allowed(&authorize_invite(
+        WorkspaceRole::Admin,
+        WorkspaceRole::Owner
+    )));
 }
 
 #[test]
 fn invite_owner_can_grant_any_role() {
     for target in ALL {
-        assert!(allowed(&authorize_invite(WorkspaceRole::Owner, target)), "target {target:?}");
+        assert!(
+            allowed(&authorize_invite(WorkspaceRole::Owner, target)),
+            "target {target:?}"
+        );
     }
 }
 
@@ -186,8 +209,20 @@ fn invite_never_escalates_for_any_actor() {
 #[test]
 fn invite_denials_are_403() {
     // A denial is an authorization failure, not a 400/404.
-    assert_eq!(status_of(&authorize_invite(WorkspaceRole::Member, WorkspaceRole::Member)), 403);
-    assert_eq!(status_of(&authorize_invite(WorkspaceRole::Admin, WorkspaceRole::Owner)), 403);
+    assert_eq!(
+        status_of(&authorize_invite(
+            WorkspaceRole::Member,
+            WorkspaceRole::Member
+        )),
+        403
+    );
+    assert_eq!(
+        status_of(&authorize_invite(
+            WorkspaceRole::Admin,
+            WorkspaceRole::Owner
+        )),
+        403
+    );
 }
 
 // ----- authorize_role_change -----
@@ -196,8 +231,16 @@ fn invite_denials_are_403() {
 fn role_change_members_and_guests_can_never_change_anyone() {
     for new_role in ALL {
         for subject in ALL {
-            assert!(!allowed(&authorize_role_change(WorkspaceRole::Member, new_role, subject)));
-            assert!(!allowed(&authorize_role_change(WorkspaceRole::Guest, new_role, subject)));
+            assert!(!allowed(&authorize_role_change(
+                WorkspaceRole::Member,
+                new_role,
+                subject
+            )));
+            assert!(!allowed(&authorize_role_change(
+                WorkspaceRole::Guest,
+                new_role,
+                subject
+            )));
         }
     }
 }
@@ -239,7 +282,11 @@ fn role_change_owner_can_set_any_role_on_any_subject() {
     for new_role in ALL {
         for subject in ALL {
             assert!(
-                allowed(&authorize_role_change(WorkspaceRole::Owner, new_role, subject)),
+                allowed(&authorize_role_change(
+                    WorkspaceRole::Owner,
+                    new_role,
+                    subject
+                )),
                 "new_role {new_role:?} subject {subject:?}"
             );
         }
@@ -295,17 +342,41 @@ fn role_change_denials_are_403() {
 #[test]
 fn remove_members_and_guests_can_remove_nobody_else() {
     for subject in ALL {
-        assert!(!allowed(&authorize_remove(WorkspaceRole::Member, subject, false)));
-        assert!(!allowed(&authorize_remove(WorkspaceRole::Guest, subject, false)));
+        assert!(!allowed(&authorize_remove(
+            WorkspaceRole::Member,
+            subject,
+            false
+        )));
+        assert!(!allowed(&authorize_remove(
+            WorkspaceRole::Guest,
+            subject,
+            false
+        )));
     }
 }
 
 #[test]
 fn remove_admin_can_remove_at_or_below_but_not_owner() {
-    assert!(allowed(&authorize_remove(WorkspaceRole::Admin, WorkspaceRole::Guest, false)));
-    assert!(allowed(&authorize_remove(WorkspaceRole::Admin, WorkspaceRole::Member, false)));
-    assert!(allowed(&authorize_remove(WorkspaceRole::Admin, WorkspaceRole::Admin, false)));
-    assert!(!allowed(&authorize_remove(WorkspaceRole::Admin, WorkspaceRole::Owner, false)));
+    assert!(allowed(&authorize_remove(
+        WorkspaceRole::Admin,
+        WorkspaceRole::Guest,
+        false
+    )));
+    assert!(allowed(&authorize_remove(
+        WorkspaceRole::Admin,
+        WorkspaceRole::Member,
+        false
+    )));
+    assert!(allowed(&authorize_remove(
+        WorkspaceRole::Admin,
+        WorkspaceRole::Admin,
+        false
+    )));
+    assert!(!allowed(&authorize_remove(
+        WorkspaceRole::Admin,
+        WorkspaceRole::Owner,
+        false
+    )));
 }
 
 #[test]
@@ -337,18 +408,33 @@ fn remove_never_acts_on_more_privileged_subject() {
 #[test]
 fn self_leave_allowed_for_non_owners() {
     // A guest/member/admin may leave on their own, even without admin rights.
-    for r in [WorkspaceRole::Guest, WorkspaceRole::Member, WorkspaceRole::Admin] {
+    for r in [
+        WorkspaceRole::Guest,
+        WorkspaceRole::Member,
+        WorkspaceRole::Admin,
+    ] {
         // subject == caller's own role for a self-removal.
-        assert!(allowed(&authorize_remove(r, r, true)), "self-leave for {r:?}");
+        assert!(
+            allowed(&authorize_remove(r, r, true)),
+            "self-leave for {r:?}"
+        );
     }
 }
 
 #[test]
 fn self_leave_forbidden_for_owner() {
     // Owner leaving would orphan the workspace.
-    assert!(!allowed(&authorize_remove(WorkspaceRole::Owner, WorkspaceRole::Owner, true)));
+    assert!(!allowed(&authorize_remove(
+        WorkspaceRole::Owner,
+        WorkspaceRole::Owner,
+        true
+    )));
     assert_eq!(
-        status_of(&authorize_remove(WorkspaceRole::Owner, WorkspaceRole::Owner, true)),
+        status_of(&authorize_remove(
+            WorkspaceRole::Owner,
+            WorkspaceRole::Owner,
+            true
+        )),
         403
     );
 }
@@ -357,13 +443,28 @@ fn self_leave_forbidden_for_owner() {
 fn member_can_leave_but_not_remove_others() {
     // The asymmetry that makes self-removal a distinct rule: a member may
     // leave (self) yet cannot remove any other member.
-    assert!(allowed(&authorize_remove(WorkspaceRole::Member, WorkspaceRole::Member, true)));
-    assert!(!allowed(&authorize_remove(WorkspaceRole::Member, WorkspaceRole::Member, false)));
+    assert!(allowed(&authorize_remove(
+        WorkspaceRole::Member,
+        WorkspaceRole::Member,
+        true
+    )));
+    assert!(!allowed(&authorize_remove(
+        WorkspaceRole::Member,
+        WorkspaceRole::Member,
+        false
+    )));
 }
 
 #[test]
 fn remove_denials_are_403() {
-    assert_eq!(status_of(&authorize_remove(WorkspaceRole::Member, WorkspaceRole::Member, false)), 403);
+    assert_eq!(
+        status_of(&authorize_remove(
+            WorkspaceRole::Member,
+            WorkspaceRole::Member,
+            false
+        )),
+        403
+    );
 }
 
 // ----- slug validation -----

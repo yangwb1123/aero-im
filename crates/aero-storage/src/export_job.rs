@@ -73,25 +73,21 @@ impl ExportJobRepo {
 
     /// Mark a job `done`, recording the produced archive blob.
     pub async fn complete(&self, id: Uuid, blob: BlobId) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            "UPDATE export_jobs SET status = 'done', blob_id = $2, completed_at = NOW() WHERE id = $1",
-        )
-        .bind(id)
-        .bind(blob.to_uuid())
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("UPDATE export_jobs SET status = 'done', blob_id = $2, completed_at = NOW() WHERE id = $1")
+            .bind(id)
+            .bind(blob.to_uuid())
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
     /// Mark a job `failed` with an error message.
     pub async fn fail(&self, id: Uuid, error: &str) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            "UPDATE export_jobs SET status = 'failed', error = $2, completed_at = NOW() WHERE id = $1",
-        )
-        .bind(id)
-        .bind(error)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("UPDATE export_jobs SET status = 'failed', error = $2, completed_at = NOW() WHERE id = $1")
+            .bind(id)
+            .bind(error)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -139,7 +135,10 @@ pub const EXPORT_LINK_TTL: time::Duration = time::Duration::hours(24);
 
 /// Whether a completed job's download link is still valid at `now`.
 #[must_use]
-pub fn link_is_valid(completed_at: Option<time::OffsetDateTime>, now: time::OffsetDateTime) -> bool {
+pub fn link_is_valid(
+    completed_at: Option<time::OffsetDateTime>,
+    now: time::OffsetDateTime,
+) -> bool {
     matches!(completed_at, Some(done) if now < done + EXPORT_LINK_TTL)
 }
 

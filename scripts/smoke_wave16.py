@@ -80,17 +80,17 @@ def main():
     listed = as_list(req("GET", f"/api/rooms/{R}/canvases", token=A), "canvases")
     if not any(c.get("id") == cid for c in listed):
         fail(f"new canvas not in list: {listed}")
-    got = req("GET", f"/api/canvases/{cid}", token=A)
+    got = req("GET", f"/api/rooms/{R}/canvases/{cid}", token=A)
     if got.get("title") != "Team Plan":
         fail(f"canvas title mismatch: {got}")
-    req("PUT", f"/api/canvases/{cid}", {"title": "Team Plan v2"}, token=A, expect=[200])
-    got2 = req("GET", f"/api/canvases/{cid}", token=A)
+    req("PUT", f"/api/rooms/{R}/canvases/{cid}", {"title": "Team Plan v2"}, token=A, expect=[200])
+    got2 = req("GET", f"/api/rooms/{R}/canvases/{cid}", token=A)
     if got2.get("title") != "Team Plan v2":
         fail(f"canvas update not applied: {got2}")
     # bob is not a room member → no access
-    req("GET", f"/api/canvases/{cid}", token=B, expect=[403, 404])
-    req("DELETE", f"/api/canvases/{cid}", token=A, expect=[200])
-    req("GET", f"/api/canvases/{cid}", token=A, expect=[404])
+    req("GET", f"/api/rooms/{R}/canvases/{cid}", token=B, expect=[403, 404])
+    req("DELETE", f"/api/rooms/{R}/canvases/{cid}", token=A, expect=[200])
+    req("GET", f"/api/rooms/{R}/canvases/{cid}", token=A, expect=[404])
     ok("canvas create/list/get/update ok; non-member 403/404; delete→404")
 
     # ---------------- Channel bookmarks ----------------
@@ -98,14 +98,15 @@ def main():
     bm = req("POST", f"/api/rooms/{R}/bookmarks",
              {"title": "Runbook", "url": "https://example.com/runbook", "emoji": "📘"}, token=A)
     bid = bm["id"]
+    assert req("GET", f"/api/rooms/{R}/bookmarks/{bid}", token=A)["id"] == bid
     blist = as_list(req("GET", f"/api/rooms/{R}/bookmarks", token=A), "bookmarks")
     if not any(b.get("id") == bid for b in blist):
         fail(f"bookmark not in list: {blist}")
-    req("PATCH", f"/api/channel-bookmarks/{bid}", {"title": "Runbook v2"}, token=A, expect=[200])
+    req("PATCH", f"/api/rooms/{R}/bookmarks/{bid}", {"title": "Runbook v2"}, token=A, expect=[200])
     blist2 = as_list(req("GET", f"/api/rooms/{R}/bookmarks", token=A), "bookmarks")
     if not any(b.get("id") == bid and b.get("title") == "Runbook v2" for b in blist2):
         fail(f"bookmark patch not applied: {blist2}")
-    req("DELETE", f"/api/channel-bookmarks/{bid}", token=A, expect=[200])
+    req("DELETE", f"/api/rooms/{R}/bookmarks/{bid}", token=A, expect=[200])
     ok("channel bookmark add/list/patch/delete ok")
 
     # ---------------- Stream categories & discovery ----------------
@@ -114,7 +115,7 @@ def main():
     slugs = {c.get("slug") for c in cats}
     if len(cats) < 5 or "gaming" not in slugs:
         fail(f"seeded categories missing: {cats}")
-    S = req("POST", "/api/streams", {"title": "w16 stream", "protocol": "rtmp", "room_id": R}, token=A)["stream"]["id"]
+    S = req("POST", "/api/streams", {"title": "w16 stream", "protocol": "rtmp", "room_id": R}, token=A)["id"]
     req("POST", f"/api/streams/{S}/category", {"slug": "gaming"}, token=A, expect=[200])
     # non-owner cannot file someone else's stream
     req("POST", f"/api/streams/{S}/category", {"slug": "music"}, token=B, expect=[403])

@@ -86,7 +86,13 @@ mod tests {
 
     #[test]
     fn group_id_eq_by_bytes() {
-        assert_eq!(MlsGroupId::new(b"abc".to_vec()), MlsGroupId::new(vec![97, 98, 99]));
-        assert_ne!(MlsGroupId::new(b"abc".to_vec()), MlsGroupId::new(b"abd".to_vec()));
+        assert_eq!(
+            MlsGroupId::new(b"abc".to_vec()),
+            MlsGroupId::new(vec![97, 98, 99])
+        );
+        assert_ne!(
+            MlsGroupId::new(b"abc".to_vec()),
+            MlsGroupId::new(b"abd".to_vec())
+        );
     }
 }

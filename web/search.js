@@ -112,7 +112,7 @@ function saveAiHistory(roomId, entry) {
     arr.push({ ...entry, ts: Date.now() });
     if (arr.length > 50) arr.shift();
     sessionStorage.setItem(k, JSON.stringify(arr));
-  } catch (e) { /* quota; ignore */ }
+  } catch { /* quota; ignore */ }
 }
 
 export function restoreAiHistory(roomId) {
@@ -140,5 +140,5 @@ export function restoreAiHistory(roomId) {
       }
       els.aiResults.appendChild(wrap);
     }
-  } catch (err) { /* ignore */ }
+  } catch { /* ignore */ }
 }

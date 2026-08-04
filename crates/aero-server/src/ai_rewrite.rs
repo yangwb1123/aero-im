@@ -16,7 +16,7 @@
 
 use aero_auth::AuthUser;
 use aero_common::Error as AeroError;
-use axum::{extract::State, routing::post, Json, Router};
+use axum::{extract::State, http::HeaderMap, routing::post, Json, Router};
 use serde::Deserialize;
 
 use crate::error::ApiResult;
@@ -77,7 +77,9 @@ impl RewriteStyle {
             "expand" => Ok(Self::Expand),
             "friendly" => Ok(Self::Friendly),
             "fix" => Ok(Self::Fix),
-            other => Err(AeroError::Invalid(format!("unknown rewrite style: {other}"))),
+            other => Err(AeroError::Invalid(format!(
+                "unknown rewrite style: {other}"
+            ))),
         }
     }
 
@@ -134,7 +136,8 @@ impl RewriteStyle {
 ///   backend call fails.
 async fn rewrite(
     State(s): State<AppState>,
-    _auth: AuthUser,
+    auth: AuthUser,
+    headers: HeaderMap,
     Json(req): Json<RewriteReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let text = req.text.trim();
@@ -146,12 +149,20 @@ async fn rewrite(
     // Same backend seam as caption/message translation; `None` (no AI wired at
     // all) is a 502, matching the other AI routes. With a backend but no key,
     // `translate` echoes the source, so `rewritten == original` and we still 200.
-    let ai = s
-        .ai
-        .as_ref()
-        .ok_or_else(|| AeroError::Upstream("AI not configured".into()))?;
+    let ai =
+        s.ai.as_ref()
+            .ok_or_else(|| AeroError::Upstream("AI not configured".into()))?;
     let rewritten = ai
-        .translate(text, style.directive())
+        .translate_with_usage_context(
+            text,
+            style.directive(),
+            crate::ai_usage::request_usage_context(
+                &headers,
+                auth.participant_id,
+                None,
+                &format!("ai_rewrite:{}:{text}", style.label()),
+            ),
+        )
         .await
         .map_err(AeroError::Upstream)?;
 
@@ -178,17 +189,35 @@ mod tests {
     #[test]
     fn parse_defaults_to_professional_when_absent_or_blank() {
         assert_eq!(RewriteStyle::parse(None).unwrap(), RewriteStyle::DEFAULT);
-        assert_eq!(RewriteStyle::parse(Some("")).unwrap(), RewriteStyle::DEFAULT);
-        assert_eq!(RewriteStyle::parse(Some("   ")).unwrap(), RewriteStyle::DEFAULT);
+        assert_eq!(
+            RewriteStyle::parse(Some("")).unwrap(),
+            RewriteStyle::DEFAULT
+        );
+        assert_eq!(
+            RewriteStyle::parse(Some("   ")).unwrap(),
+            RewriteStyle::DEFAULT
+        );
         assert_eq!(RewriteStyle::DEFAULT, RewriteStyle::Professional);
     }
 
     #[test]
     fn parse_is_case_insensitive_and_trimmed() {
-        assert_eq!(RewriteStyle::parse(Some("Casual")).unwrap(), RewriteStyle::Casual);
-        assert_eq!(RewriteStyle::parse(Some(" CONCISE ")).unwrap(), RewriteStyle::Concise);
-        assert_eq!(RewriteStyle::parse(Some("expand")).unwrap(), RewriteStyle::Expand);
-        assert_eq!(RewriteStyle::parse(Some("friendly")).unwrap(), RewriteStyle::Friendly);
+        assert_eq!(
+            RewriteStyle::parse(Some("Casual")).unwrap(),
+            RewriteStyle::Casual
+        );
+        assert_eq!(
+            RewriteStyle::parse(Some(" CONCISE ")).unwrap(),
+            RewriteStyle::Concise
+        );
+        assert_eq!(
+            RewriteStyle::parse(Some("expand")).unwrap(),
+            RewriteStyle::Expand
+        );
+        assert_eq!(
+            RewriteStyle::parse(Some("friendly")).unwrap(),
+            RewriteStyle::Friendly
+        );
         assert_eq!(RewriteStyle::parse(Some("fix")).unwrap(), RewriteStyle::Fix);
     }
 
@@ -210,7 +239,11 @@ mod tests {
         let mut seen = std::collections::HashSet::new();
         for style in ALL {
             let d = style.directive();
-            assert!(!d.trim().is_empty(), "{} has empty directive", style.label());
+            assert!(
+                !d.trim().is_empty(),
+                "{} has empty directive",
+                style.label()
+            );
             assert!(seen.insert(d), "{} shares a directive", style.label());
         }
     }

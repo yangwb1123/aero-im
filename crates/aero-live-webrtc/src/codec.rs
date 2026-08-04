@@ -34,6 +34,19 @@ pub enum Codec {
     Unknown,
 }
 
+impl Codec {
+    /// Whether packets for this codec need a decodable random-access point
+    /// before a newly attached bridge may start forwarding them.
+    ///
+    /// Audio, RTX, and unknown codecs have no video keyframe concept. Treating
+    /// them as keyframe-gated would permanently suppress Opus because
+    /// [`payload_is_keyframe`] correctly returns `false` for it.
+    #[must_use]
+    pub const fn requires_keyframe(self) -> bool {
+        !matches!(self, Self::Unknown)
+    }
+}
+
 impl From<str0m::format::Codec> for Codec {
     fn from(c: str0m::format::Codec) -> Self {
         match c {
@@ -78,7 +91,7 @@ mod tests {
     const VP9_KEY: [u8; 2] = [0x08, 0x86];
     /// AV1 aggregation header with the N (new coded video sequence) bit set.
     const AV1_KEY: [u8; 2] = [0x08, 0xAA];
-    /// H.265 single-NAL IDR_W_RADL (type 19) header byte 0 + a payload byte.
+    /// H.265 single-NAL `IDR_W_RADL` (type 19) header byte 0 + a payload byte.
     const H265_KEY: [u8; 2] = [19 << 1, 0x01];
 
     #[test]
@@ -118,7 +131,14 @@ mod tests {
 
     #[test]
     fn unknown_codec_is_never_keyframe() {
-        for payload in [&H264_IDR[..], &VP8_KEY[..], &VP9_KEY[..], &AV1_KEY[..], &H265_KEY[..], &[][..]] {
+        for payload in [
+            &H264_IDR[..],
+            &VP8_KEY[..],
+            &VP9_KEY[..],
+            &AV1_KEY[..],
+            &H265_KEY[..],
+            &[][..],
+        ] {
             assert!(!payload_is_keyframe(Codec::Unknown, payload));
         }
     }
@@ -127,9 +147,23 @@ mod tests {
     fn cross_codec_payloads_do_not_panic() {
         // Feeding the wrong codec's bytes must be safe (result is undefined
         // but must not panic); empty input is false for all codecs.
-        let codecs = [Codec::H264, Codec::H265, Codec::Vp8, Codec::Vp9, Codec::Av1, Codec::Unknown];
+        let codecs = [
+            Codec::H264,
+            Codec::H265,
+            Codec::Vp8,
+            Codec::Vp9,
+            Codec::Av1,
+            Codec::Unknown,
+        ];
         for codec in codecs {
-            for payload in [&H264_IDR[..], &VP8_KEY[..], &VP9_KEY[..], &AV1_KEY[..], &H265_KEY[..], &[][..]] {
+            for payload in [
+                &H264_IDR[..],
+                &VP8_KEY[..],
+                &VP9_KEY[..],
+                &AV1_KEY[..],
+                &H265_KEY[..],
+                &[][..],
+            ] {
                 let _ = payload_is_keyframe(codec, payload);
             }
             assert!(!payload_is_keyframe(codec, &[]));
@@ -151,5 +185,13 @@ mod tests {
     #[test]
     fn default_is_unknown() {
         assert_eq!(Codec::default(), Codec::Unknown);
+    }
+
+    #[test]
+    fn only_known_video_codecs_require_keyframes() {
+        for codec in [Codec::H264, Codec::H265, Codec::Vp8, Codec::Vp9, Codec::Av1] {
+            assert!(codec.requires_keyframe());
+        }
+        assert!(!Codec::Unknown.requires_keyframe());
     }
 }

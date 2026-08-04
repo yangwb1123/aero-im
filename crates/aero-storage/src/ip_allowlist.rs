@@ -14,9 +14,11 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use aero_common::WorkspaceId;
+use aero_common::{Error, ParticipantId, WorkspaceId};
 use serde::Serialize;
 use sqlx::PgPool;
+
+use crate::workspace::authz::assert_effective_admin_in_tx;
 
 /// One authorized-network entry — a `(workspace, cidr)` pair plus an optional note.
 ///
@@ -106,6 +108,33 @@ impl IpAllowlistRepo {
         Ok(row_to_model(row))
     }
 
+    /// Add or update a CIDR under a transactionally current workspace
+    /// Owner/Admin decision.
+    pub async fn add_authorized(
+        &self,
+        workspace: WorkspaceId,
+        cidr: &str,
+        note: Option<&str>,
+        actor: ParticipantId,
+    ) -> Result<IpAllowEntry, Error> {
+        let mut tx = self.pool.begin().await?;
+        assert_effective_admin_in_tx(&mut tx, workspace, actor).await?;
+        let sql = format!(
+            "INSERT INTO workspace_ip_allowlist (workspace_id, cidr, note)
+               VALUES ($1, $2, $3)
+             ON CONFLICT (workspace_id, cidr) DO UPDATE SET note = EXCLUDED.note
+             RETURNING {COLUMNS}"
+        );
+        let row = sqlx::query_as::<_, Row>(&sql)
+            .bind(workspace.to_uuid())
+            .bind(cidr)
+            .bind(note)
+            .fetch_one(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(row_to_model(row))
+    }
+
     /// Remove `cidr` from `workspace`'s allowlist. Returns `true` iff a row was
     /// removed — removing a range that was never added (or a second remove) is a
     /// no-op returning `false`.
@@ -113,14 +142,35 @@ impl IpAllowlistRepo {
     /// # Errors
     /// Propagates any [`sqlx::Error`] from the delete.
     pub async fn remove(&self, workspace: WorkspaceId, cidr: &str) -> Result<bool, sqlx::Error> {
-        let result = sqlx::query(
-            "DELETE FROM workspace_ip_allowlist WHERE workspace_id = $1 AND cidr = $2",
-        )
-        .bind(workspace.to_uuid())
-        .bind(cidr)
-        .execute(&self.pool)
-        .await?;
+        let result =
+            sqlx::query("DELETE FROM workspace_ip_allowlist WHERE workspace_id = $1 AND cidr = $2")
+                .bind(workspace.to_uuid())
+                .bind(cidr)
+                .execute(&self.pool)
+                .await?;
         Ok(result.rows_affected() > 0)
+    }
+
+    /// Remove a CIDR under the same workspace lock as the effective
+    /// administrator decision.
+    pub async fn remove_authorized(
+        &self,
+        workspace: WorkspaceId,
+        cidr: &str,
+        actor: ParticipantId,
+    ) -> Result<bool, Error> {
+        let mut tx = self.pool.begin().await?;
+        assert_effective_admin_in_tx(&mut tx, workspace, actor).await?;
+        let removed =
+            sqlx::query("DELETE FROM workspace_ip_allowlist WHERE workspace_id = $1 AND cidr = $2")
+                .bind(workspace.to_uuid())
+                .bind(cidr)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected()
+                > 0;
+        tx.commit().await?;
+        Ok(removed)
     }
 
     /// List the authorized networks for `workspace`, oldest first.
@@ -147,7 +197,45 @@ impl IpAllowlistRepo {
     /// # Errors
     /// Propagates any [`sqlx::Error`] from the query.
     pub async fn cidrs(&self, workspace: WorkspaceId) -> Result<Vec<String>, sqlx::Error> {
-        Ok(self.list(workspace).await?.into_iter().map(|e| e.cidr).collect())
+        Ok(self
+            .list(workspace)
+            .await?
+            .into_iter()
+            .map(|e| e.cidr)
+            .collect())
+    }
+
+    /// Return every configured authorized network for workspaces the participant
+    /// currently belongs to.
+    ///
+    /// The result is ordered by workspace and allowlist row so callers can group
+    /// it without another query. Workspaces with an empty allowlist are absent:
+    /// they are unrestricted by definition. This single JOIN is the hot-path
+    /// primitive used by the gateway for global REST and WebSocket enforcement;
+    /// it avoids a query per workspace and, importantly, also covers resource
+    /// routes whose URL contains a room/message id rather than a workspace id.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] from the query.
+    pub async fn configured_for_participant(
+        &self,
+        participant: ParticipantId,
+    ) -> Result<Vec<(WorkspaceId, String)>, sqlx::Error> {
+        let rows = sqlx::query_as::<_, (uuid::Uuid, String)>(
+            r"SELECT a.workspace_id, a.cidr
+                FROM workspace_ip_allowlist a
+                JOIN workspace_members m
+                  ON m.workspace_id = a.workspace_id
+               WHERE m.participant_id = $1
+               ORDER BY a.workspace_id, a.created_at, a.id",
+        )
+        .bind(participant.to_uuid())
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(workspace, cidr)| (WorkspaceId::from_uuid(workspace), cidr))
+            .collect())
     }
 }
 
@@ -356,6 +444,7 @@ mod db_tests {
     /// tests running in parallel against the shared DB.
     async fn fresh_ws(p: &PgPool, creator: ParticipantId) -> WorkspaceId {
         let id = WorkspaceId::new();
+        let mut tx = p.begin().await.expect("begin workspace fixture");
         sqlx::query(
             "INSERT INTO workspaces (id, name, slug, created_by, created_at)
              VALUES ($1, $2, $3, $4, now())",
@@ -364,9 +453,19 @@ mod db_tests {
         .bind(format!("ip-allow-ws-{id}"))
         .bind(format!("ipa-{id}"))
         .bind(creator.to_uuid())
-        .execute(p)
+        .execute(&mut *tx)
         .await
         .expect("insert workspace");
+        sqlx::query(
+            "INSERT INTO workspace_members (workspace_id, participant_id, role)
+             VALUES ($1, $2, 'owner')",
+        )
+        .bind(id.to_uuid())
+        .bind(creator.to_uuid())
+        .execute(&mut *tx)
+        .await
+        .expect("insert workspace owner");
+        tx.commit().await.expect("commit workspace fixture");
         id
     }
 
@@ -380,16 +479,39 @@ mod db_tests {
 
         // Empty to start ⇒ allow-all.
         assert!(repo.list(ws).await.unwrap().is_empty());
-        assert!(is_allowed("203.0.113.7".parse().unwrap(), &repo.cidrs(ws).await.unwrap()));
+        assert!(is_allowed(
+            "203.0.113.7".parse().unwrap(),
+            &repo.cidrs(ws).await.unwrap()
+        ));
 
         // Add two ranges; one with a note.
         let added = repo.add(ws, "10.0.0.0/8", Some("HQ")).await.unwrap();
         assert_eq!(added.cidr, "10.0.0.0/8");
         assert_eq!(added.note.as_deref(), Some("HQ"));
         repo.add(ws, "192.168.1.0/24", None).await.unwrap();
+        let configured = repo.configured_for_participant(creator).await.unwrap();
+        assert_eq!(
+            configured
+                .iter()
+                .filter(|(configured_ws, _)| *configured_ws == ws)
+                .count(),
+            2,
+            "the participant-wide lookup returns every configured CIDR"
+        );
+        let outsider = mk_participant(&p).await;
+        assert!(
+            repo.configured_for_participant(outsider)
+                .await
+                .unwrap()
+                .is_empty(),
+            "non-members cannot inherit another workspace's network policy"
+        );
 
         // Idempotent re-add updates only the note, keeps the id.
-        let re = repo.add(ws, "10.0.0.0/8", Some("HQ-renamed")).await.unwrap();
+        let re = repo
+            .add(ws, "10.0.0.0/8", Some("HQ-renamed"))
+            .await
+            .unwrap();
         assert_eq!(re.id, added.id, "re-add keeps the same row id");
         assert_eq!(re.note.as_deref(), Some("HQ-renamed"));
 
@@ -407,7 +529,10 @@ mod db_tests {
 
         // Remove → true once, then a no-op false; list shrinks.
         assert!(repo.remove(ws, "10.0.0.0/8").await.unwrap(), "first remove");
-        assert!(!repo.remove(ws, "10.0.0.0/8").await.unwrap(), "second remove no-op");
+        assert!(
+            !repo.remove(ws, "10.0.0.0/8").await.unwrap(),
+            "second remove no-op"
+        );
         let after = repo.list(ws).await.unwrap();
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].cidr, "192.168.1.0/24");

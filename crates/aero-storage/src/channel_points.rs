@@ -87,7 +87,14 @@ pub struct Redemption {
 
 const REDEMPTION_COLUMNS: &str = "id, reward_id, viewer_id, status, created_at, resolved_at";
 
-type RedemptionRow = (Uuid, Uuid, Uuid, String, time::OffsetDateTime, Option<time::OffsetDateTime>);
+type RedemptionRow = (
+    Uuid,
+    Uuid,
+    Uuid,
+    String,
+    time::OffsetDateTime,
+    Option<time::OffsetDateTime>,
+);
 
 fn redemption_row_to_model(r: RedemptionRow) -> Redemption {
     let (id, reward_id, viewer_id, status, created_at, resolved_at) = r;
@@ -307,7 +314,11 @@ impl ChannelPointsRepo {
 
         // Enqueue the pending redemption (auto-fulfill resolves immediately).
         let redemption_id = RedemptionId::new();
-        let status = if reward.auto_fulfill { "fulfilled" } else { "pending" };
+        let status = if reward.auto_fulfill {
+            "fulfilled"
+        } else {
+            "pending"
+        };
         sqlx::query(
             r"INSERT INTO redemption_queue (id, reward_id, viewer_id, status, resolved_at)
                VALUES ($1, $2, $3, $4, CASE WHEN $4 = 'pending' THEN NULL ELSE now() END)",
@@ -383,7 +394,11 @@ impl ChannelPointsRepo {
                JOIN reward_definitions rd ON rd.id = rq.reward_id
               WHERE rd.creator_id = $1";
         let order = " ORDER BY rq.created_at ASC, rq.id ASC";
-        let filter = if status.is_some() { " AND rq.status = $2" } else { "" };
+        let filter = if status.is_some() {
+            " AND rq.status = $2"
+        } else {
+            ""
+        };
         let sql = [base, filter, order].concat();
 
         let mut q = sqlx::query_as::<_, RedemptionRow>(&sql).bind(creator.to_uuid());

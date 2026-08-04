@@ -23,7 +23,10 @@
 //! the verified boundary is "gateways compile, builders + [`FakeGateway`] are
 //! unit-tested".
 
-use std::sync::{Arc, Mutex};
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use futures::future::BoxFuture;
 use serde_json::{json, Value};
@@ -33,6 +36,8 @@ const FCM_SEND_URL: &str = "https://fcm.googleapis.com/v1/projects/{project}/mes
 
 /// APNs production push endpoint template; `{token}` is the device token.
 const APNS_SEND_URL: &str = "https://api.push.apple.com/3/device/{token}";
+/// Total timeout for one provider request, including response-body download.
+const PUSH_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A provider-neutral push notification.
 ///
@@ -134,10 +139,7 @@ pub fn fcm_message_json(token: &str, payload: &PushPayload) -> Value {
     // Android coalescing: a new push with the same `collapse_key` replaces an
     // undelivered older one on the device, so a busy room shows one entry not N.
     if let Some(collapse_key) = &payload.collapse_key {
-        message.insert(
-            "android".into(),
-            json!({ "collapse_key": collapse_key }),
-        );
+        message.insert("android".into(), json!({ "collapse_key": collapse_key }));
     }
     json!({ "message": Value::Object(message) })
 }
@@ -229,7 +231,11 @@ impl FcmGateway {
         project: impl Into<String>,
         token_provider: TokenProvider,
     ) -> Self {
-        Self { http, project: project.into(), token_provider }
+        Self {
+            http,
+            project: project.into(),
+            token_provider,
+        }
     }
 }
 
@@ -243,6 +249,7 @@ impl PushGateway for FcmGateway {
         let resp = self
             .http
             .post(&url)
+            .timeout(PUSH_REQUEST_TIMEOUT)
             .bearer_auth(bearer)
             .json(&body)
             .send()
@@ -287,7 +294,11 @@ impl ApnsGateway {
         topic: impl Into<String>,
         token_provider: TokenProvider,
     ) -> Self {
-        Self { http, topic: topic.into(), token_provider }
+        Self {
+            http,
+            topic: topic.into(),
+            token_provider,
+        }
     }
 }
 
@@ -301,6 +312,7 @@ impl PushGateway for ApnsGateway {
         let mut req = self
             .http
             .post(&url)
+            .timeout(PUSH_REQUEST_TIMEOUT)
             .header("apns-topic", &self.topic)
             .header("authorization", format!("bearer {jwt}"));
         // Coalescing: when present, this header makes APNs replace any undelivered
@@ -357,7 +369,10 @@ impl FakeGateway {
     /// Snapshot of every `(token, payload)` seen so far, in send order.
     #[must_use]
     pub fn sent(&self) -> Vec<(String, PushPayload)> {
-        self.sends.lock().expect("fake-gateway mutex not poisoned").clone()
+        self.sends
+            .lock()
+            .expect("fake-gateway mutex not poisoned")
+            .clone()
     }
 }
 
@@ -412,7 +427,10 @@ mod tests {
     fn fcm_message_json_omits_none_data_keys() {
         let json = fcm_message_json("tok", &bare_payload());
         let data = json["message"]["data"].as_object().unwrap();
-        assert!(data.is_empty(), "data must be present but empty when no ids");
+        assert!(
+            data.is_empty(),
+            "data must be present but empty when no ids"
+        );
         assert!(data.get("room_id").is_none());
         assert!(data.get("message_id").is_none());
     }
@@ -454,7 +472,10 @@ mod tests {
 
     #[test]
     fn fcm_message_json_sets_android_collapse_key_when_present() {
-        let payload = PushPayload { collapse_key: Some("room:42".into()), ..full_payload() };
+        let payload = PushPayload {
+            collapse_key: Some("room:42".into()),
+            ..full_payload()
+        };
         let json = fcm_message_json("tok", &payload);
         assert_eq!(json["message"]["android"]["collapse_key"], "room:42");
     }
@@ -470,7 +491,10 @@ mod tests {
 
     #[test]
     fn apns_collapse_id_returns_key_when_present_and_within_cap() {
-        let payload = PushPayload { collapse_key: Some("room:7".into()), ..bare_payload() };
+        let payload = PushPayload {
+            collapse_key: Some("room:7".into()),
+            ..bare_payload()
+        };
         assert_eq!(apns_collapse_id(&payload).as_deref(), Some("room:7"));
     }
 
@@ -482,7 +506,10 @@ mod tests {
     #[test]
     fn apns_collapse_id_truncates_to_64_bytes_on_char_boundary() {
         // 100 multibyte chars (3 bytes each) — must truncate without splitting a char.
-        let payload = PushPayload { collapse_key: Some("界".repeat(100)), ..bare_payload() };
+        let payload = PushPayload {
+            collapse_key: Some("界".repeat(100)),
+            ..bare_payload()
+        };
         let id = apns_collapse_id(&payload).expect("some");
         assert!(id.len() <= APNS_COLLAPSE_ID_MAX_BYTES);
         // 64 / 3 = 21 whole chars (63 bytes); the 22nd would overflow the cap.

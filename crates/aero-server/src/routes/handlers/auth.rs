@@ -1,52 +1,29 @@
 // ----- Auth -----
 
-/// Best-effort: record an active login session keyed on the refresh token's hash
-/// (so it lines up with the revoked-token check), pulling the `User-Agent` from
-/// request headers when present. A failure here must NOT fail the login /
-/// registration, so any error is logged and swallowed. Wave 21.
+/// Record an active login session keyed on the refresh token's hash (so it lines
+/// up with the revoked-token check), pulling the `User-Agent` from request
+/// headers when present.
 async fn record_session(
     s: &AppState,
     participant: ParticipantId,
+    session_id: aero_common::SessionId,
     refresh_token: &str,
     headers: &header::HeaderMap,
-) {
-    let ua = headers
-        .get(header::USER_AGENT)
-        .and_then(|v| v.to_str().ok());
+) -> Result<(), sqlx::Error> {
+    let ua = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok());
     let hash = aero_storage::revoked_token::hash_token(refresh_token);
-    if let Err(e) = aero_storage::SessionRepo::new(s.pg.clone())
-        .record(participant, &hash, ua)
-        .await
-    {
-        tracing::warn!(error = ?e, %participant, "auth session record failed");
-    }
+    aero_storage::SessionRepo::new(s.pg.clone())
+        .record_with_id(participant, session_id, &hash, ua)
+        .await?;
+    Ok(())
 }
 
-/// The client's source IP, read from the standard reverse-proxy forwarding
-/// headers (`X-Forwarded-For`'s first hop, then `X-Real-IP`). Returns `None` when
-/// neither is present (e.g. a direct connection in dev) — callers treat an absent
-/// IP as "unobservable", never as a security signal.
+/// Source address resolved by the edge middleware's trusted-proxy policy.
 ///
-/// TRUST ASSUMPTION: this value is only trustworthy when a trusted reverse proxy
-/// **overwrites** `X-Forwarded-For` with the real client address (the standard
-/// cloud-LB / nginx `proxy_set_header` setup). A client can forge the header, so
-/// the IP fed to the new-login-IP signal is *defence-in-depth*, not an authz
-/// input: a forged-known-IP can only suppress a new-IP alert (a false negative),
-/// never grant access. Deploy behind a header-rewriting proxy for the signal to
-/// be reliable.
-fn client_ip(headers: &header::HeaderMap) -> Option<String> {
-    headers
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        // `X-Forwarded-For: client, proxy1, proxy2` — the client is the first hop.
-        .and_then(|s| s.split(',').next())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            headers.get("x-real-ip").and_then(|v| v.to_str().ok()).map(str::trim)
-        })
-        .filter(|s| !s.is_empty())
-        .map(ToOwned::to_owned)
+/// Never read forwarding headers directly here: doing so would let a direct
+/// client suppress new-IP alerts with a forged `X-Forwarded-For` value.
+fn client_ip(resolved: Option<crate::ip_allowlist::ResolvedClientIp>) -> Option<String> {
+    resolved.map(|ip| ip.0.to_string())
 }
 
 /// Best-effort: record this successful login in the IP/device history and, when
@@ -60,14 +37,18 @@ async fn record_login_event(
     participant: ParticipantId,
     workspace: Option<aero_common::WorkspaceId>,
     headers: &header::HeaderMap,
+    resolved_ip: Option<crate::ip_allowlist::ResolvedClientIp>,
 ) {
-    let ip = client_ip(headers);
+    let ip = client_ip(resolved_ip);
     let ua = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok());
     let repo = aero_storage::LoginEventRepo::new(s.pg.clone());
 
     // Flag a login from a new IP — but only for an account that already has
     // history (every IP is "new" on the first-ever login).
-    match (repo.is_known_ip(participant, ip.as_deref()).await, repo.has_any(participant).await) {
+    match (
+        repo.is_known_ip(participant, ip.as_deref()).await,
+        repo.has_any(participant).await,
+    ) {
         (Ok(false), Ok(true)) => {
             tracing::warn!(%participant, ip = ip.as_deref().unwrap_or("?"), "login from a new IP");
             if let Some(ws) = workspace {
@@ -98,23 +79,11 @@ async fn auth_register(
     headers: header::HeaderMap,
     Json(req): Json<RegisterRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let out = s.auth.register(req).await?;
-    // Enroll the brand-new participant into the legacy/default workspace so they
-    // immediately belong to a tenant — otherwise they could not create rooms
-    // (`create_room_in_workspace` requires workspace membership). `add_member` is
-    // an idempotent `ON CONFLICT DO NOTHING` upsert, so a retry is harmless. We
-    // propagate failures (rather than swallowing) to preserve the invariant
-    // "registered ⇒ workspace member"; the default workspace is guaranteed to
-    // exist by migration 0006's backfill.
-    s.workspaces
-        .add_member(DEFAULT_WORKSPACE_ID, out.participant.id, WorkspaceRole::Member)
-        .await
-        .map_err(AeroError::from)?;
-    // Onboarding: auto-join the new participant into the default workspace's
-    // default channels (Wave 12). Best-effort — never fails registration.
-    crate::default_channels::auto_join_defaults(&s, DEFAULT_WORKSPACE_ID, out.participant.id).await;
-    // Wave 21: record the active session (best-effort; never fails registration).
-    record_session(&s, out.participant.id, &out.refresh_token, &headers).await;
+    let user_agent = headers.get(header::USER_AGENT).and_then(|value| value.to_str().ok());
+    // Account, credentials, default-tenant/channel memberships, and the initial
+    // refresh-session inventory commit atomically. No token can escape for a
+    // half-created account and a failed signup can be retried with the same email.
+    let out = s.auth.register_enrolled(req, DEFAULT_WORKSPACE_ID, user_agent).await?;
     Ok(Json(serde_json::json!({
         "access_token": out.access_token,
         "refresh_token": out.refresh_token,
@@ -122,25 +91,38 @@ async fn auth_register(
     })))
 }
 
-/// Login request — email + password, plus an optional `totp` code that is
-/// *required* when the account has activated two-factor auth (Wave 14).
+/// Login request — email + password, plus either a current TOTP or a one-time
+/// recovery code when the account has activated two-factor auth.
 #[derive(Deserialize)]
 struct LoginReq {
     email: String,
     password: String,
     #[serde(default)]
     totp: Option<String>,
+    #[serde(default)]
+    recovery_code: Option<String>,
 }
 
 async fn auth_login(
     State(s): State<AppState>,
     headers: header::HeaderMap,
+    resolved_ip: Option<axum::Extension<crate::ip_allowlist::ResolvedClientIp>>,
     Json(req): Json<LoginReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let email = req.email.trim().to_lowercase();
+    let resolved_ip = resolved_ip.map(|axum::Extension(ip)| ip);
+    let LoginReq {
+        email,
+        password,
+        totp: submitted_totp,
+        recovery_code,
+    } = req;
+    let email = email.trim().to_lowercase();
     let out = match s
         .auth
-        .login(LoginRequest { email: email.clone(), password: req.password })
+        .login(LoginRequest {
+            email: email.clone(),
+            password,
+        })
         .await
     {
         Ok(u) => u,
@@ -154,7 +136,7 @@ async fn auth_login(
             // name a real account — enumeration is recorded too), not a
             // participant_id. Fail-OPEN: a recording error must never block the
             // login response, so we only warn.
-            let ip = client_ip(&headers);
+            let ip = client_ip(resolved_ip);
             let ua = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok());
             if let Err(rec_err) = aero_storage::LoginFailureRepo::new(s.pg.clone())
                 .record(&email, ip.as_deref(), ua)
@@ -169,22 +151,36 @@ async fn auth_login(
     // valid current code must accompany the (already-verified) password. Returns
     // 401 `2fa_required` when the code is missing or wrong, so a stolen password
     // alone can't complete the login.
-    let totp = aero_storage::TotpRepo::new(s.pg.clone());
-    if totp.is_activated(out.participant.id).await.map_err(AeroError::from)? {
-        let secret = totp
+    let totp_repo = aero_storage::TotpRepo::new(s.pg.clone());
+    let mut used_recovery_code = false;
+    if totp_repo
+        .is_activated(out.participant.id)
+        .await
+        .map_err(AeroError::from)?
+    {
+        let secret = totp_repo
             .get_secret(out.participant.id)
             .await
             .map_err(AeroError::from)?
             .ok_or_else(|| AeroError::Internal(anyhow::anyhow!("2FA activated without a secret")))?;
         let now = u64::try_from(time::OffsetDateTime::now_utc().unix_timestamp()).unwrap_or(0);
-        let code = req.totp.as_deref().unwrap_or("");
-        if !aero_auth::totp::verify(&secret, code, now) {
+        let totp_code = submitted_totp.as_deref().map(str::trim).unwrap_or("");
+        let totp_valid = aero_auth::totp::verify(&secret, totp_code, now);
+        if !totp_valid {
+            if let Some(code) = recovery_code.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+                used_recovery_code = aero_storage::RecoveryCodeRepo::new(s.pg.clone())
+                    .verify(out.participant.id, code)
+                    .await
+                    .map_err(AeroError::from)?;
+            }
+        }
+        if !totp_valid && !used_recovery_code {
             // A wrong/missing second factor is a FAILED login: count it on the
             // lockout throttle (the password success was deferred, not recorded) so
             // the code can't be brute-forced, and leave the same durable trail a
             // bad password leaves. Both best-effort — never block the 401 response.
             s.auth.finalize_login(&email, false).await;
-            let ip = client_ip(&headers);
+            let ip = client_ip(resolved_ip);
             let ua = headers.get(header::USER_AGENT).and_then(|v| v.to_str().ok());
             if let Err(rec_err) = aero_storage::LoginFailureRepo::new(s.pg.clone())
                 .record(&email, ip.as_deref(), ua)
@@ -199,14 +195,38 @@ async fn auth_login(
     // per-account lockout counter (deferred from `auth.login` so a failed 2FA above
     // counted as a failure instead of resetting it).
     s.auth.finalize_login(&email, true).await;
-    // Wave 21: record the active session (best-effort; never fails login). Done
-    // only after 2FA passes, so a half-completed login leaves no session row.
-    record_session(&s, out.participant.id, &out.refresh_token, &headers).await;
+    // A password login is safely retryable, so fail closed if its refresh
+    // session cannot be recorded. Otherwise the token would escape global
+    // revocation inventory and later fail refresh unexpectedly.
+    record_session(&s, out.participant.id, out.session_id, &out.refresh_token, &headers)
+        .await
+        .map_err(AeroError::from)?;
     // ROADMAP5 方向五: record the login in the IP/device history + flag a new-IP
     // login (best-effort; never fails login). The audit event is scoped to the
     // default workspace (login is workspace-agnostic — a participant can belong to
     // several; the all-zero default is where account-level security events land).
-    record_login_event(&s, out.participant.id, Some(DEFAULT_WORKSPACE_ID), &headers).await;
+    record_login_event(
+        &s,
+        out.participant.id,
+        Some(DEFAULT_WORKSPACE_ID),
+        &headers,
+        resolved_ip,
+    )
+    .await;
+    if used_recovery_code {
+        if let Err(e) = aero_storage::AuditRepo::new(s.pg.clone())
+            .append(
+                DEFAULT_WORKSPACE_ID,
+                Some(out.participant.id),
+                "auth.login.recovery_code",
+                None,
+                serde_json::json!({}),
+            )
+            .await
+        {
+            tracing::warn!(error = ?e, participant = %out.participant.id, "recovery-code login audit failed");
+        }
+    }
     Ok(Json(serde_json::json!({
         "access_token": out.access_token,
         "refresh_token": out.refresh_token,
@@ -217,10 +237,7 @@ async fn auth_login(
 /// `GET /api/auth/login-history` — the caller's recent successful logins (IP +
 /// user-agent + time), newest first, for a "recent login activity" view
 /// (ROADMAP5 方向五). Owner-scoped: a participant only ever sees their own.
-async fn auth_login_history(
-    State(s): State<AppState>,
-    auth: AuthUser,
-) -> ApiResult<Json<serde_json::Value>> {
+async fn auth_login_history(State(s): State<AppState>, auth: AuthUser) -> ApiResult<Json<serde_json::Value>> {
     let events = aero_storage::LoginEventRepo::new(s.pg.clone())
         .recent(auth.participant_id, 50)
         .await
@@ -266,7 +283,9 @@ async fn update_me(
             return Err(AeroError::Invalid("display_name too long".into()).into());
         }
     }
-    let url = req.avatar_url.map(|inner| inner.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()));
+    let url = req
+        .avatar_url
+        .map(|inner| inner.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()));
     let url_ref = url.as_ref().map(|inner| inner.as_deref());
     let updated = s
         .participants
@@ -281,4 +300,3 @@ async fn update_me(
     s.participant_cache.invalidate(&auth.participant_id);
     Ok(Json(serde_json::to_value(updated).map_err(AeroError::from)?))
 }
-

@@ -65,8 +65,35 @@ fn spec() -> Value {
                 "post": {
                     "summary": "Send a message",
                     "tags": ["messages"],
+                    "parameters": [{
+                        "name": "Idempotency-Key",
+                        "in": "header",
+                        "required": false,
+                        "schema": { "type": "string", "format": "uuid" }
+                    }],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "required": ["blocks"],
+                                    "properties": {
+                                        "blocks": { "type": "array", "maxItems": 50 },
+                                        "reply_to": { "type": "string" },
+                                        "expires_after_secs": { "type": "integer", "minimum": 0 },
+                                        "client_message_id": { "type": "string", "format": "uuid" }
+                                    }
+                                }
+                            }
+                        }
+                    },
                     "responses": {
-                        "200": { "description": "Sent message" }
+                        "201": { "description": "Message created" },
+                        "200": { "description": "Idempotent replay of the canonical message" },
+                        "403": { "description": "Room access denied" },
+                        "409": { "description": "Idempotency key reused with a different request" },
+                        "429": { "description": "Workspace rate or slow-mode limit" }
                     }
                 }
             },
@@ -97,11 +124,21 @@ fn spec() -> Value {
             },
             "/auth/login": {
                 "post": {
-                    "summary": "Login",
+                    "summary": "Login with password and optional TOTP or recovery code",
                     "tags": ["auth"],
                     "responses": {
                         "200": { "description": "Access and refresh tokens" },
                         "401": { "description": "Invalid credentials" }
+                    }
+                }
+            },
+            "/auth/2fa/recover": {
+                "post": {
+                    "summary": "Login with password and a one-time recovery code",
+                    "tags": ["auth"],
+                    "responses": {
+                        "200": { "description": "Access and refresh tokens" },
+                        "401": { "description": "Invalid credentials or recovery code" }
                     }
                 }
             },

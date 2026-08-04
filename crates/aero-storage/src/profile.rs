@@ -153,7 +153,8 @@ impl ProfileRepo {
         // list; the new status_emoji / status_expires_at columns are left at
         // their current values by the ON CONFLICT DO UPDATE because they are not
         // in EXCLUDED.
-        self.upsert(participant, title, pronouns, timezone, phone, status_text).await
+        self.upsert(participant, title, pronouns, timezone, phone, status_text)
+            .await
     }
 
     /// Update the custom status fields (`status_text`, `status_emoji`,
@@ -194,8 +195,7 @@ impl ProfileRepo {
     /// # Errors
     /// Propagates any [`sqlx::Error`] from the query.
     pub async fn get(&self, participant: ParticipantId) -> Result<Option<Profile>, sqlx::Error> {
-        let sql =
-            format!("SELECT {COLUMNS} FROM participant_profiles WHERE participant_id = $1");
+        let sql = format!("SELECT {COLUMNS} FROM participant_profiles WHERE participant_id = $1");
         let row = sqlx::query_as::<_, Row>(&sql)
             .bind(participant.to_uuid())
             .fetch_optional(&self.pool)

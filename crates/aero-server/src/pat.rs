@@ -122,18 +122,20 @@ async fn mint_pat(
     auth: AuthUser,
     Json(req): Json<MintPatReq>,
 ) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
-    let name = req
-        .name
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
+    let name = req.name.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let scopes = normalize_scopes(req.scopes)?;
     let expires_at = resolve_expiry(req.expires_in_secs, time::OffsetDateTime::now_utc())?;
 
     // Generate the plaintext once; persist only its hash.
     let token = generate_pat();
     let id = pat_repo(&s)
-        .create(auth.participant_id, &hash_pat(&token), name, &scopes, expires_at)
+        .create(
+            auth.participant_id,
+            &hash_pat(&token),
+            name,
+            &scopes,
+            expires_at,
+        )
         .await
         .map_err(AeroError::from)?;
 
@@ -149,10 +151,7 @@ async fn mint_pat(
 
 /// `GET /api/pat` — list the caller's tokens (metadata only; never the hash or
 /// plaintext), newest first.
-async fn list_pat(
-    State(s): State<AppState>,
-    auth: AuthUser,
-) -> ApiResult<Json<serde_json::Value>> {
+async fn list_pat(State(s): State<AppState>, auth: AuthUser) -> ApiResult<Json<serde_json::Value>> {
     let tokens = pat_repo(&s)
         .list(auth.participant_id)
         .await
@@ -168,8 +167,7 @@ async fn revoke_pat(
     auth: AuthUser,
     Path(id): Path<String>,
 ) -> ApiResult<StatusCode> {
-    let pat_id =
-        PatId::from_str(&id).map_err(|e| AeroError::Invalid(format!("pat id: {e}")))?;
+    let pat_id = PatId::from_str(&id).map_err(|e| AeroError::Invalid(format!("pat id: {e}")))?;
     let revoked = pat_repo(&s)
         .revoke(pat_id, auth.participant_id)
         .await

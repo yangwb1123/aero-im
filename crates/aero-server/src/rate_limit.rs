@@ -11,7 +11,7 @@
 //! refill), independent of any HTTP plumbing.
 
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use aero_common::Error as AeroError;
@@ -119,10 +119,10 @@ impl RateLimiter {
     // conversions below never wrap or lose sign — the lint can't see those bounds.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     pub fn check_status_at(&self, key: ClientKey, now: Instant) -> RateLimitStatus {
-        let mut entry = self
-            .buckets
-            .entry(key)
-            .or_insert(Bucket { tokens: self.capacity, last: now });
+        let mut entry = self.buckets.entry(key).or_insert(Bucket {
+            tokens: self.capacity,
+            last: now,
+        });
         let bucket = entry.value_mut();
         // Refill for the elapsed interval, capped at capacity.
         let elapsed = now.saturating_duration_since(bucket.last).as_secs_f64();
@@ -140,11 +140,18 @@ impl RateLimiter {
         // On reject: seconds until the next whole token (the Retry-After hint),
         // at least 1 so a client never busy-retries.
         let reset_secs = if allowed {
-            ((self.capacity - bucket.tokens) / self.rate).ceil().max(0.0) as u64
+            ((self.capacity - bucket.tokens) / self.rate)
+                .ceil()
+                .max(0.0) as u64
         } else {
             ((1.0 - bucket.tokens) / self.rate).ceil().max(1.0) as u64
         };
-        RateLimitStatus { allowed, limit, remaining, reset_secs }
+        RateLimitStatus {
+            allowed,
+            limit,
+            remaining,
+            reset_secs,
+        }
     }
 
     /// Convenience wrapper using the current monotonic clock.
@@ -219,14 +226,23 @@ fn is_operational_path(path: &str) -> bool {
     OPERATIONAL_PATHS.contains(&path)
 }
 
-/// Auth endpoints that accept credentials — these get a stricter token bucket
-/// (the general one, beyond the two per-path limiters below).
+/// Authentication transaction endpoints — these get a stricter token bucket
+/// (the general one, beyond the two per-path limiters below). This includes the
+/// OIDC redirect endpoints: `/start` creates state and `/callback` exchanges an
+/// authorization code with the upstream provider.
 const SENSITIVE_AUTH_PATHS: &[&str] = &[
     "/api/auth/login",
+    "/api/auth/2fa/recover",
     "/api/auth/register",
     "/api/auth/forgot-password",
     "/api/auth/reset-password",
     "/api/auth/refresh",
+    "/api/auth/logout",
+    "/api/auth/oidc",
+    "/api/auth/oidc/start",
+    "/callback",
+    "/saml/login",
+    "/saml/acs",
 ];
 
 /// Axum middleware enforcing per-client rate limits with per-route severity
@@ -259,7 +275,7 @@ pub async fn layer(
     }
     let key = client_key(&state, &headers, connect_info.map(|ci| ci.0));
     let limiter = match request.uri().path() {
-        "/api/auth/login" => &state.login_rate_limiter,
+        "/api/auth/login" | "/api/auth/2fa/recover" => &state.login_rate_limiter,
         "/api/auth/forgot-password" => &state.forgot_rate_limiter,
         p if SENSITIVE_AUTH_PATHS.contains(&p) => &state.auth_rate_limiter,
         _ => &state.rate_limiter,
@@ -275,7 +291,9 @@ pub async fn layer(
     if !cluster_allowed {
         crate::metrics::record_rate_limit_rejection();
         let mut response = ApiError(AeroError::RateLimited).into_response();
-        response.headers_mut().insert("retry-after", HeaderValue::from_static("1"));
+        response
+            .headers_mut()
+            .insert("retry-after", HeaderValue::from_static("1"));
         return Ok(response);
     }
     let status = limiter.check_status(key);
@@ -329,24 +347,94 @@ fn client_key(
 /// token so authenticated clients are limited per-identity, not per-IP. Returns
 /// `None` for missing/invalid tokens (those fall back to IP keying).
 fn bearer_participant(state: &AppState, headers: &HeaderMap) -> Option<aero_common::ParticipantId> {
-    let raw = headers.get(axum::http::header::AUTHORIZATION)?.to_str().ok()?;
-    let token = raw.strip_prefix("Bearer ").or_else(|| raw.strip_prefix("bearer "))?;
+    let raw = headers
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?;
+    let token = raw
+        .strip_prefix("Bearer ")
+        .or_else(|| raw.strip_prefix("bearer "))?;
     let claims = state.auth.verify(token.trim()).ok()?;
     claims.participant_id().ok()
 }
 
-/// Resolve the client IP: first hop of `X-Forwarded-For` if present, else the
-/// transport peer, else an unspecified address (so keying still works). Shared with
-/// the IP-allowlist enforcement middleware so both honour XFF identically.
+/// Resolve the client IP from the transport peer and, only when that peer is a
+/// configured trusted proxy, its forwarding chain.
+///
+/// `AERO_TRUSTED_PROXY_CIDRS` is a comma-separated list of proxy networks. With
+/// the default empty value all forwarding headers are ignored, so a direct
+/// client cannot forge `X-Forwarded-For` to bypass an authorized-network policy
+/// or escape an IP rate bucket. For a trusted peer we walk `X-Forwarded-For`
+/// right-to-left and return the first untrusted hop, which is the standard
+/// spoof-resistant interpretation of a multi-proxy chain.
 pub(crate) fn client_ip(headers: &HeaderMap, peer: Option<std::net::SocketAddr>) -> IpAddr {
-    if let Some(xff) = headers.get("x-forwarded-for").and_then(|v| v.to_str().ok()) {
-        if let Some(first) = xff.split(',').next() {
-            if let Ok(ip) = first.trim().parse::<IpAddr>() {
+    resolve_client_ip(headers, peer, trusted_proxy_cidrs())
+}
+
+fn trusted_proxy_cidrs() -> &'static [String] {
+    static TRUSTED: OnceLock<Vec<String>> = OnceLock::new();
+    TRUSTED
+        .get_or_init(|| {
+            std::env::var("AERO_TRUSTED_PROXY_CIDRS")
+                .unwrap_or_default()
+                .split(',')
+                .map(str::trim)
+                .filter(|cidr| !cidr.is_empty())
+                .map(ToOwned::to_owned)
+                .collect()
+        })
+        .as_slice()
+}
+
+fn resolve_client_ip(
+    headers: &HeaderMap,
+    peer: Option<std::net::SocketAddr>,
+    trusted_proxies: &[String],
+) -> IpAddr {
+    let unspecified = IpAddr::from([0, 0, 0, 0]);
+    let Some(peer_ip) = peer.map(|address| address.ip()) else {
+        // Forwarding headers without a transport peer cannot be authenticated.
+        return unspecified;
+    };
+    let trusted = |ip| {
+        trusted_proxies
+            .iter()
+            .any(|cidr| aero_storage::ip_allowlist::ip_in_cidr(ip, cidr))
+    };
+    if !trusted(peer_ip) {
+        return peer_ip;
+    }
+
+    if let Some(raw) = headers.get("x-forwarded-for") {
+        let Ok(raw) = raw.to_str() else {
+            return unspecified;
+        };
+        let mut chain = Vec::new();
+        for hop in raw.split(',') {
+            let Ok(ip) = hop.trim().parse::<IpAddr>() else {
+                // A malformed trusted-proxy chain is not safe authorization
+                // input. Use an address that will not accidentally match.
+                return unspecified;
+            };
+            chain.push(ip);
+        }
+        if chain.is_empty() {
+            return unspecified;
+        }
+        chain.push(peer_ip);
+        for ip in chain.iter().rev().copied() {
+            if !trusted(ip) {
                 return ip;
             }
         }
+        return chain[0];
     }
-    peer.map_or(IpAddr::from([0, 0, 0, 0]), |a| a.ip())
+
+    headers
+        .get("x-real-ip")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<IpAddr>().ok())
+        .unwrap_or(peer_ip)
 }
 
 /// Cluster-wide rate check (ROADMAP 第二次分析·方向二): a Redis INCR with a
@@ -409,7 +497,10 @@ mod tests {
     #[test]
     fn allows_burst_then_blocks_then_refills() {
         // Capacity 3, 1 token/sec.
-        let rl = RateLimiter::new(RateLimitConfig { per_second: 1, burst: 3 });
+        let rl = RateLimiter::new(RateLimitConfig {
+            per_second: 1,
+            burst: 3,
+        });
         let key = ip_key(1);
         let t0 = Instant::now();
 
@@ -435,7 +526,10 @@ mod tests {
 
     #[test]
     fn different_keys_have_independent_buckets() {
-        let rl = RateLimiter::new(RateLimitConfig { per_second: 1, burst: 1 });
+        let rl = RateLimiter::new(RateLimitConfig {
+            per_second: 1,
+            burst: 1,
+        });
         let t0 = Instant::now();
 
         // Each key's single token is independent.
@@ -449,7 +543,10 @@ mod tests {
 
     #[test]
     fn participant_and_ip_keys_are_distinct() {
-        let rl = RateLimiter::new(RateLimitConfig { per_second: 1, burst: 1 });
+        let rl = RateLimiter::new(RateLimitConfig {
+            per_second: 1,
+            burst: 1,
+        });
         let t0 = Instant::now();
         let pid = ParticipantId::new();
         let p_key = ClientKey::Participant(pid);
@@ -466,10 +563,17 @@ mod tests {
     fn sensitive_auth_paths_are_enumerated() {
         // Verify the path list covers the expected credential endpoints.
         assert!(SENSITIVE_AUTH_PATHS.contains(&"/api/auth/login"));
+        assert!(SENSITIVE_AUTH_PATHS.contains(&"/api/auth/2fa/recover"));
         assert!(SENSITIVE_AUTH_PATHS.contains(&"/api/auth/register"));
         assert!(SENSITIVE_AUTH_PATHS.contains(&"/api/auth/forgot-password"));
         assert!(SENSITIVE_AUTH_PATHS.contains(&"/api/auth/reset-password"));
         assert!(SENSITIVE_AUTH_PATHS.contains(&"/api/auth/refresh"));
+        assert!(SENSITIVE_AUTH_PATHS.contains(&"/api/auth/logout"));
+        assert!(SENSITIVE_AUTH_PATHS.contains(&"/api/auth/oidc"));
+        assert!(SENSITIVE_AUTH_PATHS.contains(&"/api/auth/oidc/start"));
+        assert!(SENSITIVE_AUTH_PATHS.contains(&"/callback"));
+        assert!(SENSITIVE_AUTH_PATHS.contains(&"/saml/login"));
+        assert!(SENSITIVE_AUTH_PATHS.contains(&"/saml/acs"));
         assert!(!SENSITIVE_AUTH_PATHS.contains(&"/api/messages"));
     }
 
@@ -486,18 +590,43 @@ mod tests {
     }
 
     #[test]
-    fn x_forwarded_for_first_hop_wins() {
+    fn direct_client_cannot_spoof_forwarding_headers() {
         let mut headers = HeaderMap::new();
         headers.insert("x-forwarded-for", "203.0.113.7, 10.0.0.1".parse().unwrap());
-        let ip = client_ip(&headers, Some("127.0.0.1:5000".parse().unwrap()));
+        let ip = resolve_client_ip(&headers, Some("198.51.100.4:5000".parse().unwrap()), &[]);
+        assert_eq!(ip, "198.51.100.4".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn trusted_proxy_chain_uses_rightmost_untrusted_hop() {
+        let mut headers = HeaderMap::new();
+        // The attacker-controlled leftmost value must not win; 203.0.113.7 is
+        // the actual client immediately before the two trusted proxies.
+        headers.insert(
+            "x-forwarded-for",
+            "192.0.2.66, 203.0.113.7, 10.0.0.2".parse().unwrap(),
+        );
+        let trusted = vec!["10.0.0.0/8".to_owned()];
+        let ip = resolve_client_ip(&headers, Some("10.0.0.1:5000".parse().unwrap()), &trusted);
         assert_eq!(ip, "203.0.113.7".parse::<IpAddr>().unwrap());
     }
 
     #[test]
     fn client_ip_falls_back_to_peer() {
         let headers = HeaderMap::new();
-        let ip = client_ip(&headers, Some("198.51.100.4:9000".parse().unwrap()));
+        let ip = resolve_client_ip(&headers, Some("198.51.100.4:9000".parse().unwrap()), &[]);
         assert_eq!(ip, "198.51.100.4".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn forwarding_headers_without_a_transport_peer_are_ignored() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "203.0.113.7".parse().unwrap());
+        let trusted = vec!["0.0.0.0/0".to_owned()];
+        assert_eq!(
+            resolve_client_ip(&headers, None, &trusted),
+            "0.0.0.0".parse::<IpAddr>().unwrap()
+        );
     }
 
     #[test]
@@ -520,7 +649,10 @@ mod tests {
     fn per_minute_capacity_matches_burst_plus_refill() {
         // 20 req/s, burst 40 (the default general-route limiter): a fully
         // refilled bucket sustaining requests for 60s allows burst + 60*rate.
-        let rl = RateLimiter::new(RateLimitConfig { per_second: 20, burst: 40 });
+        let rl = RateLimiter::new(RateLimitConfig {
+            per_second: 20,
+            burst: 40,
+        });
         assert_eq!(rl.per_minute_capacity(), 40 + 20 * 60);
 
         // A tight per-minute window limiter (login: 5/min, burst 5) must report
@@ -582,7 +714,10 @@ mod tests {
 
     #[test]
     fn check_status_reports_headers() {
-        let rl = RateLimiter::new(RateLimitConfig { per_second: 2, burst: 5 });
+        let rl = RateLimiter::new(RateLimitConfig {
+            per_second: 2,
+            burst: 5,
+        });
         let key = ip_key(30);
         let t0 = Instant::now();
 

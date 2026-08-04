@@ -49,7 +49,8 @@ pub struct ActivityEntry {
 
 /// The columns an [`ActivityEntry`] is built from, in select order. Shared by every
 /// query so the row decoding stays in one place.
-const COLUMNS: &str = "id, participant_id, kind, actor_id, subject_id, summary, created_at, read_at";
+const COLUMNS: &str =
+    "id, participant_id, kind, actor_id, subject_id, summary, created_at, read_at";
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct Row {
@@ -286,15 +287,33 @@ mod db_tests {
 
         // Insert three entries for `me` (oldest → newest).
         let a = repo
-            .insert(me, "stream_live", Some(actor), Some(subj_a), "first is live")
+            .insert(
+                me,
+                "stream_live",
+                Some(actor),
+                Some(subj_a),
+                "first is live",
+            )
             .await
             .unwrap();
         let b = repo
-            .insert(me, "stream_live", Some(actor), Some(subj_b), "second is live")
+            .insert(
+                me,
+                "stream_live",
+                Some(actor),
+                Some(subj_b),
+                "second is live",
+            )
             .await
             .unwrap();
         let c = repo
-            .insert(me, "stream_live", Some(actor), Some(subj_c), "third is live")
+            .insert(
+                me,
+                "stream_live",
+                Some(actor),
+                Some(subj_c),
+                "third is live",
+            )
             .await
             .unwrap();
         // An entry for someone else must never leak into `me`'s feed.
@@ -309,7 +328,10 @@ mod db_tests {
         assert_eq!(listed[2].id, a, "oldest last");
         assert_eq!(listed[0].actor_id, Some(actor));
         assert_eq!(listed[0].subject_id, Some(subj_c), "newest entry's subject");
-        assert!(listed.iter().all(|e| e.read_at.is_none()), "all start unread");
+        assert!(
+            listed.iter().all(|e| e.read_at.is_none()),
+            "all start unread"
+        );
 
         // Keyset pagination: `before = c` skips the newest.
         let page = repo.list(me, Some(c), 10).await.unwrap();
@@ -357,16 +379,32 @@ mod db_tests {
         let owner = mk_participant(&p).await;
         let stream = Ulid::new();
 
-        let first = repo.insert_go_live(me, Some(owner), stream, "live!").await.unwrap();
+        let first = repo
+            .insert_go_live(me, Some(owner), stream, "live!")
+            .await
+            .unwrap();
         assert!(first.is_some(), "first delivery inserts");
         // Redelivery of the SAME broadcast → deduped (None), no second row.
-        let dup = repo.insert_go_live(me, Some(owner), stream, "live!").await.unwrap();
+        let dup = repo
+            .insert_go_live(me, Some(owner), stream, "live!")
+            .await
+            .unwrap();
         assert!(dup.is_none(), "redelivery of the same stream is a no-op");
-        assert_eq!(repo.unread_count(me).await.unwrap(), 1, "exactly one feed entry");
+        assert_eq!(
+            repo.unread_count(me).await.unwrap(),
+            1,
+            "exactly one feed entry"
+        );
 
         // A genuinely new broadcast (fresh stream_id) still notifies.
-        let next = repo.insert_go_live(me, Some(owner), Ulid::new(), "live again!").await.unwrap();
-        assert!(next.is_some(), "a new broadcast is not blocked by the dedup");
+        let next = repo
+            .insert_go_live(me, Some(owner), Ulid::new(), "live again!")
+            .await
+            .unwrap();
+        assert!(
+            next.is_some(),
+            "a new broadcast is not blocked by the dedup"
+        );
         assert_eq!(repo.unread_count(me).await.unwrap(), 2);
 
         sqlx::query("DELETE FROM activity_feed WHERE participant_id = $1")

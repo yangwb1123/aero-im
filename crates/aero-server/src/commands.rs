@@ -71,6 +71,9 @@ pub fn routes() -> Router<AppState> {
 pub enum CommandOutcome {
     /// Post these blocks to the room as a normal message (the common case).
     Post(Vec<Block>),
+    /// Resolve a query through the configured GIPHY API integration, then post
+    /// the returned attributed media card through the normal message path.
+    Giphy { query: String },
     /// A reminder request: deliver `text` at the relative time named by `when_raw`
     /// (e.g. `10m`). The async handler resolves `when_raw` against the clock via
     /// [`parse_reminder_delay`] and persists it through
@@ -127,16 +130,15 @@ pub fn render_command(name: &str, rest: &str, author_display: &str) -> CommandOu
             let line = format!("{rest} ¯\\_(ツ)_/¯");
             CommandOutcome::Post(vec![Block::text(line.trim().to_string())])
         }
-        // Stub GIF card — a real GIPHY fetch is a documented seam (the client, or a
-        // later server enrichment, swaps the stub for a chosen GIF url).
         "giphy" => {
             if rest.is_empty() {
                 CommandOutcome::Error("usage: /giphy <query>".into())
+            } else if rest.chars().count() > 50 {
+                CommandOutcome::Error("GIPHY query must be at most 50 characters".into())
             } else {
-                CommandOutcome::Post(vec![Block::Card {
-                    schema: "giphy".into(),
-                    payload: serde_json::json!({ "query": rest }),
-                }])
+                CommandOutcome::Giphy {
+                    query: rest.to_owned(),
+                }
             }
         }
         // Reminder: split off the leading "<when>" token; the remainder is the note.
@@ -159,7 +161,10 @@ pub fn render_command(name: &str, rest: &str, author_display: &str) -> CommandOu
 /// naturally; otherwise the first token is the when and the rest is the note.
 fn split_remind(rest: &str) -> (String, String) {
     let rest = rest.trim();
-    if let Some(after_in) = rest.strip_prefix("in ").or_else(|| rest.strip_prefix("IN ")) {
+    if let Some(after_in) = rest
+        .strip_prefix("in ")
+        .or_else(|| rest.strip_prefix("IN "))
+    {
         let mut parts = after_in.trim_start().splitn(2, char::is_whitespace);
         let when = parts.next().unwrap_or("").trim();
         let text = parts.next().unwrap_or("").trim();
@@ -223,10 +228,22 @@ pub fn parse_reminder_delay(when_raw: &str) -> Option<std::time::Duration> {
 #[must_use]
 pub fn builtin_help() -> Vec<(&'static str, &'static str)> {
     vec![
-        ("me", "/me <action> — post an emote/action line (\"* you wave\")"),
-        ("shrug", "/shrug [text] — append ¯\\_(ツ)_/¯ to your message"),
-        ("giphy", "/giphy <query> — drop a GIF card for <query>"),
-        ("remind", "/remind <when> <text> — schedule a reminder (e.g. 10m, 2h, in 30s)"),
+        (
+            "me",
+            "/me <action> — post an emote/action line (\"* you wave\")",
+        ),
+        (
+            "shrug",
+            "/shrug [text] — append ¯\\_(ツ)_/¯ to your message",
+        ),
+        (
+            "giphy",
+            "/giphy <query> — search GIPHY and post an attributed GIF",
+        ),
+        (
+            "remind",
+            "/remind <when> <text> — schedule a reminder (e.g. 10m, 2h, in 30s)",
+        ),
     ]
 }
 
@@ -251,6 +268,19 @@ async fn display_name_of(s: &AppState, who: ParticipantId) -> String {
     }
 }
 
+/// Spend the same workspace budget and enforce the same room policy/slow-mode
+/// gate as an immediate WS send before any provider-backed command goes out to
+/// the network. The eventual service write rechecks access and post policy.
+async fn preflight_immediate_post(
+    state: &AppState,
+    sender: ParticipantId,
+    room: RoomId,
+) -> aero_common::Result<crate::message_send_policy::SlowmodeReservation> {
+    state.im.assert_message_send_preflight(sender, room).await?;
+    crate::ws_rate::check_ws_rate_room(state, room).await?;
+    crate::message_send_policy::reserve_slowmode(state, sender, room).await
+}
+
 /// `GET /api/commands` — list the built-in commands (name + one-line help) so the
 /// client can render an autocomplete menu. Auth-gated; no room scope.
 async fn list_commands(
@@ -259,7 +289,13 @@ async fn list_commands(
 ) -> ApiResult<Json<serde_json::Value>> {
     let commands: Vec<serde_json::Value> = builtin_help()
         .into_iter()
-        .map(|(name, help)| serde_json::json!({ "name": name, "help": help }))
+        .map(|(name, help)| {
+            serde_json::json!({
+                "name": name,
+                "help": help,
+                "available": name != "giphy" || crate::giphy::configured(),
+            })
+        })
         .collect();
     Ok(Json(serde_json::json!({ "commands": commands })))
 }
@@ -275,6 +311,8 @@ struct RunCommandReq {
 ///
 /// * [`CommandOutcome::Post`] → sent through [`ImService::send_message`] (the same
 ///   path normal messages take); the persisted message is returned.
+/// * [`CommandOutcome::Giphy`] → resolves one safe HTTPS rendition through the
+///   configured provider, then follows the same normal-message path.
 /// * [`CommandOutcome::Ephemeral`] → returned as `{ "ephemeral": msg }`, not posted.
 /// * [`CommandOutcome::Error`] → `400 Invalid`.
 /// * [`CommandOutcome::Remind`] → schedules a self-authored reminder note for later
@@ -291,13 +329,39 @@ async fn run_command(
     let room = parse_room(&room_str)?;
     s.im.assert_room_access(auth.participant_id, room).await?;
 
-    let (name, rest) = parse_command(&req.text)
-        .ok_or_else(|| AeroError::Invalid("not a command".into()))?;
+    let (name, rest) =
+        parse_command(&req.text).ok_or_else(|| AeroError::Invalid("not a command".into()))?;
     let author = display_name_of(&s, auth.participant_id).await;
 
     match render_command(&name, &rest, &author) {
         CommandOutcome::Post(blocks) => {
-            let msg = s.im.send_message(auth.participant_id, room, blocks, None, None).await?;
+            aero_im_core::validate_blocks(&blocks)?;
+            let slowmode = preflight_immediate_post(&s, auth.participant_id, room).await?;
+            let result =
+                s.im.send_message(auth.participant_id, room, blocks, None, None)
+                    .await;
+            let msg = slowmode.finish(result).await?;
+            Ok(Json(serde_json::to_value(msg).map_err(AeroError::from)?))
+        }
+        CommandOutcome::Giphy { query } => {
+            crate::giphy::check_caller_rate(&s, auth.participant_id).await?;
+            let slowmode = preflight_immediate_post(&s, auth.participant_id, room).await?;
+            let card = match crate::giphy::search_card(&query).await {
+                Ok(card) => card,
+                Err(error) => {
+                    slowmode.release().await;
+                    return Err(error.into());
+                }
+            };
+            let blocks = vec![card];
+            if let Err(error) = aero_im_core::validate_blocks(&blocks) {
+                slowmode.release().await;
+                return Err(AeroError::from(error).into());
+            }
+            let result =
+                s.im.send_message(auth.participant_id, room, blocks, None, None)
+                    .await;
+            let msg = slowmode.finish(result).await?;
             Ok(Json(serde_json::to_value(msg).map_err(AeroError::from)?))
         }
         CommandOutcome::Ephemeral(msg) => Ok(Json(serde_json::json!({ "ephemeral": msg }))),
@@ -316,8 +380,9 @@ async fn run_command(
             let deliver_at = time::OffsetDateTime::now_utc()
                 + time::Duration::seconds(i64::try_from(delay.as_secs()).unwrap_or(i64::MAX));
             let blocks = vec![Block::text(format!("⏰ Reminder: {text}"))];
+            crate::deferred_blocks::validate(&blocks)?;
             let id = ScheduledRepo::new(s.pg.clone())
-                .create(room, auth.participant_id, &blocks, None, deliver_at)
+                .create_authorized(room, auth.participant_id, &blocks, None, deliver_at)
                 .await?;
             Ok(Json(serde_json::json!({
                 "scheduled": true,
@@ -358,12 +423,18 @@ mod tests {
             Some(("me".into(), "hugs the bot".into()))
         );
         // Leading whitespace before the slash is tolerated.
-        assert_eq!(parse_command("   /shrug"), Some(("shrug".into(), String::new())));
+        assert_eq!(
+            parse_command("   /shrug"),
+            Some(("shrug".into(), String::new()))
+        );
     }
 
     #[test]
     fn parse_command_name_only_has_empty_rest() {
-        assert_eq!(parse_command("/shrug"), Some(("shrug".into(), String::new())));
+        assert_eq!(
+            parse_command("/shrug"),
+            Some(("shrug".into(), String::new()))
+        );
     }
 
     #[test]
@@ -405,8 +476,14 @@ mod tests {
 
     #[test]
     fn me_without_text_is_error() {
-        assert!(matches!(render_command("me", "", "Alice"), CommandOutcome::Error(_)));
-        assert!(matches!(render_command("me", "   ", "Alice"), CommandOutcome::Error(_)));
+        assert!(matches!(
+            render_command("me", "", "Alice"),
+            CommandOutcome::Error(_)
+        ));
+        assert!(matches!(
+            render_command("me", "   ", "Alice"),
+            CommandOutcome::Error(_)
+        ));
     }
 
     // ---- render_command: /shrug ----
@@ -433,22 +510,23 @@ mod tests {
     // ---- render_command: /giphy ----
 
     #[test]
-    fn giphy_renders_card_with_query() {
+    fn giphy_yields_a_provider_request_instead_of_a_placeholder_card() {
         match render_command("giphy", "dancing cat", "Carol") {
-            CommandOutcome::Post(blocks) => match blocks.as_slice() {
-                [Block::Card { schema, payload }] => {
-                    assert_eq!(schema, "giphy");
-                    assert_eq!(payload, &serde_json::json!({ "query": "dancing cat" }));
-                }
-                _ => panic!("expected one giphy card, got {blocks:?}"),
-            },
-            other => panic!("expected Post, got {other:?}"),
+            CommandOutcome::Giphy { query } => assert_eq!(query, "dancing cat"),
+            other => panic!("expected Giphy request, got {other:?}"),
         }
     }
 
     #[test]
     fn giphy_without_query_is_error() {
-        assert!(matches!(render_command("giphy", "", "Carol"), CommandOutcome::Error(_)));
+        assert!(matches!(
+            render_command("giphy", "", "Carol"),
+            CommandOutcome::Error(_)
+        ));
+        assert!(matches!(
+            render_command("giphy", &"x".repeat(51), "Carol"),
+            CommandOutcome::Error(_)
+        ));
     }
 
     // ---- render_command: /remind ----
@@ -477,9 +555,15 @@ mod tests {
 
     #[test]
     fn remind_without_text_or_when_is_error() {
-        assert!(matches!(render_command("remind", "", "Dee"), CommandOutcome::Error(_)));
+        assert!(matches!(
+            render_command("remind", "", "Dee"),
+            CommandOutcome::Error(_)
+        ));
         // Only a "when", no note.
-        assert!(matches!(render_command("remind", "10m", "Dee"), CommandOutcome::Error(_)));
+        assert!(matches!(
+            render_command("remind", "10m", "Dee"),
+            CommandOutcome::Error(_)
+        ));
     }
 
     // ---- parse_reminder_delay ----
@@ -533,7 +617,10 @@ mod tests {
             CommandOutcome::Error(e) => assert_eq!(e, "unknown command: /foo"),
             other => panic!("expected Error, got {other:?}"),
         }
-        assert!(matches!(render_command("", "", "Eve"), CommandOutcome::Error(_)));
+        assert!(matches!(
+            render_command("", "", "Eve"),
+            CommandOutcome::Error(_)
+        ));
     }
 
     // ---- help / names ----
@@ -547,7 +634,10 @@ mod tests {
             assert_eq!(name, n);
             assert!(!text.is_empty(), "help for /{name} is empty");
             // Every help line documents its own command name.
-            assert!(text.contains(name), "help for /{name} should mention it: {text}");
+            assert!(
+                text.contains(name),
+                "help for /{name} should mention it: {text}"
+            );
         }
     }
 

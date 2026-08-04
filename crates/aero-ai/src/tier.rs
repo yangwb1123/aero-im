@@ -23,8 +23,22 @@ pub enum AiTier {
 
 /// Markers that signal cross-document reasoning / synthesis (→ Hard).
 const REASONING_MARKERS: &[&str] = &[
-    "compare", "对比", "分析", "analyze", "why", "为什么", "explain", "解释",
-    "综合", "trade-off", "权衡", "pros and cons", "step by step", "逐步", "推理", "summarize across",
+    "compare",
+    "对比",
+    "分析",
+    "analyze",
+    "why",
+    "为什么",
+    "explain",
+    "解释",
+    "综合",
+    "trade-off",
+    "权衡",
+    "pros and cons",
+    "step by step",
+    "逐步",
+    "推理",
+    "summarize across",
 ];
 
 /// Classify an answer query by difficulty from the query text + how many retrieval
@@ -62,7 +76,10 @@ pub fn tier_model(tier: AiTier) -> Option<String> {
         AiTier::Hard => "AERO_AI_MODEL_HARD",
         AiTier::Medium => return None,
     };
-    std::env::var(var).ok().map(|s| s.trim().to_owned()).filter(|s| !s.is_empty())
+    std::env::var(var)
+        .ok()
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty())
 }
 
 #[cfg(test)]
@@ -98,7 +115,10 @@ mod tests {
         // Mid-length (41–160 chars), grounded, no marker → not short enough for
         // Easy, not long/marked/ungrounded for Hard.
         let mid = "我们这次线上发布用到的灰度放量策略和回滚预案具体是怎么安排的，分别涉及哪些下游服务以及对应的值班同学和告警阈值";
-        assert!(mid.chars().count() > 40 && mid.chars().count() <= 160, "fixture length");
+        assert!(
+            mid.chars().count() > 40 && mid.chars().count() <= 160,
+            "fixture length"
+        );
         assert_eq!(classify_tier(mid, 3), AiTier::Medium);
     }
 

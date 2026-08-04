@@ -40,10 +40,6 @@ pub struct MessageEdit {
     pub recorded_at: time::OffsetDateTime,
 }
 
-/// The columns a [`MessageEdit`] is built from, in select order. Shared by every
-/// query so the row decoding stays in one place.
-const COLUMNS: &str = "id, message_id, editor_id, blocks, recorded_at";
-
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct Row {
     id: uuid::Uuid,
@@ -106,9 +102,10 @@ impl MessageEditRepo {
         Ok(id)
     }
 
-    /// List every captured prior version of `message`, newest first. The caller
-    /// is responsible for asserting the requester may read the message's room
-    /// (see [`MessageEditRepo::message_room`]).
+    /// List every captured prior version of a live `message`, newest first.
+    /// Soft-deleted messages return an empty list: the rows stay in
+    /// `message_edits` as audit/legal evidence, but ordinary room members cannot
+    /// retrieve retired content after the tombstone.
     ///
     /// # Errors
     /// Propagates any [`sqlx::Error`] from the query.
@@ -116,33 +113,32 @@ impl MessageEditRepo {
         &self,
         message: MessageId,
     ) -> Result<Vec<MessageEdit>, sqlx::Error> {
-        let sql = format!(
-            "SELECT {COLUMNS}
-               FROM message_edits
-              WHERE message_id = $1
-              ORDER BY recorded_at DESC, id DESC"
-        );
-        let rows = sqlx::query_as::<_, Row>(&sql)
-            .bind(message.to_uuid())
-            .fetch_all(&self.pool)
-            .await?;
+        let rows = sqlx::query_as::<_, Row>(
+            r"SELECT e.id, e.message_id, e.editor_id, e.blocks, e.recorded_at
+                FROM message_edits e
+                JOIN messages m ON m.id = e.message_id
+               WHERE e.message_id = $1 AND m.deleted_at IS NULL
+               ORDER BY e.recorded_at DESC, e.id DESC",
+        )
+        .bind(message.to_uuid())
+        .fetch_all(&self.pool)
+        .await?;
         Ok(rows.into_iter().map(row_to_model).collect())
     }
 
-    /// Resolve the room a message belongs to, or `None` if no such message exists.
-    /// Used by the read route to membership-gate edit history: the caller asserts
-    /// access to the returned room before surfacing any prior versions.
+    /// Resolve the room a live message belongs to, or `None` if it is missing or
+    /// soft-deleted. Used by the ordinary read route both to membership-gate edit
+    /// history and to keep retained evidence inaccessible after deletion.
     ///
     /// # Errors
     /// Propagates any [`sqlx::Error`] from the query.
-    pub async fn message_room(
-        &self,
-        message: MessageId,
-    ) -> Result<Option<RoomId>, sqlx::Error> {
-        let row = sqlx::query_as::<_, (uuid::Uuid,)>("SELECT room_id FROM messages WHERE id = $1")
-            .bind(message.to_uuid())
-            .fetch_optional(&self.pool)
-            .await?;
+    pub async fn message_room(&self, message: MessageId) -> Result<Option<RoomId>, sqlx::Error> {
+        let row = sqlx::query_as::<_, (uuid::Uuid,)>(
+            "SELECT room_id FROM messages WHERE id = $1 AND deleted_at IS NULL",
+        )
+        .bind(message.to_uuid())
+        .fetch_optional(&self.pool)
+        .await?;
         Ok(row.map(|(room_id,)| RoomId::from_uuid(room_id)))
     }
 }
@@ -252,7 +248,11 @@ mod db_tests {
 
         // message_room resolves the seeded message's room; an unknown id is None.
         let resolved = repo.message_room(message).await.unwrap();
-        assert_eq!(resolved, Some(room), "message_room resolves the seeded room");
+        assert_eq!(
+            resolved,
+            Some(room),
+            "message_room resolves the seeded room"
+        );
         assert!(
             repo.message_room(MessageId::new()).await.unwrap().is_none(),
             "unknown message resolves to None"
@@ -280,7 +280,30 @@ mod db_tests {
         assert_eq!(history[0].message_id, message);
         assert_eq!(history[0].editor_id, owner);
 
-        // Cleanup so reruns stay self-contained (FK cascade clears edits/messages).
+        // A tombstone retains both evidence rows in storage while closing the
+        // ordinary room-history surface.
+        sqlx::query("UPDATE messages SET deleted_at = now() WHERE id = $1")
+            .bind(message.to_uuid())
+            .execute(&p)
+            .await
+            .unwrap();
+        assert!(
+            repo.message_room(message).await.unwrap().is_none(),
+            "deleted message cannot authorize an ordinary history read"
+        );
+        assert!(
+            repo.list_for_message(message).await.unwrap().is_empty(),
+            "retained edit evidence is hidden after deletion"
+        );
+        let retained: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM message_edits WHERE message_id = $1")
+                .bind(message.to_uuid())
+                .fetch_one(&p)
+                .await
+                .unwrap();
+        assert_eq!(retained, 2, "edit evidence is retained");
+
+        // Cleanup so reruns stay self-contained.
         sqlx::query("DELETE FROM message_edits WHERE message_id = $1")
             .bind(message.to_uuid())
             .execute(&p)

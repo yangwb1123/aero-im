@@ -71,15 +71,14 @@ async fn set_snooze(
         .set_snooze(auth.participant_id, Some(req.until))
         .await
         .map_err(AeroError::from)?;
-    Ok(Json(SnoozeView { snooze_until: Some(req.until) }))
+    Ok(Json(SnoozeView {
+        snooze_until: Some(req.until),
+    }))
 }
 
 /// `DELETE /api/notifications/snooze` — clear the caller's one-off snooze (the
 /// daily DND window, if any, is left intact). Idempotent.
-async fn clear_snooze(
-    State(s): State<AppState>,
-    auth: AuthUser,
-) -> ApiResult<Json<SnoozeView>> {
+async fn clear_snooze(State(s): State<AppState>, auth: AuthUser) -> ApiResult<Json<SnoozeView>> {
     repo(&s)
         .clear_snooze(auth.participant_id)
         .await
@@ -90,10 +89,7 @@ async fn clear_snooze(
 /// `GET /api/notifications/snooze` — the caller's current snooze instant, or
 /// `null` when not snoozed. A value in the past may be returned verbatim (it
 /// simply reads as no-longer-active).
-async fn get_snooze(
-    State(s): State<AppState>,
-    auth: AuthUser,
-) -> ApiResult<Json<SnoozeView>> {
+async fn get_snooze(State(s): State<AppState>, auth: AuthUser) -> ApiResult<Json<SnoozeView>> {
     let snooze_until = repo(&s)
         .get_snooze(auth.participant_id)
         .await

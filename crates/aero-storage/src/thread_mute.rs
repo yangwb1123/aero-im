@@ -20,8 +20,10 @@
 
 use std::collections::HashSet;
 
-use aero_common::{MessageId, ParticipantId};
+use aero_common::{Error, MessageId, ParticipantId};
 use sqlx::PgPool;
+
+use crate::thread_subscription::lock_effective_live_thread_root_in_tx;
 
 /// Repository over the `thread_mutes` table (per-user thread mutes).
 ///
@@ -45,7 +47,8 @@ impl ThreadMuteRepo {
     ///
     /// # Errors
     /// Propagates any [`sqlx::Error`] from the insert.
-    pub async fn mute(
+    #[cfg(test)]
+    pub(crate) async fn mute(
         &self,
         participant: ParticipantId,
         root: MessageId,
@@ -69,7 +72,8 @@ impl ThreadMuteRepo {
     ///
     /// # Errors
     /// Propagates any [`sqlx::Error`] from the delete.
-    pub async fn unmute(
+    #[cfg(test)]
+    pub(crate) async fn unmute(
         &self,
         participant: ParticipantId,
         root: MessageId,
@@ -93,7 +97,18 @@ impl ThreadMuteRepo {
     /// Propagates any [`sqlx::Error`] from the query.
     pub async fn muted_by(&self, root: MessageId) -> Result<HashSet<ParticipantId>, sqlx::Error> {
         let rows = sqlx::query_as::<_, (uuid::Uuid,)>(
-            r"SELECT participant_id FROM thread_mutes WHERE root_message_id = $1",
+            r"SELECT mute.participant_id
+                FROM thread_mutes AS mute
+                JOIN messages AS root
+                  ON root.id = mute.root_message_id
+                 AND root.reply_to IS NULL
+                 AND root.deleted_at IS NULL
+               WHERE mute.root_message_id = $1
+                 AND aero_effective_room_access(
+                         root.room_id,
+                         mute.participant_id,
+                         NULL
+                     )",
         )
         .bind(root.to_uuid())
         .fetch_all(&self.pool)
@@ -109,7 +124,8 @@ impl ThreadMuteRepo {
     ///
     /// # Errors
     /// Propagates any [`sqlx::Error`] from the query.
-    pub async fn is_muted(
+    #[cfg(test)]
+    pub(crate) async fn is_muted(
         &self,
         participant: ParticipantId,
         root: MessageId,
@@ -124,6 +140,81 @@ impl ThreadMuteRepo {
         .await?;
         Ok(row.is_some())
     }
+
+    /// Mute a live canonical thread under the caller's current room-access
+    /// fence.
+    ///
+    /// # Errors
+    /// Returns an opaque root/access error or a database error.
+    pub async fn mute_authorized(
+        &self,
+        participant: ParticipantId,
+        root: MessageId,
+    ) -> Result<(), Error> {
+        let mut tx = self.pool.begin().await?;
+        lock_effective_live_thread_root_in_tx(&mut tx, participant, root).await?;
+        sqlx::query(
+            r"INSERT INTO thread_mutes (participant_id, root_message_id)
+               VALUES ($1, $2)
+               ON CONFLICT (participant_id, root_message_id) DO NOTHING",
+        )
+        .bind(participant.to_uuid())
+        .bind(root.to_uuid())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Unmute a live canonical thread under the caller's current room-access
+    /// fence.
+    ///
+    /// # Errors
+    /// Returns an opaque root/access error or a database error.
+    pub async fn unmute_authorized(
+        &self,
+        participant: ParticipantId,
+        root: MessageId,
+    ) -> Result<bool, Error> {
+        let mut tx = self.pool.begin().await?;
+        lock_effective_live_thread_root_in_tx(&mut tx, participant, root).await?;
+        let result = sqlx::query(
+            r"DELETE FROM thread_mutes
+               WHERE participant_id = $1 AND root_message_id = $2",
+        )
+        .bind(participant.to_uuid())
+        .bind(root.to_uuid())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Check a mute under the caller's current room-access fence.
+    ///
+    /// # Errors
+    /// Returns an opaque root/access error or a database error.
+    pub async fn is_muted_authorized(
+        &self,
+        participant: ParticipantId,
+        root: MessageId,
+    ) -> Result<bool, Error> {
+        let mut tx = self.pool.begin().await?;
+        lock_effective_live_thread_root_in_tx(&mut tx, participant, root).await?;
+        let muted: bool = sqlx::query_scalar(
+            r"SELECT EXISTS(
+                   SELECT 1
+                     FROM thread_mutes
+                    WHERE participant_id = $1 AND root_message_id = $2
+               )",
+        )
+        .bind(participant.to_uuid())
+        .bind(root.to_uuid())
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(muted)
+    }
 }
 
 /// PG-gated integration tests (run with a live Postgres + applied migrations):
@@ -136,6 +227,13 @@ impl ThreadMuteRepo {
 mod db_tests {
     use super::*;
 
+    struct Fixture {
+        owner: ParticipantId,
+        other: ParticipantId,
+        stranger: ParticipantId,
+        root: MessageId,
+    }
+
     fn pool() -> PgPool {
         let url = std::env::var("DATABASE_URL")
             .unwrap_or_else(|_| "postgres://aero:aero_dev_pw@localhost:5432/aero".into());
@@ -145,18 +243,90 @@ mod db_tests {
             .expect("connect_lazy never fails on a well-formed URL")
     }
 
-    /// Create a throwaway participant so the test is self-contained. Mutes store
-    /// opaque `root_message_id` uuids (no FK to `messages`), so a fresh
-    /// [`MessageId`] can be used without inserting a message.
-    async fn mk_participant(p: &PgPool) -> ParticipantId {
-        let id = ParticipantId::new();
-        sqlx::query("INSERT INTO participants (id, kind, display_name) VALUES ($1, 'human', $2)")
-            .bind(id.to_uuid())
-            .bind(format!("thread-mute-owner-{id}"))
-            .execute(p)
+    async fn fixture(p: &PgPool) -> Fixture {
+        let owner = ParticipantId::new();
+        let other = ParticipantId::new();
+        let stranger = ParticipantId::new();
+        let workspace = uuid::Uuid::new_v4();
+        let room = uuid::Uuid::new_v4();
+        let root_message = MessageId::new();
+        let mut tx = p.begin().await.expect("begin thread mute fixture");
+
+        for participant in [owner, other, stranger] {
+            sqlx::query(
+                "INSERT INTO participants (id, kind, display_name)
+                 VALUES ($1, 'human', $2)",
+            )
+            .bind(participant.to_uuid())
+            .bind(format!("thread-mute-{participant}"))
+            .execute(&mut *tx)
             .await
             .expect("insert participant");
-        id
+        }
+        sqlx::query(
+            "INSERT INTO workspaces (id, name, slug, created_by)
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(workspace)
+        .bind(format!("Thread mute {workspace}"))
+        .bind(format!("thread-mute-{workspace}"))
+        .bind(owner.to_uuid())
+        .execute(&mut *tx)
+        .await
+        .expect("insert workspace");
+        for (participant, role) in [(owner, "owner"), (other, "member")] {
+            sqlx::query(
+                "INSERT INTO workspace_members (workspace_id, participant_id, role)
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(workspace)
+            .bind(participant.to_uuid())
+            .bind(role)
+            .execute(&mut *tx)
+            .await
+            .expect("insert workspace member");
+        }
+        sqlx::query(
+            "INSERT INTO rooms (id, kind, name, created_by, workspace_id)
+             VALUES ($1, 'group', $2, $3, $4)",
+        )
+        .bind(room)
+        .bind(format!("Thread mute room {room}"))
+        .bind(owner.to_uuid())
+        .bind(workspace)
+        .execute(&mut *tx)
+        .await
+        .expect("insert room");
+        for (participant, role) in [(owner, "owner"), (other, "member")] {
+            sqlx::query(
+                "INSERT INTO room_members (room_id, participant_id, role)
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(room)
+            .bind(participant.to_uuid())
+            .bind(role)
+            .execute(&mut *tx)
+            .await
+            .expect("insert room member");
+        }
+        sqlx::query(
+            "INSERT INTO messages (id, room_id, sender_id, blocks, searchable_text)
+             VALUES ($1, $2, $3, '[]'::jsonb, 'thread mute root')",
+        )
+        .bind(root_message.to_uuid())
+        .bind(room)
+        .bind(owner.to_uuid())
+        .execute(&mut *tx)
+        .await
+        .expect("insert live root message");
+        tx.commit().await.expect("commit thread mute fixture");
+
+        Fixture {
+            owner,
+            other,
+            stranger,
+            root: root_message,
+        }
     }
 
     #[tokio::test]
@@ -164,10 +334,12 @@ mod db_tests {
     async fn thread_mute_mute_is_muted_muted_by_unmute_owner_scoped() {
         let p = pool();
         let repo = ThreadMuteRepo::new(p.clone());
-        let owner = mk_participant(&p).await;
-        let other = mk_participant(&p).await;
-        let stranger = mk_participant(&p).await;
-        let root = MessageId::new();
+        let Fixture {
+            owner,
+            other,
+            stranger,
+            root,
+        } = fixture(&p).await;
 
         // Not muted yet.
         assert!(
@@ -185,7 +357,10 @@ mod db_tests {
         repo.mute(other, root).await.unwrap();
         assert!(repo.is_muted(owner, root).await.unwrap(), "muted");
         let muters = repo.muted_by(root).await.unwrap();
-        assert!(muters.contains(&owner) && muters.contains(&other), "both muters in the set");
+        assert!(
+            muters.contains(&owner) && muters.contains(&other),
+            "both muters in the set"
+        );
 
         // Owner-scoping: a stranger neither shows as muted nor can remove a mute.
         assert!(
@@ -203,7 +378,10 @@ mod db_tests {
             !repo.unmute(owner, root).await.unwrap(),
             "second unmute is a no-op"
         );
-        assert!(!repo.is_muted(owner, root).await.unwrap(), "no longer muted");
+        assert!(
+            !repo.is_muted(owner, root).await.unwrap(),
+            "no longer muted"
+        );
         assert!(
             !repo.muted_by(root).await.unwrap().contains(&owner),
             "owner gone from the muter set"

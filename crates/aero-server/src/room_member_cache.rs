@@ -1,23 +1,21 @@
-//! Per-process TTL cache for room membership lists (ROADMAP6 方向四 多级缓存).
+//! Per-process TTL cache for non-authoritative room-membership hints.
 //!
-//! The `RoomRepo::members(room)` query is a hot read path in the bus-listener
-//! fan-out: every `RoomEvent` without explicit recipients calls it once to
-//! expand recipients. For high-traffic rooms this means dozens of PG queries
-//! per second, each scanning the `room_members` index.
+//! This cache must never decide whether a participant receives room content or
+//! may perform a room-scoped operation. Cross-node invalidation is deliberately
+//! best-effort, so a cached list can be stale for its whole TTL.
 //!
-//! Room membership changes rarely (a member joins or leaves), so a local TTL
-//! cache with write-invalidation eliminates the majority of these round-trips
-//! while staying safe.
+//! The NATS-to-WebSocket path therefore reads
+//! `RoomRepo::delivery_members(room)` from PostgreSQL for every event. That
+//! authoritative query intersects room membership, workspace membership,
+//! account/deactivation state, and mandatory-2FA policy before fan-out.
 //!
-//! ## Safety under concurrent writes
+//! ## Permitted use
 //! - **Reads** hit `DashMap` (lock-free per shard).
 //! - **Writes** (add/remove member) invalidate the cached entry.
-//! - **TTL** (default 60s) is a freshness floor: if membership changes on
-//!   another node, this node may serve the stale list for up to `TTL` seconds.
-//!   A stale member list causes a short window of over- or under-fan-out
-//!   (the new member receives an extra few seconds of frames, or a just-removed
-//!   member receives frames they shouldn't see). Both are acceptable for the
-//!   live fan-out path (the member / auth gate downstream filters anyway).
+//! - Consumers may use the result only for non-sensitive hints, diagnostics, or
+//!   prefetching where stale over/under-counts are harmless.
+//! - Any authorization or content-delivery decision must re-read an
+//!   authoritative repository query.
 //!
 //! ## Design
 //! - `DashMap` per-process, `Arc<Vec<ParticipantId>>` values.
@@ -72,8 +70,10 @@ impl RoomMemberCache {
         Self::new(ROOM_MEMBER_CACHE_TTL)
     }
 
-    /// Look up room members, falling back to `repo` when the cache misses or
-    /// the cached entry has expired.
+    /// Look up a non-authoritative room-member hint, falling back to `repo` when
+    /// the cache misses or the cached entry has expired.
+    ///
+    /// Do not use this method for authorization or content delivery.
     ///
     /// Returns `Ok(Arc::new([]))` when the room genuinely has no members (the
     /// negative result is NOT cached — a later `add_member` will be visible on
@@ -102,7 +102,13 @@ impl RoomMemberCache {
         self.misses.fetch_add(1, Ordering::Relaxed);
         let rows = repo.members(room).await?;
         let cached: Arc<[ParticipantId]> = rows.into();
-        self.map.insert(room, CachedEntry { members: cached.clone(), at: now });
+        self.map.insert(
+            room,
+            CachedEntry {
+                members: cached.clone(),
+                at: now,
+            },
+        );
         Ok(cached)
     }
 
@@ -172,7 +178,13 @@ mod tests {
         let cache = RoomMemberCache::new(Duration::from_secs(100));
         let room = RoomId::new();
         let members: Arc<[ParticipantId]> = vec![ParticipantId::new(), ParticipantId::new()].into();
-        cache.map.insert(room, CachedEntry { members, at: Instant::now() });
+        cache.map.insert(
+            room,
+            CachedEntry {
+                members,
+                at: Instant::now(),
+            },
+        );
 
         assert_eq!(cache.len(), 1);
         assert!(cache.probe_fresh(room).is_some());
@@ -196,11 +208,17 @@ mod tests {
         // TTL 0 ⇒ always stale.
         let stale = RoomMemberCache::new(Duration::from_secs(0));
         let sroom = RoomId::new();
-        stale.map.insert(sroom, CachedEntry {
-            members: vec![ParticipantId::new()].into(),
-            at: Instant::now(),
-        });
-        assert!(stale.probe_fresh(sroom).is_none(), "expired entry must miss");
+        stale.map.insert(
+            sroom,
+            CachedEntry {
+                members: vec![ParticipantId::new()].into(),
+                at: Instant::now(),
+            },
+        );
+        assert!(
+            stale.probe_fresh(sroom).is_none(),
+            "expired entry must miss"
+        );
         assert_eq!(stale.misses(), 1);
     }
 
@@ -208,12 +226,18 @@ mod tests {
     fn invalidate_forces_a_subsequent_miss() {
         let cache = RoomMemberCache::new(Duration::from_secs(100));
         let room = RoomId::new();
-        cache.map.insert(room, CachedEntry {
-            members: vec![ParticipantId::new()].into(),
-            at: Instant::now(),
-        });
+        cache.map.insert(
+            room,
+            CachedEntry {
+                members: vec![ParticipantId::new()].into(),
+                at: Instant::now(),
+            },
+        );
         assert!(cache.probe_fresh(room).is_some());
         cache.invalidate(&room);
-        assert!(cache.probe_fresh(room).is_none(), "post-invalidate must miss");
+        assert!(
+            cache.probe_fresh(room).is_none(),
+            "post-invalidate must miss"
+        );
     }
 }

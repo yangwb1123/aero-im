@@ -76,7 +76,9 @@ async fn list_activity(
         .list(auth.participant_id, before, limit)
         .await
         .map_err(AeroError::from)?;
-    Ok(Json(serde_json::to_value(entries).map_err(AeroError::from)?))
+    Ok(Json(
+        serde_json::to_value(entries).map_err(AeroError::from)?,
+    ))
 }
 
 /// `GET /api/activity/count` — the caller's unread activity count (for a badge).

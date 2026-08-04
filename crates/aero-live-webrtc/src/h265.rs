@@ -64,7 +64,10 @@ mod tests {
     fn single_nal_irap_types_are_keyframes() {
         // IDR_W_RADL=19, IDR_N_LP=20, CRA_NUT=21, BLA_W_LP=16 — all IRAP.
         for t in [16u8, 19, 20, 21] {
-            assert!(h265_payload_is_keyframe(&[nal0(t), 0x01]), "type {t} is IRAP");
+            assert!(
+                h265_payload_is_keyframe(&[nal0(t), 0x01]),
+                "type {t} is IRAP"
+            );
         }
     }
 
@@ -72,7 +75,10 @@ mod tests {
     fn single_nal_non_irap_is_not_keyframe() {
         // TRAIL_R=1, TRAIL_N=0 (inter), VPS=32, SPS=33, PPS=34 are not pictures.
         for t in [0u8, 1, 32, 33, 34] {
-            assert!(!h265_payload_is_keyframe(&[nal0(t), 0x01]), "type {t} not IRAP");
+            assert!(
+                !h265_payload_is_keyframe(&[nal0(t), 0x01]),
+                "type {t} not IRAP"
+            );
         }
     }
 

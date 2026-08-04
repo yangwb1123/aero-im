@@ -112,7 +112,7 @@ def main():
 
     # ---------------- Cross-room search ----------------
     say("search: messages across the caller's rooms are found via /api/search")
-    asyncio.get_event_loop().run_until_complete(ws_send(A, Rid, [{"type": "text", "content": f"zylophone-{ts} meeting notes"}]))
+    asyncio.run(ws_send(A, Rid, [{"type": "text", "content": f"zylophone-{ts} meeting notes"}]))
     time.sleep(0.4)
     res = req("POST", "/api/search", {"query": f"zylophone-{ts}", "limit": 10}, token=A)
     if not res.get("results"): fail(f"search found nothing: {res}")
@@ -128,16 +128,32 @@ def main():
     req("POST", "/api/notifications/read", {"all": True}, token=B)  # clear inbox
     base = bob_unread()
     req("POST", f"/api/rooms/{Rid}/mute", token=B, expect=200)
-    asyncio.get_event_loop().run_until_complete(
-        ws_send(A, Rid, [{"type": "text", "content": "muted "}, {"type": "mention", "participant": Bpid}]))
+    asyncio.run(
+        ws_send(
+            A,
+            Rid,
+            [
+                {"type": "text", "content": "muted "},
+                {"type": "mention", "participant": Bpid},
+            ],
+        )
+    )
     time.sleep(0.5)
     if bob_unread() != base: fail(f"muted mention still notified (base={base}, now={bob_unread()})")
     ok("muted: no notification delivered")
 
     say("unmute: bob is notified again")
     req("DELETE", f"/api/rooms/{Rid}/mute", token=B, expect=200)
-    asyncio.get_event_loop().run_until_complete(
-        ws_send(A, Rid, [{"type": "text", "content": "unmuted "}, {"type": "mention", "participant": Bpid}]))
+    asyncio.run(
+        ws_send(
+            A,
+            Rid,
+            [
+                {"type": "text", "content": "unmuted "},
+                {"type": "mention", "participant": Bpid},
+            ],
+        )
+    )
     time.sleep(0.5)
     if bob_unread() <= base: fail(f"unmuted mention not notified (base={base}, now={bob_unread()})")
     ok(f"unmuted: notification delivered (unread {base}→{bob_unread()})")
@@ -149,14 +165,30 @@ def main():
     req("PUT", "/api/notifications/prefs/dnd", {"start_minute": now_min, "end_minute": (now_min + 1) % 1440}, token=B, expect=200)
     prefs = req("GET", "/api/notifications/prefs", token=B)
     if not prefs.get("dnd"): fail(f"DND not set: {prefs}")
-    asyncio.get_event_loop().run_until_complete(
-        ws_send(A, Rid, [{"type": "text", "content": "dnd "}, {"type": "mention", "participant": Bpid}]))
+    asyncio.run(
+        ws_send(
+            A,
+            Rid,
+            [
+                {"type": "text", "content": "dnd "},
+                {"type": "mention", "participant": Bpid},
+            ],
+        )
+    )
     time.sleep(0.5)
     if bob_unread() != base2: fail(f"DND mention still notified (base={base2}, now={bob_unread()})")
     ok("DND: no notification during window")
     req("PUT", "/api/notifications/prefs/dnd", {}, token=B, expect=200)  # clear
-    asyncio.get_event_loop().run_until_complete(
-        ws_send(A, Rid, [{"type": "text", "content": "post-dnd "}, {"type": "mention", "participant": Bpid}]))
+    asyncio.run(
+        ws_send(
+            A,
+            Rid,
+            [
+                {"type": "text", "content": "post-dnd "},
+                {"type": "mention", "participant": Bpid},
+            ],
+        )
+    )
     time.sleep(0.5)
     if bob_unread() <= base2: fail("after clearing DND, mention not notified")
     ok("DND cleared: notification delivered again")

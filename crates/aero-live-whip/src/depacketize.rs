@@ -152,7 +152,12 @@ impl H264Depacketizer {
     /// `_marker` is the RTP marker bit; for H.264 it signals the last packet of
     /// an access unit. We accept it for API completeness and future AU-boundary
     /// detection but reassembly itself is driven by NAL/FU headers.
-    pub fn push(&mut self, payload: &[u8], _marker: bool, out: &mut BytesMut) -> Result<(), DepacketizeError> {
+    pub fn push(
+        &mut self,
+        payload: &[u8],
+        _marker: bool,
+        out: &mut BytesMut,
+    ) -> Result<(), DepacketizeError> {
         let first = *payload
             .first()
             .ok_or(DepacketizeError::Truncated("empty payload"))?;
@@ -217,7 +222,11 @@ impl H264Depacketizer {
         Ok(())
     }
 
-    fn depacketize_stap_a(&self, payload: &[u8], out: &mut BytesMut) -> Result<(), DepacketizeError> {
+    fn depacketize_stap_a(
+        &self,
+        payload: &[u8],
+        out: &mut BytesMut,
+    ) -> Result<(), DepacketizeError> {
         // RFC 6184 §5.7.1: STAP-A = [STAP-A NAL hdr][ (16-bit size)(NAL unit) ]+
         let mut p = 1usize; // skip the STAP-A header byte
         while p < payload.len() {
@@ -239,7 +248,11 @@ impl H264Depacketizer {
         Ok(())
     }
 
-    fn depacketize_fu_a(&mut self, payload: &[u8], out: &mut BytesMut) -> Result<(), DepacketizeError> {
+    fn depacketize_fu_a(
+        &mut self,
+        payload: &[u8],
+        out: &mut BytesMut,
+    ) -> Result<(), DepacketizeError> {
         // RFC 6184 §5.8: FU-A = [FU indicator][FU header][FU payload]
         if payload.len() < 2 {
             return Err(DepacketizeError::Truncated("fu-a header"));
@@ -315,7 +328,11 @@ mod tests {
         let mut units = Vec::new();
         let mut i = 0;
         while i + 4 <= buf.len() {
-            assert_eq!(&buf[i..i + 4], &ANNEX_B_START_CODE, "missing start code at {i}");
+            assert_eq!(
+                &buf[i..i + 4],
+                &ANNEX_B_START_CODE,
+                "missing start code at {i}"
+            );
             i += 4;
             let nal_start = i;
             // Scan to the next start code (or end).
@@ -373,7 +390,11 @@ mod tests {
         assert!(!d.is_reassembling());
 
         // Reassembled NAL = reconstructed header 0x65 + concatenated body.
-        let expected: Vec<u8> = [&ANNEX_B_START_CODE[..], &[0x65, 0x01, 0x02, 0x03, 0x04, 0x05]].concat();
+        let expected: Vec<u8> = [
+            &ANNEX_B_START_CODE[..],
+            &[0x65, 0x01, 0x02, 0x03, 0x04, 0x05],
+        ]
+        .concat();
         assert_eq!(&out[..], &expected[..]);
         let units = parse_annex_b(&out);
         assert_eq!(units, vec![(5u8, 6usize)]); // type 5, header + 5 body bytes
@@ -461,7 +482,7 @@ mod tests {
         let mut d = H264Depacketizer::new();
         let mut out = BytesMut::new();
         d.push(&[0x7C, 0x85, 0x01], false, &mut out).unwrap(); // start type 5
-        // continuation but type 1 → reconstructed header differs → desync.
+                                                               // continuation but type 1 → reconstructed header differs → desync.
         let err = d.push(&[0x7C, 0x41, 0x02], true, &mut out).unwrap_err();
         assert_eq!(err, DepacketizeError::FragmentDesync);
     }
@@ -471,7 +492,7 @@ mod tests {
         let mut d = H264Depacketizer::new();
         let mut out = BytesMut::new();
         d.push(&[0x7C, 0x85, 0x01], false, &mut out).unwrap(); // FU-A start
-        // A single-NAL packet now arrives before the FU-A ended.
+                                                               // A single-NAL packet now arrives before the FU-A ended.
         let err = d.push(&[0x65, 0xAA], true, &mut out).unwrap_err();
         assert_eq!(err, DepacketizeError::FragmentDesync);
         assert!(!d.is_reassembling());
@@ -533,7 +554,8 @@ mod tests {
 
         // Start fragment: FU indicator 0x7C, FU header 0x85 (S=1,E=0,type=5),
         // body = 5 bytes. Reassembled NAL so far = 1 (header) + 5 = 6 ≤ 16.
-        d.push(&[0x7C, 0x85, 1, 2, 3, 4, 5], false, &mut out).unwrap();
+        d.push(&[0x7C, 0x85, 1, 2, 3, 4, 5], false, &mut out)
+            .unwrap();
         assert!(d.is_reassembling());
 
         // Middle fragment: FU header 0x05 (S=0,E=0,type=5), body = 8 bytes.
@@ -544,7 +566,11 @@ mod tests {
 
         // Another Middle fragment of 8 bytes: would reach 14 + 8 = 22 > 16.
         let err = d
-            .push(&[0x7C, 0x05, 20, 21, 22, 23, 24, 25, 26, 27], false, &mut out)
+            .push(
+                &[0x7C, 0x05, 20, 21, 22, 23, 24, 25, 26, 27],
+                false,
+                &mut out,
+            )
             .unwrap_err();
         assert_eq!(
             err,
@@ -576,7 +602,10 @@ mod tests {
                 limit: 4
             }
         );
-        assert!(!d.is_reassembling(), "oversize start fragment is not buffered");
+        assert!(
+            !d.is_reassembling(),
+            "oversize start fragment is not buffered"
+        );
     }
 
     #[test]
@@ -604,7 +633,9 @@ mod tests {
         // A single-NAL packet larger than the cap is rejected too.
         let mut d = H264Depacketizer::with_max_nal_size(4);
         let mut out = BytesMut::new();
-        let err = d.push(&[0x65, 0xAA, 0xBB, 0xCC, 0xDD], true, &mut out).unwrap_err();
+        let err = d
+            .push(&[0x65, 0xAA, 0xBB, 0xCC, 0xDD], true, &mut out)
+            .unwrap_err();
         assert_eq!(
             err,
             DepacketizeError::Oversized {

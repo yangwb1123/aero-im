@@ -122,10 +122,9 @@ impl ActivityStore for InProcessActivityStore {
         content_hash: u64,
         now: Instant,
     ) -> SpamDecision {
-        let mut entry = self
-            .senders
-            .entry(sender)
-            .or_insert_with(|| Activity { events: VecDeque::new() });
+        let mut entry = self.senders.entry(sender).or_insert_with(|| Activity {
+            events: VecDeque::new(),
+        });
         let act = entry.value_mut();
 
         // Drop events that have aged out of the window (events are time-ordered).
@@ -164,9 +163,9 @@ impl ActivityStore for InProcessActivityStore {
     fn sweep_idle(&self, now: Instant) -> usize {
         let before = self.senders.len();
         self.senders.retain(|_, act| {
-            act.events
-                .back()
-                .map_or(false, |(t, _, _)| now.duration_since(*t) <= self.thresholds.window)
+            act.events.back().map_or(false, |(t, _, _)| {
+                now.duration_since(*t) <= self.thresholds.window
+            })
         });
         before.saturating_sub(self.senders.len())
     }
@@ -218,7 +217,10 @@ impl RedisActivityStore {
         // At least one whole window; +1s so a key read at the window boundary is
         // still present. The window's identity is relative (scores), so a
         // refreshed TTL can never widen it — the expiry is pure cleanup.
-        i64::try_from(self.thresholds.window.as_secs()).unwrap_or(i64::MAX).saturating_add(1).max(1)
+        i64::try_from(self.thresholds.window.as_secs())
+            .unwrap_or(i64::MAX)
+            .saturating_add(1)
+            .max(1)
     }
 
     /// Insert one window member and return the post-prune window count. `member`
@@ -242,7 +244,9 @@ impl RedisActivityStore {
             .client
             .zadd(key, None, None, false, false, (now_ms, member))
             .await?;
-        self.client.expire::<(), _>(key, self.window_ttl_secs()).await?;
+        self.client
+            .expire::<(), _>(key, self.window_ttl_secs())
+            .await?;
         let n: i64 = self.client.zcard(key).await?;
         Ok(n)
     }
@@ -268,7 +272,11 @@ impl RedisActivityStore {
 
         // duplicate: repeats of this content (unique member per event).
         let dup = self
-            .bump(&Self::dup_key(sender, content_hash), &format!("{now_ms}:{uniq}"), now_ms)
+            .bump(
+                &Self::dup_key(sender, content_hash),
+                &format!("{now_ms}:{uniq}"),
+                now_ms,
+            )
             .await?;
         if usize::try_from(dup).unwrap_or(usize::MAX) > self.thresholds.max_duplicates {
             return Ok(SpamDecision::Throttle(SpamReason::Duplicate));
@@ -277,7 +285,11 @@ impl RedisActivityStore {
         // fan-out: distinct rooms for this content (member = room id, so a
         // re-send to a room already counted does not grow the set).
         let rooms = self
-            .bump(&Self::fanout_key(sender, content_hash), &room.to_string(), now_ms)
+            .bump(
+                &Self::fanout_key(sender, content_hash),
+                &room.to_string(),
+                now_ms,
+            )
             .await?;
         if usize::try_from(rooms).unwrap_or(usize::MAX) > self.thresholds.max_rooms {
             return Ok(SpamDecision::Throttle(SpamReason::Fanout));
@@ -386,7 +398,11 @@ mod tests {
         let t0 = Instant::now();
         // 5 distinct messages to one room are fine; the 6th floods.
         for i in 0..5 {
-            assert_eq!(g.record(sender, room, i, t0).await, SpamDecision::Allow, "msg {i} ok");
+            assert_eq!(
+                g.record(sender, room, i, t0).await,
+                SpamDecision::Allow,
+                "msg {i} ok"
+            );
         }
         assert_eq!(
             g.record(sender, room, 99, t0).await,
@@ -403,7 +419,10 @@ mod tests {
         // Same content to 3 rooms is allowed (max_rooms=3); the 4th distinct room
         // is a same-content blast → Fanout (dup ceiling is higher, so it trips first).
         for _ in 0..3 {
-            assert_eq!(g.record(sender, RoomId::new(), hash, t0).await, SpamDecision::Allow);
+            assert_eq!(
+                g.record(sender, RoomId::new(), hash, t0).await,
+                SpamDecision::Allow
+            );
         }
         assert_eq!(
             g.record(sender, RoomId::new(), hash, t0).await,
@@ -494,8 +513,12 @@ mod redis_tests {
 
     async fn client() -> RedisClient {
         let url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".into());
-        let c =
-            RedisClient::new(fred::types::RedisConfig::from_url(&url).unwrap(), None, None, None);
+        let c = RedisClient::new(
+            fred::types::RedisConfig::from_url(&url).unwrap(),
+            None,
+            None,
+            None,
+        );
         c.connect();
         c.wait_for_connect().await.unwrap();
         c
@@ -519,7 +542,11 @@ mod redis_tests {
         let room = RoomId::new();
         let t0 = Instant::now();
         for i in 0..5 {
-            assert_eq!(g.record(sender, room, i, t0).await, SpamDecision::Allow, "msg {i}");
+            assert_eq!(
+                g.record(sender, room, i, t0).await,
+                SpamDecision::Allow,
+                "msg {i}"
+            );
         }
         assert_eq!(
             g.record(sender, room, 99, t0).await,
@@ -535,7 +562,10 @@ mod redis_tests {
         let t0 = Instant::now();
         let hash = 0xc0ff_eeu64;
         for _ in 0..3 {
-            assert_eq!(g.record(sender, RoomId::new(), hash, t0).await, SpamDecision::Allow);
+            assert_eq!(
+                g.record(sender, RoomId::new(), hash, t0).await,
+                SpamDecision::Allow
+            );
         }
         assert_eq!(
             g.record(sender, RoomId::new(), hash, t0).await,

@@ -1,9 +1,11 @@
-
 use std::str::FromStr;
 
 use aero_common::{
-    Error as AeroError, MessageId, Result as AeroResult, RoomId, RoomKind,
+    Error as AeroError, MessageId, ParticipantId, Result as AeroResult, RoomId, RoomKind,
+    WorkspaceId,
 };
+
+use crate::state::AppState;
 
 // ----- helpers -----
 
@@ -35,7 +37,11 @@ pub(crate) fn merge_hits(
         }
     }
     let mut out: Vec<_> = best.into_values().collect();
-    out.sort_by(|x, y| y.score.partial_cmp(&x.score).unwrap_or(std::cmp::Ordering::Equal));
+    out.sort_by(|x, y| {
+        y.score
+            .partial_cmp(&x.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     let limit = limit.clamp(1, 100) as usize;
     out.truncate(limit);
     out
@@ -45,3 +51,43 @@ pub(crate) fn parse_room_id(s: &str) -> AeroResult<RoomId> {
     RoomId::from_str(s).map_err(|e| AeroError::Invalid(format!("room id: {e}")))
 }
 
+/// Assert that `participant` may currently enter a workspace-scoped request.
+///
+/// A retained `workspace_members` row is not sufficient authorization: deleted
+/// accounts, workspace deactivations, and members who have not satisfied a
+/// mandatory-2FA policy are all rejected by `effective_member_role`.
+pub(crate) async fn assert_effective_workspace_member(
+    state: &AppState,
+    workspace: WorkspaceId,
+    participant: ParticipantId,
+) -> AeroResult<()> {
+    state
+        .workspaces
+        .effective_member_role(workspace, participant)
+        .await
+        .map_err(AeroError::from)?
+        .map(|_| ())
+        .ok_or_else(|| AeroError::Forbidden("not an active workspace member".into()))
+}
+
+/// Batch form of [`assert_effective_workspace_member`], used when a client-
+/// supplied operation would expose a new conversation to several participants.
+/// The repository evaluates the entire set with one effective-access query.
+pub(crate) async fn assert_effective_workspace_members(
+    state: &AppState,
+    workspace: WorkspaceId,
+    participants: &[ParticipantId],
+) -> AeroResult<()> {
+    if state
+        .workspaces
+        .all_effective_members(workspace, participants)
+        .await
+        .map_err(AeroError::from)?
+    {
+        Ok(())
+    } else {
+        Err(AeroError::Forbidden(
+            "every conversation member must be an active workspace member".into(),
+        ))
+    }
+}

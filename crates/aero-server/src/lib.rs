@@ -9,63 +9,72 @@ pub mod bot_dispatch;
 pub mod call_bridge_subscribe;
 pub mod call_bridge_supervisor;
 // ROADMAP 方向五: per-peer SFU media session (the str0m loop driving on_rtp).
-pub mod sfu_media;
-pub mod moderation_bot;
-pub mod transcribe_bot;
-pub mod unfurl_bot;
 pub mod ai_adapter;
 /// ClamAV (`clamd`) INSTREAM anti-virus scanning for uploaded blobs.
 pub mod av_scan;
 pub mod bookmarks;
 pub mod channel_sections;
+pub mod channels;
 pub mod collab;
+pub mod commands;
 pub mod config;
+mod consumer_event_receipt;
 /// Magic-byte content sniffing for uploaded blobs (reject disguised executables/markup).
 pub mod content_sniff;
+mod deferred_blocks;
 pub mod drafts;
 pub mod emoji;
 pub mod error;
+pub mod forward;
+mod giphy;
 pub mod guests;
 pub mod hub;
+pub mod identity_migrations;
+pub mod integrations;
 pub mod invitations;
 pub mod live;
 /// Minimal transactional email sender (password reset, invitation).
 pub mod mailer;
+pub mod message_reminders;
+mod message_send_policy;
 pub mod metrics;
+pub mod moderation_bot;
 pub mod notif_prefs;
 /// Per-process TTL cache for participant profiles (ROADMAP6 方向四 多级缓存).
 pub mod participant_cache;
-/// Per-process TTL cache for room membership lists (ROADMAP6 方向四 多级缓存).
-pub mod room_member_cache;
 pub mod pat;
 pub mod polls;
 pub mod rate_limit;
+/// Per-process TTL cache for room membership lists (ROADMAP6 方向四 多级缓存).
+pub mod room_member_cache;
 pub mod routes;
 pub mod saml;
 pub mod saved_searches;
+pub mod scheduled;
+pub mod scheduled_streams;
 pub mod scim;
+pub mod search;
+pub mod sfu_media;
 pub mod sso;
 pub mod state;
+pub mod stream_live_outbox;
 pub mod stream_mod;
+mod task_shutdown;
+pub mod transcribe_bot;
+pub mod translate;
+pub mod unfurl_bot;
 pub mod user_status;
 pub mod vod;
 pub mod webhooks;
+pub mod whip_media;
 pub mod workspaces;
 pub mod ws;
-pub mod channels;
-pub mod commands;
-pub mod forward;
-pub mod message_reminders;
-pub mod scheduled;
-pub mod scheduled_streams;
-pub mod search;
-pub mod translate;
 // Wave 10 (0033-0038).
 pub mod announcements;
 pub mod favorites;
 pub mod keyword_alerts;
-pub mod message_history;
 pub mod message_context;
+pub mod message_history;
 pub mod profiles;
 pub mod user_groups;
 // Wave 11.
@@ -74,25 +83,26 @@ pub mod read_all;
 pub mod stream_follows;
 pub mod thread_subs;
 // Wave 12.
-pub mod dm;
-pub mod recurring;
 pub mod catchup;
-pub mod reaction_detail;
 pub mod default_channels;
+pub mod dm;
+pub mod reaction_detail;
+pub mod recurring;
 // Wave 13.
-pub mod group_dm;
 pub mod action_items;
-pub mod join_requests;
 pub mod conversation_export;
+pub mod group_dm;
+pub mod join_requests;
 // Wave 14.
-pub mod twofa;
 pub mod deactivation;
 pub mod templates;
+pub mod twofa;
 // Wave 15.
-pub mod session;
-pub mod search_advanced;
-pub mod smart_replies;
 pub mod channel_roles;
+pub mod search_advanced;
+pub mod session;
+pub mod session_control;
+pub mod smart_replies;
 
 // ---- Wave 16 ----
 pub mod analytics;
@@ -136,21 +146,21 @@ pub mod sessions;
 pub mod call_recap;
 
 // ---- Wave 24 ----
-pub mod workspace_security;
-pub mod me_export;
-pub mod push_tokens;
-pub mod push_bot;
+pub mod admin_sessions;
 pub mod ai_dlq;
 pub mod ai_usage;
-pub mod admin_sessions;
+pub mod me_export;
+pub mod push_bot;
+pub mod push_tokens;
+pub mod workspace_security;
 
 // ---- Wave 16 Round 9 ----
 pub mod online;
 
 // ---- Parity batch: live chat modes, stream metadata edit, IP allowlist ----
+pub mod ip_allowlist;
 pub mod stream_chat_modes;
 pub mod stream_meta;
-pub mod ip_allowlist;
 
 // ---- ROADMAP3 方向五: per-workspace rate-limit tiers (租户公平) ----
 pub mod ws_rate;
@@ -170,20 +180,20 @@ pub mod stream_moderators;
 pub mod vod_chapters;
 
 // ---- AI-native cluster: thread summary, scheduled digests, find-expert ----
+pub mod digests;
+pub mod find_expert;
+/// Per-message sentiment / toxicity scoring: POST /api/messages/:id/sentiment.
+pub mod message_sentiment;
+/// AI recommendations: suggested channels & people to follow (member-gated).
+pub mod recommendations;
+pub mod saved_search_monitor;
 pub mod thread_summarize;
 /// Thread auto-titling: POST /api/messages/:id/thread-title (degrade-safe).
 pub mod thread_title;
-/// Per-message sentiment / toxicity scoring: POST /api/messages/:id/sentiment.
-pub mod message_sentiment;
-pub mod digests;
-pub mod saved_search_monitor;
-pub mod find_expert;
-/// AI recommendations: suggested channels & people to follow (member-gated).
-pub mod recommendations;
 
 // ---- Operability: webhook delivery DLQ admin + per-tenant usage reports ----
-pub mod webhook_admin;
 pub mod usage_report;
+pub mod webhook_admin;
 
 // ---- Interactive message blocks (Slack Block Kit-lite) ----
 // Record clicks / option-picks on interactive Button/Select blocks (migration
@@ -192,9 +202,9 @@ pub mod interactions;
 
 // ---- Live / creator economy (migrations 0089-0091) ----
 // Channel points + custom-reward redemption, goal/bounty bars, ban/timeout appeals.
+pub mod ban_appeals;
 pub mod channel_points;
 pub mod goals;
-pub mod ban_appeals;
 
 // ---- Community predictions / channel betting (migration 0092) ----
 // Creator opens a prediction (2+ outcomes); viewers STAKE channel points on one;
@@ -220,19 +230,19 @@ pub mod subscription_tiers;
 // ---- ROADMAP10 ----
 /// Auto-moderation rules: workspace admins define text-matching block/warn rules.
 pub mod auto_mod;
-/// User-level report flow: any user can report another; admins resolve reports.
-pub mod user_reports;
 /// Channel-points expiry info endpoint.
 pub mod point_expiry;
+/// User-level report flow: any user can report another; admins resolve reports.
+pub mod user_reports;
 
 // ---- ROADMAP11 ----
-/// Workspace custom emoji (UUID-PK variant, migration 0115).
-pub mod workspace_custom_emoji;
-/// Creator verified badge: admin grant/revoke (migration 0116).
-pub mod verified_badge;
-/// Bulk unread summary: GET /api/me/unread-summary (no migration).
-pub mod unread_summary;
 /// Report-only PII backfill scan over historical messages (no migration).
 pub mod pii_backfill;
+/// Bulk unread summary: GET /api/me/unread-summary (no migration).
+pub mod unread_summary;
+/// Creator verified badge: admin grant/revoke (migration 0116).
+pub mod verified_badge;
+/// Workspace custom emoji (UUID-PK variant, migration 0115).
+pub mod workspace_custom_emoji;
 
 pub use state::AppState;

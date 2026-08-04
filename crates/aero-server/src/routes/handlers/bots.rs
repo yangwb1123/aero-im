@@ -9,24 +9,43 @@ struct CreateBotReq {
     workspace_id: Option<String>,
 }
 
+const MAX_BOT_ICON_URL_BYTES: usize = 2_048;
+
+fn validate_bot_icon_url(raw: Option<&str>) -> Result<Option<String>, AeroError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let icon_url = raw.trim();
+    if icon_url.is_empty() {
+        return Ok(None);
+    }
+    if icon_url.len() > MAX_BOT_ICON_URL_BYTES {
+        return Err(AeroError::Invalid(format!(
+            "icon_url must be at most {MAX_BOT_ICON_URL_BYTES} bytes"
+        )));
+    }
+    Ok(Some(icon_url.to_owned()))
+}
+
 /// Register a new bot (participant + bot row + initial token).
 async fn bot_create(
     State(s): State<AppState>,
     auth: AuthUser,
     Json(req): Json<CreateBotReq>,
 ) -> ApiResult<Response> {
-    let workspace = req.workspace_id.as_ref().and_then(|w| aero_common::WorkspaceId::from_str(w).ok());
+    let workspace = match req.workspace_id.as_deref() {
+        Some(raw) => Some(
+            WorkspaceId::from_str(raw.trim())
+                .map_err(|e| AeroError::Invalid(format!("workspace id: {e}")))?,
+        ),
+        None => None,
+    };
     let name = crate::routes::agents::validate_bot_name(&req.name)?;
+    let icon_url = validate_bot_icon_url(req.icon_url.as_deref())?;
     let repo = aero_storage::BotRepo::new(s.pg.clone());
-    let bot_id = repo
-        .create(auth.participant_id, &name, req.icon_url.as_deref(), workspace)
-        .await
-        .map_err(AeroError::from)?;
-    let token = repo
-        .rotate_token(bot_id)
-        .await
-        .map_err(AeroError::from)?
-        .ok_or_else(|| AeroError::Internal(anyhow::anyhow!("bot created but token failed")))?;
+    let (bot_id, token) = repo
+        .create_authorized_with_token(auth.participant_id, &name, icon_url.as_deref(), workspace)
+        .await?;
     let body = Json(serde_json::json!({
         "bot_id": bot_id,
         "token": token,
@@ -41,58 +60,20 @@ async fn bot_create(
     })
 }
 
-/// Look up a bot's `owner_id` by its participant id, scoped to the `bots`
-/// table only.  Returns `None` when no such bot exists.
-///
-/// Authorization helper kept in the routes layer: `BotRepo` exposes no
-/// fetch-by-id, so we read just the `owner_id` column here to assert ownership
-/// before any mutating bot operation. We never expose this row directly.
-async fn bot_owner(
-    pg: &sqlx::PgPool,
-    bot_id: ParticipantId,
-) -> Result<Option<ParticipantId>, AeroError> {
-    let row = sqlx::query_as::<_, (Uuid,)>("SELECT owner_id FROM bots WHERE id = $1")
-        .bind(bot_id.to_uuid())
-        .fetch_optional(pg)
-        .await
-        .map_err(AeroError::from)?;
-    Ok(row.map(|(o,)| ParticipantId::from_uuid(o)))
-}
-
-/// Assert that `caller` owns the bot `bot_id`.
-///
-/// Returns [`AeroError::NotFound`] when the bot does not exist and
-/// [`AeroError::Forbidden`] when the caller is not its owner. On success the
-/// caller is cleared to perform a mutating operation on the bot.
-async fn ensure_bot_owner(
-    pg: &sqlx::PgPool,
-    bot_id: ParticipantId,
-    caller: ParticipantId,
-) -> Result<(), AeroError> {
-    let owner = bot_owner(pg, bot_id)
-        .await?
-        .ok_or_else(|| AeroError::NotFound(format!("bot {bot_id}")))?;
-    if owner != caller {
-        return Err(AeroError::Forbidden("not the bot owner".into()));
-    }
-    Ok(())
-}
-
 /// List the calling participant's own bots (across all workspaces).
 ///
 /// Scoped strictly to `owner_id = auth.participant_id` — callers never see
 /// bots owned by other participants.
-async fn bot_list(
-    State(s): State<AppState>,
-    auth: AuthUser,
-) -> ApiResult<Json<serde_json::Value>> {
+async fn bot_list(State(s): State<AppState>, auth: AuthUser) -> ApiResult<Json<serde_json::Value>> {
     let rows = sqlx::query_as::<_, BotListRow>(
         r"SELECT id, owner_id, name, icon_url, workspace_id, token_hash IS NOT NULL AS has_token, created_at
            FROM bots
           WHERE owner_id = $1
-          ORDER BY created_at DESC",
+          ORDER BY created_at DESC
+          LIMIT $2",
     )
     .bind(auth.participant_id.to_uuid())
+    .bind(aero_storage::MAX_BOTS_PER_OWNER)
     .fetch_all(&s.pg)
     .await
     .map_err(AeroError::from)?;
@@ -134,15 +115,25 @@ async fn bot_rotate_token(
     auth: AuthUser,
     Path(id_str): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let bot_id = ParticipantId::from_str(&id_str)
-        .map_err(|e| AeroError::Invalid(format!("bot id: {e}")))?;
-    ensure_bot_owner(&s.pg, bot_id, auth.participant_id).await?;
-    let repo = aero_storage::BotRepo::new(s.pg.clone());
-    let token = repo
-        .rotate_token(bot_id)
-        .await
-        .map_err(AeroError::from)?
-        .ok_or_else(|| AeroError::NotFound(format!("bot {bot_id}")))?;
+    let bot_id =
+        ParticipantId::from_str(&id_str).map_err(|e| AeroError::Invalid(format!("bot id: {e}")))?;
+    let token = aero_storage::BotRepo::new(s.pg.clone())
+        .rotate_token_authorized(bot_id, auth.participant_id)
+        .await?;
     Ok(Json(serde_json::json!({ "token": token })))
 }
 
+#[cfg(test)]
+mod bot_input_bound_tests {
+    use super::*;
+
+    #[test]
+    fn icon_url_is_trimmed_and_byte_bounded() {
+        assert_eq!(
+            validate_bot_icon_url(Some("  https://example.test/icon.png  ")).unwrap(),
+            Some("https://example.test/icon.png".into())
+        );
+        assert_eq!(validate_bot_icon_url(Some("   ")).unwrap(), None);
+        assert!(validate_bot_icon_url(Some(&"x".repeat(MAX_BOT_ICON_URL_BYTES + 1))).is_err());
+    }
+}

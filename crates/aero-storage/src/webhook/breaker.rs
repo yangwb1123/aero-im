@@ -92,7 +92,10 @@ impl BreakerState {
     pub fn after(self, outcome: DeliveryOutcome, now: i64) -> BreakerState {
         match outcome {
             // Any success fully closes the breaker (a 2xx means the endpoint is up).
-            DeliveryOutcome::Success => BreakerState { failures: 0, open_until: None },
+            DeliveryOutcome::Success => BreakerState {
+                failures: 0,
+                open_until: None,
+            },
             // 429: back off immediately for the requested (or default) cooldown,
             // regardless of how few failures preceded it.
             DeliveryOutcome::RateLimited { retry_after_secs } => {
@@ -110,14 +113,18 @@ impl BreakerState {
                 let failures = self.failures.saturating_add(1);
                 let opened = if failures >= BREAKER_FAILURE_THRESHOLD {
                     let over = (failures - BREAKER_FAILURE_THRESHOLD).min(6);
-                    let cooldown = (BREAKER_BASE_COOLDOWN_SECS << over).min(BREAKER_MAX_COOLDOWN_SECS);
+                    let cooldown =
+                        (BREAKER_BASE_COOLDOWN_SECS << over).min(BREAKER_MAX_COOLDOWN_SECS);
                     Some(now + cooldown)
                 } else {
                     // Still below threshold: don't open on our own account; the
                     // delivery-log layer's per-delivery backoff handles early retries.
                     None
                 };
-                BreakerState { failures, open_until: later_gate(self.open_until, opened) }
+                BreakerState {
+                    failures,
+                    open_until: later_gate(self.open_until, opened),
+                }
             }
         }
     }
@@ -142,9 +149,9 @@ fn later_gate(a: Option<i64>, b: Option<i64>) -> Option<i64> {
 pub fn outcome_of(result: &Result<DeliveryResponse, String>) -> DeliveryOutcome {
     match result {
         Ok(r) if (200..300).contains(&r.status) => DeliveryOutcome::Success,
-        Ok(r) if r.status == 429 => {
-            DeliveryOutcome::RateLimited { retry_after_secs: r.retry_after_secs }
-        }
+        Ok(r) if r.status == 429 => DeliveryOutcome::RateLimited {
+            retry_after_secs: r.retry_after_secs,
+        },
         Ok(_) | Err(_) => DeliveryOutcome::Failure,
     }
 }
@@ -153,7 +160,10 @@ pub fn outcome_of(result: &Result<DeliveryResponse, String>) -> DeliveryOutcome 
 /// `breaker_failures` (impossible under the schema's `DEFAULT 0`, but cheap to
 /// guard) clamps to 0; the timestamp becomes unix seconds.
 #[must_use]
-pub(crate) fn breaker_from_row(failures: i32, open_until: Option<time::OffsetDateTime>) -> BreakerState {
+pub(crate) fn breaker_from_row(
+    failures: i32,
+    open_until: Option<time::OffsetDateTime>,
+) -> BreakerState {
     BreakerState {
         failures: u32::try_from(failures).unwrap_or(0),
         open_until: open_until.map(|t| t.unix_timestamp()),

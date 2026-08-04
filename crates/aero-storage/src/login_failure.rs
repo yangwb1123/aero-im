@@ -138,17 +138,18 @@ impl LoginFailureRepo {
         limit: i64,
     ) -> Result<Vec<LoginFailure>, sqlx::Error> {
         let limit = limit.clamp(1, 100);
-        let rows = sqlx::query_as::<_, (String, Option<String>, Option<String>, time::OffsetDateTime)>(
-            r"SELECT account, ip, user_agent, created_at
+        let rows =
+            sqlx::query_as::<_, (String, Option<String>, Option<String>, time::OffsetDateTime)>(
+                r"SELECT account, ip, user_agent, created_at
                FROM login_failures
               WHERE account = $1
               ORDER BY created_at DESC
               LIMIT $2",
-        )
-        .bind(account)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
+            )
+            .bind(account)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
         Ok(rows
             .into_iter()
             .map(|(account, ip, user_agent, created_at)| LoginFailure {
@@ -166,10 +167,7 @@ impl LoginFailureRepo {
     ///
     /// # Errors
     /// Propagates any [`sqlx::Error`].
-    pub async fn sweep_before(
-        &self,
-        cutoff: time::OffsetDateTime,
-    ) -> Result<u64, sqlx::Error> {
+    pub async fn sweep_before(&self, cutoff: time::OffsetDateTime) -> Result<u64, sqlx::Error> {
         let res = sqlx::query(r"DELETE FROM login_failures WHERE created_at < $1")
             .bind(cutoff)
             .execute(&self.pool)
@@ -208,23 +206,46 @@ mod db_tests {
         let since = time::OffsetDateTime::now_utc() - time::Duration::hours(1);
 
         // Nothing yet.
-        assert_eq!(repo.recent_failures_for_account(&acct, since).await.expect("count empty"), 0);
-        assert_eq!(repo.recent_failures_for_ip(Some(ip), since).await.expect("ip empty"), 0);
+        assert_eq!(
+            repo.recent_failures_for_account(&acct, since)
+                .await
+                .expect("count empty"),
+            0
+        );
+        assert_eq!(
+            repo.recent_failures_for_ip(Some(ip), since)
+                .await
+                .expect("ip empty"),
+            0
+        );
         // A missing IP never aggregates into a bucket.
-        assert_eq!(repo.recent_failures_for_ip(None, since).await.expect("none ip"), 0);
+        assert_eq!(
+            repo.recent_failures_for_ip(None, since)
+                .await
+                .expect("none ip"),
+            0
+        );
 
         // Three failed attempts against the account, two of them from `ip`.
-        repo.record(&acct, Some(ip), Some("curl/8")).await.expect("rec 1");
-        repo.record(&acct, Some(ip), Some("curl/8")).await.expect("rec 2");
+        repo.record(&acct, Some(ip), Some("curl/8"))
+            .await
+            .expect("rec 1");
+        repo.record(&acct, Some(ip), Some("curl/8"))
+            .await
+            .expect("rec 2");
         repo.record(&acct, None, None).await.expect("rec 3");
 
         assert_eq!(
-            repo.recent_failures_for_account(&acct, since).await.expect("count acct"),
+            repo.recent_failures_for_account(&acct, since)
+                .await
+                .expect("count acct"),
             3,
             "three attempts against the account in-window"
         );
         assert_eq!(
-            repo.recent_failures_for_ip(Some(ip), since).await.expect("count ip"),
+            repo.recent_failures_for_ip(Some(ip), since)
+                .await
+                .expect("count ip"),
             2,
             "two attempts from the ip in-window"
         );
@@ -232,7 +253,9 @@ mod db_tests {
         // A far-past `since` window excludes everything just recorded.
         let future = time::OffsetDateTime::now_utc() + time::Duration::hours(1);
         assert_eq!(
-            repo.recent_failures_for_account(&acct, future).await.expect("count future"),
+            repo.recent_failures_for_account(&acct, future)
+                .await
+                .expect("count future"),
             0,
             "nothing newer than a future cutoff"
         );

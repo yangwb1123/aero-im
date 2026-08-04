@@ -3,12 +3,11 @@
 //! Extracted from `service.rs` as part of REFACTOR_PLAN.md Step 1f.
 
 use aero_bus::{traits::BusError, EventBus};
-use aero_common::{
-    metrics, ParticipantId, RoomEvent, RoomId,
-};
+use aero_common::{metrics, ParticipantId, RoomEvent, RoomId};
 use async_trait::async_trait;
 use bytes;
 use tracing::warn;
+use uuid::Uuid;
 
 use crate::service::ImService;
 
@@ -22,8 +21,17 @@ pub(crate) const EVENTS_SUBJECT: &str = "im.events";
 /// [`EventBus`] implementation in this object-safe shim.
 #[async_trait]
 pub trait BusSink: Send + Sync + 'static {
-    async fn publish_bytes(&self, subject: &str, payload: bytes::Bytes)
-        -> std::result::Result<(), BusError>;
+    async fn publish_bytes(
+        &self,
+        subject: &str,
+        payload: bytes::Bytes,
+    ) -> std::result::Result<(), BusError>;
+    async fn publish_bytes_idempotent(
+        &self,
+        subject: &str,
+        payload: bytes::Bytes,
+        message_id: &str,
+    ) -> std::result::Result<(), BusError>;
 }
 
 #[async_trait]
@@ -37,6 +45,15 @@ where
         payload: bytes::Bytes,
     ) -> std::result::Result<(), BusError> {
         EventBus::publish(self, subject, payload).await
+    }
+
+    async fn publish_bytes_idempotent(
+        &self,
+        subject: &str,
+        payload: bytes::Bytes,
+        message_id: &str,
+    ) -> std::result::Result<(), BusError> {
+        EventBus::publish_idempotent(self, subject, payload, message_id).await
     }
 }
 
@@ -67,6 +84,7 @@ impl ImService {
 
     pub(crate) async fn publish_room_event(&self, room: RoomId, event: &RoomEvent) {
         let subject = Self::room_subject(room);
+        let event_id = Uuid::new_v4();
         // Publish-time seq stamp (ROADMAP 第三版 方向一): mint the per-room seq
         // BEFORE the bytes hit NATS, so an at-least-once redelivery carries the
         // SAME seq and clients can dedup/order Edited/Deleted/Reaction/Typing
@@ -81,18 +99,57 @@ impl ImService {
         // decode; `None` (no active trace) leaves the event untraced.
         let traceparent = aero_common::telemetry::current_traceparent();
         let publish = async {
-            let mut value = serde_json::to_value(event)?;
-            aero_bus::stamp_seq(&mut value, seq);
-            aero_bus::stamp_traceparent(&mut value, traceparent.as_deref());
-            let bytes = serde_json::to_vec(&value)?;
-            self.bus.publish_bytes(&subject, bytes.into()).await
+            let bytes = room_event_wire_bytes(event, event_id, seq, traceparent.as_deref())?;
+            self.bus
+                .publish_bytes_idempotent(&subject, bytes.into(), &event_id.to_string())
+                .await
         };
         if let Err(err) = publish.await {
             warn!(?err, %subject, "publish RoomEvent failed");
-            metrics::inc_counter(
-                metrics::names::NATS_PUBLISH_ERRORS_TOTAL,
-                1,
-            );
+            metrics::inc_counter(metrics::names::NATS_PUBLISH_ERRORS_TOTAL, 1);
         }
+    }
+}
+
+fn room_event_wire_bytes(
+    event: &RoomEvent,
+    event_id: Uuid,
+    seq: Option<u64>,
+    traceparent: Option<&str>,
+) -> serde_json::Result<Vec<u8>> {
+    let mut value = serde_json::to_value(event)?;
+    if let serde_json::Value::Object(object) = &mut value {
+        object.insert(
+            "event_id".into(),
+            serde_json::Value::String(event_id.to_string()),
+        );
+    }
+    aero_bus::stamp_seq(&mut value, seq);
+    aero_bus::stamp_traceparent(&mut value, traceparent);
+    serde_json::to_vec(&value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn room_event_wire_payload_preserves_stable_producer_id() {
+        let room = RoomId::new();
+        let event_id = Uuid::new_v4();
+        let event = RoomEvent::Typing {
+            room_id: room,
+            participant: ParticipantId::new(),
+            on: true,
+        };
+
+        let first = room_event_wire_bytes(&event, event_id, Some(42), Some("trace")).unwrap();
+        let retry = room_event_wire_bytes(&event, event_id, Some(42), Some("trace")).unwrap();
+        assert_eq!(first, retry);
+
+        let wire: serde_json::Value = serde_json::from_slice(&first).unwrap();
+        assert_eq!(wire["event_id"], event_id.to_string());
+        assert_eq!(wire["seq"], 42);
+        assert_eq!(wire["traceparent"], "trace");
     }
 }

@@ -26,26 +26,57 @@ pub fn check_filesize(root: &Path, config: &EngineeringConfig) -> Outcome {
 
     let crates_dir = root.join("crates");
     if crates_dir.exists() {
-        scan_dir(&crates_dir, ".rs", cfg.rust_warn, cfg.rust_hard, "routes.rs", cfg.routes_hard, &mut violations, &mut checked);
+        scan_dir(
+            &crates_dir,
+            ".rs",
+            cfg.rust_warn,
+            cfg.rust_hard,
+            "routes.rs",
+            cfg.routes_hard,
+            &mut violations,
+            &mut checked,
+        );
     }
 
     let web_dir = root.join("web");
     if web_dir.exists() {
-        scan_dir(&web_dir, ".js", cfg.js_warn, cfg.js_warn + 500, "", 0, &mut violations, &mut checked);
+        scan_dir(
+            &web_dir,
+            ".js",
+            cfg.js_warn,
+            cfg.js_warn + 500,
+            "",
+            0,
+            &mut violations,
+            &mut checked,
+        );
     }
 
     let mig_dir = root.join("migrations");
     if mig_dir.exists() {
-        scan_dir(&mig_dir, ".sql", 200, 400, "", 0, &mut violations, &mut checked);
+        scan_dir(
+            &mig_dir,
+            ".sql",
+            200,
+            400,
+            "",
+            0,
+            &mut violations,
+            &mut checked,
+        );
     }
 
     if violations.is_empty() {
-        Outcome::ok(format!("✓ filesize: {checked} files checked, all within limits"))
-            .with_detail(detail_json(checked, &violations))
+        Outcome::ok(format!(
+            "✓ filesize: {checked} files checked, all within limits"
+        ))
+        .with_detail(detail_json(checked, &violations))
     } else {
         let hard_count = violations.iter().filter(|v| v.is_hard).count();
-        let msg = format!("✗ filesize: {hard_count} hard violations, {} warnings ({checked} files checked)",
-            violations.len() - hard_count);
+        let msg = format!(
+            "✗ filesize: {hard_count} hard violations, {} warnings ({checked} files checked)",
+            violations.len() - hard_count
+        );
         if hard_count > 0 {
             Outcome::error(msg).with_detail(detail_json(checked, &violations))
         } else {
@@ -79,11 +110,18 @@ fn detail_json(checked: usize, violations: &[FileViolation]) -> serde_json::Valu
 }
 
 fn scan_dir(
-    dir: &Path, ext: &str, warn: usize, hard: usize,
-    exempt_name: &str, exempt_hard: usize,
-    violations: &mut Vec<FileViolation>, checked: &mut usize,
+    dir: &Path,
+    ext: &str,
+    warn: usize,
+    hard: usize,
+    exempt_name: &str,
+    exempt_hard: usize,
+    violations: &mut Vec<FileViolation>,
+    checked: &mut usize,
 ) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
@@ -91,8 +129,20 @@ fn scan_dir(
             if name.starts_with('.') || name == "node_modules" || name == "target" {
                 continue;
             }
-            scan_dir(&path, ext, warn, hard, exempt_name, exempt_hard, violations, checked);
-        } else if path.extension().map_or(false, |e| e == ext.trim_start_matches('.')) {
+            scan_dir(
+                &path,
+                ext,
+                warn,
+                hard,
+                exempt_name,
+                exempt_hard,
+                violations,
+                checked,
+            );
+        } else if path
+            .extension()
+            .map_or(false, |e| e == ext.trim_start_matches('.'))
+        {
             *checked += 1;
             let lines = line_count(&path);
             let fname = path.file_name().unwrap_or_default().to_string_lossy();
@@ -101,18 +151,26 @@ fn scan_dir(
                 if lines > exempt_hard {
                     violations.push(FileViolation {
                         path: path.to_string_lossy().into(),
-                        lines, limit: exempt_hard, is_hard: true,
+                        lines,
+                        limit: exempt_hard,
+                        is_hard: true,
                     });
                 }
                 continue;
             }
             if lines > hard {
                 violations.push(FileViolation {
-                    path: path.to_string_lossy().into(), lines, limit: hard, is_hard: true,
+                    path: path.to_string_lossy().into(),
+                    lines,
+                    limit: hard,
+                    is_hard: true,
                 });
             } else if lines > warn {
                 violations.push(FileViolation {
-                    path: path.to_string_lossy().into(), lines, limit: warn, is_hard: false,
+                    path: path.to_string_lossy().into(),
+                    lines,
+                    limit: warn,
+                    is_hard: false,
                 });
             }
         }
@@ -120,7 +178,9 @@ fn scan_dir(
 }
 
 fn line_count(path: &Path) -> usize {
-    std::fs::read_to_string(path).map(|s| s.lines().count()).unwrap_or(0)
+    std::fs::read_to_string(path)
+        .map(|s| s.lines().count())
+        .unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -130,22 +190,67 @@ fn line_count(path: &Path) -> usize {
 /// Allowed dependency edges: map of `(crate_name, allowed_dep)` pairs.
 /// Generated from `skills/clean-architecture.md`.
 const ALLOWED_DEPS: &[(&str, &[&str])] = &[
-    ("aero-common",    &[]),             // leaf — no internal deps
-    ("aero-bus",       &["aero-common"]),
-    ("aero-storage",   &["aero-common"]),
-    ("aero-auth",      &["aero-common", "aero-storage"]),
+    ("aero-common", &[]), // leaf — no internal deps
+    ("aero-bus", &["aero-common"]),
+    ("aero-storage", &["aero-common"]),
+    ("aero-auth", &["aero-common", "aero-storage"]),
     ("aero-signaling", &["aero-common"]),
-    ("aero-im-core",   &["aero-common", "aero-bus", "aero-storage", "aero-signaling"]),
-    ("aero-im-call",   &["aero-common", "aero-bus", "aero-storage", "aero-signaling", "aero-live-webrtc"]),
-    ("aero-ai",        &["aero-common", "aero-storage", "aero-bus"]),
+    (
+        "aero-im-core",
+        &["aero-common", "aero-bus", "aero-storage", "aero-signaling"],
+    ),
+    (
+        "aero-im-call",
+        &[
+            "aero-common",
+            "aero-bus",
+            "aero-storage",
+            "aero-signaling",
+            "aero-live-webrtc",
+        ],
+    ),
+    ("aero-ai", &["aero-common", "aero-storage", "aero-bus"]),
     ("aero-live-core", &["aero-common", "aero-storage"]),
-    ("aero-live-rtmp", &["aero-common", "aero-storage", "aero-live-core", "aero-live-hls"]),
-    ("aero-live-hls",  &["aero-common", "aero-live-core"]),
-    ("aero-live-whip", &["aero-common", "aero-live-core", "aero-live-hls", "aero-signaling", "aero-storage"]),
-    ("aero-live-webrtc", &["aero-common", "aero-live-core", "aero-live-hls", "aero-signaling"]),
-    ("aero-live-srt",  &["aero-common", "aero-live-core", "aero-live-hls", "aero-storage"]),
-    ("aero-push",      &["aero-common"]),
-    ("aero-eng",       &["aero-common", "serde", "tokio"]),  // engineering CLI framework
+    (
+        "aero-live-rtmp",
+        &[
+            "aero-common",
+            "aero-storage",
+            "aero-live-core",
+            "aero-live-hls",
+        ],
+    ),
+    ("aero-live-hls", &["aero-common", "aero-live-core"]),
+    (
+        "aero-live-whip",
+        &[
+            "aero-common",
+            "aero-live-core",
+            "aero-live-hls",
+            "aero-signaling",
+            "aero-storage",
+        ],
+    ),
+    (
+        "aero-live-webrtc",
+        &[
+            "aero-common",
+            "aero-live-core",
+            "aero-live-hls",
+            "aero-signaling",
+        ],
+    ),
+    (
+        "aero-live-srt",
+        &[
+            "aero-common",
+            "aero-live-core",
+            "aero-live-hls",
+            "aero-storage",
+        ],
+    ),
+    ("aero-push", &["aero-common"]),
+    ("aero-eng", &["aero-common", "serde", "tokio"]), // engineering CLI framework
 ];
 
 /// The root crate that may depend on everything.
@@ -216,7 +321,9 @@ pub fn check_deps(root: &Path) -> Outcome {
             let allowed_deps = match allowed {
                 Some((_, ad)) => ad,
                 None => {
-                    violations.push(format!("{member}: unknown crate (not in architecture rules)"));
+                    violations.push(format!(
+                        "{member}: unknown crate (not in architecture rules)"
+                    ));
                     continue;
                 }
             };
@@ -233,11 +340,13 @@ pub fn check_deps(root: &Path) -> Outcome {
     }
 
     if violations.is_empty() {
-        Outcome::ok(format!("✓ deps: {checked} crates checked, all dependencies valid"))
-            .with_detail(serde_json::json!({
-                "checked": checked,
-                "violations": 0,
-            }))
+        Outcome::ok(format!(
+            "✓ deps: {checked} crates checked, all dependencies valid"
+        ))
+        .with_detail(serde_json::json!({
+            "checked": checked,
+            "violations": 0,
+        }))
     } else {
         Outcome::error(format!(
             "✗ deps: {} dependency violations across {checked} crates",
@@ -357,9 +466,16 @@ pub fn check_workspace_members(root: &Path) -> Outcome {
         }
     }
     if missing.is_empty() {
-        Outcome::ok(format!("✓ workspace: {} members all present", members.len()))
+        Outcome::ok(format!(
+            "✓ workspace: {} members all present",
+            members.len()
+        ))
     } else {
-        Outcome::error(format!("✗ workspace: {} missing members: {}", missing.len(), missing.join(", ")))
+        Outcome::error(format!(
+            "✗ workspace: {} missing members: {}",
+            missing.len(),
+            missing.join(", ")
+        ))
     }
 }
 
@@ -379,25 +495,35 @@ pub fn check_todos(root: &Path) -> Outcome {
             "total": todos.len(),
             "items": todos,
         });
-        Outcome::warning(0, format!("! {} TODO/FIXME/HACK comments found", todos.len()))
-            .with_detail(detail)
+        Outcome::warning(
+            0,
+            format!("! {} TODO/FIXME/HACK comments found", todos.len()),
+        )
+        .with_detail(detail)
     }
 }
 
 /// Recursively scan a directory for Rust files containing TODO/FIXME/HACK.
 fn scan_todos(dir: &Path, todos: &mut Vec<serde_json::Value>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
             let name = path.file_name().unwrap_or_default().to_string_lossy();
-            if name.starts_with('.') || name == "target" || name == "node_modules" { continue; }
+            if name.starts_with('.') || name == "target" || name == "node_modules" {
+                continue;
+            }
             scan_todos(&path, todos);
         } else if path.extension().map_or(false, |e| e == "rs") {
             if let Ok(content) = std::fs::read_to_string(&path) {
                 for (i, line) in content.lines().enumerate() {
                     let trimmed = line.trim();
-                    if trimmed.starts_with("// TODO") || trimmed.starts_with("// FIXME") || trimmed.starts_with("// HACK") {
+                    if trimmed.starts_with("// TODO")
+                        || trimmed.starts_with("// FIXME")
+                        || trimmed.starts_with("// HACK")
+                    {
                         todos.push(serde_json::json!({
                             "file": path.to_string_lossy(),
                             "line": i + 1,
@@ -413,16 +539,30 @@ fn scan_todos(dir: &Path, todos: &mut Vec<serde_json::Value>) {
 /// Check that every workspace crate has a README.md file.
 #[must_use]
 pub fn check_readme(root: &Path) -> Outcome {
-    let members = parse_workspace_members(&std::fs::read_to_string(&root.join("Cargo.toml")).unwrap_or_default());
+    let members = parse_workspace_members(
+        &std::fs::read_to_string(&root.join("Cargo.toml")).unwrap_or_default(),
+    );
     let mut missing: Vec<String> = Vec::new();
     for m in &members {
         let readme = root.join("crates").join(m).join("README.md");
-        if !readme.exists() { missing.push(m.clone()); }
+        if !readme.exists() {
+            missing.push(m.clone());
+        }
     }
     if missing.is_empty() {
-        Outcome::ok(format!("✓ README: all {} crates have README.md", members.len()))
+        Outcome::ok(format!(
+            "✓ README: all {} crates have README.md",
+            members.len()
+        ))
     } else {
-        Outcome::warning(0, format!("! README: {} crates missing README.md: {}", missing.len(), missing.join(", ")))
+        Outcome::warning(
+            0,
+            format!(
+                "! README: {} crates missing README.md: {}",
+                missing.len(),
+                missing.join(", ")
+            ),
+        )
     }
 }
 
@@ -435,7 +575,9 @@ pub fn check_crate_metadata(root: &Path) -> Outcome {
     let mut violations = Vec::new();
     for member in &members {
         let path = root.join("crates").join(member).join("Cargo.toml");
-        if !path.exists() { continue; }
+        if !path.exists() {
+            continue;
+        }
         let content = std::fs::read_to_string(&path).unwrap_or_default();
         for field in &["version", "edition", "license"] {
             let expected = format!("{field}.workspace = true");
@@ -445,9 +587,16 @@ pub fn check_crate_metadata(root: &Path) -> Outcome {
         }
     }
     if violations.is_empty() {
-        Outcome::ok(format!("✓ metadata: {} crates all use workspace standards", members.len()))
+        Outcome::ok(format!(
+            "✓ metadata: {} crates all use workspace standards",
+            members.len()
+        ))
     } else {
-        Outcome::error(format!("✗ metadata: {} violations: {}", violations.len(), violations.join("; ")))
+        Outcome::error(format!(
+            "✗ metadata: {} violations: {}",
+            violations.len(),
+            violations.join("; ")
+        ))
     }
 }
 
@@ -507,7 +656,9 @@ mod tests {
         let nm = dir.path().join("web").join("node_modules");
         std::fs::create_dir_all(&nm).unwrap();
         let mut f = std::fs::File::create(nm.join("huge.js")).unwrap();
-        for i in 0..5000usize { writeln!(f, "// line {i}").unwrap(); }
+        for i in 0..5000usize {
+            writeln!(f, "// line {i}").unwrap();
+        }
         let cfg = EngineeringConfig::default();
         let outcome = check_filesize(dir.path(), &cfg);
         assert!(outcome.is_ok(), "node_modules should be skipped: {outcome}");
@@ -579,44 +730,65 @@ aero-storage = { path = "../aero-storage" }
         let dir = tmp_dir();
         let root = dir.path();
         // Workspace Cargo.toml
-        write_cargo(&root.join("Cargo.toml"), r#"
+        write_cargo(
+            &root.join("Cargo.toml"),
+            r#"
 [workspace]
 members = ["crates/aero-common"]
-"#);
+"#,
+        );
         // aero-common has no internal deps (correct for leaf)
-        write_cargo(&root.join("crates/aero-common/Cargo.toml"), r#"
+        write_cargo(
+            &root.join("crates/aero-common/Cargo.toml"),
+            r#"
 [package]
 name = "aero-common"
 [dependencies]
 serde.workspace = true
-"#);
+"#,
+        );
         let outcome = check_deps(root);
-        assert!(outcome.is_ok(), "leaf crate with only external deps: {outcome}");
+        assert!(
+            outcome.is_ok(),
+            "leaf crate with only external deps: {outcome}"
+        );
     }
 
     #[test]
     fn check_deps_rejects_illegal_upward_dep() {
         let dir = tmp_dir();
         let root = dir.path();
-        write_cargo(&root.join("Cargo.toml"), r#"
+        write_cargo(
+            &root.join("Cargo.toml"),
+            r#"
 [workspace]
 members = ["crates/aero-common", "crates/aero-storage"]
-"#);
+"#,
+        );
         // aero-common depends on aero-storage — ILLEGAL (leaf depends on higher layer)
-        write_cargo(&root.join("crates/aero-common/Cargo.toml"), r#"
+        write_cargo(
+            &root.join("crates/aero-common/Cargo.toml"),
+            r#"
 [package]
 name = "aero-common"
 [dependencies]
 aero-storage.workspace = true
-"#);
-        write_cargo(&root.join("crates/aero-storage/Cargo.toml"), r#"
+"#,
+        );
+        write_cargo(
+            &root.join("crates/aero-storage/Cargo.toml"),
+            r#"
 [package]
 name = "aero-storage"
 [dependencies]
 aero-common.workspace = true
-"#);
+"#,
+        );
         let outcome = check_deps(root);
-        assert!(outcome.is_error(), "leaf → storage should be illegal: {outcome}");
+        assert!(
+            outcome.is_error(),
+            "leaf → storage should be illegal: {outcome}"
+        );
     }
 
     #[test]
@@ -624,10 +796,13 @@ aero-common.workspace = true
         let dir = tmp_dir();
         let root = dir.path();
         // Create workspace Cargo.toml
-        write_cargo(&root.join("Cargo.toml"), r#"
+        write_cargo(
+            &root.join("Cargo.toml"),
+            r#"
 [workspace]
 members = ["crates/aero-foo", "crates/aero-bar"]
-"#);
+"#,
+        );
         std::fs::create_dir_all(root.join("crates/aero-foo/src")).unwrap();
         std::fs::create_dir_all(root.join("crates/aero-bar/src")).unwrap();
         let outcome = check_workspace_members(root);
@@ -638,10 +813,13 @@ members = ["crates/aero-foo", "crates/aero-bar"]
     fn check_workspace_members_fails_on_missing() {
         let dir = tmp_dir();
         let root = dir.path();
-        write_cargo(&root.join("Cargo.toml"), r#"
+        write_cargo(
+            &root.join("Cargo.toml"),
+            r#"
 [workspace]
 members = ["crates/aero-foo", "crates/aero-missing"]
-"#);
+"#,
+        );
         std::fs::create_dir_all(root.join("crates/aero-foo/src")).unwrap();
         let outcome = check_workspace_members(root);
         assert!(outcome.is_error(), "missing member should fail: {outcome}");
@@ -651,18 +829,24 @@ members = ["crates/aero-foo", "crates/aero-missing"]
     fn check_crate_metadata_ok_for_workspace_crates() {
         let dir = tmp_dir();
         let root = dir.path();
-        write_cargo(&root.join("Cargo.toml"), r#"
+        write_cargo(
+            &root.join("Cargo.toml"),
+            r#"
 [workspace]
 members = ["crates/aero-foo"]
-"#);
+"#,
+        );
         std::fs::create_dir_all(root.join("crates/aero-foo/src")).unwrap();
-        write_cargo(&root.join("crates/aero-foo/Cargo.toml"), r#"
+        write_cargo(
+            &root.join("crates/aero-foo/Cargo.toml"),
+            r#"
 [package]
 name = "aero-foo"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-"#);
+"#,
+        );
         let outcome = check_crate_metadata(root);
         assert!(outcome.is_ok(), "metadata ok: {outcome}");
     }
@@ -671,16 +855,22 @@ license.workspace = true
     fn check_crate_metadata_fails_on_missing_field() {
         let dir = tmp_dir();
         let root = dir.path();
-        write_cargo(&root.join("Cargo.toml"), r#"
+        write_cargo(
+            &root.join("Cargo.toml"),
+            r#"
 [workspace]
 members = ["crates/aero-foo"]
-"#);
+"#,
+        );
         std::fs::create_dir_all(root.join("crates/aero-foo/src")).unwrap();
-        write_cargo(&root.join("crates/aero-foo/Cargo.toml"), r#"
+        write_cargo(
+            &root.join("crates/aero-foo/Cargo.toml"),
+            r#"
 [package]
 name = "aero-foo"
 version = "0.1.0"
-"#);
+"#,
+        );
         let outcome = check_crate_metadata(root);
         assert!(outcome.is_error(), "missing workspace fields: {outcome}");
     }
@@ -702,7 +892,11 @@ version = "0.1.0"
         let root = dir.path();
         let crates = root.join("crates/aero-foo/src");
         std::fs::create_dir_all(&crates).unwrap();
-        std::fs::write(crates.join("lib.rs"), "// TODO: implement this later\npub fn maybe() {}\n").unwrap();
+        std::fs::write(
+            crates.join("lib.rs"),
+            "// TODO: implement this later\npub fn maybe() {}\n",
+        )
+        .unwrap();
         let outcome = check_todos(root);
         assert!(!outcome.is_ok(), "should find TODO: {outcome}");
         if let Some(d) = outcome.detail() {
@@ -714,29 +908,47 @@ version = "0.1.0"
     fn check_readme_reports_missing_all() {
         let dir = tmp_dir();
         let root = dir.path();
-        write_cargo(&root.join("Cargo.toml"), r#"
+        write_cargo(
+            &root.join("Cargo.toml"),
+            r#"
 [workspace]
 members = ["crates/aero-foo"]
-"#);
+"#,
+        );
         std::fs::create_dir_all(root.join("crates/aero-foo/src")).unwrap();
         // No README.md
         let outcome = check_readme(root);
-        assert_eq!(outcome.exit_code(), 0, "readme check is warning only: {outcome}");
+        assert_eq!(
+            outcome.exit_code(),
+            0,
+            "readme check is warning only: {outcome}"
+        );
         // Should report the missing README
-        assert!(outcome.message().contains("aero-foo"), "should mention missing crate: {}", outcome.message());
+        assert!(
+            outcome.message().contains("aero-foo"),
+            "should mention missing crate: {}",
+            outcome.message()
+        );
     }
 
     #[test]
     fn check_readme_ok_when_present() {
         let dir = tmp_dir();
         let root = dir.path();
-        write_cargo(&root.join("Cargo.toml"), r#"
+        write_cargo(
+            &root.join("Cargo.toml"),
+            r#"
 [workspace]
 members = ["crates/aero-foo"]
-"#);
+"#,
+        );
         std::fs::create_dir_all(root.join("crates/aero-foo/src")).unwrap();
         std::fs::write(root.join("crates/aero-foo/README.md"), "# Foo\n").unwrap();
         let outcome = check_readme(root);
-        assert!(outcome.message().contains("all"), "all present: {}", outcome.message());
+        assert!(
+            outcome.message().contains("all"),
+            "all present: {}",
+            outcome.message()
+        );
     }
 }

@@ -139,13 +139,12 @@ impl BookmarkCollectionRepo {
         id: BookmarkCollectionId,
         participant: ParticipantId,
     ) -> Result<bool, sqlx::Error> {
-        let result = sqlx::query(
-            r"DELETE FROM bookmark_collections WHERE id = $1 AND participant_id = $2",
-        )
-        .bind(id.to_uuid())
-        .bind(participant.to_uuid())
-        .execute(&self.pool)
-        .await?;
+        let result =
+            sqlx::query(r"DELETE FROM bookmark_collections WHERE id = $1 AND participant_id = $2")
+                .bind(id.to_uuid())
+                .bind(participant.to_uuid())
+                .execute(&self.pool)
+                .await?;
         Ok(result.rows_affected() > 0)
     }
 
@@ -236,7 +235,7 @@ mod db_tests {
         let room = RoomId::new();
         sqlx::query(
             "INSERT INTO rooms (id, kind, name, created_by, created_at, workspace_id)
-             VALUES ($1,'channel',$2,$3, now(), '00000000-0000-0000-0000-000000000000')",
+             VALUES ($1,'group',$2,$3, now(), '00000000-0000-0000-0000-000000000000')",
         )
         .bind(room.to_uuid())
         .bind("bc-room")
@@ -272,18 +271,31 @@ mod db_tests {
         assert!(listed.iter().any(|c| c.id == cid && c.name == "Read later"));
 
         // Save the message, then file it into the collection.
-        assert!(bookmarks.save(actor, message, room, None).await.unwrap(), "saved");
-        assert!(collections.assign(actor, message, cid).await.unwrap(), "assigned");
+        assert!(
+            bookmarks.save(actor, message, room, None).await.unwrap(),
+            "saved"
+        );
+        assert!(
+            collections.assign(actor, message, cid).await.unwrap(),
+            "assigned"
+        );
 
         // list-by-collection returns only the assigned item...
-        let in_coll = bookmarks.list_in_collection(actor, Some(cid), None).await.unwrap();
+        let in_coll = bookmarks
+            .list_in_collection(actor, Some(cid), None)
+            .await
+            .unwrap();
         assert_eq!(in_coll.len(), 1, "exactly the filed message");
         assert_eq!(in_coll[0].message.id, message);
 
         // ...and another (empty) collection returns nothing.
         let other = collections.create(actor, "Empty", 1).await.unwrap();
         assert!(
-            bookmarks.list_in_collection(actor, Some(other), None).await.unwrap().is_empty(),
+            bookmarks
+                .list_in_collection(actor, Some(other), None)
+                .await
+                .unwrap()
+                .is_empty(),
             "empty collection returns no items"
         );
     }
@@ -304,12 +316,21 @@ mod db_tests {
         // the bookmark survives and reappears in the flat (un-foldered) list.
         assert!(collections.delete(cid, actor).await.unwrap(), "deleted");
         assert!(
-            bookmarks.list_in_collection(actor, Some(cid), None).await.unwrap().is_empty(),
+            bookmarks
+                .list_in_collection(actor, Some(cid), None)
+                .await
+                .unwrap()
+                .is_empty(),
             "no items remain under the deleted collection id"
         );
         // The bookmark is still present overall (flat list).
         assert!(
-            bookmarks.list(actor, None).await.unwrap().iter().any(|s| s.message.id == message),
+            bookmarks
+                .list(actor, None)
+                .await
+                .unwrap()
+                .iter()
+                .any(|s| s.message.id == message),
             "the saved message survived the collection delete"
         );
     }
@@ -334,7 +355,10 @@ mod db_tests {
 
         assert!(bookmarks.save(actor, message, room, None).await.unwrap());
         assert!(
-            !collections.assign(actor, message, stranger_coll).await.unwrap(),
+            !collections
+                .assign(actor, message, stranger_coll)
+                .await
+                .unwrap(),
             "cannot file into another user's collection"
         );
     }

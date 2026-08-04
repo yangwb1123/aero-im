@@ -4,21 +4,51 @@
 //! Uses `pub(crate)` fields/methods on `ImService` — these are module-internal
 //! and should NOT be considered a public API.
 
+use crate::service::orig::{per_tenant_metrics_enabled, spam_content_hash, WORKSPACE_NONE};
+use crate::{moderation_text, validate_blocks, ImService, ModerationVerdict};
 use aero_common::{
     metrics::{self, names},
-    Block, Error, Message, MessageEnvelope, MessageId, ParticipantId, Result, RoomEvent,
-    RoomId, RoomKind, WorkspaceId,
+    Block, Error, Message, MessageId, ParticipantId, Result, RoomId, RoomKind, WorkspaceId,
 };
-use aero_storage::{message::NewMessage, AiJobKind};
-use crate::{
-    validate_blocks, ImService, ModerationVerdict,
-};
-use crate::service::orig::{
-    spam_content_hash, per_tenant_metrics_enabled, WORKSPACE_NONE,
-};
+use aero_storage::{message::NewMessage, MessageIdempotency};
 use tracing::{instrument, warn, Instrument};
 
+#[derive(Debug, Clone)]
+pub struct SendMessageOutcome {
+    pub message: Message,
+    pub deduplicated: bool,
+}
+
 impl ImService {
+    /// Apply the full synchronous message policy before an external producer
+    /// enters its own transaction-owned insert path. Commit-time room, post
+    /// policy, information-barrier and attachment checks are still repeated by
+    /// storage, so this preflight cannot become stale authority.
+    pub async fn assert_external_message_send_preflight(
+        &self,
+        sender: ParticipantId,
+        room: RoomId,
+        blocks: &[Block],
+    ) -> Result<()> {
+        self.assert_room_access(sender, room).await?;
+        self.assert_can_post(sender, room).await?;
+        validate_blocks(blocks)?;
+        if let ModerationVerdict::Block(reason) = self.moderator.check(blocks) {
+            return Err(Error::Invalid(reason));
+        }
+        if let Some(guard) = self.spam_guard.as_ref() {
+            let content_hash = spam_content_hash(blocks);
+            if let crate::SpamDecision::Throttle(reason) = guard
+                .record(sender, room, content_hash, std::time::Instant::now())
+                .await
+            {
+                tracing::warn!(%sender, %room, ?reason, "external message spam guard throttled");
+                return Err(Error::RateLimited);
+            }
+        }
+        self.enforce_pii_and_auto_mod(sender, room, blocks).await
+    }
+
     /// Send a message into a room: access → moderator → spam → PII → persist →
     /// notify → AI embed/moderate → metrics.
     #[instrument(skip(self, blocks), fields(?sender, ?room))]
@@ -30,11 +60,78 @@ impl ImService {
         reply_to: Option<MessageId>,
         expires_at: Option<time::OffsetDateTime>,
     ) -> Result<Message> {
+        Ok(self
+            .send_message_inner(sender, room, blocks, reply_to, expires_at, None)
+            .await?
+            .message)
+    }
+
+    /// Sender-confirmed message send using a stable client UUID. A retry with
+    /// the same sender/key/payload returns the canonical message without
+    /// publishing or dispatching any side effect again.
+    pub async fn send_message_idempotent(
+        &self,
+        sender: ParticipantId,
+        room: RoomId,
+        blocks: Vec<Block>,
+        reply_to: Option<MessageId>,
+        expires_at: Option<time::OffsetDateTime>,
+        client_message_id: uuid::Uuid,
+        request_hash: [u8; 32],
+    ) -> Result<SendMessageOutcome> {
+        self.send_message_inner(
+            sender,
+            room,
+            blocks,
+            reply_to,
+            expires_at,
+            Some((client_message_id, request_hash)),
+        )
+        .await
+    }
+
+    async fn send_message_inner(
+        &self,
+        sender: ParticipantId,
+        room: RoomId,
+        blocks: Vec<Block>,
+        reply_to: Option<MessageId>,
+        expires_at: Option<time::OffsetDateTime>,
+        idempotency: Option<(uuid::Uuid, [u8; 32])>,
+    ) -> Result<SendMessageOutcome> {
         let started = std::time::Instant::now();
-        if !self.rooms.is_member(room, sender).await? {
-            return Err(Error::Forbidden(format!(
-                "sender {sender} is not a member of room {room}"
-            )));
+        // Keep this before the idempotency lookup: a revoked/deactivated account
+        // must not recover the canonical message through a replay key.
+        self.assert_room_access(sender, room).await?;
+        if let Some((client_message_id, request_hash)) = idempotency {
+            if let Some(message) = self
+                .messages
+                .find_by_client_message_id(sender, client_message_id, &request_hash)
+                .await?
+            {
+                // The canonical message may have committed immediately before a
+                // process crash prevented its fast publish. Nudge its retained
+                // outbox row now; failure is harmless because the background
+                // relay owns the durable retry.
+                let repo = aero_storage::EventOutboxRepo::new(self.messages.pool.clone());
+                if let Ok(Some(row)) = repo.pending_for_message(message.id).await {
+                    if let Err(error) = self.dispatch_event_outbox_id(row.id).await {
+                        warn!(?error, message_id = %message.id, "fast outbox retry failed");
+                    }
+                }
+                self.kick_message_side_effects(message.id).await;
+                return Ok(SendMessageOutcome {
+                    message,
+                    deduplicated: true,
+                });
+            }
+        }
+        if let Some(parent) = reply_to {
+            let parent_matches_room = self
+                .messages
+                .reply_parent_exists_in_room(parent, room)
+                .await?;
+            validate_reply_parent_scope(parent, room, parent_matches_room)?;
         }
         self.assert_can_post(sender, room).await?;
         validate_blocks(&blocks)?;
@@ -45,97 +142,55 @@ impl ImService {
         // Behavioral spam/flood guard
         if let Some(guard) = self.spam_guard.as_ref() {
             let content_hash = spam_content_hash(&blocks);
-            if let crate::SpamDecision::Throttle(reason) =
-                guard.record(sender, room, content_hash, std::time::Instant::now()).await
+            if let crate::SpamDecision::Throttle(reason) = guard
+                .record(sender, room, content_hash, std::time::Instant::now())
+                .await
             {
                 tracing::warn!(%sender, %room, ?reason, "spam guard throttled");
                 return Err(Error::RateLimited);
             }
         }
 
-        // PII guard
-        if let Some(detector) = self.pii_detector.as_ref() {
-            let text = blocks
-                .iter()
-                .flat_map(|b| {
-                    b.searchable_text().into_iter().chain(b.extra_searchable_text())
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            let kinds = detector.scan(&text);
-            if !kinds.is_empty() {
-                let tags = kinds.iter().map(|k| k.tag()).collect::<Vec<_>>().join(", ");
-                tracing::warn!(%sender, %room, pii = %tags, "PII guard blocked");
-                return Err(Error::Invalid(format!(
-                    "message blocked: it appears to contain sensitive personal information ({tags})"
-                )));
-            }
-        }
+        self.enforce_pii_and_auto_mod(sender, room, &blocks).await?;
 
-        // Auto-mod rules
-        if let Some(ref rule_repo) = self.auto_mod_rules.as_ref() {
-            if let Ok(Some(workspace)) = self.rooms.room_workspace(room).await {
-                if let Ok(rules) = rule_repo.list_for_workspace(workspace).await {
-                    let text: String = blocks.iter().filter_map(|b| {
-                        if let Block::Text { content, .. } = b { Some(content.as_str()) } else { None }
-                    }).collect::<Vec<_>>().join(" ");
-                    for rule in &rules {
-                        if rule.action == "block" && rule.matches(&text) {
-                            return Err(Error::Invalid("blocked by auto-mod rule".into()));
-                        }
-                    }
-                }
-            }
-        }
-
-        let message = self.messages.insert(NewMessage {
+        let new = NewMessage {
             room_id: room,
             sender_id: sender,
             blocks,
             reply_to,
             metadata: serde_json::Value::Null,
             expires_at,
-        }).await?;
-
-        let recipients = self.rooms.members(room).await.unwrap_or_else(|err| {
-            warn!(?err, %room, "fetching recipients failed");
-            Vec::new()
-        });
-        let envelope = MessageEnvelope {
-            message: message.clone(),
-            recipients: recipients.clone(),
         };
-
-        self.publish_room_event(room, &RoomEvent::Message(envelope)).await;
-
-        // Detached notification dispatch
-        {
-            let svc = self.clone();
-            let msg = message.clone();
-            let dispatch = tokio::spawn(
-                async move { svc.dispatch_notifications(&msg, &recipients).await }
-                    .in_current_span(),
-            );
-            #[cfg(test)]
-            if let Err(err) = dispatch.await {
-                warn!(?err, "notification dispatch panicked");
-            }
-            #[cfg(not(test))]
-            drop(dispatch);
+        // A committed message must always have a committed event. Fan-out and
+        // notification workers resolve current membership at delivery time, so
+        // a transient member-list read cannot block this durable write.
+        let traceparent = aero_common::telemetry::current_traceparent();
+        let inserted = self
+            .messages
+            .insert_outboxed(
+                new,
+                idempotency.map(|(client_message_id, request_hash)| {
+                    MessageIdempotency::new(client_message_id, request_hash)
+                }),
+                Vec::new(),
+                traceparent.as_deref(),
+            )
+            .await?;
+        let deduplicated = inserted.deduplicated();
+        let outbox_id = inserted.outbox_id;
+        let message = inserted.into_message();
+        // Fast path: make the event visible before returning when NATS is healthy.
+        // Crucially, a publish error no longer turns a committed send into an
+        // ambiguous failure; the durable relay will retry the same event id/seq.
+        if let Err(error) = self.dispatch_event_outbox_id(outbox_id).await {
+            warn!(?error, %outbox_id, message_id = %message.id, "fast outbox dispatch failed");
         }
-
-        // AI embed + moderate jobs
-        let searchable = message.searchable_text();
-        if !searchable.is_empty() {
-            let ws = self.rooms.room_workspace(room).await.ok().flatten().map(|w| w.to_uuid());
-            if let Err(err) = self.ai_jobs.enqueue(
-                AiJobKind::Embed, Some(message.id.to_uuid()), ws,
-                serde_json::json!({"room_id": room.to_string()}),
-            ).await { warn!(?err, "enqueue embed failed"); }
-            if let Err(err) = self.ai_jobs.enqueue(
-                AiJobKind::Moderate, Some(message.id.to_uuid()), ws,
-                serde_json::json!({"text": searchable}),
-            ).await { warn!(?err, "enqueue moderate failed"); }
+        self.kick_message_side_effects(message.id).await;
+        if deduplicated {
+            return Ok(SendMessageOutcome {
+                message,
+                deduplicated: true,
+            });
         }
 
         // Metrics
@@ -147,17 +202,69 @@ impl ImService {
         };
         metrics::inc_counter_labeled(names::MESSAGES_SENT_TOTAL, 1, &[("room_type", room_type)]);
         if per_tenant_metrics_enabled() {
-            let ws_label = self.rooms.room_workspace(room).await
-                .ok().flatten()
+            let ws_label = self
+                .rooms
+                .room_workspace(room)
+                .await
+                .ok()
+                .flatten()
                 .map_or_else(|| WORKSPACE_NONE.to_string(), |w| w.to_string());
-            metrics::inc_counter_labeled(names::MESSAGES_SENT_TOTAL, 1, &[("workspace", ws_label.as_str())]);
+            metrics::inc_counter_labeled(
+                names::MESSAGES_SENT_TOTAL,
+                1,
+                &[("workspace", ws_label.as_str())],
+            );
         }
         metrics::observe_histogram_labeled(
             names::MESSAGE_PROCESSING_DURATION_SECONDS,
             started.elapsed().as_secs_f64(),
             &[("op", "send")],
         );
-        Ok(message)
+        Ok(SendMessageOutcome {
+            message,
+            deduplicated: false,
+        })
+    }
+
+    /// Apply the configured synchronous governance policies that need tenant
+    /// context. Send and edit both call this before their durable write so an
+    /// edit cannot turn previously clean content into PII or an auto-mod match.
+    async fn enforce_pii_and_auto_mod(
+        &self,
+        actor: ParticipantId,
+        room: RoomId,
+        blocks: &[Block],
+    ) -> Result<()> {
+        let text = moderation_text(blocks);
+        if let Some(detector) = self.pii_detector.as_ref() {
+            let kinds = detector.scan(&text);
+            if !kinds.is_empty() {
+                let tags = kinds.iter().map(|k| k.tag()).collect::<Vec<_>>().join(", ");
+                tracing::warn!(%actor, %room, pii = %tags, "PII guard blocked");
+                return Err(Error::Invalid(format!(
+                    "message blocked: it appears to contain sensitive personal information ({tags})"
+                )));
+            }
+        }
+
+        if let Some(rule_repo) = self.auto_mod_rules.as_ref() {
+            if let Some(workspace) = self.rooms.room_workspace(room).await? {
+                // Rule lookup is part of the configured governance decision.
+                // Fail closed on storage errors so a policy cannot disappear
+                // silently while the subsequent message write still succeeds.
+                let rules = rule_repo.list_for_enforcement(workspace).await?;
+                if !rules.is_empty() {
+                    let lowercase_text = text.to_lowercase();
+                    if rules
+                        .iter()
+                        .any(|rule| rule.matches_lowercase(&lowercase_text))
+                    {
+                        return Err(Error::Invalid("blocked by auto-mod rule".into()));
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Edit a message. Only the sender may edit; soft-deleted messages refuse.
@@ -180,51 +287,48 @@ impl ImService {
         expected_version: Option<i32>,
     ) -> Result<Message> {
         let started = std::time::Instant::now();
-        let existing = self.messages.get(id).await?
-            .ok_or_else(|| Error::NotFound(format!("message {id}")))?;
-        if existing.deleted_at.is_some() {
-            return Err(Error::Conflict("message is deleted".into()));
-        }
-        if existing.sender_id != actor {
-            return Err(Error::Forbidden("only sender may edit".into()));
-        }
+        let existing = self.editable_message(actor, id).await?;
         validate_blocks(&blocks)?;
-
-        if let Some(ref history) = self.message_edits {
-            if let Ok(old) = serde_json::to_value(&existing.blocks) {
-                if let Err(err) = history.record(id, actor, &old).await {
-                    warn!(?err, %id, "record edit history failed");
-                }
-            }
+        if let ModerationVerdict::Block(reason) = self.moderator.check(&blocks) {
+            return Err(Error::Invalid(reason));
         }
+        self.enforce_pii_and_auto_mod(actor, existing.room_id, &blocks)
+            .await?;
 
         // Optimistic-lock version (migration 0157): use the client-supplied
         // expectation when present (the real lost-update guard); otherwise fall
         // back to reading the current version, matching pre-versioning behavior.
-        let version = match expected_version {
-            Some(v) => v,
-            None => self.messages.get_version(id).await?
-                .ok_or_else(|| Error::NotFound(format!("message {id} disappeared before edit")))?,
-        };
+        let version =
+            match expected_version {
+                Some(v) => v,
+                None => self.messages.get_version(id).await?.ok_or_else(|| {
+                    Error::NotFound(format!("message {id} disappeared before edit"))
+                })?,
+            };
 
-        let updated = self.messages.edit(id, blocks, version).await?
+        let traceparent = aero_common::telemetry::current_traceparent();
+        let edited = self
+            .messages
+            .edit_outboxed_authorized(
+                id,
+                actor,
+                blocks,
+                version,
+                self.message_edits.is_some(),
+                traceparent.as_deref(),
+            )
+            .await?
             .ok_or_else(|| Error::Conflict("version mismatch or edit raced with delete".into()))?;
-
-        self.publish_room_event(updated.room_id, &RoomEvent::Edited(updated.clone())).await;
-
-        let edit_text = updated.searchable_text();
-        if !edit_text.is_empty() {
-            let ws = self.rooms.room_workspace(updated.room_id).await
-                .ok().flatten().map(|w| w.to_uuid());
-            if let Err(err) = self.ai_jobs.enqueue(
-                AiJobKind::Embed, Some(updated.id.to_uuid()), ws,
-                serde_json::json!({"room_id": updated.room_id.to_string()}),
-            ).await { warn!(?err, %id, "re-embed failed"); }
-            if let Err(err) = self.ai_jobs.enqueue(
-                AiJobKind::Moderate, Some(updated.id.to_uuid()), ws,
-                serde_json::json!({"text": edit_text}),
-            ).await { warn!(?err, %id, "re-moderate failed"); }
+        let updated = edited.message;
+        if let Err(error) = self.dispatch_event_outbox_id(edited.outbox_id).await {
+            warn!(
+                ?error,
+                outbox_id = %edited.outbox_id,
+                message_id = %id,
+                "fast edited-event outbox dispatch failed"
+            );
         }
+        self.kick_message_side_effects(updated.id).await;
         metrics::inc_counter(names::MESSAGES_EDITED_TOTAL, 1);
         metrics::observe_histogram_labeled(
             names::MESSAGE_PROCESSING_DURATION_SECONDS,
@@ -234,21 +338,73 @@ impl ImService {
         Ok(updated)
     }
 
-    /// Soft-delete a message. Sender or room-owner may delete.
+    /// Resolve and authorize an edit before an edge spends tenant rate/slow-mode
+    /// capacity. The eventual [`Self::edit_message`] call repeats these checks so
+    /// a concurrent membership, account, or announcement-policy change cannot
+    /// turn this preflight result into authority.
+    pub async fn assert_message_edit_preflight(
+        &self,
+        actor: ParticipantId,
+        id: MessageId,
+    ) -> Result<RoomId> {
+        Ok(self.editable_message(actor, id).await?.room_id)
+    }
+
+    async fn editable_message(&self, actor: ParticipantId, id: MessageId) -> Result<Message> {
+        let existing = self
+            .messages
+            .get(id)
+            .await?
+            .ok_or_else(|| Error::NotFound(format!("message {id}")))?;
+        // Resolve the message's tenant/room first, then apply the shared access
+        // guard before author checks. This prevents a global message id from
+        // becoming an IDOR/oracle across workspaces.
+        self.assert_room_access(actor, existing.room_id).await?;
+        if existing.deleted_at.is_some() {
+            return Err(Error::Conflict("message is deleted".into()));
+        }
+        if existing.sender_id != actor {
+            return Err(Error::Forbidden("only sender may edit".into()));
+        }
+        // Editing mutates the channel's current visible content, so it must
+        // respect the same announcement-channel policy as a fresh post. Without
+        // this recheck, a member could publish arbitrary new text by editing a
+        // message created before the room became admins-only.
+        self.assert_can_post(actor, existing.room_id).await?;
+        Ok(existing)
+    }
+
+    /// Soft-delete a message. Only the sender may delete.
     #[instrument(skip(self), fields(?actor, ?id))]
     pub async fn delete_message(&self, actor: ParticipantId, id: MessageId) -> Result<()> {
         let started = std::time::Instant::now();
-        let existing = self.messages.get(id).await?
+        let existing = self
+            .messages
+            .get(id)
+            .await?
             .ok_or_else(|| Error::NotFound(format!("message {id}")))?;
-        if existing.deleted_at.is_some() { return Ok(()); }
+        self.assert_room_access(actor, existing.room_id).await?;
+        if existing.deleted_at.is_some() {
+            return Ok(());
+        }
         if existing.sender_id != actor {
             return Err(Error::Forbidden("only sender may delete in P2".into()));
         }
-        self.messages.soft_delete(id).await?;
-        self.publish_room_event(
-            existing.room_id,
-            &RoomEvent::Deleted { room_id: existing.room_id, message_id: id, by: actor },
-        ).await;
+        let traceparent = aero_common::telemetry::current_traceparent();
+        let deleted = self
+            .messages
+            .soft_delete_outboxed_authorized(id, actor, traceparent.as_deref())
+            .await?;
+        if let Some(deleted) = deleted {
+            if let Err(error) = self.dispatch_event_outbox_id(deleted.outbox_id).await {
+                warn!(
+                    ?error,
+                    outbox_id = %deleted.outbox_id,
+                    message_id = %id,
+                    "fast deleted-event outbox dispatch failed"
+                );
+            }
+        }
         metrics::inc_counter(names::MESSAGES_DELETED_TOTAL, 1);
         metrics::observe_histogram_labeled(
             names::MESSAGE_PROCESSING_DURATION_SECONDS,
@@ -267,23 +423,90 @@ impl ImService {
         reason: &str,
         digest: &str,
     ) -> Result<()> {
-        let existing = self.messages.get(message_id).await?
+        let existing = self
+            .messages
+            .get(message_id)
+            .await?
             .ok_or_else(|| Error::NotFound(format!("message {message_id}")))?;
-        if existing.deleted_at.is_some() { return Ok(()); }
-        match workspace {
-            Some(ws) => {
-                let detail = serde_json::json!({
-                    "room_id": existing.room_id, "reason": reason, "digest": digest,
-                });
-                self.messages.soft_delete_moderated(message_id, ws, detail).await?;
-            }
-            None => { self.messages.soft_delete(message_id).await?; }
+        if existing.deleted_at.is_some() {
+            return Ok(());
         }
+        let detail = serde_json::json!({
+            "room_id": existing.room_id, "reason": reason, "digest": digest,
+        });
+        let traceparent = aero_common::telemetry::current_traceparent();
+        let deleted = self
+            .messages
+            .soft_delete_outboxed_system(
+                message_id,
+                workspace,
+                None,
+                workspace.map(|_| "message.moderated"),
+                detail,
+                ParticipantId::nil(),
+                traceparent.as_deref(),
+            )
+            .await?;
         warn!(%message_id, reason, "message removed by AI moderation");
-        self.publish_room_event(
-            existing.room_id,
-            &RoomEvent::Deleted { room_id: existing.room_id, message_id, by: existing.sender_id },
-        ).await;
+        if let Some(deleted) = deleted {
+            if let Err(error) = self.dispatch_event_outbox_id(deleted.outbox_id).await {
+                warn!(
+                    ?error,
+                    outbox_id = %deleted.outbox_id,
+                    %message_id,
+                    "fast moderation-event outbox dispatch failed"
+                );
+            }
+        }
         Ok(())
+    }
+
+    async fn kick_message_side_effects(&self, message_id: MessageId) {
+        let service = self.clone();
+        let dispatch = tokio::spawn(
+            async move {
+                if let Err(error) = service.dispatch_message_side_effects_for(message_id).await {
+                    warn!(?error, %message_id, "fast message side-effect dispatch failed");
+                }
+            }
+            .in_current_span(),
+        );
+        #[cfg(test)]
+        if let Err(error) = dispatch.await {
+            warn!(?error, %message_id, "message side-effect dispatcher panicked");
+        }
+        #[cfg(not(test))]
+        drop(dispatch);
+    }
+}
+
+fn validate_reply_parent_scope(
+    parent: MessageId,
+    room: RoomId,
+    parent_matches_room: bool,
+) -> Result<()> {
+    if parent_matches_room {
+        Ok(())
+    } else {
+        Err(Error::Invalid(format!(
+            "reply_to {parent} does not reference a message in room {room}"
+        )))
+    }
+}
+
+#[cfg(test)]
+mod reply_scope_tests {
+    use super::*;
+
+    #[test]
+    fn reply_parent_scope_fails_closed() {
+        let parent = MessageId::new();
+        let room = RoomId::new();
+        assert!(validate_reply_parent_scope(parent, room, true).is_ok());
+        assert!(matches!(
+            validate_reply_parent_scope(parent, room, false),
+            Err(Error::Invalid(message))
+                if message.contains(&parent.to_string()) && message.contains(&room.to_string())
+        ));
     }
 }

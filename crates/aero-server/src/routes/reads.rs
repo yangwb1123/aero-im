@@ -1,13 +1,17 @@
 #![allow(unused_imports)]
 //! Read receipts route handlers.
-use std::str::FromStr;
-use axum::{extract::{Path, Query, State}, routing::{get, post}, Json, Router};
-use aero_auth::AuthUser;
-use aero_common::{Error as AeroError, MessageId, ParticipantId, RoomId, Result as AeroResult};
-use serde::Deserialize;
 use crate::error::ApiResult;
 use crate::routes::helpers::parse_room_id;
 use crate::state::AppState;
+use aero_auth::AuthUser;
+use aero_common::{Error as AeroError, MessageId, ParticipantId, Result as AeroResult, RoomId};
+use axum::{
+    extract::{Path, Query, State},
+    routing::{get, post},
+    Json, Router,
+};
+use serde::Deserialize;
+use std::str::FromStr;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
@@ -69,4 +73,3 @@ pub(crate) async fn get_delivery_cursor(
         .map_err(AeroError::from)?;
     Ok(Json(serde_json::to_value(cur).map_err(AeroError::from)?))
 }
-

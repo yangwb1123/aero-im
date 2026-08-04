@@ -75,13 +75,12 @@ impl BookmarkRepo {
         participant: ParticipantId,
         message: MessageId,
     ) -> Result<bool, sqlx::Error> {
-        let result = sqlx::query(
-            r"DELETE FROM bookmarks WHERE participant_id = $1 AND message_id = $2",
-        )
-        .bind(participant.to_uuid())
-        .bind(message.to_uuid())
-        .execute(&self.pool)
-        .await?;
+        let result =
+            sqlx::query(r"DELETE FROM bookmarks WHERE participant_id = $1 AND message_id = $2")
+                .bind(participant.to_uuid())
+                .bind(message.to_uuid())
+                .execute(&self.pool)
+                .await?;
         Ok(result.rows_affected() > 0)
     }
 
@@ -242,7 +241,7 @@ mod db_tests {
         let room = RoomId::new();
         sqlx::query(
             "INSERT INTO rooms (id, kind, name, created_by, created_at, workspace_id)
-             VALUES ($1,'channel',$2,$3, now(), '00000000-0000-0000-0000-000000000000')",
+             VALUES ($1,'group',$2,$3, now(), '00000000-0000-0000-0000-000000000000')",
         )
         .bind(room.to_uuid())
         .bind("bm-room")
@@ -280,11 +279,16 @@ mod db_tests {
         let (room, message, actor) = fixture(&p, false).await;
 
         assert!(
-            repo.save(actor, message, room, Some("read later")).await.unwrap(),
+            repo.save(actor, message, room, Some("read later"))
+                .await
+                .unwrap(),
             "first save created"
         );
         assert!(
-            !repo.save(actor, message, room, Some("ignored")).await.unwrap(),
+            !repo
+                .save(actor, message, room, Some("ignored"))
+                .await
+                .unwrap(),
             "re-save is idempotent"
         );
         assert!(repo.is_saved(actor, message).await.unwrap());
@@ -293,10 +297,20 @@ mod db_tests {
         assert_eq!(saved.len(), 1, "one saved item");
         assert_eq!(saved[0].message.id, message);
         assert_eq!(saved[0].room_id, room);
-        assert_eq!(saved[0].note.as_deref(), Some("read later"), "original note kept");
-        assert!(!saved[0].message.blocks.is_empty(), "joined message content present");
+        assert_eq!(
+            saved[0].note.as_deref(),
+            Some("read later"),
+            "original note kept"
+        );
+        assert!(
+            !saved[0].message.blocks.is_empty(),
+            "joined message content present"
+        );
 
-        assert!(repo.unsave(actor, message).await.unwrap(), "unsave removed it");
+        assert!(
+            repo.unsave(actor, message).await.unwrap(),
+            "unsave removed it"
+        );
         assert!(!repo.is_saved(actor, message).await.unwrap());
         assert!(repo.list(actor, None).await.unwrap().is_empty());
     }
@@ -309,7 +323,10 @@ mod db_tests {
         let (room, message, actor) = fixture(&p, true).await;
 
         // The row saves fine (FK still resolves to the soft-deleted message)...
-        assert!(repo.save(actor, message, room, None).await.unwrap(), "save created");
+        assert!(
+            repo.save(actor, message, room, None).await.unwrap(),
+            "save created"
+        );
         assert!(repo.is_saved(actor, message).await.unwrap(), "row exists");
 
         // ...but the listing JOINs out soft-deleted messages.

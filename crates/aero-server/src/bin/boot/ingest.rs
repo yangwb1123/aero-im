@@ -1,14 +1,25 @@
 //! RTMP and SRT ingest spawning.
+use aero_live_core::LiveStreamConfig;
+use aero_live_rtmp::RtmpIngest;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
-use aero_live_core::{GoLiveHook, LiveIngest, LiveStreamConfig};
-use aero_live_rtmp::spawn_rtmp_ingest;
 use tracing::info;
 
 pub(crate) struct IngestConfig {
     pub(crate) rtmp: std::net::SocketAddr,
     pub(crate) hls_dir: std::path::PathBuf,
     pub(crate) srt: std::net::SocketAddr,
+}
+
+impl IngestConfig {
+    /// Actual public/listen address used by the SRT socket. Internally the SRT
+    /// crate shares `LiveStreamConfig` with RTMP and therefore stores the
+    /// one-lower backing port in `self.srt`.
+    #[must_use]
+    pub(crate) fn srt_listen(&self) -> std::net::SocketAddr {
+        std::net::SocketAddr::new(self.srt.ip(), self.srt.port().saturating_add(1))
+    }
 }
 
 pub(crate) fn from_server_cfg(cfg: &aero_common::config::AppConfig) -> IngestConfig {
@@ -19,10 +30,9 @@ pub(crate) fn from_server_cfg(cfg: &aero_common::config::AppConfig) -> IngestCon
         .unwrap_or_else(|_| "0.0.0.0:1935".parse().expect("default rtmp addr"));
     let hls_dir = std::path::PathBuf::from(&cfg.server.hls_dir);
     let srt = super::srt_backing_rtmp_addr(&rtmp_listen);
-    let srt_listen = srt.ip().to_string();
-    let srt_port = srt.port().saturating_add(1);
+    let srt_listen = std::net::SocketAddr::new(srt.ip(), srt.port().saturating_add(1));
     info!(addr = %rtmp_listen, "rtmp ingest listening");
-    info!(addr = %format!("{srt_listen}:{srt_port}"), "srt ingest configured");
+    info!(addr = %srt_listen, "srt ingest configured");
     IngestConfig {
         rtmp: rtmp_listen,
         hls_dir,
@@ -34,39 +44,38 @@ pub(crate) fn spawn(
     tracker: &TaskTracker,
     streams: aero_storage::StreamRepo,
     cfg: IngestConfig,
-    // Best-effort go-live notification hook (publishes the follower fan-out event).
-    // Wired from `AppState.live` so RTMP/SRT notify followers like WHIP does.
-    go_live: Option<GoLiveHook>,
+    shutdown: &CancellationToken,
 ) -> Arc<LiveStreamConfig> {
     let live_cfg = Arc::new(LiveStreamConfig {
         hls_dir: cfg.hls_dir.clone(),
         rtmp_listen: cfg.rtmp,
-        go_live: go_live.clone(),
     });
 
     // RTMP
     {
         let repo = streams.clone();
         let live_cfg = live_cfg.clone();
+        let cancel = shutdown.clone();
         tracker.spawn(async move {
-            let handle = spawn_rtmp_ingest(repo, live_cfg);
-            if let Err(e) = handle.await {
-                tracing::warn!(error = ?e, "rtmp ingest task ended");
+            if let Err(error) = RtmpIngest::new()
+                .run_until_cancelled(repo, live_cfg, cancel)
+                .await
+            {
+                tracing::warn!(%error, "RTMP ingest task ended");
             }
         });
     }
 
-    // SRT (HSv5 handshake + AES-CTR + ACK/NAK reliability → TS→HLS). `SrtIngest`
-    // implements the `LiveIngest::run` trait method (aero-live-srt/src/lib.rs:282),
-    // so it wires exactly like RTMP — the prior "method not available" note was
-    // stale. AES-CTR encryption activates when AERO_SRT_PASSPHRASE is set.
+    // SRT (HSv5 handshake + AES-128-CTR + ACK/NAK reliability → TS→HLS).
+    // AERO_SRT_PASSPHRASE enables enforced encryption: the production listener
+    // validates KMREQ in the caller's CONCLUSION, installs the unwrapped SEK,
+    // and responds with KMRSP before accepting media.
     // E2E push needs a real ffmpeg/OBS SRT source (staging seam), same as RTMP.
     {
         let repo = streams.clone();
         let srt_cfg = Arc::new(LiveStreamConfig {
             hls_dir: cfg.hls_dir,
             rtmp_listen: cfg.srt,
-            go_live,
         });
         let mut srt = aero_live_srt::SrtIngest::new();
         if let Ok(pass) = std::env::var("AERO_SRT_PASSPHRASE") {
@@ -74,9 +83,10 @@ pub(crate) fn spawn(
                 srt = srt.with_passphrase(pass.into_bytes());
             }
         }
+        let cancel = shutdown.clone();
         tracker.spawn(async move {
-            if let Err(e) = srt.run(repo, srt_cfg).await {
-                tracing::warn!(error = ?e, "SRT ingest task ended");
+            if let Err(error) = srt.run_until_cancelled(repo, srt_cfg, cancel).await {
+                tracing::warn!(%error, "SRT ingest task ended");
             }
         });
     }

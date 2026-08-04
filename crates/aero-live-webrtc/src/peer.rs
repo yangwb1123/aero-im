@@ -4,8 +4,8 @@
 //! caller drives it by (a) feeding inbound UDP datagrams + the current time via
 //! [`Rtc::handle_input`], and (b) draining [`Rtc::poll_output`] for packets to
 //! send, the next wake-up deadline, and media/connection events. [`SfuPeer`]
-//! wraps that contract behind a small, server-friendly API so the (out-of-scope)
-//! UDP task can stay a thin loop:
+//! wraps that contract behind a small, server-friendly API so the owning UDP
+//! task can stay a thin loop:
 //!
 //! ```ignore
 //! loop {
@@ -26,14 +26,24 @@ use std::net::SocketAddr;
 use std::time::Instant;
 
 use aero_common::{CallId, ParticipantId};
+use str0m::bwe::{Bitrate, BweKind};
 use str0m::change::{SdpAnswer, SdpOffer};
-use str0m::media::{KeyframeRequestKind, MediaKind, Mid, Pt};
+use str0m::media::{KeyframeRequestKind, MediaKind, Mid, Pt, Rid};
 use str0m::net::{Protocol, Receive};
-use str0m::rtp::{ExtensionValues, RtpPacket, SeqNo};
-use str0m::{Event, Input, Output, Rtc};
+use str0m::rtp::{ExtensionValues, RtpPacket, SeqNo, Ssrc};
+use str0m::{Candidate, Event, Input, Output, Rtc};
 
 use crate::codec::{payload_is_keyframe, Codec};
 use crate::SfuError;
+
+/// Canonical form str0m uses for an SDP media id.
+///
+/// Route keys must use this form too: str0m normalizes some token characters
+/// (for example `publisher-mid` becomes `publisher_mid`) before surfacing RTP.
+#[must_use]
+pub fn canonical_mid(value: &str) -> String {
+    Mid::from(value).to_string()
+}
 
 /// One forwarded RTP packet lifted out of `str0m`'s [`RtpPacket`] into the
 /// minimal set of fields the forwarder needs to rewrite + re-emit it.
@@ -47,6 +57,12 @@ pub struct InboundRtp {
     pub seq_no: SeqNo,
     /// Wire RTP timestamp (codec clock rate).
     pub rtp_time: u32,
+    /// Synchronization source from the publisher-facing RTP header.
+    ///
+    /// Local forwarding rewrites packets onto each subscriber's declared SSRC,
+    /// but the source value must survive a node-to-node bridge so RTCP,
+    /// diagnostics, and future SSRC-aware routing can still attribute the packet.
+    pub ssrc: str0m::rtp::Ssrc,
     /// Marker bit (frame boundary for many codecs).
     pub marker: bool,
     /// Header extension values (audio level, video orientation, …).
@@ -78,35 +94,42 @@ pub struct InboundRtp {
     /// **Limitation**: audio / RTX / any other codec yields `false` — there is
     /// no intra-frame concept to gate on for those tracks.
     pub is_keyframe: bool,
+    /// Whether a newly attached cross-node bridge must wait for
+    /// [`Self::is_keyframe`] before forwarding this track.
+    ///
+    /// This is `true` for the video codecs understood by the SFU and `false`
+    /// for audio/unknown codecs, which have no intra-frame concept.
+    pub requires_keyframe: bool,
 }
 
 impl InboundRtp {
-    fn from_packet(p: &RtpPacket, codec: Codec) -> Self {
+    fn from_packet(p: &RtpPacket, codec: Codec, mid: Mid, rid: Option<Rid>) -> Self {
         // Codec-aware keyframe detection from the raw payload; unknown codecs
         // are never keyframes (see `payload_is_keyframe` docs).
         let is_keyframe = payload_is_keyframe(codec, &p.payload);
+        let mut ext_vals = p.header.ext_vals.clone();
+        ext_vals.mid = Some(mid);
+        ext_vals.rid = rid;
         Self {
-            mid: p.header.ext_vals.mid.unwrap_or_else(|| mid_fallback(p)),
+            mid,
             pt: p.header.payload_type,
             seq_no: p.seq_no,
             rtp_time: p.header.timestamp,
+            ssrc: p.header.ssrc,
             marker: p.header.marker,
-            rid: p.header.ext_vals.rid,
+            rid,
             is_keyframe,
-            ext_vals: p.header.ext_vals.clone(),
+            requires_keyframe: codec.requires_keyframe(),
+            ext_vals,
             wallclock: p.timestamp,
             payload: p.payload.clone(),
         }
     }
 }
 
-/// `str0m`'s `RtpPacket` carries the `mid` in the header extension only when the
-/// MID extension was negotiated and sent. When it's absent the SFU resolves the
-/// owning track from the packet's SSRC (the publisher's `Rtc` knows the
-/// SSRC→`mid` mapping); this synthetic default keeps header parsing total and
-/// panic-free until that lookup is wired by the server. With BUNDLE + a single
-/// m-section the first mid is `"0"`, which is also the common single-track case.
-fn mid_fallback(_p: &RtpPacket) -> Mid {
+/// Last-resort MID for a packet that neither carries a MID extension nor maps
+/// to one of str0m's negotiated receive streams.
+fn mid_fallback() -> Mid {
     Mid::from("0")
 }
 
@@ -116,6 +139,15 @@ fn mid_fallback(_p: &RtpPacket) -> Mid {
 pub struct KeyframeReq {
     pub mid: Mid,
     pub kind: KeyframeRequestKind,
+}
+
+/// Receiver bandwidth estimate bubbled up from a subscriber.
+#[derive(Debug, Clone, Copy)]
+pub struct BandwidthEstimate {
+    /// REMB is scoped to one outbound MID; TWCC estimates the whole peer
+    /// connection and therefore has no MID.
+    pub mid: Option<Mid>,
+    pub bitrate_bps: u64,
 }
 
 /// Outcome of a single [`SfuPeer::poll`] step.
@@ -129,6 +161,8 @@ pub enum PeerProgress {
     Media(Box<InboundRtp>),
     /// A subscriber asked for a keyframe; relay upstream.
     KeyframeRequest(KeyframeReq),
+    /// REMB/TWCC from a subscriber; aggregate and relay it upstream.
+    BandwidthEstimate(BandwidthEstimate),
     /// ICE/DTLS finished — the peer is now sending/receiving.
     Connected,
     /// Nothing actionable this step (an event we don't route).
@@ -188,14 +222,39 @@ impl SfuPeer {
     /// Used for the standard browser ⇄ SFU negotiation. The offered
     /// transceivers become this peer's inbound/outbound streams.
     pub fn accept_offer(&mut self, offer: &str) -> Result<String, SfuError> {
-        let offer = SdpOffer::from_sdp_string(offer)
-            .map_err(|e| SfuError::Sdp(e.to_string()))?;
+        let offer = SdpOffer::from_sdp_string(offer).map_err(|e| SfuError::Sdp(e.to_string()))?;
         let answer: SdpAnswer = self
             .rtc
             .sdp_api()
             .accept_offer(offer)
             .map_err(|e| SfuError::Sdp(e.to_string()))?;
         Ok(answer.to_sdp_string())
+    }
+
+    /// Add the UDP host candidate advertised in this peer's SDP answer.
+    ///
+    /// This must run before [`Self::accept_offer`], because str0m snapshots
+    /// already-known local candidates into the generated answer.
+    pub fn add_local_candidate(&mut self, addr: SocketAddr) -> Result<(), SfuError> {
+        let candidate = Candidate::host(addr, "udp").map_err(|e| SfuError::Net(e.to_string()))?;
+        self.rtc.add_local_candidate(candidate);
+        Ok(())
+    }
+
+    /// Add one browser trickle-ICE candidate.
+    ///
+    /// Browsers normally send the `RTCIceCandidate.candidate` attribute value
+    /// (`candidate:...`); a few clients include the leading `a=`, which is
+    /// accepted for parity with `aero-signaling`'s validation.
+    pub fn add_remote_candidate(&mut self, candidate: &str) -> Result<(), SfuError> {
+        let candidate = candidate
+            .trim()
+            .strip_prefix("a=")
+            .unwrap_or(candidate.trim());
+        let candidate =
+            Candidate::from_sdp_string(candidate).map_err(|e| SfuError::Net(e.to_string()))?;
+        self.rtc.add_remote_candidate(candidate);
+        Ok(())
     }
 
     /// Feed an inbound UDP datagram received at `now` from `source` on `dest`.
@@ -228,7 +287,11 @@ impl SfuPeer {
     /// Call in a loop until you get [`PeerProgress::Timeout`], which means the
     /// machine is parked until that instant or the next inbound datagram.
     pub fn poll(&mut self) -> Result<PeerProgress, SfuError> {
-        match self.rtc.poll_output().map_err(|e| SfuError::Rtc(e.to_string()))? {
+        match self
+            .rtc
+            .poll_output()
+            .map_err(|e| SfuError::Rtc(e.to_string()))?
+        {
             Output::Timeout(at) => Ok(PeerProgress::Timeout(at)),
             Output::Transmit(t) => Ok(PeerProgress::Transmit(Box::new(t))),
             Output::Event(e) => Ok(self.classify_event(e)),
@@ -250,22 +313,60 @@ impl SfuPeer {
             .map_or(Codec::Unknown, |p| Codec::from(p.spec().codec))
     }
 
-    fn classify_event(&self, event: Event) -> PeerProgress {
+    fn classify_event(&mut self, event: Event) -> PeerProgress {
         match event {
             Event::Connected => PeerProgress::Connected,
             Event::RtpPacket(p) => {
                 let codec = self.codec_for_pt(p.header.payload_type);
-                PeerProgress::Media(Box::new(InboundRtp::from_packet(&p, codec)))
+                let (mid, rid) = self.resolve_packet_route(
+                    p.header.ssrc,
+                    p.header.ext_vals.mid,
+                    p.header.ext_vals.rid,
+                );
+                PeerProgress::Media(Box::new(InboundRtp::from_packet(&p, codec, mid, rid)))
             }
             Event::KeyframeRequest(kf) => PeerProgress::KeyframeRequest(KeyframeReq {
                 mid: kf.mid,
                 kind: kf.kind,
             }),
+            Event::EgressBitrateEstimate(estimate) => match estimate {
+                BweKind::Remb(mid, bitrate) => PeerProgress::BandwidthEstimate(BandwidthEstimate {
+                    mid: Some(mid),
+                    bitrate_bps: bitrate.as_u64(),
+                }),
+                BweKind::Twcc(bitrate) => PeerProgress::BandwidthEstimate(BandwidthEstimate {
+                    mid: None,
+                    bitrate_bps: bitrate.as_u64(),
+                }),
+                _ => PeerProgress::Idle,
+            },
             // Other events (stats, channel data, media-added, ICE state, …) are
             // not part of the forwarding hot path; the server can subscribe to
             // them separately if needed.
             _ => PeerProgress::Idle,
         }
+    }
+
+    fn resolve_packet_route(
+        &mut self,
+        ssrc: Ssrc,
+        signalled_mid: Option<Mid>,
+        signalled_rid: Option<Rid>,
+    ) -> (Mid, Option<Rid>) {
+        // str0m already owns the bounded SSRC lifecycle and normalizes RTX to
+        // its primary stream. Reuse that authoritative mapping when browsers
+        // stop repeating MID/RID extensions instead of growing a parallel map.
+        let negotiated = self
+            .rtc
+            .direct_api()
+            .stream_rx(&ssrc)
+            .map(|stream| (stream.mid(), stream.rid()));
+        (
+            signalled_mid
+                .or_else(|| negotiated.map(|(mid, _)| mid))
+                .unwrap_or_else(mid_fallback),
+            signalled_rid.or_else(|| negotiated.and_then(|(_, rid)| rid)),
+        )
     }
 
     /// Write a (remapped) RTP packet onto this peer's **outbound** stream for
@@ -289,7 +390,9 @@ impl SfuPeer {
             return Ok(false);
         };
         stream
-            .write_rtp(pt, seq_no, rtp_time, wallclock, marker, ext_vals, true, payload)
+            .write_rtp(
+                pt, seq_no, rtp_time, wallclock, marker, ext_vals, true, payload,
+            )
             .map_err(|e| SfuError::Rtc(e.to_string()))?;
         Ok(true)
     }
@@ -302,11 +405,34 @@ impl SfuPeer {
         mid: Mid,
         kind: KeyframeRequestKind,
     ) -> Result<bool, SfuError> {
+        self.request_keyframe_for_rid(mid, None, kind)
+    }
+
+    /// Ask one exact simulcast receive stream to emit a keyframe. `rid=None`
+    /// retains the historical MID-scoped behavior for non-simulcast callers.
+    pub fn request_keyframe_for_rid(
+        &mut self,
+        mid: Mid,
+        rid: Option<Rid>,
+        kind: KeyframeRequestKind,
+    ) -> Result<bool, SfuError> {
+        let mut api = self.rtc.direct_api();
+        let Some(stream) = api.stream_rx_by_mid(mid, rid) else {
+            return Ok(false);
+        };
+        stream.request_keyframe(kind);
+        Ok(true)
+    }
+
+    /// Ask this publisher to cap one inbound stream at `bitrate_bps` by
+    /// emitting REMB toward the browser. Returns `Ok(false)` when `mid` is not
+    /// an active receive stream on this peer.
+    pub fn request_remb(&mut self, mid: Mid, bitrate_bps: u64) -> Result<bool, SfuError> {
         let mut api = self.rtc.direct_api();
         let Some(stream) = api.stream_rx_by_mid(mid, None) else {
             return Ok(false);
         };
-        stream.request_keyframe(kind);
+        stream.request_remb(Bitrate::bps(bitrate_bps));
         Ok(true)
     }
 
@@ -315,13 +441,7 @@ impl SfuPeer {
     ///
     /// `ssrc`/`rtx` are the SFU-chosen synchronization sources for the
     /// subscriber-facing stream (the remapper rewrites seq/ts into this space).
-    pub fn declare_outbound(
-        &mut self,
-        mid: Mid,
-        kind: MediaKind,
-        ssrc: u32,
-        rtx: Option<u32>,
-    ) {
+    pub fn declare_outbound(&mut self, mid: Mid, kind: MediaKind, ssrc: u32, rtx: Option<u32>) {
         let mut api = self.rtc.direct_api();
         api.declare_media(mid, kind);
         api.declare_stream_tx(ssrc.into(), rtx.map(Into::into), mid, None);
@@ -350,6 +470,18 @@ mod tests {
     }
 
     #[test]
+    fn accepts_local_and_trickled_remote_candidates() {
+        let mut peer = SfuPeer::new(CallId::new(), ParticipantId::new());
+        peer.add_local_candidate("127.0.0.1:5000".parse().unwrap())
+            .expect("valid local host candidate");
+        peer.add_remote_candidate("a=candidate:1 1 udp 2113937151 127.0.0.1 5001 typ host")
+            .expect("valid remote trickle candidate");
+        assert!(peer
+            .add_remote_candidate("definitely-not-a-candidate")
+            .is_err());
+    }
+
+    #[test]
     fn codec_for_pt_resolves_default_payload_types() {
         // str0m 0.19 pre-negotiation defaults: VP8=96 (RTX 97), VP9=98,
         // Opus=111, first H.264 config=127. Negotiation rewrites these to the
@@ -365,6 +497,39 @@ mod tests {
     }
 
     #[test]
+    fn negotiated_stream_restores_mid_and_rid_for_extensionless_packets() {
+        let mut peer = SfuPeer::new(CallId::new(), ParticipantId::new());
+        let video_ssrc = Ssrc::from(0x0102_0304);
+        let video_mid = Mid::from("video-track");
+        let video_rid = Rid::from("high");
+        {
+            let mut api = peer.rtc.direct_api();
+            api.declare_media(video_mid, MediaKind::Video);
+            api.expect_stream_rx(video_ssrc, None, video_mid, Some(video_rid));
+        }
+
+        assert_eq!(
+            peer.resolve_packet_route(video_ssrc, None, None),
+            (video_mid, Some(video_rid)),
+            "str0m's bounded stream mapping restores omitted routing extensions"
+        );
+        assert_eq!(
+            peer.resolve_packet_route(
+                video_ssrc,
+                Some(Mid::from("explicit")),
+                Some(Rid::from("low"))
+            ),
+            (Mid::from("explicit"), Some(Rid::from("low"))),
+            "packet extensions remain authoritative when present"
+        );
+        assert_eq!(
+            peer.resolve_packet_route(Ssrc::from(0x0506_0708), None, None),
+            (Mid::from("0"), None),
+            "an unseen malformed SSRC still uses the total fallback"
+        );
+    }
+
+    #[test]
     fn poll_returns_timeout_before_any_input() {
         // A fresh Rtc with no negotiated session parks on a timeout.
         let mut peer = SfuPeer::new(CallId::new(), ParticipantId::new());
@@ -373,5 +538,62 @@ mod tests {
             matches!(p, PeerProgress::Timeout(_) | PeerProgress::Idle),
             "fresh peer should be idle/parked, got {p:?}"
         );
+    }
+
+    #[test]
+    fn negotiated_publisher_stream_accepts_pli_and_remb_requests() {
+        const OFFER: &str = "v=0\r\n\
+o=- 1 2 IN IP4 127.0.0.1\r\n\
+s=-\r\n\
+t=0 0\r\n\
+a=group:BUNDLE 0\r\n\
+m=video 9 UDP/TLS/RTP/SAVPF 96\r\n\
+c=IN IP4 0.0.0.0\r\n\
+a=ice-ufrag:abcd\r\n\
+a=ice-pwd:abcdefghijklmnopqrstuvwx\r\n\
+a=fingerprint:sha-256 11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00:11:22:33:44:55:66:77:88:99:AA:BB:CC:DD:EE:FF:00\r\n\
+a=setup:actpass\r\n\
+a=mid:0\r\n\
+a=sendonly\r\n\
+a=rtcp-mux\r\n\
+a=rtpmap:96 VP8/90000\r\n\
+a=rtcp-fb:96 nack pli\r\n\
+a=rtcp-fb:96 goog-remb\r\n";
+        let mut peer = SfuPeer::new(CallId::new(), ParticipantId::new());
+        peer.add_local_candidate("127.0.0.1:5000".parse().unwrap())
+            .unwrap();
+        peer.accept_offer(OFFER).unwrap();
+        peer.rtc
+            .direct_api()
+            .expect_stream_rx(123_u32.into(), None, Mid::from("0"), None);
+        peer.rtc.direct_api().expect_stream_rx(
+            124_u32.into(),
+            None,
+            Mid::from("0"),
+            Some(Rid::from("high")),
+        );
+
+        assert!(peer
+            .request_keyframe(Mid::from("0"), KeyframeRequestKind::Pli)
+            .unwrap());
+        assert!(peer
+            .request_keyframe_for_rid(
+                Mid::from("0"),
+                Some(Rid::from("high")),
+                KeyframeRequestKind::Pli
+            )
+            .unwrap());
+        assert!(!peer
+            .request_keyframe_for_rid(
+                Mid::from("0"),
+                Some(Rid::from("missing")),
+                KeyframeRequestKind::Pli
+            )
+            .unwrap());
+        assert!(peer.request_remb(Mid::from("0"), 750_000).unwrap());
+        assert!(!peer
+            .request_keyframe(Mid::from("missing"), KeyframeRequestKind::Pli)
+            .unwrap());
+        assert!(!peer.request_remb(Mid::from("missing"), 750_000).unwrap());
     }
 }

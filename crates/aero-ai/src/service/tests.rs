@@ -66,7 +66,10 @@ fn moderation_verdict_parsing() {
         parse_moderation_verdict("BLOCK：色情内容"), // fullwidth colon
         Some("色情内容".to_owned())
     );
-    assert_eq!(parse_moderation_verdict("BLOCK"), Some("内容违规".to_owned()));
+    assert_eq!(
+        parse_moderation_verdict("BLOCK"),
+        Some("内容违规".to_owned())
+    );
 }
 
 fn mk_msg(text: &str) -> Message {
@@ -114,7 +117,10 @@ fn heuristic_text_digest_takes_first_five_nonblank_lines() {
     assert_eq!(lines.len(), 5, "capped at 5 lines");
     assert!(lines[0].starts_with("- "), "bullet form, got {}", lines[0]);
     assert!(lines[0].contains("line 0"));
-    assert!(lines[1].contains("line 1"), "blank line skipped, whitespace trimmed");
+    assert!(
+        lines[1].contains("line 1"),
+        "blank line skipped, whitespace trimmed"
+    );
     assert!(lines[4].contains("line 4"));
 }
 
@@ -126,7 +132,11 @@ fn heuristic_text_digest_empty_when_blank() {
 fn hit(sender: ParticipantId, score: f32) -> SearchHit {
     let mut m = mk_msg("topic message");
     m.sender_id = sender;
-    SearchHit { message: m, score, headline: None }
+    SearchHit {
+        message: m,
+        score,
+        headline: None,
+    }
 }
 
 #[test]
@@ -151,7 +161,11 @@ fn rank_experts_caps_citations_and_truncates_to_k() {
     let hits: Vec<SearchHit> = (0..5).map(|_| hit(alice, 0.2)).collect();
     let ranked = rank_experts(&hits, 1);
     assert_eq!(ranked.len(), 1, "truncated to k=1");
-    assert_eq!(ranked[0].citations.len(), MAX_EXPERT_CITATIONS, "citations capped");
+    assert_eq!(
+        ranked[0].citations.len(),
+        MAX_EXPERT_CITATIONS,
+        "citations capped"
+    );
 }
 
 #[test]
@@ -193,7 +207,10 @@ fn rank_channels_orders_by_activity_desc_and_normalizes() {
     assert_eq!(ranked[2].room, dead);
     assert!((ranked[2].score - 0.0).abs() < 1e-6);
     assert!(ranked[2].reason.contains("未加入"));
-    assert!(ranked[0].reason.contains("10"), "active reason cites the count");
+    assert!(
+        ranked[0].reason.contains("10"),
+        "active reason cites the count"
+    );
 }
 
 #[test]
@@ -231,7 +248,10 @@ fn rank_people_orders_by_shared_overlap_desc() {
     assert_eq!(ranked.len(), 2);
     assert_eq!(ranked[0].participant, close);
     assert!((ranked[0].score - 1.0).abs() < 1e-6);
-    assert!(ranked[0].reason.contains('4'), "reason cites the overlap count");
+    assert!(
+        ranked[0].reason.contains('4'),
+        "reason cites the overlap count"
+    );
     assert_eq!(ranked[1].participant, acquaintance);
     assert!((ranked[1].score - 0.25).abs() < 1e-6);
 }
@@ -303,20 +323,29 @@ fn heuristic_title_truncates_unbroken_cjk() {
     // No whitespace boundaries — char-truncated rather than returned whole.
     let cjk = "这是一个非常长的没有空格的中文标题需要被截断处理以免标题过长影响显示".to_owned();
     let title = heuristic_title(&cjk);
-    assert!(title.ends_with('…'), "long unbroken title truncated, got {title}");
+    assert!(
+        title.ends_with('…'),
+        "long unbroken title truncated, got {title}"
+    );
     assert!(title.chars().count() <= 25);
 }
 
 #[test]
 fn clean_title_strips_quotes_and_trailing_punct() {
-    assert_eq!(clean_title("\"Billing flow redesign.\""), "Billing flow redesign");
+    assert_eq!(
+        clean_title("\"Billing flow redesign.\""),
+        "Billing flow redesign"
+    );
     assert_eq!(clean_title("「发布计划讨论。」"), "发布计划讨论");
     assert_eq!(clean_title("  Roadmap sync!  "), "Roadmap sync");
 }
 
 #[test]
 fn clean_title_takes_first_nonblank_line() {
-    assert_eq!(clean_title("\n\nHere is a title\nignored second line"), "Here is a title");
+    assert_eq!(
+        clean_title("\n\nHere is a title\nignored second line"),
+        "Here is a title"
+    );
 }
 
 // ---- FEATURE #9: sentiment / toxicity heuristic truth table ----
@@ -325,7 +354,11 @@ fn clean_title_takes_first_nonblank_line() {
 fn heuristic_sentiment_insult_is_negative_high_toxicity() {
     let s = heuristic_sentiment("you are an idiot and a loser");
     assert_eq!(s.sentiment, Sentiment::Negative);
-    assert!(s.toxicity >= 0.8, "insult => high toxicity, got {}", s.toxicity);
+    assert!(
+        s.toxicity >= 0.8,
+        "insult => high toxicity, got {}",
+        s.toxicity
+    );
     assert_eq!(s.tone, "angry");
 }
 
@@ -341,7 +374,11 @@ fn heuristic_sentiment_cjk_insult_is_negative() {
 fn heuristic_sentiment_all_caps_is_angry() {
     let s = heuristic_sentiment("STOP DOING THAT RIGHT NOW");
     assert_eq!(s.sentiment, Sentiment::Negative);
-    assert!(s.toxicity >= 0.5 && s.toxicity < 0.85, "shout < keyword, got {}", s.toxicity);
+    assert!(
+        s.toxicity >= 0.5 && s.toxicity < 0.85,
+        "shout < keyword, got {}",
+        s.toxicity
+    );
     assert_eq!(s.tone, "angry");
 }
 
@@ -386,7 +423,11 @@ fn heuristic_sentiment_lone_exclamation_is_excited() {
 fn heuristic_sentiment_blank_is_neutral() {
     let s = heuristic_sentiment("   ");
     assert_eq!(s.sentiment, Sentiment::Neutral);
-    assert!(s.toxicity.abs() < 1e-6, "blank text has zero toxicity, got {}", s.toxicity);
+    assert!(
+        s.toxicity.abs() < 1e-6,
+        "blank text has zero toxicity, got {}",
+        s.toxicity
+    );
     assert_eq!(s.tone, "neutral");
 }
 
@@ -416,12 +457,19 @@ fn parse_sentiment_verdict_rejects_malformed() {
 #[test]
 fn parse_sentiment_verdict_empty_tone_falls_back_to_label() {
     let s = parse_sentiment_verdict("positive|0.0|").expect("parses");
-    assert_eq!(s.tone, "positive", "empty tone defaults to the sentiment label");
+    assert_eq!(
+        s.tone, "positive",
+        "empty tone defaults to the sentiment label"
+    );
 }
 
 #[test]
 fn sentiment_serializes_lowercase() {
-    let s = SentimentScore { sentiment: Sentiment::Negative, toxicity: 0.5, tone: "angry".into() };
+    let s = SentimentScore {
+        sentiment: Sentiment::Negative,
+        toxicity: 0.5,
+        tone: "angry".into(),
+    };
     let v = serde_json::to_value(&s).unwrap();
     assert_eq!(v["sentiment"], "negative");
     assert_eq!(v["tone"], "angry");
@@ -436,15 +484,24 @@ fn sentiment_serializes_lowercase() {
 fn fold_searchable_with_document_combines_appends_and_handles_edges() {
     // Both present → message text first, doc body after, blank-line separated.
     let folded = fold_searchable_with_document("see attached spec", "Revenue grew 12% in Q3");
-    assert!(folded.starts_with("see attached spec"), "msg text leads: {folded:?}");
-    assert!(folded.contains("Revenue grew 12% in Q3"), "doc body folded in: {folded:?}");
+    assert!(
+        folded.starts_with("see attached spec"),
+        "msg text leads: {folded:?}"
+    );
+    assert!(
+        folded.contains("Revenue grew 12% in Q3"),
+        "doc body folded in: {folded:?}"
+    );
 
     // Empty / whitespace-only doc text → unchanged base (nothing to add).
     assert_eq!(fold_searchable_with_document("hello", "   \n\t"), "hello");
     assert_eq!(fold_searchable_with_document("hello", ""), "hello");
 
     // File-only message (base is just the file name / blank) → doc body stands alone.
-    assert_eq!(fold_searchable_with_document("   ", "Quarterly report body"), "Quarterly report body");
+    assert_eq!(
+        fold_searchable_with_document("   ", "Quarterly report body"),
+        "Quarterly report body"
+    );
 }
 
 /// `first_extractable_file` returns the first `File` block (skipping non-file
@@ -454,7 +511,11 @@ fn first_extractable_file_picks_first_file_block() {
     let blob = aero_common::BlobId::new();
     let blocks = vec![
         Block::text("intro"),
-        Block::Voice { blob_id: aero_common::BlobId::new(), duration_ms: 100, transcript: None },
+        Block::Voice {
+            blob_id: aero_common::BlobId::new(),
+            duration_ms: 100,
+            transcript: None,
+        },
         Block::File {
             blob_id: blob,
             kind: aero_common::FileKind::Document,
@@ -530,14 +591,23 @@ fn docx_body_is_extracted_and_folded_into_message_searchable_text() {
     );
     // The same extractor the worker uses on the blob bytes.
     let doc_text = extract_text(&docx, MAX_ATTACHMENT_BYTES).expect("docx extracts");
-    assert!(doc_text.contains("rotate the TLS cert"), "body text extracted: {doc_text:?}");
+    assert!(
+        doc_text.contains("rotate the TLS cert"),
+        "body text extracted: {doc_text:?}"
+    );
 
     // A message that just says "see attached" with the file name as its own text.
     let base = "see attached\nrunbook.docx";
     let folded = fold_searchable_with_document(base, &doc_text);
     // The document's *contents* are now in the indexed text, not just the name.
-    assert!(folded.contains("rotate the TLS cert"), "doc body now searchable: {folded:?}");
-    assert!(folded.contains("see attached"), "original message text retained: {folded:?}");
+    assert!(
+        folded.contains("rotate the TLS cert"),
+        "doc body now searchable: {folded:?}"
+    );
+    assert!(
+        folded.contains("see attached"),
+        "original message text retained: {folded:?}"
+    );
 }
 
 /// A binary / unextractable attachment yields no extra text, so folding is a
@@ -548,5 +618,8 @@ fn unextractable_attachment_leaves_searchable_text_unchanged() {
     // A short NUL-filled "binary" blob: extract_text returns None.
     assert!(extract_text(&[0u8; 32], MAX_ATTACHMENT_BYTES).is_none());
     // With no doc text, the fold returns the base verbatim.
-    assert_eq!(fold_searchable_with_document("hello world", ""), "hello world");
+    assert_eq!(
+        fold_searchable_with_document("hello world", ""),
+        "hello world"
+    );
 }

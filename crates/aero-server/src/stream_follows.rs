@@ -30,10 +30,7 @@ use crate::state::AppState;
 /// All stream-follow routes, ready to `.merge` into the gateway router.
 pub fn routes() -> Router<AppState> {
     Router::new()
-        .route(
-            "/api/participants/:id/follow",
-            put(follow).delete(unfollow),
-        )
+        .route("/api/participants/:id/follow", put(follow).delete(unfollow))
         .route("/api/participants/:id/followers", get(list_followers))
         .route("/api/me/following", get(list_following))
 }
@@ -54,10 +51,7 @@ fn parse_participant(s: &str) -> Result<ParticipantId, AeroError> {
 ///
 /// # Errors
 /// [`AeroError::Invalid`] when `follower` and `streamer` are the same participant.
-fn reject_self_follow(
-    follower: ParticipantId,
-    streamer: ParticipantId,
-) -> Result<(), AeroError> {
+fn reject_self_follow(follower: ParticipantId, streamer: ParticipantId) -> Result<(), AeroError> {
     if follower == streamer {
         return Err(AeroError::Invalid("cannot follow yourself".into()));
     }

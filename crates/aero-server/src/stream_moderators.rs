@@ -4,7 +4,8 @@
 //! a moderator ROLE to a participant on a stream. The stream OWNER adds/removes
 //! moderators and lists them; a moderator then gains the same chat-ban/timeout
 //! authority as the owner (the ban handler in [`crate::stream_mod`] allows owner OR
-//! [`is_stream_moderator`]). Thin handlers over [`aero_storage::StreamModeratorRepo`].
+//! [`is_stream_moderator`]). Management handlers use actor-aware storage
+//! transactions; the helper reads remain for other live feature gates.
 //!
 //! `POST`/`DELETE /api/streams/:id/moderators[/:pid]` are owner-gated; `GET` lists
 //! the stream's moderators. Owner-gating resolves the stream and checks
@@ -42,27 +43,12 @@ fn parse_stream(s: &str) -> Result<Ulid, AeroError> {
 }
 
 fn parse_participant(s: &str) -> Result<ParticipantId, AeroError> {
-    ParticipantId::from_str(s.trim()).map_err(|e| AeroError::Invalid(format!("participant id: {e}")))
+    ParticipantId::from_str(s.trim())
+        .map_err(|e| AeroError::Invalid(format!("participant id: {e}")))
 }
 
 fn repo(s: &AppState) -> StreamModeratorRepo {
     StreamModeratorRepo::new(s.pg.clone())
-}
-
-/// Resolve `stream` and assert `caller` owns it. `NotFound` if unknown,
-/// `Forbidden` if the caller is not the owner.
-async fn require_owner(s: &AppState, stream: Ulid, caller: ParticipantId) -> Result<(), AeroError> {
-    let row = StreamRepo::new(s.pg.clone())
-        .get(stream)
-        .await
-        .map_err(AeroError::from)?
-        .ok_or_else(|| AeroError::NotFound(format!("stream {stream}")))?;
-    if row.owner_id != caller {
-        return Err(AeroError::Forbidden(
-            "only the stream owner may manage moderators".into(),
-        ));
-    }
-    Ok(())
 }
 
 /// Whether `participant` may moderate `stream`'s chat: they are the stream OWNER
@@ -120,12 +106,10 @@ async fn add_moderator(
     Json(req): Json<AddModReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let stream = parse_stream(&id_str)?;
-    require_owner(&s, stream, auth.participant_id).await?;
     let target = parse_participant(&req.participant_id)?;
     let id = repo(&s)
-        .add(stream, target, auth.participant_id)
-        .await
-        .map_err(AeroError::from)?;
+        .add_authorized(stream, target, auth.participant_id)
+        .await?;
     Ok(Json(serde_json::json!({
         "moderator_id": id.to_string(),
         "stream_id": stream.to_string(),
@@ -140,12 +124,10 @@ async fn remove_moderator(
     Path((id_str, pid_str)): Path<(String, String)>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let stream = parse_stream(&id_str)?;
-    require_owner(&s, stream, auth.participant_id).await?;
     let target = parse_participant(&pid_str)?;
     let removed = repo(&s)
-        .remove(stream, target)
-        .await
-        .map_err(AeroError::from)?;
+        .remove_authorized(stream, target, auth.participant_id)
+        .await?;
     Ok(Json(serde_json::json!({ "removed": removed })))
 }
 
@@ -157,7 +139,8 @@ async fn list_moderators(
     Path(id_str): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let stream = parse_stream(&id_str)?;
-    require_owner(&s, stream, auth.participant_id).await?;
-    let mods = repo(&s).list(stream).await.map_err(AeroError::from)?;
+    let mods = repo(&s)
+        .list_authorized(stream, auth.participant_id)
+        .await?;
     Ok(Json(serde_json::json!({ "moderators": mods })))
 }

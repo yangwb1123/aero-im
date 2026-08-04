@@ -28,19 +28,31 @@ use std::sync::Arc;
 use aero_common::{Block, MessageEnvelope, RoomEvent};
 use aero_storage::unfurl::{
     extract_urls, is_link_preview_card, parse_og, preview_to_card, LinkPreview, ReqwestUnfurler,
-    Unfurler, UnfurlRepo,
+    UnfurlRepo, Unfurler,
 };
-use aero_storage::MessageRepo;
-use futures::StreamExt;
+use aero_storage::{ConsumerEventReceiptRepo, MessageRepo};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use crate::state::AppState;
+use crate::{
+    state::AppState,
+    task_shutdown::{self, NextOrCancelled},
+};
 
 /// Run the unfurl listener until the bus stream ends. `cache` is the cache repo
 /// (constructed by the binary from the shared pool); the real [`ReqwestUnfurler`]
 /// is used for the live fetch.
 pub async fn run(state: AppState, cache: UnfurlRepo) -> anyhow::Result<()> {
-    run_with(state, cache, Arc::new(ReqwestUnfurler::new())).await
+    run_until_cancelled(state, cache, CancellationToken::new()).await
+}
+
+/// Run with the production transport until `cancel` is triggered.
+pub async fn run_until_cancelled(
+    state: AppState,
+    cache: UnfurlRepo,
+    cancel: CancellationToken,
+) -> anyhow::Result<()> {
+    run_with_until_cancelled(state, cache, Arc::new(ReqwestUnfurler::new()), cancel).await
 }
 
 /// Run the listener with an injected [`Unfurler`] — the seam used to drive the
@@ -51,29 +63,71 @@ pub async fn run_with(
     cache: UnfurlRepo,
     fetcher: Arc<dyn Unfurler>,
 ) -> anyhow::Result<()> {
+    run_with_until_cancelled(state, cache, fetcher, CancellationToken::new()).await
+}
+
+/// Run with an injected transport until `cancel` is triggered, finishing and
+/// ACKing any event already received before returning.
+pub async fn run_with_until_cancelled(
+    state: AppState,
+    cache: UnfurlRepo,
+    fetcher: Arc<dyn Unfurler>,
+    cancel: CancellationToken,
+) -> anyhow::Result<()> {
     let bus = state.bus.clone();
+    let receipts = ConsumerEventReceiptRepo::new(state.pg.clone());
     // Resubscribe across NATS reconnects (mirrors `ws::run_bus_listener`); durable
     // consumer "aero-unfurl" resumes from its cursor, every message is acked.
     loop {
-        let mut stream = match bus.subscribe("im.room.*", Some("aero-unfurl")).await {
-            Ok(s) => s,
-            Err(e) => {
+        let subscribed =
+            task_shutdown::subscribe_or_cancelled(&bus, "im.room.*", Some("aero-unfurl"), &cancel)
+                .await;
+        let mut stream = match subscribed {
+            None => return Ok(()),
+            Some(Ok(s)) => s,
+            Some(Err(e)) => {
                 warn!(error = %e, "unfurl_bot subscribe failed; retrying");
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                if task_shutdown::delay_or_cancelled(std::time::Duration::from_secs(1), &cancel)
+                    .await
+                {
+                    return Ok(());
+                }
                 continue;
             }
         };
         info!("unfurl_bot listener started");
-        while let Some(sub) = stream.next().await {
-            if let Ok(RoomEvent::Message(env)) = serde_json::from_slice::<RoomEvent>(sub.payload()) {
-                if let Err(e) = handle(&state, &cache, fetcher.as_ref(), env).await {
-                    warn!(error = ?e, "unfurl_bot handle failed");
-                }
-            }
-            let _ = sub.ack().await;
+        loop {
+            let sub = match task_shutdown::next_or_cancelled(&mut stream, &cancel).await {
+                NextOrCancelled::Item(sub) => sub,
+                NextOrCancelled::Ended => break,
+                NextOrCancelled::Cancelled => return Ok(()),
+            };
+            let event = serde_json::from_slice::<RoomEvent>(sub.payload());
+            let handler_state = &state;
+            let handler_cache = &cache;
+            let handler_fetcher = fetcher.as_ref();
+            let _ = crate::consumer_event_receipt::process(
+                &receipts,
+                "aero-unfurl",
+                sub,
+                || async move {
+                    match event {
+                        Ok(RoomEvent::Message(env)) => {
+                            handle(handler_state, handler_cache, handler_fetcher, env).await
+                        }
+                        Ok(_) | Err(_) => Ok(()),
+                    }
+                },
+            )
+            .await;
+        }
+        if cancel.is_cancelled() {
+            return Ok(());
         }
         warn!("unfurl_bot subscription stream ended; resubscribing");
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        if task_shutdown::delay_or_cancelled(std::time::Duration::from_secs(1), &cancel).await {
+            return Ok(());
+        }
     }
 }
 
@@ -111,8 +165,6 @@ async fn handle(
     }
 
     let messages: &MessageRepo = &state.messages;
-    let room_id = msg.room_id;
-
     // Append the preview cards to the message's existing blocks and persist. Use
     // the message repo's `edit` directly (a system patch, like transcribe_bot),
     // not `ImService::edit_message`, which is sender-only.
@@ -132,14 +184,23 @@ async fn handle(
         }
     };
 
-    match messages.edit(msg.id, new_blocks, version).await {
+    let traceparent = aero_common::telemetry::current_traceparent();
+    match messages
+        .edit_outboxed_system(msg.id, new_blocks, version, None, traceparent.as_deref())
+        .await
+    {
         Ok(Some(updated)) => {
-            // Through the stamped seam (ROADMAP3 方向一) so this Edited carries
-            // a `seq` like every hot-path publish; best-effort like before.
-            state
-                .im
-                .broadcast_room_event(room_id, RoomEvent::Edited(updated))
-                .await;
+            if let Err(error) = state.im.dispatch_event_outbox_id(updated.outbox_id).await {
+                warn!(
+                    ?error,
+                    outbox_id = %updated.outbox_id,
+                    message_id = %msg.id,
+                    "unfurl edited-event fast dispatch failed"
+                );
+            }
+            if let Err(error) = state.im.dispatch_message_side_effects_for(msg.id).await {
+                warn!(?error, message_id = %msg.id, "unfurl AI side-effect dispatch failed");
+            }
             info!(message_id = %msg.id, "link preview(s) attached");
         }
         Ok(None) => debug!(message_id = %msg.id, "message missing/deleted during unfurl edit"),
@@ -186,10 +247,16 @@ mod tests {
             ..LinkPreview::default()
         };
         let blocks = [Block::text("https://x.com"), preview_to_card(&preview)];
-        assert!(blocks.iter().any(is_link_preview_card), "guard catches our own card");
+        assert!(
+            blocks.iter().any(is_link_preview_card),
+            "guard catches our own card"
+        );
 
         let plain = [Block::text("https://x.com")];
-        assert!(!plain.iter().any(is_link_preview_card), "plain message not skipped");
+        assert!(
+            !plain.iter().any(is_link_preview_card),
+            "plain message not skipped"
+        );
     }
 
     // Confirm the seam wiring compiles + the fake yields a parseable preview, so
@@ -204,7 +271,10 @@ mod tests {
             let fetcher: Arc<dyn Unfurler> = Arc::new(FakeUnfurler::with_html(
                 r#"<meta property="og:title" content="Hi"><title>t</title>"#,
             ));
-            let html = fetcher.fetch("https://x.com").await.expect("fake returns html");
+            let html = fetcher
+                .fetch("https://x.com")
+                .await
+                .expect("fake returns html");
             let preview = parse_og(&html, "https://x.com");
             assert_eq!(preview.title.as_deref(), Some("Hi"));
         });

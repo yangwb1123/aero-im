@@ -9,16 +9,19 @@
 //!
 //! Keywords are normalized (trimmed + lowercased) by [`normalize_keyword`] before
 //! insert, and the match query lowercases the message text, so matching is
-//! case-insensitive. Every read/mutate method except the match query is
-//! owner-scoped (`participant_id` in the `WHERE`), so a caller can only ever list
-//! or delete their own alerts. Purely additive: a NEW [`KeywordAlertRepo`]; no
-//! existing repo is touched. The [`KeywordAlert`] model lives here (and is
-//! re-exported from the crate root) rather than in `aero-common`, since it is a
-//! storage-layer projection.
+//! case-insensitive. Production CRUD owns effective-workspace authorization and
+//! the owner-scoped mutation in one transaction. The match query is a current
+//! snapshot: revoked/deleted/mandatory-2FA-ineligible subscribers are excluded,
+//! while a retained alert re-enters only after access is restored. The
+//! [`KeywordAlert`] model lives here (and is re-exported from the crate root)
+//! rather than in `aero-common`, since it is a storage-layer projection.
 
-use aero_common::{KeywordAlertId, ParticipantId, WorkspaceId};
+use aero_common::{Error, KeywordAlertId, ParticipantId, WorkspaceId};
 use serde::Serialize;
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
+
+/// Maximum normalized keyword length, in Unicode scalar values.
+pub const MAX_KEYWORD_CHARS: usize = 64;
 
 /// One keyword alert — a per-user, workspace-scoped keyword subscription.
 ///
@@ -88,15 +91,132 @@ impl KeywordAlertRepo {
         Self { pool }
     }
 
-    /// Subscribe `participant` to `keyword` in `workspace`, returning the alert's
-    /// id. The keyword is normalized via [`normalize_keyword`] first. Idempotent:
-    /// re-subscribing to the same keyword is a no-op
-    /// (`ON CONFLICT DO NOTHING`) that returns the existing alert's id rather than
-    /// creating a duplicate. The caller is responsible for workspace-membership
-    /// and keyword validation.
+    /// Subscribe `participant` to `keyword` while effective workspace access is
+    /// locked through the insert and canonical row read.
+    ///
+    /// Re-subscribing is idempotent and returns the exact existing row from this
+    /// transaction; callers never need a second unguarded list query.
+    pub async fn add_authorized(
+        &self,
+        participant: ParticipantId,
+        workspace: WorkspaceId,
+        keyword: &str,
+    ) -> Result<KeywordAlert, Error> {
+        let normalized = validate_keyword(keyword)?;
+        let mut tx = self.pool.begin().await?;
+        assert_effective_member_in_tx(&mut tx, workspace, participant).await?;
+
+        let id = KeywordAlertId::new();
+        let insert_sql = format!(
+            "INSERT INTO keyword_alerts (id, participant_id, workspace_id, keyword)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (participant_id, workspace_id, keyword) DO NOTHING
+             RETURNING {COLUMNS}"
+        );
+        let inserted = sqlx::query_as::<_, Row>(&insert_sql)
+            .bind(id.to_uuid())
+            .bind(participant.to_uuid())
+            .bind(workspace.to_uuid())
+            .bind(&normalized)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let row = match inserted {
+            Some(row) => row,
+            None => {
+                let select_sql = format!(
+                    "SELECT {COLUMNS}
+                       FROM keyword_alerts
+                      WHERE participant_id = $1
+                        AND workspace_id = $2
+                        AND keyword = $3"
+                );
+                sqlx::query_as::<_, Row>(&select_sql)
+                    .bind(participant.to_uuid())
+                    .bind(workspace.to_uuid())
+                    .bind(&normalized)
+                    .fetch_one(&mut *tx)
+                    .await?
+            }
+        };
+        let alert = row_to_model(row);
+        tx.commit().await?;
+        Ok(alert)
+    }
+
+    /// List the caller's alerts while current effective workspace access is held
+    /// through the tenant-scoped read.
+    pub async fn list_authorized(
+        &self,
+        participant: ParticipantId,
+        workspace: WorkspaceId,
+    ) -> Result<Vec<KeywordAlert>, Error> {
+        let mut tx = self.pool.begin().await?;
+        assert_effective_member_in_tx(&mut tx, workspace, participant).await?;
+        let sql = format!(
+            "SELECT {COLUMNS}
+               FROM keyword_alerts
+              WHERE participant_id = $1 AND workspace_id = $2
+              ORDER BY created_at DESC, id DESC"
+        );
+        let rows = sqlx::query_as::<_, Row>(&sql)
+            .bind(participant.to_uuid())
+            .bind(workspace.to_uuid())
+            .fetch_all(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(rows.into_iter().map(row_to_model).collect())
+    }
+
+    /// Delete an alert while its canonical tenant and current owner access are
+    /// held in one transaction.
+    ///
+    /// Unknown ids and ids belonging to a different participant are deliberately
+    /// indistinguishable (`NotFound`). The alert row is locked only after the
+    /// workspace authorization boundary, preserving the global lock order.
+    pub async fn delete_authorized(
+        &self,
+        id: KeywordAlertId,
+        participant: ParticipantId,
+    ) -> Result<(), Error> {
+        let mut tx = self.pool.begin().await?;
+        let resolved = sqlx::query_as::<_, (uuid::Uuid, uuid::Uuid)>(
+            "SELECT participant_id, workspace_id
+               FROM keyword_alerts
+              WHERE id = $1",
+        )
+        .bind(id.to_uuid())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((owner, workspace)) = resolved else {
+            return Err(Error::NotFound(format!("keyword alert {id}")));
+        };
+        if owner != participant.to_uuid() {
+            return Err(Error::NotFound(format!("keyword alert {id}")));
+        }
+        let workspace = WorkspaceId::from_uuid(workspace);
+        assert_effective_member_in_tx(&mut tx, workspace, participant).await?;
+
+        let removed = sqlx::query(
+            "DELETE FROM keyword_alerts
+              WHERE id = $1 AND participant_id = $2 AND workspace_id = $3",
+        )
+        .bind(id.to_uuid())
+        .bind(participant.to_uuid())
+        .bind(workspace.to_uuid())
+        .execute(&mut *tx)
+        .await?;
+        if removed.rows_affected() != 1 {
+            return Err(Error::NotFound(format!("keyword alert {id}")));
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Low-level compatibility seam used only by storage tests.
     ///
     /// # Errors
     /// Propagates any [`sqlx::Error`] from the insert or the conflict lookup.
+    #[cfg(test)]
     pub async fn add(
         &self,
         participant: ParticipantId,
@@ -135,11 +255,11 @@ impl KeywordAlertRepo {
         Ok(KeywordAlertId::from_uuid(existing))
     }
 
-    /// List `participant`'s keyword alerts in `workspace`, newest first.
-    /// Owner-scoped — only the caller's own rows are returned.
+    /// Low-level compatibility seam used only by storage tests.
     ///
     /// # Errors
     /// Propagates any [`sqlx::Error`] from the query.
+    #[cfg(test)]
     pub async fn list_for(
         &self,
         participant: ParticipantId,
@@ -159,12 +279,11 @@ impl KeywordAlertRepo {
         Ok(rows.into_iter().map(row_to_model).collect())
     }
 
-    /// Delete one of `participant`'s keyword alerts. Returns `true` iff a row was
-    /// removed — owner-scoped, so a caller can never delete another user's alert,
-    /// and a second delete (or a stranger's) is a no-op returning `false`.
+    /// Low-level compatibility seam used only by storage tests.
     ///
     /// # Errors
     /// Propagates any [`sqlx::Error`] from the delete.
+    #[cfg(test)]
     pub async fn delete(
         &self,
         id: KeywordAlertId,
@@ -185,8 +304,11 @@ impl KeywordAlertRepo {
     /// The match uses `position(keyword IN lower($text)) > 0`; stored keywords are
     /// already normalized (lowercased), so the comparison is case-insensitive.
     ///
-    /// The caller must apply its own dedupe (against already-notified
-    /// mention/reply recipients) and never self-notify the sender.
+    /// Effective access is evaluated on every invocation. A revoked subscriber's
+    /// retained row is skipped; restoring access makes it eligible again on a
+    /// later invocation. The caller must apply its own dedupe (against
+    /// already-notified mention/reply recipients) and never self-notify the
+    /// sender.
     ///
     /// # Errors
     /// Propagates any [`sqlx::Error`] from the query.
@@ -200,7 +322,11 @@ impl KeywordAlertRepo {
             r"SELECT DISTINCT participant_id
                FROM keyword_alerts
               WHERE workspace_id = $1
-                AND position(keyword IN $2) > 0",
+                AND position(keyword IN $2) > 0
+                AND aero_participant_has_effective_workspace_access(
+                        workspace_id,
+                        participant_id
+                    )",
         )
         .bind(workspace.to_uuid())
         .bind(&lowered)
@@ -211,6 +337,41 @@ impl KeywordAlertRepo {
             .map(|(p,)| ParticipantId::from_uuid(p))
             .collect())
     }
+}
+
+fn validate_keyword(raw: &str) -> Result<String, Error> {
+    let normalized = normalize_keyword(raw);
+    if normalized.is_empty() {
+        return Err(Error::Invalid("keyword must not be empty".into()));
+    }
+    if normalized.chars().count() > MAX_KEYWORD_CHARS {
+        return Err(Error::Invalid(format!(
+            "keyword too long (max {MAX_KEYWORD_CHARS} chars)"
+        )));
+    }
+    Ok(normalized)
+}
+
+async fn assert_effective_member_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    workspace: WorkspaceId,
+    participant: ParticipantId,
+) -> Result<(), Error> {
+    let exists =
+        sqlx::query_scalar::<_, bool>("SELECT true FROM workspaces WHERE id = $1 FOR SHARE")
+            .bind(workspace.to_uuid())
+            .fetch_optional(&mut **tx)
+            .await?
+            .is_some();
+    if !exists {
+        return Err(Error::NotFound(format!("workspace {workspace}")));
+    }
+    if !crate::workspace::members::effective_workspace_access_in_tx(tx, workspace, participant)
+        .await?
+    {
+        return Err(Error::Forbidden("workspace member required".into()));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -237,10 +398,7 @@ mod tests {
 #[cfg(test)]
 mod db_tests {
     use super::*;
-
-    /// The reserved all-zero default workspace, guaranteed to exist by migration
-    /// 0006's backfill — reused so the keyword-alert rows are well-scoped.
-    const DEFAULT_WS: &str = "00000000-0000-0000-0000-000000000000";
+    use aero_common::WorkspaceRole;
 
     fn pool() -> PgPool {
         let url = std::env::var("DATABASE_URL")
@@ -263,8 +421,16 @@ mod db_tests {
         id
     }
 
-    fn default_ws() -> WorkspaceId {
-        WorkspaceId::from_uuid(uuid::Uuid::parse_str(DEFAULT_WS).expect("valid uuid"))
+    async fn workspace(p: &PgPool, owner: ParticipantId, label: &str) -> WorkspaceId {
+        crate::WorkspaceRepo::new(p.clone())
+            .create(
+                format!("{label}-{owner}"),
+                format!("{label}-{owner}").to_ascii_lowercase(),
+                owner,
+            )
+            .await
+            .unwrap()
+            .id
     }
 
     #[tokio::test]
@@ -272,8 +438,8 @@ mod db_tests {
     async fn keyword_alert_add_idempotent_list_delete_owner_scoped() {
         let p = pool();
         let repo = KeywordAlertRepo::new(p.clone());
-        let ws = default_ws();
         let owner = owner(&p).await;
+        let ws = workspace(&p, owner, "keyword-alert-crud").await;
         let stranger = ParticipantId::new();
 
         // add → list shows it; the keyword is normalized (lowercased).
@@ -305,7 +471,12 @@ mod db_tests {
             "second delete is a no-op"
         );
         assert!(
-            !repo.list_for(owner, ws).await.unwrap().iter().any(|a| a.id == id),
+            !repo
+                .list_for(owner, ws)
+                .await
+                .unwrap()
+                .iter()
+                .any(|a| a.id == id),
             "deleted alert leaves the list"
         );
 
@@ -322,9 +493,13 @@ mod db_tests {
     async fn matching_subscribers_finds_match_excludes_non_match() {
         let p = pool();
         let repo = KeywordAlertRepo::new(p.clone());
-        let ws = default_ws();
         let subscriber = owner(&p).await;
         let other = owner(&p).await;
+        let ws = workspace(&p, subscriber, "keyword-alert-match").await;
+        crate::WorkspaceRepo::new(p.clone())
+            .add_member(ws, other, WorkspaceRole::Member)
+            .await
+            .unwrap();
 
         repo.add(subscriber, ws, "incident").await.unwrap();
         repo.add(other, ws, "vacation").await.unwrap();
@@ -359,3 +534,7 @@ mod db_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "keyword_alert/security_tests.rs"]
+mod security_tests;

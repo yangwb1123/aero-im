@@ -4,21 +4,22 @@
 //! Operates entirely within the EXISTING `room_members.role` values
 //! (`CHECK (role IN ('owner', 'member', 'admin'))`, migration 0001) via
 //! [`RoomRoleRepo`](aero_storage::RoomRoleRepo) — no new table, no new id, no
-//! schema change. A requested role is validated against [`ALLOWED_ROLES`] up front
-//! (others ⇒ `400`), so the DB CHECK is never the thing that rejects a bad value.
+//! schema change. A requested role is parsed into [`RoomMemberRole`] up front
+//! (unknown values ⇒ `400`), so the DB CHECK is never the input validator.
 //!
 //! Authorization is two-tier: everyone with room access may *view* the roster
 //! (the same [`assert_room_access`](aero_im_core::ImService::assert_room_access)
 //! tenant + membership guard the rest of the app uses); only the room's CURRENT
-//! owner (`role_of == "owner"`) may *mutate* roles or transfer ownership. The last
-//! owner can never be demoted (checked via `count_owners`), so a channel is never
-//! left ownerless. Mounted via [`routes`] and `.merge`d into the main router.
+//! owner (`role_of == "owner"`) may *mutate* roles or transfer ownership. Storage
+//! locks the workspace, channel, and membership aggregate and commits each
+//! governance operation atomically, so concurrent demotions/transfers cannot
+//! leave the channel ownerless.
 
 use std::str::FromStr;
 
 use aero_auth::AuthUser;
 use aero_common::{Error as AeroError, ParticipantId, RoomId};
-use aero_storage::RoomRoleRepo;
+use aero_storage::{RoomMemberRole, RoomMembershipWriteError, RoomRoleRepo};
 use axum::{
     extract::{Path, State},
     routing::{get, post, put},
@@ -29,21 +30,15 @@ use serde::Deserialize;
 use crate::error::ApiResult;
 use crate::state::AppState;
 
-/// The role tokens a member may hold, matching the `room_members.role` CHECK
-/// constraint (migration 0001) exactly. A requested role outside this set is
-/// rejected `400` before any write, so the DB CHECK never has to.
-const ALLOWED_ROLES: [&str; 3] = ["owner", "member", "admin"];
-
-/// The role a former owner is demoted to on ownership transfer — the canonical
-/// non-owner value.
-const DEMOTED_ROLE: &str = "member";
-
 /// All channel-role routes, ready to `.merge` into the gateway router.
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/rooms/:id/roles", get(list_roles))
         .route("/api/rooms/:id/roles/:pid", put(set_member_role))
-        .route("/api/rooms/:id/transfer-ownership", post(transfer_ownership))
+        .route(
+            "/api/rooms/:id/transfer-ownership",
+            post(transfer_ownership),
+        )
 }
 
 /// Build a [`RoomRoleRepo`] from shared state, over the shared pool.
@@ -65,17 +60,58 @@ fn parse_participant(s: &str) -> Result<ParticipantId, AeroError> {
 /// ([`assert_room_access`](aero_im_core::ImService::assert_room_access)), so a
 /// missing room is `404` and a non-member / cross-tenant caller is `403`; a member
 /// who is not the owner is then rejected `403`.
-async fn assert_owner(
-    s: &AppState,
-    room: RoomId,
-    caller: ParticipantId,
-) -> Result<(), AeroError> {
-    s.im.assert_room_access(caller, room).await?;
-    let role = repo(s).role_of(room, caller).await.map_err(AeroError::from)?;
+async fn assert_owner(s: &AppState, room: RoomId, caller: ParticipantId) -> Result<(), AeroError> {
+    s.im.assert_channel_access(caller, room).await?;
+    let role = repo(s)
+        .role_of(room, caller)
+        .await
+        .map_err(AeroError::from)?;
     if role.as_deref() == Some("owner") {
         Ok(())
     } else {
-        Err(AeroError::Forbidden("only the channel owner may manage roles".into()))
+        Err(AeroError::Forbidden(
+            "only the channel owner may manage roles".into(),
+        ))
+    }
+}
+
+fn parse_role(role: &str) -> Result<RoomMemberRole, AeroError> {
+    match role.trim() {
+        "owner" => Ok(RoomMemberRole::Owner),
+        "admin" => Ok(RoomMemberRole::Admin),
+        "member" => Ok(RoomMemberRole::Member),
+        _ => Err(AeroError::Invalid(
+            "role must be one of [owner, admin, member]".into(),
+        )),
+    }
+}
+
+fn map_channel_write_error(error: RoomMembershipWriteError) -> AeroError {
+    match error {
+        RoomMembershipWriteError::WorkspaceNotFound => AeroError::NotFound("workspace".into()),
+        RoomMembershipWriteError::RoomNotFound => AeroError::NotFound("room".into()),
+        RoomMembershipWriteError::NotChannel => AeroError::Invalid("room is not a channel".into()),
+        RoomMembershipWriteError::FixedMembership => {
+            AeroError::Conflict("direct and group-DM membership is fixed".into())
+        }
+        RoomMembershipWriteError::NotJoinable => {
+            AeroError::Forbidden("channel is private or archived".into())
+        }
+        RoomMembershipWriteError::MemberNotFound => AeroError::NotFound("room member".into()),
+        RoomMembershipWriteError::NotAuthorized => {
+            AeroError::Forbidden("only the current channel owner may manage roles".into())
+        }
+        RoomMembershipWriteError::LastOwner => {
+            AeroError::Conflict("cannot demote the last owner".into())
+        }
+        RoomMembershipWriteError::TargetNotEligible => AeroError::Conflict(
+            "target must be a retained, non-guest workspace member with an active account".into(),
+        ),
+        RoomMembershipWriteError::TransferToSelf => {
+            AeroError::Invalid("cannot transfer ownership to yourself".into())
+        }
+        RoomMembershipWriteError::InvalidInput(message) => AeroError::Invalid(message),
+        RoomMembershipWriteError::Storage(error) => AeroError::from(error),
     }
 }
 
@@ -88,7 +124,8 @@ async fn list_roles(
     Path(room_str): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let room = parse_room(&room_str)?;
-    s.im.assert_room_access(auth.participant_id, room).await?;
+    s.im.assert_channel_access(auth.participant_id, room)
+        .await?;
     let members = repo(&s)
         .members_with_roles(room)
         .await
@@ -106,13 +143,13 @@ async fn list_roles(
 
 #[derive(Deserialize)]
 struct SetRoleReq {
-    /// The new room role for the target member (one of [`ALLOWED_ROLES`]).
+    /// The new room role for the target member (`owner`, `admin`, or `member`).
     role: String,
 }
 
 /// `PUT /api/rooms/:id/roles/:pid` — change member `pid`'s role in the room. Only
 /// the room's owner may call (`403` otherwise). The requested role must be one of
-/// [`ALLOWED_ROLES`] (`400` otherwise); the target must already be a member (`404`
+/// those three role tokens (`400` otherwise); the target must already be a member (`404`
 /// otherwise). Demoting the last owner is refused `400` so the channel is never
 /// left ownerless. Returns `{ "participant_id", "role" }`.
 async fn set_member_role(
@@ -125,44 +162,17 @@ async fn set_member_role(
     let target = parse_participant(&pid_str)?;
     assert_owner(&s, room, auth.participant_id).await?;
 
-    let role = req.role.trim();
-    if !ALLOWED_ROLES.contains(&role) {
-        return Err(AeroError::Invalid(format!(
-            "role must be one of {ALLOWED_ROLES:?}"
-        ))
-        .into());
-    }
-
-    // The target must already be a member; their current role drives the
-    // last-owner guard below.
-    let current = repo(&s)
-        .role_of(room, target)
+    let role = parse_role(&req.role)?;
+    s.rooms
+        .change_channel_member_role_authorized(room, auth.participant_id, target, role)
         .await
-        .map_err(AeroError::from)?
-        .ok_or_else(|| AeroError::NotFound("room member".into()))?;
-
-    // Refuse to demote the final owner — that would leave the channel ownerless.
-    if current == "owner" && role != "owner" {
-        let owners = repo(&s).count_owners(room).await.map_err(AeroError::from)?;
-        if owners <= 1 {
-            return Err(AeroError::Invalid("cannot demote the last owner".into()).into());
-        }
-    }
-
-    let changed = repo(&s)
-        .set_role(room, target, role)
-        .await
-        .map_err(AeroError::from)?;
-    if !changed {
-        // Lost a race with a concurrent removal — the member is gone.
-        return Err(AeroError::NotFound("room member".into()).into());
-    }
+        .map_err(map_channel_write_error)?;
     // Best-effort privileged-operation audit (ROADMAP 方向四). The role change has
     // already committed; a logging failure must only warn, never fail the request.
-    audit_role_changed(&s, room, auth.participant_id, target, role).await;
+    audit_role_changed(&s, room, auth.participant_id, target, role.as_str()).await;
     Ok(Json(serde_json::json!({
         "participant_id": target,
-        "role": role,
+        "role": role.as_str(),
     })))
 }
 
@@ -214,7 +224,7 @@ struct TransferReq {
 /// member. Only the current owner may call (`403` otherwise); the recipient must
 /// be an existing member (`404` otherwise) and distinct from the caller (`400`
 /// otherwise). The recipient is promoted to `owner` FIRST (so the room is never
-/// momentarily ownerless), then the caller is demoted to [`DEMOTED_ROLE`]. Returns
+/// momentarily ownerless), then the caller is demoted to `member`. Returns
 /// `{ "ok": true }`.
 async fn transfer_ownership(
     State(s): State<AppState>,
@@ -229,24 +239,21 @@ async fn transfer_ownership(
     if to == auth.participant_id {
         return Err(AeroError::Invalid("cannot transfer ownership to yourself".into()).into());
     }
-    // The recipient must already be a member of the room.
-    repo(&s)
-        .role_of(room, to)
+    s.rooms
+        .transfer_channel_ownership_authorized(room, auth.participant_id, to)
         .await
-        .map_err(AeroError::from)?
-        .ok_or_else(|| AeroError::NotFound("room member".into()))?;
-
-    // Promote the recipient first so there is always at least one owner, then
-    // step the former owner down to the canonical non-owner role.
-    repo(&s).set_role(room, to, "owner").await.map_err(AeroError::from)?;
-    repo(&s)
-        .set_role(room, auth.participant_id, DEMOTED_ROLE)
-        .await
-        .map_err(AeroError::from)?;
+        .map_err(map_channel_write_error)?;
     // Best-effort privileged-operation audit (ROADMAP 方向四): record both halves
     // of the transfer (recipient → owner, former owner → demoted). Already
     // committed above; logging failures only warn, never fail the request.
     audit_role_changed(&s, room, auth.participant_id, to, "owner").await;
-    audit_role_changed(&s, room, auth.participant_id, auth.participant_id, DEMOTED_ROLE).await;
+    audit_role_changed(
+        &s,
+        room,
+        auth.participant_id,
+        auth.participant_id,
+        RoomMemberRole::Member.as_str(),
+    )
+    .await;
     Ok(Json(serde_json::json!({ "ok": true })))
 }

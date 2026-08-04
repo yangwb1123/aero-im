@@ -8,12 +8,12 @@
 //!
 //! ## Authorization
 //!
-//! Every route is admin/owner-gated. The privilege decision is the pure,
-//! DB-free [`authorize_admin`] (mirroring `crate::workspaces`), so the role
-//! matrix is unit-tested offline (Postgres is absent in CI); the async handlers
-//! resolve the caller's role from the shared [`WorkspaceRepo`](aero_storage::WorkspaceRepo)
-//! and then call the guard. Deactivating yourself is rejected `400` — an admin
-//! locking themselves out of the tenant is almost certainly a mistake.
+//! Listing is gated by the caller's effective admin/owner role. Mutations use
+//! storage-owned transactions that lock the workspace and both membership rows,
+//! enforce the current role hierarchy and effective caller state, then commit
+//! the state change together with its audit event. Workspace owners are
+//! protected until ownership is explicitly transferred or demoted, and
+//! self-deactivation is rejected.
 
 use std::str::FromStr;
 
@@ -21,7 +21,7 @@ use aero_auth::AuthUser;
 use aero_common::{
     Error as AeroError, ParticipantId, Result as AeroResult, WorkspaceId, WorkspaceRole,
 };
-use aero_storage::{DeactivationRepo, WorkspaceRepo};
+use aero_storage::{DeactivationRepo, DeactivationWriteError, WorkspaceRepo};
 use axum::{
     extract::{Path, State},
     routing::{get, post},
@@ -82,11 +82,31 @@ async fn assert_admin(
     caller: ParticipantId,
 ) -> Result<(), AeroError> {
     let role = repo
-        .member_role(workspace, caller)
+        .effective_member_role(workspace, caller)
         .await
         .map_err(AeroError::from)?
-        .ok_or_else(|| AeroError::Forbidden("not a workspace member".into()))?;
+        .ok_or_else(|| AeroError::Forbidden("not an active workspace member".into()))?;
     authorize_admin(role)
+}
+
+fn map_write_error(error: DeactivationWriteError) -> AeroError {
+    match error {
+        DeactivationWriteError::WorkspaceNotFound => AeroError::NotFound("workspace".into()),
+        DeactivationWriteError::MemberNotFound => AeroError::NotFound("workspace member".into()),
+        DeactivationWriteError::NotAuthorized => {
+            AeroError::Forbidden("not allowed to manage this workspace member".into())
+        }
+        DeactivationWriteError::SelfDeactivation => {
+            AeroError::Invalid("cannot deactivate yourself".into())
+        }
+        DeactivationWriteError::OwnerProtected => {
+            AeroError::Conflict("transfer or demote workspace ownership before deactivation".into())
+        }
+        DeactivationWriteError::ChannelOwnerProtected => {
+            AeroError::Conflict("transfer channel ownership before deactivation".into())
+        }
+        DeactivationWriteError::Storage(error) => AeroError::from(error),
+    }
 }
 
 /// `POST /api/workspaces/:id/members/:pid/deactivate` — admin/owner deactivates a
@@ -99,14 +119,10 @@ async fn deactivate_member(
 ) -> ApiResult<Json<serde_json::Value>> {
     let ws = parse_workspace(&ws_str)?;
     let target = parse_participant(&pid_str)?;
-    assert_admin(&s.workspaces, ws, auth.participant_id).await?;
-    if target == auth.participant_id {
-        return Err(AeroError::Invalid("cannot deactivate yourself".into()).into());
-    }
     repo(&s)
-        .deactivate(ws, target, auth.participant_id)
+        .deactivate_authorized(ws, target, auth.participant_id)
         .await
-        .map_err(AeroError::from)?;
+        .map_err(map_write_error)?;
     Ok(Json(serde_json::json!({ "deactivated": true })))
 }
 
@@ -119,11 +135,10 @@ async fn reactivate_member(
 ) -> ApiResult<Json<serde_json::Value>> {
     let ws = parse_workspace(&ws_str)?;
     let target = parse_participant(&pid_str)?;
-    assert_admin(&s.workspaces, ws, auth.participant_id).await?;
     repo(&s)
-        .reactivate(ws, target)
+        .reactivate_authorized(ws, target, auth.participant_id)
         .await
-        .map_err(AeroError::from)?;
+        .map_err(map_write_error)?;
     Ok(Json(serde_json::json!({ "reactivated": true })))
 }
 

@@ -8,8 +8,9 @@
 // Public surface:
 //   • initAuthUi({ enterChat, showAuth }) — wire login/register/logout
 
-import { api, auth } from './api.js';
+import { api, auth, ApiError } from './api.js';
 import { state, ws, els, setBusy } from './context.js';
+import { discardPersistedDeliveries } from './delivery.js';
 import { toast } from './render.js';
 
 let enterChat = () => {};
@@ -26,10 +27,24 @@ export function initAuthUi(deps) {
     const fd = new FormData(els.formLogin);
     const email = String(fd.get('email') || '').trim();
     const password = String(fd.get('password') || '');
+    const secondFactor = String(fd.get('second_factor') || '').trim();
+    const factor = /^\d{6}$/.test(secondFactor)
+      ? { totp: secondFactor }
+      : { recovery_code: secondFactor };
     if (!email || !password) return;
     setBusy(els.formLogin, true);
-    try { onAuthSuccess(await api.login({ email, password })); }
-    catch (err) { toast(err.message || '登录失败', 'error'); }
+    try {
+      onAuthSuccess(await api.login({ email, password, ...factor }));
+    } catch (err) {
+      if (isTwoFactorError(err)) {
+        setBusy(els.formLogin, false);
+        els.loginSecondFactor.value = '';
+        els.loginSecondFactor.focus();
+        toast('请输入有效的 6 位验证码或一次性恢复码', 'error');
+      } else {
+        toast(err.message || '登录失败', 'error');
+      }
+    }
     finally { setBusy(els.formLogin, false); }
   });
 
@@ -46,7 +61,12 @@ export function initAuthUi(deps) {
     finally { setBusy(els.formRegister, false); }
   });
 
-  els.btnLogout.addEventListener('click', () => {
+  els.btnLogout.addEventListener('click', async () => {
+    const refreshToken = auth.getRefresh();
+    // Start revocation before clearing localStorage. The refresh token itself
+    // authenticates logout, so this remains valid even if the access JWT expired.
+    const revoke = refreshToken ? api.logout(refreshToken) : Promise.resolve();
+    discardPersistedDeliveries(state.me?.id);
     ws.close();
     auth.clear();
     Object.assign(state, {
@@ -54,18 +74,31 @@ export function initAuthUi(deps) {
       rooms: new Map(), participants: new Map(), messagesByRoom: new Map(),
       reachedTop: new Set(), pendingByTempId: new Map(),
       typing: new Map(), reactionsByMsg: new Map(), receiptsByRoom: new Map(),
+      unreadByRoom: new Map(),
     });
     els.roomList.replaceChildren();
     els.msgList.replaceChildren();
     els.onlineList.replaceChildren();
     showAuth();
+    try {
+      await revoke;
+    } catch (err) {
+      toast(`本机已退出；服务端会话撤销失败:${err.message}`, 'error');
+    }
   });
 }
 
 function onAuthSuccess(res) {
   if (!res?.access_token || !res?.participant) { toast('服务端返回不完整', 'error'); return; }
   auth.setSession(res.access_token, res.refresh_token, res.participant.id);
+  els.formLogin.reset();
   state.me = res.participant;
   state.participants.set(res.participant.id, res.participant);
   enterChat();
+}
+
+function isTwoFactorError(err) {
+  if (!(err instanceof ApiError) || err.status !== 401) return false;
+  const detail = err.body?.msg || err.body?.message || err.message || '';
+  return String(detail).includes('2fa_required');
 }

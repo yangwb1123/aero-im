@@ -16,6 +16,26 @@ use serde::Serialize;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+/// Maximum encoded size accepted for an FCM/APNs token.
+///
+/// Real provider tokens are far smaller; the ceiling also stays below
+/// `PostgreSQL`'s btree entry limit for the `(platform, token)` unique index.
+pub const MAX_PUSH_TOKEN_BYTES: usize = 2_048;
+
+/// Maximum number of registered devices retained for one participant.
+pub const MAX_PUSH_TOKENS_PER_PARTICIPANT: i64 = 32;
+
+/// A registration failure that callers can map without parsing database text.
+#[derive(Debug, thiserror::Error)]
+pub enum PushTokenRegistrationError {
+    #[error("push token must be 1..={MAX_PUSH_TOKEN_BYTES} bytes")]
+    InvalidToken,
+    #[error("push token quota exceeded")]
+    QuotaExceeded,
+    #[error(transparent)]
+    Db(#[from] sqlx::Error),
+}
+
 /// One registered push device for a participant.
 #[derive(Debug, Clone, Serialize)]
 pub struct PushToken {
@@ -74,9 +94,49 @@ impl PushTokenRepo {
         participant: ParticipantId,
         platform: PushPlatform,
         token: &str,
-    ) -> Result<PushToken, sqlx::Error> {
+    ) -> Result<PushToken, PushTokenRegistrationError> {
+        if token.is_empty() || token.len() > MAX_PUSH_TOKEN_BYTES {
+            return Err(PushTokenRegistrationError::InvalidToken);
+        }
+
         let id = Uuid::new_v4();
         let now = time::OffsetDateTime::now_utc();
+        let mut tx = self.pool.begin().await?;
+
+        // Serialize the count-check + upsert for this target participant. A hash
+        // collision only causes harmless extra contention. Locking the existing
+        // token row below also keeps concurrent cross-account transfers ordered.
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!("aero:push-token:{}", participant.to_uuid()))
+            .execute(&mut *tx)
+            .await?;
+
+        let current_owner = sqlx::query_scalar::<_, Uuid>(
+            r"SELECT participant_id
+                FROM push_tokens
+               WHERE platform = $1 AND token = $2
+               FOR UPDATE",
+        )
+        .bind(platform.as_str())
+        .bind(token)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        // Refreshing a token already owned by this participant consumes no new
+        // quota. A transfer/new token must reserve one of the bounded slots.
+        if current_owner != Some(participant.to_uuid()) {
+            let count = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM push_tokens WHERE participant_id = $1",
+            )
+            .bind(participant.to_uuid())
+            .fetch_one(&mut *tx)
+            .await?;
+            if count >= MAX_PUSH_TOKENS_PER_PARTICIPANT {
+                tx.commit().await?;
+                return Err(PushTokenRegistrationError::QuotaExceeded);
+            }
+        }
+
         let row = sqlx::query_as::<_, PushTokenRow>(
             r"INSERT INTO push_tokens (id, participant_id, platform, token, registered_at)
                VALUES ($1, $2, $3, $4, $5)
@@ -90,8 +150,9 @@ impl PushTokenRepo {
         .bind(platform.as_str())
         .bind(token)
         .bind(now)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(PushToken::from(row))
     }
 
@@ -102,13 +163,11 @@ impl PushTokenRepo {
         participant: ParticipantId,
         token: &str,
     ) -> Result<bool, sqlx::Error> {
-        let res = sqlx::query(
-            r"DELETE FROM push_tokens WHERE participant_id = $1 AND token = $2",
-        )
-        .bind(participant.to_uuid())
-        .bind(token)
-        .execute(&self.pool)
-        .await?;
+        let res = sqlx::query(r"DELETE FROM push_tokens WHERE participant_id = $1 AND token = $2")
+            .bind(participant.to_uuid())
+            .bind(token)
+            .execute(&self.pool)
+            .await?;
         Ok(res.rows_affected() > 0)
     }
 
@@ -121,9 +180,11 @@ impl PushTokenRepo {
             r"SELECT id, participant_id, platform, token, registered_at
                FROM push_tokens
                WHERE participant_id = $1
-               ORDER BY registered_at DESC",
+               ORDER BY registered_at DESC
+               LIMIT $2",
         )
         .bind(participant.to_uuid())
+        .bind(MAX_PUSH_TOKENS_PER_PARTICIPANT)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(PushToken::from).collect())
@@ -143,11 +204,20 @@ impl PushTokenRepo {
         let uuids: Vec<Uuid> = participants.iter().map(ParticipantId::to_uuid).collect();
         let rows = sqlx::query_as::<_, PushTokenRow>(
             r"SELECT id, participant_id, platform, token, registered_at
-               FROM push_tokens
-               WHERE participant_id = ANY($1)
+                FROM (
+                    SELECT id, participant_id, platform, token, registered_at,
+                           ROW_NUMBER() OVER (
+                               PARTITION BY participant_id
+                               ORDER BY registered_at DESC
+                           ) AS participant_rank
+                      FROM push_tokens
+                     WHERE participant_id = ANY($1)
+                ) AS ranked
+               WHERE participant_rank <= $2
                ORDER BY participant_id, registered_at DESC",
         )
         .bind(&uuids)
+        .bind(MAX_PUSH_TOKENS_PER_PARTICIPANT)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(PushToken::from).collect())
@@ -187,5 +257,11 @@ mod tests {
         assert_eq!(PushPlatform::parse(""), None);
         assert_eq!(PushPlatform::Fcm.as_str(), "fcm");
         assert_eq!(PushPlatform::Apns.as_str(), "apns");
+    }
+
+    #[test]
+    fn token_byte_limit_is_utf8_aware() {
+        assert!("a".repeat(MAX_PUSH_TOKEN_BYTES).len() <= MAX_PUSH_TOKEN_BYTES);
+        assert!("界".repeat(MAX_PUSH_TOKEN_BYTES / 3 + 1).len() > MAX_PUSH_TOKEN_BYTES);
     }
 }

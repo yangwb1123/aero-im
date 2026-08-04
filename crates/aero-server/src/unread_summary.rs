@@ -10,11 +10,7 @@
 
 use aero_auth::AuthUser;
 use aero_common::Error as AeroError;
-use axum::{
-    extract::State,
-    routing::get,
-    Json, Router,
-};
+use axum::{extract::State, routing::get, Json, Router};
 
 use crate::error::ApiResult;
 use crate::state::AppState;
@@ -49,8 +45,6 @@ async fn unread_summary(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn empty_counts_serializes_to_empty_rooms_array() {
         // Purely structural check — no DB needed.

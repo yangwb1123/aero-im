@@ -43,11 +43,16 @@ use std::time::Duration;
 
 use aero_ai::{CostBudget, KeyedCostBudget};
 use aero_common::{metrics, MessageId, RoomEvent, RoomId, WorkspaceId};
-use futures::StreamExt;
+use aero_im_core::moderation_text;
+use aero_storage::ConsumerEventReceiptRepo;
 use tokio::sync::{mpsc, Mutex};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use crate::state::{AiBackend, AppState};
+use crate::{
+    state::{AiBackend, AppState},
+    task_shutdown::{self, NextOrCancelled},
+};
 
 /// Counter: moderation LLM calls attempted (admitted past every gate). The
 /// hard per-window spend signal for this pipeline.
@@ -160,10 +165,7 @@ impl SkipReason {
 
 /// Queue admission: non-blocking enqueue so the bus consumer can never be
 /// stalled by a slow LLM. A full (or closed) queue is a skip, not back-pressure.
-fn try_enqueue(
-    tx: &mpsc::Sender<ModerationJob>,
-    job: ModerationJob,
-) -> Result<(), SkipReason> {
+fn try_enqueue(tx: &mpsc::Sender<ModerationJob>, job: ModerationJob) -> Result<(), SkipReason> {
     tx.try_send(job).map_err(|e| match e {
         mpsc::error::TrySendError::Full(_) => SkipReason::QueueFull,
         mpsc::error::TrySendError::Closed(_) => SkipReason::QueueClosed,
@@ -211,11 +213,27 @@ fn record_skip(reason: SkipReason, message_id: MessageId) {
 /// Run the moderation listener with env-derived tunables until the bus stream
 /// ends. No-op (returns `Ok`) when no AI backend is configured.
 pub async fn run(state: AppState) -> anyhow::Result<()> {
-    run_with_config(state, ModerationConfig::from_env()).await
+    run_until_cancelled(state, CancellationToken::new()).await
+}
+
+/// Run with env-derived tunables until `cancel` is triggered.
+pub async fn run_until_cancelled(state: AppState, cancel: CancellationToken) -> anyhow::Result<()> {
+    run_with_config_until_cancelled(state, ModerationConfig::from_env(), cancel).await
 }
 
 /// Run the moderation listener with an explicit [`ModerationConfig`].
 pub async fn run_with_config(state: AppState, cfg: ModerationConfig) -> anyhow::Result<()> {
+    run_with_config_until_cancelled(state, cfg, CancellationToken::new()).await
+}
+
+/// Run with an explicit config until `cancel` is triggered. Workers stop
+/// accepting queued work on cancellation, finish at most their current job,
+/// and are joined before this function returns.
+pub async fn run_with_config_until_cancelled(
+    state: AppState,
+    cfg: ModerationConfig,
+    cancel: CancellationToken,
+) -> anyhow::Result<()> {
     let Some(ai) = state.ai.clone() else {
         info!("moderation_bot: no AI backend; not started");
         return Ok(());
@@ -249,17 +267,20 @@ pub async fn run_with_config(state: AppState, cfg: ModerationConfig) -> anyhow::
     // the duration of one `recv`, so items are handed out one-at-a-time while
     // processing runs concurrently across workers.
     let rx = Arc::new(Mutex::new(rx));
+    let mut workers = Vec::with_capacity(cfg.concurrency.max(1));
     for _ in 0..cfg.concurrency.max(1) {
-        tokio::spawn(worker_loop(
+        workers.push(tokio::spawn(worker_loop(
             state.clone(),
             Arc::clone(&ai),
             Arc::clone(&global_budget),
             Arc::clone(&ws_budget),
             Arc::clone(&rx),
-        ));
+            cancel.clone(),
+        )));
     }
 
     let bus = state.bus.clone();
+    let receipts = ConsumerEventReceiptRepo::new(state.pg.clone());
     info!(
         queue = cfg.queue_capacity,
         concurrency = cfg.concurrency,
@@ -280,52 +301,98 @@ pub async fn run_with_config(state: AppState, cfg: ModerationConfig) -> anyhow::
     // set skips the re-screen. (It does not survive a process restart; the per-call
     // budget admission gate bounds that residual double-charge.)
     const DEDUP_CAP: usize = 8192;
-    let mut seen: std::collections::HashSet<aero_common::MessageId> = std::collections::HashSet::new();
+    let mut seen: std::collections::HashSet<aero_common::MessageId> =
+        std::collections::HashSet::new();
     let mut seen_order: std::collections::VecDeque<aero_common::MessageId> =
         std::collections::VecDeque::new();
-    loop {
-        let mut stream = match bus.subscribe("im.room.*", Some("aero-moderation")).await {
-            Ok(s) => s,
-            Err(e) => {
+    'listener: loop {
+        let subscribed = task_shutdown::subscribe_or_cancelled(
+            &bus,
+            "im.room.*",
+            Some("aero-moderation"),
+            &cancel,
+        )
+        .await;
+        let mut stream = match subscribed {
+            None => break 'listener,
+            Some(Ok(s)) => s,
+            Some(Err(e)) => {
                 warn!(error = %e, "moderation_bot subscribe failed; retrying");
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                if task_shutdown::delay_or_cancelled(std::time::Duration::from_secs(1), &cancel)
+                    .await
+                {
+                    break 'listener;
+                }
                 continue;
             }
         };
-        while let Some(sub) = stream.next().await {
-            if let Ok(RoomEvent::Message(env)) = serde_json::from_slice::<RoomEvent>(sub.payload()) {
-                let text = env.message.searchable_text();
-                if !text.trim().is_empty() {
-                    let job = ModerationJob {
-                        message_id: env.message.id,
-                        room_id: env.message.room_id,
-                        text,
-                    };
-                    let id = job.message_id;
-                    if seen.contains(&id) {
-                        // Redelivery of an already-screened message — skip the
-                        // duplicate paid moderation call (and its cost/audit double).
-                    } else {
-                        if seen_order.len() >= DEDUP_CAP {
-                            if let Some(old) = seen_order.pop_front() {
-                                seen.remove(&old);
+        loop {
+            let sub = match task_shutdown::next_or_cancelled(&mut stream, &cancel).await {
+                NextOrCancelled::Item(sub) => sub,
+                NextOrCancelled::Ended => break,
+                NextOrCancelled::Cancelled => break 'listener,
+            };
+            let event = serde_json::from_slice::<RoomEvent>(sub.payload());
+            let handler_tx = &tx;
+            let handler_seen = &mut seen;
+            let handler_seen_order = &mut seen_order;
+            // For this explicitly best-effort pipeline, queue admission (including
+            // a budget/capacity skip) is the consumer action protected by the
+            // receipt. Workers remain detached from the broker ACK exactly as
+            // before, but a completed event can no longer enqueue a second paid
+            // call after a late producer replay.
+            let _ = crate::consumer_event_receipt::process(
+                &receipts,
+                "aero-moderation",
+                sub,
+                || async move {
+                    if let Ok(RoomEvent::Message(env)) = event {
+                        let text = moderation_text(&env.message.blocks);
+                        if !text.trim().is_empty() {
+                            let job = ModerationJob {
+                                message_id: env.message.id,
+                                room_id: env.message.room_id,
+                                text,
+                            };
+                            let id = job.message_id;
+                            if !handler_seen.contains(&id) {
+                                if handler_seen_order.len() >= DEDUP_CAP {
+                                    if let Some(old) = handler_seen_order.pop_front() {
+                                        handler_seen.remove(&old);
+                                    }
+                                }
+                                handler_seen.insert(id);
+                                handler_seen_order.push_back(id);
+                                if let Err(reason) = try_enqueue(handler_tx, job) {
+                                    record_skip(reason, id);
+                                }
                             }
                         }
-                        seen.insert(id);
-                        seen_order.push_back(id);
-                        if let Err(reason) = try_enqueue(&tx, job) {
-                            record_skip(reason, id);
-                        }
                     }
-                }
-            }
-            // Ack regardless: skipped messages are deliberately not redelivered —
-            // moderation is best-effort screening, not a delivery gate.
-            let _ = sub.ack().await;
+                    Ok(())
+                },
+            )
+            .await;
+        }
+        if cancel.is_cancelled() {
+            break;
         }
         warn!("moderation_bot subscription stream ended; resubscribing");
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        if task_shutdown::delay_or_cancelled(std::time::Duration::from_secs(1), &cancel).await {
+            break;
+        }
     }
+
+    // No detached workers survive the tracked listener. Cancellation makes
+    // idle workers leave immediately and lets in-flight jobs finish; queued
+    // best-effort screening work is intentionally discarded.
+    drop(tx);
+    for worker in workers {
+        if let Err(e) = worker.await {
+            warn!(error = ?e, "moderation worker task failed during shutdown");
+        }
+    }
+    Ok(())
 }
 
 /// One worker: pull jobs off the shared queue until it closes.
@@ -335,11 +402,23 @@ async fn worker_loop(
     global: Arc<CostBudget>,
     per_ws: Arc<KeyedCostBudget<WorkspaceId>>,
     rx: Arc<Mutex<mpsc::Receiver<ModerationJob>>>,
+    cancel: CancellationToken,
 ) {
     loop {
-        let job = { rx.lock().await.recv().await };
+        let job = recv_job_or_cancelled(&rx, &cancel).await;
         let Some(job) = job else { return };
         process(&state, ai.as_ref(), &global, &per_ws, job).await;
+    }
+}
+
+async fn recv_job_or_cancelled(
+    rx: &Arc<Mutex<mpsc::Receiver<ModerationJob>>>,
+    cancel: &CancellationToken,
+) -> Option<ModerationJob> {
+    tokio::select! {
+        biased;
+        () = cancel.cancelled() => None,
+        job = async { rx.lock().await.recv().await } => job,
     }
 }
 
@@ -368,22 +447,15 @@ async fn process(
     }
 
     metrics::inc_counter(AI_MODERATION_CALLS_TOTAL, 1);
-    let verdict = ai.moderate(&job.text).await;
-    // Charge the AI cost of this paid moderation call onto the same
-    // aero_ai_cost_micros_total counter as worker jobs (ROADMAP 方向四) — the
-    // server moderation path previously recorded NO cost, so a flooding tenant's
-    // thousands of paid moderation calls were invisible. Only when a key is
-    // configured (the call actually hit Anthropic); the flat per-kind estimate is
-    // used since the AiBackend trait doesn't surface token usage. Best-effort.
-    if verdict.is_ok() && ai.has_anthropic() {
-        aero_ai::metrics::record_cost(
-            aero_common::metrics::global(),
-            &aero_ai::CostModel::default(),
-            aero_storage::AiJobKind::Moderate,
-            workspace.map(|w| w.to_uuid()),
-            true,
-        );
-    }
+    let verdict = ai
+        .moderate_with_context(
+            &job.text,
+            aero_ai::usage::UsageContext::for_message(
+                job.message_id.to_uuid(),
+                workspace.map(|value| value.to_uuid()),
+            ),
+        )
+        .await;
     match verdict {
         Ok(Some(reason)) => {
             metrics::inc_counter(AI_MODERATION_FLAGGED_TOTAL, 1);
@@ -439,7 +511,11 @@ mod tests {
         let ws = WorkspaceId::new();
         assert_eq!(admit_call(&global, &per_ws, Some(ws)), Ok(()));
         assert_eq!(global.used(), 1, "admitted call charges the global window");
-        assert_eq!(per_ws.used(&ws), 1, "admitted call charges the tenant window");
+        assert_eq!(
+            per_ws.used(&ws),
+            1,
+            "admitted call charges the tenant window"
+        );
     }
 
     #[test]
@@ -450,7 +526,10 @@ mod tests {
         assert_eq!(admit_call(&global, &per_ws, Some(ws)), Ok(()));
         // Tenant window exhausted: denied, and the global window must NOT be
         // charged for a call that never happens.
-        assert_eq!(admit_call(&global, &per_ws, Some(ws)), Err(SkipReason::WorkspaceBudget));
+        assert_eq!(
+            admit_call(&global, &per_ws, Some(ws)),
+            Err(SkipReason::WorkspaceBudget)
+        );
         assert_eq!(global.used(), 2, "denied tenant burned no global budget");
     }
 
@@ -461,7 +540,10 @@ mod tests {
         let quiet = WorkspaceId::new();
         assert_eq!(admit_call(&global, &per_ws, Some(noisy)), Ok(()));
         assert_eq!(admit_call(&global, &per_ws, Some(noisy)), Ok(()));
-        assert_eq!(admit_call(&global, &per_ws, Some(noisy)), Err(SkipReason::WorkspaceBudget));
+        assert_eq!(
+            admit_call(&global, &per_ws, Some(noisy)),
+            Err(SkipReason::WorkspaceBudget)
+        );
         // The quiet tenant still has its full independent window.
         assert_eq!(admit_call(&global, &per_ws, Some(quiet)), Ok(()));
     }
@@ -475,8 +557,14 @@ mod tests {
         assert_eq!(admit_call(&global, &per_ws, Some(b)), Ok(()));
         // Global window exhausted: every tenant is denied, regardless of its
         // own remaining per-ws budget.
-        assert_eq!(admit_call(&global, &per_ws, Some(a)), Err(SkipReason::GlobalBudget));
-        assert_eq!(admit_call(&global, &per_ws, None), Err(SkipReason::GlobalBudget));
+        assert_eq!(
+            admit_call(&global, &per_ws, Some(a)),
+            Err(SkipReason::GlobalBudget)
+        );
+        assert_eq!(
+            admit_call(&global, &per_ws, None),
+            Err(SkipReason::GlobalBudget)
+        );
     }
 
     #[test]
@@ -487,8 +575,14 @@ mod tests {
         assert_eq!(admit_call(&global, &per_ws, None), Ok(()));
         assert_eq!(global.used(), 2);
         // A real workspace still has its own full (independent) window.
-        assert_eq!(admit_call(&global, &per_ws, Some(WorkspaceId::new())), Ok(()));
-        assert_eq!(admit_call(&global, &per_ws, None), Err(SkipReason::GlobalBudget));
+        assert_eq!(
+            admit_call(&global, &per_ws, Some(WorkspaceId::new())),
+            Ok(())
+        );
+        assert_eq!(
+            admit_call(&global, &per_ws, None),
+            Err(SkipReason::GlobalBudget)
+        );
     }
 
     // ---------- queue admission ----------
@@ -524,6 +618,24 @@ mod tests {
         assert_eq!(try_enqueue(&tx, mk_job()), Err(SkipReason::QueueClosed));
     }
 
+    #[tokio::test]
+    async fn idle_worker_receive_stops_promptly_on_cancellation() {
+        let (_tx, rx) = mpsc::channel::<ModerationJob>(1);
+        let rx = Arc::new(Mutex::new(rx));
+        let cancel = CancellationToken::new();
+        let task_rx = Arc::clone(&rx);
+        let task_cancel = cancel.clone();
+        let task = tokio::spawn(async move { recv_job_or_cancelled(&task_rx, &task_cancel).await });
+
+        cancel.cancel();
+
+        let result = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("idle worker should stop promptly")
+            .expect("worker wait should not panic");
+        assert!(result.is_none());
+    }
+
     // ---------- labels / digest ----------
 
     #[test]
@@ -535,7 +647,15 @@ mod tests {
             SkipReason::WorkspaceBudget,
         ];
         let labels: Vec<_> = all.iter().map(|r| r.label()).collect();
-        assert_eq!(labels, ["queue_full", "queue_closed", "global_budget", "workspace_budget"]);
+        assert_eq!(
+            labels,
+            [
+                "queue_full",
+                "queue_closed",
+                "global_budget",
+                "workspace_budget"
+            ]
+        );
         let mut dedup = labels.clone();
         dedup.sort_unstable();
         dedup.dedup();

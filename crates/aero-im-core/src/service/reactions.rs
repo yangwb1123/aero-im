@@ -3,8 +3,7 @@
 //! Extracted from `service.rs` as part of REFACTOR_PLAN.md Step 1b.
 
 use aero_common::{
-    Error, MessageId, NotificationKind, ParticipantId, ReactionOp, ReactionSummary, Result,
-    RoomEvent,
+    MessageId, NotificationKind, ParticipantId, ReactionOp, ReactionSummary, Result, RoomEvent,
 };
 use std::collections::BTreeMap;
 use tracing::{instrument, warn};
@@ -32,10 +31,14 @@ impl ImService {
         viewer: ParticipantId,
         message_ids: &[MessageId],
     ) -> Result<BTreeMap<MessageId, Vec<ReactionSummary>>> {
-        Ok(self.reactions.summaries_for_accessible(viewer, message_ids).await?)
+        Ok(self
+            .reactions
+            .summaries_for_accessible(viewer, message_ids)
+            .await?)
     }
 
-    /// Toggle a reaction on a message. Caller must be a member of the message's room.
+    /// Toggle a reaction through the transaction-owned storage path, then make a
+    /// best-effort immediate attempt to dispatch its durable outbox event.
     #[instrument(skip(self), fields(?actor, ?message_id, emoji))]
     pub async fn toggle_reaction(
         &self,
@@ -43,74 +46,52 @@ impl ImService {
         message_id: MessageId,
         emoji: &str,
     ) -> Result<ReactionOp> {
-        let msg = self
-            .messages
-            .get(message_id)
-            .await?
-            .ok_or_else(|| Error::NotFound(format!("message {message_id}")))?;
-        if !self.rooms.is_member(msg.room_id, actor).await? {
-            return Err(Error::Forbidden("not a room member".into()));
+        let traceparent = aero_common::telemetry::current_traceparent();
+        let toggled = self
+            .reactions
+            .toggle_authorized_outboxed(message_id, actor, emoji, traceparent.as_deref())
+            .await?;
+        if let Err(error) = self.dispatch_event_outbox_id(toggled.outbox_id).await {
+            warn!(
+                ?error,
+                outbox_id = %toggled.outbox_id,
+                message_id = %message_id,
+                "fast reaction-event outbox dispatch failed"
+            );
         }
-        if emoji.is_empty() || emoji.len() > 32 {
-            return Err(Error::Invalid("emoji length".into()));
-        }
-        // Reaction spam limit (ROADMAP12 migration 0118): the per-user distinct-emoji
-        // cap is enforced ATOMICALLY inside `toggle_capped` (advisory-locked on
-        // (message, participant)), so two concurrent new-emoji Adds can't both pass a
-        // check-then-insert race. A Remove is always allowed; `None` cap = unlimited.
-        // Best-effort cap lookup: a missing room row / lookup error → no cap.
-        let cap = self
-            .rooms
-            .get_max_reactions_per_user(msg.room_id)
-            .await
-            .ok()
-            .flatten()
-            .map(i64::from);
-        let op = match self.reactions.toggle_capped(message_id, actor, emoji, cap).await? {
-            Some(op) => op,
-            None => {
-                return Err(Error::Invalid(format!(
-                    "reaction limit: max {} reactions per message",
-                    cap.unwrap_or(0)
-                )));
-            }
-        };
-        self.publish_room_event(
-            msg.room_id,
-            &RoomEvent::Reaction {
-                room_id: msg.room_id,
-                message_id,
-                participant: actor,
-                emoji: emoji.to_owned(),
-                op,
-            },
-        )
-        .await;
+
         // Reaction notification: a freshly-ADDED reaction to someone else's message
         // drops a durable inbox entry for the author (never self-notify on your own
         // reaction). Best-effort + gated like every other notification (mute / DND /
         // snooze via `should_notify`); only when a NotificationRepo is wired.
-        if op == ReactionOp::Add && actor != msg.sender_id {
+        if toggled.op == ReactionOp::Add && actor != toggled.message_sender {
             if let Some(repo) = self.notifications.as_ref() {
-                if self.should_notify(msg.sender_id, msg.room_id).await {
+                if self
+                    .should_notify(toggled.message_sender, toggled.room_id)
+                    .await
+                {
                     if let Err(err) = repo
                         .insert(
-                            msg.sender_id,
-                            msg.room_id,
+                            toggled.message_sender,
+                            toggled.room_id,
                             message_id,
                             NotificationKind::Reaction,
                             Some(actor),
                         )
                         .await
                     {
-                        warn!(?err, recipient = ?msg.sender_id, "persist reaction notification failed");
+                        warn!(
+                            ?err,
+                            recipient = ?toggled.message_sender,
+                            "persist reaction notification failed"
+                        );
                     } else {
                         self.publish_room_event(
-                            msg.room_id,
+                            toggled.room_id,
                             &RoomEvent::Notify {
-                                room_id: msg.room_id,
+                                room_id: toggled.room_id,
                                 message_id,
-                                mentioned: msg.sender_id,
+                                mentioned: toggled.message_sender,
                                 by: actor,
                                 kind: NotificationKind::Reaction,
                             },
@@ -120,6 +101,6 @@ impl ImService {
                 }
             }
         }
-        Ok(op)
+        Ok(toggled.op)
     }
 }

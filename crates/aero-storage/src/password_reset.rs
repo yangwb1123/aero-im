@@ -85,6 +85,48 @@ impl PasswordResetRepo {
         .await?;
         Ok(row.map(|(uid,)| ParticipantId::from_uuid(uid)))
     }
+
+    /// Resolve the owner of a currently usable token without consuming it.
+    ///
+    /// The reset handler uses this read to perform the expensive Argon2 history
+    /// checks before entering the final atomic credential-rotation transaction.
+    /// The transaction rechecks and locks the token, so this is not treated as an
+    /// authorization decision on its own.
+    pub async fn valid_owner(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<ParticipantId>, sqlx::Error> {
+        let row: Option<(uuid::Uuid,)> = sqlx::query_as(
+            r"SELECT participant_id
+                FROM password_reset_tokens
+               WHERE token_hash = $1
+                 AND used_at IS NULL
+                 AND expires_at > now()",
+        )
+        .bind(token_hash)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(uid,)| ParticipantId::from_uuid(uid)))
+    }
+
+    /// Delete expired or consumed token history older than `cutoff`.
+    ///
+    /// Rows that may still authorize a reset (`used_at IS NULL` and
+    /// `expires_at >= cutoff`) are never removed by this sweep.
+    pub async fn sweep_terminal_before(
+        &self,
+        cutoff: time::OffsetDateTime,
+    ) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query(
+            r"DELETE FROM password_reset_tokens
+                WHERE expires_at < $1
+                   OR (used_at IS NOT NULL AND used_at < $1)",
+        )
+        .bind(cutoff)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
 }
 
 /// Generate a cryptographically random 32-byte reset token as a hex string.
@@ -93,8 +135,8 @@ impl PasswordResetRepo {
 /// token"). It must be hashed with [`hash_reset_token`] before storage.
 #[must_use]
 pub fn generate_token() -> String {
-    use std::fmt::Write as _;
     use rand::RngCore as _;
+    use std::fmt::Write as _;
     let mut buf = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut buf);
     let mut s = String::with_capacity(buf.len() * 2);
@@ -148,5 +190,69 @@ mod tests {
     #[test]
     fn hash_reset_token_differs_for_different_inputs() {
         assert_ne!(hash_reset_token("a"), hash_reset_token("b"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL with migrations applied"]
+    async fn retention_sweeps_only_old_terminal_tokens() {
+        let Ok(url) = std::env::var("DATABASE_URL") else {
+            return;
+        };
+        let pool = sqlx::PgPool::connect(&url).await.unwrap();
+        let participant = ParticipantId::new();
+        sqlx::query("INSERT INTO participants (id, kind, display_name) VALUES ($1, 'human', $2)")
+            .bind(participant.to_uuid())
+            .bind(format!("password-reset-retention-{participant}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let repo = PasswordResetRepo::new(pool.clone());
+        let now = time::OffsetDateTime::now_utc();
+        let cutoff = now - time::Duration::days(7);
+        for (hash, expires_at, used_at) in [
+            (
+                format!("expired-old-{participant}"),
+                now - time::Duration::days(30),
+                None,
+            ),
+            (
+                format!("used-old-{participant}"),
+                now + time::Duration::hours(1),
+                Some(now - time::Duration::days(30)),
+            ),
+            (
+                format!("expired-recent-{participant}"),
+                now - time::Duration::hours(1),
+                None,
+            ),
+            (
+                format!("active-{participant}"),
+                now + time::Duration::hours(1),
+                None,
+            ),
+        ] {
+            sqlx::query(
+                r"INSERT INTO password_reset_tokens
+                      (token_hash, participant_id, expires_at, used_at)
+                   VALUES ($1, $2, $3, $4)",
+            )
+            .bind(hash)
+            .bind(participant.to_uuid())
+            .bind(expires_at)
+            .bind(used_at)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(repo.sweep_terminal_before(cutoff).await.unwrap(), 2);
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM password_reset_tokens WHERE participant_id = $1",
+        )
+        .bind(participant.to_uuid())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(remaining, 2);
     }
 }

@@ -7,14 +7,11 @@
 //!
 //! ## Authorization
 //!
-//! Reading the chart (manager / reports / chain) is open to any authenticated
-//! participant — an org chart is normally visible org-wide. **Mutating** a
-//! reporting line is gated by the pure, DB-free [`authorize_manage`]: a
-//! participant may always set/clear their OWN line, and an Owner/Admin of the
-//! default workspace may set/clear anyone's. Self-as-own-manager is rejected
-//! `400`. The guard is unit-tested offline (Postgres is absent in CI); the async
-//! [`assert_can_manage`] resolves the caller's default-workspace role from the
-//! shared [`WorkspaceRepo`](aero_storage::WorkspaceRepo) before applying it.
+//! Reading is visible only to effective members of the explicitly selected
+//! workspace, and every target/manager must be an effective member of that same
+//! workspace. **Mutating** a reporting line is gated by [`authorize_manage`]: a
+//! participant may set/clear their own line, while an Owner/Admin may manage
+//! another member. Storage repeats those checks transactionally.
 //! Mounted via [`routes`] and `.merge`d into the main router.
 
 use std::str::FromStr;
@@ -23,7 +20,7 @@ use aero_auth::AuthUser;
 use aero_common::{
     Error as AeroError, ParticipantId, Result as AeroResult, WorkspaceId, WorkspaceRole,
 };
-use aero_storage::{OrgChartRepo, DEFAULT_CHAIN_DEPTH};
+use aero_storage::{OrgChartRepo, OrgChartWriteError, DEFAULT_CHAIN_DEPTH};
 use axum::{
     extract::{Path, State},
     routing::{get, put},
@@ -38,17 +35,18 @@ use crate::state::AppState;
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route(
-            "/api/participants/:id/manager",
+            "/api/workspaces/:wid/participants/:id/manager",
             put(set_manager).delete(clear_manager).get(get_manager),
         )
-        .route("/api/participants/:id/reports", get(list_reports))
-        .route("/api/participants/:id/chain", get(get_chain))
+        .route(
+            "/api/workspaces/:wid/participants/:id/reports",
+            get(list_reports),
+        )
+        .route(
+            "/api/workspaces/:wid/participants/:id/chain",
+            get(get_chain),
+        )
 }
-
-/// The legacy / default workspace (all-zero UUID), whose Owner/Admin set may
-/// administer the org chart for everyone. Mirrors `crate::routes`'
-/// `DEFAULT_WORKSPACE_ID`.
-const DEFAULT_WORKSPACE_ID: WorkspaceId = WorkspaceId(ulid::Ulid(0));
 
 /// Build an [`OrgChartRepo`] from shared state, over the shared pool.
 fn repo(s: &AppState) -> OrgChartRepo {
@@ -56,17 +54,43 @@ fn repo(s: &AppState) -> OrgChartRepo {
 }
 
 fn parse_participant(s: &str) -> Result<ParticipantId, AeroError> {
-    ParticipantId::from_str(s.trim()).map_err(|e| AeroError::Invalid(format!("participant id: {e}")))
+    ParticipantId::from_str(s.trim())
+        .map_err(|e| AeroError::Invalid(format!("participant id: {e}")))
+}
+
+fn parse_workspace(s: &str) -> Result<WorkspaceId, AeroError> {
+    WorkspaceId::from_str(s.trim()).map_err(|e| AeroError::Invalid(format!("workspace id: {e}")))
+}
+
+fn map_org_write_error(error: OrgChartWriteError) -> AeroError {
+    match error {
+        OrgChartWriteError::Database(error) => AeroError::from(error),
+        OrgChartWriteError::ActorNotMember | OrgChartWriteError::Forbidden => {
+            AeroError::Forbidden("not allowed to manage this reporting line".into())
+        }
+        OrgChartWriteError::TargetNotMember => {
+            AeroError::NotFound("participant in workspace".into())
+        }
+        OrgChartWriteError::ManagerNotMember => {
+            AeroError::Invalid("manager is not an active workspace member".into())
+        }
+        OrgChartWriteError::SelfManager => {
+            AeroError::Invalid("a participant cannot be their own manager".into())
+        }
+        OrgChartWriteError::Cycle => {
+            AeroError::Conflict("reporting line would create a cycle".into())
+        }
+    }
 }
 
 /// May `caller` set or clear `target`'s reporting line? A participant may always
 /// manage their OWN line (`caller == target`); otherwise the caller must be an
-/// administrator (Owner/Admin) of the default workspace. Pure + DB-free so the
+/// administrator (Owner/Admin) of the selected workspace. Pure + DB-free so the
 /// authorization matrix is unit-tested offline.
 ///
 /// # Errors
 /// [`AeroError::Forbidden`] when `caller != target` and the caller is not a
-/// default-workspace administrator.
+/// workspace administrator.
 pub fn authorize_manage(
     caller: ParticipantId,
     target: ParticipantId,
@@ -83,24 +107,44 @@ pub fn authorize_manage(
     }
 }
 
-/// Resolve the caller's default-workspace role and assert they may manage
-/// `target`'s reporting line. Self-management always passes; managing another's
-/// line requires Owner/Admin of the default workspace.
+async fn effective_role(
+    s: &AppState,
+    workspace: WorkspaceId,
+    participant: ParticipantId,
+) -> Result<Option<WorkspaceRole>, AeroError> {
+    s.workspaces
+        .effective_member_role(workspace, participant)
+        .await
+        .map_err(AeroError::from)
+}
+
+async fn assert_effective_member(
+    s: &AppState,
+    workspace: WorkspaceId,
+    participant: ParticipantId,
+    missing: AeroError,
+) -> Result<WorkspaceRole, AeroError> {
+    effective_role(s, workspace, participant)
+        .await?
+        .ok_or(missing)
+}
+
+/// Resolve the caller's selected-workspace role and assert they may manage
+/// `target`'s reporting line.
 async fn assert_can_manage(
     s: &AppState,
+    workspace: WorkspaceId,
     caller: ParticipantId,
     target: ParticipantId,
 ) -> Result<(), AeroError> {
-    // Fast path: self-management needs no role lookup.
-    if caller == target {
-        return Ok(());
-    }
-    let role = s
-        .workspaces
-        .member_role(DEFAULT_WORKSPACE_ID, caller)
-        .await
-        .map_err(AeroError::from)?;
-    authorize_manage(caller, target, role)
+    let role = assert_effective_member(
+        s,
+        workspace,
+        caller,
+        AeroError::Forbidden("not an active workspace member".into()),
+    )
+    .await?;
+    authorize_manage(caller, target, Some(role))
 }
 
 #[derive(Deserialize)]
@@ -109,91 +153,146 @@ struct SetManagerReq {
     manager_id: String,
 }
 
-/// `PUT /api/participants/:id/manager` — set (or re-point) `:id`'s manager.
+/// Set (or re-point) `:id`'s manager in the selected workspace.
 /// Gated by [`authorize_manage`]; a participant cannot be their own manager
 /// (`400`). Returns the new reporting line.
 async fn set_manager(
     State(s): State<AppState>,
     auth: AuthUser,
-    Path(id_str): Path<String>,
+    Path((ws_str, id_str)): Path<(String, String)>,
     Json(req): Json<SetManagerReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    let workspace = parse_workspace(&ws_str)?;
     let target = parse_participant(&id_str)?;
-    assert_can_manage(&s, auth.participant_id, target).await?;
+    assert_can_manage(&s, workspace, auth.participant_id, target).await?;
+    assert_effective_member(
+        &s,
+        workspace,
+        target,
+        AeroError::NotFound("participant in workspace".into()),
+    )
+    .await?;
     let manager = parse_participant(&req.manager_id)?;
-    if manager == target {
-        return Err(AeroError::Invalid("a participant cannot be their own manager".into()).into());
-    }
+    assert_effective_member(
+        &s,
+        workspace,
+        manager,
+        AeroError::Invalid("manager is not an active workspace member".into()),
+    )
+    .await?;
     repo(&s)
-        .set_manager(target, manager, auth.participant_id)
+        .set_manager(workspace, target, manager, auth.participant_id)
         .await
-        .map_err(AeroError::from)?;
+        .map_err(map_org_write_error)?;
     Ok(Json(serde_json::json!({
+        "workspace_id": workspace,
         "participant_id": target,
         "manager_id": manager,
     })))
 }
 
-/// `DELETE /api/participants/:id/manager` — clear `:id`'s reporting line. Gated by
-/// [`authorize_manage`]. `404` if `:id` had no manager (nothing to clear).
+/// Clear `:id`'s reporting line in the selected workspace. Gated by
+/// [`authorize_manage`]. Returns `404` if `:id` had no manager.
 async fn clear_manager(
     State(s): State<AppState>,
     auth: AuthUser,
-    Path(id_str): Path<String>,
+    Path((ws_str, id_str)): Path<(String, String)>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    let workspace = parse_workspace(&ws_str)?;
     let target = parse_participant(&id_str)?;
-    assert_can_manage(&s, auth.participant_id, target).await?;
+    assert_can_manage(&s, workspace, auth.participant_id, target).await?;
     let removed = repo(&s)
-        .clear_manager(target)
+        .clear_manager(workspace, target, auth.participant_id)
         .await
-        .map_err(AeroError::from)?;
+        .map_err(map_org_write_error)?;
     if !removed {
         return Err(AeroError::NotFound(format!("manager for participant {target}")).into());
     }
     Ok(Json(serde_json::json!({ "cleared": true })))
 }
 
-/// `GET /api/participants/:id/manager` — `:id`'s manager, or `null` if they have
-/// no reporting line. Readable by any authenticated participant.
+/// Return `:id`'s manager in the selected workspace, or `null` if absent.
 async fn get_manager(
     State(s): State<AppState>,
-    _auth: AuthUser,
-    Path(id_str): Path<String>,
+    auth: AuthUser,
+    Path((ws_str, id_str)): Path<(String, String)>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    let workspace = parse_workspace(&ws_str)?;
     let target = parse_participant(&id_str)?;
+    assert_effective_member(
+        &s,
+        workspace,
+        auth.participant_id,
+        AeroError::Forbidden("not an active workspace member".into()),
+    )
+    .await?;
+    assert_effective_member(
+        &s,
+        workspace,
+        target,
+        AeroError::NotFound("participant in workspace".into()),
+    )
+    .await?;
     let manager = repo(&s)
-        .manager_of(target)
+        .manager_of(workspace, target)
         .await
         .map_err(AeroError::from)?;
     Ok(Json(serde_json::json!({ "manager_id": manager })))
 }
 
-/// `GET /api/participants/:id/reports` — `:id`'s direct reports. Readable by any
-/// authenticated participant.
+/// Return `:id`'s direct reports in the selected workspace.
 async fn list_reports(
     State(s): State<AppState>,
-    _auth: AuthUser,
-    Path(id_str): Path<String>,
+    auth: AuthUser,
+    Path((ws_str, id_str)): Path<(String, String)>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    let workspace = parse_workspace(&ws_str)?;
     let target = parse_participant(&id_str)?;
+    assert_effective_member(
+        &s,
+        workspace,
+        auth.participant_id,
+        AeroError::Forbidden("not an active workspace member".into()),
+    )
+    .await?;
+    assert_effective_member(
+        &s,
+        workspace,
+        target,
+        AeroError::NotFound("participant in workspace".into()),
+    )
+    .await?;
     let reports = repo(&s)
-        .direct_reports(target)
+        .direct_reports(workspace, target)
         .await
         .map_err(AeroError::from)?;
     Ok(Json(serde_json::json!({ "reports": reports })))
 }
 
-/// `GET /api/participants/:id/chain` — `:id`'s reporting chain walked upward to
-/// the top (nearest manager first, excluding `:id`). Bounded depth with cycle
-/// detection. Readable by any authenticated participant.
+/// Return `:id`'s tenant-local reporting chain, nearest manager first.
 async fn get_chain(
     State(s): State<AppState>,
-    _auth: AuthUser,
-    Path(id_str): Path<String>,
+    auth: AuthUser,
+    Path((ws_str, id_str)): Path<(String, String)>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    let workspace = parse_workspace(&ws_str)?;
     let target = parse_participant(&id_str)?;
+    assert_effective_member(
+        &s,
+        workspace,
+        auth.participant_id,
+        AeroError::Forbidden("not an active workspace member".into()),
+    )
+    .await?;
+    assert_effective_member(
+        &s,
+        workspace,
+        target,
+        AeroError::NotFound("participant in workspace".into()),
+    )
+    .await?;
     let chain = repo(&s)
-        .reporting_chain(target, DEFAULT_CHAIN_DEPTH)
+        .reporting_chain(workspace, target, DEFAULT_CHAIN_DEPTH)
         .await
         .map_err(AeroError::from)?;
     Ok(Json(serde_json::json!({ "chain": chain })))
@@ -224,14 +323,18 @@ mod tests {
     }
 
     #[test]
-    fn managing_another_requires_default_ws_admin() {
+    fn managing_another_requires_selected_workspace_admin() {
         let caller = ParticipantId::new();
         let other = ParticipantId::new();
         // Admin and Owner may set someone else's manager.
         assert!(authorize_manage(caller, other, Some(WorkspaceRole::Owner)).is_ok());
         assert!(authorize_manage(caller, other, Some(WorkspaceRole::Admin)).is_ok());
         // Member, Guest, and non-members may not — and the denial is a 403.
-        for role in [Some(WorkspaceRole::Member), Some(WorkspaceRole::Guest), None] {
+        for role in [
+            Some(WorkspaceRole::Member),
+            Some(WorkspaceRole::Guest),
+            None,
+        ] {
             let r = authorize_manage(caller, other, role);
             assert!(r.is_err(), "role {role:?} must not manage another's line");
             assert_eq!(status_of(&r), 403, "denial is 403 for role {role:?}");

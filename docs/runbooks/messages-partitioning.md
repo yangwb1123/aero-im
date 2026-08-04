@@ -179,27 +179,30 @@ CREATE INDEX … ON messages_partitioned USING hnsw (embedding vector_cosine_ops
 ### Step C — Cutover (the short exclusive window)
 
 > **▶ USE THE VERIFIED SCRIPT: [`docs/runbooks/messages-cutover.sql`](./messages-cutover.sql).**
-> That file is the exact, end-to-end **verified** cutover (parity gate + the 8 FK
-> rewrites + index rebuild + table swap + rollback section). It is a **docs
+> That file is the exact, end-to-end verified cutover procedure (parity gate +
+> the 8 FK rewrites + index rebuild + table swap + rollback section). Its
+> current revision was most recently rehearsed against the chain through
+> `0176_rolling_upgrade_fences.sql` on 2026-07-28; evidence is recorded in
+> **§5d**. It is a **docs
 > artifact — NOT a migration**: never put it in `migrations/`, never let the
 > deploy chain run it. Execute it BY HAND, by a DBA, in the approved window, with
 > writes gated and a tested backup. Run it with `-v ON_ERROR_STOP=1` so any error
 > aborts the single transaction and leaves the live `messages` untouched. The
-> verification of that exact script is recorded in **§5a** below.
+> verification of that exact script and its rollback is recorded in **§5d** below.
 
 The script's shape (read the file for the fully-commented form):
 ```sql
 BEGIN;
 LOCK TABLE messages IN ACCESS EXCLUSIVE MODE;
--- 1. Final catch-up loop (backfill_messages_partition until 0) + a FULL-COLUMN
---    final sync that ALSO copies mls_group_id/mls_epoch/mls_payload — the shipped
---    backfill function OMITS those 3 MLS columns (see ⚠️ below) — then a hard
---    row-parity gate that RAISEs and aborts if messages ≠ messages_partitioned.
+-- 1. Final catch-up loop (backfill_messages_partition until 0) + a full
+--    mutable-column sync including MLS, version, and delivery_ordinal, then hard row
+--    parity + ordinal-equality gates that RAISE and abort on drift.
 -- 2a. Rename the old table's indexes aside (`__old` suffix): index names are
 --     SCHEMA-GLOBAL, so the canonical names must be freed before 2b.
--- 2b. Build all 11 messages indexes on the shadow parent (GIN search_tsv,
+-- 2b. Build/rename all 12 messages indexes on the shadow parent (GIN search_tsv,
 --     searchable_text trgm, blocks GIN, HNSW embedding, room_created, room_mutated,
---     room_active_id, reply_to, mls_group, expires_at, sender_id_active).
+--     room_active_id, room_delivery_ordinal, reply_to, mls_group, expires_at,
+--     sender_id_active).
 -- 3. Re-add the outbound FKs (room_id→rooms, sender_id→participants).
 -- 4. Self-ref reply_to: add reply_to_created_at, backfill, composite self-FK to (id,created_at).
 -- 5. Repoint the 7 inbound child FKs — each: DROP old (message_id) FK, ADD
@@ -208,22 +211,29 @@ LOCK TABLE messages IN ACCESS EXCLUSIVE MODE;
 --    ON DELETE CASCADE  (reactions, notifications, pins, bookmarks,
 --    message_receipts, block_interactions, notification_bundles).
 -- 6. ALTER TABLE messages RENAME TO messages_old; messages_partitioned RENAME TO messages;
+-- 7. Add permanent BEFORE triggers that resolve child msg_created_at and
+--    reply_to_created_at from the canonical parent for deployed writers.
+-- 8. Replace ensure_messages_partitions() with a relation-aware implementation
+--    that maintains canonical messages after the swap and the parked parent
+--    after a rollback.
 COMMIT;
 ```
 
 **FK strategy = composite FK (option A).** Each child gains a redundant
 `msg_created_at` column so its FK can reference the full composite PK
 `(id, created_at)`; this **preserves the DB-enforced `ON DELETE CASCADE`** every
-child relies on (no triggers, no app change). The trade-off vs. option B
-(trigger-enforced, no real FK) is spelled out in the script header. The self-ref
-uses a `reply_to_created_at` column for the same reason.
+child relies on. A permanent fill trigger keeps the stable application write
+contract (`message_id` only) compatible; the trigger supplies only the redundant
+key half and the real composite FK remains the integrity authority. The self-ref
+uses `reply_to_created_at` plus the same fill pattern and `MATCH FULL`, so a
+caller cannot bypass it by nulling only the redundant key half.
 
-> ⚠️ **MLS-column gap (important).** The shipped `backfill_messages_partition`
-> function (migration `0148`) lists only 12 columns and **omits `mls_group_id`,
-> `mls_epoch`, `mls_payload`**. The pre-window backfill loop therefore does NOT
-> carry MLS payloads. The cutover script's in-window **full-column** final sync
-> (Step 1) copies all 15 non-generated columns including MLS, so no encrypted
-> payload is lost — but do NOT rely on the backfill loop alone for MLS rows.
+> **Schema mirror invariant.** Migration `0174` reissues
+> `backfill_messages_partition` with every current non-generated message column,
+> including MLS, `version`, and `delivery_ordinal`, and mirrors the ordinal
+> constraint/index/trigger onto `messages_partitioned`. `LIKE` remains a one-time
+> snapshot: every future column added to live `messages` must update the shadow,
+> backfill projection, final sync, and §5 verification in the same change.
 
 > ⚠️ **Older-than-(this month − 1) history needs partitions pre-created.**
 > `ensure_messages_partitions(ahead)` only creates `[this month − 1 .. + ahead]`.
@@ -294,7 +304,7 @@ After cutover, before dropping `messages_old`:
 - **Row parity**: `SELECT count(*) FROM messages;` equals the pre-cutover count
   of `messages_old` (account for rows written during the final catch-up).
 - **Partition routing**: spot-check that recent rows landed in the right monthly
-  partition and none unexpectedly fell into `messages_part_default`.
+  partition and none unexpectedly fell into `messages_partitioned_default`.
 - **FK integrity**: for each child table, every `message_id` still resolves —
   `SELECT count(*) FROM child c LEFT JOIN messages m ON m.id=c.message_id WHERE
   m.id IS NULL;` must be 0. Confirm the FKs exist and are `VALIDATED`
@@ -303,7 +313,7 @@ After cutover, before dropping `messages_old`:
   indexes on the parent; run a representative semantic-search and a room-history
   query and check `EXPLAIN` prunes partitions and uses the indexes.
 - **App smoke**: post a message, react, pin, bookmark, mark-read, get a
-  notification — every FK-CASCADE path — then soft-delete and confirm cascade.
+  notification — every FK-CASCADE path — then hard-delete and confirm cascade.
 
 ---
 
@@ -365,10 +375,10 @@ it) and `messages-cutover.sql`'s final-sync (now reconciles `version` alongside
 the existing MLS columns).
 
 Re-ran the full §5a procedure on a fresh throwaway DB (`pgvector/pgvector:pg17`,
-isolated container, **not** the shared `aero` DB) against the current 158-migration
-chain, with one addition: message A was seeded at `version = 5` (simulating 4
+isolated container, **not** the shared `aero` DB) against the then-current full
+migration chain, with one addition: message A was seeded at `version = 5` (simulating 4
 prior edits) instead of the column default, specifically to exercise the fix.
-Procedure: replay all 158 migrations → seed 4 messages (A at version 5, spanning
+Procedure: replay the complete chain → seed 4 messages (A at version 5, spanning
 3 months) + 1 reply + one row in each of the 7 child tables → `ensure_messages_partitions(12)`
 → `backfill_messages_partition` to `rows_copied = 0` → run the updated
 `messages-cutover.sql` → verify. Results:
@@ -389,10 +399,100 @@ Procedure: replay all 158 migrations → seed 4 messages (A at version 5, spanni
   dropped to 0).
 
 The throwaway database was dropped after verification; the shared `aero` DB and
-the `migrations/` chain were never touched. **The cutover script is now verified
-current** against the schema as of migration 0158 — a future column addition to
+the `migrations/` chain were never touched. **The cutover script's version-column
+handling was verified** against the schema as of migration 0158 — a future column addition to
 `messages` will reintroduce the same class of gap unless this runbook and
 `messages-cutover.sql`'s final-sync column list are updated alongside it.
+
+## 5c. Re-verification for `delivery_ordinal` (throwaway DB, 2026-07-28)
+
+Migration `0174` adds a transactional per-room `delivery_ordinal`. Because
+`messages_partitioned` was snapshotted by migration 0148, 0174 explicitly:
+
+- adds/backfills the shadow column and applies its NOT NULL/positive invariant;
+- reissues `backfill_messages_partition` with MLS, version, and ordinal;
+- builds the partition-compatible unique index
+  `(room_id, delivery_ordinal, created_at)`;
+- attaches the NULL-only ordinal-allocation trigger to both live and shadow
+  parents, so explicit backfill ordinals are preserved while post-cutover
+  application inserts still allocate from `room_delivery_sequences`;
+- updates the final sync and parity gate in `messages-cutover.sql`.
+
+The full isolated rehearsal was repeated against the then-current complete chain
+embedded in a freshly rebuilt `aero-cli`. A separate 0173→0174 upgrade
+fixture seeded an unsafe legacy MAX-ULID cursor, pre-existing shadow rows, three
+message outbox rows, and a soft-deleted message; 0174 was then executed
+repeatedly. The full-chain fixture seeded MLS/version values plus an intentionally
+wrong pre-existing shadow ordinal before running the current cutover script.
+Results:
+
+- **Conservative upgrade:** the legacy cursor retained its diagnostic
+  `last_seq = 99` but migrated to `last_delivery_ordinal = 0`; the unsafe old
+  message id was never certified as a contiguous prefix.
+- **Idempotency:** re-executing the original 0174 SQL after assignment reported
+  zero message/shadow/cursor updates; live ordinals remained exactly `1,2,3`,
+  and each named constraint/index remained singular.
+- **Shadow fidelity:** the reissued batch backfill preserved
+  `delivery_ordinal = 2`, `version = 6`, `mls_epoch = 8`, and MLS payload
+  `cafe`. Final sync corrected the deliberately stale shadow ordinal `99` to
+  live ordinal `1`.
+- **Cutover parity:** the full-chain rehearsal committed with new/old row counts
+  `3 = 3`, zero ordinal mismatches, zero invalid or duplicate room ordinals,
+  and zero `room_delivery_sequences` coverage gaps.
+- **Post-cutover allocation:** exactly one enabled
+  `messages_assign_delivery_ordinal` parent trigger remained; an application
+  insert omitting the column received the next room ordinal `4`.
+- **Replay safety/performance:** the deleted-secret fixture produced zero
+  visible replay rows; all three delivery-cursor PG tests and both outbox
+  ordering/retry PG tests passed. With sequential scans disabled, `EXPLAIN`
+  selected each partition's `(room_id, delivery_ordinal, created_at)` index for
+  the ordinal replay query.
+
+Both purpose-built databases were dropped after verification; no shared
+development or final-validation database was used.
+
+## 5d. Re-verification of write compatibility and exact rollback (throwaway DB, 2026-07-28)
+
+The current chain through `0176_rolling_upgrade_fences.sql` was replayed on a
+fresh PostgreSQL 17 + pgvector database with a freshly rebuilt `aero-cli`.
+The fixture covered a cross-partition reply, every inbound child relation, a
+workspace-scoped blob, delivery ordinals, and rows later inserted, edited, and
+hard-deleted during the post-cutover soak. The exact current
+`messages-cutover.sql` and its exact companion
+`messages-cutover-rollback.sql` were then executed without hand edits.
+
+Results:
+
+- **Stable child write contract:** post-cutover inserts into reactions,
+  notifications, pins, bookmarks, message receipts, block interactions, and
+  notification bundles all omitted `msg_created_at`; the permanent triggers
+  resolved the real parent key and all composite FKs validated.
+- **Self-reference cannot be weakened:** the self-FK reported `MATCH FULL`.
+  Directly setting `reply_to_created_at = NULL` was repaired to the target's
+  timestamp, and deleting a still-referenced target failed with SQLSTATE
+  `23503`.
+- **Partition maintenance follows the relation:** calls before and after the
+  swap both increased the appropriate partitioned parent's child count. After
+  an exact rollback, the same function maintained the parked
+  `messages_partitioned` parent rather than the restored heap.
+- **Blob tenancy survives the rename:** the `0176` blob-scope trigger remained
+  attached to the promoted parent and rejected a cross-workspace attachment
+  with SQLSTATE `23514`.
+- **Rollback replays the soak:** messages inserted after cutover were present in
+  the restored heap, an edit remained visible, and a hard-deleted row remained
+  absent. The rollback parity gate found no differing application-visible row.
+- **Original catalog shape restored:** all seven child relations returned to
+  their message-id-only FK and no longer exposed `msg_created_at`; together with
+  the heap self-reference, all eight inbound FKs were validated. Every canonical
+  message index and the PK belonged to the restored heap, while the failed
+  partitioned copy retained only its parked names.
+- **Post-rollback application probes:** message, reply, and all seven child
+  writes succeeded without redundant columns; delivery ordinals continued
+  monotonically, hard-delete cascade removed every child, and the blob
+  workspace boundary remained enforced.
+
+The throwaway database was force-dropped after verification. No shared
+development or final-validation database was used.
 
 ---
 
@@ -403,11 +503,11 @@ current** against the schema as of migration 0158 — a future column addition t
 - **At/after cutover (Step C):** the cutover is one transaction — if it fails it
   `ROLLBACK`s and the original `messages` is intact (it was only `RENAME`d at the
   very end inside the txn). If a problem surfaces *after* `COMMIT` but before
-  `DROP TABLE messages_old`, reverse the renames inside a new locking txn
-  (`messages` → `messages_partitioned`, `messages_old` → `messages`) and recreate the
-  original `(id)` FKs; writes since cutover live in `messages_partitioned` (now renamed
-  back) and must be replayed into `messages_old` — script this replay as part of
-  window prep, do not improvise it.
+  `DROP TABLE messages_old`, keep writes gated and execute the verified companion
+  [`messages-cutover-rollback.sql`](./messages-cutover-rollback.sql). It replays
+  post-cutover inserts/updates/hard-deletes, restores all seven original child
+  FKs and every canonical index/PK name, reverses the table swap, and runs
+  catalog gates in one transaction.
 - **Ultimate fallback:** restore the pre-window backup. This loses any writes
   since the backup, so it is the last resort and is why writes are paused at
   cutover and the soak period precedes `DROP messages_old`.
@@ -419,7 +519,7 @@ current** against the schema as of migration 0158 — a future column addition t
 - **Doubled disk** during migration (shadow copy). Verify headroom first.
 - **Long HNSW/FTS index builds** dominate the window; size `maintenance_work_mem`
   and the window accordingly.
-- **FK rewrite touches 7 relationships across 6 tables** — any missed child FK
+- **FK rewrite touches 7 relationships across 7 tables** — any missed child FK
   silently loses referential integrity; the §5 LEFT JOIN check is mandatory.
 - **Partition explosion** if daily partitions are chosen for multi-year history —
   use monthly + retention.

@@ -24,8 +24,8 @@ use axum::{
     routing::{get, put},
     Json, Router,
 };
-use time::OffsetDateTime;
 use serde::Deserialize;
+use time::OffsetDateTime;
 
 use crate::error::ApiResult;
 use crate::state::AppState;
@@ -34,8 +34,14 @@ use crate::state::AppState;
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/me/profile", put(put_my_profile).get(get_my_profile))
-        .route("/api/me/profile/status", axum::routing::patch(patch_profile_status))
-        .route("/api/participants/:id/profile", get(get_participant_profile))
+        .route(
+            "/api/me/profile/status",
+            axum::routing::patch(patch_profile_status),
+        )
+        .route(
+            "/api/participants/:id/profile",
+            get(get_participant_profile),
+        )
 }
 
 /// Maximum length (in characters) of any single profile field.
@@ -162,7 +168,9 @@ async fn get_participant_profile(
         .await
         .map_err(AeroError::from)?
         .ok_or_else(|| AeroError::NotFound(format!("profile for {target}")))?;
-    Ok(Json(serde_json::to_value(profile).map_err(AeroError::from)?))
+    Ok(Json(
+        serde_json::to_value(profile).map_err(AeroError::from)?,
+    ))
 }
 
 /// Maximum lifetime (in minutes) for a profile-level status expiry.
@@ -217,7 +225,10 @@ async fn patch_profile_status(
         .map_err(AeroError::from)?;
 
     // Re-read the full profile row so the response is canonical (includes updated_at).
-    let row = repo(&s).get(auth.participant_id).await.map_err(AeroError::from)?;
+    let row = repo(&s)
+        .get(auth.participant_id)
+        .await
+        .map_err(AeroError::from)?;
     match row {
         Some(p) => Ok(Json(serde_json::to_value(p).map_err(AeroError::from)?)),
         None => Ok(Json(serde_json::json!({

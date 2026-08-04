@@ -2,23 +2,22 @@
 //!
 //! Opening a DM with another participant is idempotent find-or-create: the first
 //! request between two people creates a two-member `direct`-kind room; every later
-//! request resolves to that same room. Lookup is owned by
-//! [`DmRepo`](aero_storage::DmRepo); room *creation* reuses the existing
-//! [`RoomRepo`](aero_storage::RoomRepo) (`create_in_workspace` enrolls the caller
-//! as owner, then the target is added as the second member), so the create SQL is
-//! not duplicated here.
+//! request resolves to that same room. [`DmRepo`](aero_storage::DmRepo) owns the
+//! transaction: an exact-conversation advisory lock serializes concurrent opens,
+//! then one transaction rechecks the room and, when absent, inserts the room plus
+//! both memberships atomically.
 //!
 //! DMs are not a per-tenant concept here, so they are created in the legacy
 //! all-zero default workspace (mirroring `crate::routes`'s `DEFAULT_WORKSPACE_ID`).
-//! Listing is owner-scoped — it filters the caller's own room list down to the
-//! `direct` rooms — so a caller can only ever see their own DMs. Mounted via
-//! [`routes`] and `.merge`d into the main router.
+//! Every participant supplied to open and every listing caller must have effective
+//! access to that workspace (active account + membership + no deactivation +
+//! mandatory 2FA). Mounted via [`routes`] and `.merge`d into the main router.
 
 use std::str::FromStr;
 
 use aero_auth::AuthUser;
-use aero_common::{Error as AeroError, ParticipantId, Room, RoomId, RoomKind, WorkspaceId};
-use aero_storage::DmRepo;
+use aero_common::{Error as AeroError, ParticipantId, Room, RoomKind, WorkspaceId};
+use aero_storage::{DmRepo, DmWriteError};
 use axum::{
     extract::{Path, State},
     routing::{get, post},
@@ -26,6 +25,9 @@ use axum::{
 };
 
 use crate::error::ApiResult;
+use crate::routes::helpers::{
+    assert_effective_workspace_member, assert_effective_workspace_members,
+};
 use crate::state::AppState;
 
 /// All direct-message routes, ready to `.merge` into the gateway router.
@@ -42,21 +44,8 @@ pub fn routes() -> Router<AppState> {
 const DEFAULT_WORKSPACE_ID: WorkspaceId = WorkspaceId(ulid::Ulid(0));
 
 fn parse_participant(s: &str) -> Result<ParticipantId, AeroError> {
-    ParticipantId::from_str(s.trim()).map_err(|e| AeroError::Invalid(format!("participant id: {e}")))
-}
-
-/// Resolve the full [`Room`] row for a room the caller belongs to, by scanning the
-/// caller's own room list — no new single-room query is needed. `find_direct` only
-/// ever returns a room the caller is a member of, so the lookup succeeds; a
-/// defensive `NotFound` covers the impossible miss.
-async fn caller_room(s: &AppState, caller: ParticipantId, room: RoomId) -> Result<Room, AeroError> {
-    s.rooms
-        .rooms_for(caller)
-        .await
-        .map_err(AeroError::from)?
-        .into_iter()
-        .find(|r| r.id == room)
-        .ok_or_else(|| AeroError::NotFound("direct room".into()))
+    ParticipantId::from_str(s.trim())
+        .map_err(|e| AeroError::Invalid(format!("participant id: {e}")))
 }
 
 /// `POST /api/dm/:participant_id` — open the 1:1 direct room with another
@@ -72,6 +61,12 @@ async fn open_dm(
     if target == auth.participant_id {
         return Err(AeroError::Invalid("cannot open a direct message with yourself".into()).into());
     }
+
+    // A DM is a default-workspace resource. Gate the caller before barrier
+    // lookup, find-existing, or room creation so a deleted/deactivated account
+    // (or one missing mandatory 2FA) cannot observe or mutate retained rows.
+    assert_effective_workspace_members(&s, DEFAULT_WORKSPACE_ID, &[auth.participant_id, target])
+        .await?;
 
     // Information barrier (ethical wall) enforcement: if the caller and target sit
     // across a barred pair of user-groups, they may not open a DM. The repo is
@@ -96,40 +91,33 @@ async fn open_dm(
         return Err(AeroError::Forbidden("blocked".into()).into());
     }
 
-    let dm = DmRepo::new(s.pg.clone());
-    if let Some(room_id) = dm
-        .find_direct(auth.participant_id, target)
+    let room = DmRepo::new(s.pg.clone())
+        .find_or_create_in_workspace(DEFAULT_WORKSPACE_ID, auth.participant_id, target)
         .await
-        .map_err(AeroError::from)?
-    {
-        // Existing 1:1 — return its full row (the caller is a member, so it is in
-        // their room list).
-        let room = caller_room(&s, auth.participant_id, room_id).await?;
-        return Ok(Json(serde_json::to_value(room).map_err(AeroError::from)?));
-    }
-
-    // First contact: create the direct room (the caller is enrolled as owner by
-    // `create_in_workspace`) and enroll the target as the second member, so the
-    // room has exactly two members and future lookups match.
-    let room = s
-        .rooms
-        .create_in_workspace(DEFAULT_WORKSPACE_ID, RoomKind::Direct, None, auth.participant_id)
-        .await
-        .map_err(AeroError::from)?;
-    s.rooms
-        .add_member(room.id, target)
-        .await
-        .map_err(AeroError::from)?;
+        .map_err(map_dm_write_error)?;
     Ok(Json(serde_json::to_value(room).map_err(AeroError::from)?))
 }
 
+fn map_dm_write_error(error: DmWriteError) -> AeroError {
+    match error {
+        DmWriteError::Forbidden => {
+            AeroError::Forbidden("direct-message member access was revoked".into())
+        }
+        DmWriteError::InformationBarrier => AeroError::Forbidden("information barrier".into()),
+        DmWriteError::Blocked => AeroError::Forbidden("blocked".into()),
+        DmWriteError::Storage(source) => AeroError::from(source),
+    }
+}
+
 /// `GET /api/dm` — the caller's direct rooms (1:1 and group DMs), newest first.
-/// Owner-scoped: filters the caller's own room list down to `direct`-kind rooms,
-/// so it can never surface a room the caller does not belong to.
+/// Effective-access scoped: deleted/deactivated callers and members missing
+/// mandatory 2FA are rejected before the listing query, which itself is limited
+/// to the default workspace and repeats those effective-access predicates.
 async fn list_dms(State(s): State<AppState>, auth: AuthUser) -> ApiResult<Json<serde_json::Value>> {
+    assert_effective_workspace_member(&s, DEFAULT_WORKSPACE_ID, auth.participant_id).await?;
     let rooms: Vec<Room> = s
         .rooms
-        .rooms_for(auth.participant_id)
+        .rooms_for_in_workspace(auth.participant_id, DEFAULT_WORKSPACE_ID)
         .await
         .map_err(AeroError::from)?
         .into_iter()

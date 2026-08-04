@@ -2,7 +2,7 @@
 //!
 //! Claims schema (Spec §6 / `AuthConfig`):
 //! ```json
-//! { "sub": "<ParticipantId ulid>", "iss": "aero-im", "iat": 0, "exp": 0, "kind": "access" | "refresh" }
+//! { "sub": "<ParticipantId ulid>", "iss": "aero-im", "iat": 0, "exp": 0, "kind": "access" | "refresh", "sid": "<SessionId>" }
 //! ```
 //!
 //! Keys are RSA PEM strings, loaded once at startup and held inside [`JwtCodec`].
@@ -12,7 +12,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use aero_common::{Error, ParticipantId, Result};
+use aero_common::{Error, ParticipantId, Result, SessionId};
 use jsonwebtoken::{
     decode, decode_header, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation,
 };
@@ -39,6 +39,11 @@ pub struct Claims {
     pub iat: u64,
     pub exp: u64,
     pub kind: TokenKind,
+    /// Stable login-session id shared by the access and refresh token in one
+    /// pair. Legacy tokens pre-dating session binding omit it and remain
+    /// decodable during the compatibility window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sid: Option<String>,
     /// Unique nonce (UUID v4). Populated by `JwtCodec::issue`; present in all
     /// tokens generated from this version onward. Old tokens without `jti`
     /// deserialize fine: serde defaults to an empty string, which is harmless.
@@ -51,6 +56,19 @@ impl Claims {
     pub fn participant_id(&self) -> Result<ParticipantId> {
         ParticipantId::from_str(&self.sub)
             .map_err(|e| Error::Unauthorized(format!("invalid sub claim: {e}")))
+    }
+
+    /// Parses the optional `sid` into a typed [`SessionId`]. A missing sid is a
+    /// supported legacy token; a present but malformed sid is never treated as
+    /// legacy and fails closed.
+    pub fn session_id(&self) -> Result<Option<SessionId>> {
+        self.sid
+            .as_deref()
+            .map(|sid| {
+                SessionId::from_str(sid)
+                    .map_err(|e| Error::Unauthorized(format!("invalid sid claim: {e}")))
+            })
+            .transpose()
     }
 }
 
@@ -88,7 +106,14 @@ impl JwtCodec {
         access_ttl: Duration,
         refresh_ttl: Duration,
     ) -> Result<Self> {
-        Self::from_pems::<&str>(private_pem, public_pem, &[], issuer, access_ttl, refresh_ttl)
+        Self::from_pems::<&str>(
+            private_pem,
+            public_pem,
+            &[],
+            issuer,
+            access_ttl,
+            refresh_ttl,
+        )
     }
 
     /// Like [`Self::from_pem`] but also registers extra verify-only public keys
@@ -111,8 +136,9 @@ impl JwtCodec {
         let encoding = EncodingKey::from_rsa_pem(private_pem.as_bytes())
             .map_err(|e| Error::Internal(anyhow::anyhow!("invalid RSA private key: {e}")))?;
         let decode_rsa = |pem: &str, label: &str| {
-            DecodingKey::from_rsa_pem(pem.as_bytes())
-                .map_err(|e| Error::Internal(anyhow::anyhow!("invalid {label} RSA public key: {e}")))
+            DecodingKey::from_rsa_pem(pem.as_bytes()).map_err(|e| {
+                Error::Internal(anyhow::anyhow!("invalid {label} RSA public key: {e}"))
+            })
         };
         let decoding = decode_rsa(public_pem, "active")?;
         let kid = key_id(public_pem);
@@ -156,6 +182,27 @@ impl JwtCodec {
     /// Each call generates a fresh `jti` (UUID v4) so tokens are globally unique
     /// even when issued for the same participant within the same second.
     pub fn issue(&self, participant: ParticipantId, kind: TokenKind) -> Result<String> {
+        self.issue_inner(participant, kind, None)
+    }
+
+    /// Issue a token bound to the stable login `session`. Calling this once for
+    /// access and once for refresh yields a pair with the same `sid` but distinct
+    /// per-token `jti` values.
+    pub fn issue_for_session(
+        &self,
+        participant: ParticipantId,
+        kind: TokenKind,
+        session: SessionId,
+    ) -> Result<String> {
+        self.issue_inner(participant, kind, Some(session))
+    }
+
+    fn issue_inner(
+        &self,
+        participant: ParticipantId,
+        kind: TokenKind,
+        session: Option<SessionId>,
+    ) -> Result<String> {
         let now = unix_now();
         let exp = now + self.ttl(kind).as_secs();
         let claims = Claims {
@@ -164,6 +211,7 @@ impl JwtCodec {
             iat: now,
             exp,
             kind,
+            sid: session.map(|id| id.to_string()),
             jti: uuid::Uuid::new_v4().to_string(),
         };
         let mut header = Header::new(Algorithm::RS256);
@@ -229,9 +277,7 @@ mod tests {
             .to_pkcs8_pem(rsa::pkcs8::LineEnding::LF)
             .unwrap()
             .to_string();
-        let public_pem = public
-            .to_pkcs1_pem(rsa::pkcs8::LineEnding::LF)
-            .unwrap();
+        let public_pem = public.to_pkcs1_pem(rsa::pkcs8::LineEnding::LF).unwrap();
         (private_pem, public_pem)
     }
 
@@ -276,7 +322,11 @@ mod tests {
         let codec_a = JwtCodec::from_pem(&priv_a, &pub_a, "aero-im", acc, refr).unwrap();
         let token_a = codec_a.issue(pid, TokenKind::Access).unwrap();
         let header = jsonwebtoken::decode_header(&token_a).unwrap();
-        assert_eq!(header.kid.as_deref(), Some(key_id(&pub_a).as_str()), "token carries active kid");
+        assert_eq!(
+            header.kid.as_deref(),
+            Some(key_id(&pub_a).as_str()),
+            "token carries active kid"
+        );
 
         // Rotate: key B active, key A retained as an extra verifier.
         let codec_b =
@@ -295,7 +345,10 @@ mod tests {
 
         // Without A retained, A's token is rejected (its key is gone from the ring).
         let codec_b_only = JwtCodec::from_pem(&priv_b, &pub_b, "aero-im", acc, refr).unwrap();
-        assert!(codec_b_only.verify(&token_a).is_err(), "retired key removed → old token rejected");
+        assert!(
+            codec_b_only.verify(&token_a).is_err(),
+            "retired key removed → old token rejected"
+        );
     }
 
     #[test]
@@ -352,6 +405,41 @@ mod tests {
     }
 
     #[test]
+    fn session_pair_shares_sid_but_not_jti() {
+        let c = codec(Duration::from_secs(3600), Duration::from_secs(7200));
+        let participant = ParticipantId::new();
+        let session = SessionId::new();
+        let access = c
+            .issue_for_session(participant, TokenKind::Access, session)
+            .unwrap();
+        let refresh = c
+            .issue_for_session(participant, TokenKind::Refresh, session)
+            .unwrap();
+        let access_claims = c.verify(&access).unwrap();
+        let refresh_claims = c.verify(&refresh).unwrap();
+
+        assert_eq!(access_claims.session_id().unwrap(), Some(session));
+        assert_eq!(refresh_claims.session_id().unwrap(), Some(session));
+        assert_ne!(access_claims.jti, refresh_claims.jti);
+    }
+
+    #[test]
+    fn sidless_is_legacy_but_malformed_sid_is_rejected() {
+        let c = codec(Duration::from_secs(60), Duration::from_secs(60));
+        let legacy = c
+            .verify(&c.issue(ParticipantId::new(), TokenKind::Access).unwrap())
+            .unwrap();
+        assert_eq!(legacy.session_id().unwrap(), None);
+
+        let mut malformed = legacy;
+        malformed.sid = Some("not-a-session-id".into());
+        assert!(matches!(
+            malformed.session_id(),
+            Err(Error::Unauthorized(_))
+        ));
+    }
+
+    #[test]
     fn wrong_issuer_is_rejected() {
         let (priv_pem, pub_pem) = keypair();
         let signer = JwtCodec::from_pem(
@@ -370,7 +458,9 @@ mod tests {
             Duration::from_secs(60),
         )
         .unwrap();
-        let token = signer.issue(ParticipantId::new(), TokenKind::Access).unwrap();
+        let token = signer
+            .issue(ParticipantId::new(), TokenKind::Access)
+            .unwrap();
         let res = verifier.verify(&token);
         assert!(matches!(res, Err(Error::Unauthorized(_))));
     }

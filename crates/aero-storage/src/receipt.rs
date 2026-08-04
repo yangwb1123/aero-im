@@ -3,8 +3,8 @@
 //! One row per (room, participant) recording the highest message id that the
 //! participant has seen. Upserted on every `mark_read` call.
 
-use aero_common::{MessageId, ParticipantId, ReadReceipt, RoomId};
-use sqlx::PgPool;
+use aero_common::{Error, MessageId, ParticipantId, ReadReceipt, Result as AeroResult, RoomId};
+use sqlx::{PgPool, Postgres, Transaction};
 
 #[derive(Clone)]
 pub struct ReceiptRepo {
@@ -16,34 +16,131 @@ impl ReceiptRepo {
         Self { pool }
     }
 
-    /// Idempotent UPSERT. Refuses to roll the cursor backwards.
+    /// Low-level idempotent UPSERT. Refuses to roll the cursor backwards.
+    ///
+    /// Request paths must use [`Self::mark_read_authorized`], which holds
+    /// effective room access and message containment through commit.
     pub async fn mark_read(
         &self,
         room: RoomId,
         participant: ParticipantId,
         last_read: MessageId,
     ) -> Result<ReadReceipt, sqlx::Error> {
-        let now = time::OffsetDateTime::now_utc();
-        sqlx::query(
-            r#"INSERT INTO read_receipts (room_id, participant_id, last_read_message_id, updated_at)
-               VALUES ($1, $2, $3, $4)
-               ON CONFLICT (room_id, participant_id) DO UPDATE
-               SET last_read_message_id = EXCLUDED.last_read_message_id,
-                   updated_at = EXCLUDED.updated_at
-               WHERE EXCLUDED.last_read_message_id > read_receipts.last_read_message_id"#,
+        let mut tx = self.pool.begin().await?;
+        let receipt = mark_read_in_tx(&mut tx, room, participant, last_read).await?;
+        tx.commit().await?;
+        Ok(receipt)
+    }
+
+    /// Advance a read cursor only while `participant` still has effective room
+    /// access and `last_read` is a message in that exact room.
+    ///
+    /// The database access helper owns the workspace → room → membership lock
+    /// order. The message identity is then locked before the receipt UPSERT, so
+    /// membership revocation and cross-room message substitution cannot race the
+    /// committed cursor.
+    pub async fn mark_read_authorized(
+        &self,
+        room: RoomId,
+        participant: ParticipantId,
+        last_read: MessageId,
+    ) -> AeroResult<ReadReceipt> {
+        let mut tx = self.pool.begin().await?;
+        let allowed: bool = sqlx::query_scalar("SELECT aero_effective_room_access($1, $2, NULL)")
+            .bind(room.to_uuid())
+            .bind(participant.to_uuid())
+            .fetch_one(&mut *tx)
+            .await?;
+        if !allowed {
+            return Err(Error::Forbidden(
+                "read-receipt room access was revoked before commit".into(),
+            ));
+        }
+
+        let message_in_room = sqlx::query_scalar::<_, bool>(
+            "SELECT true
+               FROM messages
+              WHERE id = $1 AND room_id = $2
+              FOR SHARE",
         )
-        .bind(room.to_uuid())
-        .bind(participant.to_uuid())
         .bind(last_read.to_uuid())
-        .bind(now)
-        .execute(&self.pool)
-        .await?;
-        Ok(ReadReceipt {
-            room_id: room,
-            participant_id: participant,
-            last_read_message_id: last_read,
-            updated_at: now,
-        })
+        .bind(room.to_uuid())
+        .fetch_optional(&mut *tx)
+        .await?
+        .is_some();
+        if !message_in_room {
+            return Err(Error::NotFound("message in room".into()));
+        }
+
+        let receipt = mark_read_in_tx(&mut tx, room, participant, last_read).await?;
+        tx.commit().await?;
+        Ok(receipt)
+    }
+
+    /// Move the caller's cursor immediately before `target`, atomically
+    /// rechecking effective access to the target's canonical room.
+    ///
+    /// Returns `(room, predecessor, updated_at)`. A missing predecessor means
+    /// the target is the room's first visible message and the receipt was
+    /// deleted so the whole room becomes unread.
+    pub async fn mark_unread_authorized(
+        &self,
+        participant: ParticipantId,
+        target: MessageId,
+    ) -> AeroResult<(RoomId, Option<MessageId>, time::OffsetDateTime)> {
+        let mut tx = self.pool.begin().await?;
+        let resolved_room =
+            sqlx::query_scalar::<_, uuid::Uuid>("SELECT room_id FROM messages WHERE id = $1")
+                .bind(target.to_uuid())
+                .fetch_optional(&mut *tx)
+                .await?
+                .map(RoomId::from_uuid)
+                .ok_or_else(|| Error::NotFound(format!("message {target}")))?;
+
+        let allowed: bool = sqlx::query_scalar("SELECT aero_effective_room_access($1, $2, NULL)")
+            .bind(resolved_room.to_uuid())
+            .bind(participant.to_uuid())
+            .fetch_one(&mut *tx)
+            .await?;
+        if !allowed {
+            return Err(Error::Forbidden(
+                "mark-unread room access was revoked before commit".into(),
+            ));
+        }
+
+        let locked_room = sqlx::query_scalar::<_, uuid::Uuid>(
+            "SELECT room_id FROM messages WHERE id = $1 FOR SHARE",
+        )
+        .bind(target.to_uuid())
+        .fetch_optional(&mut *tx)
+        .await?
+        .map(RoomId::from_uuid)
+        .ok_or_else(|| Error::NotFound(format!("message {target}")))?;
+        if locked_room != resolved_room {
+            return Err(Error::Conflict(
+                "message room changed concurrently; reload and retry".into(),
+            ));
+        }
+
+        let predecessor = sqlx::query_scalar::<_, uuid::Uuid>(
+            "SELECT id
+               FROM messages
+              WHERE room_id = $1
+                AND id < $2
+                AND deleted_at IS NULL
+                AND (expires_at IS NULL OR expires_at > now())
+              ORDER BY id DESC
+              LIMIT 1
+              FOR SHARE",
+        )
+        .bind(resolved_room.to_uuid())
+        .bind(target.to_uuid())
+        .fetch_optional(&mut *tx)
+        .await?
+        .map(MessageId::from_uuid);
+        let updated_at = set_cursor_in_tx(&mut tx, resolved_room, participant, predecessor).await?;
+        tx.commit().await?;
+        Ok((resolved_room, predecessor, updated_at))
     }
 
     /// Set the read cursor to an exact value, **bypassing the monotonic guard**
@@ -60,7 +157,8 @@ impl ReceiptRepo {
     /// given the `read_receipts.last_read_message_id` column is `NOT NULL`.
     ///
     /// Unlike [`mark_read`](Self::mark_read) this performs no membership check;
-    /// callers must gate access first.
+    /// callers must gate access first. Migration 0201 still rejects a message
+    /// cursor that does not belong to `room`.
     ///
     /// # Errors
     /// Propagates any [`sqlx::Error`] from the upsert/delete.
@@ -70,32 +168,9 @@ impl ReceiptRepo {
         participant: ParticipantId,
         last_read: Option<MessageId>,
     ) -> Result<(), sqlx::Error> {
-        match last_read {
-            Some(mid) => {
-                sqlx::query(
-                    r"INSERT INTO read_receipts (room_id, participant_id, last_read_message_id, updated_at)
-                       VALUES ($1, $2, $3, $4)
-                       ON CONFLICT (room_id, participant_id) DO UPDATE
-                       SET last_read_message_id = EXCLUDED.last_read_message_id,
-                           updated_at = EXCLUDED.updated_at",
-                )
-                .bind(room.to_uuid())
-                .bind(participant.to_uuid())
-                .bind(mid.to_uuid())
-                .bind(time::OffsetDateTime::now_utc())
-                .execute(&self.pool)
-                .await?;
-            }
-            None => {
-                sqlx::query(
-                    r"DELETE FROM read_receipts WHERE room_id = $1 AND participant_id = $2",
-                )
-                .bind(room.to_uuid())
-                .bind(participant.to_uuid())
-                .execute(&self.pool)
-                .await?;
-            }
-        }
+        let mut tx = self.pool.begin().await?;
+        set_cursor_in_tx(&mut tx, room, participant, last_read).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -141,6 +216,87 @@ impl ReceiptRepo {
     }
 }
 
+async fn mark_read_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    room: RoomId,
+    participant: ParticipantId,
+    last_read: MessageId,
+) -> Result<ReadReceipt, sqlx::Error> {
+    let now = time::OffsetDateTime::now_utc();
+    sqlx::query(
+        r#"INSERT INTO read_receipts (room_id, participant_id, last_read_message_id, updated_at)
+           VALUES ($1, $2, $3, $4)
+           ON CONFLICT (room_id, participant_id) DO UPDATE
+           SET last_read_message_id = EXCLUDED.last_read_message_id,
+               updated_at = EXCLUDED.updated_at
+           WHERE EXCLUDED.last_read_message_id > read_receipts.last_read_message_id"#,
+    )
+    .bind(room.to_uuid())
+    .bind(participant.to_uuid())
+    .bind(last_read.to_uuid())
+    .bind(now)
+    .execute(&mut **tx)
+    .await?;
+
+    // Return the durable cursor, not merely the requested id. A stale retry that
+    // loses the monotonic comparison must not broadcast a fictitious rollback.
+    let (actual_message, actual_updated_at) =
+        sqlx::query_as::<_, (uuid::Uuid, time::OffsetDateTime)>(
+            "SELECT last_read_message_id, updated_at
+               FROM read_receipts
+              WHERE room_id = $1 AND participant_id = $2
+              FOR UPDATE",
+        )
+        .bind(room.to_uuid())
+        .bind(participant.to_uuid())
+        .fetch_one(&mut **tx)
+        .await?;
+    Ok(ReadReceipt {
+        room_id: room,
+        participant_id: participant,
+        last_read_message_id: MessageId::from_uuid(actual_message),
+        updated_at: actual_updated_at,
+    })
+}
+
+async fn set_cursor_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    room: RoomId,
+    participant: ParticipantId,
+    last_read: Option<MessageId>,
+) -> Result<time::OffsetDateTime, sqlx::Error> {
+    let now = time::OffsetDateTime::now_utc();
+    match last_read {
+        Some(message) => {
+            sqlx::query(
+                r"INSERT INTO read_receipts
+                     (room_id, participant_id, last_read_message_id, updated_at)
+                   VALUES ($1, $2, $3, $4)
+                   ON CONFLICT (room_id, participant_id) DO UPDATE
+                   SET last_read_message_id = EXCLUDED.last_read_message_id,
+                       updated_at = EXCLUDED.updated_at",
+            )
+            .bind(room.to_uuid())
+            .bind(participant.to_uuid())
+            .bind(message.to_uuid())
+            .bind(now)
+            .execute(&mut **tx)
+            .await?;
+        }
+        None => {
+            sqlx::query(
+                "DELETE FROM read_receipts
+                  WHERE room_id = $1 AND participant_id = $2",
+            )
+            .bind(room.to_uuid())
+            .bind(participant.to_uuid())
+            .execute(&mut **tx)
+            .await?;
+        }
+    }
+    Ok(now)
+}
+
 /// PG-gated integration tests (run with a live Postgres + applied migrations):
 ///
 /// ```text
@@ -150,6 +306,8 @@ impl ReceiptRepo {
 #[cfg(test)]
 mod db_tests {
     use super::*;
+    use crate::{RoomRepo, WorkspaceRepo};
+    use aero_common::{RoomKind, WorkspaceRole};
 
     fn pool() -> PgPool {
         let url = std::env::var("DATABASE_URL")
@@ -172,7 +330,7 @@ mod db_tests {
         let room = RoomId::new();
         sqlx::query(
             "INSERT INTO rooms (id, kind, name, created_by, created_at, workspace_id)
-             VALUES ($1,'channel',$2,$3, now(), '00000000-0000-0000-0000-000000000000')",
+             VALUES ($1,'group',$2,$3, now(), '00000000-0000-0000-0000-000000000000')",
         )
         .bind(room.to_uuid())
         .bind("receipt-room")
@@ -181,6 +339,19 @@ mod db_tests {
         .await
         .expect("insert room");
         (room, actor)
+    }
+
+    async fn insert_message(p: &PgPool, id: MessageId, room: RoomId, sender: ParticipantId) {
+        sqlx::query(
+            "INSERT INTO messages (id, room_id, sender_id, blocks)
+             VALUES ($1, $2, $3, '[]'::jsonb)",
+        )
+        .bind(id.to_uuid())
+        .bind(room.to_uuid())
+        .bind(sender.to_uuid())
+        .execute(p)
+        .await
+        .expect("insert receipt anchor message");
     }
 
     /// `set_cursor` is non-monotonic: it can roll the read cursor *backwards*
@@ -200,32 +371,50 @@ mod db_tests {
         let low = MessageId::from_uuid(
             uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001").expect("uuid"),
         );
+        insert_message(&p, high, room, actor).await;
+        insert_message(&p, low, room, actor).await;
 
         // Forward-only `mark_read` parks the cursor at `high`.
         repo.mark_read(room, actor, high).await.expect("mark_read");
         assert_eq!(
-            repo.get(room, actor).await.unwrap().unwrap().last_read_message_id,
+            repo.get(room, actor)
+                .await
+                .unwrap()
+                .unwrap()
+                .last_read_message_id,
             high
         );
 
         // `mark_read` refuses to roll back (monotonic guard) — cursor stays at `high`.
         repo.mark_read(room, actor, low).await.expect("mark_read");
         assert_eq!(
-            repo.get(room, actor).await.unwrap().unwrap().last_read_message_id,
+            repo.get(room, actor)
+                .await
+                .unwrap()
+                .unwrap()
+                .last_read_message_id,
             high,
             "mark_read is forward-only"
         );
 
         // `set_cursor` DOES roll back — the mark-as-unread move.
-        repo.set_cursor(room, actor, Some(low)).await.expect("set_cursor back");
+        repo.set_cursor(room, actor, Some(low))
+            .await
+            .expect("set_cursor back");
         assert_eq!(
-            repo.get(room, actor).await.unwrap().unwrap().last_read_message_id,
+            repo.get(room, actor)
+                .await
+                .unwrap()
+                .unwrap()
+                .last_read_message_id,
             low,
             "set_cursor rolls the cursor backward"
         );
 
         // `None` clears the receipt → whole room re-badges unread.
-        repo.set_cursor(room, actor, None).await.expect("set_cursor clear");
+        repo.set_cursor(room, actor, None)
+            .await
+            .expect("set_cursor clear");
         assert!(
             repo.get(room, actor).await.unwrap().is_none(),
             "set_cursor(None) clears the read cursor"
@@ -242,5 +431,128 @@ mod db_tests {
             .execute(&p)
             .await
             .ok();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres with migrations through 0201"]
+    async fn authorized_cursor_is_room_contained_and_rechecks_current_access() {
+        let p = pool();
+        let workspaces = WorkspaceRepo::new(p.clone());
+        let rooms = RoomRepo::new(p.clone());
+        let receipts = ReceiptRepo::new(p.clone());
+        let actor = ParticipantId::new();
+        let successor = ParticipantId::new();
+        for participant in [actor, successor] {
+            sqlx::query(
+                "INSERT INTO participants (id, kind, display_name)
+                 VALUES ($1, 'human', $2)",
+            )
+            .bind(participant.to_uuid())
+            .bind(format!("receipt-auth-{participant}"))
+            .execute(&p)
+            .await
+            .unwrap();
+        }
+        let workspace = workspaces
+            .create(
+                "Receipt auth".into(),
+                format!("receipt-{}", uuid::Uuid::new_v4().simple()),
+                actor,
+            )
+            .await
+            .unwrap();
+        workspaces
+            .add_member(workspace.id, successor, WorkspaceRole::Owner)
+            .await
+            .unwrap();
+        let first = rooms
+            .create_in_workspace_authorized(
+                workspace.id,
+                RoomKind::Group,
+                Some("first".into()),
+                actor,
+            )
+            .await
+            .unwrap();
+        let second = rooms
+            .create_in_workspace_authorized(
+                workspace.id,
+                RoomKind::Group,
+                Some("second".into()),
+                actor,
+            )
+            .await
+            .unwrap();
+        let message_base = uuid::Uuid::new_v4().as_u128() & !0xffff_u128;
+        let first_message = MessageId::from_uuid(uuid::Uuid::from_u128(message_base + 1));
+        let later_first_message = MessageId::from_uuid(uuid::Uuid::from_u128(message_base + 2));
+        let second_message = MessageId::from_uuid(uuid::Uuid::from_u128(message_base + 3));
+        insert_message(&p, first_message, first.id, actor).await;
+        insert_message(&p, later_first_message, first.id, actor).await;
+        insert_message(&p, second_message, second.id, actor).await;
+
+        let cross_room = receipts
+            .mark_read_authorized(first.id, actor, second_message)
+            .await
+            .unwrap_err();
+        assert!(matches!(cross_room, Error::NotFound(_)));
+        assert!(receipts.get(first.id, actor).await.unwrap().is_none());
+
+        let direct_error = sqlx::query(
+            "INSERT INTO read_receipts
+                 (room_id, participant_id, last_read_message_id)
+             VALUES ($1, $2, $3)",
+        )
+        .bind(first.id.to_uuid())
+        .bind(actor.to_uuid())
+        .bind(second_message.to_uuid())
+        .execute(&p)
+        .await
+        .unwrap_err();
+        assert_eq!(
+            direct_error
+                .as_database_error()
+                .and_then(sqlx::error::DatabaseError::constraint),
+            Some("read_receipts_message_room_chk")
+        );
+
+        let receipt = receipts
+            .mark_read_authorized(first.id, actor, first_message)
+            .await
+            .unwrap();
+        assert_eq!(receipt.last_read_message_id, first_message);
+        let (unread_room, predecessor, _) = receipts
+            .mark_unread_authorized(actor, later_first_message)
+            .await
+            .unwrap();
+        assert_eq!(unread_room, first.id);
+        assert_eq!(predecessor, Some(first_message));
+
+        workspaces
+            .remove_member_authorized(workspace.id, successor, actor)
+            .await
+            .unwrap();
+        let revoked = receipts
+            .mark_read_authorized(first.id, actor, first_message)
+            .await
+            .unwrap_err();
+        assert!(matches!(revoked, Error::Forbidden(_)));
+        let unread_revoked = receipts
+            .mark_unread_authorized(actor, later_first_message)
+            .await
+            .unwrap_err();
+        assert!(matches!(unread_revoked, Error::Forbidden(_)));
+
+        workspaces
+            .delete_authorized(workspace.id, successor)
+            .await
+            .unwrap();
+        for participant in [actor, successor] {
+            sqlx::query("DELETE FROM participants WHERE id = $1")
+                .bind(participant.to_uuid())
+                .execute(&p)
+                .await
+                .ok();
+        }
     }
 }

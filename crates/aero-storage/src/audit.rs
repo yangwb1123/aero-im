@@ -61,10 +61,7 @@ impl AuditRepo {
     ///
     /// # Errors
     /// Propagates any [`sqlx::Error`].
-    pub async fn sweep_before(
-        &self,
-        cutoff: time::OffsetDateTime,
-    ) -> Result<u64, sqlx::Error> {
+    pub async fn sweep_before(&self, cutoff: time::OffsetDateTime) -> Result<u64, sqlx::Error> {
         // Legal-hold immutability (方向五·②): never purge audit events for a
         // workspace under an active hold — the trail is evidence for the held
         // data, so it must outlive retention while the hold stands (mirrors the
@@ -103,11 +100,7 @@ impl AuditRepo {
     ///
     /// # Errors
     /// Propagates any [`sqlx::Error`] from the function call.
-    pub async fn ensure_partitions(
-        &self,
-        keep_days: i32,
-        ahead: i32,
-    ) -> Result<(), sqlx::Error> {
+    pub async fn ensure_partitions(&self, keep_days: i32, ahead: i32) -> Result<(), sqlx::Error> {
         sqlx::query("SELECT ensure_audit_event_partitions($1, $2)")
             .bind(keep_days)
             .bind(ahead)
@@ -400,7 +393,11 @@ mod tests {
 
     // ----- events_to_csv: header + rows, JSON details, escaping -----
 
-    fn sample_event(action: &str, actor: Option<ParticipantId>, detail: serde_json::Value) -> AuditEvent {
+    fn sample_event(
+        action: &str,
+        actor: Option<ParticipantId>,
+        detail: serde_json::Value,
+    ) -> AuditEvent {
         AuditEvent {
             id: AuditId::new(),
             workspace_id: WorkspaceId::new(),
@@ -416,7 +413,11 @@ mod tests {
     fn events_to_csv_emits_header_then_rows() {
         let actor = ParticipantId::new();
         let csv = events_to_csv(&[
-            sample_event("member.add", Some(actor), serde_json::json!({ "role": "member" })),
+            sample_event(
+                "member.add",
+                Some(actor),
+                serde_json::json!({ "role": "member" }),
+            ),
             sample_event("workspace.create", None, serde_json::json!({})),
         ]);
         let lines: Vec<&str> = csv.lines().collect();
@@ -442,16 +443,25 @@ mod tests {
     #[test]
     fn sign_csv_is_deterministic_and_tamper_evident() {
         let key = b"audit-signing-key";
-        let csv = "timestamp,actor,action,target,details\n2026-01-01T00:00:00Z,,workspace.create,,{}\n";
+        let csv =
+            "timestamp,actor,action,target,details\n2026-01-01T00:00:00Z,,workspace.create,,{}\n";
         let sig = sign_csv(csv, key);
         // 64-char lowercase-hex SHA-256 digest, deterministic for the same input.
         assert_eq!(sig.len(), 64);
         assert_eq!(sign_csv(csv, key), sig, "same csv+key ⇒ same signature");
         // Any tamper to the CSV changes the signature (one altered byte).
         let tampered = csv.replacen("workspace.create", "workspace.delete", 1);
-        assert_ne!(sign_csv(&tampered, key), sig, "altered csv ⇒ different signature");
+        assert_ne!(
+            sign_csv(&tampered, key),
+            sig,
+            "altered csv ⇒ different signature"
+        );
         // A different key changes the signature.
-        assert_ne!(sign_csv(csv, b"other-key"), sig, "different key ⇒ different signature");
+        assert_ne!(
+            sign_csv(csv, b"other-key"),
+            sig,
+            "different key ⇒ different signature"
+        );
     }
 }
 
@@ -485,14 +495,25 @@ mod db_tests {
             .await
             .expect("insert participant");
         let ws = WorkspaceId::new();
+        let mut tx = repo_pool.begin().await.expect("begin workspace fixture");
         sqlx::query("INSERT INTO workspaces (id, name, slug, created_by, created_at) VALUES ($1,$2,$3,$4, now())")
             .bind(ws.to_uuid())
             .bind("Audit Test WS")
             .bind(format!("audit-{ws}"))
             .bind(actor.to_uuid())
-            .execute(repo_pool)
+            .execute(&mut *tx)
             .await
             .expect("insert workspace");
+        sqlx::query(
+            "INSERT INTO workspace_members (workspace_id, participant_id, role)
+             VALUES ($1, $2, 'owner')",
+        )
+        .bind(ws.to_uuid())
+        .bind(actor.to_uuid())
+        .execute(&mut *tx)
+        .await
+        .expect("insert workspace owner");
+        tx.commit().await.expect("commit workspace fixture");
         (ws, actor)
     }
 
@@ -503,9 +524,15 @@ mod db_tests {
         let repo = AuditRepo::new(p.clone());
         let (ws, actor) = fixture(&p).await;
 
-        repo.append(ws, Some(actor), "workspace.create", None, serde_json::json!({}))
-            .await
-            .unwrap();
+        repo.append(
+            ws,
+            Some(actor),
+            "workspace.create",
+            None,
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
         let target = ParticipantId::new();
         repo.append(
             ws,
@@ -566,15 +593,33 @@ mod db_tests {
             .await
             .expect("insert other participant");
 
-        repo.append(ws, Some(actor), "member.add", Some("t1"), serde_json::json!({ "role": "member" }))
-            .await
-            .unwrap();
-        repo.append(ws, Some(actor), "member.remove", Some("t1"), serde_json::json!({}))
-            .await
-            .unwrap();
-        repo.append(ws, Some(other), "member.add", Some("t2"), serde_json::json!({}))
-            .await
-            .unwrap();
+        repo.append(
+            ws,
+            Some(actor),
+            "member.add",
+            Some("t1"),
+            serde_json::json!({ "role": "member" }),
+        )
+        .await
+        .unwrap();
+        repo.append(
+            ws,
+            Some(actor),
+            "member.remove",
+            Some("t1"),
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+        repo.append(
+            ws,
+            Some(other),
+            "member.add",
+            Some("t2"),
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
         repo.append(ws, None, "workspace.create", None, serde_json::json!({}))
             .await
             .unwrap();
@@ -589,7 +634,15 @@ mod db_tests {
 
         // Filter by action AND actor ⇒ only `actor`'s add.
         let actor_adds = repo
-            .list_for_workspace_filtered(ws, Some("member.add"), Some(actor), None, None, None, None)
+            .list_for_workspace_filtered(
+                ws,
+                Some("member.add"),
+                Some(actor),
+                None,
+                None,
+                None,
+                None,
+            )
             .await
             .unwrap();
         assert_eq!(actor_adds.len(), 1, "only the actor's add");
@@ -612,7 +665,10 @@ mod db_tests {
         assert!(none.is_empty(), "nothing newer than a future `since`");
 
         // CSV export of all four rows: header + 4 rows.
-        let all = repo.list_for_workspace_filtered(ws, None, None, None, None, None, None).await.unwrap();
+        let all = repo
+            .list_for_workspace_filtered(ws, None, None, None, None, None, None)
+            .await
+            .unwrap();
         let csv = events_to_csv(&all);
         let lines: Vec<&str> = csv.lines().collect();
         assert_eq!(lines[0], AUDIT_CSV_HEADER);
@@ -627,21 +683,21 @@ mod db_tests {
         sender: ParticipantId,
     ) -> aero_common::MessageId {
         let room = aero_common::RoomId::new();
-        sqlx::query(
-            "INSERT INTO rooms (id, kind, name, created_by, workspace_id) VALUES ($1,'group',$2,$3,$4)",
-        )
-        .bind(room.to_uuid())
-        .bind(format!("audit-tx-room-{room}"))
-        .bind(sender.to_uuid())
-        .bind(ws.to_uuid())
-        .execute(p)
-        .await
-        .expect("insert room");
+        sqlx::query("INSERT INTO rooms (id, kind, name, created_by, workspace_id) VALUES ($1,'group',$2,$3,$4)")
+            .bind(room.to_uuid())
+            .bind(format!("audit-tx-room-{room}"))
+            .bind(sender.to_uuid())
+            .bind(ws.to_uuid())
+            .execute(p)
+            .await
+            .expect("insert room");
         let repo = crate::message::MessageRepo::new(p.clone());
         repo.insert(crate::message::NewMessage {
             room_id: room,
             sender_id: sender,
-            blocks: vec![aero_common::Block::text("to be deleted, audited atomically")],
+            blocks: vec![aero_common::Block::text(
+                "to be deleted, audited atomically",
+            )],
             reply_to: None,
             metadata: serde_json::json!({}),
             expires_at: None,
@@ -671,12 +727,21 @@ mod db_tests {
         let after = msg_repo.get(id).await.unwrap().expect("row still exists");
         assert!(after.deleted_at.is_some(), "message is soft-deleted");
 
-        let trail = AuditRepo::new(p.clone()).list_for_workspace(ws, None, None).await.unwrap();
+        let trail = AuditRepo::new(p.clone())
+            .list_for_workspace(ws, None, None)
+            .await
+            .unwrap();
         let audit_rows: Vec<_> = trail
             .iter()
-            .filter(|e| e.action == "message.deleted" && e.target.as_deref() == Some(&id.to_string()))
+            .filter(|e| {
+                e.action == "message.deleted" && e.target.as_deref() == Some(&id.to_string())
+            })
             .collect();
-        assert_eq!(audit_rows.len(), 1, "exactly one audit row committed with the delete");
+        assert_eq!(
+            audit_rows.len(),
+            1,
+            "exactly one audit row committed with the delete"
+        );
         assert_eq!(audit_rows[0].actor_id, Some(actor));
         assert_eq!(audit_rows[0].detail["digest"], "x");
 
@@ -686,10 +751,15 @@ mod db_tests {
             .await
             .unwrap();
         assert!(!again, "second delete is a no-op");
-        let trail = AuditRepo::new(p.clone()).list_for_workspace(ws, None, None).await.unwrap();
+        let trail = AuditRepo::new(p.clone())
+            .list_for_workspace(ws, None, None)
+            .await
+            .unwrap();
         let repeats = trail
             .iter()
-            .filter(|e| e.action == "message.deleted" && e.target.as_deref() == Some(&id.to_string()))
+            .filter(|e| {
+                e.action == "message.deleted" && e.target.as_deref() == Some(&id.to_string())
+            })
             .count();
         assert_eq!(repeats, 1, "the no-op repeat appended no second audit row");
     }
@@ -710,21 +780,29 @@ mod db_tests {
         let err = msg_repo
             .soft_delete_audited(id, missing_ws, Some(actor), serde_json::json!({}))
             .await;
-        assert!(err.is_err(), "audit insert into a missing workspace must fail");
+        assert!(
+            err.is_err(),
+            "audit insert into a missing workspace must fail"
+        );
 
         let after = msg_repo.get(id).await.unwrap().expect("row still exists");
-        assert!(after.deleted_at.is_none(), "soft-delete rolled back with the audit");
+        assert!(
+            after.deleted_at.is_none(),
+            "soft-delete rolled back with the audit"
+        );
         assert!(!after.blocks.is_empty(), "blocks were not cleared");
 
-        let orphaned: i64 = sqlx::query_as::<_, (i64,)>(
-            "SELECT COUNT(*) FROM audit_events WHERE target = $1",
-        )
-        .bind(id.to_string())
-        .fetch_one(&p)
-        .await
-        .unwrap()
-        .0;
-        assert_eq!(orphaned, 0, "no audit row escaped the rolled-back transaction");
+        let orphaned: i64 =
+            sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM audit_events WHERE target = $1")
+                .bind(id.to_string())
+                .fetch_one(&p)
+                .await
+                .unwrap()
+                .0;
+        assert_eq!(
+            orphaned, 0,
+            "no audit row escaped the rolled-back transaction"
+        );
     }
 
     /// Moderation path of 审计事务化 (方向三 closeout): `soft_delete_moderated`
@@ -749,14 +827,21 @@ mod db_tests {
         let after = msg_repo.get(id).await.unwrap().expect("row still exists");
         assert!(after.deleted_at.is_some(), "message is soft-deleted");
 
-        let trail = AuditRepo::new(p.clone()).list_for_workspace(ws, None, None).await.unwrap();
+        let trail = AuditRepo::new(p.clone())
+            .list_for_workspace(ws, None, None)
+            .await
+            .unwrap();
         let rows: Vec<_> = trail
             .iter()
             .filter(|e| {
                 e.action == "message.moderated" && e.target.as_deref() == Some(&id.to_string())
             })
             .collect();
-        assert_eq!(rows.len(), 1, "exactly one message.moderated row committed with the delete");
+        assert_eq!(
+            rows.len(),
+            1,
+            "exactly one message.moderated row committed with the delete"
+        );
         assert_eq!(rows[0].actor_id, None, "system-initiated → no actor");
         assert_eq!(rows[0].detail["reason"], "spam");
         assert_eq!(rows[0].detail["digest"], "buy now");
@@ -767,7 +852,10 @@ mod db_tests {
             .await
             .unwrap();
         assert!(!again, "second moderation delete is a no-op");
-        let trail = AuditRepo::new(p.clone()).list_for_workspace(ws, None, None).await.unwrap();
+        let trail = AuditRepo::new(p.clone())
+            .list_for_workspace(ws, None, None)
+            .await
+            .unwrap();
         let repeats = trail
             .iter()
             .filter(|e| {
@@ -793,10 +881,16 @@ mod db_tests {
         let err = msg_repo
             .soft_delete_moderated(id, missing_ws, serde_json::json!({ "reason": "x" }))
             .await;
-        assert!(err.is_err(), "moderation audit into a missing workspace must fail");
+        assert!(
+            err.is_err(),
+            "moderation audit into a missing workspace must fail"
+        );
 
         let after = msg_repo.get(id).await.unwrap().expect("row still exists");
-        assert!(after.deleted_at.is_none(), "moderation soft-delete rolled back with the audit");
+        assert!(
+            after.deleted_at.is_none(),
+            "moderation soft-delete rolled back with the audit"
+        );
         assert!(!after.blocks.is_empty(), "blocks were not cleared");
 
         let orphaned: i64 = sqlx::query_as::<_, (i64,)>(
@@ -807,7 +901,10 @@ mod db_tests {
         .await
         .unwrap()
         .0;
-        assert_eq!(orphaned, 0, "no moderation audit row escaped the rolled-back transaction");
+        assert_eq!(
+            orphaned, 0,
+            "no moderation audit row escaped the rolled-back transaction"
+        );
     }
 
     /// `audit_events` is partitioned (migration 0146) and the maintenance call is
@@ -832,10 +929,15 @@ mod db_tests {
         .fetch_one(&p)
         .await
         .expect("audit_events exists");
-        assert_eq!(relkind, "p", "audit_events is a partitioned (relkind=p) table");
+        assert_eq!(
+            relkind, "p",
+            "audit_events is a partitioned (relkind=p) table"
+        );
 
         // First maintenance pass creates yesterday..today+3 daily partitions.
-        repo.ensure_partitions(365, 3).await.expect("first maintenance pass");
+        repo.ensure_partitions(365, 3)
+            .await
+            .expect("first maintenance pass");
         let count_parts = || async {
             sqlx::query_scalar::<_, i64>(
                 "SELECT count(*) FROM pg_inherits i
@@ -849,20 +951,38 @@ mod db_tests {
             .unwrap()
         };
         let after_first = count_parts().await;
-        assert!(after_first >= 4, "at least yesterday..today+3 daily partitions exist");
+        assert!(
+            after_first >= 4,
+            "at least yesterday..today+3 daily partitions exist"
+        );
 
         // Re-running is a no-op: the count does not change.
-        repo.ensure_partitions(365, 3).await.expect("second maintenance pass");
-        assert_eq!(count_parts().await, after_first, "idempotent: no new partitions");
+        repo.ensure_partitions(365, 3)
+            .await
+            .expect("second maintenance pass");
+        assert_eq!(
+            count_parts().await,
+            after_first,
+            "idempotent: no new partitions"
+        );
 
         // The parent is still writable and the row is retrievable (routed into a
         // daily partition by created_at).
         let id = repo
-            .append(ws, Some(actor), "workspace.create", None, serde_json::json!({}))
+            .append(
+                ws,
+                Some(actor),
+                "workspace.create",
+                None,
+                serde_json::json!({}),
+            )
             .await
             .expect("append into partitioned parent");
         let events = repo.list_for_workspace(ws, None, Some(10)).await.unwrap();
-        assert!(events.iter().any(|e| e.id == id), "appended row is listed back");
+        assert!(
+            events.iter().any(|e| e.id == id),
+            "appended row is listed back"
+        );
     }
 
     /// Legal-hold immutability (方向五·②): the retention DELETE sweep must NOT

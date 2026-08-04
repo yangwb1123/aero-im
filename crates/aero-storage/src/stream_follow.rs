@@ -67,13 +67,12 @@ impl StreamFollowRepo {
         follower: ParticipantId,
         streamer: ParticipantId,
     ) -> Result<bool, sqlx::Error> {
-        let result = sqlx::query(
-            "DELETE FROM stream_follows WHERE follower_id = $1 AND streamer_id = $2",
-        )
-        .bind(follower.to_uuid())
-        .bind(streamer.to_uuid())
-        .execute(&self.pool)
-        .await?;
+        let result =
+            sqlx::query("DELETE FROM stream_follows WHERE follower_id = $1 AND streamer_id = $2")
+                .bind(follower.to_uuid())
+                .bind(streamer.to_uuid())
+                .execute(&self.pool)
+                .await?;
         Ok(result.rows_affected() > 0)
     }
 
@@ -95,7 +94,10 @@ impl StreamFollowRepo {
         .bind(streamer.to_uuid())
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows.into_iter().map(|(r,)| ParticipantId::from_uuid(r)).collect())
+        Ok(rows
+            .into_iter()
+            .map(|(r,)| ParticipantId::from_uuid(r))
+            .collect())
     }
 
     /// List the creators `follower` follows, newest first.
@@ -115,7 +117,10 @@ impl StreamFollowRepo {
         .bind(follower.to_uuid())
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows.into_iter().map(|(r,)| ParticipantId::from_uuid(r)).collect())
+        Ok(rows
+            .into_iter()
+            .map(|(r,)| ParticipantId::from_uuid(r))
+            .collect())
     }
 
     /// Whether `follower` currently follows `streamer`.
@@ -202,7 +207,10 @@ mod db_tests {
         );
 
         // unfollow → true once, then false/empty; is_following false.
-        assert!(repo.unfollow(follower, streamer).await.unwrap(), "unfollow removes the row");
+        assert!(
+            repo.unfollow(follower, streamer).await.unwrap(),
+            "unfollow removes the row"
+        );
         assert!(
             !repo.unfollow(follower, streamer).await.unwrap(),
             "second unfollow is a no-op"

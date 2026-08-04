@@ -37,10 +37,7 @@ const MAX_PERKS_LEN: usize = 2_000;
 /// All creator-subscription routes, ready to `.merge` into the gateway router.
 pub fn routes() -> Router<AppState> {
     Router::new()
-        .route(
-            "/api/creators/:id/tiers",
-            post(create_tier).get(list_tiers),
-        )
+        .route("/api/creators/:id/tiers", post(create_tier).get(list_tiers))
         .route("/api/creators/:id/tiers/:tid", delete(delete_tier))
         .route(
             "/api/creators/:id/subscribe",
@@ -48,7 +45,10 @@ pub fn routes() -> Router<AppState> {
         )
         .route("/api/creators/:id/subscribers", get(list_subscribers))
         .route("/api/me/subscriptions", get(my_subscriptions))
-        .route("/api/creators/:id/gift-subscription", post(gift_subscription))
+        .route(
+            "/api/creators/:id/gift-subscription",
+            post(gift_subscription),
+        )
         .route(
             "/api/creators/:id/gift-subscription/leaderboard",
             get(gift_leaderboard),
@@ -103,7 +103,11 @@ async fn create_tier(
     if req.price_cents < 0 {
         return Err(AeroError::Invalid("price_cents must not be negative".into()).into());
     }
-    let perks = req.perks.as_deref().map(str::trim).filter(|p| !p.is_empty());
+    let perks = req
+        .perks
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty());
     if let Some(p) = perks {
         if p.chars().count() > MAX_PERKS_LEN {
             return Err(AeroError::Invalid("perks too long".into()).into());
@@ -283,9 +287,7 @@ async fn gift_leaderboard(
         .map_err(AeroError::from)?;
     let leaderboard: Vec<serde_json::Value> = rows
         .into_iter()
-        .map(|(gifter_id, count)| {
-            serde_json::json!({ "gifter_id": gifter_id, "count": count })
-        })
+        .map(|(gifter_id, count)| serde_json::json!({ "gifter_id": gifter_id, "count": count }))
         .collect();
     Ok(Json(serde_json::json!({ "leaderboard": leaderboard })))
 }
@@ -326,17 +328,10 @@ async fn gift_subscription(
     }
 
     let months = req.months.max(1);
-    let duration_days = i32::try_from(months * 30)
-        .unwrap_or(i32::MAX);
+    let duration_days = i32::try_from(months * 30).unwrap_or(i32::MAX);
 
     repo(&s)
-        .gift_subscription(
-            creator,
-            tier_id.to_uuid(),
-            recipient,
-            gifter,
-            duration_days,
-        )
+        .gift_subscription(creator, tier_id.to_uuid(), recipient, gifter, duration_days)
         .await
         .map_err(AeroError::from)?;
 

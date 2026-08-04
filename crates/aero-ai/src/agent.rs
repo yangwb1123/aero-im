@@ -49,7 +49,8 @@ impl ToolChat for AnthropicClient {
         tools: &[ToolDef],
         max_tokens: u32,
     ) -> Result<AgentTurn> {
-        self.complete_with_tools(system, messages, tools, max_tokens).await
+        self.complete_with_tools(system, messages, tools, max_tokens)
+            .await
     }
 }
 
@@ -59,7 +60,7 @@ impl ToolChat for AnthropicClient {
 #[async_trait]
 pub trait AgentTool: Send + Sync {
     fn definition(&self) -> ToolDef;
-    async fn run(&self, input: &Value) -> String;
+    async fn run(&self, input: &Value) -> Result<String>;
 }
 
 /// The result of a completed (or capped) agent loop.
@@ -107,12 +108,12 @@ fn assistant_message(turn: &AgentTurn) -> Value {
 /// Execute one requested tool, returning its `tool_result` block. An unknown tool
 /// name yields an error result (fed back to the model) rather than aborting the
 /// loop — the model can recover or apologize.
-async fn run_one_tool(tools: &[Arc<dyn AgentTool>], tu: &ToolUse) -> Value {
+async fn run_one_tool(tools: &[Arc<dyn AgentTool>], tu: &ToolUse) -> Result<Value> {
     let output = match tools.iter().find(|t| t.definition().name == tu.name) {
-        Some(tool) => tool.run(&tu.input).await,
+        Some(tool) => tool.run(&tu.input).await?,
         None => format!("error: unknown tool '{}'", tu.name),
     };
-    json!({ "type": "tool_result", "tool_use_id": tu.id, "content": output })
+    Ok(json!({ "type": "tool_result", "tool_use_id": tu.id, "content": output }))
 }
 
 /// Drive the tool-use loop to a final answer.
@@ -165,7 +166,7 @@ pub async fn run_agent_loop(
         for (i, tu) in turn.tool_uses.iter().enumerate() {
             if i < MAX_TOOLS_PER_TURN {
                 tool_calls += 1;
-                result_blocks.push(run_one_tool(tools, tu).await);
+                result_blocks.push(run_one_tool(tools, tu).await?);
             } else {
                 result_blocks.push(json!({
                     "type": "tool_result",
@@ -236,7 +237,11 @@ mod tests {
 
     impl FakeTool {
         fn new(name: &str, reply: &str) -> Arc<Self> {
-            Arc::new(Self { name: name.into(), reply: reply.into(), calls: Mutex::new(Vec::new()) })
+            Arc::new(Self {
+                name: name.into(),
+                reply: reply.into(),
+                calls: Mutex::new(Vec::new()),
+            })
         }
     }
 
@@ -249,9 +254,9 @@ mod tests {
                 input_schema: json!({ "type": "object" }),
             }
         }
-        async fn run(&self, input: &Value) -> String {
+        async fn run(&self, input: &Value) -> Result<String> {
             self.calls.lock().unwrap().push(input.clone());
-            self.reply.clone()
+            Ok(self.reply.clone())
         }
     }
 
@@ -259,22 +264,34 @@ mod tests {
         AgentTurn {
             text: t.into(),
             tool_uses: vec![],
-            usage: Usage { input_tokens: usage.0, output_tokens: usage.1 },
+            usage: Usage {
+                input_tokens: usage.0,
+                output_tokens: usage.1,
+            },
         }
     }
 
     fn tool_turn(id: &str, name: &str, input: Value, usage: (u32, u32)) -> AgentTurn {
         AgentTurn {
             text: String::new(),
-            tool_uses: vec![ToolUse { id: id.into(), name: name.into(), input }],
-            usage: Usage { input_tokens: usage.0, output_tokens: usage.1 },
+            tool_uses: vec![ToolUse {
+                id: id.into(),
+                name: name.into(),
+                input,
+            }],
+            usage: Usage {
+                input_tokens: usage.0,
+                output_tokens: usage.1,
+            },
         }
     }
 
     #[tokio::test]
     async fn answers_immediately_when_no_tools_requested() {
         let chat = MockChat::new(vec![text_turn("42", (5, 2))]);
-        let out = run_agent_loop(&chat, &[], "be helpful", "the answer?", 4, 256).await.unwrap();
+        let out = run_agent_loop(&chat, &[], "be helpful", "the answer?", 4, 256)
+            .await
+            .unwrap();
         assert_eq!(out.answer, "42");
         assert_eq!(out.iterations, 1);
         assert_eq!(out.tool_calls, 0);
@@ -290,7 +307,9 @@ mod tests {
             text_turn("based on search: shipped", (8, 4)),
         ]);
         let tools: Vec<Arc<dyn AgentTool>> = vec![tool.clone()];
-        let out = run_agent_loop(&chat, &tools, "be helpful", "did we ship?", 4, 256).await.unwrap();
+        let out = run_agent_loop(&chat, &tools, "be helpful", "did we ship?", 4, 256)
+            .await
+            .unwrap();
 
         assert_eq!(out.answer, "based on search: shipped");
         assert_eq!(out.iterations, 2);
@@ -307,7 +326,11 @@ mod tests {
         // the user tool_result carrying our output.
         let seen = chat.seen.lock().unwrap();
         let second = &seen[1];
-        assert_eq!(second.len(), 3, "user q + assistant tool_use + user tool_result");
+        assert_eq!(
+            second.len(),
+            3,
+            "user q + assistant tool_use + user tool_result"
+        );
         assert_eq!(second[1]["role"], "assistant");
         assert_eq!(second[1]["content"][0]["type"], "tool_use");
         assert_eq!(second[2]["role"], "user");
@@ -322,13 +345,18 @@ mod tests {
             tool_turn("tu_x", "nonexistent", json!({}), (1, 1)),
             text_turn("sorry, I could not look that up", (1, 1)),
         ]);
-        let out = run_agent_loop(&chat, &[], "be helpful", "q", 4, 256).await.unwrap();
+        let out = run_agent_loop(&chat, &[], "be helpful", "q", 4, 256)
+            .await
+            .unwrap();
         assert_eq!(out.answer, "sorry, I could not look that up");
         assert_eq!(out.tool_calls, 1);
         // The error result was threaded back to the model on the 2nd call.
         let seen = chat.seen.lock().unwrap();
         let result = &seen[1][2]["content"][0]["content"];
-        assert!(result.as_str().unwrap().contains("unknown tool 'nonexistent'"));
+        assert!(result
+            .as_str()
+            .unwrap()
+            .contains("unknown tool 'nonexistent'"));
     }
 
     #[tokio::test]
@@ -341,7 +369,9 @@ mod tests {
             tool_turn("c", "loop", json!({}), (1, 1)),
         ]);
         let tools: Vec<Arc<dyn AgentTool>> = vec![tool];
-        let out = run_agent_loop(&chat, &tools, "be helpful", "q", 2, 256).await.unwrap();
+        let out = run_agent_loop(&chat, &tools, "be helpful", "q", 2, 256)
+            .await
+            .unwrap();
         assert!(out.hit_cap, "should report hitting the cap");
         assert_eq!(out.iterations, 2);
         assert_eq!(out.tool_calls, 2);
@@ -354,14 +384,24 @@ mod tests {
         let tool = FakeTool::new("t", "ok");
         let mut tool_uses = Vec::new();
         for i in 0..n {
-            tool_uses.push(ToolUse { id: format!("tu_{i}"), name: "t".into(), input: json!({}) });
+            tool_uses.push(ToolUse {
+                id: format!("tu_{i}"),
+                name: "t".into(),
+                input: json!({}),
+            });
         }
         let chat = MockChat::new(vec![
-            AgentTurn { text: String::new(), tool_uses, usage: Usage::default() },
+            AgentTurn {
+                text: String::new(),
+                tool_uses,
+                usage: Usage::default(),
+            },
             text_turn("done", (1, 1)),
         ]);
         let tools: Vec<Arc<dyn AgentTool>> = vec![tool.clone()];
-        let out = run_agent_loop(&chat, &tools, "be helpful", "q", 4, 256).await.unwrap();
+        let out = run_agent_loop(&chat, &tools, "be helpful", "q", 4, 256)
+            .await
+            .unwrap();
 
         // Only the cap's worth of tools actually executed (real I/O bounded)…
         assert_eq!(out.tool_calls, MAX_TOOLS_PER_TURN);
@@ -370,10 +410,17 @@ mod tests {
         // so the second model call saw n result blocks and the loop finished.
         let seen = chat.seen.lock().unwrap();
         let results = seen[1][2]["content"].as_array().expect("result blocks");
-        assert_eq!(results.len(), n, "one tool_result per tool_use, capped or not");
+        assert_eq!(
+            results.len(),
+            n,
+            "one tool_result per tool_use, capped or not"
+        );
         // The over-cap results are synthetic "not executed" markers.
         let over = results[MAX_TOOLS_PER_TURN]["content"].as_str().unwrap();
-        assert!(over.contains("per-turn tool limit"), "over-cap call is a synthetic skip: {over}");
+        assert!(
+            over.contains("per-turn tool limit"),
+            "over-cap call is a synthetic skip: {over}"
+        );
         assert_eq!(out.answer, "done");
     }
 }

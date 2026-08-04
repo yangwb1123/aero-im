@@ -11,6 +11,7 @@
 
 use aero_common::{ParticipantId, Poll, PollId, RoomId};
 use sqlx::PgPool;
+use std::collections::HashSet;
 
 /// Minimum / maximum number of options a poll may have. A poll needs at least two
 /// choices to be meaningful; the upper bound keeps the option list (and the
@@ -29,9 +30,55 @@ pub enum VoteError {
     /// The chosen option index is outside `0..options.len()`.
     #[error("option index out of range")]
     OutOfRange,
+    /// A ballot repeated the same option index.
+    #[error("duplicate option index")]
+    DuplicateOption,
+    /// A ballot is empty.
+    #[error("ballot is empty")]
+    EmptyBallot,
+    /// A ballot exceeds the poll's option count or the global poll option cap.
+    #[error("too many options in ballot")]
+    TooManyOptions,
+    /// A single-choice poll received more than one selection.
+    #[error("single-choice poll requires exactly one option")]
+    SingleChoiceMultiple,
+    /// The voter no longer has effective access to the poll's room.
+    #[error("voter cannot access poll room")]
+    Forbidden,
     /// The poll does not exist.
     #[error("poll not found")]
     NotFound,
+    /// A storage error occurred.
+    #[error(transparent)]
+    Db(#[from] sqlx::Error),
+}
+
+/// Why an atomic creator-only close was rejected.
+#[derive(Debug, thiserror::Error)]
+pub enum ClosePollError {
+    /// The poll does not exist (or no longer belongs to the expected room).
+    #[error("poll not found")]
+    NotFound,
+    /// The actor lost effective access to the poll room before the close commit.
+    #[error("actor cannot access poll room")]
+    Forbidden,
+    /// The actor has room access but did not create the poll.
+    #[error("only the poll creator may close it")]
+    NotCreator,
+    /// A storage error occurred.
+    #[error(transparent)]
+    Db(#[from] sqlx::Error),
+}
+
+/// Why a transaction-owned poll creation was rejected.
+#[derive(Debug, thiserror::Error)]
+pub enum CreatePollError {
+    /// The room disappeared before the write could acquire its aggregate lock.
+    #[error("room not found")]
+    NotFound,
+    /// The creator lost effective room access before the insert committed.
+    #[error("creator cannot access poll room")]
+    Forbidden,
     /// A storage error occurred.
     #[error(transparent)]
     Db(#[from] sqlx::Error),
@@ -51,6 +98,35 @@ pub fn option_count_valid(count: usize) -> bool {
     (MIN_OPTIONS..=MAX_OPTIONS).contains(&count)
 }
 
+fn validate_ballot(
+    option_idxs: &[usize],
+    option_count: usize,
+    multi: bool,
+) -> Result<Vec<i32>, VoteError> {
+    if option_idxs.is_empty() {
+        return Err(VoteError::EmptyBallot);
+    }
+    if option_idxs.len() > MAX_OPTIONS || option_idxs.len() > option_count {
+        return Err(VoteError::TooManyOptions);
+    }
+    if !multi && option_idxs.len() != 1 {
+        return Err(VoteError::SingleChoiceMultiple);
+    }
+
+    let mut seen = HashSet::with_capacity(option_idxs.len());
+    let mut validated = Vec::with_capacity(option_idxs.len());
+    for &option_idx in option_idxs {
+        if !option_in_range(option_idx, option_count) {
+            return Err(VoteError::OutOfRange);
+        }
+        if !seen.insert(option_idx) {
+            return Err(VoteError::DuplicateOption);
+        }
+        validated.push(i32::try_from(option_idx).map_err(|_| VoteError::OutOfRange)?);
+    }
+    Ok(validated)
+}
+
 #[derive(Clone)]
 pub struct PollRepo {
     pool: PgPool,
@@ -61,8 +137,8 @@ impl PollRepo {
         Self { pool }
     }
 
-    /// Create a poll in a room, returning its generated id. The caller has already
-    /// validated room access and the option count (`option_count_valid`).
+    /// Create a poll in a room, returning its generated id. Effective room access
+    /// is rechecked under the same locks as the insert.
     pub async fn create(
         &self,
         room: RoomId,
@@ -70,8 +146,9 @@ impl PollRepo {
         question: &str,
         options: &[String],
         multi: bool,
-    ) -> Result<PollId, sqlx::Error> {
-        self.create_with_opts(room, created_by, question, options, multi, false).await
+    ) -> Result<PollId, CreatePollError> {
+        self.create_with_opts(room, created_by, question, options, multi, false)
+            .await
     }
 
     /// Like [`create`](Self::create) but accepts the `anonymous` flag controlling
@@ -85,7 +162,20 @@ impl PollRepo {
         options: &[String],
         multi: bool,
         anonymous: bool,
-    ) -> Result<PollId, sqlx::Error> {
+    ) -> Result<PollId, CreatePollError> {
+        let mut tx = self.pool.begin().await?;
+        if !lock_effective_room_access(&mut tx, room, created_by).await? {
+            let room_exists = sqlx::query_scalar::<_, bool>("SELECT true FROM rooms WHERE id = $1")
+                .bind(room.to_uuid())
+                .fetch_optional(&mut *tx)
+                .await?
+                .is_some();
+            return if room_exists {
+                Err(CreatePollError::Forbidden)
+            } else {
+                Err(CreatePollError::NotFound)
+            };
+        }
         let id = PollId::new();
         sqlx::query(
             r"INSERT INTO polls (id, room_id, created_by, question, options, multi, anonymous, created_at)
@@ -98,8 +188,9 @@ impl PollRepo {
         .bind(sqlx::types::Json(options))
         .bind(multi)
         .bind(anonymous)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(id)
     }
 
@@ -189,85 +280,253 @@ impl PollRepo {
         Ok(row.0 > 0)
     }
 
-    /// Cast a vote. For a single-choice poll (`multi == false`) any prior vote by
-    /// this participant is replaced (delete-then-insert) so they end up with
-    /// exactly one. For a multi-choice poll the `(poll, participant, idx)` row is
-    /// upserted (idempotent). Rejects votes on a closed poll and out-of-range
-    /// option indices. The `multi` flag is supplied by the caller (it has already
-    /// loaded the poll) to avoid a redundant read.
-    pub async fn vote(
+    /// Atomically apply one complete request ballot.
+    ///
+    /// Effective authorization edges are locked in the global workspace -> room
+    /// order before the poll row is locked and its closed state, choice mode, and
+    /// options are decoded. Every index is validated before any vote row changes.
+    /// Single-choice ballots replace the prior choice; multi-choice ballots add
+    /// all requested distinct choices idempotently, preserving the existing
+    /// incremental multi-vote behavior. A stale HTTP authorization therefore
+    /// cannot create a vote after revocation.
+    pub async fn vote_ballot(
         &self,
         poll: PollId,
         participant: ParticipantId,
-        option_idx: usize,
-        multi: bool,
+        expected_room: RoomId,
+        option_idxs: &[usize],
     ) -> Result<(), VoteError> {
-        // Pre-read for fast-fail bounds (needs the option count). The closed-state
-        // that actually gates the insert is re-checked UNDER a row lock below — this
-        // read is only an optimization + an out-of-range guard.
-        let p = self.get(poll).await?.ok_or(VoteError::NotFound)?;
-        if !option_in_range(option_idx, p.options.len()) {
-            return Err(VoteError::OutOfRange);
+        if option_idxs.len() > MAX_OPTIONS {
+            return Err(VoteError::TooManyOptions);
         }
-        let idx = i32::try_from(option_idx).map_err(|_| VoteError::OutOfRange)?;
-
-        // Lock the poll row for the duration of the insert so a concurrent close()
-        // (which UPDATEs the same row, taking the same lock) serializes with us. The
-        // closed-state observed here, under the lock, is authoritative — a stale
-        // pre-read would otherwise let a ballot land in a poll that closed in the
-        // gap between the read and the insert (TOCTOU).
         let mut tx = self.pool.begin().await?;
-        let closed_at = sqlx::query_scalar::<_, Option<time::OffsetDateTime>>(
-            r"SELECT closed_at FROM polls WHERE id = $1 FOR UPDATE",
+
+        // Global authorization lock order is workspace -> room -> membership
+        // rows -> aggregate row. Resolve the immutable poll->room edge without
+        // a lock first, then acquire the authorization locks before locking the
+        // poll. Workspace/room revocation writers use the same order, so either
+        // the vote commits first or the revocation commits first and this
+        // transaction observes Forbidden; a stale HTTP preflight cannot commit
+        // after a completed revocation.
+        let resolved_room =
+            sqlx::query_scalar::<_, uuid::Uuid>("SELECT room_id FROM polls WHERE id = $1")
+                .bind(poll.to_uuid())
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or(VoteError::NotFound)?;
+        if resolved_room != expected_room.to_uuid() {
+            return Err(VoteError::NotFound);
+        }
+        if !lock_effective_room_access(&mut tx, expected_room, participant).await? {
+            return Err(VoteError::Forbidden);
+        }
+
+        let locked = sqlx::query_as::<_, BallotPollRow>(
+            r"SELECT room_id, options, multi, closed_at
+                 FROM polls
+                WHERE id = $1
+                FOR UPDATE",
         )
         .bind(poll.to_uuid())
         .fetch_optional(&mut *tx)
         .await?
         .ok_or(VoteError::NotFound)?;
-        if closed_at.is_some() {
+        if RoomId::from_uuid(locked.room_id) != expected_room {
+            return Err(VoteError::NotFound);
+        }
+        if locked.closed_at.is_some() {
             return Err(VoteError::Closed);
         }
+        let option_idxs = validate_ballot(option_idxs, locked.options.0.len(), locked.multi)?;
 
-        if !multi {
-            // Single-choice: a participant has exactly one vote. Replace any prior
-            // choice so a re-vote can't leave two rows.
+        if !locked.multi {
             sqlx::query(r"DELETE FROM poll_votes WHERE poll_id = $1 AND participant_id = $2")
                 .bind(poll.to_uuid())
                 .bind(participant.to_uuid())
                 .execute(&mut *tx)
                 .await?;
         }
-        // Insert the (new) choice. ON CONFLICT keeps multi-choice idempotent; for
-        // single-choice the prior row was just deleted, so the clause is a no-op.
+
         sqlx::query(
-            r"INSERT INTO poll_votes (poll_id, participant_id, option_idx, created_at)
-               VALUES ($1, $2, $3, now())
-               ON CONFLICT (poll_id, participant_id, option_idx) DO NOTHING",
+            r"INSERT INTO poll_votes
+                  (poll_id, participant_id, option_idx, created_at)
+               SELECT $1, $2, choice.option_idx, now()
+                 FROM UNNEST($3::int[]) AS choice(option_idx)
+          ON CONFLICT (poll_id, participant_id, option_idx) DO NOTHING",
         )
         .bind(poll.to_uuid())
         .bind(participant.to_uuid())
-        .bind(idx)
+        .bind(&option_idxs)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
         Ok(())
     }
 
-    /// Close a poll — creator only. Returns `true` if THIS call closed it: false
-    /// when the poll is gone, the actor is not the creator, or it was already
-    /// closed. Verifying `created_by` in the `WHERE` keeps the check atomic and
-    /// leaks nothing to a non-creator.
-    pub async fn close(&self, poll: PollId, actor: ParticipantId) -> Result<bool, sqlx::Error> {
-        let result = sqlx::query(
-            r"UPDATE polls SET closed_at = now()
-               WHERE id = $1 AND created_by = $2 AND closed_at IS NULL",
+    /// Close a poll with creator identity and effective room access checked under
+    /// the same locks as the update. Returns `true` when this call closed it and
+    /// `false` when the creator had already closed it.
+    pub async fn close_authorized(
+        &self,
+        poll: PollId,
+        actor: ParticipantId,
+        expected_room: RoomId,
+    ) -> Result<bool, ClosePollError> {
+        let mut tx = self.pool.begin().await?;
+        let resolved_room =
+            sqlx::query_scalar::<_, uuid::Uuid>("SELECT room_id FROM polls WHERE id = $1")
+                .bind(poll.to_uuid())
+                .fetch_optional(&mut *tx)
+                .await?
+                .ok_or(ClosePollError::NotFound)?;
+        if resolved_room != expected_room.to_uuid() {
+            return Err(ClosePollError::NotFound);
+        }
+        if !lock_effective_room_access(&mut tx, expected_room, actor).await? {
+            return Err(ClosePollError::Forbidden);
+        }
+
+        let locked = sqlx::query_as::<_, (uuid::Uuid, uuid::Uuid, Option<time::OffsetDateTime>)>(
+            r"SELECT room_id, created_by, closed_at
+                 FROM polls
+                WHERE id = $1
+                FOR UPDATE",
         )
         .bind(poll.to_uuid())
-        .bind(actor.to_uuid())
-        .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected() > 0)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(ClosePollError::NotFound)?;
+        if locked.0 != expected_room.to_uuid() {
+            return Err(ClosePollError::NotFound);
+        }
+        if locked.1 != actor.to_uuid() {
+            return Err(ClosePollError::NotCreator);
+        }
+        if locked.2.is_some() {
+            tx.commit().await?;
+            return Ok(false);
+        }
+        sqlx::query("UPDATE polls SET closed_at = now() WHERE id = $1")
+            .bind(poll.to_uuid())
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(true)
     }
+}
+
+/// Hold every mutable authorization edge needed by a room write.
+///
+/// The workspace row serializes deactivation, workspace removal, and policy
+/// changes; the room and membership rows serialize room removal/leave; the
+/// participant and TOTP rows serialize account deletion and 2FA disable. Bots
+/// and service principals are exempt from human mandatory-2FA enrollment, while
+/// every other access gate remains mandatory.
+async fn lock_effective_room_access(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    room: RoomId,
+    participant: ParticipantId,
+) -> Result<bool, sqlx::Error> {
+    let workspace =
+        sqlx::query_scalar::<_, uuid::Uuid>("SELECT workspace_id FROM rooms WHERE id = $1")
+            .bind(room.to_uuid())
+            .fetch_optional(&mut **tx)
+            .await?;
+    let Some(workspace) = workspace else {
+        return Ok(false);
+    };
+
+    let require_2fa =
+        sqlx::query_scalar::<_, bool>("SELECT require_2fa FROM workspaces WHERE id = $1 FOR SHARE")
+            .bind(workspace)
+            .fetch_optional(&mut **tx)
+            .await?;
+    let Some(require_2fa) = require_2fa else {
+        return Ok(false);
+    };
+
+    let locked_workspace = sqlx::query_scalar::<_, uuid::Uuid>(
+        "SELECT workspace_id FROM rooms WHERE id = $1 FOR SHARE",
+    )
+    .bind(room.to_uuid())
+    .fetch_optional(&mut **tx)
+    .await?;
+    if locked_workspace != Some(workspace) {
+        return Ok(false);
+    }
+
+    let workspace_member = sqlx::query_scalar::<_, bool>(
+        r"SELECT true
+            FROM workspace_members
+           WHERE workspace_id = $1 AND participant_id = $2
+           FOR SHARE",
+    )
+    .bind(workspace)
+    .bind(participant.to_uuid())
+    .fetch_optional(&mut **tx)
+    .await?
+    .is_some();
+    if !workspace_member {
+        return Ok(false);
+    }
+
+    let room_member = sqlx::query_scalar::<_, bool>(
+        r"SELECT true
+            FROM room_members
+           WHERE room_id = $1 AND participant_id = $2
+           FOR SHARE",
+    )
+    .bind(room.to_uuid())
+    .bind(participant.to_uuid())
+    .fetch_optional(&mut **tx)
+    .await?
+    .is_some();
+    if !room_member {
+        return Ok(false);
+    }
+
+    let participant_kind = sqlx::query_scalar::<_, String>(
+        r"SELECT kind
+            FROM participants
+           WHERE id = $1 AND deleted_at IS NULL
+           FOR SHARE",
+    )
+    .bind(participant.to_uuid())
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some(participant_kind) = participant_kind else {
+        return Ok(false);
+    };
+
+    let deactivated = sqlx::query_scalar::<_, bool>(
+        r"SELECT true
+            FROM workspace_deactivations
+           WHERE workspace_id = $1 AND participant_id = $2
+           FOR SHARE",
+    )
+    .bind(workspace)
+    .bind(participant.to_uuid())
+    .fetch_optional(&mut **tx)
+    .await?
+    .is_some();
+    if deactivated {
+        return Ok(false);
+    }
+
+    if participant_kind != "human" || !require_2fa {
+        return Ok(true);
+    }
+    let totp_activated = sqlx::query_scalar::<_, bool>(
+        r"SELECT activated
+            FROM totp_secrets
+           WHERE participant_id = $1
+           FOR SHARE",
+    )
+    .bind(participant.to_uuid())
+    .fetch_optional(&mut **tx)
+    .await?
+    .unwrap_or(false);
+    Ok(totp_activated)
 }
 
 #[derive(sqlx::FromRow)]
@@ -281,6 +540,14 @@ struct PollRow {
     anonymous: bool,
     closed_at: Option<time::OffsetDateTime>,
     created_at: time::OffsetDateTime,
+}
+
+#[derive(sqlx::FromRow)]
+struct BallotPollRow {
+    room_id: uuid::Uuid,
+    options: sqlx::types::Json<Vec<String>>,
+    multi: bool,
+    closed_at: Option<time::OffsetDateTime>,
 }
 
 impl From<PollRow> for Poll {
@@ -320,6 +587,36 @@ mod tests {
         assert!(option_count_valid(10));
         assert!(!option_count_valid(11));
     }
+
+    #[test]
+    fn ballot_validation_rejects_duplicates_bounds_and_wrong_choice_mode() {
+        assert_eq!(validate_ballot(&[0, 2], 3, true).unwrap(), vec![0, 2]);
+        assert!(matches!(
+            validate_ballot(&[0, 0], 3, true),
+            Err(VoteError::DuplicateOption)
+        ));
+        assert!(matches!(
+            validate_ballot(&[], 3, true),
+            Err(VoteError::EmptyBallot)
+        ));
+        assert!(matches!(
+            validate_ballot(&[0, 1], 3, false),
+            Err(VoteError::SingleChoiceMultiple)
+        ));
+        assert!(matches!(
+            validate_ballot(&[3], 3, true),
+            Err(VoteError::OutOfRange)
+        ));
+        let oversized = vec![0; MAX_OPTIONS + 1];
+        assert!(matches!(
+            validate_ballot(&oversized, MAX_OPTIONS + 1, true),
+            Err(VoteError::TooManyOptions)
+        ));
+        assert!(matches!(
+            validate_ballot(&[0, 1, 2], 2, true),
+            Err(VoteError::TooManyOptions)
+        ));
+    }
 }
 
 /// PG-gated integration tests (run with a live Postgres + applied migrations):
@@ -337,7 +634,7 @@ mod db_tests {
         let url = std::env::var("DATABASE_URL")
             .unwrap_or_else(|_| "postgres://aero:aero_dev_pw@localhost:5432/aero".into());
         sqlx::postgres::PgPoolOptions::new()
-            .max_connections(2)
+            .max_connections(4)
             .connect_lazy(&url)
             .expect("connect_lazy never fails on a well-formed URL")
     }
@@ -353,7 +650,7 @@ mod db_tests {
         let room = RoomId::new();
         sqlx::query(
             "INSERT INTO rooms (id, kind, name, created_by, created_at, workspace_id)
-             VALUES ($1,'channel',$2,$3, now(), '00000000-0000-0000-0000-000000000000')",
+             VALUES ($1,'group',$2,$3, now(), '00000000-0000-0000-0000-000000000000')",
         )
         .bind(room.to_uuid())
         .bind("poll-room")
@@ -361,6 +658,24 @@ mod db_tests {
         .execute(p)
         .await
         .expect("insert room");
+        sqlx::query(
+            "INSERT INTO workspace_members
+                 (workspace_id, participant_id, role)
+             VALUES ('00000000-0000-0000-0000-000000000000', $1, 'member')",
+        )
+        .bind(actor.to_uuid())
+        .execute(p)
+        .await
+        .expect("join workspace");
+        sqlx::query(
+            "INSERT INTO room_members (room_id, participant_id, role)
+             VALUES ($1, $2, 'owner')",
+        )
+        .bind(room.to_uuid())
+        .bind(actor.to_uuid())
+        .execute(p)
+        .await
+        .expect("join room");
         (room, actor)
     }
 
@@ -372,7 +687,10 @@ mod db_tests {
         let (room, actor) = fixture(&p).await;
 
         let opts = vec!["A".to_string(), "B".to_string(), "C".to_string()];
-        let poll = repo.create(room, actor, "pick one", &opts, false).await.unwrap();
+        let poll = repo
+            .create(room, actor, "pick one", &opts, false)
+            .await
+            .unwrap();
 
         let got = repo.get(poll).await.unwrap().expect("poll exists");
         assert_eq!(got.options.len(), 3);
@@ -381,14 +699,20 @@ mod db_tests {
         assert_eq!(repo.room_of(poll).await.unwrap(), Some(room));
 
         // Vote for option 1.
-        repo.vote(poll, actor, 1, false).await.unwrap();
+        repo.vote_ballot(poll, actor, room, &[1]).await.unwrap();
         assert!(repo.has_voted(poll, actor).await.unwrap());
         let tally = repo.tally(poll).await.unwrap();
         assert_eq!(tally, vec![0, 1, 0], "one vote on option index 1");
 
         // Close (creator) — then a second close is a no-op.
-        assert!(repo.close(poll, actor).await.unwrap(), "creator closed it");
-        assert!(!repo.close(poll, actor).await.unwrap(), "already closed");
+        assert!(
+            repo.close_authorized(poll, actor, room).await.unwrap(),
+            "creator closed it"
+        );
+        assert!(
+            !repo.close_authorized(poll, actor, room).await.unwrap(),
+            "already closed"
+        );
         assert!(repo.get(poll).await.unwrap().unwrap().is_closed());
     }
 
@@ -400,12 +724,19 @@ mod db_tests {
         let (room, actor) = fixture(&p).await;
 
         let opts = vec!["A".to_string(), "B".to_string()];
-        let poll = repo.create(room, actor, "single", &opts, false).await.unwrap();
+        let poll = repo
+            .create(room, actor, "single", &opts, false)
+            .await
+            .unwrap();
 
-        repo.vote(poll, actor, 0, false).await.unwrap();
-        repo.vote(poll, actor, 1, false).await.unwrap(); // re-vote replaces
+        repo.vote_ballot(poll, actor, room, &[0]).await.unwrap();
+        repo.vote_ballot(poll, actor, room, &[1]).await.unwrap(); // re-vote replaces
         let tally = repo.tally(poll).await.unwrap();
-        assert_eq!(tally, vec![0, 1], "single-choice keeps exactly the latest vote");
+        assert_eq!(
+            tally,
+            vec![0, 1],
+            "single-choice keeps exactly the latest vote"
+        );
     }
 
     #[tokio::test]
@@ -416,13 +747,19 @@ mod db_tests {
         let (room, actor) = fixture(&p).await;
 
         let opts = vec!["A".to_string(), "B".to_string(), "C".to_string()];
-        let poll = repo.create(room, actor, "multi", &opts, true).await.unwrap();
+        let poll = repo
+            .create(room, actor, "multi", &opts, true)
+            .await
+            .unwrap();
 
-        repo.vote(poll, actor, 0, true).await.unwrap();
-        repo.vote(poll, actor, 2, true).await.unwrap();
-        repo.vote(poll, actor, 2, true).await.unwrap(); // idempotent
+        repo.vote_ballot(poll, actor, room, &[0, 2]).await.unwrap();
+        repo.vote_ballot(poll, actor, room, &[2]).await.unwrap(); // idempotent
         let tally = repo.tally(poll).await.unwrap();
-        assert_eq!(tally, vec![1, 0, 1], "multi-choice keeps each distinct option");
+        assert_eq!(
+            tally,
+            vec![1, 0, 1],
+            "multi-choice keeps each distinct option"
+        );
     }
 
     #[tokio::test]
@@ -437,16 +774,270 @@ mod db_tests {
 
         // Out-of-range option is rejected.
         assert!(matches!(
-            repo.vote(poll, actor, 9, false).await,
+            repo.vote_ballot(poll, actor, room, &[9]).await,
             Err(VoteError::OutOfRange)
         ));
 
         // Once closed, even a valid option is rejected.
-        assert!(repo.close(poll, actor).await.unwrap());
+        assert!(repo.close_authorized(poll, actor, room).await.unwrap());
         assert!(matches!(
-            repo.vote(poll, actor, 0, false).await,
+            repo.vote_ballot(poll, actor, room, &[0]).await,
             Err(VoteError::Closed)
         ));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn poll_ballot_validation_is_atomic_without_prefix_writes() {
+        let p = pool();
+        let repo = PollRepo::new(p.clone());
+        let (room, actor) = fixture(&p).await;
+        let opts = vec!["A".to_string(), "B".to_string(), "C".to_string()];
+        let multi = repo
+            .create(room, actor, "multi", &opts, true)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            repo.vote_ballot(multi, actor, room, &[0, 99]).await,
+            Err(VoteError::OutOfRange)
+        ));
+        assert!(matches!(
+            repo.vote_ballot(multi, actor, room, &[0, 0]).await,
+            Err(VoteError::DuplicateOption)
+        ));
+        let oversized = vec![0; MAX_OPTIONS + 1];
+        assert!(matches!(
+            repo.vote_ballot(multi, actor, room, &oversized).await,
+            Err(VoteError::TooManyOptions)
+        ));
+        assert_eq!(
+            repo.tally(multi).await.unwrap(),
+            vec![0, 0, 0],
+            "an invalid batch must not commit its valid prefix"
+        );
+
+        let single = repo
+            .create(room, actor, "single", &opts, false)
+            .await
+            .unwrap();
+        repo.vote_ballot(single, actor, room, &[1]).await.unwrap();
+        assert!(matches!(
+            repo.vote_ballot(single, actor, room, &[0, 2]).await,
+            Err(VoteError::SingleChoiceMultiple)
+        ));
+        assert!(matches!(
+            repo.vote_ballot(single, actor, room, &[99]).await,
+            Err(VoteError::OutOfRange)
+        ));
+        assert_eq!(
+            repo.tally(single).await.unwrap(),
+            vec![0, 1, 0],
+            "invalid replacement ballots must preserve the old single choice"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn poll_vote_access_revocation_rolls_back_single_choice_delete() {
+        let p = pool();
+        let repo = PollRepo::new(p.clone());
+        let (room, actor) = fixture(&p).await;
+        let opts = vec!["A".to_string(), "B".to_string()];
+        let poll = repo
+            .create(room, actor, "single", &opts, false)
+            .await
+            .unwrap();
+        repo.vote_ballot(poll, actor, room, &[1]).await.unwrap();
+
+        sqlx::query("DELETE FROM room_members WHERE room_id = $1 AND participant_id = $2")
+            .bind(room.to_uuid())
+            .bind(actor.to_uuid())
+            .execute(&p)
+            .await
+            .unwrap();
+        assert!(matches!(
+            repo.vote_ballot(poll, actor, room, &[0]).await,
+            Err(VoteError::Forbidden)
+        ));
+        assert_eq!(
+            repo.tally(poll).await.unwrap(),
+            vec![0, 1],
+            "authorization failure must roll back the replacement delete"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn poll_create_rechecks_access_in_insert_transaction() {
+        let p = pool();
+        let repo = PollRepo::new(p.clone());
+        let (room, actor) = fixture(&p).await;
+
+        sqlx::query("DELETE FROM room_members WHERE room_id = $1 AND participant_id = $2")
+            .bind(room.to_uuid())
+            .bind(actor.to_uuid())
+            .execute(&p)
+            .await
+            .unwrap();
+        assert!(matches!(
+            repo.create(
+                room,
+                actor,
+                "must not persist",
+                &["A".to_owned(), "B".to_owned()],
+                false,
+            )
+            .await,
+            Err(CreatePollError::Forbidden)
+        ));
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM polls WHERE room_id = $1")
+            .bind(room.to_uuid())
+            .fetch_one(&p)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn poll_membership_revocation_wins_before_vote_commit() {
+        let p = pool();
+        let repo = PollRepo::new(p.clone());
+        let (room, actor) = fixture(&p).await;
+        let poll = repo
+            .create(
+                room,
+                actor,
+                "revocation race",
+                &["A".to_owned(), "B".to_owned()],
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Hold the mutable authorization edge exactly as a revocation writer
+        // would. The vote cannot pass its FOR SHARE authorization fence until
+        // this transaction commits the delete.
+        let mut revoker = p.begin().await.unwrap();
+        crate::ownership::lock_membership_governance(&mut revoker)
+            .await
+            .unwrap();
+        sqlx::query(
+            r"SELECT participant_id
+                FROM room_members
+               WHERE room_id = $1 AND participant_id = $2
+               FOR UPDATE",
+        )
+        .bind(room.to_uuid())
+        .bind(actor.to_uuid())
+        .fetch_one(&mut *revoker)
+        .await
+        .unwrap();
+        let racing_repo = repo.clone();
+        let vote =
+            tokio::spawn(async move { racing_repo.vote_ballot(poll, actor, room, &[0]).await });
+        tokio::task::yield_now().await;
+        sqlx::query("DELETE FROM room_members WHERE room_id = $1 AND participant_id = $2")
+            .bind(room.to_uuid())
+            .bind(actor.to_uuid())
+            .execute(&mut *revoker)
+            .await
+            .unwrap();
+        revoker.commit().await.unwrap();
+
+        assert!(matches!(vote.await.unwrap(), Err(VoteError::Forbidden)));
+        assert_eq!(
+            repo.tally(poll).await.unwrap(),
+            vec![0, 0],
+            "a vote waiting behind a committed revocation must not persist"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn poll_membership_revocation_wins_before_close_commit() {
+        let p = pool();
+        let repo = PollRepo::new(p.clone());
+        let (room, actor) = fixture(&p).await;
+        let poll = repo
+            .create(
+                room,
+                actor,
+                "close revocation race",
+                &["A".to_owned(), "B".to_owned()],
+                false,
+            )
+            .await
+            .unwrap();
+
+        let mut revoker = p.begin().await.unwrap();
+        crate::ownership::lock_membership_governance(&mut revoker)
+            .await
+            .unwrap();
+        sqlx::query(
+            r"SELECT participant_id
+                FROM room_members
+               WHERE room_id = $1 AND participant_id = $2
+               FOR UPDATE",
+        )
+        .bind(room.to_uuid())
+        .bind(actor.to_uuid())
+        .fetch_one(&mut *revoker)
+        .await
+        .unwrap();
+        let racing_repo = repo.clone();
+        let close =
+            tokio::spawn(async move { racing_repo.close_authorized(poll, actor, room).await });
+        tokio::task::yield_now().await;
+        sqlx::query("DELETE FROM room_members WHERE room_id = $1 AND participant_id = $2")
+            .bind(room.to_uuid())
+            .bind(actor.to_uuid())
+            .execute(&mut *revoker)
+            .await
+            .unwrap();
+        revoker.commit().await.unwrap();
+
+        assert!(matches!(
+            close.await.unwrap(),
+            Err(ClosePollError::Forbidden)
+        ));
+        assert!(
+            !repo.get(poll).await.unwrap().unwrap().is_closed(),
+            "a close waiting behind a committed revocation must not persist"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn poll_close_wins_row_lock_race_and_rejects_whole_ballot() {
+        let p = pool();
+        let repo = PollRepo::new(p.clone());
+        let (room, actor) = fixture(&p).await;
+        let opts = vec!["A".to_string(), "B".to_string()];
+        let poll = repo
+            .create(room, actor, "race", &opts, false)
+            .await
+            .unwrap();
+
+        let mut closer = p.begin().await.unwrap();
+        sqlx::query("SELECT id FROM polls WHERE id = $1 FOR UPDATE")
+            .bind(poll.to_uuid())
+            .fetch_one(&mut *closer)
+            .await
+            .unwrap();
+        let racing_repo = repo.clone();
+        let vote =
+            tokio::spawn(async move { racing_repo.vote_ballot(poll, actor, room, &[0]).await });
+        sqlx::query("UPDATE polls SET closed_at = now() WHERE id = $1")
+            .bind(poll.to_uuid())
+            .execute(&mut *closer)
+            .await
+            .unwrap();
+        closer.commit().await.unwrap();
+
+        assert!(matches!(vote.await.unwrap(), Err(VoteError::Closed)));
+        assert_eq!(repo.tally(poll).await.unwrap(), vec![0, 0]);
     }
 
     #[tokio::test]
@@ -460,10 +1051,23 @@ mod db_tests {
         let opts = vec!["A".to_string(), "B".to_string()];
         let poll = repo.create(room, creator, "q", &opts, false).await.unwrap();
 
-        // A non-creator cannot close it.
-        assert!(!repo.close(poll, stranger).await.unwrap(), "stranger cannot close");
+        // Give the stranger legitimate room access so this exercises the
+        // creator-only branch rather than the earlier access fence.
+        sqlx::query(
+            "INSERT INTO room_members (room_id, participant_id, role)
+             VALUES ($1, $2, 'member')",
+        )
+        .bind(room.to_uuid())
+        .bind(stranger.to_uuid())
+        .execute(&p)
+        .await
+        .unwrap();
+        assert!(matches!(
+            repo.close_authorized(poll, stranger, room).await,
+            Err(ClosePollError::NotCreator)
+        ));
         assert!(!repo.get(poll).await.unwrap().unwrap().is_closed());
         // The creator can.
-        assert!(repo.close(poll, creator).await.unwrap());
+        assert!(repo.close_authorized(poll, creator, room).await.unwrap());
     }
 }

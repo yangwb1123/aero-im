@@ -14,15 +14,11 @@
 //!   through the RFC 6184 [`H264Depacketizer`] into Annex-B access units and
 //!   forwarded to a [`MediaSink`].
 //!
-//! ## Why RTP mode
-//!
 //! In str0m's default sample mode, `Event::MediaData` hands you an
 //! already-depacketized frame, which would make our RFC 6184 depacketizer
 //! redundant. Building with `set_rtp_mode(true)` makes str0m emit raw
 //! [`RtpPacket`]s instead, so the depacketizer genuinely reassembles NAL units
 //! from the publisher's RTP — exactly the boundary this crate owns.
-//!
-//! ## Reorder buffer
 //!
 //! Inbound RTP packets are passed through a [`ReorderBuffer`] before reaching
 //! the depacketizer. The buffer holds packets that arrived out of order and
@@ -35,24 +31,18 @@
 //! seq is the start of the window — browsers choose a random initial seq, so
 //! starting at 0 would stall the drain until the window was exceeded.
 //!
-//! ## Runtime-verifiability
-//!
-//! `accept` is unit-tested (real offer → real answer). `run` is **not**
-//! runtime-verifiable here — it needs an actual browser WHIP publisher
-//! completing ICE+DTLS, which this environment cannot provide. Its constituent
-//! pieces (the depacketizer, answer generation, PT→codec classification) are
-//! tested; the loop wiring is reviewed-and-compiled only. The server is
-//! responsible for spawning `run` (out of scope for this crate).
+//! The transport is covered by an in-process two-peer ICE/DTLS/SRTP test; real
+//! browser/device and network behavior remains a staging acceptance boundary.
 
 use std::net::SocketAddr;
 use std::time::Instant;
 
 use bytes::BytesMut;
-use str0m::change::{SdpAnswer, SdpOffer};
+use str0m::change::SdpAnswer;
 use str0m::media::Pt;
 use str0m::net::{Protocol, Receive};
 use str0m::rtp::RtpPacket;
-use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc, RtcError};
+use str0m::{Event, IceConnectionState, Input, Output, Rtc};
 use tokio::net::UdpSocket;
 use tracing::{debug, trace, warn};
 
@@ -64,35 +54,13 @@ use crate::metrics;
 use crate::relay::MediaRelay;
 use crate::reorder::ReorderBuffer;
 
-/// Maximum size of a single inbound UDP datagram we buffer. WebRTC keeps
-/// datagrams under the path MTU; 2 KiB is comfortably above that.
-const RECV_BUF: usize = 2048;
+#[path = "session/hls.rs"]
+mod hls;
+#[path = "session/support.rs"]
+mod support;
 
-/// Default jitter-buffer window for the ingest [`ReorderBuffer`]: how many
-/// sequence-number slots ahead of the drain cursor we hold before declaring a
-/// missing packet lost and skipping it. 64 slots at 30 fps gives ~2 s of
-/// tolerance — ample for typical internet jitter while keeping latency bounded.
-pub const DEFAULT_REORDER_WINDOW: u16 = 64;
-
-/// Errors specific to driving a str0m session.
-#[derive(Debug, thiserror::Error)]
-pub enum SessionError {
-    /// The SDP offer could not be parsed by str0m.
-    #[error("parse offer: {0}")]
-    Offer(String),
-    /// str0m rejected the offer or failed to produce an answer.
-    #[error("rtc: {0}")]
-    Rtc(#[from] RtcError),
-    /// The supplied ingest address was not a valid `SocketAddr`.
-    #[error("invalid ingest address {0}:{1}")]
-    Addr(String, u16),
-    /// Building a local ICE candidate failed.
-    #[error("candidate: {0}")]
-    Candidate(String),
-    /// Socket I/O error while running the loop.
-    #[error("io: {0}")]
-    Io(#[from] std::io::Error),
-}
+use support::{media_time_to_90k, RECV_BUF};
+pub use support::{SessionError, DEFAULT_REORDER_WINDOW};
 
 /// A live WHIP publisher session backed by a str0m `Rtc`.
 ///
@@ -133,37 +101,12 @@ impl WhipSession {
         ingest_host: &str,
         ingest_port: u16,
     ) -> Result<(Self, SdpAnswer), SessionError> {
-        let local_addr: SocketAddr = format!("{ingest_host}:{ingest_port}")
-            .parse()
-            .map_err(|_| SessionError::Addr(ingest_host.to_string(), ingest_port))?;
-
-        let offer = SdpOffer::from_sdp_string(offer_sdp)
-            .map_err(|e| SessionError::Offer(e.to_string()))?;
-
-        // RTP mode: str0m emits raw RtpPacket events so our RFC 6184
-        // depacketizer can do the NAL reassembly. str0m still generates its own
-        // DTLS cert/fingerprint and ICE credentials.
-        let mut rtc = Rtc::builder().set_rtp_mode(true).build(Instant::now());
-
-        // Advertise a host candidate pointing at the server's ingest socket.
-        // (str0m's `Candidate::host` takes the protocol as a string, e.g. "udp".)
-        let candidate = Candidate::host(local_addr, "udp")
-            .map_err(|e| SessionError::Candidate(e.to_string()))?;
-        let _ = rtc.add_local_candidate(candidate);
-
-        // accept_offer mirrors the offer's m-lines (the browser publishes
-        // sendonly audio/video; str0m answers recvonly) and returns the answer.
-        let answer = rtc.sdp_api().accept_offer(offer)?;
-
-        // After negotiation, record which payload types are video so the run
-        // loop can route inbound RTP correctly.
-        let video_pts = rtc
-            .codec_config()
-            .params()
-            .iter()
-            .filter(|p| p.spec().codec.is_video())
-            .map(str0m::format::PayloadParams::pt)
-            .collect();
+        let support::AcceptedSession {
+            rtc,
+            local_addr,
+            video_pts,
+            answer,
+        } = support::accept(offer_sdp, ingest_host, ingest_port)?;
 
         Ok((
             Self {
@@ -207,45 +150,6 @@ impl WhipSession {
     pub fn with_relay(mut self, relay: Arc<MediaRelay>) -> Self {
         self.relay = Some(relay);
         self
-    }
-
-    /// Drive this session straight into HLS on disk under `stream_dir`.
-    ///
-    /// This is the canonical production wiring of the P5 media path, kept here so
-    /// it compiles against the real types even though it cannot *run* without a
-    /// browser completing ICE/DTLS:
-    ///
-    /// 1. Build the [`HlsSink`] / [`HlsSegmentWriter`] pair rooted at
-    ///    `stream_dir` (the caller composes `hls_dir/{stream_id}`).
-    /// 2. Spawn the async writer (it owns [`aero_live_hls::HlsWriter`] and does
-    ///    the disk I/O off the str0m hot path).
-    /// 3. [`run`](Self::run) the str0m loop with the sink; depacketized H.264
-    ///    access units become keyframe-aligned `.ts` segments + `index.m3u8`.
-    ///
-    /// Dropping the sink when `run` returns closes the channel, so the writer
-    /// finalizes the manifest and reports how many segments it persisted.
-    ///
-    /// The `socket` must be bound to [`local_addr`](Self::local_addr).
-    pub async fn run_to_hls(
-        self,
-        socket: UdpSocket,
-        stream_dir: std::path::PathBuf,
-        target_duration_secs: u32,
-    ) -> Result<u64, SessionError> {
-        let (sink, writer) = crate::hls_sink::hls_sink(stream_dir, target_duration_secs)
-            .await
-            .map_err(|e| SessionError::Io(std::io::Error::other(e.to_string())))?;
-        let writer_task = tokio::spawn(writer.run());
-        // Run the media plane; the sink is moved in and dropped on return, which
-        // closes the channel and lets the writer task finalize the manifest.
-        // `Box::pin` keeps this combined future off the stack (the str0m `run`
-        // future is large) — see clippy::large_futures.
-        Box::pin(self.run(socket, sink)).await?;
-        match writer_task.await {
-            Ok(Ok(segments)) => Ok(segments),
-            Ok(Err(e)) => Err(SessionError::Io(std::io::Error::other(e.to_string()))),
-            Err(join) => Err(SessionError::Io(std::io::Error::other(join.to_string()))),
-        }
     }
 
     /// Run the str0m event loop until the connection closes or errors.
@@ -318,7 +222,9 @@ impl WhipSession {
                                         // Gap declared lost: reset depacketizer so a
                                         // stale FU-A prefix never corrupts the next
                                         // fragment. The next IDR keyframe will resync.
-                                        trace!("whip: rtp gap declared lost, resyncing depacketizer");
+                                        trace!(
+                                            "whip: rtp gap declared lost, resyncing depacketizer"
+                                        );
                                         depacketizer.reset();
                                         au.clear();
                                     }
@@ -417,23 +323,14 @@ impl WhipSession {
     }
 }
 
-/// Convert a str0m `MediaTime` into 90 kHz ticks (the unit the MPEG-TS muxer in
-/// `aero-live-hls` uses for PTS/DTS).
-///
-/// The value is clamped to be non-negative and, for any realistic stream
-/// duration, fits comfortably in `u64`, so the float→int cast is intentional.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn media_time_to_90k(time: str0m::media::MediaTime) -> u64 {
-    (time.as_seconds() * 90_000.0).max(0.0) as u64
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use str0m::Candidate;
 
     /// A minimal but real WHIP-style publisher offer (sendonly audio+video,
     /// bundled, rtcp-mux, with ICE + DTLS attributes) that str0m can parse.
-    const PUBLISHER_OFFER: &str = "v=0\r\n\
+    pub(super) const PUBLISHER_OFFER: &str = "v=0\r\n\
 o=- 4611731400430051336 2 IN IP4 127.0.0.1\r\n\
 s=-\r\n\
 t=0 0\r\n\
@@ -481,7 +378,10 @@ a=fmtp:96 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f
         assert!(sdp.contains("m=audio"), "missing audio m-line:\n{sdp}");
         assert!(sdp.contains("m=video"), "missing video m-line:\n{sdp}");
         // str0m answers the publisher's sendonly with recvonly.
-        assert!(sdp.contains("a=recvonly"), "expected recvonly answer:\n{sdp}");
+        assert!(
+            sdp.contains("a=recvonly"),
+            "expected recvonly answer:\n{sdp}"
+        );
         // The host candidate we added points at the ingest address.
         assert!(
             sdp.contains("127.0.0.1") && sdp.contains("7000"),
@@ -502,10 +402,7 @@ a=fmtp:96 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f
             "expected at least one negotiated video payload type"
         );
         // PT 96 was offered for H.264; str0m should keep it.
-        let has_96 = session
-            .video_payload_types()
-            .iter()
-            .any(|pt| **pt == 96);
+        let has_96 = session.video_payload_types().iter().any(|pt| **pt == 96);
         assert!(has_96, "expected H.264 PT 96 among video PTs");
     }
 
@@ -628,7 +525,14 @@ a=fmtp:96 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f
 
         // ---- Access unit 1 (keyframe): STAP-A(SPS,PPS) + FU-A(IDR) ----
         // Parameter sets arrive aggregated (no marker — same AU continues).
-        feed_rtp(&mut depack, &mut au, &mut sink, &stap_a(&[sps, pps]), false, 0);
+        feed_rtp(
+            &mut depack,
+            &mut au,
+            &mut sink,
+            &stap_a(&[sps, pps]),
+            false,
+            0,
+        );
         // IDR slice fragmented across 3 FU-A packets; the last carries the marker
         // bit that terminates the access unit.
         let idr_body = [0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99];
@@ -656,7 +560,10 @@ a=fmtp:96 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f
         let segments = writer_task.await.unwrap().unwrap();
 
         // ---- Assert real HLS output on disk ----
-        assert!(segments >= 1, "at least one .ts segment persisted, got {segments}");
+        assert!(
+            segments >= 1,
+            "at least one .ts segment persisted, got {segments}"
+        );
         let seg0 = stream_dir.join("0.ts");
         assert!(seg0.exists(), "0.ts must exist on disk");
         let ts_bytes = std::fs::read(&seg0).unwrap();
@@ -668,12 +575,30 @@ a=fmtp:96 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f
         let manifest_path = stream_dir.join("index.m3u8");
         let manifest = std::fs::read_to_string(&manifest_path).unwrap();
         assert!(!manifest.is_empty(), "manifest is non-empty");
-        assert!(manifest.starts_with("#EXTM3U"), "manifest header:\n{manifest}");
-        assert!(manifest.contains("#EXT-X-VERSION:3"), "manifest:\n{manifest}");
-        assert!(manifest.contains("#EXT-X-TARGETDURATION:2"), "manifest:\n{manifest}");
-        assert!(manifest.contains("#EXTINF:"), "per-segment duration:\n{manifest}");
-        assert!(manifest.contains("0.ts"), "segment name in manifest:\n{manifest}");
-        assert!(manifest.contains("#EXT-X-ENDLIST"), "finalized:\n{manifest}");
+        assert!(
+            manifest.starts_with("#EXTM3U"),
+            "manifest header:\n{manifest}"
+        );
+        assert!(
+            manifest.contains("#EXT-X-VERSION:3"),
+            "manifest:\n{manifest}"
+        );
+        assert!(
+            manifest.contains("#EXT-X-TARGETDURATION:2"),
+            "manifest:\n{manifest}"
+        );
+        assert!(
+            manifest.contains("#EXTINF:"),
+            "per-segment duration:\n{manifest}"
+        );
+        assert!(
+            manifest.contains("0.ts"),
+            "segment name in manifest:\n{manifest}"
+        );
+        assert!(
+            manifest.contains("#EXT-X-ENDLIST"),
+            "finalized:\n{manifest}"
+        );
     }
 
     #[tokio::test]
@@ -693,13 +618,48 @@ a=fmtp:96 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f
         let mut au = BytesMut::new();
 
         // GOP 1: SPS+PPS+IDR (single-NAL IDR this time, marker terminates AU).
-        feed_rtp(&mut depack, &mut au, &mut sink, &stap_a(&[sps, pps]), false, 0);
-        feed_rtp(&mut depack, &mut au, &mut sink, &[0x65, 0x01, 0x02, 0x03], true, 0);
+        feed_rtp(
+            &mut depack,
+            &mut au,
+            &mut sink,
+            &stap_a(&[sps, pps]),
+            false,
+            0,
+        );
+        feed_rtp(
+            &mut depack,
+            &mut au,
+            &mut sink,
+            &[0x65, 0x01, 0x02, 0x03],
+            true,
+            0,
+        );
         // A P-frame.
-        feed_rtp(&mut depack, &mut au, &mut sink, &[0x41, 0x04, 0x05], true, 3_000);
+        feed_rtp(
+            &mut depack,
+            &mut au,
+            &mut sink,
+            &[0x41, 0x04, 0x05],
+            true,
+            3_000,
+        );
         // GOP 2: SPS+PPS+IDR → cuts GOP 1 into 0.ts before muxing this keyframe.
-        feed_rtp(&mut depack, &mut au, &mut sink, &stap_a(&[sps, pps]), false, 6_000);
-        feed_rtp(&mut depack, &mut au, &mut sink, &[0x65, 0x06, 0x07], true, 6_000);
+        feed_rtp(
+            &mut depack,
+            &mut au,
+            &mut sink,
+            &stap_a(&[sps, pps]),
+            false,
+            6_000,
+        );
+        feed_rtp(
+            &mut depack,
+            &mut au,
+            &mut sink,
+            &[0x65, 0x06, 0x07],
+            true,
+            6_000,
+        );
         assert_eq!(sink.segments_emitted(), 1, "one cut at the 2nd keyframe");
 
         drop(sink);
@@ -708,7 +668,10 @@ a=fmtp:96 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f
         assert!(stream_dir.join("0.ts").exists());
         assert!(stream_dir.join("1.ts").exists());
         let manifest = std::fs::read_to_string(stream_dir.join("index.m3u8")).unwrap();
-        assert!(manifest.contains("0.ts") && manifest.contains("1.ts"), "{manifest}");
+        assert!(
+            manifest.contains("0.ts") && manifest.contains("1.ts"),
+            "{manifest}"
+        );
         assert!(manifest.contains("#EXT-X-ENDLIST"));
     }
 
@@ -832,7 +795,10 @@ a=fmtp:96 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f
         for (i, ((ref_au, ref_pts), (ooo_au, ooo_pts))) in
             inorder_aus.iter().zip(reordered_aus.iter()).enumerate()
         {
-            assert_eq!(ref_au, ooo_au, "AU {i} bytes differ between in-order and reordered");
+            assert_eq!(
+                ref_au, ooo_au,
+                "AU {i} bytes differ between in-order and reordered"
+            );
             assert_eq!(ref_pts, ooo_pts, "AU {i} PTS differs");
         }
     }
@@ -1044,7 +1010,9 @@ a=fmtp:96 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f
 
             // Advance the clock to the earliest requested timeout (min 1ms step
             // so a same-instant timeout still makes progress).
-            let next = t_pub.min(t_whip).max(clock + std::time::Duration::from_millis(1));
+            let next = t_pub
+                .min(t_whip)
+                .max(clock + std::time::Duration::from_millis(1));
             clock = next;
             publisher
                 .rtc
@@ -1068,7 +1036,7 @@ a=fmtp:96 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f
             .rtc
             .codec_config()
             .find(|p| p.spec().codec == Codec::H264)
-            .cloned()
+            .copied()
             .expect("publisher negotiated H.264");
         let pt = params.pt();
 
@@ -1126,18 +1094,16 @@ a=fmtp:96 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f
 
             for ev in &events_whip[before..] {
                 if let Event::RtpPacket(p) = ev {
-                    got_rtp = Some((
-                        p.payload.clone(),
-                        p.header.payload_type,
-                        p.header.marker,
-                    ));
+                    got_rtp = Some((p.payload.clone(), p.header.payload_type, p.header.marker));
                 }
             }
             if got_rtp.is_some() {
                 break;
             }
 
-            let next = t_pub.min(t_whip).max(clock + std::time::Duration::from_millis(1));
+            let next = t_pub
+                .min(t_whip)
+                .max(clock + std::time::Duration::from_millis(1));
             clock = next;
             publisher
                 .rtc
@@ -1175,9 +1141,9 @@ a=fmtp:96 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f
         // Arrival order: 65534, 0 (post-wrap), 65535 — so 65535 arrives last
         // even though it is numerically between 65534 and 0.
         let ordered: [(u16, IngestPkt); 3] = [
-            (start, (vec![0x41, 0x01], true, 0)),         // 65534
-            (0u16, (vec![0x41, 0x03], true, 2_000)),      // 0 (after wrap)
-            (u16::MAX, (vec![0x41, 0x02], true, 1_000)),  // 65535 — arrives last
+            (start, (vec![0x41, 0x01], true, 0)),        // 65534
+            (0u16, (vec![0x41, 0x03], true, 2_000)),     // 0 (after wrap)
+            (u16::MAX, (vec![0x41, 0x02], true, 1_000)), // 65535 — arrives last
         ];
         let arrival_order = [0usize, 2, 1]; // feed 65534, 65535 oop, then 0
         for &i in &arrival_order {

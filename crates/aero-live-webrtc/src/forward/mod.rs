@@ -43,41 +43,39 @@
 //! hysteresis — whether to emit; emissions are enqueued as
 //! [`PendingRemb`]s drained via [`SfuForwarder::poll_remb_requests`].
 //!
-//! **Infra-seam boundary**: the aggregation + [`crate::rtcp_fb::encode_remb`]
-//! ENCODE + ENQUEUE built here is fully unit-tested. The drained
-//! [`PendingRemb`] still has to be written onto the publisher peer's outbound
-//! RTCP stream over real DTLS-SRTP to reach an OBS/browser encoder — that wire
-//! egress is the documented infra seam (mirrors how [`PendingKeyframeRequest`]s
-//! from [`SfuForwarder::poll_keyframe_requests`] are relayed upstream).
-//!
-//! The peer's UDP loop (out of scope) feeds [`SfuForwarder::on_rtp`] from its
-//! [`crate::peer::PeerProgress::Media`] branch and flushes each touched peer's
-//! `poll()` afterwards to emit the resulting datagrams.
+//! Production sessions route both keyframe requests and aggregated REMB through
+//! the publisher's bounded [`SfuPeerSink`]. The publisher's sole UDP/str0m task
+//! applies those commands and drains the resulting encrypted RTCP datagrams.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Instant;
 
-use aero_common::{CallId, ParticipantId};
+use aero_common::{CallId, ParticipantId, SfuSubscription};
 use parking_lot::Mutex;
-use str0m::media::Rid;
+use str0m::media::{KeyframeRequestKind, Mid, Rid};
 use tracing::trace;
 
 use crate::bwe::{BandwidthEstimator, LayerSwitchPolicy, ThroughputEwma};
+use crate::call_bridge::BridgeRtp;
 use crate::peer::{InboundRtp, SfuPeer};
 use crate::remap::{ForwardTable, RtpKey};
 use crate::rtcp_fb::{parse_bandwidth_feedback, BandwidthFeedback, PublisherRembAggregator};
 use crate::rtcp_feedback::{parse_keyframe_requests, KeyframeGate, PendingKeyframeRequest};
-use crate::simulcast::{ForwardDecision, LayerKind, LayerSet, LayerSelectorTable};
-use crate::SfuRouter;
+use crate::simulcast::{ForwardDecision, LayerKind, LayerSelectorTable, LayerSet};
+use crate::{SfuPeerSink, SfuRouter};
+
+mod adapter;
+mod production;
+use production::{CallForwardTable, CallTrack};
 
 /// An aggregated REMB the SFU must relay to a publisher so it can cap its
 /// encoder to what the slowest subscriber can receive.
 ///
-/// Drained via [`SfuForwarder::poll_remb_requests`]; the server's UDP loop
-/// encodes it with [`crate::rtcp_fb::encode_remb`] (sender SSRC = the SFU's,
-/// `ssrcs` = the publisher's media SSRC) and writes it onto the publisher
-/// peer's outbound RTCP stream — the documented DTLS-SRTP wire seam.
+/// The legacy in-forwarder peer API drains this via
+/// [`SfuForwarder::poll_remb_requests`]. Production server sessions instead
+/// enqueue the same aggregate directly through the publisher's bounded
+/// [`SfuPeerSink`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingRemb {
     /// Publisher participant the REMB is addressed to.
@@ -100,6 +98,10 @@ fn subscriber_token(p: ParticipantId) -> u64 {
     }
 }
 
+fn call_route_mid(call: CallId, publisher: ParticipantId, mid: &str) -> String {
+    format!("{call}:{publisher}:{mid}")
+}
+
 /// Live forwarding state for a single call: the per-call peer set plus the
 /// publisher→subscriber routing/remap table. Cheap to clone (`Arc` inside).
 #[derive(Clone)]
@@ -116,6 +118,21 @@ struct ForwardState {
     /// Live str0m peers keyed by participant. Boxed behind the call's lock so
     /// the UDP tasks can take `&mut` to one peer at a time.
     peers: HashMap<ParticipantId, SfuPeer>,
+    /// Production session command sinks. The corresponding `SfuPeer` stays
+    /// exclusively owned and polled by its media-session task.
+    peer_sinks: HashMap<(CallId, ParticipantId), Arc<dyn SfuPeerSink>>,
+    /// Publisher-feedback sinks owned by remote bridge pulls, keyed again by
+    /// a monotonically increasing bridge incarnation. They never replace a
+    /// local session sink; publisher control chooses local first and otherwise
+    /// the newest live bridge.
+    bridge_peer_sinks: HashMap<(CallId, ParticipantId), BTreeMap<String, Arc<dyn SfuPeerSink>>>,
+    /// Production routing/remap tables are isolated by call. SDP MIDs are only
+    /// unique within one peer connection, so a process-wide `mid -> targets`
+    /// table would leak common tracks such as `"0"` between concurrent calls.
+    call_tables: HashMap<CallId, CallForwardTable>,
+    /// Production publisher-facing REMB aggregation, isolated by call and
+    /// publisher because identical MIDs are normal across peer connections.
+    call_remb_agg: HashMap<(CallId, CallTrack), PublisherRembAggregator>,
     /// Pure routing + per-subscriber remap bookkeeping.
     table: ForwardTable,
     /// Simulcast layer selection state: one [`LayerSelector`] per
@@ -148,6 +165,55 @@ struct ForwardState {
     remb_queue: std::collections::VecDeque<PendingRemb>,
 }
 
+fn publisher_sink(
+    inner: &ForwardState,
+    call: CallId,
+    publisher: ParticipantId,
+) -> Option<Arc<dyn SfuPeerSink>> {
+    inner
+        .peer_sinks
+        .get(&(call, publisher))
+        .cloned()
+        .or_else(|| {
+            inner
+                .bridge_peer_sinks
+                .get(&(call, publisher))
+                .and_then(|sinks| sinks.values().next_back().cloned())
+        })
+}
+
+fn withdraw_call_estimates(
+    inner: &mut ForwardState,
+    call: CallId,
+    subscriber: ParticipantId,
+    keep: &HashSet<CallTrack>,
+) -> Vec<(Arc<dyn SfuPeerSink>, String, u64)> {
+    let token = subscriber_token(subscriber);
+    let sources: Vec<_> = inner
+        .call_remb_agg
+        .keys()
+        .filter_map(|(active_call, source)| {
+            (*active_call == call && !keep.contains(source)).then_some(source.clone())
+        })
+        .collect();
+    let mut lifted = Vec::new();
+    for source in sources {
+        let bitrate_bps = inner
+            .call_remb_agg
+            .get_mut(&(call, source.clone()))
+            .and_then(|aggregator| aggregator.remove(token));
+        if let (Some(bitrate_bps), Some(sink)) =
+            (bitrate_bps, publisher_sink(inner, call, source.publisher))
+        {
+            lifted.push((sink, source.mid, bitrate_bps));
+        }
+    }
+    inner
+        .call_remb_agg
+        .retain(|_, aggregator| aggregator.subscriber_count() > 0);
+    lifted
+}
+
 impl SfuForwarder {
     #[must_use]
     pub fn new(router: SfuRouter) -> Self {
@@ -166,7 +232,119 @@ impl SfuForwarder {
 
     /// Register a live peer with the forwarder (called once its `Rtc` exists).
     pub fn add_peer(&self, peer: SfuPeer) {
-        self.inner.lock().peers.insert(peer.id(), peer);
+        let mut inner = self.inner.lock();
+        inner.peer_sinks.remove(&(peer.call(), peer.id()));
+        inner.peers.insert(peer.id(), peer);
+    }
+
+    /// Register a production session's bounded command sink.
+    ///
+    /// Any legacy in-forwarder peer under the same participant is removed so a
+    /// single `SfuPeer` state machine can never have two owners.
+    pub fn attach_peer_sink(
+        &self,
+        call: CallId,
+        participant: ParticipantId,
+        sink: Arc<dyn SfuPeerSink>,
+    ) -> bool {
+        let mut inner = self.inner.lock();
+        inner.peers.remove(&participant);
+        let pending_tracks = inner
+            .call_tables
+            .get(&call)
+            .map_or_else(Vec::new, |table| table.publisher_tracks(participant));
+        let request_sink = Arc::clone(&sink);
+        let inserted = inner.peer_sinks.insert((call, participant), sink).is_none();
+        drop(inner);
+        // A route may have been installed before this publisher reconnected.
+        // Request a fresh frame as soon as its unique owner task is attached.
+        for track in pending_tracks {
+            let _ = request_sink
+                .try_request_keyframe(Mid::from(track.mid.as_str()), KeyframeRequestKind::Pli);
+        }
+        inserted
+    }
+
+    /// Register one bridge's publisher-feedback sink without competing with a
+    /// local media-session owner. Multiple bridge references are retained
+    /// independently so an owner hand-off cannot strand PLI/FIR/REMB control.
+    pub fn attach_bridge_peer_sink(
+        &self,
+        call: CallId,
+        participant: ParticipantId,
+        bridge: &str,
+        sink: Arc<dyn SfuPeerSink>,
+    ) -> bool {
+        let request_sink = sink.clone();
+        let (inserted, request_keyframes) = {
+            let mut inner = self.inner.lock();
+            let local_exists = inner.peer_sinks.contains_key(&(call, participant));
+            let pending_tracks = inner
+                .call_tables
+                .get(&call)
+                .map_or_else(Vec::new, |table| table.publisher_tracks(participant));
+            let bridge = bridge.to_owned();
+            let sinks = inner
+                .bridge_peer_sinks
+                .entry((call, participant))
+                .or_default();
+            let inserted = sinks.insert(bridge.clone(), sink).is_none();
+            let request_keyframes =
+                !local_exists && sinks.keys().next_back() == Some(&bridge) && inserted;
+            (inserted, request_keyframes.then_some(pending_tracks))
+        };
+        if let Some(tracks) = request_keyframes {
+            for track in tracks {
+                let _ = request_sink
+                    .try_request_keyframe(Mid::from(track.mid.as_str()), KeyframeRequestKind::Pli);
+            }
+        }
+        inserted
+    }
+
+    /// Remove exactly one bridge's publisher-feedback sink.
+    pub fn detach_bridge_peer_sink(
+        &self,
+        call: CallId,
+        participant: ParticipantId,
+        bridge: &str,
+    ) -> bool {
+        let mut inner = self.inner.lock();
+        let key = (call, participant);
+        let was_effective = !inner.peer_sinks.contains_key(&key)
+            && inner
+                .bridge_peer_sinks
+                .get(&key)
+                .and_then(|sinks| sinks.keys().next_back())
+                .is_some_and(|active| active == bridge);
+        let removed = inner
+            .bridge_peer_sinks
+            .get_mut(&key)
+            .is_some_and(|sinks| sinks.remove(bridge).is_some());
+        if inner
+            .bridge_peer_sinks
+            .get(&key)
+            .is_some_and(BTreeMap::is_empty)
+        {
+            inner.bridge_peer_sinks.remove(&key);
+        }
+        let fallback = (removed && was_effective)
+            .then(|| publisher_sink(&inner, call, participant))
+            .flatten();
+        let pending_tracks = fallback.as_ref().map(|_| {
+            inner
+                .call_tables
+                .get(&call)
+                .map_or_else(Vec::new, |table| table.publisher_tracks(participant))
+        });
+        drop(inner);
+        if let (Some(sink), Some(tracks)) = (fallback, pending_tracks) {
+            for track in tracks {
+                let _ = sink
+                    .try_request_keyframe(Mid::from(track.mid.as_str()), KeyframeRequestKind::Pli);
+            }
+        }
+        removed
     }
 
     /// Remove a peer and all routing/remap + simulcast + BWE state
@@ -201,6 +379,142 @@ impl SfuForwarder {
             }
         }
         g.peers.remove(&peer)
+    }
+
+    /// Remove only a production peer sink while applying the same routing-state
+    /// cleanup as [`Self::remove_peer`]. Returns whether a sink was present.
+    pub fn detach_peer_sink(&self, call: CallId, peer: ParticipantId) -> bool {
+        let mut inner = self.inner.lock();
+        let existed = inner.peer_sinks.remove(&(call, peer)).is_some();
+        let bridge_remains = inner
+            .bridge_peer_sinks
+            .get(&(call, peer))
+            .is_some_and(|sinks| !sinks.is_empty());
+        let bridge_fallback = bridge_remains
+            .then(|| publisher_sink(&inner, call, peer))
+            .flatten();
+        let pending_tracks = bridge_fallback.as_ref().map(|_| {
+            inner
+                .call_tables
+                .get(&call)
+                .map_or_else(Vec::new, |table| table.publisher_tracks(peer))
+        });
+        let lifted = withdraw_call_estimates(&mut inner, call, peer, &HashSet::new());
+        if let Some(table) = inner.call_tables.get_mut(&call) {
+            table.unlink_subscriber(peer);
+            if !bridge_remains {
+                table.unlink_publisher(peer);
+            }
+            if table.is_empty() {
+                inner.call_tables.remove(&call);
+            }
+        }
+        if !bridge_remains {
+            inner.call_remb_agg.retain(|(active_call, source), _| {
+                *active_call != call || source.publisher != peer
+            });
+        }
+        drop(inner);
+        for (sink, mid, bitrate_bps) in lifted {
+            let _ = sink.try_request_remb(Mid::from(mid.as_str()), bitrate_bps);
+        }
+        if let (Some(sink), Some(tracks)) = (bridge_fallback, pending_tracks) {
+            for track in tracks {
+                let _ = sink
+                    .try_request_keyframe(Mid::from(track.mid.as_str()), KeyframeRequestKind::Pli);
+            }
+        }
+        existed
+    }
+
+    /// Clear a reconnecting peer's sink and subscriber-side state while
+    /// retaining routes whose source is this peer's unchanged publisher track.
+    pub fn reset_peer_sink(&self, call: CallId, peer: ParticipantId) -> bool {
+        let mut inner = self.inner.lock();
+        let existed = inner.peer_sinks.remove(&(call, peer)).is_some();
+        let lifted = withdraw_call_estimates(&mut inner, call, peer, &HashSet::new());
+        if let Some(table) = inner.call_tables.get_mut(&call) {
+            table.unlink_subscriber(peer);
+            if table.is_empty() {
+                inner.call_tables.remove(&call);
+            }
+        }
+        drop(inner);
+        for (sink, mid, bitrate_bps) in lifted {
+            let _ = sink.try_request_remb(Mid::from(mid.as_str()), bitrate_bps);
+        }
+        existed
+    }
+
+    /// Atomically replace one production subscriber's explicit routes.
+    ///
+    /// Every source is keyed by `(publisher, pub_mid)`, so three participants
+    /// may all publish MID `"0"` without interleaving onto one outbound stream.
+    /// A PLI is queued to each locally-owned publisher immediately after the
+    /// route becomes active.
+    pub fn replace_call_subscriptions(
+        &self,
+        call: CallId,
+        subscriber: ParticipantId,
+        routes: &[SfuSubscription],
+    ) -> usize {
+        let mut inner = self.inner.lock();
+        let retained_sources: HashSet<_> = routes
+            .iter()
+            .map(|route| CallTrack::new(route.publisher, &route.pub_mid))
+            .collect();
+        let lifted = withdraw_call_estimates(&mut inner, call, subscriber, &retained_sources);
+        inner
+            .call_tables
+            .entry(call)
+            .or_default()
+            .replace_subscriber(subscriber, routes);
+        inner.layer_table.unlink_subscriber(subscriber);
+        for route in routes {
+            inner.layer_table.register(
+                subscriber,
+                &call_route_mid(call, route.publisher, &route.pub_mid),
+            );
+        }
+        let requests: Vec<_> = routes
+            .iter()
+            .filter_map(|route| {
+                publisher_sink(&inner, call, route.publisher)
+                    .map(|sink| (sink, Mid::from(route.pub_mid.as_str())))
+            })
+            .collect();
+        drop(inner);
+
+        for (sink, mid, bitrate_bps) in lifted {
+            let _ = sink.try_request_remb(Mid::from(mid.as_str()), bitrate_bps);
+        }
+        let mut queued = 0;
+        for (sink, mid) in requests {
+            if sink.try_request_keyframe(mid, KeyframeRequestKind::Pli) {
+                queued += 1;
+            }
+        }
+        queued
+    }
+
+    /// Compatibility helper for a single explicit route.
+    pub fn subscribe_call(
+        &self,
+        call: CallId,
+        publisher: ParticipantId,
+        pub_mid: &str,
+        subscriber: ParticipantId,
+        out_mid: &str,
+    ) {
+        self.replace_call_subscriptions(
+            call,
+            subscriber,
+            &[SfuSubscription {
+                publisher,
+                pub_mid: pub_mid.to_owned(),
+                out_mid: out_mid.to_owned(),
+            }],
+        );
     }
 
     /// Register that publisher `publisher` owns `pub_mid` and advertises the
@@ -418,10 +732,8 @@ impl SfuForwarder {
 
     /// Drain all aggregated REMBs queued for publishers since the last call.
     ///
-    /// The caller encodes each [`PendingRemb`] with
-    /// [`crate::rtcp_fb::encode_remb`] and writes it onto the publisher peer's
-    /// outbound RTCP stream (the DTLS-SRTP wire egress — the documented infra
-    /// seam), mirroring how [`Self::poll_keyframe_requests`] results are relayed.
+    /// Compatibility hook for the in-forwarder peer owner. Production
+    /// server-owned sessions deliver REMB through [`SfuPeerSink`] instead.
     pub fn poll_remb_requests(&self) -> Vec<PendingRemb> {
         let mut g = self.inner.lock();
         g.remb_queue.drain(..).collect()
@@ -434,7 +746,7 @@ impl SfuForwarder {
         g.peers.get_mut(&id).map(f)
     }
 
-    /// Core fan-out: forward one inbound RTP packet from `_publisher` to every
+    /// Core fan-out: forward one inbound RTP packet from `publisher` to every
     /// subscribed peer, applying simulcast layer selection and rewriting
     /// per-subscriber seq/timestamp.
     ///
@@ -455,10 +767,197 @@ impl SfuForwarder {
         self.on_rtp_at(publisher, rtp, Instant::now(), self.now_ms())
     }
 
+    /// Forward one packet received from a peer node through the same
+    /// header-aware path as a local publisher packet.
+    ///
+    /// [`BridgeRtp`] retains PT, extended sequence number, RTP timestamp, SSRC,
+    /// marker, MID, RID, payload, and keyframe classification. Hop-local timing
+    /// and extension values are rebuilt by [`BridgeRtp::to_inbound`] before the
+    /// normal remap/simulcast logic runs.
+    pub fn on_bridge_rtp(&self, packet: &BridgeRtp) -> usize {
+        let inbound = packet.to_inbound();
+        self.on_rtp(packet.participant, &inbound)
+    }
+
+    /// Production fan-out scoped to one call.
+    ///
+    /// SDP MIDs such as `"0"` repeat across calls. Keeping both the route table
+    /// and peer-sink lookup under `call` prevents media from one call reaching a
+    /// participant session in another call.
+    pub fn on_call_rtp(&self, call: CallId, publisher: ParticipantId, rtp: &InboundRtp) -> usize {
+        self.on_call_rtp_at(call, publisher, rtp, self.now_ms())
+    }
+
+    /// Forward one bridge packet into the matching call-scoped production
+    /// sessions.
+    pub fn on_call_bridge_rtp(&self, call: CallId, packet: &BridgeRtp) -> usize {
+        let inbound = packet.to_inbound();
+        self.on_call_rtp(call, packet.participant, &inbound)
+    }
+
+    /// Relay PLI/FIR received on a subscriber's `out_mid` to the exact
+    /// `(publisher, pub_mid)` source and its unique owner task.
+    pub fn on_call_keyframe_request(
+        &self,
+        call: CallId,
+        subscriber: ParticipantId,
+        out_mid: &str,
+        kind: KeyframeRequestKind,
+    ) -> bool {
+        let (sink, source) = {
+            let inner = self.inner.lock();
+            let Some(source) = inner
+                .call_tables
+                .get(&call)
+                .and_then(|table| table.source_for(subscriber, out_mid))
+            else {
+                return false;
+            };
+            let Some(sink) = publisher_sink(&inner, call, source.publisher) else {
+                return false;
+            };
+            (sink, source)
+        };
+        sink.try_request_keyframe(Mid::from(source.mid.as_str()), kind)
+    }
+
+    /// Aggregate a subscriber's REMB/TWCC estimate and queue REMB on each exact
+    /// publisher owner task. REMB carries an `out_mid`; a connection-wide TWCC
+    /// estimate applies to every explicitly mapped source for that subscriber.
+    pub fn on_call_bandwidth_estimate(
+        &self,
+        call: CallId,
+        subscriber: ParticipantId,
+        out_mid: Option<&str>,
+        bitrate_bps: u64,
+    ) -> usize {
+        let requests = {
+            let mut inner = self.inner.lock();
+            let Some(table) = inner.call_tables.get(&call) else {
+                return 0;
+            };
+            let sources = out_mid.map_or_else(
+                || table.sources_for_subscriber(subscriber),
+                |mid| table.source_for(subscriber, mid).into_iter().collect(),
+            );
+            let token = subscriber_token(subscriber);
+            let mut requests = Vec::new();
+            for source in sources {
+                let emitted = inner
+                    .call_remb_agg
+                    .entry((call, source.clone()))
+                    .or_default()
+                    .update(token, bitrate_bps);
+                let Some(target_bps) = emitted else {
+                    continue;
+                };
+                if let Some(sink) = publisher_sink(&inner, call, source.publisher) {
+                    requests.push((sink, source.mid, target_bps));
+                }
+            }
+            requests
+        };
+
+        let mut queued = 0;
+        for (sink, mid, bitrate) in requests {
+            if sink.try_request_remb(Mid::from(mid.as_str()), bitrate) {
+                queued += 1;
+            }
+        }
+        queued
+    }
+
+    fn on_call_rtp_at(
+        &self,
+        call: CallId,
+        publisher: ParticipantId,
+        rtp: &InboundRtp,
+        now_ms: u64,
+    ) -> usize {
+        let pub_mid = rtp.mid.to_string();
+        let route_mid = call_route_mid(call, publisher, &pub_mid);
+        let mut g = self.inner.lock();
+
+        if let Some(rid) = rtp.rid {
+            g.layer_rates
+                .entry((route_mid.clone(), rid))
+                .or_default()
+                .on_bytes(rtp.payload.len(), now_ms);
+        }
+
+        let ForwardState {
+            peer_sinks,
+            bridge_peer_sinks,
+            call_tables,
+            layer_table,
+            ..
+        } = &mut *g;
+        let Some(table) = call_tables.get_mut(&call) else {
+            return 0;
+        };
+        let targets: Vec<_> = table.targets(publisher, &pub_mid).to_vec();
+        if targets.is_empty() {
+            return 0;
+        }
+
+        let key = RtpKey::new(*rtp.seq_no, u64::from(rtp.rtp_time));
+        let mut delivered = 0usize;
+        for target in targets {
+            if target.subscriber == publisher {
+                continue;
+            }
+            if let Some(rid) = rtp.rid {
+                match layer_table.decide(target.subscriber, &route_mid, rid, rtp.is_keyframe) {
+                    Some(ForwardDecision::RequestKeyframe) => {
+                        if let Some(sink) = peer_sinks.get(&(call, publisher)).or_else(|| {
+                            bridge_peer_sinks
+                                .get(&(call, publisher))
+                                .and_then(|sinks| sinks.values().next_back())
+                        }) {
+                            let _ = sink.try_request_keyframe(
+                                Mid::from(pub_mid.as_str()),
+                                KeyframeRequestKind::Pli,
+                            );
+                        }
+                        continue;
+                    }
+                    Some(ForwardDecision::Drop) => continue,
+                    Some(ForwardDecision::Forward | ForwardDecision::SwitchAndForward) | None => {}
+                }
+            }
+
+            let Some(remapped) = table.remap_for(target.subscriber, &target.out_mid, key) else {
+                continue;
+            };
+            #[allow(clippy::cast_possible_truncation)]
+            let wire_ts = (remapped.ts & 0xFFFF_FFFF) as u32;
+            let outbound_mid = str0m::media::Mid::from(target.out_mid.as_str());
+            let Some(sink) = peer_sinks.get(&(call, target.subscriber)) else {
+                continue;
+            };
+            let mut outbound = rtp.clone();
+            outbound.mid = outbound_mid;
+            outbound.ext_vals.mid = Some(outbound_mid);
+            outbound.seq_no = remapped.seq.into();
+            outbound.rtp_time = wire_ts;
+            if sink.try_write_rtp(outbound) {
+                delivered += 1;
+            } else {
+                trace!(
+                    %call,
+                    subscriber = %target.subscriber,
+                    mid = %target.out_mid,
+                    "SFU session command queue unavailable; dropping RTP"
+                );
+            }
+        }
+        delivered
+    }
+
     /// Time-injected body of [`Self::on_rtp`].
     fn on_rtp_at(
         &self,
-        _publisher: ParticipantId,
+        publisher: ParticipantId,
         rtp: &InboundRtp,
         now: Instant,
         now_ms: u64,
@@ -496,6 +995,11 @@ impl SfuForwarder {
         let mut delivered = 0usize;
 
         for t in targets {
+            // A sendrecv participant subscribes to the common call mids too;
+            // never echo its own publisher packet back onto its browser leg.
+            if t.subscriber == publisher {
+                continue;
+            }
             // ── Simulcast layer gate ──────────────────────────────────────────
             // When the inbound packet carries a RID, consult the selector for
             // this (subscriber, pub_mid) pair.  The selector is absent for
@@ -520,16 +1024,17 @@ impl SfuForwarder {
             let Some(remapped) = table.remap_for(t.subscriber, &t.out_mid, key) else {
                 continue;
             };
-            let Some(peer) = peers.get_mut(&t.subscriber) else {
-                continue;
-            };
             // Wire RTP timestamps are 32-bit and wrap by design; the low 32 bits
             // of the remapped value are exactly the wire timestamp. str0m's
             // outbound `SeqNo` similarly wraps from the extended `u64`.
             #[allow(clippy::cast_possible_truncation)]
             let wire_ts = (remapped.ts & 0xFFFF_FFFF) as u32;
+            let outbound_mid = str0m::media::Mid::from(t.out_mid.as_str());
+            let Some(peer) = peers.get_mut(&t.subscriber) else {
+                continue;
+            };
             match peer.write_rtp(
-                rtp.mid,
+                outbound_mid,
                 rtp.pt,
                 remapped.seq.into(),
                 wire_ts,
@@ -539,7 +1044,9 @@ impl SfuForwarder {
                 rtp.payload.clone(),
             ) {
                 Ok(true) => delivered += 1,
-                Ok(false) => trace!(subscriber = %t.subscriber, mid = %t.out_mid, "no outbound stream yet"),
+                Ok(false) => {
+                    trace!(subscriber = %t.subscriber, mid = %t.out_mid, "no outbound stream yet");
+                }
                 Err(e) => trace!(error = %e, "subscriber write_rtp failed"),
             }
         }
@@ -555,7 +1062,8 @@ impl SfuForwarder {
     /// Number of live peers currently registered.
     #[must_use]
     pub fn peer_count(&self) -> usize {
-        self.inner.lock().peers.len()
+        let inner = self.inner.lock();
+        inner.peers.len() + inner.peer_sinks.len()
     }
 }
 
@@ -645,26 +1153,7 @@ impl ForwardState {
     }
 }
 
-/// Bridge the synchronous fan-out to a hypothetical higher-level call that only
-/// has the (legacy) `forward_rtp(call, mid, Bytes)` shape. This adapter is kept
-/// minimal: the real entry point is [`SfuForwarder::on_rtp`], which carries the
-/// parsed header fields the legacy `Bytes`-only signature lacks.
-#[async_trait::async_trait]
-impl crate::MediaForwarder for SfuForwarder {
-    async fn forward_rtp(&self, call: CallId, mid: &str, _packet: bytes::Bytes) {
-        // The legacy signature lacks parsed RTP header fields (pt/seq/ts), which
-        // real forwarding needs. We can still surface the routing decision so a
-        // caller wired to this trait observes the fan-out fanout count.
-        let subs = self.router.subscribers_for(call, mid);
-        trace!(
-            %call,
-            mid,
-            subscribers = subs.len(),
-            "forward_rtp(legacy): use SfuForwarder::on_rtp for real RTP fan-out"
-        );
-    }
-}
-
-
+#[cfg(test)]
+mod production_tests;
 #[cfg(test)]
 pub mod tests;

@@ -124,7 +124,10 @@ pub enum StreamEvent {
     /// Live viewer count changed.
     Viewers { stream_id: Ulid, count: u32 },
     /// Stream lifecycle transition (went live / ended).
-    Status { stream_id: Ulid, status: StreamStatus },
+    Status {
+        stream_id: Ulid,
+        status: StreamStatus,
+    },
     /// Hype-train momentum update: a gift advanced (or kept alive) the train.
     /// `level` is the current escalation level, `contribution` the running total
     /// of units fed into the train, and `expires_at` the instant the train lapses
@@ -169,10 +172,16 @@ pub enum StreamEvent {
     /// A community prediction opened on this stream: viewers may now STAKE channel
     /// points on one of its outcomes (Twitch-style Channel Prediction). Clients
     /// render the betting card from a follow-up fetch of the prediction.
-    PredictionOpened { stream_id: Ulid, prediction_id: PredictionId },
+    PredictionOpened {
+        stream_id: Ulid,
+        prediction_id: PredictionId,
+    },
     /// A community prediction locked: staking is now closed and the creator will
     /// resolve it. Clients close the betting window from this.
-    PredictionLocked { stream_id: Ulid, prediction_id: PredictionId },
+    PredictionLocked {
+        stream_id: Ulid,
+        prediction_id: PredictionId,
+    },
     /// A community prediction resolved to `winning_outcome_idx`: winners have been
     /// paid proportionally from the pool (or, if nobody picked the winner, every
     /// staker was refunded). Clients reveal the outcome + payouts from this.
@@ -229,7 +238,10 @@ mod tests {
     #[test]
     fn stream_event_tag_and_stream_id() {
         let sid = Ulid::new();
-        let ev = StreamEvent::Viewers { stream_id: sid, count: 7 };
+        let ev = StreamEvent::Viewers {
+            stream_id: sid,
+            count: 7,
+        };
         let j = serde_json::to_string(&ev).unwrap();
         assert!(j.contains("\"kind\":\"viewers\""));
         assert_eq!(ev.stream_id(), sid);
@@ -263,7 +275,10 @@ mod tests {
         assert!(j.contains("\"kind\":\"goal_progress\""));
         assert_eq!(progress.stream_id(), sid);
 
-        let reached = StreamEvent::GoalReached { stream_id: sid, goal_id: GoalId::new() };
+        let reached = StreamEvent::GoalReached {
+            stream_id: sid,
+            goal_id: GoalId::new(),
+        };
         let j = serde_json::to_string(&reached).unwrap();
         assert!(j.contains("\"kind\":\"goal_reached\""));
         assert_eq!(reached.stream_id(), sid);
@@ -303,7 +318,10 @@ mod tests {
         let back: StreamEvent = serde_json::from_str(&j).unwrap();
         assert!(matches!(
             back,
-            StreamEvent::PredictionResolved { winning_outcome_idx: 1, .. }
+            StreamEvent::PredictionResolved {
+                winning_outcome_idx: 1,
+                ..
+            }
         ));
     }
 

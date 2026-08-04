@@ -1,17 +1,17 @@
 #![allow(unused_imports)]
-use std::sync::{Arc, Mutex};
-use aero_common::{Message, MessageId, ParticipantId, RoomId, WorkspaceId};
-use aero_storage::{AiContextStore, AiJobRepo, MessageRepo, RoomRepo, SearchHit};
-use futures::stream::Stream;
-use std::pin::Pin;
+use super::tools::*;
+use super::{AiService, AnswerResult, ChannelRec, Expert, PersonRec, Sentiment, SentimentScore};
 use crate::anthropic::{AnthropicClient, ChatMsg, Usage};
 use crate::embed::{default_embedder, Embedder};
 use crate::error::{AiError, Result};
 use crate::transcribe::{default_transcriber, Transcriber};
+use crate::usage::UsageContext;
+use aero_common::{Message, MessageId, ParticipantId, RoomId, WorkspaceId};
+use aero_storage::{AiContextStore, AiJobRepo, MessageRepo, RoomRepo, SearchHit};
+use futures::stream::Stream;
 use serde_json::Value;
-
-use super::{AiService, AnswerResult, ChannelRec, Expert, PersonRec, Sentiment, SentimentScore};
-use super::tools::*;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 
 /// Answer-cache TTL (seconds) from `AERO_AI_ANSWER_CACHE_TTL_SECS`. `None` (unset
 /// or ≤0) ⇒ the cache is OFF (default), so the answer path behaves identically
@@ -44,6 +44,7 @@ impl AiService {
             context,
             blob_store: None,
             ai_profiles: None,
+            usage_sink: None,
         }
     }
 
@@ -68,6 +69,13 @@ impl AiService {
         self
     }
 
+    /// Attach the mandatory production sink for paid usage accounting.
+    #[must_use]
+    pub fn with_usage_sink(mut self, sink: Arc<dyn crate::usage::UsageSink>) -> Self {
+        self.usage_sink = Some(sink);
+        self
+    }
+
     /// Construct from env: Anthropic optional, embedder picks Voyage if configured
     /// else local hash. Repos are required since they're owned by the server.
     pub fn from_env(
@@ -85,11 +93,6 @@ impl AiService {
             rooms,
             context,
         )
-    }
-
-    /// Transcribe an audio blob via the configured transcriber.
-    pub async fn transcribe(&self, bytes: bytes::Bytes, mime: &str) -> Result<String> {
-        self.transcriber.transcribe(bytes, mime).await
     }
 
     // ---------- accessors (for the worker) ----------
@@ -110,13 +113,8 @@ impl AiService {
     }
 
     #[must_use]
-    pub fn embedder(&self) -> &Arc<dyn Embedder + Send + Sync> {
+    pub(crate) fn embedder(&self) -> &Arc<dyn Embedder + Send + Sync> {
         &self.embedder
-    }
-
-    #[must_use]
-    pub fn anthropic(&self) -> Option<&Arc<AnthropicClient>> {
-        self.anthropic.as_ref()
     }
 
     /// True when an Anthropic API key was configured at startup.
@@ -125,11 +123,9 @@ impl AiService {
         self.anthropic.is_some()
     }
 
-    // ---------- embeddings ----------
-
-    /// Embed an arbitrary text via the configured embedder.
-    pub async fn embed_text(&self, text: &str) -> Result<Vec<f32>> {
-        self.embedder.embed_one(text).await
+    #[must_use]
+    pub(crate) fn usage_sink(&self) -> Option<&Arc<dyn crate::usage::UsageSink>> {
+        self.usage_sink.as_ref()
     }
 
     /// Best-effort: extract the *body text* of the first extractable document
@@ -171,7 +167,9 @@ impl AiService {
     /// Uses Anthropic when configured; otherwise returns a deterministic
     /// "last 5 lines" fallback so the feature degrades gracefully in dev.
     pub async fn summarize_room(&self, room: RoomId, last_n: usize) -> Result<String> {
-        self.summarize_room_with_usage(room, last_n).await.map(|(summary, _usage)| summary)
+        self.summarize_room_with_usage(room, last_n)
+            .await
+            .map(|(summary, _usage)| summary)
     }
 
     /// Like [`Self::summarize_room`] but also returns the real Anthropic token
@@ -185,6 +183,17 @@ impl AiService {
         &self,
         room: RoomId,
         last_n: usize,
+    ) -> Result<(String, Option<Usage>)> {
+        let context = self.fresh_room_usage_context(room).await?;
+        self.summarize_room_with_usage_context(room, last_n, context)
+            .await
+    }
+
+    pub async fn summarize_room_with_usage_context(
+        &self,
+        room: RoomId,
+        last_n: usize,
+        context: UsageContext,
     ) -> Result<(String, Option<Usage>)> {
         // `last_n` is clamped to [1, 200] so this `as i64` is always safe.
         #[allow(clippy::cast_possible_wrap)]
@@ -205,42 +214,22 @@ impl AiService {
                 "请阅读以下聊天记录,并按照系统指令给出要点摘要。\n\n聊天记录:\n{transcript}"
             );
             let msgs = vec![ChatMsg::user(user)];
-            let (summary, usage) = client.complete_with_usage(system, &msgs, 600).await?;
+            let (summary, usage) = self
+                .complete_accounted(
+                    client,
+                    context,
+                    "anthropic_summary",
+                    "summarize",
+                    crate::metrics::CostModel::default().summarize_micros,
+                    system,
+                    &msgs,
+                    600,
+                )
+                .await?;
             return Ok((summary, Some(usage)));
         }
 
         Ok((heuristic_summary(&recent), None))
-    }
-
-    /// Summarize an arbitrary block of text into a short recap + action items.
-    ///
-    /// Mirrors [`Self::summarize_room`] but summarizes the GIVEN text rather than
-    /// a room's message history — used for the post-call meeting recap, where the
-    /// caller joins a call's persisted transcript lines into one block. With an
-    /// Anthropic key it prompts the `complete` primitive for a concise recap with
-    /// action items; without a key it falls back to the SAME heuristic style
-    /// [`Self::summarize_room`] uses (a truncated first-lines digest). Never errors
-    /// on a missing key. Empty/blank input returns an empty string.
-    ///
-    /// # Errors
-    /// Propagates an Anthropic failure when a key IS configured; the no-key path
-    /// is infallible.
-    pub async fn summarize_text(&self, text: &str) -> Result<String> {
-        let text = text.trim();
-        if text.is_empty() {
-            return Ok(String::new());
-        }
-
-        if let Some(client) = &self.anthropic {
-            let system = RECAP_SYSTEM_PROMPT;
-            let user = format!(
-                "请阅读以下通话/会议记录,并按照系统指令给出简短复盘与行动项。\n\n记录:\n{text}"
-            );
-            let msgs = vec![ChatMsg::user(user)];
-            return client.complete(system, &msgs, 600).await;
-        }
-
-        Ok(heuristic_text_digest(text))
     }
 
     // ---------- retrieval (RAG rerank, 方向三) ----------
@@ -250,9 +239,19 @@ impl AiService {
     /// over the same room boundary, so lexical agreement can promote a hit past
     /// semantically-near-but-wrong neighbours. An FTS failure degrades to pure
     /// vector order — it warns but never fails the ask.
-    pub(crate) async fn retrieve_room(&self, room: RoomId, q: &str, k: usize) -> Result<Vec<SearchHit>> {
-        let query_vec = self.embedder.embed_query(q).await?;
-        let vector = self.messages.search_vector(room, query_vec, RETRIEVAL_POOL).await?;
+    pub(crate) async fn retrieve_room_with_context(
+        &self,
+        room: RoomId,
+        q: &str,
+        k: usize,
+        context: UsageContext,
+        operation: &str,
+    ) -> Result<Vec<SearchHit>> {
+        let query_vec = self.embed_query_with_context(q, context, operation).await?;
+        let vector = self
+            .messages
+            .search_vector(room, query_vec, RETRIEVAL_POOL)
+            .await?;
         let fts = match self.messages.fts_candidates(room, q, RETRIEVAL_POOL).await {
             Ok(hits) => hits,
             Err(e) => {
@@ -264,16 +263,18 @@ impl AiService {
     }
 
     /// Workspace-scoped twin of [`Self::retrieve_room`]: both retrievers run
-    /// over the identical `JOIN room_members` / `rooms.workspace_id` boundary,
-    /// so fusion can never widen what either retriever was allowed to see.
-    pub(crate) async fn retrieve_workspace(
+    /// over the identical effective room/workspace/account/deactivation/2FA
+    /// boundary, so fusion can never widen what either retriever may see.
+    pub(crate) async fn retrieve_workspace_with_context(
         &self,
         participant: ParticipantId,
         workspace: WorkspaceId,
         q: &str,
         k: usize,
+        context: UsageContext,
+        operation: &str,
     ) -> Result<Vec<SearchHit>> {
-        let query_vec = self.embedder.embed_query(q).await?;
+        let query_vec = self.embed_query_with_context(q, context, operation).await?;
         let vector = self
             .messages
             .search_vector_workspace(participant, workspace, query_vec, RETRIEVAL_POOL)
@@ -310,7 +311,9 @@ impl AiService {
         question: &str,
         k: usize,
     ) -> Result<AnswerResult> {
-        self.answer_question_with_usage(room, question, k).await.map(|(res, _usage)| res)
+        self.answer_question_with_usage(room, question, k)
+            .await
+            .map(|(res, _usage)| res)
     }
 
     /// Like [`Self::answer_question`] but also returns the real Anthropic token
@@ -324,6 +327,18 @@ impl AiService {
         room: RoomId,
         question: &str,
         k: usize,
+    ) -> Result<(AnswerResult, Option<Usage>)> {
+        let context = self.fresh_room_usage_context(room).await?;
+        self.answer_question_with_usage_context(room, question, k, context)
+            .await
+    }
+
+    pub async fn answer_question_with_usage_context(
+        &self,
+        room: RoomId,
+        question: &str,
+        k: usize,
+        usage_context: UsageContext,
     ) -> Result<(AnswerResult, Option<Usage>)> {
         let q = question.trim();
         if q.is_empty() {
@@ -343,7 +358,15 @@ impl AiService {
                 }
             }
         }
-        let hits = self.retrieve_room(room, q, k.clamp(1, 20)).await?;
+        let hits = self
+            .retrieve_room_with_context(
+                room,
+                q,
+                k.clamp(1, 20),
+                usage_context,
+                "voyage_answer_query",
+            )
+            .await?;
 
         let citations: Vec<MessageId> = hits.iter().map(|h| h.message.id).collect();
         let context = render_context(&hits);
@@ -353,8 +376,18 @@ impl AiService {
             let user = format!(
                 "问题: {q}\n\n相关聊天上下文(每段已附 ID,引用时使用):\n{context}\n\n请基于上述上下文作答,若信息不足请说明。"
             );
-            let (answer, usage) =
-                client.complete_with_usage(system, &[ChatMsg::user(user)], 800).await?;
+            let (answer, usage) = self
+                .complete_accounted(
+                    client,
+                    usage_context,
+                    "anthropic_answer",
+                    "answer",
+                    crate::metrics::CostModel::default().answer_micros,
+                    system,
+                    &[ChatMsg::user(user)],
+                    800,
+                )
+                .await?;
             let result = AnswerResult { answer, citations };
             // Cache the fresh answer (best-effort) for subsequent identical asks.
             if let (Some(ttl), Some(ctx)) = (cache_ttl, &self.context) {
@@ -373,7 +406,13 @@ impl AiService {
         } else {
             format!("（未配置 Anthropic,以下为检索到的相关消息上下文:）\n\n{context}")
         };
-        Ok((AnswerResult { answer: fallback, citations }, None))
+        Ok((
+            AnswerResult {
+                answer: fallback,
+                citations,
+            },
+            None,
+        ))
     }
 
     /// Agentic answer (方向三 "能动AI"): instead of one fixed retrieval, give the
@@ -399,26 +438,52 @@ impl AiService {
         question: &str,
         max_iters: usize,
     ) -> Result<(AnswerResult, Option<Usage>)> {
+        let context = self.fresh_room_usage_context(room).await?;
+        self.answer_question_agentic_with_context(room, question, max_iters, context)
+            .await
+    }
+
+    pub async fn answer_question_agentic_with_context(
+        self: &Arc<Self>,
+        room: RoomId,
+        question: &str,
+        max_iters: usize,
+        usage_context: UsageContext,
+    ) -> Result<(AnswerResult, Option<Usage>)> {
         let q = question.trim();
         if q.is_empty() {
             return Err(AiError::Invalid("question must not be empty".into()));
         }
         // No key → no agency; fall back to the grounded one-shot answer.
         let Some(client) = self.anthropic.clone() else {
-            return self.answer_question_with_usage(room, q, 8).await;
+            return self
+                .answer_question_with_usage_context(room, q, 8, usage_context)
+                .await;
         };
         let search_tool = Arc::new(SearchMessagesTool {
             svc: Arc::clone(self),
             room,
             seen: std::sync::Mutex::new(Vec::new()),
+            usage_context,
+            query_counter: std::sync::atomic::AtomicUsize::new(0),
         });
         let mut tools: Vec<Arc<dyn crate::agent::AgentTool>> = vec![search_tool.clone()];
         // Offer attachment reading only when a blob store is wired (方向三 file RAG).
         if self.blob_store.is_some() {
-            tools.push(Arc::new(ReadAttachmentTool { svc: Arc::clone(self), room }));
+            tools.push(Arc::new(ReadAttachmentTool {
+                svc: Arc::clone(self),
+                room,
+            }));
         }
-        let outcome = crate::agent::run_agent_loop(
+        let chat = self.accounted_tool_chat(
             client.as_ref(),
+            usage_context,
+            "anthropic_agentic_answer",
+            "answer_agentic",
+            crate::metrics::CostModel::default().answer_micros,
+        );
+        let outcome = crate::agent::run_agent_loop(
+            &chat,
             &tools,
             AGENT_SYSTEM_PROMPT,
             q,
@@ -429,7 +494,10 @@ impl AiService {
         // Dedup citations in first-seen order.
         let mut deduped = Vec::new();
         {
-            let seen = search_tool.seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let seen = search_tool
+                .seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let mut set = std::collections::HashSet::new();
             for id in seen.iter() {
                 if set.insert(*id) {
@@ -437,7 +505,13 @@ impl AiService {
                 }
             }
         }
-        Ok((AnswerResult { answer: outcome.answer, citations: deduped }, Some(outcome.usage)))
+        Ok((
+            AnswerResult {
+                answer: outcome.answer,
+                citations: deduped,
+            },
+            Some(outcome.usage),
+        ))
     }
 
     /// Streaming variant of [`Self::answer_question`].
@@ -457,12 +531,38 @@ impl AiService {
         room: RoomId,
         question: &str,
         k: usize,
-    ) -> Result<(Vec<MessageId>, Pin<Box<dyn Stream<Item = Result<String>> + Send + 'static>>)> {
+    ) -> Result<(
+        Vec<MessageId>,
+        Pin<Box<dyn Stream<Item = Result<String>> + Send + 'static>>,
+    )> {
+        let usage_context = self.fresh_room_usage_context(room).await?;
+        self.answer_question_stream_with_usage_context(room, question, k, usage_context)
+            .await
+    }
+
+    pub async fn answer_question_stream_with_usage_context(
+        &self,
+        room: RoomId,
+        question: &str,
+        k: usize,
+        usage_context: UsageContext,
+    ) -> Result<(
+        Vec<MessageId>,
+        Pin<Box<dyn Stream<Item = Result<String>> + Send + 'static>>,
+    )> {
         let q = question.trim();
         if q.is_empty() {
             return Err(AiError::Invalid("question must not be empty".into()));
         }
-        let hits = self.retrieve_room(room, q, k.clamp(1, 20)).await?;
+        let hits = self
+            .retrieve_room_with_context(
+                room,
+                q,
+                k.clamp(1, 20),
+                usage_context,
+                "voyage_stream_answer_query",
+            )
+            .await?;
 
         let citations: Vec<MessageId> = hits.iter().map(|h| h.message.id).collect();
         let context = render_context(&hits);
@@ -471,10 +571,19 @@ impl AiService {
             let user = format!(
                 "问题: {q}\n\n相关聊天上下文(每段已附 ID,引用时使用):\n{context}\n\n请基于上述上下文作答,若信息不足请说明。"
             );
-            let stream = client
-                .complete_stream(ANSWER_SYSTEM_PROMPT, &[ChatMsg::user(user)], 800)
+            let stream = self
+                .complete_stream_accounted(
+                    client,
+                    usage_context,
+                    "anthropic_stream_answer",
+                    "answer_stream_estimate",
+                    crate::metrics::CostModel::default().answer_micros,
+                    ANSWER_SYSTEM_PROMPT,
+                    &[ChatMsg::user(user)],
+                    800,
+                )
                 .await?;
-            return Ok((citations, Box::pin(stream)));
+            return Ok((citations, stream));
         }
 
         let fallback = if hits.is_empty() {
@@ -509,11 +618,32 @@ impl AiService {
         question: &str,
         k: usize,
     ) -> Result<AnswerResult> {
+        let usage_context = self.fresh_room_usage_context(room).await?;
+        self.ask_with_context_and_usage_context(participant, room, question, k, usage_context)
+            .await
+    }
+
+    pub async fn ask_with_context_and_usage_context(
+        &self,
+        participant: ParticipantId,
+        room: RoomId,
+        question: &str,
+        k: usize,
+        usage_context: UsageContext,
+    ) -> Result<AnswerResult> {
         let q = question.trim();
         if q.is_empty() {
             return Err(AiError::Invalid("question must not be empty".into()));
         }
-        let hits = self.retrieve_room(room, q, k.clamp(1, 20)).await?;
+        let hits = self
+            .retrieve_room_with_context(
+                room,
+                q,
+                k.clamp(1, 20),
+                usage_context,
+                "voyage_context_answer_query",
+            )
+            .await?;
         let citations: Vec<MessageId> = hits.iter().map(|h| h.message.id).collect();
         let context = render_context(&hits);
 
@@ -521,14 +651,19 @@ impl AiService {
             // Load prior turns (best-effort; ignore errors so context store
             // unavailability never blocks answering).
             let prior_turns = if let Some(ctx) = &self.context {
-                ctx.get_turns(participant, room, 6).await.unwrap_or_default()
+                ctx.get_turns(participant, room, 6)
+                    .await
+                    .unwrap_or_default()
             } else {
                 Vec::new()
             };
 
             let mut messages: Vec<ChatMsg> = prior_turns
                 .into_iter()
-                .map(|(role, text)| ChatMsg { role, content: text })
+                .map(|(role, text)| ChatMsg {
+                    role,
+                    content: text,
+                })
                 .collect();
 
             let user_msg = format!(
@@ -540,8 +675,18 @@ impl AiService {
             // grounding, route to the tier's model. Opt-in/default-OFF ⇒ `None` ⇒
             // the client's default model (unchanged unless a tier env is set).
             let model = crate::tier::tier_model(crate::tier::classify_tier(q, hits.len()));
-            let answer = client
-                .complete_model(model.as_deref(), ANSWER_SYSTEM_PROMPT, &messages, 800)
+            let (answer, _) = self
+                .complete_model_accounted(
+                    client,
+                    usage_context,
+                    "anthropic_context_answer",
+                    "answer_context",
+                    crate::metrics::CostModel::default().answer_micros,
+                    model.as_deref(),
+                    ANSWER_SYSTEM_PROMPT,
+                    &messages,
+                    800,
+                )
                 .await?;
 
             // Persist new Q&A turns; log but never fail on Redis errors.
@@ -565,7 +710,10 @@ impl AiService {
         } else {
             format!("（未配置 Anthropic,以下为检索到的相关消息上下文:）\n\n{context}")
         };
-        Ok(AnswerResult { answer: fallback, citations })
+        Ok(AnswerResult {
+            answer: fallback,
+            citations,
+        })
     }
 
     /// Answer a question grounded in EVERY room the caller belongs to within a
@@ -575,8 +723,8 @@ impl AiService {
     /// RRF-fused vector + FTS retrieval, ask Anthropic to answer using only the
     /// retrieved context and cite the message IDs), but retrieves cross-room via
     /// [`MessageRepo::search_vector_workspace`](aero_storage::MessageRepo::search_vector_workspace)
-    /// and its FTS twin, whose `JOIN room_members` / `rooms.workspace_id` boundary
-    /// keeps results to rooms the caller is a member of within `workspace`. Without Anthropic it
+    /// and its FTS twin, whose effective-access boundary keeps results to rooms
+    /// the caller may currently access within `workspace`. Without Anthropic it
     /// degrades identically to [`Self::answer_question`]: the joined context block
     /// is returned as the answer so the UI can still surface grounded results.
     ///
@@ -590,11 +738,38 @@ impl AiService {
         question: &str,
         k: usize,
     ) -> Result<AnswerResult> {
+        self.answer_question_workspace_with_usage_context(
+            participant,
+            workspace,
+            question,
+            k,
+            UsageContext::new(Some(workspace.to_uuid())),
+        )
+        .await
+    }
+
+    pub async fn answer_question_workspace_with_usage_context(
+        &self,
+        participant: ParticipantId,
+        workspace: WorkspaceId,
+        question: &str,
+        k: usize,
+        usage_context: UsageContext,
+    ) -> Result<AnswerResult> {
         let q = question.trim();
         if q.is_empty() {
             return Err(AiError::Invalid("question must not be empty".into()));
         }
-        let hits = self.retrieve_workspace(participant, workspace, q, k.clamp(1, 20)).await?;
+        let hits = self
+            .retrieve_workspace_with_context(
+                participant,
+                workspace,
+                q,
+                k.clamp(1, 20),
+                usage_context,
+                "voyage_workspace_answer_query",
+            )
+            .await?;
 
         let citations: Vec<MessageId> = hits.iter().map(|h| h.message.id).collect();
         let context = render_context(&hits);
@@ -606,7 +781,10 @@ impl AiService {
             // focus/tone. Default OFF → `prefix` is `None` and the prompt is
             // byte-identical to before; a profile read failure is swallowed (it must
             // never fail the answer). Retrieval/citations are untouched.
-            let system = match self.profile_personalization_prefix(participant, workspace).await {
+            let system = match self
+                .profile_personalization_prefix(participant, workspace)
+                .await
+            {
                 Ok(Some(prefix)) => format!("{prefix}\n\n{ANSWER_SYSTEM_PROMPT}"),
                 Ok(None) => ANSWER_SYSTEM_PROMPT.to_owned(),
                 Err(e) => {
@@ -619,20 +797,32 @@ impl AiService {
             );
             // Model-tier routing (方向一·1) — same opt-in/default-OFF contract.
             let model = crate::tier::tier_model(crate::tier::classify_tier(q, hits.len()));
-            let answer = client
-                .complete_model(model.as_deref(), &system, &[ChatMsg::user(user)], 800)
+            let (answer, _) = self
+                .complete_model_accounted(
+                    client,
+                    usage_context,
+                    "anthropic_workspace_answer",
+                    "answer_workspace",
+                    crate::metrics::CostModel::default().answer_micros,
+                    model.as_deref(),
+                    &system,
+                    &[ChatMsg::user(user)],
+                    800,
+                )
                 .await?;
             return Ok(AnswerResult { answer, citations });
         }
 
-        // No Anthropic — return the raw context so the UI can still surface
-        // grounded results. This is a dev-mode escape hatch, not a quality claim.
+        // No Anthropic: return grounded raw context as a development fallback.
         let fallback = if hits.is_empty() {
             "（未配置 Anthropic,也未在工作区内检索到相关消息。）".to_string()
         } else {
             format!("（未配置 Anthropic,以下为检索到的相关消息上下文:）\n\n{context}")
         };
-        Ok(AnswerResult { answer: fallback, citations })
+        Ok(AnswerResult {
+            answer: fallback,
+            citations,
+        })
     }
 
     // ---------- thread-scoped summarization ----------
@@ -651,10 +841,25 @@ impl AiService {
     /// # Errors
     /// Propagates a storage or Anthropic failure when a key IS configured; the
     /// no-key path is infallible.
-    pub async fn summarize_thread(
+    pub async fn summarize_thread(&self, root: MessageId, max_replies: usize) -> Result<String> {
+        self.summarize_thread_inner(root, max_replies, None).await
+    }
+
+    pub async fn summarize_thread_with_usage_context(
         &self,
         root: MessageId,
         max_replies: usize,
+        usage_context: UsageContext,
+    ) -> Result<String> {
+        self.summarize_thread_inner(root, max_replies, Some(usage_context))
+            .await
+    }
+
+    async fn summarize_thread_inner(
+        &self,
+        root: MessageId,
+        max_replies: usize,
+        usage_context: Option<UsageContext>,
     ) -> Result<String> {
         // `max_replies` is clamped to [1, 200] so this `as i64` is always safe.
         #[allow(clippy::cast_possible_wrap)]
@@ -671,12 +876,28 @@ impl AiService {
         let transcript = render_transcript(&replies);
 
         if let Some(client) = &self.anthropic {
+            let usage_context = match usage_context {
+                Some(context) => context,
+                None => self.fresh_room_usage_context(replies[0].room_id).await?,
+            };
             let system = SUMMARIZE_SYSTEM_PROMPT;
             let user = format!(
                 "请阅读以下话题串(thread)的回复记录,并按照系统指令给出要点摘要。\n\n回复记录:\n{transcript}"
             );
             let msgs = vec![ChatMsg::user(user)];
-            return client.complete(system, &msgs, 600).await;
+            let (summary, _) = self
+                .complete_accounted(
+                    client,
+                    usage_context,
+                    "anthropic_thread_summary",
+                    "summarize_thread",
+                    crate::metrics::CostModel::default().summarize_micros,
+                    system,
+                    &msgs,
+                    600,
+                )
+                .await?;
+            return Ok(summary);
         }
 
         Ok(heuristic_summary(&replies))
@@ -705,6 +926,26 @@ impl AiService {
         root: MessageId,
         max_replies: usize,
     ) -> Result<String> {
+        self.generate_thread_title_inner(root, max_replies, None)
+            .await
+    }
+
+    pub async fn generate_thread_title_with_usage_context(
+        &self,
+        root: MessageId,
+        max_replies: usize,
+        usage_context: UsageContext,
+    ) -> Result<String> {
+        self.generate_thread_title_inner(root, max_replies, Some(usage_context))
+            .await
+    }
+
+    async fn generate_thread_title_inner(
+        &self,
+        root: MessageId,
+        max_replies: usize,
+        usage_context: Option<UsageContext>,
+    ) -> Result<String> {
         // Resolve the root message — it anchors the title.
         let Some(root_msg) = self.messages.get(root).await? else {
             return Ok(String::new());
@@ -719,6 +960,10 @@ impl AiService {
         let replies = self.messages.thread_replies(root, None, limit).await?;
 
         if let Some(client) = &self.anthropic {
+            let usage_context = match usage_context {
+                Some(context) => context,
+                None => self.fresh_room_usage_context(root_msg.room_id).await?,
+            };
             let mut context = String::new();
             {
                 use std::fmt::Write as _;
@@ -729,11 +974,21 @@ impl AiService {
                 }
             }
             let system = THREAD_TITLE_SYSTEM_PROMPT;
-            let user = format!(
-                "请为以下话题串生成一个简短标题(5-10 个词),概括其主旨。\n\n{context}"
-            );
+            let user =
+                format!("请为以下话题串生成一个简短标题(5-10 个词),概括其主旨。\n\n{context}");
             let msgs = vec![ChatMsg::user(user)];
-            let title = client.complete(system, &msgs, 60).await?;
+            let (title, _) = self
+                .complete_accounted(
+                    client,
+                    usage_context,
+                    "anthropic_thread_title",
+                    "thread_title",
+                    crate::metrics::CostModel::default().summarize_micros,
+                    system,
+                    &msgs,
+                    60,
+                )
+                .await?;
             return Ok(clean_title(&title));
         }
 
@@ -761,10 +1016,29 @@ impl AiService {
         workspace: WorkspaceId,
         last_n: usize,
     ) -> Result<String> {
+        self.summarize_workspace_with_usage_context(
+            participant,
+            workspace,
+            last_n,
+            UsageContext::new(Some(workspace.to_uuid())),
+        )
+        .await
+    }
+
+    pub async fn summarize_workspace_with_usage_context(
+        &self,
+        participant: ParticipantId,
+        workspace: WorkspaceId,
+        last_n: usize,
+        usage_context: UsageContext,
+    ) -> Result<String> {
         // `last_n` is clamped to [1, 200] so this `as i64` is always safe.
         #[allow(clippy::cast_possible_wrap)]
         let limit = last_n.clamp(1, 200) as i64;
-        let mut recent = self.messages.recent_workspace(participant, workspace, limit).await?;
+        let mut recent = self
+            .messages
+            .recent_workspace(participant, workspace, limit)
+            .await?;
         // `recent_workspace` returns newest-first; reverse to chronological.
         recent.reverse();
 
@@ -780,28 +1054,26 @@ impl AiService {
                 "请阅读以下工作区近期聊天记录(跨多个频道),并按照系统指令给出要点摘要。\n\n聊天记录:\n{transcript}"
             );
             let msgs = vec![ChatMsg::user(user)];
-            return client.complete(system, &msgs, 600).await;
+            let (summary, _) = self
+                .complete_accounted(
+                    client,
+                    usage_context,
+                    "anthropic_workspace_summary",
+                    "summarize_workspace",
+                    crate::metrics::CostModel::default().summarize_micros,
+                    system,
+                    &msgs,
+                    600,
+                )
+                .await?;
+            return Ok(summary);
         }
 
         Ok(heuristic_summary(&recent))
     }
 
-    // ---------- find expert ----------
-
-    /// Rank workspace members by topical authority on `topic`.
-    ///
-    /// Embeds the topic, runs the membership-bounded cross-room vector search
-    /// ([`MessageRepo::search_vector_workspace`](aero_storage::MessageRepo::search_vector_workspace)),
-    /// then aggregates the hits by author: each author's relevance is the SUM of
-    /// their matching messages' similarity scores, and a few of their highest-
-    /// scoring message ids are kept as citations. Returns the top-`k` authors,
-    /// strongest first. NO LLM call — purely retrieval + aggregation, so it never
-    /// errors on a missing Anthropic key (it degrades to whatever the embedder and
-    /// vector index return, which is empty rather than an error when nothing
-    /// matches). `pool` bounds how wide a candidate set is aggregated.
-    ///
-    /// # Errors
-    /// Propagates embedder or storage failures.
+    /// Rank workspace members by topical authority using paid embedding when
+    /// configured, then membership-bounded vector retrieval and aggregation.
     pub async fn find_expert(
         &self,
         participant: ParticipantId,
@@ -810,12 +1082,33 @@ impl AiService {
         k: usize,
         pool: usize,
     ) -> Result<Vec<Expert>> {
+        self.find_expert_with_usage_context(
+            participant,
+            workspace,
+            topic,
+            k,
+            pool,
+            UsageContext::new(Some(workspace.to_uuid())),
+        )
+        .await
+    }
+
+    pub async fn find_expert_with_usage_context(
+        &self,
+        participant: ParticipantId,
+        workspace: WorkspaceId,
+        topic: &str,
+        k: usize,
+        pool: usize,
+        usage_context: UsageContext,
+    ) -> Result<Vec<Expert>> {
         let topic = topic.trim();
         if topic.is_empty() {
             return Err(AiError::Invalid("topic must not be empty".into()));
         }
-        let query_vec = self.embedder.embed_query(topic).await?;
-        // `pool` bounds the candidate breadth aggregated; clamp to a sane window.
+        let query_vec = self
+            .embed_query_with_context(topic, usage_context, "voyage_find_expert_query")
+            .await?;
         #[allow(clippy::cast_possible_wrap)]
         let pool_limit = pool.clamp(1, 200) as i64;
         let hits = self
@@ -824,9 +1117,6 @@ impl AiService {
             .await?;
         Ok(rank_experts(&hits, k.clamp(1, 50)))
     }
-
-    // ---------- recommendations (suggested channels & people) ----------
-
     /// Rank channel candidates the caller isn't in into "channels to join"
     /// recommendations.
     ///
@@ -872,98 +1162,6 @@ impl AiService {
     ) -> Vec<PersonRec> {
         rank_people(candidates, k.clamp(1, 50))
     }
-
-    // ---------- translation (P3 实时字幕翻译) ----------
-
-    /// Translate `text` into `target_lang` (a human label or BCP-47 code).
-    ///
-    /// Uses Anthropic when configured; otherwise returns the source text
-    /// unchanged so live captions still display (just untranslated). Tuned for
-    /// short, low-latency caption lines.
-    pub async fn translate(&self, text: &str, target_lang: &str) -> Result<String> {
-        let text = text.trim();
-        if text.is_empty() {
-            return Ok(String::new());
-        }
-        if let Some(client) = &self.anthropic {
-            let system = TRANSLATE_SYSTEM_PROMPT;
-            let user = format!(
-                "目标语言: {target_lang}\n只输出译文本身,不要解释、不要引号。\n\n原文:\n{text}"
-            );
-            return client.complete(system, &[ChatMsg::user(user)], 400).await;
-        }
-        Ok(text.to_owned())
-    }
-
-    // ---------- moderation (P5 AI 内容审核) ----------
-
-    /// Classify a message body. Returns `Some(reason)` to block, `None` to allow.
-    ///
-    /// Requires Anthropic; without it returns `None` (the synchronous
-    /// `AERO_BLOCKED_WORDS` keyword filter in `ImService` remains the only gate).
-    /// Conservative by construction: only an explicit `BLOCK` verdict blocks.
-    pub async fn moderate(&self, text: &str) -> Result<Option<String>> {
-        self.moderate_with_usage(text).await.map(|(verdict, _usage)| verdict)
-    }
-
-    /// Like [`Self::moderate`] but also returns the real token [`Usage`] of the
-    /// classification call, so the worker can charge BILLED cost instead of a
-    /// flat estimate (ROADMAP 方向四). `usage` is `None` when no paid call was
-    /// made (empty text or no Anthropic key), in which case cost is zero.
-    pub async fn moderate_with_usage(
-        &self,
-        text: &str,
-    ) -> Result<(Option<String>, Option<Usage>)> {
-        let text = text.trim();
-        if text.is_empty() {
-            return Ok((None, None));
-        }
-        let Some(client) = &self.anthropic else {
-            return Ok((None, None));
-        };
-        let (verdict, usage) = client
-            .complete_with_usage(
-                MODERATE_SYSTEM_PROMPT,
-                &[ChatMsg::user(format!("待审核内容:\n{text}"))],
-                120,
-            )
-            .await?;
-        Ok((parse_moderation_verdict(&verdict), Some(usage)))
-    }
-
-    /// Score a message's affect: coarse sentiment, a `[0.0, 1.0]` toxicity
-    /// likelihood, and a short tone label.
-    ///
-    /// Additive to the binary [`Self::moderate`] gate — this NEVER blocks, it just
-    /// describes tone for a UI affordance. With an Anthropic key it prompts for a
-    /// structured one-line verdict ([`parse_sentiment_verdict`]). Without a key it
-    /// DEGRADES SAFELY to a deterministic keyword/punctuation heuristic
-    /// ([`heuristic_sentiment`]): ALL-CAPS or insult keywords raise toxicity and an
-    /// angry tone; exclamation/positive words read positive; otherwise neutral with
-    /// low toxicity. Empty text scores neutral. Never errors on a missing key.
-    ///
-    /// # Errors
-    /// Propagates an Anthropic failure when a key IS configured; the no-key path is
-    /// infallible.
-    pub async fn score_message_sentiment(&self, text: &str) -> Result<SentimentScore> {
-        let text = text.trim();
-        if text.is_empty() {
-            return Ok(SentimentScore::neutral());
-        }
-        let Some(client) = &self.anthropic else {
-            return Ok(heuristic_sentiment(text));
-        };
-        let verdict = client
-            .complete(
-                SENTIMENT_SYSTEM_PROMPT,
-                &[ChatMsg::user(format!("待评估内容:\n{text}"))],
-                120,
-            )
-            .await?;
-        // A malformed model line degrades to the heuristic rather than erroring,
-        // so the route always returns a well-formed score.
-        Ok(parse_sentiment_verdict(&verdict).unwrap_or_else(|| heuristic_sentiment(text)))
-    }
 }
 
 /// Parse a sentiment verdict line. Protocol (one line, pipe-separated):
@@ -978,7 +1176,14 @@ pub(crate) fn parse_sentiment_verdict(raw: &str) -> Option<SentimentScore> {
     let sentiment = Sentiment::from_label(parts.next()?);
     let toxicity = parts.next()?.trim().parse::<f32>().ok()?.clamp(0.0, 1.0);
     let tone = parts.next()?.trim();
-    let tone = if tone.is_empty() { sentiment.as_str() } else { tone };
-    Some(SentimentScore { sentiment, toxicity, tone: tone.to_owned() })
+    let tone = if tone.is_empty() {
+        sentiment.as_str()
+    } else {
+        tone
+    };
+    Some(SentimentScore {
+        sentiment,
+        toxicity,
+        tone: tone.to_owned(),
+    })
 }
-

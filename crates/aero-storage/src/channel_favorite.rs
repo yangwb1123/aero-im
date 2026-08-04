@@ -13,8 +13,10 @@
 //! [`ChannelSectionRepo`](crate::ChannelSectionRepo) — the HTTP layer is
 //! responsible for any room-access check before adding.
 
-use aero_common::{ParticipantId, RoomId};
+use aero_common::{Error, ParticipantId, RoomId};
 use sqlx::PgPool;
+
+use crate::draft::lock_effective_room_access_in_tx;
 
 /// Repository over the `channel_favorites` table (per-user starred channels).
 ///
@@ -38,7 +40,12 @@ impl ChannelFavoriteRepo {
     ///
     /// # Errors
     /// Propagates any [`sqlx::Error`] from the insert.
-    pub async fn add(&self, participant: ParticipantId, room: RoomId) -> Result<(), sqlx::Error> {
+    #[cfg(test)]
+    pub(crate) async fn add(
+        &self,
+        participant: ParticipantId,
+        room: RoomId,
+    ) -> Result<(), sqlx::Error> {
         sqlx::query(
             r"INSERT INTO channel_favorites (participant_id, room_id)
                VALUES ($1, $2)
@@ -58,7 +65,8 @@ impl ChannelFavoriteRepo {
     ///
     /// # Errors
     /// Propagates any [`sqlx::Error`] from the delete.
-    pub async fn remove(
+    #[cfg(test)]
+    pub(crate) async fn remove(
         &self,
         participant: ParticipantId,
         room: RoomId,
@@ -77,7 +85,11 @@ impl ChannelFavoriteRepo {
     ///
     /// # Errors
     /// Propagates any [`sqlx::Error`] from the query.
-    pub async fn list(&self, participant: ParticipantId) -> Result<Vec<RoomId>, sqlx::Error> {
+    #[cfg(test)]
+    pub(crate) async fn list(
+        &self,
+        participant: ParticipantId,
+    ) -> Result<Vec<RoomId>, sqlx::Error> {
         let rows = sqlx::query_as::<_, (uuid::Uuid,)>(
             r"SELECT room_id
                FROM channel_favorites
@@ -95,7 +107,8 @@ impl ChannelFavoriteRepo {
     ///
     /// # Errors
     /// Propagates any [`sqlx::Error`] from the query.
-    pub async fn is_favorite(
+    #[cfg(test)]
+    pub(crate) async fn is_favorite(
         &self,
         participant: ParticipantId,
         room: RoomId,
@@ -109,6 +122,98 @@ impl ChannelFavoriteRepo {
         .await?;
         Ok(row.is_some())
     }
+
+    /// Add a favorite while holding the caller's current room-access fence.
+    ///
+    /// # Errors
+    /// Returns an opaque room access error or a database error.
+    pub async fn add_authorized(
+        &self,
+        participant: ParticipantId,
+        room: RoomId,
+    ) -> Result<(), Error> {
+        let mut tx = self.pool.begin().await?;
+        lock_effective_room_access_in_tx(&mut tx, participant, room).await?;
+        sqlx::query(
+            r"INSERT INTO channel_favorites (participant_id, room_id)
+               VALUES ($1, $2)
+               ON CONFLICT (participant_id, room_id) DO NOTHING",
+        )
+        .bind(participant.to_uuid())
+        .bind(room.to_uuid())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Remove a favorite while holding the caller's current room-access fence.
+    ///
+    /// # Errors
+    /// Returns an opaque room access error or a database error.
+    pub async fn remove_authorized(
+        &self,
+        participant: ParticipantId,
+        room: RoomId,
+    ) -> Result<bool, Error> {
+        let mut tx = self.pool.begin().await?;
+        lock_effective_room_access_in_tx(&mut tx, participant, room).await?;
+        let result =
+            sqlx::query("DELETE FROM channel_favorites WHERE participant_id = $1 AND room_id = $2")
+                .bind(participant.to_uuid())
+                .bind(room.to_uuid())
+                .execute(&mut *tx)
+                .await?;
+        tx.commit().await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// List only favorites whose rooms the caller can currently access.
+    ///
+    /// # Errors
+    /// Propagates database errors.
+    pub async fn list_accessible(&self, participant: ParticipantId) -> Result<Vec<RoomId>, Error> {
+        let rows = sqlx::query_as::<_, (uuid::Uuid,)>(
+            r"SELECT room_id
+                FROM channel_favorites
+               WHERE participant_id = $1
+                 AND aero_effective_room_access(room_id, $1, NULL)
+               ORDER BY created_at DESC, room_id DESC",
+        )
+        .bind(participant.to_uuid())
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(room,)| RoomId::from_uuid(room))
+            .collect())
+    }
+
+    /// Check a favorite only after fencing current effective room access.
+    ///
+    /// # Errors
+    /// Returns an opaque room access error or a database error.
+    pub async fn is_favorite_authorized(
+        &self,
+        participant: ParticipantId,
+        room: RoomId,
+    ) -> Result<bool, Error> {
+        let mut tx = self.pool.begin().await?;
+        lock_effective_room_access_in_tx(&mut tx, participant, room).await?;
+        let exists = sqlx::query_scalar::<_, bool>(
+            r"SELECT EXISTS(
+                   SELECT 1
+                     FROM channel_favorites
+                    WHERE participant_id = $1 AND room_id = $2
+               )",
+        )
+        .bind(participant.to_uuid())
+        .bind(room.to_uuid())
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(exists)
+    }
 }
 
 /// PG-gated integration tests (run with a live Postgres + applied migrations):
@@ -120,6 +225,7 @@ impl ChannelFavoriteRepo {
 #[cfg(test)]
 mod db_tests {
     use super::*;
+    use aero_common::WorkspaceId;
 
     fn pool() -> PgPool {
         let url = std::env::var("DATABASE_URL")
@@ -130,9 +236,7 @@ mod db_tests {
             .expect("connect_lazy never fails on a well-formed URL")
     }
 
-    /// Create a throwaway owner participant so the test is self-contained.
-    /// Favorites store opaque `room_id` uuids (no FK to `rooms`), so a fresh
-    /// [`RoomId`] can be used without inserting a room.
+    /// Create a throwaway participant so the test is self-contained.
     async fn mk_participant(p: &PgPool) -> ParticipantId {
         let id = ParticipantId::new();
         sqlx::query("INSERT INTO participants (id, kind, display_name) VALUES ($1, 'human', $2)")
@@ -144,6 +248,64 @@ mod db_tests {
         id
     }
 
+    async fn room_with_members(
+        p: &PgPool,
+        owner: ParticipantId,
+        members: &[ParticipantId],
+    ) -> (WorkspaceId, RoomId) {
+        let workspace = WorkspaceId::new();
+        let room = RoomId::new();
+        let mut tx = p.begin().await.expect("begin favorite fixture");
+        sqlx::query(
+            "INSERT INTO workspaces (id, name, slug, created_by)
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(workspace.to_uuid())
+        .bind(format!("favorite-workspace-{workspace}"))
+        .bind(format!("favorite-{workspace}"))
+        .bind(owner.to_uuid())
+        .execute(&mut *tx)
+        .await
+        .expect("insert favorite workspace");
+        for member in members {
+            sqlx::query(
+                "INSERT INTO workspace_members
+                     (workspace_id, participant_id, role, joined_at)
+                 VALUES ($1, $2, $3, now())",
+            )
+            .bind(workspace.to_uuid())
+            .bind(member.to_uuid())
+            .bind(if *member == owner { "owner" } else { "member" })
+            .execute(&mut *tx)
+            .await
+            .expect("insert favorite workspace member");
+        }
+        sqlx::query(
+            "INSERT INTO rooms (id, kind, name, created_by, workspace_id)
+             VALUES ($1, 'group', $2, $3, $4)",
+        )
+        .bind(room.to_uuid())
+        .bind(format!("favorite-room-{room}"))
+        .bind(owner.to_uuid())
+        .bind(workspace.to_uuid())
+        .execute(&mut *tx)
+        .await
+        .expect("insert favorite room");
+        for member in members {
+            sqlx::query(
+                "INSERT INTO room_members (room_id, participant_id, role)
+                 VALUES ($1, $2, 'member')",
+            )
+            .bind(room.to_uuid())
+            .bind(member.to_uuid())
+            .execute(&mut *tx)
+            .await
+            .expect("insert favorite room member");
+        }
+        tx.commit().await.expect("commit favorite fixture");
+        (workspace, room)
+    }
+
     #[tokio::test]
     #[ignore = "requires live Postgres"]
     async fn channel_favorite_add_list_is_favorite_remove_owner_scoped() {
@@ -151,7 +313,7 @@ mod db_tests {
         let repo = ChannelFavoriteRepo::new(p.clone());
         let owner = mk_participant(&p).await;
         let stranger = mk_participant(&p).await;
-        let room = RoomId::new();
+        let (workspace, room) = room_with_members(&p, owner, &[owner, stranger]).await;
 
         // Not favorited yet.
         assert!(
@@ -196,9 +358,21 @@ mod db_tests {
         );
 
         // Cleanup so reruns stay self-contained.
-        sqlx::query("DELETE FROM channel_favorites WHERE participant_id = $1 OR participant_id = $2")
-            .bind(owner.to_uuid())
-            .bind(stranger.to_uuid())
+        sqlx::query(
+            "DELETE FROM channel_favorites WHERE participant_id = $1 OR participant_id = $2",
+        )
+        .bind(owner.to_uuid())
+        .bind(stranger.to_uuid())
+        .execute(&p)
+        .await
+        .ok();
+        sqlx::query("DELETE FROM workspaces WHERE id = $1")
+            .bind(workspace.to_uuid())
+            .execute(&p)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM participants WHERE id = ANY($1)")
+            .bind(vec![owner.to_uuid(), stranger.to_uuid()])
             .execute(&p)
             .await
             .ok();

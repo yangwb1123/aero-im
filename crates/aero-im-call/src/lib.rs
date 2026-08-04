@@ -46,9 +46,12 @@
 //! (`None`), behavior is exactly the single-node behavior of before:
 //! [`CallTopology::ServeLocal`] always.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use aero_common::{CallId, CallKind, CallMode, CallSession, ParticipantId, RoomId};
+use aero_common::{
+    CallId, CallKind, CallMode, CallSession, Error as CommonError, ParticipantId, RoomId,
+};
 use aero_live_webrtc::{decide_call_topology, CallTopology, PeerRole, SfuRouter};
 use aero_storage::{CallRepo, CallRouteRegistry};
 use tracing::{instrument, warn};
@@ -64,6 +67,11 @@ pub enum OrchestratorError {
     #[error("forbidden: {0}")]
     Forbidden(String),
 
+    /// The canonical call exists, but its lifecycle/mode no longer admits the
+    /// requested transition.
+    #[error("conflict: {0}")]
+    Conflict(String),
+
     /// The group call has reached its full-mesh participant ceiling
     /// ([`max_mesh_participants`]); admitting another *new* member would
     /// saturate every existing member's browser (see [`MAX_MESH_PARTICIPANTS`]).
@@ -74,6 +82,22 @@ pub enum OrchestratorError {
     /// A database error occurred.
     #[error("database: {0}")]
     Db(#[from] sqlx::Error),
+}
+
+impl From<CommonError> for OrchestratorError {
+    fn from(error: CommonError) -> Self {
+        match error {
+            CommonError::NotFound(message) => Self::NotFound(message),
+            CommonError::Forbidden(message) | CommonError::Unauthorized(message) => {
+                Self::Forbidden(message)
+            }
+            CommonError::Conflict(message) | CommonError::Invalid(message) => {
+                Self::Conflict(message)
+            }
+            CommonError::Database(error) => Self::Db(error),
+            other => Self::Conflict(other.to_string()),
+        }
+    }
 }
 
 type Result<T> = std::result::Result<T, OrchestratorError>;
@@ -125,12 +149,40 @@ pub trait CallRouteStore: Send + Sync {
         node_url: &str,
     ) -> anyhow::Result<()>;
 
+    /// Generation-fenced variant used by current SFU joins. `false` means a
+    /// newer durable leg already owns the participant route.
+    async fn register_participant_generation(
+        &self,
+        call: CallId,
+        participant: ParticipantId,
+        node_url: &str,
+        generation: i64,
+    ) -> anyhow::Result<bool> {
+        let _ = generation;
+        self.register_participant(call, participant, node_url)
+            .await?;
+        Ok(true)
+    }
+
     /// Drop `participant`'s mapping for `call`.
     async fn unregister_participant(
         &self,
         call: CallId,
         participant: ParticipantId,
     ) -> anyhow::Result<()>;
+
+    /// Remove only the route written by `generation`.
+    async fn unregister_participant_generation(
+        &self,
+        call: CallId,
+        participant: ParticipantId,
+        node_url: &str,
+        generation: i64,
+    ) -> anyhow::Result<bool> {
+        let _ = (node_url, generation);
+        self.unregister_participant(call, participant).await?;
+        Ok(true)
+    }
 
     /// Drop **every** participant mapped to `node_url` for `call` (the
     /// last-local-participant / call-end cleanup path).
@@ -152,12 +204,46 @@ impl CallRouteStore for CallRouteRegistry {
         CallRouteRegistry::register_participant(self, call, participant, node_url).await
     }
 
+    async fn register_participant_generation(
+        &self,
+        call: CallId,
+        participant: ParticipantId,
+        node_url: &str,
+        generation: i64,
+    ) -> anyhow::Result<bool> {
+        CallRouteRegistry::register_participant_generation(
+            self,
+            call,
+            participant,
+            node_url,
+            generation,
+        )
+        .await
+    }
+
     async fn unregister_participant(
         &self,
         call: CallId,
         participant: ParticipantId,
     ) -> anyhow::Result<()> {
         CallRouteRegistry::unregister_participant(self, call, participant).await
+    }
+
+    async fn unregister_participant_generation(
+        &self,
+        call: CallId,
+        participant: ParticipantId,
+        node_url: &str,
+        generation: i64,
+    ) -> anyhow::Result<bool> {
+        CallRouteRegistry::unregister_participant_generation(
+            self,
+            call,
+            participant,
+            node_url,
+            generation,
+        )
+        .await
     }
 
     async fn unregister_node(&self, call: CallId, node_url: &str) -> anyhow::Result<()> {
@@ -187,6 +273,16 @@ pub struct GroupJoin {
     /// [`CallBridge`](aero_live_webrtc::CallBridge) pull per listed node.
     /// Always [`CallTopology::ServeLocal`] when no registry is attached.
     pub topology: CallTopology,
+    /// Durable incarnation of this participant's logical call leg.
+    pub leg_generation: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GroupLeave {
+    /// This exact generation won the durable active→left transition.
+    pub transitioned: bool,
+    /// Removing this node-local generation left no local SFU peers.
+    pub call_empty: bool,
 }
 
 /// Drives the call lifecycle: persistence, SFU peer registration, and
@@ -201,13 +297,19 @@ pub struct CallOrchestrator {
     calls: CallRepo,
     sfu: Option<SfuRouter>,
     routes: Option<CallRoutes>,
+    local_leg_generations: Arc<tokio::sync::RwLock<HashMap<(CallId, ParticipantId), i64>>>,
 }
 
 impl CallOrchestrator {
     /// Create a new orchestrator backed by the given call repository.
     #[must_use]
     pub fn new(calls: CallRepo) -> Self {
-        Self { calls, sfu: None, routes: None }
+        Self {
+            calls,
+            sfu: None,
+            routes: None,
+            local_leg_generations: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
+        }
     }
 
     /// Attach an [`SfuRouter`] for tracking RTP media peers in SFU-mode calls.
@@ -237,7 +339,10 @@ impl CallOrchestrator {
         store: Arc<dyn CallRouteStore>,
         node_url: impl Into<String>,
     ) -> Self {
-        self.routes = Some(CallRoutes { store, node_url: node_url.into() });
+        self.routes = Some(CallRoutes {
+            store,
+            node_url: node_url.into(),
+        });
         self
     }
 
@@ -258,7 +363,10 @@ impl CallOrchestrator {
         callees: &[ParticipantId],
     ) -> Result<(CallId, CallSession)> {
         let call_id = CallId::new();
-        let session = self.calls.start(call_id, room, initiator, kind, mode, callees).await?;
+        let session = self
+            .calls
+            .start(call_id, room, initiator, kind, mode, callees)
+            .await?;
 
         // For SFU-mode calls add the initiator as a bidirectional peer immediately.
         if mode == CallMode::Sfu {
@@ -276,7 +384,10 @@ impl CallOrchestrator {
     /// Returns an error if the DB update fails.
     #[instrument(skip(self))]
     pub async fn answer_call(&self, call_id: CallId) -> Result<()> {
-        self.calls.mark_answered(call_id).await.map_err(OrchestratorError::Db)
+        self.calls
+            .mark_answered(call_id)
+            .await
+            .map_err(OrchestratorError::Db)
     }
 
     /// End a call and return missed-call information if applicable.
@@ -300,20 +411,7 @@ impl CallOrchestrator {
         reason: &str,
     ) -> Result<Option<(ParticipantId, Vec<ParticipantId>)>> {
         self.calls.end(call_id, reason).await?;
-
-        // Disband the SFU peer table for this call (if SFU mode was in use).
-        if let Some(sfu) = &self.sfu {
-            let members = sfu.participants(call_id);
-            for p in members {
-                sfu.remove_peer(call_id, p);
-            }
-        }
-
-        if let Some(routes) = &self.routes {
-            if let Err(e) = routes.store.unregister_node(call_id, &routes.node_url).await {
-                warn!(error = ?e, %call_id, "call-route node cleanup failed on end_call");
-            }
-        }
+        self.cleanup_ended_call(call_id).await;
 
         // Check if the call ended without anyone answering (missed call).
         match self.calls.unanswered_callees(call_id).await {
@@ -323,6 +421,37 @@ impl CallOrchestrator {
                 // fail the end-call operation.
                 warn!(error = ?e, %call_id, "unanswered_callees lookup failed");
                 Ok(None)
+            }
+        }
+    }
+
+    /// Tear down the local SFU/router and cross-node route state for a call
+    /// whose durable End transition has already committed.
+    ///
+    /// This intentionally performs no call-session write. The IM service owns
+    /// the fail-closed DB transition before it publishes `CallEnd`; both the
+    /// originating WS handler and every bus consumer can then invoke this
+    /// idempotent cleanup even if the database becomes temporarily unavailable.
+    pub async fn cleanup_ended_call(&self, call_id: CallId) {
+        self.local_leg_generations
+            .write()
+            .await
+            .retain(|(active_call, _), _| *active_call != call_id);
+        // Disband the SFU peer table for this call (if SFU mode was in use).
+        if let Some(sfu) = &self.sfu {
+            let members = sfu.participants(call_id);
+            for p in members {
+                sfu.remove_peer(call_id, p);
+            }
+        }
+
+        if let Some(routes) = &self.routes {
+            if let Err(e) = routes
+                .store
+                .unregister_node(call_id, &routes.node_url)
+                .await
+            {
+                warn!(error = ?e, %call_id, "call-route node cleanup failed on end_call");
             }
         }
     }
@@ -360,6 +489,20 @@ impl CallOrchestrator {
         participant: ParticipantId,
         kind: CallKind,
     ) -> Result<GroupJoin> {
+        // Resolve the canonical row before touching any live topology. If two
+        // creators race on the same id, only a conflict that can be re-read as
+        // the same active SFU call is accepted; a blanket 23505 success would
+        // let a caller attach an arbitrary room to somebody else's call id.
+        let call = match self.calls.get(call_id).await? {
+            Some(call) => call,
+            None => {
+                self.calls
+                    .start_group_authorized(call_id, room, participant, kind)
+                    .await?
+            }
+        };
+        validate_group_call(&call, room, kind)?;
+
         // Full-mesh admission control: reject a *new* member that would push the
         // call past the mesh-saturation ceiling, but never reject a reconnect of
         // a member already on the roster (dedup by ParticipantId). Only the SFU
@@ -382,23 +525,22 @@ impl CallOrchestrator {
             Vec::new()
         };
 
-        // Create the session row if this is the very first joiner (idempotent on
-        // unique constraint: a subsequent start returns a conflict, which is fine
-        // — the first joiner's row is the canonical one).
-        if let Err(e) = self
+        // Persist the active leg before exposing it through any live topology.
+        // The conditional upsert refuses an already-ended call; a canonical
+        // re-read disambiguates that case from an idempotent reconnect.
+        let (before_mutation, leg_generation) = self
             .calls
-            .start(call_id, room, participant, kind, CallMode::Sfu, &[])
+            .join_participant_authorized_generation(call_id, participant, room, kind)
+            .await?;
+        validate_group_call(&before_mutation, room, kind)?;
+
+        let topology = self
+            .register_and_decide(call_id, participant, leg_generation)
+            .await?;
+        self.local_leg_generations
+            .write()
             .await
-        {
-            // UniqueViolation (23505) means the call already exists — not an error.
-            if e.as_database_error()
-                .and_then(sqlx::error::DatabaseError::code)
-                .as_deref()
-                != Some("23505")
-            {
-                return Err(OrchestratorError::Db(e));
-            }
-        }
+            .insert((call_id, participant), leg_generation);
 
         // Capacity check passed — add to the SFU router (idempotent for a
         // reconnect: re-inserting the same key just refreshes the role).
@@ -406,8 +548,33 @@ impl CallOrchestrator {
             sfu.add_peer(call_id, participant, PeerRole::Bidirectional);
         }
 
-        let topology = self.register_and_decide(call_id, participant).await;
-        Ok(GroupJoin { existing_peers, topology })
+        // `end_call` can race the awaits above (including from another node).
+        // Re-read after every live mutation. If the canonical row changed or
+        // ended, reliably remove the local peer and best-effort unregister its
+        // cross-node route before the server is allowed to touch Hub/Redis.
+        let post_mutation = self.calls.get(call_id).await;
+        let post_error = match post_mutation {
+            Ok(Some(call)) => validate_group_call(&call, room, kind).err(),
+            Ok(None) => Some(OrchestratorError::NotFound(format!("call {call_id}"))),
+            Err(error) => Some(OrchestratorError::Db(error)),
+        };
+        if let Some(error) = post_error {
+            if let Err(rollback_error) = self.leave_group_call(call_id, participant).await {
+                warn!(
+                    ?rollback_error,
+                    %call_id,
+                    %participant,
+                    "failed to persist group-call join rollback"
+                );
+            }
+            return Err(error);
+        }
+
+        Ok(GroupJoin {
+            existing_peers,
+            topology,
+            leg_generation,
+        })
     }
 
     /// Register `participant` in the cross-node registry and decide this
@@ -418,23 +585,51 @@ impl CallOrchestrator {
         &self,
         call_id: CallId,
         participant: ParticipantId,
-    ) -> CallTopology {
+        leg_generation: i64,
+    ) -> Result<CallTopology> {
         let Some(routes) = &self.routes else {
-            return CallTopology::ServeLocal;
+            return Ok(CallTopology::ServeLocal);
         };
-        if let Err(e) = routes
+        match routes
             .store
-            .register_participant(call_id, participant, &routes.node_url)
+            .register_participant_generation(call_id, participant, &routes.node_url, leg_generation)
             .await
         {
-            warn!(error = ?e, %call_id, "call-route registration failed; serving locally");
-            return CallTopology::ServeLocal;
-        }
-        match routes.store.nodes_for_call(call_id).await {
-            Ok(nodes) => decide_call_topology(&routes.node_url, &nodes),
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(OrchestratorError::Conflict(
+                    "a newer call participant incarnation is already routed".into(),
+                ));
+            }
             Err(e) => {
-                warn!(error = ?e, %call_id, "call-route census failed; serving locally");
-                CallTopology::ServeLocal
+                warn!(error = ?e, %call_id, "call-route registration failed; serving locally");
+                return Ok(CallTopology::ServeLocal);
+            }
+        }
+        Ok(self
+            .current_topology(call_id)
+            .await
+            .unwrap_or(CallTopology::ServeLocal))
+    }
+
+    /// Recompute this node's bridge intent from the current cluster census.
+    ///
+    /// Unlike the join-time helper, this does not mutate participant routing.
+    /// It is used by remote Join/Publisher events and the periodic reconciler so
+    /// an already-present node discovers peers that joined later and retries a
+    /// bridge whose transport previously failed. `None` distinguishes a
+    /// transient registry failure from a genuine single-node
+    /// [`CallTopology::ServeLocal`] result; callers must retain existing bridges
+    /// on `None`.
+    pub async fn current_topology(&self, call_id: CallId) -> Option<CallTopology> {
+        let Some(routes) = &self.routes else {
+            return Some(CallTopology::ServeLocal);
+        };
+        match routes.store.nodes_for_call(call_id).await {
+            Ok(nodes) => Some(decide_call_topology(&routes.node_url, &nodes)),
+            Err(e) => {
+                warn!(error = ?e, %call_id, "call-route census failed; retaining current bridges");
+                None
             }
         }
     }
@@ -450,8 +645,8 @@ impl CallOrchestrator {
         !roster.contains(participant) && roster.len() >= max_mesh_participants()
     }
 
-    /// Leave a group call. Removes the participant from the SFU router and
-    /// the cross-node registry (if attached).
+    /// Leave a group call. Persists the active leg as left before removing the
+    /// participant from the SFU router and cross-node registry.
     ///
     /// Returns `true` if this was the **last local** participant — i.e. this
     /// node's leg of the call is now empty and the caller should disband it
@@ -466,18 +661,143 @@ impl CallOrchestrator {
     /// already computes; without it, callers have no way to detect that the
     /// final member dropped and the group call should be torn down.
     #[instrument(skip(self))]
-    pub async fn leave_group_call(&self, call_id: CallId, participant: ParticipantId) -> bool {
+    pub async fn leave_group_call(
+        &self,
+        call_id: CallId,
+        participant: ParticipantId,
+    ) -> Result<bool> {
+        if let Some(generation) = self.local_leg_generation(call_id, participant).await {
+            return Ok(self
+                .leave_group_call_generation(call_id, participant, generation)
+                .await?
+                .call_empty);
+        }
+        self.calls
+            .leave_participant_if_active(call_id, participant)
+            .await?;
+        Ok(self
+            .cleanup_group_call_participant(call_id, participant)
+            .await)
+    }
+
+    /// Leave and clean one exact durable participant incarnation.
+    ///
+    /// A stale generation still removes only matching node-local state, but
+    /// cannot mark a replacement database leg left or delete its Redis route.
+    pub async fn leave_group_call_generation(
+        &self,
+        call_id: CallId,
+        participant: ParticipantId,
+        generation: i64,
+    ) -> Result<GroupLeave> {
+        let transitioned = self
+            .calls
+            .leave_participant_if_generation(call_id, participant, generation)
+            .await?;
+        let call_empty = self
+            .cleanup_group_call_participant_generation(call_id, participant, generation)
+            .await;
+        Ok(GroupLeave {
+            transitioned,
+            call_empty,
+        })
+    }
+
+    #[must_use]
+    pub async fn local_leg_generation(
+        &self,
+        call_id: CallId,
+        participant: ParticipantId,
+    ) -> Option<i64> {
+        self.local_leg_generations
+            .read()
+            .await
+            .get(&(call_id, participant))
+            .copied()
+    }
+
+    /// Remove an exact node-local incarnation after its durable leave was
+    /// already committed (for example by `ImService::leave_call`).
+    pub async fn cleanup_group_call_participant_generation(
+        &self,
+        call_id: CallId,
+        participant: ParticipantId,
+        generation: i64,
+    ) -> bool {
+        let owned = {
+            let mut generations = self.local_leg_generations.write().await;
+            if generations.get(&(call_id, participant)) == Some(&generation) {
+                generations.remove(&(call_id, participant));
+                true
+            } else {
+                false
+            }
+        };
+        if !owned {
+            return false;
+        }
+
+        let last_local = match &self.sfu {
+            Some(sfu) => sfu.remove_peer(call_id, participant),
+            None => false,
+        };
+        if let Some(routes) = &self.routes {
+            if let Err(e) = routes
+                .store
+                .unregister_participant_generation(
+                    call_id,
+                    participant,
+                    &routes.node_url,
+                    generation,
+                )
+                .await
+            {
+                warn!(error = ?e, %call_id, %participant, generation, "call-route generation cleanup failed");
+            }
+            if last_local {
+                if let Err(e) = routes
+                    .store
+                    .unregister_node(call_id, &routes.node_url)
+                    .await
+                {
+                    warn!(error = ?e, %call_id, "call-route node deregistration failed");
+                }
+            }
+        }
+        last_local
+    }
+
+    /// Remove an already-persisted left leg from this node's live topology.
+    ///
+    /// This second phase performs no database write and is idempotent.
+    pub async fn cleanup_group_call_participant(
+        &self,
+        call_id: CallId,
+        participant: ParticipantId,
+    ) -> bool {
+        self.local_leg_generations
+            .write()
+            .await
+            .remove(&(call_id, participant));
         let last_local = match &self.sfu {
             Some(sfu) => sfu.remove_peer(call_id, participant),
             None => false,
         };
 
         if let Some(routes) = &self.routes {
-            if let Err(e) = routes.store.unregister_participant(call_id, participant).await {
+            if let Err(e) = routes
+                .store
+                .unregister_participant(call_id, participant)
+                .await
+            {
                 warn!(error = ?e, %call_id, "call-route unregistration failed");
             }
             if last_local {
-                if let Err(e) = routes.store.unregister_node(call_id, &routes.node_url).await {
+                if let Err(e) = routes
+                    .store
+                    .unregister_node(call_id, &routes.node_url)
+                    .await
+                {
                     warn!(error = ?e, %call_id, "call-route node deregistration failed");
                 }
             }
@@ -492,373 +812,29 @@ impl CallOrchestrator {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use aero_live_webrtc::SfuRouter;
-    use std::sync::Mutex;
-
-    fn make_ids() -> (ParticipantId, ParticipantId) {
-        (ParticipantId::new(), ParticipantId::new())
+fn validate_group_call(call: &CallSession, room: RoomId, kind: CallKind) -> Result<()> {
+    if call.room_id != room {
+        return Err(OrchestratorError::Forbidden(
+            "call does not belong to the claimed room".into(),
+        ));
     }
-
-    // ── full-mesh capacity guard (P1-4) ──────────────────────────────────────
-
-    #[test]
-    fn max_mesh_participants_defaults_when_env_unset() {
-        // Default is the compile-time ceiling unless AERO_MAX_CALL_MESH overrides.
-        // (Tests run without the env var set; if a hostile env leaks one in, this
-        // assertion documents the contract rather than guaranteeing the value.)
-        if std::env::var(MAX_MESH_ENV).is_err() {
-            assert_eq!(max_mesh_participants(), MAX_MESH_PARTICIPANTS);
-        }
-        assert_eq!(MAX_MESH_PARTICIPANTS, 8, "documented browser-mesh saturation point");
+    if call.mode != CallMode::Sfu {
+        return Err(OrchestratorError::Forbidden(
+            "group join requires an SFU call".into(),
+        ));
     }
-
-    /// Reaching the cap rejects the (N+1)ᵗʰ *new* member, and does so before
-    /// any DB access (so the stub repo is never awaited).
-    #[tokio::test]
-    async fn join_rejects_new_member_at_capacity() {
-        let sfu = SfuRouter::new();
-        let orch = CallOrchestrator::new_for_test(sfu.clone());
-        let call = CallId::new();
-
-        // Fill the roster to exactly the cap with distinct members.
-        let cap = max_mesh_participants();
-        for _ in 0..cap {
-            sfu.add_peer(call, ParticipantId::new(), PeerRole::Bidirectional);
-        }
-        assert_eq!(sfu.participants(call).len(), cap, "roster filled to the cap");
-
-        // A brand-new member is rejected with CallFull (no DB touched).
-        let newcomer = ParticipantId::new();
-        let err = orch
-            .join_group_call(call, RoomId::new(), newcomer, CallKind::Video)
-            .await
-            .expect_err("join past the cap must fail");
-        match err {
-            OrchestratorError::CallFull(reported) => assert_eq!(reported, cap),
-            other => panic!("expected CallFull, got {other:?}"),
-        }
-        // The newcomer was NOT added to the mesh.
-        assert_eq!(sfu.participants(call).len(), cap, "rejected member never entered the roster");
-        assert!(!sfu.participants(call).contains(&newcomer));
+    if call.kind != kind {
+        return Err(OrchestratorError::Forbidden(
+            "call kind does not match the canonical call".into(),
+        ));
     }
-
-    /// A reconnect of an *existing* member at capacity is admitted, not rejected:
-    /// the capacity gate dedups by ParticipantId and never double-counts.
-    #[tokio::test]
-    async fn join_does_not_reject_reconnecting_member_at_capacity() {
-        let sfu = SfuRouter::new();
-        let orch = CallOrchestrator::new_for_test(sfu.clone());
-        let call = CallId::new();
-
-        // Fill the roster to the cap; remember one member as the "reconnector".
-        let cap = max_mesh_participants();
-        let reconnector = ParticipantId::new();
-        sfu.add_peer(call, reconnector, PeerRole::Bidirectional);
-        for _ in 1..cap {
-            sfu.add_peer(call, ParticipantId::new(), PeerRole::Bidirectional);
-        }
-        assert_eq!(sfu.participants(call).len(), cap, "roster at the cap incl. reconnector");
-
-        // The reconnect must pass the capacity gate (it is already a member). We
-        // exercise the gate decision in isolation — the post-gate path does a DB
-        // write the stub repo can't serve, so assert on the pure decision here.
-        assert!(
-            !orch.would_reject_join(call, reconnector),
-            "an existing member reconnecting must never be rejected by the cap"
-        );
-        // And a genuinely new member at the same cap *is* rejected.
-        assert!(
-            orch.would_reject_join(call, ParticipantId::new()),
-            "a new member at the cap is rejected"
-        );
+    if call.ended_at.is_some() {
+        return Err(OrchestratorError::Forbidden(
+            "cannot join an ended call".into(),
+        ));
     }
-
-    #[tokio::test]
-    async fn join_group_call_tracks_peers_in_sfu() {
-        let sfu = SfuRouter::new();
-        let (p1, p2) = make_ids();
-        let call_id = CallId::new();
-
-        // Wire up an orchestrator with the SFU router (no real DB needed here —
-        // we test SFU bookkeeping in isolation via the non-async path).
-        let orch = CallOrchestrator::new_for_test(sfu.clone());
-
-        // Simulate p1 joining first.
-        orch.sfu_add(call_id, p1);
-        let p1_before = orch.existing_peers_excluding(call_id, p1);
-        assert!(p1_before.is_empty(), "first joiner sees no peers");
-
-        // p2 joins; should see p1.
-        orch.sfu_add(call_id, p2);
-        let p2_before = orch.existing_peers_excluding(call_id, p2);
-        assert_eq!(p2_before, vec![p1], "second joiner sees p1");
-
-        // p1 leaves; p2 remains, so the call is NOT yet empty.
-        let p1_was_last = orch.leave_group_call(call_id, p1).await;
-        assert!(!p1_was_last, "p1 leaving with p2 still present is not the last leave");
-        assert_eq!(sfu.participants(call_id), vec![p2]);
-    }
-
-    #[tokio::test]
-    async fn leave_group_call_reports_last_participant() {
-        let sfu = SfuRouter::new();
-        let (p1, p2) = make_ids();
-        let call_id = CallId::new();
-        let orch = CallOrchestrator::new_for_test(sfu.clone());
-
-        orch.sfu_add(call_id, p1);
-        orch.sfu_add(call_id, p2);
-
-        // Removing a non-last peer must not signal teardown.
-        assert!(!orch.leave_group_call(call_id, p1).await, "p1 is not the last to leave");
-        // Removing the final peer signals the call is now empty.
-        assert!(orch.leave_group_call(call_id, p2).await, "p2 is the last to leave");
-        assert!(sfu.participants(call_id).is_empty(), "roster cleared after last leave");
-
-        // A redundant leave on an already-empty / unknown call is not a teardown.
-        assert!(
-            !orch.leave_group_call(call_id, p2).await,
-            "leaving an already-empty call must not re-signal teardown"
-        );
-    }
-
-    #[tokio::test]
-    async fn leave_group_call_without_sfu_returns_false() {
-        // No SfuRouter attached: emptiness can't be tracked, so never claim
-        // "last participant" (the caller must decide via other state).
-        let orch = CallOrchestrator { calls: stub_repo(), sfu: None, routes: None };
-        let (p1, _p2) = make_ids();
-        assert!(!orch.leave_group_call(CallId::new(), p1).await);
-    }
-
-    #[tokio::test]
-    async fn end_call_disbands_sfu_roster() {
-        let sfu = SfuRouter::new();
-        let (p1, p2) = make_ids();
-        let call_id = CallId::new();
-
-        sfu.add_peer(call_id, p1, PeerRole::Bidirectional);
-        sfu.add_peer(call_id, p2, PeerRole::Bidirectional);
-        assert_eq!(sfu.participants(call_id).len(), 2);
-
-        let orch = CallOrchestrator::new_for_test(sfu.clone());
-        orch.disband_sfu(call_id);
-
-        assert!(sfu.participants(call_id).is_empty(), "SFU roster cleared after call end");
-    }
-
-    // ── cross-node route registry (ROADMAP3 方向二) ──────────────────────────
-
-    /// In-memory [`CallRouteStore`]: records operations, serves a scripted
-    /// census, optionally fails everything (for degradation tests).
-    #[derive(Default)]
-    struct FakeRoutes {
-        nodes: Mutex<Vec<(String, u32)>>,
-        registered: Mutex<Vec<(CallId, ParticipantId, String)>>,
-        unregistered: Mutex<Vec<(CallId, ParticipantId)>>,
-        nodes_unregistered: Mutex<Vec<(CallId, String)>>,
-        fail: bool,
-    }
-
-    impl FakeRoutes {
-        fn with_nodes(nodes: Vec<(String, u32)>) -> Arc<Self> {
-            Arc::new(Self { nodes: Mutex::new(nodes), ..Self::default() })
-        }
-
-        fn failing() -> Arc<Self> {
-            Arc::new(Self { fail: true, ..Self::default() })
-        }
-
-        fn check(&self) -> anyhow::Result<()> {
-            if self.fail {
-                anyhow::bail!("redis unavailable");
-            }
-            Ok(())
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl CallRouteStore for FakeRoutes {
-        async fn register_participant(
-            &self,
-            call: CallId,
-            participant: ParticipantId,
-            node_url: &str,
-        ) -> anyhow::Result<()> {
-            self.check()?;
-            self.registered.lock().unwrap().push((call, participant, node_url.to_owned()));
-            Ok(())
-        }
-
-        async fn unregister_participant(
-            &self,
-            call: CallId,
-            participant: ParticipantId,
-        ) -> anyhow::Result<()> {
-            self.check()?;
-            self.unregistered.lock().unwrap().push((call, participant));
-            Ok(())
-        }
-
-        async fn unregister_node(&self, call: CallId, node_url: &str) -> anyhow::Result<()> {
-            self.check()?;
-            self.nodes_unregistered.lock().unwrap().push((call, node_url.to_owned()));
-            Ok(())
-        }
-
-        async fn nodes_for_call(&self, _call: CallId) -> anyhow::Result<Vec<(String, u32)>> {
-            self.check()?;
-            Ok(self.nodes.lock().unwrap().clone())
-        }
-    }
-
-    const LOCAL: &str = "http://node-a.example";
-
-    #[tokio::test]
-    async fn register_and_decide_without_routes_serves_local() {
-        let orch = CallOrchestrator::new_for_test(SfuRouter::new());
-        let topology = orch.register_and_decide(CallId::new(), ParticipantId::new()).await;
-        assert_eq!(topology, CallTopology::ServeLocal, "no registry → today's behavior");
-    }
-
-    #[tokio::test]
-    async fn register_and_decide_registers_then_serves_local_when_self_only() {
-        let routes = FakeRoutes::with_nodes(vec![(LOCAL.to_owned(), 1)]);
-        let orch = CallOrchestrator::new_for_test(SfuRouter::new())
-            .with_call_routes(routes.clone(), LOCAL);
-        let (call, p) = (CallId::new(), ParticipantId::new());
-
-        let topology = orch.register_and_decide(call, p).await;
-        assert_eq!(topology, CallTopology::ServeLocal, "only this node hosts the call");
-        assert_eq!(
-            routes.registered.lock().unwrap().as_slice(),
-            &[(call, p, LOCAL.to_owned())],
-            "the joiner was registered under this node's URL"
-        );
-    }
-
-    #[tokio::test]
-    async fn register_and_decide_bridges_to_every_other_hosting_node() {
-        let routes = FakeRoutes::with_nodes(vec![
-            ("http://node-c.example".to_owned(), 1),
-            (LOCAL.to_owned(), 2),
-            ("http://node-b.example".to_owned(), 3),
-        ]);
-        let orch = CallOrchestrator::new_for_test(SfuRouter::new())
-            .with_call_routes(routes, LOCAL);
-
-        let topology = orch.register_and_decide(CallId::new(), ParticipantId::new()).await;
-        assert_eq!(
-            topology,
-            CallTopology::BridgeTo(vec![
-                "http://node-b.example".to_owned(),
-                "http://node-c.example".to_owned(),
-            ]),
-            "bridge intent covers every other node, deterministically ordered"
-        );
-    }
-
-    #[tokio::test]
-    async fn registry_failure_degrades_to_serve_local() {
-        let orch = CallOrchestrator::new_for_test(SfuRouter::new())
-            .with_call_routes(FakeRoutes::failing(), LOCAL);
-        let topology = orch.register_and_decide(CallId::new(), ParticipantId::new()).await;
-        assert_eq!(
-            topology,
-            CallTopology::ServeLocal,
-            "a registry outage must not break the (single-node-correct) join"
-        );
-    }
-
-    #[tokio::test]
-    async fn leave_unregisters_and_last_local_leave_deregisters_node() {
-        let sfu = SfuRouter::new();
-        let routes = FakeRoutes::with_nodes(Vec::new());
-        let orch =
-            CallOrchestrator::new_for_test(sfu.clone()).with_call_routes(routes.clone(), LOCAL);
-        let (p1, p2) = make_ids();
-        let call = CallId::new();
-        orch.sfu_add(call, p1);
-        orch.sfu_add(call, p2);
-
-        assert!(!orch.leave_group_call(call, p1).await, "p1 is not the last local");
-        assert_eq!(routes.unregistered.lock().unwrap().as_slice(), &[(call, p1)]);
-        assert!(
-            routes.nodes_unregistered.lock().unwrap().is_empty(),
-            "node entry kept while local participants remain"
-        );
-
-        assert!(orch.leave_group_call(call, p2).await, "p2 is the last local participant");
-        assert_eq!(
-            routes.nodes_unregistered.lock().unwrap().as_slice(),
-            &[(call, LOCAL.to_owned())],
-            "last local leave deregisters this node's entry"
-        );
-    }
-
-    // Helpers for testing SFU bookkeeping without a real DB.
-    impl CallOrchestrator {
-        fn new_for_test(sfu: SfuRouter) -> Self {
-            // `CallRepo::new` requires a live pool; use the real repo type with a
-            // test-only helper path that skips DB access. The SFU logic being
-            // tested here is sync and never touches the pool.
-            //
-            // We build a minimal repo: the test methods below bypass DB calls, so
-            // the pool value is irrelevant — only the SFU methods are exercised.
-            //
-            // SAFETY: we only call `sfu_add`, `existing_peers_excluding`,
-            // `disband_sfu`, `register_and_decide`, and `leave_group_call` in
-            // these tests, none of which touch `self.calls`.
-            #[allow(clippy::needless_pass_by_value)]
-            let calls = stub_repo();
-            Self { calls, sfu: Some(sfu), routes: None }
-        }
-
-        fn sfu_add(&self, call_id: CallId, participant: ParticipantId) {
-            if let Some(sfu) = &self.sfu {
-                sfu.add_peer(call_id, participant, PeerRole::Bidirectional);
-            }
-        }
-
-        /// Mirror of `join_group_call`'s capacity gate against the live SFU
-        /// roster, exposed so reconnect-vs-new admission can be asserted without
-        /// the post-gate DB write that the stub repo cannot serve.
-        fn would_reject_join(&self, call_id: CallId, participant: ParticipantId) -> bool {
-            let roster =
-                self.sfu.as_ref().map(|s| s.participants(call_id)).unwrap_or_default();
-            Self::cap_rejects(&roster, &participant)
-        }
-
-        fn existing_peers_excluding(
-            &self,
-            call_id: CallId,
-            exclude: ParticipantId,
-        ) -> Vec<ParticipantId> {
-            self.sfu
-                .as_ref()
-                .map(|s| s.participants(call_id).into_iter().filter(|p| *p != exclude).collect())
-                .unwrap_or_default()
-        }
-
-        fn disband_sfu(&self, call_id: CallId) {
-            if let Some(sfu) = &self.sfu {
-                for p in sfu.participants(call_id) {
-                    sfu.remove_peer(call_id, p);
-                }
-            }
-        }
-    }
-
-    /// Build a CallRepo with a lazy, never-connected Postgres pool.
-    ///
-    /// The tests above only exercise SFU bookkeeping — they never `.await` any
-    /// async `CallRepo` method, so the pool is never actually opened.
-    fn stub_repo() -> CallRepo {
-        let pg = sqlx::PgPool::connect_lazy("postgres://localhost/nonexistent")
-            .expect("pg lazy pool");
-        CallRepo::new(pg)
-    }
+    Ok(())
 }
+
+#[cfg(test)]
+mod tests;

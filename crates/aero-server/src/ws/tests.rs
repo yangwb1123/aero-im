@@ -1,11 +1,34 @@
 #[cfg(test)]
 mod tests {
     use crate::ws::ws_impl::{
-        authoritative_count, backfill_room_ids, parse_resume_cursor, same_lang,
-        truncation_cursor, BACKFILL_PER_ROOM_LIMIT, ClientFrame, ServerFrame,
+        access_participant, authoritative_count, backfill_room_ids, cursor_backfill_plan,
+        initial_backfill_page, parse_resume_cursor, same_lang, truncation_cursor, ClientFrame,
+        BACKFILL_PER_ROOM_LIMIT, INITIAL_BACKFILL_PER_ROOM_LIMIT,
     };
+    use aero_auth::{Claims, TokenKind};
     use aero_common::{MessageId, ParticipantId, Room, RoomId, RoomKind};
+    use aero_storage::DeliveryCursor;
     use ulid::Ulid;
+
+    #[test]
+    fn websocket_accepts_only_access_claims() {
+        let participant = ParticipantId::new();
+        let mut claims = Claims {
+            sub: participant.to_string(),
+            iss: "aero-im".into(),
+            iat: 1,
+            exp: u64::MAX,
+            kind: TokenKind::Access,
+            jti: "test".into(),
+            sid: Some(aero_common::SessionId::new().to_string()),
+        };
+        assert_eq!(access_participant(&claims).unwrap(), participant);
+        claims.sid = None;
+        assert!(access_participant(&claims).is_err());
+        claims.sid = Some(aero_common::SessionId::new().to_string());
+        claims.kind = TokenKind::Refresh;
+        assert!(access_participant(&claims).is_err());
+    }
 
     #[test]
     fn watch_stream_frame_carries_optional_since_cursor() {
@@ -16,7 +39,7 @@ mod tests {
         .expect("parse watch_stream without since");
         match without {
             ClientFrame::WatchStream { since, .. } => assert!(since.is_none()),
-                _ => assert!(false, "expected WatchStream"),
+            _ => assert!(false, "expected WatchStream"),
         }
         // With `since` → carried through so the watch handler can replay catch-up.
         let with: ClientFrame = serde_json::from_str(
@@ -27,7 +50,7 @@ mod tests {
             ClientFrame::WatchStream { since, .. } => {
                 assert_eq!(since.as_deref(), Some("01ARZ3NDEKTSV4RRFFQ69G5FZZ"));
             }
-                _ => assert!(false, "expected WatchStream"),
+            _ => assert!(false, "expected WatchStream"),
         }
     }
 
@@ -60,7 +83,10 @@ mod tests {
         // Redis error ⇒ fall back to the process-local count (no worse than today).
         assert_eq!(authoritative_count(Err(anyhow::anyhow!("down")), 3), 3);
         // A count that overflows u32 saturates rather than wrapping/panicking.
-        assert_eq!(authoritative_count(Ok(u64::from(u32::MAX) + 1), 0), u32::MAX);
+        assert_eq!(
+            authoritative_count(Ok(u64::from(u32::MAX) + 1), 0),
+            u32::MAX
+        );
         // Zero from Redis is honored (e.g. last viewer just left, cluster-wide).
         assert_eq!(authoritative_count(Ok(0), 9), 0);
     }
@@ -96,6 +122,65 @@ mod tests {
         // Sanity: it is a usable id-orderable cursor type (compile-time check that
         // the backfill path keys on a time-sortable MessageId/Ulid).
         let _ = Ulid::new();
+        assert_eq!(
+            INITIAL_BACKFILL_PER_ROOM_LIMIT, 50,
+            "a cursor-less room receives one normal-size newest-history page"
+        );
+    }
+
+    #[test]
+    fn cursor_backfill_plan_includes_rooms_without_a_cursor() {
+        let participant = ParticipantId::new();
+        let with_cursor = RoomId::new();
+        let first_connection = RoomId::new();
+        let another_first_connection = RoomId::new();
+        let stale_left_room = RoomId::new();
+        let message = MessageId::new();
+        let cursors = [
+            DeliveryCursor {
+                room_id: with_cursor,
+                participant_id: participant,
+                last_delivered_message_id: message,
+                last_delivery_ordinal: 42,
+                last_seq: 10,
+                updated_at: time::OffsetDateTime::UNIX_EPOCH,
+            },
+            DeliveryCursor {
+                room_id: stale_left_room,
+                participant_id: participant,
+                last_delivered_message_id: MessageId::new(),
+                last_delivery_ordinal: 99,
+                last_seq: 99,
+                updated_at: time::OffsetDateTime::UNIX_EPOCH,
+            },
+        ];
+        assert_eq!(
+            cursor_backfill_plan(
+                &[
+                    with_cursor,
+                    first_connection,
+                    another_first_connection
+                ],
+                &cursors,
+            ),
+            vec![
+                (with_cursor, Some(42)),
+                (first_connection, None),
+                (another_first_connection, None),
+            ],
+            "every current room is planned; no-cursor rooms get bounded initial replay and stale rooms drop"
+        );
+    }
+
+    #[test]
+    fn initial_cursorless_backfill_is_newest_bounded_and_chronological() {
+        let (page, truncated) = initial_backfill_page(vec![6, 5, 4, 3, 2, 1], 3);
+        assert_eq!(page, vec![4, 5, 6]);
+        assert!(truncated);
+
+        let (short, truncated) = initial_backfill_page(vec![2, 1], 3);
+        assert_eq!(short, vec![1, 2]);
+        assert!(!truncated);
     }
 
     #[test]

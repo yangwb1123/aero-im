@@ -18,8 +18,10 @@
 //! — the HTTP layer resolves the message's room (via
 //! [`ThreadSubscriptionRepo::message_room`]) and checks room access before adding.
 
-use aero_common::{MessageId, ParticipantId, RoomId};
-use sqlx::PgPool;
+use aero_common::{Error, MessageId, ParticipantId, RoomId};
+use sqlx::{PgPool, Postgres, Transaction};
+
+use crate::draft::lock_effective_room_access_in_tx;
 
 /// Repository over the `thread_subscriptions` table (per-user thread follows).
 ///
@@ -43,7 +45,8 @@ impl ThreadSubscriptionRepo {
     ///
     /// # Errors
     /// Propagates any [`sqlx::Error`] from the insert.
-    pub async fn subscribe(
+    #[cfg(test)]
+    pub(crate) async fn subscribe(
         &self,
         participant: ParticipantId,
         root: MessageId,
@@ -67,7 +70,8 @@ impl ThreadSubscriptionRepo {
     ///
     /// # Errors
     /// Propagates any [`sqlx::Error`] from the delete.
-    pub async fn unsubscribe(
+    #[cfg(test)]
+    pub(crate) async fn unsubscribe(
         &self,
         participant: ParticipantId,
         root: MessageId,
@@ -91,10 +95,20 @@ impl ThreadSubscriptionRepo {
     /// Propagates any [`sqlx::Error`] from the query.
     pub async fn subscribers(&self, root: MessageId) -> Result<Vec<ParticipantId>, sqlx::Error> {
         let rows = sqlx::query_as::<_, (uuid::Uuid,)>(
-            r"SELECT participant_id
-               FROM thread_subscriptions
-              WHERE root_message_id = $1
-              ORDER BY created_at ASC, participant_id ASC",
+            r"SELECT subscription.participant_id
+                FROM thread_subscriptions AS subscription
+                JOIN messages AS root
+                  ON root.id = subscription.root_message_id
+                 AND root.reply_to IS NULL
+                 AND root.deleted_at IS NULL
+               WHERE subscription.root_message_id = $1
+                 AND aero_effective_room_access(
+                         root.room_id,
+                         subscription.participant_id,
+                         NULL
+                     )
+               ORDER BY subscription.created_at ASC,
+                        subscription.participant_id ASC",
         )
         .bind(root.to_uuid())
         .fetch_all(&self.pool)
@@ -110,7 +124,8 @@ impl ThreadSubscriptionRepo {
     ///
     /// # Errors
     /// Propagates any [`sqlx::Error`] from the query.
-    pub async fn is_subscribed(
+    #[cfg(test)]
+    pub(crate) async fn is_subscribed(
         &self,
         participant: ParticipantId,
         root: MessageId,
@@ -131,7 +146,8 @@ impl ThreadSubscriptionRepo {
     ///
     /// # Errors
     /// Propagates any [`sqlx::Error`] from the query.
-    pub async fn followed_by(
+    #[cfg(test)]
+    pub(crate) async fn followed_by(
         &self,
         participant: ParticipantId,
     ) -> Result<Vec<MessageId>, sqlx::Error> {
@@ -150,19 +166,171 @@ impl ThreadSubscriptionRepo {
             .collect())
     }
 
-    /// Resolve the room a message belongs to, or `None` if no such message exists.
-    /// A "thread root" is just a message, so the HTTP layer calls this to find the
-    /// message's room and assert room access before letting the caller follow it.
+    /// Resolve a live canonical thread root's room, or `None` if the message is
+    /// missing, deleted, or itself a reply.
     ///
     /// # Errors
     /// Propagates any [`sqlx::Error`] from the query.
     pub async fn message_room(&self, message: MessageId) -> Result<Option<RoomId>, sqlx::Error> {
-        let row = sqlx::query_as::<_, (uuid::Uuid,)>("SELECT room_id FROM messages WHERE id = $1")
-            .bind(message.to_uuid())
-            .fetch_optional(&self.pool)
-            .await?;
+        let row = sqlx::query_as::<_, (uuid::Uuid,)>(
+            r"SELECT room_id
+                FROM messages
+               WHERE id = $1
+                 AND reply_to IS NULL
+                 AND deleted_at IS NULL",
+        )
+        .bind(message.to_uuid())
+        .fetch_optional(&self.pool)
+        .await?;
         Ok(row.map(|(r,)| RoomId::from_uuid(r)))
     }
+
+    /// Follow a live canonical thread under the caller's current room-access
+    /// fence.
+    ///
+    /// # Errors
+    /// Returns an opaque root/access error or a database error.
+    pub async fn subscribe_authorized(
+        &self,
+        participant: ParticipantId,
+        root: MessageId,
+    ) -> Result<(), Error> {
+        let mut tx = self.pool.begin().await?;
+        lock_effective_live_thread_root_in_tx(&mut tx, participant, root).await?;
+        sqlx::query(
+            r"INSERT INTO thread_subscriptions
+                  (participant_id, root_message_id)
+               VALUES ($1, $2)
+               ON CONFLICT (participant_id, root_message_id) DO NOTHING",
+        )
+        .bind(participant.to_uuid())
+        .bind(root.to_uuid())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Unfollow a live canonical thread under the caller's current room-access
+    /// fence.
+    ///
+    /// # Errors
+    /// Returns an opaque root/access error or a database error.
+    pub async fn unsubscribe_authorized(
+        &self,
+        participant: ParticipantId,
+        root: MessageId,
+    ) -> Result<bool, Error> {
+        let mut tx = self.pool.begin().await?;
+        lock_effective_live_thread_root_in_tx(&mut tx, participant, root).await?;
+        let result = sqlx::query(
+            r"DELETE FROM thread_subscriptions
+               WHERE participant_id = $1 AND root_message_id = $2",
+        )
+        .bind(participant.to_uuid())
+        .bind(root.to_uuid())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Check a follow under the caller's current room-access fence.
+    ///
+    /// # Errors
+    /// Returns an opaque root/access error or a database error.
+    pub async fn is_subscribed_authorized(
+        &self,
+        participant: ParticipantId,
+        root: MessageId,
+    ) -> Result<bool, Error> {
+        let mut tx = self.pool.begin().await?;
+        lock_effective_live_thread_root_in_tx(&mut tx, participant, root).await?;
+        let followed: bool = sqlx::query_scalar(
+            r"SELECT EXISTS(
+                   SELECT 1
+                     FROM thread_subscriptions
+                    WHERE participant_id = $1 AND root_message_id = $2
+               )",
+        )
+        .bind(participant.to_uuid())
+        .bind(root.to_uuid())
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(followed)
+    }
+
+    /// List only followed roots whose live rooms the caller can currently
+    /// access.
+    ///
+    /// # Errors
+    /// Propagates database errors.
+    pub async fn followed_by_accessible(
+        &self,
+        participant: ParticipantId,
+    ) -> Result<Vec<MessageId>, Error> {
+        let rows = sqlx::query_as::<_, (uuid::Uuid,)>(
+            r"SELECT subscription.root_message_id
+                FROM thread_subscriptions AS subscription
+                JOIN messages AS root
+                  ON root.id = subscription.root_message_id
+                 AND root.reply_to IS NULL
+                 AND root.deleted_at IS NULL
+               WHERE subscription.participant_id = $1
+                 AND aero_effective_room_access(root.room_id, $1, NULL)
+               ORDER BY subscription.created_at DESC,
+                        subscription.root_message_id DESC",
+        )
+        .bind(participant.to_uuid())
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(message,)| MessageId::from_uuid(message))
+            .collect())
+    }
+}
+
+/// Resolve and lock a live canonical root under the platform's governance lock
+/// order. The client supplies only the root id; its room is always derived from
+/// the message row and rechecked after the effective-access fence.
+pub(crate) async fn lock_effective_live_thread_root_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    participant: ParticipantId,
+    root: MessageId,
+) -> Result<RoomId, Error> {
+    let resolved_room = sqlx::query_scalar::<_, uuid::Uuid>(
+        r"SELECT room_id
+            FROM messages
+           WHERE id = $1
+             AND reply_to IS NULL
+             AND deleted_at IS NULL",
+    )
+    .bind(root.to_uuid())
+    .fetch_optional(&mut **tx)
+    .await?
+    .map(RoomId::from_uuid)
+    .ok_or_else(|| Error::NotFound("thread".into()))?;
+
+    lock_effective_room_access_in_tx(tx, participant, resolved_room).await?;
+
+    let locked_room = sqlx::query_scalar::<_, uuid::Uuid>(
+        r"SELECT room_id
+            FROM messages
+           WHERE id = $1
+             AND reply_to IS NULL
+             AND deleted_at IS NULL
+           FOR SHARE",
+    )
+    .bind(root.to_uuid())
+    .fetch_optional(&mut **tx)
+    .await?
+    .map(RoomId::from_uuid);
+    if locked_room != Some(resolved_room) {
+        return Err(Error::NotFound("thread".into()));
+    }
+    Ok(resolved_room)
 }
 
 /// PG-gated integration tests (run with a live Postgres + applied migrations):
@@ -175,9 +343,13 @@ impl ThreadSubscriptionRepo {
 mod db_tests {
     use super::*;
 
-    /// The reserved all-zero default workspace, guaranteed to exist by migration
-    /// 0006's backfill — reused so a seeded room is well-scoped.
-    const DEFAULT_WS: &str = "00000000-0000-0000-0000-000000000000";
+    struct Fixture {
+        owner: ParticipantId,
+        other: ParticipantId,
+        stranger: ParticipantId,
+        room: RoomId,
+        root: MessageId,
+    }
 
     fn pool() -> PgPool {
         let url = std::env::var("DATABASE_URL")
@@ -188,18 +360,93 @@ mod db_tests {
             .expect("connect_lazy never fails on a well-formed URL")
     }
 
-    /// Create a throwaway participant so the test is self-contained. Subscriptions
-    /// store opaque `root_message_id` uuids (no FK to `messages`), so a fresh
-    /// [`MessageId`] can be used without inserting a message.
-    async fn mk_participant(p: &PgPool) -> ParticipantId {
-        let id = ParticipantId::new();
-        sqlx::query("INSERT INTO participants (id, kind, display_name) VALUES ($1, 'human', $2)")
-            .bind(id.to_uuid())
-            .bind(format!("thread-sub-owner-{id}"))
-            .execute(p)
+    async fn fixture(p: &PgPool) -> Fixture {
+        let owner = ParticipantId::new();
+        let other = ParticipantId::new();
+        let stranger = ParticipantId::new();
+        let workspace = uuid::Uuid::new_v4();
+        let room = RoomId::new();
+        let root_message = MessageId::new();
+        let mut tx = p.begin().await.expect("begin thread subscription fixture");
+
+        for participant in [owner, other, stranger] {
+            sqlx::query(
+                "INSERT INTO participants (id, kind, display_name)
+                 VALUES ($1, 'human', $2)",
+            )
+            .bind(participant.to_uuid())
+            .bind(format!("thread-sub-{participant}"))
+            .execute(&mut *tx)
             .await
             .expect("insert participant");
-        id
+        }
+        sqlx::query(
+            "INSERT INTO workspaces (id, name, slug, created_by)
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(workspace)
+        .bind(format!("Thread subscription {workspace}"))
+        .bind(format!("thread-subscription-{workspace}"))
+        .bind(owner.to_uuid())
+        .execute(&mut *tx)
+        .await
+        .expect("insert workspace");
+        for (participant, role) in [(owner, "owner"), (other, "member")] {
+            sqlx::query(
+                "INSERT INTO workspace_members (workspace_id, participant_id, role)
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(workspace)
+            .bind(participant.to_uuid())
+            .bind(role)
+            .execute(&mut *tx)
+            .await
+            .expect("insert workspace member");
+        }
+        sqlx::query(
+            "INSERT INTO rooms (id, kind, name, created_by, workspace_id)
+             VALUES ($1, 'group', $2, $3, $4)",
+        )
+        .bind(room.to_uuid())
+        .bind(format!("Thread subscription room {room}"))
+        .bind(owner.to_uuid())
+        .bind(workspace)
+        .execute(&mut *tx)
+        .await
+        .expect("insert room");
+        for (participant, role) in [(owner, "owner"), (other, "member")] {
+            sqlx::query(
+                "INSERT INTO room_members (room_id, participant_id, role)
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(room.to_uuid())
+            .bind(participant.to_uuid())
+            .bind(role)
+            .execute(&mut *tx)
+            .await
+            .expect("insert room member");
+        }
+        sqlx::query(
+            "INSERT INTO messages (id, room_id, sender_id, blocks, searchable_text)
+             VALUES ($1, $2, $3, '[]'::jsonb, 'thread subscription root')",
+        )
+        .bind(root_message.to_uuid())
+        .bind(room.to_uuid())
+        .bind(owner.to_uuid())
+        .execute(&mut *tx)
+        .await
+        .expect("insert live root message");
+        tx.commit()
+            .await
+            .expect("commit thread subscription fixture");
+
+        Fixture {
+            owner,
+            other,
+            stranger,
+            room,
+            root: root_message,
+        }
     }
 
     #[tokio::test]
@@ -207,10 +454,13 @@ mod db_tests {
     async fn thread_subscription_subscribe_list_unsubscribe_owner_scoped() {
         let p = pool();
         let repo = ThreadSubscriptionRepo::new(p.clone());
-        let owner = mk_participant(&p).await;
-        let other = mk_participant(&p).await;
-        let stranger = mk_participant(&p).await;
-        let root = MessageId::new();
+        let Fixture {
+            owner,
+            other,
+            stranger,
+            root,
+            ..
+        } = fixture(&p).await;
 
         // Not subscribed yet.
         assert!(
@@ -228,7 +478,10 @@ mod db_tests {
             "followed_by shows the thread"
         );
         let subs = repo.subscribers(root).await.unwrap();
-        assert!(subs.contains(&owner) && subs.contains(&other), "fan-out set has both");
+        assert!(
+            subs.contains(&owner) && subs.contains(&other),
+            "fan-out set has both"
+        );
 
         // Owner-scoping: a stranger neither sees nor can remove the subscription.
         assert!(
@@ -245,7 +498,10 @@ mod db_tests {
         );
 
         // unsubscribe → true once, then false; followed_by + subscribers drop it.
-        assert!(repo.unsubscribe(owner, root).await.unwrap(), "owner unfollows");
+        assert!(
+            repo.unsubscribe(owner, root).await.unwrap(),
+            "owner unfollows"
+        );
         assert!(
             !repo.unsubscribe(owner, root).await.unwrap(),
             "second unfollow is a no-op"
@@ -276,30 +532,11 @@ mod db_tests {
     async fn thread_subscription_message_room_resolves() {
         let p = pool();
         let repo = ThreadSubscriptionRepo::new(p.clone());
-        let creator = mk_participant(&p).await;
-        let room = RoomId::new();
-        let message = MessageId::new();
-
-        // Seed a room + message so message_room has a row to resolve.
-        sqlx::query(
-            "INSERT INTO rooms (id, kind, name, created_by, workspace_id) \
-             VALUES ($1, 'channel', $2, $3, $4)",
-        )
-        .bind(room.to_uuid())
-        .bind(format!("thread-sub-room-{room}"))
-        .bind(creator.to_uuid())
-        .bind(uuid::Uuid::parse_str(DEFAULT_WS).expect("valid uuid"))
-        .execute(&p)
-        .await
-        .expect("insert room");
-        sqlx::query("INSERT INTO messages (id, room_id, sender_id, blocks) VALUES ($1, $2, $3, $4::jsonb)")
-            .bind(message.to_uuid())
-            .bind(room.to_uuid())
-            .bind(creator.to_uuid())
-            .bind("[]")
-            .execute(&p)
-            .await
-            .expect("insert message");
+        let Fixture {
+            room,
+            root: message,
+            ..
+        } = fixture(&p).await;
 
         assert_eq!(
             repo.message_room(message).await.unwrap(),

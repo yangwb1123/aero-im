@@ -5,6 +5,7 @@
 //! `parse_filter`, `is_unique_violation`) via `use super::*;`.
 
 use super::*;
+use aero_storage::user_group::{ScimGroupMutation, ScimGroupWrite, UserGroupWriteError};
 
 // ============================================================ Group handlers
 
@@ -21,6 +22,25 @@ fn parse_group_id(s: &str) -> AeroResult<UserGroupId> {
 /// Maximum mention handle length (chars, post-normalization). Mirrors the value
 /// the [`crate::user_groups`] REST surface enforces.
 pub(super) const MAX_GROUP_HANDLE_LEN: usize = 32;
+/// Match the first-party user-group API's display-name budget.
+const MAX_GROUP_NAME_BYTES: usize = 64;
+/// Bound SCIM bulk expansion and the single-transaction member lock/insert set.
+const MAX_SCIM_GROUP_MEMBERS: usize = 1_000;
+const DEFAULT_SCIM_GROUP_PAGE_SIZE: i64 = 100;
+const MAX_SCIM_GROUP_PAGE_SIZE: i64 = 200;
+
+fn validate_display_name(raw: &str) -> AeroResult<&str> {
+    let name = raw.trim();
+    if name.is_empty() {
+        return Err(AeroError::Invalid("displayName is required".into()));
+    }
+    if name.len() > MAX_GROUP_NAME_BYTES {
+        return Err(AeroError::Invalid(format!(
+            "displayName must be at most {MAX_GROUP_NAME_BYTES} bytes"
+        )));
+    }
+    Ok(name)
+}
 
 /// Derive a `[a-z0-9_-]`, `1..=32`-char mention handle from a SCIM `displayName`.
 /// A SCIM Group carries no `handle` (Aero's unique mention key), so we slugify the
@@ -116,49 +136,34 @@ async fn group_in_scim_workspace(
 /// Render a group as a SCIM resource, fetching its members in one place so every
 /// Group handler (get/create/put/patch) returns a consistent body.
 async fn render_group(s: &AppState, group: &UserGroup) -> AeroResult<ScimGroup> {
-    let members = user_group_repo(s).members(group.id).await.map_err(AeroError::from)?;
+    let members = user_group_repo(s)
+        .members(group.id)
+        .await
+        .map_err(AeroError::from)?;
     Ok(to_scim_group(group, &members))
 }
 
-/// Persist a brand-new group named `display_name` in `ws`, deriving a unique
-/// mention handle from the name (numeric suffix on collision). Returns the
-/// created [`UserGroup`]. `created_by` is a synthetic id: SCIM has no acting
-/// human, and `user_groups.created_by` carries no FK (it is attribution only).
-async fn create_group_named(
-    s: &AppState,
-    ws: WorkspaceId,
-    display_name: &str,
-) -> AeroResult<UserGroup> {
-    let repo = user_group_repo(s);
-    let base = slugify_handle(display_name);
-    let created_by = ParticipantId::new(); // no acting user / no FK on created_by.
-    // Try the base handle, then base-2, base-3, … until the unique index accepts
-    // one. Bounded so a pathological collision storm can't loop forever.
-    for attempt in 0..1000u32 {
-        let handle = if attempt == 0 {
-            base.clone()
-        } else {
-            // Keep within the handle length budget when appending the suffix.
-            let suffix = format!("-{}", attempt + 1);
-            let keep = MAX_GROUP_HANDLE_LEN.saturating_sub(suffix.len());
-            let trimmed: String = base.chars().take(keep).collect();
-            format!("{}{suffix}", trimmed.trim_end_matches('-'))
-        };
-        match repo.create(ws, &handle, display_name, created_by).await {
-            Ok(id) => {
-                return repo
-                    .get(id)
-                    .await
-                    .map_err(AeroError::from)?
-                    .ok_or_else(|| {
-                        AeroError::Internal(anyhow::anyhow!("group vanished after create"))
-                    });
-            }
-            Err(e) if is_unique_violation(&e) => continue, // handle taken — try next suffix.
-            Err(e) => return Err(AeroError::from(e)),
+fn map_group_write_error(error: UserGroupWriteError) -> AeroError {
+    match error {
+        UserGroupWriteError::NotFound => AeroError::NotFound("group".into()),
+        UserGroupWriteError::MemberNotInWorkspace(participant) => AeroError::Invalid(format!(
+            "member {participant} is not a member of this workspace"
+        )),
+        UserGroupWriteError::NotAuthorized => {
+            AeroError::Forbidden("not authorized to manage this group".into())
         }
+        UserGroupWriteError::WorkspaceHasNoCreator => {
+            AeroError::Conflict("workspace has no eligible group creator".into())
+        }
+        UserGroupWriteError::HandleExhausted => {
+            AeroError::Conflict("could not allocate a unique group handle".into())
+        }
+        UserGroupWriteError::Storage(error) => AeroError::from(error),
     }
-    Err(AeroError::Conflict("could not allocate a unique group handle".into()))
+}
+
+fn committed_scim_group(write: ScimGroupWrite) -> ScimGroup {
+    to_scim_group(&write.group, &write.members)
 }
 
 /// `GET /scim/v2/Groups` — list every real group in the token's workspace,
@@ -172,26 +177,15 @@ pub(super) async fn list_groups(
         Ok(w) => w,
         Err(e) => return scim_err(&e),
     };
-    let repo = user_group_repo(&s);
-    let mut all = match repo.list_for_workspace(ws).await {
-        Ok(g) => g,
+    let (start_index, count, offset) = group_pagination(q.start_index, q.count);
+    let (total, page) = match user_group_repo(&s)
+        .list_scim_groups_page(ws, count, offset)
+        .await
+    {
+        Ok(page) => page,
         Err(e) => return scim_err(&AeroError::from(e)),
     };
-    let total = i64::try_from(all.len()).unwrap_or(i64::MAX);
-    // SCIM pagination is 1-based; clamp `startIndex`/`count` to the slice bounds.
-    let start_index = q.start_index.filter(|n| *n >= 1).unwrap_or(1);
-    let skip = usize::try_from(start_index - 1).unwrap_or(0).min(all.len());
-    let mut page: Vec<UserGroup> = all.split_off(skip);
-    if let Some(count) = q.count.filter(|c| *c >= 0) {
-        page.truncate(usize::try_from(count).unwrap_or(usize::MAX));
-    }
-    let mut resources = Vec::with_capacity(page.len());
-    for g in &page {
-        match render_group(&s, g).await {
-            Ok(r) => resources.push(r),
-            Err(e) => return scim_err(&e),
-        }
-    }
+    let resources = page.into_iter().map(committed_scim_group).collect();
     Json(ScimListResponse::new(resources, total, start_index)).into_response()
 }
 
@@ -200,6 +194,15 @@ pub(super) struct ListGroupsQuery {
     #[serde(rename = "startIndex")]
     start_index: Option<i64>,
     count: Option<i64>,
+}
+
+fn group_pagination(start_index: Option<i64>, count: Option<i64>) -> (i64, i64, i64) {
+    let start_index = start_index.filter(|value| *value >= 1).unwrap_or(1);
+    let count = count
+        .filter(|value| *value >= 0)
+        .unwrap_or(DEFAULT_SCIM_GROUP_PAGE_SIZE)
+        .min(MAX_SCIM_GROUP_PAGE_SIZE);
+    (start_index, count, start_index.saturating_sub(1))
 }
 
 /// `GET /scim/v2/Groups/:id` — fetch one group (404 if absent or in another
@@ -238,30 +241,24 @@ pub(super) async fn create_group(
         Ok(w) => w,
         Err(e) => return scim_err(&e),
     };
-    let display_name = payload.display_name.trim();
-    if display_name.is_empty() {
-        return scim_err(&AeroError::Invalid("displayName is required".into()));
-    }
-    let group = match create_group_named(&s, ws, display_name).await {
-        Ok(g) => g,
-        Err(e) => return scim_err(&e),
+    let display_name = match validate_display_name(&payload.display_name) {
+        Ok(name) => name,
+        Err(error) => return scim_err(&error),
     };
-    // Seed the initial membership from the payload's `members[].value`.
-    let repo = user_group_repo(&s);
-    for member in &payload.members {
-        match ParticipantId::from_str(&member.value) {
-            Ok(pid) => {
-                if let Err(e) = repo.add_member(group.id, pid).await {
-                    return scim_err(&AeroError::from(e));
-                }
-            }
-            Err(e) => return scim_err(&AeroError::Invalid(format!("member value: {e}"))),
-        }
-    }
-    match render_group(&s, &group).await {
-        Ok(g) => (StatusCode::CREATED, Json(g)).into_response(),
-        Err(e) => scim_err(&e),
-    }
+    // Parse the complete body before the first write. A malformed member later in
+    // the array must not leave an orphan group or an applied membership prefix.
+    let members = match parse_member_values(&payload.members) {
+        Ok(members) => members,
+        Err(error) => return scim_err(&error),
+    };
+    let group = match user_group_repo(&s)
+        .create_scim_group(ws, &slugify_handle(display_name), display_name, &members)
+        .await
+    {
+        Ok(g) => g,
+        Err(error) => return scim_err(&map_group_write_error(error)),
+    };
+    (StatusCode::CREATED, Json(committed_scim_group(group))).into_response()
 }
 
 /// `PUT /scim/v2/Groups/:id` — replace a group (RFC 7644 §3.5.1): set its
@@ -282,48 +279,24 @@ pub(super) async fn put_group(
         Ok(g) => g,
         Err(e) => return scim_err(&e),
     };
-    let group = match group_in_scim_workspace(&s, ws, gid).await {
-        Ok(g) => g,
-        Err(e) => return scim_err(&e),
+    let display_name = match validate_display_name(&payload.display_name) {
+        Ok(name) => name,
+        Err(error) => return scim_err(&error),
     };
-    let display_name = payload.display_name.trim();
-    if display_name.is_empty() {
-        return scim_err(&AeroError::Invalid("displayName is required".into()));
-    }
-    let repo = user_group_repo(&s);
-
-    // Rename: PUT replaces the resource, so reflect displayName onto the group's
-    // `name` (the handle is immutable — it is Aero's stable mention key).
-    if display_name != group.name {
-        if let Err(e) = repo.rename(gid, ws, display_name).await {
-            return scim_err(&AeroError::from(e));
-        }
-    }
-
-    // Reconcile membership to exactly the supplied set.
+    // Parse the complete desired set before the storage transaction. Membership
+    // validity and group tenancy are then rechecked under row locks in storage.
     let desired = match parse_member_values(&payload.members) {
         Ok(d) => d,
         Err(e) => return scim_err(&e),
     };
-    let current = match repo.members(gid).await {
-        Ok(m) => m,
-        Err(e) => return scim_err(&AeroError::from(e)),
+    let group = match user_group_repo(&s)
+        .replace_scim_group(ws, gid, display_name, &desired)
+        .await
+    {
+        Ok(group) => group,
+        Err(error) => return scim_err(&map_group_write_error(error)),
     };
-    for pid in &desired {
-        if !current.contains(pid) {
-            if let Err(e) = repo.add_member(gid, *pid).await {
-                return scim_err(&AeroError::from(e));
-            }
-        }
-    }
-    for pid in &current {
-        if !desired.contains(pid) {
-            if let Err(e) = repo.remove_member(gid, *pid).await {
-                return scim_err(&AeroError::from(e));
-            }
-        }
-    }
-    finish_group(&s, ws, gid).await
+    Json(committed_scim_group(group)).into_response()
 }
 
 /// `DELETE /scim/v2/Groups/:id` — delete the group (its memberships cascade).
@@ -342,10 +315,10 @@ pub(super) async fn delete_group(
         Err(e) => return scim_err(&e),
     };
     let repo = user_group_repo(&s);
-    match repo.delete(gid, ws).await {
+    match repo.delete_scim_group(ws, gid).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => scim_err(&AeroError::NotFound("group".into())),
-        Err(e) => scim_err(&AeroError::from(e)),
+        Err(e) => scim_err(&map_group_write_error(e)),
     }
 }
 
@@ -432,8 +405,7 @@ pub fn parse_group_patch_ops(ops: &[GroupPatchOp]) -> Vec<GroupPatchAction> {
             }
             "replace" | "add"
                 if path_lower == "displayname"
-                    || (path.is_empty()
-                        && op.value.get("displayName").is_some()) =>
+                    || (path.is_empty() && op.value.get("displayName").is_some()) =>
             {
                 let name = if path_lower == "displayname" {
                     op.value.as_str().map(str::to_owned)
@@ -484,62 +456,38 @@ pub(super) async fn patch_group(
         Ok(w) => w,
         Err(e) => return scim_err(&e),
     };
+    if let Err(error) = validate_patch_operation_count(patch.operations.len()) {
+        return scim_err(&error);
+    }
     let gid = match parse_group_id(&id) {
         Ok(g) => g,
         Err(e) => return scim_err(&e),
     };
-    // Resolve first so an unknown id (or another tenant's) is a clean 404.
-    if let Err(e) = group_in_scim_workspace(&s, ws, gid).await {
-        return scim_err(&e);
-    }
-    let repo = user_group_repo(&s);
-    for action in parse_group_patch_ops(&patch.operations) {
-        match action {
-            GroupPatchAction::SetDisplayName(name) => {
-                let name = name.trim();
-                if name.is_empty() {
-                    return scim_err(&AeroError::Invalid("displayName must not be empty".into()));
-                }
-                if let Err(e) = repo.rename(gid, ws, name).await {
-                    return scim_err(&AeroError::from(e));
-                }
-            }
-            GroupPatchAction::AddMember(value) => match ParticipantId::from_str(&value) {
-                Ok(pid) => {
-                    if let Err(e) = repo.add_member(gid, pid).await {
-                        return scim_err(&AeroError::from(e));
-                    }
-                }
-                Err(e) => return scim_err(&AeroError::Invalid(format!("member value: {e}"))),
-            },
-            GroupPatchAction::RemoveMember(value) => match ParticipantId::from_str(&value) {
-                Ok(pid) => {
-                    if let Err(e) = repo.remove_member(gid, pid).await {
-                        return scim_err(&AeroError::from(e));
-                    }
-                }
-                Err(e) => return scim_err(&AeroError::Invalid(format!("member value: {e}"))),
-            },
-        }
-    }
-    finish_group(&s, ws, gid).await
-}
-
-/// Re-read a group after a write and render it as the SCIM response body (404 if
-/// it vanished — e.g. deleted concurrently).
-async fn finish_group(s: &AppState, ws: WorkspaceId, gid: UserGroupId) -> Response {
-    match group_in_scim_workspace(s, ws, gid).await {
-        Ok(group) => match render_group(s, &group).await {
-            Ok(g) => Json(g).into_response(),
-            Err(e) => scim_err(&e),
-        },
-        Err(e) => scim_err(&e),
-    }
+    // Convert every raw operation before touching storage. This makes a malformed
+    // final operation reject the whole PATCH without committing an earlier rename
+    // or member mutation.
+    let mutations = match parse_scim_group_mutations(&patch.operations) {
+        Ok(mutations) => mutations,
+        Err(error) => return scim_err(&error),
+    };
+    let group = match user_group_repo(&s)
+        .patch_scim_group(ws, gid, &mutations)
+        .await
+    {
+        Ok(group) => group,
+        Err(error) => return scim_err(&map_group_write_error(error)),
+    };
+    Json(committed_scim_group(group)).into_response()
 }
 
 /// Parse the `members[].value`s of a SCIM Group body into typed participant ids,
 /// failing the whole op on the first malformed id (a 400). Pure helper.
 fn parse_member_values(members: &[ScimGroupMember]) -> AeroResult<Vec<ParticipantId>> {
+    if members.len() > MAX_SCIM_GROUP_MEMBERS {
+        return Err(AeroError::Invalid(format!(
+            "members must contain at most {MAX_SCIM_GROUP_MEMBERS} entries"
+        )));
+    }
     members
         .iter()
         .map(|m| {
@@ -547,4 +495,205 @@ fn parse_member_values(members: &[ScimGroupMember]) -> AeroResult<Vec<Participan
                 .map_err(|e| AeroError::Invalid(format!("member value: {e}")))
         })
         .collect()
+}
+
+fn parse_scim_group_mutations(ops: &[GroupPatchOp]) -> AeroResult<Vec<ScimGroupMutation>> {
+    let mut mutations = Vec::new();
+    let mut member_actions = 0;
+    for op in ops {
+        let verb = op.op.to_ascii_lowercase();
+        let path = op.path.as_deref().unwrap_or("").trim();
+        let path_lower = path.to_ascii_lowercase();
+        match verb.as_str() {
+            "add" if path_lower == "members" => append_member_mutations(
+                &op.value,
+                ScimGroupMutation::AddMember,
+                &mut member_actions,
+                &mut mutations,
+            )?,
+            "remove" if path_lower == "members" => append_member_mutations(
+                &op.value,
+                ScimGroupMutation::RemoveMember,
+                &mut member_actions,
+                &mut mutations,
+            )?,
+            "remove" if path_lower.starts_with("members[") => {
+                let value = member_filter_value(path).ok_or_else(|| {
+                    AeroError::Invalid("invalid members remove filter".to_owned())
+                })?;
+                append_member_value(
+                    &value,
+                    ScimGroupMutation::RemoveMember,
+                    &mut member_actions,
+                    &mut mutations,
+                )?;
+            }
+            "replace" | "add" if path_lower == "displayname" => {
+                let name = op
+                    .value
+                    .as_str()
+                    .ok_or_else(|| AeroError::Invalid("displayName must be a string".to_owned()))?;
+                mutations.push(ScimGroupMutation::SetName(
+                    validate_display_name(name)?.to_owned(),
+                ));
+            }
+            "replace" | "add" if path.is_empty() => {
+                if let Some(object) = op.value.as_object() {
+                    if let Some(name) = object.get("displayName") {
+                        let name = name.as_str().ok_or_else(|| {
+                            AeroError::Invalid("displayName must be a string".to_owned())
+                        })?;
+                        mutations.push(ScimGroupMutation::SetName(
+                            validate_display_name(name)?.to_owned(),
+                        ));
+                    }
+                    if let Some(members) = object.get("members") {
+                        append_member_mutations(
+                            members,
+                            ScimGroupMutation::AddMember,
+                            &mut member_actions,
+                            &mut mutations,
+                        )?;
+                    } else if object.contains_key("value") {
+                        append_member_mutations(
+                            &op.value,
+                            ScimGroupMutation::AddMember,
+                            &mut member_actions,
+                            &mut mutations,
+                        )?;
+                    }
+                } else if verb == "add" {
+                    append_member_mutations(
+                        &op.value,
+                        ScimGroupMutation::AddMember,
+                        &mut member_actions,
+                        &mut mutations,
+                    )?;
+                }
+            }
+            _ => {} // Preserve the existing compatibility seam for unknown operations/paths.
+        }
+    }
+    Ok(mutations)
+}
+
+fn append_member_mutations(
+    value: &serde_json::Value,
+    mutation: fn(ParticipantId) -> ScimGroupMutation,
+    member_actions: &mut usize,
+    mutations: &mut Vec<ScimGroupMutation>,
+) -> AeroResult<()> {
+    match value {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                let value = member_value(item)?;
+                append_member_value(value, mutation, member_actions, mutations)?;
+            }
+        }
+        value => {
+            let value = member_value(value)?;
+            append_member_value(value, mutation, member_actions, mutations)?;
+        }
+    }
+    Ok(())
+}
+
+fn member_value(value: &serde_json::Value) -> AeroResult<&str> {
+    value
+        .as_str()
+        .or_else(|| value.get("value").and_then(serde_json::Value::as_str))
+        .ok_or_else(|| AeroError::Invalid("member entry must contain a string value".to_owned()))
+}
+
+fn append_member_value(
+    value: &str,
+    mutation: fn(ParticipantId) -> ScimGroupMutation,
+    member_actions: &mut usize,
+    mutations: &mut Vec<ScimGroupMutation>,
+) -> AeroResult<()> {
+    *member_actions += 1;
+    if *member_actions > MAX_SCIM_GROUP_MEMBERS {
+        return Err(AeroError::Invalid(format!(
+            "PATCH may reference at most {MAX_SCIM_GROUP_MEMBERS} members"
+        )));
+    }
+    let participant = ParticipantId::from_str(value)
+        .map_err(|error| AeroError::Invalid(format!("member value: {error}")))?;
+    mutations.push(mutation(participant));
+    Ok(())
+}
+
+#[cfg(test)]
+mod atomic_input_tests {
+    use super::*;
+
+    #[test]
+    fn display_name_and_member_limits_fail_before_storage() {
+        assert!(validate_display_name(&"x".repeat(MAX_GROUP_NAME_BYTES)).is_ok());
+        assert!(validate_display_name(&"x".repeat(MAX_GROUP_NAME_BYTES + 1)).is_err());
+
+        let members = (0..=MAX_SCIM_GROUP_MEMBERS)
+            .map(|_| ScimGroupMember {
+                value: ParticipantId::new().to_string(),
+                display: None,
+            })
+            .collect::<Vec<_>>();
+        assert!(parse_member_values(&members).is_err());
+    }
+
+    #[test]
+    fn typed_patch_parser_rejects_a_late_invalid_operation() {
+        let ops = vec![
+            GroupPatchOp {
+                op: "replace".into(),
+                path: Some("displayName".into()),
+                value: serde_json::json!("Changed"),
+            },
+            GroupPatchOp {
+                op: "add".into(),
+                path: Some("members".into()),
+                value: serde_json::json!([{"value": "not-a-participant-id"}]),
+            },
+        ];
+        assert!(parse_scim_group_mutations(&ops).is_err());
+    }
+
+    #[test]
+    fn typed_patch_parser_caps_member_actions() {
+        let members = (0..=MAX_SCIM_GROUP_MEMBERS)
+            .map(|_| serde_json::json!({"value": ParticipantId::new().to_string()}))
+            .collect::<Vec<_>>();
+        let ops = vec![GroupPatchOp {
+            op: "add".into(),
+            path: Some("members".into()),
+            value: serde_json::Value::Array(members),
+        }];
+
+        assert!(parse_scim_group_mutations(&ops).is_err());
+    }
+
+    #[test]
+    fn typed_patch_parser_rejects_malformed_supported_member_entries() {
+        let ops = vec![GroupPatchOp {
+            op: "add".into(),
+            path: Some("members".into()),
+            value: serde_json::json!([
+                {"value": ParticipantId::new().to_string()},
+                {"display": "missing value"}
+            ]),
+        }];
+
+        assert!(parse_scim_group_mutations(&ops).is_err());
+    }
+
+    #[test]
+    fn group_pagination_is_one_based_and_bounded() {
+        assert_eq!(group_pagination(None, None), (1, 100, 0));
+        assert_eq!(group_pagination(Some(0), Some(-1)), (1, 100, 0));
+        assert_eq!(group_pagination(Some(5), Some(10_000)), (5, 200, 4));
+        assert_eq!(
+            group_pagination(Some(i64::MAX), Some(0)),
+            (i64::MAX, 0, i64::MAX - 1)
+        );
+    }
 }

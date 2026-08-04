@@ -114,7 +114,7 @@ mod db_tests {
         let room = RoomId::new();
         sqlx::query(
             "INSERT INTO rooms (id, kind, name, created_by, created_at, workspace_id)
-             VALUES ($1,'channel',$2,$3,now(),'00000000-0000-0000-0000-000000000000')",
+             VALUES ($1,'group',$2,$3,now(),'00000000-0000-0000-0000-000000000000')",
         )
         .bind(room.to_uuid())
         .bind(format!("topic-hist-room-{room}"))
@@ -137,10 +137,14 @@ mod db_tests {
         assert!(initial.is_empty());
 
         // Record: None -> "daily standup".
-        repo.record(actor, room, None, Some("daily standup")).await.unwrap();
+        repo.record(actor, room, None, Some("daily standup"))
+            .await
+            .unwrap();
 
         // Record: "daily standup" -> "weekly sync".
-        repo.record(actor, room, Some("daily standup"), Some("weekly sync")).await.unwrap();
+        repo.record(actor, room, Some("daily standup"), Some("weekly sync"))
+            .await
+            .unwrap();
 
         let entries = repo.list(room, 10, 0).await.unwrap();
         assert_eq!(entries.len(), 2, "two topic changes recorded");

@@ -20,7 +20,11 @@ use std::str::FromStr;
 
 use aero_auth::AuthUser;
 use aero_common::{Error as AeroError, RoomId};
-use axum::{extract::{Path, State}, routing::post, Json, Router};
+use axum::{
+    extract::{Path, State},
+    routing::post,
+    Json, Router,
+};
 
 use crate::error::ApiResult;
 use crate::state::AppState;

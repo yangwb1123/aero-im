@@ -8,10 +8,9 @@
 //! Thin handlers over [`ChannelFavoriteRepo`](aero_storage::ChannelFavoriteRepo):
 //! starring a room first asserts the caller may access it
 //! ([`ImService::assert_room_access`](aero_im_core::ImService::assert_room_access),
-//! mirroring [`crate::routes`]), so a user can only favorite a room they belong to;
-//! unstarring and listing are owner-scoped at the SQL layer and need no
-//! room-access check (they only ever touch the caller's own favorites). Mounted
-//! via [`routes`] and `.merge`d into the main router.
+//! mirroring [`crate::routes`]), then every mutation repeats that check under the
+//! storage transaction. Listings filter rooms the caller can no longer access.
+//! Mounted via [`routes`] and `.merge`d into the main router.
 
 use std::str::FromStr;
 
@@ -60,40 +59,32 @@ async fn add_favorite(
     // Room access guard (workspace + room membership) before recording a favorite,
     // so a caller can only ever favorite a room they belong to.
     s.im.assert_room_access(auth.participant_id, room).await?;
-    repo(&s)
-        .add(auth.participant_id, room)
-        .await
-        .map_err(AeroError::from)?;
+    repo(&s).add_authorized(auth.participant_id, room).await?;
     Ok(Json(serde_json::json!({ "favorited": true })))
 }
 
 /// `DELETE /api/rooms/:id/favorite` — unstar a channel. Owner-scoped at the SQL
-/// layer (only the caller's own favorite is ever touched), so no room-access check
-/// is needed; unstarring a room that was never favorited is a no-op. Always reports
-/// `favorited: false`.
+/// layer. Current room access is checked both as a friendly preflight and inside
+/// the delete transaction. Unstarring a room that was never favorited is a no-op.
 async fn remove_favorite(
     State(s): State<AppState>,
     auth: AuthUser,
     Path(room_str): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let room = parse_room(&room_str)?;
+    s.im.assert_room_access(auth.participant_id, room).await?;
     repo(&s)
-        .remove(auth.participant_id, room)
-        .await
-        .map_err(AeroError::from)?;
+        .remove_authorized(auth.participant_id, room)
+        .await?;
     Ok(Json(serde_json::json!({ "favorited": false })))
 }
 
 /// `GET /api/favorites` — the caller's favorited room ids, newest first. Always
-/// scoped to the caller; no room-access check is needed since they are the
-/// caller's own favorites.
+/// scoped to the caller and filtered to rooms they can currently access.
 async fn list_favorites(
     State(s): State<AppState>,
     auth: AuthUser,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let rooms = repo(&s)
-        .list(auth.participant_id)
-        .await
-        .map_err(AeroError::from)?;
+    let rooms = repo(&s).list_accessible(auth.participant_id).await?;
     Ok(Json(serde_json::json!({ "rooms": rooms })))
 }

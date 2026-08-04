@@ -116,7 +116,10 @@ impl WorkspaceMuteRepo {
         .fetch_all(&self.pg)
         .await
         .map_err(aero_common::Error::from)?;
-        Ok(rows.into_iter().map(|(p,)| ParticipantId::from_uuid(p)).collect())
+        Ok(rows
+            .into_iter()
+            .map(|(p,)| ParticipantId::from_uuid(p))
+            .collect())
     }
 
     /// All workspace ids `participant` has muted, newest mute first.
@@ -136,7 +139,10 @@ impl WorkspaceMuteRepo {
         .fetch_all(&self.pg)
         .await
         .map_err(aero_common::Error::from)?;
-        Ok(rows.into_iter().map(|(w,)| WorkspaceId::from_uuid(w)).collect())
+        Ok(rows
+            .into_iter()
+            .map(|(w,)| WorkspaceId::from_uuid(w))
+            .collect())
     }
 }
 
@@ -195,18 +201,31 @@ mod db_tests {
         let participant = ParticipantId::new();
         let workspace = WorkspaceId::new();
 
-        assert!(!repo.is_muted(participant, workspace).await.unwrap(), "not muted initially");
+        assert!(
+            !repo.is_muted(participant, workspace).await.unwrap(),
+            "not muted initially"
+        );
 
         repo.mute(participant, workspace).await.unwrap();
         repo.mute(participant, workspace).await.unwrap(); // idempotent
-        assert!(repo.is_muted(participant, workspace).await.unwrap(), "muted after mute");
+        assert!(
+            repo.is_muted(participant, workspace).await.unwrap(),
+            "muted after mute"
+        );
 
         let muted = repo.muted_workspaces_for(participant).await.unwrap();
         assert!(muted.contains(&workspace), "muted_workspaces_for lists it");
 
         repo.unmute(participant, workspace).await.unwrap();
         repo.unmute(participant, workspace).await.unwrap(); // idempotent
-        assert!(!repo.is_muted(participant, workspace).await.unwrap(), "unmuted after unmute");
-        assert!(!repo.muted_workspaces_for(participant).await.unwrap().contains(&workspace));
+        assert!(
+            !repo.is_muted(participant, workspace).await.unwrap(),
+            "unmuted after unmute"
+        );
+        assert!(!repo
+            .muted_workspaces_for(participant)
+            .await
+            .unwrap()
+            .contains(&workspace));
     }
 }

@@ -19,6 +19,7 @@ use aero_auth::AuthUser;
 use aero_common::{Error as AeroError, MessageId};
 use axum::{
     extract::{Path, State},
+    http::HeaderMap,
     routing::post,
     Json, Router,
 };
@@ -52,6 +53,7 @@ struct TranslateReq {
 async fn translate_message(
     State(s): State<AppState>,
     auth: AuthUser,
+    headers: HeaderMap,
     Path(id_str): Path<String>,
     Json(req): Json<TranslateReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
@@ -68,7 +70,8 @@ async fn translate_message(
         .await?
         .ok_or_else(|| AeroError::NotFound(format!("message {mid}")))?;
     // Tenant + room-membership guard before exposing the message's content.
-    s.im.assert_room_access(auth.participant_id, msg.room_id).await?;
+    s.im.assert_room_access(auth.participant_id, msg.room_id)
+        .await?;
 
     let source = msg.searchable_text();
     if source.trim().is_empty() {
@@ -77,11 +80,28 @@ async fn translate_message(
 
     // Same backend seam as caption translation; `None` (no AI wired at all) is a
     // 502, matching the other AI routes. With a backend but no key, it echoes.
-    let ai = s
-        .ai
-        .as_ref()
-        .ok_or_else(|| AeroError::Upstream("AI not configured".into()))?;
-    let translated = ai.translate(&source, target).await.map_err(AeroError::Upstream)?;
+    let ai =
+        s.ai.as_ref()
+            .ok_or_else(|| AeroError::Upstream("AI not configured".into()))?;
+    let workspace = s
+        .rooms
+        .room_workspace(msg.room_id)
+        .await
+        .map_err(AeroError::from)?
+        .map(|value| value.to_uuid());
+    let translated = ai
+        .translate_with_usage_context(
+            &source,
+            target,
+            crate::ai_usage::request_usage_context(
+                &headers,
+                auth.participant_id,
+                workspace,
+                &format!("translate_message:{mid}:{target}:{source}"),
+            ),
+        )
+        .await
+        .map_err(AeroError::Upstream)?;
 
     Ok(Json(serde_json::json!({
         "message_id": mid,

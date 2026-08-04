@@ -1,18 +1,26 @@
 //! Workspace repository — tenant CRUD, membership, GDPR export/deletion, retention.
 //!
 //! Split from monolithic `workspace.rs` (1750 lines) as part of REFACTOR_PLAN.md Step 5.
+//! Route-facing membership mutations use the transaction-owned helpers in
+//! [`members`] and [`guests`], which lock the workspace and canonical member
+//! rows before rechecking RBAC, final-owner, tenancy, and single-channel guest
+//! invariants.
 
 use aero_common::{Message, Room, Workspace, WorkspaceMember};
 use serde::Serialize;
 
 use crate::audit::AuditEvent;
 
+pub(crate) mod authz;
 pub mod export;
+pub mod guests;
 pub mod members;
 pub mod settings;
 pub mod sweep;
 pub mod workspace_impl;
 
+pub use guests::GuestMembershipWriteError;
+pub use members::WorkspaceMemberWriteError;
 pub use workspace_impl::*;
 
 /// Largest number of messages exported per room.
@@ -37,3 +45,7 @@ pub struct WorkspaceExport {
     #[serde(with = "time::serde::rfc3339")]
     pub exported_at: time::OffsetDateTime,
 }
+
+#[cfg(test)]
+#[path = "owner_tests.rs"]
+mod owner_tests;

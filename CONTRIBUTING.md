@@ -4,7 +4,7 @@
 
 ### Prerequisites
 
-- Rust 1.80+ (`rustup install 1.80`)
+- Rust 1.80+ (`rustup toolchain install 1.80.0`)
 - Docker & Docker Compose (for PostgreSQL/Redis/NATS)
 - OpenSSL (for JWT key generation)
 

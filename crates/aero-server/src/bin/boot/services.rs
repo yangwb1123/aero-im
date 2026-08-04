@@ -1,7 +1,6 @@
 //! Service construction: Auth, IM, Live, AI.
 use std::sync::Arc;
 
-use anyhow::Context;
 use aero_ai::AiService;
 use aero_auth::AuthService;
 use aero_common::config::AppConfig;
@@ -9,6 +8,7 @@ use aero_im_core::ImService;
 use aero_server::live::LiveService;
 use aero_server::rate_limit::RateLimiter;
 use aero_server::ws_rate::WsRateEnforcer;
+use anyhow::Context;
 use tracing::info;
 
 /// Wired-up top-level services.
@@ -92,11 +92,15 @@ pub(crate) fn build(deps: ServicesDeps<'_>) -> anyhow::Result<Services> {
     .with_thread_subs(aero_storage::ThreadSubscriptionRepo::new(deps.pg.clone()))
     .with_deactivations(aero_storage::DeactivationRepo::new(deps.pg.clone()))
     .with_totp(aero_storage::TotpRepo::new(deps.pg.clone()))
-    .with_thread_notification_prefs(aero_storage::ThreadNotificationPrefsRepo::new(deps.pg.clone()))
+    .with_thread_notification_prefs(aero_storage::ThreadNotificationPrefsRepo::new(
+        deps.pg.clone(),
+    ))
     .with_workspace_mutes(aero_storage::WorkspaceMuteRepo::new(deps.pg.clone()))
     .with_thread_mutes(aero_storage::ThreadMuteRepo::new(deps.pg.clone()))
     .with_block_repo(aero_storage::BlockRepo::new(deps.pg.clone()))
-    .with_workspace_notif_defaults(aero_storage::WorkspaceNotifDefaultsRepo::new(deps.pg.clone()))
+    .with_workspace_notif_defaults(aero_storage::WorkspaceNotifDefaultsRepo::new(
+        deps.pg.clone(),
+    ))
     .with_presence(deps.presence.clone())
     .with_seq(deps.seq_store.clone());
 
@@ -116,9 +120,8 @@ pub(crate) fn build(deps: ServicesDeps<'_>) -> anyhow::Result<Services> {
     // strand reply notifications in the bundle table). Default off keeps the
     // legacy immediate-insert delivery semantics unchanged.
     if std::env::var("AERO_NOTIFICATION_BUNDLES").is_ok() {
-        im_svc = im_svc.with_notification_bundles(
-            aero_storage::NotificationBundleRepo::new(deps.pg.clone()),
-        );
+        im_svc = im_svc
+            .with_notification_bundles(aero_storage::NotificationBundleRepo::new(deps.pg.clone()));
         info!("notification reply-aggregation enabled (AERO_NOTIFICATION_BUNDLES)");
     }
 
@@ -142,19 +145,12 @@ pub(crate) fn build(deps: ServicesDeps<'_>) -> anyhow::Result<Services> {
         info!("behavioral spam guard enabled (AERO_SPAM_GUARD)");
     }
 
-    // Workspace-level auto-moderation rules (ROADMAP10). Opt-in via
-    // AERO_AUTO_MOD_RULES because activating the builder makes `send_message`
-    // fetch each workspace's rules and REJECT any message matched by a `"block"`
-    // rule — a behaviour change that can drop user messages. With the repo wired
-    // but no rules configured it is a no-op (`list_for_workspace` returns empty),
-    // and the path already fails open on lookup errors; the flag keeps the
-    // message-rejecting semantics off by default until an operator explicitly
-    // opts in. KeywordModerator (AERO_BLOCKED_WORDS) is wired unconditionally by
-    // `ImService::new` and is unaffected by this flag.
-    if std::env::var("AERO_AUTO_MOD_RULES").is_ok() {
-        im_svc = im_svc.with_auto_mod_rules(aero_storage::AutoModRuleRepo::new(deps.pg.clone()));
-        info!("workspace auto-moderation rules enabled (AERO_AUTO_MOD_RULES)");
-    }
+    // The management API is always mounted, so enforcement must be wired in the
+    // same production lifecycle. An empty rule set is a cheap no-op; configured
+    // rules may never be accepted by the API and then silently ignored because
+    // an unrelated process environment flag was absent.
+    im_svc = im_svc.with_auto_mod_rules(aero_storage::AutoModRuleRepo::new(deps.pg.clone()));
+    info!("workspace auto-moderation rules enabled");
     if let Some(detector) = aero_im_core::PiiDetector::from_env() {
         im_svc = im_svc.with_pii_detector(Arc::new(detector));
         info!("PII guard enabled (AERO_PII_GUARD)");
@@ -179,6 +175,12 @@ pub(crate) fn build(deps: ServicesDeps<'_>) -> anyhow::Result<Services> {
             Some(deps.ai_context.clone()),
         )
         .with_blob_store(deps.blob_store.clone())
+        // Paid providers reserve a stable usage id in PostgreSQL before the
+        // network request and finalize afterward. The relay starts later; the
+        // sink is attached before the AI worker can process its first job.
+        .with_usage_sink(Arc::new(aero_server::ai_usage::PgUsageSink::new(
+            deps.pg.clone(),
+        )))
         // Cross-room AI persona repo (方向三). Wired unconditionally; the feature
         // stays dark until AERO_AI_CROSS_ROOM_PROFILE is set, and is GDPR-erasable.
         .with_ai_profiles(aero_storage::AiProfileRepo::new(deps.pg.clone())),

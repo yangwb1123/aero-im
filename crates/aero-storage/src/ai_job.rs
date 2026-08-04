@@ -4,6 +4,7 @@
 //! for retries, dead-letter, and operator visibility. Workers `claim()` a row to
 //! flip status `queued → running`, then `complete()` or `fail()` it.
 
+use aero_common::{Error, ParticipantId, WorkspaceId};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use ulid::Ulid;
@@ -188,11 +189,7 @@ impl AiJobRepo {
         Ok(rows.into_iter().map(AiJob::from).collect())
     }
 
-    pub async fn complete(
-        &self,
-        id: Ulid,
-        result: serde_json::Value,
-    ) -> Result<(), sqlx::Error> {
+    pub async fn complete(&self, id: Ulid, result: serde_json::Value) -> Result<(), sqlx::Error> {
         sqlx::query(
             r#"UPDATE ai_jobs
                   SET status = 'done', result = $2, finished_at = NOW()
@@ -205,12 +202,7 @@ impl AiJobRepo {
         Ok(())
     }
 
-    pub async fn fail(
-        &self,
-        id: Ulid,
-        error: &str,
-        max_attempts: i32,
-    ) -> Result<(), sqlx::Error> {
+    pub async fn fail(&self, id: Ulid, error: &str, max_attempts: i32) -> Result<(), sqlx::Error> {
         sqlx::query(
             r#"UPDATE ai_jobs SET
                  status = CASE WHEN attempts >= $3 THEN 'dead' ELSE 'queued' END,
@@ -234,11 +226,7 @@ impl AiJobRepo {
     /// WITHOUT consuming a retry attempt (a deferral is not a failure). Used by
     /// the worker to push back a job whose workspace has exhausted its per-tenant
     /// budget window, so the work is delayed rather than dropped.
-    pub async fn defer(
-        &self,
-        id: Ulid,
-        until: time::OffsetDateTime,
-    ) -> Result<(), sqlx::Error> {
+    pub async fn defer(&self, id: Ulid, until: time::OffsetDateTime) -> Result<(), sqlx::Error> {
         sqlx::query(
             r"UPDATE ai_jobs
                   SET status = 'queued',
@@ -265,48 +253,115 @@ impl AiJobRepo {
             .fetch_one(&self.pool)
             .await?
         } else {
+            sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM ai_jobs WHERE status = 'dead'")
+                .fetch_one(&self.pool)
+                .await?
+        };
+        Ok(row.0)
+    }
+
+    /// Count dead-letter jobs owned by one workspace, optionally filtered by
+    /// `kind` ("moderate", "summarize", etc.).
+    ///
+    /// Unlike [`Self::count_dead`], this is tenant-scoped and is the only count
+    /// suitable for a workspace-facing API. Jobs whose `workspace_id` is `NULL`
+    /// are global/legacy work and are intentionally excluded.
+    pub async fn count_dead_for_workspace(
+        &self,
+        workspace: WorkspaceId,
+        kind: Option<&str>,
+    ) -> Result<i64, sqlx::Error> {
+        let row = if let Some(kind) = kind {
             sqlx::query_as::<_, (i64,)>(
-                "SELECT COUNT(*) FROM ai_jobs WHERE status = 'dead'",
+                r"SELECT COUNT(*)
+                    FROM ai_jobs
+                   WHERE status = 'dead'
+                     AND workspace_id = $1
+                     AND kind = $2",
             )
+            .bind(workspace.to_uuid())
+            .bind(kind)
+            .fetch_one(&self.pool)
+            .await?
+        } else {
+            sqlx::query_as::<_, (i64,)>(
+                r"SELECT COUNT(*)
+                    FROM ai_jobs
+                   WHERE status = 'dead'
+                     AND workspace_id = $1",
+            )
+            .bind(workspace.to_uuid())
             .fetch_one(&self.pool)
             .await?
         };
         Ok(row.0)
     }
 
-    /// List the most-recently-failed dead-letter jobs, newest first. Capped at
-    /// `limit` (caller should pass a reasonable ceiling like 50).
-    pub async fn list_dead(&self, limit: i64) -> Result<Vec<AiJob>, sqlx::Error> {
+    /// List the most-recently-failed dead-letter jobs owned by one workspace.
+    ///
+    /// The mandatory `workspace_id` predicate is the tenant boundary. Global
+    /// jobs (`workspace_id IS NULL`) and jobs owned by another workspace are
+    /// never returned.
+    pub async fn list_dead_for_workspace(
+        &self,
+        workspace: WorkspaceId,
+        limit: i64,
+    ) -> Result<Vec<AiJob>, sqlx::Error> {
         let rows = sqlx::query_as::<_, AiJobRow>(
             r"SELECT id, kind, target_id, workspace_id, status, attempts, payload,
                      result, error, scheduled_at, started_at, finished_at
                FROM ai_jobs
               WHERE status = 'dead'
+                AND workspace_id = $1
               ORDER BY finished_at DESC NULLS LAST, id DESC
-              LIMIT $1",
+              LIMIT $2",
         )
+        .bind(workspace.to_uuid())
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(AiJob::from).collect())
     }
 
-    /// Re-queue a dead-letter job: reset `status = 'queued'` and clear the
-    /// retry counter so it gets a fresh set of attempts. Returns `true` when
-    /// the row existed and was in `dead` state, `false` otherwise.
-    pub async fn requeue(&self, id: Ulid) -> Result<bool, sqlx::Error> {
+    /// Re-queue one workspace-owned dead-letter job while `actor` remains an
+    /// effective workspace Owner/Admin.
+    ///
+    /// The workspace governance row and the actor's effective authorization are
+    /// locked and checked in the same transaction as the update. A concurrent
+    /// demotion therefore either waits for this requeue to commit or commits
+    /// first and makes this call fail with [`Error::Forbidden`]. The update also
+    /// binds both `id` and `workspace_id`; another tenant's job and a global
+    /// (`NULL` workspace) job are indistinguishable from a missing/dead-state
+    /// mismatch and return [`Error::NotFound`].
+    pub async fn requeue_for_workspace_authorized(
+        &self,
+        id: Ulid,
+        workspace: WorkspaceId,
+        actor: ParticipantId,
+    ) -> Result<(), Error> {
         let now = time::OffsetDateTime::now_utc();
-        let rows = sqlx::query(
+        let mut tx = self.pool.begin().await?;
+        crate::workspace::authz::assert_effective_admin_in_tx(&mut tx, workspace, actor).await?;
+        let result = sqlx::query(
             r"UPDATE ai_jobs
                  SET status = 'queued', attempts = 0,
                      scheduled_at = $2, started_at = NULL, finished_at = NULL, error = NULL
-               WHERE id = $1 AND status = 'dead'",
+               WHERE id = $1
+                 AND workspace_id = $3
+                 AND status = 'dead'",
         )
         .bind(uuid::Uuid::from_u128(id.0))
         .bind(now)
-        .execute(&self.pool)
+        .bind(workspace.to_uuid())
+        .execute(&mut *tx)
         .await?;
-        Ok(rows.rows_affected() > 0)
+        if result.rows_affected() != 1 {
+            return Err(Error::NotFound(format!(
+                "dead AI job {id} in workspace {workspace}"
+            )));
+        }
+        tx.commit().await?;
+        Ok(())
     }
 }
 
@@ -383,15 +438,119 @@ mod tests {
 #[cfg(test)]
 mod db_tests {
     use super::*;
+    use std::time::Duration;
+
+    use aero_common::WorkspaceRole;
     use sqlx::postgres::PgPoolOptions;
+
+    use crate::WorkspaceRepo;
 
     fn pool() -> PgPool {
         let url = std::env::var("DATABASE_URL")
             .unwrap_or_else(|_| "postgres://aero:aero_dev_pw@localhost:5432/aero".into());
         PgPoolOptions::new()
-            .max_connections(2)
+            .max_connections(4)
             .connect_lazy(&url)
             .expect("connect_lazy never fails on a well-formed URL")
+    }
+
+    async fn participant(pool: &PgPool, label: &str) -> ParticipantId {
+        let participant = ParticipantId::new();
+        sqlx::query(
+            "INSERT INTO participants (id, kind, display_name)
+             VALUES ($1, 'human', $2)",
+        )
+        .bind(participant.to_uuid())
+        .bind(format!("{label}-{participant}"))
+        .execute(pool)
+        .await
+        .expect("insert participant");
+        participant
+    }
+
+    async fn workspace_with_admin(
+        pool: &PgPool,
+        label: &str,
+    ) -> (WorkspaceId, ParticipantId, ParticipantId) {
+        let owner = participant(pool, &format!("{label}-owner")).await;
+        let admin = participant(pool, &format!("{label}-admin")).await;
+        let workspaces = WorkspaceRepo::new(pool.clone());
+        let workspace = workspaces
+            .create(
+                format!("AI DLQ {label} {owner}"),
+                format!("ai-dlq-{label}-{owner}"),
+                owner,
+            )
+            .await
+            .expect("create workspace")
+            .id;
+        workspaces
+            .add_member(workspace, admin, WorkspaceRole::Admin)
+            .await
+            .expect("add workspace admin");
+        (workspace, owner, admin)
+    }
+
+    async fn insert_dead_job(
+        pool: &PgPool,
+        workspace: Option<WorkspaceId>,
+        kind: &str,
+        error: &str,
+    ) -> Ulid {
+        let id = Ulid::new();
+        sqlx::query(
+            r"INSERT INTO ai_jobs
+                  (id, kind, workspace_id, status, attempts, payload, error, finished_at)
+               VALUES ($1, $2, $3, 'dead', 5, '{}'::jsonb, $4, now())",
+        )
+        .bind(uuid::Uuid::from_u128(id.0))
+        .bind(kind)
+        .bind(workspace.map(|id| id.to_uuid()))
+        .bind(error)
+        .execute(pool)
+        .await
+        .expect("insert dead AI job");
+        id
+    }
+
+    async fn job_status(pool: &PgPool, id: Ulid) -> String {
+        sqlx::query_scalar("SELECT status FROM ai_jobs WHERE id = $1")
+            .bind(uuid::Uuid::from_u128(id.0))
+            .fetch_one(pool)
+            .await
+            .expect("read AI job status")
+    }
+
+    async fn cleanup(
+        pool: &PgPool,
+        jobs: &[Ulid],
+        workspaces: &[WorkspaceId],
+        participants: &[ParticipantId],
+    ) {
+        let jobs = jobs
+            .iter()
+            .map(|id| uuid::Uuid::from_u128(id.0))
+            .collect::<Vec<_>>();
+        sqlx::query("DELETE FROM ai_jobs WHERE id = ANY($1)")
+            .bind(&jobs)
+            .execute(pool)
+            .await
+            .ok();
+        let workspaces = workspaces.iter().map(|id| id.to_uuid()).collect::<Vec<_>>();
+        sqlx::query("DELETE FROM workspaces WHERE id = ANY($1)")
+            .bind(&workspaces)
+            .execute(pool)
+            .await
+            .ok();
+        let participants = participants
+            .iter()
+            .map(|id| id.to_uuid())
+            .collect::<Vec<_>>();
+        sqlx::query("DELETE FROM participants WHERE id = ANY($1)")
+            .bind(&participants)
+            .execute(pool)
+            .await
+            .ok();
     }
 
     /// Priority preempts FIFO: an `embed` (backfill) enqueued FIRST — so with an
@@ -436,5 +595,131 @@ mod db_tests {
             vec![moderate, embed],
             "moderate (higher-priority lane) is claimed before the earlier-enqueued embed"
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn workspace_dlq_scope_excludes_other_tenants_and_global_jobs() {
+        let p = pool();
+        let repo = AiJobRepo::new(p.clone());
+        let (workspace_a, owner_a, admin_a) = workspace_with_admin(&p, "scope-a").await;
+        let (workspace_b, owner_b, admin_b) = workspace_with_admin(&p, "scope-b").await;
+        let own = insert_dead_job(&p, Some(workspace_a), "moderate", "tenant-a-secret").await;
+        let foreign = insert_dead_job(&p, Some(workspace_b), "answer", "tenant-b-secret").await;
+        let global = insert_dead_job(&p, None, "summarize", "global-secret").await;
+
+        let visible = repo
+            .list_dead_for_workspace(workspace_a, 50)
+            .await
+            .expect("list tenant A DLQ");
+        assert_eq!(
+            visible.iter().map(|job| job.id).collect::<Vec<_>>(),
+            vec![own],
+            "tenant listing must exclude foreign and NULL-workspace jobs"
+        );
+        assert_eq!(
+            repo.count_dead_for_workspace(workspace_a, None)
+                .await
+                .expect("count tenant A DLQ"),
+            1
+        );
+        assert_eq!(
+            repo.count_dead_for_workspace(workspace_a, Some("moderate"))
+                .await
+                .expect("count tenant A moderation DLQ"),
+            1
+        );
+        assert_eq!(
+            repo.count_dead_for_workspace(workspace_a, Some("answer"))
+                .await
+                .expect("count tenant A answer DLQ"),
+            0
+        );
+
+        assert!(matches!(
+            repo.requeue_for_workspace_authorized(foreign, workspace_a, admin_a)
+                .await
+                .expect_err("another tenant's job must be opaque"),
+            Error::NotFound(_)
+        ));
+        assert!(matches!(
+            repo.requeue_for_workspace_authorized(global, workspace_a, admin_a)
+                .await
+                .expect_err("a global job must be opaque to workspace admins"),
+            Error::NotFound(_)
+        ));
+        assert_eq!(job_status(&p, foreign).await, "dead");
+        assert_eq!(job_status(&p, global).await, "dead");
+
+        repo.requeue_for_workspace_authorized(own, workspace_a, admin_a)
+            .await
+            .expect("current admin requeues own workspace job");
+        assert_eq!(job_status(&p, own).await, "queued");
+
+        cleanup(
+            &p,
+            &[own, foreign, global],
+            &[workspace_a, workspace_b],
+            &[owner_a, admin_a, owner_b, admin_b],
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn workspace_dlq_requeue_observes_concurrent_admin_demotion() {
+        let p = pool();
+        let repo = AiJobRepo::new(p.clone());
+        let (workspace, owner, admin) = workspace_with_admin(&p, "demotion").await;
+        let job = insert_dead_job(&p, Some(workspace), "answer", "must remain dead").await;
+
+        let mut demotion = p.begin().await.expect("begin admin demotion");
+        crate::ownership::lock_membership_governance(&mut demotion)
+            .await
+            .expect("lock membership governance");
+        sqlx::query("SELECT id FROM workspaces WHERE id = $1 FOR UPDATE")
+            .bind(workspace.to_uuid())
+            .fetch_one(&mut *demotion)
+            .await
+            .expect("lock workspace before demotion");
+        sqlx::query(
+            "UPDATE workspace_members
+                SET role = 'member'
+              WHERE workspace_id = $1 AND participant_id = $2",
+        )
+        .bind(workspace.to_uuid())
+        .bind(admin.to_uuid())
+        .execute(&mut *demotion)
+        .await
+        .expect("stage admin demotion");
+
+        let contender_repo = repo.clone();
+        let mut contender = tokio::spawn(async move {
+            contender_repo
+                .requeue_for_workspace_authorized(job, workspace, admin)
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut contender)
+                .await
+                .is_err(),
+            "requeue must wait behind the workspace governance lock"
+        );
+
+        demotion.commit().await.expect("commit admin demotion");
+        assert!(matches!(
+            contender
+                .await
+                .expect("join requeue contender")
+                .expect_err("committed demotion must revoke requeue authority"),
+            Error::Forbidden(_)
+        ));
+        assert_eq!(
+            job_status(&p, job).await,
+            "dead",
+            "forbidden contender must not mutate the job"
+        );
+
+        cleanup(&p, &[job], &[workspace], &[owner, admin]).await;
     }
 }

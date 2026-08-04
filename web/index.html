@@ -34,7 +34,22 @@
           <span>密码</span>
           <input type="password" name="password" autocomplete="current-password" required minlength="6" />
         </label>
+        <label>
+          <span>两步验证 <span class="muted">（验证码或恢复码）</span></span>
+          <input
+            type="text"
+            name="second_factor"
+            autocomplete="one-time-code"
+            inputmode="text"
+            pattern="[0-9]{6}|[A-Fa-f0-9]{8}|[A-Fa-f0-9]{16}"
+            minlength="6"
+            maxlength="16"
+            placeholder="6 位验证码 / 恢复码"
+          />
+        </label>
         <button type="submit" class="btn-primary">登录</button>
+        <div class="auth-divider" role="separator"><span>或</span></div>
+        <a class="btn-sso" href="/api/auth/oidc/start">通过 Snaplink SSO 登录</a>
       </form>
 
       <form id="form-register" class="auth-form" data-tab-panel="register" hidden>
@@ -77,7 +92,13 @@
             <div id="me-email" class="me-email muted"></div>
           </div>
         </div>
-        <button id="btn-logout" class="btn-link">退出</button>
+        <div class="account-actions">
+          <button id="btn-productivity" class="btn-link" type="button" title="任务、审批、成员与自动化">工作台</button>
+          <button id="btn-governance" class="btn-link" type="button" title="审计日志与 Bot 平台">治理</button>
+          <button id="btn-compliance" class="btn-link" type="button" title="留存、法务保全与企业合规">合规</button>
+          <button id="btn-security" class="btn-link" type="button" title="账户与工作区安全">安全</button>
+          <button id="btn-logout" class="btn-link">退出</button>
+        </div>
       </footer>
     </aside>
 
@@ -93,6 +114,7 @@
             <button id="btn-search" type="button" title="搜索">🔍 搜索</button>
             <button id="btn-ai" type="button" title="问 AI">✨ AI</button>
             <button id="btn-polls" type="button" title="投票">📊 投票</button>
+            <button id="btn-canvas" type="button" title="协作 Canvas">📝 Canvas</button>
             <button id="btn-call-audio" type="button" title="发起语音通话">📞</button>
             <button id="btn-call-video" type="button" title="发起视频通话">📹</button>
             <button id="btn-call-group" type="button" title="发起群视频通话(mesh)">👥</button>
@@ -109,6 +131,9 @@
       </div>
 
       <div id="typing-bar" class="typing-bar" hidden></div>
+      <div id="composer-network" class="composer-network" role="status" hidden>
+        正在重新连接 · 消息将排队
+      </div>
 
       <form id="composer" class="composer" hidden>
         <div class="composer-aux">
@@ -151,7 +176,6 @@
           <select name="kind">
             <option value="group">群组 group</option>
             <option value="channel">频道 channel</option>
-            <option value="direct">直接消息 direct</option>
           </select>
         </label>
         <label>
@@ -193,6 +217,88 @@
             </footer>
           </form>
         </details>
+      </div>
+    </div>
+  </div>
+
+  <!-- modal: collaborative room Canvas -->
+  <div id="modal-canvas" class="modal" hidden>
+    <div class="modal-card canvas-modal-card" role="dialog" aria-modal="true" aria-labelledby="canvas-dialog-title">
+      <header class="modal-head">
+        <div>
+          <h3 id="canvas-dialog-title">协作 Canvas</h3>
+          <p class="muted canvas-dialog-subtitle">按持久操作序号同步；断线后自动补齐</p>
+        </div>
+        <button class="btn-icon" type="button" data-close-canvas aria-label="关闭 Canvas">×</button>
+      </header>
+      <div class="canvas-modal-body">
+        <aside class="canvas-sidebar">
+          <form id="form-new-canvas" class="canvas-create-form">
+            <label for="canvas-new-title">新建 Canvas</label>
+            <div>
+              <input id="canvas-new-title" name="title" type="text" maxlength="512" placeholder="例如：项目协作笔记" required />
+              <button class="btn-primary" type="submit">创建</button>
+            </div>
+          </form>
+          <nav id="canvas-list" class="canvas-list" aria-label="Canvas 列表"></nav>
+        </aside>
+
+        <section class="canvas-workspace">
+          <p id="canvas-empty" class="muted canvas-empty">选择或新建一个 Canvas</p>
+          <div id="canvas-editor" class="canvas-editor" hidden>
+            <header class="canvas-editor-head">
+              <div>
+                <h4 id="canvas-title">未命名 Canvas</h4>
+                <p id="canvas-meta" class="muted"></p>
+              </div>
+              <div class="canvas-sync-tools">
+                <span id="canvas-sync-state" role="status">已同步</span>
+                <button id="canvas-reload" class="btn-ghost" type="button">重新同步</button>
+              </div>
+            </header>
+
+            <form id="form-canvas-text" class="canvas-section">
+              <label for="canvas-text">正文</label>
+              <textarea id="canvas-text" rows="10" maxlength="60000" placeholder="共同维护正文内容…"></textarea>
+              <footer>
+                <span class="muted">保存会追加一条有序操作，不覆盖服务端日志。</span>
+                <button class="btn-primary" type="submit">保存正文</button>
+              </footer>
+            </form>
+
+            <section class="canvas-section">
+              <div class="canvas-section-head">
+                <h5>便笺</h5>
+                <span class="muted">使用稳定 ID，可安全重放与去重</span>
+              </div>
+              <div id="canvas-notes" class="canvas-notes"></div>
+              <form id="form-canvas-note" class="canvas-note-form">
+                <input name="note" type="text" maxlength="8000" placeholder="添加一张协作便笺…" required />
+                <button class="btn-primary" type="submit">添加</button>
+              </form>
+            </section>
+
+            <details class="canvas-section canvas-advanced">
+              <summary>结构化操作</summary>
+              <p class="muted">
+                支持 set_blocks、upsert_block、delete_block，也可提交服务端允许的其他 JSON 对象。
+              </p>
+              <form id="form-canvas-structured">
+                <textarea
+                  id="canvas-structured-op"
+                  rows="5"
+                  maxlength="60000"
+                  spellcheck="false"
+                  placeholder='{"type":"upsert_block","block":{"id":"status","type":"status","value":"进行中"}}'></textarea>
+                <button class="btn-ghost" type="submit">提交 JSON 操作</button>
+              </form>
+              <div>
+                <h5>其他结构化块</h5>
+                <div id="canvas-structured-blocks" class="canvas-structured-blocks"></div>
+              </div>
+            </details>
+          </div>
+        </section>
       </div>
     </div>
   </div>
@@ -337,7 +443,7 @@
 
   <!-- modal: edit profile -->
   <div id="modal-profile" class="modal" hidden>
-    <div class="modal-card">
+    <div class="modal-card profile-card">
       <header class="modal-head">
         <h3>编辑资料</h3>
         <button class="btn-icon" data-close>×</button>
@@ -351,11 +457,498 @@
           <span>头像 URL(留空清除)</span>
           <input type="url" name="avatar_url" placeholder="https://…" />
         </label>
+        <section class="twofa-panel" aria-labelledby="twofa-heading">
+          <div class="twofa-head">
+            <h4 id="twofa-heading">账户安全 · 两步验证</h4>
+            <span id="twofa-status" class="muted" aria-live="polite">正在读取安全设置…</span>
+          </div>
+          <div class="twofa-actions">
+            <button id="btn-2fa-enroll" type="button" class="btn-ghost">启用两步验证</button>
+            <button id="btn-2fa-cancel" type="button" class="btn-link" hidden>取消待验证设置</button>
+          </div>
+          <div id="twofa-setup" class="twofa-stack" hidden>
+            <p class="muted">在验证器应用中手动输入密钥，或导入下方配置 URI。密钥只在本次设置中显示。</p>
+            <div class="twofa-secret-row">
+              <span>密钥</span>
+              <code id="twofa-secret"></code>
+            </div>
+            <label>
+              <span>验证器配置 URI</span>
+              <textarea id="twofa-uri" rows="3" readonly></textarea>
+            </label>
+            <button id="btn-2fa-copy-uri" type="button" class="btn-ghost">复制配置 URI</button>
+            <label>
+              <span>当前 6 位动态码</span>
+              <input id="twofa-verify-code" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6" />
+            </label>
+            <button id="btn-2fa-verify" type="button" class="btn-primary">确认并启用</button>
+          </div>
+          <div id="twofa-active" class="twofa-stack" hidden>
+            <button id="btn-2fa-recovery" type="button" class="btn-ghost">生成 / 重置恢复码</button>
+            <label>
+              <span>重置恢复码或关闭前输入当前动态码</span>
+              <input id="twofa-disable-code" type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="6" />
+            </label>
+            <button id="btn-2fa-disable" type="button" class="btn-danger">关闭两步验证</button>
+          </div>
+          <div id="twofa-recovery-result" class="twofa-recovery" hidden>
+            <strong>恢复码只显示这一次，请立即保存</strong>
+            <pre id="twofa-recovery-codes"></pre>
+            <button id="btn-2fa-copy-codes" type="button" class="btn-ghost">复制全部恢复码</button>
+          </div>
+        </section>
         <footer class="modal-foot">
           <button type="button" class="btn-ghost" data-close>取消</button>
           <button type="submit" class="btn-primary">保存</button>
         </footer>
       </form>
+    </div>
+  </div>
+
+  <!-- modal: workspace governance + bot platform -->
+  <div id="modal-governance" class="modal" hidden>
+    <div class="modal-card governance-modal-card" role="dialog" aria-modal="true" aria-labelledby="governance-title">
+      <header class="modal-head">
+        <div>
+          <h3 id="governance-title">治理与开放平台</h3>
+          <p class="security-subtitle">审计检索、合规导出、Bot 令牌与事件投递</p>
+        </div>
+        <button class="btn-icon" type="button" data-governance-close aria-label="关闭">×</button>
+      </header>
+
+      <div class="security-modal-body">
+        <div class="security-toolbar">
+          <label>
+            <span>审计工作区</span>
+            <select id="governance-workspace"></select>
+          </label>
+          <span id="governance-role" class="security-role">—</span>
+          <button id="governance-refresh" class="btn-ghost" type="button">全部刷新</button>
+        </div>
+
+        <div class="governance-grid">
+          <section class="security-section governance-audit" aria-labelledby="governance-audit-title">
+            <div class="security-section-head">
+              <div>
+                <h4 id="governance-audit-title">工作区审计日志</h4>
+                <p>按操作、参与者、目标和时间检索；CSV 导出使用相同过滤条件。</p>
+              </div>
+              <button id="governance-audit-export" class="btn-ghost" type="button">导出 CSV</button>
+            </div>
+            <div id="governance-audit-restricted" class="security-state restricted" hidden>
+              审计日志仅对工作区 Owner / Admin 开放。
+            </div>
+            <form id="governance-audit-form" class="governance-filter-form">
+              <label>
+                <span>操作</span>
+                <input name="action" maxlength="120" placeholder="member.add" />
+              </label>
+              <label>
+                <span>Actor ID</span>
+                <input name="actor" maxlength="64" placeholder="01J…" />
+              </label>
+              <label>
+                <span>Target</span>
+                <input name="target" maxlength="200" placeholder="目标 ID / 标识" />
+              </label>
+              <label>
+                <span>开始时间</span>
+                <input name="after" type="datetime-local" />
+              </label>
+              <label>
+                <span>结束时间</span>
+                <input name="until" type="datetime-local" />
+              </label>
+              <div class="security-actions governance-filter-actions">
+                <button class="btn-primary" type="submit">查询</button>
+                <button id="governance-audit-reset" class="btn-ghost" type="button">重置</button>
+              </div>
+            </form>
+            <div id="governance-audit-state" class="security-state" aria-live="polite">请选择工作区。</div>
+            <div id="governance-audit-list" class="governance-event-list" hidden></div>
+            <button id="governance-audit-more" class="btn-ghost governance-more" type="button" hidden>加载更早事件</button>
+          </section>
+
+          <section class="security-section governance-bots" aria-labelledby="governance-bots-title">
+            <div class="security-section-head">
+              <div>
+                <h4 id="governance-bots-title">我的 Bot</h4>
+                <p>创建 Bot 后，明文令牌仅显示一次；轮换会立即使旧令牌失效。</p>
+              </div>
+            </div>
+            <form id="governance-bot-create" class="governance-bot-form">
+              <label>
+                <span>名称</span>
+                <input name="name" required maxlength="64" placeholder="Release Assistant" />
+              </label>
+              <label>
+                <span>所属工作区</span>
+                <select id="governance-bot-workspace" name="workspace_id"></select>
+              </label>
+              <label class="governance-span-two">
+                <span>图标 URL（可选）</span>
+                <input name="icon_url" type="url" maxlength="2048" placeholder="https://…" />
+              </label>
+              <button class="btn-primary" type="submit">创建 Bot</button>
+            </form>
+            <div id="governance-bot-secret" class="security-secret" hidden>
+              <strong>令牌只显示这一次，请立即保存。</strong>
+              <div><span>Bearer</span><code id="governance-bot-token"></code></div>
+              <button id="governance-bot-copy" class="btn-ghost" type="button">复制令牌</button>
+            </div>
+            <div id="governance-bot-state" class="security-state" aria-live="polite">正在读取 Bot…</div>
+            <div id="governance-bot-list" class="governance-bot-list" hidden></div>
+          </section>
+
+          <section id="governance-bot-detail" class="security-section governance-detail" hidden>
+            <div class="security-section-head">
+              <div>
+                <h4 id="governance-bot-detail-title">Bot</h4>
+                <p>管理事件订阅，并核对最近的外部 webhook 投递结果。</p>
+              </div>
+              <button id="governance-bot-rotate" class="btn-danger" type="button">轮换令牌</button>
+            </div>
+
+            <div class="governance-detail-grid">
+              <div>
+                <h5>事件订阅</h5>
+                <form id="governance-sub-form" class="governance-sub-form">
+                  <label>
+                    <span>事件类型</span>
+                    <select name="event_type" required></select>
+                  </label>
+                  <label>
+                    <span>Webhook URL（可选）</span>
+                    <input name="webhook_url" type="url" maxlength="2048" placeholder="https://hooks.example.com/aero" />
+                  </label>
+                  <label class="governance-span-two">
+                    <span>过滤 JSON</span>
+                    <textarea name="filters" rows="3" maxlength="2000" aria-describedby="governance-sub-scope-help" placeholder='{"room_id":"01J…"}'></textarea>
+                    <small id="governance-sub-scope-help">外部 Webhook 必须填写 room_id 或 workspace_id；无 URL 的内部订阅可以留空。</small>
+                  </label>
+                  <button class="btn-primary" type="submit">添加订阅</button>
+                </form>
+                <div id="governance-sub-secret" class="security-secret" hidden>
+                  <strong>Webhook 签名 Secret 只显示这一次，请立即保存。</strong>
+                  <div><span>Secret</span><code id="governance-sub-secret-value"></code></div>
+                  <button id="governance-sub-secret-copy" class="btn-ghost" type="button">复制 Secret</button>
+                </div>
+                <div id="governance-sub-state" class="security-state">正在读取订阅…</div>
+                <div id="governance-sub-list" class="security-list" hidden></div>
+              </div>
+
+              <div>
+                <div class="governance-delivery-head">
+                  <h5>最近投递</h5>
+                  <button id="governance-delivery-refresh" class="btn-ghost" type="button">刷新</button>
+                </div>
+                <div id="governance-delivery-state" class="security-state">正在读取投递记录…</div>
+                <div id="governance-delivery-list" class="security-list" hidden></div>
+              </div>
+            </div>
+          </section>
+        </div>
+      </div>
+      <footer class="security-modal-foot">
+        <span>所有操作都由后端重新执行 Owner / Admin / 资源所有权校验。</span>
+        <button class="btn-ghost" type="button" data-governance-close>关闭</button>
+      </footer>
+    </div>
+  </div>
+
+  <!-- modal: account + workspace security -->
+  <div id="modal-security" class="modal" hidden>
+    <div class="modal-card security-modal-card" role="dialog" aria-modal="true" aria-labelledby="security-title">
+      <header class="modal-head">
+        <div>
+          <h3 id="security-title">企业安全中心</h3>
+          <p class="security-subtitle">账户会话与工作区安全策略</p>
+        </div>
+        <button class="btn-icon" type="button" data-security-close aria-label="关闭">×</button>
+      </header>
+      <div class="security-modal-body">
+        <div class="security-toolbar">
+          <label>
+            <span>工作区</span>
+            <select id="security-workspace"></select>
+          </label>
+          <span id="security-role" class="security-role">—</span>
+          <button id="security-refresh" class="btn-ghost" type="button">刷新</button>
+        </div>
+
+        <section class="security-section" aria-labelledby="security-sessions-title">
+          <div class="security-section-head">
+            <div>
+              <h4 id="security-sessions-title">我的登录会话</h4>
+              <p>查看当前账户的活跃设备，并撤销不再使用的会话。</p>
+            </div>
+            <button id="security-revoke-others" class="btn-danger" type="button">退出其他设备</button>
+          </div>
+          <div id="security-sessions-state" class="security-state" aria-live="polite">正在读取会话…</div>
+          <div id="security-sessions-list" class="security-list" hidden></div>
+        </section>
+
+        <div id="security-no-workspace" class="security-state" hidden>
+          当前账户尚未加入工作区；账户会话仍可在上方管理。
+        </div>
+
+        <div id="security-workspace-sections" class="security-grid" hidden>
+          <section class="security-section" aria-labelledby="security-twofa-title">
+            <div class="security-section-head">
+              <div>
+                <h4 id="security-twofa-title">工作区两步验证策略</h4>
+                <p>启用后，未激活 TOTP 的成员将无法访问该工作区的房间数据。</p>
+              </div>
+              <span id="security-twofa-status" class="security-pill">读取中</span>
+            </div>
+            <div id="security-own-twofa" class="security-state" aria-live="polite">正在读取个人 2FA 状态…</div>
+            <label class="security-toggle">
+              <input id="security-require-twofa" type="checkbox" />
+              <span>要求所有成员启用两步验证</span>
+            </label>
+            <div class="security-actions">
+              <button id="security-open-twofa" class="btn-ghost" type="button">管理我的两步验证</button>
+              <button id="security-save-twofa" class="btn-primary" type="button">保存策略</button>
+            </div>
+            <div id="security-twofa-error" class="security-state error" hidden></div>
+          </section>
+
+          <section class="security-section" aria-labelledby="security-region-title">
+            <div class="security-section-head">
+              <div>
+                <h4 id="security-region-title">附件存储区域</h4>
+                <p>仅影响未来上传；已有附件始终保留其创建时的存储区域。</p>
+              </div>
+              <span id="security-region-status" class="security-pill">读取中</span>
+            </div>
+            <div class="security-inline-form">
+              <label>
+                <span>新附件区域</span>
+                <select id="security-storage-region"></select>
+              </label>
+            </div>
+            <div class="security-actions">
+              <button id="security-save-region" class="btn-primary" type="button">保存区域</button>
+            </div>
+            <div id="security-region-error" class="security-state error" hidden></div>
+          </section>
+
+          <section class="security-section" aria-labelledby="security-ip-title">
+            <div class="security-section-head">
+              <div>
+                <h4 id="security-ip-title">授权网络（IP Allowlist）</h4>
+                <p>空列表表示不限制；加入首个 CIDR 后立即开始限制工作区 API。</p>
+              </div>
+              <span id="security-ip-status" class="security-pill">读取中</span>
+            </div>
+            <div id="security-ip-restricted" class="security-state restricted" hidden>
+              仅工作区 Owner / Admin 可查看和修改授权网络。
+            </div>
+            <div id="security-ip-admin" hidden>
+              <div id="security-ip-state" class="security-state" aria-live="polite">正在读取授权网络…</div>
+              <div id="security-ip-list" class="security-list" hidden></div>
+              <form id="security-ip-form" class="security-inline-form">
+                <label>
+                  <span>CIDR</span>
+                  <input name="cidr" required maxlength="64" placeholder="203.0.113.0/24" />
+                </label>
+                <label>
+                  <span>备注（可选）</span>
+                  <input name="note" maxlength="200" placeholder="公司出口网络" />
+                </label>
+                <button class="btn-primary" type="submit">添加网络</button>
+              </form>
+            </div>
+          </section>
+
+          <section class="security-section" aria-labelledby="security-scim-title">
+            <div class="security-section-head">
+              <div>
+                <h4 id="security-scim-title">SCIM 2.0 供给</h4>
+                <p>为 IdP 创建工作区级 Bearer 凭据；明文只在创建时返回一次。</p>
+              </div>
+              <span class="security-pill">入站供给</span>
+            </div>
+            <div id="security-scim-restricted" class="security-state restricted" hidden>
+              仅工作区 Owner / Admin 可创建或撤销 SCIM 凭据。
+            </div>
+            <div id="security-scim-admin" hidden>
+              <div class="security-endpoint">
+                <span>Base URL</span>
+                <code id="security-scim-url"></code>
+              </div>
+              <p class="security-note">清单只包含 ID、标签和时间；Bearer 明文不会被服务端恢复或再次返回。</p>
+              <form id="security-scim-mint-form" class="security-inline-form">
+                <label>
+                  <span>标签（可选）</span>
+                  <input name="label" maxlength="100" placeholder="Okta production" />
+                </label>
+                <button class="btn-primary" type="submit">创建一次性凭据</button>
+              </form>
+              <div id="security-scim-secret" class="security-secret" hidden>
+                <strong>现在复制，关闭窗口后不再显示</strong>
+                <div><span>凭据 ID</span><code id="security-scim-token-id"></code></div>
+                <div><span>Bearer</span><code id="security-scim-token"></code></div>
+                <div class="security-actions">
+                  <button id="security-copy-scim" class="btn-ghost" type="button">复制 Bearer</button>
+                  <button id="security-revoke-new-scim" class="btn-danger" type="button">撤销此凭据</button>
+                </div>
+              </div>
+              <div id="security-scim-state" class="security-state" aria-live="polite">正在读取凭据…</div>
+              <div id="security-scim-list" class="security-list" hidden></div>
+              <div id="security-scim-error" class="security-state error" hidden></div>
+            </div>
+          </section>
+
+          <section class="security-section" aria-labelledby="security-auto-mod-title">
+            <div class="security-section-head">
+              <div>
+                <h4 id="security-auto-mod-title">AutoMod 消息规则</h4>
+                <p>发送和编辑消息前执行工作区级文本匹配；当前动作仅支持阻止发送。</p>
+              </div>
+              <span class="security-pill">实时执行</span>
+            </div>
+            <div id="security-auto-mod-restricted" class="security-state restricted" hidden>
+              仅工作区 Owner / Admin 可查看或管理 AutoMod 规则。
+            </div>
+            <div id="security-auto-mod-admin" hidden>
+              <form id="security-auto-mod-form" class="security-inline-form">
+                <label>
+                  <span>匹配文本</span>
+                  <input name="pattern" maxlength="1000" required placeholder="需要阻止的文本" />
+                </label>
+                <label>
+                  <span>匹配方式</span>
+                  <select name="match_type">
+                    <option value="contains">包含</option>
+                    <option value="exact">完全相等</option>
+                    <option value="prefix">以前缀开始</option>
+                  </select>
+                </label>
+                <button class="btn-primary" type="submit">添加阻止规则</button>
+              </form>
+              <div id="security-auto-mod-state" class="security-state" aria-live="polite">正在读取规则…</div>
+              <div id="security-auto-mod-list" class="security-list" hidden></div>
+            </div>
+          </section>
+
+          <section class="security-section" aria-labelledby="security-idp-title">
+            <div class="security-section-head">
+              <div>
+                <h4 id="security-idp-title">身份提供商</h4>
+                <p>只呈现后端真实暴露的入口；部署参数不在浏览器中编辑。</p>
+              </div>
+            </div>
+            <div class="security-idp-grid">
+              <article class="security-idp-card">
+                <h5>OIDC</h5>
+                <p>由服务端环境配置，当前没有工作区级状态或配置 API。</p>
+                <span class="security-pill neutral">部署管理</span>
+              </article>
+              <article class="security-idp-card">
+                <h5>SAML 2.0</h5>
+                <p>元数据与登录入口真实可用；配置由服务端环境管理。断言验签默认失败关闭，生产接入仍需完成真实 IdP 联调。</p>
+                <div class="security-actions">
+                  <button id="security-check-saml" class="btn-ghost" type="button">检测元数据</button>
+                  <a class="btn-ghost security-link" href="/saml/metadata" target="_blank" rel="noopener">打开元数据</a>
+                  <a class="btn-ghost security-link" href="/saml/login">SAML 登录</a>
+                </div>
+                <div id="security-saml-state" class="security-state">尚未检测</div>
+              </article>
+            </div>
+          </section>
+
+          <section class="security-section security-section-wide" aria-labelledby="security-members-title">
+            <div class="security-section-head">
+              <div>
+                <h4 id="security-members-title">成员会话终止</h4>
+                <p>Owner / Admin 可强制撤销某个工作区成员的全部登录会话。</p>
+              </div>
+            </div>
+            <div id="security-members-restricted" class="security-state restricted" hidden>
+              你可以查看成员，但只有 Owner / Admin 能终止成员会话。
+            </div>
+            <div id="security-members-state" class="security-state" aria-live="polite">正在读取成员…</div>
+            <div id="security-members-list" class="security-list" hidden></div>
+          </section>
+        </div>
+      </div>
+      <footer class="security-modal-foot">
+        <span>安全操作会立即生效。</span>
+        <button class="btn-ghost" type="button" data-security-close>关闭</button>
+      </footer>
+    </div>
+  </div>
+
+  <!-- modal: productivity workbench -->
+  <div id="modal-productivity" class="modal" hidden>
+    <div class="modal-card workbench-modal" role="dialog" aria-modal="true" aria-labelledby="productivity-title">
+      <header class="modal-head">
+        <div>
+          <h3 id="productivity-title">协作工作台</h3>
+          <p class="muted">任务、审批、成员、自动发送与工作区动态</p>
+        </div>
+        <button class="btn-icon" type="button" data-productivity-close aria-label="关闭">×</button>
+      </header>
+      <div class="workbench-toolbar">
+        <label>
+          <span>工作区</span>
+          <select id="productivity-workspace"></select>
+        </label>
+        <nav class="workbench-tabs" aria-label="工作台功能">
+          <button class="active" type="button" data-workbench-tab="tasks">任务</button>
+          <button type="button" data-workbench-tab="approvals">审批</button>
+          <button type="button" data-workbench-tab="people">成员</button>
+          <button type="button" data-workbench-tab="automation">自动化</button>
+          <button type="button" data-workbench-tab="community">动态</button>
+        </nav>
+      </div>
+      <div id="productivity-status" class="security-state" role="status" hidden></div>
+      <div id="productivity-root" class="workbench-body"></div>
+    </div>
+  </div>
+
+  <!-- modal: enterprise compliance administration -->
+  <div id="modal-compliance" class="modal" hidden>
+    <div class="modal-card compliance-modal-card" role="dialog" aria-modal="true" aria-labelledby="compliance-title">
+      <header class="modal-head">
+        <div>
+          <h3 id="compliance-title">企业合规中心</h3>
+          <p class="muted">留存、法务保全、隔离墙、成员生命周期与 Webhook 运维</p>
+        </div>
+        <button class="btn-icon" type="button" data-compliance-close aria-label="关闭">×</button>
+      </header>
+      <div class="compliance-toolbar">
+        <label>
+          <span>工作区</span>
+          <select id="compliance-workspace"></select>
+        </label>
+        <span id="compliance-role" class="security-role">—</span>
+        <button id="compliance-refresh" class="btn-ghost" type="button">刷新</button>
+        <nav class="compliance-tabs" aria-label="合规能力">
+          <button class="active" type="button" data-compliance-tab="retention">留存与导出</button>
+          <button type="button" data-compliance-tab="holds">法务保全</button>
+          <button type="button" data-compliance-tab="barriers">信息隔离</button>
+          <button type="button" data-compliance-tab="members">停用成员</button>
+          <button type="button" data-compliance-tab="invitations">邀请</button>
+          <button type="button" data-compliance-tab="webhooks">Webhook</button>
+          <button type="button" data-compliance-tab="danger">删除工作区</button>
+        </nav>
+      </div>
+      <div id="compliance-state" class="security-state" role="status" hidden></div>
+      <div id="compliance-secret" class="security-secret compliance-secret" hidden>
+        <strong id="compliance-secret-label">敏感凭据只显示一次，请立即保存。</strong>
+        <code id="compliance-secret-value"></code>
+        <div class="security-actions">
+          <button id="compliance-secret-copy" class="btn-ghost" type="button">复制</button>
+          <button id="compliance-secret-clear" class="btn-ghost" type="button">清除</button>
+        </div>
+      </div>
+      <main id="compliance-root" class="compliance-body"></main>
+      <footer class="security-modal-foot">
+        <span>权限由后端按当前工作区与资源重新校验；关闭窗口会清除一次性凭据。</span>
+        <button class="btn-ghost" type="button" data-compliance-close>关闭</button>
+      </footer>
     </div>
   </div>
 
@@ -381,6 +974,11 @@
 
   <script type="module" src="app.js"></script>
   <script type="module" src="polls.js"></script>
+  <script type="module" src="canvas.js"></script>
   <script type="module" src="smart_replies.js"></script>
+  <script type="module" src="governance.js"></script>
+  <script type="module" src="security_admin.js"></script>
+  <script type="module" src="productivity.js"></script>
+  <script type="module" src="compliance_admin.js"></script>
 </body>
 </html>

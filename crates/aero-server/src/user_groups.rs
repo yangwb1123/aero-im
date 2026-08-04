@@ -13,16 +13,16 @@
 //! [`WorkspaceRepo`](aero_storage::WorkspaceRepo), mirroring
 //! [`crate::channel_sections`]); the management routes (delete / add+remove
 //! member) additionally require the caller to be a workspace admin/owner OR the
-//! group's creator ([`can_manage`]). Mounted via [`routes`] and `.merge`d into the
-//! main router.
+//! group's creator. Those decisions are repeated under row locks in the storage
+//! transaction that performs each mutation. Mounted via [`routes`] and `.merge`d
+//! into the main router.
 
 use std::str::FromStr;
 
 use aero_auth::AuthUser;
-use aero_common::{
-    Error as AeroError, ParticipantId, UserGroupId, WorkspaceId, WorkspaceRole,
-};
-use aero_storage::{UserGroup, UserGroupRepo};
+use aero_common::{Error as AeroError, ParticipantId, UserGroupId, WorkspaceId, WorkspaceRole};
+use aero_storage::user_group::UserGroupWriteError;
+use aero_storage::UserGroupRepo;
 use axum::{
     extract::{Path, State},
     routing::{get, put},
@@ -77,6 +77,23 @@ fn is_unique_violation(e: &sqlx::Error) -> bool {
     matches!(e, sqlx::Error::Database(db) if db.is_unique_violation())
 }
 
+fn map_member_write_error(error: UserGroupWriteError) -> AeroError {
+    match error {
+        UserGroupWriteError::NotFound => AeroError::NotFound("user group".into()),
+        UserGroupWriteError::MemberNotInWorkspace(participant) => AeroError::Invalid(format!(
+            "participant {participant} is not a member of this workspace"
+        )),
+        UserGroupWriteError::NotAuthorized => AeroError::Forbidden(
+            "managing this user group requires current admin or creator access".into(),
+        ),
+        UserGroupWriteError::Storage(error) => AeroError::from(error),
+        unexpected @ (UserGroupWriteError::WorkspaceHasNoCreator
+        | UserGroupWriteError::HandleExhausted) => {
+            AeroError::Internal(anyhow::anyhow!(unexpected.to_string()))
+        }
+    }
+}
+
 /// Maximum handle length, in characters (post-normalization).
 const MAX_HANDLE_LEN: usize = 32;
 /// Maximum display-name length, in bytes.
@@ -119,7 +136,7 @@ async fn require_member(
     caller: ParticipantId,
 ) -> Result<WorkspaceRole, AeroError> {
     s.workspaces
-        .member_role(workspace, caller)
+        .effective_member_role(workspace, caller)
         .await
         .map_err(AeroError::from)?
         .ok_or_else(|| AeroError::Forbidden("not a workspace member".into()))
@@ -129,24 +146,9 @@ async fn require_member(
 /// and owners may manage any group; otherwise only the group's creator may.
 /// Pure (DB-free) so it is unit-tested directly.
 #[must_use]
+#[cfg(test)]
 fn can_manage(role: WorkspaceRole, creator: ParticipantId, caller: ParticipantId) -> bool {
     role.can_administer() || creator == caller
-}
-
-/// Fetch a group, asserting it exists *in this workspace* (else `404`). Shared by
-/// the management routes so a group id from another tenant can never be touched.
-async fn group_in_workspace(
-    s: &AppState,
-    workspace: WorkspaceId,
-    group: UserGroupId,
-) -> Result<UserGroup, AeroError> {
-    let g = repo(s)
-        .get(group)
-        .await
-        .map_err(AeroError::from)?
-        .filter(|g| g.workspace_id == workspace)
-        .ok_or_else(|| AeroError::NotFound(format!("user group {group}")))?;
-    Ok(g)
 }
 
 #[derive(Deserialize)]
@@ -168,8 +170,6 @@ async fn create_user_group(
     Json(req): Json<CreateUserGroupReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let ws = parse_workspace(&ws_str)?;
-    require_member(&s, ws, auth.participant_id).await?;
-
     let handle = validate_handle(&req.handle)?;
     let name = req.name.trim();
     if name.is_empty() {
@@ -179,21 +179,18 @@ async fn create_user_group(
         return Err(AeroError::Invalid("name too long".into()).into());
     }
 
-    let id = match repo(&s).create(ws, &handle, name, auth.participant_id).await {
-        Ok(id) => id,
-        Err(e) if is_unique_violation(&e) => {
+    let row = match repo(&s)
+        .create_authorized(ws, &handle, name, auth.participant_id)
+        .await
+    {
+        Ok(row) => row,
+        Err(UserGroupWriteError::Storage(e)) if is_unique_violation(&e) => {
             return Err(
                 AeroError::Conflict(format!("user group '@{handle}' already exists")).into(),
             )
         }
-        Err(e) => return Err(AeroError::from(e).into()),
+        Err(e) => return Err(map_member_write_error(e).into()),
     };
-    // Re-read so the response carries the full, canonical row (created_at).
-    let row = repo(&s)
-        .get(id)
-        .await
-        .map_err(AeroError::from)?
-        .ok_or_else(|| AeroError::NotFound("user group".into()))?;
     Ok(Json(serde_json::to_value(row).map_err(AeroError::from)?))
 }
 
@@ -245,15 +242,10 @@ async fn delete_user_group(
 ) -> ApiResult<Json<serde_json::Value>> {
     let ws = parse_workspace(&ws_str)?;
     let gid = parse_group(&gid_str)?;
-    let role = require_member(&s, ws, auth.participant_id).await?;
-    let group = group_in_workspace(&s, ws, gid).await?;
-    if !can_manage(role, group.created_by, auth.participant_id) {
-        return Err(AeroError::Forbidden("managing this user group requires admin or creator".into()).into());
-    }
-    let deleted = repo(&s).delete(gid, ws).await.map_err(AeroError::from)?;
-    if !deleted {
-        return Err(AeroError::NotFound(format!("user group {gid}")).into());
-    }
+    repo(&s)
+        .delete_authorized(ws, gid, auth.participant_id)
+        .await
+        .map_err(map_member_write_error)?;
     Ok(Json(serde_json::json!({ "deleted": true })))
 }
 
@@ -268,15 +260,10 @@ async fn add_member(
     let ws = parse_workspace(&ws_str)?;
     let gid = parse_group(&gid_str)?;
     let member = parse_participant(&pid_str)?;
-    let role = require_member(&s, ws, auth.participant_id).await?;
-    let group = group_in_workspace(&s, ws, gid).await?;
-    if !can_manage(role, group.created_by, auth.participant_id) {
-        return Err(AeroError::Forbidden("managing this user group requires admin or creator".into()).into());
-    }
     repo(&s)
-        .add_member(gid, member)
+        .add_member_authorized(ws, gid, member, auth.participant_id)
         .await
-        .map_err(AeroError::from)?;
+        .map_err(map_member_write_error)?;
     Ok(Json(serde_json::json!({ "added": true })))
 }
 
@@ -292,15 +279,10 @@ async fn remove_member(
     let ws = parse_workspace(&ws_str)?;
     let gid = parse_group(&gid_str)?;
     let member = parse_participant(&pid_str)?;
-    let role = require_member(&s, ws, auth.participant_id).await?;
-    let group = group_in_workspace(&s, ws, gid).await?;
-    if !can_manage(role, group.created_by, auth.participant_id) {
-        return Err(AeroError::Forbidden("managing this user group requires admin or creator".into()).into());
-    }
     let removed = repo(&s)
-        .remove_member(gid, member)
+        .remove_member_authorized(ws, gid, member, auth.participant_id)
         .await
-        .map_err(AeroError::from)?;
+        .map_err(map_member_write_error)?;
     Ok(Json(serde_json::json!({ "removed": removed })))
 }
 
@@ -320,7 +302,10 @@ mod tests {
     #[test]
     fn validate_handle_rejects_bad_input() {
         assert!(validate_handle("   ").is_err(), "empty after trim");
-        assert!(validate_handle(&"a".repeat(MAX_HANDLE_LEN + 1)).is_err(), "too long");
+        assert!(
+            validate_handle(&"a".repeat(MAX_HANDLE_LEN + 1)).is_err(),
+            "too long"
+        );
         assert!(validate_handle("has space").is_err(), "space disallowed");
         assert!(validate_handle("emoji✨").is_err(), "non-ascii disallowed");
         assert!(validate_handle("dot.dot").is_err(), "dot disallowed");

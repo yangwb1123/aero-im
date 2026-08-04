@@ -87,6 +87,21 @@ pub fn record_participant_cache(hit: bool) {
 /// in `bin/boot/metrics_tasks.rs` via [`sample_index_sizes`].
 pub const INDEX_SIZE_BYTES: &str = "aero_index_size_bytes";
 
+/// Gauge: estimated dead-tuple ratio for each public application table.
+/// Label cardinality is bounded by the deployed schema (`table`).
+pub const PG_TABLE_DEAD_TUPLE_RATIO: &str = "aero_pg_table_dead_tuple_ratio";
+/// Gauge: cumulative sequential scans reported by PostgreSQL for each public
+/// application table. It is sampled as a gauge because PostgreSQL may reset its
+/// statistics after restart.
+pub const PG_TABLE_SEQ_SCANS_TOTAL: &str = "aero_pg_table_seq_scans_total";
+/// Gauge: cumulative index scans reported by PostgreSQL for each public index.
+/// Label cardinality is bounded by the deployed schema (`index`).
+pub const PG_INDEX_SCANS_TOTAL: &str = "aero_pg_index_scans_total";
+/// Gauge: sessions currently idle while holding an open transaction.
+pub const PG_IDLE_IN_TRANSACTION_COUNT: &str = "aero_pg_idle_in_transaction_count";
+/// Gauge: age in seconds of the oldest idle-in-transaction session.
+pub const PG_IDLE_IN_TRANSACTION_MAX_SECONDS: &str = "aero_pg_idle_in_transaction_max_seconds";
+
 /// The default set of indexes the size gauge samples — the hot, bloat-prone
 /// `messages` indexes touched by migration 0136 (partial GIN/HNSW slimming) plus
 /// the room/created lookup index. Kept small and fixed so the `index` label
@@ -107,7 +122,10 @@ const DEFAULT_TRACKED_INDEXES: &[&str] = &[
 /// never explode the series count, and each entry is trimmed/non-empty.
 #[must_use]
 pub fn tracked_indexes() -> Vec<String> {
-    let mut out: Vec<String> = DEFAULT_TRACKED_INDEXES.iter().map(|s| (*s).to_owned()).collect();
+    let mut out: Vec<String> = DEFAULT_TRACKED_INDEXES
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
     if let Ok(extra) = std::env::var("AERO_METRICS_EXTRA_INDEXES") {
         for name in extra.split(',').map(str::trim).filter(|s| !s.is_empty()) {
             if out.len() >= 12 {
@@ -138,12 +156,11 @@ pub async fn sample_index_sizes(pool: &sqlx::PgPool) -> usize {
         //   Ok(Some(Some(bytes)))  → index exists, report it
         //   Ok(Some(None)) / Ok(None) → index absent, skip
         //   Err(_)                 → query failed, warn and skip (fail-open)
-        let row: Result<Option<i64>, _> = sqlx::query_scalar::<_, Option<i64>>(
-            "SELECT pg_relation_size(to_regclass($1))",
-        )
-        .bind(&index)
-        .fetch_one(pool)
-        .await;
+        let row: Result<Option<i64>, _> =
+            sqlx::query_scalar::<_, Option<i64>>("SELECT pg_relation_size(to_regclass($1))")
+                .bind(&index)
+                .fetch_one(pool)
+                .await;
         match row {
             Ok(Some(bytes)) => {
                 #[allow(clippy::cast_precision_loss)]
@@ -165,6 +182,107 @@ pub async fn sample_index_sizes(pool: &sqlx::PgPool) -> usize {
     reported
 }
 
+/// Counts successfully sampled PostgreSQL health series. Query failures leave
+/// the previous gauge values untouched so a transient monitoring failure never
+/// fabricates a healthy zero.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PgHealthSample {
+    pub tables: usize,
+    pub indexes: usize,
+    pub idle_activity: bool,
+}
+
+/// Sample PostgreSQL maintenance and query-efficiency signals from the
+/// statistics views. Every query is read-only and restricted to the `public`
+/// schema; metric labels therefore come only from deployed relation names, not
+/// request data.
+///
+/// The three query groups fail independently. A failure logs a warning and
+/// preserves the last exported values for that group.
+pub async fn sample_pg_health(pool: &sqlx::PgPool) -> PgHealthSample {
+    let mut sample = PgHealthSample::default();
+    let tables = sqlx::query_as::<_, (String, i64, i64, i64)>(
+        r"SELECT relname,
+                  n_live_tup::bigint,
+                  n_dead_tup::bigint,
+                  seq_scan::bigint
+             FROM pg_stat_user_tables
+            WHERE schemaname = 'public'",
+    )
+    .fetch_all(pool)
+    .await;
+    match tables {
+        Ok(rows) => {
+            for (table, live, dead, sequential_scans) in rows {
+                let total = live.saturating_add(dead);
+                #[allow(clippy::cast_precision_loss)]
+                let ratio = if total <= 0 {
+                    0.0
+                } else {
+                    dead.max(0) as f64 / total as f64
+                };
+                metrics::set_gauge_labeled(
+                    PG_TABLE_DEAD_TUPLE_RATIO,
+                    ratio,
+                    &[("table", table.as_str())],
+                );
+                #[allow(clippy::cast_precision_loss)]
+                metrics::set_gauge_labeled(
+                    PG_TABLE_SEQ_SCANS_TOTAL,
+                    sequential_scans.max(0) as f64,
+                    &[("table", table.as_str())],
+                );
+                sample.tables += 1;
+            }
+        }
+        Err(error) => tracing::warn!(%error, "PostgreSQL table-stat sample failed"),
+    }
+
+    let indexes = sqlx::query_as::<_, (String, i64)>(
+        r"SELECT indexrelname, idx_scan::bigint
+             FROM pg_stat_all_indexes
+            WHERE schemaname = 'public'",
+    )
+    .fetch_all(pool)
+    .await;
+    match indexes {
+        Ok(rows) => {
+            for (index, scans) in rows {
+                #[allow(clippy::cast_precision_loss)]
+                metrics::set_gauge_labeled(
+                    PG_INDEX_SCANS_TOTAL,
+                    scans.max(0) as f64,
+                    &[("index", index.as_str())],
+                );
+                sample.indexes += 1;
+            }
+        }
+        Err(error) => tracing::warn!(%error, "PostgreSQL index-stat sample failed"),
+    }
+
+    let idle = sqlx::query_as::<_, (i64, f64)>(
+        r"SELECT COUNT(*)::bigint,
+                  COALESCE(
+                    EXTRACT(EPOCH FROM (clock_timestamp() - MIN(state_change))),
+                    0
+                  )::double precision
+             FROM pg_stat_activity
+            WHERE state = 'idle in transaction'",
+    )
+    .fetch_one(pool)
+    .await;
+    match idle {
+        Ok((count, oldest_seconds)) => {
+            #[allow(clippy::cast_precision_loss)]
+            metrics::set_gauge(PG_IDLE_IN_TRANSACTION_COUNT, count.max(0) as f64);
+            metrics::set_gauge(PG_IDLE_IN_TRANSACTION_MAX_SECONDS, oldest_seconds.max(0.0));
+            sample.idle_activity = true;
+        }
+        Err(error) => tracing::warn!(%error, "PostgreSQL idle-transaction sample failed"),
+    }
+    sample
+}
+
 /// `/metrics` exposure policy, read from the environment.
 #[derive(Debug, Clone)]
 pub struct MetricsConfig {
@@ -177,7 +295,10 @@ pub struct MetricsConfig {
 
 impl Default for MetricsConfig {
     fn default() -> Self {
-        Self { enabled: true, bearer_token: None }
+        Self {
+            enabled: true,
+            bearer_token: None,
+        }
     }
 }
 
@@ -197,7 +318,10 @@ impl MetricsConfig {
             .ok()
             .map(|t| t.trim().to_owned())
             .filter(|t| !t.is_empty());
-        Self { enabled, bearer_token }
+        Self {
+            enabled,
+            bearer_token,
+        }
     }
 }
 
@@ -225,10 +349,16 @@ pub async fn metrics_handler(
 
 /// Constant-time-ish bearer comparison for the metrics token.
 fn bearer_matches(headers: &HeaderMap, expected: &str) -> bool {
-    let Some(raw) = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()) else {
+    let Some(raw) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+    else {
         return false;
     };
-    let Some(token) = raw.strip_prefix("Bearer ").or_else(|| raw.strip_prefix("bearer ")) else {
+    let Some(token) = raw
+        .strip_prefix("Bearer ")
+        .or_else(|| raw.strip_prefix("bearer "))
+    else {
         return false;
     };
     let token = token.trim();
@@ -328,7 +458,10 @@ pub async fn http_metrics_layer(request: Request, next: Next) -> Response {
     // the response with the resolved tenant. Bounded by active-workspace count;
     // absent ⇒ the original, un-`workspace`-labeled series (no unbounded label).
     let workspace = if per_tenant_http_metrics_enabled() {
-        response.extensions().get::<WorkspaceLabel>().map(|w| w.0.to_string())
+        response
+            .extensions()
+            .get::<WorkspaceLabel>()
+            .map(|w| w.0.to_string())
     } else {
         None
     };
@@ -337,7 +470,11 @@ pub async fn http_metrics_layer(request: Request, next: Next) -> Response {
         metrics::inc_counter_labeled(
             names::HTTP_REQUESTS_TOTAL,
             1,
-            &[("method", method.as_str()), ("status", &status_str), ("workspace", ws)],
+            &[
+                ("method", method.as_str()),
+                ("status", &status_str),
+                ("workspace", ws),
+            ],
         );
         metrics::observe_histogram_labeled(
             names::HTTP_REQUEST_DURATION_SECONDS,
@@ -413,10 +550,17 @@ mod tests {
             "messages_embedding_hnsw",
             "messages_room_created_idx",
         ] {
-            assert!(idx.iter().any(|i| i == expected), "missing default index {expected}");
+            assert!(
+                idx.iter().any(|i| i == expected),
+                "missing default index {expected}"
+            );
         }
         // Default list is exactly the four hot message indexes (no env extras here).
-        assert_eq!(idx.len(), 4, "unexpected default tracked-index set: {idx:?}");
+        assert_eq!(
+            idx.len(),
+            4,
+            "unexpected default tracked-index set: {idx:?}"
+        );
     }
 
     #[test]
@@ -424,17 +568,49 @@ mod tests {
         assert_eq!(INDEX_SIZE_BYTES, "aero_index_size_bytes");
         // The gauge is auto-created on first `set`; assert it renders with the
         // bounded `index` label and shows up in the global exposition.
-        metrics::set_gauge_labeled(INDEX_SIZE_BYTES, 4096.0, &[("index", "messages_search_tsv_gin")]);
+        metrics::set_gauge_labeled(
+            INDEX_SIZE_BYTES,
+            4096.0,
+            &[("index", "messages_search_tsv_gin")],
+        );
         let body = metrics::render_prometheus();
-        assert!(body.contains(INDEX_SIZE_BYTES), "index gauge missing:\n{body}");
-        assert!(body.contains("index=\"messages_search_tsv_gin\""), "index label missing");
+        assert!(
+            body.contains(INDEX_SIZE_BYTES),
+            "index gauge missing:\n{body}"
+        );
+        assert!(
+            body.contains("index=\"messages_search_tsv_gin\""),
+            "index label missing"
+        );
+    }
+
+    #[test]
+    fn pg_health_gauges_use_bounded_schema_labels() {
+        metrics::set_gauge_labeled(PG_TABLE_DEAD_TUPLE_RATIO, 0.25, &[("table", "messages")]);
+        metrics::set_gauge_labeled(PG_TABLE_SEQ_SCANS_TOTAL, 12.0, &[("table", "messages")]);
+        metrics::set_gauge_labeled(
+            PG_INDEX_SCANS_TOTAL,
+            42.0,
+            &[("index", "messages_room_created_idx")],
+        );
+        metrics::set_gauge(PG_IDLE_IN_TRANSACTION_COUNT, 2.0);
+        metrics::set_gauge(PG_IDLE_IN_TRANSACTION_MAX_SECONDS, 90.0);
+        let body = metrics::render_prometheus();
+        assert!(body.contains("aero_pg_table_dead_tuple_ratio{table=\"messages\"} 0.25"));
+        assert!(body.contains("aero_pg_table_seq_scans_total{table=\"messages\"} 12"));
+        assert!(body.contains("aero_pg_index_scans_total{index=\"messages_room_created_idx\"} 42"));
+        assert!(body.contains("aero_pg_idle_in_transaction_count 2"));
+        assert!(body.contains("aero_pg_idle_in_transaction_max_seconds 90"));
     }
 
     #[test]
     fn rate_limit_rejection_counter_uses_server_local_name() {
         // The emit helper bumps the dedicated, namespaced counter. Assert on the
         // name constant rather than absolute values (global registry, parallel).
-        assert_eq!(RATE_LIMIT_REJECTIONS_TOTAL, "aero_rate_limit_rejections_total");
+        assert_eq!(
+            RATE_LIMIT_REJECTIONS_TOTAL,
+            "aero_rate_limit_rejections_total"
+        );
         record_rate_limit_rejection();
         assert!(metrics::render_prometheus().contains(RATE_LIMIT_REJECTIONS_TOTAL));
     }
@@ -477,24 +653,43 @@ mod tests {
             .to_owned();
         assert_eq!(ct, PROMETHEUS_CONTENT_TYPE);
 
-        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
         let body = String::from_utf8(bytes.to_vec()).unwrap();
         // Exposition advertises the key ROADMAP 方向四 signals.
-        assert!(body.contains(names::WS_CONNECTIONS), "ws gauge missing:\n{body}");
-        assert!(body.contains(names::MESSAGES_SENT_TOTAL), "msg counter missing");
-        assert!(body.contains(names::HTTP_REQUESTS_TOTAL), "http counter missing");
+        assert!(
+            body.contains(names::WS_CONNECTIONS),
+            "ws gauge missing:\n{body}"
+        );
+        assert!(
+            body.contains(names::MESSAGES_SENT_TOTAL),
+            "msg counter missing"
+        );
+        assert!(
+            body.contains(names::HTTP_REQUESTS_TOTAL),
+            "http counter missing"
+        );
         assert!(body.contains("# TYPE aero_ws_connections gauge"));
     }
 
     #[tokio::test]
     async fn metrics_route_requires_token_when_configured() {
-        let cfg = MetricsConfig { enabled: true, bearer_token: Some("scrape-me".into()) };
+        let cfg = MetricsConfig {
+            enabled: true,
+            bearer_token: Some("scrape-me".into()),
+        };
         let app = metrics_router(cfg);
 
         // No Authorization header → 401.
         let unauth = app
             .clone()
-            .oneshot(HttpRequest::builder().uri("/metrics").body(Body::empty()).unwrap())
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
@@ -519,7 +714,10 @@ mod tests {
         // (a bounded label value, not free-text).
         let ws = WorkspaceId(ulid::Ulid(0));
         let resp = attach_workspace_label("ok".into_response(), ws);
-        let got = resp.extensions().get::<WorkspaceLabel>().expect("marker present");
+        let got = resp
+            .extensions()
+            .get::<WorkspaceLabel>()
+            .expect("marker present");
         assert_eq!(got.0, ws);
         assert_eq!(got.0.to_string(), ws.to_string());
     }
@@ -555,12 +753,20 @@ mod tests {
             .route("/probe-ws", get(stamped))
             .layer(axum::middleware::from_fn(http_metrics_layer));
         let resp = app
-            .oneshot(HttpRequest::builder().uri("/probe-ws").body(Body::empty()).unwrap())
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/probe-ws")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         // The marker survives the layer (it only reads it; never strips it).
-        assert_eq!(resp.extensions().get::<WorkspaceLabel>().map(|w| w.0), Some(ws));
+        assert_eq!(
+            resp.extensions().get::<WorkspaceLabel>().map(|w| w.0),
+            Some(ws)
+        );
         assert!(metrics::render_prometheus().contains(names::HTTP_REQUESTS_TOTAL));
     }
 
@@ -577,7 +783,12 @@ mod tests {
             .layer(axum::middleware::from_fn(http_metrics_layer));
 
         let resp = app
-            .oneshot(HttpRequest::builder().uri("/probe").body(Body::empty()).unwrap())
+            .oneshot(
+                HttpRequest::builder()
+                    .uri("/probe")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);

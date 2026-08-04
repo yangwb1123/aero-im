@@ -1,12 +1,12 @@
 //! Cross-node call orchestrator + bridge supervisor.
-use std::sync::Arc;
-use tracing::info;
+use aero_im_call::CallOrchestrator;
 use aero_live_webrtc::{MediaForwarder, SfuRouter};
 use aero_server::call_bridge_supervisor::{
     BridgeSubscriberRegistry, CallBridgeSupervisor, NodeRtpPullerFactory, UpstreamFactory,
 };
-use aero_im_call::CallOrchestrator;
 use aero_storage::{CallRepo, CallRouteRegistry};
+use std::sync::Arc;
+use tracing::info;
 
 pub(crate) struct Orchestration {
     pub(crate) call_orchestrator: Arc<CallOrchestrator>,
@@ -38,8 +38,10 @@ pub(crate) fn build(
     let bridge_secret = std::env::var("AERO_INTERNAL_BRIDGE_SECRET")
         .ok()
         .filter(|s| !s.trim().is_empty());
-    let bridge_factory: Arc<dyn UpstreamFactory> =
-        Arc::new(NodeRtpPullerFactory::new(bridge_advertise_host, bridge_secret));
+    let bridge_factory: Arc<dyn UpstreamFactory> = Arc::new(NodeRtpPullerFactory::new(
+        bridge_advertise_host,
+        bridge_secret,
+    ));
 
     let bridge_subscribers = BridgeSubscriberRegistry::default();
     let call_supervisor = Arc::new(CallBridgeSupervisor::new(

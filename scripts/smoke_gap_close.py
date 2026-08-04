@@ -10,11 +10,13 @@ The blob-GC test exercises the SHARED-blob reference guard:
 A direct psql check on blob_gc_queue confirms the queue state at each step.
 """
 import json
+import http.client
 import os
 import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 BASE = os.environ.get("AERO_BASE", "http://127.0.0.1:8099")
@@ -43,16 +45,49 @@ def req(method, path, token=None, body=None):
             return e.code, {"_raw": txt}
 
 
-def upload(token, filename, ctype, data):
+def upload(token, room, filename, ctype, data):
     boundary = "----gapclose" + str(int(time.time() * 1000))
     pre = (f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; "
            f"filename=\"{filename}\"\r\nContent-Type: {ctype}\r\n\r\n").encode()
     body = pre + data + f"\r\n--{boundary}--\r\n".encode()
-    r = urllib.request.Request(BASE + "/api/blobs", data=body, method="POST",
+    r = urllib.request.Request(BASE + f"/api/rooms/{room}/blobs", data=body, method="POST",
                                headers={"Authorization": "Bearer " + token,
                                         "Content-Type": f"multipart/form-data; boundary={boundary}"})
     with urllib.request.urlopen(r, timeout=10) as resp:
         return resp.status, json.loads(resp.read().decode())
+
+
+def login_status_from(source_ip, body):
+    """Issue one login from a dedicated loopback source address.
+
+    The server keys unauthenticated login throttles by the transport peer, so
+    this gives the limiter assertion a fresh, spoof-resistant bucket even when
+    other smoke scripts have already exercised login on 127.0.0.1.
+    """
+    parsed = urllib.parse.urlsplit(BASE)
+    connection_type = (
+        http.client.HTTPSConnection
+        if parsed.scheme == "https"
+        else http.client.HTTPConnection
+    )
+    connection = connection_type(
+        parsed.hostname,
+        parsed.port,
+        timeout=10,
+        source_address=(source_ip, 0),
+    )
+    path = f"{parsed.path.rstrip('/')}/api/auth/login"
+    connection.request(
+        "POST",
+        path,
+        body=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    response = connection.getresponse()
+    response.read()
+    status = response.status
+    connection.close()
+    return status
 
 
 def check(name, cond, detail=""):
@@ -91,7 +126,7 @@ rid = room["id"]
 print("-- blob-GC reference guard --")
 q0 = gc_queue_has(None)
 # Upload one blob.
-st, blob = upload(tok, "shared.bin", "application/octet-stream", b"shared-bytes-" + sfx.encode())
+st, blob = upload(tok, rid, "shared.bin", "application/octet-stream", b"shared-bytes-" + sfx.encode())
 check("blob upload 200", st == 200, f"{st} {blob}")
 blob_id = blob["id"]
 
@@ -159,9 +194,13 @@ print("-- per-route rate limit (login 5/min) --")
 # Hammer login with WRONG password: each is 401 until the 5/min bucket drains,
 # then 429. (burst 5 ⇒ first 5 reach the handler → 401, 6th → 429.)
 codes = []
+stamp = int(time.time_ns())
+source_ip = f"127.{(stamp >> 16) % 250 + 1}.{(stamp >> 8) % 250 + 1}.{stamp % 250 + 1}"
 for i in range(8):
-    st, _ = req("POST", "/api/auth/login", body={"email": f"gap_{sfx}@x.io", "password": "wrong"})
-    codes.append(st)
+    codes.append(login_status_from(
+        source_ip,
+        {"email": f"gap_{sfx}@x.io", "password": "wrong"},
+    ))
 got_429 = 429 in codes
 check("login rate limit emits 429 after burst", got_429, f"codes={codes}")
 # The first few must NOT be 429 (burst allows them through to 401).

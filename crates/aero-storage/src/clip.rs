@@ -197,10 +197,7 @@ impl ClipRepo {
     ///
     /// # Errors
     /// Propagates any [`sqlx::Error`] from the update.
-    pub async fn generate_share_slug(
-        &self,
-        id: ClipId,
-    ) -> Result<Option<String>, sqlx::Error> {
+    pub async fn generate_share_slug(&self, id: ClipId) -> Result<Option<String>, sqlx::Error> {
         // Derive a deterministic slug from the clip's uuid bytes using base32
         // (RFC 4648 no-pad, lower-case). The first 12 chars cover 60 bits —
         // enough uniqueness for a human-readable shareable URL.
@@ -229,12 +226,10 @@ impl ClipRepo {
     /// # Errors
     /// Propagates any [`sqlx::Error`] from the update.
     pub async fn increment_view_count(&self, id: ClipId) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            r"UPDATE stream_clips SET view_count = view_count + 1 WHERE id = $1",
-        )
-        .bind(id.to_uuid())
-        .execute(&self.pool)
-        .await?;
+        sqlx::query(r"UPDATE stream_clips SET view_count = view_count + 1 WHERE id = $1")
+            .bind(id.to_uuid())
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -243,9 +238,7 @@ impl ClipRepo {
     /// # Errors
     /// Propagates any [`sqlx::Error`] from the query.
     pub async fn get_by_slug(&self, slug: &str) -> Result<Option<Clip>, sqlx::Error> {
-        let sql = format!(
-            "SELECT {COLUMNS} FROM stream_clips WHERE share_slug = $1"
-        );
+        let sql = format!("SELECT {COLUMNS} FROM stream_clips WHERE share_slug = $1");
         let row = sqlx::query_as::<_, Row>(&sql)
             .bind(slug)
             .fetch_optional(&self.pool)
@@ -276,13 +269,11 @@ impl ClipRepo {
     /// # Errors
     /// Propagates any [`sqlx::Error`] from the insert.
     pub async fn add_tag(&self, clip_id: uuid::Uuid, tag: &str) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            "INSERT INTO clip_tags (clip_id, tag) VALUES ($1, $2) ON CONFLICT DO NOTHING",
-        )
-        .bind(clip_id)
-        .bind(tag.trim().to_lowercase())
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("INSERT INTO clip_tags (clip_id, tag) VALUES ($1, $2) ON CONFLICT DO NOTHING")
+            .bind(clip_id)
+            .bind(tag.trim().to_lowercase())
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 

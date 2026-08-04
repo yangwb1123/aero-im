@@ -37,7 +37,10 @@ const DEFAULT_WORKSPACE: WorkspaceId = WorkspaceId(ulid::Ulid(0));
 /// All stream-discovery routes, ready to `.merge` into the gateway router.
 pub fn routes() -> Router<AppState> {
     Router::new()
-        .route("/api/live/categories", get(list_categories).post(admin_create_category))
+        .route(
+            "/api/live/categories",
+            get(list_categories).post(admin_create_category),
+        )
         .route("/api/live/categories/:slug/streams", get(category_streams))
         .route(
             "/api/streams/:id/category",
@@ -68,7 +71,11 @@ fn stream_uuid(id: Ulid) -> uuid::Uuid {
 /// Resolve a stream from the path and assert the caller owns it. Returns the
 /// stream's uuid id (the association-table key) on success; `NotFound` /
 /// `Forbidden` otherwise. Mirrors `crate::stream_mod::require_owner`.
-async fn require_owner(s: &AppState, id_str: &str, caller: ParticipantId) -> AeroResult<uuid::Uuid> {
+async fn require_owner(
+    s: &AppState,
+    id_str: &str,
+    caller: ParticipantId,
+) -> AeroResult<uuid::Uuid> {
     let stream_id = parse_stream_id(id_str)?;
     let stream = s
         .streams
@@ -111,7 +118,7 @@ async fn admin_create_category(
     // Platform-admin gate.
     let role = s
         .workspaces
-        .member_role(DEFAULT_WORKSPACE, auth.participant_id)
+        .effective_member_role(DEFAULT_WORKSPACE, auth.participant_id)
         .await
         .map_err(AeroError::from)?
         .ok_or_else(|| AeroError::Forbidden("platform admin required".into()))?;
@@ -123,7 +130,10 @@ async fn admin_create_category(
         .create_category(req.name.trim(), req.slug.trim(), sort)
         .await
         .map_err(AeroError::from)?;
-    Ok((StatusCode::CREATED, Json(serde_json::json!({ "category": cat }))))
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({ "category": cat })),
+    ))
 }
 
 /// `GET /api/live/categories/:slug/streams` — the live streams filed under the
@@ -181,8 +191,13 @@ async fn assign_category(
         .await
         .map_err(AeroError::from)?
         .ok_or_else(|| AeroError::NotFound(format!("category {}", req.slug)))?;
-    repo(&s).assign(stream, cat.id).await.map_err(AeroError::from)?;
-    Ok(Json(serde_json::json!({ "assigned": true, "category": cat })))
+    repo(&s)
+        .assign(stream, cat.id)
+        .await
+        .map_err(AeroError::from)?;
+    Ok(Json(
+        serde_json::json!({ "assigned": true, "category": cat }),
+    ))
 }
 
 /// `DELETE /api/streams/:id/category` — owner clears the stream's category
@@ -193,7 +208,10 @@ async fn clear_category(
     Path(id_str): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let stream = require_owner(&s, &id_str, auth.participant_id).await?;
-    repo(&s).clear_assignment(stream).await.map_err(AeroError::from)?;
+    repo(&s)
+        .clear_assignment(stream)
+        .await
+        .map_err(AeroError::from)?;
     Ok(Json(serde_json::json!({ "assigned": false })))
 }
 
@@ -224,7 +242,10 @@ async fn add_tag(
 ) -> ApiResult<Json<serde_json::Value>> {
     let stream = require_owner(&s, &id_str, auth.participant_id).await?;
     let tag = normalize_tag(&req.tag)?;
-    repo(&s).add_tag(stream, &tag).await.map_err(AeroError::from)?;
+    repo(&s)
+        .add_tag(stream, &tag)
+        .await
+        .map_err(AeroError::from)?;
     let tags = repo(&s).tags_for(stream).await.map_err(AeroError::from)?;
     Ok(Json(serde_json::json!({ "tags": tags })))
 }
@@ -250,7 +271,10 @@ async fn remove_tag(
 ) -> ApiResult<Json<serde_json::Value>> {
     let stream = require_owner(&s, &id_str, auth.participant_id).await?;
     let tag = normalize_tag(&tag)?;
-    let removed = repo(&s).remove_tag(stream, &tag).await.map_err(AeroError::from)?;
+    let removed = repo(&s)
+        .remove_tag(stream, &tag)
+        .await
+        .map_err(AeroError::from)?;
     if !removed {
         return Err(AeroError::NotFound(format!("tag {tag}")).into());
     }

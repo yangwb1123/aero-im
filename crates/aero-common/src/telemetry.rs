@@ -41,10 +41,15 @@ pub fn init(cfg: &TelemetryConfig, service_name: &'static str) -> TelemetryGuard
             .with_target(true)
             .boxed()
     } else {
-        tracing_subscriber::fmt::layer().with_target(true).with_level(true).boxed()
+        tracing_subscriber::fmt::layer()
+            .with_target(true)
+            .with_level(true)
+            .boxed()
     };
 
-    let registry = tracing_subscriber::registry().with(env_filter).with(fmt_layer);
+    let registry = tracing_subscriber::registry()
+        .with(env_filter)
+        .with(fmt_layer);
 
     // Best-effort OTLP provider: None when unconfigured or on build failure.
     let provider = cfg.otlp_endpoint.as_deref().and_then(|endpoint| {
@@ -179,11 +184,23 @@ mod json_log_tests {
         });
 
         let out = String::from_utf8(buf.0.lock().unwrap().clone()).expect("utf8 log");
-        assert!(out.contains("request_id"), "span field key present in JSON: {out}");
-        assert!(out.contains("req-abc-123"), "span field value present in JSON: {out}");
-        assert!(out.contains("handled the request"), "the event message is present: {out}");
+        assert!(
+            out.contains("request_id"),
+            "span field key present in JSON: {out}"
+        );
+        assert!(
+            out.contains("req-abc-123"),
+            "span field value present in JSON: {out}"
+        );
+        assert!(
+            out.contains("handled the request"),
+            "the event message is present: {out}"
+        );
         // It really is JSON (the event renders as an object with a "fields"/message).
-        assert!(out.trim_start().starts_with('{'), "line is a JSON object: {out}");
+        assert!(
+            out.trim_start().starts_with('{'),
+            "line is a JSON object: {out}"
+        );
     }
 }
 
@@ -204,14 +221,23 @@ mod trace_propagation_tests {
         install_trace_propagator();
         let trace_id = TraceId::from_bytes([7u8; 16]);
         let span_id = SpanId::from_bytes([3u8; 8]);
-        let sc = SpanContext::new(trace_id, span_id, TraceFlags::SAMPLED, true, TraceState::default());
+        let sc = SpanContext::new(
+            trace_id,
+            span_id,
+            TraceFlags::SAMPLED,
+            true,
+            TraceState::default(),
+        );
         let cx = opentelemetry::Context::new().with_remote_span_context(sc);
 
         let mut carrier: HashMap<String, String> = HashMap::new();
         opentelemetry::global::get_text_map_propagator(|p| {
             p.inject_context(&cx, &mut carrier);
         });
-        assert!(carrier.contains_key("traceparent"), "traceparent injected: {carrier:?}");
+        assert!(
+            carrier.contains_key("traceparent"),
+            "traceparent injected: {carrier:?}"
+        );
 
         let extracted = extract_trace_context(&carrier);
         assert_eq!(
@@ -293,10 +319,10 @@ impl opentelemetry_sdk::trace::ShouldSample for ForcePrioritySampler {
                 decision: opentelemetry::trace::SamplingDecision::RecordAndSample,
                 attributes: Vec::new(),
                 // Preserve any inbound trace state, matching the SDK samplers.
-                trace_state: parent_context.map_or_else(
-                    opentelemetry::trace::TraceState::default,
-                    |ctx| ctx.span().span_context().trace_state().clone(),
-                ),
+                trace_state: parent_context
+                    .map_or_else(opentelemetry::trace::TraceState::default, |ctx| {
+                        ctx.span().span_context().trace_state().clone()
+                    }),
             };
         }
         self.inner
@@ -320,11 +346,10 @@ fn build_otlp_provider(
     use opentelemetry::KeyValue;
     use opentelemetry_otlp::WithExportConfig;
 
-    let sampler = ForcePrioritySampler::new(opentelemetry_sdk::trace::Sampler::ParentBased(
-        Box::new(opentelemetry_sdk::trace::Sampler::TraceIdRatioBased(
-            sample_rate,
-        )),
-    ));
+    let sampler =
+        ForcePrioritySampler::new(opentelemetry_sdk::trace::Sampler::ParentBased(Box::new(
+            opentelemetry_sdk::trace::Sampler::TraceIdRatioBased(sample_rate),
+        )));
 
     // opentelemetry-otlp 0.26 pipeline API: install_batch returns the
     // TracerProvider (which we keep in the guard to flush on shutdown).
@@ -368,10 +393,7 @@ mod tests {
     use opentelemetry_sdk::trace::ShouldSample as _;
 
     /// Run the sampler against a root span (no parent) with the given start attrs.
-    fn decide(
-        sampler: &ForcePrioritySampler,
-        attributes: &[KeyValue],
-    ) -> SamplingDecision {
+    fn decide(sampler: &ForcePrioritySampler, attributes: &[KeyValue]) -> SamplingDecision {
         sampler
             .should_sample(
                 None,

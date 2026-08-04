@@ -43,7 +43,7 @@
 // domain; suppressing doc_markdown keeps them readable without backticks.
 #![allow(clippy::doc_markdown)]
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -67,6 +67,9 @@ const SEQ_MAX: u32 = 0x7FFF_FFFF;
 /// remote-triggerable CPU denial of service, since NAK ranges arrive from the
 /// network via [`crate::control::decode_nak_loss_list`].
 const MAX_NAK_RANGE_SPAN: i64 = 1 << 16;
+/// Bound out-of-order receive bookkeeping against peers that ignore flow
+/// control and spray arbitrary sequence numbers.
+const MAX_RECEIVED_AHEAD: usize = 1 << 16;
 
 /// Increment a 31-bit sequence number, wrapping at `SEQ_MAX`.
 #[must_use]
@@ -132,21 +135,13 @@ pub enum Action {
     /// `ack_seq_no` is the full-acknowledgement number (= highest contiguous
     /// received seq + 1, i.e. the next expected).  `ack_id` is a monotonic
     /// counter used to correlate the ACKACK.
-    SendAck {
-        ack_seq_no: u32,
-        ack_id: u32,
-    },
+    SendAck { ack_seq_no: u32, ack_id: u32 },
     /// Send a NAK (loss report) control packet listing the lost sequence range.
     ///
     /// `from` and `to` are inclusive endpoints of the lost range.
-    SendNak {
-        from: u32,
-        to: u32,
-    },
+    SendNak { from: u32, to: u32 },
     /// Send an ACKACK in response to an ACK we received from the sender.
-    SendAckAck {
-        ack_id: u32,
-    },
+    SendAckAck { ack_id: u32 },
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -216,6 +211,8 @@ struct PendingAck {
 /// How frequently the receiver emits a full ACK (default: 10 ms, matching the
 /// SRT reference implementation's `ACK_INTERVAL`).
 const DEFAULT_ACK_INTERVAL: Duration = Duration::from_millis(10);
+/// Bound RTT probes when a malformed peer never returns ACKACK.
+const MAX_PENDING_ACKS: usize = 1024;
 
 /// Combined sender-side and receiver-side SRT reliability state for one
 /// direction of a connection.
@@ -237,6 +234,10 @@ pub struct ReliabilityState {
     rcv_seq: Option<u32>,
     /// Last sequence number that has been fully acknowledged (contiguous).
     ack_seq: Option<u32>,
+    /// Packets received ahead of `ack_seq` while a preceding gap remains.
+    /// Once the missing packet arrives, this set lets the contiguous ACK
+    /// frontier advance across the whole recovered run.
+    received_ahead: BTreeSet<u32>,
     /// Monotonic ACK identifier counter.
     ack_id: u32,
     /// When the next periodic ACK should be emitted.
@@ -247,7 +248,7 @@ pub struct ReliabilityState {
     // ── RTT ──────────────────────────────────────────────────────────────────
     rtt: RttEstimator,
     /// Outstanding ACKs we sent, waiting for ACKACK to sample RTT.
-    pending_acks: Vec<PendingAck>,
+    pending_acks: VecDeque<PendingAck>,
 }
 
 impl ReliabilityState {
@@ -260,11 +261,12 @@ impl ReliabilityState {
             loss_list: VecDeque::new(),
             rcv_seq: None,
             ack_seq: None,
+            received_ahead: BTreeSet::new(),
             ack_id: 1,
             next_ack_at: None,
             ack_interval: DEFAULT_ACK_INTERVAL,
             rtt: RttEstimator::default(),
-            pending_acks: Vec::new(),
+            pending_acks: VecDeque::new(),
         }
     }
 
@@ -315,7 +317,7 @@ impl ReliabilityState {
     ///
     /// Returns an optional [`Action::SendAckAck`] that the sender should echo
     /// back to the receiver so it can sample RTT.
-    pub fn on_ack(&mut self, ack_no: u32, ack_id: u32, now: Instant) -> Option<Action> {
+    pub fn on_ack(&mut self, ack_no: u32, ack_id: u32) -> Option<Action> {
         // Free all buffered packets with seq_no < ack_no.
         let acked_keys: Vec<u32> = self
             .send_buf
@@ -328,8 +330,6 @@ impl ReliabilityState {
         }
         // Prune matching entries from the loss list.
         self.loss_list.retain(|&seq| !seq_lt(seq, ack_no));
-        // Record this ACK so we can emit ACKACK and time RTT.
-        self.pending_acks.push(PendingAck { ack_id, sent_at: now });
         Some(Action::SendAckAck { ack_id })
     }
 
@@ -380,8 +380,8 @@ impl ReliabilityState {
     /// - Detects gaps (missing sequence numbers between the last received and
     ///   this one) and returns a [`Action::SendNak`] for the gap.
     /// - Emits a periodic full [`Action::SendAck`] when `now >= next_ack_at`.
-    /// - Does **not** duplicate-detect; the caller is responsible for de-dup if
-    ///   needed.
+    /// - Tracks packets received ahead of a gap so a later retransmission can
+    ///   advance the contiguous ACK frontier across the recovered run.
     pub fn on_data(&mut self, seq_no: u32, now: Instant) -> Vec<Action> {
         let seq_no = seq_no & SEQ_MAX;
         let mut actions = Vec::new();
@@ -393,26 +393,43 @@ impl ReliabilityState {
                 self.ack_seq = Some(seq_no);
                 self.next_ack_at = Some(now + self.ack_interval);
             }
-            Some(prev) => {
-                let diff = seq_diff(prev, seq_no);
-                if diff <= 0 {
-                    // Out-of-order or duplicate: accept but don't NAK.
-                } else if diff == 1 {
-                    // Consecutive — advance rcv_seq.
-                    self.rcv_seq = Some(seq_no);
-                    // Also advance ack_seq if it is now contiguous with rcv_seq.
-                    if self.ack_seq.map_or(true, |a| seq_diff(a, seq_no) == 1) {
-                        self.ack_seq = Some(seq_no);
+            Some(highest) => {
+                // Update the highest packet observed and report only newly
+                // exposed gaps. Retransmissions behind `highest` do not emit a
+                // second immediate NAK.
+                let diff_from_highest = seq_diff(highest, seq_no);
+                if diff_from_highest > 0 {
+                    if diff_from_highest > 1 {
+                        let gap_from = seq_next(highest);
+                        let gap_to = (seq_no.wrapping_sub(1)) & SEQ_MAX;
+                        actions.push(Action::SendNak {
+                            from: gap_from,
+                            to: gap_to,
+                        });
                     }
-                } else {
-                    // Gap detected: [prev+1, seq_no-1] is missing.
-                    let gap_from = seq_next(prev);
-                    let gap_to = (seq_no.wrapping_sub(1)) & SEQ_MAX;
-                    actions.push(Action::SendNak {
-                        from: gap_from,
-                        to: gap_to,
-                    });
                     self.rcv_seq = Some(seq_no);
+                }
+
+                // Independently advance the contiguous ACK frontier. A packet
+                // ahead of the first gap is remembered; when the missing
+                // retransmission arrives, consume the entire contiguous run.
+                if let Some(mut contiguous) = self.ack_seq {
+                    let diff_from_contiguous = seq_diff(contiguous, seq_no);
+                    if diff_from_contiguous == 1 {
+                        contiguous = seq_no;
+                        loop {
+                            let next = seq_next(contiguous);
+                            if !self.received_ahead.remove(&next) {
+                                break;
+                            }
+                            contiguous = next;
+                        }
+                        self.ack_seq = Some(contiguous);
+                    } else if diff_from_contiguous > 1
+                        && self.received_ahead.len() < MAX_RECEIVED_AHEAD
+                    {
+                        self.received_ahead.insert(seq_no);
+                    }
                 }
             }
         }
@@ -446,6 +463,19 @@ impl ReliabilityState {
         })
     }
 
+    /// Record that one of our full ACK packets was actually sent.
+    ///
+    /// A peer echoes this `ack_id` in ACKACK; the elapsed time from this
+    /// method to [`Self::on_ackack`] is the RTT sample. Recording on inbound
+    /// [`Self::on_ack`] is the opposite direction and cannot correlate the
+    /// peer's ACKACK.
+    pub fn on_ack_sent(&mut self, ack_id: u32, sent_at: Instant) {
+        if self.pending_acks.len() >= MAX_PENDING_ACKS {
+            self.pending_acks.pop_front();
+        }
+        self.pending_acks.push_back(PendingAck { ack_id, sent_at });
+    }
+
     /// Process an incoming ACKACK — the sender echoes back an ACK id so we can
     /// sample RTT.
     ///
@@ -453,10 +483,11 @@ impl ReliabilityState {
     /// instant.  Updates the internal RTT estimator.
     pub fn on_ackack(&mut self, ackack_id: u32, now: Instant) {
         if let Some(pos) = self.pending_acks.iter().position(|p| p.ack_id == ackack_id) {
-            let pa = self.pending_acks.remove(pos);
-            let rtt_us = u64::try_from(now.duration_since(pa.sent_at).as_micros())
-                .unwrap_or(u64::MAX);
-            self.rtt.update(rtt_us);
+            if let Some(pa) = self.pending_acks.remove(pos) {
+                let rtt_us =
+                    u64::try_from(now.duration_since(pa.sent_at).as_micros()).unwrap_or(u64::MAX);
+                self.rtt.update(rtt_us);
+            }
         }
     }
 
@@ -557,14 +588,27 @@ mod tests {
         let mut state = ReliabilityState::new(10);
         let a1 = state.enqueue(b"pkt0".to_vec());
         let a2 = state.enqueue(b"pkt1".to_vec());
-        assert!(matches!(a1, Action::SendData { seq_no: 10, is_retransmit: false, .. }));
-        assert!(matches!(a2, Action::SendData { seq_no: 11, is_retransmit: false, .. }));
+        assert!(matches!(
+            a1,
+            Action::SendData {
+                seq_no: 10,
+                is_retransmit: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            a2,
+            Action::SendData {
+                seq_no: 11,
+                is_retransmit: false,
+                ..
+            }
+        ));
         assert_eq!(state.send_buffer_len(), 2);
     }
 
     #[test]
     fn on_ack_advances_send_window_and_frees_buffer() {
-        let now = Instant::now();
         let mut state = ReliabilityState::new(0);
         state.enqueue(b"pkt0".to_vec()); // seq 0
         state.enqueue(b"pkt1".to_vec()); // seq 1
@@ -572,16 +616,19 @@ mod tests {
         assert_eq!(state.send_buffer_len(), 3);
 
         // ACK for seq 2 (ack_no = 2 means seqs 0 and 1 are acked).
-        state.on_ack(2, 1, now);
-        assert_eq!(state.send_buffer_len(), 1, "seqs 0 and 1 freed; seq 2 still buffered");
+        state.on_ack(2, 1);
+        assert_eq!(
+            state.send_buffer_len(),
+            1,
+            "seqs 0 and 1 freed; seq 2 still buffered"
+        );
     }
 
     #[test]
     fn on_ack_returns_ackack() {
-        let now = Instant::now();
         let mut state = ReliabilityState::new(0);
         state.enqueue(b"x".to_vec());
-        let action = state.on_ack(1, 42, now);
+        let action = state.on_ack(1, 42);
         assert_eq!(action, Some(Action::SendAckAck { ack_id: 42 }));
     }
 
@@ -600,26 +647,47 @@ mod tests {
 
         let retx = state.drain_retransmits();
         assert_eq!(retx.len(), 2, "two packets retransmitted");
-        assert!(matches!(&retx[0], Action::SendData { seq_no: 0, is_retransmit: true, .. }));
-        assert!(matches!(&retx[1], Action::SendData { seq_no: 1, is_retransmit: true, .. }));
-        assert_eq!(state.loss_list_len(), 0, "loss list drained after retransmit");
+        assert!(matches!(
+            &retx[0],
+            Action::SendData {
+                seq_no: 0,
+                is_retransmit: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            &retx[1],
+            Action::SendData {
+                seq_no: 1,
+                is_retransmit: true,
+                ..
+            }
+        ));
+        assert_eq!(
+            state.loss_list_len(),
+            0,
+            "loss list drained after retransmit"
+        );
     }
 
     #[test]
     fn on_nak_skips_already_acked_packets() {
-        let now = Instant::now();
         let mut state = ReliabilityState::new(0);
         state.enqueue(b"pkt0".to_vec()); // seq 0
         state.enqueue(b"pkt1".to_vec()); // seq 1
 
         // ACK seq 0 (ack_no=1 → seq 0 freed).
-        state.on_ack(1, 1, now);
+        state.on_ack(1, 1);
         assert_eq!(state.send_buffer_len(), 1);
 
         // Now NAK both 0 and 1: seq 0 is no longer in the buffer.
         state.on_nak(0, 1);
         let retx = state.drain_retransmits();
-        assert_eq!(retx.len(), 1, "only seq 1 retransmitted; seq 0 was already acked");
+        assert_eq!(
+            retx.len(),
+            1,
+            "only seq 1 retransmitted; seq 0 was already acked"
+        );
         assert!(matches!(&retx[0], Action::SendData { seq_no: 1, .. }));
     }
 
@@ -629,7 +697,11 @@ mod tests {
         state.enqueue(b"x".to_vec()); // seq 0
         state.on_nak(0, 0);
         state.on_nak(0, 0); // duplicate NAK
-        assert_eq!(state.loss_list_len(), 1, "no duplicate entries in loss list");
+        assert_eq!(
+            state.loss_list_len(),
+            1,
+            "no duplicate entries in loss list"
+        );
     }
 
     #[test]
@@ -690,7 +762,11 @@ mod tests {
         let mut state = ReliabilityState::new(0);
         state.enqueue(vec![0u8; 4]); // seq 0
         state.on_nak(0, 0);
-        assert_eq!(state.loss_list_len(), 1, "single-packet NAK still retransmits");
+        assert_eq!(
+            state.loss_list_len(),
+            1,
+            "single-packet NAK still retransmits"
+        );
     }
 
     #[test]
@@ -717,7 +793,10 @@ mod tests {
 
         // Receive seq 0 (no gap).
         let a0 = state.on_data(0, now);
-        assert!(a0.iter().all(|a| !matches!(a, Action::SendNak { .. })), "no NAK for first packet");
+        assert!(
+            a0.iter().all(|a| !matches!(a, Action::SendNak { .. })),
+            "no NAK for first packet"
+        );
 
         // Skip seq 1 and receive seq 2 → gap [1, 1].
         let a2 = state.on_data(2, now);
@@ -735,6 +814,39 @@ mod tests {
         let actions = state.on_data(5, now);
         let nak = actions.iter().find(|a| matches!(a, Action::SendNak { .. }));
         assert_eq!(nak.unwrap(), &Action::SendNak { from: 1, to: 4 });
+    }
+
+    #[test]
+    fn retransmission_closes_gap_and_advances_ack_across_buffered_run() {
+        let started_at = Instant::now();
+        let mut state = ReliabilityState::new(0);
+        state.set_ack_interval(Duration::from_nanos(1));
+
+        state.on_data(100, started_at);
+        let gap_actions = state.on_data(102, started_at + Duration::from_millis(1));
+        assert!(gap_actions
+            .iter()
+            .any(|action| { matches!(action, Action::SendNak { from: 101, to: 101 }) }));
+        assert_eq!(state.ack_seq(), Some(100), "ACK remains before the gap");
+
+        let recovered = state.on_data(101, started_at + Duration::from_millis(2));
+        assert_eq!(
+            state.ack_seq(),
+            Some(102),
+            "retransmitted 101 closes the gap and consumes buffered 102"
+        );
+        assert!(
+            recovered.iter().any(|action| {
+                matches!(
+                    action,
+                    Action::SendAck {
+                        ack_seq_no: 103,
+                        ..
+                    }
+                )
+            }),
+            "the next full ACK must acknowledge through the recovered run"
+        );
     }
 
     #[test]
@@ -776,7 +888,10 @@ mod tests {
         state.on_data(1, now);
         let action = state.force_ack(now);
         assert!(action.is_some(), "force_ack must return an ACK");
-        assert!(matches!(action.unwrap(), Action::SendAck { ack_seq_no: 2, .. }));
+        assert!(matches!(
+            action.unwrap(),
+            Action::SendAck { ack_seq_no: 2, .. }
+        ));
     }
 
     // ──────────── RTT estimation from ACK/ACKACK timing ─────────────
@@ -791,8 +906,9 @@ mod tests {
         let Action::SendAck { ack_id, .. } = ack else {
             panic!("expected SendAck");
         };
-        // on_ack records the pending ACK for RTT sampling.
-        state.on_ack(1, ack_id, start);
+        // RTT starts when our ACK is actually emitted, not when a peer ACK is
+        // received in the opposite direction.
+        state.on_ack_sent(ack_id, start);
 
         // 50 ms later the ACKACK arrives.
         let ackack_time = start + Duration::from_millis(50);
@@ -814,7 +930,7 @@ mod tests {
         // Default is 100 ms.
         assert_eq!(est.rtt(), Duration::from_micros(100_000));
         est.update(0); // sample of 0 µs
-        // rtt_new = (100_000 * 7 + 0) / 8 = 87_500
+                       // rtt_new = (100_000 * 7 + 0) / 8 = 87_500
         assert_eq!(est.rtt(), Duration::from_micros(87_500));
     }
 
@@ -829,12 +945,14 @@ mod tests {
         let a2 = state.enqueue(b"c".to_vec());
         assert!(matches!(a0, Action::SendData { seq_no, .. } if seq_no == SEQ_MAX - 1));
         assert!(matches!(a1, Action::SendData { seq_no, .. } if seq_no == SEQ_MAX));
-        assert!(matches!(a2, Action::SendData { seq_no: 0, .. }), "wrapped to 0");
+        assert!(
+            matches!(a2, Action::SendData { seq_no: 0, .. }),
+            "wrapped to 0"
+        );
     }
 
     #[test]
     fn ack_frees_wrapped_seqs() {
-        let now = Instant::now();
         // Start at SEQ_MAX - 1 and enqueue 3 packets (wrapping to 0).
         let mut state = ReliabilityState::new(SEQ_MAX - 1);
         state.enqueue(b"a".to_vec()); // SEQ_MAX - 1
@@ -843,7 +961,7 @@ mod tests {
         assert_eq!(state.send_buffer_len(), 3);
 
         // ACK for seq 0 (exclusive), meaning SEQ_MAX-1 and SEQ_MAX are acked.
-        state.on_ack(0, 1, now);
+        state.on_ack(0, 1);
         assert_eq!(
             state.send_buffer_len(),
             1,
@@ -873,16 +991,15 @@ mod tests {
 
     #[test]
     fn ack_prunes_loss_list() {
-        let now = Instant::now();
         let mut state = ReliabilityState::new(0);
         state.enqueue(b"p0".to_vec()); // seq 0
         state.enqueue(b"p1".to_vec()); // seq 1
         state.enqueue(b"p2".to_vec()); // seq 2
-        // NAK all three.
+                                       // NAK all three.
         state.on_nak(0, 2);
         assert_eq!(state.loss_list_len(), 3);
         // ACK up to seq 2 (seq 0 and 1 freed).
-        state.on_ack(2, 1, now);
+        state.on_ack(2, 1);
         assert_eq!(
             state.loss_list_len(),
             1,

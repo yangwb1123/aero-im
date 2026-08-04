@@ -78,7 +78,11 @@ async fn list_calls(
     s.im.assert_room_access(auth.participant_id, room).await?;
 
     let limit = call_log_limit(q.limit);
-    let calls = s.calls.list_for_room(room, limit).await.map_err(AeroError::from)?;
+    let calls = s
+        .calls
+        .list_for_room(room, limit)
+        .await
+        .map_err(AeroError::from)?;
     Ok(Json(serde_json::json!({ "calls": calls })))
 }
 

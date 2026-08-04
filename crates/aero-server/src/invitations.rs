@@ -36,7 +36,7 @@ use aero_common::{
     Error as AeroError, InvitationId, Result as AeroResult, WorkspaceId, WorkspaceRole,
 };
 use aero_storage::invitation::{generate_token, hash_token};
-use aero_storage::InvitationRepo;
+use aero_storage::{InvitationAcceptError, InvitationRepo};
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -62,7 +62,10 @@ pub fn routes() -> Router<AppState> {
             "/api/workspaces/:id/invitations",
             post(create_invitation).get(list_invitations),
         )
-        .route("/api/invitations/:id", axum::routing::delete(revoke_invitation))
+        .route(
+            "/api/invitations/:id",
+            axum::routing::delete(revoke_invitation),
+        )
         .route("/api/invitations/accept", post(accept_invitation))
 }
 
@@ -85,7 +88,9 @@ pub fn authorize_manage_invites(caller: WorkspaceRole) -> AeroResult<()> {
     if caller.can_administer() {
         Ok(())
     } else {
-        Err(AeroError::Forbidden("managing invitations requires admin".into()))
+        Err(AeroError::Forbidden(
+            "managing invitations requires admin".into(),
+        ))
     }
 }
 
@@ -101,9 +106,13 @@ fn parse_invitation_id(s: &str) -> AeroResult<InvitationId> {
 
 /// Resolve the caller's role in a workspace, rejecting non-members with `403`.
 /// Mirrors the helper in [`crate::workspaces`] so the membership check is uniform.
-async fn caller_role(s: &AppState, ws: WorkspaceId, caller: aero_common::ParticipantId) -> AeroResult<WorkspaceRole> {
+async fn caller_role(
+    s: &AppState,
+    ws: WorkspaceId,
+    caller: aero_common::ParticipantId,
+) -> AeroResult<WorkspaceRole> {
     s.workspaces
-        .member_role(ws, caller)
+        .effective_member_role(ws, caller)
         .await
         .map_err(AeroError::from)?
         .ok_or_else(|| AeroError::Forbidden("not a workspace member".into()))
@@ -128,7 +137,9 @@ fn resolve_expiry(
 ) -> AeroResult<Option<time::OffsetDateTime>> {
     match expires_in_secs {
         None => Ok(None),
-        Some(n) if (1..=MAX_EXPIRES_IN_SECS).contains(&n) => Ok(Some(now + time::Duration::seconds(n))),
+        Some(n) if (1..=MAX_EXPIRES_IN_SECS).contains(&n) => {
+            Ok(Some(now + time::Duration::seconds(n)))
+        }
         Some(n) => Err(AeroError::Invalid(format!(
             "expires_in_secs must be 1..={MAX_EXPIRES_IN_SECS}, got {n}"
         ))),
@@ -144,7 +155,9 @@ fn validate_max_uses(max_uses: Option<i32>) -> AeroResult<()> {
     match max_uses {
         None => Ok(()),
         Some(n) if n >= 1 => Ok(()),
-        Some(n) => Err(AeroError::Invalid(format!("max_uses must be >= 1, got {n}"))),
+        Some(n) => Err(AeroError::Invalid(format!(
+            "max_uses must be >= 1, got {n}"
+        ))),
     }
 }
 
@@ -186,36 +199,33 @@ async fn create_invitation(
     authorize_invite(caller, role)?;
     validate_max_uses(req.max_uses)?;
     let expires_at = resolve_expiry(req.expires_in_secs, time::OffsetDateTime::now_utc())?;
-    let email = req.email.as_deref().map(str::trim).filter(|e| !e.is_empty());
+    let email = req
+        .email
+        .as_deref()
+        .map(str::trim)
+        .filter(|e| !e.is_empty());
 
     // Generate once, store only the hash; the plaintext is returned below.
     let token = generate_token();
     let token_hash = hash_token(&token);
     let id = repo(&s)
-        .create(ws, &token_hash, email, role, Some(auth.participant_id), req.max_uses, expires_at)
-        .await
-        .map_err(AeroError::from)?;
-
-    if let Err(e) = s
-        .audit
-        .append(
+        .create_authorized(
             ws,
-            Some(auth.participant_id),
-            "invitation.create",
-            Some(&id.to_string()),
-            serde_json::json!({
-                "role": role,
-                "email": email,
-                "max_uses": req.max_uses,
-                "expires_at": expires_at.map(time::OffsetDateTime::unix_timestamp),
-            }),
+            &token_hash,
+            email,
+            role,
+            auth.participant_id,
+            req.max_uses,
+            expires_at,
         )
         .await
-    {
-        tracing::warn!(error = ?e, %ws, "invitation.create audit append failed");
-    }
+        .map_err(map_invitation_write_error)?;
 
-    let invite_url = format!("{}/invite/{}", s.public_base_url.trim_end_matches('/'), token);
+    let invite_url = format!(
+        "{}/invite/{}",
+        s.public_base_url.trim_end_matches('/'),
+        token
+    );
     // Email the invitation link when SMTP is configured and a recipient
     // address was provided. Best-effort: the admin already received the
     // invite URL in the API response and can share it manually.
@@ -226,7 +236,9 @@ async fn create_invitation(
             Ok(Some(w)) => w.name,
             _ => "your team's workspace".into(),
         };
-        mailer.send_invitation(invite_email, &invite_url, &ws_name).await;
+        mailer
+            .send_invitation(invite_email, &invite_url, &ws_name)
+            .await;
     }
     Ok(Json(serde_json::json!({
         "id": id,
@@ -246,44 +258,39 @@ async fn list_invitations(
     let ws = parse_workspace_id(&id_str)?;
     let caller = caller_role(&s, ws, auth.participant_id).await?;
     authorize_manage_invites(caller)?;
-    let list = repo(&s).list_for_workspace(ws).await.map_err(AeroError::from)?;
+    let list = repo(&s)
+        .list_for_workspace_authorized(ws, auth.participant_id)
+        .await
+        .map_err(map_invitation_write_error)?;
     Ok(Json(serde_json::to_value(list).map_err(AeroError::from)?))
 }
 
 /// `DELETE /api/invitations/:id` — **admin/owner of the invite's workspace**:
-/// revoke an invitation. Resolves the invite to find its workspace, then applies
-/// the same admin gate. `404` if the invite does not exist; revoking an
-/// already-revoked invite is idempotent (still `204`).
+/// revoke an invitation. Storage resolves and locks the invite's own workspace,
+/// rechecks effective admin access, and commits revoke + audit together. `404`
+/// covers an unknown id or an id outside the caller's effective tenants;
+/// revoking an already-revoked invite is idempotent (still `204`).
 async fn revoke_invitation(
     State(s): State<AppState>,
     auth: AuthUser,
     Path(id_str): Path<String>,
 ) -> ApiResult<StatusCode> {
     let id = parse_invitation_id(&id_str)?;
-    let r = repo(&s);
-    let inv = r
-        .get(id)
+    repo(&s)
+        .revoke_authorized(id, auth.participant_id)
         .await
-        .map_err(AeroError::from)?
-        .ok_or_else(|| AeroError::NotFound("invitation".into()))?;
-    // Authorize against the invite's OWN workspace.
-    let caller = caller_role(&s, inv.workspace_id, auth.participant_id).await?;
-    authorize_manage_invites(caller)?;
-    let revoked = r.revoke(id).await.map_err(AeroError::from)?;
-    if let Err(e) = s
-        .audit
-        .append(
-            inv.workspace_id,
-            Some(auth.participant_id),
-            "invitation.revoke",
-            Some(&id.to_string()),
-            serde_json::json!({ "already_revoked": !revoked }),
-        )
-        .await
-    {
-        tracing::warn!(error = ?e, ws = %inv.workspace_id, "invitation.revoke audit append failed");
-    }
+        .map_err(map_invitation_write_error)?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+fn map_invitation_write_error(error: AeroError) -> AeroError {
+    match error {
+        AeroError::NotFound(_) => AeroError::NotFound("invitation".into()),
+        AeroError::Forbidden(_) => {
+            AeroError::Forbidden("current workspace invitation authority required".into())
+        }
+        other => other,
+    }
 }
 
 #[derive(Deserialize)]
@@ -291,17 +298,34 @@ struct AcceptInvitationReq {
     token: String,
 }
 
+fn map_accept_error(error: InvitationAcceptError) -> AeroError {
+    match error {
+        InvitationAcceptError::NotFound => AeroError::NotFound("invitation".into()),
+        InvitationAcceptError::ParticipantUnavailable => {
+            AeroError::Forbidden("participant is inactive".into())
+        }
+        InvitationAcceptError::NotRedeemable => {
+            AeroError::Invalid("invite is expired, revoked, or already used".into())
+        }
+        InvitationAcceptError::InvalidRole => AeroError::Internal(anyhow::anyhow!(
+            "invitation acceptance encountered an invalid persisted role"
+        )),
+        InvitationAcceptError::Storage(error) => AeroError::from(error),
+    }
+}
+
 /// `POST /api/invitations/accept` — **any logged-in user**: redeem an invite by
 /// its plaintext token and join the workspace with the invite's role.
 ///
-/// Resolves `sha256(token)` → an *active* invite (not revoked / expired /
-/// exhausted). An unknown/non-matching token is `404`; a token that resolves to a
-/// row that is no longer redeemable is `400` (the shared error type has no `410
-/// Gone`, so an expired/exhausted/revoked invite surfaces as `400 Invalid` —
-/// distinct from the `404` a never-existent token gets, so a probe can still tell
-/// "wrong token" from "spent token"). On success: enrol the caller as a member
-/// (idempotent), record one use (`409` if it was concurrently exhausted), emit an
-/// `"invitation.accept"` audit event, and return `{workspace_id, role}`.
+/// The repository locks the invitation and commits membership, durable redemption,
+/// and capacity use as one transaction. Unknown tokens return `404`; a known but
+/// expired/revoked/exhausted token returns `400`. Repeating a successful redemption
+/// returns `200` without consuming another use. If an administrator removed the
+/// membership afterward, retry remains a no-op and reports
+/// `membership_active=false` rather than bypassing that removal.
+///
+/// Existing workspace members keep their current role and consume no capacity;
+/// invitation acceptance is never a role-update path.
 async fn accept_invitation(
     State(s): State<AppState>,
     auth: AuthUser,
@@ -313,69 +337,30 @@ async fn accept_invitation(
     }
     let r = repo(&s);
     let token_hash = hash_token(token);
-    let now = time::OffsetDateTime::now_utc();
-
-    // `find_active_by_token_hash` returns Some only for a *redeemable* invite, so
-    // it folds "no such token" and "spent/expired/revoked token" into `None`. To
-    // keep those distinguishable (404 vs 400), re-fetch the raw row when the
-    // active lookup misses: a raw hit means the token exists but is spent.
-    let active = r
-        .find_active_by_token_hash(&token_hash, now)
+    let accepted = r
+        .accept_by_token_hash(&token_hash, auth.participant_id)
         .await
-        .map_err(AeroError::from)?;
-    let Some(invite) = active else {
-        // The active lookup folds "no such token" and "spent/expired/revoked
-        // token" into `None`; re-check the raw row to keep them distinguishable
-        // (a raw hit means the token exists but is no longer redeemable).
-        let exists = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM invitations WHERE token_hash = $1",
+        .map_err(map_accept_error)?;
+
+    // Acceptance already committed membership, durable redemption, capacity,
+    // and audit together. Match direct member-add onboarding: a newly-created
+    // ordinary membership receives current default channels; guest invitations
+    // must not expand beyond explicitly granted channel access.
+    if accepted.membership_created && accepted.role != WorkspaceRole::Guest {
+        crate::default_channels::auto_join_defaults(
+            &s,
+            accepted.invitation.workspace_id,
+            auth.participant_id,
         )
-        .bind(&token_hash)
-        .fetch_one(s.participants.pool())
-        .await
-        .map_err(AeroError::from)?
-            > 0;
-        return Err(if exists {
-            AeroError::Invalid("invite is expired, revoked, or already used".into()).into()
-        } else {
-            AeroError::NotFound("invitation".into()).into()
-        });
-    };
-
-    // Enrol the caller with the invite's role (idempotent ON CONFLICT DO NOTHING).
-    s.workspaces
-        .add_member(invite.workspace_id, auth.participant_id, invite.role)
-        .await
-        .map_err(AeroError::from)?;
-
-    // Record exactly one redemption; the UPDATE re-checks redeemability, so a
-    // racing accept that just exhausted the invite makes this a no-op → `409`.
-    let counted = r.increment_use(invite.id).await.map_err(AeroError::from)?;
-    if !counted {
-        return Err(AeroError::Conflict("invite was just exhausted".into()).into());
-    }
-
-    if let Err(e) = s
-        .audit
-        .append(
-            invite.workspace_id,
-            Some(auth.participant_id),
-            "invitation.accept",
-            Some(&invite.id.to_string()),
-            serde_json::json!({
-                "role": invite.role,
-                // Informational: the address the invite targeted (if any).
-                "invite_email": invite.email,
-            }),
-        )
-        .await
-    {
-        tracing::warn!(error = ?e, ws = %invite.workspace_id, "invitation.accept audit append failed");
+        .await;
     }
 
     Ok(Json(serde_json::json!({
-        "workspace_id": invite.workspace_id,
-        "role": invite.role,
+        "workspace_id": accepted.invitation.workspace_id,
+        "role": accepted.role,
+        "already_accepted": accepted.already_accepted,
+        "membership_created": accepted.membership_created,
+        "membership_active": accepted.membership_active,
     })))
 }
 
@@ -403,6 +388,21 @@ mod tests {
     }
 
     #[test]
+    fn invitation_write_errors_hide_cross_tenant_ids() {
+        let missing = map_invitation_write_error(AeroError::NotFound("other workspace".into()));
+        assert_eq!(missing.status_code(), 404);
+        assert_eq!(missing.to_string(), "not found: invitation");
+
+        let revoked =
+            map_invitation_write_error(AeroError::Forbidden("demoted after preflight".into()));
+        assert_eq!(revoked.status_code(), 403);
+        assert_eq!(
+            revoked.to_string(),
+            "forbidden: current workspace invitation authority required"
+        );
+    }
+
+    #[test]
     fn manage_invites_is_admin_and_owner_only() {
         for r in ALL {
             assert_eq!(
@@ -412,8 +412,14 @@ mod tests {
             );
         }
         // Denials are 403 (authorization), not 400/404.
-        assert_eq!(status_of(&authorize_manage_invites(WorkspaceRole::Member)), 403);
-        assert_eq!(status_of(&authorize_manage_invites(WorkspaceRole::Guest)), 403);
+        assert_eq!(
+            status_of(&authorize_manage_invites(WorkspaceRole::Member)),
+            403
+        );
+        assert_eq!(
+            status_of(&authorize_manage_invites(WorkspaceRole::Guest)),
+            403
+        );
     }
 
     #[test]
@@ -424,7 +430,10 @@ mod tests {
     #[test]
     fn resolve_expiry_adds_offset_within_bounds() {
         let now = t(1_000);
-        assert_eq!(resolve_expiry(Some(60), now).unwrap(), Some(now + time::Duration::seconds(60)));
+        assert_eq!(
+            resolve_expiry(Some(60), now).unwrap(),
+            Some(now + time::Duration::seconds(60))
+        );
         // The ceiling itself is accepted.
         assert_eq!(
             resolve_expiry(Some(MAX_EXPIRES_IN_SECS), now).unwrap(),
@@ -437,7 +446,10 @@ mod tests {
         let now = t(1_000);
         assert_eq!(status_of(&resolve_expiry(Some(0), now).map(|_| ())), 400);
         assert_eq!(status_of(&resolve_expiry(Some(-5), now).map(|_| ())), 400);
-        assert_eq!(status_of(&resolve_expiry(Some(MAX_EXPIRES_IN_SECS + 1), now).map(|_| ())), 400);
+        assert_eq!(
+            status_of(&resolve_expiry(Some(MAX_EXPIRES_IN_SECS + 1), now).map(|_| ())),
+            400
+        );
     }
 
     #[test]

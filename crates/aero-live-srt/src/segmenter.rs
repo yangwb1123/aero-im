@@ -347,14 +347,12 @@ fn parse_pmt(payload: &[u8], pusi: bool) -> Option<u16> {
     let section_length = (usize::from(section[1] & 0x0F) << 8) | usize::from(section[2]);
     let body_end = (3 + section_length).min(section.len());
     // Fixed PMT header is 12 bytes (through program_info_length); CRC is last 4.
-    let program_info_length =
-        (usize::from(section[10] & 0x0F) << 8) | usize::from(section[11]);
+    let program_info_length = (usize::from(section[10] & 0x0F) << 8) | usize::from(section[11]);
     let mut p = 12 + program_info_length;
     let loop_end = body_end.saturating_sub(4); // stop before CRC
     while p + 5 <= loop_end {
         let stream_type = section[p];
-        let elementary_pid =
-            (u16::from(section[p + 1] & 0x1F) << 8) | u16::from(section[p + 2]);
+        let elementary_pid = (u16::from(section[p + 1] & 0x1F) << 8) | u16::from(section[p + 2]);
         let es_info_length =
             (usize::from(section[p + 3] & 0x0F) << 8) | usize::from(section[p + 4]);
         if stream_type == STREAM_TYPE_H264 {
@@ -476,11 +474,11 @@ mod tests {
         s.push(0x00);
         s.extend_from_slice(&(0xE000 | (video_pid & 0x1FFF)).to_be_bytes()); // PCR PID
         s.extend_from_slice(&0xF000u16.to_be_bytes()); // program_info_length = 0
-        // Video ES entry.
+                                                       // Video ES entry.
         s.push(STREAM_TYPE_H264);
         s.extend_from_slice(&(0xE000 | (video_pid & 0x1FFF)).to_be_bytes());
         s.extend_from_slice(&0xF000u16.to_be_bytes()); // ES_info_length = 0
-        // Audio ES entry (AAC, stream_type 0x0F) — should be ignored.
+                                                       // Audio ES entry (AAC, stream_type 0x0F) — should be ignored.
         s.push(0x0F);
         s.extend_from_slice(&(0xE000 | (audio_pid & 0x1FFF)).to_be_bytes());
         s.extend_from_slice(&0xF000u16.to_be_bytes());
@@ -592,7 +590,7 @@ mod tests {
         seg.push(&ts_packet(PID_PAT, true, 0, &pat_payload(0x1000)));
         seg.push(&ts_packet(0x1000, true, 0, &pmt_payload(0x0100, 0x0101)));
         seg.push(&ts_packet(0x0100, true, 0, &video_pes_payload(&[5]))); // segment 0 opens
-        // Continuation packet of an inter frame (no PUSI) then a fresh keyframe.
+                                                                         // Continuation packet of an inter frame (no PUSI) then a fresh keyframe.
         seg.push(&ts_packet(0x0100, false, 1, &[0x11, 0x22, 0x33]));
         let kf = seg.push(&ts_packet(0x0100, true, 2, &video_pes_payload(&[6, 5])));
         assert_eq!(kf, vec![SegmentEvent::CutBeforeKeyframe]);

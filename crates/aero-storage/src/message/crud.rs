@@ -10,12 +10,69 @@ use sqlx::{Postgres, Transaction};
 use super::{MessageRepo, NewMessage};
 use crate::message::orig::{attached_blob_ids, searchable_of, MessageRow};
 
+/// Message-scoped rows that only make sense while the message is visible.
+///
+/// `message_edits` and `message_reports` are deliberately absent: they are
+/// audit/moderation evidence and must survive a soft delete. Room-level
+/// `read_receipts` and `delivery_cursors` are monotonic cursors rather than
+/// message-owned projections, so deleting their current cursor target would
+/// incorrectly make already-seen content unread again.
+const VISIBLE_ASSOCIATION_DELETE_QUERIES: &[&str] = &[
+    "DELETE FROM reactions WHERE message_id = ANY($1)",
+    "DELETE FROM message_receipts WHERE message_id = ANY($1)",
+    "DELETE FROM pins WHERE message_id = ANY($1)",
+    "DELETE FROM bookmarks WHERE message_id = ANY($1)",
+    "DELETE FROM notifications WHERE message_id = ANY($1)",
+    "DELETE FROM notification_bundles WHERE message_id = ANY($1)",
+    "DELETE FROM block_interactions WHERE message_id = ANY($1)",
+];
+
 impl MessageRepo {
     pub async fn insert(&self, new: NewMessage) -> Result<Message, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        if !Self::lock_reply_parent_in_tx(&mut tx, new.reply_to, new.room_id).await? {
+            return Err(sqlx::Error::Protocol(
+                "reply_to must reference an existing message in the same room".into(),
+            ));
+        }
+        let message = Self::insert_row_in_tx(&mut tx, new).await?;
+        tx.commit().await?;
+        Ok(message)
+    }
+
+    /// Validate an optional reply parent under the message write transaction.
+    ///
+    /// `FOR KEY SHARE` composes with migration 0190's composite foreign key:
+    /// a concurrent hard delete cannot open a check/insert race.
+    pub(crate) async fn lock_reply_parent_in_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        reply_to: Option<MessageId>,
+        room: aero_common::RoomId,
+    ) -> Result<bool, sqlx::Error> {
+        let Some(reply_to) = reply_to else {
+            return Ok(true);
+        };
+        Ok(sqlx::query_scalar::<_, bool>(
+            r"SELECT true
+                FROM messages
+               WHERE id = $1 AND room_id = $2
+               FOR KEY SHARE",
+        )
+        .bind(reply_to.to_uuid())
+        .bind(room.to_uuid())
+        .fetch_optional(&mut **tx)
+        .await?
+        .unwrap_or(false))
+    }
+
+    pub(crate) async fn insert_row_in_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        new: NewMessage,
+    ) -> Result<Message, sqlx::Error> {
         let id = MessageId::new();
         let created_at = time::OffsetDateTime::now_utc();
-        let blocks_json = serde_json::to_value(&new.blocks)
-            .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+        let blocks_json =
+            serde_json::to_value(&new.blocks).map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
         let searchable = searchable_of(&new.blocks);
 
         sqlx::query(
@@ -32,7 +89,7 @@ impl MessageRepo {
         .bind(&searchable)
         .bind(created_at)
         .bind(new.expires_at)
-        .execute(&self.pool)
+        .execute(&mut **tx)
         .await?;
 
         Ok(Message {
@@ -48,6 +105,24 @@ impl MessageRepo {
             expires_at: new.expires_at,
             version: 1,
         })
+    }
+
+    /// Cheap preflight for a user-facing validation error.
+    ///
+    /// Every repository write repeats this check under `FOR KEY SHARE`; the
+    /// composite FK is the final race-proof fence.
+    pub async fn reply_parent_exists_in_room(
+        &self,
+        reply_to: MessageId,
+        room: aero_common::RoomId,
+    ) -> Result<bool, sqlx::Error> {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM messages WHERE id = $1 AND room_id = $2)",
+        )
+        .bind(reply_to.to_uuid())
+        .bind(room.to_uuid())
+        .fetch_one(&self.pool)
+        .await
     }
 
     /// Fetch a single message by id (including soft-deleted, caller must filter).
@@ -116,7 +191,7 @@ impl MessageRepo {
             // Check existence to distinguish.
             None => {
                 let exists = sqlx::query_scalar::<_, bool>(
-                    "SELECT EXISTS(SELECT 1 FROM messages WHERE id = $1 AND deleted_at IS NULL)"
+                    "SELECT EXISTS(SELECT 1 FROM messages WHERE id = $1 AND deleted_at IS NULL)",
                 )
                 .bind(id.to_uuid())
                 .fetch_one(&self.pool)
@@ -137,7 +212,7 @@ impl MessageRepo {
     /// expected_version for [`edit`](Self::edit).
     pub async fn get_version(&self, id: MessageId) -> Result<Option<i32>, sqlx::Error> {
         sqlx::query_scalar::<_, i32>(
-            "SELECT version FROM messages WHERE id = $1 AND deleted_at IS NULL"
+            "SELECT version FROM messages WHERE id = $1 AND deleted_at IS NULL",
         )
         .bind(id.to_uuid())
         .fetch_optional(&self.pool)
@@ -191,32 +266,89 @@ impl MessageRepo {
         .execute(&mut **tx)
         .await?;
 
-        // Enqueue each attached blob for GC unless another live message still
-        // references it. The ULID string is globally unique, so a substring
-        // containment test over the remaining live blocks is a safe reference
-        // check (this row's blocks are already cleared above).
-        for blob in blob_ids {
-            let still_referenced = sqlx::query_as::<_, (bool,)>(
-                r"SELECT EXISTS(
-                    SELECT 1 FROM messages
-                     WHERE deleted_at IS NULL AND blocks::text LIKE $1
-                  )",
+        Self::cleanup_visible_associations_in_tx(tx, &[id.to_uuid()]).await?;
+
+        Self::enqueue_unreferenced_blobs_in_tx(tx, &blob_ids).await?;
+
+        Ok(true)
+    }
+
+    /// Remove message-owned, user-visible projections in the caller's
+    /// transaction.
+    ///
+    /// This is shared by the single-message delete path and the set-based
+    /// retention sweep. Keeping the cleanup transaction-scoped prevents pins,
+    /// reactions, inbox rows, precise read receipts, saved items, or interactive
+    /// payloads from surviving a committed tombstone.
+    pub(crate) async fn cleanup_visible_associations_in_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        message_ids: &[uuid::Uuid],
+    ) -> Result<(), sqlx::Error> {
+        if message_ids.is_empty() {
+            return Ok(());
+        }
+        for query in VISIBLE_ASSOCIATION_DELETE_QUERIES {
+            sqlx::query(query)
+                .bind(message_ids)
+                .execute(&mut **tx)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Enqueue attachment bytes that no currently visible message references.
+    ///
+    /// Shared by explicit deletion, workspace/channel retention, and ephemeral
+    /// expiry. The exact JSONB containment predicate avoids substring matches;
+    /// already-expired messages do not keep bytes alive while waiting for their
+    /// eventual hard-delete sweep.
+    pub(crate) async fn enqueue_unreferenced_blobs_in_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        blob_ids: &[aero_common::BlobId],
+    ) -> Result<(), sqlx::Error> {
+        let mut unique: Vec<_> = blob_ids
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        unique.sort_unstable_by_key(|blob| blob.to_uuid());
+        for blob in unique {
+            let exists = sqlx::query_scalar::<_, uuid::Uuid>(
+                "SELECT id FROM blobs WHERE id = $1 FOR UPDATE",
             )
-            .bind(format!("%{blob}%"))
-            .fetch_one(&mut **tx)
+            .bind(blob.to_uuid())
+            .fetch_optional(&mut **tx)
             .await?
-            .0;
+            .is_some();
+            if !exists {
+                continue;
+            }
+            let reference = serde_json::json!([{ "blob_id": blob.to_string() }]);
+            let still_referenced: bool = sqlx::query_scalar(
+                r"SELECT EXISTS(
+                     SELECT 1
+                       FROM messages
+                      WHERE deleted_at IS NULL
+                        AND (expires_at IS NULL OR expires_at > now())
+                        AND blocks @> $1
+                   )",
+            )
+            .bind(reference)
+            .fetch_one(&mut **tx)
+            .await?;
             if !still_referenced {
                 sqlx::query(
-                    r"INSERT INTO blob_gc_queue (blob_id) VALUES ($1) ON CONFLICT (blob_id) DO NOTHING",
+                    r"INSERT INTO blob_gc_queue (blob_id, force_delete)
+                      VALUES ($1, FALSE)
+                      ON CONFLICT (blob_id) DO NOTHING",
                 )
                 .bind(blob.to_uuid())
                 .execute(&mut **tx)
                 .await?;
             }
         }
-
-        Ok(true)
+        Ok(())
     }
 
     /// Soft-delete `id` AND append a `message.deleted` audit row to `workspace`'s
@@ -356,5 +488,290 @@ impl MessageRepo {
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() > 0)
+    }
+}
+
+#[cfg(test)]
+mod association_tests {
+    use super::*;
+    use aero_common::RoomId;
+    use sqlx::PgPool;
+
+    const DEFAULT_WORKSPACE: &str = "00000000-0000-0000-0000-000000000000";
+
+    fn pool() -> PgPool {
+        let url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://aero:aero_dev_pw@localhost:5432/aero".into());
+        sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect_lazy(&url)
+            .expect("connect_lazy accepts a valid URL")
+    }
+
+    async fn count_for(p: &PgPool, table: &str, message: MessageId) -> i64 {
+        let sql = format!("SELECT COUNT(*) FROM {table} WHERE message_id = $1");
+        sqlx::query_scalar(&sql)
+            .bind(message.to_uuid())
+            .fetch_one(p)
+            .await
+            .expect("count association")
+    }
+
+    #[test]
+    fn visible_cleanup_classification_preserves_evidence_and_cursors() {
+        let sql = VISIBLE_ASSOCIATION_DELETE_QUERIES.join("\n");
+        for table in [
+            "reactions",
+            "message_receipts",
+            "pins",
+            "bookmarks",
+            "notifications",
+            "notification_bundles",
+            "block_interactions",
+        ] {
+            assert!(
+                sql.contains(table),
+                "{table} is a visible message projection"
+            );
+        }
+        for retained in [
+            "message_edits",
+            "message_reports",
+            "read_receipts",
+            "delivery_cursors",
+            "message_send_keys",
+            "event_outbox",
+        ] {
+            assert!(
+                !sql.contains(retained),
+                "{retained} is evidence, a monotonic cursor, or a delivery ledger"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres with applied migrations"]
+    async fn soft_delete_cleans_visible_associations_but_retains_evidence() {
+        let p = pool();
+        let sender = ParticipantId::new();
+        let room = RoomId::new();
+        sqlx::query("INSERT INTO participants (id, kind, display_name) VALUES ($1,'human',$2)")
+            .bind(sender.to_uuid())
+            .bind(format!("soft-delete-associations-{sender}"))
+            .execute(&p)
+            .await
+            .expect("participant");
+        sqlx::query(
+            "INSERT INTO rooms (id, kind, name, created_by, workspace_id)
+             VALUES ($1,'group',$2,$3,$4::uuid)",
+        )
+        .bind(room.to_uuid())
+        .bind(format!("soft-delete-associations-{room}"))
+        .bind(sender.to_uuid())
+        .bind(DEFAULT_WORKSPACE)
+        .execute(&p)
+        .await
+        .expect("room");
+        sqlx::query(
+            "INSERT INTO workspace_members (workspace_id, participant_id, role)
+             VALUES ($1::uuid,$2,'member')
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(DEFAULT_WORKSPACE)
+        .bind(sender.to_uuid())
+        .execute(&p)
+        .await
+        .expect("workspace membership");
+        sqlx::query(
+            "INSERT INTO room_members (room_id, participant_id, role)
+             VALUES ($1,$2,'owner')",
+        )
+        .bind(room.to_uuid())
+        .bind(sender.to_uuid())
+        .execute(&p)
+        .await
+        .expect("room membership");
+
+        let repo = MessageRepo::new(p.clone());
+        let message = repo
+            .insert(NewMessage {
+                room_id: room,
+                sender_id: sender,
+                blocks: vec![Block::text("retire me")],
+                reply_to: None,
+                metadata: serde_json::json!({}),
+                expires_at: None,
+            })
+            .await
+            .expect("message")
+            .id;
+
+        sqlx::query(
+            "INSERT INTO reactions (message_id, participant_id, emoji)
+             VALUES ($1,$2,'👍')",
+        )
+        .bind(message.to_uuid())
+        .bind(sender.to_uuid())
+        .execute(&p)
+        .await
+        .expect("reaction");
+        sqlx::query("INSERT INTO message_receipts (message_id, participant_id) VALUES ($1,$2)")
+            .bind(message.to_uuid())
+            .bind(sender.to_uuid())
+            .execute(&p)
+            .await
+            .expect("message receipt");
+        sqlx::query("INSERT INTO pins (room_id, message_id, pinned_by) VALUES ($1,$2,$3)")
+            .bind(room.to_uuid())
+            .bind(message.to_uuid())
+            .bind(sender.to_uuid())
+            .execute(&p)
+            .await
+            .expect("pin");
+        sqlx::query(
+            "INSERT INTO bookmarks (participant_id, message_id, room_id, note)
+             VALUES ($1,$2,$3,'private note')",
+        )
+        .bind(sender.to_uuid())
+        .bind(message.to_uuid())
+        .bind(room.to_uuid())
+        .execute(&p)
+        .await
+        .expect("bookmark");
+        sqlx::query(
+            "INSERT INTO notifications
+                 (id, participant_id, room_id, message_id, kind, actor_id)
+             VALUES ($1,$2,$3,$4,'mention',$2)",
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(sender.to_uuid())
+        .bind(room.to_uuid())
+        .bind(message.to_uuid())
+        .execute(&p)
+        .await
+        .expect("notification");
+        sqlx::query(
+            "INSERT INTO notification_bundles
+                 (participant_id, room_id, message_id, kind, actor_id)
+             VALUES ($1,$2,$3,'reply',$1)",
+        )
+        .bind(sender.to_uuid())
+        .bind(room.to_uuid())
+        .bind(message.to_uuid())
+        .execute(&p)
+        .await
+        .expect("notification bundle");
+        sqlx::query(
+            "INSERT INTO block_interactions
+                 (id, message_id, room_id, participant_id, action_id, value)
+             VALUES ($1,$2,$3,$4,'approve','yes')",
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(message.to_uuid())
+        .bind(room.to_uuid())
+        .bind(sender.to_uuid())
+        .execute(&p)
+        .await
+        .expect("interaction");
+
+        sqlx::query(
+            "INSERT INTO message_edits (id, message_id, editor_id, blocks)
+             VALUES ($1,$2,$3,$4)",
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(message.to_uuid())
+        .bind(sender.to_uuid())
+        .bind(serde_json::json!([{ "type": "text", "text": "prior body" }]))
+        .execute(&p)
+        .await
+        .expect("edit evidence");
+        sqlx::query(
+            "INSERT INTO message_reports
+                 (id, workspace_id, message_id, reporter_id, reason)
+             VALUES ($1,$2::uuid,$3,$4,'policy violation')",
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(DEFAULT_WORKSPACE)
+        .bind(message.to_uuid())
+        .bind(sender.to_uuid())
+        .execute(&p)
+        .await
+        .expect("report evidence");
+        sqlx::query(
+            "INSERT INTO read_receipts (room_id, participant_id, last_read_message_id)
+             VALUES ($1,$2,$3)",
+        )
+        .bind(room.to_uuid())
+        .bind(sender.to_uuid())
+        .bind(message.to_uuid())
+        .execute(&p)
+        .await
+        .expect("room read cursor");
+
+        assert!(repo.soft_delete(message).await.expect("soft delete"));
+        for table in [
+            "reactions",
+            "message_receipts",
+            "pins",
+            "bookmarks",
+            "notifications",
+            "notification_bundles",
+            "block_interactions",
+        ] {
+            assert_eq!(
+                count_for(&p, table, message).await,
+                0,
+                "{table} was transactionally removed"
+            );
+        }
+        assert_eq!(count_for(&p, "message_edits", message).await, 1);
+        assert_eq!(count_for(&p, "message_reports", message).await, 1);
+        let room_cursor: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM read_receipts
+              WHERE room_id = $1 AND participant_id = $2 AND last_read_message_id = $3",
+        )
+        .bind(room.to_uuid())
+        .bind(sender.to_uuid())
+        .bind(message.to_uuid())
+        .fetch_one(&p)
+        .await
+        .expect("room cursor count");
+        assert_eq!(room_cursor, 1, "monotonic room read cursor is retained");
+
+        let edits = crate::MessageEditRepo::new(p.clone());
+        assert_eq!(
+            edits.message_room(message).await.expect("history room"),
+            None,
+            "ordinary history route cannot resolve a deleted message"
+        );
+        assert!(
+            edits
+                .list_for_message(message)
+                .await
+                .expect("history list")
+                .is_empty(),
+            "retained prior bodies do not surface on ordinary reads"
+        );
+
+        sqlx::query("DELETE FROM message_reports WHERE message_id = $1")
+            .bind(message.to_uuid())
+            .execute(&p)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM message_edits WHERE message_id = $1")
+            .bind(message.to_uuid())
+            .execute(&p)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM rooms WHERE id = $1")
+            .bind(room.to_uuid())
+            .execute(&p)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM participants WHERE id = $1")
+            .bind(sender.to_uuid())
+            .execute(&p)
+            .await
+            .ok();
     }
 }

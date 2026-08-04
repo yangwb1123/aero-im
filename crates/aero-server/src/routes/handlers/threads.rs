@@ -40,10 +40,11 @@ async fn thread_mute(
         .map_err(|e| AeroError::Invalid(format!("message id: {e}")))?;
     assert_thread_room_access(&s, auth.participant_id, root).await?;
     aero_storage::ThreadMuteRepo::new(s.pg.clone())
-        .mute(auth.participant_id, root)
-        .await
-        .map_err(AeroError::from)?;
-    Ok(Json(serde_json::json!({ "root_message_id": root, "muted": true })))
+        .mute_authorized(auth.participant_id, root)
+        .await?;
+    Ok(Json(
+        serde_json::json!({ "root_message_id": root, "muted": true }),
+    ))
 }
 
 /// `DELETE /api/threads/:root_message_id/mute` — unmute the thread for the caller.
@@ -59,10 +60,11 @@ async fn thread_unmute(
         .map_err(|e| AeroError::Invalid(format!("message id: {e}")))?;
     assert_thread_room_access(&s, auth.participant_id, root).await?;
     aero_storage::ThreadMuteRepo::new(s.pg.clone())
-        .unmute(auth.participant_id, root)
-        .await
-        .map_err(AeroError::from)?;
-    Ok(Json(serde_json::json!({ "root_message_id": root, "muted": false })))
+        .unmute_authorized(auth.participant_id, root)
+        .await?;
+    Ok(Json(
+        serde_json::json!({ "root_message_id": root, "muted": false }),
+    ))
 }
 
 /// `GET /api/threads/:root_message_id/mutes` — the participants who have MUTED this
@@ -82,6 +84,7 @@ async fn thread_muters(
         .muted_by(root)
         .await
         .map_err(AeroError::from)?;
-    Ok(Json(serde_json::json!({ "root_message_id": root, "muters": muters })))
+    Ok(Json(
+        serde_json::json!({ "root_message_id": root, "muters": muters }),
+    ))
 }
-

@@ -47,7 +47,10 @@ impl Default for RateLimitConfig {
     fn default() -> Self {
         // 20 req/s sustained, bursting to 40 — generous for an interactive UI,
         // tight enough to blunt scripted abuse.
-        Self { per_second: 20, burst: 40 }
+        Self {
+            per_second: 20,
+            burst: 40,
+        }
     }
 }
 
@@ -63,7 +66,10 @@ impl Default for GatewayConfig {
             rate_limit: RateLimitConfig::default(),
             // 3 req/s, burst 5 — tight enough to frustrate credential stuffing
             // while allowing a human who fat-fingers their password a few retries.
-            auth_rate_limit: RateLimitConfig { per_second: 3, burst: 5 },
+            auth_rate_limit: RateLimitConfig {
+                per_second: 3,
+                burst: 5,
+            },
         }
     }
 }
@@ -85,7 +91,8 @@ impl GatewayConfig {
     #[must_use]
     pub fn from_env() -> Self {
         let d = Self::default();
-        let timeout_secs = env_parse("AERO_HTTP_TIMEOUT_SECS").unwrap_or(d.request_timeout.as_secs());
+        let timeout_secs =
+            env_parse("AERO_HTTP_TIMEOUT_SECS").unwrap_or(d.request_timeout.as_secs());
         let cors_allowed_origins = std::env::var("AERO_CORS_ALLOWED_ORIGINS")
             .ok()
             .map(|raw| {
@@ -108,8 +115,7 @@ impl GatewayConfig {
             auth_rate_limit: RateLimitConfig {
                 per_second: env_parse("AERO_AUTH_RATE_LIMIT_PER_SEC")
                     .unwrap_or(d.auth_rate_limit.per_second),
-                burst: env_parse("AERO_AUTH_RATE_LIMIT_BURST")
-                    .unwrap_or(d.auth_rate_limit.burst),
+                burst: env_parse("AERO_AUTH_RATE_LIMIT_BURST").unwrap_or(d.auth_rate_limit.burst),
             },
         }
     }
@@ -128,7 +134,10 @@ pub struct WsConfig {
 
 impl Default for WsConfig {
     fn default() -> Self {
-        Self { send_queue_capacity: 256, disconnect_on_full: true }
+        Self {
+            send_queue_capacity: 256,
+            disconnect_on_full: true,
+        }
     }
 }
 
@@ -146,8 +155,13 @@ impl WsConfig {
             .unwrap_or(d.send_queue_capacity);
         let disconnect_on_full = std::env::var("AERO_WS_DISCONNECT_ON_FULL")
             .ok()
-            .map_or(d.disconnect_on_full, |v| !matches!(v.trim(), "0" | "false" | "off"));
-        Self { send_queue_capacity: cap, disconnect_on_full }
+            .map_or(d.disconnect_on_full, |v| {
+                !matches!(v.trim(), "0" | "false" | "off")
+            });
+        Self {
+            send_queue_capacity: cap,
+            disconnect_on_full,
+        }
     }
 }
 

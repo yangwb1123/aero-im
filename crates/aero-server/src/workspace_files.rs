@@ -5,10 +5,9 @@
 //! read-only handler over [`WorkspaceFileRepo`](aero_storage::WorkspaceFileRepo),
 //! which projects `File` blocks out of the existing `messages` table (no new
 //! storage). The single route is workspace-member gated via
-//! [`WorkspaceRepo::member_role`](aero_storage::WorkspaceRepo) (mirroring
-//! [`crate::directory`]), but the real boundary is the repo's `JOIN room_members`:
-//! a caller only ever sees files from rooms they are in within the workspace — so
-//! the browser can never surface an attachment from a room they don't belong to.
+//! [`WorkspaceRepo::effective_member_role`](aero_storage::WorkspaceRepo) (mirroring
+//! [`crate::directory`]), while the content boundary is the repo's effective
+//! room/workspace/account/deactivation/2FA intersection.
 //! Mounted via [`routes`] and `.merge`d into the main router.
 
 use std::str::FromStr;
@@ -52,7 +51,7 @@ async fn assert_member(
     caller: ParticipantId,
 ) -> Result<(), AeroError> {
     s.workspaces
-        .member_role(workspace, caller)
+        .effective_member_role(workspace, caller)
         .await
         .map_err(AeroError::from)?
         .ok_or_else(|| AeroError::Forbidden("not a workspace member".into()))?;
@@ -79,8 +78,8 @@ struct FilesQuery {
 /// `GET /api/workspaces/:id/files?kind=&q=&limit=&offset=` — the file/media
 /// attachments shared across every room the caller belongs to in this workspace,
 /// newest-first. Members only (any role); a non-member is rejected `403`. The
-/// repo's `JOIN room_members` is the real scope boundary, so only files from the
-/// caller's rooms are returned. The optional `kind`/`q` filters narrow the result;
+/// repo's effective-access joins are the real scope boundary. The optional
+/// `kind`/`q` filters narrow the result;
 /// `limit`/`offset` page it. A malformed workspace id is `400`.
 async fn list_workspace_files(
     State(s): State<AppState>,

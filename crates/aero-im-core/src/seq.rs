@@ -96,8 +96,14 @@ mod tests {
         let p = LocalSeqProvider::new();
         let mut prev = 0;
         for expected in 1..=100u64 {
-            let got = p.next_seq("im.room.a").await.expect("local provider never fails");
-            assert_eq!(got, expected, "1-based, strictly increasing, no gaps locally");
+            let got = p
+                .next_seq("im.room.a")
+                .await
+                .expect("local provider never fails");
+            assert_eq!(
+                got, expected,
+                "1-based, strictly increasing, no gaps locally"
+            );
             assert!(got > prev);
             prev = got;
         }

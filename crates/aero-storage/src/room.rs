@@ -3,6 +3,12 @@
 use aero_common::{ParticipantId, Room, RoomId, RoomKind, WorkspaceId};
 use sqlx::PgPool;
 
+mod governance;
+pub use governance::{
+    ChannelMetaPatch, RoomMemberRole, RoomMembershipWriteError, MAX_CHANNEL_DESCRIPTION_CHARS,
+    MAX_CHANNEL_TOPIC_CHARS,
+};
+
 /// Map a `RoomKind` to its lowercase DB token.
 fn room_kind_str(kind: RoomKind) -> &'static str {
     match kind {
@@ -38,6 +44,11 @@ impl RoomRepo {
         name: Option<String>,
         created_by: ParticipantId,
     ) -> Result<Room, sqlx::Error> {
+        if kind == RoomKind::Direct {
+            return Err(sqlx::Error::Protocol(
+                "direct rooms must be created atomically through DmRepo".into(),
+            ));
+        }
         let id = RoomId::new();
         let created_at = time::OffsetDateTime::now_utc();
         let kind_s = match kind {
@@ -75,14 +86,37 @@ impl RoomRepo {
         .await?;
         tx.commit().await?;
 
-        Ok(Room { id, kind, name, created_by, created_at })
+        Ok(Room {
+            id,
+            kind,
+            name,
+            created_by,
+            created_at,
+        })
     }
 
-    pub async fn add_member(
-        &self,
-        room: RoomId,
-        member: ParticipantId,
-    ) -> Result<(), sqlx::Error> {
+    /// Add a member to a non-direct room.
+    ///
+    /// Direct rooms are an exact two-member aggregate owned by
+    /// [`crate::DmRepo`]; this storage guard rejects fixed aggregates before the
+    /// write. Migration 0196 repeats the invariant in a trigger so mixed-version
+    /// old pods cannot bypass it. Deliberately do not lock the room here: the
+    /// trigger owns the workspace → compatibility-advisory → room lock order
+    /// needed to serialize legacy group-DM claim without a lock inversion.
+    pub async fn add_member(&self, room: RoomId, member: ParticipantId) -> Result<(), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let (kind, is_group_dm) = sqlx::query_as::<_, (String, bool)>(
+            "SELECT kind, is_group_dm FROM rooms WHERE id = $1",
+        )
+        .bind(room.to_uuid())
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(sqlx::Error::RowNotFound)?;
+        if kind == "direct" || is_group_dm {
+            return Err(sqlx::Error::Protocol(
+                "direct and group-DM membership is managed by their dedicated aggregate".into(),
+            ));
+        }
         sqlx::query(
             r#"INSERT INTO room_members (room_id, participant_id, role, joined_at)
                VALUES ($1, $2, 'member', NOW())
@@ -90,8 +124,9 @@ impl RoomRepo {
         )
         .bind(room.to_uuid())
         .bind(member.to_uuid())
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -117,15 +152,92 @@ impl RoomRepo {
         .bind(room.to_uuid())
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows.into_iter().map(|(u,)| ParticipantId::from_uuid(u)).collect())
+        Ok(rows
+            .into_iter()
+            .map(|(u,)| ParticipantId::from_uuid(u))
+            .collect())
     }
 
+    /// Current effective recipients for security-sensitive real-time delivery.
+    ///
+    /// Room membership alone is insufficient: workspace removal, administrative
+    /// deactivation, and mandatory-2FA enrollment are all part of
+    /// `ImService::assert_room_access`. Keeping those gates in this one SQL query
+    /// prevents an already-connected socket from receiving content after access
+    /// is revoked.
+    pub async fn delivery_members(&self, room: RoomId) -> Result<Vec<ParticipantId>, sqlx::Error> {
+        let rows = sqlx::query_scalar::<_, uuid::Uuid>(
+            r"SELECT rm.participant_id
+                FROM room_members rm
+                JOIN rooms r
+                  ON r.id = rm.room_id
+                JOIN workspaces w
+                  ON w.id = r.workspace_id
+                JOIN workspace_members wm
+                  ON wm.workspace_id = r.workspace_id
+                 AND wm.participant_id = rm.participant_id
+                JOIN participants participant
+                  ON participant.id = rm.participant_id
+                 AND participant.deleted_at IS NULL
+                LEFT JOIN workspace_deactivations deactivated
+                  ON deactivated.workspace_id = r.workspace_id
+                 AND deactivated.participant_id = rm.participant_id
+                LEFT JOIN totp_secrets totp
+                  ON totp.participant_id = rm.participant_id
+               WHERE rm.room_id = $1
+                 AND deactivated.participant_id IS NULL
+                 AND (
+                     participant.kind <> 'human'
+                     OR NOT w.require_2fa
+                     OR COALESCE(totp.activated, false)
+                 )
+               ORDER BY rm.participant_id",
+        )
+        .bind(room.to_uuid())
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(ParticipantId::from_uuid).collect())
+    }
+
+    /// Rooms the participant may currently access.
+    ///
+    /// Retained room/workspace memberships do not surface rooms after account
+    /// deletion, workspace deactivation, or while mandatory 2FA is unsatisfied.
     pub async fn rooms_for(&self, participant: ParticipantId) -> Result<Vec<Room>, sqlx::Error> {
-        let rows = sqlx::query_as::<_, (uuid::Uuid, String, Option<String>, uuid::Uuid, time::OffsetDateTime)>(
+        let rows = sqlx::query_as::<
+            _,
+            (
+                uuid::Uuid,
+                String,
+                Option<String>,
+                uuid::Uuid,
+                time::OffsetDateTime,
+            ),
+        >(
             r#"SELECT r.id, r.kind, r.name, r.created_by, r.created_at
                FROM rooms r
-               JOIN room_members m ON m.room_id = r.id
+               JOIN room_members m
+                 ON m.room_id = r.id
+               JOIN workspaces w
+                 ON w.id = r.workspace_id
+               JOIN workspace_members wm
+                 ON wm.workspace_id = r.workspace_id
+                AND wm.participant_id = m.participant_id
+               JOIN participants p
+                 ON p.id = m.participant_id
+                AND p.deleted_at IS NULL
+               LEFT JOIN workspace_deactivations deactivated
+                 ON deactivated.workspace_id = r.workspace_id
+                AND deactivated.participant_id = m.participant_id
+               LEFT JOIN totp_secrets totp
+                 ON totp.participant_id = m.participant_id
                WHERE m.participant_id = $1
+                 AND deactivated.participant_id IS NULL
+                 AND (
+                     p.kind <> 'human'
+                     OR NOT w.require_2fa
+                     OR COALESCE(totp.activated, false)
+                 )
                ORDER BY r.created_at DESC"#,
         )
         .bind(participant.to_uuid())
@@ -159,6 +271,11 @@ impl RoomRepo {
         name: Option<String>,
         created_by: ParticipantId,
     ) -> Result<Room, sqlx::Error> {
+        if kind == RoomKind::Direct {
+            return Err(sqlx::Error::Protocol(
+                "direct rooms must be created atomically through DmRepo".into(),
+            ));
+        }
         let id = RoomId::new();
         let created_at = time::OffsetDateTime::now_utc();
         let kind_s = room_kind_str(kind);
@@ -188,21 +305,58 @@ impl RoomRepo {
         .await?;
         tx.commit().await?;
 
-        Ok(Room { id, kind, name, created_by, created_at })
+        Ok(Room {
+            id,
+            kind,
+            name,
+            created_by,
+            created_at,
+        })
     }
 
-    /// Rooms the participant belongs to, restricted to a single `workspace`.
-    /// Tenancy-scoped counterpart to [`rooms_for`](Self::rooms_for).
+    /// Rooms the participant may currently access, restricted to one workspace.
+    /// This carries the same active-account, deactivation, and mandatory-2FA
+    /// boundary as [`rooms_for`](Self::rooms_for).
     pub async fn rooms_for_in_workspace(
         &self,
         participant: ParticipantId,
         workspace: WorkspaceId,
     ) -> Result<Vec<Room>, sqlx::Error> {
-        let rows = sqlx::query_as::<_, (uuid::Uuid, String, Option<String>, uuid::Uuid, time::OffsetDateTime)>(
+        let rows = sqlx::query_as::<
+            _,
+            (
+                uuid::Uuid,
+                String,
+                Option<String>,
+                uuid::Uuid,
+                time::OffsetDateTime,
+            ),
+        >(
             r"SELECT r.id, r.kind, r.name, r.created_by, r.created_at
                FROM rooms r
-               JOIN room_members m ON m.room_id = r.id
-               WHERE m.participant_id = $1 AND r.workspace_id = $2
+               JOIN room_members m
+                 ON m.room_id = r.id
+               JOIN workspaces w
+                 ON w.id = r.workspace_id
+               JOIN workspace_members wm
+                 ON wm.workspace_id = r.workspace_id
+                AND wm.participant_id = m.participant_id
+               JOIN participants p
+                 ON p.id = m.participant_id
+                AND p.deleted_at IS NULL
+               LEFT JOIN workspace_deactivations deactivated
+                 ON deactivated.workspace_id = r.workspace_id
+                AND deactivated.participant_id = m.participant_id
+               LEFT JOIN totp_secrets totp
+                 ON totp.participant_id = m.participant_id
+               WHERE m.participant_id = $1
+                 AND r.workspace_id = $2
+                 AND deactivated.participant_id IS NULL
+                 AND (
+                     p.kind <> 'human'
+                     OR NOT w.require_2fa
+                     OR COALESCE(totp.activated, false)
+                 )
                ORDER BY r.created_at DESC",
         )
         .bind(participant.to_uuid())
@@ -224,16 +378,12 @@ impl RoomRepo {
 
     /// The workspace a room belongs to, or `None` if the room does not exist.
     /// Used by services to resolve a room's tenant before access checks.
-    pub async fn room_workspace(
-        &self,
-        room: RoomId,
-    ) -> Result<Option<WorkspaceId>, sqlx::Error> {
-        let row = sqlx::query_as::<_, (uuid::Uuid,)>(
-            r"SELECT workspace_id FROM rooms WHERE id = $1",
-        )
-        .bind(room.to_uuid())
-        .fetch_optional(&self.pool)
-        .await?;
+    pub async fn room_workspace(&self, room: RoomId) -> Result<Option<WorkspaceId>, sqlx::Error> {
+        let row =
+            sqlx::query_as::<_, (uuid::Uuid,)>(r"SELECT workspace_id FROM rooms WHERE id = $1")
+                .bind(room.to_uuid())
+                .fetch_optional(&self.pool)
+                .await?;
         Ok(row.map(|(ws,)| WorkspaceId::from_uuid(ws)))
     }
 
@@ -246,6 +396,15 @@ impl RoomRepo {
             .fetch_optional(&self.pool)
             .await?;
         Ok(row.map(|(k,)| room_kind_from_str(&k)))
+    }
+
+    /// Whether an existing room is a marker-backed group DM.
+    pub async fn is_group_dm(&self, room: RoomId) -> Result<Option<bool>, sqlx::Error> {
+        let row = sqlx::query_scalar::<_, bool>("SELECT is_group_dm FROM rooms WHERE id = $1")
+            .bind(room.to_uuid())
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row)
     }
 
     // ------------------------------------------------ channels (migration 0012)
@@ -373,7 +532,9 @@ impl RoomRepo {
                 .bind(room.to_uuid())
                 .fetch_optional(&self.pool)
                 .await?;
-        Ok(row.and_then(|(p,)| p).unwrap_or_else(|| "everyone".to_owned()))
+        Ok(row
+            .and_then(|(p,)| p)
+            .unwrap_or_else(|| "everyone".to_owned()))
     }
 
     /// Public, non-archived channels in a workspace — the discovery listing a
@@ -387,10 +548,22 @@ impl RoomRepo {
         workspace: WorkspaceId,
         q: Option<&str>,
     ) -> Result<Vec<Room>, sqlx::Error> {
-        let rows = sqlx::query_as::<_, (uuid::Uuid, String, Option<String>, uuid::Uuid, time::OffsetDateTime)>(
+        let rows = sqlx::query_as::<
+            _,
+            (
+                uuid::Uuid,
+                String,
+                Option<String>,
+                uuid::Uuid,
+                time::OffsetDateTime,
+            ),
+        >(
             r"SELECT id, kind, name, created_by, created_at
                FROM rooms
-               WHERE workspace_id = $1 AND is_private = false AND is_archived = false
+               WHERE workspace_id = $1
+                 AND kind = 'channel'
+                 AND is_private = false
+                 AND is_archived = false
                  AND ($2::text IS NULL OR name ILIKE '%' || $2 || '%')
                ORDER BY created_at DESC",
         )
@@ -435,13 +608,11 @@ impl RoomRepo {
         room: RoomId,
         limit: Option<i32>,
     ) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            "UPDATE rooms SET max_reactions_per_user = $1 WHERE id = $2",
-        )
-        .bind(limit)
-        .bind(room.to_uuid())
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("UPDATE rooms SET max_reactions_per_user = $1 WHERE id = $2")
+            .bind(limit)
+            .bind(room.to_uuid())
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -479,12 +650,11 @@ impl RoomRepo {
     /// # Errors
     /// Propagates any [`sqlx::Error`] from the query.
     pub async fn retention_days(&self, room: RoomId) -> Result<Option<i32>, sqlx::Error> {
-        let row = sqlx::query_as::<_, (Option<i32>,)>(
-            r"SELECT retention_days FROM rooms WHERE id = $1",
-        )
-        .bind(room.to_uuid())
-        .fetch_optional(&self.pool)
-        .await?;
+        let row =
+            sqlx::query_as::<_, (Option<i32>,)>(r"SELECT retention_days FROM rooms WHERE id = $1")
+                .bind(room.to_uuid())
+                .fetch_optional(&self.pool)
+                .await?;
         Ok(row.and_then(|(d,)| d))
     }
 
@@ -516,7 +686,14 @@ impl RoomRepo {
         let recent_days = recent_days.max(1);
         let rows = sqlx::query_as::<
             _,
-            (uuid::Uuid, String, Option<String>, uuid::Uuid, time::OffsetDateTime, i64),
+            (
+                uuid::Uuid,
+                String,
+                Option<String>,
+                uuid::Uuid,
+                time::OffsetDateTime,
+                i64,
+            ),
         >(
             r"SELECT r.id, r.kind, r.name, r.created_by, r.created_at,
                      COALESCE(act.cnt, 0) AS activity
@@ -529,6 +706,7 @@ impl RoomRepo {
                       AND m.created_at >= NOW() - make_interval(days => $3::int)
                ) act ON true
               WHERE r.workspace_id = $1
+                AND r.kind = 'channel'
                 AND r.is_private = false
                 AND r.is_archived = false
                 AND NOT EXISTS (
@@ -617,12 +795,10 @@ impl RoomRepo {
     /// if the room does not exist (fail-open so a glitch never silently blocks
     /// posting).
     pub async fn get_slowmode(&self, room: RoomId) -> Result<i32, sqlx::Error> {
-        let row = sqlx::query_as::<_, (i32,)>(
-            "SELECT slowmode_seconds FROM rooms WHERE id = $1",
-        )
-        .bind(room.to_uuid())
-        .fetch_optional(&self.pool)
-        .await?;
+        let row = sqlx::query_as::<_, (i32,)>("SELECT slowmode_seconds FROM rooms WHERE id = $1")
+            .bind(room.to_uuid())
+            .fetch_optional(&self.pool)
+            .await?;
         Ok(row.map(|(s,)| s).unwrap_or(0))
     }
 
@@ -641,7 +817,6 @@ impl RoomRepo {
         Ok(())
     }
 }
-
 /// PG-gated integration tests for channel management (migration 0012). Run with a
 /// live Postgres + applied migrations:
 ///
@@ -650,260 +825,5 @@ impl RoomRepo {
 ///   cargo test -p aero-storage --lib -- --ignored channel_
 /// ```
 #[cfg(test)]
-mod db_tests {
-    use super::*;
-
-    fn pool() -> PgPool {
-        let url = std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://aero:aero_dev_pw@localhost:5432/aero".into());
-        sqlx::postgres::PgPoolOptions::new()
-            .max_connections(2)
-            .connect_lazy(&url)
-            .expect("connect_lazy never fails on a well-formed URL")
-    }
-
-    /// A throwaway workspace + creator participant so each test is self-contained
-    /// (mirrors `audit::db_tests::fixture`).
-    async fn fixture(p: &PgPool) -> (WorkspaceId, ParticipantId) {
-        let actor = ParticipantId::new();
-        sqlx::query("INSERT INTO participants (id, kind, display_name) VALUES ($1, 'human', $2)")
-            .bind(actor.to_uuid())
-            .bind(format!("chan-actor-{actor}"))
-            .execute(p)
-            .await
-            .expect("insert participant");
-        let ws = WorkspaceId::new();
-        sqlx::query("INSERT INTO workspaces (id, name, slug, created_by, created_at) VALUES ($1,$2,$3,$4, now())")
-            .bind(ws.to_uuid())
-            .bind("Channel Test WS")
-            .bind(format!("chan-{ws}"))
-            .bind(actor.to_uuid())
-            .execute(p)
-            .await
-            .expect("insert workspace");
-        (ws, actor)
-    }
-
-    /// Insert a channel room directly in `workspace` (no auto-enrolled owner) with
-    /// an explicit visibility, so listing/visibility assertions are deterministic.
-    async fn insert_channel(
-        p: &PgPool,
-        workspace: WorkspaceId,
-        creator: ParticipantId,
-        is_private: bool,
-    ) -> RoomId {
-        let id = RoomId::new();
-        sqlx::query(
-            r"INSERT INTO rooms (id, kind, name, created_by, created_at, workspace_id, is_private)
-               VALUES ($1, 'channel', $2, $3, now(), $4, $5)",
-        )
-        .bind(id.to_uuid())
-        .bind(format!("chan-{id}"))
-        .bind(creator.to_uuid())
-        .bind(workspace.to_uuid())
-        .bind(is_private)
-        .execute(p)
-        .await
-        .expect("insert channel");
-        id
-    }
-
-    #[tokio::test]
-    #[ignore = "requires live Postgres"]
-    async fn channel_visibility_and_archive_roundtrip() {
-        let p = pool();
-        let repo = RoomRepo::new(p.clone());
-        let (ws, actor) = fixture(&p).await;
-        let room = insert_channel(&p, ws, actor, true).await;
-
-        assert_eq!(repo.is_private(room).await.unwrap(), Some(true));
-        assert_eq!(repo.is_archived(room).await.unwrap(), Some(false));
-
-        repo.set_visibility(room, false).await.unwrap();
-        assert_eq!(repo.is_private(room).await.unwrap(), Some(false));
-
-        repo.set_archived(room, true).await.unwrap();
-        assert_eq!(repo.is_archived(room).await.unwrap(), Some(true));
-
-        // Unknown room ⇒ None, never an error.
-        assert_eq!(repo.is_private(RoomId::new()).await.unwrap(), None);
-        assert_eq!(repo.is_archived(RoomId::new()).await.unwrap(), None);
-    }
-
-    #[tokio::test]
-    #[ignore = "requires live Postgres"]
-    async fn channel_topic_and_description_roundtrip() {
-        let p = pool();
-        let repo = RoomRepo::new(p.clone());
-        let (ws, actor) = fixture(&p).await;
-        let room = insert_channel(&p, ws, actor, false).await;
-
-        repo.set_topic(room, Some("daily standup")).await.unwrap();
-        repo.set_description(room, Some("the team channel")).await.unwrap();
-        let (topic, desc) = sqlx::query_as::<_, (Option<String>, Option<String>)>(
-            r"SELECT topic, description FROM rooms WHERE id = $1",
-        )
-        .bind(room.to_uuid())
-        .fetch_one(&p)
-        .await
-        .unwrap();
-        assert_eq!(topic.as_deref(), Some("daily standup"));
-        assert_eq!(desc.as_deref(), Some("the team channel"));
-
-        // Clearing sets them back to NULL.
-        repo.set_topic(room, None).await.unwrap();
-        let (topic, _) = sqlx::query_as::<_, (Option<String>, Option<String>)>(
-            r"SELECT topic, description FROM rooms WHERE id = $1",
-        )
-        .bind(room.to_uuid())
-        .fetch_one(&p)
-        .await
-        .unwrap();
-        assert_eq!(topic, None);
-    }
-
-    #[tokio::test]
-    #[ignore = "requires live Postgres"]
-    async fn channel_list_public_excludes_private_and_archived() {
-        let p = pool();
-        let repo = RoomRepo::new(p.clone());
-        let (ws, actor) = fixture(&p).await;
-
-        let public = insert_channel(&p, ws, actor, false).await;
-        let private = insert_channel(&p, ws, actor, true).await;
-        let archived = insert_channel(&p, ws, actor, false).await;
-        repo.set_archived(archived, true).await.unwrap();
-
-        let listed = repo.list_public_channels(ws, None).await.unwrap();
-        let ids: Vec<RoomId> = listed.iter().map(|r| r.id).collect();
-        assert!(ids.contains(&public), "public channel is discoverable");
-        assert!(!ids.contains(&private), "private channel is hidden");
-        assert!(!ids.contains(&archived), "archived channel is hidden");
-    }
-
-    #[tokio::test]
-    #[ignore = "requires live Postgres"]
-    async fn channel_join_then_leave_roundtrip() {
-        let p = pool();
-        let repo = RoomRepo::new(p.clone());
-        let (ws, actor) = fixture(&p).await;
-        let room = insert_channel(&p, ws, actor, false).await;
-
-        let joiner = ParticipantId::new();
-        sqlx::query("INSERT INTO participants (id, kind, display_name) VALUES ($1, 'human', $2)")
-            .bind(joiner.to_uuid())
-            .bind(format!("joiner-{joiner}"))
-            .execute(&p)
-            .await
-            .unwrap();
-
-        assert!(!repo.is_member(room, joiner).await.unwrap());
-        repo.add_member(room, joiner).await.unwrap();
-        assert!(repo.is_member(room, joiner).await.unwrap());
-        // Leave is idempotent: a second remove is a harmless no-op.
-        repo.remove_member(room, joiner).await.unwrap();
-        assert!(!repo.is_member(room, joiner).await.unwrap());
-        repo.remove_member(room, joiner).await.unwrap();
-        assert!(!repo.is_member(room, joiner).await.unwrap());
-    }
-
-    #[tokio::test]
-    #[ignore = "requires live Postgres"]
-    async fn channels_not_member_excludes_joined_private_and_archived() {
-        let p = pool();
-        let repo = RoomRepo::new(p.clone());
-        let (ws, actor) = fixture(&p).await;
-
-        // A public channel the caller is NOT in (the expected candidate),
-        // a public channel the caller HAS joined (excluded by the anti-join),
-        // a private channel (excluded by discovery boundary),
-        // an archived channel (excluded by discovery boundary).
-        let candidate = insert_channel(&p, ws, actor, false).await;
-        let joined = insert_channel(&p, ws, actor, false).await;
-        let private = insert_channel(&p, ws, actor, true).await;
-        let archived = insert_channel(&p, ws, actor, false).await;
-        repo.set_archived(archived, true).await.unwrap();
-
-        let caller = ParticipantId::new();
-        sqlx::query("INSERT INTO participants (id, kind, display_name) VALUES ($1, 'human', $2)")
-            .bind(caller.to_uuid())
-            .bind(format!("caller-{caller}"))
-            .execute(&p)
-            .await
-            .unwrap();
-        repo.add_member(joined, caller).await.unwrap();
-
-        let listed = repo
-            .list_workspace_channels_not_member(ws, caller, 30)
-            .await
-            .unwrap();
-        let ids: Vec<RoomId> = listed.iter().map(|(r, _)| r.id).collect();
-        assert!(ids.contains(&candidate), "non-member public channel is a candidate");
-        assert!(!ids.contains(&joined), "channel the caller is in is excluded");
-        assert!(!ids.contains(&private), "private channel is excluded");
-        assert!(!ids.contains(&archived), "archived channel is excluded");
-        // Each candidate carries a non-negative activity count.
-        for (_, activity) in &listed {
-            assert!(*activity >= 0);
-        }
-    }
-
-    #[tokio::test]
-    #[ignore = "requires live Postgres"]
-    async fn shared_room_counts_excludes_caller_and_counts_overlap() {
-        let p = pool();
-        let repo = RoomRepo::new(p.clone());
-        let (ws, actor) = fixture(&p).await;
-
-        let caller = ParticipantId::new();
-        let buddy = ParticipantId::new();
-        for (id, name) in [(caller, "caller"), (buddy, "buddy")] {
-            sqlx::query(
-                "INSERT INTO participants (id, kind, display_name) VALUES ($1, 'human', $2)",
-            )
-            .bind(id.to_uuid())
-            .bind(format!("{name}-{id}"))
-            .execute(&p)
-            .await
-            .unwrap();
-        }
-
-        // Two channels both the caller and buddy belong to → shared count 2.
-        let c1 = insert_channel(&p, ws, actor, false).await;
-        let c2 = insert_channel(&p, ws, actor, false).await;
-        for room in [c1, c2] {
-            repo.add_member(room, caller).await.unwrap();
-            repo.add_member(room, buddy).await.unwrap();
-        }
-
-        let counts = repo.shared_room_counts_in_workspace(ws, caller).await.unwrap();
-        // The caller never appears as a candidate for following themselves.
-        assert!(!counts.iter().any(|(p, _)| *p == caller), "caller excluded");
-        let buddy_count = counts.iter().find(|(p, _)| *p == buddy).map(|(_, n)| *n);
-        assert_eq!(buddy_count, Some(2), "buddy shares both channels");
-    }
-
-    #[tokio::test]
-    #[ignore = "requires live Postgres"]
-    async fn post_policy_roundtrip_defaults_to_everyone() {
-        let p = pool();
-        let repo = RoomRepo::new(p.clone());
-        let (ws, actor) = fixture(&p).await;
-        let room = insert_channel(&p, ws, actor, false).await;
-
-        // A fresh row carries the NOT NULL DEFAULT 'everyone' (migration 0030).
-        assert_eq!(repo.post_policy(room).await.unwrap(), "everyone");
-        // The creator is recoverable for the post-policy guard.
-        assert_eq!(repo.created_by(room).await.unwrap(), Some(actor));
-
-        repo.set_post_policy(room, "admins").await.unwrap();
-        assert_eq!(repo.post_policy(room).await.unwrap(), "admins");
-
-        repo.set_post_policy(room, "everyone").await.unwrap();
-        assert_eq!(repo.post_policy(room).await.unwrap(), "everyone");
-
-        // Unknown room ⇒ open default, never an error (fail-open on read).
-        assert_eq!(repo.post_policy(RoomId::new()).await.unwrap(), "everyone");
-        assert_eq!(repo.created_by(RoomId::new()).await.unwrap(), None);
-    }
-}
+#[path = "room/basic_tests.rs"]
+mod db_tests;

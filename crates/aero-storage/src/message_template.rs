@@ -236,7 +236,12 @@ mod db_tests {
             "second delete is a no-op"
         );
         assert!(
-            !repo.list_for(owner).await.unwrap().iter().any(|t| t.id == id),
+            !repo
+                .list_for(owner)
+                .await
+                .unwrap()
+                .iter()
+                .any(|t| t.id == id),
             "deleted template leaves the list"
         );
 

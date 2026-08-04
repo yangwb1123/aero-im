@@ -3,6 +3,8 @@ use aero_storage::AiJobStatus;
 use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
+mod usage;
+
 /// A fresh, isolated registry for a test — never the process-global one,
 /// which is shared across the binary's parallel tests and would be flaky.
 fn test_reg() -> Registry {
@@ -23,6 +25,42 @@ fn test_cost() -> CostModel {
         input_micros_per_mtok: 3_000_000,
         output_micros_per_mtok: 15_000_000,
     }
+}
+
+struct AcceptUsageSink;
+
+#[async_trait]
+impl UsageSink for AcceptUsageSink {
+    async fn reserve(
+        &self,
+        event: ai_usage::UsageEvent,
+    ) -> Result<ai_usage::UsageReserveOutcome, String> {
+        Ok(ai_usage::UsageReserveOutcome::Acquired(
+            ai_usage::UsageReservation {
+                usage_id: event.usage_id,
+                token: uuid::Uuid::new_v4(),
+            },
+        ))
+    }
+
+    async fn finalize(
+        &self,
+        _reservation: ai_usage::UsageReservation,
+        _actual_micros: u64,
+        _outcome: Option<ai_usage::UsageOutcome>,
+    ) -> Result<ai_usage::UsagePersistOutcome, String> {
+        Ok(ai_usage::UsagePersistOutcome::Inserted)
+    }
+
+    async fn cancel(&self, _reservation: ai_usage::UsageReservation) -> Result<bool, String> {
+        Ok(true)
+    }
+}
+
+static ACCEPT_USAGE_SINK: AcceptUsageSink = AcceptUsageSink;
+
+fn test_usage_sink() -> Option<&'static dyn UsageSink> {
+    Some(&ACCEPT_USAGE_SINK)
 }
 
 // ---------- existing parse/payload tests ----------
@@ -118,9 +156,16 @@ fn was_paid_matches_handler_result_shapes() {
         AiJobKind::Moderate,
         &serde_json::json!({ "verdict": "safe", "anthropic": false })
     ));
-    // Summarize / Answer always make a completion call on success.
-    assert!(was_paid(AiJobKind::Summarize, &serde_json::json!({ "summary": "x" })));
-    assert!(was_paid(AiJobKind::Answer, &serde_json::json!({ "answer": "y" })));
+    // Summarize / Answer are paid only when Anthropic was configured; the
+    // deterministic no-key fallback must not create a ledger charge.
+    assert!(was_paid(
+        AiJobKind::Summarize,
+        &serde_json::json!({ "summary": "x", "anthropic": true })
+    ));
+    assert!(!was_paid(
+        AiJobKind::Answer,
+        &serde_json::json!({ "answer": "y", "anthropic": false })
+    ));
 }
 
 /// A no-op Embed (empty text) returns the `skipped` marker and performs no
@@ -157,7 +202,10 @@ async fn embed_handler_skips_paid_call_when_nothing_to_embed() {
     // text — verify the predicate the handler relies on. (The handler itself
     // needs a DB-backed AiService, covered by integration; here we assert the
     // decision + that the embedder is the thing gated on it.)
-    let embedder = CountingEmbedder { inner: HashEmbedder::new(), calls: Arc::clone(&calls) };
+    let embedder = CountingEmbedder {
+        inner: HashEmbedder::new(),
+        calls: Arc::clone(&calls),
+    };
 
     // Simulate the handler's gate: skip → no embed; else → embed.
     for (text, expect_call) in [("", false), ("real content", true)] {
@@ -166,9 +214,16 @@ async fn embed_handler_skips_paid_call_when_nothing_to_embed() {
             let _ = embedder.embed_one(text).await.unwrap();
         }
         let made_call = calls.load(Ordering::SeqCst) > before;
-        assert_eq!(made_call, expect_call, "text={text:?} should_call={expect_call}");
+        assert_eq!(
+            made_call, expect_call,
+            "text={text:?} should_call={expect_call}"
+        );
     }
-    assert_eq!(calls.load(Ordering::SeqCst), 1, "exactly one paid call, for the non-empty text");
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        1,
+        "exactly one paid call, for the non-empty text"
+    );
 }
 
 /// Stronger idempotency: an Embed whose target ALREADY has a stored embedding
@@ -202,14 +257,17 @@ async fn embed_handler_skips_paid_call_when_already_embedded() {
     }
 
     let calls = Arc::new(AtomicUsize::new(0));
-    let embedder = CountingEmbedder { inner: HashEmbedder::new(), calls: Arc::clone(&calls) };
+    let embedder = CountingEmbedder {
+        inner: HashEmbedder::new(),
+        calls: Arc::clone(&calls),
+    };
 
     // (searchable_text, already_embedded, expect_paid_call)
     let cases = [
-        ("real content", false, true),  // fresh, non-empty → embed
-        ("real content", true, false),  // already embedded → skip (the new gate)
-        ("", false, false),             // empty → skip (existing gate)
-        ("", true, false),              // empty AND embedded → skip
+        ("real content", false, true), // fresh, non-empty → embed
+        ("real content", true, false), // already embedded → skip (the new gate)
+        ("", false, false),            // empty → skip (existing gate)
+        ("", true, false),             // empty AND embedded → skip
     ];
     for (text, already_embedded, expect_call) in cases {
         let before = calls.load(Ordering::SeqCst);
@@ -277,9 +335,15 @@ impl FakeQueue {
     fn with_jobs(jobs: Vec<AiJob>) -> Self {
         let rows = jobs
             .into_iter()
-            .map(|job| FakeRow { job, status: AiJobStatus::Queued })
+            .map(|job| FakeRow {
+                job,
+                status: AiJobStatus::Queued,
+            })
             .collect();
-        Self { rows: Mutex::new(rows), deferred: Mutex::default() }
+        Self {
+            rows: Mutex::new(rows),
+            deferred: Mutex::default(),
+        }
     }
 
     fn deferred_ids(&self) -> Vec<Ulid> {
@@ -288,12 +352,18 @@ impl FakeQueue {
 
     fn status_of(&self, id: Ulid) -> AiJobStatus {
         let rows = self.rows.lock().unwrap();
-        rows.iter().find(|r| r.job.id == id).map(|r| r.status).unwrap()
+        rows.iter()
+            .find(|r| r.job.id == id)
+            .map(|r| r.status)
+            .unwrap()
     }
 
     fn attempts_of(&self, id: Ulid) -> i32 {
         let rows = self.rows.lock().unwrap();
-        rows.iter().find(|r| r.job.id == id).map(|r| r.job.attempts).unwrap()
+        rows.iter()
+            .find(|r| r.job.id == id)
+            .map(|r| r.job.attempts)
+            .unwrap()
     }
 
     fn count_status(&self, want: AiJobStatus) -> usize {
@@ -373,7 +443,11 @@ struct ConcurrencyProbe {
 }
 impl ConcurrencyProbe {
     fn new() -> Self {
-        Self { live: AtomicI32::new(0), peak: AtomicI32::new(0), total: AtomicUsize::new(0) }
+        Self {
+            live: AtomicI32::new(0),
+            peak: AtomicI32::new(0),
+            total: AtomicUsize::new(0),
+        }
     }
 }
 #[async_trait]
@@ -395,14 +469,19 @@ struct OkCounter {
 }
 impl OkCounter {
     fn new() -> Self {
-        Self { ran: AtomicUsize::new(0) }
+        Self {
+            ran: AtomicUsize::new(0),
+        }
     }
 }
 #[async_trait]
 impl JobProcessor for OkCounter {
-    async fn process(&self, _job: AiJob) -> Result<serde_json::Value> {
+    async fn process(&self, job: AiJob) -> Result<serde_json::Value> {
         self.ran.fetch_add(1, Ordering::SeqCst);
-        Ok(serde_json::json!({"ok": true}))
+        Ok(match job.kind {
+            AiJobKind::Embed => serde_json::json!({"ok": true, "paid_provider": true}),
+            _ => serde_json::json!({"ok": true, "anthropic": true}),
+        })
     }
 }
 
@@ -426,7 +505,9 @@ async fn poison_job_dead_letters_after_max_attempts_and_is_not_repicked() {
     let job = mk_job(AiJobKind::Summarize, 0);
     let id = job.id;
     let queue = FakeQueue::with_jobs(vec![job]);
-    let proc = AlwaysFail { calls: AtomicUsize::new(0) };
+    let proc = AlwaysFail {
+        calls: AtomicUsize::new(0),
+    };
     let shutdown = CancellationToken::new();
     let sem = Arc::new(Semaphore::new(4));
 
@@ -439,12 +520,26 @@ async fn poison_job_dead_letters_after_max_attempts_and_is_not_repicked() {
         if claimed.is_empty() {
             break;
         }
-        process_batch(&queue, &proc, &sem, claimed, &reg, &cost, &shutdown).await;
+        process_batch(
+            &queue,
+            &proc,
+            &sem,
+            claimed,
+            &reg,
+            &cost,
+            test_usage_sink(),
+            &shutdown,
+        )
+        .await;
     }
 
     // Terminal: dead, exactly MAX_ATTEMPTS deliveries, never re-claimed after.
     assert_eq!(queue.status_of(id), AiJobStatus::Dead);
-    assert_eq!(queue.attempts_of(id), MAX_ATTEMPTS, "attempts capped at MAX_ATTEMPTS");
+    assert_eq!(
+        queue.attempts_of(id),
+        MAX_ATTEMPTS,
+        "attempts capped at MAX_ATTEMPTS"
+    );
     assert_eq!(
         i32::try_from(proc.calls.load(Ordering::SeqCst)).unwrap(),
         MAX_ATTEMPTS,
@@ -477,13 +572,19 @@ async fn over_cap_job_dead_letters_without_spending() {
         let mut rows = queue.rows.lock().unwrap();
         rows[0].status = AiJobStatus::Running;
     }
-    let proc = AlwaysFail { calls: AtomicUsize::new(0) };
+    let proc = AlwaysFail {
+        calls: AtomicUsize::new(0),
+    };
     let reg = test_reg();
     let cost = test_cost();
 
-    run_one(&queue, &proc, job, &reg, &cost).await;
+    run_one(&queue, &proc, job, &reg, &cost, test_usage_sink()).await;
 
-    assert_eq!(proc.calls.load(Ordering::SeqCst), 0, "must not spend past the cap");
+    assert_eq!(
+        proc.calls.load(Ordering::SeqCst),
+        0,
+        "must not spend past the cap"
+    );
     assert_eq!(queue.status_of(id), AiJobStatus::Dead);
 
     // Over-cap path records a dead-letter outcome and no duration/cost (the
@@ -513,11 +614,24 @@ async fn batch_is_processed_with_bounded_concurrency() {
     let limit = 4usize;
     let sem = Arc::new(Semaphore::new(limit));
 
-    process_batch(&queue, &probe, &sem, claimed.clone(), &test_reg(), &test_cost(), &shutdown).await;
+    process_batch(
+        &queue,
+        &probe,
+        &sem,
+        claimed.clone(),
+        &test_reg(),
+        &test_cost(),
+        test_usage_sink(),
+        &shutdown,
+    )
+    .await;
 
     assert_eq!(probe.total.load(Ordering::SeqCst), claimed.len());
     let peak = probe.peak.load(Ordering::SeqCst);
-    assert!(peak <= i32::try_from(limit).unwrap(), "peak {peak} exceeded limit {limit}");
+    assert!(
+        peak <= i32::try_from(limit).unwrap(),
+        "peak {peak} exceeded limit {limit}"
+    );
     assert!(peak > 1, "expected real parallelism, peak was {peak}");
 }
 
@@ -532,9 +646,23 @@ async fn serial_when_concurrency_is_one() {
     let shutdown = CancellationToken::new();
     let sem = Arc::new(Semaphore::new(1));
 
-    process_batch(&queue, &probe, &sem, claimed.clone(), &test_reg(), &test_cost(), &shutdown).await;
+    process_batch(
+        &queue,
+        &probe,
+        &sem,
+        claimed.clone(),
+        &test_reg(),
+        &test_cost(),
+        test_usage_sink(),
+        &shutdown,
+    )
+    .await;
 
-    assert_eq!(probe.peak.load(Ordering::SeqCst), 1, "concurrency=1 must serialize");
+    assert_eq!(
+        probe.peak.load(Ordering::SeqCst),
+        1,
+        "concurrency=1 must serialize"
+    );
     assert_eq!(probe.total.load(Ordering::SeqCst), claimed.len());
 }
 
@@ -545,7 +673,9 @@ async fn process_batch_stops_starting_new_jobs_on_shutdown() {
     // branches in random order, so a few already-permitted jobs may start
     // before the cancel branch wins — but never the entire batch.
     let total_jobs = 8usize;
-    let jobs: Vec<AiJob> = (0..total_jobs).map(|_| mk_job(AiJobKind::Moderate, 1)).collect();
+    let jobs: Vec<AiJob> = (0..total_jobs)
+        .map(|_| mk_job(AiJobKind::Moderate, 1))
+        .collect();
     let queue = FakeQueue::with_jobs(jobs);
     let claimed = queue.claim(BATCH_SIZE).await.unwrap();
     let probe = ConcurrencyProbe::new();
@@ -556,7 +686,16 @@ async fn process_batch_stops_starting_new_jobs_on_shutdown() {
 
     tokio::time::timeout(
         Duration::from_secs(2),
-        process_batch(&queue, &probe, &sem, claimed.clone(), &test_reg(), &test_cost(), &shutdown),
+        process_batch(
+            &queue,
+            &probe,
+            &sem,
+            claimed.clone(),
+            &test_reg(),
+            &test_cost(),
+            test_usage_sink(),
+            &shutdown,
+        ),
     )
     .await
     .expect("process_batch must return promptly when cancelled");
@@ -572,7 +711,9 @@ async fn process_batch_stops_starting_new_jobs_on_shutdown() {
 #[tokio::test]
 async fn run_loop_exits_promptly_on_shutdown() {
     let queue = FakeQueue::default(); // empty → would idle-sleep forever
-    let proc = AlwaysFail { calls: AtomicUsize::new(0) };
+    let proc = AlwaysFail {
+        calls: AtomicUsize::new(0),
+    };
     let budget = CostBudget::new(10, Duration::from_secs(60));
     let shutdown = CancellationToken::new();
     shutdown.cancel(); // pre-cancelled
@@ -588,6 +729,7 @@ async fn run_loop_exits_promptly_on_shutdown() {
             WorkerConfig::default(),
             &test_reg(),
             &test_cost(),
+            test_usage_sink(),
             &shutdown,
         ),
     )
@@ -606,7 +748,12 @@ async fn run_loop_stops_claiming_once_budget_exhausted() {
     let queue = FakeQueue::with_jobs(jobs);
     let proc = OkCounter::new();
     let budget = CostBudget::new(3, Duration::from_secs(3600));
-    let cfg = WorkerConfig { max_concurrency: 4, max_calls_per_window: 3, max_calls_per_window_per_workspace: u32::MAX, budget_window: Duration::from_secs(3600) };
+    let cfg = WorkerConfig {
+        max_concurrency: 4,
+        max_calls_per_window: 3,
+        max_calls_per_window_per_workspace: u32::MAX,
+        budget_window: Duration::from_secs(3600),
+    };
     let shutdown = CancellationToken::new();
     let reg = test_reg();
     let cost = test_cost();
@@ -617,13 +764,32 @@ async fn run_loop_stops_claiming_once_budget_exhausted() {
         tokio::time::sleep(Duration::from_millis(300)).await;
         token.cancel();
     });
-    run_loop(&queue, &proc, &budget, &unlimited_keyed(), cfg, &reg, &cost, &shutdown).await;
+    run_loop(
+        &queue,
+        &proc,
+        &budget,
+        &unlimited_keyed(),
+        cfg,
+        &reg,
+        &cost,
+        test_usage_sink(),
+        &shutdown,
+    )
+    .await;
     handle.await.unwrap();
 
-    assert_eq!(proc.ran.load(Ordering::SeqCst), 3, "processed exactly the budget");
+    assert_eq!(
+        proc.ran.load(Ordering::SeqCst),
+        3,
+        "processed exactly the budget"
+    );
     assert_eq!(budget.available(), 0, "budget window fully consumed");
     // Remaining rows are still queued (not failed, not dead) for a later window.
-    assert_eq!(queue.count_status(AiJobStatus::Queued), 17, "rest left for later window");
+    assert_eq!(
+        queue.count_status(AiJobStatus::Queued),
+        17,
+        "rest left for later window"
+    );
     assert_eq!(queue.count_status(AiJobStatus::Dead), 0);
 
     // End-to-end metrics for the run-loop: exactly 3 successful summarize
@@ -653,8 +819,7 @@ async fn weighted_budget_defers_expensive_jobs() {
     // 5 units. A 5-unit window therefore admits exactly ONE Answer — whereas
     // a flat call-count budget of 5 would have run both. The second is
     // deferred (not dropped), proving the window is a weighted COST ceiling.
-    let jobs: Vec<AiJob> =
-        vec![mk_job(AiJobKind::Answer, 1), mk_job(AiJobKind::Answer, 1)];
+    let jobs: Vec<AiJob> = vec![mk_job(AiJobKind::Answer, 1), mk_job(AiJobKind::Answer, 1)];
     let queue = FakeQueue::with_jobs(jobs);
     let proc = OkCounter::new();
     let budget = CostBudget::new(5, Duration::from_secs(3600));
@@ -673,8 +838,18 @@ async fn weighted_budget_defers_expensive_jobs() {
         tokio::time::sleep(Duration::from_millis(300)).await;
         token.cancel();
     });
-    run_loop(&queue, &proc, &budget, &unlimited_keyed(), cfg, &test_reg(), &cost, &shutdown)
-        .await;
+    run_loop(
+        &queue,
+        &proc,
+        &budget,
+        &unlimited_keyed(),
+        cfg,
+        &test_reg(),
+        &cost,
+        test_usage_sink(),
+        &shutdown,
+    )
+    .await;
     handle.await.unwrap();
 
     assert_eq!(
@@ -682,7 +857,11 @@ async fn weighted_budget_defers_expensive_jobs() {
         1,
         "one Answer (weight 5) fills the whole 5-unit window"
     );
-    assert_eq!(budget.available(), 0, "Answer consumed the full weighted window");
+    assert_eq!(
+        budget.available(),
+        0,
+        "Answer consumed the full weighted window"
+    );
     assert_eq!(
         queue.count_status(AiJobStatus::Queued),
         1,
@@ -700,7 +879,12 @@ async fn run_loop_does_not_orphan_claimed_jobs() {
     let queue = FakeQueue::with_jobs(jobs);
     let proc = OkCounter::new();
     let budget = CostBudget::new(5, Duration::from_secs(3600));
-    let cfg = WorkerConfig { max_concurrency: 2, max_calls_per_window: 5, max_calls_per_window_per_workspace: u32::MAX, budget_window: Duration::from_secs(3600) };
+    let cfg = WorkerConfig {
+        max_concurrency: 2,
+        max_calls_per_window: 5,
+        max_calls_per_window_per_workspace: u32::MAX,
+        budget_window: Duration::from_secs(3600),
+    };
     let shutdown = CancellationToken::new();
 
     let token = shutdown.clone();
@@ -708,12 +892,31 @@ async fn run_loop_does_not_orphan_claimed_jobs() {
         tokio::time::sleep(Duration::from_millis(200)).await;
         token.cancel();
     });
-    run_loop(&queue, &proc, &budget, &unlimited_keyed(), cfg, &test_reg(), &test_cost(), &shutdown).await;
+    run_loop(
+        &queue,
+        &proc,
+        &budget,
+        &unlimited_keyed(),
+        cfg,
+        &test_reg(),
+        &test_cost(),
+        test_usage_sink(),
+        &shutdown,
+    )
+    .await;
     handle.await.unwrap();
 
     assert_eq!(proc.ran.load(Ordering::SeqCst), 5);
-    assert_eq!(queue.count_status(AiJobStatus::Done), 5, "all claimed jobs completed");
-    assert_eq!(queue.count_status(AiJobStatus::Running), 0, "no orphaned running rows");
+    assert_eq!(
+        queue.count_status(AiJobStatus::Done),
+        5,
+        "all claimed jobs completed"
+    );
+    assert_eq!(
+        queue.count_status(AiJobStatus::Running),
+        0,
+        "no orphaned running rows"
+    );
 }
 
 #[tokio::test]
@@ -744,12 +947,34 @@ async fn run_loop_defers_jobs_over_the_per_workspace_budget() {
         tokio::time::sleep(Duration::from_millis(150)).await;
         token.cancel();
     });
-    run_loop(&queue, &proc, &budget, &keyed, cfg, &test_reg(), &test_cost(), &shutdown).await;
+    run_loop(
+        &queue,
+        &proc,
+        &budget,
+        &keyed,
+        cfg,
+        &test_reg(),
+        &test_cost(),
+        test_usage_sink(),
+        &shutdown,
+    )
+    .await;
     handle.await.unwrap();
 
-    assert_eq!(proc.ran.load(Ordering::SeqCst), 1, "only the within-budget job runs");
-    assert!(queue.deferred_ids().contains(&b_id), "over-budget job was deferred");
-    assert_eq!(queue.count_status(AiJobStatus::Done), 1, "exactly one job completed");
+    assert_eq!(
+        proc.ran.load(Ordering::SeqCst),
+        1,
+        "only the within-budget job runs"
+    );
+    assert!(
+        queue.deferred_ids().contains(&b_id),
+        "over-budget job was deferred"
+    );
+    assert_eq!(
+        queue.count_status(AiJobStatus::Done),
+        1,
+        "exactly one job completed"
+    );
 }
 
 // ---------- (方向四) observability instrumentation ----------
@@ -767,11 +992,13 @@ async fn run_one_success_records_duration_cost_and_outcome() {
         let mut rows = queue.rows.lock().unwrap();
         rows[0].status = AiJobStatus::Running;
     }
-    let proc = FixedResult { value: serde_json::json!({ "answer": "42" }) };
+    let proc = FixedResult {
+        value: serde_json::json!({ "answer": "42", "anthropic": true }),
+    };
     let reg = test_reg();
     let cost = test_cost();
 
-    run_one(&queue, &proc, job, &reg, &cost).await;
+    run_one(&queue, &proc, job, &reg, &cost, test_usage_sink()).await;
 
     assert_eq!(queue.status_of(id), AiJobStatus::Done);
     let out = reg.render_prometheus();
@@ -789,162 +1016,6 @@ async fn run_one_success_records_duration_cost_and_outcome() {
     assert!(
         out.contains(r#"aero_ai_jobs_total{kind="answer",outcome="success"} 1"#),
         "success outcome not recorded:\n{out}"
-    );
-}
-
-// ---------- (方向三) real token usage → cost ----------
-
-#[test]
-fn attach_and_read_usage_round_trips() {
-    let mut result = serde_json::json!({ "answer": "x" });
-    attach_usage(&mut result, Some(Usage { input_tokens: 100, output_tokens: 25 }));
-    // The usage is now part of the persisted result JSON (queryable).
-    assert_eq!(result["usage"]["input_tokens"], 100);
-    assert_eq!(result["usage"]["output_tokens"], 25);
-    // And reads back as the same Usage.
-    let u = usage_from_result(&result).expect("usage present");
-    assert_eq!(u, Usage { input_tokens: 100, output_tokens: 25 });
-}
-
-#[test]
-fn attach_usage_none_is_noop_and_reads_back_none() {
-    let mut result = serde_json::json!({ "summary": "x" });
-    attach_usage(&mut result, None);
-    assert!(result.get("usage").is_none());
-    assert!(usage_from_result(&result).is_none());
-}
-
-#[tokio::test]
-async fn run_one_records_real_token_cost_when_usage_present() {
-    // A successful Answer job whose result carries REAL token usage must
-    // charge the cost counter the token-based figure, not the flat estimate.
-    let job = mk_job(AiJobKind::Answer, 1);
-    let queue = FakeQueue::with_jobs(vec![job.clone()]);
-    {
-        let mut rows = queue.rows.lock().unwrap();
-        rows[0].status = AiJobStatus::Running;
-    }
-    // Result shape a real handler produces: answer + usage block.
-    let proc = FixedResult {
-        value: serde_json::json!({
-            "answer": "42",
-            "usage": { "input_tokens": 1000, "output_tokens": 100 },
-        }),
-    };
-    let reg = test_reg();
-    let cost = CostModel::default();
-
-    run_one(&queue, &proc, job, &reg, &cost).await;
-
-    // Real token cost: 1000*3 + 100*15 = 3000 + 1500 = 4500 micros (default
-    // Sonnet rates) — NOT the flat answer_micros estimate (5000).
-    let want = cost.token_micros(1000, 100);
-    assert_ne!(want, cost.answer_micros, "test must distinguish real vs estimate");
-    let out = reg.render_prometheus();
-    assert!(
-        out.contains(&format!(
-            r#"aero_ai_cost_micros_total{{kind="answer"}} {want}"#
-        )),
-        "expected real token cost {want}, not the flat estimate:\n{out}"
-    );
-}
-
-#[tokio::test]
-async fn run_one_labels_cost_with_job_workspace() {
-    // The job's workspace_id must flow through to a per-workspace cost series
-    // (方向三 per-tenant 成本指标), while the aggregate per-kind series is kept.
-    let ws = uuid::Uuid::from_u128(0x0000_0000_0000_0000_0000_0000_0000_0099);
-    let mut job = mk_job(AiJobKind::Answer, 1);
-    job.workspace_id = Some(ws);
-    let queue = FakeQueue::with_jobs(vec![job.clone()]);
-    {
-        let mut rows = queue.rows.lock().unwrap();
-        rows[0].status = AiJobStatus::Running;
-    }
-    let proc = FixedResult {
-        value: serde_json::json!({
-            "answer": "42",
-            "usage": { "input_tokens": 1000, "output_tokens": 100 },
-        }),
-    };
-    let reg = test_reg();
-    let cost = CostModel::default();
-
-    run_one(&queue, &proc, job, &reg, &cost).await;
-
-    let want = cost.token_micros(1000, 100); // 4500
-    let out = reg.render_prometheus();
-    assert!(
-        out.contains(&format!(
-            r#"aero_ai_cost_micros_total{{kind="answer",workspace="{ws}"}} {want}"#
-        )),
-        "per-workspace cost not recorded under the job's workspace:\n{out}"
-    );
-    // Aggregate per-kind series still present (operators want both views).
-    assert!(
-        out.contains(&format!(
-            r#"aero_ai_cost_micros_total{{kind="answer"}} {want}"#
-        )),
-        "aggregate cost series must be preserved:\n{out}"
-    );
-}
-
-#[tokio::test]
-async fn run_one_falls_back_to_estimate_when_usage_absent() {
-    // A successful Summarize job WITHOUT a usage block (heuristic / no-key
-    // path) must fall back to the flat per-kind estimate.
-    let job = mk_job(AiJobKind::Summarize, 1);
-    let queue = FakeQueue::with_jobs(vec![job.clone()]);
-    {
-        let mut rows = queue.rows.lock().unwrap();
-        rows[0].status = AiJobStatus::Running;
-    }
-    let proc = FixedResult { value: serde_json::json!({ "summary": "x", "anthropic": false }) };
-    let reg = test_reg();
-    let cost = CostModel::default();
-
-    run_one(&queue, &proc, job, &reg, &cost).await;
-
-    let out = reg.render_prometheus();
-    assert!(
-        out.contains(&format!(
-            r#"aero_ai_cost_micros_total{{kind="summarize"}} {}"#,
-            cost.summarize_micros
-        )),
-        "expected the flat estimate fallback:\n{out}"
-    );
-}
-
-#[tokio::test]
-async fn run_one_embed_skip_records_zero_cost_but_still_succeeds() {
-    // An idempotent embed no-op (handler returns a `skipped` marker) must
-    // record duration + a SUCCESS outcome but charge ZERO cost.
-    let job = mk_job(AiJobKind::Embed, 1);
-    let queue = FakeQueue::with_jobs(vec![job.clone()]);
-    {
-        let mut rows = queue.rows.lock().unwrap();
-        rows[0].status = AiJobStatus::Running;
-    }
-    let proc = FixedResult {
-        value: serde_json::json!({ "skipped": "empty", "updated": false }),
-    };
-    let reg = test_reg();
-    let cost = test_cost();
-
-    run_one(&queue, &proc, job, &reg, &cost).await;
-
-    let out = reg.render_prometheus();
-    assert!(
-        out.contains(r#"aero_ai_jobs_total{kind="embed",outcome="success"} 1"#),
-        "embed skip is still a success:\n{out}"
-    );
-    assert!(
-        out.contains(r#"aero_ai_cost_micros_total{kind="embed"} 0"#),
-        "embed skip must charge zero cost:\n{out}"
-    );
-    assert!(
-        out.contains(r#"aero_ai_job_duration_seconds_count{kind="embed"} 1"#),
-        "duration still recorded for a skip:\n{out}"
     );
 }
 
@@ -976,7 +1047,18 @@ async fn run_loop_sets_queue_depth_gauge_during_a_batch() {
         token.cancel();
         mid
     });
-    run_loop(&queue, &probe, &budget, &unlimited_keyed(), cfg, &reg, &cost, &shutdown).await;
+    run_loop(
+        &queue,
+        &probe,
+        &budget,
+        &unlimited_keyed(),
+        cfg,
+        &reg,
+        &cost,
+        test_usage_sink(),
+        &shutdown,
+    )
+    .await;
     let mid = handle.await.unwrap();
 
     assert!(
@@ -985,7 +1067,8 @@ async fn run_loop_sets_queue_depth_gauge_during_a_batch() {
     );
     // After draining, it settles back to 0.
     assert!(
-        reg.render_prometheus().contains("\naero_ai_queue_depth 0\n"),
+        reg.render_prometheus()
+            .contains("\naero_ai_queue_depth 0\n"),
         "queue depth should return to 0 after drain"
     );
 }

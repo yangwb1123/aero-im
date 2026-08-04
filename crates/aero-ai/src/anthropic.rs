@@ -38,12 +38,18 @@ pub struct ChatMsg {
 impl ChatMsg {
     #[must_use]
     pub fn user(content: impl Into<String>) -> Self {
-        Self { role: "user".into(), content: content.into() }
+        Self {
+            role: "user".into(),
+            content: content.into(),
+        }
     }
 
     #[must_use]
     pub fn assistant(content: impl Into<String>) -> Self {
-        Self { role: "assistant".into(), content: content.into() }
+        Self {
+            role: "assistant".into(),
+            content: content.into(),
+        }
     }
 }
 
@@ -140,7 +146,9 @@ impl AnthropicClient {
         messages: &[ChatMsg],
         max_tokens: u32,
     ) -> Result<String> {
-        self.complete_with_usage(system, messages, max_tokens).await.map(|(text, _usage)| text)
+        self.complete_with_usage(system, messages, max_tokens)
+            .await
+            .map(|(text, _usage)| text)
     }
 
     /// Like [`Self::complete`] but also returns the real token [`Usage`] parsed
@@ -155,7 +163,8 @@ impl AnthropicClient {
         messages: &[ChatMsg],
         max_tokens: u32,
     ) -> Result<(String, Usage)> {
-        self.complete_with_usage_model(None, system, messages, max_tokens).await
+        self.complete_with_usage_model(None, system, messages, max_tokens)
+            .await
     }
 
     /// Text-only completion routed to a specific `model` when given (model-tier
@@ -310,7 +319,10 @@ impl AnthropicClient {
         let status = resp.status();
         let raw = resp.text().await?;
         if !status.is_success() {
-            return Err(AiError::Anthropic { status: status.as_u16(), message: truncate(&raw, 1024) });
+            return Err(AiError::Anthropic {
+                status: status.as_u16(),
+                message: truncate(&raw, 1024),
+            });
         }
         parse_agent_turn(&raw)
     }
@@ -404,7 +416,7 @@ pub struct ToolDef {
 
 /// A `tool_use` block the model emitted: run `name` with `input`, then reply with
 /// a `tool_result` echoing `id` so the API can correlate the result.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolUse {
     pub id: String,
     pub name: String,
@@ -413,7 +425,7 @@ pub struct ToolUse {
 
 /// One assistant turn in a tool-use loop: any text it produced, the tool calls it
 /// wants executed (empty ⇒ it's done answering), and the real token [`Usage`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentTurn {
     pub text: String,
     pub tool_uses: Vec<ToolUse>,
@@ -439,11 +451,17 @@ fn parse_agent_turn(raw: &str) -> Result<AgentTurn> {
     for block in parsed.content {
         match block {
             ContentBlock::Text { text: t } => text.push_str(&t),
-            ContentBlock::ToolUse { id, name, input } => tool_uses.push(ToolUse { id, name, input }),
+            ContentBlock::ToolUse { id, name, input } => {
+                tool_uses.push(ToolUse { id, name, input })
+            }
             ContentBlock::Other => {}
         }
     }
-    Ok(AgentTurn { text, tool_uses, usage })
+    Ok(AgentTurn {
+        text,
+        tool_uses,
+        usage,
+    })
 }
 
 /// Serialize `tools` to JSON and tag the **last** tool definition with
@@ -452,8 +470,10 @@ fn parse_agent_turn(raw: &str) -> Result<AgentTurn> {
 /// tool covers all of them. Returns the tools unchanged (just re-serialized) when
 /// the slice is empty. Pure + serialization-only, so it's unit-tested without HTTP.
 fn tools_with_cache_control(tools: &[ToolDef]) -> Vec<serde_json::Value> {
-    let mut values: Vec<serde_json::Value> =
-        tools.iter().map(|t| serde_json::to_value(t).unwrap_or(serde_json::Value::Null)).collect();
+    let mut values: Vec<serde_json::Value> = tools
+        .iter()
+        .map(|t| serde_json::to_value(t).unwrap_or(serde_json::Value::Null))
+        .collect();
     if let Some(last) = values.last_mut() {
         if let Some(obj) = last.as_object_mut() {
             obj.insert(
@@ -501,7 +521,11 @@ struct SystemBlock<'a> {
 impl<'a> SystemBlock<'a> {
     /// Wrap a system prompt as a cache-tagged text block array (length 1).
     fn cached(text: &'a str) -> [Self; 1] {
-        [Self { kind: "text", text, cache_control: CacheControl::EPHEMERAL }]
+        [Self {
+            kind: "text",
+            text,
+            cache_control: CacheControl::EPHEMERAL,
+        }]
     }
 }
 
@@ -529,10 +553,16 @@ struct ResponseBody {
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ContentBlock {
-    Text { text: String },
+    Text {
+        text: String,
+    },
     /// A tool the model wants run — surfaced by [`AnthropicClient::complete_with_tools`]
     /// for the agentic loop; ignored by the plain-text [`AnthropicClient::complete`] path.
-    ToolUse { id: String, name: String, input: serde_json::Value },
+    ToolUse {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    },
     #[serde(other)]
     Other,
 }
@@ -549,7 +579,11 @@ struct OwnedSystemBlock {
 
 impl OwnedSystemBlock {
     fn cached(text: String) -> [Self; 1] {
-        [Self { kind: "text", text, cache_control: CacheControl::EPHEMERAL }]
+        [Self {
+            kind: "text",
+            text,
+            cache_control: CacheControl::EPHEMERAL,
+        }]
     }
 }
 
@@ -674,7 +708,9 @@ mod tests {
         assert_eq!(json["max_tokens"], 256);
         // `system` is now the cache-tagged content-block array form (required to
         // carry `cache_control`), not a bare string. The text is preserved.
-        let sys = json["system"].as_array().expect("system must be a block array");
+        let sys = json["system"]
+            .as_array()
+            .expect("system must be a block array");
         assert_eq!(sys.len(), 1);
         assert_eq!(sys[0]["type"], "text");
         assert_eq!(sys[0]["text"], "be terse");
@@ -859,7 +895,13 @@ mod tests {
     #[test]
     fn usage_deserializes_standalone_object() {
         let u: Usage = serde_json::from_str(r#"{"input_tokens":10,"output_tokens":20}"#).unwrap();
-        assert_eq!(u, Usage { input_tokens: 10, output_tokens: 20 });
+        assert_eq!(
+            u,
+            Usage {
+                input_tokens: 10,
+                output_tokens: 20
+            }
+        );
     }
 
     #[test]
@@ -876,7 +918,13 @@ mod tests {
         // Defensive: a usage object missing one field defaults it to zero rather
         // than failing (the `#[serde(default)]` on each field).
         let u: Usage = serde_json::from_str(r#"{"input_tokens":7}"#).unwrap();
-        assert_eq!(u, Usage { input_tokens: 7, output_tokens: 0 });
+        assert_eq!(
+            u,
+            Usage {
+                input_tokens: 7,
+                output_tokens: 0
+            }
+        );
     }
 
     #[test]

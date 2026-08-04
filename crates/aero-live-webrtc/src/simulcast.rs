@@ -351,9 +351,7 @@ impl LayerSelectorTable {
         target: LayerKind,
     ) -> Option<Rid> {
         let layer_set = self.layer_sets.get(pub_mid)?;
-        let selected = layer_set
-            .select(target)
-            .or_else(|| layer_set.lowest())?;
+        let selected = layer_set.select(target).or_else(|| layer_set.lowest())?;
         let rid = selected.rid;
         self.selectors
             .entry((subscriber, pub_mid.to_owned()))
@@ -395,11 +393,7 @@ impl LayerSelectorTable {
     /// Only compiled in `#[cfg(test)]` builds.
     #[cfg(test)]
     #[must_use]
-    pub fn selector_for(
-        &self,
-        subscriber: ParticipantId,
-        pub_mid: &str,
-    ) -> Option<&LayerSelector> {
+    pub fn selector_for(&self, subscriber: ParticipantId, pub_mid: &str) -> Option<&LayerSelector> {
         self.selectors.get(&(subscriber, pub_mid.to_owned()))
     }
 }
@@ -433,10 +427,8 @@ mod tests {
     #[test]
     fn select_returns_none_when_no_layer_meets_target() {
         // Only high available, target is low → no layer ≤ low
-        let set = LayerSet::from_layers(vec![SimulcastLayer::spatial(
-            rid("high"),
-            LayerKind::High,
-        )]);
+        let set =
+            LayerSet::from_layers(vec![SimulcastLayer::spatial(rid("high"), LayerKind::High)]);
         assert!(set.select(LayerKind::Low).is_none());
     }
 
@@ -551,10 +543,16 @@ mod tests {
         sel.request_switch(rid("high"));
 
         // Bootstrap on "low".
-        assert_eq!(sel.should_forward(rid("low"), false), ForwardDecision::Forward);
+        assert_eq!(
+            sel.should_forward(rid("low"), false),
+            ForwardDecision::Forward
+        );
 
         // Subsequent "low" packets keep flowing while we wait for the target.
-        assert_eq!(sel.should_forward(rid("low"), false), ForwardDecision::Forward);
+        assert_eq!(
+            sel.should_forward(rid("low"), false),
+            ForwardDecision::Forward
+        );
 
         // Non-keyframe on target → request a keyframe (first time only).
         assert_eq!(

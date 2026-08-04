@@ -81,7 +81,8 @@ async fn interact(
         .await?
         .filter(|m| m.deleted_at.is_none())
         .ok_or_else(|| AeroError::NotFound(format!("message {message}")))?;
-    s.im.assert_room_access(auth.participant_id, msg.room_id).await?;
+    s.im.assert_room_access(auth.participant_id, msg.room_id)
+        .await?;
 
     let action_id = req.action_id.trim();
     if action_id.is_empty() {
@@ -97,24 +98,29 @@ async fn interact(
         .into());
     }
 
-    let value = req.value.as_deref().map(str::trim).filter(|v| !v.is_empty());
+    let value = req
+        .value
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
     let recorded = repo(&s)
         .record(message, msg.room_id, auth.participant_id, action_id, value)
         .await?;
 
-    s.im
-        .broadcast_room_event(
-            msg.room_id,
-            RoomEvent::Interaction {
-                room_id: msg.room_id,
-                message_id: message,
-                participant: auth.participant_id,
-                action_id: action_id.to_owned(),
-            },
-        )
-        .await;
+    s.im.broadcast_room_event(
+        msg.room_id,
+        RoomEvent::Interaction {
+            room_id: msg.room_id,
+            message_id: message,
+            participant: auth.participant_id,
+            action_id: action_id.to_owned(),
+        },
+    )
+    .await;
 
-    Ok(Json(serde_json::to_value(recorded).map_err(AeroError::from)?))
+    Ok(Json(
+        serde_json::to_value(recorded).map_err(AeroError::from)?,
+    ))
 }
 
 /// `GET /api/messages/:id/interactions` — the chronological list of interactions
@@ -133,7 +139,8 @@ async fn list_interactions(
         .await?
         .filter(|m| m.deleted_at.is_none())
         .ok_or_else(|| AeroError::NotFound(format!("message {message}")))?;
-    s.im.assert_room_access(auth.participant_id, msg.room_id).await?;
+    s.im.assert_room_access(auth.participant_id, msg.room_id)
+        .await?;
 
     let interactions = repo(&s).list_for_message(message).await?;
     Ok(Json(serde_json::json!({
@@ -162,7 +169,10 @@ mod tests {
             Block::Select {
                 action_id: "assignee".into(),
                 placeholder: Some("Assign to".into()),
-                options: vec![SelectOption { value: "u1".into(), label: "Alice".into() }],
+                options: vec![SelectOption {
+                    value: "u1".into(),
+                    label: "Alice".into(),
+                }],
             },
         ];
         // Real components match.

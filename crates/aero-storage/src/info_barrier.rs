@@ -7,18 +7,22 @@
 //!
 //! The KEY method is [`BarrierRepo::barred`]: it answers "may these two
 //! participants converse?" by joining `info_barriers` against each participant's
-//! `user_group_members` rows in BOTH orderings, scoped to one workspace. The DM /
-//! group-DM creation paths call it as a pre-flight check; admins manage the
-//! barrier set through the server's `info_barriers` module.
+//! `user_group_members` rows in BOTH orderings, scoped to one workspace. DM /
+//! group-DM creation checks it, and every user-authored message create/edit
+//! transaction repeats an aggregate room-recipient check while holding the
+//! workspace policy fence. A barrier created after a conversation therefore
+//! blocks subsequent communication too.
 //!
 //! Purely additive: a NEW [`BarrierRepo`]; no existing repo is touched. The
 //! [`InfoBarrier`] model lives here (and is re-exported from the crate root)
 //! rather than in `aero-common`, since it is a storage-layer projection — mirroring
 //! [`UserGroup`](crate::UserGroup) and [`SavedSearch`](crate::SavedSearch).
 
-use aero_common::{BarrierId, ParticipantId, UserGroupId, WorkspaceId};
+use aero_common::{BarrierId, Error, ParticipantId, UserGroupId, WorkspaceId};
 use serde::Serialize;
 use sqlx::PgPool;
+
+use crate::workspace::authz::assert_effective_admin_in_tx;
 
 /// One information barrier — an admin-defined barred PAIR of user-groups in a
 /// workspace.
@@ -92,7 +96,8 @@ impl BarrierRepo {
     ///
     /// # Errors
     /// Propagates any [`sqlx::Error`] from the insert.
-    pub async fn create(
+    #[cfg(test)]
+    pub(crate) async fn create(
         &self,
         workspace: WorkspaceId,
         group_a: UserGroupId,
@@ -111,6 +116,53 @@ impl BarrierRepo {
         .bind(created_by.to_uuid())
         .execute(&self.pool)
         .await?;
+        Ok(id)
+    }
+
+    /// Create a barred pair with administrator authorization, distinctness, and
+    /// group tenant-containment checked in the same transaction as the insert.
+    pub async fn create_authorized(
+        &self,
+        workspace: WorkspaceId,
+        group_a: UserGroupId,
+        group_b: UserGroupId,
+        actor: ParticipantId,
+    ) -> Result<BarrierId, Error> {
+        if group_a == group_b {
+            return Err(Error::Invalid(
+                "a group cannot be barred from itself".into(),
+            ));
+        }
+        let mut tx = self.pool.begin().await?;
+        assert_effective_admin_in_tx(&mut tx, workspace, actor).await?;
+        let groups = sqlx::query_scalar::<_, uuid::Uuid>(
+            "SELECT id
+               FROM user_groups
+              WHERE workspace_id = $1 AND id = ANY($2)
+              FOR SHARE",
+        )
+        .bind(workspace.to_uuid())
+        .bind(vec![group_a.to_uuid(), group_b.to_uuid()])
+        .fetch_all(&mut *tx)
+        .await?;
+        if groups.len() != 2 {
+            return Err(Error::NotFound(
+                "both groups must belong to the workspace".into(),
+            ));
+        }
+        let id = BarrierId::new();
+        sqlx::query(
+            "INSERT INTO info_barriers (id, workspace_id, group_a, group_b, created_by)
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(id.to_uuid())
+        .bind(workspace.to_uuid())
+        .bind(group_a.to_uuid())
+        .bind(group_b.to_uuid())
+        .bind(actor.to_uuid())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
         Ok(id)
     }
 
@@ -152,13 +204,46 @@ impl BarrierRepo {
     ///
     /// # Errors
     /// Propagates any [`sqlx::Error`] from the delete.
-    pub async fn delete(&self, id: BarrierId, workspace: WorkspaceId) -> Result<bool, sqlx::Error> {
+    #[cfg(test)]
+    pub(crate) async fn delete(
+        &self,
+        id: BarrierId,
+        workspace: WorkspaceId,
+    ) -> Result<bool, sqlx::Error> {
         let result = sqlx::query("DELETE FROM info_barriers WHERE id = $1 AND workspace_id = $2")
             .bind(id.to_uuid())
             .bind(workspace.to_uuid())
             .execute(&self.pool)
             .await?;
         Ok(result.rows_affected() > 0)
+    }
+
+    /// Delete a barrier only if `actor` remains an effective administrator of
+    /// the barrier's immutable workspace until commit.
+    pub async fn delete_authorized(
+        &self,
+        id: BarrierId,
+        actor: ParticipantId,
+    ) -> Result<bool, Error> {
+        let mut tx = self.pool.begin().await?;
+        let workspace = sqlx::query_scalar::<_, uuid::Uuid>(
+            "SELECT workspace_id FROM info_barriers WHERE id = $1",
+        )
+        .bind(id.to_uuid())
+        .fetch_optional(&mut *tx)
+        .await?
+        .map(WorkspaceId::from_uuid)
+        .ok_or_else(|| Error::NotFound(format!("barrier {id}")))?;
+        assert_effective_admin_in_tx(&mut tx, workspace, actor).await?;
+        let removed = sqlx::query("DELETE FROM info_barriers WHERE id = $1 AND workspace_id = $2")
+            .bind(id.to_uuid())
+            .bind(workspace.to_uuid())
+            .execute(&mut *tx)
+            .await?
+            .rows_affected()
+            > 0;
+        tx.commit().await?;
+        Ok(removed)
     }
 
     /// Are participants `x` and `y` barred from conversing in `workspace`?
@@ -244,8 +329,14 @@ mod db_tests {
         let carol = actor(&p).await; // ungrouped
 
         // Two groups in the workspace; alice in A, bob in B, carol in neither.
-        let ga = groups.create(ws, "traders", "Traders", creator).await.unwrap();
-        let gb = groups.create(ws, "research", "Research", creator).await.unwrap();
+        let ga = groups
+            .create(ws, "traders", "Traders", creator)
+            .await
+            .unwrap();
+        let gb = groups
+            .create(ws, "research", "Research", creator)
+            .await
+            .unwrap();
         groups.add_member(ga, alice).await.unwrap();
         groups.add_member(gb, bob).await.unwrap();
 

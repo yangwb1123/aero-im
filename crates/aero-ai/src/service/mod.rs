@@ -13,11 +13,12 @@ use crate::anthropic::AnthropicClient;
 use crate::embed::Embedder;
 use crate::transcribe::Transcriber;
 
+mod accounting;
 pub mod profile;
 pub mod service_impl;
-pub mod tools;
 #[cfg(test)]
 pub mod tests;
+pub mod tools;
 
 pub use profile::{cross_room_profile_enabled, ExtractedProfile};
 
@@ -132,7 +133,11 @@ impl SentimentScore {
     /// when a model verdict cannot be parsed.
     #[must_use]
     pub fn neutral() -> Self {
-        Self { sentiment: Sentiment::Neutral, toxicity: 0.0, tone: "neutral".to_owned() }
+        Self {
+            sentiment: Sentiment::Neutral,
+            toxicity: 0.0,
+            tone: "neutral".to_owned(),
+        }
     }
 }
 
@@ -159,4 +164,9 @@ pub struct AiService {
     /// fresh deploy never reads or writes a profile. `None` ⇒ the feature is
     /// entirely absent and every profile path is a no-op.
     pub(crate) ai_profiles: Option<AiProfileRepo>,
+    /// Durable paid-usage sink supplied by the server composition root.
+    ///
+    /// `None` is valid for no-key/local-only test embeddings. Any paid success
+    /// path must treat it as an error rather than silently skipping accounting.
+    pub(crate) usage_sink: Option<Arc<dyn crate::usage::UsageSink>>,
 }

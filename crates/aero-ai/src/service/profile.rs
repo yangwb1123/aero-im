@@ -4,7 +4,7 @@
 //! message history into a durable [`aero_storage::AiProfile`] the answer /
 //! recommendation paths can read to personalise a reply.
 //!
-//! ## Privacy posture (隐私第一) — three hard gates
+//! ## Privacy posture (隐私第一) — four hard gates
 //!
 //! 1. **Opt-in, default OFF.** Every public method here short-circuits to a no-op
 //!    unless [`cross_room_profile_enabled`] returns `true`, i.e. the operator set
@@ -15,7 +15,10 @@
 //!    `ParticipantRepo::delete_participant`'s explicit erasure DELETE list, so a
 //!    right-to-erasure request removes the profile (the FK cascade does not fire
 //!    on a tombstone — see the storage module docs).
-//! 3. **Transparent.** The extracted fields are plain readable data
+//! 3. **Tenant-isolated.** Profiles are keyed and read by both participant and
+//!    workspace. A hint extracted from one tenant can never enter another
+//!    tenant's prompt; workspace deletion cascades its derived profile rows.
+//! 4. **Transparent.** The extracted fields are plain readable data
 //!    (`topics` array, `preferences` object, a short `summary`), never an opaque
 //!    vector, so the subject can be shown exactly what is stored.
 //!
@@ -154,17 +157,19 @@ impl AiService {
         // Read the participant's own recent cross-room messages over the SAME
         // membership/workspace boundary the workspace RAG uses — so extraction can
         // never see anything the participant could not.
-        let mut recent =
-            self.messages.recent_workspace(participant, workspace, EXTRACT_MAX_MESSAGES).await?;
+        let mut recent = self
+            .messages
+            .recent_workspace(participant, workspace, EXTRACT_MAX_MESSAGES)
+            .await?;
         recent.reverse(); // chronological for the LLM / heuristic
-        // Keep only the participant's OWN authored lines — a profile of THEM, not
-        // of everyone they talk to.
+                          // Keep only the participant's OWN authored lines — a profile of THEM, not
+                          // of everyone they talk to.
         recent.retain(|m| m.sender_id == participant);
         if recent.is_empty() {
             return Ok(None);
         }
 
-        let extracted = self.extract_profile_from(&recent).await?;
+        let extracted = self.extract_profile_from(workspace, &recent).await?;
         if extracted.is_empty() {
             return Ok(None);
         }
@@ -172,7 +177,7 @@ impl AiService {
         let stored = store
             .upsert(
                 participant,
-                Some(workspace),
+                workspace,
                 &extracted.topics_json(),
                 &extracted.preferences_json(),
                 &extracted.summary,
@@ -184,7 +189,11 @@ impl AiService {
     /// Extract a profile from a chronological slice of the participant's own
     /// messages. LLM path when an Anthropic key is configured; deterministic
     /// heuristic otherwise. Internal to the opt-in entrypoint.
-    async fn extract_profile_from(&self, messages: &[Message]) -> Result<ExtractedProfile> {
+    async fn extract_profile_from(
+        &self,
+        workspace: WorkspaceId,
+        messages: &[Message],
+    ) -> Result<ExtractedProfile> {
         let transcript = render_transcript(messages);
         if transcript.trim().is_empty() {
             return Ok(ExtractedProfile::default());
@@ -193,7 +202,18 @@ impl AiService {
             let user = format!(
                 "请阅读以下某用户的跨频道发言,并按系统指令抽取画像。\n\n发言记录:\n{transcript}"
             );
-            let verdict = client.complete(PROFILE_SYSTEM_PROMPT, &[ChatMsg::user(user)], 300).await?;
+            let (verdict, _) = self
+                .complete_accounted(
+                    client,
+                    crate::usage::UsageContext::new(Some(workspace.to_uuid())),
+                    "anthropic_profile_extract",
+                    "profile_extract",
+                    crate::metrics::CostModel::default().summarize_micros,
+                    PROFILE_SYSTEM_PROMPT,
+                    &[ChatMsg::user(user)],
+                    300,
+                )
+                .await?;
             // A malformed model line degrades to the heuristic rather than erroring.
             let parsed = parse_profile_verdict(&verdict);
             if !parsed.is_empty() {
@@ -231,7 +251,7 @@ impl AiService {
         // re-checks the same opt-in/store gates, returns `None` cheaply when the
         // participant has no own messages (no LLM call), and a failure/empty result
         // just yields no prefix this turn (never fails the answer).
-        let profile = match store.get(participant).await? {
+        let profile = match store.get(participant, workspace).await? {
             Some(p) => Some(p),
             None => self
                 .extract_and_store_profile(participant, workspace)
@@ -252,7 +272,11 @@ pub(crate) fn render_personalization_prefix(profile: &aero_storage::AiProfile) -
     let topics: Vec<String> = profile
         .topics
         .as_array()
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect()
+        })
         .unwrap_or_default();
     let summary = profile.summary.trim();
     if topics.is_empty() && summary.is_empty() {
@@ -277,7 +301,9 @@ pub(crate) fn render_personalization_prefix(profile: &aero_storage::AiProfile) -
 pub(crate) fn parse_profile_verdict(raw: &str) -> ExtractedProfile {
     let mut out = ExtractedProfile::default();
     for line in raw.lines().map(str::trim) {
-        let Some((key, rest)) = line.split_once(':') else { continue };
+        let Some((key, rest)) = line.split_once(':') else {
+            continue;
+        };
         let rest = rest.trim();
         match key.trim().to_ascii_uppercase().as_str() {
             "TOPICS" => {
@@ -328,17 +354,27 @@ pub(crate) fn heuristic_profile(messages: &[Message]) -> ExtractedProfile {
         }
     }
     // Most frequent first; ties broken by the token for determinism.
-    let mut ranked: Vec<(String, usize)> =
-        freq.into_iter().filter(|(_, n)| *n >= MIN_TOPIC_FREQ).collect();
+    let mut ranked: Vec<(String, usize)> = freq
+        .into_iter()
+        .filter(|(_, n)| *n >= MIN_TOPIC_FREQ)
+        .collect();
     ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-    let topics: Vec<String> = ranked.into_iter().take(MAX_TOPICS).map(|(t, _)| t).collect();
+    let topics: Vec<String> = ranked
+        .into_iter()
+        .take(MAX_TOPICS)
+        .map(|(t, _)| t)
+        .collect();
 
     let summary = if topics.is_empty() {
         String::new()
     } else {
         format!("常讨论:{}", topics.join("、"))
     };
-    ExtractedProfile { topics, preferences: BTreeMap::new(), summary }
+    ExtractedProfile {
+        topics,
+        preferences: BTreeMap::new(),
+        summary,
+    }
 }
 
 #[cfg(test)]
@@ -365,7 +401,10 @@ mod tests {
 
     #[test]
     fn flag_default_off_and_truthy_values() {
-        assert!(!flag_is_enabled(None), "unset is OFF (default privacy-safe)");
+        assert!(
+            !flag_is_enabled(None),
+            "unset is OFF (default privacy-safe)"
+        );
         assert!(!flag_is_enabled(Some("0")));
         assert!(!flag_is_enabled(Some("false")));
         assert!(!flag_is_enabled(Some("")));
@@ -379,8 +418,14 @@ mod tests {
         let raw = "TOPICS: rust, postgres, oncall\nPREFERENCES: tone=concise, language=zh\nSUMMARY: 关注后端与值班";
         let p = parse_profile_verdict(raw);
         assert_eq!(p.topics, vec!["rust", "postgres", "oncall"]);
-        assert_eq!(p.preferences.get("tone").map(String::as_str), Some("concise"));
-        assert_eq!(p.preferences.get("language").map(String::as_str), Some("zh"));
+        assert_eq!(
+            p.preferences.get("tone").map(String::as_str),
+            Some("concise")
+        );
+        assert_eq!(
+            p.preferences.get("language").map(String::as_str),
+            Some("zh")
+        );
         assert_eq!(p.summary, "关注后端与值班");
         assert!(!p.is_empty());
     }
@@ -390,7 +435,10 @@ mod tests {
         let raw = "summary: hi\njunk line\nTopics: a、b\npreferences:";
         let p = parse_profile_verdict(raw);
         assert_eq!(p.topics, vec!["a", "b"]);
-        assert!(p.preferences.is_empty(), "empty PREFERENCES yields no entries");
+        assert!(
+            p.preferences.is_empty(),
+            "empty PREFERENCES yields no entries"
+        );
         assert_eq!(p.summary, "hi");
     }
 
@@ -411,10 +459,19 @@ mod tests {
             msg(s, "another postgres thing"),
         ];
         let p = heuristic_profile(&messages);
-        assert!(p.topics.contains(&"postgres".to_string()), "recurring topic kept");
-        assert!(!p.topics.contains(&"hello".to_string()), "one-off word dropped");
+        assert!(
+            p.topics.contains(&"postgres".to_string()),
+            "recurring topic kept"
+        );
+        assert!(
+            !p.topics.contains(&"hello".to_string()),
+            "one-off word dropped"
+        );
         assert!(p.summary.contains("postgres"), "summary mentions the topic");
-        assert!(p.preferences.is_empty(), "heuristic path sets no preferences");
+        assert!(
+            p.preferences.is_empty(),
+            "heuristic path sets no preferences"
+        );
     }
 
     #[test]
@@ -423,7 +480,10 @@ mod tests {
         p.topics = vec!["x".into(), "y".into()];
         p.preferences.insert("tone".into(), "concise".into());
         assert_eq!(p.topics_json(), serde_json::json!(["x", "y"]));
-        assert_eq!(p.preferences_json(), serde_json::json!({ "tone": "concise" }));
+        assert_eq!(
+            p.preferences_json(),
+            serde_json::json!({ "tone": "concise" })
+        );
     }
 
     #[test]
@@ -432,7 +492,7 @@ mod tests {
         // Empty profile → no hint (no personalisation).
         let empty = AiProfile {
             participant_id: ParticipantId::new(),
-            workspace_id: None,
+            workspace_id: WorkspaceId::new(),
             topics: serde_json::json!([]),
             preferences: serde_json::json!({}),
             summary: String::new(),
@@ -442,7 +502,7 @@ mod tests {
 
         let full = AiProfile {
             participant_id: ParticipantId::new(),
-            workspace_id: None,
+            workspace_id: WorkspaceId::new(),
             topics: serde_json::json!(["rust", "pg"]),
             preferences: serde_json::json!({}),
             summary: "后端工程师".into(),

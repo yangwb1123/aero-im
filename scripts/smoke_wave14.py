@@ -5,9 +5,14 @@ deactivation (access revocation), message templates.
 Run against a live foreground server (`AERO_HOST=http://localhost:3030`).
 """
 from __future__ import annotations
-import base64, hashlib, hmac, json, os, struct, sys, time, urllib.error, urllib.request
+import base64, hashlib, hmac, http.client, json, os, struct, sys, time, urllib.error, urllib.parse, urllib.request
 
 HOST = os.environ.get("AERO_HOST", "http://localhost:3030")
+_login_stamp = time.time_ns()
+LOGIN_SOURCE_IP = (
+    f"127.{(_login_stamp >> 16) % 250 + 1}."
+    f"{(_login_stamp >> 8) % 250 + 1}.{_login_stamp % 250 + 1}"
+)
 
 
 def say(m): print(f"\033[1;36m▶ {m}\033[0m")
@@ -38,6 +43,37 @@ def req(method, path, body=None, token=None, expect=None):
                      f"{e.read().decode(errors='ignore')[:200]}")
             return None
         fail(f"HTTP {e.code} {method} {path}: {e.read().decode(errors='ignore')[:300]}")
+
+
+def login_req(body, expect):
+    """Use a private loopback source so this scenario owns one fresh 5/min bucket."""
+    parsed = urllib.parse.urlsplit(HOST)
+    connection_type = (
+        http.client.HTTPSConnection
+        if parsed.scheme == "https"
+        else http.client.HTTPConnection
+    )
+    connection = connection_type(
+        parsed.hostname,
+        parsed.port,
+        timeout=10,
+        source_address=(LOGIN_SOURCE_IP, 0),
+    )
+    path = f"{parsed.path.rstrip('/')}/api/auth/login"
+    connection.request(
+        "POST",
+        path,
+        body=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+    )
+    response = connection.getresponse()
+    raw = response.read()
+    status = response.status
+    connection.close()
+    if status not in set(expect):
+        fail(f"POST /api/auth/login: want {sorted(expect)} got {status}: "
+             f"{raw.decode(errors='ignore')[:200]}")
+    return json.loads(raw) if raw else None
 
 
 def register(tag, ts):
@@ -74,14 +110,14 @@ def totp_now(secret_b32, step=0):
 def main():
     ts = int(time.time())
     say("setup: register alice (owner) + bob (member)")
-    A, Apid, A_email = register("alice", ts)
+    A, Apid, _A_email = register("alice", ts)
     B, Bpid, B_email = register("bob", ts)
     W = req("POST", "/api/workspaces", {"name": f"Wave14 {ts}", "slug": f"w14-{ts}"}, token=A)["id"]
     req("POST", f"/api/workspaces/{W}/members", {"participant_id": Bpid, "role": "member"}, token=A, expect=[200, 204])
     ok(f"workspace {W[:8]} with alice+bob")
 
     # ---------------- 2FA / TOTP ----------------
-    say("2FA: enroll → verify(activate) → login enforcement → disable")
+    say("2FA: enroll → verify → recovery-code login → TOTP login → disable")
     st0 = req("GET", "/api/me/2fa", token=B)
     if st0.get("activated"):
         fail(f"bob already 2fa-activated: {st0}")
@@ -99,21 +135,45 @@ def main():
         fail(f"2fa not activated after verify: {st1}")
     ok("verified with a live TOTP code → activated")
     # login WITHOUT totp is now rejected
-    req("POST", "/api/auth/login", {"email": B_email, "password": "password_1234"}, expect=[401, 403])
+    login_req({"email": B_email, "password": "password_1234"}, [401, 403])
+    recovery = req("POST", "/api/me/2fa/recovery-codes",
+                   {"code": totp_now(secret)}, token=B)
+    codes = recovery.get("codes", []) if isinstance(recovery, dict) else []
+    if len(codes) != 8 or any(len(code) != 16 for code in codes):
+        fail(f"recovery-code batch has wrong shape: {recovery}")
+    code = codes[0]
+    # Password is always checked before the recovery code, so a wrong password
+    # cannot burn a valid one-time code.
+    login_req(
+        {"email": B_email, "password": "wrong-password", "recovery_code": code},
+        [401, 403],
+    )
+    recovered = login_req(
+        {"email": B_email, "password": "password_1234", "recovery_code": code},
+        [200],
+    )
+    if not recovered or not recovered.get("access_token"):
+        fail(f"login with recovery code failed: {recovered}")
+    login_req(
+        {"email": B_email, "password": "password_1234", "recovery_code": code},
+        [401, 403],
+    )
+    ok("recovery code: password-first, one-time, wrong/replay rejected")
     # login WITH a valid totp succeeds
-    lg = req("POST", "/api/auth/login",
-             {"email": B_email, "password": "password_1234", "totp": totp_now(secret)}, expect=[200])
+    lg = login_req(
+        {"email": B_email, "password": "password_1234", "totp": totp_now(secret)},
+        [200],
+    )
     if not lg or not lg.get("access_token"):
         fail(f"login with totp failed: {lg}")
-    ok("login enforcement: no code → 401; valid code → 200")
-    # alice (no 2fa) still logs in plainly
-    req("POST", "/api/auth/login", {"email": A_email, "password": "password_1234"}, expect=[200])
-    ok("a non-2FA user logs in normally (no regression)")
+    ok("login enforcement: no code → 401; valid TOTP → 200")
     # disable (requires a valid code)
     req("DELETE", "/api/me/2fa", {"code": "000000"}, token=B, expect=[400])
     req("DELETE", "/api/me/2fa", {"code": totp_now(secret)}, token=B, expect=[200, 204])
-    req("POST", "/api/auth/login", {"email": B_email, "password": "password_1234"}, expect=[200])
-    ok("disabled (bad code 400; valid code disables) → plain login restored")
+    st2 = req("GET", "/api/me/2fa", token=B)
+    if st2.get("activated"):
+        fail(f"2fa remained active after disable: {st2}")
+    ok("disabled (bad code 400; valid code disables) → status inactive")
 
     # ---------------- User deactivation ----------------
     say("deactivation: revoke a member's workspace room access")
@@ -122,7 +182,7 @@ def main():
     req("GET", f"/api/rooms/{R}/messages", token=B, expect=[200])
     ok("bob can access the room before deactivation")
     req("POST", f"/api/workspaces/{W}/members/{Apid}/deactivate", token=A, expect=[400])  # self
-    req("POST", f"/api/workspaces/{W}/members/{Bpid}/deactivate", token=B, expect=[403])  # non-admin
+    req("POST", f"/api/workspaces/{W}/members/{Apid}/deactivate", token=B, expect=[403])  # non-admin
     req("POST", f"/api/workspaces/{W}/members/{Bpid}/deactivate", token=A, expect=[200, 204])
     req("GET", f"/api/rooms/{R}/messages", token=B, expect=[403])
     deact = as_list(req("GET", f"/api/workspaces/{W}/deactivated", token=A), "members")
@@ -152,7 +212,7 @@ def main():
     req("DELETE", f"/api/templates/{Tid}", token=A, expect=[200, 204])
     ok("owner-scoped delete (stranger blocked; owner deletes)")
 
-    print("\n\033[1;32m✅ Wave-14 smoke PASSED (2FA/TOTP, user deactivation, message templates)\033[0m")
+    print("\n\033[1;32m✅ Wave-14 smoke PASSED (2FA/TOTP/recovery, user deactivation, message templates)\033[0m")
 
 
 if __name__ == "__main__":

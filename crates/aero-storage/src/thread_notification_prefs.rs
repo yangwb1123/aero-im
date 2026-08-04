@@ -13,8 +13,10 @@
 
 use std::collections::HashMap;
 
-use aero_common::{MessageId, ParticipantId};
+use aero_common::{Error, MessageId, ParticipantId};
 use sqlx::PgPool;
+
+use crate::thread_subscription::lock_effective_live_thread_root_in_tx;
 
 #[derive(Clone)]
 pub struct ThreadNotificationPrefsRepo {
@@ -32,7 +34,8 @@ impl ThreadNotificationPrefsRepo {
     ///
     /// # Errors
     /// Propagates any [`sqlx::Error`] from the upsert.
-    pub async fn set_level(
+    #[cfg(test)]
+    pub(crate) async fn set_level(
         &self,
         participant: ParticipantId,
         root: MessageId,
@@ -58,7 +61,8 @@ impl ThreadNotificationPrefsRepo {
     ///
     /// # Errors
     /// Propagates any [`sqlx::Error`] from the query.
-    pub async fn get_level(
+    #[cfg(test)]
+    pub(crate) async fn get_level(
         &self,
         participant: ParticipantId,
         root: MessageId,
@@ -72,7 +76,7 @@ impl ThreadNotificationPrefsRepo {
         .fetch_optional(&self.pg)
         .await
         .map_err(aero_common::Error::from)?;
-        Ok(row.map(|(l,)| l).unwrap_or_else(|| "all".to_owned()))
+        Ok(row.map_or_else(|| "all".to_owned(), |(level,)| level))
     }
 
     /// Batch-fetch the notification level for `participant` across many thread roots
@@ -81,7 +85,8 @@ impl ThreadNotificationPrefsRepo {
     ///
     /// # Errors
     /// Propagates any [`sqlx::Error`] from the query.
-    pub async fn level_map(
+    #[cfg(test)]
+    pub(crate) async fn level_map(
         &self,
         participant: ParticipantId,
         roots: &[MessageId],
@@ -125,8 +130,19 @@ impl ThreadNotificationPrefsRepo {
         }
         let ids: Vec<uuid::Uuid> = participants.iter().map(ParticipantId::to_uuid).collect();
         let rows = sqlx::query_as::<_, (uuid::Uuid, String)>(
-            r"SELECT participant_id, level FROM thread_notification_prefs
-               WHERE root_message_id = $1 AND participant_id = ANY($2)",
+            r"SELECT preference.participant_id, preference.level
+                FROM thread_notification_prefs AS preference
+                JOIN messages AS root
+                  ON root.id = preference.root_message_id
+                 AND root.reply_to IS NULL
+                 AND root.deleted_at IS NULL
+               WHERE preference.root_message_id = $1
+                 AND preference.participant_id = ANY($2)
+                 AND aero_effective_room_access(
+                         root.room_id,
+                         preference.participant_id,
+                         NULL
+                     )",
         )
         .bind(root.to_uuid())
         .bind(&ids)
@@ -138,12 +154,106 @@ impl ThreadNotificationPrefsRepo {
             .map(|(p, l)| (ParticipantId::from_uuid(p), l))
             .collect())
     }
+
+    /// Set a notification level under a live-root/current-access fence.
+    ///
+    /// # Errors
+    /// Returns an opaque root/access error or a database error.
+    pub async fn set_level_authorized(
+        &self,
+        participant: ParticipantId,
+        root: MessageId,
+        level: &str,
+    ) -> Result<(), Error> {
+        let mut tx = self.pg.begin().await?;
+        lock_effective_live_thread_root_in_tx(&mut tx, participant, root).await?;
+        sqlx::query(
+            r"INSERT INTO thread_notification_prefs
+                  (participant_id, root_message_id, level, created_at)
+               VALUES ($1, $2, $3, now())
+               ON CONFLICT (participant_id, root_message_id)
+               DO UPDATE SET level = EXCLUDED.level",
+        )
+        .bind(participant.to_uuid())
+        .bind(root.to_uuid())
+        .bind(level)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Read a notification level under a live-root/current-access fence.
+    ///
+    /// # Errors
+    /// Returns an opaque root/access error or a database error.
+    pub async fn get_level_authorized(
+        &self,
+        participant: ParticipantId,
+        root: MessageId,
+    ) -> Result<String, Error> {
+        let mut tx = self.pg.begin().await?;
+        lock_effective_live_thread_root_in_tx(&mut tx, participant, root).await?;
+        let level = sqlx::query_scalar::<_, String>(
+            r"SELECT level
+                FROM thread_notification_prefs
+               WHERE participant_id = $1 AND root_message_id = $2",
+        )
+        .bind(participant.to_uuid())
+        .bind(root.to_uuid())
+        .fetch_optional(&mut *tx)
+        .await?
+        .unwrap_or_else(|| "all".to_owned());
+        tx.commit().await?;
+        Ok(level)
+    }
+
+    /// Batch-read only live roots the caller can currently access. Missing
+    /// entries remain absent so callers can apply the `"all"` default.
+    ///
+    /// # Errors
+    /// Propagates database errors.
+    pub async fn level_map_accessible(
+        &self,
+        participant: ParticipantId,
+        roots: &[MessageId],
+    ) -> Result<HashMap<MessageId, String>, Error> {
+        if roots.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let ids: Vec<uuid::Uuid> = roots.iter().map(MessageId::to_uuid).collect();
+        let rows = sqlx::query_as::<_, (uuid::Uuid, String)>(
+            r"SELECT preference.root_message_id, preference.level
+                FROM thread_notification_prefs AS preference
+                JOIN messages AS root
+                  ON root.id = preference.root_message_id
+                 AND root.reply_to IS NULL
+                 AND root.deleted_at IS NULL
+               WHERE preference.participant_id = $1
+                 AND preference.root_message_id = ANY($2)
+                 AND aero_effective_room_access(root.room_id, $1, NULL)",
+        )
+        .bind(participant.to_uuid())
+        .bind(&ids)
+        .fetch_all(&self.pg)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(message, level)| (MessageId::from_uuid(message), level))
+            .collect())
+    }
 }
 
 #[cfg(test)]
 mod db_tests {
     use super::*;
     use aero_common::{MessageId, ParticipantId};
+
+    struct Fixture {
+        owner: ParticipantId,
+        member: ParticipantId,
+        roots: Vec<MessageId>,
+    }
 
     fn pool() -> PgPool {
         let url = std::env::var("DATABASE_URL")
@@ -152,6 +262,95 @@ mod db_tests {
             .max_connections(2)
             .connect_lazy(&url)
             .expect("connect_lazy never fails on a well-formed URL")
+    }
+
+    async fn fixture(p: &PgPool, root_count: usize) -> Fixture {
+        let owner = ParticipantId::new();
+        let member = ParticipantId::new();
+        let workspace = uuid::Uuid::new_v4();
+        let room = uuid::Uuid::new_v4();
+        let roots: Vec<MessageId> = (0..root_count).map(|_| MessageId::new()).collect();
+        let mut tx = p.begin().await.expect("begin thread notification fixture");
+
+        for participant in [owner, member] {
+            sqlx::query(
+                "INSERT INTO participants (id, kind, display_name)
+                 VALUES ($1, 'human', $2)",
+            )
+            .bind(participant.to_uuid())
+            .bind(format!("thread-notification-{participant}"))
+            .execute(&mut *tx)
+            .await
+            .expect("insert participant");
+        }
+        sqlx::query(
+            "INSERT INTO workspaces (id, name, slug, created_by)
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(workspace)
+        .bind(format!("Thread notification {workspace}"))
+        .bind(format!("thread-notification-{workspace}"))
+        .bind(owner.to_uuid())
+        .execute(&mut *tx)
+        .await
+        .expect("insert workspace");
+        for (participant, role) in [(owner, "owner"), (member, "member")] {
+            sqlx::query(
+                "INSERT INTO workspace_members (workspace_id, participant_id, role)
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(workspace)
+            .bind(participant.to_uuid())
+            .bind(role)
+            .execute(&mut *tx)
+            .await
+            .expect("insert workspace member");
+        }
+        sqlx::query(
+            "INSERT INTO rooms (id, kind, name, created_by, workspace_id)
+             VALUES ($1, 'group', $2, $3, $4)",
+        )
+        .bind(room)
+        .bind(format!("Thread notification room {room}"))
+        .bind(owner.to_uuid())
+        .bind(workspace)
+        .execute(&mut *tx)
+        .await
+        .expect("insert room");
+        for (participant, role) in [(owner, "owner"), (member, "member")] {
+            sqlx::query(
+                "INSERT INTO room_members (room_id, participant_id, role)
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(room)
+            .bind(participant.to_uuid())
+            .bind(role)
+            .execute(&mut *tx)
+            .await
+            .expect("insert room member");
+        }
+        for (index, root) in roots.iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO messages (id, room_id, sender_id, blocks, searchable_text)
+                 VALUES ($1, $2, $3, '[]'::jsonb, $4)",
+            )
+            .bind(root.to_uuid())
+            .bind(room)
+            .bind(owner.to_uuid())
+            .bind(format!("thread notification root {index}"))
+            .execute(&mut *tx)
+            .await
+            .expect("insert live root message");
+        }
+        tx.commit()
+            .await
+            .expect("commit thread notification fixture");
+
+        Fixture {
+            owner,
+            member,
+            roots,
+        }
     }
 
     #[tokio::test]
@@ -169,15 +368,22 @@ mod db_tests {
     #[tokio::test]
     #[ignore = "requires live Postgres"]
     async fn levels_for_returns_only_set_levels() {
-        let repo = ThreadNotificationPrefsRepo::new(pool());
-        let root = MessageId::new();
-        let muted = ParticipantId::new();
-        let defaulted = ParticipantId::new();
+        let p = pool();
+        let repo = ThreadNotificationPrefsRepo::new(p.clone());
+        let Fixture {
+            owner: muted,
+            member: defaulted,
+            roots,
+        } = fixture(&p, 1).await;
+        let root = roots[0];
         repo.set_level(muted, root, "none").await.unwrap();
 
         let map = repo.levels_for(root, &[muted, defaulted]).await.unwrap();
         assert_eq!(map.get(&muted).map(String::as_str), Some("none"));
-        assert!(!map.contains_key(&defaulted), "no row → absent (caller defaults to all)");
+        assert!(
+            !map.contains_key(&defaulted),
+            "no row → absent (caller defaults to all)"
+        );
     }
 
     #[tokio::test]
@@ -185,8 +391,12 @@ mod db_tests {
     async fn thread_notif_prefs_set_get_roundtrip() {
         let p = pool();
         let repo = ThreadNotificationPrefsRepo::new(p.clone());
-        let participant = ParticipantId::new();
-        let root = MessageId::new();
+        let Fixture {
+            owner: participant,
+            roots,
+            ..
+        } = fixture(&p, 1).await;
+        let root = roots[0];
 
         // No row → default "all".
         let level = repo.get_level(participant, root).await.unwrap();
@@ -207,18 +417,25 @@ mod db_tests {
     async fn thread_notif_prefs_level_map_batch() {
         let p = pool();
         let repo = ThreadNotificationPrefsRepo::new(p.clone());
-        let participant = ParticipantId::new();
-        let root_a = MessageId::new();
-        let root_b = MessageId::new();
-        let root_c = MessageId::new(); // no row
+        let Fixture {
+            owner: participant,
+            roots,
+            ..
+        } = fixture(&p, 3).await;
+        let [root_a, root_b, root_c] = roots.as_slice() else {
+            panic!("fixture creates three roots");
+        };
 
-        repo.set_level(participant, root_a, "all").await.unwrap();
-        repo.set_level(participant, root_b, "none").await.unwrap();
+        repo.set_level(participant, *root_a, "all").await.unwrap();
+        repo.set_level(participant, *root_b, "none").await.unwrap();
 
-        let map = repo.level_map(participant, &[root_a, root_b, root_c]).await.unwrap();
-        assert_eq!(map.get(&root_a).map(String::as_str), Some("all"));
-        assert_eq!(map.get(&root_b).map(String::as_str), Some("none"));
-        assert!(map.get(&root_c).is_none(), "missing row absent from map");
+        let map = repo
+            .level_map(participant, &[*root_a, *root_b, *root_c])
+            .await
+            .unwrap();
+        assert_eq!(map.get(root_a).map(String::as_str), Some("all"));
+        assert_eq!(map.get(root_b).map(String::as_str), Some("none"));
+        assert!(!map.contains_key(root_c), "missing row absent from map");
 
         // Empty input short-circuits.
         let empty = repo.level_map(participant, &[]).await.unwrap();

@@ -26,46 +26,87 @@
 //! packets fanned out for each bridged track form a decodable random-access
 //! point.
 //!
-//! ## What is real vs. a seam
+//! ## Production transport boundary
 //!
 //! Everything here is unit-tested against [`FakeCallUpstream`], a scripted
-//! in-memory source — there is **no real socket** in this module. The
-//! production [`CallUpstream`] (a node-to-node RTP puller) and the wire side
-//! of [`CallEgress`] (serving local participants' RTP to remote pullers) are
-//! **documented seams**: see the `TODO(real-transport)` notes on each. The
-//! bridge *logic* (pump → synthetic publisher → SFU fan-in, keyframe gating,
-//! topology policy) is fully exercised without I/O; only the inter-node
-//! transport is left to wire.
+//! in-memory source; socket ownership deliberately lives in `aero-server`.
+//! Its production `NodeRtpPullerFactory` and `UdpRtpEgress` implement framed
+//! plain-RTP pull/push, while a secret-gated HTTP control plane carries
+//! subscribe and PLI/FIR/REMB feedback commands. Localhost tests cover those
+//! transports. A deployment still needs a real two-node reachability run in
+//! staging.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
 
 use aero_common::{CallId, ParticipantId};
 use async_trait::async_trait;
 use bytes::Bytes;
+use str0m::media::{KeyframeRequestKind, Mid, Pt, Rid};
+use str0m::rtp::{ExtensionValues, SeqNo, Ssrc};
 use tokio::sync::broadcast;
 use tracing::{debug, trace};
 
-use crate::{MediaForwarder, PeerRole, SfuRouter};
+use crate::{InboundRtp, MediaForwarder, PeerRole, SfuPeerSink, SfuRouter};
+
+static NEXT_BRIDGE_SINK_OWNER: AtomicU64 = AtomicU64::new(1);
+const KEYFRAME_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct BridgeTrack {
+    participant: ParticipantId,
+    mid: Mid,
+    rid: Option<Rid>,
+}
+
+impl BridgeTrack {
+    fn from_rtp(rtp: &BridgeRtp) -> Self {
+        Self {
+            participant: rtp.participant,
+            mid: rtp.mid,
+            rid: rtp.rid,
+        }
+    }
+}
 
 /// One RTP packet pulled from (or exposed to) a peer node, attributed to the
 /// participant that published it and the track (`mid`) it belongs to.
 ///
-/// `Bytes` is reference-counted, so fanning a packet out is zero-copy. The
-/// `keyframe` flag marks a decodable random-access point — the puller side
-/// learns it from depacketization on the owning node; [`FakeCallUpstream`]
-/// scripts it directly.
+/// `Bytes` is reference-counted, so fanning a packet out is zero-copy. Besides
+/// the media payload, this carries every RTP header field the header-aware
+/// [`crate::SfuForwarder::on_rtp`] path needs to remap and write the packet on a
+/// subscriber leg. Transport-local extensions are deliberately not copied
+/// between nodes; MID and RID are retained explicitly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BridgeRtp {
     /// The remote participant whose media this packet carries.
     pub participant: ParticipantId,
-    /// The published track id on the owning node. Used as-is on the pulling
-    /// node — allocating non-colliding mids is part of the real transport's
-    /// SDP exchange (see [`CallUpstream`]'s seam note).
-    pub mid: String,
-    /// The RTP packet payload to feed the local forwarder.
+    /// The publisher-scoped track id on the owning node. It may collide with
+    /// another participant's MID because production routes key the source by
+    /// `(participant, mid)`.
+    pub mid: Mid,
+    /// Simulcast restriction identifier, when the source packet carried one.
+    pub rid: Option<Rid>,
+    /// Negotiated RTP payload type.
+    pub pt: Pt,
+    /// Extended sequence number, including rollover state.
+    pub seq_no: SeqNo,
+    /// RTP media timestamp in the codec clock.
+    pub rtp_time: u32,
+    /// Publisher-facing synchronization source.
+    pub ssrc: Ssrc,
+    /// RTP marker bit.
+    pub marker: bool,
+    /// RTP media payload (without its wire header).
     pub payload: Bytes,
     /// `true` if this packet starts a decodable random-access point.
     pub keyframe: bool,
+    /// Whether a newly attached bridge must wait for [`Self::keyframe`] before
+    /// forwarding this track. Video codecs set this; audio/unknown codecs do
+    /// not have a keyframe concept and must pass immediately.
+    pub requires_keyframe: bool,
 }
 
 impl BridgeRtp {
@@ -73,15 +114,79 @@ impl BridgeRtp {
     #[must_use]
     pub fn new(
         participant: ParticipantId,
-        mid: impl Into<String>,
+        mid: &str,
         payload: impl Into<Bytes>,
         keyframe: bool,
     ) -> Self {
         Self {
             participant,
-            mid: mid.into(),
+            mid: Mid::from(mid),
+            rid: None,
+            pt: Pt::from(96),
+            seq_no: SeqNo::from(0),
+            rtp_time: 0,
+            ssrc: Ssrc::from(0),
+            marker: false,
             payload: payload.into(),
             keyframe,
+            requires_keyframe: true,
+        }
+    }
+
+    /// Override whether this packet's track is subject to bridge keyframe
+    /// startup gating.
+    #[must_use]
+    pub fn with_keyframe_requirement(mut self, requires_keyframe: bool) -> Self {
+        self.requires_keyframe = requires_keyframe;
+        self
+    }
+
+    /// Lift a local, decrypted RTP packet into the complete bridge
+    /// representation. This is the only constructor the production SFU media
+    /// path should use; [`Self::new`] keeps compact test fixtures ergonomic.
+    #[must_use]
+    pub fn from_inbound(participant: ParticipantId, rtp: &InboundRtp) -> Self {
+        Self {
+            participant,
+            mid: rtp.mid,
+            rid: rtp.rid,
+            pt: rtp.pt,
+            seq_no: rtp.seq_no,
+            rtp_time: rtp.rtp_time,
+            ssrc: rtp.ssrc,
+            marker: rtp.marker,
+            payload: Bytes::copy_from_slice(&rtp.payload),
+            keyframe: rtp.is_keyframe,
+            requires_keyframe: rtp.requires_keyframe,
+        }
+    }
+
+    /// Rebuild the header-aware packet consumed by
+    /// [`crate::SfuForwarder::on_rtp`] on the pulling node.
+    ///
+    /// Wall-clock arrival time and hop-local RTP extensions are intentionally
+    /// refreshed at this node. MID and RID are restored into `ext_vals` because
+    /// those two values describe media routing rather than one transport hop.
+    #[must_use]
+    pub fn to_inbound(&self) -> InboundRtp {
+        let ext_vals = ExtensionValues {
+            mid: Some(self.mid),
+            rid: self.rid,
+            ..ExtensionValues::default()
+        };
+        InboundRtp {
+            mid: self.mid,
+            pt: self.pt,
+            seq_no: self.seq_no,
+            rtp_time: self.rtp_time,
+            ssrc: self.ssrc,
+            marker: self.marker,
+            ext_vals,
+            wallclock: std::time::Instant::now(),
+            payload: self.payload.to_vec(),
+            rid: self.rid,
+            is_keyframe: self.keyframe,
+            requires_keyframe: self.requires_keyframe,
         }
     }
 }
@@ -93,23 +198,10 @@ impl BridgeRtp {
 /// the next packet and returns `None` at end-of-stream (the remote node's last
 /// participant left, or the link dropped).
 ///
-/// # TODO(real-transport) — documented seam
-///
-/// The production implementation is a **node-to-node RTP puller** that:
-/// 1. resolves the peer nodes hosting remote participants for `call_id` (the
-///    cross-node `CallRouteRegistry` that `join_group_call` already populates,
-///    turned into targets by [`decide_call_topology`]),
-/// 2. performs a `recvonly` SDP exchange with that node's bridge endpoint
-///    (the wire side of [`CallEgress`]),
-/// 3. completes ICE/DTLS/SRTP and receives RTP over UDP,
-/// 4. attributes each packet to its owning participant + mid (+ keyframe flag
-///    from depacketization), yielding it via [`next_rtp`](CallUpstream::next_rtp).
-///
-/// That leg needs a real socket + a peer node and so is **not unit-testable in
-/// this sandbox** — it is left as a seam, mirroring `aero-live-whip`'s
-/// `UpstreamSource` (`TODO(real-transport)` there). The bridge *logic*
-/// downstream of a received packet ([`CallBridge`]) is fully tested via
-/// [`FakeCallUpstream`].
+/// `aero-server` supplies the production UDP implementation. It announces its
+/// receive address through the cluster-authenticated bridge endpoint, decodes
+/// metadata-complete frames into [`BridgeRtp`], and exposes a bounded feedback
+/// sink that POSTs PLI/FIR/REMB to the publisher's owning node.
 #[async_trait]
 pub trait CallUpstream: Send {
     /// The call being bridged.
@@ -117,6 +209,12 @@ pub trait CallUpstream: Send {
 
     /// Public base URL of the peer node this upstream pulls from.
     fn node_url(&self) -> &str;
+
+    /// Build a participant-bound feedback sink for PLI/FIR/REMB flowing back
+    /// to the peer node that owns this publisher.
+    fn feedback_sink(&self, _participant: ParticipantId) -> Option<Arc<dyn SfuPeerSink>> {
+        None
+    }
 
     /// Await and return the next packet, or `None` at end-of-stream.
     async fn next_rtp(&mut self) -> Option<BridgeRtp>;
@@ -140,45 +238,74 @@ pub trait CallUpstream: Send {
 /// Constructed with [`new`](Self::new), the bridge withholds each bridged
 /// track's fan-out until that track's first keyframe packet arrives —
 /// pre-keyframe packets are dropped so the first bytes local subscribers
-/// receive per track are decodable. The gate is **per mid** (tracks from
-/// different remote participants start independently). Use
+/// receive per track are decodable. The gate is **per publisher + MID + RID**
+/// (different participants and simulcast layers routinely share a MID). Use
 /// [`new_passthrough`](Self::new_passthrough) to forward every packet
 /// immediately (no gating).
 pub struct CallBridge<S: CallUpstream, F: MediaForwarder> {
     source: S,
     router: SfuRouter,
     forwarder: F,
-    /// When `true`, withhold each mid's fan-out until its first keyframe.
+    /// When `true`, withhold each publisher track until its first keyframe.
     require_keyframe: bool,
-    /// Mids whose keyframe gate has opened (unused in passthrough mode).
-    started_mids: HashSet<String>,
+    /// Publisher-scoped tracks whose keyframe gate has opened or which do not
+    /// require a gate (unused in passthrough mode). MIDs are not call-global:
+    /// different publishers commonly negotiate the same `"0"`/`"1"` values.
+    started_tracks: HashSet<BridgeTrack>,
     /// Synthetic publisher peers this bridge registered, removed on detach.
     registered: HashSet<ParticipantId>,
+    /// Participant-bound feedback sinks retained so a closed video gate can
+    /// periodically retry PLI instead of relying on a single best-effort POST.
+    feedback_sinks: HashMap<ParticipantId, Arc<dyn SfuPeerSink>>,
+    /// Last successfully queued bridge PLI per publisher-scoped track.
+    keyframe_requested_at: HashMap<BridgeTrack, tokio::time::Instant>,
+    /// Video layers still waiting for a random-access point. Keeping this set
+    /// separate lets the production loop retry PLI even if RTP goes silent.
+    waiting_tracks: HashSet<BridgeTrack>,
+    /// Incarnation-fenced key for publisher feedback sinks. A replacement pull
+    /// to the same node must not be deleted by the old aborted task's late Drop.
+    sink_owner: String,
 }
 
 impl<S: CallUpstream, F: MediaForwarder> CallBridge<S, F> {
     /// Create a bridge with **keyframe-gated** startup (per bridged mid).
     pub fn new(source: S, router: SfuRouter, forwarder: F) -> Self {
+        let sink_owner = format!(
+            "{:020}",
+            NEXT_BRIDGE_SINK_OWNER.fetch_add(1, Ordering::Relaxed)
+        );
         Self {
             source,
             router,
             forwarder,
             require_keyframe: true,
-            started_mids: HashSet::new(),
+            started_tracks: HashSet::new(),
             registered: HashSet::new(),
+            feedback_sinks: HashMap::new(),
+            keyframe_requested_at: HashMap::new(),
+            waiting_tracks: HashSet::new(),
+            sink_owner,
         }
     }
 
     /// Create a bridge that forwards **every** packet immediately (no
     /// keyframe gating).
     pub fn new_passthrough(source: S, router: SfuRouter, forwarder: F) -> Self {
+        let sink_owner = format!(
+            "{:020}",
+            NEXT_BRIDGE_SINK_OWNER.fetch_add(1, Ordering::Relaxed)
+        );
         Self {
             source,
             router,
             forwarder,
             require_keyframe: false,
-            started_mids: HashSet::new(),
+            started_tracks: HashSet::new(),
             registered: HashSet::new(),
+            feedback_sinks: HashMap::new(),
+            keyframe_requested_at: HashMap::new(),
+            waiting_tracks: HashSet::new(),
+            sink_owner,
         }
     }
 
@@ -198,7 +325,37 @@ impl<S: CallUpstream, F: MediaForwarder> CallBridge<S, F> {
     /// or gating is disabled).
     #[must_use]
     pub fn has_started(&self, mid: &str) -> bool {
-        !self.require_keyframe || self.started_mids.contains(mid)
+        !self.require_keyframe
+            || self
+                .started_tracks
+                .iter()
+                .any(|track| track.mid.to_string() == mid)
+    }
+
+    /// Whether fan-out has started for one exact publisher-scoped track.
+    #[must_use]
+    pub fn has_started_for(&self, publisher: ParticipantId, mid: &str) -> bool {
+        !self.require_keyframe
+            || self
+                .started_tracks
+                .iter()
+                .any(|track| track.participant == publisher && track.mid.to_string() == mid)
+    }
+
+    /// Whether one exact simulcast layer's startup gate has opened.
+    #[must_use]
+    pub fn has_started_for_rid(
+        &self,
+        publisher: ParticipantId,
+        mid: Mid,
+        rid: Option<Rid>,
+    ) -> bool {
+        !self.require_keyframe
+            || self.started_tracks.contains(&BridgeTrack {
+                participant: publisher,
+                mid,
+                rid,
+            })
     }
 
     /// Remote participants currently registered as synthetic publishers.
@@ -211,39 +368,107 @@ impl<S: CallUpstream, F: MediaForwarder> CallBridge<S, F> {
     /// allows, register its publisher (first sighting) and fan it out.
     ///
     /// Returns:
-    /// - `Some(n)` — a packet was pulled and forwarded; `n` is the number of
-    ///   local subscribers currently subscribed to its mid (`0` if none yet,
-    ///   which is not an error).
+    /// - `Some(n)` — a packet was pulled and forwarded; `n` is the delivery
+    ///   count reported by the forwarder (`0` if nobody was written to, which
+    ///   is not an error).
     /// - `Some(0)` is *also* returned when the packet was **dropped** by the
     ///   keyframe gate. Callers that care can disambiguate via
     ///   [`has_started`](Self::has_started).
     /// - `None` — upstream reached end-of-stream.
     pub async fn pump_once(&mut self) -> Option<usize> {
         let rtp = self.source.next_rtp().await?;
+        Some(self.handle_rtp(rtp).await)
+    }
+
+    async fn handle_rtp(&mut self, rtp: BridgeRtp) -> usize {
         let call = self.source.call_id();
+        let mid = rtp.mid.to_string();
 
-        // Per-track keyframe gate: until a mid's first keyframe, drop its
-        // packets so fan-out begins at a decodable random-access point.
-        if self.require_keyframe && !self.started_mids.contains(&rtp.mid) {
-            if !rtp.keyframe {
-                trace!(mid = %rtp.mid, "call-bridge: dropping pre-keyframe RTP");
-                return Some(0);
-            }
-            self.started_mids.insert(rtp.mid.clone());
-            debug!(mid = %rtp.mid, "call-bridge: keyframe gate opened, fan-out started");
-        }
-
-        // First sighting of a remote participant/track: register it with the
-        // local router as a synthetic publisher so subscriptions resolve.
+        // Register control routing on first sight, even when this packet is a
+        // pre-keyframe delta that the media gate will drop. Attaching the sink
+        // can immediately send the initial PLI back to the remote owner and
+        // avoids waiting for a periodic keyframe to break the startup cycle.
         if self.registered.insert(rtp.participant) {
-            self.router.add_peer(call, rtp.participant, PeerRole::Publisher);
+            self.router
+                .add_bridged_peer(call, rtp.participant, PeerRole::Publisher);
+            if let Some(sink) = self.source.feedback_sink(rtp.participant) {
+                self.forwarder.attach_bridge_peer_sink(
+                    call,
+                    rtp.participant,
+                    &self.sink_owner,
+                    sink.clone(),
+                );
+                self.feedback_sinks.insert(rtp.participant, sink);
+            }
         }
-        if self.router.owner_of(call, &rtp.mid).is_none() {
-            self.router.add_track(call, &rtp.mid, rtp.participant);
+        if !self.router.has_track(call, rtp.participant, &mid) {
+            self.router.add_track(call, &mid, rtp.participant);
         }
 
-        self.forwarder.forward_rtp(call, &rtp.mid, rtp.payload).await;
-        Some(self.router.subscribers_for(call, &rtp.mid).len())
+        // Per-publisher-track keyframe gate: until this source's first
+        // keyframe, drop its packets so fan-out begins at a decodable
+        // random-access point. MIDs alone are not unique across publishers.
+        let track = BridgeTrack::from_rtp(&rtp);
+        if !rtp.requires_keyframe {
+            self.started_tracks.insert(track);
+            self.waiting_tracks.remove(&track);
+            self.keyframe_requested_at.remove(&track);
+        }
+        if self.require_keyframe && rtp.requires_keyframe && !self.started_tracks.contains(&track) {
+            if !rtp.keyframe {
+                self.waiting_tracks.insert(track);
+                self.request_keyframe_if_due(track, tokio::time::Instant::now());
+                trace!(
+                    %mid,
+                    rid = ?rtp.rid.map(|rid| rid.to_string()),
+                    "call-bridge: dropping pre-keyframe RTP"
+                );
+                return 0;
+            }
+            self.keyframe_requested_at.remove(&track);
+            self.waiting_tracks.remove(&track);
+            self.started_tracks.insert(track);
+            debug!(
+                publisher = %rtp.participant,
+                %mid,
+                rid = ?rtp.rid.map(|rid| rid.to_string()),
+                "call-bridge: keyframe gate opened, fan-out started"
+            );
+        }
+
+        self.forwarder.forward_bridge_rtp(call, rtp).await
+    }
+
+    fn request_keyframe_if_due(&mut self, track: BridgeTrack, now: tokio::time::Instant) {
+        let retry_due = self.keyframe_requested_at.get(&track).map_or(true, |last| {
+            now.duration_since(*last) >= KEYFRAME_RETRY_INTERVAL
+        });
+        if !retry_due {
+            return;
+        }
+        let queued = self
+            .feedback_sinks
+            .get(&track.participant)
+            .is_some_and(|sink| {
+                sink.try_request_keyframe_for_rid(track.mid, track.rid, KeyframeRequestKind::Pli)
+            });
+        if queued {
+            self.keyframe_requested_at.insert(track, now);
+        }
+        trace!(
+            mid = %track.mid,
+            rid = ?track.rid.map(|rid| rid.to_string()),
+            queued,
+            "call-bridge: requested keyframe for closed gate"
+        );
+    }
+
+    fn retry_waiting_keyframes(&mut self) {
+        let now = tokio::time::Instant::now();
+        let waiting: Vec<_> = self.waiting_tracks.iter().copied().collect();
+        for track in waiting {
+            self.request_keyframe_if_due(track, now);
+        }
     }
 
     /// Remove every synthetic publisher peer this bridge registered from the
@@ -252,9 +477,14 @@ impl<S: CallUpstream, F: MediaForwarder> CallBridge<S, F> {
     pub fn detach(&mut self) {
         let call = self.source.call_id();
         for participant in self.registered.drain() {
-            self.router.remove_peer(call, participant);
+            self.forwarder
+                .detach_bridge_peer_sink(call, participant, &self.sink_owner);
+            self.router.release_bridged_peer(call, participant);
         }
-        self.started_mids.clear();
+        self.started_tracks.clear();
+        self.feedback_sinks.clear();
+        self.keyframe_requested_at.clear();
+        self.waiting_tracks.clear();
     }
 
     /// Drive the bridge to completion: repeatedly [`pump_once`](Self::pump_once)
@@ -262,18 +492,43 @@ impl<S: CallUpstream, F: MediaForwarder> CallBridge<S, F> {
     /// synthetic peers.
     ///
     /// This is the production driver: the server spawns one per
-    /// [`CallTopology::BridgeTo`] target node. It performs no I/O of its own —
-    /// all I/O lives behind the [`CallUpstream`] seam.
+    /// [`CallTopology::BridgeTo`] target node. It performs no I/O of its own;
+    /// all socket work lives behind the [`CallUpstream`] abstraction.
     pub async fn run(mut self) {
         let call = self.source.call_id();
         debug!(%call, node = self.source.node_url(), "call-bridge: pull loop started");
-        while self.pump_once().await.is_some() {}
+        let mut retry = tokio::time::interval(KEYFRAME_RETRY_INTERVAL);
+        retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        retry.tick().await;
+        loop {
+            enum Next {
+                Packet(Option<BridgeRtp>),
+                Retry,
+            }
+            let next = tokio::select! {
+                packet = self.source.next_rtp() => Next::Packet(packet),
+                _ = retry.tick() => Next::Retry,
+            };
+            match next {
+                Next::Packet(Some(packet)) => {
+                    self.handle_rtp(packet).await;
+                }
+                Next::Packet(None) => break,
+                Next::Retry => self.retry_waiting_keyframes(),
+            }
+        }
         self.detach();
         debug!(%call, "call-bridge: upstream ended, synthetic peers detached");
     }
 }
 
-// ───────────────────────────── egress seam ─────────────────────────────────
+impl<S: CallUpstream, F: MediaForwarder> Drop for CallBridge<S, F> {
+    fn drop(&mut self) {
+        self.detach();
+    }
+}
+
+// ───────────────────────────── egress bus ──────────────────────────────────
 
 /// Default per-call egress fan-out buffer (packets a slow puller may lag by).
 const DEFAULT_EGRESS_CAPACITY: usize = 64;
@@ -286,14 +541,10 @@ const DEFAULT_EGRESS_CAPACITY: usize = 64;
 /// [`CallEgressTap`]. A lagging tap skips dropped packets rather than stalling
 /// the publisher — correct for realtime media.
 ///
-/// # TODO(real-transport) — documented seam
-///
-/// Serving a [`CallEgressTap`] to a remote node — a node-authenticated,
-/// `sendonly` SDP exchange + SRTP egress that the remote [`CallUpstream`]
-/// pulls from — is the wire half of the same seam documented on
-/// [`CallUpstream`]; it needs a real socket + peer node and is left to wire.
-/// [`LoopbackUpstream`] is the in-process stand-in that proves the two halves
-/// compose.
+/// `aero-server` consumes each tap in its production UDP egress relay and
+/// frames packets for every cluster-authenticated puller address. The
+/// [`LoopbackUpstream`] remains the in-process composition fixture.
+#[derive(Clone)]
 pub struct CallEgress {
     call_id: CallId,
     tx: broadcast::Sender<BridgeRtp>,
@@ -385,7 +636,10 @@ impl LoopbackUpstream {
     /// Wrap `tap` as an upstream that claims to pull from `node_url`.
     #[must_use]
     pub fn new(node_url: impl Into<String>, tap: CallEgressTap) -> Self {
-        Self { node_url: node_url.into(), tap }
+        Self {
+            node_url: node_url.into(),
+            tap,
+        }
     }
 }
 
@@ -507,318 +761,7 @@ impl CallUpstream for FakeCallUpstream {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::Arc;
+mod feedback_tests;
 
-    // ── fixtures ─────────────────────────────────────────────────────────────
-
-    fn key_pkt(p: ParticipantId, mid: &str, byte: u8) -> BridgeRtp {
-        BridgeRtp::new(p, mid, vec![byte], true)
-    }
-
-    fn delta_pkt(p: ParticipantId, mid: &str, byte: u8) -> BridgeRtp {
-        BridgeRtp::new(p, mid, vec![byte], false)
-    }
-
-    /// A [`MediaForwarder`] that records every forwarded packet.
-    #[derive(Default, Clone)]
-    struct RecordingForwarder {
-        log: Arc<parking_lot::Mutex<Vec<(CallId, String, Bytes)>>>,
-    }
-
-    impl RecordingForwarder {
-        fn forwarded(&self) -> Vec<(CallId, String, Bytes)> {
-            self.log.lock().clone()
-        }
-    }
-
-    #[async_trait]
-    impl MediaForwarder for RecordingForwarder {
-        async fn forward_rtp(&self, call: CallId, mid: &str, packet: Bytes) {
-            self.log.lock().push((call, mid.to_owned(), packet));
-        }
-    }
-
-    // ── decide_call_topology (exhaustive) ────────────────────────────────────
-
-    #[test]
-    fn empty_census_serves_local() {
-        assert_eq!(decide_call_topology("http://a.example", &[]), CallTopology::ServeLocal);
-    }
-
-    #[test]
-    fn self_only_census_serves_local() {
-        let nodes = vec![("http://a.example".to_owned(), 3)];
-        assert_eq!(decide_call_topology("http://a.example", &nodes), CallTopology::ServeLocal);
-        // Trailing-slash variants are still this node.
-        let slashed = vec![("http://a.example/".to_owned(), 1)];
-        assert_eq!(decide_call_topology("http://a.example", &slashed), CallTopology::ServeLocal);
-    }
-
-    #[test]
-    fn bridges_to_every_other_hosting_node_sorted() {
-        // Census order shuffled on purpose — output must be deterministic.
-        let nodes = vec![
-            ("http://c.example".to_owned(), 1),
-            ("http://a.example".to_owned(), 2),
-            ("http://b.example".to_owned(), 4),
-        ];
-        assert_eq!(
-            decide_call_topology("http://a.example", &nodes),
-            CallTopology::BridgeTo(vec![
-                "http://b.example".to_owned(),
-                "http://c.example".to_owned(),
-            ]),
-        );
-    }
-
-    #[test]
-    fn bridges_even_when_local_node_not_in_census_yet() {
-        // A joiner whose registration hasn't landed still sees remote hosts.
-        let nodes = vec![("http://b.example".to_owned(), 1)];
-        assert_eq!(
-            decide_call_topology("http://a.example", &nodes),
-            CallTopology::BridgeTo(vec!["http://b.example".to_owned()]),
-        );
-    }
-
-    #[test]
-    fn zero_count_and_empty_nodes_are_ignored() {
-        let nodes = vec![
-            ("http://b.example".to_owned(), 0),
-            (String::new(), 2),
-            ("http://a.example".to_owned(), 1),
-        ];
-        assert_eq!(
-            decide_call_topology("http://a.example", &nodes),
-            CallTopology::ServeLocal,
-            "a node with no participants (or a malformed entry) is not a bridge target"
-        );
-    }
-
-    #[test]
-    fn duplicate_slash_variants_dedupe_to_one_target() {
-        let nodes = vec![
-            ("http://b.example".to_owned(), 1),
-            ("http://b.example/".to_owned(), 1),
-        ];
-        assert_eq!(
-            decide_call_topology("http://a.example", &nodes),
-            CallTopology::BridgeTo(vec!["http://b.example".to_owned()]),
-        );
-    }
-
-    // ── FakeCallUpstream ─────────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn fake_upstream_emits_scripted_sequence_then_none() {
-        let call = CallId::new();
-        let p = ParticipantId::new();
-        let pkts = vec![key_pkt(p, "v0", 1), delta_pkt(p, "v0", 2)];
-        let mut up = FakeCallUpstream::new(call, "http://b.example", pkts.clone());
-
-        assert_eq!(up.call_id(), call);
-        assert_eq!(up.node_url(), "http://b.example");
-        assert_eq!(up.remaining(), 2);
-        for expected in &pkts {
-            assert_eq!(up.next_rtp().await.as_ref(), Some(expected));
-        }
-        assert!(up.next_rtp().await.is_none(), "end-of-stream after the script");
-        assert_eq!(up.remaining(), 0);
-    }
-
-    // ── CallBridge fan-in ────────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn bridge_registers_synthetic_publisher_and_fans_in_to_local_subscriber() {
-        let call = CallId::new();
-        let remote = ParticipantId::new();
-        let local_sub = ParticipantId::new();
-        let router = SfuRouter::new();
-        let fwd = RecordingForwarder::default();
-
-        // A local subscriber already wants the bridged track.
-        router.add_peer(call, local_sub, PeerRole::Subscriber);
-        router.add_subscription(call, "v0", local_sub);
-
-        let up = FakeCallUpstream::new(
-            call,
-            "http://b.example",
-            vec![key_pkt(remote, "v0", 0xA0), delta_pkt(remote, "v0", 0xA1)],
-        );
-        let mut bridge = CallBridge::new(up, router.clone(), fwd.clone());
-        assert_eq!(bridge.call_id(), call);
-        assert_eq!(bridge.upstream_node(), "http://b.example");
-
-        assert_eq!(bridge.pump_once().await, Some(1), "keyframe → 1 local subscriber");
-        assert_eq!(bridge.pump_once().await, Some(1), "delta → 1 local subscriber");
-        assert_eq!(bridge.pump_once().await, None, "end-of-stream");
-
-        // The remote participant became a synthetic publisher owning the mid.
-        assert_eq!(router.owner_of(call, "v0"), Some(remote));
-        assert!(router.participants(call).contains(&remote));
-        assert_eq!(bridge.synthetic_peer_count(), 1);
-
-        // Both packets went through the same forwarder path local RTP takes.
-        let log = fwd.forwarded();
-        assert_eq!(log.len(), 2);
-        assert_eq!(log[0], (call, "v0".to_owned(), Bytes::from(vec![0xA0])));
-        assert_eq!(log[1], (call, "v0".to_owned(), Bytes::from(vec![0xA1])));
-    }
-
-    #[tokio::test]
-    async fn keyframe_gate_drops_pre_keyframe_packets_per_mid() {
-        let call = CallId::new();
-        let (pa, pb) = (ParticipantId::new(), ParticipantId::new());
-        let router = SfuRouter::new();
-        let fwd = RecordingForwarder::default();
-
-        let up = FakeCallUpstream::new(
-            call,
-            "http://b.example",
-            vec![
-                delta_pkt(pa, "v0", 0x01), // dropped (v0 gate closed)
-                key_pkt(pa, "v0", 0x02),   // v0 gate opens
-                delta_pkt(pb, "v1", 0x03), // dropped (v1 gate independent, still closed)
-                delta_pkt(pa, "v0", 0x04), // forwarded (v0 open)
-                key_pkt(pb, "v1", 0x05),   // v1 gate opens
-            ],
-        );
-        let mut bridge = CallBridge::new(up, router.clone(), fwd.clone());
-
-        assert_eq!(bridge.pump_once().await, Some(0), "pre-keyframe v0 dropped");
-        assert!(!bridge.has_started("v0"));
-        assert_eq!(fwd.forwarded().len(), 0, "dropped packet never reaches the forwarder");
-
-        assert_eq!(bridge.pump_once().await, Some(0), "keyframe forwarded (no subscribers yet)");
-        assert!(bridge.has_started("v0"));
-
-        assert_eq!(bridge.pump_once().await, Some(0), "v1 still gated despite v0 being open");
-        assert!(!bridge.has_started("v1"));
-
-        bridge.pump_once().await;
-        bridge.pump_once().await;
-        assert!(bridge.has_started("v1"));
-
-        let mids: Vec<String> = fwd.forwarded().into_iter().map(|(_, mid, _)| mid).collect();
-        assert_eq!(mids, vec!["v0", "v0", "v1"], "only post-gate packets forwarded");
-        // The gated v1 delta never registered pb's track prematurely under pa.
-        assert_eq!(router.owner_of(call, "v1"), Some(pb));
-    }
-
-    #[tokio::test]
-    async fn passthrough_mode_forwards_pre_keyframe_packets() {
-        let call = CallId::new();
-        let p = ParticipantId::new();
-        let fwd = RecordingForwarder::default();
-        let up = FakeCallUpstream::new(
-            call,
-            "http://b.example",
-            vec![delta_pkt(p, "v0", 0x01), key_pkt(p, "v0", 0x02)],
-        );
-        let mut bridge = CallBridge::new_passthrough(up, SfuRouter::new(), fwd.clone());
-        assert!(bridge.has_started("v0"), "passthrough starts immediately");
-
-        assert_eq!(bridge.pump_once().await, Some(0), "delta forwarded (no gate)");
-        assert_eq!(bridge.pump_once().await, Some(0), "keyframe forwarded");
-        assert_eq!(bridge.pump_once().await, None);
-        assert_eq!(fwd.forwarded().len(), 2, "both packets forwarded in passthrough mode");
-    }
-
-    #[tokio::test]
-    async fn run_drives_to_completion_and_detaches_synthetic_peers() {
-        let call = CallId::new();
-        let remote = ParticipantId::new();
-        let local_sub = ParticipantId::new();
-        let router = SfuRouter::new();
-        let fwd = RecordingForwarder::default();
-
-        router.add_peer(call, local_sub, PeerRole::Subscriber);
-        router.add_subscription(call, "v0", local_sub);
-
-        let up = FakeCallUpstream::new(
-            call,
-            "http://b.example",
-            vec![key_pkt(remote, "v0", 0x01), delta_pkt(remote, "v0", 0x02)],
-        );
-        CallBridge::new(up, router.clone(), fwd.clone()).run().await;
-
-        assert_eq!(fwd.forwarded().len(), 2, "run() pumped the entire script");
-        // Synthetic publisher (and its track) detached; the local peer remains.
-        assert!(!router.participants(call).contains(&remote), "synthetic peer removed");
-        assert!(router.participants(call).contains(&local_sub), "local peer untouched");
-        assert_eq!(router.owner_of(call, "v0"), None, "synthetic track removed");
-    }
-
-    #[tokio::test]
-    async fn fan_in_reaches_multiple_local_subscribers() {
-        let call = CallId::new();
-        let remote = ParticipantId::new();
-        let router = SfuRouter::new();
-        let fwd = RecordingForwarder::default();
-        for _ in 0..3 {
-            let sub = ParticipantId::new();
-            router.add_peer(call, sub, PeerRole::Subscriber);
-            router.add_subscription(call, "v0", sub);
-        }
-
-        let up = FakeCallUpstream::new(call, "http://b.example", vec![key_pkt(remote, "v0", 0x01)]);
-        let mut bridge = CallBridge::new(up, router, fwd);
-        assert_eq!(bridge.pump_once().await, Some(3), "keyframe routed to all 3 subscribers");
-    }
-
-    // ── egress seam ──────────────────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn egress_publishes_to_taps_and_closes_on_drop() {
-        let call = CallId::new();
-        let p = ParticipantId::new();
-        let egress = CallEgress::new(call);
-        assert_eq!(egress.call_id(), call);
-        assert_eq!(egress.publish(key_pkt(p, "v0", 0x01)), 0, "no taps yet → 0, not an error");
-
-        let mut tap = egress.tap();
-        assert_eq!(egress.tap_count(), 1);
-        assert_eq!(egress.publish(key_pkt(p, "v0", 0x02)), 1);
-        assert_eq!(egress.publish(delta_pkt(p, "v0", 0x03)), 1);
-        drop(egress);
-
-        // Buffered packets drain, then the closed egress yields None.
-        assert_eq!(tap.next_rtp().await, Some(key_pkt(p, "v0", 0x02)));
-        assert_eq!(tap.next_rtp().await, Some(delta_pkt(p, "v0", 0x03)));
-        assert!(tap.next_rtp().await.is_none(), "egress gone → end-of-stream");
-    }
-
-    #[tokio::test]
-    async fn loopback_upstream_composes_egress_into_bridge_fan_in() {
-        // Node A's egress → (in-process "wire") → node B's bridge → B's router.
-        let call = CallId::new();
-        let remote = ParticipantId::new(); // publisher on "node A"
-        let local_sub = ParticipantId::new(); // subscriber on "node B"
-
-        let egress_a = CallEgress::new(call);
-        let tap = egress_a.tap();
-        egress_a.publish(key_pkt(remote, "v0", 0x01));
-        egress_a.publish(delta_pkt(remote, "v0", 0x02));
-        drop(egress_a); // A's publisher leaves → B's upstream ends.
-
-        let router_b = SfuRouter::new();
-        let fwd = RecordingForwarder::default();
-        router_b.add_peer(call, local_sub, PeerRole::Subscriber);
-        router_b.add_subscription(call, "v0", local_sub);
-
-        let up = LoopbackUpstream::new("http://a.example", tap);
-        assert_eq!(up.call_id(), call);
-        CallBridge::new(up, router_b.clone(), fwd.clone()).run().await;
-
-        let log = fwd.forwarded();
-        assert_eq!(log.len(), 2, "both packets crossed the loopback into B's fan-out");
-        assert_eq!(log[0].2, Bytes::from(vec![0x01]));
-        assert_eq!(log[1].2, Bytes::from(vec![0x02]));
-        assert!(
-            !router_b.participants(call).contains(&remote),
-            "synthetic peer detached after upstream ended"
-        );
-    }
-}
+#[cfg(test)]
+mod tests;

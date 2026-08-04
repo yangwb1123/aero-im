@@ -71,7 +71,16 @@ def main():
     req("GET", f"/api/rooms/{R}/messages", token=B, expect=[200])
     ok("bob reads room messages (no mandate yet)")
 
-    say("admin mandates 2FA → bob (no TOTP) is locked out of room data")
+    say("admin must activate 2FA before imposing the workspace mandate")
+    req("PUT", f"/api/workspaces/{W}/security", {"require_2fa": True}, token=A, expect=[403])
+    owner_enrollment = req("POST", "/api/me/2fa/enroll", token=A)
+    owner_secret = owner_enrollment.get("secret")
+    if not owner_secret:
+        fail(f"owner enroll missing secret: {owner_enrollment}")
+    req("POST", "/api/me/2fa/verify", {"code": totp_now(owner_secret)}, token=A, expect=[200])
+    ok("unprotected owner was rejected; owner activated TOTP")
+
+    say("protected admin mandates 2FA → bob (no TOTP) is locked out of room data")
     sec = req("PUT", f"/api/workspaces/{W}/security", {"require_2fa": True}, token=A, expect=[200])
     if sec.get("require_2fa") is not True:
         fail(f"set_require_2fa did not stick: {sec}")

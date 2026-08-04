@@ -47,6 +47,9 @@ pub enum StakeError {
     /// is not accepting stakes.
     #[error("prediction is not open for staking")]
     BadState,
+    /// The prediction's betting window has expired.
+    #[error("prediction has expired")]
+    Expired,
     /// The chosen `outcome_idx` is not one of the prediction's outcomes.
     #[error("no such outcome")]
     BadOutcome,
@@ -129,8 +132,18 @@ type PredictionRow = (
 
 /// Build a [`Prediction`] from its base row + (separately fetched) outcomes.
 fn prediction_from_parts(r: PredictionRow, outcomes: Vec<PredictionOutcome>) -> Prediction {
-    let (id, stream_id, creator_id, question, status, winning_outcome_idx, created_at, locked_at, resolved_at, expires_at) =
-        r;
+    let (
+        id,
+        stream_id,
+        creator_id,
+        question,
+        status,
+        winning_outcome_idx,
+        created_at,
+        locked_at,
+        resolved_at,
+        expires_at,
+    ) = r;
     Prediction {
         id: PredictionId::from_uuid(id),
         stream_id: Ulid(stream_id.as_u128()),
@@ -184,6 +197,11 @@ impl PredictionRepo {
                 "a prediction requires at least 2 outcomes".into(),
             ));
         }
+        if expires.is_some_and(|at| at <= OffsetDateTime::now_utc()) {
+            return Err(sqlx::Error::Protocol(
+                "prediction expiry must be in the future".into(),
+            ));
+        }
         let id = PredictionId::new();
         let mut tx = self.pool.begin().await?;
         sqlx::query(
@@ -210,7 +228,10 @@ impl PredictionRepo {
             .bind(label)
             .execute(&mut *tx)
             .await?;
-            models.push(PredictionOutcome { idx, label: label.clone() });
+            models.push(PredictionOutcome {
+                idx,
+                label: label.clone(),
+            });
         }
         tx.commit().await?;
 
@@ -275,7 +296,9 @@ impl PredictionRepo {
         let sql = format!(
             "SELECT {PREDICTION_COLUMNS}
                FROM predictions
-              WHERE stream_id = $1 AND status = 'open'
+              WHERE stream_id = $1
+                AND status = 'open'
+                AND (expires_at IS NULL OR expires_at > clock_timestamp())
               ORDER BY created_at DESC, id DESC"
         );
         let rows = sqlx::query_as::<_, PredictionRow>(&sql)
@@ -303,7 +326,8 @@ impl PredictionRepo {
     /// can never both succeed.
     ///
     /// # Errors
-    /// - [`StakeError::NotFound`] / [`StakeError::BadState`] / [`StakeError::BadOutcome`].
+    /// - [`StakeError::NotFound`] / [`StakeError::BadState`] /
+    ///   [`StakeError::Expired`] / [`StakeError::BadOutcome`].
     /// - [`StakeError::InsufficientPoints`] if the balance does not cover the stake.
     /// - [`StakeError::AlreadyStaked`] if the viewer already staked here.
     /// - [`StakeError::Db`] on any storage error.
@@ -321,22 +345,33 @@ impl PredictionRepo {
         }
         let mut tx = self.pool.begin().await?;
 
-        // Resolve the prediction (status + creator) inside the tx so the gating and
-        // the debited creator are consistent with the stake.
-        let row = sqlx::query_as::<_, (String, Uuid)>(
-            r"SELECT status, creator_id FROM predictions WHERE id = $1",
+        // The prediction row is the lifecycle serialization point. Holding it
+        // through debit + stake insert makes stake race linearly with
+        // lock/resolve/cancel: either this transaction commits first and settlement
+        // sees the stake, or the lifecycle transition commits first and this path
+        // rejects without retaining a debit.
+        let row = sqlx::query_as::<_, (String, Uuid, Option<OffsetDateTime>, OffsetDateTime)>(
+            r"SELECT status, creator_id, expires_at, clock_timestamp()
+                FROM predictions
+               WHERE id = $1
+               FOR UPDATE",
         )
         .bind(prediction.to_uuid())
         .fetch_optional(&mut *tx)
         .await?;
-        let Some((status, creator_uuid)) = row else {
+        let Some((status, creator_uuid, expires_at, database_now)) = row else {
             return Err(StakeError::NotFound);
         };
         if status != "open" {
             return Err(StakeError::BadState);
         }
+        if expires_at.is_some_and(|at| at <= database_now) {
+            return Err(StakeError::Expired);
+        }
 
-        // The chosen outcome must exist.
+        // Outcome ownership is checked after locking the parent so a raw lifecycle
+        // writer cannot race this validation. Migration 0217 also installs a
+        // composite FK as a database backstop.
         let outcome_ok = sqlx::query_scalar::<_, i32>(
             r"SELECT idx FROM prediction_outcomes WHERE prediction_id = $1 AND idx = $2",
         )
@@ -348,6 +383,8 @@ impl PredictionRepo {
         if !outcome_ok {
             return Err(StakeError::BadOutcome);
         }
+
+        let stake_id = aero_common::PredictionStakeId::new();
 
         // Conditional debit against the viewer's balance with THIS prediction's
         // creator — only succeeds if the balance covers the stake. A missing ledger
@@ -370,7 +407,6 @@ impl PredictionRepo {
         // Record the stake. A UNIQUE violation on (prediction, viewer) means the
         // viewer already staked here — surface as AlreadyStaked (the debit rolls back
         // with the tx).
-        let stake_id = aero_common::PredictionStakeId::new();
         let res = sqlx::query(
             r"INSERT INTO prediction_stakes (id, prediction_id, outcome_idx, viewer_id, points)
                VALUES ($1, $2, $3, $4, $5)",
@@ -387,8 +423,39 @@ impl PredictionRepo {
                 // tx drops -> rollback (the debit is undone).
                 return Err(StakeError::AlreadyStaked);
             }
+            let constraint = database_constraint(&e);
+            if constraint == Some("prediction_stake_not_expired_chk") {
+                return Err(StakeError::Expired);
+            }
+            if matches!(
+                constraint,
+                Some(
+                    "prediction_stake_open_state_chk"
+                        | "prediction_stakes_outcome_fkey"
+                        | "prediction_stake_outcome_chk"
+                )
+            ) {
+                return Err(if constraint == Some("prediction_stake_open_state_chk") {
+                    StakeError::BadState
+                } else {
+                    StakeError::BadOutcome
+                });
+            }
             return Err(StakeError::Db(e));
         }
+
+        // The channel-points history is the reconstructable +/- journal for the
+        // ledger. Migration 0217's rolling-upgrade trigger inserts the same stable
+        // reason for old binaries; this idempotent insert is therefore a no-op when
+        // that backstop already ran, and the authoritative writer when it did not.
+        ensure_stake_debit_history(
+            &mut tx,
+            stake_id.to_uuid(),
+            viewer.to_uuid(),
+            creator_uuid,
+            points,
+        )
+        .await?;
 
         tx.commit().await?;
         Ok(())
@@ -401,14 +468,30 @@ impl PredictionRepo {
     /// # Errors
     /// Propagates any [`sqlx::Error`] from the update.
     pub async fn lock(&self, prediction: PredictionId) -> Result<bool, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let status = sqlx::query_scalar::<_, String>(
+            r"SELECT status
+                FROM predictions
+               WHERE id = $1
+               FOR UPDATE",
+        )
+        .bind(prediction.to_uuid())
+        .fetch_optional(&mut *tx)
+        .await?;
+        if status.as_deref() != Some("open") {
+            tx.commit().await?;
+            return Ok(false);
+        }
+
         let res = sqlx::query(
             r"UPDATE predictions SET status = 'locked', locked_at = now()
                WHERE id = $1 AND status = 'open'",
         )
         .bind(prediction.to_uuid())
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
-        Ok(res.rows_affected() > 0)
+        tx.commit().await?;
+        Ok(res.rows_affected() == 1)
     }
 
     /// Resolve a prediction to `winning_idx`, paying winners PROPORTIONALLY from the
@@ -473,7 +556,9 @@ impl PredictionRepo {
         // computed from this in-memory set so the math is auditable + overflow-safe.
         let stakes = sqlx::query_as::<_, (Uuid, Uuid, i32, i64)>(
             r"SELECT id, viewer_id, outcome_idx, points
-               FROM prediction_stakes WHERE prediction_id = $1",
+               FROM prediction_stakes
+              WHERE prediction_id = $1
+              ORDER BY viewer_id, id",
         )
         .bind(prediction.to_uuid())
         .fetch_all(&mut *tx)
@@ -513,8 +598,14 @@ impl PredictionRepo {
 
             if payout > 0 {
                 // Credit the winner/refundee's ledger with the prediction's creator.
-                credit_ledger(&mut tx, *viewer_uuid, prediction, payout, "prediction_payout")
-                    .await?;
+                credit_ledger(
+                    &mut tx,
+                    *viewer_uuid,
+                    prediction,
+                    payout,
+                    "prediction_payout",
+                )
+                .await?;
                 payouts.push((ParticipantId::from_uuid(*viewer_uuid), payout));
             }
         }
@@ -544,24 +635,29 @@ impl PredictionRepo {
     pub async fn cancel(&self, prediction: PredictionId) -> Result<bool, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
 
-        // Only an open/locked prediction is cancellable; stamp it cancelled and
-        // confirm THIS call did it (RETURNING). A resolved/cancelled one is a no-op.
-        let cancelled = sqlx::query_scalar::<_, Uuid>(
-            r"UPDATE predictions SET status = 'cancelled'
-               WHERE id = $1 AND status IN ('open', 'locked')
-               RETURNING id",
+        // Use the same parent-row serialization point as stake/lock/resolve. A
+        // concurrent stake either commits before this lock (and is included below)
+        // or observes `cancelled` after commit and rolls its debit back.
+        let status = sqlx::query_scalar::<_, String>(
+            r"SELECT status
+                FROM predictions
+               WHERE id = $1
+               FOR UPDATE",
         )
         .bind(prediction.to_uuid())
         .fetch_optional(&mut *tx)
-        .await?
-        .is_some();
-        if !cancelled {
+        .await?;
+        if !matches!(status.as_deref(), Some("open" | "locked")) {
+            tx.commit().await?;
             return Ok(false);
         }
 
         // Refund every staker their own stake, stamping payout = points.
         let stakes = sqlx::query_as::<_, (Uuid, Uuid, i64)>(
-            r"SELECT id, viewer_id, points FROM prediction_stakes WHERE prediction_id = $1",
+            r"SELECT id, viewer_id, points
+                FROM prediction_stakes
+               WHERE prediction_id = $1
+               ORDER BY viewer_id, id",
         )
         .bind(prediction.to_uuid())
         .fetch_all(&mut *tx)
@@ -572,9 +668,26 @@ impl PredictionRepo {
                 .bind(points)
                 .execute(&mut *tx)
                 .await?;
-            credit_ledger(&mut tx, *viewer_uuid, prediction, *points, "prediction_refund")
-                .await?;
+            credit_ledger(
+                &mut tx,
+                *viewer_uuid,
+                prediction,
+                *points,
+                "prediction_refund",
+            )
+            .await?;
         }
+
+        let transitioned = sqlx::query(
+            r"UPDATE predictions
+                  SET status = 'cancelled'
+                WHERE id = $1
+                  AND status IN ('open', 'locked')",
+        )
+        .bind(prediction.to_uuid())
+        .execute(&mut *tx)
+        .await?;
+        debug_assert_eq!(transitioned.rows_affected(), 1);
 
         tx.commit().await?;
         Ok(true)
@@ -687,6 +800,50 @@ fn is_unique_violation(e: &sqlx::Error) -> bool {
     matches!(e, sqlx::Error::Database(db) if db.code().as_deref() == Some("23505"))
 }
 
+/// Constraint name attached to a Postgres database error, when available.
+fn database_constraint(e: &sqlx::Error) -> Option<&str> {
+    match e {
+        sqlx::Error::Database(db) => db.constraint(),
+        _ => None,
+    }
+}
+
+/// Append the reconstructable negative channel-points journal entry for one stake.
+///
+/// Migration 0217 installs an insert trigger with the same stable reason so old
+/// binaries remain audit-complete during a rolling upgrade. `WHERE NOT EXISTS`
+/// makes the application write converge with that trigger without relying on a
+/// broad uniqueness rule over unrelated channel-points reasons.
+async fn ensure_stake_debit_history(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    stake_uuid: Uuid,
+    viewer_uuid: Uuid,
+    creator_uuid: Uuid,
+    points: i64,
+) -> Result<(), sqlx::Error> {
+    let reason = format!("prediction_stake:{stake_uuid}");
+    sqlx::query(
+        r"INSERT INTO points_earn_history
+              (id, viewer_id, creator_id, delta, reason)
+           SELECT $1, $2, $3, $4, $5
+            WHERE NOT EXISTS (
+                SELECT 1
+                  FROM points_earn_history
+                 WHERE viewer_id = $2
+                   AND creator_id = $3
+                   AND reason = $5
+            )",
+    )
+    .bind(Uuid::from_u128(ulid::Ulid::new().0))
+    .bind(viewer_uuid)
+    .bind(creator_uuid)
+    .bind(-points)
+    .bind(reason)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 /// Credit a viewer's channel-points balance with `prediction`'s creator by `amount`
 /// (the ledger upsert), and append the `points_earn_history` audit row — inside the
 /// caller's transaction. Resolves the creator from the prediction so the credit lands
@@ -700,12 +857,11 @@ async fn credit_ledger(
 ) -> Result<(), sqlx::Error> {
     // The creator is fixed per prediction; sub-select it so the credit always lands
     // on the right ledger pair even though `prediction_stakes` keeps only the viewer.
-    let creator_uuid = sqlx::query_scalar::<_, Uuid>(
-        r"SELECT creator_id FROM predictions WHERE id = $1",
-    )
-    .bind(prediction.to_uuid())
-    .fetch_one(&mut **tx)
-    .await?;
+    let creator_uuid =
+        sqlx::query_scalar::<_, Uuid>(r"SELECT creator_id FROM predictions WHERE id = $1")
+            .bind(prediction.to_uuid())
+            .fetch_one(&mut **tx)
+            .await?;
     sqlx::query(
         r"INSERT INTO points_ledger (viewer_id, creator_id, balance)
            VALUES ($1, $2, $3)
@@ -764,224 +920,5 @@ mod tests {
 ///   cargo test -p aero-storage --lib -- --ignored predictions_
 /// ```
 #[cfg(test)]
-mod db_tests {
-    use super::*;
-    use crate::ChannelPointsRepo;
-
-    fn pool() -> PgPool {
-        let url = std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://aero:aero_dev_pw@localhost:5432/aero".into());
-        sqlx::postgres::PgPoolOptions::new()
-            .max_connections(2)
-            .connect_lazy(&url)
-            .expect("connect_lazy never fails on a well-formed URL")
-    }
-
-    async fn participant(p: &PgPool, label: &str) -> ParticipantId {
-        let id = ParticipantId::new();
-        sqlx::query("INSERT INTO participants (id, kind, display_name) VALUES ($1,'human',$2)")
-            .bind(id.to_uuid())
-            .bind(format!("pred-{label}-{id}"))
-            .execute(p)
-            .await
-            .expect("insert participant");
-        id
-    }
-
-    #[tokio::test]
-    #[ignore = "requires live Postgres"]
-    async fn predictions_stake_debits_and_rejects_dupes() {
-        let p = pool();
-        let cp = ChannelPointsRepo::new(p.clone());
-        let repo = PredictionRepo::new(p.clone());
-        let stream = Ulid::new();
-        let creator = participant(&p, "creator").await;
-        let viewer = participant(&p, "viewer").await;
-        let poor = participant(&p, "poor").await;
-
-        // Fund the viewer with the creator.
-        cp.earn(viewer, creator, 100, "watch").await.unwrap();
-
-        let pred = repo
-            .create_prediction(
-                stream,
-                creator,
-                "Will they win?",
-                &["yes".into(), "no".into()],
-                None,
-            )
-            .await
-            .unwrap();
-        assert_eq!(pred.outcomes.len(), 2);
-        assert_eq!(pred.status, "open");
-
-        // Stake 40 on outcome 0 -> balance drops to 60.
-        repo.stake(pred.id, viewer, 0, 40).await.unwrap();
-        assert_eq!(cp.balance(viewer, creator).await.unwrap(), 60);
-
-        // A second stake (any outcome) is rejected — one stake per viewer.
-        let err = repo.stake(pred.id, viewer, 1, 10).await.unwrap_err();
-        assert!(matches!(err, StakeError::AlreadyStaked));
-        assert_eq!(cp.balance(viewer, creator).await.unwrap(), 60, "no extra debit");
-
-        // A staker with no points cannot stake.
-        let err = repo.stake(pred.id, poor, 0, 5).await.unwrap_err();
-        assert!(matches!(err, StakeError::InsufficientPoints));
-
-        // A bad outcome index is rejected.
-        let other = participant(&p, "other").await;
-        cp.earn(other, creator, 10, "watch").await.unwrap();
-        let err = repo.stake(pred.id, other, 9, 5).await.unwrap_err();
-        assert!(matches!(err, StakeError::BadOutcome));
-    }
-
-    #[tokio::test]
-    #[ignore = "requires live Postgres"]
-    async fn predictions_resolve_pays_winners_proportionally() {
-        let p = pool();
-        let cp = ChannelPointsRepo::new(p.clone());
-        let repo = PredictionRepo::new(p.clone());
-        let stream = Ulid::new();
-        let creator = participant(&p, "creator").await;
-        let alice = participant(&p, "alice").await; // bets on the WINNER (0)
-        let bob = participant(&p, "bob").await; // bets on the LOSER (1)
-
-        cp.earn(alice, creator, 100, "watch").await.unwrap();
-        cp.earn(bob, creator, 200, "watch").await.unwrap();
-
-        let pred = repo
-            .create_prediction(stream, creator, "Pick one", &["A".into(), "B".into()], None)
-            .await
-            .unwrap();
-
-        // Alice stakes 100 on A (idx 0); Bob stakes 200 on B (idx 1).
-        repo.stake(pred.id, alice, 0, 100).await.unwrap();
-        repo.stake(pred.id, bob, 1, 200).await.unwrap();
-        assert_eq!(cp.balance(alice, creator).await.unwrap(), 0);
-        assert_eq!(cp.balance(bob, creator).await.unwrap(), 0);
-
-        // Resolve to A: total_pool = 300, winning_pool = 100 (just Alice).
-        // Alice's payout = floor(100 * 300 / 100) = 300; Bob gets 0.
-        let payouts = repo.resolve(pred.id, 0).await.unwrap();
-        assert_eq!(payouts.len(), 1);
-        assert_eq!(payouts[0], (alice, 300));
-        assert_eq!(cp.balance(alice, creator).await.unwrap(), 300, "winner paid the full pool");
-        assert_eq!(cp.balance(bob, creator).await.unwrap(), 0, "loser paid nothing");
-
-        let got = repo.get(pred.id).await.unwrap().unwrap();
-        assert_eq!(got.status, "resolved");
-        assert_eq!(got.winning_outcome_idx, Some(0));
-        assert!(got.resolved_at.is_some());
-
-        // Re-resolving is rejected (bad state).
-        let err = repo.resolve(pred.id, 0).await.unwrap_err();
-        assert!(matches!(err, ResolveError::BadState));
-    }
-
-    #[tokio::test]
-    #[ignore = "requires live Postgres"]
-    async fn predictions_resolve_no_winner_refunds_all() {
-        let p = pool();
-        let cp = ChannelPointsRepo::new(p.clone());
-        let repo = PredictionRepo::new(p.clone());
-        let stream = Ulid::new();
-        let creator = participant(&p, "creator").await;
-        let alice = participant(&p, "alice").await;
-        let bob = participant(&p, "bob").await;
-
-        cp.earn(alice, creator, 50, "watch").await.unwrap();
-        cp.earn(bob, creator, 70, "watch").await.unwrap();
-
-        let pred = repo
-            .create_prediction(
-                stream,
-                creator,
-                "Three-way",
-                &["A".into(), "B".into(), "C".into()],
-                None,
-            )
-            .await
-            .unwrap();
-
-        // Both stake on A (0) and B (1); resolve to C (2) — nobody picked the winner.
-        repo.stake(pred.id, alice, 0, 50).await.unwrap();
-        repo.stake(pred.id, bob, 1, 70).await.unwrap();
-
-        let payouts = repo.resolve(pred.id, 2).await.unwrap();
-        // Everyone refunded their own stake.
-        assert_eq!(payouts.len(), 2);
-        assert_eq!(cp.balance(alice, creator).await.unwrap(), 50);
-        assert_eq!(cp.balance(bob, creator).await.unwrap(), 70);
-    }
-
-    #[tokio::test]
-    #[ignore = "requires live Postgres"]
-    async fn predictions_cancel_refunds_all() {
-        let p = pool();
-        let cp = ChannelPointsRepo::new(p.clone());
-        let repo = PredictionRepo::new(p.clone());
-        let stream = Ulid::new();
-        let creator = participant(&p, "creator").await;
-        let alice = participant(&p, "alice").await;
-
-        cp.earn(alice, creator, 80, "watch").await.unwrap();
-        let pred = repo
-            .create_prediction(stream, creator, "Cancelable", &["A".into(), "B".into()], None)
-            .await
-            .unwrap();
-        repo.stake(pred.id, alice, 0, 80).await.unwrap();
-        assert_eq!(cp.balance(alice, creator).await.unwrap(), 0);
-
-        // Cancel refunds the stake; a second cancel is a no-op.
-        assert!(repo.cancel(pred.id).await.unwrap());
-        assert!(!repo.cancel(pred.id).await.unwrap());
-        assert_eq!(cp.balance(alice, creator).await.unwrap(), 80, "stake refunded");
-        assert_eq!(repo.get(pred.id).await.unwrap().unwrap().status, "cancelled");
-    }
-
-    #[tokio::test]
-    #[ignore = "requires live Postgres"]
-    async fn predictions_cannot_stake_after_lock_or_resolve() {
-        let p = pool();
-        let cp = ChannelPointsRepo::new(p.clone());
-        let repo = PredictionRepo::new(p.clone());
-        let stream = Ulid::new();
-        let creator = participant(&p, "creator").await;
-        let alice = participant(&p, "alice").await;
-        let bob = participant(&p, "bob").await;
-
-        cp.earn(alice, creator, 100, "watch").await.unwrap();
-        cp.earn(bob, creator, 100, "watch").await.unwrap();
-
-        let pred = repo
-            .create_prediction(stream, creator, "Locked soon", &["A".into(), "B".into()], None)
-            .await
-            .unwrap();
-        repo.stake(pred.id, alice, 0, 10).await.unwrap();
-
-        // Lock -> the prediction is no longer open; staking is rejected.
-        assert!(repo.lock(pred.id).await.unwrap());
-        assert!(!repo.lock(pred.id).await.unwrap(), "second lock is a no-op");
-        let err = repo.stake(pred.id, bob, 0, 10).await.unwrap_err();
-        assert!(matches!(err, StakeError::BadState));
-
-        // Resolve a LOCKED prediction (open/locked are both resolvable).
-        repo.resolve(pred.id, 0).await.unwrap();
-
-        // Staking on a resolved prediction is likewise rejected.
-        let err = repo.stake(pred.id, bob, 0, 10).await.unwrap_err();
-        assert!(matches!(err, StakeError::BadState));
-    }
-
-    #[tokio::test]
-    #[ignore = "requires live Postgres"]
-    async fn predictions_create_requires_two_outcomes() {
-        let p = pool();
-        let repo = PredictionRepo::new(p.clone());
-        let creator = participant(&p, "creator").await;
-        let err = repo
-            .create_prediction(Ulid::new(), creator, "Only one", &["solo".into()], None)
-            .await;
-        assert!(err.is_err(), "fewer than 2 outcomes is rejected");
-    }
-}
+#[path = "predictions/db_tests.rs"]
+mod db_tests;

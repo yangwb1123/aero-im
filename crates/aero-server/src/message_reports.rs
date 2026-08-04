@@ -14,11 +14,9 @@
 //! - `GET  /api/workspaces/:id/admin/moderation-queue` — admin/owner lists the
 //!   pending reports (oldest first).
 //! - `POST /api/workspaces/:id/admin/moderation-queue/:rid/review` — admin/owner
-//!   decides `keep` | `remove`. The repo `review` is RETURNING-idempotent; on a
-//!   `remove` that actually transitioned a pending row, the handler then invokes the
-//!   EXISTING transactional [`ImService::moderate_delete`](aero_im_core::ImService::moderate_delete)
-//!   path so the soft-delete + `message.moderated` audit commit together. Order:
-//!   stamp the review first, then moderate-delete.
+//!   decides `keep` | `remove`. Storage commits the review transition, optional
+//!   message tombstone, audit row, attachment cleanup, and deleted-event outbox
+//!   atomically.
 //!
 //! Note: this does NOT add pre-visibility gating — messages are already broadcast
 //! before async screening, so a report removes a message that was already seen,
@@ -46,18 +44,10 @@ use serde::Deserialize;
 use crate::error::ApiResult;
 use crate::state::AppState;
 
-/// Char-boundary-safe content summary recorded in the moderation audit detail when a
-/// reviewer removes a message — mirrors [`crate::moderation_bot`]'s `content_digest`
-/// so the AI-removal and report-removal audit shapes review the same way.
-const DIGEST_CHARS: usize = 120;
-
 /// All message-report + moderation-queue routes, ready to `.merge` into the router.
 pub fn routes() -> Router<AppState> {
     Router::new()
-        .route(
-            "/api/rooms/:id/messages/:mid/report",
-            post(report_message),
-        )
+        .route("/api/rooms/:id/messages/:mid/report", post(report_message))
         .route(
             "/api/workspaces/:id/admin/moderation-queue",
             get(list_queue),
@@ -117,7 +107,7 @@ async fn assert_admin(
 ) -> Result<(), AeroError> {
     let role = s
         .workspaces
-        .member_role(workspace, caller)
+        .effective_member_role(workspace, caller)
         .await
         .map_err(AeroError::from)?
         .ok_or_else(|| AeroError::Forbidden("not a workspace member".into()))?;
@@ -151,31 +141,14 @@ async fn report_message(
         return Err(AeroError::Invalid("reason is empty".into()).into());
     }
 
-    // Room-access gate (mirrors sibling message handlers): you can only report a
-    // message in a room you can see.
+    // Fast preflight for a clear response and authz-lint visibility. The storage
+    // method repeats this under the canonical workspace/room/membership/message
+    // locks and owns the definitive decision through commit.
     s.im.assert_room_access(auth.participant_id, room).await?;
-
-    // The message must exist, still be live, and belong to THIS room — so the path's
-    // room id can't be used to file a report scoped to the wrong workspace.
-    let msg = s
-        .messages
-        .get(message)
-        .await?
-        .filter(|m| m.deleted_at.is_none() && m.room_id == room)
-        .ok_or_else(|| AeroError::NotFound(format!("message {message} in room {room}")))?;
-    let _ = &msg;
-
-    // Resolve the room's owning workspace to scope the report / queue.
-    let workspace = s
-        .rooms
-        .room_workspace(room)
-        .await
-        .map_err(AeroError::from)?
-        .ok_or_else(|| AeroError::NotFound(format!("room {room}")))?;
-
     let filed = repo(&s)
-        .report(workspace, message, auth.participant_id, reason)
-        .await?;
+        .report_authorized(room, message, auth.participant_id, reason)
+        .await
+        .map_err(map_report_error)?;
     Ok(Json(serde_json::to_value(filed).map_err(AeroError::from)?))
 }
 
@@ -188,7 +161,10 @@ async fn list_queue(
 ) -> ApiResult<Json<serde_json::Value>> {
     let ws = parse_workspace(&ws_str)?;
     assert_admin(&s, ws, auth.participant_id).await?;
-    let reports = repo(&s).list_pending(ws).await?;
+    let reports = repo(&s)
+        .list_pending_authorized(ws, auth.participant_id)
+        .await
+        .map_err(map_review_error)?;
     Ok(Json(serde_json::json!({ "reports": reports })))
 }
 
@@ -203,14 +179,10 @@ struct ReviewReq {
 }
 
 /// `POST /api/workspaces/:id/admin/moderation-queue/:rid/review` — decide a pending
-/// report. Admin/owner only. The repo `review` is RETURNING-idempotent: it stamps
-/// `kept`/`removed` + reviewer + `reviewed_at` + note on a still-`pending` row and
-/// returns whether it transitioned. On a `remove` that actually transitioned, the
-/// handler then invokes the existing transactional
-/// [`ImService::moderate_delete`](aero_im_core::ImService::moderate_delete) so the
-/// soft-delete + `message.moderated` audit commit together (NOT a new delete path).
-/// Order: stamp the review first, then moderate-delete — so a double-submit (the
-/// second `review` returns `false`) can never re-fire the deletion.
+/// report. Admin/owner only. The repository rechecks current effective admin
+/// access and commits the decision plus optional message deletion, audit, blob
+/// cleanup, and durable event outbox in one transaction. A double-submit sees no
+/// pending report and cannot re-fire deletion.
 ///
 /// 404 if the report is unknown or already reviewed; 400 on an unknown `decision`.
 async fn review_report(
@@ -234,60 +206,60 @@ async fn review_report(
         }
     };
 
-    // The report must exist AND belong to THIS workspace (so the admin can only act
-    // on their own tenant's queue).
-    let report = repo(&s)
-        .get(rid)
-        .await?
-        .filter(|r| r.workspace_id == ws)
-        .ok_or_else(|| AeroError::NotFound(format!("report {rid}")))?;
-
     let note = req.note.as_deref().map(str::trim).filter(|n| !n.is_empty());
+    let traceparent = aero_common::telemetry::current_traceparent();
+    let outcome = repo(&s)
+        .review_authorized(
+            rid,
+            ws,
+            auth.participant_id,
+            remove,
+            note,
+            traceparent.as_deref(),
+        )
+        .await
+        .map_err(map_review_error)?;
 
-    // Stamp the decision idempotently. `false` ⇒ already reviewed / unknown: a
-    // double-submit, surfaced as 404 (the thing you're acting on is gone from the
-    // queue), and crucially the moderate-delete below is NOT fired.
-    let transitioned = repo(&s)
-        .review(rid, auth.participant_id, remove, note)
-        .await?;
-    if !transitioned {
-        return Err(AeroError::NotFound(format!(
-            "report {rid} is not pending (already reviewed)"
-        ))
-        .into());
+    // Commit is already durable. This is only the low-latency dispatch attempt;
+    // the outbox dispatcher retries a failed publish without rolling back or
+    // asking the reviewer to submit again.
+    if let Some(outbox_id) = outcome.delete_outbox_id {
+        if let Err(error) = s.im.dispatch_event_outbox_id(outbox_id).await {
+            tracing::warn!(
+                ?error,
+                %outbox_id,
+                report_id = %rid,
+                "fast message-report deletion outbox dispatch failed"
+            );
+        }
     }
-
-    // On a remove that actually transitioned, soft-delete the reported message via
-    // the EXISTING transactional moderate-delete path (review-stamp first, then
-    // delete). The message may already be gone (AI pipeline / sender delete) — that
-    // is fine: `moderate_delete` is itself a no-op on an already-deleted message.
-    if remove {
-        let reason = format!("workspace report {rid} removed by {}", auth.participant_id);
-        // Resolve the message's room/workspace + a content digest for the audit
-        // detail, mirroring the AI moderation path. Resolve the workspace from the
-        // message's room (its true owner) rather than trusting the report row.
-        let (workspace, digest) = match s.messages.get(report.message_id).await? {
-            Some(m) => {
-                let ws = s
-                    .rooms
-                    .room_workspace(m.room_id)
-                    .await
-                    .map_err(AeroError::from)?;
-                (ws, m.searchable_text().chars().take(DIGEST_CHARS).collect())
-            }
-            // Message already hard-gone: keep the decision, skip the delete.
-            None => (None, String::new()),
-        };
-        s.im
-            .moderate_delete(report.message_id, workspace, &reason, &digest)
-            .await?;
-    }
-
-    let decided = repo(&s).get(rid).await?;
     Ok(Json(serde_json::json!({
         "reviewed": true,
-        "report": decided,
+        "report": outcome.report,
     })))
+}
+
+fn map_report_error(error: AeroError) -> AeroError {
+    match error {
+        AeroError::Forbidden(_) => {
+            AeroError::Forbidden("current room access required to report a message".into())
+        }
+        AeroError::NotFound(_) => AeroError::NotFound("live message in requested room".into()),
+        other => other,
+    }
+}
+
+fn map_review_error(error: AeroError) -> AeroError {
+    match error {
+        AeroError::Forbidden(_) => {
+            AeroError::Forbidden("current workspace admin access required".into())
+        }
+        AeroError::NotFound(_) => AeroError::NotFound("pending message report".into()),
+        AeroError::Conflict(_) => {
+            AeroError::Conflict("message report tenant binding changed".into())
+        }
+        other => other,
+    }
 }
 
 #[cfg(test)]
@@ -329,5 +301,31 @@ mod tests {
         for r in [WorkspaceRole::Guest, WorkspaceRole::Member] {
             assert_eq!(status_of(&authorize_admin(r)), 403, "role {r:?}");
         }
+    }
+
+    #[test]
+    fn scope_and_revocation_errors_do_not_disclose_cross_tenant_details() {
+        let report_missing =
+            map_report_error(AeroError::NotFound("message belongs elsewhere".into()));
+        assert_eq!(report_missing.status_code(), 404);
+        assert_eq!(
+            report_missing.to_string(),
+            "not found: live message in requested room"
+        );
+
+        let review_missing =
+            map_review_error(AeroError::NotFound("report belongs elsewhere".into()));
+        assert_eq!(review_missing.status_code(), 404);
+        assert_eq!(
+            review_missing.to_string(),
+            "not found: pending message report"
+        );
+
+        let revoked = map_review_error(AeroError::Forbidden("demoted after preflight".into()));
+        assert_eq!(revoked.status_code(), 403);
+        assert_eq!(
+            revoked.to_string(),
+            "forbidden: current workspace admin access required"
+        );
     }
 }

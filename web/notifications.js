@@ -18,7 +18,7 @@ import { state, els, loadingDiv, mutedDiv, formatTime, scrollToMessage } from '.
 import { toast } from './render.js';
 
 let notifUnread = 0;
-let switchRoom = (id) => {}; // injected by initNotifications
+let switchRoom = () => {}; // injected by initNotifications
 
 export function initNotifications(deps) {
   if (deps && typeof deps.switchRoom === 'function') switchRoom = deps.switchRoom;

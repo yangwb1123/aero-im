@@ -185,13 +185,11 @@ impl ClipCollectionRepo {
         id: ClipCollectionId,
         creator: ParticipantId,
     ) -> Result<bool, sqlx::Error> {
-        let r = sqlx::query(
-            r"DELETE FROM clip_collections WHERE id = $1 AND creator_id = $2",
-        )
-        .bind(id.to_uuid())
-        .bind(creator.to_uuid())
-        .execute(&self.pg)
-        .await?;
+        let r = sqlx::query(r"DELETE FROM clip_collections WHERE id = $1 AND creator_id = $2")
+            .bind(id.to_uuid())
+            .bind(creator.to_uuid())
+            .execute(&self.pg)
+            .await?;
         Ok(r.rows_affected() > 0)
     }
 }
@@ -211,14 +209,12 @@ mod db_tests {
 
     async fn make_participant(pg: &PgPool, label: &str) -> ParticipantId {
         let id = ParticipantId::new();
-        sqlx::query(
-            "INSERT INTO participants (id, kind, display_name) VALUES ($1, 'human', $2)",
-        )
-        .bind(id.to_uuid())
-        .bind(format!("{label}-{id}"))
-        .execute(pg)
-        .await
-        .expect("insert participant");
+        sqlx::query("INSERT INTO participants (id, kind, display_name) VALUES ($1, 'human', $2)")
+            .bind(id.to_uuid())
+            .bind(format!("{label}-{id}"))
+            .execute(pg)
+            .await
+            .expect("insert participant");
         id
     }
 
@@ -268,12 +264,18 @@ mod db_tests {
 
         // remove_clip
         assert!(repo.remove_clip(cid, clip1).await.unwrap());
-        assert!(!repo.remove_clip(cid, clip1).await.unwrap(), "second remove is no-op");
+        assert!(
+            !repo.remove_clip(cid, clip1).await.unwrap(),
+            "second remove is no-op"
+        );
         let clips = repo.list_clips(cid).await.unwrap();
         assert_eq!(clips, vec![clip2]);
 
         // delete (scoped to creator)
-        assert!(!repo.delete(cid, stranger).await.unwrap(), "stranger cannot delete");
+        assert!(
+            !repo.delete(cid, stranger).await.unwrap(),
+            "stranger cannot delete"
+        );
         assert!(repo.delete(cid, creator).await.unwrap());
         assert!(repo.get(cid).await.unwrap().is_none(), "gone after delete");
 

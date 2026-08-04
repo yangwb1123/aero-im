@@ -6,17 +6,20 @@
 //! (which only summarizes a channel): a task here is a durable, stateful row that
 //! can be listed, reassigned, and re-statused.
 //!
-//! This repo owns only the task CRUD; it does NOT enforce room membership — the
-//! server layer gates every route on
-//! [`ImService::assert_room_access`](aero_im_core::ImService::assert_room_access)
-//! against the task's `room_id`. Purely additive: a NEW [`TaskRepo`]; no existing
-//! repo is touched. The [`Task`] model lives here (and is re-exported from the
-//! crate root) rather than in `aero-common`, since it is a storage-layer
-//! projection.
+//! Mutations enforce the actor/assignee/source room boundary in the same
+//! transaction as the task write, while the server layer also gates routes with
+//! [`ImService::assert_room_access`](aero_im_core::ImService::assert_room_access).
+//! The [`Task`] model lives here (and is re-exported from the crate root) rather
+//! than in `aero-common`, since it is a storage-layer projection.
 
 use aero_common::{MessageId, ParticipantId, RoomId, TaskId};
 use serde::Serialize;
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
+
+mod action_item_batch;
+pub use action_item_batch::{
+    ActionItemBatchError, MAX_ACTION_ITEM_BATCH_KEY_LEN, MAX_ACTION_ITEM_BATCH_SIZE,
+};
 
 /// Task status: a freshly created, not-yet-started task.
 pub const STATUS_OPEN: &str = "open";
@@ -57,7 +60,11 @@ pub struct Task {
     /// Lifecycle status: `open` | `in_progress` | `done`.
     pub status: String,
     /// Optional due date (RFC 3339 on the wire; omitted when unset).
-    #[serde(default, skip_serializing_if = "Option::is_none", with = "time::serde::rfc3339::option")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "time::serde::rfc3339::option"
+    )]
     pub due_at: Option<time::OffsetDateTime>,
     /// When the task was created (RFC 3339 on the wire).
     #[serde(with = "time::serde::rfc3339")]
@@ -71,6 +78,22 @@ pub struct Task {
 /// so the row decoding stays in one place.
 const COLUMNS: &str =
     "id, room_id, creator_id, assignee_id, title, source_message_id, status, due_at, created_at, updated_at";
+const TASK_COLUMNS: &str = "task.id, task.room_id, task.creator_id, task.assignee_id, task.title, task.source_message_id, task.status, task.due_at, task.created_at, task.updated_at";
+
+/// A task mutation failed before it could preserve the room access boundary.
+#[derive(Debug, thiserror::Error)]
+pub enum TaskWriteError {
+    #[error(transparent)]
+    Database(#[from] sqlx::Error),
+    #[error("task does not exist")]
+    NotFound,
+    #[error("actor is not an effective member of the task room")]
+    ActorNotMember,
+    #[error("assignee is not an effective member of the task room")]
+    AssigneeNotMember,
+    #[error("source message does not belong to the task room")]
+    SourceMessageNotInRoom,
+}
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct Row {
@@ -101,6 +124,75 @@ fn row_to_model(r: Row) -> Task {
     }
 }
 
+/// Apply the same positive membership gates as
+/// `ImService::assert_room_access` while holding the membership rows stable for
+/// the surrounding task transaction.
+async fn is_effective_room_member(
+    tx: &mut Transaction<'_, Postgres>,
+    room: RoomId,
+    participant: ParticipantId,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>(
+        r"SELECT true
+            FROM room_members membership
+            JOIN rooms room
+              ON room.id = membership.room_id
+            JOIN workspaces workspace
+              ON workspace.id = room.workspace_id
+            JOIN workspace_members workspace_membership
+              ON workspace_membership.workspace_id = room.workspace_id
+             AND workspace_membership.participant_id = membership.participant_id
+            JOIN participants participant
+              ON participant.id = membership.participant_id
+             AND participant.deleted_at IS NULL
+           WHERE membership.room_id = $1
+             AND membership.participant_id = $2
+             AND NOT EXISTS (
+                 SELECT 1
+                   FROM workspace_deactivations deactivated
+                  WHERE deactivated.workspace_id = room.workspace_id
+                    AND deactivated.participant_id = membership.participant_id
+             )
+             AND (
+                 participant.kind <> 'human'
+                 OR NOT workspace.require_2fa
+                 OR EXISTS (
+                     SELECT 1
+                       FROM totp_secrets totp
+                      WHERE totp.participant_id = membership.participant_id
+                        AND totp.activated
+                 )
+             )
+           FOR SHARE OF membership, room, workspace, workspace_membership, participant",
+    )
+    .bind(room.to_uuid())
+    .bind(participant.to_uuid())
+    .fetch_optional(&mut **tx)
+    .await
+    .map(|row| row.is_some())
+}
+
+async fn source_message_is_visible_in_room(
+    tx: &mut Transaction<'_, Postgres>,
+    room: RoomId,
+    message: MessageId,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>(
+        r"SELECT true
+            FROM messages
+           WHERE id = $1
+             AND room_id = $2
+             AND deleted_at IS NULL
+             AND (expires_at IS NULL OR expires_at > now())
+           FOR SHARE",
+    )
+    .bind(message.to_uuid())
+    .bind(room.to_uuid())
+    .fetch_optional(&mut **tx)
+    .await
+    .map(|row| row.is_some())
+}
+
 /// Repository over the `tasks` table (room to-do items).
 ///
 /// Cheap to clone — it just wraps a [`PgPool`] (itself an `Arc` internally), so
@@ -118,8 +210,12 @@ impl TaskRepo {
     }
 
     /// Persist a new task in `room`, created by `creator`, returning its generated
-    /// id. The new row starts in status [`STATUS_OPEN`]. The caller is responsible
-    /// for room-access and title validation.
+    /// id. The new row starts in status [`STATUS_OPEN`].
+    ///
+    /// The actor, optional assignee, and optional source message are validated
+    /// inside the same transaction as the insert. This prevents a caller from
+    /// assigning private-room work to an arbitrary global participant or
+    /// attaching a message from another room.
     ///
     /// # Errors
     /// Propagates any [`sqlx::Error`] from the insert.
@@ -131,7 +227,22 @@ impl TaskRepo {
         assignee: Option<ParticipantId>,
         source_message: Option<MessageId>,
         due_at: Option<time::OffsetDateTime>,
-    ) -> Result<TaskId, sqlx::Error> {
+    ) -> Result<TaskId, TaskWriteError> {
+        let mut tx = self.pool.begin().await?;
+        if !is_effective_room_member(&mut tx, room, creator).await? {
+            return Err(TaskWriteError::ActorNotMember);
+        }
+        if let Some(assignee) = assignee {
+            if !is_effective_room_member(&mut tx, room, assignee).await? {
+                return Err(TaskWriteError::AssigneeNotMember);
+            }
+        }
+        if let Some(source_message) = source_message {
+            if !source_message_is_visible_in_room(&mut tx, room, source_message).await? {
+                return Err(TaskWriteError::SourceMessageNotInRoom);
+            }
+        }
+
         let id = TaskId::new();
         sqlx::query(
             r"INSERT INTO tasks
@@ -145,8 +256,9 @@ impl TaskRepo {
         .bind(title)
         .bind(source_message.map(|m| m.to_uuid()))
         .bind(due_at)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(id)
     }
 
@@ -189,17 +301,53 @@ impl TaskRepo {
         Ok(rows.into_iter().map(row_to_model).collect())
     }
 
-    /// List the tasks assigned to `assignee` across all rooms, unfinished first
-    /// (`done` sinks to the bottom), then by soonest due date, then newest.
+    /// List tasks assigned to `assignee` only in rooms they may currently
+    /// access, unfinished first (`done` sinks to the bottom), then by soonest
+    /// due date, then newest.
     ///
     /// # Errors
     /// Propagates any [`sqlx::Error`] from the query.
-    pub async fn list_for_assignee(&self, assignee: ParticipantId) -> Result<Vec<Task>, sqlx::Error> {
+    pub async fn list_for_assignee(
+        &self,
+        assignee: ParticipantId,
+    ) -> Result<Vec<Task>, sqlx::Error> {
         let sql = format!(
-            "SELECT {COLUMNS}
-               FROM tasks
-              WHERE assignee_id = $1
-              ORDER BY (status = 'done') ASC, due_at ASC NULLS LAST, created_at DESC, id DESC"
+            "SELECT {TASK_COLUMNS}
+               FROM tasks task
+               JOIN room_members membership
+                 ON membership.room_id = task.room_id
+                AND membership.participant_id = task.assignee_id
+               JOIN rooms room
+                 ON room.id = task.room_id
+               JOIN workspaces workspace
+                 ON workspace.id = room.workspace_id
+               JOIN workspace_members workspace_membership
+                 ON workspace_membership.workspace_id = room.workspace_id
+                AND workspace_membership.participant_id = task.assignee_id
+               JOIN participants participant
+                 ON participant.id = task.assignee_id
+                AND participant.deleted_at IS NULL
+              WHERE task.assignee_id = $1
+                AND NOT EXISTS (
+                    SELECT 1
+                      FROM workspace_deactivations deactivated
+                     WHERE deactivated.workspace_id = room.workspace_id
+                       AND deactivated.participant_id = task.assignee_id
+                )
+                AND (
+                    participant.kind <> 'human'
+                    OR NOT workspace.require_2fa
+                    OR EXISTS (
+                        SELECT 1
+                          FROM totp_secrets totp
+                         WHERE totp.participant_id = task.assignee_id
+                           AND totp.activated
+                    )
+                )
+              ORDER BY (task.status = 'done') ASC,
+                       task.due_at ASC NULLS LAST,
+                       task.created_at DESC,
+                       task.id DESC"
         );
         let rows = sqlx::query_as::<_, Row>(&sql)
             .bind(assignee.to_uuid())
@@ -208,24 +356,45 @@ impl TaskRepo {
         Ok(rows.into_iter().map(row_to_model).collect())
     }
 
-    /// Apply a partial edit to a task, bumping `updated_at`. Each field is
-    /// optional: a `None` argument keeps the task's current value (`COALESCE`),
-    /// while `Some` replaces it. Returns `true` iff a row matched (the id exists).
+    /// Apply a partial edit to a task, bumping `updated_at`. The task row is
+    /// locked first, then the actor and any replacement assignee are checked
+    /// against the task's current room inside the same transaction.
     ///
     /// # Errors
     /// Propagates any [`sqlx::Error`] from the update.
     pub async fn update(
         &self,
         id: TaskId,
+        actor: ParticipantId,
         title: Option<&str>,
         assignee: Option<ParticipantId>,
         due_at: Option<time::OffsetDateTime>,
-    ) -> Result<bool, sqlx::Error> {
+        status: Option<&str>,
+    ) -> Result<bool, TaskWriteError> {
+        let mut tx = self.pool.begin().await?;
+        let room = sqlx::query_scalar::<_, uuid::Uuid>(
+            "SELECT room_id FROM tasks WHERE id = $1 FOR UPDATE",
+        )
+        .bind(id.to_uuid())
+        .fetch_optional(&mut *tx)
+        .await?
+        .map(RoomId::from_uuid)
+        .ok_or(TaskWriteError::NotFound)?;
+        if !is_effective_room_member(&mut tx, room, actor).await? {
+            return Err(TaskWriteError::ActorNotMember);
+        }
+        if let Some(assignee) = assignee {
+            if !is_effective_room_member(&mut tx, room, assignee).await? {
+                return Err(TaskWriteError::AssigneeNotMember);
+            }
+        }
+
         let result = sqlx::query(
             r"UPDATE tasks
                  SET title = COALESCE($2, title),
                      assignee_id = COALESCE($3, assignee_id),
                      due_at = COALESCE($4, due_at),
+                     status = COALESCE($5, status),
                      updated_at = now()
                WHERE id = $1",
         )
@@ -233,38 +402,36 @@ impl TaskRepo {
         .bind(title)
         .bind(assignee.map(|a| a.to_uuid()))
         .bind(due_at)
-        .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected() > 0)
-    }
-
-    /// Set a task's `status`, bumping `updated_at`. Returns `true` iff a row was
-    /// updated (the id exists). The caller is responsible for validating `status`
-    /// via [`validate_status`].
-    ///
-    /// # Errors
-    /// Propagates any [`sqlx::Error`] from the update.
-    pub async fn set_status(&self, id: TaskId, status: &str) -> Result<bool, sqlx::Error> {
-        let result = sqlx::query(
-            r"UPDATE tasks SET status = $2, updated_at = now() WHERE id = $1",
-        )
-        .bind(id.to_uuid())
         .bind(status)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(result.rows_affected() > 0)
     }
 
-    /// Delete a task by id. Returns `true` iff a row was removed — a second delete
-    /// (or an unknown id) is a no-op returning `false`.
+    /// Delete a task only while `actor` remains an effective member of its room.
+    /// The row lock and access check share the delete transaction.
     ///
     /// # Errors
     /// Propagates any [`sqlx::Error`] from the delete.
-    pub async fn delete(&self, id: TaskId) -> Result<bool, sqlx::Error> {
+    pub async fn delete(&self, id: TaskId, actor: ParticipantId) -> Result<bool, TaskWriteError> {
+        let mut tx = self.pool.begin().await?;
+        let room = sqlx::query_scalar::<_, uuid::Uuid>(
+            "SELECT room_id FROM tasks WHERE id = $1 FOR UPDATE",
+        )
+        .bind(id.to_uuid())
+        .fetch_optional(&mut *tx)
+        .await?
+        .map(RoomId::from_uuid)
+        .ok_or(TaskWriteError::NotFound)?;
+        if !is_effective_room_member(&mut tx, room, actor).await? {
+            return Err(TaskWriteError::ActorNotMember);
+        }
         let result = sqlx::query("DELETE FROM tasks WHERE id = $1")
             .bind(id.to_uuid())
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        tx.commit().await?;
         Ok(result.rows_affected() > 0)
     }
 }
@@ -320,20 +487,120 @@ mod db_tests {
         id
     }
 
+    async fn room_with_members(
+        p: &PgPool,
+        creator: ParticipantId,
+        members: &[ParticipantId],
+    ) -> RoomId {
+        let workspace = aero_common::WorkspaceId::new();
+        let room = RoomId::new();
+        let mut tx = p.begin().await.expect("begin workspace fixture");
+        sqlx::query(
+            "INSERT INTO workspaces (id, name, slug, created_by)
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(workspace.to_uuid())
+        .bind(format!("task-workspace-{workspace}"))
+        .bind(format!("task-{workspace}"))
+        .bind(creator.to_uuid())
+        .execute(&mut *tx)
+        .await
+        .expect("insert workspace");
+        for member in members {
+            sqlx::query(
+                "INSERT INTO workspace_members
+                     (workspace_id, participant_id, role, joined_at)
+                 VALUES ($1, $2, $3, now())",
+            )
+            .bind(workspace.to_uuid())
+            .bind(member.to_uuid())
+            .bind(if *member == creator {
+                "owner"
+            } else {
+                "member"
+            })
+            .execute(&mut *tx)
+            .await
+            .expect("insert workspace member");
+        }
+        tx.commit().await.expect("commit workspace fixture");
+        sqlx::query(
+            "INSERT INTO rooms (id, kind, name, created_by, workspace_id)
+             VALUES ($1, 'group', $2, $3, $4)",
+        )
+        .bind(room.to_uuid())
+        .bind(format!("task-room-{room}"))
+        .bind(creator.to_uuid())
+        .bind(workspace.to_uuid())
+        .execute(p)
+        .await
+        .expect("insert room");
+        for member in members {
+            sqlx::query(
+                "INSERT INTO room_members
+                     (room_id, participant_id, role, joined_at)
+                 VALUES ($1, $2, 'member', now())",
+            )
+            .bind(room.to_uuid())
+            .bind(member.to_uuid())
+            .execute(p)
+            .await
+            .expect("insert room member");
+        }
+        room
+    }
+
     #[tokio::test]
     #[ignore = "requires live Postgres"]
     async fn task_create_get_list_update_status_delete() {
         let p = pool();
         let repo = TaskRepo::new(p.clone());
-        let room = RoomId::new();
-        let other_room = RoomId::new();
         let creator = participant(&p).await;
         let assignee = participant(&p).await;
+        let outsider = participant(&p).await;
+        let room = room_with_members(&p, creator, &[creator, assignee]).await;
+        let other_room = room_with_members(&p, outsider, &[outsider]).await;
+        let other_message = MessageId::new();
+        sqlx::query(
+            "INSERT INTO messages (id, room_id, sender_id, blocks)
+             VALUES ($1, $2, $3, '[]'::jsonb)",
+        )
+        .bind(other_message.to_uuid())
+        .bind(other_room.to_uuid())
+        .bind(outsider.to_uuid())
+        .execute(&p)
+        .await
+        .expect("insert other-room source message");
         let due = time::OffsetDateTime::now_utc() + time::Duration::days(2);
+
+        assert!(matches!(
+            repo.create(room, creator, "Do not leak", Some(outsider), None, None)
+                .await,
+            Err(TaskWriteError::AssigneeNotMember)
+        ));
+        assert!(matches!(
+            repo.create(
+                room,
+                creator,
+                "Do not cross-link",
+                None,
+                Some(other_message),
+                None
+            )
+            .await,
+            Err(TaskWriteError::SourceMessageNotInRoom)
+        ));
 
         // create → get returns the row, defaulted to 'open'.
         let id = repo
-            .create(room, creator, "Ship the thing", Some(assignee), None, Some(due))
+            .create(
+                room,
+                creator,
+                "Ship the thing",
+                Some(assignee),
+                None,
+                Some(due),
+            )
             .await
             .unwrap();
         let got = repo.get(id).await.unwrap().expect("created task exists");
@@ -347,49 +614,128 @@ mod db_tests {
 
         // list_for_room (no filter + status filter); a different room does not show it.
         assert!(
-            repo.list_for_room(room, None).await.unwrap().iter().any(|t| t.id == id),
+            repo.list_for_room(room, None)
+                .await
+                .unwrap()
+                .iter()
+                .any(|t| t.id == id),
             "room list shows the task"
         );
         assert!(
-            repo.list_for_room(room, Some("open")).await.unwrap().iter().any(|t| t.id == id),
+            repo.list_for_room(room, Some("open"))
+                .await
+                .unwrap()
+                .iter()
+                .any(|t| t.id == id),
             "open filter shows the open task"
         );
         assert!(
-            !repo.list_for_room(room, Some("done")).await.unwrap().iter().any(|t| t.id == id),
+            !repo
+                .list_for_room(room, Some("done"))
+                .await
+                .unwrap()
+                .iter()
+                .any(|t| t.id == id),
             "done filter hides the open task"
         );
         assert!(
-            !repo.list_for_room(other_room, None).await.unwrap().iter().any(|t| t.id == id),
+            !repo
+                .list_for_room(other_room, None)
+                .await
+                .unwrap()
+                .iter()
+                .any(|t| t.id == id),
             "another room's list does not show it"
         );
 
         // list_for_assignee shows it.
         assert!(
-            repo.list_for_assignee(assignee).await.unwrap().iter().any(|t| t.id == id),
+            repo.list_for_assignee(assignee)
+                .await
+                .unwrap()
+                .iter()
+                .any(|t| t.id == id),
             "assignee list shows the task"
         );
+        sqlx::query("DELETE FROM room_members WHERE room_id = $1 AND participant_id = $2")
+            .bind(room.to_uuid())
+            .bind(assignee.to_uuid())
+            .execute(&p)
+            .await
+            .unwrap();
+        assert!(
+            !repo
+                .list_for_assignee(assignee)
+                .await
+                .unwrap()
+                .iter()
+                .any(|task| task.id == id),
+            "revoked room membership hides historical assigned tasks"
+        );
+        sqlx::query(
+            "INSERT INTO room_members (room_id, participant_id, role)
+             VALUES ($1, $2, 'member')",
+        )
+        .bind(room.to_uuid())
+        .bind(assignee.to_uuid())
+        .execute(&p)
+        .await
+        .unwrap();
 
         // partial update: change title only; assignee/due unchanged (COALESCE).
-        assert!(repo.update(id, Some("Ship it now"), None, None).await.unwrap());
+        assert!(repo
+            .update(id, creator, Some("Ship it now"), None, None, None)
+            .await
+            .unwrap());
+        assert!(matches!(
+            repo.update(id, creator, None, Some(outsider), None, None)
+                .await,
+            Err(TaskWriteError::AssigneeNotMember)
+        ));
         let after = repo.get(id).await.unwrap().expect("still present");
         assert_eq!(after.title, "Ship it now");
         assert_eq!(after.assignee_id, Some(assignee), "assignee preserved");
-        assert!(after.updated_at >= got.updated_at, "updated_at moved forward");
-
-        // set_status to done; the open filter no longer shows it.
-        assert!(repo.set_status(id, STATUS_DONE).await.unwrap());
-        assert_eq!(repo.get(id).await.unwrap().expect("present").status, STATUS_DONE);
         assert!(
-            !repo.list_for_room(room, Some("open")).await.unwrap().iter().any(|t| t.id == id),
+            after.updated_at >= got.updated_at,
+            "updated_at moved forward"
+        );
+
+        // Status update to done; the open filter no longer shows it.
+        assert!(repo
+            .update(id, creator, None, None, None, Some(STATUS_DONE))
+            .await
+            .unwrap());
+        assert_eq!(
+            repo.get(id).await.unwrap().expect("present").status,
+            STATUS_DONE
+        );
+        assert!(
+            !repo
+                .list_for_room(room, Some("open"))
+                .await
+                .unwrap()
+                .iter()
+                .any(|t| t.id == id),
             "done task leaves the open filter"
         );
 
-        // delete: first removes, second is a no-op; unknown updates are false.
-        assert!(repo.delete(id).await.unwrap(), "first delete removes");
-        assert!(!repo.delete(id).await.unwrap(), "second delete is a no-op");
-        assert!(!repo.update(id, Some("x"), None, None).await.unwrap(), "update on gone id is false");
-        assert!(!repo.set_status(id, STATUS_OPEN).await.unwrap(), "set_status on gone id is false");
-        assert!(repo.get(id).await.unwrap().is_none(), "deleted task is gone");
+        // Delete is authorized in the same transaction; stale ids report NotFound.
+        assert!(
+            repo.delete(id, creator).await.unwrap(),
+            "first delete removes"
+        );
+        assert!(matches!(
+            repo.update(id, creator, Some("x"), None, None, None).await,
+            Err(TaskWriteError::NotFound)
+        ));
+        assert!(matches!(
+            repo.delete(id, creator).await,
+            Err(TaskWriteError::NotFound)
+        ));
+        assert!(
+            repo.get(id).await.unwrap().is_none(),
+            "deleted task is gone"
+        );
 
         // Cleanup so reruns stay self-contained.
         sqlx::query("DELETE FROM tasks WHERE room_id = $1")
@@ -397,7 +743,21 @@ mod db_tests {
             .execute(&p)
             .await
             .ok();
-        for who in [creator, assignee] {
+        sqlx::query("DELETE FROM rooms WHERE id = ANY($1)")
+            .bind(vec![room.to_uuid(), other_room.to_uuid()])
+            .execute(&p)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM workspaces WHERE created_by = ANY($1)")
+            .bind(vec![
+                creator.to_uuid(),
+                assignee.to_uuid(),
+                outsider.to_uuid(),
+            ])
+            .execute(&p)
+            .await
+            .ok();
+        for who in [creator, assignee, outsider] {
             sqlx::query("DELETE FROM participants WHERE id = $1")
                 .bind(who.to_uuid())
                 .execute(&p)

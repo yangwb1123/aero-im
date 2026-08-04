@@ -181,10 +181,7 @@ impl SubscriptionRepo {
     ///
     /// # Errors
     /// Propagates any [`sqlx::Error`] from the query.
-    pub async fn get_tier(
-        &self,
-        id: CreatorTierId,
-    ) -> Result<Option<CreatorTier>, sqlx::Error> {
+    pub async fn get_tier(&self, id: CreatorTierId) -> Result<Option<CreatorTier>, sqlx::Error> {
         let sql = format!("SELECT {TIER_COLUMNS} FROM creator_tiers WHERE id = $1");
         let row = sqlx::query_as::<_, TierRow>(&sql)
             .bind(id.to_uuid())
@@ -204,12 +201,11 @@ impl SubscriptionRepo {
         id: CreatorTierId,
         creator: ParticipantId,
     ) -> Result<bool, sqlx::Error> {
-        let result =
-            sqlx::query("DELETE FROM creator_tiers WHERE id = $1 AND creator_id = $2")
-                .bind(id.to_uuid())
-                .bind(creator.to_uuid())
-                .execute(&self.pool)
-                .await?;
+        let result = sqlx::query("DELETE FROM creator_tiers WHERE id = $1 AND creator_id = $2")
+            .bind(id.to_uuid())
+            .bind(creator.to_uuid())
+            .execute(&self.pool)
+            .await?;
         Ok(result.rows_affected() > 0)
     }
 
@@ -438,8 +434,14 @@ mod db_tests {
         let stranger = participant(&p, "stranger-sub").await;
 
         // create → list shows it, cheapest first.
-        let t1 = repo.create_tier(creator, "Gold", 999, Some("emotes")).await.unwrap();
-        let t2 = repo.create_tier(creator, "Bronze", 199, None).await.unwrap();
+        let t1 = repo
+            .create_tier(creator, "Gold", 999, Some("emotes"))
+            .await
+            .unwrap();
+        let t2 = repo
+            .create_tier(creator, "Bronze", 199, None)
+            .await
+            .unwrap();
         let listed = repo.list_tiers(creator).await.unwrap();
         assert!(listed.iter().any(|t| t.id == t1));
         assert!(listed.iter().any(|t| t.id == t2));
@@ -452,9 +454,18 @@ mod db_tests {
         assert_eq!(got.perks.as_deref(), Some("emotes"));
 
         // A stranger's delete is a no-op; the creator's succeeds, the second is a no-op.
-        assert!(!repo.delete_tier(t1, stranger).await.unwrap(), "stranger cannot delete");
-        assert!(repo.delete_tier(t1, creator).await.unwrap(), "creator deletes");
-        assert!(!repo.delete_tier(t1, creator).await.unwrap(), "second delete is a no-op");
+        assert!(
+            !repo.delete_tier(t1, stranger).await.unwrap(),
+            "stranger cannot delete"
+        );
+        assert!(
+            repo.delete_tier(t1, creator).await.unwrap(),
+            "creator deletes"
+        );
+        assert!(
+            !repo.delete_tier(t1, creator).await.unwrap(),
+            "second delete is a no-op"
+        );
 
         // Cleanup.
         sqlx::query("DELETE FROM creator_tiers WHERE creator_id = $1")
@@ -492,8 +503,14 @@ mod db_tests {
         assert!(subscribers.iter().any(|s| s.subscriber_id == viewer));
 
         // Unsubscribe deactivates; a second is a no-op; listings drop it.
-        assert!(repo.unsubscribe(creator, viewer).await.unwrap(), "deactivates");
-        assert!(!repo.unsubscribe(creator, viewer).await.unwrap(), "second is a no-op");
+        assert!(
+            repo.unsubscribe(creator, viewer).await.unwrap(),
+            "deactivates"
+        );
+        assert!(
+            !repo.unsubscribe(creator, viewer).await.unwrap(),
+            "second is a no-op"
+        );
         assert!(!repo.is_subscribed(creator, viewer).await.unwrap());
         assert!(repo.subscriptions_of(viewer).await.unwrap().is_empty());
         assert!(repo.subscribers_of(creator).await.unwrap().is_empty());

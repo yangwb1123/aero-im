@@ -30,7 +30,11 @@ pub struct PasswordPolicy {
 
 impl Default for PasswordPolicy {
     fn default() -> Self {
-        Self { min_len: 8, max_len: 1024, required_classes: 0 }
+        Self {
+            min_len: 8,
+            max_len: 1024,
+            required_classes: 0,
+        }
     }
 }
 
@@ -114,7 +118,10 @@ mod tests {
     fn default_policy_matches_legacy_behaviour() {
         let p = PasswordPolicy::default();
         assert!(p.validate("short").is_err(), "<8 chars rejected");
-        assert!(p.validate("longenough").is_ok(), "8+ chars, single class, accepted by default");
+        assert!(
+            p.validate("longenough").is_ok(),
+            "8+ chars, single class, accepted by default"
+        );
         assert!(p.validate(&"x".repeat(1025)).is_err(), ">1024 rejected");
     }
 
@@ -129,9 +136,19 @@ mod tests {
 
     #[test]
     fn required_classes_gate() {
-        let strict = PasswordPolicy { min_len: 8, max_len: 1024, required_classes: 3 };
-        assert!(strict.validate("longenough").is_err(), "single class fails a 3-class policy");
-        assert!(strict.validate("password_123").is_ok(), "lower+digit+symbol = 3 classes");
+        let strict = PasswordPolicy {
+            min_len: 8,
+            max_len: 1024,
+            required_classes: 3,
+        };
+        assert!(
+            strict.validate("longenough").is_err(),
+            "single class fails a 3-class policy"
+        );
+        assert!(
+            strict.validate("password_123").is_ok(),
+            "lower+digit+symbol = 3 classes"
+        );
         assert!(strict.validate("pw-Aa123456!").is_ok(), "4 classes");
     }
 

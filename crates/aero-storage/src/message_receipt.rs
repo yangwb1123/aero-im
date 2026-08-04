@@ -111,7 +111,7 @@ mod db_tests {
         let room = RoomId::new();
         sqlx::query(
             "INSERT INTO rooms (id, kind, name, created_by, created_at, workspace_id)
-             VALUES ($1,'channel',$2,$3, now(), '00000000-0000-0000-0000-000000000000')",
+             VALUES ($1,'group',$2,$3, now(), '00000000-0000-0000-0000-000000000000')",
         )
         .bind(room.to_uuid())
         .bind("mr-room")
@@ -144,8 +144,14 @@ mod db_tests {
         assert!(repo.list_readers(message).await.unwrap().is_empty());
 
         // Two distinct users mark seen → both appear.
-        assert!(repo.mark_read(message, author).await.unwrap(), "first mark created");
-        assert!(repo.mark_read(message, reader).await.unwrap(), "second reader created");
+        assert!(
+            repo.mark_read(message, author).await.unwrap(),
+            "first mark created"
+        );
+        assert!(
+            repo.mark_read(message, reader).await.unwrap(),
+            "second reader created"
+        );
 
         let readers = repo.list_readers(message).await.unwrap();
         assert_eq!(readers.len(), 2, "both readers listed");
@@ -160,9 +166,15 @@ mod db_tests {
         let repo = MessageReceiptRepo::new(p.clone());
         let (message, _author, reader) = fixture(&p).await;
 
-        assert!(repo.mark_read(message, reader).await.unwrap(), "first mark created");
+        assert!(
+            repo.mark_read(message, reader).await.unwrap(),
+            "first mark created"
+        );
         // Re-marking is a no-op (returns false) and does not duplicate the row.
-        assert!(!repo.mark_read(message, reader).await.unwrap(), "re-mark is a no-op");
+        assert!(
+            !repo.mark_read(message, reader).await.unwrap(),
+            "re-mark is a no-op"
+        );
 
         let readers = repo.list_readers(message).await.unwrap();
         assert_eq!(readers.len(), 1, "still exactly one reader after re-mark");

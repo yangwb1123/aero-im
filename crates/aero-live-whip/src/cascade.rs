@@ -21,13 +21,18 @@
 //!
 //! ## What is real vs. a seam
 //!
-//! Everything here is unit-tested against [`FakeUpstream`], a scripted in-memory
-//! source — there is **no real socket** in this module. The production
-//! [`UpstreamSource`] (a WHEP/relay client that pulls RTP/NAL over UDP from the
-//! owning node and depacketizes it) is a **documented seam**: see the
-//! `TODO(real-transport)` on [`UpstreamSource`]. The cascade *logic* (pump →
-//! relay → fan-out, keyframe-gated startup, decision policy) is fully exercised
-//! without I/O; only the inter-node transport is left to wire.
+//! The cascade policy and pump are unit-tested against [`FakeUpstream`]. The
+//! concrete [`WhepUpstreamSource`](crate::upstream::WhepUpstreamSource) is the
+//! real transport implementation: it performs a WHEP SDP exchange, drives
+//! str0m ICE/DTLS/SRTP over UDP, reorders/depacketizes H.264 RTP, and yields
+//! access units through this trait.
+//!
+//! `aero-server` currently serves a remote stream with its production sticky
+//! routing path (a 307 to the node recorded in `StreamRouteRegistry`); it does
+//! not instantiate a local [`CascadeRelay`]. Selecting cascade based on
+//! node-local demand and owning that extra upstream WHEP resource is the
+//! remaining optional scaling-policy integration. It is not required for
+//! remote WHEP playback, which already works through the sticky redirect.
 //!
 //! ## Relationship to [`MediaRelay`]
 //!
@@ -88,21 +93,13 @@ impl UpstreamAu {
 /// asynchronous: it awaits the next access unit and returns `None` at
 /// end-of-stream (the upstream publisher stopped or the link dropped).
 ///
-/// # TODO(real-transport) — documented seam
-///
-/// The production implementation is a **WHEP / relay client** that:
-/// 1. resolves the owning node for `stream_id` (the cross-node registry the
-///    sibling sticky-routing work already populates),
-/// 2. performs the WHEP `recvonly` SDP exchange with that node,
-/// 3. completes ICE/DTLS/SRTP and receives RTP over UDP,
-/// 4. reorders ([`crate::reorder::ReorderBuffer`]) and depacketizes
-///    ([`crate::depacketize::H264Depacketizer`]) the RTP into Annex-B access
-///    units, yielding each via [`next_au`](UpstreamSource::next_au).
-///
-/// That leg needs a real socket + a peer node and so is **not unit-testable in
-/// this sandbox** — it is left as a seam, mirroring [`crate::session::WhipSession::run`]
-/// and [`crate::whep::WhepSession::run`]. The cascade *logic* downstream of a
-/// received access unit ([`CascadeRelay`]) is fully tested via [`FakeUpstream`].
+/// The production implementation is
+/// [`WhepUpstreamSource`](crate::upstream::WhepUpstreamSource). Its SDP/error
+/// paths compile and run in unit tests; a successful two-node ICE/DTLS/SRTP
+/// exchange still needs a routable staging peer, just like
+/// [`crate::session::WhipSession::run`] and [`crate::whep::WhepSession::run`].
+/// The cascade logic downstream of received access units ([`CascadeRelay`]) is
+/// fully deterministic and tested via [`FakeUpstream`].
 #[async_trait]
 pub trait UpstreamSource: Send {
     /// The id of the remote stream being relayed.
@@ -251,9 +248,9 @@ impl<S: UpstreamSource> CascadeRelay<S> {
     ///
     /// This is the production driver, analogous to
     /// [`WhepSession::run`](crate::whep::WhepSession::run): it owns the pull loop
-    /// and runs until the upstream link ends. The server spawns it once per
-    /// cascaded stream. It performs no I/O of its own — all I/O lives behind the
-    /// [`UpstreamSource`] seam.
+    /// and runs until the upstream link ends. A caller that enables the optional
+    /// cascade policy spawns it once per cascaded stream. It performs no I/O of
+    /// its own — all I/O lives behind the [`UpstreamSource`] implementation.
     pub async fn run(mut self) {
         let stream_id = self.source.stream_id();
         debug!(%stream_id, "cascade: relay loop started");
@@ -418,7 +415,10 @@ mod tests {
 
     #[test]
     fn keyframe_au_is_classified_as_keyframe() {
-        assert!(keyframe_au(0).is_keyframe(), "SPS+PPS+IDR must be a keyframe");
+        assert!(
+            keyframe_au(0).is_keyframe(),
+            "SPS+PPS+IDR must be a keyframe"
+        );
     }
 
     #[test]
@@ -447,7 +447,11 @@ mod tests {
     #[tokio::test]
     async fn fake_upstream_emits_scripted_sequence_then_none() {
         let id = Ulid::new();
-        let aus = vec![keyframe_au(0), delta_au(&[0x01], 3_000), delta_au(&[0x02], 6_000)];
+        let aus = vec![
+            keyframe_au(0),
+            delta_au(&[0x01], 3_000),
+            delta_au(&[0x02], 6_000),
+        ];
         let mut up = FakeUpstream::new(id, aus.clone());
 
         assert_eq!(up.stream_id(), id);
@@ -457,7 +461,10 @@ mod tests {
             let got = up.next_au().await.expect("scripted AU must be emitted");
             assert_eq!(&got, expected, "AU must match the scripted one");
         }
-        assert!(up.next_au().await.is_none(), "end-of-stream after the script");
+        assert!(
+            up.next_au().await.is_none(),
+            "end-of-stream after the script"
+        );
         assert_eq!(up.remaining(), 0);
     }
 
@@ -478,7 +485,11 @@ mod tests {
         let id = Ulid::new();
         let up = FakeUpstream::new(
             id,
-            vec![keyframe_au(0), delta_au(&[0x10], 3_000), delta_au(&[0x20], 6_000)],
+            vec![
+                keyframe_au(0),
+                delta_au(&[0x10], 3_000),
+                delta_au(&[0x20], 6_000),
+            ],
         );
         let mut cascade = CascadeRelay::new(up);
 
@@ -488,7 +499,11 @@ mod tests {
         assert_eq!(cascade.stream_id(), id);
 
         // Pump the whole script.
-        assert_eq!(cascade.pump_once().await, Some(1), "keyframe → 1 subscriber");
+        assert_eq!(
+            cascade.pump_once().await,
+            Some(1),
+            "keyframe → 1 subscriber"
+        );
         assert_eq!(cascade.pump_once().await, Some(1), "delta 1 → 1 subscriber");
         assert_eq!(cascade.pump_once().await, Some(1), "delta 2 → 1 subscriber");
         assert_eq!(cascade.pump_once().await, None, "end-of-stream");
@@ -527,7 +542,11 @@ mod tests {
             let received = drain(sub);
             assert_eq!(received.len(), 2, "subscriber {i}: two AUs");
             assert_eq!(received[0].0.len(), 3, "subscriber {i}: keyframe 3 NALs");
-            assert_eq!(received[1].0, vec![vec![0x41, 0x42]], "subscriber {i}: delta");
+            assert_eq!(
+                received[1].0,
+                vec![vec![0x41, 0x42]],
+                "subscriber {i}: delta"
+            );
             assert_eq!(received[1].1, 3_000, "subscriber {i}: delta ts");
         }
     }
@@ -537,7 +556,11 @@ mod tests {
         let id = Ulid::new();
         let up = FakeUpstream::new(
             id,
-            vec![keyframe_au(0), delta_au(&[0x01], 3_000), delta_au(&[0x02], 6_000)],
+            vec![
+                keyframe_au(0),
+                delta_au(&[0x01], 3_000),
+                delta_au(&[0x02], 6_000),
+            ],
         );
         let cascade = CascadeRelay::new(up);
         let mut sub = cascade.subscribe();
@@ -571,9 +594,17 @@ mod tests {
         let mut sub = cascade.subscribe();
 
         // First two pumps drop their AUs (gate closed) → 0 subscribers reached.
-        assert_eq!(cascade.pump_once().await, Some(0), "pre-keyframe AU dropped");
+        assert_eq!(
+            cascade.pump_once().await,
+            Some(0),
+            "pre-keyframe AU dropped"
+        );
         assert!(!cascade.has_started(), "gate still closed");
-        assert_eq!(cascade.pump_once().await, Some(0), "pre-keyframe AU dropped");
+        assert_eq!(
+            cascade.pump_once().await,
+            Some(0),
+            "pre-keyframe AU dropped"
+        );
         assert!(!cascade.has_started(), "gate still closed");
 
         // Keyframe opens the gate and is published.
@@ -581,7 +612,11 @@ mod tests {
         assert!(cascade.has_started(), "gate open after keyframe");
 
         // Subsequent delta is fanned out.
-        assert_eq!(cascade.pump_once().await, Some(1), "post-keyframe delta fans out");
+        assert_eq!(
+            cascade.pump_once().await,
+            Some(1),
+            "post-keyframe delta fans out"
+        );
         assert_eq!(cascade.pump_once().await, None);
 
         let received = drain(&mut sub);
@@ -606,13 +641,21 @@ mod tests {
         let mut sub = cascade.subscribe();
 
         // No gating: the leading delta is published too.
-        assert_eq!(cascade.pump_once().await, Some(1), "delta published (no gate)");
+        assert_eq!(
+            cascade.pump_once().await,
+            Some(1),
+            "delta published (no gate)"
+        );
         assert_eq!(cascade.pump_once().await, Some(1), "keyframe published");
         assert_eq!(cascade.pump_once().await, None);
 
         let received = drain(&mut sub);
         assert_eq!(received.len(), 2, "both AUs fanned out in passthrough mode");
-        assert_eq!(received[0].0, vec![vec![0x41, 0x01]], "leading delta delivered");
+        assert_eq!(
+            received[0].0,
+            vec![vec![0x41, 0x01]],
+            "leading delta delivered"
+        );
         assert_eq!(received[0].1, 0);
     }
 
@@ -625,21 +668,41 @@ mod tests {
         let id = Ulid::new();
         let up = FakeUpstream::new(
             id,
-            vec![keyframe_au(0), delta_au(&[0x01], 3_000), delta_au(&[0x02], 6_000)],
+            vec![
+                keyframe_au(0),
+                delta_au(&[0x01], 3_000),
+                delta_au(&[0x02], 6_000),
+            ],
         );
         let mut cascade = CascadeRelay::new(up);
 
         // Pump the keyframe + first delta BEFORE anyone subscribes.
-        assert_eq!(cascade.pump_once().await, Some(0), "keyframe, no subscribers yet");
-        assert_eq!(cascade.pump_once().await, Some(0), "delta 1, no subscribers yet");
+        assert_eq!(
+            cascade.pump_once().await,
+            Some(0),
+            "keyframe, no subscribers yet"
+        );
+        assert_eq!(
+            cascade.pump_once().await,
+            Some(0),
+            "delta 1, no subscribers yet"
+        );
 
         // Now a late viewer joins.
         let mut sub = cascade.subscribe();
-        assert_eq!(cascade.pump_once().await, Some(1), "delta 2 reaches the late joiner");
+        assert_eq!(
+            cascade.pump_once().await,
+            Some(1),
+            "delta 2 reaches the late joiner"
+        );
         assert_eq!(cascade.pump_once().await, None);
 
         let received = drain(&mut sub);
-        assert_eq!(received.len(), 1, "late joiner only sees the AU after it joined");
+        assert_eq!(
+            received.len(),
+            1,
+            "late joiner only sees the AU after it joined"
+        );
         assert_eq!(received[0].0, vec![vec![0x41, 0x02]]);
         assert_eq!(received[0].1, 6_000);
     }
@@ -660,7 +723,11 @@ mod tests {
         let up = FakeUpstream::new(id, Vec::new());
         let mut cascade = CascadeRelay::new(up);
         let mut sub = cascade.subscribe();
-        assert_eq!(cascade.pump_once().await, None, "empty upstream → immediate EOS");
+        assert_eq!(
+            cascade.pump_once().await,
+            None,
+            "empty upstream → immediate EOS"
+        );
         assert!(drain(&mut sub).is_empty(), "nothing fanned out");
     }
 
@@ -681,7 +748,10 @@ mod tests {
         while cascade.pump_once().await.is_some() {}
 
         // The lagged subscriber must still get at least one AU (no panic).
-        assert!(sub.next_access_unit().is_some(), "lagged subscriber recovers");
+        assert!(
+            sub.next_access_unit().is_some(),
+            "lagged subscriber recovers"
+        );
     }
 
     // ── decision policy (exhaustive) ──────────────────────────────────────────
@@ -761,7 +831,11 @@ mod tests {
             local_subscribers: 1,
             cascade_threshold: 0,
         });
-        assert_eq!(one_viewer, CascadeDecision::CascadeFromOwner, "thr=0 clamps to 1");
+        assert_eq!(
+            one_viewer,
+            CascadeDecision::CascadeFromOwner,
+            "thr=0 clamps to 1"
+        );
 
         let zero_viewers = decide_cascade(CascadeInputs {
             stream_is_local: false,
@@ -804,7 +878,15 @@ mod tests {
             local_subscribers: thr - 1,
             cascade_threshold: thr,
         });
-        assert_eq!(at, CascadeDecision::CascadeFromOwner, "exactly at threshold → cascade");
-        assert_eq!(below, CascadeDecision::RedirectToOwner, "one below → redirect");
+        assert_eq!(
+            at,
+            CascadeDecision::CascadeFromOwner,
+            "exactly at threshold → cascade"
+        );
+        assert_eq!(
+            below,
+            CascadeDecision::RedirectToOwner,
+            "one below → redirect"
+        );
     }
 }

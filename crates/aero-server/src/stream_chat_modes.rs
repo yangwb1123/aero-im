@@ -11,10 +11,9 @@
 //!
 //! The HTTP surface here is just owner read/write of those settings
 //! (`GET`/`PUT /api/streams/:id/chat-settings`). *Enforcement* of the modes on
-//! the posting path lives in [`enforce_chat_modes`], which both the REST
-//! `stream_chat_post` handler and the WS `StreamChat` frame call (after the
-//! existing ban check) to reject a violating post with 403 before the line is
-//! accepted/broadcast.
+//! the posting path lives in [`enforce_chat_post`], which both the REST
+//! `stream_chat_post` handler and the WS `StreamChat` frame call to reject bans
+//! and mode violations with 403 before the line is accepted/broadcast.
 //!
 //! Slow mode needs a per-(stream, viewer) last-post timestamp. Rather than widen
 //! [`AppState`], we keep a process-static [`DashMap`] keyed by
@@ -31,7 +30,8 @@ use std::time::{Duration, Instant};
 
 use aero_common::{Error as AeroError, ParticipantId, Result as AeroResult};
 use aero_storage::{
-    StreamChatSettings, StreamChatSettingsRepo, StreamFollowRepo, StreamRepo, SubscriptionRepo,
+    StreamChatSettings, StreamChatSettingsRepo, StreamFollowRepo, StreamModRepo, StreamRepo,
+    SubscriptionRepo,
 };
 use axum::{
     extract::{Path, State},
@@ -56,8 +56,7 @@ const MAX_SLOW_MODE_SECS: i32 = 86_400;
 /// slow-mode enforcement. Best-effort, per-process (see module docs). Keyed by
 /// the stream id and the posting viewer; the value is the `Instant` of that
 /// viewer's most recent accepted post.
-static LAST_POST: LazyLock<DashMap<(Ulid, ParticipantId), Instant>> =
-    LazyLock::new(DashMap::new);
+static LAST_POST: LazyLock<DashMap<(Ulid, ParticipantId), Instant>> = LazyLock::new(DashMap::new);
 
 /// Mount the chat-modes routes. Folded into the main router by
 /// [`crate::routes::build`]; kept separate so the chat-modes surface lives next
@@ -101,10 +100,7 @@ async fn get_settings(
     Path(id_str): Path<String>,
 ) -> ApiResult<Json<StreamChatSettings>> {
     let stream_id = require_owner(&s, &id_str, auth.participant_id).await?;
-    let settings = settings_repo(&s)
-        .get(stream_id)
-        .await?
-        .unwrap_or_default();
+    let settings = settings_repo(&s).get(stream_id).await?.unwrap_or_default();
     Ok(Json(settings))
 }
 
@@ -150,9 +146,29 @@ async fn put_settings(
     }))
 }
 
-/// Enforce a stream's chat modes for `sender` posting to `stream`, called by
-/// BOTH the REST `stream_chat_post` handler and the WS `StreamChat` frame after
-/// the existing ban check, before the line is accepted/broadcast.
+/// Enforce every authoritative chat-post gate shared by REST and `WebSocket`.
+///
+/// Keeping the active-ban check and the configurable chat-mode checks behind
+/// this single entry point prevents one transport from accepting a line that
+/// the other rejects.
+pub async fn enforce_chat_post(
+    state: &AppState,
+    stream: Ulid,
+    sender: ParticipantId,
+) -> AeroResult<()> {
+    let pool = state.participants.pool().clone();
+    if StreamModRepo::new(pool)
+        .is_banned(stream, sender, time::OffsetDateTime::now_utc())
+        .await?
+    {
+        return Err(AeroError::Forbidden(
+            "banned from this stream's chat".into(),
+        ));
+    }
+    enforce_chat_modes(state, stream, sender).await
+}
+
+/// Enforce a stream's configurable chat modes after the active-ban gate.
 ///
 /// On success the viewer's slow-mode clock is advanced (so the *next* post is
 /// rate-limited). Returns:
@@ -228,11 +244,7 @@ pub async fn enforce_chat_modes(
 /// viewer's last post in this stream was less than `secs` seconds ago; otherwise
 /// record `now` and allow. Split out so the timestamp bookkeeping stays in one
 /// place. `secs > 0` is the caller's precondition.
-fn slow_mode_check_and_record(
-    stream: Ulid,
-    sender: ParticipantId,
-    secs: i32,
-) -> AeroResult<()> {
+fn slow_mode_check_and_record(stream: Ulid, sender: ParticipantId, secs: i32) -> AeroResult<()> {
     let key = (stream, sender);
     let now = Instant::now();
     let window = std::time::Duration::from_secs(u64::from(secs.unsigned_abs()));

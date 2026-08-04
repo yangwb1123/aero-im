@@ -6,10 +6,17 @@
 host = "0.0.0.0"
 port = 8080
 web_dir = "./web"
+# RTMP binds independently from the HTTP gateway. When this host is wildcard,
+# stream-create responses advertise AERO_INGEST_HOST or the AERO_PUBLIC_BASE_URL host.
+rtmp_listen = "0.0.0.0:1935"
 
 [database]
 url = "postgres://aero:aero_dev_pw@localhost:5432/aero"
 max_connections = 16
+# Optional streaming read replica. Only explicitly eventual, already-authorized
+# single-room reads use it; auth/security, cross-room, latest/reconnect and all
+# write/read-after-write paths remain on `url`. Omit to route every read to primary.
+# replica_url = "postgres://aero:replace-me@replica.internal:5432/aero"
 
 [redis]
 url = "redis://localhost:6379"
@@ -38,9 +45,25 @@ refresh_ttl_secs = 604800        # 7 days
 otlp_endpoint = "http://localhost:4317"
 log_level = "info,aero=debug"
 
+# Optional S3-compatible residency backends. `default` is reserved for the
+# primary AERO_BLOB_BACKEND/LocalFs store and must not be declared here.
+# Workspace Owner/Admin can select only these keys (or `default`) for future
+# room-scoped uploads. Each blob snapshots its selected key, so changing a
+# workspace later never moves or misroutes existing bytes.
+# [storage_regions.eu-central-1]
+# endpoint = "https://s3.eu-central-1.amazonaws.com"
+# bucket = "aero-blobs-eu-central-1"
+# region = "eu-central-1"
+# access_key = "replace-me"
+# secret_key = "replace-me"
+# Optional: PUT requests use SSE-KMS; the encryption headers are SigV4-signed.
+# Blank, untrimmed, oversized, or header-unsafe values abort startup.
+# kms_key_id = "arn:aws:kms:eu-central-1:123456789012:key/replace-me"
+
 # SMTP / transactional email (password reset, workspace invitations).
-# When absent, reset tokens are logged (development mode).
-# Configure via env vars AERO__EMAIL__HOST / _PORT / _USERNAME / _PASSWORD / _FROM / _STARTTLS.
+# When absent, password-reset requests remain enumeration-safe no-ops.
+# Configure via `AERO__EMAIL__*` env vars or this section. STARTTLS is required
+# by default; `starttls = false` selects implicit TLS (normally port 465).
 # [email]
 # host = "smtp.example.com"
 # port = 587
@@ -48,3 +71,5 @@ log_level = "info,aero=debug"
 # password = "smtp-password"
 # from = "noreply@example.com"
 # starttls = true
+# Local capture servers only: forces plaintext and fails closed for non-loopback hosts.
+# allow_insecure_localhost = false

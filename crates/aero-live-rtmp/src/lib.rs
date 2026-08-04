@@ -34,9 +34,11 @@ use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use aero_live_core::{hls_path_for, hls_url_for, LiveError, LiveIngest, LiveResult, LiveStreamConfig};
+use aero_live_core::{
+    hls_path_for, hls_url_for, LiveError, LiveIngest, LiveResult, LiveStreamConfig,
+};
 use aero_live_hls::{FlvToTsConverter, HlsWriter, DEFAULT_SEGMENT_EXT};
-use aero_storage::StreamRepo;
+use aero_storage::{MarkLiveOutcome, StreamRepo};
 use async_trait::async_trait;
 use bytes::Bytes;
 use rml_rtmp::handshake::{Handshake, HandshakeProcessResult, PeerType};
@@ -46,8 +48,9 @@ use rml_rtmp::sessions::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::interval;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use ulid::Ulid;
 
@@ -56,6 +59,10 @@ pub const SEGMENT_DURATION_SECS: u64 = 2;
 
 /// Receive-buffer size for each TCP read off the socket.
 const SOCKET_READ_BUF: usize = 8 * 1024;
+
+/// Maximum time shutdown waits for publishers to flush their current HLS
+/// segment and mark the stream ended before aborting a stuck connection task.
+const CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Maximum bytes a single per-connection task will buffer for HLS segmenting
 /// before it drops new data with a warning. Acts as a back-pressure safety
@@ -139,9 +146,22 @@ pub fn spawn_rtmp_ingest(
     repo: StreamRepo,
     cfg: Arc<LiveStreamConfig>,
 ) -> JoinHandle<LiveResult<()>> {
+    spawn_rtmp_ingest_until_cancelled(repo, cfg, CancellationToken::new())
+}
+
+/// Spawn RTMP ingest tied to a process-lifecycle cancellation token.
+///
+/// On cancellation the listener stops accepting, existing publishers are
+/// allowed to flush/finalize for [`CONNECTION_DRAIN_TIMEOUT`], and any task
+/// still stuck in external I/O is then aborted.
+pub fn spawn_rtmp_ingest_until_cancelled(
+    repo: StreamRepo,
+    cfg: Arc<LiveStreamConfig>,
+    cancel: CancellationToken,
+) -> JoinHandle<LiveResult<()>> {
     tokio::spawn(async move {
         let ingest = RtmpIngest::new();
-        ingest.run(repo, cfg).await
+        ingest.run_until_cancelled(repo, cfg, cancel).await
     })
 }
 
@@ -155,11 +175,17 @@ impl RtmpIngest {
     pub fn new() -> Self {
         Self
     }
-}
 
-#[async_trait]
-impl LiveIngest for RtmpIngest {
-    async fn run(&self, repo: StreamRepo, cfg: Arc<LiveStreamConfig>) -> LiveResult<()> {
+    /// Run the listener until `cancel` is triggered.
+    ///
+    /// Connection tasks are owned by a [`JoinSet`] rather than detached, so
+    /// process shutdown has a deterministic drain boundary.
+    pub async fn run_until_cancelled(
+        &self,
+        repo: StreamRepo,
+        cfg: Arc<LiveStreamConfig>,
+        cancel: CancellationToken,
+    ) -> LiveResult<()> {
         let listener = TcpListener::bind(cfg.rtmp_listen)
             .await
             .map_err(LiveError::from)?;
@@ -169,24 +195,69 @@ impl LiveIngest for RtmpIngest {
             "RTMP ingest listening"
         );
 
+        let mut connections = JoinSet::new();
         loop {
-            let (socket, peer) = match listener.accept().await {
-                Ok(p) => p,
-                Err(e) => {
-                    error!(error = %e, "RTMP accept failed");
-                    continue;
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    info!(
+                        active_connections = connections.len(),
+                        "RTMP ingest shutdown requested; draining publishers"
+                    );
+                    let drain = async {
+                        while let Some(result) = connections.join_next().await {
+                            if let Err(error) = result {
+                                warn!(%error, "RTMP connection task failed while draining");
+                            }
+                        }
+                    };
+                    if tokio::time::timeout(CONNECTION_DRAIN_TIMEOUT, drain).await.is_err() {
+                        warn!(
+                            active_connections = connections.len(),
+                            timeout_secs = CONNECTION_DRAIN_TIMEOUT.as_secs(),
+                            "RTMP publisher drain timed out; aborting remaining connections"
+                        );
+                        connections.abort_all();
+                        while connections.join_next().await.is_some() {}
+                    }
+                    return Ok(());
                 }
-            };
-            debug!(%peer, "RTMP connection accepted");
+                joined = connections.join_next(), if !connections.is_empty() => {
+                    if let Some(Err(error)) = joined {
+                        warn!(%error, "RTMP connection task failed");
+                    }
+                }
+                accepted = listener.accept() => {
+                    let (socket, peer) = match accepted {
+                        Ok(pair) => pair,
+                        Err(error) => {
+                            error!(%error, "RTMP accept failed");
+                            continue;
+                        }
+                    };
+                    debug!(%peer, "RTMP connection accepted");
 
-            let repo = repo.clone();
-            let cfg = cfg.clone();
-            tokio::spawn(async move {
-                if let Err(e) = handle_connection(socket, repo, cfg).await {
-                    warn!(error = %e, %peer, "RTMP connection ended with error");
+                    let repo = repo.clone();
+                    let cfg = cfg.clone();
+                    let connection_cancel = cancel.clone();
+                    connections.spawn(async move {
+                        if let Err(error) =
+                            handle_connection(socket, repo, cfg, connection_cancel).await
+                        {
+                            warn!(%error, %peer, "RTMP connection ended with error");
+                        }
+                    });
                 }
-            });
+            }
         }
+    }
+}
+
+#[async_trait]
+impl LiveIngest for RtmpIngest {
+    async fn run(&self, repo: StreamRepo, cfg: Arc<LiveStreamConfig>) -> LiveResult<()> {
+        self.run_until_cancelled(repo, cfg, CancellationToken::new())
+            .await
     }
 }
 
@@ -195,13 +266,16 @@ async fn handle_connection(
     mut socket: TcpStream,
     repo: StreamRepo,
     cfg: Arc<LiveStreamConfig>,
+    cancel: CancellationToken,
 ) -> LiveResult<()> {
     let mut buf = [0u8; SOCKET_READ_BUF];
 
     // 1) Handshake.
     let mut handshake = Handshake::new(PeerType::Server);
     let remaining_after_handshake = loop {
-        let n = socket.read(&mut buf).await.map_err(LiveError::from)?;
+        let Some(n) = read_or_cancelled(&mut socket, &mut buf, &cancel).await? else {
+            return Ok(());
+        };
         if n == 0 {
             return Err(LiveError::Protocol(
                 "peer closed during handshake".to_string(),
@@ -256,7 +330,9 @@ async fn handle_connection(
 
     // 3) Drive the session until the connection ends or we transition into the publish loop.
     let publish = loop {
-        let n = socket.read(&mut buf).await.map_err(LiveError::from)?;
+        let Some(n) = read_or_cancelled(&mut socket, &mut buf, &cancel).await? else {
+            return Ok(());
+        };
         if n == 0 {
             return Err(LiveError::Protocol(
                 "peer closed before publish accepted".to_string(),
@@ -274,7 +350,7 @@ async fn handle_connection(
 
     // 4) Publish loop.
     let stream_id = publish.stream_id;
-    let publish_result = run_publish_loop(socket, session, buf, publish, &cfg).await;
+    let publish_result = run_publish_loop(socket, session, buf, publish, &cfg, &cancel).await;
 
     // 5) Mark the row ended regardless of how the publish loop exited.
     if let Err(e) = repo.mark_ended(stream_id).await {
@@ -282,6 +358,18 @@ async fn handle_connection(
     }
 
     publish_result
+}
+
+async fn read_or_cancelled(
+    socket: &mut TcpStream,
+    buf: &mut [u8],
+    cancel: &CancellationToken,
+) -> LiveResult<Option<usize>> {
+    tokio::select! {
+        biased;
+        () = cancel.cancelled() => Ok(None),
+        result = socket.read(buf) => result.map(Some).map_err(LiveError::from),
+    }
 }
 
 enum ProcessOutcome {
@@ -329,7 +417,10 @@ async fn process_results(
                 debug!(?payload, "RTMP unhandleable message");
             }
             ServerSessionResult::RaisedEvent(event) => match event {
-                ServerSessionEvent::ConnectionRequested { request_id, app_name } => {
+                ServerSessionEvent::ConnectionRequested {
+                    request_id,
+                    app_name,
+                } => {
                     info!(%app_name, "RTMP connect");
                     let more = session
                         .accept_request(request_id)
@@ -346,7 +437,11 @@ async fn process_results(
                     stream_key,
                     mode: _,
                 } => {
-                    info!(%app_name, %stream_key, "RTMP publish requested");
+                    info!(
+                        %app_name,
+                        stream_key_len = stream_key.len(),
+                        "RTMP publish requested"
+                    );
                     if let Err(reason) = validate_stream_key(&stream_key) {
                         // Malformed/abusive key — reject over RTMP exactly like an
                         // unknown key, but without a database round-trip. We log the
@@ -363,9 +458,7 @@ async fn process_results(
                                 "NetStream.Publish.Start",
                                 "Invalid stream key",
                             )
-                            .map_err(|e| {
-                                LiveError::Protocol(format!("reject publish: {e:?}"))
-                            })?;
+                            .map_err(|e| LiveError::Protocol(format!("reject publish: {e:?}")))?;
                         for r in more {
                             if let ServerSessionResult::OutboundResponse(p) = r {
                                 socket.write_all(&p.bytes).await.map_err(LiveError::from)?;
@@ -381,43 +474,73 @@ async fn process_results(
                     {
                         Some(stream) => {
                             let hls_url = hls_url_for(stream.id);
-                            repo.mark_live(stream.id, &hls_url)
+                            let transition = repo
+                                .mark_live(stream.id, &hls_url)
                                 .await
                                 .map_err(LiveError::Database)?;
-                            // Best-effort follower notification: WHIP publishes the
-                            // go-live event directly; RTMP carries only this bus-free
-                            // hook (wired by the server) so followers are notified too.
-                            if let Some(hook) = &cfg.go_live {
-                                hook(stream.id);
+                            let refusal = match transition {
+                                MarkLiveOutcome::Started(_) => None,
+                                MarkLiveOutcome::AlreadyLive => {
+                                    Some("Stream already has an active publisher")
+                                }
+                                MarkLiveOutcome::NotFound => Some("Unknown stream key"),
+                            };
+                            if let Some(description) = refusal {
+                                warn!(
+                                    stream_id = %stream.id,
+                                    %description,
+                                    "rejecting competing RTMP publisher"
+                                );
+                                let more = session
+                                    .reject_request(
+                                        request_id,
+                                        "NetStream.Publish.BadName",
+                                        description,
+                                    )
+                                    .map_err(|e| {
+                                        LiveError::Protocol(format!("reject publish: {e:?}"))
+                                    })?;
+                                for r in more {
+                                    if let ServerSessionResult::OutboundResponse(p) = r {
+                                        socket
+                                            .write_all(&p.bytes)
+                                            .await
+                                            .map_err(LiveError::from)?;
+                                    }
+                                }
+                                outcome = ProcessOutcome::Disconnect;
+                                continue;
                             }
-
                             let dir = hls_path_for(&cfg.hls_dir, stream.id);
-                            let hls = HlsWriter::new(dir, SEGMENT_DURATION_SECS as u32)
-                                .await
-                                .map_err(|e| {
-                                    LiveError::Internal(anyhow::anyhow!(
-                                        "hls writer init: {e}"
-                                    ))
-                                })?
-                                .with_segment_ext(DEFAULT_SEGMENT_EXT);
+                            let segment_duration_secs = u32::try_from(SEGMENT_DURATION_SECS)
+                                .expect("RTMP segment duration must fit in u32");
+                            let hls = match HlsWriter::new(dir, segment_duration_secs).await {
+                                Ok(hls) => hls.with_segment_ext(DEFAULT_SEGMENT_EXT),
+                                Err(error) => {
+                                    if let Err(mark_error) = repo.mark_ended(stream.id).await {
+                                        warn!(
+                                            %mark_error,
+                                            stream_id = %stream.id,
+                                            "failed to roll back live state after HLS init error"
+                                        );
+                                    }
+                                    return Err(LiveError::Internal(anyhow::anyhow!(
+                                        "hls writer init: {error}"
+                                    )));
+                                }
+                            };
 
                             info!(
                                 stream_id = %stream.id,
-                                stream_key = %stream_key,
                                 "RTMP publisher accepted; emitting MPEG-TS segments"
                             );
 
-                            let more = session
-                                .accept_request(request_id)
-                                .map_err(|e| {
-                                    LiveError::Protocol(format!("accept publish: {e:?}"))
-                                })?;
+                            let more = session.accept_request(request_id).map_err(|e| {
+                                LiveError::Protocol(format!("accept publish: {e:?}"))
+                            })?;
                             for r in more {
                                 if let ServerSessionResult::OutboundResponse(p) = r {
-                                    socket
-                                        .write_all(&p.bytes)
-                                        .await
-                                        .map_err(LiveError::from)?;
+                                    socket.write_all(&p.bytes).await.map_err(LiveError::from)?;
                                 }
                             }
                             outcome = ProcessOutcome::Publishing(PublishContext {
@@ -426,7 +549,10 @@ async fn process_results(
                             });
                         }
                         None => {
-                            warn!(%stream_key, "rejecting publish: unknown stream key");
+                            warn!(
+                                stream_key_len = stream_key.len(),
+                                "rejecting publish: unknown stream key"
+                            );
                             let more = session
                                 .reject_request(
                                     request_id,
@@ -438,10 +564,7 @@ async fn process_results(
                                 })?;
                             for r in more {
                                 if let ServerSessionResult::OutboundResponse(p) = r {
-                                    socket
-                                        .write_all(&p.bytes)
-                                        .await
-                                        .map_err(LiveError::from)?;
+                                    socket.write_all(&p.bytes).await.map_err(LiveError::from)?;
                                 }
                             }
                             outcome = ProcessOutcome::Disconnect;
@@ -480,11 +603,9 @@ async fn run_publish_loop(
     mut buf: [u8; SOCKET_READ_BUF],
     ctx: PublishContext,
     cfg: &Arc<LiveStreamConfig>,
+    cancel: &CancellationToken,
 ) -> LiveResult<()> {
-    let PublishContext {
-        stream_id,
-        mut hls,
-    } = ctx;
+    let PublishContext { stream_id, mut hls } = ctx;
 
     // Channel from the socket-reading task to the segmenter task. Bounded to
     // back-pressure pathological encoders without dropping silently.
@@ -545,7 +666,7 @@ async fn run_publish_loop(
         }
     });
 
-    let result = drive_publish_io(&mut socket, &mut session, &mut buf, &tx, cfg).await;
+    let result = drive_publish_io(&mut socket, &mut session, &mut buf, &tx, cfg, cancel).await;
     drop(tx); // Lets the segmenter flush and exit.
     if let Err(e) = segmenter.await {
         warn!(error = %e, %stream_id, "segmenter task join failed");
@@ -559,15 +680,29 @@ async fn drive_publish_io(
     buf: &mut [u8; SOCKET_READ_BUF],
     tx: &mpsc::Sender<MediaChunk>,
     _cfg: &Arc<LiveStreamConfig>,
+    cancel: &CancellationToken,
 ) -> LiveResult<()> {
     loop {
-        let n = match socket.read(buf).await {
+        let read = tokio::select! {
+            biased;
+            () = cancel.cancelled() => {
+                info!("RTMP publisher stopping for process shutdown");
+                return Ok(());
+            }
+            result = socket.read(buf) => result,
+        };
+        let n = match read {
             Ok(0) => {
                 info!("RTMP publisher disconnected");
                 return Ok(());
             }
             Ok(n) => n,
-            Err(e) if matches!(e.kind(), io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset) => {
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset
+                ) =>
+            {
                 info!(error = %e, "RTMP publisher closed connection");
                 return Ok(());
             }
@@ -585,7 +720,9 @@ async fn drive_publish_io(
                     debug!(?payload, "RTMP unhandleable message (publish)");
                 }
                 ServerSessionResult::RaisedEvent(event) => match event {
-                    ServerSessionEvent::VideoDataReceived { data, timestamp, .. } => {
+                    ServerSessionEvent::VideoDataReceived {
+                        data, timestamp, ..
+                    } => {
                         if tx
                             .send(MediaChunk {
                                 kind: FLV_TAG_VIDEO,
@@ -598,7 +735,9 @@ async fn drive_publish_io(
                             return Ok(());
                         }
                     }
-                    ServerSessionEvent::AudioDataReceived { data, timestamp, .. } => {
+                    ServerSessionEvent::AudioDataReceived {
+                        data, timestamp, ..
+                    } => {
                         if tx
                             .send(MediaChunk {
                                 kind: FLV_TAG_AUDIO,
@@ -635,11 +774,7 @@ struct MediaChunk {
 /// Drain the converter's pending TS bytes (prepending PAT+PMT) and hand them
 /// to the HLS writer. The converter keeps codec config + saw_first_keyframe
 /// state across segments so subsequent calls remain valid TS.
-async fn flush_ts_segment(
-    hls: &mut HlsWriter,
-    mux: &mut FlvToTsConverter,
-    duration_secs: f32,
-) {
+async fn flush_ts_segment(hls: &mut HlsWriter, mux: &mut FlvToTsConverter, duration_secs: f32) {
     if !mux.has_segment_data() {
         return;
     }
@@ -682,7 +817,10 @@ mod tests {
     #[test]
     fn validate_stream_key_rejects_empty_and_whitespace() {
         assert_eq!(validate_stream_key(""), Err(StreamKeyRejection::Empty));
-        assert_eq!(validate_stream_key("   \t "), Err(StreamKeyRejection::Empty));
+        assert_eq!(
+            validate_stream_key("   \t "),
+            Err(StreamKeyRejection::Empty)
+        );
     }
 
     #[test]
@@ -736,5 +874,35 @@ mod tests {
             validate_stream_key("ab..cd"),
             Err(StreamKeyRejection::PathTraversal)
         );
+    }
+
+    #[tokio::test]
+    async fn idle_listener_stops_promptly_when_cancelled() {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listen = probe.local_addr().unwrap();
+        drop(probe);
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://u:p@localhost/aero")
+            .unwrap();
+        let cfg = Arc::new(LiveStreamConfig {
+            hls_dir: std::env::temp_dir().join("aero-rtmp-cancel-test"),
+            rtmp_listen: listen,
+        });
+        let cancel = CancellationToken::new();
+        let task_cancel = cancel.clone();
+        let task = tokio::spawn(async move {
+            RtmpIngest::new()
+                .run_until_cancelled(StreamRepo::new(pool), cfg, task_cancel)
+                .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        cancel.cancel();
+
+        let result = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("cancelled listener should stop promptly")
+            .expect("listener task should not panic");
+        assert!(result.is_ok(), "listener should stop cleanly: {result:?}");
     }
 }

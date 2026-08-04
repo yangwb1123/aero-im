@@ -1,6 +1,41 @@
 // ws.js — WebSocket client with exponential backoff reconnect and a tiny event bus.
 
+import { DeliveryCursorLedger } from './delivery_cursor.js';
+
 const BACKOFF_MS = [1000, 2000, 4000, 8000, 16000, 30000];
+const SERVER_AWAY_RECONNECT_MS = 100;
+const DELIVERY_ACK_FLUSH_MS = 250;
+const ACCESS_TOKEN_REFRESH_SKEW_MS = 5000;
+
+// JWT payloads are inspected only to decide when to ask the server for a new
+// access token. This is not authentication: signature and session validation
+// remain entirely server-side.
+export function accessTokenNeedsRefresh(token, now = Date.now()) {
+  if (typeof token !== 'string') return false;
+  const parts = token.split('.');
+  if (parts.length !== 3 || !parts[1]) return false;
+  try {
+    const encoded = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+    const padded = encoded.padEnd(encoded.length + ((4 - (encoded.length % 4)) % 4), '=');
+    const payload = JSON.parse(atob(padded));
+    return typeof payload.exp === 'number'
+      && Number.isFinite(payload.exp)
+      && payload.exp * 1000 <= now + ACCESS_TOKEN_REFRESH_SKEW_MS;
+  } catch {
+    // Opaque/legacy tokens retain the existing reconnect behaviour. The server
+    // remains authoritative for whether they are valid.
+    return false;
+  }
+}
+
+/** Compute reconnect delay. RFC 6455 code 1001 means the server is intentionally
+ * going away (for example a rolling deploy), so migrate promptly instead of
+ * applying the ordinary failure backoff. */
+export function reconnectDelay(attempts, closeCode = null) {
+  if (closeCode === 1001) return SERVER_AWAY_RECONNECT_MS;
+  const idx = Math.min(Math.max(0, attempts), BACKOFF_MS.length - 1);
+  return BACKOFF_MS[idx];
+}
 
 // How many recently-seen seqs to remember per room/stream scope. Duplicates
 // from NATS at-least-once redelivery arrive close together, so a small window
@@ -33,6 +68,14 @@ export class SeqGate {
   /** Highest seq applied for a scope (0 when none) — lets callers ignore
    *  events older than something newer they already applied. */
   high(scope) { return this.scopes.get(scope)?.high || 0; }
+  /** Undo a just-recorded seq when application handlers rejected its frame. */
+  forget(scope, seq) {
+    const s = this.scopes.get(scope);
+    if (!s || !s.recent.delete(seq)) return;
+    s.order = s.order.filter((value) => value !== seq);
+    s.high = s.order.length ? Math.max(...s.order) : 0;
+    if (!s.order.length) this.scopes.delete(scope);
+  }
   reset() { this.scopes.clear(); }
 }
 
@@ -48,7 +91,7 @@ function seqScope(msg) {
 }
 
 export class WsClient {
-  constructor() {
+  constructor({ cursorStorage } = {}) {
     this.ws = null;
     this.token = null;
     this.attempts = 0;
@@ -64,6 +107,19 @@ export class WsClient {
     // Event-seq dedup across the whole connection lifetime (survives reconnects
     // on purpose: the post-reconnect live stream may redeliver stamped events).
     this._seqGate = new SeqGate();
+    this.capabilities = new Set();
+    this.connectionId = 0;
+    this._socketGeneration = 0;
+    this._deliveryCursorSupported = false;
+    this._deliveryReady = false;
+    this._deliveryLedger = new DeliveryCursorLedger(cursorStorage);
+    this._pendingDeliveryAcks = new Map();
+    this._preReadyDeliveryAcks = new Map();
+    this._deliveryFailedRooms = new Set();
+    this._deliveryPauseDepth = 0;
+    this._pausedDeliveryAcks = new Map();
+    this._deliveryAckTimer = null;
+    this._refreshAccessToken = null;
   }
 
   on(event, fn) {
@@ -73,86 +129,219 @@ export class WsClient {
   }
   _emit(event, ...args) {
     const set = this.handlers.get(event);
-    if (!set) return;
+    if (!set) return true;
+    let applied = true;
     for (const fn of set) {
-      try { fn(...args); } catch (e) { console.error('[ws handler]', event, e); }
+      try { fn(...args); } catch (e) {
+        applied = false;
+        console.error('[ws handler]', event, e);
+      }
     }
+    return applied;
   }
 
-  connect(token) {
+  connect(token, participantId = null, { refreshAccessToken = null } = {}) {
+    // Invalidate callbacks from a previous account/socket before opening the
+    // replacement. WebSocket.close() is asynchronous and already-queued events
+    // from account A must never mutate account B's ledger or UI.
+    const previous = this.ws;
+    this._socketGeneration += 1;
+    this.ws = null;
+    if (previous) {
+      try { previous.close(1000, 'replaced'); } catch { /* already closed */ }
+    }
+    this._stopPing();
+    if (this._deliveryAckTimer) {
+      clearTimeout(this._deliveryAckTimer);
+      this._deliveryAckTimer = null;
+    }
     this.token = token;
+    this._refreshAccessToken = typeof refreshAccessToken === 'function'
+      ? refreshAccessToken : null;
     this.closedByUser = false;
     this._lastSeen = null; // fresh session → no backfill cursor yet
     this._seqGate.reset(); // fresh session → forget seen seqs too
-    this._open();
+    this.capabilities.clear();
+    this._deliveryCursorSupported = false;
+    this._deliveryReady = false;
+    this._pendingDeliveryAcks.clear();
+    this._preReadyDeliveryAcks.clear();
+    this._deliveryFailedRooms.clear();
+    this._deliveryPauseDepth = 0;
+    this._pausedDeliveryAcks.clear();
+    this._deliveryLedger.open(participantId);
+    const generation = this._socketGeneration;
+    if (accessTokenNeedsRefresh(this.token)) {
+      this._emit('status', 'wait');
+      void this._openWithFreshAccessToken(generation);
+    } else {
+      this._open();
+    }
+  }
+
+  async _openWithFreshAccessToken(expectedGeneration) {
+    if (this.closedByUser || expectedGeneration !== this._socketGeneration) return;
+    if (accessTokenNeedsRefresh(this.token)) {
+      if (!this._refreshAccessToken) {
+        this._stopExpiredTokenReconnect();
+        return;
+      }
+      let freshToken;
+      try {
+        freshToken = await this._refreshAccessToken();
+      } catch {
+        if (!this.closedByUser && expectedGeneration === this._socketGeneration) {
+          this._stopExpiredTokenReconnect();
+        }
+        return;
+      }
+      if (this.closedByUser || expectedGeneration !== this._socketGeneration) return;
+      if (typeof freshToken !== 'string'
+        || !freshToken.trim()
+        || accessTokenNeedsRefresh(freshToken)) {
+        this._stopExpiredTokenReconnect();
+        return;
+      }
+      this.token = freshToken;
+    }
+    if (!this.closedByUser && expectedGeneration === this._socketGeneration) this._open();
+  }
+
+  _stopExpiredTokenReconnect() {
+    this.closedByUser = true;
+    this.token = null;
+    if (this._reconnectTimer) {
+      clearTimeout(this._reconnectTimer);
+      this._reconnectTimer = null;
+    }
+    this._emit('status', 'auth');
+    this._emit('auth_expired');
   }
 
   _open() {
     if (this._reconnectTimer) { clearTimeout(this._reconnectTimer); this._reconnectTimer = null; }
     const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
     let url = `${proto}//${location.host}/ws?token=${encodeURIComponent(this.token)}`;
+    // Modern servers use per-room delivery cursors; legacy servers ignore this
+    // additive query parameter and continue using `since` below.
+    url += '&cursors=1';
     // On reconnect, ask the server to replay everything created after the last
-    // message we saw, so a network blip never silently drops messages.
+    // message we saw. A cursor-capable server prefers `cursors=1`; an older
+    // server ignores it and retains this legacy global fallback.
     if (this._lastSeen) url += `&since=${encodeURIComponent(this._lastSeen)}`;
     this._emit('status', 'connecting');
     let ws;
+    const generation = ++this._socketGeneration;
     try {
       ws = new WebSocket(url);
-    } catch (e) {
+    } catch {
       this._emit('status', 'down');
       this._scheduleReconnect();
       return;
     }
     this.ws = ws;
+    const isCurrent = () => this.ws === ws && this._socketGeneration === generation;
 
     ws.addEventListener('open', () => {
+      if (!isCurrent()) return;
       this.attempts = 0;
+      this.connectionId += 1;
+      this.capabilities.clear();
+      this._deliveryCursorSupported = false;
+      this._deliveryReady = false;
+      this._preReadyDeliveryAcks.clear();
+      this._deliveryFailedRooms.clear();
+      this._deliveryPauseDepth = 0;
+      this._pausedDeliveryAcks.clear();
       this._emit('status', 'up');
       this._emit('open');
       this._startPing();
     });
 
     ws.addEventListener('message', (ev) => {
+      if (!isCurrent()) return;
       let msg;
       try { msg = JSON.parse(ev.data); }
       catch { this._emit('error', { code: 'PARSE', msg: 'invalid frame' }); return; }
+      if (msg?.type === 'welcome') {
+        const participant = typeof msg.participant === 'string' ? msg.participant : null;
+        if (participant && participant !== this._deliveryLedger.participantId) {
+          // The authenticated Welcome is authoritative. Switching the ledger
+          // here prevents a stale UI/account hint from crossing identities.
+          this._pendingDeliveryAcks.clear();
+          this._preReadyDeliveryAcks.clear();
+          this._pausedDeliveryAcks.clear();
+          this._deliveryFailedRooms.clear();
+          this._deliveryPauseDepth = 0;
+          this._lastSeen = null;
+          this._seqGate.reset();
+          this._deliveryLedger.open(participant);
+        }
+        this.capabilities = new Set(
+          Array.isArray(msg.capabilities) ? msg.capabilities.map(String) : [],
+        );
+        this._deliveryCursorSupported = this.capabilities.has('delivery_cursor_v2');
+      }
+      if (msg?.type === 'delivery_ready' && this._deliveryCursorSupported) {
+        this._deliveryReady = true;
+        for (const cursor of this._preReadyDeliveryAcks.values()) {
+          this._commitDeliveryCursor(
+            cursor.room_id,
+            cursor.message_id,
+            cursor.delivery_ordinal,
+            cursor.seq,
+          );
+        }
+        this._preReadyDeliveryAcks.clear();
+        this._restoreDeliveryAcks();
+        this._flushDeliveryAcks();
+      }
       // Seq dedup (ROADMAP v3 方向一): drop a frame whose per-room/per-stream
       // seq was already applied (at-least-once redelivery). Frames without a
       // seq pass through unchanged.
       if (msg && msg.seq != null && !this._seqGate.accept(seqScope(msg), msg.seq)) return;
-      this._emit('message', msg);
-      // Track the newest message id for the reconnect `?since=` cursor. ULIDs sort
-      // lexicographically, so a string compare yields the latest; only `message`
-      // frames carry a fresh id (an edit/delete carries an older one, which the
-      // `>` guard ignores).
-      const mid = msg && msg.message && msg.message.id;
-      if (mid && (!this._lastSeen || mid > this._lastSeen)) this._lastSeen = mid;
-      if (msg && typeof msg.type === 'string') {
-        this._emit(`msg:${msg.type}`, msg);
+      const genericApplied = this._emit('message', msg);
+      const typedApplied = !msg || typeof msg.type !== 'string'
+        ? true : this._emit(`msg:${msg.type}`, msg);
+      const applied = genericApplied && typedApplied;
+      // A handler failure is not delivery: undo seq de-duplication and do not
+      // move even the legacy `?since=` fallback past the rejected frame.
+      if (!applied && msg?.seq != null) this._seqGate.forget(seqScope(msg), msg.seq);
+      if (applied) {
+        const mid = msg?.message?.id;
+        if (mid && (!this._lastSeen || mid > this._lastSeen)) this._lastSeen = mid;
       }
+      // Persist ordinary room messages after applying them. Live frames carry a
+      // publish-time room seq; database backfill frames use the zero sentinel.
+      this._queueDeliveryAck(msg, applied);
     });
 
     ws.addEventListener('close', (ev) => {
+      if (!isCurrent()) return;
       this._stopPing();
       this.ws = null;
       this._emit('status', 'down');
       this._emit('close', ev);
-      if (!this.closedByUser) this._scheduleReconnect();
+      if (!this.closedByUser) this._scheduleReconnect(ev.code);
     });
 
     ws.addEventListener('error', () => {
+      if (!isCurrent()) return;
       // Browsers don't expose much; rely on close for reconnect logic.
       this._emit('status', 'down');
     });
   }
 
-  _scheduleReconnect() {
-    if (this.closedByUser) return;
-    const idx = Math.min(this.attempts, BACKOFF_MS.length - 1);
-    const wait = BACKOFF_MS[idx];
+  _scheduleReconnect(closeCode = null) {
+    if (this.closedByUser || this._reconnectTimer) return;
+    const wait = reconnectDelay(this.attempts, closeCode);
     this.attempts += 1;
     this._emit('status', 'wait');
-    this._reconnectTimer = setTimeout(() => this._open(), wait);
+    const generation = this._socketGeneration;
+    this._reconnectTimer = setTimeout(async () => {
+      this._reconnectTimer = null;
+      await this._openWithFreshAccessToken(generation);
+    }, wait);
   }
 
   _startPing() {
@@ -163,6 +352,133 @@ export class WsClient {
   }
   _stopPing() {
     if (this.pingTimer) { clearInterval(this.pingTimer); this.pingTimer = null; }
+  }
+
+  _restoreDeliveryAcks() {
+    for (const cursor of this._deliveryLedger.entries()) {
+      if (this._deliveryFailedRooms.has(cursor.room_id)) continue;
+      const current = this._pendingDeliveryAcks.get(cursor.room_id);
+      if (!current || cursor.delivery_ordinal > current.delivery_ordinal
+        || (cursor.delivery_ordinal === current.delivery_ordinal
+          && cursor.seq > current.seq)) {
+        this._pendingDeliveryAcks.set(cursor.room_id, cursor);
+      }
+    }
+  }
+
+  _queueDeliveryAck(msg, applied) {
+    if (msg?.type !== 'message') return;
+    const roomId = msg.message?.room_id;
+    const messageId = msg.message?.id;
+    const deliveryOrdinal = msg.delivery_ordinal;
+    // Backfill messages are database rows and therefore have no NATS seq. ACK
+    // them with the explicit zero sentinel so a second reconnect does not replay
+    // the same offline batch forever. A present seq must still be a valid
+    // positive bus position.
+    if (msg.seq != null && (!Number.isSafeInteger(msg.seq) || msg.seq <= 0)) return;
+    const seq = msg.seq == null ? 0 : msg.seq;
+    if (typeof roomId !== 'string' || typeof messageId !== 'string'
+      || !Number.isSafeInteger(deliveryOrdinal) || deliveryOrdinal <= 0) return;
+    if (!applied) {
+      this._deliveryFailedRooms.add(roomId);
+      this._preReadyDeliveryAcks.delete(roomId);
+      this._pendingDeliveryAcks.delete(roomId);
+      this._pausedDeliveryAcks.delete(roomId);
+      // Reconnect from the unchanged durable cursor so this exact frame is
+      // replayed after the application recovers.
+      try { this.ws?.close(1011, 'message application failed'); } catch { /* close event retries */ }
+      return;
+    }
+    if (this._deliveryFailedRooms.has(roomId)) return;
+    if (!this._deliveryReady) {
+      const current = this._preReadyDeliveryAcks.get(roomId);
+      if (!current || deliveryOrdinal > current.delivery_ordinal
+        || (deliveryOrdinal === current.delivery_ordinal && seq > current.seq)) {
+        this._preReadyDeliveryAcks.set(roomId, {
+          room_id: roomId,
+          message_id: deliveryOrdinal >= (current?.delivery_ordinal ?? 0)
+            ? messageId : current.message_id,
+          delivery_ordinal: Math.max(current?.delivery_ordinal ?? 0, deliveryOrdinal),
+          seq: current ? Math.max(current.seq, seq) : seq,
+        });
+      }
+      return;
+    }
+    this._commitDeliveryCursor(roomId, messageId, deliveryOrdinal, seq);
+  }
+
+  _commitDeliveryCursor(roomId, messageId, deliveryOrdinal, seq) {
+    if (this._deliveryFailedRooms.has(roomId)) return;
+    if (this._deliveryPauseDepth > 0) {
+      const current = this._pausedDeliveryAcks.get(roomId);
+      if (!current || deliveryOrdinal > current.delivery_ordinal
+        || (deliveryOrdinal === current.delivery_ordinal && seq > current.seq)) {
+        this._pausedDeliveryAcks.set(roomId, {
+          room_id: roomId,
+          message_id: deliveryOrdinal >= (current?.delivery_ordinal ?? 0)
+            ? messageId : current.message_id,
+          delivery_ordinal: Math.max(current?.delivery_ordinal ?? 0, deliveryOrdinal),
+          seq: current ? Math.max(current.seq, seq) : seq,
+        });
+      }
+      return;
+    }
+    const cursor = this._deliveryLedger.advance(
+      roomId, messageId, deliveryOrdinal, seq,
+    );
+    if (!cursor) return;
+    this._pendingDeliveryAcks.set(roomId, cursor);
+    if (!this._deliveryCursorSupported || this._deliveryAckTimer) return;
+    this._deliveryAckTimer = setTimeout(() => {
+      this._deliveryAckTimer = null;
+      this._flushDeliveryAcks();
+    }, DELIVERY_ACK_FLUSH_MS);
+  }
+
+  _flushDeliveryAcks() {
+    if (!this._deliveryCursorSupported || !this._deliveryReady
+      || this._deliveryPauseDepth > 0) return;
+    for (const [roomId, cursor] of this._pendingDeliveryAcks) {
+      if (this.deliveryAck(
+        roomId, cursor.message_id, cursor.delivery_ordinal, cursor.seq,
+      )) {
+        this._pendingDeliveryAcks.delete(roomId);
+      }
+    }
+  }
+
+  /** Freeze durable cursor advancement while an application-level REST resync
+   * closes a known delivery gap. The returned callback must be invoked with
+   * `true` only after every page was successfully applied. */
+  pauseDeliveryAcks() {
+    const generation = this._socketGeneration;
+    this._deliveryPauseDepth += 1;
+    let finished = false;
+    return (success) => {
+      if (finished || generation !== this._socketGeneration) return;
+      finished = true;
+      if (!success) {
+        this._deliveryPauseDepth = 0;
+        this._pausedDeliveryAcks.clear();
+        // Reconnect from the unchanged server cursor. Do not mark this as a
+        // user close: the ordinary close handler owns the retry.
+        try { this.ws?.close(1011, 'delivery catch-up failed'); } catch { /* retry via close */ }
+        return;
+      }
+      this._deliveryPauseDepth = Math.max(0, this._deliveryPauseDepth - 1);
+      if (this._deliveryPauseDepth > 0) return;
+      const pending = Array.from(this._pausedDeliveryAcks.values());
+      this._pausedDeliveryAcks.clear();
+      for (const cursor of pending) {
+        this._commitDeliveryCursor(
+          cursor.room_id,
+          cursor.message_id,
+          cursor.delivery_ordinal,
+          cursor.seq,
+        );
+      }
+      this._flushDeliveryAcks();
+    };
   }
 
   send(obj) {
@@ -176,16 +492,36 @@ export class WsClient {
     }
   }
 
+  supports(capability) { return this.capabilities.has(capability); }
+
   joinRoom(roomId) { return this.send({ type: 'join_room', room_id: roomId }); }
-  sendMessage(roomId, blocks, replyTo = null) {
-    return this.send({ type: 'send_message', room_id: roomId, blocks, reply_to: replyTo });
+  deliveryAck(roomId, messageId, deliveryOrdinal, seq) {
+    return this.send({
+      type: 'delivery_ack',
+      room_id: roomId,
+      message_id: messageId,
+      delivery_ordinal: deliveryOrdinal,
+      seq,
+    });
+  }
+  sendMessage(roomId, blocks, replyTo = null, clientMessageId = null) {
+    const frame = { type: 'send_message', room_id: roomId, blocks, reply_to: replyTo };
+    if (clientMessageId) frame.client_message_id = clientMessageId;
+    return this.send(frame);
   }
   // Send raw Markdown text; the server parses it into rich Text blocks (with
   // spans for **bold** / *italic* / `code` / ~~strike~~ / [link](url)) and
   // broadcasts the resulting message. See the `SendMarkdown` WS frame.
-  sendMarkdown(roomId, markdown, replyTo = null, expiresAfterSecs = null) {
+  sendMarkdown(
+    roomId,
+    markdown,
+    replyTo = null,
+    expiresAfterSecs = null,
+    clientMessageId = null,
+  ) {
     const frame = { type: 'send_markdown', room_id: roomId, markdown, reply_to: replyTo };
     if (expiresAfterSecs != null) frame.expires_after_secs = expiresAfterSecs;
+    if (clientMessageId) frame.client_message_id = clientMessageId;
     return this.send(frame);
   }
   editMessage(id, blocks) {
@@ -231,6 +567,28 @@ export class WsClient {
   callOffer(callId, roomId, to, sdp) {
     return this.send({ type: 'call_offer', call_id: callId, room_id: roomId, to, sdp });
   }
+  callSfuOffer(callId, roomId, sdp) {
+    return this.send({ type: 'call_sfu_offer', call_id: callId, room_id: roomId, sdp });
+  }
+  callSfuIce(callId, roomId, sessionGeneration, candidate) {
+    return this.send({
+      type: 'call_sfu_ice',
+      call_id: callId,
+      room_id: roomId,
+      session_generation: sessionGeneration,
+      candidate,
+    });
+  }
+  callSfuSubscribe(callId, roomId, sessionGeneration, revision, tracks) {
+    return this.send({
+      type: 'call_sfu_subscribe',
+      call_id: callId,
+      room_id: roomId,
+      session_generation: sessionGeneration,
+      revision,
+      tracks,
+    });
+  }
 
   // ----- live interactivity (P4 弹幕 + 礼物) -----
   // `since` (optional): last chat-line id already rendered — the server then
@@ -250,11 +608,17 @@ export class WsClient {
 
   close() {
     this.closedByUser = true;
+    this._socketGeneration += 1;
     if (this._reconnectTimer) { clearTimeout(this._reconnectTimer); this._reconnectTimer = null; }
     this._stopPing();
-    if (this.ws) {
-      try { this.ws.close(1000, 'bye'); } catch {}
-      this.ws = null;
+    if (this._deliveryAckTimer) {
+      clearTimeout(this._deliveryAckTimer);
+      this._deliveryAckTimer = null;
+    }
+    const ws = this.ws;
+    this.ws = null;
+    if (ws) {
+      try { ws.close(1000, 'bye'); } catch { /* already closed */ }
     }
   }
 }

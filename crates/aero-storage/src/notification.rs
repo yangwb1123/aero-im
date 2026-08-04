@@ -12,9 +12,13 @@
 //! same pattern as [`crate::AuditRepo`].
 
 use aero_common::{
-    MessageId, Notification, NotificationId, NotificationKind, ParticipantId, RoomId,
+    MessageId, Notification, NotificationId, NotificationKind, NotifyTarget, ParticipantId,
+    RoomEvent, RoomId,
 };
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
+
+use crate::event_outbox::{EventOutboxKind, EventOutboxRepo};
+use crate::message_side_effect::MessageSideEffectRepo;
 
 /// Largest page a notification listing will return, regardless of requested `limit`.
 const MAX_PAGE: i64 = 100;
@@ -120,12 +124,21 @@ impl NotificationRepo {
             return Ok(0);
         }
         let created_at = time::OffsetDateTime::now_utc();
-        let ids: Vec<uuid::Uuid> = recipients.iter().map(|_| NotificationId::new().to_uuid()).collect();
+        let ids: Vec<uuid::Uuid> = recipients
+            .iter()
+            .map(|_| NotificationId::new().to_uuid())
+            .collect();
         let pids: Vec<uuid::Uuid> = recipients.iter().map(|(p, _)| p.to_uuid()).collect();
-        let kinds: Vec<String> = recipients.iter().map(|(_, k)| k.as_str().to_owned()).collect();
+        let kinds: Vec<String> = recipients
+            .iter()
+            .map(|(_, k)| k.as_str().to_owned())
+            .collect();
         // Per-row importance from the kind (parallel to the UNNEST arrays below) —
         // otherwise every batched row keeps the static 0.5 default.
-        let imps: Vec<f32> = recipients.iter().map(|(_, k)| aero_common::model::importance_for(k)).collect();
+        let imps: Vec<f32> = recipients
+            .iter()
+            .map(|(_, k)| aero_common::model::importance_for(k))
+            .collect();
         let actor_uuid = actor.map(|a| a.to_uuid());
         // The same `delivery_id` (or NULL) is stamped onto every row of the
         // batch via the $8 bind (broadcast across the UNNEST rows). The partial
@@ -151,6 +164,136 @@ impl NotificationRepo {
         .execute(&self.pool)
         .await?;
         Ok(res.rows_affected())
+    }
+
+    /// Persist a deterministic notification batch and its realtime event in one
+    /// transaction. Reusing `delivery_id` is idempotent for both projections.
+    /// The message row is locked and rechecked so a delayed notification job
+    /// cannot notify for content already deleted or expired.
+    pub async fn insert_many_outboxed(
+        &self,
+        room: RoomId,
+        message: MessageId,
+        actor: ParticipantId,
+        recipients: &[(ParticipantId, NotificationKind)],
+        delivery_id: uuid::Uuid,
+        source: Option<(uuid::Uuid, i32)>,
+    ) -> Result<bool, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let live =
+            sqlx::query_as::<_, (Option<time::OffsetDateTime>, Option<time::OffsetDateTime>)>(
+                r"SELECT deleted_at, expires_at
+                FROM messages
+               WHERE id = $1
+               FOR UPDATE",
+            )
+            .bind(message.to_uuid())
+            .fetch_optional(&mut *tx)
+            .await?
+            .is_some_and(|(deleted_at, expires_at)| {
+                deleted_at.is_none()
+                    && expires_at.map_or(true, |expires_at| {
+                        expires_at > time::OffsetDateTime::now_utc()
+                    })
+            });
+        if !live {
+            return complete_notification_source(tx, source).await;
+        }
+
+        let candidate_ids: Vec<uuid::Uuid> = recipients
+            .iter()
+            .map(|(participant, _)| participant.to_uuid())
+            .collect();
+        let current_members: std::collections::HashSet<uuid::Uuid> = if candidate_ids.is_empty() {
+            std::collections::HashSet::new()
+        } else {
+            sqlx::query_scalar::<_, uuid::Uuid>(
+                r"SELECT participant_id
+                    FROM room_members
+                   WHERE room_id = $1
+                     AND participant_id = ANY($2)
+                   FOR KEY SHARE",
+            )
+            .bind(room.to_uuid())
+            .bind(&candidate_ids)
+            .fetch_all(&mut *tx)
+            .await?
+            .into_iter()
+            .collect()
+        };
+        let recipients: Vec<(ParticipantId, NotificationKind)> = recipients
+            .iter()
+            .copied()
+            .filter(|(participant, _)| current_members.contains(&participant.to_uuid()))
+            .collect();
+        if recipients.is_empty() {
+            return complete_notification_source(tx, source).await;
+        }
+
+        let created_at = time::OffsetDateTime::now_utc();
+        let ids: Vec<uuid::Uuid> = recipients
+            .iter()
+            .map(|_| NotificationId::new().to_uuid())
+            .collect();
+        let pids: Vec<uuid::Uuid> = recipients.iter().map(|(p, _)| p.to_uuid()).collect();
+        let kinds: Vec<String> = recipients
+            .iter()
+            .map(|(_, k)| k.as_str().to_owned())
+            .collect();
+        let importance: Vec<f32> = recipients
+            .iter()
+            .map(|(_, kind)| aero_common::model::importance_for(kind))
+            .collect();
+        sqlx::query(
+            r"INSERT INTO notifications
+                 (id, participant_id, room_id, message_id, kind, actor_id,
+                  created_at, delivery_id, importance_score)
+              SELECT u.id, u.pid, $4, $5, u.kind, $6, $7, $8, u.importance
+                FROM UNNEST(
+                     $1::uuid[], $2::uuid[], $3::text[], $9::real[]
+                ) AS u(id, pid, kind, importance)
+              ON CONFLICT (delivery_id, participant_id)
+                  WHERE delivery_id IS NOT NULL
+                  DO NOTHING",
+        )
+        .bind(ids)
+        .bind(pids)
+        .bind(kinds)
+        .bind(room.to_uuid())
+        .bind(message.to_uuid())
+        .bind(actor.to_uuid())
+        .bind(created_at)
+        .bind(delivery_id)
+        .bind(importance)
+        .execute(&mut *tx)
+        .await?;
+
+        let targets = recipients
+            .into_iter()
+            .map(|(participant, kind)| NotifyTarget { participant, kind })
+            .collect();
+        EventOutboxRepo::insert_room_event_in_tx(
+            &mut tx,
+            message,
+            room,
+            EventOutboxKind::Notify,
+            &RoomEvent::NotifyBatch {
+                room_id: room,
+                message_id: message,
+                by: actor,
+                delivery_id,
+                recipients: targets,
+            },
+            None,
+            Some(delivery_id),
+        )
+        .await?;
+        if !complete_source_claim_in_tx(&mut tx, source, time::OffsetDateTime::now_utc()).await? {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        tx.commit().await?;
+        Ok(true)
     }
 
     /// List a participant's notifications, newest first, paginated by a keyset
@@ -263,6 +406,29 @@ impl NotificationRepo {
     }
 }
 
+async fn complete_source_claim_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    source: Option<(uuid::Uuid, i32)>,
+    now: time::OffsetDateTime,
+) -> Result<bool, sqlx::Error> {
+    let Some((id, attempts)) = source else {
+        return Ok(true);
+    };
+    MessageSideEffectRepo::complete_in_tx(tx, id, attempts, now).await
+}
+
+async fn complete_notification_source(
+    mut tx: Transaction<'_, Postgres>,
+    source: Option<(uuid::Uuid, i32)>,
+) -> Result<bool, sqlx::Error> {
+    if !complete_source_claim_in_tx(&mut tx, source, time::OffsetDateTime::now_utc()).await? {
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    tx.commit().await?;
+    Ok(true)
+}
+
 #[derive(sqlx::FromRow)]
 struct NotificationRow {
     id: uuid::Uuid,
@@ -322,7 +488,8 @@ mod tests {
 #[cfg(test)]
 mod db_tests {
     use super::*;
-    use aero_common::{MessageId, NotificationKind, ParticipantId, RoomId};
+    use crate::{MessageSideEffectKind, MessageSideEffectRepo};
+    use aero_common::{MessageId, NotificationKind, ParticipantId, RoomEvent, RoomId};
 
     fn pool() -> PgPool {
         let url = std::env::var("DATABASE_URL")
@@ -349,7 +516,7 @@ mod db_tests {
         let room = RoomId::new();
         sqlx::query(
             "INSERT INTO rooms (id, kind, name, created_by, created_at, workspace_id)
-             VALUES ($1,'channel',$2,$3, now(), '00000000-0000-0000-0000-000000000000')",
+             VALUES ($1,'group',$2,$3, now(), '00000000-0000-0000-0000-000000000000')",
         )
         .bind(room.to_uuid())
         .bind("notif-room")
@@ -371,6 +538,40 @@ mod db_tests {
         (recipient, room, message, actor)
     }
 
+    async fn claim_notification_source(
+        p: &PgPool,
+        message: MessageId,
+        mutation_version: i32,
+    ) -> (uuid::Uuid, i32) {
+        sqlx::query(
+            r"INSERT INTO message_side_effect_jobs
+                 (id, message_id, mutation_version, kind)
+               VALUES ($1, $2, $3, 'notifications')",
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(message.to_uuid())
+        .bind(mutation_version)
+        .execute(p)
+        .await
+        .unwrap();
+        let jobs = MessageSideEffectRepo::new(p.clone())
+            .claim_for_message(
+                message,
+                time::OffsetDateTime::now_utc(),
+                time::Duration::seconds(30),
+            )
+            .await
+            .unwrap();
+        let job = jobs
+            .iter()
+            .find(|job| {
+                job.kind == MessageSideEffectKind::Notifications
+                    && job.mutation_version == mutation_version
+            })
+            .expect("claimed notification source");
+        (job.id, job.attempts)
+    }
+
     #[tokio::test]
     #[ignore = "requires live Postgres"]
     async fn notif_insert_list_count_and_mark_read() {
@@ -379,7 +580,13 @@ mod db_tests {
         let (recipient, room, message, actor) = fixture(&p).await;
 
         let id = repo
-            .insert(recipient, room, message, NotificationKind::Mention, Some(actor))
+            .insert(
+                recipient,
+                room,
+                message,
+                NotificationKind::Mention,
+                Some(actor),
+            )
             .await
             .unwrap();
 
@@ -437,13 +644,22 @@ mod db_tests {
         .fetch_one(&p)
         .await
         .unwrap();
-        assert_eq!(count.0, 1, "exactly one durable row survives the redelivery");
+        assert_eq!(
+            count.0, 1,
+            "exactly one durable row survives the redelivery"
+        );
 
         // A DIFFERENT delivery_id for the same recipient is NOT de-duped (two
         // distinct batches — e.g. mention then reply of one message — coexist).
         let other_delivery = uuid::Uuid::new_v4();
         let third = repo
-            .insert_many(room, message, Some(actor), &recipients, Some(other_delivery))
+            .insert_many(
+                room,
+                message,
+                Some(actor),
+                &recipients,
+                Some(other_delivery),
+            )
             .await
             .unwrap();
         assert_eq!(third, 1, "a distinct delivery_id inserts a fresh row");
@@ -470,7 +686,13 @@ mod db_tests {
         let other = actor; // a different participant
 
         let id = repo
-            .insert(recipient, room, message, NotificationKind::Reply, Some(actor))
+            .insert(
+                recipient,
+                room,
+                message,
+                NotificationKind::Reply,
+                Some(actor),
+            )
             .await
             .unwrap();
 
@@ -478,7 +700,10 @@ mod db_tests {
         let updated = repo.mark_read(other, &[id]).await.unwrap();
         assert_eq!(updated, 0, "cross-user mark-read is a no-op");
         let still = repo.list(recipient, None, true, Some(10)).await.unwrap();
-        assert!(still.iter().any(|n| n.id == id), "still unread for the owner");
+        assert!(
+            still.iter().any(|n| n.id == id),
+            "still unread for the owner"
+        );
     }
 
     /// `importance_score` is COMPUTED at insert (per kind) and SURFACED by `list`
@@ -493,15 +718,158 @@ mod db_tests {
         let (recipient, room, message, actor) = fixture(&p).await;
 
         // A Mention scores 1.0; a Reaction scores 0.3 (per importance_for).
-        repo.insert(recipient, room, message, NotificationKind::Mention, Some(actor)).await.unwrap();
-        repo.insert(recipient, room, message, NotificationKind::Reaction, Some(actor)).await.unwrap();
+        repo.insert(
+            recipient,
+            room,
+            message,
+            NotificationKind::Mention,
+            Some(actor),
+        )
+        .await
+        .unwrap();
+        repo.insert(
+            recipient,
+            room,
+            message,
+            NotificationKind::Reaction,
+            Some(actor),
+        )
+        .await
+        .unwrap();
 
         let list = repo.list(recipient, None, false, Some(10)).await.unwrap();
-        let mention = list.iter().find(|n| n.kind == NotificationKind::Mention).expect("mention present");
-        let reaction = list.iter().find(|n| n.kind == NotificationKind::Reaction).expect("reaction present");
-        assert!((mention.importance_score - 1.0).abs() < 1e-6, "mention importance computed + surfaced, got {}", mention.importance_score);
-        assert!((reaction.importance_score - 0.3).abs() < 1e-6, "reaction importance computed + surfaced, got {}", reaction.importance_score);
+        let mention = list
+            .iter()
+            .find(|n| n.kind == NotificationKind::Mention)
+            .expect("mention present");
+        let reaction = list
+            .iter()
+            .find(|n| n.kind == NotificationKind::Reaction)
+            .expect("reaction present");
+        assert!(
+            (mention.importance_score - 1.0).abs() < 1e-6,
+            "mention importance computed + surfaced, got {}",
+            mention.importance_score
+        );
+        assert!(
+            (reaction.importance_score - 0.3).abs() < 1e-6,
+            "reaction importance computed + surfaced, got {}",
+            reaction.importance_score
+        );
         // Non-aggregate notifications surface aggregate_count = None (not a hardcoded default).
         assert!(mention.aggregate_count.is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres with migrations through 0165"]
+    async fn outboxed_batch_filters_and_locks_membership_and_completes_source_atomically() {
+        let p = pool();
+        let repo = NotificationRepo::new(p.clone());
+        let (recipient, room, message, actor) = fixture(&p).await;
+        let departed = ParticipantId::new();
+        sqlx::query("INSERT INTO participants (id, kind, display_name) VALUES ($1, 'human', $2)")
+            .bind(departed.to_uuid())
+            .bind(format!("notif-departed-{departed}"))
+            .execute(&p)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO room_members (room_id, participant_id, role)
+             VALUES ($1, $2, 'member')",
+        )
+        .bind(room.to_uuid())
+        .bind(recipient.to_uuid())
+        .execute(&p)
+        .await
+        .unwrap();
+
+        let source = claim_notification_source(&p, message, 1).await;
+        let delivery_id = uuid::Uuid::new_v4();
+        assert!(repo
+            .insert_many_outboxed(
+                room,
+                message,
+                actor,
+                &[
+                    (recipient, NotificationKind::Mention),
+                    (departed, NotificationKind::Reply),
+                ],
+                delivery_id,
+                Some(source),
+            )
+            .await
+            .unwrap());
+        let recipients: Vec<uuid::Uuid> =
+            sqlx::query_scalar("SELECT participant_id FROM notifications WHERE delivery_id = $1")
+                .bind(delivery_id)
+                .fetch_all(&p)
+                .await
+                .unwrap();
+        assert_eq!(recipients, [recipient.to_uuid()]);
+        let payload: serde_json::Value =
+            sqlx::query_scalar("SELECT payload FROM event_outbox WHERE event_id = $1")
+                .bind(delivery_id)
+                .fetch_one(&p)
+                .await
+                .unwrap();
+        let RoomEvent::NotifyBatch {
+            recipients: targets,
+            ..
+        } = serde_json::from_value(payload).unwrap()
+        else {
+            panic!("expected notify batch");
+        };
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].participant, recipient);
+        assert!(sqlx::query_scalar::<_, bool>(
+            "SELECT completed_at IS NOT NULL FROM message_side_effect_jobs WHERE id = $1",
+        )
+        .bind(source.0)
+        .fetch_one(&p)
+        .await
+        .unwrap());
+
+        // A stale, unclaimed completion token rolls the entire projection back.
+        let stale_source = uuid::Uuid::new_v4();
+        sqlx::query(
+            r"INSERT INTO message_side_effect_jobs
+                 (id, message_id, mutation_version, kind)
+               VALUES ($1, $2, 2, 'notifications')",
+        )
+        .bind(stale_source)
+        .bind(message.to_uuid())
+        .execute(&p)
+        .await
+        .unwrap();
+        let stale_delivery = uuid::Uuid::new_v4();
+        assert!(!repo
+            .insert_many_outboxed(
+                room,
+                message,
+                actor,
+                &[(recipient, NotificationKind::Mention)],
+                stale_delivery,
+                Some((stale_source, 0)),
+            )
+            .await
+            .unwrap());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM notifications WHERE delivery_id = $1"
+            )
+            .bind(stale_delivery)
+            .fetch_one(&p)
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM event_outbox WHERE event_id = $1")
+                .bind(stale_delivery)
+                .fetch_one(&p)
+                .await
+                .unwrap(),
+            0
+        );
     }
 }

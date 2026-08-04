@@ -6,11 +6,10 @@
 //! saturation, and HTTP request count / latency by route + status — plus a
 //! Prometheus `/metrics` exposition so the gateway can scrape them.
 //!
-//! This module is a **self-contained, additive foundation**. It deliberately
-//! avoids heavy metrics frameworks (and the `opentelemetry-otlp` version churn,
-//! see [`otlp`]) in favour of a small hand-rolled registry over
-//! [`std::sync::atomic`] + [`dashmap::DashMap`]. It is fully unit-testable with
-//! no network: register → increment / observe → render → assert.
+//! The Prometheus path remains a small hand-rolled registry over
+//! [`std::sync::atomic`] + [`dashmap::DashMap`]. The optional [`otlp`] path
+//! mirrors the same updates into OpenTelemetry instruments only after its
+//! exporter is installed. Both paths are fully testable with no network.
 //!
 //! # Quick start
 //!
@@ -50,6 +49,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 use dashmap::DashMap;
+use opentelemetry::metrics::{
+    Counter as OtelCounter, Gauge as OtelGauge, Histogram as OtelHistogram, Meter,
+};
+use opentelemetry::KeyValue;
 
 /// Metric-name constants for the key signals ROADMAP 方向四 enumerates.
 ///
@@ -111,6 +114,18 @@ pub mod names {
     /// means a chronically-down receiver — the breaker is shielding us from
     /// hammering it (ROADMAP5 方向一).
     pub const WEBHOOK_BREAKER_OPEN_SKIPS_TOTAL: &str = "aero_webhook_breaker_open_skips_total";
+    /// Gauge: outgoing webhook jobs currently waiting for a concurrency permit,
+    /// labeled by the bounded `stage` set (`initial` / `retry`).
+    pub const WEBHOOK_DELIVERY_QUEUE_DEPTH: &str = "aero_webhook_delivery_queue_depth";
+    /// Gauge: outgoing webhook HTTP requests currently in flight, labeled by the
+    /// bounded `stage` set (`initial` / `retry`).
+    pub const WEBHOOK_DELIVERY_IN_FLIGHT: &str = "aero_webhook_delivery_in_flight";
+    /// Histogram: outgoing webhook HTTP round-trip duration in seconds, labeled
+    /// by the bounded `stage` set (`initial` / `retry`).
+    pub const WEBHOOK_DELIVERY_DURATION_SECONDS: &str = "aero_webhook_delivery_duration_seconds";
+    /// Counter: outgoing webhook processing outcomes, labeled only by bounded
+    /// `stage` and `outcome` vocabularies.
+    pub const WEBHOOK_DELIVERY_OUTCOMES_TOTAL: &str = "aero_webhook_delivery_outcomes_total";
 
     // --- Live media ingest ---
     /// Gauge: active WHIP ingest sessions (WebRTC streams currently being ingested).
@@ -231,15 +246,16 @@ impl AtomicF64 {
         f64::from_bits(self.0.load(Ordering::Relaxed))
     }
     /// Atomic add via compare-and-swap (handles concurrent inc/dec on gauges).
-    fn add(&self, delta: f64) {
+    fn add(&self, delta: f64) -> f64 {
         let mut cur = self.0.load(Ordering::Relaxed);
         loop {
-            let next = (f64::from_bits(cur) + delta).to_bits();
+            let next_value = f64::from_bits(cur) + delta;
+            let next = next_value.to_bits();
             match self
                 .0
                 .compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed)
             {
-                Ok(_) => break,
+                Ok(_) => return next_value,
                 Err(observed) => cur = observed,
             }
         }
@@ -302,6 +318,101 @@ struct Metric {
     family: Family,
 }
 
+/// OpenTelemetry instruments backing a [`Registry`] after the opt-in exporter
+/// has been installed. The `Invalid` sentinel keeps malformed or conflicting
+/// dynamic metric names from turning a hot-path observation into a panic.
+#[derive(Debug)]
+enum OtelInstrument {
+    Counter(OtelCounter<u64>),
+    Gauge(OtelGauge<f64>),
+    Histogram(OtelHistogram<f64>),
+    Invalid,
+}
+
+/// Lazily creates real instruments from an already-configured SDK meter.
+///
+/// This mirror is attached only after the OTLP pipeline is installed. In
+/// particular, it never asks `opentelemetry::global` for a meter before install,
+/// so no-op instruments created by the default global provider can never enter
+/// this cache.
+#[derive(Debug)]
+struct OtelMirror {
+    meter: Meter,
+    instruments: DashMap<String, OtelInstrument>,
+}
+
+impl OtelMirror {
+    fn new(meter: Meter) -> Self {
+        Self {
+            meter,
+            instruments: DashMap::new(),
+        }
+    }
+
+    fn attributes(labels: &LabelSet) -> Vec<KeyValue> {
+        labels
+            .0
+            .iter()
+            .map(|(key, value)| KeyValue::new(key.clone(), value.clone()))
+            .collect()
+    }
+
+    fn record_counter(&self, name: &str, delta: u64, help: &str, labels: &LabelSet) {
+        let instrument = self.instruments.entry(name.to_owned()).or_insert_with(|| {
+            let mut builder = self.meter.u64_counter(name.to_owned());
+            if !help.is_empty() {
+                builder = builder.with_description(help.to_owned());
+            }
+            builder
+                .try_init()
+                .map_or(OtelInstrument::Invalid, OtelInstrument::Counter)
+        });
+        if let OtelInstrument::Counter(counter) = instrument.value() {
+            counter.add(delta, &Self::attributes(labels));
+        }
+    }
+
+    fn record_gauge(&self, name: &str, value: f64, help: &str, labels: &LabelSet) {
+        let instrument = self.instruments.entry(name.to_owned()).or_insert_with(|| {
+            let mut builder = self.meter.f64_gauge(name.to_owned());
+            if !help.is_empty() {
+                builder = builder.with_description(help.to_owned());
+            }
+            builder
+                .try_init()
+                .map_or(OtelInstrument::Invalid, OtelInstrument::Gauge)
+        });
+        if let OtelInstrument::Gauge(gauge) = instrument.value() {
+            gauge.record(value, &Self::attributes(labels));
+        }
+    }
+
+    fn record_histogram(
+        &self,
+        name: &str,
+        value: f64,
+        help: &str,
+        bounds: &[f64],
+        labels: &LabelSet,
+    ) {
+        let instrument = self.instruments.entry(name.to_owned()).or_insert_with(|| {
+            let mut builder = self
+                .meter
+                .f64_histogram(name.to_owned())
+                .with_boundaries(bounds.to_vec());
+            if !help.is_empty() {
+                builder = builder.with_description(help.to_owned());
+            }
+            builder
+                .try_init()
+                .map_or(OtelInstrument::Invalid, OtelInstrument::Histogram)
+        });
+        if let OtelInstrument::Histogram(histogram) = instrument.value() {
+            histogram.record(value, &Self::attributes(labels));
+        }
+    }
+}
+
 /// A thread-safe registry of counters / gauges / histograms.
 ///
 /// Cheap to share: wrap in `Arc` (or use the process-global one via the
@@ -313,6 +424,7 @@ struct Metric {
 #[derive(Debug, Default)]
 pub struct Registry {
     metrics: DashMap<String, Metric>,
+    otel: OnceLock<OtelMirror>,
 }
 
 impl Registry {
@@ -321,7 +433,16 @@ impl Registry {
     pub fn new() -> Self {
         Self {
             metrics: DashMap::new(),
+            otel: OnceLock::new(),
         }
+    }
+
+    /// Attaches the opt-in OpenTelemetry mirror exactly once.
+    ///
+    /// Existing Prometheus values are intentionally not replayed: the `OTel`
+    /// stream begins with updates made after installation.
+    fn install_otel_meter(&self, meter: Meter) -> bool {
+        self.otel.set(OtelMirror::new(meter)).is_ok()
     }
 
     /// Sets (or overrides) the `# HELP` text for a metric, creating it with the
@@ -377,9 +498,13 @@ impl Registry {
                 family: Family::Counter(DashMap::new()),
             });
         if let Family::Counter(map) = &metric.family {
-            map.entry(LabelSet::from_pairs(labels))
+            let label_set = LabelSet::from_pairs(labels);
+            map.entry(label_set.clone())
                 .or_insert_with(|| AtomicU64::new(0))
                 .fetch_add(delta, Ordering::Relaxed);
+            if let Some(otel) = self.otel.get() {
+                otel.record_counter(name, delta, &metric.help, &label_set);
+            }
         }
     }
 
@@ -398,7 +523,10 @@ impl Registry {
             if let Some(g) = map.get(&key) {
                 g.set(value);
             } else {
-                map.insert(key, AtomicF64::new(value));
+                map.insert(key.clone(), AtomicF64::new(value));
+            }
+            if let Some(otel) = self.otel.get() {
+                otel.record_gauge(name, value, &metric.help, &key);
             }
         }
     }
@@ -412,9 +540,14 @@ impl Registry {
     pub fn add_gauge_labeled(&self, name: &str, delta: f64, labels: &[(&str, &str)]) {
         let metric = self.gauge_family(name);
         if let Family::Gauge(map) = &metric.family {
-            map.entry(LabelSet::from_pairs(labels))
+            let label_set = LabelSet::from_pairs(labels);
+            let value = map
+                .entry(label_set.clone())
                 .or_insert_with(|| AtomicF64::new(0.0))
                 .add(delta);
+            if let Some(otel) = self.otel.get() {
+                otel.record_gauge(name, value, &metric.help, &label_set);
+            }
         }
     }
 
@@ -459,10 +592,14 @@ impl Registry {
                 },
             });
         if let Family::Histogram { bounds, series } = &metric.family {
+            let label_set = LabelSet::from_pairs(labels);
             series
-                .entry(LabelSet::from_pairs(labels))
+                .entry(label_set.clone())
                 .or_insert_with(|| Histogram::new(bounds))
                 .observe(value);
+            if let Some(otel) = self.otel.get() {
+                otel.record_histogram(name, value, &metric.help, bounds, &label_set);
+            }
         }
     }
 
@@ -680,6 +817,31 @@ pub fn register_known_metrics(r: &Registry) {
         "Configured database pool size (max connections).",
     );
     r.register_help(
+        names::WEBHOOK_BREAKER_OPEN_SKIPS_TOTAL,
+        MetricKind::Counter,
+        "Outgoing webhook deliveries skipped while their circuit breaker was open.",
+    );
+    r.register_help(
+        names::WEBHOOK_DELIVERY_QUEUE_DEPTH,
+        MetricKind::Gauge,
+        "Outgoing webhook jobs waiting for concurrency permits by stage.",
+    );
+    r.register_help(
+        names::WEBHOOK_DELIVERY_IN_FLIGHT,
+        MetricKind::Gauge,
+        "Outgoing webhook HTTP requests currently in flight by stage.",
+    );
+    r.register_histogram(
+        names::WEBHOOK_DELIVERY_DURATION_SECONDS,
+        DEFAULT_BUCKETS,
+        "Outgoing webhook HTTP round-trip duration in seconds by stage.",
+    );
+    r.register_help(
+        names::WEBHOOK_DELIVERY_OUTCOMES_TOTAL,
+        MetricKind::Counter,
+        "Outgoing webhook processing outcomes by stage and bounded outcome.",
+    );
+    r.register_help(
         names::HTTP_REQUESTS_TOTAL,
         MetricKind::Counter,
         "Total HTTP requests by route and status.",
@@ -715,6 +877,11 @@ pub fn set_gauge(name: &str, value: f64) {
 /// Sets a labeled gauge on the global registry.
 pub fn set_gauge_labeled(name: &str, value: f64, labels: &[(&str, &str)]) {
     global().set_gauge_labeled(name, value, labels);
+}
+
+/// Adds `delta` to a labeled gauge on the global registry.
+pub fn add_gauge_labeled(name: &str, delta: f64, labels: &[(&str, &str)]) {
+    global().add_gauge_labeled(name, delta, labels);
 }
 
 /// Increments an unlabeled gauge by 1 on the global registry.
@@ -862,7 +1029,12 @@ pub mod otlp {
         get_env("AERO_OTLP_ENDPOINT")
             .map(|s| s.trim().to_owned())
             .filter(|s| !s.is_empty())
-            .or_else(|| config_endpoint.map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned))
+            .or_else(|| {
+                config_endpoint
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+            })
     }
 
     /// Truthy parse for the gate flag: `1`/`true`/`yes`/`on` (case-insensitive).
@@ -885,10 +1057,7 @@ pub mod otlp {
     /// never take the process down.
     #[must_use]
     pub fn install_from_env(service_name: &str, config_endpoint: Option<&str>) -> InstallOutcome {
-        let Some(endpoint) = resolve_from_env(
-            |k| std::env::var(k).ok(),
-            config_endpoint,
-        ) else {
+        let Some(endpoint) = resolve_from_env(|k| std::env::var(k).ok(), config_endpoint) else {
             // Distinguish "gate off" from "gate on but no endpoint" for clearer logs.
             let gate_on = std::env::var("AERO_OTLP_METRICS").is_ok_and(|v| is_truthy(&v));
             return if gate_on {
@@ -909,7 +1078,10 @@ pub mod otlp {
                 InstallOutcome::Installed(guard)
             }
             Err(e) => {
-                tracing::warn!(error = e, "OTLP metrics export disabled (exporter build failed)");
+                tracing::warn!(
+                    error = e,
+                    "OTLP metrics export disabled (exporter build failed)"
+                );
                 InstallOutcome::NoEndpoint
             }
         }
@@ -934,6 +1106,7 @@ pub mod otlp {
     /// endpoint) as a string. Callers in the boot path prefer [`install_from_env`],
     /// which downgrades any such error to a logged no-op.
     pub fn install(cfg: &OtlpExportConfig) -> Result<OtlpMetricsGuard, String> {
+        use opentelemetry::metrics::MeterProvider as _;
         use opentelemetry::KeyValue;
         use opentelemetry_otlp::WithExportConfig;
 
@@ -958,6 +1131,14 @@ pub mod otlp {
             .build()
             .map_err(|e| format!("build OTLP metrics pipeline: {e}"))?;
 
+        // Create the Registry mirror from this concrete provider, not from the
+        // pre-install global provider (which is a no-op). Every Registry update
+        // after this point now records a real OTel measurement as well.
+        if !super::global().install_otel_meter(provider.meter("aero-common-registry")) {
+            let _ = provider.shutdown();
+            return Err("OTLP metrics mirror is already installed".to_owned());
+        }
+
         // Make this the process-wide meter provider so any OTel instruments
         // created via `opentelemetry::global::meter(..)` flow to the collector.
         opentelemetry::global::set_meter_provider(provider.clone());
@@ -967,7 +1148,6 @@ pub mod otlp {
         })
     }
 }
-
 
 #[cfg(test)]
 mod tests;

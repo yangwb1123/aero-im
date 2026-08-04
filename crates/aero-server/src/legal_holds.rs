@@ -85,7 +85,7 @@ async fn assert_admin(
 ) -> Result<(), AeroError> {
     let role = s
         .workspaces
-        .member_role(workspace, caller)
+        .effective_member_role(workspace, caller)
         .await
         .map_err(AeroError::from)?
         .ok_or_else(|| AeroError::Forbidden("not a workspace member".into()))?;
@@ -113,7 +113,6 @@ async fn create_hold(
     Json(req): Json<CreateHoldReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let ws = parse_workspace(&ws_str)?;
-    assert_admin(&s, ws, auth.participant_id).await?;
 
     let reason = req.reason.trim();
     if reason.is_empty() {
@@ -123,22 +122,22 @@ async fn create_hold(
         return Err(AeroError::Invalid("reason too long".into()).into());
     }
 
-    // A room-scoped hold must target a room that lives in *this* workspace.
-    let room = match req.room_id.as_deref().map(str::trim).filter(|r| !r.is_empty()) {
+    let room = match req
+        .room_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+    {
         Some(raw) => {
-            let room = RoomId::from_str(raw)
-                .map_err(|e| AeroError::Invalid(format!("room id: {e}")))?;
-            let owner = s.rooms.room_workspace(room).await.map_err(AeroError::from)?;
-            if owner != Some(ws) {
-                return Err(AeroError::NotFound("room in this workspace".into()).into());
-            }
+            let room =
+                RoomId::from_str(raw).map_err(|e| AeroError::Invalid(format!("room id: {e}")))?;
             Some(room)
         }
         None => None,
     };
 
     let id = repo(&s)
-        .create(ws, room, reason, auth.participant_id)
+        .create_authorized(ws, room, reason, auth.participant_id)
         .await
         .map_err(AeroError::from)?;
     // Re-read so the response carries the full, canonical row (created_at etc.).
@@ -172,15 +171,8 @@ async fn release_hold(
     Path(id_str): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let id = parse_hold(&id_str)?;
-    let hold = repo(&s)
-        .get(id)
-        .await
-        .map_err(AeroError::from)?
-        .ok_or_else(|| AeroError::NotFound(format!("legal hold {id}")))?;
-    // Re-check admin on the hold's OWN workspace (the path carries no workspace).
-    assert_admin(&s, hold.workspace_id, auth.participant_id).await?;
     let released = repo(&s)
-        .release(id, hold.workspace_id)
+        .release_authorized(id, auth.participant_id)
         .await
         .map_err(AeroError::from)?;
     if !released {

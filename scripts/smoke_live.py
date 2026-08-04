@@ -106,7 +106,7 @@ async def main():
 
     say("host goes live (rtmp, linked to room)")
     created = req("POST", "/api/streams", {"title": "live smoke", "protocol": "rtmp", "room_id": Rid}, token=A)
-    Sid = created["stream"]["id"]
+    Sid = created["id"]
     ok(f"stream={Sid[:8]}")
 
     say("gift catalog")

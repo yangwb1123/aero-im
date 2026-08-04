@@ -19,7 +19,7 @@ use std::str::FromStr;
 
 use aero_auth::AuthUser;
 use aero_common::{Error as AeroError, MessageId, ParticipantId, RoomId, TaskId};
-use aero_storage::{validate_status, Task, TaskRepo};
+use aero_storage::{validate_status, Task, TaskRepo, TaskWriteError};
 use axum::{
     extract::{Path, Query, State},
     routing::{get, patch},
@@ -36,7 +36,10 @@ const MAX_TITLE_LEN: usize = 512;
 /// All task routes, ready to `.merge` into the gateway router.
 pub fn routes() -> Router<AppState> {
     Router::new()
-        .route("/api/rooms/:id/tasks", get(list_room_tasks).post(create_task))
+        .route(
+            "/api/rooms/:id/tasks",
+            get(list_room_tasks).post(create_task),
+        )
         .route("/api/me/tasks", get(list_my_tasks))
         .route("/api/tasks/:tid", patch(update_task).delete(delete_task))
 }
@@ -64,6 +67,22 @@ fn clean_title(raw: &str) -> Result<&str, AeroError> {
         return Err(AeroError::Invalid("title too long".into()));
     }
     Ok(title)
+}
+
+fn map_task_write_error(error: TaskWriteError) -> AeroError {
+    match error {
+        TaskWriteError::Database(error) => AeroError::from(error),
+        TaskWriteError::NotFound => AeroError::NotFound("task".into()),
+        TaskWriteError::ActorNotMember => {
+            AeroError::Forbidden("task room access was revoked".into())
+        }
+        TaskWriteError::AssigneeNotMember => {
+            AeroError::Invalid("assignee must be an active member of the task room".into())
+        }
+        TaskWriteError::SourceMessageNotInRoom => {
+            AeroError::Invalid("source message must be a visible message in the task room".into())
+        }
+    }
 }
 
 /// Load a task by id (`404` if missing), then assert the caller may access the
@@ -137,16 +156,26 @@ async fn create_task(
     };
 
     let id = repo(&s)
-        .create(room, auth.participant_id, title, assignee, source_message, req.due_at)
+        .create(
+            room,
+            auth.participant_id,
+            title,
+            assignee,
+            source_message,
+            req.due_at,
+        )
         .await
-        .map_err(AeroError::from)?;
+        .map_err(map_task_write_error)?;
 
     // Best-effort mobile push to a freshly-assigned assignee (ROADMAP 方向二).
     // Skip when the assignee is the actor (no self-notify) or when no push gateway
     // is configured. Out-of-band + best-effort, so a failed send never fails the
     // create. No DND/snooze gate (a task assignment is worth surfacing regardless).
     if let Some(assignee) = assignee {
-        if assignee != auth.participant_id && s.push.any_enabled() {
+        if assignee != auth.participant_id
+            && s.push.any_enabled()
+            && s.im.assert_room_access(assignee, room).await.is_ok()
+        {
             let payload = aero_push::PushPayload {
                 title: format!("New task assigned: {title}"),
                 body: String::new(),
@@ -192,9 +221,10 @@ async fn list_room_tasks(
     Ok(Json(serde_json::to_value(tasks).map_err(AeroError::from)?))
 }
 
-/// `GET /api/me/tasks` — the tasks assigned to the caller across all rooms,
-/// unfinished first. Caller-scoped (the assignee is the authenticated participant),
-/// so no per-room access check is needed.
+/// `GET /api/me/tasks` — the tasks assigned to the caller across rooms they may
+/// still access, unfinished first. The repository reapplies workspace
+/// membership, room membership, deactivation and mandatory-2FA gates so stale
+/// rows cannot disclose a private-room task after access is revoked.
 async fn list_my_tasks(
     State(s): State<AppState>,
     auth: AuthUser,
@@ -235,7 +265,8 @@ async fn update_task(
     Json(req): Json<UpdateTaskReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let id = parse_task(&id_str)?;
-    // Establishes existence (`404`) and access (`403`) before mutating.
+    // Establishes existence (`404`) and access (`403`) before parsing the edit.
+    // The repository repeats this check while holding the task row lock.
     load_with_access(&s, id, auth.participant_id).await?;
 
     let title = match req.title.as_deref() {
@@ -250,21 +281,24 @@ async fn update_task(
         None => None,
     };
 
-    // Apply the field edits (title/assignee/due_at) when any are present.
-    if title.is_some() || assignee.is_some() || req.due_at.is_some() {
-        repo(&s)
-            .update(id, title, assignee, req.due_at)
-            .await
-            .map_err(AeroError::from)?;
+    let status = req
+        .status
+        .as_deref()
+        .map(str::trim)
+        .filter(|status| !status.is_empty());
+    if let Some(status) = status {
+        if !validate_status(status) {
+            return Err(AeroError::Invalid(format!("unknown status '{status}'")).into());
+        }
     }
 
-    // Apply the status transition when present (separately, so updated_at is set
-    // even for a status-only PATCH).
-    if let Some(st) = req.status.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        if !validate_status(st) {
-            return Err(AeroError::Invalid(format!("unknown status '{st}'")).into());
-        }
-        repo(&s).set_status(id, st).await.map_err(AeroError::from)?;
+    // Apply all fields in one authorized transaction, so an assignee validation
+    // failure cannot leave a title/status-only prefix committed.
+    if title.is_some() || assignee.is_some() || req.due_at.is_some() || status.is_some() {
+        repo(&s)
+            .update(id, auth.participant_id, title, assignee, req.due_at, status)
+            .await
+            .map_err(map_task_write_error)?;
     }
 
     Ok(reread(&s, id).await?)
@@ -281,7 +315,10 @@ async fn delete_task(
     let id = parse_task(&id_str)?;
     // Establishes existence (`404`) and access (`403`) before deleting.
     load_with_access(&s, id, auth.participant_id).await?;
-    let removed = repo(&s).delete(id).await.map_err(AeroError::from)?;
+    let removed = repo(&s)
+        .delete(id, auth.participant_id)
+        .await
+        .map_err(map_task_write_error)?;
     if !removed {
         return Err(AeroError::NotFound(format!("task {id}")).into());
     }

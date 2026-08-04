@@ -1,8 +1,10 @@
 //! Live-stream repository (P4/P5).
 
-use aero_common::{ParticipantId, RoomId, Stream, StreamProtocol, StreamStatus};
-use sqlx::PgPool;
+use aero_common::{ParticipantId, RoomId, Stream, StreamProtocol, StreamStatus, WorkspaceId};
+use sqlx::{PgPool, Postgres, Transaction};
 use ulid::Ulid;
+
+use crate::stream_go_live_outbox::{GoLiveTransition, MarkLiveOutcome};
 
 #[derive(Clone)]
 pub struct StreamRepo {
@@ -19,12 +21,43 @@ pub struct NewStream {
     pub stream_key: Option<String>,
 }
 
+/// A stream write failed before its optional room relationship could be
+/// preserved safely.
+#[derive(Debug, thiserror::Error)]
+pub enum StreamWriteError {
+    #[error(transparent)]
+    Database(#[from] sqlx::Error),
+    #[error("stream owner cannot access the requested room")]
+    RoomNotAccessible,
+}
+
+async fn has_effective_room_access(
+    tx: &mut Transaction<'_, Postgres>,
+    room: RoomId,
+    participant: ParticipantId,
+    expected_workspace: Option<WorkspaceId>,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar("SELECT aero_effective_room_access($1, $2, $3)")
+        .bind(room.to_uuid())
+        .bind(participant.to_uuid())
+        .bind(expected_workspace.map(|workspace| workspace.to_uuid()))
+        .fetch_one(&mut **tx)
+        .await
+}
+
 impl StreamRepo {
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
 
-    pub async fn create(&self, new: NewStream) -> Result<Stream, sqlx::Error> {
+    pub async fn create(&self, new: NewStream) -> Result<Stream, StreamWriteError> {
+        let mut tx = self.pool.begin().await?;
+        if let Some(room) = new.room_id {
+            if !has_effective_room_access(&mut tx, room, new.owner_id, None).await? {
+                return Err(StreamWriteError::RoomNotAccessible);
+            }
+        }
+
         let id = Ulid::new();
         let created_at = time::OffsetDateTime::now_utc();
         let proto = match new.protocol {
@@ -44,8 +77,9 @@ impl StreamRepo {
         .bind(&key)
         .bind(proto)
         .bind(created_at)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         Ok(Stream {
             id,
@@ -135,26 +169,103 @@ impl StreamRepo {
         Ok(res.rows_affected() > 0)
     }
 
-    pub async fn mark_live(&self, id: Ulid, hls_path: &str) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            r#"UPDATE streams
-                  SET status = 'live', started_at = NOW(), hls_path = $2
-               WHERE id = $1"#,
+    /// Atomically reserve the publisher and append its durable lifecycle event.
+    ///
+    /// Exactly one competing protocol/node can change an `idle` or `ended` row
+    /// to `live`.  The data-modifying CTE makes the stream update and immutable
+    /// outbox snapshot one `PostgreSQL` statement, so either both commit or neither
+    /// does.  A repeated call while live returns [`MarkLiveOutcome::AlreadyLive`]
+    /// without changing timestamps or appending another event.
+    pub async fn mark_live(
+        &self,
+        id: Ulid,
+        hls_path: &str,
+    ) -> Result<MarkLiveOutcome, sqlx::Error> {
+        let stream_id = uuid::Uuid::from_u128(id.0);
+        let mut tx = self.pool.begin().await?;
+        // Resolve without locking the aggregate. Room-linked writes must enter
+        // the canonical workspace -> room -> membership lock order before they
+        // take the stream row lock; otherwise a workspace-first revocation or
+        // cascade can deadlock against stream -> workspace.
+        let resolved = sqlx::query_as::<_, (uuid::Uuid, Option<uuid::Uuid>)>(
+            "SELECT owner_id, room_id FROM streams WHERE id = $1",
         )
-        .bind(uuid::Uuid::from_u128(id.0))
-        .bind(hls_path)
-        .execute(&self.pool)
+        .bind(stream_id)
+        .fetch_optional(&mut *tx)
         .await?;
-        Ok(())
+        let Some((owner_id, room_id)) = resolved else {
+            return Ok(MarkLiveOutcome::NotFound);
+        };
+        if let Some(room_id) = room_id {
+            let allowed = has_effective_room_access(
+                &mut tx,
+                RoomId::from_uuid(room_id),
+                ParticipantId::from_uuid(owner_id),
+                None,
+            )
+            .await?;
+            if !allowed {
+                return Ok(MarkLiveOutcome::NotFound);
+            }
+        }
+        let locked = sqlx::query_as::<_, (uuid::Uuid, Option<uuid::Uuid>)>(
+            "SELECT owner_id, room_id FROM streams WHERE id = $1 FOR UPDATE",
+        )
+        .bind(stream_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if locked != Some((owner_id, room_id)) {
+            // The unlocked routing snapshot is only a lock-order hint. Never
+            // authorize a different owner/room relationship after waiting.
+            return Ok(MarkLiveOutcome::NotFound);
+        }
+
+        let outbox_id = uuid::Uuid::new_v4();
+        let event_id = uuid::Uuid::new_v4();
+        let subject = format!("live.stream.{id}");
+        let traceparent = aero_common::telemetry::current_traceparent();
+        let inserted = sqlx::query_as::<_, (uuid::Uuid, uuid::Uuid)>(
+            r"WITH transitioned AS (
+                  UPDATE streams
+                     SET status = 'live',
+                         started_at = now(),
+                         ended_at = NULL,
+                         hls_path = $2
+                   WHERE id = $1
+                     AND status <> 'live'
+               RETURNING id, room_id, owner_id, title
+              )
+              INSERT INTO stream_go_live_outbox
+                    (id, event_id, stream_id, room_id, owner_id, title, subject, traceparent)
+              SELECT $3, $4, id, room_id, owner_id, title, $5, $6
+                FROM transitioned
+           RETURNING id, event_id",
+        )
+        .bind(stream_id)
+        .bind(hls_path)
+        .bind(outbox_id)
+        .bind(event_id)
+        .bind(subject)
+        .bind(traceparent)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        if let Some((outbox_id, event_id)) = inserted {
+            tx.commit().await?;
+            return Ok(MarkLiveOutcome::Started(GoLiveTransition {
+                outbox_id,
+                event_id,
+            }));
+        }
+        tx.commit().await?;
+        Ok(MarkLiveOutcome::AlreadyLive)
     }
 
     pub async fn mark_ended(&self, id: Ulid) -> Result<(), sqlx::Error> {
-        sqlx::query(
-            r#"UPDATE streams SET status = 'ended', ended_at = NOW() WHERE id = $1"#,
-        )
-        .bind(uuid::Uuid::from_u128(id.0))
-        .execute(&self.pool)
-        .await?;
+        sqlx::query(r#"UPDATE streams SET status = 'ended', ended_at = NOW() WHERE id = $1"#)
+            .bind(uuid::Uuid::from_u128(id.0))
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -259,7 +370,10 @@ mod db_tests {
             "stranger cannot rotate another owner's stream key"
         );
         let after_stranger = repo.get(stream.id).await.expect("get").expect("present");
-        assert_eq!(after_stranger.stream_key, original, "key untouched by stranger");
+        assert_eq!(
+            after_stranger.stream_key, original,
+            "key untouched by stranger"
+        );
 
         // The owner rotates: a NEW key is returned and persisted.
         let rotated = repo
@@ -269,15 +383,24 @@ mod db_tests {
             .expect("owner rotates");
         assert_ne!(rotated, original, "rotated key differs from the original");
         let reread = repo.get(stream.id).await.expect("get").expect("present");
-        assert_eq!(reread.stream_key, rotated, "persisted key matches the returned one");
+        assert_eq!(
+            reread.stream_key, rotated,
+            "persisted key matches the returned one"
+        );
 
         // The old key no longer resolves; the new one does.
         assert!(
-            repo.get_by_key(&original).await.expect("by old key").is_none(),
+            repo.get_by_key(&original)
+                .await
+                .expect("by old key")
+                .is_none(),
             "the leaked key is invalidated"
         );
         assert_eq!(
-            repo.get_by_key(&rotated).await.expect("by new key").map(|s| s.id),
+            repo.get_by_key(&rotated)
+                .await
+                .expect("by new key")
+                .map(|s| s.id),
             Some(stream.id),
             "the new key resolves to the stream"
         );
@@ -309,7 +432,10 @@ mod db_tests {
             .expect("create stream");
 
         // Updating an existing stream reports a match and persists the new title.
-        let matched = repo.update_title(stream.id, "renamed live").await.expect("update");
+        let matched = repo
+            .update_title(stream.id, "renamed live")
+            .await
+            .expect("update");
         assert!(matched, "an existing stream's title update matches a row");
         let reread = repo.get(stream.id).await.expect("get").expect("present");
         assert_eq!(reread.title, "renamed live", "the new title is persisted");
@@ -323,6 +449,244 @@ mod db_tests {
 
         // Cleanup so reruns stay self-contained.
         sqlx::query("DELETE FROM streams WHERE owner_id = $1")
+            .bind(owner.to_uuid())
+            .execute(&p)
+            .await
+            .ok();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn mark_live_is_atomic_idempotent_and_snapshot_survives_stream_delete() {
+        let p = pool();
+        let repo = StreamRepo::new(p.clone());
+        let owner = owner(&p).await;
+        let stream = repo
+            .create(NewStream {
+                owner_id: owner,
+                room_id: None,
+                title: "durable launch".into(),
+                protocol: StreamProtocol::Rtmp,
+                stream_key: None,
+            })
+            .await
+            .expect("create stream");
+
+        let first = repo
+            .mark_live(stream.id, "/hls/first/index.m3u8")
+            .await
+            .expect("first transition");
+        let MarkLiveOutcome::Started(first) = first else {
+            panic!("first transition must start");
+        };
+        assert_eq!(
+            repo.mark_live(stream.id, "/hls/duplicate/index.m3u8")
+                .await
+                .expect("duplicate transition"),
+            MarkLiveOutcome::AlreadyLive
+        );
+
+        let outbox = crate::StreamGoLiveOutboxRepo::new(p.clone())
+            .get(first.outbox_id)
+            .await
+            .expect("read outbox")
+            .expect("outbox present");
+        assert_eq!(outbox.event_id, first.event_id);
+        assert_eq!(outbox.stream_id, stream.id);
+        assert_eq!(outbox.owner_id, owner);
+        assert_eq!(outbox.title, "durable launch");
+        let count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM stream_go_live_outbox WHERE stream_id = $1")
+                .bind(uuid::Uuid::from_u128(stream.id.0))
+                .fetch_one(&p)
+                .await
+                .expect("count outbox");
+        assert_eq!(count, 1, "live->live cannot append an event");
+
+        repo.mark_ended(stream.id).await.expect("end stream");
+        let second = repo
+            .mark_live(stream.id, "/hls/second/index.m3u8")
+            .await
+            .expect("second genuine broadcast");
+        let MarkLiveOutcome::Started(second) = second else {
+            panic!("ended->live must start a new broadcast");
+        };
+        assert_ne!(second.event_id, first.event_id);
+
+        sqlx::query("DELETE FROM streams WHERE id = $1")
+            .bind(uuid::Uuid::from_u128(stream.id.0))
+            .execute(&p)
+            .await
+            .expect("delete source stream");
+        let retained: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM stream_go_live_outbox WHERE stream_id = $1")
+                .bind(uuid::Uuid::from_u128(stream.id.0))
+                .fetch_one(&p)
+                .await
+                .expect("count retained snapshots");
+        assert_eq!(retained, 2, "outbox snapshots have no source-row FK");
+
+        sqlx::query("DELETE FROM stream_go_live_outbox WHERE stream_id = $1")
+            .bind(uuid::Uuid::from_u128(stream.id.0))
+            .execute(&p)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM participants WHERE id = $1")
+            .bind(owner.to_uuid())
+            .execute(&p)
+            .await
+            .ok();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn competing_publishers_have_one_atomic_winner() {
+        let p = pool();
+        let repo = StreamRepo::new(p.clone());
+        let owner = owner(&p).await;
+        let stream = repo
+            .create(NewStream {
+                owner_id: owner,
+                room_id: None,
+                title: "publisher race".into(),
+                protocol: StreamProtocol::Whip,
+                stream_key: None,
+            })
+            .await
+            .expect("create stream");
+
+        let (left, right) = tokio::join!(
+            repo.mark_live(stream.id, "/hls/left/index.m3u8"),
+            repo.mark_live(stream.id, "/hls/right/index.m3u8")
+        );
+        let outcomes = [left.expect("left"), right.expect("right")];
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, MarkLiveOutcome::Started(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|outcome| matches!(outcome, MarkLiveOutcome::AlreadyLive))
+                .count(),
+            1
+        );
+        let count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM stream_go_live_outbox WHERE stream_id = $1")
+                .bind(uuid::Uuid::from_u128(stream.id.0))
+                .fetch_one(&p)
+                .await
+                .expect("count outbox");
+        assert_eq!(count, 1);
+
+        sqlx::query("DELETE FROM stream_go_live_outbox WHERE stream_id = $1")
+            .bind(uuid::Uuid::from_u128(stream.id.0))
+            .execute(&p)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM streams WHERE id = $1")
+            .bind(uuid::Uuid::from_u128(stream.id.0))
+            .execute(&p)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM participants WHERE id = $1")
+            .bind(owner.to_uuid())
+            .execute(&p)
+            .await
+            .ok();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn go_live_outbox_claim_token_fences_stale_workers() {
+        let p = pool();
+        let streams = StreamRepo::new(p.clone());
+        let outbox = crate::StreamGoLiveOutboxRepo::new(p.clone());
+        let owner = owner(&p).await;
+        let stream = streams
+            .create(NewStream {
+                owner_id: owner,
+                room_id: None,
+                title: "claim fence".into(),
+                protocol: StreamProtocol::Srt,
+                stream_key: None,
+            })
+            .await
+            .expect("create stream");
+        let MarkLiveOutcome::Started(transition) = streams
+            .mark_live(stream.id, "/hls/fenced/index.m3u8")
+            .await
+            .expect("mark live")
+        else {
+            panic!("transition must start");
+        };
+
+        let now = time::OffsetDateTime::now_utc();
+        let first = outbox
+            .claim_by_id(transition.outbox_id, now, time::Duration::seconds(1))
+            .await
+            .expect("first claim")
+            .expect("claimed");
+        let second = outbox
+            .claim_by_id(
+                transition.outbox_id,
+                now + time::Duration::seconds(2),
+                time::Duration::seconds(1),
+            )
+            .await
+            .expect("reclaim")
+            .expect("reclaimed");
+        assert_ne!(first.claim_token, second.claim_token);
+        assert_eq!(second.attempts, first.attempts + 1);
+        assert!(!outbox
+            .mark_nats_published(first.id, first.claim_token, now)
+            .await
+            .expect("stale stage"));
+        assert!(!outbox
+            .mark_failed(first.id, first.claim_token, first.attempts, now, "stale")
+            .await
+            .expect("stale fail"));
+        assert_eq!(
+            outbox
+                .assign_seq_if_absent(second.id, second.claim_token, 41)
+                .await
+                .expect("assign seq"),
+            Some(41)
+        );
+        assert!(outbox
+            .mark_nats_published(second.id, second.claim_token, now)
+            .await
+            .expect("nats stage"));
+        assert!(outbox
+            .mark_webhooks_materialized(second.id, second.claim_token, now)
+            .await
+            .expect("webhook stage"));
+        assert!(outbox
+            .mark_completed(second.id, second.claim_token, now)
+            .await
+            .expect("complete"));
+        let completed = outbox
+            .get(transition.outbox_id)
+            .await
+            .expect("read")
+            .expect("present");
+        assert!(completed.completed_at.is_some());
+        assert_eq!(completed.seq, Some(41));
+
+        sqlx::query("DELETE FROM stream_go_live_outbox WHERE stream_id = $1")
+            .bind(uuid::Uuid::from_u128(stream.id.0))
+            .execute(&p)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM streams WHERE id = $1")
+            .bind(uuid::Uuid::from_u128(stream.id.0))
+            .execute(&p)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM participants WHERE id = $1")
             .bind(owner.to_uuid())
             .execute(&p)
             .await

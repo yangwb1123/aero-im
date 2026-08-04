@@ -11,7 +11,7 @@
 //! * `unlimited` — no workspace ceiling (per-client limits still apply).
 //!
 //! The tier token is stored on `workspaces.rate_tier` (migration 0076,
-//! [`aero_storage::WorkspaceRepo::set_rate_tier`]); the counter is a Redis
+//! [`aero_storage::WorkspaceRepo::set_rate_tier_authorized`]); the counter is a Redis
 //! fixed window ([`aero_storage::WsRateStore`]) shared by every gateway node,
 //! so the budget cannot be multiplied by spraying requests across nodes.
 //!
@@ -173,8 +173,12 @@ impl WsRateLimits {
     #[must_use]
     pub fn from_env() -> Self {
         Self::resolve(
-            std::env::var("AERO_WS_RATE_STANDARD_PER_MIN").ok().as_deref(),
-            std::env::var("AERO_WS_RATE_PREMIUM_PER_MIN").ok().as_deref(),
+            std::env::var("AERO_WS_RATE_STANDARD_PER_MIN")
+                .ok()
+                .as_deref(),
+            std::env::var("AERO_WS_RATE_PREMIUM_PER_MIN")
+                .ok()
+                .as_deref(),
         )
     }
 
@@ -297,7 +301,9 @@ pub async fn check_ws_rate(state: &AppState, workspace: WorkspaceId) -> AeroResu
             // Unknown workspace ⇒ treat as standard; downstream access checks
             // 404/403 it anyway, and charging a dead key is harmless.
             Ok(token) => {
-                let t = token.as_deref().map_or(WsRateTier::Standard, WsRateTier::parse);
+                let t = token
+                    .as_deref()
+                    .map_or(WsRateTier::Standard, WsRateTier::parse);
                 e.tiers.insert(workspace, (t, now));
                 t
             }
@@ -419,7 +425,7 @@ async fn caller_role(
     caller: ParticipantId,
 ) -> AeroResult<aero_common::WorkspaceRole> {
     s.workspaces
-        .member_role(ws, caller)
+        .effective_member_role(ws, caller)
         .await
         .map_err(AeroError::from)?
         .ok_or_else(|| AeroError::Forbidden("not a workspace member".into()))
@@ -442,25 +448,16 @@ async fn set_rate_tier(
     Json(req): Json<SetTierReq>,
 ) -> ApiResult<StatusCode> {
     let ws = parse_workspace_id(&id_str)?;
-    let role = caller_role(&s, ws, auth.participant_id).await?;
-    if !role.can_manage_workspace() {
-        return Err(AeroError::Forbidden("rate tier requires workspace owner".into()).into());
-    }
     let tier = WsRateTier::parse_strict(&req.tier).ok_or_else(|| {
         AeroError::Invalid(format!(
             "unknown rate tier {:?} (expected standard | premium | unlimited)",
             req.tier
         ))
     })?;
-    let updated = s
-        .workspaces
-        .set_rate_tier(ws, tier.as_str())
+    s.workspaces
+        .set_rate_tier_authorized(ws, tier.as_str(), auth.participant_id)
         .await
         .map_err(AeroError::from)?;
-    if !updated {
-        // Raced with a workspace delete between the role check and the update.
-        return Err(AeroError::NotFound("workspace".into()).into());
-    }
     s.ws_rate.note_tier(ws, tier);
     // Best-effort audit (observability, not a transactional invariant).
     if let Err(e) = s
@@ -511,17 +508,36 @@ mod tests {
 
     #[test]
     fn parse_strict_accepts_known_tiers_case_insensitively() {
-        assert_eq!(WsRateTier::parse_strict("standard"), Some(WsRateTier::Standard));
-        assert_eq!(WsRateTier::parse_strict("premium"), Some(WsRateTier::Premium));
-        assert_eq!(WsRateTier::parse_strict("unlimited"), Some(WsRateTier::Unlimited));
-        assert_eq!(WsRateTier::parse_strict(" Premium "), Some(WsRateTier::Premium));
-        assert_eq!(WsRateTier::parse_strict("UNLIMITED"), Some(WsRateTier::Unlimited));
+        assert_eq!(
+            WsRateTier::parse_strict("standard"),
+            Some(WsRateTier::Standard)
+        );
+        assert_eq!(
+            WsRateTier::parse_strict("premium"),
+            Some(WsRateTier::Premium)
+        );
+        assert_eq!(
+            WsRateTier::parse_strict("unlimited"),
+            Some(WsRateTier::Unlimited)
+        );
+        assert_eq!(
+            WsRateTier::parse_strict(" Premium "),
+            Some(WsRateTier::Premium)
+        );
+        assert_eq!(
+            WsRateTier::parse_strict("UNLIMITED"),
+            Some(WsRateTier::Unlimited)
+        );
     }
 
     #[test]
     fn parse_strict_rejects_unknown_tokens() {
         for bad in ["", "gold", "premium+", "standard premium", "none", "0"] {
-            assert_eq!(WsRateTier::parse_strict(bad), None, "{bad:?} must not parse");
+            assert_eq!(
+                WsRateTier::parse_strict(bad),
+                None,
+                "{bad:?} must not parse"
+            );
         }
     }
 
@@ -536,7 +552,11 @@ mod tests {
 
     #[test]
     fn as_str_round_trips_through_strict_parse() {
-        for tier in [WsRateTier::Standard, WsRateTier::Premium, WsRateTier::Unlimited] {
+        for tier in [
+            WsRateTier::Standard,
+            WsRateTier::Premium,
+            WsRateTier::Unlimited,
+        ] {
             assert_eq!(WsRateTier::parse_strict(tier.as_str()), Some(tier));
         }
     }
@@ -554,21 +574,39 @@ mod tests {
     fn resolve_parses_env_strings_and_falls_back_on_garbage() {
         // Explicit values win.
         let l = WsRateLimits::resolve(Some("300"), Some("9000"));
-        assert_eq!(l, WsRateLimits { standard_per_min: 300, premium_per_min: 9000 });
+        assert_eq!(
+            l,
+            WsRateLimits {
+                standard_per_min: 300,
+                premium_per_min: 9000
+            }
+        );
         // Missing / unparsable → defaults.
         let l = WsRateLimits::resolve(None, Some("not-a-number"));
         assert_eq!(l.standard_per_min, DEFAULT_STANDARD_PER_MIN);
         assert_eq!(l.premium_per_min, DEFAULT_PREMIUM_PER_MIN);
         // Whitespace tolerated.
-        assert_eq!(WsRateLimits::resolve(Some(" 42 "), None).standard_per_min, 42);
+        assert_eq!(
+            WsRateLimits::resolve(Some(" 42 "), None).standard_per_min,
+            42
+        );
         // A configured 0 is floored to 1 (can't hard-block a tier by typo).
-        assert_eq!(WsRateLimits::resolve(Some("0"), Some("0")).standard_per_min, 1);
-        assert_eq!(WsRateLimits::resolve(Some("0"), Some("0")).premium_per_min, 1);
+        assert_eq!(
+            WsRateLimits::resolve(Some("0"), Some("0")).standard_per_min,
+            1
+        );
+        assert_eq!(
+            WsRateLimits::resolve(Some("0"), Some("0")).premium_per_min,
+            1
+        );
     }
 
     #[test]
     fn limit_for_maps_each_tier() {
-        let l = WsRateLimits { standard_per_min: 100, premium_per_min: 500 };
+        let l = WsRateLimits {
+            standard_per_min: 100,
+            premium_per_min: 500,
+        };
         assert_eq!(l.limit_for(WsRateTier::Standard), Some(100));
         assert_eq!(l.limit_for(WsRateTier::Premium), Some(500));
         assert_eq!(l.limit_for(WsRateTier::Unlimited), None);
@@ -598,7 +636,10 @@ mod tests {
         assert_eq!(fresh(Some((7u8, now)), newish, ttl), Some(7));
         // At/after the boundary → miss (strict `<`).
         assert_eq!(fresh(Some((7u8, now)), now + ttl, ttl), None);
-        assert_eq!(fresh(Some((7u8, now)), now + ttl + Duration::from_secs(5), ttl), None);
+        assert_eq!(
+            fresh(Some((7u8, now)), now + ttl + Duration::from_secs(5), ttl),
+            None
+        );
     }
 
     #[test]

@@ -21,43 +21,150 @@ fn stamped_frame_json(frame: &ServerFrame<'_>, seq: Option<u64>) -> String {
 /// Translate a `RoomEvent` into the JSON wire frame the browser expects.
 pub fn room_event_to_frame_json(event: &RoomEvent, seq: Option<u64>) -> String {
     let frame: ServerFrame<'_> = match event.clone() {
-        RoomEvent::Message(env) => ServerFrame::Message { message: env.message },
+        RoomEvent::Message(env) => ServerFrame::Message {
+            message: env.message,
+            delivery_ordinal: env.delivery_ordinal,
+            client_message_id: env.client_message_id,
+        },
         RoomEvent::Edited(m) => ServerFrame::Edited { message: m },
-        RoomEvent::Deleted { room_id, message_id, by } => {
-            ServerFrame::Deleted { room_id, message_id, by }
-        }
-        RoomEvent::Reaction { room_id, message_id, participant, emoji, op } => {
-            ServerFrame::Reaction { room_id, message_id, participant, emoji, op }
-        }
-        RoomEvent::Read { room_id, participant, last_message_id, at } => {
-            ServerFrame::Read { room_id, participant, last_message_id, at }
-        }
-        RoomEvent::Typing { room_id, participant, on } => {
-            ServerFrame::Typing { room_id, participant, on }
-        }
-        RoomEvent::Notify { room_id, message_id, mentioned, by, kind } => {
-            ServerFrame::Notify { room_id, message_id, mentioned, by, notify_kind: kind }
-        }
-        RoomEvent::NotifyBatch { room_id, message_id, by, delivery_id: _, recipients } => {
+        RoomEvent::Deleted {
+            room_id,
+            message_id,
+            by,
+        } => ServerFrame::Deleted {
+            room_id,
+            message_id,
+            by,
+        },
+        RoomEvent::Reaction {
+            room_id,
+            message_id,
+            participant,
+            emoji,
+            op,
+        } => ServerFrame::Reaction {
+            room_id,
+            message_id,
+            participant,
+            emoji,
+            op,
+        },
+        RoomEvent::Read {
+            room_id,
+            participant,
+            last_message_id,
+            at,
+        } => ServerFrame::Read {
+            room_id,
+            participant,
+            last_message_id,
+            at,
+        },
+        RoomEvent::Typing {
+            room_id,
+            participant,
+            on,
+        } => ServerFrame::Typing {
+            room_id,
+            participant,
+            on,
+        },
+        RoomEvent::Notify {
+            room_id,
+            message_id,
+            mentioned,
+            by,
+            kind,
+        } => ServerFrame::Notify {
+            room_id,
+            message_id,
+            mentioned,
+            by,
+            notify_kind: kind,
+        },
+        RoomEvent::NotifyBatch {
+            room_id,
+            message_id,
+            by,
+            delivery_id: _,
+            recipients,
+        } => {
             let (mentioned, notify_kind) = recipients
                 .first()
                 .map_or((by, NotificationKind::Mention), |t| (t.participant, t.kind));
-            ServerFrame::Notify { room_id, message_id, mentioned, by, notify_kind }
+            ServerFrame::Notify {
+                room_id,
+                message_id,
+                mentioned,
+                by,
+                notify_kind,
+            }
         }
-        RoomEvent::Pin { room_id, message_id, by, op } => {
-            ServerFrame::Pin { room_id, message_id, by, op }
-        }
-        RoomEvent::Membership { room_id, participant, op } => {
-            ServerFrame::Membership { room_id, participant, op }
-        }
+        RoomEvent::Pin {
+            room_id,
+            message_id,
+            by,
+            op,
+        } => ServerFrame::Pin {
+            room_id,
+            message_id,
+            by,
+            op,
+        },
+        RoomEvent::Membership {
+            room_id,
+            participant,
+            op,
+        } => ServerFrame::Membership {
+            room_id,
+            participant,
+            op,
+        },
         RoomEvent::Call(call) => ServerFrame::Call { event: call },
-        RoomEvent::Poll { room_id, poll_id, op } => ServerFrame::Poll { room_id, poll_id, op },
-        RoomEvent::MessageSeen { room_id, message_id, participant } => {
-            ServerFrame::MessageSeen { room_id, message_id, participant }
-        }
-        RoomEvent::Interaction { room_id, message_id, participant, action_id } => {
-            ServerFrame::Interaction { room_id, message_id, participant, action_id }
-        }
+        RoomEvent::Poll {
+            room_id,
+            poll_id,
+            op,
+        } => ServerFrame::Poll {
+            room_id,
+            poll_id,
+            op,
+        },
+        RoomEvent::CanvasOp {
+            room_id,
+            canvas_id,
+            op_id,
+            op_seq,
+            author_id,
+            op,
+        } => ServerFrame::CanvasOp {
+            room_id,
+            canvas_id,
+            op_id,
+            op_seq,
+            author_id,
+            op,
+        },
+        RoomEvent::MessageSeen {
+            room_id,
+            message_id,
+            participant,
+        } => ServerFrame::MessageSeen {
+            room_id,
+            message_id,
+            participant,
+        },
+        RoomEvent::Interaction {
+            room_id,
+            message_id,
+            participant,
+            action_id,
+        } => ServerFrame::Interaction {
+            room_id,
+            message_id,
+            participant,
+            action_id,
+        },
     };
     stamped_frame_json(&frame, seq)
 }
@@ -84,5 +191,32 @@ mod tests {
         let without: serde_json::Value =
             serde_json::from_str(&stamped_frame_json(&frame, None)).unwrap();
         assert!(without.get("seq").is_none());
+    }
+
+    #[test]
+    fn canvas_frame_keeps_room_bus_seq_separate_from_persisted_op_seq() {
+        let room = aero_common::RoomId::new();
+        let canvas = aero_common::CanvasId::new();
+        let op_id = uuid::Uuid::new_v4();
+        let author = aero_common::ParticipantId::new();
+        let event = RoomEvent::CanvasOp {
+            room_id: room,
+            canvas_id: canvas,
+            op_id,
+            op_seq: 23,
+            author_id: author,
+            op: serde_json::json!({"type": "insert", "text": "hello"}),
+        };
+
+        let frame: serde_json::Value =
+            serde_json::from_str(&room_event_to_frame_json(&event, Some(91))).unwrap();
+        assert_eq!(frame["type"], "canvas_op");
+        assert_eq!(frame["room_id"], room.to_string());
+        assert_eq!(frame["canvas_id"], canvas.to_string());
+        assert_eq!(frame["op_id"], op_id.to_string());
+        assert_eq!(frame["author_id"], author.to_string());
+        assert_eq!(frame["seq"], 91, "room-bus delivery order");
+        assert_eq!(frame["op_seq"], 23, "durable per-canvas recovery cursor");
+        assert_eq!(frame["op"]["type"], "insert");
     }
 }

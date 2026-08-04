@@ -10,14 +10,18 @@
 //!   * `GET    /api/streams/:id/goals` — list a stream's goals.
 //!   * `DELETE /api/goals/:id`         — the creator cancels a goal.
 //!
-//! Creator-gating on create/cancel resolves the stream (or the goal's creator) and
-//! checks ownership against the caller.
+//! Creator-gating on create/cancel resolves the stream's current canonical owner
+//! and effective access in the storage transaction.
 
 use std::str::FromStr;
 
 use aero_auth::AuthUser;
-use aero_common::{Error as AeroError, GoalId, ParticipantId};
-use aero_storage::{is_valid_goal_metric, GoalRepo, StreamRepo};
+use aero_common::{Error as AeroError, GoalId};
+use aero_storage::goals::GoalCancelOutcome;
+use aero_storage::{
+    is_valid_goal_metric, GoalCreateError, GoalRepo, MAX_ACTIVE_GOALS_PER_STREAM,
+    MAX_GOAL_DESCRIPTION_CHARS, MAX_GOAL_TITLE_CHARS,
+};
 use axum::{
     extract::{Path, Query, State},
     routing::{delete, post},
@@ -49,18 +53,12 @@ fn repo(s: &AppState) -> GoalRepo {
     GoalRepo::new(s.pg.clone())
 }
 
-/// Resolve `stream` and assert `caller` owns it. `NotFound` if unknown, `Forbidden`
-/// if the caller is not the owner.
-async fn require_owner(s: &AppState, stream: Ulid, caller: ParticipantId) -> Result<(), AeroError> {
-    let row = StreamRepo::new(s.pg.clone())
-        .get(stream)
-        .await
-        .map_err(AeroError::from)?
-        .ok_or_else(|| AeroError::NotFound(format!("stream {stream}")))?;
-    if row.owner_id != caller {
-        return Err(AeroError::Forbidden("only the stream owner may manage goals".into()));
+fn map_owner_scoped_cancel(goal: GoalId, outcome: GoalCancelOutcome) -> Result<bool, AeroError> {
+    match outcome {
+        GoalCancelOutcome::Cancelled => Ok(true),
+        GoalCancelOutcome::AlreadyCancelled => Ok(false),
+        GoalCancelOutcome::NotFound => Err(AeroError::NotFound(format!("goal {goal}"))),
     }
-    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -82,24 +80,46 @@ async fn create_goal(
     Json(req): Json<CreateGoalReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let stream = parse_stream(&id_str)?;
-    require_owner(&s, stream, auth.participant_id).await?;
 
     let title = req.title.trim();
     if title.is_empty() {
         return Err(AeroError::Invalid("goal title is empty".into()).into());
     }
+    if title.chars().count() > MAX_GOAL_TITLE_CHARS {
+        return Err(AeroError::Invalid(format!(
+            "goal title is too long (max {MAX_GOAL_TITLE_CHARS} chars)"
+        ))
+        .into());
+    }
     if !is_valid_goal_metric(&req.metric_type) {
-        return Err(
-            AeroError::Invalid("metric_type must be 'gifts', 'viewers', or 'points'".into()).into(),
-        );
+        return Err(AeroError::Invalid(
+            "metric_type must be 'gifts', 'viewers', or 'points'".into(),
+        )
+        .into());
     }
     if req.target < 1 {
         return Err(AeroError::Invalid("target must be >= 1".into()).into());
     }
-    let description = req.description.as_deref().map(str::trim).filter(|d| !d.is_empty());
+    let description = req
+        .description
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| !d.is_empty());
+    if description.is_some_and(|value| value.chars().count() > MAX_GOAL_DESCRIPTION_CHARS) {
+        return Err(AeroError::Invalid(format!(
+            "goal description is too long (max {MAX_GOAL_DESCRIPTION_CHARS} chars)"
+        ))
+        .into());
+    }
+    if req
+        .expires_at
+        .is_some_and(|expiry| expiry <= OffsetDateTime::now_utc())
+    {
+        return Err(AeroError::Invalid("expires_at must be in the future".into()).into());
+    }
 
     let id = repo(&s)
-        .create_goal(
+        .create_goal_authorized(
             stream,
             auth.participant_id,
             title,
@@ -109,7 +129,20 @@ async fn create_goal(
             req.expires_at,
         )
         .await
-        .map_err(AeroError::from)?;
+        .map_err(|error| match error {
+            GoalCreateError::StreamNotFound => AeroError::NotFound(format!("stream {stream}")),
+            GoalCreateError::NotOwner => {
+                AeroError::Forbidden("only the stream owner may manage goals".into())
+            }
+            GoalCreateError::NotAuthorized => {
+                AeroError::Forbidden("stream owner lacks effective access".into())
+            }
+            GoalCreateError::LimitReached => AeroError::Invalid(format!(
+                "active goal limit reached ({MAX_ACTIVE_GOALS_PER_STREAM})"
+            )),
+            GoalCreateError::InvalidInput(message) => AeroError::Invalid(message),
+            GoalCreateError::Storage(error) => AeroError::from(error),
+        })?;
     Ok(Json(serde_json::json!({
         "goal_id": id.to_string(),
         "stream_id": stream.to_string(),
@@ -125,8 +158,10 @@ struct ListGoalsFilter {
     active_only: bool,
 }
 
-/// `GET /api/streams/:id/goals` — a stream's goals. Any authenticated viewer may read
-/// (the goal bars are public broadcast UI). `?active_only=true` filters to active.
+/// `GET /api/streams/:id/goals` — a stream's goals. Any authenticated viewer may
+/// read: like `GET /api/streams/:id`, stream metadata and its broadcast goal bars
+/// are public even when the stream carries an optional room association.
+/// `?active_only=true` filters to active.
 async fn list_goals(
     State(s): State<AppState>,
     _auth: AuthUser,
@@ -134,6 +169,14 @@ async fn list_goals(
     Query(filter): Query<ListGoalsFilter>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let stream = parse_stream(&id_str)?;
+    // Match the canonical public stream-detail contract: optional room
+    // association does not make a broadcast private, but an unknown/pruned
+    // stream cannot be used to expose retained goal text.
+    s.streams
+        .get(stream)
+        .await
+        .map_err(AeroError::from)?
+        .ok_or_else(|| AeroError::NotFound(format!("stream {stream}")))?;
     let r = repo(&s);
     let goals = if filter.active_only {
         r.list_active(stream).await
@@ -144,30 +187,36 @@ async fn list_goals(
     Ok(Json(serde_json::json!({ "goals": goals })))
 }
 
-/// `DELETE /api/goals/:id` — the goal's creator cancels it.
+/// `DELETE /api/goals/:id` — the stream's current canonical owner cancels it.
 async fn cancel_goal(
     State(s): State<AppState>,
     auth: AuthUser,
     Path(id_str): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let goal = parse_goal(&id_str)?;
-    let cancelled = repo(&s)
+    let outcome = repo(&s)
         .cancel_goal(goal, auth.participant_id)
         .await
         .map_err(AeroError::from)?;
-    if !cancelled {
-        // Either the goal is unknown, not owned by the caller, or already cancelled.
-        // Distinguish: a non-existent goal is 404; otherwise it was a no-op (already
-        // cancelled / not owned -> forbidden vs. conflict). Keep it simple: report
-        // NotFound when the goal does not exist for this caller.
-        let exists = repo(&s).get_goal(goal).await.map_err(AeroError::from)?;
-        return match exists {
-            None => Err(AeroError::NotFound(format!("goal {goal}")).into()),
-            Some(g) if g.creator_id != auth.participant_id => {
-                Err(AeroError::Forbidden("only the goal's creator may cancel it".into()).into())
-            }
-            Some(_) => Ok(Json(serde_json::json!({ "cancelled": false }))),
-        };
+    // Unknown, former-owner, and foreign-owned ids are deliberately
+    // indistinguishable. Only the authorized current owner can observe the
+    // idempotent already-cancelled result.
+    let cancelled = map_owner_scoped_cancel(goal, outcome)?;
+    Ok(Json(serde_json::json!({ "cancelled": cancelled })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn owner_cancel_retry_is_idempotent_but_foreign_ids_are_opaque() {
+        let goal = GoalId::new();
+        assert!(map_owner_scoped_cancel(goal, GoalCancelOutcome::Cancelled).unwrap());
+        assert!(!map_owner_scoped_cancel(goal, GoalCancelOutcome::AlreadyCancelled).unwrap());
+        assert!(matches!(
+            map_owner_scoped_cancel(goal, GoalCancelOutcome::NotFound),
+            Err(AeroError::NotFound(_))
+        ));
     }
-    Ok(Json(serde_json::json!({ "cancelled": true })))
 }

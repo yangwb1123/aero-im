@@ -3,12 +3,12 @@
 //! Each workspace can define named custom emoji (`:shipit:`) backed by an
 //! already-uploaded image blob. Unlike the existing [`crate::EmojiRepo`] (which
 //! is also workspace-scoped), this table uses UUID primary keys and records the
-//! `created_by` participant so admin-delete gates can be enforced. The two tables
-//! serve the same purpose at different levels of history (the emoji repo is the
-//! primary workspace emoji store; this is an additive, independently-operable
+//! `created_by` administrator for attribution. The two tables serve the same
+//! purpose at different levels of history (the emoji repo is the primary
+//! workspace emoji store; this is an additive, independently-operable
 //! alternative seeded in migration 0115).
 
-use aero_common::{Error, WorkspaceId};
+use aero_common::{Error, ParticipantId, WorkspaceId};
 use serde::Serialize;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -34,33 +34,48 @@ impl WorkspaceEmojiRepo {
         Self { pg }
     }
 
-    /// Create a custom emoji for `workspace`. Name is normalised to lowercase
-    /// with leading/trailing whitespace removed. Returns a `UniqueViolation`
-    /// sqlx error on a duplicate `(workspace, name)` pair — callers map it to
-    /// `409 Conflict`.
+    /// Create a custom emoji for `workspace` while `actor` remains an effective
+    /// Owner/Admin. The backing blob is locked and must be a finalized,
+    /// non-GC-queued image in the same immutable workspace scope.
     ///
     /// # Errors
-    /// Propagates any [`sqlx::Error`] from the insert, including a
-    /// unique-constraint violation when the name already exists in the workspace.
-    pub async fn create(
+    /// Returns [`Error::Invalid`] for an invalid normalized name,
+    /// [`Error::Forbidden`] unless `actor` is a current effective Owner/Admin,
+    /// [`Error::NotFound`] for an unavailable or cross-tenant blob, and
+    /// [`Error::Conflict`] when the normalized name already exists.
+    pub async fn create_authorized(
         &self,
         workspace: WorkspaceId,
         name: &str,
         blob_id: Uuid,
-        created_by: Uuid,
+        actor: ParticipantId,
     ) -> Result<WorkspaceEmojiRow, Error> {
-        let row: WorkspaceEmojiRow = sqlx::query_as(
+        let name = name.trim().to_lowercase();
+        if !crate::emoji::is_valid_emoji_name(&name) {
+            return Err(Error::Invalid(
+                "emoji name must be 1-64 chars of lowercase [a-z0-9_-]".into(),
+            ));
+        }
+
+        let mut tx = self.pg.begin().await?;
+        crate::workspace::authz::assert_effective_admin_in_tx(&mut tx, workspace, actor).await?;
+        crate::emoji::lock_usable_emoji_blob(&mut tx, workspace, blob_id).await?;
+        let row: Option<WorkspaceEmojiRow> = sqlx::query_as(
             "INSERT INTO workspace_emoji (workspace_id, name, blob_id, created_by) \
              VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (workspace_id, name) DO NOTHING \
              RETURNING id, workspace_id, name, blob_id, created_by",
         )
         .bind(workspace.to_uuid())
-        .bind(name.trim().to_lowercase())
+        .bind(&name)
         .bind(blob_id)
-        .bind(created_by)
-        .fetch_one(&self.pg)
-        .await
-        .map_err(Error::from)?;
+        .bind(actor.to_uuid())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let row = row.ok_or_else(|| {
+            Error::Conflict(format!("emoji ':{name}:' already exists in this workspace"))
+        })?;
+        tx.commit().await?;
         Ok(row)
     }
 
@@ -83,25 +98,50 @@ impl WorkspaceEmojiRepo {
         Ok(rows)
     }
 
-    /// Delete a custom emoji by id, scoped to the workspace (so a cross-tenant
-    /// delete is a no-op). Returns `true` iff a row was removed.
+    /// Delete a custom emoji by id, scoped to the workspace and guarded by a
+    /// transactionally current effective Owner/Admin decision.
     ///
     /// # Errors
-    /// Propagates any [`sqlx::Error`] from the delete.
-    pub async fn delete(&self, id: Uuid, workspace: WorkspaceId) -> Result<bool, Error> {
-        let r = sqlx::query(
-            "DELETE FROM workspace_emoji WHERE id = $1 AND workspace_id = $2",
+    /// Returns [`Error::Forbidden`] unless `actor` remains a current effective
+    /// Owner/Admin, [`Error::NotFound`] when `id` is absent from the requested
+    /// workspace, and propagates storage failures.
+    pub async fn delete_authorized(
+        &self,
+        id: Uuid,
+        workspace: WorkspaceId,
+        actor: ParticipantId,
+    ) -> Result<(), Error> {
+        let mut tx = self.pg.begin().await?;
+        crate::workspace::authz::assert_effective_admin_in_tx(&mut tx, workspace, actor).await?;
+        let locked = sqlx::query_scalar::<_, bool>(
+            "SELECT true
+               FROM workspace_emoji
+              WHERE id = $1 AND workspace_id = $2
+              FOR UPDATE",
         )
         .bind(id)
         .bind(workspace.to_uuid())
-        .execute(&self.pg)
-        .await
-        .map_err(Error::from)?;
-        Ok(r.rows_affected() > 0)
+        .fetch_optional(&mut *tx)
+        .await?
+        .is_some();
+        if !locked {
+            return Err(Error::NotFound("emoji".into()));
+        }
+
+        let r = sqlx::query("DELETE FROM workspace_emoji WHERE id = $1 AND workspace_id = $2")
+            .bind(id)
+            .bind(workspace.to_uuid())
+            .execute(&mut *tx)
+            .await
+            .map_err(Error::from)?;
+        if r.rows_affected() != 1 {
+            return Err(Error::NotFound("emoji".into()));
+        }
+        tx.commit().await?;
+        Ok(())
     }
 
-    /// Look up a single emoji by id (workspace-agnostic). Used by the delete
-    /// handler to resolve the creator before the auth guard runs.
+    /// Look up a single emoji by id (workspace-agnostic).
     ///
     /// # Errors
     /// Propagates any [`sqlx::Error`] from the query.
@@ -148,21 +188,35 @@ mod db_tests {
             .await
             .expect("insert participant");
         let ws = WorkspaceId::new();
+        let mut tx = p.begin().await.expect("begin workspace fixture");
         sqlx::query("INSERT INTO workspaces (id, name, slug, created_by, created_at) VALUES ($1,$2,$3,$4, now())")
             .bind(ws.to_uuid())
             .bind("WE Test WS")
             .bind(format!("we-{}", ws.to_uuid()))
             .bind(actor)
-            .execute(p)
+            .execute(&mut *tx)
             .await
             .expect("insert workspace");
+        sqlx::query(
+            "INSERT INTO workspace_members (workspace_id, participant_id, role)
+             VALUES ($1, $2, 'owner')",
+        )
+        .bind(ws.to_uuid())
+        .bind(actor)
+        .execute(&mut *tx)
+        .await
+        .expect("insert workspace owner");
+        tx.commit().await.expect("commit workspace fixture");
         let blob_id = Uuid::new_v4();
         sqlx::query(
-            "INSERT INTO blobs (id, owner_id, kind, name, mime, size, storage_key) \
-             VALUES ($1, $2, 'image', 'emoji.png', 'image/png', 512, $3)",
+            "INSERT INTO blobs
+                 (id, owner_id, workspace_id, kind, name, mime, size, storage_key,
+                  finalized_at)
+             VALUES ($1, $2, $3, 'image', 'emoji.png', 'image/png', 512, $4, now())",
         )
         .bind(blob_id)
         .bind(actor)
+        .bind(ws.to_uuid())
         .bind(format!("test-key-{blob_id}"))
         .execute(p)
         .await
@@ -177,7 +231,10 @@ mod db_tests {
         let repo = WorkspaceEmojiRepo::new(p.clone());
         let (ws, actor, blob_id) = fixture(&p).await;
 
-        let created = repo.create(ws, "shipit", blob_id, actor).await.unwrap();
+        let created = repo
+            .create_authorized(ws, "shipit", blob_id, ParticipantId::from_uuid(actor))
+            .await
+            .unwrap();
         assert_eq!(created.name, "shipit");
         assert_eq!(created.created_by, Some(actor));
 
@@ -188,8 +245,14 @@ mod db_tests {
         let fetched = repo.get(created.id).await.unwrap().expect("emoji exists");
         assert_eq!(fetched.id, created.id);
 
-        assert!(repo.delete(created.id, ws).await.unwrap());
-        assert!(!repo.delete(created.id, ws).await.unwrap(), "idempotent");
+        repo.delete_authorized(created.id, ws, ParticipantId::from_uuid(actor))
+            .await
+            .unwrap();
+        assert!(matches!(
+            repo.delete_authorized(created.id, ws, ParticipantId::from_uuid(actor))
+                .await,
+            Err(Error::NotFound(_))
+        ));
 
         let list2 = repo.list_for_workspace(ws).await.unwrap();
         assert!(list2.is_empty());

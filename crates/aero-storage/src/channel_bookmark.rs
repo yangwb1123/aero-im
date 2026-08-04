@@ -7,16 +7,17 @@
 //! items ([`BookmarkRepo`](crate::BookmarkRepo), which are per-user save-for-
 //! later) — a channel bookmark belongs to the channel itself.
 //!
-//! Every method is room-scoped: the caller (the server handler) is responsible
-//! for asserting room access before reading or mutating, mirroring the other
-//! room-scoped repos. Purely additive: a NEW [`ChannelBookmarkRepo`]; no existing
-//! repo is touched. The [`ChannelBookmark`] model lives here (and is re-exported
-//! from the crate root) rather than in `aero-common`, since it is a storage-layer
-//! projection.
+//! Every public operation owns a transaction-scoped effective-access recheck and
+//! binds global bookmark ids to the request's live channel. A cross-room id is an
+//! opaque not-found; a member whose access was revoked is forbidden.
 
-use aero_common::{ChannelBookmarkId, ParticipantId, RoomId};
+use aero_common::{ChannelBookmarkId, Error, ParticipantId, RoomId};
 use serde::Serialize;
 use sqlx::PgPool;
+
+const MAX_TITLE_CHARS: usize = 256;
+const MAX_URL_CHARS: usize = 2_048;
+const MAX_EMOJI_CHARS: usize = 64;
 
 /// One channel bookmark — a per-channel header link / pinned resource.
 ///
@@ -43,6 +44,19 @@ pub struct ChannelBookmark {
     /// When the bookmark was created (RFC 3339 on the wire).
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: time::OffsetDateTime,
+}
+
+/// Optional fields for one authorized channel-bookmark update.
+#[derive(Debug, Clone, Copy)]
+pub struct ChannelBookmarkPatch<'a> {
+    /// Replacement title; omitted to retain the current title.
+    pub title: Option<&'a str>,
+    /// Replacement URL; omitted to retain the current URL.
+    pub url: Option<&'a str>,
+    /// Omitted to retain the emoji, `Some(None)` to clear it.
+    pub emoji: Option<Option<&'a str>>,
+    /// Replacement display order; omitted to retain it.
+    pub position: Option<i32>,
 }
 
 /// The columns a [`ChannelBookmark`] is built from, in select order. Shared by
@@ -90,13 +104,11 @@ impl ChannelBookmarkRepo {
         Self { pool }
     }
 
-    /// Persist a new bookmark in `room`, created by `creator`, returning its
-    /// generated id. The caller is responsible for room-access and
-    /// title/url validation.
+    /// Persist a new bookmark while `creator` remains an effective member of the
+    /// live channel, returning the exact committed row.
     ///
     /// # Errors
-    /// Propagates any [`sqlx::Error`] from the insert.
-    pub async fn add(
+    pub async fn add_channel_bookmark_authorized(
         &self,
         room: RoomId,
         creator: ParticipantId,
@@ -104,34 +116,44 @@ impl ChannelBookmarkRepo {
         url: &str,
         emoji: Option<&str>,
         position: i32,
-    ) -> Result<ChannelBookmarkId, sqlx::Error> {
+    ) -> Result<ChannelBookmark, Error> {
+        let title = validate_required(title, MAX_TITLE_CHARS, "title")?;
+        let url = validate_required(url, MAX_URL_CHARS, "url")?;
+        let emoji = validate_emoji(emoji)?;
+        let mut tx = self.pool.begin().await?;
+        crate::canvas::lock_live_channel_access(&mut tx, room, creator).await?;
         let id = ChannelBookmarkId::new();
-        sqlx::query(
-            r"INSERT INTO channel_bookmarks
-                  (id, room_id, title, url, emoji, created_by, position)
-               VALUES ($1, $2, $3, $4, $5, $6, $7)",
-        )
-        .bind(id.to_uuid())
-        .bind(room.to_uuid())
-        .bind(title)
-        .bind(url)
-        .bind(emoji)
-        .bind(creator.to_uuid())
-        .bind(position)
-        .execute(&self.pool)
-        .await?;
-        Ok(id)
+        let sql = format!(
+            "INSERT INTO channel_bookmarks
+                 (id, room_id, title, url, emoji, created_by, position)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
+             RETURNING {COLUMNS}"
+        );
+        let row = sqlx::query_as::<_, Row>(&sql)
+            .bind(id.to_uuid())
+            .bind(room.to_uuid())
+            .bind(title)
+            .bind(url)
+            .bind(emoji.as_deref())
+            .bind(creator.to_uuid())
+            .bind(position)
+            .fetch_one(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(row_to_model(row))
     }
 
-    /// List `room`'s bookmarks in display order (by `position`, then
-    /// `created_at`). Room-scoped — the caller asserts room access first.
+    /// List a live channel's bookmarks in display order while the actor's
+    /// effective access remains locked.
     ///
     /// # Errors
-    /// Propagates any [`sqlx::Error`] from the query.
-    pub async fn list_for_room(
+    pub async fn list_channel_bookmarks_authorized(
         &self,
         room: RoomId,
-    ) -> Result<Vec<ChannelBookmark>, sqlx::Error> {
+        actor: ParticipantId,
+    ) -> Result<Vec<ChannelBookmark>, Error> {
+        let mut tx = self.pool.begin().await?;
+        crate::canvas::lock_live_channel_access(&mut tx, room, actor).await?;
         let sql = format!(
             "SELECT {COLUMNS}
                FROM channel_bookmarks
@@ -140,70 +162,150 @@ impl ChannelBookmarkRepo {
         );
         let rows = sqlx::query_as::<_, Row>(&sql)
             .bind(room.to_uuid())
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *tx)
             .await?;
+        tx.commit().await?;
         Ok(rows.into_iter().map(row_to_model).collect())
     }
 
-    /// Fetch one bookmark by id, or `None` if no such row exists. The caller
-    /// resolves the owning room from the returned row to assert room access.
+    /// Fetch one path-bound bookmark while effective live-channel access remains
+    /// locked. Missing and cross-room ids share one not-found result.
     ///
     /// # Errors
-    /// Propagates any [`sqlx::Error`] from the query.
-    pub async fn get(
+    pub async fn get_channel_bookmark_authorized(
         &self,
+        room: RoomId,
         id: ChannelBookmarkId,
-    ) -> Result<Option<ChannelBookmark>, sqlx::Error> {
-        let sql = format!("SELECT {COLUMNS} FROM channel_bookmarks WHERE id = $1");
+        actor: ParticipantId,
+    ) -> Result<ChannelBookmark, Error> {
+        let mut tx = self.pool.begin().await?;
+        crate::canvas::lock_live_channel_access(&mut tx, room, actor).await?;
+        let sql = format!("SELECT {COLUMNS} FROM channel_bookmarks WHERE id = $1 AND room_id = $2");
         let row = sqlx::query_as::<_, Row>(&sql)
             .bind(id.to_uuid())
-            .fetch_optional(&self.pool)
-            .await?;
-        Ok(row.map(row_to_model))
+            .bind(room.to_uuid())
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(|| Error::NotFound(format!("channel bookmark {id}")))?;
+        tx.commit().await?;
+        Ok(row_to_model(row))
     }
 
-    /// Update a bookmark's title, url, emoji, and position in place. Returns
-    /// `true` iff a row was changed (so a missing id is a no-op returning
-    /// `false`). The caller asserts room access (via [`get`](Self::get)) first.
+    /// Update a path-bound bookmark while the actor's effective channel access
+    /// remains locked. `emoji = None` leaves it unchanged; `Some(None)` clears
+    /// it; `Some(Some(value))` replaces it.
     ///
     /// # Errors
-    /// Propagates any [`sqlx::Error`] from the update.
-    pub async fn update(
+    pub async fn update_channel_bookmark_authorized(
         &self,
+        room: RoomId,
         id: ChannelBookmarkId,
-        title: &str,
-        url: &str,
-        emoji: Option<&str>,
-        position: i32,
-    ) -> Result<bool, sqlx::Error> {
-        let result = sqlx::query(
-            r"UPDATE channel_bookmarks
-                 SET title = $2, url = $3, emoji = $4, position = $5
-               WHERE id = $1",
+        actor: ParticipantId,
+        patch: ChannelBookmarkPatch<'_>,
+    ) -> Result<ChannelBookmark, Error> {
+        let ChannelBookmarkPatch {
+            title,
+            url,
+            emoji,
+            position,
+        } = patch;
+        if title.is_none() && url.is_none() && emoji.is_none() && position.is_none() {
+            return Err(Error::Invalid("bookmark patch is empty".into()));
+        }
+        let title = title
+            .map(|value| validate_required(value, MAX_TITLE_CHARS, "title"))
+            .transpose()?;
+        let url = url
+            .map(|value| validate_required(value, MAX_URL_CHARS, "url"))
+            .transpose()?;
+        let emoji = emoji.map(validate_emoji).transpose()?;
+
+        let mut tx = self.pool.begin().await?;
+        crate::canvas::lock_live_channel_access(&mut tx, room, actor).await?;
+        let exists = sqlx::query_scalar::<_, bool>(
+            "SELECT true
+               FROM channel_bookmarks
+              WHERE id = $1 AND room_id = $2
+              FOR UPDATE",
         )
         .bind(id.to_uuid())
-        .bind(title)
-        .bind(url)
-        .bind(emoji)
-        .bind(position)
-        .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected() > 0)
+        .bind(room.to_uuid())
+        .fetch_optional(&mut *tx)
+        .await?
+        .is_some();
+        if !exists {
+            return Err(Error::NotFound(format!("channel bookmark {id}")));
+        }
+
+        let sql = format!(
+            r"UPDATE channel_bookmarks
+                 SET title = COALESCE($3, title),
+                     url = COALESCE($4, url),
+                     emoji = CASE WHEN $5 THEN $6 ELSE emoji END,
+                     position = COALESCE($7, position)
+               WHERE id = $1 AND room_id = $2
+               RETURNING {COLUMNS}"
+        );
+        let row = sqlx::query_as::<_, Row>(&sql)
+            .bind(id.to_uuid())
+            .bind(room.to_uuid())
+            .bind(title.as_deref())
+            .bind(url.as_deref())
+            .bind(emoji.is_some())
+            .bind(emoji.as_ref().and_then(Option::as_deref))
+            .bind(position)
+            .fetch_one(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(row_to_model(row))
     }
 
-    /// Delete a bookmark by id. Returns `true` iff a row was removed, so a second
-    /// delete (or an unknown id) is a no-op returning `false`. The caller asserts
-    /// room access (via [`get`](Self::get)) first.
+    /// Delete a path-bound bookmark while effective live-channel access remains
+    /// locked. Missing/already-deleted/cross-room ids are opaque not-found.
     ///
     /// # Errors
-    /// Propagates any [`sqlx::Error`] from the delete.
-    pub async fn delete(&self, id: ChannelBookmarkId) -> Result<bool, sqlx::Error> {
-        let result = sqlx::query("DELETE FROM channel_bookmarks WHERE id = $1")
-            .bind(id.to_uuid())
-            .execute(&self.pool)
-            .await?;
-        Ok(result.rows_affected() > 0)
+    pub async fn delete_channel_bookmark_authorized(
+        &self,
+        room: RoomId,
+        id: ChannelBookmarkId,
+        actor: ParticipantId,
+    ) -> Result<(), Error> {
+        let mut tx = self.pool.begin().await?;
+        crate::canvas::lock_live_channel_access(&mut tx, room, actor).await?;
+        let deleted = sqlx::query_scalar::<_, uuid::Uuid>(
+            "DELETE FROM channel_bookmarks
+              WHERE id = $1 AND room_id = $2
+              RETURNING id",
+        )
+        .bind(id.to_uuid())
+        .bind(room.to_uuid())
+        .fetch_optional(&mut *tx)
+        .await?;
+        if deleted.is_none() {
+            return Err(Error::NotFound(format!("channel bookmark {id}")));
+        }
+        tx.commit().await?;
+        Ok(())
     }
+}
+
+fn validate_required(raw: &str, max_chars: usize, field: &str) -> Result<String, Error> {
+    let value = raw.trim();
+    if value.is_empty() {
+        return Err(Error::Invalid(format!("{field} must not be empty")));
+    }
+    if value.chars().count() > max_chars {
+        return Err(Error::Invalid(format!("{field} too long")));
+    }
+    Ok(value.to_owned())
+}
+
+fn validate_emoji(raw: Option<&str>) -> Result<Option<String>, Error> {
+    let value = raw.map(str::trim).filter(|value| !value.is_empty());
+    if value.is_some_and(|value| value.chars().count() > MAX_EMOJI_CHARS) {
+        return Err(Error::Invalid("emoji too long".into()));
+    }
+    Ok(value.map(str::to_owned))
 }
 
 /// PG-gated integration tests (run with a live Postgres + applied migrations):
@@ -213,6 +315,10 @@ impl ChannelBookmarkRepo {
 ///   cargo test -p aero-storage --lib -- --ignored channel_bookmark
 /// ```
 #[cfg(test)]
+#[path = "channel_bookmark/security_tests.rs"]
+mod security_tests;
+
+#[cfg(any())] // Replaced by transaction-fence PG tests in this change.
 mod db_tests {
     use super::*;
 

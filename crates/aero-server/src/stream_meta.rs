@@ -60,7 +60,9 @@ pub(crate) fn validate_title(raw: &str) -> AeroResult<String> {
         return Err(AeroError::Invalid("title must not be empty".into()));
     }
     if trimmed.chars().count() > MAX_TITLE_LEN {
-        return Err(AeroError::Invalid(format!("title too long (max {MAX_TITLE_LEN} chars)")));
+        return Err(AeroError::Invalid(format!(
+            "title too long (max {MAX_TITLE_LEN} chars)"
+        )));
     }
     Ok(trimmed.to_owned())
 }
@@ -118,7 +120,9 @@ async fn update_meta(
         .await
         .map_err(AeroError::from)?
         .ok_or_else(|| AeroError::NotFound(format!("stream {id}")))?;
-    Ok(Json(serde_json::to_value(updated).map_err(AeroError::from)?))
+    Ok(Json(
+        serde_json::to_value(updated).map_err(AeroError::from)?,
+    ))
 }
 
 #[cfg(test)]
@@ -143,7 +147,10 @@ mod tests {
         let long: String = "a".repeat(MAX_TITLE_LEN + 1);
         assert!(validate_title(&long).is_err());
         let max: String = "b".repeat(MAX_TITLE_LEN);
-        assert_eq!(validate_title(&max).expect("ok").chars().count(), MAX_TITLE_LEN);
+        assert_eq!(
+            validate_title(&max).expect("ok").chars().count(),
+            MAX_TITLE_LEN
+        );
     }
 
     #[test]
@@ -151,7 +158,10 @@ mod tests {
         // Multi-byte chars count once each, so a string of MAX multi-byte chars
         // is accepted even though its byte length far exceeds the cap.
         let multibyte: String = "界".repeat(MAX_TITLE_LEN);
-        assert!(multibyte.len() > MAX_TITLE_LEN, "precondition: byte len exceeds cap");
+        assert!(
+            multibyte.len() > MAX_TITLE_LEN,
+            "precondition: byte len exceeds cap"
+        );
         assert!(validate_title(&multibyte).is_ok());
         let over: String = "界".repeat(MAX_TITLE_LEN + 1);
         assert!(validate_title(&over).is_err());

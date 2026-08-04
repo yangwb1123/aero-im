@@ -60,24 +60,26 @@ async fn mark_seen(
         .await?
         .filter(|m| m.deleted_at.is_none())
         .ok_or_else(|| AeroError::NotFound(format!("message {message}")))?;
-    s.im.assert_room_access(auth.participant_id, msg.room_id).await?;
+    s.im.assert_room_access(auth.participant_id, msg.room_id)
+        .await?;
 
     let created = repo(&s).mark_read(message, auth.participant_id).await?;
     // Only broadcast on a genuine first-seen, so a client re-marking on every
     // scroll doesn't spam the room's bus.
     if created {
-        s.im
-            .broadcast_room_event(
-                msg.room_id,
-                RoomEvent::MessageSeen {
-                    room_id: msg.room_id,
-                    message_id: message,
-                    participant: auth.participant_id,
-                },
-            )
-            .await;
+        s.im.broadcast_room_event(
+            msg.room_id,
+            RoomEvent::MessageSeen {
+                room_id: msg.room_id,
+                message_id: message,
+                participant: auth.participant_id,
+            },
+        )
+        .await;
     }
-    Ok(Json(serde_json::json!({ "seen": true, "created": created })))
+    Ok(Json(
+        serde_json::json!({ "seen": true, "created": created }),
+    ))
 }
 
 /// `GET /api/messages/:id/seen` — the reader list for a message: every
@@ -96,7 +98,8 @@ async fn list_seen(
         .await?
         .filter(|m| m.deleted_at.is_none())
         .ok_or_else(|| AeroError::NotFound(format!("message {message}")))?;
-    s.im.assert_room_access(auth.participant_id, msg.room_id).await?;
+    s.im.assert_room_access(auth.participant_id, msg.room_id)
+        .await?;
 
     let readers = repo(&s).list_readers(message).await?;
     let body: Vec<serde_json::Value> = readers
@@ -110,5 +113,7 @@ async fn list_seen(
             })
         })
         .collect();
-    Ok(Json(serde_json::json!({ "message_id": message, "readers": body })))
+    Ok(Json(
+        serde_json::json!({ "message_id": message, "readers": body }),
+    ))
 }

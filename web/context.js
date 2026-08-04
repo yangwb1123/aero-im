@@ -55,12 +55,20 @@ export const state = {
 // ---------- ws singleton ----------
 export const ws = new WsClient();
 
+export function hasPendingForRoom(roomId) {
+  for (const pending of state.pendingByTempId.values()) {
+    if (pending.room_id === roomId) return true;
+  }
+  return false;
+}
+
 // ---------- cached DOM refs ----------
 export const els = {
   viewAuth: $('#view-auth'),
   viewChat: $('#view-chat'),
   formLogin: $('#form-login'),
   formRegister: $('#form-register'),
+  loginSecondFactor: $('#form-login input[name="second_factor"]'),
   tabs: $$('.tab'),
   tabPanels: $$('[data-tab-panel]'),
 

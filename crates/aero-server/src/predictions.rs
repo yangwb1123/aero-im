@@ -80,6 +80,7 @@ fn map_stake_error(e: StakeError) -> AeroError {
     match e {
         StakeError::NotFound => AeroError::NotFound("prediction not found".into()),
         StakeError::BadState => AeroError::Conflict("prediction is not open for staking".into()),
+        StakeError::Expired => AeroError::Conflict("prediction has expired".into()),
         StakeError::BadOutcome => AeroError::Invalid("no such outcome".into()),
         StakeError::InsufficientPoints => AeroError::Conflict("insufficient points".into()),
         StakeError::AlreadyStaked => {
@@ -187,9 +188,23 @@ async fn create_prediction(
         ))
         .into());
     }
+    if req
+        .expires_at
+        .is_some_and(|at| at <= time::OffsetDateTime::now_utc())
+    {
+        return Err(
+            AeroError::Invalid("prediction expires_at must be in the future".into()).into(),
+        );
+    }
 
     let pred = repo(&s)
-        .create_prediction(stream, auth.participant_id, question, &outcomes, req.expires_at)
+        .create_prediction(
+            stream,
+            auth.participant_id,
+            question,
+            &outcomes,
+            req.expires_at,
+        )
         .await
         .map_err(AeroError::from)?;
 
@@ -258,7 +273,8 @@ async fn lock(
     Path(id_str): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let prediction = parse_prediction(&id_str)?;
-    let (creator, _stream) = require_prediction_creator(&s, prediction, auth.participant_id).await?;
+    let (creator, _stream) =
+        require_prediction_creator(&s, prediction, auth.participant_id).await?;
     let locked = repo(&s).lock(prediction).await.map_err(AeroError::from)?;
 
     if locked {
@@ -289,7 +305,8 @@ async fn resolve(
     Json(req): Json<ResolveReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let prediction = parse_prediction(&id_str)?;
-    let (creator, _stream) = require_prediction_creator(&s, prediction, auth.participant_id).await?;
+    let (creator, _stream) =
+        require_prediction_creator(&s, prediction, auth.participant_id).await?;
     let payouts = repo(&s)
         .resolve(prediction, req.winning_outcome_idx)
         .await
@@ -373,14 +390,16 @@ async fn prediction_analytics(
         .map_err(AeroError::from)?
         .ok_or_else(|| AeroError::NotFound(format!("stream {stream}")))?;
     if row.owner_id != auth.participant_id {
-        return Err(
-            AeroError::Forbidden("only the stream owner may view prediction analytics".into())
-                .into(),
-        );
+        return Err(AeroError::Forbidden(
+            "only the stream owner may view prediction analytics".into(),
+        )
+        .into());
     }
     let analytics = repo(&s)
         .creator_analytics(stream)
         .await
         .map_err(AeroError::from)?;
-    Ok(Json(serde_json::to_value(analytics).map_err(AeroError::from)?))
+    Ok(Json(
+        serde_json::to_value(analytics).map_err(AeroError::from)?,
+    ))
 }

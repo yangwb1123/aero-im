@@ -21,10 +21,7 @@ use crate::error::ApiResult;
 use crate::state::AppState;
 
 pub fn routes() -> Router<AppState> {
-    Router::new().route(
-        "/api/admin/participants/:id/verify",
-        patch(set_verified),
-    )
+    Router::new().route("/api/admin/participants/:id/verify", patch(set_verified))
 }
 
 fn parse_participant_id(s: &str) -> Result<ParticipantId, AeroError> {
@@ -53,7 +50,7 @@ async fn set_verified(
     // Platform-admin gate: caller must be Admin or Owner of the default workspace.
     let role = s
         .workspaces
-        .member_role(DEFAULT_WORKSPACE, auth.participant_id)
+        .effective_member_role(DEFAULT_WORKSPACE, auth.participant_id)
         .await
         .map_err(AeroError::from)?
         .ok_or_else(|| AeroError::Forbidden("platform admin required".into()))?;
@@ -62,9 +59,10 @@ async fn set_verified(
     }
     let target = parse_participant_id(&id_str)?;
     s.participants
-        .set_verified(target, req.verified)
+        .set_verified_authorized(DEFAULT_WORKSPACE, auth.participant_id, target, req.verified)
         .await
-        .map_err(AeroError::from)?;
+        .map_err(map_verified_write_error)?;
+    s.participant_cache.invalidate(&target);
     Ok(Json(serde_json::json!({
         "participant_id": target,
         "is_verified": req.verified,
@@ -82,34 +80,40 @@ pub async fn get_verified_status(
 ) -> ApiResult<Json<serde_json::Value>> {
     let target = parse_participant_id(&id_str)?;
     let row = s
-        .participants
-        .get(target)
+        .participant_cache
+        .get_or_fetch(target, &s.participants)
         .await
         .map_err(AeroError::from)?
         .ok_or_else(|| AeroError::NotFound("participant".into()))?;
     // is_verified is not yet on the Participant struct — query directly.
-    let is_verified: bool = sqlx::query_scalar(
-        "SELECT is_verified FROM participants WHERE id = $1",
-    )
-    .bind(target.to_uuid())
-    .fetch_optional(&s.pg)
-    .await
-    .map_err(AeroError::from)?
-    .unwrap_or(false);
-    let verified_at: Option<time::OffsetDateTime> = sqlx::query_scalar(
-        "SELECT verified_at FROM participants WHERE id = $1",
-    )
-    .bind(target.to_uuid())
-    .fetch_optional(&s.pg)
-    .await
-    .map_err(AeroError::from)?
-    .flatten();
+    let is_verified: bool =
+        sqlx::query_scalar("SELECT is_verified FROM participants WHERE id = $1")
+            .bind(target.to_uuid())
+            .fetch_optional(&s.pg)
+            .await
+            .map_err(AeroError::from)?
+            .unwrap_or(false);
+    let verified_at: Option<time::OffsetDateTime> =
+        sqlx::query_scalar("SELECT verified_at FROM participants WHERE id = $1")
+            .bind(target.to_uuid())
+            .fetch_optional(&s.pg)
+            .await
+            .map_err(AeroError::from)?
+            .flatten();
     let _ = row; // participant exists check done
     Ok(Json(serde_json::json!({
         "participant_id": target,
         "is_verified": is_verified,
         "verified_at": verified_at.map(|t| t.to_string()),
     })))
+}
+
+fn map_verified_write_error(error: AeroError) -> AeroError {
+    match error {
+        AeroError::Forbidden(_) => AeroError::Forbidden("platform admin required".into()),
+        AeroError::NotFound(_) => AeroError::NotFound("active participant".into()),
+        other => other,
+    }
 }
 
 pub fn get_routes() -> Router<AppState> {
@@ -126,6 +130,19 @@ mod tests {
     #[test]
     fn default_workspace_is_all_zero_ulid() {
         // The all-zero ulid is the documented DEFAULT_WORKSPACE_ID sentinel in routes.rs.
-        assert_eq!(DEFAULT_WORKSPACE.0.to_string(), "00000000000000000000000000");
+        assert_eq!(
+            DEFAULT_WORKSPACE.0.to_string(),
+            "00000000000000000000000000"
+        );
+    }
+
+    #[test]
+    fn verified_write_errors_have_stable_public_shapes() {
+        let revoked = map_verified_write_error(AeroError::Forbidden("demoted".into()));
+        assert_eq!(revoked.status_code(), 403);
+        assert_eq!(revoked.to_string(), "forbidden: platform admin required");
+        let missing = map_verified_write_error(AeroError::NotFound("deleted target id".into()));
+        assert_eq!(missing.status_code(), 404);
+        assert_eq!(missing.to_string(), "not found: active participant");
     }
 }

@@ -127,7 +127,10 @@ pub enum Block {
 
 impl Block {
     pub fn text(content: impl Into<String>) -> Self {
-        Self::Text { content: content.into(), spans: Vec::new() }
+        Self::Text {
+            content: content.into(),
+            spans: Vec::new(),
+        }
     }
 
     /// Returns the primary plain-text projection used for fulltext indexing and
@@ -141,8 +144,14 @@ impl Block {
     pub fn searchable_text(&self) -> Option<&str> {
         match self {
             Self::Text { content, .. } | Self::Code { content, .. } => Some(content),
-            Self::Voice { transcript: Some(t), .. } => Some(t),
-            Self::Thought { content, hidden: false } => Some(content),
+            Self::Voice {
+                transcript: Some(t),
+                ..
+            } => Some(t),
+            Self::Thought {
+                content,
+                hidden: false,
+            } => Some(content),
             Self::Button { label, .. } => Some(label),
             // Index the attachment's file name so a message carrying e.g.
             // "deploy-runbook.pdf" is findable by name (ROADMAP5 方向三: file search

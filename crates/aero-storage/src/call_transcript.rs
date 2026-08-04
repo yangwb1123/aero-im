@@ -4,9 +4,10 @@
 //! repo:
 //! - `call_transcripts` rows: the *final* caption lines spoken during a call,
 //!   appended one-per-line off the existing P3 caption relay (see the
-//!   `CallCaption` handler in `aero-server`'s `ws.rs`). [`CallTranscriptRepo::append`]
-//!   is the write path; [`CallTranscriptRepo::lines`] reads them back in spoken
-//!   order for display or for grounding an AI recap.
+//!   `CallCaption` handler in `aero-server`'s `ws.rs`).
+//!   [`CallTranscriptRepo::append_authorized`] is the write path;
+//!   [`CallTranscriptRepo::lines`] reads them back in spoken order for display
+//!   or for grounding an AI recap.
 //! - `call_sessions.recap`: the post-call AI summary grounded in the joined
 //!   transcript, written once when the call ends ([`CallTranscriptRepo::set_recap`])
 //!   and read back via [`CallTranscriptRepo::recap`].
@@ -20,7 +21,7 @@
 //! from the crate root) rather than in `aero-common`, since it is a storage-layer
 //! projection.
 
-use aero_common::{CallId, ParticipantId};
+use aero_common::{CallId, ParticipantId, RoomId};
 use serde::Serialize;
 use sqlx::PgPool;
 
@@ -69,18 +70,26 @@ impl CallTranscriptRepo {
         Self { pool }
     }
 
-    /// Append one transcript line for `call`, spoken by `speaker`. The primary
-    /// key is generated inline from a fresh ULID. The caller is responsible for
-    /// access-gating and for trimming/non-empty validation of `text`.
+    /// Append one transcript line for `call`, spoken by `speaker`.
+    ///
+    /// The insert shares one transaction with the canonical call-room,
+    /// effective room-access, active call-leg, and live-call checks. A room
+    /// membership revocation or call end therefore either commits first and
+    /// rejects the caption, or waits until the complete line has committed.
+    /// The caller remains responsible for trimming/non-empty validation.
     ///
     /// # Errors
     /// Propagates any [`sqlx::Error`] from the insert.
-    pub async fn append(
+    pub async fn append_authorized(
         &self,
         call: CallId,
         speaker: ParticipantId,
+        expected_room: RoomId,
         text: &str,
-    ) -> Result<(), sqlx::Error> {
+    ) -> aero_common::Result<()> {
+        let mut tx = self.pool.begin().await?;
+        crate::call::lock_authorized_active_call(&mut tx, call, speaker, expected_room, None, None)
+            .await?;
         let id = uuid::Uuid::from_u128(ulid::Ulid::new().0);
         sqlx::query(
             r"INSERT INTO call_transcripts (id, call_id, speaker_id, text)
@@ -90,8 +99,9 @@ impl CallTranscriptRepo {
         .bind(call.to_uuid())
         .bind(speaker.to_uuid())
         .bind(text)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -150,9 +160,7 @@ impl CallTranscriptRepo {
 #[cfg(test)]
 mod db_tests {
     use super::*;
-    use aero_common::{CallKind, CallMode, RoomId};
-
-    const DEFAULT_WS: &str = "00000000-0000-0000-0000-000000000000";
+    use aero_common::{CallKind, CallMode, RoomId, WorkspaceId};
 
     fn pool() -> PgPool {
         let url = std::env::var("DATABASE_URL")
@@ -174,51 +182,127 @@ mod db_tests {
         id
     }
 
-    async fn room(p: &PgPool, creator: ParticipantId) -> RoomId {
+    async fn room(p: &PgPool, creator: ParticipantId) -> (WorkspaceId, RoomId) {
+        let workspace = WorkspaceId::new();
         let id = RoomId::new();
+        let mut tx = p.begin().await.expect("begin transcript fixture");
+        sqlx::query(
+            "INSERT INTO workspaces (id, name, slug, created_by)
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(workspace.to_uuid())
+        .bind(format!("transcript-workspace-{workspace}"))
+        .bind(format!("transcript-{workspace}"))
+        .bind(creator.to_uuid())
+        .execute(&mut *tx)
+        .await
+        .expect("insert transcript workspace");
+        sqlx::query(
+            "INSERT INTO workspace_members (workspace_id, participant_id, role)
+             VALUES ($1, $2, 'owner')",
+        )
+        .bind(workspace.to_uuid())
+        .bind(creator.to_uuid())
+        .execute(&mut *tx)
+        .await
+        .expect("insert transcript workspace owner");
         sqlx::query(
             "INSERT INTO rooms (id, kind, name, created_by, created_at, workspace_id)
-             VALUES ($1, 'direct', $2, $3, now(), $4)",
+             VALUES ($1, 'group', $2, $3, now(), $4)",
         )
         .bind(id.to_uuid())
         .bind(format!("transcript-room-{id}"))
         .bind(creator.to_uuid())
-        .bind(uuid::Uuid::parse_str(DEFAULT_WS).expect("uuid"))
-        .execute(p)
+        .bind(workspace.to_uuid())
+        .execute(&mut *tx)
         .await
         .expect("insert room");
-        id
+        tx.commit().await.expect("commit transcript fixture");
+        (workspace, id)
     }
 
-    /// `append` two lines → `lines` returns them in spoken order; `set_recap` /
-    /// `recap` round-trip over `call_sessions.recap`.
+    async fn grant_access(
+        p: &PgPool,
+        workspace: WorkspaceId,
+        room: RoomId,
+        participants: &[ParticipantId],
+    ) {
+        for participant in participants {
+            sqlx::query(
+                "INSERT INTO workspace_members (workspace_id, participant_id, role)
+                 VALUES ($1, $2, 'member')
+                 ON CONFLICT DO NOTHING",
+            )
+            .bind(workspace.to_uuid())
+            .bind(participant.to_uuid())
+            .execute(p)
+            .await
+            .expect("insert workspace member");
+            sqlx::query(
+                "INSERT INTO room_members (room_id, participant_id, role)
+                 VALUES ($1, $2, 'member')
+                 ON CONFLICT DO NOTHING",
+            )
+            .bind(room.to_uuid())
+            .bind(participant.to_uuid())
+            .execute(p)
+            .await
+            .expect("insert room member");
+        }
+    }
+
+    /// `append_authorized` two lines → `lines` returns them in spoken order;
+    /// `set_recap` / `recap` round-trip over `call_sessions.recap`.
     #[tokio::test]
     #[ignore = "requires live Postgres"]
     async fn append_lines_and_recap_roundtrip() {
         let p = pool();
         let repo = CallTranscriptRepo::new(p.clone());
-        let caller = participant(&p, "caller").await;
-        let callee = participant(&p, "callee").await;
-        let r = room(&p, caller).await;
+        let initiator = participant(&p, "caller").await;
+        let recipient = participant(&p, "callee").await;
+        let (workspace, r) = room(&p, initiator).await;
 
-        // A real call session so `set_recap`/`recap` (which update/select
-        // `call_sessions`) have a row to hang off.
+        grant_access(&p, workspace, r, &[initiator, recipient]).await;
+
+        // A real call session so transcript authorization and recap storage have
+        // a canonical aggregate to bind to.
         let call_id = CallId::new();
         crate::CallRepo::new(p.clone())
-            .start(call_id, r, caller, CallKind::Audio, CallMode::P2p, &[callee])
+            .start(
+                call_id,
+                r,
+                initiator,
+                CallKind::Audio,
+                CallMode::P2p,
+                &[recipient],
+            )
             .await
             .expect("start call");
 
         // Append two lines (caller then callee).
-        repo.append(call_id, caller, "hello there").await.unwrap();
-        repo.append(call_id, callee, "general kenobi").await.unwrap();
+        repo.append_authorized(call_id, initiator, r, "hello there")
+            .await
+            .unwrap();
+        repo.append_authorized(call_id, recipient, r, "general kenobi")
+            .await
+            .unwrap();
 
         let lines = repo.lines(call_id).await.unwrap();
         assert_eq!(lines.len(), 2, "both lines persisted");
-        assert_eq!(lines[0].speaker_id, caller);
+        assert_eq!(lines[0].speaker_id, initiator);
         assert_eq!(lines[0].text, "hello there");
-        assert_eq!(lines[1].speaker_id, callee);
+        assert_eq!(lines[1].speaker_id, recipient);
         assert_eq!(lines[1].text, "general kenobi");
+
+        let raw_rewrite =
+            sqlx::query("UPDATE call_transcripts SET text = 'rewritten' WHERE call_id = $1")
+                .bind(call_id.to_uuid())
+                .execute(&p)
+                .await;
+        assert!(
+            raw_rewrite.is_err(),
+            "persisted transcript lines are append-only"
+        );
 
         // Recap round-trips; absent before, present after.
         assert!(repo.recap(call_id).await.unwrap().is_none(), "no recap yet");
@@ -240,11 +324,82 @@ mod db_tests {
             .execute(&p)
             .await
             .ok();
-        sqlx::query("DELETE FROM rooms WHERE id = $1").bind(r.to_uuid()).execute(&p).await.ok();
-        sqlx::query("DELETE FROM participants WHERE id = ANY($1)")
-            .bind(vec![caller.to_uuid(), callee.to_uuid()])
+        sqlx::query("DELETE FROM rooms WHERE id = $1")
+            .bind(r.to_uuid())
             .execute(&p)
             .await
             .ok();
+        sqlx::query("DELETE FROM workspaces WHERE id = $1")
+            .bind(workspace.to_uuid())
+            .execute(&p)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM participants WHERE id = ANY($1)")
+            .bind(vec![initiator.to_uuid(), recipient.to_uuid()])
+            .execute(&p)
+            .await
+            .ok();
+    }
+
+    /// An in-flight caption cannot cross a concurrent room-membership
+    /// revocation. The append waits on the membership fence and then rejects
+    /// without leaving a transcript row.
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn append_is_linearized_with_room_revocation() {
+        let p = pool();
+        let repo = CallTranscriptRepo::new(p.clone());
+        let initiator = participant(&p, "revoked-caller").await;
+        let recipient = participant(&p, "revoked-callee").await;
+        let (workspace, r) = room(&p, initiator).await;
+        grant_access(&p, workspace, r, &[initiator, recipient]).await;
+        let call_id = CallId::new();
+        crate::CallRepo::new(p.clone())
+            .start(
+                call_id,
+                r,
+                initiator,
+                CallKind::Audio,
+                CallMode::P2p,
+                &[recipient],
+            )
+            .await
+            .expect("start call");
+
+        let mut revoke = p.begin().await.expect("begin revocation");
+        sqlx::query(
+            "DELETE FROM room_members
+              WHERE room_id = $1 AND participant_id = $2",
+        )
+        .bind(r.to_uuid())
+        .bind(initiator.to_uuid())
+        .execute(&mut *revoke)
+        .await
+        .expect("stage revocation");
+
+        let append = repo.append_authorized(call_id, initiator, r, "must not persist");
+        tokio::pin!(append);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(150), &mut append)
+                .await
+                .is_err(),
+            "caption must wait for the membership revocation transaction"
+        );
+        revoke.commit().await.expect("commit revocation");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), append)
+                .await
+                .expect("append completes after revocation")
+                .is_err(),
+            "committed revocation must reject the caption"
+        );
+
+        let persisted: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM call_transcripts WHERE call_id = $1")
+                .bind(call_id.to_uuid())
+                .fetch_one(&p)
+                .await
+                .expect("count transcript lines");
+        assert_eq!(persisted, 0);
     }
 }

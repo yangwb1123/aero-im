@@ -11,11 +11,11 @@
 //! and `size`. [`WorkspaceFileRepo::list_for_workspace`] laterally unnests that
 //! array and projects one [`WorkspaceFile`] per file block, newest-message-first.
 //!
-//! The `JOIN room_members` is the security boundary, replicating
-//! [`MessageRepo::search_all_rooms_in_workspace`](crate::MessageRepo): a caller
-//! only ever sees files from rooms they are in within the workspace, so the
-//! browser can never leak an attachment from a room they don't belong to. There
-//! is NO migration and NO new id — it reads existing tables only.
+//! The same effective-access boundary as
+//! [`MessageRepo::search_all_rooms_in_workspace`](crate::MessageRepo) intersects
+//! room/workspace membership, active account/deactivation state, and mandatory
+//! 2FA, so stale room edges cannot leak attachments. There is NO migration and
+//! NO new id — it reads existing tables only.
 //!
 //! Purely additive: a NEW [`WorkspaceFileRepo`]; no existing repo is touched. The
 //! [`WorkspaceFile`] model lives here (and is re-exported from the crate root)
@@ -119,8 +119,9 @@ impl WorkspaceFileRepo {
     ///
     /// Laterally unnests each (non-deleted) message's `blocks` array and projects
     /// one [`WorkspaceFile`] per `File` block (`b->>'type' = 'file'`). The
-    /// `JOIN room_members` is the membership boundary — only files from rooms the
-    /// caller is in are ever returned. An optional `kind` narrows to one file kind
+    /// Effective-access joins are the authorization boundary — only files from
+    /// rooms the caller may currently access are returned. An optional `kind`
+    /// narrows to one file kind
     /// (exact match, e.g. `image`); an optional `q` narrows by a filename
     /// substring (`ILIKE '%q%'`). A blank/empty filter is ignored (treated as
     /// absent). `limit` is clamped into `[1, MAX_FILES_LIMIT]` and `offset` floored
@@ -158,9 +159,25 @@ impl WorkspaceFileRepo {
                     m.created_at
                FROM messages m
                JOIN rooms r ON m.room_id = r.id
-               JOIN room_members rm ON rm.room_id = r.id AND rm.participant_id = $1
+               JOIN workspaces w ON w.id = r.workspace_id
+               JOIN room_members rm
+                 ON rm.room_id = r.id AND rm.participant_id = $1
+               JOIN workspace_members wm
+                 ON wm.workspace_id = r.workspace_id AND wm.participant_id = $1
+               JOIN participants viewer
+                 ON viewer.id = $1 AND viewer.deleted_at IS NULL
+               LEFT JOIN workspace_deactivations deactivated
+                 ON deactivated.workspace_id = r.workspace_id
+                AND deactivated.participant_id = $1
+               LEFT JOIN totp_secrets totp ON totp.participant_id = $1
                CROSS JOIN LATERAL jsonb_array_elements(m.blocks) AS b
               WHERE r.workspace_id = $2
+                AND deactivated.participant_id IS NULL
+                AND (
+                    viewer.kind <> 'human'
+                    OR NOT w.require_2fa
+                    OR COALESCE(totp.activated, false)
+                )
                 AND m.deleted_at IS NULL
                 AND b->>'type' = 'file'",
         );
@@ -175,7 +192,12 @@ impl WorkspaceFileRepo {
             let _ = write!(sql, " AND b->>'name' ILIKE '%'||${idx}||'%'");
             idx += 1;
         }
-        let _ = write!(sql, " ORDER BY m.id DESC LIMIT ${} OFFSET ${}", idx, idx + 1);
+        let _ = write!(
+            sql,
+            " ORDER BY m.id DESC LIMIT ${} OFFSET ${}",
+            idx,
+            idx + 1
+        );
 
         let mut query = sqlx::query_as::<_, Row>(&sql)
             .bind(caller.to_uuid())
@@ -186,11 +208,7 @@ impl WorkspaceFileRepo {
         if let Some(needle) = q {
             query = query.bind(needle.to_owned());
         }
-        let rows = query
-            .bind(limit)
-            .bind(offset)
-            .fetch_all(&self.pool)
-            .await?;
+        let rows = query.bind(limit).bind(offset).fetch_all(&self.pool).await?;
         Ok(rows.into_iter().filter_map(row_to_model).collect())
     }
 }
@@ -204,7 +222,11 @@ mod tests {
         assert_eq!(clamp_limit(0), 1, "zero floors to 1");
         assert_eq!(clamp_limit(-5), 1, "negative floors to 1");
         assert_eq!(clamp_limit(50), 50, "in-range passes through");
-        assert_eq!(clamp_limit(MAX_FILES_LIMIT), MAX_FILES_LIMIT, "cap passes through");
+        assert_eq!(
+            clamp_limit(MAX_FILES_LIMIT),
+            MAX_FILES_LIMIT,
+            "cap passes through"
+        );
         assert_eq!(clamp_limit(10_000), MAX_FILES_LIMIT, "over-cap clamps down");
     }
 
@@ -275,10 +297,7 @@ mod tests {
 #[cfg(test)]
 mod db_tests {
     use super::*;
-
-    /// The reserved all-zero default workspace, guaranteed to exist by migration
-    /// 0006's backfill — reused as the seeded rooms' tenant.
-    const DEFAULT_WS: &str = "00000000-0000-0000-0000-000000000000";
+    use crate::WorkspaceRepo;
 
     fn pool() -> PgPool {
         let url = std::env::var("DATABASE_URL")
@@ -289,8 +308,28 @@ mod db_tests {
             .expect("connect_lazy never fails on a well-formed URL")
     }
 
-    fn default_ws() -> WorkspaceId {
-        WorkspaceId::from_uuid(uuid::Uuid::parse_str(DEFAULT_WS).expect("valid uuid"))
+    async fn mk_workspace(p: &PgPool, owner: ParticipantId) -> WorkspaceId {
+        WorkspaceRepo::new(p.clone())
+            .create(
+                format!("Workspace files {owner}"),
+                format!("workspace-files-{owner}"),
+                owner,
+            )
+            .await
+            .expect("create workspace")
+            .id
+    }
+
+    async fn enroll(p: &PgPool, workspace: WorkspaceId, participant: ParticipantId) {
+        sqlx::query(
+            "INSERT INTO workspace_members (workspace_id, participant_id, role)
+             VALUES ($1, $2, 'member')",
+        )
+        .bind(workspace.to_uuid())
+        .bind(participant.to_uuid())
+        .execute(p)
+        .await
+        .expect("enroll participant");
     }
 
     /// Create a throwaway participant so the test is self-contained.
@@ -305,17 +344,17 @@ mod db_tests {
         id
     }
 
-    /// Create a throwaway channel room owned by `creator`, in the default workspace.
-    async fn mk_room(p: &PgPool, creator: ParticipantId) -> RoomId {
+    /// Create a throwaway group room owned by `creator`.
+    async fn mk_room(p: &PgPool, workspace: WorkspaceId, creator: ParticipantId) -> RoomId {
         let id = RoomId::new();
         sqlx::query(
             "INSERT INTO rooms (id, kind, name, created_by, workspace_id) \
-             VALUES ($1, 'channel', $2, $3, $4)",
+             VALUES ($1, 'group', $2, $3, $4)",
         )
         .bind(id.to_uuid())
         .bind(format!("ws-files-room-{id}"))
         .bind(creator.to_uuid())
-        .bind(default_ws().to_uuid())
+        .bind(workspace.to_uuid())
         .execute(p)
         .await
         .expect("insert room");
@@ -334,15 +373,23 @@ mod db_tests {
     }
 
     /// Insert a message with an explicit id and raw `blocks` JSON.
-    async fn mk_message(p: &PgPool, id: MessageId, room: RoomId, sender: ParticipantId, blocks: &str) {
-        sqlx::query("INSERT INTO messages (id, room_id, sender_id, blocks) VALUES ($1, $2, $3, $4::jsonb)")
-            .bind(id.to_uuid())
-            .bind(room.to_uuid())
-            .bind(sender.to_uuid())
-            .bind(blocks)
-            .execute(p)
-            .await
-            .expect("insert message");
+    async fn mk_message(
+        p: &PgPool,
+        id: MessageId,
+        room: RoomId,
+        sender: ParticipantId,
+        blocks: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO messages (id, room_id, sender_id, blocks) VALUES ($1, $2, $3, $4::jsonb)",
+        )
+        .bind(id.to_uuid())
+        .bind(room.to_uuid())
+        .bind(sender.to_uuid())
+        .bind(blocks)
+        .execute(p)
+        .await
+        .expect("insert message");
     }
 
     #[tokio::test]
@@ -350,11 +397,11 @@ mod db_tests {
     async fn list_is_membership_scoped() {
         let p = pool();
         let repo = WorkspaceFileRepo::new(p.clone());
-        let ws = default_ws();
-
         let member = mk_participant(&p).await;
+        let ws = mk_workspace(&p, member).await;
         let nonmember = mk_participant(&p).await;
-        let room = mk_room(&p, member).await;
+        enroll(&p, ws, nonmember).await;
+        let room = mk_room(&p, ws, member).await;
         join(&p, room, member).await; // member joins; nonmember does NOT.
 
         let blob = BlobId::new();
@@ -365,9 +412,7 @@ mod db_tests {
             mid,
             room,
             member,
-            &format!(
-                r#"[{{"type":"file","blob_id":"{blob}","kind":"document","name":"{fname}","size":321}}]"#
-            ),
+            &format!(r#"[{{"type":"file","blob_id":"{blob}","kind":"document","name":"{fname}","size":321}}]"#),
         )
         .await;
 
@@ -406,8 +451,8 @@ mod db_tests {
             "kind=document keeps it"
         );
 
-        // The non-member sees NOTHING from this room — the JOIN room_members is the
-        // boundary.
+        // The non-member sees NOTHING from this room — the effective-access joins
+        // are the boundary.
         assert!(
             !repo
                 .list_for_workspace(ws, nonmember, None, None, 50, 0)
@@ -434,6 +479,11 @@ mod db_tests {
             .execute(&p)
             .await
             .ok();
+        sqlx::query("DELETE FROM workspaces WHERE id = $1")
+            .bind(ws.to_uuid())
+            .execute(&p)
+            .await
+            .expect("delete workspace");
         for who in [member, nonmember] {
             sqlx::query("DELETE FROM participants WHERE id = $1")
                 .bind(who.to_uuid())

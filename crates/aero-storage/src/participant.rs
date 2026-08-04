@@ -1,7 +1,7 @@
 //! Participant + credential repositories. Implementation is delegated to the
 //! storage agent (see Spec §3.3).
 
-use aero_common::{Participant, ParticipantId, ParticipantKind};
+use aero_common::{Error, Participant, ParticipantId, ParticipantKind, RoomId, WorkspaceId};
 use sqlx::PgPool;
 
 #[derive(Clone)]
@@ -21,6 +21,19 @@ pub struct CredentialRecord {
     pub participant_id: ParticipantId,
     pub email: String,
     pub password_hash: String,
+}
+
+/// Expected account-erasure failures.
+#[derive(Debug, thiserror::Error)]
+pub enum ParticipantDeleteError {
+    /// Workspace ownership must be explicitly transferred or demoted first.
+    #[error("workspace ownership must be transferred before account deletion")]
+    WorkspaceOwnerProtected,
+    /// The account is the last effective owner of a channel.
+    #[error("channel {0} ownership must be transferred before account deletion")]
+    ChannelOwnerProtected(RoomId),
+    #[error(transparent)]
+    Storage(#[from] sqlx::Error),
 }
 
 impl ParticipantRepo {
@@ -139,15 +152,13 @@ impl ParticipantRepo {
         participant_id: ParticipantId,
         new_email: &str,
     ) -> Result<bool, sqlx::Error> {
-        let rows = sqlx::query(
-            "UPDATE credentials SET email = $1 WHERE participant_id = $2",
-        )
-        // Trim so a changed address stays consistent with the trimmed login lookup
-        // (mirrors `create_human`; `citext` is case- but not whitespace-insensitive).
-        .bind(new_email.trim())
-        .bind(participant_id.to_uuid())
-        .execute(&self.pool)
-        .await?;
+        let rows = sqlx::query("UPDATE credentials SET email = $1 WHERE participant_id = $2")
+            // Trim so a changed address stays consistent with the trimmed login lookup
+            // (mirrors `create_human`; `citext` is case- but not whitespace-insensitive).
+            .bind(new_email.trim())
+            .bind(participant_id.to_uuid())
+            .execute(&self.pool)
+            .await?;
         Ok(rows.rows_affected() > 0)
     }
 
@@ -177,11 +188,68 @@ impl ParticipantRepo {
     pub async fn delete_participant(
         &self,
         participant_id: ParticipantId,
-    ) -> Result<bool, sqlx::Error> {
+    ) -> Result<bool, ParticipantDeleteError> {
         let mut tx = self.pool.begin().await?;
 
+        // Account deletion changes effective access in every tenant at once.
+        // Migration 0198's direct-SQL guard takes this same low-frequency,
+        // cross-tenant fence before PostgreSQL locks the participant target.
+        // Call it explicitly before the narrower diagnostic locks below so the
+        // later UPDATE statement only re-enters locks already held in canonical
+        // order instead of trying to widen a partially-held workspace set.
+        sqlx::query("SELECT aero_lock_all_channel_governance()")
+            .execute(&mut *tx)
+            .await?;
+
+        // Retain the participant-scoped rows for the explicit error checks:
+        // workspace rows -> channel rows -> external identities -> participant.
+        // Identity migration and OIDC JIT both enter the concrete workspace
+        // before taking their per-identity lifecycle lock, so erasure must not
+        // acquire an identity lock while it can still wait on a workspace row.
+        let workspace_ids = sqlx::query_scalar::<_, uuid::Uuid>(
+            r"SELECT workspace.id
+                FROM workspaces workspace
+                JOIN workspace_members membership
+                  ON membership.workspace_id = workspace.id
+                 AND membership.participant_id = $1
+               ORDER BY workspace.id
+               FOR UPDATE OF workspace",
+        )
+        .bind(participant_id.to_uuid())
+        .fetch_all(&mut *tx)
+        .await?;
+        if !workspace_ids.is_empty() {
+            sqlx::query_scalar::<_, uuid::Uuid>(
+                r"SELECT room.id
+                    FROM rooms room
+                   WHERE room.workspace_id = ANY($1)
+                     AND room.kind = 'channel'
+                   ORDER BY room.workspace_id, room.id
+                   FOR UPDATE",
+            )
+            .bind(&workspace_ids)
+            .fetch_all(&mut *tx)
+            .await?;
+        }
+
+        // External-identity operations use a per-(issuer, subject) advisory
+        // lock. Acquire every current binding in database order after all
+        // workspace/channel rows, but before the participant row below. This
+        // matches migration/JIT's workspace -> identity -> participant order
+        // while still preventing an identity -> participant inversion with a
+        // concurrent repeat login.
+        sqlx::query(
+            r"SELECT aero_lock_external_identity(identity.issuer, identity.subject)
+                FROM sso_identities identity
+               WHERE identity.participant_id = $1
+               ORDER BY identity.issuer, identity.subject",
+        )
+        .bind(participant_id.to_uuid())
+        .fetch_all(&mut *tx)
+        .await?;
+
         let row = sqlx::query_as::<_, (Option<time::OffsetDateTime>,)>(
-            "SELECT deleted_at FROM participants WHERE id = $1",
+            "SELECT deleted_at FROM participants WHERE id = $1 FOR UPDATE",
         )
         .bind(participant_id.to_uuid())
         .fetch_optional(&mut *tx)
@@ -194,6 +262,46 @@ impl ParticipantRepo {
                 return Ok(false);
             }
             Some((None,)) => {}
+        }
+
+        if sqlx::query_scalar::<_, bool>(
+            r"SELECT EXISTS (
+                   SELECT 1
+                     FROM workspace_members
+                    WHERE participant_id = $1
+                      AND role = 'owner'
+               )",
+        )
+        .bind(participant_id.to_uuid())
+        .fetch_one(&mut *tx)
+        .await?
+        {
+            return Err(ParticipantDeleteError::WorkspaceOwnerProtected);
+        }
+
+        let stranded_channel = sqlx::query_scalar::<_, uuid::Uuid>(
+            r"SELECT room.id
+                FROM rooms room
+                JOIN room_members owner_membership
+                  ON owner_membership.room_id = room.id
+                 AND owner_membership.participant_id = $1
+                 AND owner_membership.role = 'owner'
+               WHERE room.kind = 'channel'
+                 AND aero_participant_has_effective_workspace_access(
+                         room.workspace_id,
+                         $1
+                     )
+                 AND NOT aero_channel_has_other_effective_owner(room.id, $1)
+               ORDER BY room.id
+               LIMIT 1",
+        )
+        .bind(participant_id.to_uuid())
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some(room) = stranded_channel {
+            return Err(ParticipantDeleteError::ChannelOwnerProtected(
+                RoomId::from_uuid(room),
+            ));
         }
 
         let now = time::OffsetDateTime::now_utc();
@@ -210,6 +318,73 @@ impl ParticipantRepo {
         .bind(participant_id.to_uuid())
         .execute(&mut *tx)
         .await?;
+
+        // Action-item tasks are shared room work, not private idempotency
+        // receipts. Migration 0226 permits exactly this metadata detach only
+        // after the creator is tombstoned and the matching transaction-local
+        // erasure actor is set. Detach first so deleting the 0224 receipt cannot
+        // cascade-delete the preserved tasks.
+        sqlx::query("SELECT set_config('aero.participant_erasure_actor', $1, true)")
+            .bind(participant_id.to_uuid().to_string())
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            r"UPDATE tasks
+                  SET action_item_batch_key = NULL,
+                      action_item_batch_index = NULL
+                WHERE creator_id = $1
+                  AND action_item_batch_key IS NOT NULL",
+        )
+        .bind(participant_id.to_uuid())
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM task_action_item_batches WHERE participant_id = $1")
+            .bind(participant_id.to_uuid())
+            .execute(&mut *tx)
+            .await?;
+
+        // Preserve a deliberately retained pseudonymous deny record for every
+        // erased external identity. Issuer/subject can still be personal data;
+        // this security-retention record is distinct from ordinary profile PII.
+        // The DELETE trigger introduced by migration 0231 takes a transaction
+        // advisory lock per (issuer, subject); a concurrent JIT login therefore
+        // waits until these tombstones commit and cannot recreate the account.
+        // Keep this transition ahead of the generic PII-delete loop because the
+        // original issuer/subject values are intentionally unavailable after it.
+        let erased_identities = sqlx::query_as::<_, (String, String)>(
+            r"DELETE FROM sso_identities
+                WHERE participant_id = $1
+            RETURNING issuer, subject",
+        )
+        .bind(participant_id.to_uuid())
+        .fetch_all(&mut *tx)
+        .await?;
+        for (issuer, subject) in erased_identities {
+            // Legacy installations could contain malformed empty/control keys.
+            // The resolver now rejects those forever, so they need no reusable-
+            // identity tombstone; skipping them keeps GDPR erasure available
+            // while operators clean the NOT VALID legacy constraint backlog.
+            if !crate::sso::valid_external_identity_component(&issuer)
+                || !crate::sso::valid_external_identity_component(&subject)
+            {
+                tracing::warn!(
+                    participant_id = %participant_id,
+                    "erased malformed legacy SSO binding without a reusable identity tombstone"
+                );
+                continue;
+            }
+            sqlx::query(
+                r"INSERT INTO sso_identity_tombstones
+                      (issuer, subject, former_participant_id, reason)
+                   VALUES ($1, $2, $3, 'account_erased')
+                   ON CONFLICT (issuer, subject) DO NOTHING",
+            )
+            .bind(issuer)
+            .bind(subject)
+            .bind(participant_id.to_uuid())
+            .execute(&mut *tx)
+            .await?;
+        }
 
         // Hard-delete the participant's satellite PII and unsent authored content —
         // nothing references these tables, so a plain delete fully removes them:
@@ -229,9 +404,12 @@ impl ParticipantRepo {
         for stmt in [
             "DELETE FROM credentials WHERE participant_id = $1",
             "DELETE FROM participant_profiles WHERE participant_id = $1",
-            "DELETE FROM sso_identities WHERE participant_id = $1",
             "DELETE FROM totp_secrets WHERE participant_id = $1",
             "DELETE FROM message_drafts WHERE participant_id = $1",
+            // Client-send dedup hashes are derived from the sender's message
+            // content and the participant row is tombstoned rather than deleted,
+            // so ON DELETE CASCADE would never run.
+            "DELETE FROM message_send_keys WHERE sender_id = $1",
             "DELETE FROM out_of_office WHERE participant_id = $1",
             "DELETE FROM scheduled_messages WHERE sender_id = $1",
             "DELETE FROM recurring_messages WHERE sender_id = $1",
@@ -248,8 +426,11 @@ impl ParticipantRepo {
             "DELETE FROM workspace_mutes WHERE participant_id = $1",
             "DELETE FROM digest_subscriptions WHERE participant_id = $1",
             "DELETE FROM user_group_members WHERE participant_id = $1",
-            // Behavioural-history tables added in 第五版 (ROADMAP5 方向三/五). Both
-            // carry re-identifiable PII keyed by participant and must be erased:
+            // Behavioural-history tables added in 第五版 (ROADMAP5 方向三/五).
+            // All carry re-identifiable PII keyed by participant and must be erased:
+            //   - search_impressions: full normalized queries plus ordered result
+            //     snapshots. Its participant FK cannot fire because erasure is an
+            //     UPDATE/tombstone, not a hard delete.
             //   - search_click_events: the user's search query_text + clicked
             //     results (no FK — it deliberately survives result deletion, so it
             //     is NOT cascade-cleaned and MUST be deleted explicitly here).
@@ -257,6 +438,7 @@ impl ParticipantRepo {
             //     CASCADE, but erasure TOMBSTONES the participant row (UPDATE) rather
             //     than hard-deleting it, so the cascade never fires — delete explicitly.
             "DELETE FROM search_click_events WHERE participant_id = $1",
+            "DELETE FROM search_impressions WHERE participant_id = $1",
             "DELETE FROM login_events WHERE participant_id = $1",
             // Call-plane PII (P3 voice/video). Both must be deleted explicitly:
             //   - call_transcripts (0064): verbatim transcribed speech keyed by
@@ -312,7 +494,7 @@ impl ParticipantRepo {
             // — delete explicitly (project invariant: every participant-keyed PII
             // table must be wired into erasure; CASCADE is not enough because
             // erasure is a tombstone, not a hard delete).
-            "DELETE FROM participant_ai_profiles WHERE participant_id = $1",
+            "DELETE FROM participant_ai_profiles_scoped WHERE participant_id = $1",
             // Moderation reports / ban appeals AUTHORED BY the erased user. Each row
             // carries the user's own free-text `reason` / `appeal_reason` PII and is
             // keyed by them as the author, so scope to the authoring column: only the
@@ -341,7 +523,10 @@ impl ParticipantRepo {
             // rows where they are the BLOCKED party (others' lists) are kept.
             "DELETE FROM user_blocks WHERE blocker_id = $1",
         ] {
-            sqlx::query(stmt).bind(participant_id.to_uuid()).execute(&mut *tx).await?;
+            sqlx::query(stmt)
+                .bind(participant_id.to_uuid())
+                .execute(&mut *tx)
+                .await?;
         }
 
         // Anonymise message content (GDPR right-to-erasure). Null the pgvector
@@ -356,7 +541,7 @@ impl ParticipantRepo {
         // room, or (room_id IS NULL) the whole workspace. NOTE: holds that release
         // *after* erasure leave these messages un-erased — completing erasure on
         // hold release is a deferred follow-up (would need an erasure queue).
-        sqlx::query(
+        let anonymized_messages: Vec<(uuid::Uuid,)> = sqlx::query_as(
             r#"UPDATE messages m
                SET blocks          = '[{"type":"text","text":"[deleted]"}]'::jsonb,
                    searchable_text = '',
@@ -370,15 +555,49 @@ impl ParticipantRepo {
                          AND (lh.room_id = r.id
                               OR (lh.room_id IS NULL AND lh.workspace_id = r.workspace_id))
                         WHERE r.id = m.room_id
-                     )"#,
+                     )
+               RETURNING m.id"#,
         )
         .bind(participant_id.to_uuid())
-        .execute(&mut *tx)
+        .fetch_all(&mut *tx)
         .await?;
 
-        // Revoke all active sessions so existing tokens are immediately invalid.
+        // Prior edit bodies are retained as audit rows, but they contain the same
+        // authored content erased above. Anonymise those bodies for exactly the
+        // non-held messages selected by the UPDATE; active legal holds therefore
+        // preserve both the live row and its history. Interactive payloads are a
+        // user-visible derivative of the retired blocks rather than evidence, so
+        // remove them for the same message set.
+        let anonymized_message_ids: Vec<uuid::Uuid> =
+            anonymized_messages.into_iter().map(|(id,)| id).collect();
+        if !anonymized_message_ids.is_empty() {
+            sqlx::query(
+                r#"UPDATE message_edits
+                      SET blocks = '[{"type":"text","text":"[deleted]"}]'::jsonb
+                    WHERE message_id = ANY($1)"#,
+            )
+            .bind(&anonymized_message_ids)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query("DELETE FROM block_interactions WHERE message_id = ANY($1)")
+                .bind(&anonymized_message_ids)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        // Revoke and blacklist every active refresh session inside this same
+        // erasure transaction. Updating auth_sessions alone would leave the JWT
+        // refreshable because the refresh path consults revoked_tokens.
         sqlx::query(
-            "UPDATE auth_sessions SET revoked_at = $1 WHERE participant_id = $2 AND revoked_at IS NULL",
+            r"WITH revoked AS (
+                   UPDATE auth_sessions
+                      SET revoked_at = $1
+                    WHERE participant_id = $2 AND revoked_at IS NULL
+                RETURNING token_hash
+               )
+               INSERT INTO revoked_tokens (token_hash, participant_id)
+               SELECT token_hash, $2 FROM revoked
+               ON CONFLICT (token_hash) DO NOTHING",
         )
         .bind(now)
         .bind(participant_id.to_uuid())
@@ -387,9 +606,10 @@ impl ParticipantRepo {
 
         // Enqueue all owned blobs for background storage deletion.
         sqlx::query(
-            r"INSERT INTO blob_gc_queue (blob_id)
-              SELECT id FROM blobs WHERE owner_id = $1
-              ON CONFLICT (blob_id) DO NOTHING",
+            r"INSERT INTO blob_gc_queue (blob_id, force_delete)
+              SELECT id, TRUE FROM blobs WHERE owner_id = $1
+              ON CONFLICT (blob_id) DO UPDATE
+                  SET force_delete = TRUE",
         )
         .bind(participant_id.to_uuid())
         .execute(&mut *tx)
@@ -411,7 +631,8 @@ impl ParticipantRepo {
     /// # Errors
     /// Propagates any [`sqlx::Error`] from the update.
     pub async fn sweep_deferred_erasure(&self) -> Result<u64, sqlx::Error> {
-        let result = sqlx::query(
+        let mut tx = self.pool.begin().await?;
+        let erased: Vec<(uuid::Uuid,)> = sqlx::query_as(
             r#"UPDATE messages m
                SET blocks          = '[{"type":"text","text":"[deleted]"}]'::jsonb,
                    searchable_text = '',
@@ -428,11 +649,28 @@ impl ParticipantRepo {
                          AND (lh.room_id = r.id
                               OR (lh.room_id IS NULL AND lh.workspace_id = r.workspace_id))
                         WHERE r.id = m.room_id
-                     )"#,
+                     )
+               RETURNING m.id"#,
         )
-        .execute(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
-        Ok(result.rows_affected())
+        let message_ids: Vec<uuid::Uuid> = erased.into_iter().map(|(id,)| id).collect();
+        if !message_ids.is_empty() {
+            sqlx::query(
+                r#"UPDATE message_edits
+                      SET blocks = '[{"type":"text","text":"[deleted]"}]'::jsonb
+                    WHERE message_id = ANY($1)"#,
+            )
+            .bind(&message_ids)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query("DELETE FROM block_interactions WHERE message_id = ANY($1)")
+                .bind(&message_ids)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(u64::try_from(message_ids.len()).unwrap_or(u64::MAX))
     }
 
     /// Replace the password hash stored for a participant.
@@ -444,67 +682,35 @@ impl ParticipantRepo {
         participant_id: ParticipantId,
         new_hash: &str,
     ) -> Result<bool, sqlx::Error> {
-        let rows = sqlx::query(
-            r#"UPDATE credentials SET password_hash = $1 WHERE participant_id = $2"#,
-        )
-        .bind(new_hash)
-        .bind(participant_id.to_uuid())
-        .execute(&self.pool)
-        .await?;
+        let rows =
+            sqlx::query(r#"UPDATE credentials SET password_hash = $1 WHERE participant_id = $2"#)
+                .bind(new_hash)
+                .bind(participant_id.to_uuid())
+                .execute(&self.pool)
+                .await?;
         Ok(rows.rows_affected() > 0)
-    }
-
-    /// Create a non-human participant (Bot or Agent). No credentials row.
-    pub async fn create_bot(
-        &self,
-        display_name: &str,
-        kind: ParticipantKind,
-        created_by: Option<ParticipantId>,
-        avatar_url: Option<&str>,
-    ) -> Result<Participant, sqlx::Error> {
-        let id = ParticipantId::new();
-        let created_at = time::OffsetDateTime::now_utc();
-        let kind_s = match kind {
-            ParticipantKind::Bot => "bot",
-            ParticipantKind::Agent => "agent",
-            ParticipantKind::Human => "human",
-        };
-        sqlx::query(
-            r#"INSERT INTO participants (id, kind, display_name, avatar_url, created_by, created_at)
-               VALUES ($1, $2, $3, $4, $5, $6)"#,
-        )
-        .bind(id.to_uuid())
-        .bind(kind_s)
-        .bind(display_name)
-        .bind(avatar_url)
-        .bind(created_by.map(|p| p.to_uuid()))
-        .bind(created_at)
-        .execute(&self.pool)
-        .await?;
-        Ok(Participant {
-            id,
-            kind,
-            display_name: display_name.to_owned(),
-            avatar_url: avatar_url.map(str::to_owned),
-            created_by,
-            created_at,
-        })
     }
 
     /// Substring search over display_name + credentials.email. Returns up to
     /// `limit` participants ordered by display_name. Excludes soft-removed rows.
-    pub async fn search(
-        &self,
-        query: &str,
-        limit: i64,
-    ) -> Result<Vec<Participant>, sqlx::Error> {
+    pub async fn search(&self, query: &str, limit: i64) -> Result<Vec<Participant>, sqlx::Error> {
         let q = query.trim();
         if q.is_empty() {
             return Ok(Vec::new());
         }
         let pattern = format!("%{}%", q.replace('%', "\\%"));
         let limit = limit.clamp(1, 50);
-        let rows = sqlx::query_as::<_, (uuid::Uuid, String, String, Option<String>, Option<uuid::Uuid>, time::OffsetDateTime)>(
+        let rows = sqlx::query_as::<
+            _,
+            (
+                uuid::Uuid,
+                String,
+                String,
+                Option<String>,
+                Option<uuid::Uuid>,
+                time::OffsetDateTime,
+            ),
+        >(
             r#"SELECT DISTINCT p.id, p.kind, p.display_name, p.avatar_url, p.created_by, p.created_at
                FROM participants p
                LEFT JOIN credentials c ON c.participant_id = p.id
@@ -540,7 +746,17 @@ impl ParticipantRepo {
         &self,
         room: aero_common::RoomId,
     ) -> Result<Vec<Participant>, sqlx::Error> {
-        let rows = sqlx::query_as::<_, (uuid::Uuid, String, String, Option<String>, Option<uuid::Uuid>, time::OffsetDateTime)>(
+        let rows = sqlx::query_as::<
+            _,
+            (
+                uuid::Uuid,
+                String,
+                String,
+                Option<String>,
+                Option<uuid::Uuid>,
+                time::OffsetDateTime,
+            ),
+        >(
             r#"SELECT p.id, p.kind, p.display_name, p.avatar_url, p.created_by, p.created_at
                FROM participants p
                JOIN room_members m ON m.participant_id = p.id
@@ -577,7 +793,17 @@ impl ParticipantRepo {
         display_name: Option<&str>,
         avatar_url: Option<Option<&str>>,
     ) -> Result<Option<Participant>, sqlx::Error> {
-        let row = sqlx::query_as::<_, (uuid::Uuid, String, String, Option<String>, Option<uuid::Uuid>, time::OffsetDateTime)>(
+        let row = sqlx::query_as::<
+            _,
+            (
+                uuid::Uuid,
+                String,
+                String,
+                Option<String>,
+                Option<uuid::Uuid>,
+                time::OffsetDateTime,
+            ),
+        >(
             r#"UPDATE participants SET
                  display_name = COALESCE($2, display_name),
                  avatar_url   = CASE
@@ -610,38 +836,82 @@ impl ParticipantRepo {
         }))
     }
 
-    /// Set or clear the verified badge on a participant (migration 0116).
+    /// Set or clear the verified badge while `actor` remains an effective
+    /// administrator of the platform administration workspace.
     ///
     /// `verified = true` sets `is_verified = TRUE` and records `verified_at = NOW()`.
     /// `verified = false` clears both columns. Idempotent in both directions.
     ///
+    /// The authorization fence, active-target lock, badge update, and audit
+    /// append commit in one transaction.
+    ///
     /// # Errors
-    /// Propagates any [`sqlx::Error`] from the update.
-    pub async fn set_verified(
+    /// Returns [`Error::Forbidden`] unless `actor` remains an effective
+    /// Owner/Admin, [`Error::NotFound`] for a missing/deleted target, and
+    /// propagates storage errors.
+    pub async fn set_verified_authorized(
         &self,
+        platform_workspace: WorkspaceId,
+        actor: ParticipantId,
         participant: ParticipantId,
         verified: bool,
-    ) -> Result<(), sqlx::Error> {
-        if verified {
-            sqlx::query(
-                "UPDATE participants SET is_verified = TRUE, verified_at = NOW() WHERE id = $1",
-            )
-            .bind(participant.to_uuid())
-            .execute(&self.pool)
+    ) -> Result<Option<time::OffsetDateTime>, Error> {
+        let mut tx = self.pool.begin().await?;
+        crate::workspace::authz::assert_effective_admin_in_tx(&mut tx, platform_workspace, actor)
             .await?;
-        } else {
-            sqlx::query(
-                "UPDATE participants SET is_verified = FALSE, verified_at = NULL WHERE id = $1",
-            )
-            .bind(participant.to_uuid())
-            .execute(&self.pool)
-            .await?;
+        let active = sqlx::query_scalar::<_, bool>(
+            "SELECT deleted_at IS NULL
+               FROM participants
+              WHERE id = $1
+              FOR UPDATE",
+        )
+        .bind(participant.to_uuid())
+        .fetch_optional(&mut *tx)
+        .await?
+        .unwrap_or(false);
+        if !active {
+            return Err(Error::NotFound("active participant".into()));
         }
-        Ok(())
+
+        let verified_at = sqlx::query_scalar::<_, Option<time::OffsetDateTime>>(
+            "UPDATE participants
+                SET is_verified = $2,
+                    verified_at = CASE
+                        WHEN $2 THEN COALESCE(verified_at, clock_timestamp())
+                        ELSE NULL
+                    END
+              WHERE id = $1
+          RETURNING verified_at",
+        )
+        .bind(participant.to_uuid())
+        .bind(verified)
+        .fetch_one(&mut *tx)
+        .await?;
+        crate::audit::AuditRepo::append_in_tx(
+            &mut tx,
+            platform_workspace,
+            Some(actor),
+            "participant.verified",
+            Some(&participant.to_string()),
+            serde_json::json!({ "verified": verified }),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(verified_at)
     }
 
     pub async fn get(&self, id: ParticipantId) -> Result<Option<Participant>, sqlx::Error> {
-        let row = sqlx::query_as::<_, (uuid::Uuid, String, String, Option<String>, Option<uuid::Uuid>, time::OffsetDateTime)>(
+        let row = sqlx::query_as::<
+            _,
+            (
+                uuid::Uuid,
+                String,
+                String,
+                Option<String>,
+                Option<uuid::Uuid>,
+                time::OffsetDateTime,
+            ),
+        >(
             r#"SELECT id, kind, display_name, avatar_url, created_by, created_at
                FROM participants WHERE id = $1 AND deleted_at IS NULL"#,
         )
@@ -668,4 +938,16 @@ impl ParticipantRepo {
 }
 
 #[cfg(test)]
+#[path = "participant/credential_tests.rs"]
+mod credential_tests;
+#[cfg(test)]
 mod db_tests;
+#[cfg(test)]
+#[path = "participant/erasure_moderation_tests.rs"]
+mod erasure_moderation_tests;
+#[cfg(test)]
+#[path = "participant/ownership_tests.rs"]
+mod ownership_tests;
+#[cfg(test)]
+#[path = "participant/verified_tests.rs"]
+mod verified_tests;

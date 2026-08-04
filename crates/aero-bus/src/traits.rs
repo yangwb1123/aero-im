@@ -14,12 +14,18 @@ pub enum BusError {
     Serde(#[from] serde_json::Error),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    /// The idempotency key cannot be represented safely as a NATS header value.
+    #[error("invalid message id: {reason}")]
+    InvalidMessageId { reason: &'static str },
     /// The subject is not a publishable NATS subject (empty, contains an empty
     /// token, whitespace, control characters, or a `*`/`>` wildcard). Surfaced
     /// before the bytes ever reach the broker so callers get a precise reason
     /// instead of an opaque publish timeout or a silently misrouted message.
     #[error("invalid subject {subject:?}: {reason}")]
-    InvalidSubject { subject: String, reason: &'static str },
+    InvalidSubject {
+        subject: String,
+        reason: &'static str,
+    },
 }
 
 pub type BusResult<T> = Result<T, BusError>;
@@ -38,6 +44,21 @@ pub trait Subscription: Send {
 pub trait EventBus: Send + Sync {
     /// Publish raw bytes to a subject. Must be persisted on JetStream.
     async fn publish(&self, subject: &str, payload: bytes::Bytes) -> BusResult<()>;
+
+    /// Publish one logical message with a stable idempotency key.
+    ///
+    /// Backends without broker-level deduplication fall back to [`Self::publish`],
+    /// preserving compatibility with lightweight fakes. Concrete durable
+    /// backends should override this method and use `message_id` to collapse
+    /// retries of the same logical publish.
+    async fn publish_idempotent(
+        &self,
+        subject: &str,
+        payload: bytes::Bytes,
+        _message_id: &str,
+    ) -> BusResult<()> {
+        self.publish(subject, payload).await
+    }
 
     /// Publish a JSON-serializable event.
     ///
@@ -65,4 +86,51 @@ pub trait EventBus: Send + Sync {
         subject: &str,
         durable: Option<&str>,
     ) -> BusResult<BoxStream<'static, Box<dyn Subscription + Send>>>;
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+
+    #[derive(Default)]
+    struct FakeBus {
+        published: Mutex<Vec<(String, bytes::Bytes)>>,
+    }
+
+    #[async_trait]
+    impl EventBus for FakeBus {
+        async fn publish(&self, subject: &str, payload: bytes::Bytes) -> BusResult<()> {
+            self.published
+                .lock()
+                .expect("published mutex")
+                .push((subject.to_owned(), payload));
+            Ok(())
+        }
+
+        async fn subscribe(
+            &self,
+            _subject: &str,
+            _durable: Option<&str>,
+        ) -> BusResult<BoxStream<'static, Box<dyn Subscription + Send>>> {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+    }
+
+    #[tokio::test]
+    async fn object_safe_default_idempotent_publish_falls_back_to_publish() {
+        let fake = Arc::new(FakeBus::default());
+        let bus: Arc<dyn EventBus> = fake.clone();
+        let payload = bytes::Bytes::from_static(b"payload");
+
+        bus.publish_idempotent("im.room.1", payload.clone(), "outbox-1")
+            .await
+            .expect("default publish");
+
+        assert_eq!(
+            *fake.published.lock().expect("published mutex"),
+            vec![("im.room.1".to_owned(), payload)]
+        );
+    }
 }

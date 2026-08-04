@@ -1,17 +1,21 @@
 #![allow(unused_imports)]
 //! Search route handlers.
-use std::str::FromStr;
-use axum::{extract::{Path, Query, State}, routing::{get, post}, Json, Router};
-use aero_auth::AuthUser;
-use aero_common::{Error as AeroError, MessageId, ParticipantId, RoomId, Result as AeroResult};
-use serde::Deserialize;
 use crate::error::ApiResult;
 use crate::routes::helpers::{merge_hits, parse_room_id};
 use crate::state::AppState;
+use aero_auth::AuthUser;
+use aero_common::{Error as AeroError, MessageId, ParticipantId, Result as AeroResult, RoomId};
+use axum::{
+    extract::{Path, Query, State},
+    http::HeaderMap,
+    routing::{get, post},
+    Json, Router,
+};
+use serde::Deserialize;
+use std::str::FromStr;
 
 pub fn routes() -> Router<AppState> {
-    Router::new()
-        .route("/api/rooms/:id/search", post(room_search))
+    Router::new().route("/api/rooms/:id/search", post(room_search))
 }
 
 // ----- Search -----
@@ -29,6 +33,7 @@ pub(crate) struct SearchReq {
 pub(crate) async fn room_search(
     State(s): State<AppState>,
     auth: AuthUser,
+    headers: HeaderMap,
     Path(room_str): Path<String>,
     Json(req): Json<SearchReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
@@ -47,8 +52,23 @@ pub(crate) async fn room_search(
 
     let hits = match (mode, &s.ai) {
         ("vector", Some(ai)) => {
+            let workspace = s
+                .rooms
+                .room_workspace(room)
+                .await
+                .map_err(AeroError::from)?
+                .map(|value| value.to_uuid());
             let embedding = ai
-                .embed_text(&req.query)
+                .embed_text_with_usage_context(
+                    &req.query,
+                    crate::ai_usage::request_usage_context(
+                        &headers,
+                        auth.participant_id,
+                        workspace,
+                        &format!("room_search_vector:{room}:{limit}:{}", req.query),
+                    ),
+                    "voyage_room_search_vector",
+                )
                 .await
                 .map_err(|e| AeroError::Upstream(format!("ai embed: {e}")))?;
             s.messages
@@ -63,13 +83,39 @@ pub(crate) async fn room_search(
                 .search_fts(room, &req.query, limit)
                 .await
                 .map_err(AeroError::from)?;
-            if let Ok(embedding) = ai.embed_text(&req.query).await {
-                let vec_hits = s
-                    .messages
-                    .search_vector(room, embedding, limit)
-                    .await
-                    .map_err(AeroError::from)?;
-                fts = merge_hits(fts, vec_hits, limit);
+            let workspace = s
+                .rooms
+                .room_workspace(room)
+                .await
+                .map_err(AeroError::from)?
+                .map(|value| value.to_uuid());
+            let embedding = ai
+                .embed_text_with_usage_context(
+                    &req.query,
+                    crate::ai_usage::request_usage_context(
+                        &headers,
+                        auth.participant_id,
+                        workspace,
+                        &format!("room_search_hybrid:{room}:{limit}:{}", req.query),
+                    ),
+                    "voyage_room_search_hybrid",
+                )
+                .await;
+            match embedding {
+                Ok(embedding) => {
+                    let vec_hits = s
+                        .messages
+                        .search_vector(room, embedding, limit)
+                        .await
+                        .map_err(AeroError::from)?;
+                    fts = merge_hits(fts, vec_hits, limit);
+                }
+                Err(error) if error.contains("AI usage accounting:") => {
+                    return Err(AeroError::Upstream(format!("ai embed: {error}")).into());
+                }
+                Err(error) => {
+                    tracing::warn!(%error, %room, "hybrid search embedding failed; using FTS");
+                }
             }
             fts
         }
@@ -91,4 +137,3 @@ pub(crate) async fn room_search(
         }).collect::<Vec<_>>(),
     })))
 }
-

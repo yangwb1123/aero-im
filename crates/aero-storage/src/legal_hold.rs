@@ -15,9 +15,11 @@
 //! from the crate root) rather than in `aero-common`, since it is a storage-layer
 //! projection.
 
-use aero_common::{LegalHoldId, ParticipantId, RoomId, WorkspaceId};
+use aero_common::{Error, LegalHoldId, ParticipantId, RoomId, WorkspaceId};
 use serde::Serialize;
 use sqlx::PgPool;
+
+use crate::workspace::authz::assert_effective_admin_in_tx;
 
 /// One legal hold — an admin-placed preservation order over a room or a whole
 /// workspace.
@@ -124,14 +126,51 @@ impl LegalHoldRepo {
         Ok(id)
     }
 
+    /// Place a legal hold with effective administrator authorization and room
+    /// tenant containment checked in the same transaction as the insert.
+    pub async fn create_authorized(
+        &self,
+        workspace: WorkspaceId,
+        room: Option<RoomId>,
+        reason: &str,
+        actor: ParticipantId,
+    ) -> Result<LegalHoldId, Error> {
+        let mut tx = self.pool.begin().await?;
+        assert_effective_admin_in_tx(&mut tx, workspace, actor).await?;
+        if let Some(room) = room {
+            let room_workspace = sqlx::query_scalar::<_, uuid::Uuid>(
+                "SELECT workspace_id FROM rooms WHERE id = $1 FOR SHARE",
+            )
+            .bind(room.to_uuid())
+            .fetch_optional(&mut *tx)
+            .await?;
+            if room_workspace != Some(workspace.to_uuid()) {
+                return Err(Error::NotFound(format!(
+                    "room {room} in workspace {workspace}"
+                )));
+            }
+        }
+        let id = LegalHoldId::new();
+        sqlx::query(
+            "INSERT INTO legal_holds (id, workspace_id, room_id, reason, created_by)
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(id.to_uuid())
+        .bind(workspace.to_uuid())
+        .bind(room.map(|room| room.to_uuid()))
+        .bind(reason)
+        .bind(actor.to_uuid())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(id)
+    }
+
     /// List the active legal holds in `workspace`, newest first.
     ///
     /// # Errors
     /// Propagates any [`sqlx::Error`] from the query.
-    pub async fn list_active(
-        &self,
-        workspace: WorkspaceId,
-    ) -> Result<Vec<LegalHold>, sqlx::Error> {
+    pub async fn list_active(&self, workspace: WorkspaceId) -> Result<Vec<LegalHold>, sqlx::Error> {
         let sql = format!(
             "SELECT {COLUMNS}
                FROM legal_holds
@@ -181,6 +220,38 @@ impl LegalHoldRepo {
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() > 0)
+    }
+
+    /// Release a hold only if `actor` remains an effective administrator of the
+    /// hold's immutable workspace under the same transaction as the update.
+    pub async fn release_authorized(
+        &self,
+        id: LegalHoldId,
+        actor: ParticipantId,
+    ) -> Result<bool, Error> {
+        let mut tx = self.pool.begin().await?;
+        let workspace = sqlx::query_scalar::<_, uuid::Uuid>(
+            "SELECT workspace_id FROM legal_holds WHERE id = $1",
+        )
+        .bind(id.to_uuid())
+        .fetch_optional(&mut *tx)
+        .await?
+        .map(WorkspaceId::from_uuid)
+        .ok_or_else(|| Error::NotFound(format!("legal hold {id}")))?;
+        assert_effective_admin_in_tx(&mut tx, workspace, actor).await?;
+        let released = sqlx::query(
+            "UPDATE legal_holds
+                SET active = false, released_at = now()
+              WHERE id = $1 AND workspace_id = $2 AND active",
+        )
+        .bind(id.to_uuid())
+        .bind(workspace.to_uuid())
+        .execute(&mut *tx)
+        .await?
+        .rows_affected()
+            > 0;
+        tx.commit().await?;
+        Ok(released)
     }
 
     /// Whether `room` is currently under an active legal hold — either a
@@ -254,6 +325,7 @@ mod db_tests {
     /// concurrent test checking `is_held` on a default-workspace room).
     async fn fresh_ws(p: &PgPool, creator: ParticipantId) -> WorkspaceId {
         let id = WorkspaceId::new();
+        let mut tx = p.begin().await.expect("begin workspace fixture");
         sqlx::query(
             "INSERT INTO workspaces (id, name, slug, created_by, created_at)
              VALUES ($1, $2, $3, $4, now())",
@@ -262,9 +334,19 @@ mod db_tests {
         .bind(format!("legal-hold-ws-{id}"))
         .bind(format!("lh-{id}"))
         .bind(creator.to_uuid())
-        .execute(p)
+        .execute(&mut *tx)
         .await
         .expect("insert workspace");
+        sqlx::query(
+            "INSERT INTO workspace_members (workspace_id, participant_id, role)
+             VALUES ($1, $2, 'owner')",
+        )
+        .bind(id.to_uuid())
+        .bind(creator.to_uuid())
+        .execute(&mut *tx)
+        .await
+        .expect("insert workspace owner");
+        tx.commit().await.expect("commit workspace fixture");
         id
     }
 
@@ -273,7 +355,7 @@ mod db_tests {
         let id = RoomId::new();
         sqlx::query(
             "INSERT INTO rooms (id, kind, name, created_by, workspace_id)
-             VALUES ($1, 'channel', $2, $3, $4)",
+             VALUES ($1, 'group', $2, $3, $4)",
         )
         .bind(id.to_uuid())
         .bind(format!("legal-hold-room-{id}"))
@@ -318,7 +400,12 @@ mod db_tests {
         assert!(!repo.release(id, ws).await.unwrap(), "second release no-op");
         assert!(!repo.is_held(room).await.unwrap(), "released → not held");
         assert!(
-            !repo.list_active(ws).await.unwrap().iter().any(|h| h.id == id),
+            !repo
+                .list_active(ws)
+                .await
+                .unwrap()
+                .iter()
+                .any(|h| h.id == id),
             "released hold leaves the active list"
         );
 
@@ -422,12 +509,24 @@ mod db_tests {
 
         // 1-day retention; a message 5 days old is well past the window.
         workspaces.set_retention(ws, Some(1)).await.unwrap();
-        let msg = insert_msg(&p, room, actor, time::OffsetDateTime::now_utc() - time::Duration::days(5)).await;
+        let msg = insert_msg(
+            &p,
+            room,
+            actor,
+            time::OffsetDateTime::now_utc() - time::Duration::days(5),
+        )
+        .await;
         let now = time::OffsetDateTime::now_utc();
 
         // Held → sweep preserves the message.
-        let hid = holds.create(ws, Some(room), "litigation hold", actor).await.unwrap();
-        workspaces.sweep_expired_messages(now, Some(ws)).await.unwrap();
+        let hid = holds
+            .create(ws, Some(room), "litigation hold", actor)
+            .await
+            .unwrap();
+        workspaces
+            .sweep_expired_messages(now, Some(ws))
+            .await
+            .unwrap();
         assert!(
             !is_deleted(&p, msg).await,
             "a held room's past-window message must survive the sweep"
@@ -435,16 +534,35 @@ mod db_tests {
 
         // Released → next sweep soft-deletes it.
         assert!(holds.release(hid, ws).await.unwrap());
-        workspaces.sweep_expired_messages(now, Some(ws)).await.unwrap();
+        workspaces
+            .sweep_expired_messages(now, Some(ws))
+            .await
+            .unwrap();
         assert!(
             is_deleted(&p, msg).await,
             "after release, the past-window message is swept"
         );
 
         // Cleanup.
-        sqlx::query("DELETE FROM messages WHERE room_id = $1").bind(room.to_uuid()).execute(&p).await.ok();
-        sqlx::query("DELETE FROM legal_holds WHERE created_by = $1").bind(actor.to_uuid()).execute(&p).await.ok();
-        sqlx::query("DELETE FROM rooms WHERE id = $1").bind(room.to_uuid()).execute(&p).await.ok();
-        sqlx::query("DELETE FROM workspaces WHERE id = $1").bind(ws.to_uuid()).execute(&p).await.ok();
+        sqlx::query("DELETE FROM messages WHERE room_id = $1")
+            .bind(room.to_uuid())
+            .execute(&p)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM legal_holds WHERE created_by = $1")
+            .bind(actor.to_uuid())
+            .execute(&p)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM rooms WHERE id = $1")
+            .bind(room.to_uuid())
+            .execute(&p)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM workspaces WHERE id = $1")
+            .bind(ws.to_uuid())
+            .execute(&p)
+            .await
+            .ok();
     }
 }

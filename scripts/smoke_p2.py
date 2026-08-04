@@ -14,6 +14,7 @@ import os
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 import websockets
@@ -61,14 +62,19 @@ def multipart(field_name, filename, content_type, payload):
     return boundary, head + payload + tail
 
 
-def upload(token, filename, content_type, payload):
+def upload(token, room_id, filename, content_type, payload):
     boundary, body = multipart("file", filename, content_type, payload)
     headers = {
         "authorization": f"Bearer {token}",
         "content-type": f"multipart/form-data; boundary={boundary}",
         "accept": "application/json",
     }
-    r = urllib.request.Request(HOST + "/api/blobs", method="POST", data=body, headers=headers)
+    r = urllib.request.Request(
+        HOST + f"/api/rooms/{room_id}/blobs",
+        method="POST",
+        data=body,
+        headers=headers,
+    )
     with urllib.request.urlopen(r) as resp:
         return json.loads(resp.read())
 
@@ -121,9 +127,13 @@ async def main():
     req("POST", f"/api/rooms/{Rid}/members", {"participant_id": Cpid}, token=A)
     ok(f"room={Rid[:8]}")
 
-    say("alice creates an AI agent bot, invites it to the room")
-    bot = req("POST", "/api/agents", {"display_name": "AeroBot", "kind": "bot"}, token=A)
-    req("POST", f"/api/rooms/{Rid}/members", {"participant_id": bot["id"]}, token=A)
+    say("alice atomically creates and installs an AI agent bot in the room")
+    bot = req(
+        "POST",
+        "/api/agents",
+        {"room_id": Rid, "display_name": "AeroBot", "kind": "bot"},
+        token=A,
+    )
     ok(f"bot={bot['id'][:8]}")
 
     say("list room members")
@@ -184,7 +194,7 @@ async def main():
 
     say("alice uploads a file")
     payload = b"hello, this is a smoke test file" * 8
-    blob = upload(A, "smoke.txt", "text/plain", payload)
+    blob = upload(A, Rid, "smoke.txt", "text/plain", payload)
     if blob.get("kind") != "document": fail(f"unexpected kind: {blob}")
     ok(f"blob={blob['id'][:8]} size={blob['size']}")
 
@@ -214,7 +224,8 @@ async def main():
     stream = req("POST", "/api/streams", {"title": "smoke-stream", "protocol": "rtmp", "room_id": Rid}, token=A)
     if not stream.get("ingest_url", "").startswith("rtmp://"):
         fail(f"expected rtmp ingest, got {stream}")
-    ok(f"stream={stream['stream']['id'][:8]} ingest={stream['ingest_url']}")
+    ingest = urllib.parse.urlsplit(stream["ingest_url"])
+    ok(f"stream={stream['id'][:8]} ingest={ingest.scheme}://{ingest.hostname}:{ingest.port}")
 
     say("rtc config")
     rtc = req("GET", "/api/rtc/config", token=A)
@@ -227,7 +238,7 @@ async def main():
               "payload_b64": base64.b64encode(b"fake-keypackage-bytes").decode()},
              token=B)
     if "id" not in kp: fail(f"kp publish: {kp}")
-    consumed = req("GET", f"/api/mls/key-packages/{Bpid}", token=A)
+    consumed = req("GET", f"/api/rooms/{Rid}/mls/key-packages/{Bpid}", token=A)
     if base64.b64decode(consumed["payload_b64"]) != b"fake-keypackage-bytes":
         fail(f"kp payload mismatch: {consumed}")
     ok("MLS KeyPackage round-trip ok")

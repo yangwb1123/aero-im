@@ -191,8 +191,7 @@ impl Pacer {
         self.refill(now);
         self.roll_windows(now);
         let len = u64::try_from(packet_len).unwrap_or(u64::MAX);
-        let need = i64::try_from(len.min(BUCKET_CAPACITY_BYTES) * TOKEN_SCALE)
-            .unwrap_or(i64::MAX);
+        let need = i64::try_from(len.min(BUCKET_CAPACITY_BYTES) * TOKEN_SCALE).unwrap_or(i64::MAX);
         if self.tokens >= need {
             let cost = i64::try_from(len.saturating_mul(TOKEN_SCALE)).unwrap_or(i64::MAX);
             self.tokens = self.tokens.saturating_sub(cost);
@@ -340,7 +339,10 @@ mod tests {
         // deferrals are side-effect-free.
         let first = p.allowance(t0, 1000);
         let second = p.allowance(t0, 1000);
-        assert_eq!(first, second, "repeated deferred queries must not consume budget");
+        assert_eq!(
+            first, second,
+            "repeated deferred queries must not consume budget"
+        );
     }
 
     #[test]
@@ -364,9 +366,17 @@ mod tests {
         let t0 = Instant::now();
         p.on_ack(20_000, 0, t0); // baseline = 20 ms
         p.on_ack(24_000, 0, t0 + ms(10)); // 24 ms ≤ 25 ms threshold → clean
-        assert_eq!(p.current_rate(), 1000, "below-threshold RTT must not back off");
+        assert_eq!(
+            p.current_rate(),
+            1000,
+            "below-threshold RTT must not back off"
+        );
         p.on_ack(26_000, 0, t0 + ms(20)); // 26 ms > 25 ms → back off
-        assert_eq!(p.current_rate(), 850, "rate must drop to 85% on RTT inflation");
+        assert_eq!(
+            p.current_rate(),
+            850,
+            "rate must drop to 85% on RTT inflation"
+        );
     }
 
     #[test]
@@ -374,9 +384,13 @@ mod tests {
         let mut p = Pacer::new(1000);
         let t0 = Instant::now();
         p.on_ack(20_000, 0, t0); // baseline 20 ms
-        // Threshold = 25 ms + 10 ms rttvar = 35 ms: 26 ms is jitter, not congestion.
+                                 // Threshold = 25 ms + 10 ms rttvar = 35 ms: 26 ms is jitter, not congestion.
         p.on_ack(26_000, 10_000, t0 + ms(10));
-        assert_eq!(p.current_rate(), 1000, "jitter within rttvar must not back off");
+        assert_eq!(
+            p.current_rate(),
+            1000,
+            "jitter within rttvar must not back off"
+        );
         p.on_ack(40_000, 10_000, t0 + ms(20)); // 40 ms > 35 ms → congestion
         assert_eq!(p.current_rate(), 850);
     }
@@ -387,10 +401,14 @@ mod tests {
         let t0 = Instant::now();
         p.on_ack(30_000, 0, t0); // initial baseline 30 ms
         p.on_ack(20_000, 0, t0 + ms(10)); // lower sample re-bases to 20 ms
-        // 26 ms would be fine against a 30 ms baseline but is inflated
-        // against the re-based 20 ms one (threshold 25 ms).
+                                          // 26 ms would be fine against a 30 ms baseline but is inflated
+                                          // against the re-based 20 ms one (threshold 25 ms).
         p.on_ack(26_000, 0, t0 + ms(20));
-        assert_eq!(p.current_rate(), 850, "baseline must follow the minimum RTT");
+        assert_eq!(
+            p.current_rate(),
+            850,
+            "baseline must follow the minimum RTT"
+        );
     }
 
     #[test]
@@ -399,7 +417,11 @@ mod tests {
         let t0 = Instant::now();
         p.on_ack(0, 0, t0); // untracked peer field — must not become baseline
         p.on_ack(20_000, 0, t0 + ms(10));
-        assert_eq!(p.current_rate(), 1000, "first real sample is the baseline, no back-off");
+        assert_eq!(
+            p.current_rate(),
+            1000,
+            "first real sample is the baseline, no back-off"
+        );
         p.on_ack(26_000, 0, t0 + ms(20));
         assert_eq!(p.current_rate(), 850, "real baseline must be 20 ms, not 0");
     }
@@ -421,7 +443,11 @@ mod tests {
         p.on_nak(2, t0);
         assert_eq!(p.current_rate(), 1000, "2 NAKs are below the threshold");
         p.on_nak(2, t0 + ms(10)); // running total 4 > 3 in the same window
-        assert_eq!(p.current_rate(), 850, "accumulated NAKs must trigger back-off");
+        assert_eq!(
+            p.current_rate(),
+            850,
+            "accumulated NAKs must trigger back-off"
+        );
     }
 
     #[test]
@@ -447,7 +473,11 @@ mod tests {
         p.on_nak(10, t0 + ms(10)); // same window: gated
         p.on_ack(20_000, 0, t0 + ms(20));
         p.on_ack(90_000, 0, t0 + ms(30)); // RTT signal in same window: gated too
-        assert_eq!(p.current_rate(), 850, "only one multiplicative decrease per window");
+        assert_eq!(
+            p.current_rate(),
+            850,
+            "only one multiplicative decrease per window"
+        );
         p.on_nak(10, t0 + ms(150)); // next window: a fresh decrease may fire
         assert_eq!(p.current_rate(), 722, "850 * 85 / 100 = 722");
     }
@@ -474,9 +504,13 @@ mod tests {
         let t0 = Instant::now();
         p.on_ack(20_000, 0, t0);
         p.on_nak(10, t0); // → 850, window marked congested
-        // The congested window itself grants no recovery…
+                          // The congested window itself grants no recovery…
         p.on_ack(20_000, 0, t0 + ms(150));
-        assert_eq!(p.current_rate(), 850, "congested window must not grant recovery");
+        assert_eq!(
+            p.current_rate(),
+            850,
+            "congested window must not grant recovery"
+        );
         // …but each following clean window adds 5% of configured (50 B/s).
         p.on_ack(20_000, 0, t0 + ms(250));
         assert_eq!(p.current_rate(), 900);
@@ -486,7 +520,11 @@ mod tests {
         assert_eq!(p.current_rate(), 1000);
         // Recovery never overshoots the configured maximum.
         p.on_ack(20_000, 0, t0 + ms(950));
-        assert_eq!(p.current_rate(), 1000, "recovery must cap at the configured rate");
+        assert_eq!(
+            p.current_rate(),
+            1000,
+            "recovery must cap at the configured rate"
+        );
     }
 
     #[test]
@@ -494,9 +532,9 @@ mod tests {
         let mut p = Pacer::new(1000);
         let t0 = Instant::now();
         p.on_nak(10, t0); // → 850
-        // 5 full windows elapse before the next signal: the congested one
-        // grants nothing, the 4 idle ones are clean → +200, capped at the
-        // configured 1000 (850 + 200 would overshoot).
+                          // 5 full windows elapse before the next signal: the congested one
+                          // grants nothing, the 4 idle ones are clean → +200, capped at the
+                          // configured 1000 (850 + 200 would overshoot).
         p.on_ack(20_000, 0, t0 + ms(550));
         assert_eq!(p.current_rate(), 1000);
     }
@@ -510,8 +548,8 @@ mod tests {
             assert_eq!(p.allowance(t0, 1500), Allowance::Allow);
         }
         p.on_nak(10, t0); // rate → 850
-        // 1500-byte deficit at 850 B/s = ceil(1.5e9 / 850) µs = 1_764_706 µs,
-        // visibly later than the 1.5 s it would take at the full rate.
+                          // 1500-byte deficit at 850 B/s = ceil(1.5e9 / 850) µs = 1_764_706 µs,
+                          // visibly later than the 1.5 s it would take at the full rate.
         let Allowance::DeferUntil(at) = p.allowance(t0, 1500) else {
             panic!("bucket is empty — must defer");
         };

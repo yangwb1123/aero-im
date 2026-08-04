@@ -315,7 +315,10 @@ mod db_tests {
             .expect("gaming resolves");
         assert_eq!(gaming.name, "Gaming");
         assert!(
-            repo.category_by_slug("does-not-exist").await.unwrap().is_none(),
+            repo.category_by_slug("does-not-exist")
+                .await
+                .unwrap()
+                .is_none(),
             "unknown slug resolves to None"
         );
     }
@@ -333,17 +336,33 @@ mod db_tests {
         let uniq = uuid::Uuid::new_v4().simple().to_string();
         let slug = format!("MixedCat-{uniq}");
         let want = slug.to_lowercase();
-        repo.create_category("Mixed Cat", &slug, 999).await.expect("create");
-        for variant in [slug.clone(), slug.to_lowercase(), slug.to_uppercase(), format!("  {slug}  ")] {
+        repo.create_category("Mixed Cat", &slug, 999)
+            .await
+            .expect("create");
+        for variant in [
+            slug.clone(),
+            slug.to_lowercase(),
+            slug.to_uppercase(),
+            format!("  {slug}  "),
+        ] {
             let got = repo
                 .category_by_slug(&variant)
                 .await
                 .unwrap()
-                .unwrap_or_else(|| panic!("category_by_slug must normalize case/space (failed for {variant:?})"));
-            assert_eq!(got.slug, want, "variant {variant:?} resolved the wrong category");
+                .unwrap_or_else(|| {
+                    panic!("category_by_slug must normalize case/space (failed for {variant:?})")
+                });
+            assert_eq!(
+                got.slug, want,
+                "variant {variant:?} resolved the wrong category"
+            );
             assert_eq!(got.name, "Mixed Cat");
         }
-        sqlx::query("DELETE FROM stream_categories WHERE slug = $1").bind(&want).execute(&pool()).await.ok();
+        sqlx::query("DELETE FROM stream_categories WHERE slug = $1")
+            .bind(&want)
+            .execute(&pool())
+            .await
+            .ok();
     }
 
     #[tokio::test]
@@ -352,14 +371,25 @@ mod db_tests {
         let p = pool();
         let repo = StreamCategoryRepo::new(p.clone());
         let stream = live_stream(&p).await;
-        let gaming = repo.category_by_slug("gaming").await.unwrap().expect("gaming");
-        let music = repo.category_by_slug("music").await.unwrap().expect("music");
+        let gaming = repo
+            .category_by_slug("gaming")
+            .await
+            .unwrap()
+            .expect("gaming");
+        let music = repo
+            .category_by_slug("music")
+            .await
+            .unwrap()
+            .expect("music");
 
         // assign → category_of reflects it; appears in discovery.
         repo.assign(stream, gaming.id).await.unwrap();
         assert_eq!(repo.category_of(stream).await.unwrap(), Some(gaming.id));
         assert!(
-            repo.streams_in_category(gaming.id, 50).await.unwrap().contains(&stream),
+            repo.streams_in_category(gaming.id, 50)
+                .await
+                .unwrap()
+                .contains(&stream),
             "the live stream shows up in its category"
         );
 
@@ -367,7 +397,11 @@ mod db_tests {
         repo.assign(stream, music.id).await.unwrap();
         assert_eq!(repo.category_of(stream).await.unwrap(), Some(music.id));
         assert!(
-            !repo.streams_in_category(gaming.id, 50).await.unwrap().contains(&stream),
+            !repo
+                .streams_in_category(gaming.id, 50)
+                .await
+                .unwrap()
+                .contains(&stream),
             "no longer in the old category"
         );
 
@@ -378,7 +412,11 @@ mod db_tests {
             .await
             .unwrap();
         assert!(
-            !repo.streams_in_category(music.id, 50).await.unwrap().contains(&stream),
+            !repo
+                .streams_in_category(music.id, 50)
+                .await
+                .unwrap()
+                .contains(&stream),
             "an ended stream is not discoverable"
         );
 
@@ -387,7 +425,11 @@ mod db_tests {
         assert_eq!(repo.category_of(stream).await.unwrap(), None);
         repo.clear_assignment(stream).await.unwrap();
 
-        sqlx::query("DELETE FROM streams WHERE id = $1").bind(stream).execute(&p).await.ok();
+        sqlx::query("DELETE FROM streams WHERE id = $1")
+            .bind(stream)
+            .execute(&p)
+            .await
+            .ok();
     }
 
     #[tokio::test]
@@ -404,10 +446,24 @@ mod db_tests {
         assert_eq!(tags, vec!["fps".to_string(), "speedrun".to_string()]);
 
         assert!(repo.remove_tag(stream, "fps").await.unwrap());
-        assert!(!repo.remove_tag(stream, "fps").await.unwrap(), "second remove is a no-op");
-        assert_eq!(repo.tags_for(stream).await.unwrap(), vec!["speedrun".to_string()]);
+        assert!(
+            !repo.remove_tag(stream, "fps").await.unwrap(),
+            "second remove is a no-op"
+        );
+        assert_eq!(
+            repo.tags_for(stream).await.unwrap(),
+            vec!["speedrun".to_string()]
+        );
 
-        sqlx::query("DELETE FROM stream_tags WHERE stream_id = $1").bind(stream).execute(&p).await.ok();
-        sqlx::query("DELETE FROM streams WHERE id = $1").bind(stream).execute(&p).await.ok();
+        sqlx::query("DELETE FROM stream_tags WHERE stream_id = $1")
+            .bind(stream)
+            .execute(&p)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM streams WHERE id = $1")
+            .bind(stream)
+            .execute(&p)
+            .await
+            .ok();
     }
 }

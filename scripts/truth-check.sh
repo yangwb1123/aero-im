@@ -3,14 +3,15 @@
 #
 # 本项目反复出现一类失败：功能被标记为「完成」，实际是死代码。
 # cargo check 抓不到这类问题，因为：
-#   - 孤儿模块（源文件存在，但从未被 `mod foo;` 声明）根本不参与编译；
+#   - 孤儿模块（源文件存在，但从未被 `mod foo;` 或 `include!` 引用）根本不参与编译；
 #   - 零调用 builder（`with_xxx()` 有定义但没有任何调用方）是合法 Rust。
 # 本脚本把这两类「写了但没接线」变成可见的红灯。
 #
 # 检测项：
 #   1. ORPHAN MODULE（硬违规，计入 exit 码）：
 #      crates/*/src/ 下有实质内容的 .rs 文件，在同 crate 内没有任何
-#      `mod foo;` / `pub mod foo;` / `pub(crate) mod foo;` 声明引用它。
+#      `mod foo;` / `pub mod foo;` / `pub(crate) mod foo;` 声明或
+#      `include!("path.rs")` 引用它。
 #   2. UNWIRED BUILDER（⚠️ 警告，不计入 exit 码）：
 #      `fn with_xxx(` builder 方法在全仓没有任何 `.with_xxx(` 调用点。
 #
@@ -38,6 +39,53 @@ has_substance() {
     local code_lines
     code_lines=$(grep -vE '^[[:space:]]*(//|/\*|\*|$)' "$f" 2>/dev/null | grep -cvE '^[[:space:]]*$' || true)
     [ "${code_lines:-0}" -gt 0 ]
+}
+
+# `include!` 的路径相对于包含它的源文件解析，不能只按候选文件名做文本
+# 匹配。逐个解析同 crate 内的字符串字面量 include，并比较规范化后的
+# 绝对路径，避免 `routes/handlers/*.rs` 这类合法拆分被误报为孤儿。
+is_included_file() {
+    local target="$1"
+    local crate_src="$2"
+    local target_abs include_file include_line include_path included_abs
+    target_abs=$(realpath "$target")
+
+    while IFS=: read -r include_file _ include_line; do
+        include_path=$(printf '%s\n' "$include_line" \
+            | sed -nE 's/.*include!\([[:space:]]*"([^"]+)".*/\1/p')
+        [ -z "$include_path" ] && continue
+        included_abs=$(realpath "$(dirname "$include_file")/$include_path" 2>/dev/null || true)
+        if [ "$included_abs" = "$target_abs" ]; then
+            return 0
+        fi
+    done < <(grep -rnE --include='*.rs' 'include!\([[:space:]]*"[^"]+"' "$crate_src" 2>/dev/null || true)
+
+    return 1
+}
+
+is_path_module_file() {
+    local target=$1
+    local crate_src=$2
+    local target_abs
+    target_abs=$(realpath -m "$target")
+
+    local declaration source attribute referenced candidate
+    while IFS= read -r declaration; do
+        source=${declaration%%:*}
+        attribute=${declaration#*:}
+        attribute=${attribute#*:}
+        referenced=$(printf '%s\n' "$attribute" \
+            | sed -nE 's/^[[:space:]]*#\[path[[:space:]]*=[[:space:]]*"([^"]+)"\].*/\1/p')
+        [ -n "$referenced" ] || continue
+        candidate=$(realpath -m "$(dirname "$source")/$referenced")
+        if [ "$candidate" = "$target_abs" ]; then
+            return 0
+        fi
+    done < <(
+        grep -rHnE '^[[:space:]]*#\[path[[:space:]]*=[[:space:]]*"[^"]+"\]' \
+            "$crate_src" --include='*.rs' 2>/dev/null || true
+    )
+    return 1
 }
 
 # 遍历每个 crate，单独处理（mod 声明只在同 crate 内查找）。
@@ -76,10 +124,13 @@ while IFS= read -r -d '' crate_src; do
             continue
         fi
 
-        # 在同 crate 内查找 `mod <name>;`（允许 pub / pub(crate) 前缀、行内多空格）。
-        # 仅匹配文件式声明（以分号结尾），不匹配内联 `mod foo {`。
+        # 在同 crate 内查找 `mod <name>;`（允许 pub / pub(crate) 前缀、行内多空格）
+        # 或解析后指向该文件的 `include!`。
+        # mod 仅匹配文件式声明（以分号结尾），不匹配内联 `mod foo {`。
         # 调用 grep 时用 || true，避免无命中触发 set -e。
-        if grep -rqE "^[[:space:]]*(pub[[:space:]]+|pub\([^)]*\)[[:space:]]+)?mod[[:space:]]+${mod_name}[[:space:]]*;" "$crate_src" 2>/dev/null; then
+        if grep -rqE "^[[:space:]]*(pub[[:space:]]+|pub\([^)]*\)[[:space:]]+)?mod[[:space:]]+${mod_name}[[:space:]]*;" "$crate_src" 2>/dev/null \
+            || is_included_file "$f" "$crate_src" \
+            || is_path_module_file "$f" "$crate_src"; then
             : # 已被声明，正常
         else
             echo "  ❌ ORPHAN MODULE: $f（写了但未 mod 声明，不参与编译）"

@@ -42,8 +42,8 @@
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 
-pub use str0m::rtp::rtcp::{FirEntry, Pli};
 use str0m::rtp::rtcp::Fir;
+pub use str0m::rtp::rtcp::{FirEntry, Pli};
 pub use str0m::rtp::Ssrc;
 
 use aero_common::ParticipantId;
@@ -285,22 +285,12 @@ impl KeyframeGate {
     }
 
     /// Called when a subscriber sends a PLI toward a publisher track.
-    pub fn on_subscriber_pli(
-        &mut self,
-        publisher: ParticipantId,
-        pub_mid: &str,
-        now: Instant,
-    ) {
+    pub fn on_subscriber_pli(&mut self, publisher: ParticipantId, pub_mid: &str, now: Instant) {
         self.enqueue_inner(publisher, pub_mid, false, now);
     }
 
     /// Called when a subscriber sends a FIR toward a publisher track.
-    pub fn on_subscriber_fir(
-        &mut self,
-        publisher: ParticipantId,
-        pub_mid: &str,
-        now: Instant,
-    ) {
+    pub fn on_subscriber_fir(&mut self, publisher: ParticipantId, pub_mid: &str, now: Instant) {
         self.enqueue_inner(publisher, pub_mid, true, now);
     }
 
@@ -365,7 +355,11 @@ mod tests {
         // byte 1: PT=206 (PayloadSpecificFeedback)
         assert_eq!(buf[1], 206, "PT=206");
         // bytes 2-3: length in words - 1 = 2 (total 3 words = 12 bytes)
-        assert_eq!(u16::from_be_bytes([buf[2], buf[3]]), 2, "length words-1 = 2");
+        assert_eq!(
+            u16::from_be_bytes([buf[2], buf[3]]),
+            2,
+            "length words-1 = 2"
+        );
 
         // Parse back the FCI (bytes after the 4-byte common header)
         let parsed = parse_pli(&buf[4..]).expect("PLI parse must succeed");
@@ -481,8 +475,12 @@ mod tests {
 
         let reqs: Vec<_> = gate.poll_requests().collect();
         assert_eq!(reqs.len(), 2);
-        assert!(reqs.iter().any(|r| r.publisher == pub_a && r.pub_mid == "v0"));
-        assert!(reqs.iter().any(|r| r.publisher == pub_b && r.pub_mid == "v1"));
+        assert!(reqs
+            .iter()
+            .any(|r| r.publisher == pub_a && r.pub_mid == "v0"));
+        assert!(reqs
+            .iter()
+            .any(|r| r.publisher == pub_b && r.pub_mid == "v1"));
     }
 
     #[test]

@@ -32,6 +32,25 @@ def req(method, path, body=None, token=None, expect=None):
         fail(f"HTTP {e.code} {method} {path}: {e.read().decode(errors='ignore')[:300]}")
 
 
+async def expect_ws_chat_forbidden(token, stream_id):
+    async with websockets.connect(f"{WS_HOST}/ws?token={token}") as ws:
+        welcome = json.loads(await asyncio.wait_for(ws.recv(), timeout=3))
+        if welcome.get("type") != "welcome":
+            fail(f"unexpected WS welcome: {welcome}")
+        await ws.send(json.dumps({
+            "type": "stream_chat",
+            "stream_id": stream_id,
+            "body": "banned websocket post",
+        }))
+        for _ in range(6):
+            frame = json.loads(await asyncio.wait_for(ws.recv(), timeout=3))
+            if frame.get("type") == "error":
+                if "banned from this stream" not in frame.get("msg", ""):
+                    fail(f"WS chat rejected for the wrong reason: {frame}")
+                return
+        fail("banned viewer's WS chat did not return an error")
+
+
 def main():
     ts = int(time.time())
     a = req("POST", "/api/auth/register", {"email": f"a_w6+{ts}@aero.dev", "password": "password_1234", "display_name": "AliceW6"})
@@ -72,13 +91,14 @@ def main():
     # ---------------- Stream chat moderation ----------------
     say("stream moderation: owner bans a viewer; their chat is rejected")
     stream = req("POST", "/api/streams", {"title": f"w6-stream-{ts}", "room_id": Rid, "protocol": "rtmp"}, token=A)
-    Sid = stream["stream"]["id"]
+    Sid = stream["id"]
     # Bob can chat before the ban.
     req("POST", f"/api/streams/{Sid}/chat", {"body": "hi from bob"}, token=B, expect=200)
     ok("bob can chat pre-ban")
     req("POST", f"/api/streams/{Sid}/ban", {"participant_id": Bpid, "reason": "spam"}, token=A, expect=200)
     req("POST", f"/api/streams/{Sid}/chat", {"body": "spam spam"}, token=B, expect=403)
-    ok("banned viewer's chat rejected (403)")
+    asyncio.run(expect_ws_chat_forbidden(B, Sid))
+    ok("banned viewer's REST + WS chat rejected")
     bans = req("GET", f"/api/streams/{Sid}/bans", token=A)
     if not any((x.get("participant_id") == Bpid) for x in (bans if isinstance(bans, list) else bans.get("bans", []))):
         fail(f"ban not listed: {bans}")

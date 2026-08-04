@@ -1,4 +1,5 @@
 #![allow(unused_imports)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use aero_common::{Block, Message, MessageId, ParticipantId, RoomId, WorkspaceId};
@@ -9,11 +10,16 @@ use time::OffsetDateTime;
 use crate::agent::AgentTool;
 use crate::anthropic::ToolDef;
 use crate::service::{AiService, ChannelRec, Expert, PersonRec, Sentiment, SentimentScore};
+use crate::usage::UsageContext;
 
 pub(crate) fn parse_moderation_verdict(raw: &str) -> Option<String> {
     raw.trim().strip_prefix("BLOCK").map(|rest| {
         let reason = rest.trim_start_matches([':', '：', ' ']).trim();
-        if reason.is_empty() { "内容违规".to_owned() } else { reason.to_owned() }
+        if reason.is_empty() {
+            "内容违规".to_owned()
+        } else {
+            reason.to_owned()
+        }
     })
 }
 
@@ -102,8 +108,6 @@ pub(crate) const AGENT_SYSTEM_PROMPT: &str = "\
 必要时可用不同关键词多次检索。若某条消息带有文本附件且与问题相关,可用 `read_attachment` 读取其内容。\
 只依据检索到的上下文作答,引用所依据消息的 id;若信息不足,如实说明。";
 
-
-
 /// A room-scoped retrieval tool for the agentic answer loop. The model calls it
 /// with a `query`; it runs the same hybrid (vector + FTS) retrieval as the one-shot
 /// path and records every surfaced message id so the caller can build citations.
@@ -112,6 +116,8 @@ pub(crate) struct SearchMessagesTool {
     pub(crate) svc: Arc<AiService>,
     pub(crate) room: RoomId,
     pub(crate) seen: Mutex<Vec<MessageId>>,
+    pub(crate) usage_context: UsageContext,
+    pub(crate) query_counter: AtomicUsize,
 }
 
 #[async_trait::async_trait]
@@ -132,24 +138,29 @@ impl crate::agent::AgentTool for SearchMessagesTool {
         }
     }
 
-    async fn run(&self, input: &Value) -> String {
-        let q = input.get("query").and_then(serde_json::Value::as_str).unwrap_or("").trim();
+    async fn run(&self, input: &Value) -> crate::error::Result<String> {
+        let q = input
+            .get("query")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .trim();
         if q.is_empty() {
-            return "error: 'query' 不能为空".to_string();
+            return Ok("error: 'query' 不能为空".to_string());
         }
-        match self.svc.retrieve_room(self.room, q, 6).await {
-            Ok(hits) => {
-                if let Ok(mut seen) = self.seen.lock() {
-                    seen.extend(hits.iter().map(|h| h.message.id));
-                }
-                let ctx = render_context(&hits);
-                if ctx.trim().is_empty() {
-                    "（未检索到相关消息。）".to_string()
-                } else {
-                    ctx
-                }
-            }
-            Err(e) => format!("error: 检索失败: {e}"),
+        let query_number = self.query_counter.fetch_add(1, Ordering::Relaxed);
+        let operation = format!("voyage_agent_tool_query_{query_number}");
+        let hits = self
+            .svc
+            .retrieve_room_with_context(self.room, q, 6, self.usage_context, &operation)
+            .await?;
+        if let Ok(mut seen) = self.seen.lock() {
+            seen.extend(hits.iter().map(|h| h.message.id));
+        }
+        let ctx = render_context(&hits);
+        if ctx.trim().is_empty() {
+            Ok("（未检索到相关消息。）".to_string())
+        } else {
+            Ok(ctx)
         }
     }
 }
@@ -190,9 +201,16 @@ pub(crate) fn extract_text(bytes: &[u8], cap: usize) -> Option<String> {
 /// `searchable_text` (方向三-2). `Voice` blocks are excluded — their transcript
 /// is already indexed via [`Block::searchable_text`].
 #[must_use]
-pub(crate) fn first_extractable_file(blocks: &[Block]) -> Option<(aero_common::BlobId, String, u64)> {
+pub(crate) fn first_extractable_file(
+    blocks: &[Block],
+) -> Option<(aero_common::BlobId, String, u64)> {
     blocks.iter().find_map(|b| match b {
-        Block::File { blob_id, name, size, .. } => Some((*blob_id, name.clone(), *size)),
+        Block::File {
+            blob_id,
+            name,
+            size,
+            ..
+        } => Some((*blob_id, name.clone(), *size)),
         _ => None,
     })
 }
@@ -247,41 +265,48 @@ impl crate::agent::AgentTool for ReadAttachmentTool {
         }
     }
 
-    async fn run(&self, input: &Value) -> String {
+    async fn run(&self, input: &Value) -> crate::error::Result<String> {
         let Some(store) = self.svc.blob_store.as_ref() else {
-            return "error: 附件读取未启用".to_string();
+            return Ok("error: 附件读取未启用".to_string());
         };
-        let raw = input.get("message_id").and_then(serde_json::Value::as_str).unwrap_or("").trim();
+        let raw = input
+            .get("message_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .trim();
         let Ok(mid) = raw.parse::<MessageId>() else {
-            return "error: 无效的 message_id".to_string();
+            return Ok("error: 无效的 message_id".to_string());
         };
         // Authz: resolve the message and require it to belong to THIS room.
         let msg = match self.svc.messages.get(mid).await {
             Ok(Some(m)) if m.room_id == self.room => m,
-            Ok(Some(_)) => return "error: 该消息不属于当前房间".to_string(),
-            Ok(None) => return "error: 未找到该消息".to_string(),
-            Err(e) => return format!("error: 查询失败: {e}"),
+            Ok(Some(_)) => return Ok("error: 该消息不属于当前房间".to_string()),
+            Ok(None) => return Ok("error: 未找到该消息".to_string()),
+            Err(e) => return Ok(format!("error: 查询失败: {e}")),
         };
         let file = msg.blocks.iter().find_map(|b| match b {
-            aero_common::Block::File { blob_id, name, size, .. } => {
-                Some((*blob_id, name.clone(), *size))
-            }
+            aero_common::Block::File {
+                blob_id,
+                name,
+                size,
+                ..
+            } => Some((*blob_id, name.clone(), *size)),
             _ => None,
         });
         let Some((blob_id, name, size)) = file else {
-            return "（该消息没有文件附件。）".to_string();
+            return Ok("（该消息没有文件附件。）".to_string());
         };
         if size > MAX_ATTACHMENT_BYTES as u64 {
-            return format!("（附件 '{name}' 过大,未读取。）");
+            return Ok(format!("（附件 '{name}' 过大,未读取。）"));
         }
         let bytes = match store.get(blob_id).await {
             Ok(b) => b,
-            Err(e) => return format!("error: 读取附件失败: {e}"),
+            Err(e) => return Ok(format!("error: 读取附件失败: {e}")),
         };
-        match extract_text(&bytes, MAX_ATTACHMENT_BYTES) {
+        Ok(match extract_text(&bytes, MAX_ATTACHMENT_BYTES) {
             Some(text) => format!("附件 '{name}' 内容:\n{text}"),
             None => format!("（附件 '{name}' 不是可读文本(二进制或过大)。）"),
-        }
+        })
     }
 }
 
@@ -344,7 +369,11 @@ pub(crate) fn rank_experts(hits: &[SearchHit], k: usize) -> Vec<Expert> {
                 .take(MAX_EXPERT_CITATIONS)
                 .map(|(_, id)| id)
                 .collect();
-            Expert { participant, score, citations }
+            Expert {
+                participant,
+                score,
+                citations,
+            }
         })
         .collect();
 
@@ -378,7 +407,12 @@ pub(crate) fn rank_channels(candidates: &[(RoomId, String, i64)], k: usize) -> V
         return Vec::new();
     }
     // Normalize against the busiest candidate so scores are comparable.
-    let max_activity = candidates.iter().map(|(_, _, a)| *a).max().unwrap_or(0).max(0);
+    let max_activity = candidates
+        .iter()
+        .map(|(_, _, a)| *a)
+        .max()
+        .unwrap_or(0)
+        .max(0);
 
     let mut ranked: Vec<(i64, ChannelRec)> = candidates
         .iter()
@@ -400,7 +434,15 @@ pub(crate) fn rank_channels(candidates: &[(RoomId, String, i64)], k: usize) -> V
             } else {
                 "工作区公开频道,你还未加入".to_owned()
             };
-            (activity, ChannelRec { room: *room, name: display, score, reason })
+            (
+                activity,
+                ChannelRec {
+                    room: *room,
+                    name: display,
+                    score,
+                    reason,
+                },
+            )
         })
         .collect();
 
@@ -441,11 +483,21 @@ pub(crate) fn rank_people(candidates: &[(ParticipantId, i64)], k: usize) -> Vec<
             } else {
                 "同工作区成员".to_owned()
             };
-            (shared, PersonRec { participant: *participant, score, reason })
+            (
+                shared,
+                PersonRec {
+                    participant: *participant,
+                    score,
+                    reason,
+                },
+            )
         })
         .collect();
 
-    ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.participant.cmp(&b.1.participant)));
+    ranked.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| a.1.participant.cmp(&b.1.participant))
+    });
     ranked.truncate(k);
     ranked.into_iter().map(|(_, rec)| rec).collect()
 }
@@ -511,7 +563,10 @@ pub(crate) fn heuristic_title(root_text: &str) -> String {
     if trimmed.is_empty() {
         return String::new();
     }
-    let words: Vec<&str> = trimmed.split_whitespace().take(HEURISTIC_TITLE_WORDS).collect();
+    let words: Vec<&str> = trimmed
+        .split_whitespace()
+        .take(HEURISTIC_TITLE_WORDS)
+        .collect();
     if words.len() <= 1 {
         // No word boundaries (e.g. CJK) — char-truncate so the title stays bounded.
         return truncate_for_summary(trimmed, 24);
@@ -525,7 +580,12 @@ pub(crate) fn heuristic_title(root_text: &str) -> String {
 /// a one-line title, and collapse to a single trimmed line. Bounds the length.
 pub(crate) fn clean_title(raw: &str) -> String {
     // Models occasionally add a leading note line; take the first non-blank line.
-    let line = raw.lines().map(str::trim).find(|l| !l.is_empty()).unwrap_or("").trim();
+    let line = raw
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("")
+        .trim();
     let line = line
         .trim_matches(|c| c == '"' || c == '\'' || c == '“' || c == '”' || c == '「' || c == '」')
         .trim_end_matches(['.', '。', '!', '!', '?', '?'])
@@ -537,16 +597,33 @@ pub(crate) fn clean_title(raw: &str) -> String {
 /// matched case-insensitively as substrings. Deliberately small and conservative —
 /// this is a degrade path, not a real classifier.
 const TOXIC_KEYWORDS: &[&str] = &[
-    "idiot", "stupid", "shut up", "hate", "kill you", "moron", "loser", "trash",
-    "dumb", "fool", "scum", "滚", "废物", "白痴", "去死", "蠢", "垃圾", "傻",
+    "idiot", "stupid", "shut up", "hate", "kill you", "moron", "loser", "trash", "dumb", "fool",
+    "scum", "滚", "废物", "白痴", "去死", "蠢", "垃圾", "傻",
 ];
 
 /// Positive-sentiment keyword set for the no-LLM heuristic. Lowercased, matched
 /// case-insensitively as substrings.
 const POSITIVE_KEYWORDS: &[&str] = &[
-    "thank", "thanks", "great", "awesome", "love", "good job", "well done",
-    "nice", "excellent", "appreciate", "congrats", "happy", "谢谢", "感谢",
-    "太好了", "棒", "赞", "干得好", "厉害", "开心",
+    "thank",
+    "thanks",
+    "great",
+    "awesome",
+    "love",
+    "good job",
+    "well done",
+    "nice",
+    "excellent",
+    "appreciate",
+    "congrats",
+    "happy",
+    "谢谢",
+    "感谢",
+    "太好了",
+    "棒",
+    "赞",
+    "干得好",
+    "厉害",
+    "开心",
 ];
 
 /// Deterministic keyword/punctuation sentiment+toxicity heuristic used when
@@ -597,9 +674,14 @@ pub(crate) fn heuristic_sentiment(text: &str) -> SentimentScore {
 
     // Neutral baseline; a lone exclamation reads as excited (still neutral polarity,
     // still low toxicity).
-    let tone = if text.contains('!') || text.contains('!') { "excited" } else { "neutral" };
-    SentimentScore { sentiment: Sentiment::Neutral, toxicity: 0.05, tone: tone.to_owned() }
+    let tone = if text.contains('!') || text.contains('!') {
+        "excited"
+    } else {
+        "neutral"
+    };
+    SentimentScore {
+        sentiment: Sentiment::Neutral,
+        toxicity: 0.05,
+        tone: tone.to_owned(),
+    }
 }
-
-
-

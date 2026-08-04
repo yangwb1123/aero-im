@@ -215,10 +215,8 @@ pub fn parse_twcc(pkt: &[u8]) -> Option<TwccFeedback> {
     let base_seq = u16::from_be_bytes([pkt[12], pkt[13]]);
     let status_count = usize::from(u16::from_be_bytes([pkt[14], pkt[15]]));
     // 24-bit signed reference time, sign-extended via an i32 shift.
-    let reference_time_64ms = (i32::from(pkt[16]) << 24
-        | i32::from(pkt[17]) << 16
-        | i32::from(pkt[18]) << 8)
-        >> 8;
+    let reference_time_64ms =
+        (i32::from(pkt[16]) << 24 | i32::from(pkt[17]) << 16 | i32::from(pkt[18]) << 8) >> 8;
     let fb_pkt_count = pkt[19];
 
     // Walk the packet-status chunks until `status_count` symbols are decoded.
@@ -704,7 +702,10 @@ mod tests {
         let s = fb.summary();
         assert_eq!(s.received, 19);
         assert_eq!(s.lost, 1);
-        assert!(s.delay_trend_us > 0, "monotonically growing deltas → rising");
+        assert!(
+            s.delay_trend_us > 0,
+            "monotonically growing deltas → rising"
+        );
     }
 
     #[test]
@@ -825,7 +826,7 @@ mod tests {
         // Default alpha = 0.3: a one-shot dip moves the aggregate only partway.
         let mut a = PublisherRembAggregator::default();
         assert_eq!(a.update(1, 1_000_000), Some(1_000_000)); // first sample taken as-is
-        // Dip to 400k: 0.3×400k + 0.7×1M = 820k — a 18 % drop, past hysteresis.
+                                                             // Dip to 400k: 0.3×400k + 0.7×1M = 820k — a 18 % drop, past hysteresis.
         assert_eq!(a.update(1, 400_000), Some(820_000));
         // Recover to 1M: 0.3×1M + 0.7×820k = 874k — a smoothed +6.6 % move, below
         // the 10 % threshold, so it is suppressed (no snap-back REMB flap).

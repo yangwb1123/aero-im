@@ -1,148 +1,70 @@
-# CURRENT_SPRINT.md — 当前 Sprint 目标与任务看板
+# CURRENT_SPRINT.md — 当前实现收口看板
 
-> 这是 Agent 的任务看板。
-> 每次 Agent 启动时读此文件决定下一步做什么。
-> 完成一个任务后，将 `[ ]` 改为 `[x]` 并更新下方进度。
+> 本文件只记录当前源码可证明的状态，不保存会漂移的迁移、测试或文件行数。
+> 开始任务前先检查工作树、`README.md`、`docs/SESSION_HANDOFF.md` 和相关源码；
+> 历史阶段名不能替代现场验证。
 
-## Sprint 元信息
+## 当前目标
 
-- **Sprint 编号**: S1（2026-06-15 ~ 持续）
-- **状态**: 🟢 功能开发阶段（Phase 1 REFACTOR 已完成 ✅）
+- 状态：功能实现收口与验证。
+- 优先级：先修复源码与文档不一致，再处理真实缺陷，最后补充明确授权的新能力。
+- 完成标准：实现、鉴权、事务/幂等、实时或后台接线、Web 消费面和相应测试一起闭环。
 
----
+## 已落地的当前能力
 
-## 🟢 Phase 1: REFACTOR — 全部完成
+| 能力域 | 当前源码事实 | 主要复核锚点 |
+|---|---|---|
+| 消息可靠性 | 创建、编辑、删除以消息聚合版本写入事务 outbox；通知和 AI 后置工作与业务状态一起提交；REST/WS 发送共享校验与幂等语义；外部副作用 consumer 使用带租约和 fencing 的 durable receipt | `ImService`、`event_outbox`、`message_side_effect`、`ConsumerEventReceiptRepo` |
+| 事务与资源围栏 | 定时/周期消息、MLS 不透明中继与关键词提醒、预测、置顶、直播治理、直播目标和预约直播均在数据库提交点复检 actor、租户/房间/stream 归属、生命周期与配额；活跃工作区在 participant、TOTP、成员角色或强制 2FA 跨行变更提交后仍须保有有效 Owner；应用层按规范化顺序取锁，raw SQL 不能绕过关键边界 | `scheduled`、`recurring`、`mls`、`keyword_alert`、`predictions`、`pin`、`stream_mod`、`raids`、`goals`、`scheduled_stream`、`aero_workspace_has_effective_owner` |
+| AI 行动项持久化 | `POST /api/rooms/:id/action-items?persist=true` 要求 `Idempotency-Key`；同一 actor/room/idempotency-key digest 原子创建批次与任务，重放返回原任务 ID，空结果也有 durable receipt，并发重试不会拼接不同批次；账户擦除保留共享任务，仅解绑 batch key/index 并删除私有 receipt/digest | `action_items.rs`、`task/action_item_batch.rs`、`ParticipantRepo::delete_participant` |
+| 搜索反馈 | 高级搜索由服务端保存短期 impression、完整规范化请求与有序结果快照；点击只提交 `impression_id` 与 `result_id`，仓储推导 query/rank、复检当前访问权并限制每个 impression 一次确定性点击 | `search_advanced.rs`、`search_feedback.rs` |
+| 保存搜索监控 | Owner-scoped 保存搜索支持启停监控；首次启用以当前时间为基线，不回灌历史；后台 worker 用 `(created_at,message_id)` 复合游标、有界 keyset 分页和稳定通知 ID，在并发实例及崩溃重试下收敛 | `saved_searches.rs`、`saved_search_monitor.rs`、`saved_search/` |
+| 直播治理与申诉 | moderator/ban/raid 等写路径在 stream 围栏下复检当前权限；ban revision 标识具体封禁代际。被封禁用户可 `POST /api/streams/:id/appeals`，主播/当前 moderator 可读取队列并通过 `POST /api/appeals/:id/review` 审核；旧申诉不能解除后续重新建立的封禁 | `stream_mod.rs`、`stream_moderators.rs`、`raids.rs`、`ban_appeals.rs` |
+| Agent/Bot 租户安装 | `/api/agents` 必须显式给出 `room_id`，仅当前 room manager 可创建；participant、workspace membership 与 room membership 原子提交后发送 `MemberAdded`，direct/标记 group DM 零写拒绝。`/api/bots` 提供 `workspace_id` 时把 participant、普通 workspace membership、Bot registry 与 token hash 原子提交，省略时为个人/system Bot；workspace Bot membership backfill 修复存量 live scoped Bot 的成员边，同时保留已有更高角色 | `create_service_identity_authorized`、`create_authorized_with_token`、`migrations/*_bot_workspace_membership_backfill.sql` |
+| 企业 Web 前台 | Web SPA 已提供治理、企业安全、企业合规三个管理面：审计与 Bot、会话/2FA/存储区域/IP allowlist/SCIM/AutoMod/IdP、留存/导出/法务保全/信息隔离/成员生命周期/邀请/Webhook。前端只做可用性门控，后端仍按当前 Owner/Admin 和资源归属复检 | `web/governance.js`、`web/security_admin.js`、`web/compliance_admin.js` |
+| SFU 与跨节点媒体 | 浏览器 `call_sfu_v2` offer/ICE/subscription 已进入生产 WS lifecycle，并驱动 `SfuMediaRegistry` bind/run；持久 call-leg generation 经 PG/Redis CAS、WS/SFU 事件和精确清理围栏旧连接，legacy caller reconnect 兼容迁移仍对伪造 caller fail-closed。本地 RTP 进入 `SfuForwarder` 和 `CallEgress`；supervisor 已接 `ensure_bridges`/`ensure_egress`，内部 subscribe/feedback 端点以共享 secret 保护；真实旧 v3 / 当前 v4 二进制已通过双向媒体与协议降级验收 | `ws/ws_impl/sfu.rs`、`sfu_media.rs`、`call_bridge_supervisor.rs`、`call.rs`、`call_route.rs`、`live_presence.rs`、`web/sfu_calls.js` |
 
+通知聚合、部分索引、富文本与搜索高亮、多级缓存、SMTP、安全响应头和
+Bot 开放平台也已落地；需要细节时以对应模块和 `README.md` 功能矩阵为准。
+
+## 明确尚未完成的环境验收
+
+以下项目不能因结构测试、协议测试或 localhost 测试通过而标记为生产完成：
+
+| 项目 | 仍需完成 |
+|---|---|
+| 浏览器 WebRTC | 首 offer 预留 7 对 recvonly 槽覆盖默认 8 人群规模；当前 generation-fenced 构建已通过本机真实 Chrome 双客户端、late-subscriber、跨 gateway 重连，真实 Firefox 双向音视频和本机 coturn 强制 relay-only；物理设备、Safari、跨主机/公网 NAT/公网 TURN、长时弱网与超出默认规模的 Firefox 实机扩容仍待 |
+| 跨主机 call-bridge | 本机两个独立 gateway 的 generation-bound 双向 RTP 与旧连接清理围栏已通过；可路由 advertise 地址、UDP 可达性、NAT/防火墙、sticky route 与跨主机双向 RTP/RTCP 仍待 |
+| 直播摄入/播放 | 真实 ffmpeg RTMP/WHIP/加密 SRT（含 post-handshake SEK 轮换）、真实 OBS Studio RTMP 与 Chrome WHEP 播放已通过；Safari 播放、真实推流设备与跨网部署仍待 |
+| 外部服务 | 本机 MinIO/Mailpit/mock OIDC/Jaeger/ClamAV/OTel 已通过；真实外部 S3/KMS、FCM/APNs、SMTP/OIDC/OTLP 等供应商凭据网络往返仍待 |
+| SAML | 默认 ACS 继续 fail-closed；生产启用前须接入并安全评审经审计的 XML-DSig verifier |
+| 消息分区切换 | shadow、回填与 runbook 已准备；生产表交换仍需获批维护窗、写入闸门、备份/恢复演练、DBA 执行与回滚方案 |
+
+MLS 客户端密码学、联邦和原生移动 SDK 是既定非目标，不应作为当前 Sprint
+的待实现项。
+
+## 验证纪律
+
+迁移会编译进 `aero-cli`；任何迁移变化都必须先 build，再在全新一次性数据库
+执行 migrate。不要修改共享开发库或手工改 `_sqlx_migrations`。
+
+```bash
+cargo build --workspace
+cargo check --workspace
+cargo test --workspace --lib
+cargo clippy --workspace --all-targets
+scripts/truth-check.sh
+scripts/file-size-check.sh
+scripts/web-check.sh
 ```
-📊 重构进度:
-   14/14 已完成
-   ██████████████ 100%
 
-所有 HARD 违规文件已拆分。最后一步：routes/health.rs 路由提取完成。
-```
+PG 门控测试使用指向已完整迁移的一次性数据库的 `DATABASE_URL`。运行时 REST/WS
+smoke 也应使用同一隔离库，服务停止后再删除。
 
-## 🟢 Phase 2: 功能开发
+## Agent 决策流程
 
-### P0: 通知聚合摘要 — ✅ 全部完成
-
-| 状态 | 任务 |
-|------|------|
-| [x] | 新增 notification_bundles 表（迁移 0143） |
-| [x] | 通知插入点加延迟聚合逻辑 |
-| [x] | push_bot 注入 collapse_key / apns-collapse-id |
-| [x] | WS 重连回放压缩 (?summarize=true) |
-| [x] | web/app.js JS 模块拆分（998 行，降到了 <1000） |
-
-### P0: 索引瘦身 — ✅ 全部完成
-
-| 状态 | 任务 |
-|------|------|
-| [x] | GIN partial index (migration 0136) |
-| [x] | HNSW partial index (migration 0136) |
-| [x] | 索引膨胀 Prometheus gauge |
-
-### P1: 富文本编辑 — ✅ 全部完成
-
-| 状态 | 任务 |
-|------|------|
-| [x] | 服务端 Markdown 解析器 (markdown.rs, 已接入 WS send_message 管线) |
-| [x] | Span 合法性校验（嵌套深度）|
-| [x] | Web 前端 span 渲染 (render.js appendTextWithSpans) |
-| [x] | 搜索高亮 ts_headline (headline 已加入 search/search_advanced 响应) |
-
-### P1: 多级缓存 — ✅ 全部完成
-
-| 状态 | 任务 |
-|------|------|
-| [x] | Participant profile 本地缓存 (participant_cache.rs, DashMap + TTL) |
-| [x] | Room membership 批量预取 (room_member_cache.rs, get_or_fetch) |
-| [x] | 缓存命中率指标 (metrics.rs, PARTICIPANT_CACHE_LOOKUPS_TOTAL) |
-
-### P0: 邮件通讯渠道 — ✅ 全部完成
-
-| 状态 | 任务 |
-|------|------|
-| [x] | mailer.rs: SMTP 发送基础设施 (lettre) |
-| [x] | 密码重置邮件 (sessions.rs:360) |
-| [x] | 邀请邮件 (invitations.rs:222) |
-| [x] | EmailConfig + build_mailer 装配 (state_builder.rs + main.rs) |
-
-### P1: 安全响应头 — ✅ 全部完成
-
-| 状态 | 任务 |
-|------|------|
-| [x] | X-Frame-Options: DENY |
-| [x] | X-Content-Type-Options: nosniff |
-| [x] | Strict-Transport-Security |
-| [x] | Referrer-Policy |
-| [x] | Permissions-Policy |
-| [x] | CSP (opt-in via AERO_CSP_POLICY) |
-
-### P1: 搜索高亮 & 路由拆分 — ✅ 全部完成
-
-| 状态 | 任务 |
-|------|------|
-| [x] | headline 字段加入 /api/search 和 /api/search/advanced 响应 |
-| [x] | health 路由提取到 routes/health.rs（routes.rs 3002→2848 行） |
-
----
-
-## Phase 3: 能力扩展（下一阶段）
-
-> Phase 2 在功能层面已基本完成。以下候选方向供下一 sprint 选取。
-
-### P2: 开放平台（Bot + App SDK）— ✅ 已完成（本 sprint 复核发现早前已建好，未在此文档同步）
-
-| 状态 | 任务 | 备注 |
-|------|------|------|
-| [x] | Bot 注册与 token 管理 | `bots`/`bot_event_subscriptions` 表（mig 0141/0142），`aero-storage/src/bot.rs::BotRepo`，`POST /api/bots` + `POST /api/bots/:id/token` |
-| [x] | Bot API 端点 | routes.rs `bot_create`/`bot_list`/`bot_rotate_token`/`bot_list_subscriptions`/`bot_create_subscription`/`bot_delete_subscription`/`bot_list_deliveries`，均 `ensure_bot_owner` 所有权校验 |
-| [x] | 事件订阅细化 | `subscribe`/`list_subscriptions`/`delete_subscription`/`subscriptions_for_event`，JSONB `filters`（room/workspace/action_id），`bot_dispatch.rs` 按订阅分发，投递日志见 mig 0147 |
-
-复核时发现并修复一个真实 SSRF 漏洞：`bot_create_subscription` 此前对用户提供的 `webhook_url` **零校验**，而 `bot_dispatch.rs` 会对其发起服务端 HTTP 请求——任意已认证用户都可以注册 bot 并订阅一个指向内网/云元数据地址的 webhook。已接入与房间级 outgoing webhook 相同的 `assert_webhook_url_safe` 防护并现场验证（loopback/元数据地址 400，公网 URL / 无 URL 均成功）。
-
-### P2: 分片扩展
-
-| 状态 | 任务 | 预估 |
-|------|------|------|
-| [x] | Redis 热键分片（presence/viewers 256 分片，live_presence.rs + presence.rs） | L |
-| [x]（准备 + cutover 脚本均已验证，执行本身留给维护窗口） | 消息表自动分区 — shadow 表 + 回填/维护函数（mig 0148）+ 已验证的 cutover 脚本（`docs/runbooks/messages-cutover.sql`） | XL |
-
-复核 `docs/runbooks/messages-partitioning.md` §5a 的 6 月验证记录时发现：迁移 `0157`（本 sprint 新增的 `messages.version` 乐观锁列）晚于 `0148` 建好 shadow 表，而 `LIKE messages INCLUDING DEFAULTS` 是建表那一刻的快照、不会自动跟进后续新列——`messages_partitioned` 和 `backfill_messages_partition` 因此从未携带 `version`。若不修，真正执行 cutover 会让每条曾被编辑过的消息 version 静默重置为默认值 1，导致客户端记住的 `expected_version` 永久失配、编辑一律 409。已修复（`migrations/0158_messages_partition_shadow_version_column.sql` + 更新 `messages-cutover.sql` 的最终同步列表)，并在全新 throwaway DB（158 条迁移链，不是共享 `aero` DB）上端到端重新验证：种入一条 version=5（模拟 4 次真实编辑）的消息 → 回填 → 跑 cutover 脚本 → 确认 cutover 后 version 仍为 5（未被重置），以及 6 月记录的全部检查项（行数对齐、8 条 FK 校验通过、7 张子表 0 孤儿、级联删除、FTS、分区裁剪）在当前 schema 下依然全部通过。**实际执行仍需真实维护窗口 + product/ops 批准 + 已测试的备份**——这是刻意的部署期操作，不是（也不应该是）sandbox 里能单方面"执行"的代码任务；但"脚本本身是否正确"这一层已经完整验证，不再是未验证的假设。
-
-### P2: 直播媒体面生产接线 — 移出本 sprint 范围（环境/设计边界，非遗漏）
-
-复核前先假设"文档写 `[ ]` 就是没做"，结果两次都错了（Bot 平台、分区 cutover 脚本其实都已完整实现）。这次逐项深挖代码后确认：这两项这次是**真的**卡在需要人工设计决策或真实基础设施，不是"文档过期"的第三次重演。逐项证据：
-
-- **`CallBridge::ensure_egress` 跨节点生产接线**：`call_bridge_supervisor.rs` 自身文档写得很清楚——registry、spawn-on-`BridgeTo`、幂等去重、leave 时取消，全部是真实代码且被单元测试覆盖（对 `FakeCallUpstream`/`LoopbackUpstream`）。唯一留白的是 `UpstreamFactory`：为对端节点 URL 建立一条真实的跨节点 RTP 拉取连接（SDP recvonly 交换 + ICE/DTLS/SRTP + UDP）。这一段结构上就需要**另一个真实节点**去连接和验证——单节点 sandbox 里无法有意义地实现或测试它，不是造 WebRTC 造得不够多的问题（`aero-live-webrtc` 本身已有 7500+ 行经测试的编解码器/RTCP/simulcast/BWE 实现）。
-
-- **`SfuMediaSession` bind+run 生产接线**：`bind()`/`accept_offer()`/`run()` 本身是完整实现且有单元测试（`sfu_media.rs`）；但深挖调用方发现 `SfuMediaSession::bind` **在全代码库零调用**——`join_group_call()` 只把参与者登记进 `SfuRouter`（记账），真正建立媒体连接这一步从未发生；`ClientFrame::CallOffer` 至今仍走纯 P2P 中继（`relay_call_event`），也就是说无论 DB 里 `call_mode` 标不标 `Sfu`，**当前运行时的实际路径是全网状 P2P**，服务端从未真正终结过一路媒体。把它接上意味着：(a) offer 要路由到 `SfuMediaSession` 而不是转发给对端——这一半是纯后端接线，可以做；(b) 但 web 前端（`calls.js`，639 行）目前假设的是"直接连其他浏览器的 ICE candidate"，要切到"连服务端 socket 的 ICE candidate"是一次同等量级的前端改造，不是本次顺手能带的小改动；(c) 真实媒体流转（ICE/DTLS/SRTP 握手）按模块自身文档明确说明"要靠真实 WebRTC peer 验证，CI 里验证不了"——这个 sandbox 没有可用的真实浏览器/WebRTC 客户端来端到端跑通。在没有产品侧对"是否要把现有能跑的全网状通话换成服务端终结"做出决策、也没有配套前端改造计划的情况下，单方面改动服务端会在改变一个当前工作正常的通话系统的行为语义，且改完也无法在本环境验证是否真的能建立媒体连接——风险与不可验证性都指向"需要人工决策 + 真实基础设施"，而不是"续接线代码"。
-
-两项均需要：产品/工程侧对目标架构的决策 + 真实基础设施（第二真实节点 / 真实 WebRTC 客户端）+（SfuMediaSession 这项）配套前端改造计划。这是环境与设计边界，留给专门排期的下一阶段，不计入本 sprint 完成范围。
-
-这两项依赖真实媒体服务器基础设施（非本 sandbox 环境可提供），历次 ROADMAP 复核均得出相同结论——不是遗漏，是部署环境缺口。
-
----
-
-## 当前纪律
-
-1. **禁止**修改以下模块（除非修复 bug）：
-   - `aero-live-srt/`（SRT 协议）
-   - `aero-live-webrtc/`（SFU 媒体面）
-   - `aero-live-whip/`（WHIP/WHEP）
-
-2. **每次修改后必须运行**：`cargo check --workspace -q`
-
-3. **Phase 2 内**，按 P0 优先于 P1 优先于 P2 的顺序执行
-
-## 决策流程（Agent 每次启动）
-
-```
-读 CURRENT_SPRINT.md
-│
-├─ 有 [ ] 任务 → 实现下一个
-│
-├─ 编译失败 → cargo check 修复
-│
-└─ 全部通过 → 读 ROADMAP.md 选择下一项
-```
+1. 读取本文件、`README.md`、`docs/SESSION_HANDOFF.md` 和当前 `git status`。
+2. 用 `rg` 找到路由、仓储、迁移、boot/worker、WS/Web 消费面的真实调用链。
+3. 若文档与源码不一致，先按源码修正文档；若源码有缺口，再实现最小完整闭环。
+4. 执行与风险相称的目标测试和上述静态门禁。
+5. 只有真实环境完成验收后，才能关闭对应 staging 项。

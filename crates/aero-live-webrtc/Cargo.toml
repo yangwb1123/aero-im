@@ -23,8 +23,10 @@ tracing.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
 ulid = { workspace = true, features = ["serde", "uuid"] }
+uuid.workspace = true
 time.workspace = true
 parking_lot.workspace = true
-# Pure-Rust crypto backend (no system C toolchain / NASM required) so the SFU
-# builds reliably everywhere. RTP mode = forward raw RTP without transcoding.
-str0m = { version = "0.19.0", default-features = false, features = ["rust-crypto"] }
+# The str0m DTLS/SRTP path uses its pure-Rust `rust-crypto` backend. This does
+# not make unrelated workspace TLS dependencies free of native providers.
+# RTP mode forwards raw RTP without transcoding.
+str0m = { path = "../../vendor/aero-str0m-msrv/str0m", version = "0.19.0", default-features = false, features = ["rust-crypto"] }

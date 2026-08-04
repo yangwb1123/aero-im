@@ -18,6 +18,10 @@ use crate::error::{AiError, Result};
 pub trait Transcriber: Send + Sync {
     async fn transcribe(&self, bytes: Bytes, mime: &str) -> Result<String>;
     fn name(&self) -> &'static str;
+
+    fn is_paid_provider(&self) -> bool {
+        false
+    }
 }
 
 pub struct WhisperTranscriber {
@@ -31,14 +35,19 @@ impl WhisperTranscriber {
     #[must_use]
     pub fn from_env() -> Option<Self> {
         let api_key = std::env::var("OPENAI_API_KEY").ok()?;
-        let base_url = std::env::var("OPENAI_BASE_URL")
-            .unwrap_or_else(|_| "https://api.openai.com/v1".into());
+        let base_url =
+            std::env::var("OPENAI_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".into());
         let model = std::env::var("WHISPER_MODEL").unwrap_or_else(|_| "whisper-1".into());
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(60))
             .build()
             .ok()?;
-        Some(Self { api_key, base_url, model, http })
+        Some(Self {
+            api_key,
+            base_url,
+            model,
+            http,
+        })
     }
 }
 
@@ -84,6 +93,10 @@ impl Transcriber for WhisperTranscriber {
     fn name(&self) -> &'static str {
         "whisper-1"
     }
+
+    fn is_paid_provider(&self) -> bool {
+        true
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -115,7 +128,10 @@ mod tests {
     #[tokio::test]
     async fn stub_returns_placeholder_with_size() {
         let t = StubTranscriber;
-        let s = t.transcribe(Bytes::from_static(b"abcd"), "audio/webm").await.unwrap();
+        let s = t
+            .transcribe(Bytes::from_static(b"abcd"), "audio/webm")
+            .await
+            .unwrap();
         assert!(s.contains("4 bytes"));
     }
 }

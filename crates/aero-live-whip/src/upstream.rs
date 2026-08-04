@@ -52,7 +52,10 @@ const RECV_BUF: usize = 2048;
 /// yields access units via [`UpstreamSource::next_au`].
 ///
 /// Construct with [`WhepUpstreamSource::connect`]. The background WebRTC receive
-/// task starts immediately; dropping this struct closes the channel and stops it.
+/// task starts immediately. Dropping this struct closes the AU receiver; the
+/// transport task then exits when the peer/link ends or its next AU send observes
+/// the closed channel. A server that enables cascade must additionally own
+/// explicit task cancellation and the upstream WHEP resource `DELETE` lifecycle.
 #[derive(Debug)]
 pub struct WhepUpstreamSource {
     stream_id: Ulid,

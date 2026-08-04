@@ -16,7 +16,6 @@
 use aero_common::{MessageId, ParticipantId, RoomId, Workspace, WorkspaceId, WorkspaceRole};
 use sqlx::PgPool;
 
-
 #[derive(Clone)]
 pub struct WorkspaceRepo {
     pub(crate) pool: PgPool,
@@ -81,8 +80,17 @@ impl WorkspaceRepo {
     pub async fn get(&self, workspace: WorkspaceId) -> Result<Option<Workspace>, sqlx::Error> {
         let row = sqlx::query_as::<
             _,
-            (uuid::Uuid, String, String, Option<uuid::Uuid>, time::OffsetDateTime,
-             Option<String>, Option<String>, Option<String>, Option<String>),
+            (
+                uuid::Uuid,
+                String,
+                String,
+                Option<uuid::Uuid>,
+                time::OffsetDateTime,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+            ),
         >(
             r"SELECT id, name, slug, created_by, created_at,
                      logo_url, color_scheme, custom_domain, description
@@ -91,19 +99,22 @@ impl WorkspaceRepo {
         .bind(workspace.to_uuid())
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(|(id, name, slug, by, at, logo_url, color_scheme, custom_domain, description)| Workspace {
-            id: WorkspaceId::from_uuid(id),
-            name,
-            slug,
-            created_by: by.map(ParticipantId::from_uuid),
-            created_at: at,
-            logo_url,
-            color_scheme,
-            custom_domain,
-            description,
-        }))
+        Ok(row.map(
+            |(id, name, slug, by, at, logo_url, color_scheme, custom_domain, description)| {
+                Workspace {
+                    id: WorkspaceId::from_uuid(id),
+                    name,
+                    slug,
+                    created_by: by.map(ParticipantId::from_uuid),
+                    created_at: at,
+                    logo_url,
+                    color_scheme,
+                    custom_domain,
+                    description,
+                }
+            },
+        ))
     }
-
 }
 
 // ---------- Pure authorization predicates (DB-free, unit-tested) ----------
@@ -216,7 +227,10 @@ mod tests {
     #[test]
     fn owner_can_grant_anything() {
         for target in ALL {
-            assert!(role_can_assign(WorkspaceRole::Owner, target), "target {target:?}");
+            assert!(
+                role_can_assign(WorkspaceRole::Owner, target),
+                "target {target:?}"
+            );
         }
     }
 
@@ -238,13 +252,25 @@ mod tests {
     #[test]
     fn manage_member_respects_hierarchy() {
         // Admin can manage members/guests/other admins, but not owners.
-        assert!(role_can_manage_member(WorkspaceRole::Admin, WorkspaceRole::Member));
-        assert!(role_can_manage_member(WorkspaceRole::Admin, WorkspaceRole::Admin));
-        assert!(!role_can_manage_member(WorkspaceRole::Admin, WorkspaceRole::Owner));
+        assert!(role_can_manage_member(
+            WorkspaceRole::Admin,
+            WorkspaceRole::Member
+        ));
+        assert!(role_can_manage_member(
+            WorkspaceRole::Admin,
+            WorkspaceRole::Admin
+        ));
+        assert!(!role_can_manage_member(
+            WorkspaceRole::Admin,
+            WorkspaceRole::Owner
+        ));
 
         // Owner can manage anyone.
         for subject in ALL {
-            assert!(role_can_manage_member(WorkspaceRole::Owner, subject), "subject {subject:?}");
+            assert!(
+                role_can_manage_member(WorkspaceRole::Owner, subject),
+                "subject {subject:?}"
+            );
         }
 
         // Regular members and guests can manage nobody.
@@ -287,9 +313,18 @@ mod tests {
         // strict `<`, so it is NOT yet expired); one a hair older is expired.
         let cutoff = retention_cutoff(now, 7);
         let exactly_seven_days_old = now - time::Duration::days(7);
-        assert_eq!(exactly_seven_days_old, cutoff, "boundary is inclusive of cutoff");
-        assert!(now - time::Duration::days(8) < cutoff, "8-day-old is past cutoff");
-        assert!(now - time::Duration::days(6) > cutoff, "6-day-old is within window");
+        assert_eq!(
+            exactly_seven_days_old, cutoff,
+            "boundary is inclusive of cutoff"
+        );
+        assert!(
+            now - time::Duration::days(8) < cutoff,
+            "8-day-old is past cutoff"
+        );
+        assert!(
+            now - time::Duration::days(6) > cutoff,
+            "6-day-old is within window"
+        );
     }
 }
 
@@ -336,22 +371,24 @@ mod db_tests {
         owner: ParticipantId,
     ) -> (WorkspaceId, RoomId, MessageId) {
         let ws = repo
-            .create("Export WS".into(), format!("exp-{}", WorkspaceId::new()), owner)
+            .create(
+                "Export WS".into(),
+                format!("exp-{}", WorkspaceId::new()),
+                owner,
+            )
             .await
             .expect("create workspace");
 
-        let room = RoomId::new();
-        sqlx::query(
-            r"INSERT INTO rooms (id, kind, name, created_by, created_at, workspace_id)
-               VALUES ($1, 'channel', $2, $3, now(), $4)",
-        )
-        .bind(room.to_uuid())
-        .bind("general")
-        .bind(owner.to_uuid())
-        .bind(ws.id.to_uuid())
-        .execute(p)
-        .await
-        .expect("insert room");
+        let room = crate::RoomRepo::new(p.clone())
+            .create_in_workspace(
+                ws.id,
+                aero_common::RoomKind::Channel,
+                Some("general".into()),
+                owner,
+            )
+            .await
+            .expect("insert room")
+            .id;
 
         let msg = MessageId::new();
         sqlx::query(
@@ -384,11 +421,18 @@ mod db_tests {
         assert_eq!(export.workspace.id, ws);
         // Owner is enrolled as a member by `create`.
         assert!(
-            export.members.iter().any(|m| m.participant_id == owner && m.role == WorkspaceRole::Owner),
+            export
+                .members
+                .iter()
+                .any(|m| m.participant_id == owner && m.role == WorkspaceRole::Owner),
             "owner must appear as a member"
         );
         // The seeded channel + its message are present.
-        let r = export.rooms.iter().find(|r| r.room.id == room).expect("room exported");
+        let r = export
+            .rooms
+            .iter()
+            .find(|r| r.room.id == room)
+            .expect("room exported");
         assert!(!r.message_cap_hit, "tiny room is not capped");
         assert!(r.messages.iter().any(|m| m.id == msg), "message exported");
         // The workspace.create audit event is captured.
@@ -447,7 +491,13 @@ mod db_tests {
         .unwrap();
         // An audit row to prove the cascade reaches audit_events.
         AuditRepo::new(p.clone())
-            .append(ws, Some(owner), "workspace.delete", None, serde_json::json!({}))
+            .append(
+                ws,
+                Some(owner),
+                "workspace.delete",
+                None,
+                serde_json::json!({}),
+            )
             .await
             .unwrap();
 
@@ -455,24 +505,28 @@ mod db_tests {
         assert!(deleted, "delete reports a row was removed");
 
         // Workspace gone.
-        assert!(repo.get(ws).await.unwrap().is_none(), "workspace row deleted");
+        assert!(
+            repo.get(ws).await.unwrap().is_none(),
+            "workspace row deleted"
+        );
         // Members cascade-deleted.
-        assert!(!repo.is_member(ws, owner).await.unwrap(), "members cascade-deleted");
+        assert!(
+            !repo.is_member(ws, owner).await.unwrap(),
+            "members cascade-deleted"
+        );
         // Room explicitly deleted (rooms→workspaces FK has no cascade).
-        let room_left: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM rooms WHERE id = $1")
-                .bind(room.to_uuid())
-                .fetch_one(&p)
-                .await
-                .unwrap();
+        let room_left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rooms WHERE id = $1")
+            .bind(room.to_uuid())
+            .fetch_one(&p)
+            .await
+            .unwrap();
         assert_eq!(room_left, 0, "room deleted with its workspace");
         // Messages cascade-deleted with the room.
-        let msg_left: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE id = $1")
-                .bind(msg.to_uuid())
-                .fetch_one(&p)
-                .await
-                .unwrap();
+        let msg_left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE id = $1")
+            .bind(msg.to_uuid())
+            .fetch_one(&p)
+            .await
+            .unwrap();
         assert_eq!(msg_left, 0, "messages cascade-deleted with the room");
         // Audit rows cascade-deleted with the workspace.
         let audit_left: i64 =
@@ -481,7 +535,10 @@ mod db_tests {
                 .fetch_one(&p)
                 .await
                 .unwrap();
-        assert_eq!(audit_left, 0, "audit events cascade-deleted with the workspace");
+        assert_eq!(
+            audit_left, 0,
+            "audit events cascade-deleted with the workspace"
+        );
         // Non-FK room-scoped content (drafts) is explicitly cleaned, not orphaned.
         let draft_left: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM message_drafts WHERE room_id = $1")
@@ -489,7 +546,10 @@ mod db_tests {
                 .fetch_one(&p)
                 .await
                 .unwrap();
-        assert_eq!(draft_left, 0, "non-FK room-scoped drafts cleaned, not orphaned");
+        assert_eq!(
+            draft_left, 0,
+            "non-FK room-scoped drafts cleaned, not orphaned"
+        );
         // Non-FK workspace-scoped content (keyword alerts) is cleaned too.
         let kw_left: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM keyword_alerts WHERE workspace_id = $1")
@@ -497,7 +557,10 @@ mod db_tests {
                 .fetch_one(&p)
                 .await
                 .unwrap();
-        assert_eq!(kw_left, 0, "non-FK workspace-scoped keyword alerts cleaned, not orphaned");
+        assert_eq!(
+            kw_left, 0,
+            "non-FK workspace-scoped keyword alerts cleaned, not orphaned"
+        );
         // Analytics PII (search_click_events) cleaned — the cleanup re-dropped by the
         // split. Guards GDPR erasure completeness for the broader non-FK table set.
         let clicks_left: i64 =
@@ -506,7 +569,10 @@ mod db_tests {
                 .fetch_one(&p)
                 .await
                 .unwrap();
-        assert_eq!(clicks_left, 0, "non-FK workspace-scoped search_click_events (PII) cleaned, not orphaned");
+        assert_eq!(
+            clicks_left, 0,
+            "non-FK workspace-scoped search_click_events (PII) cleaned, not orphaned"
+        );
     }
 
     #[tokio::test]
@@ -514,7 +580,10 @@ mod db_tests {
     async fn workspace_delete_missing_reports_false() {
         let p = pool();
         let repo = WorkspaceRepo::new(p);
-        assert!(!repo.delete(WorkspaceId::new()).await.unwrap(), "no row to delete");
+        assert!(
+            !repo.delete(WorkspaceId::new()).await.unwrap(),
+            "no row to delete"
+        );
     }
 
     #[tokio::test]
@@ -532,12 +601,24 @@ mod db_tests {
         // Tenant A is gone …
         assert!(repo.get(ws_a).await.unwrap().is_none());
         // … but tenant B is completely intact: workspace, member, room, message.
-        assert!(repo.get(ws_b).await.unwrap().is_some(), "second workspace survives");
-        assert!(repo.is_member(ws_b, owner_b).await.unwrap(), "B's member survives");
-        let b_export = repo.export(ws_b).await.unwrap().expect("B still exportable");
         assert!(
-            b_export.rooms.iter().any(|r| r.room.id == room_b
-                && r.messages.iter().any(|m| m.id == msg_b)),
+            repo.get(ws_b).await.unwrap().is_some(),
+            "second workspace survives"
+        );
+        assert!(
+            repo.is_member(ws_b, owner_b).await.unwrap(),
+            "B's member survives"
+        );
+        let b_export = repo
+            .export(ws_b)
+            .await
+            .unwrap()
+            .expect("B still exportable");
+        assert!(
+            b_export
+                .rooms
+                .iter()
+                .any(|r| r.room.id == room_b && r.messages.iter().any(|m| m.id == msg_b)),
             "B's room + message survive A's deletion"
         );
         // And A's room/message are truly gone (tenant isolation, both directions).
@@ -610,21 +691,49 @@ mod db_tests {
         let now = time::OffsetDateTime::now_utc();
         // 40 days old: strictly past the 30-day cutoff → swept.
         let old = insert_message_at(&p, room, owner, now - time::Duration::days(40)).await;
+        sqlx::query(
+            "INSERT INTO reactions (message_id, participant_id, emoji) VALUES ($1,$2,'👍')",
+        )
+        .bind(old.to_uuid())
+        .bind(owner.to_uuid())
+        .execute(&p)
+        .await
+        .expect("retention association");
         // 10 days old: within the window → kept.
         let fresh = insert_message_at(&p, room, owner, now - time::Duration::days(10)).await;
 
         let swept = repo.sweep_expired_messages(now, Some(ws)).await.unwrap();
-        assert_eq!(swept.len(), 1, "exactly the one 40-day-old message is swept");
+        assert_eq!(
+            swept.len(),
+            1,
+            "exactly the one 40-day-old message is swept"
+        );
 
         // The old message now wears the canonical soft-delete shape.
         let (deleted_at, blocks, text) = message_state(&p, old).await;
         assert!(deleted_at.is_some(), "old message is soft-deleted");
         assert_eq!(blocks, serde_json::json!([]), "blocks cleared to []");
         assert_eq!(text, "", "searchable_text cleared");
+        let old_reactions: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM reactions WHERE message_id = $1")
+                .bind(old.to_uuid())
+                .fetch_one(&p)
+                .await
+                .unwrap();
+        assert_eq!(
+            old_reactions, 0,
+            "retention uses the shared visible-association cleanup"
+        );
 
         // The within-window messages are untouched.
-        assert!(message_state(&p, fresh).await.0.is_none(), "10-day message kept");
-        assert!(message_state(&p, recent_seeded).await.0.is_none(), "now() message kept");
+        assert!(
+            message_state(&p, fresh).await.0.is_none(),
+            "10-day message kept"
+        );
+        assert!(
+            message_state(&p, recent_seeded).await.0.is_none(),
+            "now() message kept"
+        );
     }
 
     #[tokio::test]
@@ -641,7 +750,10 @@ mod db_tests {
 
         let swept = repo.sweep_expired_messages(now, Some(ws)).await.unwrap();
         assert_eq!(swept.len(), 0, "a policy-less workspace is never swept");
-        assert!(message_state(&p, ancient).await.0.is_none(), "10-year message kept");
+        assert!(
+            message_state(&p, ancient).await.0.is_none(),
+            "10-year message kept"
+        );
     }
 
     #[tokio::test]
@@ -655,20 +767,41 @@ mod db_tests {
         let (ws_b, room_b, _sb) = seed_workspace(&repo, &p, owner_b).await;
         // Only A opts into retention; B keeps forever.
         repo.set_retention(ws_a, Some(7)).await.unwrap();
-        assert_eq!(repo.retention_days(ws_a).await.unwrap(), Some(7), "A policy persisted");
-        assert_eq!(repo.retention_days(ws_b).await.unwrap(), None, "B has no policy");
+        assert_eq!(
+            repo.retention_days(ws_a).await.unwrap(),
+            Some(7),
+            "A policy persisted"
+        );
+        assert_eq!(
+            repo.retention_days(ws_b).await.unwrap(),
+            None,
+            "B has no policy"
+        );
 
         let now = time::OffsetDateTime::now_utc();
         let old_a = insert_message_at(&p, room_a, owner_a, now - time::Duration::days(30)).await;
         let old_b = insert_message_at(&p, room_b, owner_b, now - time::Duration::days(30)).await;
 
         let first = repo.sweep_expired_messages(now, Some(ws_a)).await.unwrap();
-        assert_eq!(first.len(), 1, "only A's old message is swept; B is untouched");
-        assert!(message_state(&p, old_a).await.0.is_some(), "A's old message swept");
-        assert!(message_state(&p, old_b).await.0.is_none(), "B's old message survives");
+        assert_eq!(
+            first.len(),
+            1,
+            "only A's old message is swept; B is untouched"
+        );
+        assert!(
+            message_state(&p, old_a).await.0.is_some(),
+            "A's old message swept"
+        );
+        assert!(
+            message_state(&p, old_b).await.0.is_none(),
+            "B's old message survives"
+        );
         // B has no policy: scoping the sweep to B deletes nothing.
         assert_eq!(
-            repo.sweep_expired_messages(now, Some(ws_b)).await.unwrap().len(),
+            repo.sweep_expired_messages(now, Some(ws_b))
+                .await
+                .unwrap()
+                .len(),
             0,
             "unpolicied workspace B is never swept"
         );
@@ -694,31 +827,34 @@ mod db_tests {
 
         let now = time::OffsetDateTime::now_utc();
         let old = insert_message_at(&p, room, owner, now - time::Duration::days(365)).await;
-        assert_eq!(repo.sweep_expired_messages(now, Some(ws)).await.unwrap().len(), 0, "cleared policy = no sweep");
-        assert!(message_state(&p, old).await.0.is_none(), "message kept after policy cleared");
+        assert_eq!(
+            repo.sweep_expired_messages(now, Some(ws))
+                .await
+                .unwrap()
+                .len(),
+            0,
+            "cleared policy = no sweep"
+        );
+        assert!(
+            message_state(&p, old).await.0.is_none(),
+            "message kept after policy cleared"
+        );
     }
 
-    /// Insert a bare channel room in `workspace` (no retention override, no
-    /// auto-enrolled owner), returning its id. Lets the per-channel override sweep
-    /// test place several rooms in one tenant deterministically.
-    async fn insert_room(
-        p: &PgPool,
-        workspace: WorkspaceId,
-        creator: ParticipantId,
-    ) -> RoomId {
-        let id = RoomId::new();
-        sqlx::query(
-            r"INSERT INTO rooms (id, kind, name, created_by, created_at, workspace_id)
-               VALUES ($1, 'channel', $2, $3, now(), $4)",
-        )
-        .bind(id.to_uuid())
-        .bind(format!("room-{id}"))
-        .bind(creator.to_uuid())
-        .bind(workspace.to_uuid())
-        .execute(p)
-        .await
-        .expect("insert room");
-        id
+    /// Insert a channel room in `workspace` (no retention override), returning
+    /// its id. Lets the per-channel override sweep test place several rooms in
+    /// one tenant deterministically.
+    async fn insert_room(p: &PgPool, workspace: WorkspaceId, creator: ParticipantId) -> RoomId {
+        crate::RoomRepo::new(p.clone())
+            .create_in_workspace(
+                workspace,
+                aero_common::RoomKind::Channel,
+                Some(format!("room-{}", RoomId::new())),
+                creator,
+            )
+            .await
+            .expect("insert room")
+            .id
     }
 
     #[tokio::test]
@@ -737,32 +873,67 @@ mod db_tests {
         let short_room = insert_room(&p, ws, owner).await;
         let long_room = insert_room(&p, ws, owner).await;
         rooms.set_retention_days(short_room, Some(7)).await.unwrap();
-        rooms.set_retention_days(long_room, Some(365)).await.unwrap();
-        assert_eq!(rooms.retention_days(short_room).await.unwrap(), Some(7), "short override persisted");
-        assert_eq!(rooms.retention_days(long_room).await.unwrap(), Some(365), "long override persisted");
-        assert_eq!(rooms.retention_days(inherit_room).await.unwrap(), None, "no override = inherit");
+        rooms
+            .set_retention_days(long_room, Some(365))
+            .await
+            .unwrap();
+        assert_eq!(
+            rooms.retention_days(short_room).await.unwrap(),
+            Some(7),
+            "short override persisted"
+        );
+        assert_eq!(
+            rooms.retention_days(long_room).await.unwrap(),
+            Some(365),
+            "long override persisted"
+        );
+        assert_eq!(
+            rooms.retention_days(inherit_room).await.unwrap(),
+            None,
+            "no override = inherit"
+        );
 
         let now = time::OffsetDateTime::now_utc();
         // 10 days old: KEPT under the 30-day default, but PAST the 7-day override.
-        let in_short = insert_message_at(&p, short_room, owner, now - time::Duration::days(10)).await;
+        let in_short =
+            insert_message_at(&p, short_room, owner, now - time::Duration::days(10)).await;
         // 3 days old: within the 7-day override → kept.
-        let fresh_short = insert_message_at(&p, short_room, owner, now - time::Duration::days(3)).await;
+        let fresh_short =
+            insert_message_at(&p, short_room, owner, now - time::Duration::days(3)).await;
         // 100 days old: SWEPT under the 30-day default, but WITHIN the 365-day override.
-        let in_long = insert_message_at(&p, long_room, owner, now - time::Duration::days(100)).await;
+        let in_long =
+            insert_message_at(&p, long_room, owner, now - time::Duration::days(100)).await;
         // 40 days old: swept under the inherited 30-day workspace default.
-        let in_inherit = insert_message_at(&p, inherit_room, owner, now - time::Duration::days(40)).await;
+        let in_inherit =
+            insert_message_at(&p, inherit_room, owner, now - time::Duration::days(40)).await;
 
         let swept = repo.sweep_expired_messages(now, Some(ws)).await.unwrap();
-        assert_eq!(swept.len(), 2, "the short-override 10d message and the inherited 40d message");
+        assert_eq!(
+            swept.len(),
+            2,
+            "the short-override 10d message and the inherited 40d message"
+        );
 
         // A shorter override sweeps a message the workspace default would have kept.
-        assert!(message_state(&p, in_short).await.0.is_some(), "shorter override swept the 10-day message");
+        assert!(
+            message_state(&p, in_short).await.0.is_some(),
+            "shorter override swept the 10-day message"
+        );
         // Within the shorter override → kept.
-        assert!(message_state(&p, fresh_short).await.0.is_none(), "3-day message within 7-day override kept");
+        assert!(
+            message_state(&p, fresh_short).await.0.is_none(),
+            "3-day message within 7-day override kept"
+        );
         // A longer override keeps a message the workspace default would have swept.
-        assert!(message_state(&p, in_long).await.0.is_none(), "longer override kept the 100-day message");
+        assert!(
+            message_state(&p, in_long).await.0.is_none(),
+            "longer override kept the 100-day message"
+        );
         // No override inherits the workspace default.
-        assert!(message_state(&p, in_inherit).await.0.is_some(), "inherited default swept the 40-day message");
+        assert!(
+            message_state(&p, in_inherit).await.0.is_some(),
+            "inherited default swept the 40-day message"
+        );
     }
 
     // ----- rate tier (0076) -----
@@ -776,16 +947,31 @@ mod db_tests {
         let (ws, _room, _msg) = seed_workspace(&repo, &p, owner).await;
 
         // 0076's column default: every new workspace starts at 'standard'.
-        assert_eq!(repo.rate_tier(ws).await.unwrap().as_deref(), Some("standard"));
+        assert_eq!(
+            repo.rate_tier(ws).await.unwrap().as_deref(),
+            Some("standard")
+        );
 
-        assert!(repo.set_rate_tier(ws, "premium").await.unwrap(), "row updated");
-        assert_eq!(repo.rate_tier(ws).await.unwrap().as_deref(), Some("premium"));
+        assert!(
+            repo.set_rate_tier(ws, "premium").await.unwrap(),
+            "row updated"
+        );
+        assert_eq!(
+            repo.rate_tier(ws).await.unwrap().as_deref(),
+            Some("premium")
+        );
 
         assert!(repo.set_rate_tier(ws, "unlimited").await.unwrap());
-        assert_eq!(repo.rate_tier(ws).await.unwrap().as_deref(), Some("unlimited"));
+        assert_eq!(
+            repo.rate_tier(ws).await.unwrap().as_deref(),
+            Some("unlimited")
+        );
 
         // Unknown workspace: nothing to update, nothing to read.
-        assert!(!repo.set_rate_tier(WorkspaceId::new(), "premium").await.unwrap());
+        assert!(!repo
+            .set_rate_tier(WorkspaceId::new(), "premium")
+            .await
+            .unwrap());
         assert_eq!(repo.rate_tier(WorkspaceId::new()).await.unwrap(), None);
     }
 
@@ -801,12 +987,18 @@ mod db_tests {
         let guest = new_participant(&p).await;
 
         // Brand-new participant, not yet a member: neither member nor guest.
-        assert!(!repo.is_member(ws, guest).await.unwrap(), "not a member yet");
+        assert!(
+            !repo.is_member(ws, guest).await.unwrap(),
+            "not a member yet"
+        );
         assert!(!repo.is_guest(ws, guest).await.unwrap(), "not a guest yet");
 
         repo.add_guest_member(ws, guest).await.unwrap();
         // Now a member, flagged as a guest, with role stored as `member`.
-        assert!(repo.is_member(ws, guest).await.unwrap(), "guest is a member");
+        assert!(
+            repo.is_member(ws, guest).await.unwrap(),
+            "guest is a member"
+        );
         assert!(repo.is_guest(ws, guest).await.unwrap(), "guest flag set");
         assert_eq!(
             repo.member_role(ws, guest).await.unwrap(),
@@ -815,34 +1007,45 @@ mod db_tests {
         );
 
         // The owner is an ordinary member, never a guest.
-        assert!(!repo.is_guest(ws, owner).await.unwrap(), "owner is not a guest");
+        assert!(
+            !repo.is_guest(ws, owner).await.unwrap(),
+            "owner is not a guest"
+        );
     }
 
     #[tokio::test]
     #[ignore = "requires live Postgres"]
-    async fn add_guest_member_is_idempotent_and_promotes_existing_member() {
+    async fn add_guest_member_is_idempotent_and_never_promotes_existing_member() {
         let p = pool();
         let repo = WorkspaceRepo::new(p.clone());
         let owner = new_participant(&p).await;
         let (ws, _room, _msg) = seed_workspace(&repo, &p, owner).await;
         let member = new_participant(&p).await;
 
-        // Enroll as an ordinary member first, then promote to guest.
-        repo.add_member(ws, member, WorkspaceRole::Member).await.unwrap();
-        assert!(!repo.is_guest(ws, member).await.unwrap(), "plain member is not a guest");
+        // Enroll as an ordinary member first. The low-level fixture helper must
+        // not turn an existing canonical member into a guest.
+        repo.add_member(ws, member, WorkspaceRole::Member)
+            .await
+            .unwrap();
+        assert!(
+            !repo.is_guest(ws, member).await.unwrap(),
+            "plain member is not a guest"
+        );
 
         repo.add_guest_member(ws, member).await.unwrap();
-        assert!(repo.is_guest(ws, member).await.unwrap(), "member promoted to guest");
-        // The role is untouched by the conflict-update branch.
+        assert!(
+            !repo.is_guest(ws, member).await.unwrap(),
+            "existing member is never promoted to guest"
+        );
         assert_eq!(
             repo.member_role(ws, member).await.unwrap(),
             Some(WorkspaceRole::Member),
-            "promotion leaves role unchanged"
+            "existing member role stays unchanged"
         );
 
-        // Re-inviting an existing guest is a harmless no-op.
+        // Repeating the fixture insert remains a harmless no-op.
         repo.add_guest_member(ws, member).await.unwrap();
-        assert!(repo.is_guest(ws, member).await.unwrap(), "re-invite keeps guest flag");
+        assert!(!repo.is_guest(ws, member).await.unwrap());
     }
 
     #[tokio::test]
@@ -856,7 +1059,9 @@ mod db_tests {
         let guest_a = new_participant(&p).await;
         let guest_b = new_participant(&p).await;
 
-        repo.add_member(ws, plain, WorkspaceRole::Member).await.unwrap();
+        repo.add_member(ws, plain, WorkspaceRole::Member)
+            .await
+            .unwrap();
         repo.add_guest_member(ws, guest_a).await.unwrap();
         repo.add_guest_member(ws, guest_b).await.unwrap();
 
@@ -870,8 +1075,14 @@ mod db_tests {
 
         // Removing a guest removes their membership entirely.
         repo.remove_member(ws, guest_a).await.unwrap();
-        assert!(!repo.is_member(ws, guest_a).await.unwrap(), "removed guest is no longer a member");
-        assert!(!repo.is_guest(ws, guest_a).await.unwrap(), "removed guest is no longer a guest");
+        assert!(
+            !repo.is_member(ws, guest_a).await.unwrap(),
+            "removed guest is no longer a member"
+        );
+        assert!(
+            !repo.is_guest(ws, guest_a).await.unwrap(),
+            "removed guest is no longer a guest"
+        );
         let after = repo.list_guests(ws).await.unwrap();
         assert_eq!(after.len(), 1, "one guest left");
         assert_eq!(after[0].participant_id, guest_b, "guest_b remains");
@@ -890,12 +1101,20 @@ mod db_tests {
         let (ws, room, _) = seed_workspace(&repo, &p, owner).await;
 
         let bob = new_participant(&p).await;
-        repo.add_member(ws, bob, WorkspaceRole::Member).await.unwrap();
+        repo.add_member(ws, bob, WorkspaceRole::Member)
+            .await
+            .unwrap();
         rooms.add_member(room, bob).await.unwrap();
-        assert!(rooms.is_member(room, bob).await.unwrap(), "bob starts as a room member");
+        assert!(
+            rooms.is_member(room, bob).await.unwrap(),
+            "bob starts as a room member"
+        );
 
         repo.remove_member(ws, bob).await.unwrap();
-        assert!(!repo.is_member(ws, bob).await.unwrap(), "no longer a workspace member");
+        assert!(
+            !repo.is_member(ws, bob).await.unwrap(),
+            "no longer a workspace member"
+        );
         assert!(
             !rooms.is_member(room, bob).await.unwrap(),
             "room membership revoked on workspace removal (no restore on re-add)",

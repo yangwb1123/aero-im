@@ -94,20 +94,30 @@ fn find_eocd(b: &[u8]) -> Option<(usize, usize)> {
 fn central_directory(b: &[u8], want: impl Fn(&str) -> bool) -> Vec<ZipEntry> {
     const SIG: [u8; 4] = [0x50, 0x4B, 0x01, 0x02];
     let mut out = Vec::new();
-    let Some((cd_off, count)) = find_eocd(b) else { return out };
+    let Some((cd_off, count)) = find_eocd(b) else {
+        return out;
+    };
     let mut off = cd_off;
     for _ in 0..count {
         if b.get(off..off + 4) != Some(&SIG) {
             break;
         }
-        let (Some(method), Some(comp), Some(name_len), Some(extra_len), Some(comment_len), Some(lho)) = (
+        let (
+            Some(method),
+            Some(comp),
+            Some(name_len),
+            Some(extra_len),
+            Some(comment_len),
+            Some(lho),
+        ) = (
             le_u16(b, off + 10),
             le_u32(b, off + 20),
             le_u16(b, off + 28),
             le_u16(b, off + 30),
             le_u16(b, off + 32),
             le_u32(b, off + 42),
-        ) else {
+        )
+        else {
             break;
         };
         let name_start = off + 46;
@@ -191,8 +201,12 @@ pub fn extract_office_text(bytes: &[u8]) -> Option<String> {
         if budget == 0 {
             break;
         }
-        let Some(data) = entry_data(bytes, e) else { continue };
-        let Some(xml) = inflate_entry(data, e.method, budget) else { continue };
+        let Some(data) = entry_data(bytes, e) else {
+            continue;
+        };
+        let Some(xml) = inflate_entry(data, e.method, budget) else {
+            continue;
+        };
         budget = budget.saturating_sub(xml.len());
         let part = xml_to_text(&xml);
         if !part.trim().is_empty() {
@@ -576,9 +590,15 @@ mod tests {
         let zip = make_zip(&[("word/document.xml", doc)]);
         let text = extract_office_text(&zip).expect("docx text");
         assert!(text.contains("Hello"), "split runs join: {text:?}");
-        assert!(text.contains("second & line"), "entity decoded + run kept: {text:?}");
+        assert!(
+            text.contains("second & line"),
+            "entity decoded + run kept: {text:?}"
+        );
         // Two paragraphs ⇒ a line break between them.
-        assert!(text.contains("Hello\nsecond"), "paragraph break inserted: {text:?}");
+        assert!(
+            text.contains("Hello\nsecond"),
+            "paragraph break inserted: {text:?}"
+        );
     }
 
     #[test]
@@ -646,7 +666,10 @@ mod tests {
         let pdf = b"%PDF-1.4\n1 0 obj<<>>\nstream\nBT (Hello) Tj T* [(Wor)-10(ld)] TJ ET\nendstream endobj\n";
         let t = extract_pdf_text(pdf).expect("pdf text");
         assert!(t.contains("Hello"), "{t:?}");
-        assert!(t.contains("Wor") && t.contains("ld"), "TJ array parts: {t:?}");
+        assert!(
+            t.contains("Wor") && t.contains("ld"),
+            "TJ array parts: {t:?}"
+        );
     }
 
     #[test]

@@ -11,7 +11,7 @@ services:
       POSTGRES_PASSWORD: aero_dev_pw
       PGDATA: /var/lib/postgresql/data/pgdata
     ports:
-      - "5432:5432"
+      - "${AERO_DEPENDENCY_BIND_HOST:-127.0.0.1}:5432:5432"
     volumes:
       - ./data/pg:/var/lib/postgresql/data
     networks:
@@ -29,7 +29,7 @@ services:
     restart: unless-stopped
     command: ["redis-server", "--appendonly", "yes", "--dir", "/data"]
     ports:
-      - "6379:6379"
+      - "${AERO_DEPENDENCY_BIND_HOST:-127.0.0.1}:6379:6379"
     volumes:
       - ./data/redis:/data
     networks:
@@ -41,13 +41,17 @@ services:
       retries: 10
 
   nats:
-    image: nats:2.10
+    # The default 2.10 image is distroless and has neither /bin/sh nor wget,
+    # while this service's HTTP health probe intentionally uses both. Keep the
+    # Alpine variant so Docker can execute the probe instead of permanently
+    # misreporting a healthy NATS process as unhealthy.
+    image: nats:2.10-alpine
     container_name: aero-nats
     restart: unless-stopped
     command: ["-js", "-sd", "/data", "-m", "8222"]
     ports:
-      - "4222:4222"
-      - "8222:8222"
+      - "${AERO_DEPENDENCY_BIND_HOST:-127.0.0.1}:4222:4222"
+      - "${AERO_DEPENDENCY_BIND_HOST:-127.0.0.1}:8222:8222"
     volumes:
       - ./data/nats:/data
     networks:
@@ -66,9 +70,9 @@ services:
     environment:
       COLLECTOR_OTLP_ENABLED: "true"
     ports:
-      - "4317:4317"   # OTLP gRPC
-      - "4318:4318"   # OTLP HTTP
-      - "16686:16686" # UI
+      - "${AERO_DEPENDENCY_BIND_HOST:-127.0.0.1}:4317:4317"   # OTLP gRPC
+      - "${AERO_DEPENDENCY_BIND_HOST:-127.0.0.1}:4318:4318"   # OTLP HTTP
+      - "${AERO_DEPENDENCY_BIND_HOST:-127.0.0.1}:16686:16686" # UI
     networks:
       - aero-dev
     healthcheck:
@@ -86,8 +90,8 @@ services:
       MINIO_ROOT_USER: aero_minio
       MINIO_ROOT_PASSWORD: aero_minio_pw
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "${AERO_DEPENDENCY_BIND_HOST:-127.0.0.1}:9000:9000"
+      - "${AERO_DEPENDENCY_BIND_HOST:-127.0.0.1}:9001:9001"
     volumes:
       - ./data/minio:/data
     networks:

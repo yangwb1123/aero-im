@@ -7,23 +7,21 @@
 //! when.
 //!
 //! A partial unique index (`channel_join_requests_pending_uq`) keeps at most one
-//! OUTSTANDING (`pending`) request per `(room, requester)`, so [`create`] is
-//! idempotent for a repeated ask: on the unique violation it resolves to the
-//! existing pending row's id rather than erroring. *Granting* membership on
-//! approval is deliberately left to the existing
-//! [`RoomRepo::add_member`](crate::RoomRepo) — this repo only owns the request
-//! lifecycle and never touches `room_members`.
+//! outstanding request per `(room, requester)`. Creation and decision both
+//! repeat tenant authorization inside their transaction; approval grants room
+//! membership in that same transaction, so a crash cannot leave a pending
+//! request whose requester was already admitted.
 //!
 //! Purely additive: a NEW [`JoinRequestRepo`] over a NEW table; no existing repo
 //! is touched. The [`JoinRequest`] model lives here (and is re-exported from the
 //! crate root) rather than in `aero-common`, since it is a storage-layer
 //! projection.
 //!
-//! [`create`]: JoinRequestRepo::create
+//! [`create_authorized`]: JoinRequestRepo::create_authorized
 
-use aero_common::{JoinRequestId, ParticipantId, RoomId};
+use aero_common::{JoinRequestId, ParticipantId, RoomId, WorkspaceRole};
 use serde::Serialize;
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 
 /// One channel join request — a member's request to join a channel, pending an
 /// owner's / admin's decision.
@@ -54,8 +52,7 @@ pub struct JoinRequest {
 
 /// The columns a [`JoinRequest`] is built from, in select order. Shared by every
 /// query so the row decoding stays in one place.
-const COLUMNS: &str =
-    "id, room_id, requester_id, status, created_at, decided_at, decided_by";
+const COLUMNS: &str = "id, room_id, requester_id, status, created_at, decided_at, decided_by";
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct Row {
@@ -80,6 +77,62 @@ fn row_to_model(r: Row) -> JoinRequest {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum JoinRequestWriteError {
+    #[error(transparent)]
+    Database(#[from] sqlx::Error),
+    #[error("channel or request not found")]
+    NotFound,
+    #[error("requester is not an effective member of the channel workspace")]
+    RequesterNotMember,
+    #[error("requester is already a room member")]
+    AlreadyMember,
+    #[error("decider is not allowed to manage this channel")]
+    Forbidden,
+    #[error("decision status must be approved or denied")]
+    InvalidStatus,
+}
+
+async fn effective_role(
+    tx: &mut Transaction<'_, Postgres>,
+    workspace: uuid::Uuid,
+    participant: ParticipantId,
+) -> Result<Option<WorkspaceRole>, sqlx::Error> {
+    let role = sqlx::query_scalar::<_, String>(
+        r"SELECT membership.role
+            FROM workspace_members membership
+            JOIN workspaces workspace
+              ON workspace.id = membership.workspace_id
+            JOIN participants participant
+              ON participant.id = membership.participant_id
+             AND participant.deleted_at IS NULL
+           WHERE membership.workspace_id = $1
+             AND membership.participant_id = $2
+             AND NOT EXISTS (
+                 SELECT 1
+                   FROM workspace_deactivations deactivated
+                  WHERE deactivated.workspace_id = membership.workspace_id
+                    AND deactivated.participant_id = membership.participant_id
+             )
+             AND (
+                 participant.kind <> 'human'
+                 OR NOT workspace.require_2fa
+                 OR EXISTS (
+                     SELECT 1
+                       FROM totp_secrets totp
+                      WHERE totp.participant_id = membership.participant_id
+                        AND totp.activated
+                 )
+             )
+           FOR SHARE OF membership, workspace, participant",
+    )
+    .bind(workspace)
+    .bind(participant.to_uuid())
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(role.and_then(|value| WorkspaceRole::from_db_str(&value)))
+}
+
 /// Repository over the `channel_join_requests` table (request-to-join lifecycle).
 ///
 /// Cheap to clone — it just wraps a [`PgPool`] (itself an `Arc` internally), so
@@ -96,51 +149,60 @@ impl JoinRequestRepo {
         Self { pool }
     }
 
-    /// Create a pending join request for `requester` to join `room`, returning its
-    /// id. Idempotent for an outstanding ask: if a `pending` request already
-    /// exists for this `(room, requester)` the partial unique index rejects the
-    /// insert, and this resolves to the existing pending row's id instead of
-    /// erroring. Caller is responsible for the owner/admin authorization and for
-    /// rejecting an already-member requester.
+    /// Create a pending request after transactionally proving that `requester`
+    /// remains an effective member of the room's workspace and is not already in
+    /// the room. Repeated pending asks return the existing id.
     ///
     /// # Errors
-    /// Propagates any [`sqlx::Error`] other than the expected unique-violation
-    /// fast path (which is recovered into the existing id).
-    pub async fn create(
+    /// Propagates storage errors and returns a typed authorization conflict.
+    pub async fn create_authorized(
         &self,
         room: RoomId,
         requester: ParticipantId,
-    ) -> Result<JoinRequestId, sqlx::Error> {
+    ) -> Result<JoinRequestId, JoinRequestWriteError> {
+        let mut tx = self.pool.begin().await?;
+        let workspace = sqlx::query_scalar::<_, uuid::Uuid>(
+            "SELECT workspace_id
+               FROM rooms
+              WHERE id = $1 AND kind = 'channel'
+              FOR SHARE",
+        )
+        .bind(room.to_uuid())
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(JoinRequestWriteError::NotFound)?;
+        effective_role(&mut tx, workspace, requester)
+            .await?
+            .ok_or(JoinRequestWriteError::RequesterNotMember)?;
+        let already_member = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (
+                 SELECT 1 FROM room_members
+                  WHERE room_id = $1 AND participant_id = $2
+             )",
+        )
+        .bind(room.to_uuid())
+        .bind(requester.to_uuid())
+        .fetch_one(&mut *tx)
+        .await?;
+        if already_member {
+            return Err(JoinRequestWriteError::AlreadyMember);
+        }
+
         let id = JoinRequestId::new();
-        let result = sqlx::query(
+        let stored = sqlx::query_scalar::<_, uuid::Uuid>(
             r"INSERT INTO channel_join_requests (id, room_id, requester_id)
-               VALUES ($1, $2, $3)",
+               VALUES ($1, $2, $3)
+               ON CONFLICT (room_id, requester_id) WHERE status = 'pending'
+               DO UPDATE SET requester_id = EXCLUDED.requester_id
+               RETURNING id",
         )
         .bind(id.to_uuid())
         .bind(room.to_uuid())
         .bind(requester.to_uuid())
-        .execute(&self.pool)
-        .await;
-
-        match result {
-            Ok(_) => Ok(id),
-            // A pending request already exists for this (room, requester): the
-            // partial unique index fires. Resolve to the existing pending row so a
-            // repeated ask is idempotent.
-            Err(e) if is_unique_violation(&e) => {
-                let row = sqlx::query_as::<_, (uuid::Uuid,)>(
-                    r"SELECT id FROM channel_join_requests
-                       WHERE room_id = $1 AND requester_id = $2 AND status = 'pending'
-                       LIMIT 1",
-                )
-                .bind(room.to_uuid())
-                .bind(requester.to_uuid())
-                .fetch_one(&self.pool)
-                .await?;
-                Ok(JoinRequestId::from_uuid(row.0))
-            }
-            Err(e) => Err(e),
-        }
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(JoinRequestId::from_uuid(stored))
     }
 
     /// List join requests for `room`, newest first. When `status` is `Some`, only
@@ -183,10 +245,7 @@ impl JoinRequestRepo {
     ///
     /// # Errors
     /// Propagates any [`sqlx::Error`] from the query.
-    pub async fn get(
-        &self,
-        id: JoinRequestId,
-    ) -> Result<Option<JoinRequest>, sqlx::Error> {
+    pub async fn get(&self, id: JoinRequestId) -> Result<Option<JoinRequest>, sqlx::Error> {
         let sql = format!("SELECT {COLUMNS} FROM channel_join_requests WHERE id = $1");
         let row = sqlx::query_as::<_, Row>(&sql)
             .bind(id.to_uuid())
@@ -195,43 +254,77 @@ impl JoinRequestRepo {
         Ok(row.map(row_to_model))
     }
 
-    /// Decide a `pending` request: set its `status` (to `approved` / `denied`),
-    /// stamp `decided_at` + `decided_by`, and return `true` iff a pending row was
-    /// changed. Only ever transitions a `pending` row (the `WHERE status =
-    /// 'pending'` guard), so a second decide (or deciding an already-decided
-    /// request) is a no-op returning `false` — making the decision idempotent and
-    /// race-safe. Validating the target status string is the caller's concern.
+    /// Decide a pending request under one row lock. The decider must still be the
+    /// room creator or an effective workspace administrator; the requester must
+    /// still be an effective workspace member. Approval inserts `room_members`
+    /// before the request transition in the same transaction.
     ///
     /// # Errors
-    /// Propagates any [`sqlx::Error`] from the update.
-    pub async fn decide(
+    /// Returns typed authorization/lifecycle errors.
+    pub async fn decide_authorized(
         &self,
         id: JoinRequestId,
         status: &str,
         decider: ParticipantId,
-    ) -> Result<bool, sqlx::Error> {
-        let result = sqlx::query(
-            r"UPDATE channel_join_requests
-                 SET status = $2, decided_at = now(), decided_by = $3
-               WHERE id = $1 AND status = 'pending'",
+    ) -> Result<JoinRequest, JoinRequestWriteError> {
+        if !matches!(status, "approved" | "denied") {
+            return Err(JoinRequestWriteError::InvalidStatus);
+        }
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query_as::<_, (uuid::Uuid, uuid::Uuid, String, uuid::Uuid, uuid::Uuid)>(
+            r"SELECT request.room_id, request.requester_id, request.status,
+                     room.workspace_id, room.created_by
+                FROM channel_join_requests request
+                JOIN rooms room ON room.id = request.room_id
+               WHERE request.id = $1
+               FOR UPDATE OF request, room",
         )
         .bind(id.to_uuid())
-        .bind(status)
-        .bind(decider.to_uuid())
-        .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected() > 0)
-    }
-}
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(JoinRequestWriteError::NotFound)?;
+        let (room_id, requester_id, current_status, workspace, creator) = row;
+        if current_status != "pending" {
+            return Err(JoinRequestWriteError::NotFound);
+        }
+        let role = effective_role(&mut tx, workspace, decider)
+            .await?
+            .ok_or(JoinRequestWriteError::Forbidden)?;
+        if decider.to_uuid() != creator && !role.can_administer() {
+            return Err(JoinRequestWriteError::Forbidden);
+        }
+        let requester = ParticipantId::from_uuid(requester_id);
+        effective_role(&mut tx, workspace, requester)
+            .await?
+            .ok_or(JoinRequestWriteError::RequesterNotMember)?;
 
-/// Whether a [`sqlx::Error`] is a Postgres unique-violation (`SQLSTATE 23505`).
-/// Used to recover [`JoinRequestRepo::create`]'s idempotent fast path when a
-/// pending request already exists for the same `(room, requester)`.
-fn is_unique_violation(e: &sqlx::Error) -> bool {
-    matches!(
-        e,
-        sqlx::Error::Database(db) if db.code().as_deref() == Some("23505")
-    )
+        if status == "approved" {
+            sqlx::query(
+                "INSERT INTO room_members (room_id, participant_id, role)
+                 VALUES ($1, $2, 'member')
+                 ON CONFLICT (room_id, participant_id) DO NOTHING",
+            )
+            .bind(room_id)
+            .bind(requester_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        let sql = format!(
+            "UPDATE channel_join_requests
+                SET status = $2, decided_at = now(), decided_by = $3
+              WHERE id = $1 AND status = 'pending'
+          RETURNING {COLUMNS}"
+        );
+        let updated = sqlx::query_as::<_, Row>(&sql)
+            .bind(id.to_uuid())
+            .bind(status)
+            .bind(decider.to_uuid())
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(JoinRequestWriteError::NotFound)?;
+        tx.commit().await?;
+        Ok(row_to_model(updated))
+    }
 }
 
 /// PG-gated integration tests (run with a live Postgres + applied migrations):
@@ -243,6 +336,7 @@ fn is_unique_violation(e: &sqlx::Error) -> bool {
 #[cfg(test)]
 mod db_tests {
     use super::*;
+    use crate::{RoomRepo, WorkspaceRepo};
 
     fn pool() -> PgPool {
         let url = std::env::var("DATABASE_URL")
@@ -265,20 +359,54 @@ mod db_tests {
         id
     }
 
-    /// Insert a channel room in the default workspace so the request is well-scoped.
-    async fn mk_room(p: &PgPool, creator: ParticipantId) -> RoomId {
-        let id = RoomId::new();
+    async fn mk_workspace(p: &PgPool, owner: ParticipantId) -> aero_common::WorkspaceId {
+        WorkspaceRepo::new(p.clone())
+            .create(
+                format!("Join request {owner}"),
+                format!("join-request-{owner}"),
+                owner,
+            )
+            .await
+            .expect("create workspace")
+            .id
+    }
+
+    /// Insert a channel room in a test-owned workspace.
+    async fn mk_room(
+        p: &PgPool,
+        workspace: aero_common::WorkspaceId,
+        creator: ParticipantId,
+    ) -> RoomId {
+        RoomRepo::new(p.clone())
+            .create_in_workspace(
+                workspace,
+                aero_common::RoomKind::Channel,
+                Some(format!("join-req-room-{}", RoomId::new())),
+                creator,
+            )
+            .await
+            .expect("insert room")
+            .id
+    }
+
+    async fn enroll(
+        p: &PgPool,
+        workspace: aero_common::WorkspaceId,
+        participant: ParticipantId,
+        role: &str,
+    ) {
         sqlx::query(
-            r"INSERT INTO rooms (id, kind, name, created_by, workspace_id)
-               VALUES ($1, 'channel', $2, $3, '00000000-0000-0000-0000-000000000000')",
+            "INSERT INTO workspace_members (workspace_id, participant_id, role)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (workspace_id, participant_id)
+             DO UPDATE SET role = EXCLUDED.role",
         )
-        .bind(id.to_uuid())
-        .bind(format!("join-req-room-{id}"))
-        .bind(creator.to_uuid())
+        .bind(workspace.to_uuid())
+        .bind(participant.to_uuid())
+        .bind(role)
         .execute(p)
         .await
-        .expect("insert room");
-        id
+        .expect("enroll participant");
     }
 
     #[tokio::test]
@@ -289,13 +417,24 @@ mod db_tests {
 
         let owner = mk_participant(&p).await;
         let requester = mk_participant(&p).await;
+        let revoked_requester = mk_participant(&p).await;
         let admin = mk_participant(&p).await;
-        let room = mk_room(&p, owner).await;
+        let outsider = mk_participant(&p).await;
+        let workspace = mk_workspace(&p, owner).await;
+        let room = mk_room(&p, workspace, owner).await;
+        enroll(&p, workspace, requester, "member").await;
+        enroll(&p, workspace, revoked_requester, "member").await;
+        enroll(&p, workspace, admin, "admin").await;
+
+        assert!(matches!(
+            repo.create_authorized(room, outsider).await,
+            Err(JoinRequestWriteError::RequesterNotMember)
+        ));
 
         // create → a second create for the same (room, requester) while pending
         // resolves to the SAME id (idempotent for an outstanding ask).
-        let id = repo.create(room, requester).await.unwrap();
-        let again = repo.create(room, requester).await.unwrap();
+        let id = repo.create_authorized(room, requester).await.unwrap();
+        let again = repo.create_authorized(room, requester).await.unwrap();
         assert_eq!(id, again, "repeated pending ask is idempotent");
 
         // list_for_room(pending) surfaces it.
@@ -313,13 +452,66 @@ mod db_tests {
 
         // decide('approved', admin) flips the pending row; a second decide is a
         // no-op (false).
+        assert!(matches!(
+            repo.decide_authorized(id, "approved", outsider).await,
+            Err(JoinRequestWriteError::Forbidden)
+        ));
+        let approved = repo.decide_authorized(id, "approved", admin).await.unwrap();
+        assert_eq!(approved.status, "approved");
+        assert!(matches!(
+            repo.decide_authorized(id, "approved", admin).await,
+            Err(JoinRequestWriteError::NotFound)
+        ));
+        let admitted = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (
+                 SELECT 1 FROM room_members
+                  WHERE room_id = $1 AND participant_id = $2
+             )",
+        )
+        .bind(room.to_uuid())
+        .bind(requester.to_uuid())
+        .fetch_one(&p)
+        .await
+        .unwrap();
+        assert!(admitted, "approval grants membership atomically");
+        assert!(matches!(
+            repo.create_authorized(room, requester).await,
+            Err(JoinRequestWriteError::AlreadyMember)
+        ));
+
+        let revoked_id = repo
+            .create_authorized(room, revoked_requester)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO workspace_deactivations
+                 (workspace_id, participant_id, deactivated_by)
+             VALUES ($1, $2, $3)",
+        )
+        .bind(workspace.to_uuid())
+        .bind(revoked_requester.to_uuid())
+        .bind(admin.to_uuid())
+        .execute(&p)
+        .await
+        .unwrap();
+        assert!(matches!(
+            repo.decide_authorized(revoked_id, "approved", admin).await,
+            Err(JoinRequestWriteError::RequesterNotMember)
+        ));
+        let not_admitted = sqlx::query_scalar::<_, bool>(
+            "SELECT NOT EXISTS (
+                 SELECT 1 FROM room_members
+                  WHERE room_id = $1 AND participant_id = $2
+             )",
+        )
+        .bind(room.to_uuid())
+        .bind(revoked_requester.to_uuid())
+        .fetch_one(&p)
+        .await
+        .unwrap();
         assert!(
-            repo.decide(id, "approved", admin).await.unwrap(),
-            "first decision flips the pending row"
-        );
-        assert!(
-            !repo.decide(id, "approved", admin).await.unwrap(),
-            "second decision is a no-op"
+            not_admitted,
+            "revoked requester is never partially admitted"
         );
 
         // get reflects the new status + decision stamp.
@@ -358,7 +550,12 @@ mod db_tests {
             .execute(&p)
             .await
             .ok();
-        for who in [owner, requester, admin] {
+        sqlx::query("DELETE FROM workspaces WHERE id = $1")
+            .bind(workspace.to_uuid())
+            .execute(&p)
+            .await
+            .expect("delete workspace");
+        for who in [owner, requester, revoked_requester, admin, outsider] {
             sqlx::query("DELETE FROM participants WHERE id = $1")
                 .bind(who.to_uuid())
                 .execute(&p)

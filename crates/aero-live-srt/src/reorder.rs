@@ -49,7 +49,11 @@ impl ReorderBuffer {
     /// held (`max_depth` is floored at 1).
     #[must_use]
     pub fn new(max_depth: usize) -> Self {
-        Self { next: None, pending: BTreeMap::new(), max_depth: max_depth.max(1) }
+        Self {
+            next: None,
+            pending: BTreeMap::new(),
+            max_depth: max_depth.max(1),
+        }
     }
 
     /// Accept a data packet; return the payloads now releasable **in order**:

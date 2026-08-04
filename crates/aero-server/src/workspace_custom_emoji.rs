@@ -3,7 +3,8 @@
 //! Backs the `workspace_emoji` table introduced in migration 0115. This module
 //! runs ALONGSIDE the existing `crate::emoji` routes which operate on the
 //! `custom_emoji` (ULID-PK) table from migration 0021. The two stores coexist;
-//! clients may use either. Admin-only creation + deletion, member-readable listing.
+//! clients may use either. Creation and deletion recheck the current effective
+//! Owner/Admin under the workspace lock; listing is member-readable.
 //!
 //! Routes:
 //!   POST   /api/workspaces/:id/custom-emoji       — admin creates a custom emoji
@@ -53,7 +54,7 @@ async fn caller_role(
     workspace: WorkspaceId,
     caller: ParticipantId,
 ) -> Result<aero_common::WorkspaceRole, AeroError> {
-    repo.member_role(workspace, caller)
+    repo.effective_member_role(workspace, caller)
         .await
         .map_err(AeroError::from)?
         .ok_or_else(|| AeroError::Forbidden("not a workspace member".into()))
@@ -87,16 +88,15 @@ async fn create_custom_emoji(
     Json(req): Json<CreateCustomEmojiReq>,
 ) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
     let ws = parse_workspace_id(&id_str)?;
-    let role = caller_role(&s.workspaces, ws, auth.participant_id).await?;
-    if !role.can_administer() {
-        return Err(AeroError::Forbidden("only workspace admin/owner may create custom emoji".into()).into());
-    }
     let blob_uuid = parse_emoji_uuid(req.blob_id.trim())?;
     let repo = WorkspaceEmojiRepo::new(s.pg.clone());
     let created = repo
-        .create(ws, req.name.trim(), blob_uuid, auth.participant_id.to_uuid())
+        .create_authorized(ws, req.name.trim(), blob_uuid, auth.participant_id)
         .await?;
-    Ok((StatusCode::CREATED, Json(serde_json::to_value(created).map_err(AeroError::from)?)))
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::to_value(created).map_err(AeroError::from)?),
+    ))
 }
 
 /// `DELETE /api/workspaces/:id/custom-emoji/:eid` — delete a custom emoji (admin only).
@@ -107,21 +107,7 @@ async fn delete_custom_emoji(
 ) -> ApiResult<StatusCode> {
     let ws = parse_workspace_id(&id_str)?;
     let eid = parse_emoji_uuid(&eid_str)?;
-    let role = caller_role(&s.workspaces, ws, auth.participant_id).await?;
-    // Admin may delete any emoji; non-admin creators may delete their own.
     let repo = WorkspaceEmojiRepo::new(s.pg.clone());
-    if !role.can_administer() {
-        // Check ownership before rejecting.
-        let existing = repo.get(eid).await?.ok_or_else(|| AeroError::NotFound("emoji".into()))?;
-        if existing.created_by != Some(auth.participant_id.to_uuid()) {
-            return Err(AeroError::Forbidden(
-                "only the creator or a workspace admin may delete this emoji".into(),
-            ).into());
-        }
-    }
-    let deleted = repo.delete(eid, ws).await?;
-    if !deleted {
-        return Err(AeroError::NotFound("emoji".into()).into());
-    }
+    repo.delete_authorized(eid, ws, auth.participant_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }

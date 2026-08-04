@@ -7,8 +7,8 @@
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-use crate::ids::{MessageId, ParticipantId, RoomId};
 use super::block::Block;
+use crate::ids::{MessageId, ParticipantId, RoomId};
 
 // ---------- Message ----------
 
@@ -69,6 +69,16 @@ impl Message {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageEnvelope {
     pub message: Message,
+    /// Durable per-room creation order used by delivery-cursor v2. It is stamped
+    /// from the transactional message row before publication. Legacy/direct
+    /// publishers may omit it; such frames remain readable but are not eligible
+    /// for cumulative `ACK`s.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_ordinal: Option<i64>,
+    /// Sender-generated UUID used to settle optimistic delivery exactly. Omitted
+    /// for legacy/API/bot sends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_message_id: Option<uuid::Uuid>,
     /// Recipients (room members at publish time); used by Agents to avoid loops.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub recipients: Vec<ParticipantId>,

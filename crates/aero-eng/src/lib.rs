@@ -79,19 +79,6 @@ pub fn default_context() -> ExecutionContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::command::Command;
-    use crate::outcome::Outcome;
-    use async_trait::async_trait;
-
-    struct TestCmd;
-    #[async_trait]
-    impl Command for TestCmd {
-        fn name(&self) -> &'static str { "test-cmd" }
-        fn description(&self) -> &'static str { "test" }
-        async fn execute(&self, _: &ExecutionContext, _: &[String]) -> Outcome {
-            Outcome::ok("test")
-        }
-    }
 
     #[tokio::test]
     async fn test_dispatch_help() {

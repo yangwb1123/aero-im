@@ -28,7 +28,11 @@ impl IceServer {
     /// Convenience constructor for a STUN-only entry.
     #[must_use]
     pub fn stun<S: Into<String>>(url: S) -> Self {
-        Self { urls: vec![url.into()], username: None, credential: None }
+        Self {
+            urls: vec![url.into()],
+            username: None,
+            credential: None,
+        }
     }
 
     /// Convenience constructor for a TURN entry with credentials.
@@ -57,7 +61,10 @@ impl RtcConfig {
     /// Builds a config with the supplied ICE servers and `"all"` policy.
     #[must_use]
     pub fn new(ice_servers: Vec<IceServer>) -> Self {
-        Self { ice_servers, ice_transport_policy: "all".into() }
+        Self {
+            ice_servers,
+            ice_transport_policy: "all".into(),
+        }
     }
 }
 
@@ -87,7 +94,11 @@ pub fn default_rtc_config_from_env() -> RtcConfig {
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| vec![DEFAULT_STUN_URL.to_owned()]);
 
-    let mut ice_servers = vec![IceServer { urls: stun_urls, username: None, credential: None }];
+    let mut ice_servers = vec![IceServer {
+        urls: stun_urls,
+        username: None,
+        credential: None,
+    }];
 
     if let (Ok(url), Ok(user), Ok(pass)) = (
         env::var("AERO_TURN_URL"),
@@ -110,5 +121,8 @@ pub fn default_rtc_config_from_env() -> RtcConfig {
         .filter(|s| s == "all" || s == "relay")
         .unwrap_or_else(|| "all".into());
 
-    RtcConfig { ice_servers, ice_transport_policy: policy }
+    RtcConfig {
+        ice_servers,
+        ice_transport_policy: policy,
+    }
 }

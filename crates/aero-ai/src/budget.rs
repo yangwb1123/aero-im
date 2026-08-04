@@ -41,7 +41,10 @@ struct State {
 impl State {
     /// A fresh, empty window anchored at `now`.
     fn fresh(now: Instant) -> Self {
-        Self { used: 0, window_start: now }
+        Self {
+            used: 0,
+            window_start: now,
+        }
     }
 
     /// Roll over to a new window if `window` has elapsed since this one began.
@@ -144,7 +147,10 @@ impl CostBudget {
     /// orphaned waiting on budget.
     pub fn acquire_up_to(&self, n: u32) -> u32 {
         let now = self.clock.now();
-        let mut st = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut st = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         st.acquire_up_to(now, self.window, self.max_per_window, n)
     }
 
@@ -157,7 +163,10 @@ impl CostBudget {
             return true;
         }
         let now = self.clock.now();
-        let mut st = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut st = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         st.try_acquire_n(now, self.window, self.max_per_window, n)
     }
 
@@ -171,7 +180,10 @@ impl CostBudget {
     #[must_use]
     pub fn used(&self) -> u32 {
         let now = self.clock.now();
-        let st = self.state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let st = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         st.used_now(now, self.window)
     }
 
@@ -276,7 +288,10 @@ impl<K: Eq + Hash + Clone> KeyedCostBudget<K> {
             return 0;
         }
         let now = self.clock.now();
-        let mut map = self.windows.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut map = self
+            .windows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if !map.contains_key(&key) {
             // A new key is about to be tracked. First reclaim any windows that
             // have fully elapsed (dropping a zero-use rolled-over window is
@@ -310,7 +325,10 @@ impl<K: Eq + Hash + Clone> KeyedCostBudget<K> {
     #[must_use]
     pub fn used(&self, key: &K) -> u32 {
         let now = self.clock.now();
-        let map = self.windows.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let map = self
+            .windows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         map.get(key).map_or(0, |st| st.used_now(now, self.window))
     }
 
@@ -323,7 +341,10 @@ impl<K: Eq + Hash + Clone> KeyedCostBudget<K> {
     /// Number of keys currently holding a tracked window (test/diagnostic).
     #[cfg(test)]
     fn live_keys(&self) -> usize {
-        self.windows.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len()
+        self.windows
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
     }
 }
 
@@ -339,7 +360,10 @@ mod tests {
     }
     impl FakeClock {
         fn new() -> Self {
-            Self { base: Instant::now(), offset_ms: AtomicU64::new(0) }
+            Self {
+                base: Instant::now(),
+                offset_ms: AtomicU64::new(0),
+            }
         }
         fn advance(&self, d: Duration) {
             self.offset_ms.fetch_add(
@@ -385,7 +409,10 @@ mod tests {
         assert!(b.try_acquire());
         assert!(b.try_acquire());
         assert!(b.try_acquire());
-        assert!(!b.try_acquire(), "4th acquire over a limit of 3 must be denied");
+        assert!(
+            !b.try_acquire(),
+            "4th acquire over a limit of 3 must be denied"
+        );
         assert!(!b.try_acquire());
         assert_eq!(b.used(), 3);
         assert_eq!(b.limit(), 3);
@@ -484,7 +511,10 @@ mod tests {
             }));
         }
         let total: u32 = handles.into_iter().map(|h| h.join().unwrap()).sum();
-        assert_eq!(total, 50, "exactly limit-many acquisitions across all threads");
+        assert_eq!(
+            total, 50,
+            "exactly limit-many acquisitions across all threads"
+        );
     }
 
     // ---- KeyedCostBudget ----------------------------------------------------
@@ -496,7 +526,10 @@ mod tests {
         for _ in 0..3 {
             assert!(b.try_acquire("a"));
         }
-        assert!(!b.try_acquire("a"), "4th acquire over a limit of 3 must be denied");
+        assert!(
+            !b.try_acquire("a"),
+            "4th acquire over a limit of 3 must be denied"
+        );
         assert_eq!(b.used(&"a"), 3);
         assert_eq!(b.available(&"a"), 0);
     }
@@ -512,7 +545,11 @@ mod tests {
         assert_eq!(b.used(&"a"), 3);
 
         // "b" is entirely unaffected and still has its full, independent limit.
-        assert_eq!(b.available(&"b"), 3, "untouched key reports the full ceiling");
+        assert_eq!(
+            b.available(&"b"),
+            3,
+            "untouched key reports the full ceiling"
+        );
         assert_eq!(b.used(&"b"), 0);
         assert!(b.try_acquire("b"));
         assert!(b.try_acquire("b"));
@@ -547,7 +584,11 @@ mod tests {
         assert_eq!(b.acquire_up_to("a", 4), 0, "nothing left this window for a");
 
         // A different key is on its own fresh budget.
-        assert_eq!(b.acquire_up_to("b", 10), 5, "b clamped to its own full limit");
+        assert_eq!(
+            b.acquire_up_to("b", 10),
+            5,
+            "b clamped to its own full limit"
+        );
         assert_eq!(b.available(&"b"), 0);
     }
 
@@ -583,12 +624,18 @@ mod tests {
         assert_eq!(b.live_keys(), 2, "denied key was not inserted");
 
         // Existing keys still work at capacity.
-        assert!(b.try_acquire("a"), "already-tracked key unaffected by the cap");
+        assert!(
+            b.try_acquire("a"),
+            "already-tracked key unaffected by the cap"
+        );
 
         // Once the active windows elapse, the next new key triggers eviction of
         // the rolled-over windows and is admitted again.
         clk.advance(Duration::from_secs(11));
-        assert!(b.try_acquire("c"), "new key admitted after stale windows reclaimed");
+        assert!(
+            b.try_acquire("c"),
+            "new key admitted after stale windows reclaimed"
+        );
         assert!(b.live_keys() <= 2, "map stays within the key ceiling");
     }
 
@@ -612,7 +659,10 @@ mod tests {
         clk.advance(Duration::from_secs(6));
         assert!(b.try_acquire("a"), "a's new window admits again");
         assert!(b.try_acquire("a"));
-        assert!(!b.try_acquire("a"), "a's new window exhausted at limit again");
+        assert!(
+            !b.try_acquire("a"),
+            "a's new window exhausted at limit again"
+        );
         // ...but b's window (started t=5s) has NOT yet elapsed at t=11s.
         assert!(!b.try_acquire("b"), "b still in its first window at t=11s");
 
@@ -650,7 +700,10 @@ mod tests {
         use std::sync::Arc as StdArc;
         use std::thread;
 
-        let b = StdArc::new(KeyedCostBudget::<&'static str>::new(50, Duration::from_secs(600)));
+        let b = StdArc::new(KeyedCostBudget::<&'static str>::new(
+            50,
+            Duration::from_secs(600),
+        ));
         let mut handles = Vec::new();
         for _ in 0..8 {
             let b = StdArc::clone(&b);
@@ -665,7 +718,10 @@ mod tests {
             }));
         }
         let total: u32 = handles.into_iter().map(|h| h.join().unwrap()).sum();
-        assert_eq!(total, 50, "exactly limit-many acquisitions on the contended key");
+        assert_eq!(
+            total, 50,
+            "exactly limit-many acquisitions on the contended key"
+        );
     }
 
     #[test]
@@ -690,6 +746,10 @@ mod tests {
             }));
         }
         let total: u32 = handles.into_iter().map(|h| h.join().unwrap()).sum();
-        assert_eq!(total, 8 * 50, "each of the 8 keys granted its full independent limit");
+        assert_eq!(
+            total,
+            8 * 50,
+            "each of the 8 keys granted its full independent limit"
+        );
     }
 }

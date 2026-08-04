@@ -303,7 +303,10 @@ mod tests {
         let b1 = r.remap(RtpKey::new(8, 3012));
         assert_eq!(b1.seq, 3, "source B stays contiguous after switch");
         // Timestamp must not go backwards across the switch.
-        assert!(b0.ts > a1.ts, "outbound ts strictly increases across switch");
+        assert!(
+            b0.ts > a1.ts,
+            "outbound ts strictly increases across switch"
+        );
         assert!(b1.ts > b0.ts);
     }
 
@@ -361,8 +364,12 @@ mod tests {
 
         let targets = t.targets("v0");
         assert_eq!(targets.len(), 2);
-        assert!(targets.iter().any(|x| x.subscriber == s1 && x.out_mid == "100"));
-        assert!(targets.iter().any(|x| x.subscriber == s2 && x.out_mid == "200"));
+        assert!(targets
+            .iter()
+            .any(|x| x.subscriber == s1 && x.out_mid == "100"));
+        assert!(targets
+            .iter()
+            .any(|x| x.subscriber == s2 && x.out_mid == "200"));
         // A different publisher track has no subscribers.
         assert!(t.targets("a0").is_empty());
     }
@@ -373,7 +380,11 @@ mod tests {
         let s1 = pid();
         t.link("v0", s1, "100");
         t.link("v0", s1, "100");
-        assert_eq!(t.targets("v0").len(), 1, "duplicate link must not duplicate target");
+        assert_eq!(
+            t.targets("v0").len(),
+            1,
+            "duplicate link must not duplicate target"
+        );
     }
 
     #[test]
@@ -398,7 +409,13 @@ mod tests {
         assert_eq!(r1b, RemappedRtp { seq: 1, ts: 3000 });
         let r2b = t.remap_for(s2, "200", RtpKey::new(950, 50_000)).unwrap();
         // s2 only ever saw seq 900 then 950: gap of 50 within same source.
-        assert_eq!(r2b, RemappedRtp { seq: 50, ts: 43_000 });
+        assert_eq!(
+            r2b,
+            RemappedRtp {
+                seq: 50,
+                ts: 43_000
+            }
+        );
     }
 
     #[test]

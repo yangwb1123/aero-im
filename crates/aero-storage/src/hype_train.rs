@@ -68,7 +68,10 @@ pub struct Escalation {
 pub fn apply_contribution(contribution: u32, units: u32) -> Escalation {
     let total = contribution.saturating_add(units);
     let level = (1 + total / UNITS_PER_LEVEL).min(MAX_LEVEL);
-    Escalation { level, contribution: total }
+    Escalation {
+        level,
+        contribution: total,
+    }
 }
 
 /// Whether a train with the given `expires_at` has lapsed at `now` (the window
@@ -104,8 +107,7 @@ fn row_to_session(r: SessionRow) -> HypeTrainSession {
     }
 }
 
-const SESSION_COLUMNS: &str =
-    "id, stream_id, level, contribution, state, started_at, expires_at";
+const SESSION_COLUMNS: &str = "id, stream_id, level, contribution, state, started_at, expires_at";
 
 impl HypeTrainRepo {
     /// Build a repo over the given pool.
@@ -459,7 +461,10 @@ mod db_tests {
         assert_eq!(cur.id, s.id);
 
         // A second contribution advances the same train past a level boundary.
-        let s2 = repo.add_contribution(stream, bob, UNITS_PER_LEVEL, now).await.unwrap();
+        let s2 = repo
+            .add_contribution(stream, bob, UNITS_PER_LEVEL, now)
+            .await
+            .unwrap();
         assert_eq!(s2.id, s.id, "same active train");
         assert_eq!(s2.contribution, 3 + i32::try_from(UNITS_PER_LEVEL).unwrap());
         assert_eq!(s2.level, 2);
@@ -467,8 +472,14 @@ mod db_tests {
         // After the window lapses, `current` sweeps it to expired and a new
         // contribution starts a brand-new train.
         let later = now + Duration::seconds(WINDOW_SECS + 1);
-        assert!(repo.current(stream, later).await.unwrap().is_none(), "lapsed");
-        let s3 = repo.add_contribution(stream, alice, 1, later).await.unwrap();
+        assert!(
+            repo.current(stream, later).await.unwrap().is_none(),
+            "lapsed"
+        );
+        let s3 = repo
+            .add_contribution(stream, alice, 1, later)
+            .await
+            .unwrap();
         assert_ne!(s3.id, s.id, "a fresh train started after expiry");
         assert_eq!(s3.level, 1);
 

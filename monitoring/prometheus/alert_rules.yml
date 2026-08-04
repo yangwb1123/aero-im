@@ -95,3 +95,37 @@ groups:
         annotations:
           summary: "Postgres connection pool >90% saturated"
           description: "Sustained high pool usage; queries may start queueing."
+
+      - alert: AeroPostgresDeadTupleRatioHigh
+        expr: avg_over_time(aero_pg_table_dead_tuple_ratio[5m]) > 0.30
+        for: 15m
+        labels: { severity: ticket }
+        annotations:
+          summary: "Postgres dead tuples >30% ({{ $labels.table }})"
+          description: "A public table has sustained dead-tuple bloat; inspect autovacuum and long transactions."
+
+      - alert: AeroPostgresDeadTupleRatioCritical
+        expr: avg_over_time(aero_pg_table_dead_tuple_ratio[5m]) > 0.50
+        for: 10m
+        labels: { severity: page }
+        annotations:
+          summary: "Postgres dead tuples >50% ({{ $labels.table }})"
+          description: "Severe table bloat is likely affecting query latency and storage."
+
+      - alert: AeroPostgresIdleInTransactionStuck
+        expr: aero_pg_idle_in_transaction_max_seconds > 300
+        for: 5m
+        labels: { severity: ticket }
+        annotations:
+          summary: "Postgres session idle in transaction for >5m"
+          description: "An open transaction may be retaining locks or blocking vacuum."
+
+      - alert: AeroPostgresSequentialScansSurging
+        expr: |
+          rate(aero_pg_table_seq_scans_total[15m])
+            > 2 * clamp_min(avg_over_time(rate(aero_pg_table_seq_scans_total[15m])[6h:15m]), 0.01)
+        for: 30m
+        labels: { severity: ticket }
+        annotations:
+          summary: "Postgres sequential scans surged ({{ $labels.table }})"
+          description: "Sequential-scan rate is more than twice its six-hour baseline; inspect query plans and indexes."

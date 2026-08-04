@@ -30,7 +30,10 @@ pub struct StreamRouteRegistry {
 impl StreamRouteRegistry {
     #[must_use]
     pub fn new(client: RedisClient) -> Self {
-        Self { client, ttl: DEFAULT_TTL }
+        Self {
+            client,
+            ttl: DEFAULT_TTL,
+        }
     }
 
     #[must_use]
@@ -120,9 +123,15 @@ mod tests {
             Some("http://b.example".to_owned())
         );
         // Stream's registered home IS this node (stale/local) → no redirect.
-        assert_eq!(redirect_base("http://a.example", Some("http://a.example")), None);
+        assert_eq!(
+            redirect_base("http://a.example", Some("http://a.example")),
+            None
+        );
         // Trailing-slash difference is still the same node → no redirect loop.
-        assert_eq!(redirect_base("http://a.example", Some("http://a.example/")), None);
+        assert_eq!(
+            redirect_base("http://a.example", Some("http://a.example/")),
+            None
+        );
         // Not registered anywhere → serve locally / 404.
         assert_eq!(redirect_base("http://a.example", None), None);
         // Empty registry value is treated as absent.
@@ -143,7 +152,12 @@ mod redis_tests {
 
     async fn client() -> RedisClient {
         let url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".into());
-        let c = RedisClient::new(fred::types::RedisConfig::from_url(&url).unwrap(), None, None, None);
+        let c = RedisClient::new(
+            fred::types::RedisConfig::from_url(&url).unwrap(),
+            None,
+            None,
+            None,
+        );
         c.connect();
         c.wait_for_connect().await.unwrap();
         c
@@ -154,9 +168,16 @@ mod redis_tests {
     async fn streamroute_publish_locate_unpublish_roundtrip() {
         let reg = StreamRouteRegistry::new(client().await);
         let s = Ulid::new();
-        assert_eq!(reg.locate(s).await.unwrap(), None, "unpublished stream is nowhere");
+        assert_eq!(
+            reg.locate(s).await.unwrap(),
+            None,
+            "unpublished stream is nowhere"
+        );
         reg.publish(s, "http://node-a:3030").await.unwrap();
-        assert_eq!(reg.locate(s).await.unwrap().as_deref(), Some("http://node-a:3030"));
+        assert_eq!(
+            reg.locate(s).await.unwrap().as_deref(),
+            Some("http://node-a:3030")
+        );
         reg.unpublish(s).await.unwrap();
         assert_eq!(reg.locate(s).await.unwrap(), None, "unpublished again");
     }

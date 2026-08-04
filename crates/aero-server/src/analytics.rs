@@ -22,7 +22,7 @@ use aero_auth::AuthUser;
 use aero_common::{
     Error as AeroError, ParticipantId, Result as AeroResult, RoomId, WorkspaceId, WorkspaceRole,
 };
-use aero_storage::AnalyticsRepo;
+use aero_storage::{AnalyticsRepo, QueryConsistency};
 use axum::{
     extract::{Path, Query, State},
     routing::get,
@@ -59,11 +59,11 @@ const DEFAULT_TOP_LIMIT: i64 = 10;
 /// Default timeline window (in days) when the client omits `?days=`.
 const DEFAULT_TIMELINE_DAYS: i64 = 14;
 
-/// Build an [`AnalyticsRepo`] over the READ pool (ROADMAP 方向四): analytics is
-/// read-only aggregation — the heaviest, most-replica-friendly queries — so it
-/// routes to the replica when one is configured (else the primary, unchanged).
+/// Workspace analytics spans rooms. Keep it on primary so authorization and the
+/// aggregate observe one current tenant snapshot; replica use is limited to
+/// already-authorized single-room reads.
 fn repo(s: &AppState) -> AnalyticsRepo {
-    AnalyticsRepo::new(s.pg_read.clone())
+    AnalyticsRepo::new(s.query_router.repo_pool(QueryConsistency::Strong))
 }
 
 fn parse_workspace(s: &str) -> Result<WorkspaceId, AeroError> {
@@ -95,7 +95,7 @@ async fn assert_admin(
 ) -> Result<(), AeroError> {
     let role = s
         .workspaces
-        .member_role(workspace, caller)
+        .effective_member_role(workspace, caller)
         .await
         .map_err(AeroError::from)?
         .ok_or_else(|| AeroError::Forbidden("not a workspace member".into()))?;
@@ -111,7 +111,7 @@ async fn assert_member(
     caller: ParticipantId,
 ) -> Result<(), AeroError> {
     s.workspaces
-        .member_role(workspace, caller)
+        .effective_member_role(workspace, caller)
         .await
         .map_err(AeroError::from)?
         .ok_or_else(|| AeroError::Forbidden("not a workspace member".into()))?;
@@ -130,7 +130,10 @@ async fn summary(
 ) -> ApiResult<Json<serde_json::Value>> {
     let ws = parse_workspace(&ws_str)?;
     assert_member(&s, ws, auth.participant_id).await?;
-    let stats = repo(&s).workspace_summary(ws).await.map_err(AeroError::from)?;
+    let stats = repo(&s)
+        .workspace_summary(ws)
+        .await
+        .map_err(AeroError::from)?;
     Ok(Json(serde_json::to_value(stats).map_err(AeroError::from)?))
 }
 

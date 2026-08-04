@@ -1,119 +1,183 @@
 # Aero IM — 扩展路线图（ROADMAP · 第六版）
 
-> **资深架构师 / 产品经理视角。** 基于一次性战略全局代码扫描（16 crates / 150+ 迁移 / web SPA），5 个架构维度并行映射「现状 → 缺口 → 高价值扩展」，每条结论附 `file:module` 证据，可逐条核验。
-> 本文只做规划与论证，**不含任何代码**。工程约定见 [`AGENTS.md`](../AGENTS.md)，功能矩阵见 [`README.md`](../README.md)。
+> 本文是平台纵深方向的**源码事实与运维剩余项**，不保存会漂移的迁移或
+> 测试计数。工程约定见 [`AGENTS.md`](../AGENTS.md)，完整功能矩阵见
+> [`README.md`](../README.md)。
 
 ---
 
-## 缘起：广度与正确性已挖尽，本版攻「平台纵深」
+## 缘起：平台纵深从规划进入交付与验收
 
-前五版攻的是**功能广度**与**已交付能力的收口**（投递一致性、计量准入、零停机部署、媒体面通电、GDPR 正确性…），**均已逐一交付并核验退休**。最近一轮工作进一步做了 **9 轮对抗式收敛扫描**（安全 / DoS / GDPR / IDOR / 并发 / SQL 正确性 / 状态机 / 缓存 / 异步安全…共 ~22 类，末轮干涸 0 确认），把应用层的 bug 与正确性缺口挖到收敛。
+前五版覆盖功能广度与正确性收口。本版原先列出的成本、可观测、离线投递、
+扩展性、合规和协作方向，已有对应实现进入主工作树。本文不再把一次性扫描的
+“未发现”当作永久事实，而以当前模块、迁移和运行路径为准。
 
-**到此，「再加一个功能」或「再修一个 bug」已是边际递减。** 真正未被任何一版覆盖、且决定这个平台能否从「功能丰富的 demo」走向「可规模化运营的产品」的，是另一类更深的实体——**平台纵深**：当**真实流量、AI 成本、滚动运维、合规审计**同时压上来时，架构在哪一层先暴露根性短板。本版 5 个方向即针对这四类压力，全部在本次扫描中 grep + 读码实测**现状成立、缺口真实**，并给出**建立在既有架构之上**的扩展（非推倒重来）。
+当前“完成”分两类：可由源码、单测、PG 门控测试与 localhost smoke 证明的
+实现；以及必须由真实环境或运维授权完成的验收。真实外部供应商凭据、跨主机
+WebRTC/NAT 与生产 `messages` 分区切换属于后一类，不能由 hermetic 测试代替。
 
 ---
 
 ## 总览与优先级
 
-| 优先级 | 方向 | 一句话缺口 | 守住的支柱 | 体量 | 状态 |
-|---|---|---|---|---|---|
-| **P0** | 一、AI 成本治理与检索质量 | 每个琐碎问答都按 Sonnet 满价计费，无分层路由 / 无语义缓存 / 无按租户计费台账 | 商业模型（AI-native 是差异化也是最大成本中心） | L | **✅ 本会话交付**（用量台账 + 模型分层路由 + 房间级答案缓存，全 opt-in 可验证） |
-| **P0** | 二、端到端分布式追踪 + 每租户 SLO/成本归因 | ~~追踪在每个 NATS 进程边界被切断~~ | 可运维性 | L | **✅ 实为已实现**（核实更正：trace 经 envelope `traceparent` stamp/extract 全链贯通——入站 HTTP→NATS 生产→消费 set_parent→出站 webhook + JSON 日志 + 每租户成本归因经方向一用量台账；扫描误判为缺口。剩仅 SLO/告警规则/看板=ops 配置非代码） |
-| **P1** | 三、每用户持久投递台账 + 紧凑离线同步 | 重连只能按房重放全量历史，多设备各刷一遍，无 per-user 投递游标 | 核心 UX（IM 的根本承诺：消息必达 + 离线无缝追平） | L | 待做（核实：确无 delivery_cursor） |
-| **P1** | 四、读副本路由 + 消息表自动分区 + Redis 热键分片 | 万人房在「水平脊柱」生效前先撞 PG 连接池 + Redis 单热键 | 规模就绪（第一道扩展悬崖在 5–20k 并发） | L | 待做（核实：replica 无；分区已起 shadow `0148` 未 cutover） |
-| **P2** | 五、企业合规纵深 + 实时协作原语 | 无数据驻留 / 无静态加密 KMS / 审计可变 / canvas 是后写覆盖无 CRDT | 上探高端（解锁受监管 + 企业合同） | L | 待做（核实：region_code/KMS/canvas-CRDT 确无） |
+| 优先级 | 方向 | 当前源码状态 | 剩余验收 |
+|---|---|---|---|
+| **P0** | 一、AI 成本治理与检索质量 | 用量台账、模型分层、租户隔离的答案缓存已实现 | 真实模型账单与质量基准校准 |
+| **P0** | 二、端到端追踪 + 每租户归因 | envelope `traceparent`、消费端 parent 恢复、结构化日志和租户成本归因已实现 | 生产 SLO/告警/看板与真实 collector 验收 |
+| **P1** | 三、持久投递游标 + 离线同步 | per-room `delivery_ordinal`、participant/room 游标、完整回放 barrier 与客户端 ACK 已实现 | 真实多设备断线重连与长时运行 staging 验收 |
+| **P1** | 四、读副本 + 分区 + Redis 热键 | 一致性路由和 presence/viewer 256 路分片已实现；分区 shadow/backfill/runbook 已就绪 | 生产分区 cutover 必须获批维护窗 |
+| **P2** | 五、合规 + Canvas | workspace 区域路由、legal-hold-aware 审计与签名导出、S3 SSE-KMS、Canvas op log/快照基线/幂等已实现 | 真实 S3/KMS 与受监管环境验收 |
 
-> **核实更正（动手前必做)**：ROADMAP 的现状映射来自一次性扫描,**会高估缺口**——方向二的 trace 续传 + 方向二里点到的 JSON 结构化日志**均已实现**(本会话核实)。教训:执行任一方向前先 grep 核实「真缺」,别重建已有功能(false-completion)。方向一/三/四/五经核实为真缺,方向二已退休。
-
-**排期逻辑**：P0 两条是「今天就在漏血 / 盲飞」——成本未分层即每月在补贴琐碎问答，追踪断裂即故障晚 30 分钟才告警；先做。P1 两条是「一长大就断」——核心投递 UX 与第一道扩展悬崖；紧随。P2 是「上探收入天花板」——合规与协作纵深解锁高端市场，依赖 P0 的成本台账与 P1 的可靠性底座，最后做。
+> **核实原则**：执行或汇报前先 grep 当前源码；一次性扫描、迁移序号和测试
+> 数量都会漂移。尤其不要把 shadow/runbook 就绪写成生产 cutover 完成，也不要把
+> staging 联调项误写成未接线代码。
 
 ---
 
 ## 方向一（P0）·AI 成本治理与检索质量——把「会答题」升级为「答得准、付得起、算得清」
 
-**现状（已建得相当扎实）**：双路检索（Voyage 非对称 query/doc 嵌入 + FTS）经 **RRF 融合**（`aero-ai/rerank.rs`）+ 房/工作区边界 + 可选 agentic tool-use 环；成本治理有**全局 `CostBudget` + 每租户 `KeyedCostBudget`**、按 kind 加权计费（Embed1/Mod2/Sum3/Ans5，`aero-ai/budget.rs`）、真实 token 计费（`token_micros`，`aero-ai/metrics.rs`）、prompt caching（system+tool 前缀）。
+**已实现**：Voyage/FTS 经 RRF 融合并守住房间/工作区成员边界；
+`CostBudget` / `KeyedCostBudget` 继续负责准入。每个付费 provider operation
+在出网前以稳定 id 和 fencing token 写 reservation；成功按真实 token 成本
+finalize 并同时保存最小可重放结果，普通失败 cancel，传输结果不明则保留并在
+过期后按保守估算结算。因此业务写入失败后的稳定重试不会再次调用 provider。
+最终台账由 `AiUsageRepo` 按 workspace 持久化并经 outbox 更新指标。答案路径
+支持模型分层和房间隔离缓存，`Edited`/`Deleted` 事件会失效对应房间缓存。
 
-**缺口**：① **无按难度的模型分层路由**——琐碎查找与复杂综合都打同一个 `ANTHROPIC_MODEL`（默认 Sonnet 4.6），无难度估计、无 haiku/opus 选择。② **无语义答案缓存**——近似重复问题每次重跑全量 RAG + completion。③ **只有按租户成本 _指标_，无按租户 _计费台账_**——无发票 ledger、无信用额度消耗、无用量阈值/告警，无法做定价档位或自助成本可见性。④ **检索质量无评测回路**——无 NDCG/MRR 追踪、无嵌入消融调参，无法证明也无法改进「答得准」。
+**剩余验收**：用真实 provider 账单校准 token 单价、模型桶和预算阈值；以固定
+语料持续测 RAG 的召回/排序质量。此项是运营调参与外部账单对账，不是缺少
+服务端调用路径。
 
-**扩展提案**：(1) **难度估计 + 模型分层路由**——按 query token 数 / 领域关键词 / 检索命中质量分 easy/medium/hard 桶，easy→haiku、hard→opus；典型部署 60–70% 是 easy，预计答案生成成本降 40–50%。(2) **每租户用量台账 + 计费 API**——`(tenant_id, job_kind, real_cost_micros, ts, job_id)` ledger，job 完成即记账，暴露 `/billing/usage`（按 kind 拆分 / 时序 / 信用余额 / 阈值告警）。(3) **语义答案缓存**——归一化 query → 嵌入聚类 → Redis 查 `similarity>0.95` 的 `(answer, citations)`，命中直返、未命中跑 RAG 再缓存（每工作区 TTL 24h），典型 20–30% 命中。
-
-**为何高价值**：AI 是产品的**陈述性差异化**（「AI-native IM」）也是**最大单用户成本中心**。无分层路由，每个琐碎查找都付 Sonnet 满价，**直接侵蚀毛利**；无用量台账，SaaS **无法公平计费、无法限额、无法向客户展示其消费**——既失信任又丢 upsell 空间；语义缓存是 LLM 产品的 table-stakes。
-
-**关键边界情况**：缓存的**多租户隔离**（A 租户的答案绝不命中给 B——缓存 key 必含 workspace + 成员边界）；**陈旧失效**（被引用消息编辑/删除后缓存须失效，挂到现有 `Edited`/`Deleted` 事件）；分层路由的**降级**（opus 限额耗尽 → 退 sonnet，不是拒答）；台账与既有预算窗口的**口径一致**（ledger 记真实 token，预算用加权估计——两者别打架）。
-
-**体量 L**·切入锚点：`aero-ai/service/service_impl.rs`（answer 路径）、`rerank.rs`、`budget.rs`、`metrics.rs::charge_cost`、`anthropic.rs`（模型选择）。
+**关键边界**：缓存 key 必含租户/房间边界；消息变更必须失效；付费路径必须
+先 reserve 后出网；不明确的 provider 结果宁可保守计费，也不能用同一稳定
+operation id 再次出网。台账记录真实 token 成本而预算仍可使用保守估算，
+两者口径不能混为一谈。锚点：
+`aero-ai/service/accounting.rs`、`aero-ai/usage.rs`、`aero-ai/metrics.rs`、
+`aero-storage/ai_context.rs`、`aero-storage/ai_usage.rs`。
 
 ---
 
 ## 方向二（P0）·端到端分布式追踪 + 每租户 SLO/成本归因——把「有指标」升级为「可规模化运营」
 
-**现状**：有 Prometheus 指标（well-known 常量在 `aero-common/metrics.rs`：`MESSAGES_SENT_TOTAL`/`AI_COST_MICROS_TOTAL`/`NATS_CONSUMER_PENDING_MESSAGES`/`DB_POOL_IN_USE`…）、OTLP trace、`/health{,/live,/ready}`、三个 observability gauge sampler、HTTP RED 中间件 + 可选 per-tenant workspace label（`AERO_PER_TENANT_METRICS`），AI 成本可按 workspace 归因（`charge_cost(workspace)`）。
+**已实现**：HTTP 入站提取 W3C `traceparent`，房间/直播事件 envelope 携带该
+上下文，NATS 消费端恢复 parent；webhook 等出站路径保留追踪上下文。
+`AERO_LOG_FORMAT=json` 使用 current-span JSON，Prometheus、OTLP、
+`/health{,/live,/ready}`、RED 中间件和观测 gauge 已接线，可选 workspace
+label 与 AI 用量台账承担租户归因。
 
-**缺口**：① **追踪在进程边界断裂**——`EventBus::publish`（`aero-bus/traits.rs`）签名无 `headers` 参数，trace 上下文只能塞进 payload 字段而非 OTEL 标准 header；出站调用（webhook/AI provider/S3/跨节点 call-bridge）从不注入 `traceparent`；HTTP 层不提取入站 `traceparent`。**一个卡死的 NATS consumer（「看起来健康其实已死」的黑洞）在跨进程边界没有任何 trace 连续性信号**——日志散落，告警要等 backlog 阈值跳了（故障开始 30 分钟后）才响。② **日志是 stdout 纯文本**，无 JSON / 无 trace_id 关联。③ **有指标但无 SLO / 无告警规则 / 无仪表盘**——只是原始信号。④ **无备份/恢复 + DR 叙事**。
+**剩余验收**：本机 Jaeger/OTel collector 往返已通过；SLO、告警规则、仪表盘、
+采样率和备份/恢复演练属于部署环境的运维配置，真实外部 collector 及供应商
+凭据仍必须在 staging/production 验证。
 
-**扩展提案**：分两期。**A 期（追踪脊柱）**——`EventBus::publish` 加可选 `headers`，生产端把当前 span 注入 NATS header（W3C `traceparent`）、消费端从 header 提取 `set_parent`（替代现 payload 字段法）；HTTP TraceLayer 提取入站 + 向出站 webhook/AI/S3 注入；日志切 `.json().with_current_span(true)`（`AERO_LOG_FORMAT=json`，`request_id`/`trace_id` 扁平进每行）。**B 期（SLO 层）**——定义核心 SLO（消息扇出 p99、AI 答案延迟、readiness）+ 告警规则（consumer pending 持续 >N、错误率、池饱和）+ 每租户成本/用量仪表盘（复用 per-tenant label）。
-
-**为何高价值**：平台「有指标 + 有告警规则」看起来运维成熟，但**三道地基缝在规模下崩**：静默故障跨进程边界无连续信号（黑洞晚 30 分钟才告警）、租户级问题无法定位到具体 workspace、成本归因不可审计则无法做容量规划与公平限额。**多租户 SaaS 的本质是「可运营」，不是「有功能」**；A 期的追踪连续性是把一切串起来的脊柱，B 期把它变成主动的 SLO/告警而非事后挖日志。
-
-**关键边界情况**：`EventBus` trait 改签名要**向后兼容**（`headers: Option<…>`，既有调用方传 None）；header 注入**不能拖慢热路径**（fan-out 每事件一次，须廉价）；JSON 日志**不泄密**（承密字段已 `<redacted>` Debug，别在 span 里漏）；trace 采样率（`AERO_TRACE_SAMPLE_RATE`）在高吞吐下要可控，避免追踪自身成为成本。
-
-**体量 L**·切入锚点：`aero-bus/traits.rs`（publish 签名）、`ws/ws_impl/bus.rs`（消费端 set_parent）、`aero-common/telemetry.rs`、`aero-server/metrics.rs::http_metrics_layer`、各 sampler。
-
----
-
-## 方向三（P1）·每用户持久投递台账 + 紧凑离线同步——兑现 IM「消息必达 + 离线无缝追平」的根本承诺
-
-**现状（脊柱已对）**：发布期 per-subject 单调 seq（`aero-bus/seq.rs`，本地原子 or Redis INCR）+ 客户端按 seq 去重；durable consumer + poison 边界（max_deliver=16/ack_wait=120s，`jetstream.rs`）+ ack-on-success/decode-fail；Hub 有界 mpsc + 慢消费者背压（drop+resync 标记 或 断连，`hub.rs`）；重连 `?since=message_id` 按房 `backfill_since`（cap 200）；per-message 读回执表。
-
-**缺口**：**无 per-user 持久投递台账 / inbox**。今天重连完全靠 PG 按房重放历史（`list_since` keyset 扫描），**无 per-participant 投递游标**记录「谁 ack 了哪条」。后果：① 长离线窗（数天）须按房全量重放，无「已投递 vs 待投递」紧凑追踪；② 弱网频繁断连触发 backfill 有界 channel 溢出→每房每 gap 退化为 REST 兜底（分页循环，碎片化 UX）；③ **多设备各刷一遍**——一个用户三台手机各自独立重放同一 1000 条 backfill，在关键时刻（系统故障后全员首次启动）**三倍 DB 负载**；④ backfill 本身无投递确认，drop-only 模式回来一个 resync 标记但客户端无法区分「哪些被丢 vs 哪些是新 live」。
-
-**扩展提案**：**每用户持久投递台账 + 紧凑增量同步**——`delivery_cursor(participant_id, room_id, last_acked_message_id, last_seq, last_cursor_at)` 唯一索引 `(participant, room)`。重连带 `?since=&seq=`，服务端在**索引化 seq 列上二分**只返 seq 之后的（O(log N) vs 现 O(N) 扫描，cap 200）；维护 per-participant Last-Known-Good（LKG）游标；backfill 发紧凑 `backfill_delta` 帧（含 gap 内总数），客户端 ack 后原子推进 LKG。**多设备共享同一 per-room LKG 游标**——第二台设备重连只见首台 ack 后的真正新消息，消灭 per-device 重放。unacked 超阈（1000+）发 `backpressure_for_rooms` 帧让客户端卸低优订阅。**法务保全/留存清扫时清 LKG**，保证被保全消息绝不被跳过。
-
-**为何高价值**：IM 与创作者平台的核心承诺是**高移动性下的无缝恢复**（蜂窝切换/wifi 抖动/App 后台）与**长离线追平**（离线一天的创作者回来面对跨房 50k+ 消息）。今天系统强制 per-房 per-设备 per-重连 全量重放，**成本随 房×设备×重连 乘积膨胀**；故障后全员同时重连即 DB I/O 尖峰。持久台账把 O(N) 塌缩为 O(log N)、消灭多设备重复、给创作者「消息确达」的确定性，并为**离线优先客户端**（桌面 Tauri 预取后再渲染）与**E2E 加密消息的读写同步**（免二次解密）铺路。
-
-**关键边界情况**：游标推进的**幂等**（at-least-once redelivery 同 seq，LKG 只进不退）；**多设备竞态**（两设备并发 ack，以 max(seq) 收敛，advisory lock 或原子 `WHERE last_seq < $1`）；法务保全/留存与游标的**交互**（清扫软删消息时游标不能让客户端跳过 held 消息）；seq **回绕/重置**（per-room 计数器迁移期与既有 per-subject seq 的兼容）。
-
-**体量 L**·切入锚点：`aero-bus/seq.rs`、`ws/ws_impl/bus.rs`+`mod.rs`（backfill）、`hub.rs`（背压）、`storage/message/query.rs`（`changes_since`/`list_since`）、新增 `delivery_cursor` 迁移 + repo。
+**关键边界**：高吞吐下控制采样成本，span 不记录密钥/令牌等敏感值。锚点：
+`aero-common/telemetry.rs`、`aero-bus/seq.rs`、
+`aero-server/ws/ws_impl/bus.rs` 与 metrics samplers。
 
 ---
 
-## 方向四（P1）·读副本路由 + 消息表自动分区 + Redis 热键分片——跨越第一道扩展悬崖
+## 方向三（P1）·每用户持久投递台账 + 有序离线同步——兑现 IM「消息必达 + 离线无缝追平」的根本承诺
 
-**现状**：水平脊柱已对（NATS durable consumer + Redis 集群态 + 多开实例扩消息吞吐）。但**应用层数据访问全打单 PG 主库**：默认 `max_connections=16`、`POOL_ACQUIRE_TIMEOUT`（`storage/db.rs`、`common/config.rs`）；presence/viewer/roster 是 per-room 单 sorted-set 热键（`storage/presence.rs`、`live_presence.rs`）；消息表单体（有 messages-partition runbook 但**未自动应用**，设计在 `runbooks/` 标了 7 个入站 FK 的 hard-STOP）。
+**已实现**：消息事务在房间级 counter 下取得正的、连续累积语义的
+`delivery_ordinal`；creation outbox 以该 ordinal 保序。服务端
+`delivery_cursors` 按 `(participant,room)` 保存
+`last_delivery_ordinal`，NATS `seq` 只作诊断/实时去重，绝不再把独立的
+ULID 最大值或 bus seq 拼成错误的“连续前缀”。
 
-**缺口**：**第一道扩展悬崖在「水平脊柱机制」生效前先撞**：万人活跃房 = 100 msg/s × 10k 成员 → 每事件 `room.members()` 查 + 回执查竞争 16 个连接槽（饱和时每连接 6+ 查/s）→ **消息延迟劣化 + 客户端超时级联，早于任何 NATS consumer rebalance / Hub 背压触发**；同时 presence 单热键在**同步用户涌入**下 ZADD 串行化。两者都表现为 5–20k 并发处突发请求延迟尖峰 + 连接超时。
+重连时服务端从每房 ordinal 完整分页回放；没有 cursor 的房间只给最新初始
+窗口，旧历史继续走 REST。所有回放帧入队后才发送 `delivery_ready`，live 帧
+在 barrier 前单独有界缓冲。Web 客户端在同步 handler 成功应用消息后才发送
+`delivery_ack`，游标以 participant 作为本地存储命名空间，并以 socket/account
+generation 防止旧连接污染新会话。
 
-**扩展提案**：(1) **多租户读副本路由**——`AppConfig` 加可选 `database.replica_url`，薄 `QueryRouter`（包 PgPool）把只读查询（`room.members()`/消息查/回执/反应）路由副本，写留主库，读独立扩。(2) **消息表自动分区**——按 `created_at` RANGE 月桶，**部署期自动应用**（非人工维护窗）：影子 `messages_partitioned` + 0148 式 backfill 函数 + `insert()` 期双写转发（7 天 ramp，flag 控）→ 追平后约束交换原子切换（安全处理 runbook 的 7 个 FK 重写）。(3) **Redis 热键分片**——presence/viewers 从 `presence:room:{id}` 改 `presence:room:{id}:shard:{uid%256}`，化解单热键 ZADD 串行化；读时聚合 256 分片。
+**状态**：实现、针对性测试、全工作区门禁与 localhost runtime 验收均纳入
+交付流程。真实多设备、弱网断线重连和长时运行仍须在 staging 验证；源码就绪
+不等于某个部署环境已经发布。
 
-**为何高价值**：大规模 IM（Slack/Discord/Teams）的生产部署都撞两堵可预测的墙：(A) **单热表（messages）的读写争用**早于应用逻辑扩展；(B) **同步用户涌入下 Redis 热键串行化**。两者都在 ~5–20k 并发处表现为请求延迟突刺 + 连接超时，然后短暂宽限期后雪崩。读副本 + 自动分区把读容量与表大小解耦，热键分片消除涌入串行化——**把「号称能水平扩」变成「实测能扛第一道悬崖」**。
+**关键边界**：游标只进不退；软删/过期消息不能作为明文回放；分页不能在任意
+上限处提前发 barrier；多设备 ACK 以 ordinal 最大值收敛。锚点：
+`aero-storage/delivery_cursor.rs`、`aero-storage/message/query.rs`、
+`aero-server/ws/ws_impl/backfill.rs`、`web/ws.js`。
 
-**关键边界情况**：读副本**复制延迟**（刚写的消息从副本读不到→读己写一致性：写后短窗读主库，或关键路径强制主库）；分区**切换的零停机**（双写期一致性 + 原子 cutover + 回滚预案，绝不在另一次重构中途叠加，见 `AGENTS.md §4.2`）；热键分片的**计数一致性**（256 分片聚合 viewer 数，过期驱逐跨分片）；连接池**按主/副本分别配额**。
+---
 
-**体量 L**·切入锚点：`common/config.rs`（`database.*`）、`storage/db.rs`（pool/QueryRouter）、`storage/presence.rs`+`live_presence.rs`（分片）、`migrations/`（分区，参 `runbooks/messages-partitioning`）。
+## 方向四（P1）·读副本路由 + 消息分区准备 + Redis 热键分片——跨越第一道扩展悬崖
+
+**已实现——读副本合同**：`database.replica_url` 与 `QueryRouter` 只服务显式
+`Eventual`。历史接口先在 primary 做完整鉴权，并由 primary 证明 `before`
+后确有更新可见消息，才把它当作真正的旧页；未来 cursor 仍是最新页语义，
+留在 primary。消息上下文默认 `strong`，只有显式
+`consistency=eventual` 才可用副本。鉴权、安全状态、跨房查询、重连追平和
+变更回放永远 strong。副本启动建连失败或 eventual 查询失败都会回 primary。
+
+**已实现——Redis 热键**：房间 presence 与直播 viewer 分别按 participant
+低位分成 256 个 sorted-set shard，写入散列、读取并发聚合并逐 shard 驱逐
+过期成员。它们不再是单个房间/直播热键。通话 roster 是另一套状态，不应据此
+宣称也完成相同分片。
+
+**已预构建、未生产切换——消息分区**：`messages_partitioned` monthly shadow、
+DEFAULT partition、增量幂等 backfill、未来分区维护函数及完整 cutover runbook
+已经存在。生产交换涉及复合主键、消息索引和多张子表外键，必须在获批维护窗
+停写、校验 parity、由 DBA 执行并保留回滚；禁止放进普通自动迁移链，也不得
+描述为已完成 production cutover。
+
+**锚点**：`aero-storage/query_router.rs`、`aero-server/routes/handlers/rooms.rs`、
+`aero-server/message_context.rs`、`aero-storage/presence.rs`、
+`aero-storage/live_presence.rs`、`docs/runbooks/messages-partitioning.md`。
 
 ---
 
 ## 方向五（P2）·企业合规纵深 + 实时协作原语——上探受监管与高端市场
 
-**现状**：GDPR 抹除扎实（tombstone + 显式删全部 participant-keyed PII 表）；`audit_events`（含分区 `ensure_partitions` + CSV 导出 `events_to_csv`）、`legal_holds`（`is_held` + sweep FK 排除）、`info_barriers`、工作区导出/删除（`workspace/export.rs`）均在；canvas 协作（`canvas.rs`）。
+**已实现——驻留与加密**：workspace 持久化 `region_code`，`RegionRouter`
+只接受已配置 code，并在每个 blob reservation 上快照不可变
+`workspace_id/storage_region`。房间上传从已鉴权房间解析 workspace，客户端
+不能自报区域；旧 `/api/blobs` 仅保留个人/迁移读取兼容，未限定 workspace 的
+对象不能进入新消息。S3 PUT 支持并签名 SSE-KMS headers，显式选择 S3 时配置
+缺失或 header-unsafe KMS key 会启动失败。
 
-**缺口**：三道挡住上探的能力：① **无数据驻留**——EU/APAC 客户无法把数据钉到区域，S3 region 是全局部署配置，从不 per-workspace。② **审计可变 + 无静态加密**——`audit_events` 会被 sweep 老化（可变），blob **零静态加密**（无 KMS、无密封信封），legal hold 让数据活过删除但**审计轨迹本身没有同等不可变性**。③ **协作纵深不足**——canvas 是**后写覆盖**（`PUT` 读-合并-写，竞态丢失，`canvas.rs`），无 OT/CRDT，并发编辑静默互相覆盖；无在线感知（谁在编辑、活动光标、空闲超时）。
+**已实现——审计**：应用仓储仅暴露追加事件；active legal hold 会阻止行级
+retention 与分区 DROP，审计 CSV 可用 `AERO_AUDIT_SIGNING_KEY` 输出
+HMAC-SHA256 防篡改签名。常规保留期结束后的授权清理仍存在，因此这里的
+“不可变”是追加接口、保全期不可清除与签名导出，不宣称外部 WORM 存储。
 
-**扩展提案**：(1) **数据驻留**——`workspace` 加 `region_code`(eu/us/apac/custom)，在 `blob_store_from_env` 选后端时按 workspace region 路由到区域桶/自定义端点；扩 `legal_holds` 豁免 `audit_events` 出 sweep，加**不可变审计导出**（签名、防篡改 CSV）。(2) **静态加密**——blob-store 包**信封加密层**（per-workspace DEK，DEK 存 KMS，所有 blob I/O seal/unseal）+ 轮换策略。(3) **canvas CRDT**——`PUT` 全量替换改为**操作日志**：`POST /api/canvases/:cid/ops` 追加增量编辑（insert/delete/format），客户端本地 OT/CRDT 解冲突，服务端存不可变 op log；加在线感知 `/api/canvases/:cid/presence`（WS 广播活动光标/编辑者/空闲超时）；**补 web 端 canvas 编辑器 UI**（实时同步、在线头像、撤销/重做）。
+**已实现——Canvas**：服务端以 canvas-row lock 分配 gap-free `op_seq`，
+`client_op_id` 在 `(canvas,author)` 范围幂等；同 key 不同 payload 返回冲突。
+快照更新同时校验 `expected_version` 和 `snapshot_op_seq`，确保 blocks 的基线
+与仍需重放的 tail 不重叠、不漏项。Web reducer 从快照基线有序拉取 ops，并
+处理 gap、重试和实时 `canvas_op`。这是有序操作日志与确定性 reducer，不把它
+夸写成通用 CRDT。
 
-**为何高价值**：企业销售撞监管墙：FedRAMP/SOC2/ISO27001 买家要审计不可变 + 加密 + 驻留证明；GDPR 执法（2024+）处罚跨境默认。Slack/Teams/Discord 用合规变现 5 万+ 高端合同。协作 UX 缺口（无 CRDT）逼重度用户回 Notion/Figma 做异步文档，aero-im 沦为「纯消息」。**驻留 + 审计不可变 + KMS 加密是受监管行业的入场券，CRDT canvas 是现代工作区的对等项**——三者共同把产品从「消息工具」抬到「企业工作区平台」。
-
-**关键边界情况**：驻留与**跨区功能**（跨区 workspace 的搜索/AI 检索如何不违反驻留——检索须区域内）；KMS 的**密钥轮换与历史 blob**（轮换后旧 blob 用旧 DEK 解，信封记 key 版本）；审计不可变与**GDPR 抹除的张力**（被抹除用户的审计行——保留治理记录但脱敏 PII，与现 erasure 策略对齐）；CRDT 的**离线编辑合并**（长离线后 op log 分叉收敛）与**op log 增长**（快照压缩）。
-
-**体量 L**·切入锚点：`storage/audit.rs`、`storage/legal_hold.rs`、`storage/blob_store`/`s3_blob_store.rs`（信封层）、`server/canvas.rs`（op log）、`web/`（canvas 编辑器）、`workspace` 表（`region_code`）。
+**剩余验收**：本机 MinIO 已通过，但真实外部 S3/KMS 供应商凭据与区域网络
+往返仍必须在 staging 验证；受监管部署若要求 WORM、跨区搜索策略或客户自管
+密钥，仍需对应基础设施与合规验收。锚点：
+`aero-storage/region_blob_store.rs`、
+`aero-storage/s3_blob_store.rs`、`aero-storage/audit.rs`、
+`aero-storage/canvas_op.rs`、`aero-server/canvas.rs`、`web/canvas.js`。
 
 ---
 
 ## 跨方向的共识工程基线（动手前对齐 `AGENTS.md`）
 
-- **迁移**：所有新表/列照既有配方，加后**先 `cargo build` 再 migrate**（编译期嵌入）；分区/双写**绝不在另一次重构中途叠加**。
-- **鉴权**：任何新路由（billing/usage、canvas ops、audit export）仍**先 `assert_room_access` / `member_role`**，过 `authz_lint`；计费/导出端点尤其要防 IDOR。
-- **可验证性**：每方向都应有 db_test + 一次性库 E2E smoke（本会话的验证范式）；分区/副本切换要 `migrate-smoke` 在 throwaway 库 replay 全链。
-- **媒体面 seam 不在本版**：SFU live socket / call-bridge egress 仍是「待真实 WebRTC 对端」的 staging seam（见 `AGENTS.md §4.5`），非本版方向——别误当扩展点重造。
+- **迁移**：所有新表/列照既有配方，加后**先 `cargo build` 再 migrate**
+  （编译期嵌入）。生产消息分区 cutover 只走获批维护窗，不进入迁移链。
+- **鉴权**：billing/usage、canvas ops、audit export 和 workspace region 路由仍
+  先走 `assert_room_access` / `effective_member_role`，并过 `authz_lint`。
+- **可验证性**：每方向都用 db_test + 全新一次性库 E2E smoke；读副本故障
+  回退、投递 barrier 与 Canvas 并发基线需要针对性回归。
+- **媒体面**：SFU media session 与 call-bridge egress 已在生产 lifecycle
+  接线。持久单调 call-leg generation 与 legacy caller reconnect 兼容围栏；
+  PostgreSQL 与 Redis route/roster 的 generation CAS、WS/SFU 事件和精确清理
+  共同围栏旧 socket、心跳与 leave。internal subscriber 使用 60 秒 lease、
+  每 15 秒认证 refresh 与 best-effort unsubscribe；新请求携带
+  `lease_secs` + `subscription_id` + `wire_version`，RTP 帧绑定 call 与订阅
+  代际。真实旧 v3 / 当前 v4 二进制已完成双向媒体与 wire-version 降级验收；
+  无绑定 v2 只支持新 owner 服务旧 puller，发布链仍含 v2 时必须先
+  drain/重连。当前 generation-fenced 构建已通过真实 Chrome 单机双 gateway
+  late-subscriber、同参与者跨 gateway 重连与旧连接延迟清理，真实 Firefox
+  双向媒体与本机 coturn 强制 relay-only 也已通过。Chrome WHEP、OBS RTMP 和
+  ffmpeg 加密 SRT 周期 SEK 轮换均有真实运行证据。跨主机公网 UDP/NAT/防火墙、
+  物理设备与 Safari 仍是 staging 验收。
 
-> **本版与前五版的关系**：前五版把**广度与正确性**挖尽（功能矩阵 + 9 轮收敛的 bug/正确性收敛）。第六版回答下一个根问题——**当真实流量、AI 成本、滚动运维与合规审计同时压上来，平台在架构层先暴露什么短板**：答案是成本未分层（漏血）、追踪断裂（盲飞）、投递无 per-user 台账（一长大就断）、数据访问全打主库（第一道悬崖）、合规与协作未纵深化（够不着高端）。五者皆建立在既有脊柱之上，非推倒重来。
+> 第六版的实现方向已经落地到不同验收阶段。后续路线图应围绕量化容量、
+> 真实环境验收和运维授权展开，而不是继续沿用“投递无游标、全读主库、
+> presence 单热键、无驻留/KMS/Canvas op log”等已经失效的缺口描述。

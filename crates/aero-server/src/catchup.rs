@@ -23,6 +23,7 @@ use aero_auth::AuthUser;
 use aero_common::{Error as AeroError, RoomId};
 use axum::{
     extract::{Path, State},
+    http::HeaderMap,
     routing::post,
     Json, Router,
 };
@@ -46,7 +47,9 @@ const MAX_CATCHUP: usize = 200;
 /// pinned into `[1, MAX_CATCHUP]`.
 #[must_use]
 fn catchup_window(unread: u32) -> usize {
-    usize::try_from(unread).unwrap_or(MAX_CATCHUP).clamp(1, MAX_CATCHUP)
+    usize::try_from(unread)
+        .unwrap_or(MAX_CATCHUP)
+        .clamp(1, MAX_CATCHUP)
 }
 
 /// Parse a `RoomId` from a path segment, mapping a decode failure to `400`.
@@ -63,6 +66,7 @@ fn parse_room(s: &str) -> Result<RoomId, AeroError> {
 async fn catchup(
     State(s): State<AppState>,
     auth: AuthUser,
+    headers: HeaderMap,
     Path(room_str): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let room = parse_room(&room_str)?;
@@ -93,12 +97,19 @@ async fn catchup(
     // Degrade exactly like `POST /api/ai/summarize`: `502` when no AI backend is
     // wired; a wired backend echoes / heuristically summarizes when no LLM key
     // is configured.
-    let ai = s
-        .ai
-        .as_ref()
-        .ok_or_else(|| AeroError::Upstream("AI not configured".into()))?;
+    let ai =
+        s.ai.as_ref()
+            .ok_or_else(|| AeroError::Upstream("AI not configured".into()))?;
+    let usage_context = crate::ai_usage::room_request_usage_context(
+        &s,
+        &headers,
+        auth.participant_id,
+        room,
+        &format!("catchup:{room}:{n}"),
+    )
+    .await?;
     let summary = ai
-        .summarize_room(room, n)
+        .summarize_room_with_usage_context(room, n, usage_context)
         .await
         .map_err(|e| AeroError::Upstream(format!("ai: {e}")))?;
     Ok(Json(serde_json::json!({

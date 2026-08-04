@@ -13,7 +13,7 @@
 //! - Header word 1 (`type_specific`): the monotonic ACK ID (`ack_id`).
 //! - CIF (28 bytes as encoded here): ack-sequence-number, RTT (µs), RTT-variance
 //!   (µs), available buffer size, packets receiving rate (zero — not tracked),
-//!   estimated link capacity (zero — not tracked), and a receive buffer size
+//!   estimated link capacity (zero — not tracked), and receiving rate
 //!   (zero — not tracked).
 //!   Fields that are not tracked by this implementation are set to zero and
 //!   documented as such inline.
@@ -46,7 +46,9 @@ use crate::reliability::Action;
 /// the SRT header).  `ts` is the packet timestamp in microseconds since
 /// connection start (typically `now - connect_time`; use 0 when not tracked).
 /// `rtt_us` and `rttvar_us` are the smoothed RTT and its variance in
-/// microseconds, used to populate the ACK CIF.
+/// microseconds, used to populate the ACK CIF. `available_buffer_packets` is
+/// the receiver's currently available packet capacity negotiated during the
+/// handshake; it is a flow-control value, not an optional statistic.
 ///
 /// Returns `None` for [`Action::SendData`], which is a data-plane action and
 /// does not produce a control packet via this function.
@@ -54,11 +56,15 @@ use crate::reliability::Action;
 /// # ACK fields not yet tracked
 ///
 /// The ACK CIF contains several fields this implementation does not track:
-/// - **Packets receiving rate** (field 4): set to 0.
-/// - **Estimated link capacity** (field 5): set to 0.
-/// - **Available receiver buffer size** (field 6): set to 0.
+/// - **Packets receiving rate** (field 5): set to 0.
+/// - **Estimated link capacity** (field 6): set to 0.
+/// - **Receiving rate** (field 7): set to 0.
 ///
-/// A production implementation should fill these from window/buffer accounting.
+/// The available receiver buffer (field 4) must be non-zero: libsrt installs
+/// this value as its current send flow window. Advertising zero stalls the
+/// publisher after its initial congestion window and eventually trips the
+/// peer-idle timeout. The ingest path consumes packets as they arrive, so it
+/// advertises the receive window negotiated by this implementation.
 #[must_use]
 pub fn encode_control(
     action: &Action,
@@ -66,11 +72,18 @@ pub fn encode_control(
     ts: u32,
     rtt_us: u32,
     rttvar_us: u32,
+    available_buffer_packets: u32,
 ) -> Option<Vec<u8>> {
     match action {
-        Action::SendAck { ack_seq_no, ack_id } => {
-            Some(encode_ack(*ack_seq_no, *ack_id, dst_socket_id, ts, rtt_us, rttvar_us))
-        }
+        Action::SendAck { ack_seq_no, ack_id } => Some(encode_ack(
+            *ack_seq_no,
+            *ack_id,
+            dst_socket_id,
+            ts,
+            rtt_us,
+            rttvar_us,
+            available_buffer_packets,
+        )),
         Action::SendNak { from, to } => Some(encode_nak(*from, *to, dst_socket_id, ts)),
         Action::SendAckAck { ack_id } => Some(encode_ackack(*ack_id, dst_socket_id, ts)),
         Action::SendData { .. } => None,
@@ -84,10 +97,10 @@ pub fn encode_control(
 /// [ack_seq_no: u32]  — next expected sequence number (highest contiguous + 1)
 /// [rtt_us: u32]      — smoothed RTT in microseconds
 /// [rttvar_us: u32]   — RTT variance in microseconds
-/// [buf_avail: u32]   — available receiver buffer (packets); 0 = not tracked
+/// [buf_avail: u32]   — available receiver buffer (packets)
 /// [pkt_rate: u32]    — packets per second receiving rate;  0 = not tracked
 /// [link_cap: u32]    — estimated link capacity (packets/s); 0 = not tracked
-/// [recv_buf: u32]    — receive buffer size (bytes);         0 = not tracked
+/// [recv_rate: u32]   — estimated receiving rate (bytes/s);  0 = not tracked
 /// ```
 fn encode_ack(
     ack_seq_no: u32,
@@ -96,6 +109,7 @@ fn encode_ack(
     ts: u32,
     rtt_us: u32,
     rttvar_us: u32,
+    available_buffer_packets: u32,
 ) -> Vec<u8> {
     // The ACK ID lives in the "type_specific" header word (word 1 of the
     // 16-byte SRT header), addressed to the peer.
@@ -116,10 +130,12 @@ fn encode_ack(
     out.put_u32(ack_seq_no);
     out.put_u32(rtt_us);
     out.put_u32(rttvar_us);
-    out.put_u32(0); // available buffer size — not tracked
+    // This is flow control, not an optional statistic. libsrt assigns it to
+    // `m_iFlowWindowSize`; zero therefore deadlocks a live publisher.
+    out.put_u32(available_buffer_packets);
     out.put_u32(0); // packets receiving rate — not tracked
     out.put_u32(0); // estimated link capacity — not tracked
-    out.put_u32(0); // receive buffer size — not tracked
+    out.put_u32(0); // receiving rate — not tracked
 
     out.to_vec()
 }
@@ -224,6 +240,7 @@ mod tests {
 
     const DST_SOCK: u32 = 0xDEAD_CAFE;
     const TS: u32 = 0x0001_2345;
+    const BUFFER_AVAIL: u32 = 8192;
 
     // ─── ACK round-trip ─────────────────────────────────────────────────────
 
@@ -233,7 +250,7 @@ mod tests {
             ack_seq_no: 42,
             ack_id: 7,
         };
-        let pkt = encode_control(&action, DST_SOCK, TS, 10_000, 2_500)
+        let pkt = encode_control(&action, DST_SOCK, TS, 10_000, 2_500, BUFFER_AVAIL)
             .expect("ACK must produce a packet");
 
         let hdr = SrtHeader::parse(&pkt).expect("must be a valid SRT header");
@@ -258,12 +275,14 @@ mod tests {
         };
         let rtt_us = 50_000u32;
         let rttvar_us = 12_500u32;
-        let pkt =
-            encode_control(&action, DST_SOCK, TS, rtt_us, rttvar_us).unwrap();
+        let pkt = encode_control(&action, DST_SOCK, TS, rtt_us, rttvar_us, BUFFER_AVAIL).unwrap();
 
         // CIF starts right after the 16-byte header.
         let cif = &pkt[SRT_HEADER_LEN..];
-        assert!(cif.len() >= 28, "ACK CIF must be at least 28 bytes (7 words)");
+        assert!(
+            cif.len() >= 28,
+            "ACK CIF must be at least 28 bytes (7 words)"
+        );
 
         let ack_seq = u32::from_be_bytes([cif[0], cif[1], cif[2], cif[3]]);
         let rtt = u32::from_be_bytes([cif[4], cif[5], cif[6], cif[7]]);
@@ -275,18 +294,38 @@ mod tests {
     }
 
     #[test]
-    fn ack_untracked_cif_fields_are_zero() {
+    fn ack_advertises_nonzero_receiver_window_and_zeroes_optional_stats() {
         let pkt = encode_control(
-            &Action::SendAck { ack_seq_no: 1, ack_id: 1 },
+            &Action::SendAck {
+                ack_seq_no: 1,
+                ack_id: 1,
+            },
             0,
             0,
             0,
             0,
+            BUFFER_AVAIL,
         )
         .unwrap();
         let cif = &pkt[SRT_HEADER_LEN..];
-        // Words 3..6 (buf_avail, pkt_rate, link_cap, recv_buf) must be 0.
-        assert_eq!(&cif[12..28], &[0u8; 16], "untracked CIF fields must be zero");
+
+        let available_buffer = u32::from_be_bytes([cif[12], cif[13], cif[14], cif[15]]);
+        assert_eq!(
+            available_buffer, BUFFER_AVAIL,
+            "a full ACK must keep the peer's send flow window open"
+        );
+        assert_ne!(
+            available_buffer, 0,
+            "zero ACKD_BUFFERLEFT stalls libsrt until peer-idle timeout"
+        );
+
+        // Words 4..6 (packet rate, link capacity, receiving byte rate) are
+        // optional statistics that this implementation does not track.
+        assert_eq!(
+            &cif[16..28],
+            &[0u8; 12],
+            "untracked ACK statistics must be zero"
+        );
     }
 
     // ─── NAK round-trip ─────────────────────────────────────────────────────
@@ -294,7 +333,7 @@ mod tests {
     #[test]
     fn nak_single_loss_encodes_as_one_word_without_range_bit() {
         let action = Action::SendNak { from: 5, to: 5 };
-        let pkt = encode_control(&action, DST_SOCK, TS, 0, 0).unwrap();
+        let pkt = encode_control(&action, DST_SOCK, TS, 0, 0, BUFFER_AVAIL).unwrap();
 
         let hdr = SrtHeader::parse(&pkt).unwrap();
         assert_eq!(
@@ -309,7 +348,11 @@ mod tests {
         let body = &pkt[SRT_HEADER_LEN..];
         assert_eq!(body.len(), 4, "single loss = 1 word");
         let word = u32::from_be_bytes([body[0], body[1], body[2], body[3]]);
-        assert_eq!(word & 0x8000_0000, 0, "bit 31 must be clear for a single loss");
+        assert_eq!(
+            word & 0x8000_0000,
+            0,
+            "bit 31 must be clear for a single loss"
+        );
         assert_eq!(word, 5);
 
         let ranges = decode_nak_loss_list(body);
@@ -319,7 +362,7 @@ mod tests {
     #[test]
     fn nak_range_encodes_as_two_words_with_range_bit() {
         let action = Action::SendNak { from: 10, to: 20 };
-        let pkt = encode_control(&action, DST_SOCK, TS, 0, 0).unwrap();
+        let pkt = encode_control(&action, DST_SOCK, TS, 0, 0, BUFFER_AVAIL).unwrap();
 
         let body = &pkt[SRT_HEADER_LEN..];
         assert_eq!(body.len(), 8, "range loss = 2 words");
@@ -327,7 +370,11 @@ mod tests {
         let w0 = u32::from_be_bytes([body[0], body[1], body[2], body[3]]);
         let w1 = u32::from_be_bytes([body[4], body[5], body[6], body[7]]);
 
-        assert_ne!(w0 & 0x8000_0000, 0, "bit 31 must be set on the range-start word");
+        assert_ne!(
+            w0 & 0x8000_0000,
+            0,
+            "bit 31 must be set on the range-start word"
+        );
         assert_eq!(w0 & 0x7FFF_FFFF, 10, "range start = from");
         assert_eq!(w1 & 0x7FFF_FFFF, 20, "range end = to");
         assert_eq!(w1 & 0x8000_0000, 0, "bit 31 clear on range-end word");
@@ -340,7 +387,7 @@ mod tests {
     fn nak_with_gap_from_1_to_2() {
         // The session gap test exercises [1, 2]; verify encoding/decoding here.
         let action = Action::SendNak { from: 1, to: 2 };
-        let pkt = encode_control(&action, DST_SOCK, TS, 0, 0).unwrap();
+        let pkt = encode_control(&action, DST_SOCK, TS, 0, 0, BUFFER_AVAIL).unwrap();
         let body = &pkt[SRT_HEADER_LEN..];
         let ranges = decode_nak_loss_list(body);
         assert_eq!(ranges, vec![(1, 2)]);
@@ -351,7 +398,7 @@ mod tests {
     #[test]
     fn ackack_encodes_to_correct_control_type_and_ack_id() {
         let action = Action::SendAckAck { ack_id: 99 };
-        let pkt = encode_control(&action, DST_SOCK, TS, 0, 0).unwrap();
+        let pkt = encode_control(&action, DST_SOCK, TS, 0, 0, BUFFER_AVAIL).unwrap();
 
         assert_eq!(pkt.len(), SRT_HEADER_LEN, "ACKACK has no CIF body");
 
@@ -378,7 +425,7 @@ mod tests {
             is_retransmit: false,
         };
         assert!(
-            encode_control(&action, 0, 0, 0, 0).is_none(),
+            encode_control(&action, 0, 0, 0, 0, BUFFER_AVAIL).is_none(),
             "SendData is a data-plane action; encode_control must return None"
         );
     }

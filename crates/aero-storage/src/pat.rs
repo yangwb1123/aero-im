@@ -134,10 +134,7 @@ impl PatRepo {
     /// On a hit it best-effort bumps `last_used_at = now()` (a separate statement
     /// whose failure is swallowed) so a stale clock or transient write error can
     /// never turn a valid token into a 401.
-    pub async fn verify(
-        &self,
-        token_hash: &str,
-    ) -> Result<Option<ParticipantId>, sqlx::Error> {
+    pub async fn verify(&self, token_hash: &str) -> Result<Option<ParticipantId>, sqlx::Error> {
         let row = sqlx::query_as::<_, (uuid::Uuid,)>(
             r"SELECT participant_id FROM pat_tokens
                WHERE token_hash = $1
@@ -173,10 +170,7 @@ impl PatRepo {
     /// the hash or plaintext — so a listing can never surface a usable credential.
     /// Revoked tokens are included (with their `revoked_at` set) so a UI can show
     /// history; the caller can filter if it wants only active ones.
-    pub async fn list(
-        &self,
-        participant: ParticipantId,
-    ) -> Result<Vec<PatSummary>, sqlx::Error> {
+    pub async fn list(&self, participant: ParticipantId) -> Result<Vec<PatSummary>, sqlx::Error> {
         let rows = sqlx::query_as::<_, PatSqlRow>(
             r"SELECT id, name, scopes, created_at, last_used_at, expires_at, revoked_at
                FROM pat_tokens
@@ -193,11 +187,7 @@ impl PatRepo {
     /// absent, or owned by someone else). Owner-scoped: the `participant_id`
     /// predicate means one participant can never revoke another's token. Returns
     /// `true` if a still-active row that the caller owns was revoked by this call.
-    pub async fn revoke(
-        &self,
-        id: PatId,
-        participant: ParticipantId,
-    ) -> Result<bool, sqlx::Error> {
+    pub async fn revoke(&self, id: PatId, participant: ParticipantId) -> Result<bool, sqlx::Error> {
         let result = sqlx::query(
             r"UPDATE pat_tokens SET revoked_at = now()
                WHERE id = $1 AND participant_id = $2 AND revoked_at IS NULL",
@@ -339,9 +329,15 @@ mod db_tests {
 
         // … but the owner can, after which it no longer verifies, and a second
         // revoke is a no-op.
-        assert!(repo.revoke(id, owner).await.unwrap(), "owner revoke succeeds");
+        assert!(
+            repo.revoke(id, owner).await.unwrap(),
+            "owner revoke succeeds"
+        );
         assert_eq!(repo.verify(&hash_pat(&secret)).await.unwrap(), None);
-        assert!(!repo.revoke(id, owner).await.unwrap(), "second revoke is a no-op");
+        assert!(
+            !repo.revoke(id, owner).await.unwrap(),
+            "second revoke is a no-op"
+        );
     }
 
     #[tokio::test]

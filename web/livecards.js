@@ -15,6 +15,7 @@
 import { api } from './api.js';
 import { state, ws } from './context.js';
 import { toast } from './render.js';
+import { dispatchStreamEvent } from './stream_events.js';
 
 // Hooks handed to render.js's stream cards. Built fresh per render so the gift
 // catalog + my id are always current.
@@ -26,6 +27,8 @@ export function liveHooks() {
     chat: (streamId, body) => ws.streamChat(streamId, body),
     gift: (streamId, giftId, qty) => ws.streamGift(streamId, giftId, qty),
     end: (streamId) => endStream(streamId),
+    raid: (sourceStreamId, targetStreamId, controller) =>
+      followRaid(sourceStreamId, targetStreamId, controller),
   };
 }
 
@@ -71,13 +74,18 @@ export function handleStreamEvent(ev) {
   if (!ev || !ev.kind || !ev.stream_id) return;
   const ctrl = state.liveCards.get(ev.stream_id);
   if (!ctrl) return;
-  switch (ev.kind) {
-    case 'chat': ctrl.addChat(ev); break;
-    case 'gift': ctrl.addGift(ev); break;
-    case 'viewers': ctrl.setViewers(ev.count); break;
-    case 'status': ctrl.setStatus(ev.status); break;
-    default: break;
-  }
+  dispatchStreamEvent(ctrl, ev);
+}
+
+async function followRaid(sourceStreamId, targetStreamId, controller) {
+  const target = await api.getStream(targetStreamId);
+  ws.unwatchStream(sourceStreamId);
+  state.watchedStreams.delete(sourceStreamId);
+  state.liveCards.delete(sourceStreamId);
+  state.liveCards.set(targetStreamId, controller);
+  state.watchedStreams.add(targetStreamId);
+  ws.watchStream(targetStreamId);
+  return target;
 }
 
 async function endStream(streamId) {

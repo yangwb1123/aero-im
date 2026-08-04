@@ -22,6 +22,133 @@ function el(tag, opts = {}) {
   return n;
 }
 
+function safeGiphyUrl(raw, media) {
+  if (typeof raw !== 'string' || !raw) return false;
+  try {
+    const url = new URL(raw);
+    const host = url.hostname.toLowerCase();
+    if (
+      url.protocol !== 'https:'
+      || url.username
+      || url.password
+      || (host !== 'giphy.com' && !host.endsWith('.giphy.com'))
+    ) return false;
+    if (!media) return true;
+    const path = url.pathname.toLowerCase();
+    return path.endsWith('.gif') || path.endsWith('.webp');
+  } catch {
+    return false;
+  }
+}
+
+// Defense-in-depth counterpart to the server's provider URL allowlist.
+export function isSafeGiphyMediaUrl(raw) {
+  return safeGiphyUrl(raw, true);
+}
+
+export function isSafeGiphyPageUrl(raw) {
+  return safeGiphyUrl(raw, false);
+}
+
+function boundedString(value, maxBytes) {
+  if (typeof value !== 'string') return '';
+  const bytes = new TextEncoder().encode(value);
+  if (bytes.length <= maxBytes) return value;
+  return new TextDecoder().decode(bytes.slice(0, maxBytes));
+}
+
+function readPayloadField(payload, key) {
+  try {
+    return payload[key];
+  } catch {
+    return undefined;
+  }
+}
+
+function giphyDimension(value) {
+  if (typeof value !== 'number' && typeof value !== 'string') return null;
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed > 0 && parsed <= 10000 ? parsed : null;
+}
+
+function objectPayloadOrEmpty(payload) {
+  try {
+    return payload !== null && typeof payload === 'object' && !Array.isArray(payload)
+      ? payload
+      : {};
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Convert any JSON-shaped (or otherwise malformed) value into the small,
+ * renderer-safe GIPHY card contract. This is deliberately total: one bad
+ * persisted card must not abort rendering the rest of a message list.
+ */
+export function normalizeGiphyPayload(payload) {
+  const source = objectPayloadOrEmpty(payload);
+  const title = boundedString(readPayloadField(source, 'title'), 512)
+    || boundedString(readPayloadField(source, 'query'), 512)
+    || 'GIF';
+  const attribution = boundedString(readPayloadField(source, 'attribution'), 256)
+    || 'Powered by GIPHY';
+  const imageUrl = readPayloadField(source, 'image_url');
+  const sourceUrl = readPayloadField(source, 'source_url');
+  return {
+    title,
+    attribution,
+    imageUrl: isSafeGiphyMediaUrl(imageUrl) ? imageUrl : '',
+    sourceUrl: isSafeGiphyPageUrl(sourceUrl) ? sourceUrl : '',
+    width: giphyDimension(readPayloadField(source, 'width')),
+    height: giphyDimension(readPayloadField(source, 'height')),
+  };
+}
+
+export function buildGiphyCard(payload) {
+  const card = normalizeGiphyPayload(payload);
+  const wrap = el('div', { className: 'card-block giphy-card' });
+  wrap.appendChild(el('div', { className: 'card-title', text: card.title }));
+
+  if (card.imageUrl) {
+    const image = el('img', {
+      className: 'giphy-image',
+      attrs: {
+        src: card.imageUrl,
+        alt: card.title,
+        loading: 'lazy',
+        decoding: 'async',
+        referrerpolicy: 'no-referrer',
+      },
+    });
+    if (card.width !== null) image.setAttribute('width', String(card.width));
+    if (card.height !== null) image.setAttribute('height', String(card.height));
+    if (card.sourceUrl) {
+      const link = el('a', {
+        className: 'giphy-media-link',
+        attrs: { href: card.sourceUrl, target: '_blank', rel: 'noopener noreferrer' },
+      });
+      link.appendChild(image);
+      wrap.appendChild(link);
+    } else {
+      wrap.appendChild(image);
+    }
+  } else {
+    wrap.appendChild(el('div', { className: 'card-body', text: 'GIF unavailable' }));
+  }
+
+  if (card.sourceUrl) {
+    wrap.appendChild(el('a', {
+      className: 'giphy-attribution',
+      text: card.attribution,
+      attrs: { href: card.sourceUrl, target: '_blank', rel: 'noopener noreferrer' },
+    }));
+  } else {
+    wrap.appendChild(el('div', { className: 'giphy-attribution', text: card.attribution }));
+  }
+  return wrap;
+}
+
 // ---------- rich text spans ----------
 // The server annotates a Text block with `spans: [{ start, end, style }]` where
 // `start`/`end` are UTF-8 byte offsets into `content` and `style` is either a
@@ -187,6 +314,10 @@ function appendBlock(parent, b, ctx = {}) {
       return;
     }
     case 'card': {
+      if (b.schema === 'giphy') {
+        parent.appendChild(buildGiphyCard(b.payload));
+        return;
+      }
       if (b.schema === 'stream' && b.payload && b.payload.hls_url) {
         parent.appendChild(buildStreamCard(b.payload, ctx));
         return;
@@ -355,6 +486,32 @@ function buildStreamCard(payload, ctx = {}) {
   const giftFeed = el('div', { className: 'gift-feed' });
   wrap.appendChild(giftFeed);
 
+  // ---- advanced live event surface: hype / raids / rewards / goals / predictions ----
+  const eventPanel = el('div', {
+    className: 'stream-card-events',
+    attrs: { 'aria-live': 'polite' },
+  });
+  const hypeStatus = el('div', { className: 'stream-event-state hype-state' });
+  hypeStatus.hidden = true;
+  const goalStatus = el('div', { className: 'stream-event-state goal-state' });
+  goalStatus.hidden = true;
+  const goalText = el('span');
+  const goalMeter = el('progress', { attrs: { max: '1', value: '0' } });
+  goalStatus.appendChild(goalText);
+  goalStatus.appendChild(goalMeter);
+  const eventFeed = el('div', { className: 'stream-event-feed' });
+  eventPanel.appendChild(hypeStatus);
+  eventPanel.appendChild(goalStatus);
+  eventPanel.appendChild(eventFeed);
+  wrap.appendChild(eventPanel);
+
+  function addLiveAlert(text, tone = 'info') {
+    const row = el('div', { className: `stream-event-alert ${tone}`, text });
+    eventFeed.prepend(row);
+    while (eventFeed.childElementCount > 5) eventFeed.lastElementChild.remove();
+    return row;
+  }
+
   // ---- danmaku composer ----
   const composer = el('form', { className: 'danmaku-composer' });
   const input = el('input', {
@@ -391,6 +548,66 @@ function buildStreamCard(payload, ctx = {}) {
         liveBadge.textContent = 'LIVE';
         liveBadge.classList.remove('ended');
       }
+    },
+    setHypeTrain(event) {
+      hypeStatus.hidden = false;
+      const expires = event.expires_at ? formatHM(event.expires_at) : '—';
+      hypeStatus.textContent =
+        `🔥 Hype Train Lv.${Number(event.level) || 0} · ${Number(event.contribution) || 0} · ${expires} 到期`;
+    },
+    showRaid(event) {
+      const target = event.target_stream_id;
+      const row = addLiveAlert(`🚀 Raid · ${Number(event.viewer_count) || 0} 位观众`, 'raid');
+      if (!target || typeof live.raid !== 'function') return;
+      const follow = el('button', {
+        className: 'stream-event-action',
+        attrs: { type: 'button' },
+        text: '前往目标直播',
+      });
+      follow.addEventListener('click', async () => {
+        follow.disabled = true;
+        try {
+          const next = await live.raid(streamId, target, controller);
+          const src = next?.hls_path || next?.hls_url || `/hls/${encodeURIComponent(target)}/index.m3u8`;
+          attachHls(video, src);
+          title.textContent = next?.title || 'Raid 目标直播';
+          wrap.dataset.streamId = target;
+          controller.streamId = target;
+          row.remove();
+        } catch {
+          follow.disabled = false;
+          follow.textContent = '切换失败，重试';
+        }
+      });
+      row.appendChild(follow);
+    },
+    showPointsRedemption(event) {
+      addLiveAlert(
+        `🎟 ${shortId(event.viewer)} 兑换奖励 ${shortId(event.reward_id)}`,
+        'points',
+      );
+    },
+    setGoalProgress(event) {
+      const current = Math.max(0, Number(event.current) || 0);
+      const target = Math.max(1, Number(event.target) || 1);
+      goalStatus.hidden = false;
+      goalStatus.classList.remove('reached');
+      goalText.textContent = `🎯 目标 ${current} / ${target}`;
+      goalMeter.max = target;
+      goalMeter.value = Math.min(current, target);
+    },
+    showGoalReached(event) {
+      goalStatus.hidden = false;
+      goalStatus.classList.add('reached');
+      addLiveAlert(`🎉 目标达成 · ${shortId(event.goal_id)}`, 'goal');
+    },
+    updatePrediction(event) {
+      const stateLabel = {
+        prediction_opened: '预测已开放',
+        prediction_locked: '预测已锁定',
+        prediction_resolved: `预测已结算 · 结果 ${Number(event.winning_outcome_idx) + 1}`,
+      }[event.kind] || '预测更新';
+      addLiveAlert(`🔮 ${stateLabel} · ${shortId(event.prediction_id)}`, 'prediction');
     },
   };
   if (streamId && typeof live.register === 'function') live.register(streamId, controller);
@@ -432,12 +649,12 @@ function spawnGift(feed, layer, line) {
   }
 }
 
-function attachHls(video, src) {
-  if (!src) return;
+export function attachHls(video, src) {
+  if (!src) return false;
   // Safari (and iOS) natively supports HLS.
   if (video.canPlayType('application/vnd.apple.mpegurl')) {
     video.src = src;
-    return;
+    return true;
   }
   // hls.js is loaded from CDN in index.html; if unavailable, fall back.
   const HlsLib = window.Hls;
@@ -445,8 +662,10 @@ function attachHls(video, src) {
     const hls = new HlsLib({ lowLatencyMode: true, liveSyncDurationCount: 2 });
     hls.loadSource(src);
     hls.attachMedia(video);
+    return true;
   } else {
     video.src = src;
+    return false;
   }
 }
 
@@ -489,12 +708,14 @@ export function renderMessage(m, mePid, participants, opts = {}) {
   const sender = participants.get(m.sender_id);
   const senderName = sender?.display_name || (isSelf ? '我' : shortId(m.sender_id));
   const isDeleted = Boolean(m.deleted_at);
+  const deliveryStatus = opts.pending ? m.delivery_status : null;
 
   const wrap = el('div', {
     className:
       'msg' +
       (isSelf ? ' self' : '') +
       (opts.pending ? ' pending' : '') +
+      (deliveryStatus === 'failed' ? ' failed' : '') +
       (isDeleted ? ' deleted' : ''),
     dataset: {
       msgId: m.id,
@@ -514,6 +735,19 @@ export function renderMessage(m, mePid, participants, opts = {}) {
   meta.appendChild(timeEl);
   if (m.edited_at) {
     meta.appendChild(el('span', { className: 'edited muted', text: '· 已编辑' }));
+  }
+  if (deliveryStatus) {
+    const labels = {
+      sending: '· 发送中',
+      retrying: '· 重试中',
+      waiting: '· 等待连接',
+      failed: '· 发送失败',
+    };
+    meta.appendChild(el('span', {
+      className: `delivery-state ${deliveryStatus}`,
+      text: labels[deliveryStatus] || '· 待确认',
+      attrs: { title: m.failure_message || '' },
+    }));
   }
 
   // Optional reply chip — references the parent message.

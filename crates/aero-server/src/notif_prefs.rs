@@ -25,19 +25,13 @@ use crate::state::AppState;
 
 pub fn routes() -> Router<AppState> {
     Router::new()
-        .route(
-            "/api/rooms/:id/mute",
-            post(mute_room).delete(unmute_room),
-        )
+        .route("/api/rooms/:id/mute", post(mute_room).delete(unmute_room))
         .route(
             "/api/rooms/:id/notification-level",
             axum::routing::put(set_notification_level).get(get_notification_level),
         )
         .route("/api/notifications/prefs", get(get_prefs))
-        .route(
-            "/api/notifications/prefs/dnd",
-            axum::routing::put(set_dnd),
-        )
+        .route("/api/notifications/prefs/dnd", axum::routing::put(set_dnd))
 }
 
 /// The three permitted per-room notification levels (the DB CHECK enforces the
@@ -62,7 +56,7 @@ async fn mute_room(
 ) -> ApiResult<Json<serde_json::Value>> {
     let room = parse_room(&room_str)?;
     s.im.assert_room_access(auth.participant_id, room).await?;
-    repo(&s).mute(auth.participant_id, room).await?;
+    repo(&s).mute_authorized(auth.participant_id, room).await?;
     Ok(Json(serde_json::json!({ "room_id": room, "muted": true })))
 }
 
@@ -74,8 +68,12 @@ async fn unmute_room(
 ) -> ApiResult<Json<serde_json::Value>> {
     let room = parse_room(&room_str)?;
     s.im.assert_room_access(auth.participant_id, room).await?;
-    let removed = repo(&s).unmute(auth.participant_id, room).await?;
-    Ok(Json(serde_json::json!({ "room_id": room, "muted": false, "removed": removed })))
+    let removed = repo(&s)
+        .unmute_authorized(auth.participant_id, room)
+        .await?;
+    Ok(Json(
+        serde_json::json!({ "room_id": room, "muted": false, "removed": removed }),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -97,13 +95,12 @@ async fn set_notification_level(
     let room = parse_room(&room_str)?;
     let level = req.level.trim().to_ascii_lowercase();
     if !NOTIFICATION_LEVELS.contains(&level.as_str()) {
-        return Err(AeroError::Invalid(
-            "level must be one of: all, mentions, none".into(),
-        )
-        .into());
+        return Err(AeroError::Invalid("level must be one of: all, mentions, none".into()).into());
     }
     s.im.assert_room_access(auth.participant_id, room).await?;
-    repo(&s).set_level(auth.participant_id, room, &level).await?;
+    repo(&s)
+        .set_level_authorized(auth.participant_id, room, &level)
+        .await?;
     Ok(Json(serde_json::json!({ "room_id": room, "level": level })))
 }
 
@@ -119,12 +116,14 @@ async fn get_notification_level(
     let room = parse_room(&room_str)?;
     s.im.assert_room_access(auth.participant_id, room).await?;
     let r = repo(&s);
-    let explicit = r.get_level(auth.participant_id, room).await?;
+    let (explicit, muted) = r
+        .room_preference_authorized(auth.participant_id, room)
+        .await?;
     // Effective level mirrors the dispatcher: explicit row wins; else a muted
     // room reads as `none`, else `all`.
     let effective = match explicit.as_deref() {
         Some(l) => l.to_owned(),
-        None if r.is_muted(auth.participant_id, room).await? => "none".to_owned(),
+        None if muted => "none".to_owned(),
         None => "all".to_owned(),
     };
     Ok(Json(serde_json::json!({
@@ -140,7 +139,7 @@ async fn get_prefs(
     auth: AuthUser,
 ) -> ApiResult<Json<serde_json::Value>> {
     let r = repo(&s);
-    let muted = r.muted_rooms(auth.participant_id).await?;
+    let muted = r.muted_rooms_accessible(auth.participant_id).await?;
     let dnd = r.get_dnd(auth.participant_id).await?;
     Ok(Json(serde_json::json!({
         "muted_rooms": muted,
@@ -176,9 +175,10 @@ async fn set_dnd(
     }
     // Arming requires both bounds; a single bound is ambiguous.
     if req.start_minute.is_some() != req.end_minute.is_some() {
-        return Err(
-            AeroError::Invalid("provide both start_minute and end_minute, or neither".into()).into(),
-        );
+        return Err(AeroError::Invalid(
+            "provide both start_minute and end_minute, or neither".into(),
+        )
+        .into());
     }
     repo(&s)
         .set_dnd(auth.participant_id, req.start_minute, req.end_minute)

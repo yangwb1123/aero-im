@@ -121,18 +121,12 @@ impl HlsWriter {
     /// Persists a new segment to disk and updates the rolling manifest.
     ///
     /// Returns the absolute path of the segment file just written.
-    pub async fn push_segment(
-        &mut self,
-        bytes: Bytes,
-        duration_secs: f32,
-    ) -> HlsResult<PathBuf> {
+    pub async fn push_segment(&mut self, bytes: Bytes, duration_secs: f32) -> HlsResult<PathBuf> {
         if self.finalized {
             return Err(HlsError::Finalized);
         }
         if !(duration_secs > 0.0) {
-            return Err(HlsError::Invalid(
-                "duration_secs must be > 0".to_string(),
-            ));
+            return Err(HlsError::Invalid("duration_secs must be > 0".to_string()));
         }
 
         let file_name = format!("{}.{}", self.segment_index, self.segment_ext);
@@ -184,10 +178,7 @@ impl HlsWriter {
             "#EXT-X-TARGETDURATION:{}\n",
             self.target_duration_secs
         ));
-        buf.push_str(&format!(
-            "#EXT-X-MEDIA-SEQUENCE:{}\n",
-            self.media_sequence
-        ));
+        buf.push_str(&format!("#EXT-X-MEDIA-SEQUENCE:{}\n", self.media_sequence));
         if !end {
             // Live: hint to players that this is a sliding window.
             buf.push_str("#EXT-X-PLAYLIST-TYPE:EVENT\n");
@@ -238,7 +229,10 @@ mod tests {
     #[tokio::test]
     async fn rejects_zero_target_duration() {
         let dir = tempfile::tempdir().unwrap();
-        let err = HlsWriter::new(dir.path().to_path_buf(), 0).await.err().unwrap();
+        let err = HlsWriter::new(dir.path().to_path_buf(), 0)
+            .await
+            .err()
+            .unwrap();
         assert!(matches!(err, HlsError::Invalid(_)));
     }
 
@@ -328,7 +322,10 @@ mod tests {
             .await
             .unwrap();
         let m = read_manifest(&writer).await;
-        assert!(m.contains("0.bin"), "manifest missing custom ext entry:\n{m}");
+        assert!(
+            m.contains("0.bin"),
+            "manifest missing custom ext entry:\n{m}"
+        );
     }
 
     #[tokio::test]

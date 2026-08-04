@@ -42,7 +42,9 @@ pub(crate) fn build_push_gateways() -> aero_server::state::PushGateways {
             let key = env_key;
             Box::pin(async move {
                 std::env::var(key).map_err(|_| {
-                    aero_push::PushError::Auth(format!("{key} unset (no push credential configured)"))
+                    aero_push::PushError::Auth(format!(
+                        "{key} unset (no push credential configured)"
+                    ))
                 })
             })
         })
@@ -60,9 +62,7 @@ pub(crate) fn build_push_gateways() -> aero_server::state::PushGateways {
 }
 
 /// Resolve the RTMP-shaped backing address for SRT ingest.
-pub(crate) fn srt_backing_rtmp_addr(
-    rtmp_addr: &std::net::SocketAddr,
-) -> std::net::SocketAddr {
+pub(crate) fn srt_backing_rtmp_addr(rtmp_addr: &std::net::SocketAddr) -> std::net::SocketAddr {
     match std::env::var("AERO__LIVE__SRT_LISTEN")
         .ok()
         .and_then(|s| s.trim().parse::<std::net::SocketAddr>().ok())

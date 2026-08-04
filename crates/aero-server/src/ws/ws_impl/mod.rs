@@ -1,47 +1,57 @@
 //! WebSocket endpoint and protocol.
 //!
 //! Wire format is JSON; all frames are tagged with `type`. See the design spec
-//! for the full message set. JWT is passed via `?token=...` query parameter
-//! because browser WebSocket clients can't set custom headers.
+//! for the full message set. Non-browser clients should use an Authorization
+//! bearer; browser clients retain the `?token=...` compatibility fallback
+//! because the WebSocket constructor cannot set custom headers.
 //!
 //! ## Reconnect backfill protocol (ROADMAP 方向五)
 //!
 //! A client that dropped its socket can avoid silently losing messages by
-//! reconnecting with an extra query param: `/ws?token=...&since=<message_id>`,
-//! where `<message_id>` is the id of the **last message it successfully
-//! received** (any room). On connect, before any live event resumes, the server
-//! replays every message created strictly after that cursor — across all rooms
-//! the participant belongs to — as ordinary `message` frames (via
-//! [`aero_storage::MessageRepo::list_since`], oldest-first, capped per room).
-//! `since` is best-effort: a malformed/garbage cursor is ignored (the client
-//! simply gets no backfill) rather than failing the upgrade, and replay
-//! failures never abort the connection. The forward REST complement is
-//! `GET /api/rooms/:id/messages?since=<message_id>`.
-use std::str::FromStr;
-use std::sync::Arc;
+//! Modern clients opt into `/ws?...&cursors=1`: each effective current room
+//! resumes from its participant/room delivery cursor, while a room with no
+//! cursor receives only the newest bounded history page (older history remains
+//! available through ordinary REST `before` pagination). The server then emits
+//! `delivery_ready`, after which a client may persist/send `delivery_ack`.
+//!
+//! Legacy clients can reconnect with `since=<message_id>` and replay each room
+//! forward from that global id, oldest-first and capped per room. When both are
+//! present, cursor mode wins and `since` remains a rolling-downgrade fallback
+//! for an older server. Malformed cursors and replay failures never reject the
+//! WebSocket upgrade.
+use crate::hub::WsSender;
+use crate::state::AppState;
+use aero_auth::{Claims, TokenKind};
 use aero_common::metrics::{self, names};
 use aero_common::{
-    Block, CallEvent, CallId, CallKind, CallMode, MembershipOp, MessageId, NotificationKind,
-    ParticipantId, PinOp, PollId, PollOp, ReactionOp, RoomId, StreamEvent,
+    Block, CallEvent, CallId, CallKind, CallMode, CallSession, CanvasId, MembershipOp, MessageId,
+    NotificationKind, ParticipantId, PinOp, PollId, PollOp, ReactionOp, RoomId, SessionId,
+    SfuPublisherDescription, SfuSubscription, StreamEvent,
 };
-use ulid::Ulid;
 use axum::{
     extract::{
-        ws::{Message, WebSocketUpgrade},
-        Query, State,
+        rejection::QueryRejection,
+        ws::{CloseFrame, Message, WebSocketUpgrade},
+        ConnectInfo, Query, State,
     },
+    http::HeaderMap,
     response::IntoResponse,
 };
+use credentials::{select_access_token, RedactedAccessToken};
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
+use std::{collections::HashMap, fmt, sync::Arc};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, instrument, warn};
-use crate::hub::WsSender;
-use crate::state::AppState;
-#[derive(Debug, Deserialize)]
+use ulid::Ulid;
+
+#[derive(Deserialize)]
 pub struct WsParams {
-    token: String,
+    /// Legacy browser fallback. This is deliberately a redacting newtype rather
+    /// than `String`, so query bearer material cannot leak through `Debug`.
+    #[serde(default)]
+    token: Option<RedactedAccessToken>,
     /// Optional reconnect cursor: the id of the last message the client already
     /// has. On connect the server backfills everything created after it across
     /// the participant's rooms before live events resume. See the module docs.
@@ -54,24 +64,44 @@ pub struct WsParams {
     #[serde(default)]
     summarize: Option<bool>,
     /// Opt-in per-room delivery-cursor backfill (ROADMAP 方向三·A). When truthy
-    /// (`1`/`true`/`yes`) AND no explicit `since` is given, the server resumes each
+    /// (`1`/`true`/`yes`), the server resumes each
     /// room from this participant's persisted DELIVERY cursor (multi-device-shared)
-    /// instead of a single global cursor. Ignored when `since` is present (explicit
-    /// wins, for back-compat). A free-form string (not `Option<bool>`) so a `1`
-    /// from a client is lenient — like `since` — rather than 400-ing the whole
-    /// upgrade. Absent/empty ⇒ off.
+    /// instead of a single global cursor. Cursor mode wins when both parameters
+    /// are present, allowing a modern browser to keep `since` as a rolling-
+    /// downgrade fallback for legacy servers. A free-form string (not
+    /// `Option<bool>`) lets clients send `1` without 400-ing the upgrade.
     #[serde(default)]
     cursors: Option<String>,
+}
+
+// Browser clients still present their access token in the WebSocket query
+// string. Keep a redacted Debug implementation as defence in depth: even if
+// this value is accidentally attached to a future trace/event, the bearer
+// credential can never be formatted into logs.
+impl fmt::Debug for WsParams {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WsParams")
+            .field("token", &"[REDACTED]")
+            .field("since", &self.since)
+            .field("summarize", &self.summarize)
+            .field("cursors", &self.cursors)
+            .finish()
+    }
 }
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum ClientFrame {
     /// Subscribe local presence for a room.
-    JoinRoom { room_id: RoomId },
+    JoinRoom {
+        room_id: RoomId,
+    },
     /// Send a new message.
     SendMessage {
         room_id: RoomId,
         blocks: Vec<Block>,
+        /// Stable sender-generated UUID for retry-safe persistence.
+        #[serde(default)]
+        client_message_id: Option<uuid::Uuid>,
         #[serde(default)]
         reply_to: Option<MessageId>,
         /// Optional sender-set TTL in seconds. If > 0, the message is
@@ -94,6 +124,8 @@ pub(crate) enum ClientFrame {
         room_id: RoomId,
         markdown: String,
         #[serde(default)]
+        client_message_id: Option<uuid::Uuid>,
+        #[serde(default)]
         reply_to: Option<MessageId>,
         /// Optional sender-set TTL in seconds. If > 0, the message is
         /// hard-deleted by the ephemeral sweep once this many seconds elapse.
@@ -110,20 +142,40 @@ pub(crate) enum ClientFrame {
         expected_version: Option<i32>,
     },
     /// Soft-delete a message.
-    DeleteMessage { id: MessageId },
+    DeleteMessage {
+        id: MessageId,
+    },
     /// Toggle a reaction.
-    React { message_id: MessageId, emoji: String },
+    React {
+        message_id: MessageId,
+        emoji: String,
+    },
     /// Mark a room read up to the given message.
-    MarkRead { room_id: RoomId, last_message_id: MessageId },
+    MarkRead {
+        room_id: RoomId,
+        last_message_id: MessageId,
+    },
     /// Acknowledge durable receipt of a message (ROADMAP 方向三·A). Distinct from
     /// `MarkRead` (visual "seen"): this advances the per-room DELIVERY cursor — the
-    /// Last-Known-Good point reconnect resumes each room from. Monotonic on `seq`
-    /// (the per-subject bus seq the client already dedupes on), so redelivery and
-    /// racing multi-device ACKs are harmless. Best-effort: a failed persist never
-    /// tears down the socket.
-    DeliveryAck { room_id: RoomId, message_id: MessageId, seq: i64 },
+    /// Last-Known-Good point reconnect resumes each room from. Monotonic on the
+    /// transactional `delivery_ordinal`; `seq` is retained only as a diagnostic
+    /// bus dedup high-water mark. Database-backfill frames use `seq = 0`.
+    /// Best-effort: a failed persist never tears down the socket.
+    DeliveryAck {
+        room_id: RoomId,
+        message_id: MessageId,
+        /// Durable per-room creation order. Required for cursor v2; an omitted
+        /// value is a legacy ACK and is deliberately ignored rather than
+        /// reviving the unsafe MAX(message_id) cursor.
+        #[serde(default)]
+        delivery_ordinal: Option<i64>,
+        seq: i64,
+    },
     /// Best-effort typing indicator.
-    Typing { room_id: RoomId, on: bool },
+    Typing {
+        room_id: RoomId,
+        on: bool,
+    },
     /// Start a call (1:1 or group).
     CallInvite {
         room_id: RoomId,
@@ -174,13 +226,41 @@ pub(crate) enum ClientFrame {
         call_id: Option<CallId>,
     },
     /// Leave a group call.
-    CallLeave { call_id: CallId, room_id: RoomId },
+    CallLeave {
+        call_id: CallId,
+        room_id: RoomId,
+    },
     /// A per-pair mesh offer to one peer in a group call.
     CallOffer {
         call_id: CallId,
         room_id: RoomId,
         to: ParticipantId,
         sdp: String,
+    },
+    /// Negotiate a browser media leg directly with the server SFU.
+    ///
+    /// This is deliberately distinct from `CallOffer`, which remains a
+    /// peer-to-peer mesh relay for backward compatibility.
+    CallSfuOffer {
+        call_id: CallId,
+        room_id: RoomId,
+        sdp: String,
+    },
+    /// Trickle a browser ICE candidate into its server-owned SFU session.
+    CallSfuIce {
+        call_id: CallId,
+        room_id: RoomId,
+        session_generation: u64,
+        candidate: serde_json::Value,
+    },
+    /// Install explicit publisher-track → outbound-transceiver routes after
+    /// negotiating enough receive-capable media sections.
+    CallSfuSubscribe {
+        call_id: CallId,
+        room_id: RoomId,
+        session_generation: u64,
+        revision: u64,
+        tracks: Vec<SfuSubscription>,
     },
     /// Start watching a live stream (danmaku/gift fan-out + viewer count).
     WatchStream {
@@ -192,9 +272,14 @@ pub(crate) enum ClientFrame {
         since: Option<String>,
     },
     /// Stop watching a live stream.
-    UnwatchStream { stream_id: Ulid },
+    UnwatchStream {
+        stream_id: Ulid,
+    },
     /// Post a danmaku line on a stream.
-    StreamChat { stream_id: Ulid, body: String },
+    StreamChat {
+        stream_id: Ulid,
+        body: String,
+    },
     /// Send a gift on a stream (`qty` defaults to 1).
     StreamGift {
         stream_id: Ulid,
@@ -208,14 +293,55 @@ pub(crate) enum ClientFrame {
     },
     Ping,
 }
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct DeliveryRoomBarrier {
+    pub room_id: RoomId,
+    pub delivery_ordinal: i64,
+}
+
 #[derive(Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum ServerFrame<'a> {
-    Welcome { participant: ParticipantId },
-    Presence { room_id: RoomId, online: Vec<ParticipantId> },
-    Message { message: aero_common::Message },
-    Edited { message: aero_common::Message },
-    Deleted { room_id: RoomId, message_id: MessageId, by: ParticipantId },
+    Welcome {
+        participant: ParticipantId,
+        capabilities: &'static [&'static str],
+    },
+    Presence {
+        room_id: RoomId,
+        online: Vec<ParticipantId>,
+    },
+    Message {
+        message: aero_common::Message,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        delivery_ordinal: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        client_message_id: Option<uuid::Uuid>,
+    },
+    MessageAck {
+        client_message_id: uuid::Uuid,
+        message: aero_common::Message,
+        deduplicated: bool,
+    },
+    MessageNack {
+        client_message_id: uuid::Uuid,
+        code: &'a str,
+        msg: String,
+        retryable: bool,
+    },
+    /// All reconnect backfill frames have been queued. Cursor-aware clients
+    /// must not persist/ACK an interleaved live message before this barrier,
+    /// otherwise a disconnect could advance past older frames still in replay.
+    DeliveryReady {
+        rooms: Vec<DeliveryRoomBarrier>,
+    },
+    Edited {
+        message: aero_common::Message,
+    },
+    Deleted {
+        room_id: RoomId,
+        message_id: MessageId,
+        by: ParticipantId,
+    },
     Reaction {
         room_id: RoomId,
         message_id: MessageId,
@@ -229,7 +355,11 @@ pub(crate) enum ServerFrame<'a> {
         last_message_id: MessageId,
         at: time::OffsetDateTime,
     },
-    Typing { room_id: RoomId, participant: ParticipantId, on: bool },
+    Typing {
+        room_id: RoomId,
+        participant: ParticipantId,
+        on: bool,
+    },
     /// You were mentioned / replied to (targeted to the recipient only).
     Notify {
         room_id: RoomId,
@@ -239,16 +369,82 @@ pub(crate) enum ServerFrame<'a> {
         notify_kind: NotificationKind,
     },
     /// A message was pinned/unpinned in a room (fans out to all members).
-    Pin { room_id: RoomId, message_id: MessageId, by: ParticipantId, op: PinOp },
+    Pin {
+        room_id: RoomId,
+        message_id: MessageId,
+        by: ParticipantId,
+        op: PinOp,
+    },
     /// A participant joined/left a channel (fans out to all room members).
-    Membership { room_id: RoomId, participant: ParticipantId, op: MembershipOp },
-    Call { event: CallEvent },
+    Membership {
+        room_id: RoomId,
+        participant: ParticipantId,
+        op: MembershipOp,
+    },
+    Call {
+        event: CallEvent,
+    },
+    /// Server SDP answer for a `call_sfu_offer`.
+    CallSfuAnswer {
+        call_id: CallId,
+        sdp: String,
+        /// Reachable host candidate selected for this media session.
+        local_addr: String,
+        /// Media IDs accepted from the offer. v1 routing expects sendrecv peers
+        /// to use matching mids for their outbound transceivers.
+        mids: Vec<String>,
+        /// Changes on every accepted offer, even when topology revision does
+        /// not. ICE/subscription commands must echo this value.
+        session_generation: u64,
+        revision: u64,
+        publishers: Vec<SfuPublisherDescription>,
+        required_recv_slots: usize,
+    },
+    /// Confirms that a trickled candidate was parsed and applied by the
+    /// single-owner media task.
+    CallSfuIceAck {
+        call_id: CallId,
+        session_generation: u64,
+    },
+    /// Publisher topology changed and the browser must (re)offer enough
+    /// receive-capable transceivers before replacing its route plan.
+    CallSfuRenegotiate {
+        call_id: CallId,
+        revision: u64,
+        publishers: Vec<SfuPublisherDescription>,
+        required_recv_slots: usize,
+    },
+    /// Confirms the explicit route plan was installed at `revision`.
+    CallSfuSubscribed {
+        call_id: CallId,
+        session_generation: u64,
+        revision: u64,
+    },
     /// A poll was created/voted/closed in a room (fans out to all members so the
     /// tally stays live).
-    Poll { room_id: RoomId, poll_id: PollId, op: PollOp },
+    Poll {
+        room_id: RoomId,
+        poll_id: PollId,
+        op: PollOp,
+    },
+    /// One committed append to a canvas's durable operation log. `op_seq`
+    /// orders the per-canvas recovery stream; the frame's separately stamped
+    /// `seq` orders all room-bus events.
+    CanvasOp {
+        room_id: RoomId,
+        canvas_id: CanvasId,
+        op_id: uuid::Uuid,
+        op_seq: i64,
+        author_id: ParticipantId,
+        op: serde_json::Value,
+    },
     /// A participant acknowledged seeing a specific message ("Seen by …"; fans
     /// out to all members so the per-message read indicator stays live).
-    MessageSeen { room_id: RoomId, message_id: MessageId, participant: ParticipantId },
+    MessageSeen {
+        room_id: RoomId,
+        message_id: MessageId,
+        participant: ParticipantId,
+    },
     /// A participant clicked a Button / picked a Select option on an interactive
     /// message block (fans out to all members so the poster's bot/app sees it live).
     Interaction {
@@ -258,29 +454,119 @@ pub(crate) enum ServerFrame<'a> {
         action_id: String,
     },
     /// Per-stream interactivity event (danmaku/gift/viewers/status).
-    StreamEvent { event: StreamEvent },
-    Error { code: &'a str, msg: String },
+    StreamEvent {
+        event: StreamEvent,
+    },
+    Error {
+        code: &'a str,
+        msg: String,
+    },
     Pong,
 }
-#[instrument(skip(ws, state))]
+
+const WS_CAPABILITIES: &[&str] = &[
+    "message_ack_v1",
+    "delivery_cursor_v2",
+    "call_sfu_v1",
+    "call_sfu_v2",
+];
+const SESSION_RECHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+const SERVER_SHUTDOWN_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+fn server_shutdown_close_frame() -> Message {
+    Message::Close(Some(CloseFrame {
+        code: 1001,
+        reason: std::borrow::Cow::Borrowed("server shutdown"),
+    }))
+}
+
+pub(crate) fn access_participant(claims: &Claims) -> aero_common::Result<ParticipantId> {
+    if claims.kind != TokenKind::Access {
+        return Err(aero_common::Error::Unauthorized(
+            "websocket requires an access token".into(),
+        ));
+    }
+    if claims.session_id()?.is_none() {
+        return Err(aero_common::Error::Unauthorized(
+            "websocket access token is missing a session id".into(),
+        ));
+    }
+    claims.participant_id()
+}
+
+fn invalid_ws_query_response() -> axum::response::Response {
+    (
+        axum::http::StatusCode::BAD_REQUEST,
+        "invalid websocket query",
+    )
+        .into_response()
+}
+
+// `p` may contain the query bearer, while `headers` may contain Authorization,
+// OIDC flow cookies, or proxy credentials. Do not let the generated span capture
+// any handler argument.
+#[instrument(name = "ws_handshake", skip_all)]
 pub async fn handler(
     ws: WebSocketUpgrade,
-    Query(p): Query<WsParams>,
+    query: Result<Query<WsParams>, QueryRejection>,
     State(state): State<AppState>,
+    connect_info: Option<ConnectInfo<std::net::SocketAddr>>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
-    let claims = match state.auth.verify(&p.token) {
+    // Capture Query's rejection so its detailed serde error (which is allowed to
+    // contain request data) is never rendered or logged by Axum.
+    let Query(p) = match query {
+        Ok(query) => query,
+        Err(_) => return invalid_ws_query_response(),
+    };
+    let access_token = match select_access_token(&headers, p.token) {
+        Ok(token) => token,
+        Err(error) => {
+            warn!(reason = %error, "ws credential rejected");
+            return (
+                axum::http::StatusCode::UNAUTHORIZED,
+                "invalid websocket credential",
+            )
+                .into_response();
+        }
+    };
+    let claims = match state.auth.verify_access(access_token.expose()).await {
         Ok(c) => c,
-        Err(e) => {
-            warn!(error = %e, "ws auth failed");
+        Err(_) => {
+            warn!("ws auth failed");
             return (axum::http::StatusCode::UNAUTHORIZED, "invalid token").into_response();
         }
     };
-    let pid: ParticipantId = match claims.participant_id() {
+    let pid: ParticipantId = match access_participant(&claims) {
         Ok(p) => p,
-        Err(_) => {
-            return (axum::http::StatusCode::UNAUTHORIZED, "invalid sub").into_response();
+        Err(e) => {
+            warn!(error = %e, "ws access-token check failed");
+            return (axum::http::StatusCode::UNAUTHORIZED, "invalid access token").into_response();
         }
     };
+    // `/ws` is global and bus fan-out can deliver events before a client sends a
+    // room-scoped frame. Enforce the intersection of every restricted workspace
+    // membership at the handshake, rather than relying on URL parsing or a later
+    // `join_room` guard that would be too late to prevent passive data leakage.
+    let client_ip = crate::rate_limit::client_ip(&headers, connect_info.map(|info| info.0));
+    if let Err(error) =
+        crate::ip_allowlist::assert_participant_network_access(&state, pid, client_ip).await
+    {
+        warn!(%pid, %client_ip, %error, "ws authorized-network check failed");
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            "client IP is not authorized for this account's workspaces",
+        )
+            .into_response();
+    }
+    let session_id = match claims.session_id() {
+        Ok(session_id) => session_id,
+        Err(e) => {
+            warn!(error = %e, "ws session-id check failed");
+            return (axum::http::StatusCode::UNAUTHORIZED, "invalid access token").into_response();
+        }
+    };
+    let access_exp = claims.exp;
     // Best-effort reconnect cursor: a garbage value is simply ignored (no
     // backfill) rather than rejecting the upgrade. See module-level protocol docs.
     let since = parse_resume_cursor(p.since.as_deref());
@@ -289,33 +575,120 @@ pub async fn handler(
         p.cursors.as_deref().map(str::trim),
         Some("1" | "true" | "yes" | "on")
     );
-    ws.on_upgrade(move |socket| run_socket(socket, state, pid, since, summarize, use_cursors))
+    ws.on_upgrade(move |socket| {
+        run_socket(
+            socket,
+            state,
+            pid,
+            session_id,
+            access_exp,
+            since,
+            summarize,
+            use_cursors,
+        )
+    })
 }
 #[instrument(skip(socket, state, since), fields(%pid))]
 async fn run_socket(
     socket: axum::extract::ws::WebSocket,
     state: AppState,
     pid: ParticipantId,
+    session_id: Option<SessionId>,
+    access_exp: u64,
     since: Option<MessageId>,
     summarize: bool,
     use_cursors: bool,
 ) {
     let (mut sender, mut receiver) = socket.split();
-    // Bounded outbound queue: a slow/stalled client can never make the
-    // broadcaster grow memory without limit (OOM guard). On a full queue the Hub
-    // drops the frame and — per config — disconnects the client via `close`.
+    // `tx` is the ordered socket-output queue. Hub traffic is deliberately
+    // registered on a separate bounded queue (`live_tx`) until reconnect
+    // backfill has crossed its DeliveryReady barrier. Otherwise a NATS event can
+    // race the async history queries and reach the browser ahead of older replay
+    // frames, letting the browser persist an ACK past content it has not applied.
+    //
+    // Both queues are bounded: a slow/stalled client (or an exceptionally busy
+    // room while backfill is running) can never grow memory without limit. Hub's
+    // existing full-queue policy still drops/evicts through the shared `close`.
     let (tx, mut rx) = mpsc::channel::<Message>(state.ws_config.send_queue_capacity);
+    let (live_tx, mut live_rx) = mpsc::channel::<Message>(state.ws_config.send_queue_capacity);
     let close = CancellationToken::new();
-    state.hub.register(pid, WsSender::new(tx.clone(), close.clone()));
+    let registered = match session_id {
+        Some(session_id) => WsSender::for_session(live_tx, close.clone(), session_id),
+        None => WsSender::new(live_tx, close.clone()),
+    };
+    state.hub.register(pid, registered.clone());
+    let now = u64::try_from(time::OffsetDateTime::now_utc().unix_timestamp()).unwrap_or(0);
+    let expires_in = std::time::Duration::from_secs(access_exp.saturating_sub(now));
+    let expiry = {
+        let close = close.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(expires_in).await;
+            debug!(%pid, "ws access token expired");
+            close.cancel();
+        })
+    };
+    let session_watchdog = session_id.map(|session_id| {
+        let sessions = aero_storage::SessionRepo::new(state.pg.clone());
+        let close = close.clone();
+        tokio::spawn(async move {
+            let mut ticks = tokio::time::interval(SESSION_RECHECK_INTERVAL);
+            ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // `interval`'s first tick is immediate. Authentication just checked
+            // this row, so consume it and wait a full period before re-querying.
+            ticks.tick().await;
+            loop {
+                tokio::select! {
+                    () = close.cancelled() => break,
+                    _ = ticks.tick() => {
+                        match sessions.is_active(session_id, pid).await {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                debug!(%pid, %session_id, "ws session revoked");
+                                close.cancel();
+                                break;
+                            }
+                            Err(e) => {
+                                // Fail open on transient DB errors; the next tick
+                                // retries, while explicit local revocation still
+                                // closes immediately through the Hub.
+                                warn!(error = ?e, %pid, %session_id, "ws session check failed");
+                            }
+                        }
+                    }
+                }
+            }
+        })
+    });
     let _ = tx.try_send(Message::Text(
-        serde_json::to_string(&ServerFrame::Welcome { participant: pid }).unwrap_or_default(),
+        serde_json::to_string(&ServerFrame::Welcome {
+            participant: pid,
+            capabilities: WS_CAPABILITIES,
+        })
+        .unwrap_or_default(),
     ));
     let outgoing = {
         let close = close.clone();
+        let shutdown = state.shutdown.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
-                        () = close.cancelled() => break,
+                    biased;
+                    () = shutdown.cancelled() => {
+                        // Tell browsers/load balancers this is an intentional
+                        // rolling-deploy departure, not an abnormal 1006 loss.
+                        // The direct sink bypasses a potentially-full Hub queue.
+                        let sent = tokio::time::timeout(
+                            SERVER_SHUTDOWN_CLOSE_TIMEOUT,
+                            sender.send(server_shutdown_close_frame()),
+                        )
+                        .await;
+                        if !matches!(sent, Ok(Ok(()))) {
+                            debug!(%pid, "ws shutdown Close frame could not be flushed");
+                        }
+                        close.cancel();
+                        break;
+                    }
+                    () = close.cancelled() => break,
                     msg = rx.recv() => match msg {
                         Some(msg) => {
                             if sender.send(msg).await.is_err() {
@@ -328,18 +701,49 @@ async fn run_socket(
             }
         })
     };
-    // Reconnect backfill (ROADMAP 方向五): before live events resume, replay
-    // everything the client missed while disconnected. Done after the outgoing
-    // task is draining `tx` (so we apply real back-pressure instead of dropping)
-    // and before the receive loop (so the catch-up is chronological and lands
-    // ahead of any new live frames). Best-effort: failures never abort the conn.
-    if let Some(cursor) = since {
+    // Reconnect backfill (ROADMAP 方向五): replay everything the client missed
+    // while Hub traffic waits in `live_rx`. The outgoing task drains `tx` so
+    // replay applies real back-pressure, and the live forwarder is created only
+    // after the barrier is queued. Best-effort: failures never abort the conn.
+    if use_cursors {
+        // Resume every effective room from its persisted delivery cursor. A room
+        // without one receives only a bounded newest-history seed.
+        // Cursor ACKs are only valid for messages the application applied.
+        // Summary-only replay intentionally stays a legacy presentation mode;
+        // cursor v2 always sends the full ordered message pages.
+        if let Some(rooms) = backfill_from_cursors(&state, pid, &tx, &close, false).await {
+            let _ = tx
+                .send(Message::Text(
+                    serde_json::to_string(&ServerFrame::DeliveryReady { rooms })
+                        .unwrap_or_default(),
+                ))
+                .await;
+        }
+    } else if let Some(cursor) = since {
         backfill_since(&state, pid, cursor, &tx, &close, summarize).await;
-    } else if use_cursors {
-        // No explicit `since`: resume each room from its persisted delivery cursor
-        // (ROADMAP 方向三·A, multi-device-shared per-room catch-up).
-        backfill_from_cursors(&state, pid, &tx, &close, summarize).await;
     }
+    // The DeliveryReady send above has completed before this task can enqueue a
+    // Hub frame, providing a strict FIFO boundary even when a live event arrived
+    // during the database replay. Legacy/no-cursor clients get the same ordering
+    // guarantee after their optional `since` backfill.
+    let live_forwarder = {
+        let tx = tx.clone();
+        let close = close.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    () = close.cancelled() => break,
+                    frame = live_rx.recv() => {
+                        let Some(frame) = frame else { break };
+                        if tx.send(frame).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        })
+    };
+    let mut call_generations = HashMap::new();
     loop {
         tokio::select! {
             // The Hub asked us to drop this connection (laggy / evicted).
@@ -348,7 +752,9 @@ async fn run_socket(
                 let Some(Ok(msg)) = incoming else { break };
                 match msg {
                     Message::Text(text) => {
-                        if let Err(e) = frame::handle_text(&text, &state, pid, &tx).await {
+                        if let Err(e) =
+                            frame::handle_text(&text, &state, pid, &tx, &mut call_generations).await
+                        {
                             let _ = tx.try_send(Message::Text(
                                 serde_json::to_string(&ServerFrame::Error {
                                     code: "handler",
@@ -376,21 +782,148 @@ async fn run_socket(
             }
         }
     }
+    let joined_rooms = state.hub.rooms_of(pid);
+    let last_socket_closed = state.hub.unregister(pid, &registered);
+    cleanup_connection_call_generations(&state, pid, call_generations).await;
     // Cluster-wide presence (ROADMAP 方向一): drop this participant from every
-    // room's Redis presence set BEFORE the hub purges its local reverse index.
+    // room's Redis presence set only after the last local socket is gone.
     // Retry transient Redis failures so a brief timeout doesn't leave a ghost
     // online status until the heartbeat TTL expires. Crashed clients (no graceful
     // disconnect) also age out via the heartbeat TTL, so this is additive safety.
-    for room in state.hub.rooms_of(pid) {
-        if let Err(e) = retry_leave(&state.presence, room, pid).await {
-            warn!(error = ?e, %room, %pid, "redis room-presence leave failed after retries — TTL will clear");
+    if last_socket_closed {
+        for room in joined_rooms {
+            if let Err(e) = retry_leave(&state.presence, room, pid).await {
+                warn!(error = ?e, %room, %pid, "redis room-presence leave failed after retries — TTL will clear");
+            }
         }
     }
-    let registered = WsSender::new(tx, close.clone());
-    state.hub.unregister(pid, &registered);
     close.cancel();
+    if let Some(session_watchdog) = session_watchdog {
+        session_watchdog.abort();
+    }
+    expiry.abort();
+    live_forwarder.abort();
     outgoing.abort();
     info!(%pid, "ws closed");
+}
+
+/// Converge only the durable call incarnations owned by this WebSocket.
+///
+/// A participant may have multiple tabs or may reconnect on another node. The
+/// per-connection generation map ensures an old socket can remove its own
+/// media/route/roster state without deleting the replacement incarnation.
+async fn cleanup_connection_call_generations(
+    state: &AppState,
+    participant: ParticipantId,
+    call_generations: HashMap<CallId, i64>,
+) {
+    for (call_id, leg_generation) in call_generations {
+        let _lifecycle_guard = state.call_supervisor.lock_sfu_lifecycle(call_id).await;
+        let local_owned = state
+            .call_orchestrator
+            .local_leg_generation(call_id, participant)
+            .await
+            == Some(leg_generation);
+
+        // Commit the exact durable leave before claiming any cluster-visible
+        // departure. Retry transient failures briefly; local media is removed
+        // for safety even when persistence remains unavailable.
+        let mut durable_room = None;
+        for attempt in 1..=3 {
+            let call = match state.calls.get(call_id).await {
+                Ok(call) => call,
+                Err(error) => {
+                    warn!(
+                        %call_id,
+                        %participant,
+                        ?error,
+                        attempt,
+                        "disconnect: canonical call lookup failed"
+                    );
+                    if attempt < 3 {
+                        tokio::time::sleep(std::time::Duration::from_millis(100 * attempt as u64))
+                            .await;
+                        continue;
+                    }
+                    break;
+                }
+            };
+            let Some(call) = call.filter(|call| call.ended_at.is_none()) else {
+                break;
+            };
+            match state
+                .im
+                .leave_call(participant, call.room_id, call_id, leg_generation)
+                .await
+            {
+                Ok(()) => {
+                    durable_room = Some(call.room_id);
+                    break;
+                }
+                Err(aero_common::Error::Conflict(_))
+                | Err(aero_common::Error::NotFound(_))
+                | Err(aero_common::Error::Forbidden(_)) => break,
+                Err(error) => {
+                    warn!(
+                        %call_id,
+                        %participant,
+                        ?error,
+                        attempt,
+                        "disconnect: durable SFU leave failed"
+                    );
+                    if attempt < 3 {
+                        tokio::time::sleep(std::time::Duration::from_millis(100 * attempt as u64))
+                            .await;
+                    }
+                }
+            }
+        }
+
+        // If the media owner stopped just before the socket closed, supersede
+        // its queued lifecycle event while holding the same per-call lock.
+        state
+            .call_supervisor
+            .invalidate_ended_sfu_session(call_id, participant);
+        let (removed_sfu, topology) = state
+            .call_supervisor
+            .remove_sfu_session_generation_with_topology(call_id, participant, leg_generation);
+        if let Some(topology) = topology {
+            sfu::fan_out_topology(state, &topology, None);
+        }
+        if local_owned {
+            state.hub.call_leave(call_id, participant);
+        }
+        if let Err(error) = state
+            .call_roster
+            .leave_generation(call_id, participant, leg_generation)
+            .await
+        {
+            warn!(%call_id, %participant, %error, "disconnect: Redis SFU roster leave failed");
+        }
+        let call_empty = state
+            .call_orchestrator
+            .cleanup_group_call_participant_generation(call_id, participant, leg_generation)
+            .await;
+        if let Some(room_id) = durable_room {
+            if let Err(error) =
+                sfu::publish_departure(state, participant, call_id, room_id, leg_generation).await
+            {
+                warn!(%call_id, %participant, %error, "disconnect: SFU topology publish failed");
+            }
+        }
+        if local_owned && call_empty {
+            state.call_supervisor.cancel_call(call_id);
+        }
+        debug!(
+            %call_id,
+            %participant,
+            leg_generation,
+            removed_sfu,
+            durable_transition = durable_room.is_some(),
+            call_empty,
+            "disconnect SFU call-leg cleanup completed"
+        );
+    }
 }
 
 /// Retry `presence.leave()` up to 3 times with 100ms backoff to survive
@@ -408,7 +941,8 @@ async fn retry_leave(
             Err(e) => {
                 last_err = Some(e);
                 if attempt < 3 {
-                    tokio::time::sleep(std::time::Duration::from_millis(100 * attempt as u64)).await;
+                    tokio::time::sleep(std::time::Duration::from_millis(100 * attempt as u64))
+                        .await;
                 }
             }
         }
@@ -416,35 +950,6 @@ async fn retry_leave(
     Err(last_err.unwrap_or_else(|| anyhow::anyhow!("presence leave exhausted retries")))
 }
 
-/// Per-room cap on reconnect backfill replay, so a client that has been away for
-/// a long time can't make a single connection replay an unbounded history (it
-/// can keep paging via the REST `?since=` route). Matches the keyset page window
-/// `MessageRepo::list_since` clamps to.
-pub(crate) const BACKFILL_PER_ROOM_LIMIT: i64 = 200;
-/// Parse a best-effort reconnect/resume cursor. `None` (absent) and any value
-/// that fails to decode as a [`MessageId`] both yield `None` — backfill is
-/// purely additive, so a bad cursor must degrade to "no backfill" rather than
-/// fail the connection. Pure + total, so it unit-tests without any I/O.
-#[must_use]
-pub(crate) fn parse_resume_cursor(raw: Option<&str>) -> Option<MessageId> {
-    raw.and_then(|s| MessageId::from_str(s.trim()).ok())
-}
-/// Truncation decision for a capped replay (ROADMAP 第三版 方向一): when a
-/// replay returned exactly `limit` rows it may have been cut short, so the
-/// client must be told to continue via the REST `?since=` route from the last
-/// replayed id. Returns that continuation cursor, or `None` when the replay
-/// fit under the cap (or replayed nothing). A full-but-complete page yields one
-/// harmless extra REST round-trip that returns empty — never a missed message.
-/// Pure + total, so it unit-tests without any I/O.
-#[must_use]
-pub(crate) fn truncation_cursor<T: Copy>(replayed: usize, limit: i64, last: Option<T>) -> Option<T> {
-    let replayed = i64::try_from(replayed).unwrap_or(i64::MAX);
-    if replayed >= limit {
-        last
-    } else {
-        None
-    }
-}
 /// Pick the authoritative cluster-wide count from the Redis result, falling back
 /// to the process-local Hub value when Redis is unavailable so the reported
 /// number is never worse than today's single-node behaviour.
@@ -483,217 +988,6 @@ async fn call_peers_excluding(
         }
     }
 }
-/// The rooms whose history we replay on reconnect: every room the participant
-/// belongs to. Factored out (and kept pure over the room list) so the
-/// selection/iteration logic is unit-testable without a database.
-#[must_use]
-pub(crate) fn backfill_room_ids(rooms: &[aero_common::Room]) -> Vec<RoomId> {
-    rooms.iter().map(|r| r.id).collect()
-}
-/// Replay messages missed since `cursor` for every room the participant belongs
-/// to, oldest-first, as ordinary `message` frames — the WS half of ROADMAP
-/// 方向五 reconnect backfill. Best-effort throughout: a failed room lookup or a
-/// failed per-room query is logged and skipped, never aborting the connection.
-/// Sends honour `close` so a torn-down connection stops replaying immediately,
-/// and use the bounded channel's back-pressure (await, not `try_send`) so a
-/// large catch-up is delivered rather than silently dropped.
-async fn backfill_since(
-    state: &AppState,
-    pid: ParticipantId,
-    cursor: MessageId,
-    tx: &mpsc::Sender<Message>,
-    close: &CancellationToken,
-    summarize: bool,
-) {
-    let rooms = match state.rooms.rooms_for(pid).await {
-        Ok(rs) => rs,
-        Err(e) => {
-            warn!(error = ?e, %pid, "reconnect backfill: list rooms failed");
-            return;
-        }
-    };
-    let mut replayed = 0usize;
-    for room in backfill_room_ids(&rooms) {
-        // Every room replays from the SAME global `cursor` (legacy `?since=`).
-        match replay_room_since(state, room, cursor, tx, close, summarize).await {
-            Ok(n) => replayed += n,
-            Err(()) => return, // connection gone mid-replay
-        }
-    }
-    if replayed > 0 {
-        debug!(%pid, replayed, "reconnect backfill replayed missed messages");
-    }
-}
-
-/// Per-room reconnect backfill from each room's persisted DELIVERY cursor
-/// (ROADMAP 方向三·A · opt-in `?cursors=1`). Unlike [`backfill_since`] — which
-/// replays every room from one global id — this resumes each room from exactly
-/// what *this participant has ACKed receiving there*, so a second device sharing
-/// the (participant, room) cursor only sees genuinely-new messages (no per-device
-/// re-replay), and rooms the client is already caught up on send nothing.
-///
-/// Rooms whose cursor exists but where the participant is no longer a member are
-/// skipped (a stale cursor for a left room must never replay). Best-effort: a
-/// failed cursor/room lookup logs and returns.
-async fn backfill_from_cursors(
-    state: &AppState,
-    pid: ParticipantId,
-    tx: &mpsc::Sender<Message>,
-    close: &CancellationToken,
-    summarize: bool,
-) {
-    let cursors = match state.delivery_cursors.cursors_for(pid).await {
-        Ok(c) => c,
-        Err(e) => {
-            warn!(error = ?e, %pid, "reconnect backfill: list delivery cursors failed");
-            return;
-        }
-    };
-    if cursors.is_empty() {
-        return;
-    }
-    // Current membership: a cursor for a room the participant has since left must
-    // not replay (membership can change between disconnect and reconnect).
-    let member_rooms: std::collections::HashSet<RoomId> = match state.rooms.rooms_for(pid).await {
-        Ok(rs) => backfill_room_ids(&rs).into_iter().collect(),
-        Err(e) => {
-            warn!(error = ?e, %pid, "reconnect backfill: list rooms failed");
-            return;
-        }
-    };
-    let mut replayed = 0usize;
-    for cur in cursors {
-        if !member_rooms.contains(&cur.room_id) {
-            continue;
-        }
-        match replay_room_since(
-            state,
-            cur.room_id,
-            cur.last_delivered_message_id,
-            tx,
-            close,
-            summarize,
-        )
-        .await
-        {
-            Ok(n) => replayed += n,
-            Err(()) => return,
-        }
-    }
-    if replayed > 0 {
-        debug!(%pid, replayed, "reconnect backfill (per-room cursors) replayed missed messages");
-    }
-}
-
-/// Replay one room's messages newer than `cursor`, oldest-first. Returns the
-/// number of frames replayed, or `Err(())` when the connection went away
-/// mid-replay (the caller must stop the whole backfill). A per-room query error
-/// is logged and yields `Ok(0)` (skip this room, keep going) — best-effort, never
-/// aborting on a single bad room. Shared by [`backfill_since`] (one global cursor
-/// for every room) and [`backfill_from_cursors`] (per-room delivery cursors).
-async fn replay_room_since(
-    state: &AppState,
-    room: RoomId,
-    cursor: MessageId,
-    tx: &mpsc::Sender<Message>,
-    close: &CancellationToken,
-    summarize: bool,
-) -> Result<usize, ()> {
-    // Fetch one PAST the replay cap: a full `cap + 1` page is the reliable
-    // "there is more behind the cap" signal that drives the truncation frame
-    // below (and keeps the burst bounded — a long offline gap must not dump
-    // thousands of rows over the socket; the client pulls the remainder via
-    // REST). list_since HONOURS this limit (it previously hardcoded 500).
-    let missed = match state
-        .messages
-        .list_since(room, cursor, BACKFILL_PER_ROOM_LIMIT + 1)
-        .await
-    {
-        Ok(m) => m,
-        Err(e) => {
-            warn!(error = ?e, %room, "reconnect backfill: list_since failed");
-            return Ok(0);
-        }
-    };
-    let room_count = missed.len();
-    let mut replayed = 0usize;
-    // Per-room replay cap. The full per-message replay below stops at
-    // BACKFILL_PER_ROOM_LIMIT and the client pulls the remainder via REST.
-    // CRITICAL: the truncation cursor must be the last *replayed* id, not the
-    // last *missed* id — otherwise the REST continuation (`id > since`) starts
-    // past the whole gap and returns nothing (regression: list_since once
-    // replayed everything yet still signalled truncation pointing at the tail
-    // → smoke_roadmap3_wave_c REST-continuation returned 0).
-    let cap = usize::try_from(BACKFILL_PER_ROOM_LIMIT).unwrap_or(usize::MAX);
-    let next_since: Option<MessageId> = if summarize {
-        // Summarized backfill: one room-level summary stands in for the whole
-        // gap (not a per-message burst), so it is not subject to the cap.
-        let last_id = missed.last().map(|m| m.id);
-        let participants: std::collections::BTreeSet<ParticipantId> =
-            missed.iter().map(|m| m.sender_id).collect();
-        let snippet = missed.last().map(|m| {
-            let text = m.searchable_text();
-            let truncated: String = text.chars().take(120).collect();
-            if text.chars().count() > 120 { format!("{truncated}…") } else { truncated }
-        }).unwrap_or_default();
-        let frame = serde_json::json!({
-            "type": "backfill_summary",
-            "room_id": room,
-            "total": room_count,
-            "participant_count": participants.len(),
-            "snippet": snippet,
-        });
-        tokio::select! {
-            () = close.cancelled() => return Err(()),
-            res = tx.send(Message::Text(frame.to_string())) => {
-                if res.is_err() { return Err(()); }
-            }
-        }
-        // Still track replayed count for the debug log.
-        replayed += room_count;
-        truncation_cursor(room_count, BACKFILL_PER_ROOM_LIMIT, last_id)
-    } else {
-        // Full per-message replay (legacy behaviour), capped at the per-room
-        // limit; `last_replayed` tracks the gap boundary for the cursor.
-        let mut last_replayed = None;
-        for message in missed.into_iter().take(cap) {
-            last_replayed = Some(message.id);
-            let frame = ServerFrame::Message { message };
-            let json = serde_json::to_string(&frame).unwrap_or_default();
-            tokio::select! {
-                    () = close.cancelled() => return Err(()),
-                res = tx.send(Message::Text(json)) => {
-                    if res.is_err() {
-                        return Err(()); // receiver gone
-                    }
-                }
-            }
-            replayed += 1;
-        }
-        // Signal truncation only when the gap genuinely exceeded the cap; the
-        // cursor is the last replayed id so REST resumes exactly at the gap.
-        if room_count > cap { last_replayed } else { None }
-    };
-    // Truncation signal (ROADMAP 第三版 方向一): newer messages were left
-    // behind, so tell the client to continue via REST
-    // `GET /api/rooms/:id/messages?since=<next_since>` instead of silently
-    // missing the remainder.
-    if let Some(next_since) = next_since {
-        let frame = serde_json::json!({
-            "type": "backfill",
-            "room_id": room,
-            "truncated": true,
-            "next_since": next_since,
-        });
-        tokio::select! {
-            () = close.cancelled() => return Err(()),
-            res = tx.send(Message::Text(frame.to_string())) => {
-                if res.is_err() { return Err(()); }
-            }
-        }
-    }
-    Ok(replayed)
-}
 /// Loose BCP-47 comparison on the primary subtag, so `en` and `en-US` are the
 /// same language and the server skips a no-op translation.
 pub(crate) fn same_lang(a: &str, b: &str) -> bool {
@@ -701,12 +995,99 @@ pub(crate) fn same_lang(a: &str, b: &str) -> bool {
     primary(a) == primary(b)
 }
 
-mod frame;
+/// Resolve and authorize an existing call using the persisted room before a WS
+/// handler mutates any call/SFU/roster state. Errors are returned as ordinary
+/// protocol frames so a rejected call claim does not tear down the socket.
+async fn active_call_for_frame(
+    state: &AppState,
+    participant: ParticipantId,
+    call_id: CallId,
+    claimed_room: RoomId,
+    required_mode: Option<CallMode>,
+    tx: &mpsc::Sender<Message>,
+) -> Option<CallSession> {
+    match state
+        .im
+        .assert_active_call_access(participant, call_id, claimed_room, required_mode)
+        .await
+    {
+        Ok(call) => Some(call),
+        Err(error) => {
+            let _ = tx.try_send(Message::Text(
+                serde_json::to_string(&ServerFrame::Error {
+                    code: error.code(),
+                    msg: error.to_string(),
+                })
+                .unwrap_or_default(),
+            ));
+            None
+        }
+    }
+}
+
+/// Resolve the canonical active SFU call for a new joiner. Unlike
+/// `active_call_for_frame`, this intentionally checks room access but not call
+/// participation: successful orchestration creates that active participant leg
+/// before any subsequent call mutation is relayed.
+async fn joinable_call_for_frame(
+    state: &AppState,
+    participant: ParticipantId,
+    call_id: CallId,
+    claimed_room: RoomId,
+    tx: &mpsc::Sender<Message>,
+) -> Option<CallSession> {
+    match state
+        .im
+        .assert_joinable_call_access(participant, call_id, claimed_room, CallMode::Sfu)
+        .await
+    {
+        Ok(call) => Some(call),
+        Err(error) => {
+            let _ = tx.try_send(Message::Text(
+                serde_json::to_string(&ServerFrame::Error {
+                    code: error.code(),
+                    msg: error.to_string(),
+                })
+                .unwrap_or_default(),
+            ));
+            None
+        }
+    }
+}
+
+/// Process spontaneous SFU media-session exits under the server's tracked
+/// shutdown lifecycle. Public for the binary boot assembler; protocol details
+/// remain in the private SFU WS module.
+pub async fn run_sfu_lifecycle_events(
+    state: AppState,
+    events: mpsc::UnboundedReceiver<crate::sfu_media::SfuSessionEnded>,
+    cancel: CancellationToken,
+) {
+    sfu::run_lifecycle_events(state, events, cancel).await;
+}
+
+mod ai_usage;
+mod backfill;
 mod bus;
+mod credentials;
+mod delivery;
+mod frame;
 #[cfg(test)]
 #[path = "tests.rs"]
 mod send_markdown_tests;
+mod sfu;
+#[cfg(test)]
+#[path = "ws_params_security_tests.rs"]
+mod ws_params_security_tests;
 
 // `run_bus_listener` / `run_live_bus_listener` moved to `bus`; re-exported
 // here so `crate::ws::ws_impl::run_bus_listener` (the boot path) still resolves.
+use backfill::{backfill_from_cursors, backfill_since};
+#[cfg(test)]
+pub(crate) use backfill::{
+    backfill_room_ids, cursor_backfill_plan, initial_backfill_page, BACKFILL_PER_ROOM_LIMIT,
+    INITIAL_BACKFILL_PER_ROOM_LIMIT,
+};
+pub(crate) use backfill::{parse_resume_cursor, truncation_cursor};
 pub use bus::{run_bus_listener, run_live_bus_listener};
+pub(crate) use frame::send_blocks_frame;

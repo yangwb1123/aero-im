@@ -1,20 +1,27 @@
 //! Live-stream chat moderation repository (bans / timeouts).
 //!
-//! Backs `migrations/0026_stream_moderation.sql`. A stream owner bans (permanent)
-//! or times-out (until an expiry) a viewer from posting in that stream's danmaku
-//! chat; a banned/timed-out viewer's chat posts are rejected until the ban is
-//! lifted ([`unban`](StreamModRepo::unban)) or the timeout expires.
+//! Backs `migrations/0026_stream_moderation.sql`. A stream owner or current
+//! moderator bans (permanent) or times-out (until an expiry) a viewer from
+//! posting in that stream's danmaku chat; a banned/timed-out viewer's chat posts
+//! are rejected until the ban is lifted or the timeout expires.
 //!
 //! Purely additive: a NEW [`StreamModRepo`]; no existing repo is touched. Stream
 //! ids are [`Ulid`]s stored as UUID (same as the `streams` table), bound via
 //! `uuid::Uuid::from_u128(ulid.0)` to match [`StreamRepo`](crate::StreamRepo).
 
-use aero_common::ParticipantId;
+use aero_common::{Error as AeroError, ParticipantId};
 use serde::Serialize;
 use sqlx::PgPool;
 use time::OffsetDateTime;
 use ulid::Ulid;
 use uuid::Uuid;
+
+use crate::stream_moderator::{
+    lock_stream_authority_in_tx, set_live_governance_actor, RequiredStreamAuthority,
+};
+
+/// Maximum stored moderation reason length, measured in Unicode scalar values.
+pub const MAX_BAN_REASON_CHARS: usize = 500;
 
 /// One active or recorded ban/timeout on a stream's chat.
 #[derive(Debug, Clone, Serialize)]
@@ -54,17 +61,44 @@ impl StreamModRepo {
         Self { pool }
     }
 
-    /// Ban (or re-ban) a viewer from a stream's chat. Upserts on
-    /// `(stream_id, participant_id)`, so re-banning refreshes the reason/expiry.
-    /// `until = None` is a permanent ban; `Some(t)` a timeout expiring at `t`.
-    pub async fn ban(
+    /// Ban (or re-ban) a viewer while atomically proving `actor` is the current
+    /// stream owner/moderator. The canonical stream lock serializes this with a
+    /// concurrent moderator revocation.
+    pub async fn ban_authorized(
         &self,
         stream: Ulid,
         participant: ParticipantId,
-        banned_by: ParticipantId,
+        actor: ParticipantId,
         reason: Option<&str>,
         until: Option<OffsetDateTime>,
-    ) -> Result<(), sqlx::Error> {
+    ) -> Result<(), AeroError> {
+        let reason = reason.map(str::trim).filter(|value| !value.is_empty());
+        if reason.is_some_and(|value| value.chars().count() > MAX_BAN_REASON_CHARS) {
+            return Err(AeroError::Invalid(format!(
+                "ban reason exceeds {MAX_BAN_REASON_CHARS} characters"
+            )));
+        }
+
+        let mut tx = self.pool.begin().await?;
+        lock_stream_authority_in_tx(
+            &mut tx,
+            stream,
+            actor,
+            RequiredStreamAuthority::OwnerOrModerator,
+        )
+        .await?;
+        let target_active = sqlx::query_scalar::<_, bool>(
+            "SELECT deleted_at IS NULL FROM participants WHERE id = $1 FOR SHARE",
+        )
+        .bind(participant.to_uuid())
+        .fetch_optional(&mut *tx)
+        .await?
+        .unwrap_or(false);
+        if !target_active {
+            return Err(AeroError::NotFound(format!("participant {participant}")));
+        }
+        set_live_governance_actor(&mut tx, actor).await?;
+
         sqlx::query(
             r"INSERT INTO stream_bans (stream_id, participant_id, banned_by, reason, until)
                VALUES ($1, $2, $3, $4, $5)
@@ -76,28 +110,54 @@ impl StreamModRepo {
         )
         .bind(Uuid::from_u128(stream.0))
         .bind(participant.to_uuid())
-        .bind(banned_by.to_uuid())
+        .bind(actor.to_uuid())
         .bind(reason)
         .bind(until)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 
-    /// Lift a ban. Returns `true` if a row was removed (idempotent: `false` when
-    /// the viewer was not banned).
-    pub async fn unban(
+    /// Compatibility spelling for internal workflows and older callers. This
+    /// delegates to the actor-aware transaction; `banned_by` is the actor whose
+    /// current authority is proved, not trusted audit metadata.
+    pub async fn ban(
         &self,
         stream: Ulid,
         participant: ParticipantId,
-    ) -> Result<bool, sqlx::Error> {
-        let res = sqlx::query(
-            r"DELETE FROM stream_bans WHERE stream_id = $1 AND participant_id = $2",
+        banned_by: ParticipantId,
+        reason: Option<&str>,
+        until: Option<OffsetDateTime>,
+    ) -> Result<(), AeroError> {
+        self.ban_authorized(stream, participant, banned_by, reason, until)
+            .await
+    }
+
+    /// Lift a ban after atomically proving `actor` still owns/moderates the
+    /// stream. Returns `false` when no row existed.
+    pub async fn unban_authorized(
+        &self,
+        stream: Ulid,
+        participant: ParticipantId,
+        actor: ParticipantId,
+    ) -> Result<bool, AeroError> {
+        let mut tx = self.pool.begin().await?;
+        lock_stream_authority_in_tx(
+            &mut tx,
+            stream,
+            actor,
+            RequiredStreamAuthority::OwnerOrModerator,
         )
-        .bind(Uuid::from_u128(stream.0))
-        .bind(participant.to_uuid())
-        .execute(&self.pool)
         .await?;
+        set_live_governance_actor(&mut tx, actor).await?;
+        let res =
+            sqlx::query(r"DELETE FROM stream_bans WHERE stream_id = $1 AND participant_id = $2")
+                .bind(Uuid::from_u128(stream.0))
+                .bind(participant.to_uuid())
+                .execute(&mut *tx)
+                .await?;
+        tx.commit().await?;
         Ok(res.rows_affected() > 0)
     }
 
@@ -134,17 +194,27 @@ impl StreamModRepo {
     /// `expires_at`, so the original `WHERE expires_at < NOW()` matched zero rows and
     /// expired timeouts were never garbage-collected (a dead sweep).
     pub async fn sweep_expired_bans(&self) -> Result<u64, sqlx::Error> {
-        let r = sqlx::query(
-            "DELETE FROM stream_bans WHERE until IS NOT NULL AND until < NOW()",
-        )
-        .execute(&self.pool)
-        .await?;
+        let r = sqlx::query("DELETE FROM stream_bans WHERE until IS NOT NULL AND until < NOW()")
+            .execute(&self.pool)
+            .await?;
         Ok(r.rows_affected())
     }
 
-    /// All bans recorded for a stream (active and expired-timeout rows), newest
-    /// first. Always filtered to `stream`.
-    pub async fn list_bans(&self, stream: Ulid) -> Result<Vec<StreamBan>, sqlx::Error> {
+    /// All bans recorded for a stream, visible only to its current
+    /// owner/moderators. Authorization and the read share one transaction.
+    pub async fn list_bans_authorized(
+        &self,
+        stream: Ulid,
+        actor: ParticipantId,
+    ) -> Result<Vec<StreamBan>, AeroError> {
+        let mut tx = self.pool.begin().await?;
+        lock_stream_authority_in_tx(
+            &mut tx,
+            stream,
+            actor,
+            RequiredStreamAuthority::OwnerOrModerator,
+        )
+        .await?;
         let rows = sqlx::query_as::<
             _,
             (
@@ -162,8 +232,9 @@ impl StreamModRepo {
                ORDER BY created_at DESC",
         )
         .bind(Uuid::from_u128(stream.0))
-        .fetch_all(&self.pool)
+        .fetch_all(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         Ok(rows
             .into_iter()
@@ -189,7 +260,10 @@ mod tests {
     #[test]
     fn ban_active_permanent_is_always_active() {
         let now = OffsetDateTime::now_utc();
-        assert!(ban_active(None, now), "a permanent ban (None) is always active");
+        assert!(
+            ban_active(None, now),
+            "a permanent ban (None) is always active"
+        );
         // Independent of the reference instant.
         assert!(ban_active(None, now + Duration::days(365)));
         assert!(ban_active(None, now - Duration::days(365)));
@@ -224,6 +298,8 @@ mod tests {
 #[cfg(test)]
 mod db_tests {
     use super::*;
+    use crate::StreamModeratorRepo;
+    use sqlx::postgres::PgConnectOptions;
     use time::Duration;
 
     fn pool() -> PgPool {
@@ -235,8 +311,44 @@ mod db_tests {
             .expect("connect_lazy never fails on a well-formed URL")
     }
 
-    // Create a throwaway viewer + moderator so the test is self-contained. The
-    // stream id is a fresh ULID (no `streams` FK on `stream_bans.stream_id`).
+    async fn tagged_pool(application_name: &str) -> PgPool {
+        let url = std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://aero:aero_dev_pw@localhost:5432/aero".into());
+        let options = url
+            .parse::<PgConnectOptions>()
+            .expect("valid DATABASE_URL")
+            .application_name(application_name);
+        sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .expect("connect tagged moderation test pool")
+    }
+
+    async fn wait_until_tagged_query_waits_on_lock(pool: &PgPool, application_name: &str) {
+        for _ in 0..100 {
+            let waiting = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS (
+                     SELECT 1
+                       FROM pg_stat_activity
+                      WHERE datname = current_database()
+                        AND application_name = $1
+                        AND wait_event_type = 'Lock'
+                 )",
+            )
+            .bind(application_name)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            if waiting {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("tagged moderation transaction never reached its expected lock wait");
+    }
+
+    // Create a throwaway viewer + owner and their canonical roomless stream.
     async fn fixture(repo_pool: &PgPool) -> (Ulid, ParticipantId, ParticipantId) {
         let viewer = ParticipantId::new();
         let owner = ParticipantId::new();
@@ -250,7 +362,20 @@ mod db_tests {
             .await
             .expect("insert participant");
         }
-        (Ulid::new(), viewer, owner)
+        let stream = Ulid::new();
+        sqlx::query(
+            r"INSERT INTO streams
+                    (id, owner_id, title, stream_key, status, protocol)
+              VALUES ($1, $2, $3, $4, 'idle', 'rtmp')",
+        )
+        .bind(Uuid::from_u128(stream.0))
+        .bind(owner.to_uuid())
+        .bind(format!("stream-mod-{stream}"))
+        .bind(format!("stream-mod-key-{stream}"))
+        .execute(repo_pool)
+        .await
+        .expect("insert stream");
+        (stream, viewer, owner)
     }
 
     #[tokio::test]
@@ -260,7 +385,7 @@ mod db_tests {
         let repo = StreamModRepo::new(p.clone());
         let (stream, viewer, owner) = fixture(&p).await;
 
-        repo.ban(stream, viewer, owner, Some("spam"), None)
+        repo.ban_authorized(stream, viewer, owner, Some("spam"), None)
             .await
             .unwrap();
         let now = OffsetDateTime::now_utc();
@@ -269,7 +394,7 @@ mod db_tests {
             "a permanent ban is active"
         );
 
-        let bans = repo.list_bans(stream).await.unwrap();
+        let bans = repo.list_bans_authorized(stream, owner).await.unwrap();
         assert_eq!(bans.len(), 1);
         assert_eq!(bans[0].participant_id, viewer);
         assert_eq!(bans[0].reason.as_deref(), Some("spam"));
@@ -285,7 +410,7 @@ mod db_tests {
 
         let now = OffsetDateTime::now_utc();
         // Timeout expired an hour ago.
-        repo.ban(stream, viewer, owner, None, Some(now - Duration::hours(1)))
+        repo.ban_authorized(stream, viewer, owner, None, Some(now - Duration::hours(1)))
             .await
             .unwrap();
         assert!(
@@ -293,7 +418,22 @@ mod db_tests {
             "an expired timeout is not an active ban"
         );
         // The row still exists for the audit/list view.
-        assert_eq!(repo.list_bans(stream).await.unwrap().len(), 1);
+        assert_eq!(
+            repo.list_bans_authorized(stream, owner)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            repo.sweep_expired_bans().await.unwrap() >= 1,
+            "the actorless system sweep may remove expired timeouts"
+        );
+        assert!(repo
+            .list_bans_authorized(stream, owner)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
@@ -303,18 +443,208 @@ mod db_tests {
         let repo = StreamModRepo::new(p.clone());
         let (stream, viewer, owner) = fixture(&p).await;
 
-        repo.ban(stream, viewer, owner, None, None).await.unwrap();
+        repo.ban_authorized(stream, viewer, owner, None, None)
+            .await
+            .unwrap();
         let now = OffsetDateTime::now_utc();
         assert!(repo.is_banned(stream, viewer, now).await.unwrap());
 
-        assert!(repo.unban(stream, viewer).await.unwrap(), "row removed");
+        assert!(
+            repo.unban_authorized(stream, viewer, owner).await.unwrap(),
+            "row removed"
+        );
         assert!(
             !repo.is_banned(stream, viewer, now).await.unwrap(),
             "after unban the viewer is no longer banned"
         );
         assert!(
-            !repo.unban(stream, viewer).await.unwrap(),
+            !repo.unban_authorized(stream, viewer, owner).await.unwrap(),
             "unban is idempotent: nothing to remove the second time"
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn stream_mod_revocation_fences_inflight_moderation() {
+        let p = pool();
+        let repo = StreamModRepo::new(p.clone());
+        let (stream, viewer, owner) = fixture(&p).await;
+        let moderator = ParticipantId::new();
+        sqlx::query("INSERT INTO participants (id, kind, display_name) VALUES ($1, 'human', $2)")
+            .bind(moderator.to_uuid())
+            .bind(format!("stream-mod-race-{moderator}"))
+            .execute(&p)
+            .await
+            .unwrap();
+        StreamModeratorRepo::new(p.clone())
+            .add_authorized(stream, moderator, owner)
+            .await
+            .unwrap();
+
+        let mut revocation = p.begin().await.unwrap();
+        sqlx::query("SELECT id FROM streams WHERE id = $1 FOR UPDATE")
+            .bind(Uuid::from_u128(stream.0))
+            .execute(&mut *revocation)
+            .await
+            .unwrap();
+        crate::stream_moderator::set_live_governance_actor(&mut revocation, owner)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM stream_moderators WHERE stream_id = $1 AND participant_id = $2")
+            .bind(Uuid::from_u128(stream.0))
+            .bind(moderator.to_uuid())
+            .execute(&mut *revocation)
+            .await
+            .unwrap();
+
+        let application_name = format!("stream-mod-revocation-race-{moderator}");
+        let raced_repo = StreamModRepo::new(tagged_pool(&application_name).await);
+        let raced = tokio::spawn(async move {
+            raced_repo
+                .ban_authorized(stream, viewer, moderator, Some("raced"), None)
+                .await
+        });
+        wait_until_tagged_query_waits_on_lock(&p, &application_name).await;
+        revocation.commit().await.unwrap();
+
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(3), raced)
+                .await
+                .expect("moderation race completed")
+                .expect("moderation task"),
+            Err(AeroError::Forbidden(_))
+        ));
+        assert!(
+            !repo
+                .is_banned(stream, viewer, OffsetDateTime::now_utc())
+                .await
+                .unwrap(),
+            "a revoked moderator cannot commit a ban after revocation"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn stream_mod_raw_sql_cannot_forge_authority_or_identity() {
+        let p = pool();
+        let repo = StreamModRepo::new(p.clone());
+        let (stream, viewer, owner) = fixture(&p).await;
+        let outsider = ParticipantId::new();
+        sqlx::query("INSERT INTO participants (id, kind, display_name) VALUES ($1, 'human', $2)")
+            .bind(outsider.to_uuid())
+            .bind(format!("stream-mod-raw-outsider-{outsider}"))
+            .execute(&p)
+            .await
+            .unwrap();
+
+        let missing_context = sqlx::query(
+            r"INSERT INTO stream_bans
+                    (stream_id, participant_id, banned_by, reason)
+              VALUES ($1, $2, $3, 'no-context')",
+        )
+        .bind(Uuid::from_u128(stream.0))
+        .bind(viewer.to_uuid())
+        .bind(owner.to_uuid())
+        .execute(&p)
+        .await;
+        assert!(
+            missing_context.is_err(),
+            "copying the canonical owner UUID cannot replace actor context"
+        );
+
+        let mut legacy = p.begin().await.unwrap();
+        crate::stream_moderator::set_live_governance_actor(&mut legacy, owner)
+            .await
+            .unwrap();
+        let first_revision: i64 = sqlx::query_scalar(
+            r"INSERT INTO stream_bans
+                    (stream_id, participant_id, banned_by, reason)
+              VALUES ($1, $2, $3, 'legacy-a')
+              RETURNING ban_revision",
+        )
+        .bind(Uuid::from_u128(stream.0))
+        .bind(viewer.to_uuid())
+        .bind(owner.to_uuid())
+        .fetch_one(&mut *legacy)
+        .await
+        .expect("a 0219 writer remains compatible after revision rollout");
+        let second_revision: i64 = sqlx::query_scalar(
+            r"INSERT INTO stream_bans
+                    (stream_id, participant_id, banned_by, reason)
+              VALUES ($1, $2, $3, 'legacy-b')
+              ON CONFLICT (stream_id, participant_id)
+              DO UPDATE SET banned_by = EXCLUDED.banned_by,
+                            reason = EXCLUDED.reason,
+                            created_at = now()
+              RETURNING ban_revision",
+        )
+        .bind(Uuid::from_u128(stream.0))
+        .bind(viewer.to_uuid())
+        .bind(owner.to_uuid())
+        .fetch_one(&mut *legacy)
+        .await
+        .expect("old ON CONFLICT re-ban remains compatible");
+        assert_ne!(
+            first_revision, second_revision,
+            "every old-writer re-ban receives a new incarnation revision"
+        );
+        legacy.commit().await.unwrap();
+
+        let raw_unban =
+            sqlx::query("DELETE FROM stream_bans WHERE stream_id = $1 AND participant_id = $2")
+                .bind(Uuid::from_u128(stream.0))
+                .bind(viewer.to_uuid())
+                .execute(&p)
+                .await;
+        assert!(
+            raw_unban.is_err(),
+            "an active ban cannot be deleted without actor context"
+        );
+
+        let mut forged = p.begin().await.unwrap();
+        crate::stream_moderator::set_live_governance_actor(&mut forged, outsider)
+            .await
+            .unwrap();
+        let forged_authority = sqlx::query(
+            r"INSERT INTO stream_bans
+                    (stream_id, participant_id, banned_by, reason)
+              VALUES ($1, $2, $3, 'forged')",
+        )
+        .bind(Uuid::from_u128(stream.0))
+        .bind(viewer.to_uuid())
+        .bind(outsider.to_uuid())
+        .execute(&mut *forged)
+        .await;
+        assert!(
+            forged_authority.is_err(),
+            "an authenticated outsider is not owner/mod authority"
+        );
+        forged.rollback().await.unwrap();
+
+        repo.ban_authorized(stream, viewer, owner, None, None)
+            .await
+            .unwrap();
+        let tamper = sqlx::query(
+            r"UPDATE stream_bans
+                  SET participant_id = $1
+                WHERE stream_id = $2
+                  AND participant_id = $3",
+        )
+        .bind(outsider.to_uuid())
+        .bind(Uuid::from_u128(stream.0))
+        .bind(viewer.to_uuid())
+        .execute(&p)
+        .await;
+        assert!(tamper.is_err(), "persisted ban scope is immutable");
+
+        sqlx::query("DELETE FROM participants WHERE id = $1")
+            .bind(viewer.to_uuid())
+            .execute(&p)
+            .await
+            .expect("participant FK cascade may remove its active ban");
+        assert!(!repo
+            .is_banned(stream, viewer, OffsetDateTime::now_utc())
+            .await
+            .unwrap());
     }
 }

@@ -28,12 +28,17 @@ impl MessageRepo {
     ) -> Result<Vec<Message>, sqlx::Error> {
         let limit = limit.clamp(1, 200);
         let rows = sqlx::query_as::<_, MessageRow>(
-            r#"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at, version
-               FROM messages
-               WHERE reply_to = $1
-                 AND deleted_at IS NULL
-                 AND ($2::uuid IS NULL OR id > $2)
-               ORDER BY id ASC
+            r#"SELECT reply.id, reply.room_id, reply.sender_id, reply.blocks,
+                      reply.reply_to, reply.metadata, reply.created_at,
+                      reply.edited_at, reply.deleted_at, reply.expires_at,
+                      reply.version
+               FROM messages AS reply
+               JOIN messages AS root
+                 ON root.id = $1 AND root.room_id = reply.room_id
+               WHERE reply.reply_to = $1
+                 AND reply.deleted_at IS NULL
+                 AND ($2::uuid IS NULL OR reply.id > $2)
+               ORDER BY reply.id ASC
                LIMIT $3"#,
         )
         .bind(root.to_uuid())
@@ -66,9 +71,12 @@ impl MessageRepo {
             Option<Vec<uuid::Uuid>>,
         ) = sqlx::query_as(
             r"WITH replies AS MATERIALIZED (
-                  SELECT id, sender_id, created_at
-                    FROM messages
-                   WHERE reply_to = $1 AND deleted_at IS NULL
+                  SELECT reply.id, reply.sender_id, reply.created_at
+                    FROM messages AS reply
+                    JOIN messages AS root
+                      ON root.id = $1 AND root.room_id = reply.room_id
+                   WHERE reply.reply_to = $1
+                     AND reply.deleted_at IS NULL
               )
               SELECT
                   (SELECT COUNT(*) FROM replies),
@@ -110,14 +118,19 @@ impl MessageRepo {
         // lookups. A roster is a UI affordance, so 500 distinct participants is far
         // beyond what any view renders.
         let rows = sqlx::query_as::<_, (uuid::Uuid,)>(
-            r#"SELECT DISTINCT sender_id
-               FROM messages
-               WHERE reply_to = $1 AND deleted_at IS NULL
+            r#"SELECT DISTINCT reply.sender_id
+               FROM messages AS reply
+               JOIN messages AS root
+                 ON root.id = $1 AND root.room_id = reply.room_id
+               WHERE reply.reply_to = $1 AND reply.deleted_at IS NULL
                LIMIT 500"#,
         )
         .bind(root.to_uuid())
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows.into_iter().map(|(p,)| ParticipantId::from_uuid(p)).collect())
+        Ok(rows
+            .into_iter()
+            .map(|(p,)| ParticipantId::from_uuid(p))
+            .collect())
     }
 }

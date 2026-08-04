@@ -1,12 +1,10 @@
 //! Message-report repository — user-initiated reports feeding a workspace
 //! moderation review queue.
 //!
-//! Backs `migrations/0093_message_reports.sql`. A room member flags a message they
-//! find abusive/spammy/etc.; the report lands here as `pending` and surfaces in a
-//! workspace-admin review queue, where an administrator either KEEPs (dismisses the
-//! report) or REMOVEs (the handler then soft-deletes the message via the existing
-//! transactional moderate-delete path). This is the human-review counterpart to the
-//! AI moderation pipeline, which auto-soft-deletes async with no human in the loop.
+//! Backs migrations 0093 and 0205. A room member flags a message they find
+//! abusive/spammy/etc.; the report lands here as `pending` and surfaces in a
+//! workspace-admin review queue, where an administrator either KEEPS (dismisses
+//! the report) or REMOVEs it.
 //!
 //! A report is a HISTORICAL record: there is no FK to `messages`, so a report row
 //! outlives the message it references (existence is validated by the handler at
@@ -15,15 +13,22 @@
 //! model lives here (and is re-exported from the crate root), a storage-layer
 //! projection.
 //!
-//! [`review`](MessageReportRepo::review) is RETURNING-idempotent: it stamps the
-//! decision (`status` + reviewer + `reviewed_at` + note) on a STILL-`pending` row in
-//! one statement, returning whether a row actually transitioned. A second review of
-//! an already-decided (or unknown) report touches nothing and returns `false`, so a
-//! double-submit can never re-trigger the moderate-delete side effect.
+//! Filing owns room/message containment and effective-access checks through
+//! commit. Review owns workspace-admin authorization, the report transition,
+//! optional message tombstone, audit row, blob cleanup, and durable room-event
+//! outbox in one transaction. A delete/audit/outbox failure therefore leaves the
+//! report pending instead of committing a false `"removed"` decision.
 
-use aero_common::{MessageId, MessageReportId, ParticipantId, WorkspaceId};
+use aero_common::{Error, MessageId, MessageReportId, ParticipantId, RoomId, WorkspaceId};
 use serde::Serialize;
 use sqlx::PgPool;
+
+use crate::message::authorization::{lock_effective_message_write_access, PostPolicy};
+use crate::message::MessageRepo;
+
+const MAX_REASON_BYTES: usize = 2_000;
+const MAX_NOTE_BYTES: usize = 2_000;
+const DIGEST_CHARS: usize = 120;
 
 /// One user-filed message report (a row in the moderation review queue).
 ///
@@ -50,11 +55,22 @@ pub struct MessageReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reviewed_by: Option<ParticipantId>,
     /// When the decision was stamped; `None` while pending.
-    #[serde(with = "time::serde::rfc3339::option", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        with = "time::serde::rfc3339::option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub reviewed_at: Option<time::OffsetDateTime>,
     /// When the report was filed (RFC 3339 on the wire).
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: time::OffsetDateTime,
+}
+
+/// One committed review decision and its optional deletion outbox row.
+#[derive(Debug, Clone)]
+pub struct MessageReportReview {
+    pub report: MessageReport,
+    /// Present only when this review newly tombstoned the message.
+    pub delete_outbox_id: Option<uuid::Uuid>,
 }
 
 /// The columns a [`MessageReport`] is built from, in select order. Shared by every
@@ -76,8 +92,18 @@ type Row = (
 );
 
 fn row_to_model(r: Row) -> MessageReport {
-    let (id, workspace_id, message_id, reporter_id, reason, status, note, reviewed_by, reviewed_at, created_at) =
-        r;
+    let (
+        id,
+        workspace_id,
+        message_id,
+        reporter_id,
+        reason,
+        status,
+        note,
+        reviewed_by,
+        reviewed_at,
+        created_at,
+    ) = r;
     MessageReport {
         id: MessageReportId::from_uuid(id),
         workspace_id: WorkspaceId::from_uuid(workspace_id),
@@ -108,19 +134,49 @@ impl MessageReportRepo {
         Self { pool }
     }
 
-    /// File a new report, returning the freshly inserted (`pending`) row. The caller
-    /// is responsible for resolving the message's `workspace`, asserting the reporter
-    /// may access the room, and validating the message exists (there is no FK).
+    /// File a new report after locking the reporter's complete effective room
+    /// access and the live message in the same transaction.
     ///
     /// # Errors
-    /// Propagates any [`sqlx::Error`] from the insert / read-back.
-    pub async fn report(
+    /// Returns [`Error::Invalid`] for an empty/overlong reason,
+    /// [`Error::Forbidden`] when room access was revoked, [`Error::NotFound`]
+    /// when the message is missing/deleted/not in `room`, and propagates
+    /// storage errors.
+    pub async fn report_authorized(
         &self,
-        workspace: WorkspaceId,
+        room: RoomId,
         message: MessageId,
         reporter: ParticipantId,
         reason: &str,
-    ) -> Result<MessageReport, sqlx::Error> {
+    ) -> Result<MessageReport, Error> {
+        let reason = reason.trim();
+        if reason.is_empty() {
+            return Err(Error::Invalid("reason is empty".into()));
+        }
+        if reason.len() > MAX_REASON_BYTES {
+            return Err(Error::Invalid("reason too long".into()));
+        }
+
+        let mut tx = self.pool.begin().await?;
+        let Some(access) =
+            lock_effective_message_write_access(&mut tx, room, reporter, PostPolicy::Ignore)
+                .await?
+        else {
+            return Err(Error::Forbidden(
+                "message-report room access was revoked before commit".into(),
+            ));
+        };
+        let Some(existing) = MessageRepo::lock_message_in_tx(&mut tx, message).await? else {
+            return Err(Error::NotFound(format!(
+                "live message {message} in room {room}"
+            )));
+        };
+        if existing.room_id != room || existing.deleted_at.is_some() {
+            return Err(Error::NotFound(format!(
+                "live message {message} in room {room}"
+            )));
+        }
+
         let id = MessageReportId::new();
         let sql = format!(
             "INSERT INTO message_reports
@@ -130,24 +186,29 @@ impl MessageReportRepo {
         );
         let row = sqlx::query_as::<_, Row>(&sql)
             .bind(id.to_uuid())
-            .bind(workspace.to_uuid())
+            .bind(access.workspace.to_uuid())
             .bind(message.to_uuid())
             .bind(reporter.to_uuid())
             .bind(reason)
-            .fetch_one(&self.pool)
+            .fetch_one(&mut *tx)
             .await?;
+        tx.commit().await?;
         Ok(row_to_model(row))
     }
 
-    /// List the workspace's PENDING reports, oldest first (so an administrator works
-    /// the backlog FIFO). Reviewed reports drop out of the queue.
+    /// List a workspace's pending queue while `actor` remains an effective
+    /// Owner/Admin. Oldest reports come first.
     ///
     /// # Errors
-    /// Propagates any [`sqlx::Error`] from the query.
-    pub async fn list_pending(
+    /// Returns [`Error::Forbidden`] unless `actor` is a current effective
+    /// workspace admin and propagates storage errors.
+    pub async fn list_pending_authorized(
         &self,
         workspace: WorkspaceId,
-    ) -> Result<Vec<MessageReport>, sqlx::Error> {
+        actor: ParticipantId,
+    ) -> Result<Vec<MessageReport>, Error> {
+        let mut tx = self.pool.begin().await?;
+        crate::workspace::authz::assert_effective_admin_in_tx(&mut tx, workspace, actor).await?;
         let sql = format!(
             "SELECT {COLUMNS}
                FROM message_reports
@@ -156,16 +217,136 @@ impl MessageReportRepo {
         );
         let rows = sqlx::query_as::<_, Row>(&sql)
             .bind(workspace.to_uuid())
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *tx)
             .await?;
+        tx.commit().await?;
         Ok(rows.into_iter().map(row_to_model).collect())
     }
 
-    /// Fetch a single report by id (any status), or `None` if unknown.
+    /// Decide one pending workspace report while `reviewer` remains an
+    /// effective Owner/Admin.
+    ///
+    /// A `remove` decision and any live message tombstone, audit row, attachment
+    /// cleanup, and durable deleted-event outbox all commit with the report
+    /// transition. A message that was already removed does not prevent recording
+    /// the terminal review decision.
     ///
     /// # Errors
-    /// Propagates any [`sqlx::Error`] from the query.
-    pub async fn get(
+    /// Returns [`Error::Invalid`] for an overlong note,
+    /// [`Error::Forbidden`] unless `reviewer` is a current effective admin,
+    /// [`Error::NotFound`] for a missing/cross-tenant/non-pending report,
+    /// [`Error::Conflict`] if a retained historical report points at a message
+    /// that now belongs to another workspace, and propagates storage errors.
+    pub async fn review_authorized(
+        &self,
+        id: MessageReportId,
+        workspace: WorkspaceId,
+        reviewer: ParticipantId,
+        remove: bool,
+        note: Option<&str>,
+        traceparent: Option<&str>,
+    ) -> Result<MessageReportReview, Error> {
+        if note.is_some_and(|note| note.len() > MAX_NOTE_BYTES) {
+            return Err(Error::Invalid("review note too long".into()));
+        }
+
+        let mut tx = self.pool.begin().await?;
+        crate::workspace::authz::assert_effective_admin_in_tx(&mut tx, workspace, reviewer).await?;
+
+        let select = format!(
+            "SELECT {COLUMNS}
+               FROM message_reports
+              WHERE id = $1
+                AND workspace_id = $2
+                AND status = 'pending'
+              FOR UPDATE"
+        );
+        let pending = sqlx::query_as::<_, Row>(&select)
+            .bind(id.to_uuid())
+            .bind(workspace.to_uuid())
+            .fetch_optional(&mut *tx)
+            .await?
+            .map(row_to_model)
+            .ok_or_else(|| Error::NotFound(format!("pending message report {id}")))?;
+
+        let delete_outbox_id = if remove {
+            if let Some(message) =
+                MessageRepo::lock_message_in_tx(&mut tx, pending.message_id).await?
+            {
+                let actual_workspace = sqlx::query_scalar::<_, uuid::Uuid>(
+                    "SELECT workspace_id FROM rooms WHERE id = $1 FOR SHARE",
+                )
+                .bind(message.room_id.to_uuid())
+                .fetch_optional(&mut *tx)
+                .await?;
+                if actual_workspace != Some(workspace.to_uuid()) {
+                    return Err(Error::Conflict(
+                        "reported message no longer belongs to the report workspace".into(),
+                    ));
+                }
+
+                let digest: String = message
+                    .searchable_text()
+                    .chars()
+                    .take(DIGEST_CHARS)
+                    .collect();
+                let reason = format!("workspace report {id} removed by {reviewer}");
+                let detail = serde_json::json!({
+                    "room_id": message.room_id,
+                    "report_id": id,
+                    "reason": reason,
+                    "digest": digest,
+                });
+                MessageRepo::soft_delete_locked_outboxed_in_tx(
+                    &mut tx,
+                    message,
+                    Some(workspace),
+                    Some(reviewer),
+                    Some("message.moderated"),
+                    detail,
+                    reviewer,
+                    traceparent,
+                )
+                .await?
+                .map(|deleted| deleted.outbox_id)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let status = if remove { "removed" } else { "kept" };
+        let update = format!(
+            "UPDATE message_reports
+                SET status = $2,
+                    reviewed_by = $3,
+                    reviewed_at = now(),
+                    note = $4
+              WHERE id = $1
+                AND workspace_id = $5
+                AND status = 'pending'
+            RETURNING {COLUMNS}"
+        );
+        let report = sqlx::query_as::<_, Row>(&update)
+            .bind(id.to_uuid())
+            .bind(status)
+            .bind(reviewer.to_uuid())
+            .bind(note)
+            .bind(workspace.to_uuid())
+            .fetch_optional(&mut *tx)
+            .await?
+            .map(row_to_model)
+            .ok_or_else(|| Error::NotFound(format!("pending message report {id}")))?;
+        tx.commit().await?;
+        Ok(MessageReportReview {
+            report,
+            delete_outbox_id,
+        })
+    }
+
+    #[cfg(test)]
+    async fn get_unscoped(
         &self,
         id: MessageReportId,
     ) -> Result<Option<MessageReport>, sqlx::Error> {
@@ -175,43 +356,6 @@ impl MessageReportRepo {
             .fetch_optional(&self.pool)
             .await?;
         Ok(row.map(row_to_model))
-    }
-
-    /// Record an administrator's decision on a report, RETURNING-idempotently.
-    ///
-    /// Stamps `status` (`removed` when `remove`, else `kept`), the `reviewer`,
-    /// `reviewed_at = now()`, and the optional `note` on a STILL-`pending` row in a
-    /// single statement. Returns `true` exactly when a row transitioned from
-    /// `pending`; `false` if the report is unknown or already reviewed. The
-    /// `WHERE status = 'pending'` guard makes a double-submit a no-op `false`, so the
-    /// caller can safely fire the moderate-delete side effect only on a `true`.
-    ///
-    /// # Errors
-    /// Propagates any [`sqlx::Error`] from the update.
-    pub async fn review(
-        &self,
-        id: MessageReportId,
-        reviewer: ParticipantId,
-        remove: bool,
-        note: Option<&str>,
-    ) -> Result<bool, sqlx::Error> {
-        let status = if remove { "removed" } else { "kept" };
-        let row = sqlx::query_as::<_, (uuid::Uuid,)>(
-            "UPDATE message_reports
-                SET status = $2,
-                    reviewed_by = $3,
-                    reviewed_at = now(),
-                    note = $4
-              WHERE id = $1 AND status = 'pending'
-            RETURNING id",
-        )
-        .bind(id.to_uuid())
-        .bind(status)
-        .bind(reviewer.to_uuid())
-        .bind(note)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row.is_some())
     }
 }
 
@@ -223,205 +367,368 @@ impl MessageReportRepo {
 /// ```
 #[cfg(test)]
 mod db_tests {
+    use std::time::Duration;
+
+    use aero_common::{Block, RoomKind, WorkspaceRole};
+
     use super::*;
     use crate::message::{MessageRepo, NewMessage};
+    use crate::{RoomRepo, WorkspaceRepo};
 
     fn pool() -> PgPool {
         let url = std::env::var("DATABASE_URL")
             .unwrap_or_else(|_| "postgres://aero:aero_dev_pw@localhost:5432/aero".into());
         sqlx::postgres::PgPoolOptions::new()
-            .max_connections(2)
+            .max_connections(4)
             .connect_lazy(&url)
-            .expect("connect_lazy never fails on a well-formed URL")
+            .expect("valid DATABASE_URL")
     }
 
-    /// The reserved all-zero default workspace, guaranteed to exist by migration
-    /// 0006's backfill — reused so the room is well-scoped.
-    const DEFAULT_WS: &str = "00000000-0000-0000-0000-000000000000";
-
-    fn default_ws() -> WorkspaceId {
-        WorkspaceId::from_uuid(uuid::Uuid::parse_str(DEFAULT_WS).unwrap())
-    }
-
-    /// Create a throwaway participant so the test is self-contained.
-    async fn participant(p: &PgPool) -> ParticipantId {
+    async fn participant(p: &PgPool, label: &str) -> ParticipantId {
         let id = ParticipantId::new();
         sqlx::query("INSERT INTO participants (id, kind, display_name) VALUES ($1, 'human', $2)")
             .bind(id.to_uuid())
-            .bind(format!("message-report-{id}"))
+            .bind(format!("message-report-{label}-{id}"))
             .execute(p)
             .await
-            .expect("insert participant");
+            .unwrap();
         id
     }
 
-    /// Create a throwaway room in the default workspace, created by `by`.
-    async fn room(p: &PgPool, by: ParticipantId) -> aero_common::RoomId {
-        let id = aero_common::RoomId::new();
-        sqlx::query(
-            "INSERT INTO rooms (id, kind, name, created_by, created_at, workspace_id)
-             VALUES ($1, 'channel', $2, $3, now(), $4::uuid)",
-        )
-        .bind(id.to_uuid())
-        .bind(format!("mr-room-{id}"))
-        .bind(by.to_uuid())
-        .bind(DEFAULT_WS)
-        .execute(p)
-        .await
-        .expect("insert room");
-        id
-    }
-
-    /// Insert a throwaway message so a report has something real to reference.
-    async fn message(p: &PgPool, sender: ParticipantId, room: aero_common::RoomId) -> MessageId {
+    async fn message(p: &PgPool, sender: ParticipantId, room: RoomId) -> MessageId {
         let msgs = MessageRepo::new(p.clone());
         let m = msgs
             .insert(NewMessage {
                 room_id: room,
                 sender_id: sender,
-                blocks: vec![aero_common::Block::text("reportable")],
+                blocks: vec![Block::text("reportable content")],
                 reply_to: None,
                 metadata: serde_json::Value::Null,
                 expires_at: None,
             })
             .await
-            .expect("insert message");
+            .unwrap();
         m.id
     }
 
-    #[tokio::test]
-    #[ignore = "requires live Postgres"]
-    async fn report_then_list_pending_finds_it() {
-        let p = pool();
-        let repo = MessageReportRepo::new(p.clone());
-        let sender = participant(&p).await;
-        let reporter = participant(&p).await;
-        let r = room(&p, sender).await;
-        let msg = message(&p, sender, r).await;
-        let ws = default_ws();
+    struct Fixture {
+        pool: PgPool,
+        repo: MessageReportRepo,
+        workspace: WorkspaceId,
+        other_workspace: WorkspaceId,
+        room: RoomId,
+        message: MessageId,
+        other_message: MessageId,
+        reviewer: ParticipantId,
+        reporter: ParticipantId,
+        outsider: ParticipantId,
+    }
 
-        let filed = repo
-            .report(ws, msg, reporter, "spam")
+    async fn fixture() -> Fixture {
+        let pool = pool();
+        let workspaces = WorkspaceRepo::new(pool.clone());
+        let rooms = RoomRepo::new(pool.clone());
+        let owner = participant(&pool, "owner").await;
+        let reviewer = participant(&pool, "reviewer").await;
+        let reporter = participant(&pool, "reporter").await;
+        let other_owner = participant(&pool, "other-owner").await;
+        let outsider = participant(&pool, "outsider").await;
+        let workspace = workspaces
+            .create(
+                format!("Message reports {owner}"),
+                format!("message-reports-{owner}"),
+                owner,
+            )
             .await
-            .expect("file report");
+            .unwrap()
+            .id;
+        let other_workspace = workspaces
+            .create(
+                format!("Other reports {other_owner}"),
+                format!("other-message-reports-{other_owner}"),
+                other_owner,
+            )
+            .await
+            .unwrap()
+            .id;
+        workspaces
+            .add_member(workspace, reviewer, WorkspaceRole::Admin)
+            .await
+            .unwrap();
+        workspaces
+            .add_member(workspace, reporter, WorkspaceRole::Member)
+            .await
+            .unwrap();
+        workspaces
+            .add_member(other_workspace, outsider, WorkspaceRole::Member)
+            .await
+            .unwrap();
+        let room = rooms
+            .create_in_workspace(
+                workspace,
+                RoomKind::Channel,
+                Some(format!("reports-{}", RoomId::new())),
+                owner,
+            )
+            .await
+            .unwrap()
+            .id;
+        rooms.add_member(room, reporter).await.unwrap();
+        let other_room = rooms
+            .create_in_workspace(
+                other_workspace,
+                RoomKind::Channel,
+                Some(format!("other-reports-{}", RoomId::new())),
+                other_owner,
+            )
+            .await
+            .unwrap()
+            .id;
+        rooms.add_member(other_room, outsider).await.unwrap();
+        let primary_message = message(&pool, owner, room).await;
+        let other_message = message(&pool, other_owner, other_room).await;
+        Fixture {
+            repo: MessageReportRepo::new(pool.clone()),
+            pool,
+            workspace,
+            other_workspace,
+            room,
+            message: primary_message,
+            other_message,
+            reviewer,
+            reporter,
+            outsider,
+        }
+    }
+
+    fn constraint(error: &sqlx::Error) -> Option<&str> {
+        error
+            .as_database_error()
+            .and_then(sqlx::error::DatabaseError::constraint)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL with migrations applied"]
+    async fn report_authorization_binds_room_message_and_workspace() {
+        let fixture = fixture().await;
+        let filed = fixture
+            .repo
+            .report_authorized(fixture.room, fixture.message, fixture.reporter, "spam")
+            .await
+            .unwrap();
         assert_eq!(filed.status, "pending");
         assert_eq!(filed.reason, "spam");
-        assert_eq!(filed.message_id, msg);
-        assert!(filed.reviewed_by.is_none());
-        assert!(filed.reviewed_at.is_none());
+        assert_eq!(filed.workspace_id, fixture.workspace);
+        assert!(matches!(
+            fixture
+                .repo
+                .report_authorized(
+                    fixture.room,
+                    fixture.other_message,
+                    fixture.reporter,
+                    "cross-room",
+                )
+                .await,
+            Err(Error::NotFound(_))
+        ));
+        assert!(matches!(
+            fixture
+                .repo
+                .report_authorized(
+                    fixture.room,
+                    fixture.message,
+                    fixture.outsider,
+                    "no room access",
+                )
+                .await,
+            Err(Error::Forbidden(_))
+        ));
 
-        let pending = repo.list_pending(ws).await.expect("list pending");
-        assert!(
-            pending.iter().any(|x| x.id == filed.id),
-            "freshly filed report shows in the pending queue"
+        let raw = sqlx::query(
+            "INSERT INTO message_reports
+                 (id, workspace_id, message_id, reporter_id, reason)
+             VALUES ($1, $2, $3, $4, 'raw cross-tenant report')",
+        )
+        .bind(MessageReportId::new().to_uuid())
+        .bind(fixture.other_workspace.to_uuid())
+        .bind(fixture.message.to_uuid())
+        .bind(fixture.reporter.to_uuid())
+        .execute(&fixture.pool)
+        .await
+        .expect_err("migration trigger rejects raw workspace spoofing");
+        assert_eq!(
+            constraint(&raw),
+            Some("message_reports_scope_containment_chk")
         );
 
-        // get() round-trips the same row.
-        let got = repo.get(filed.id).await.expect("get").expect("present");
-        assert_eq!(got.id, filed.id);
+        let mutate = sqlx::query(
+            "UPDATE message_reports
+                SET workspace_id = $2
+              WHERE id = $1",
+        )
+        .bind(filed.id.to_uuid())
+        .bind(fixture.other_workspace.to_uuid())
+        .execute(&fixture.pool)
+        .await
+        .expect_err("report identity is immutable");
+        assert_eq!(
+            constraint(&mutate),
+            Some("message_reports_identity_immutable_chk")
+        );
 
-        cleanup(&p, msg, r).await;
+        let queue = fixture
+            .repo
+            .list_pending_authorized(fixture.workspace, fixture.reviewer)
+            .await
+            .unwrap();
+        assert!(queue.iter().any(|report| report.id == filed.id));
     }
 
     #[tokio::test]
-    #[ignore = "requires live Postgres"]
-    async fn review_remove_transitions_and_stamps_then_is_idempotent() {
-        let p = pool();
-        let repo = MessageReportRepo::new(p.clone());
-        let sender = participant(&p).await;
-        let reporter = participant(&p).await;
-        let reviewer = participant(&p).await;
-        let r = room(&p, sender).await;
-        let msg = message(&p, sender, r).await;
-        let ws = default_ws();
-
-        let filed = repo.report(ws, msg, reporter, "abuse").await.unwrap();
-
-        // First review (remove) transitions the pending row -> true.
-        let changed = repo
-            .review(filed.id, reviewer, true, Some("clear violation"))
-            .await
-            .expect("review");
-        assert!(changed, "pending -> removed returns true");
-
-        let after = repo.get(filed.id).await.unwrap().expect("present");
-        assert_eq!(after.status, "removed");
-        assert_eq!(after.reviewed_by, Some(reviewer));
-        assert!(after.reviewed_at.is_some());
-        assert_eq!(after.note.as_deref(), Some("clear violation"));
-
-        // It drops out of the pending queue.
-        let pending = repo.list_pending(ws).await.unwrap();
-        assert!(
-            !pending.iter().any(|x| x.id == filed.id),
-            "reviewed report leaves the pending queue"
-        );
-
-        // Re-reviewing an already-decided report is a no-op -> false (the
-        // moderate-delete side effect can never re-fire).
-        let again = repo
-            .review(filed.id, reviewer, true, Some("dup"))
+    #[ignore = "requires DATABASE_URL with migrations applied"]
+    async fn remove_review_commits_decision_delete_audit_and_outbox_once() {
+        let fixture = fixture().await;
+        let filed = fixture
+            .repo
+            .report_authorized(fixture.room, fixture.message, fixture.reporter, "abuse")
             .await
             .unwrap();
-        assert!(!again, "idempotent re-review returns false");
-        // And the original decision/note is untouched.
-        let unchanged = repo.get(filed.id).await.unwrap().expect("present");
-        assert_eq!(unchanged.note.as_deref(), Some("clear violation"));
+        let outcome = fixture
+            .repo
+            .review_authorized(
+                filed.id,
+                fixture.workspace,
+                fixture.reviewer,
+                true,
+                Some("clear violation"),
+                Some("00-message-report-test"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.report.status, "removed");
+        assert_eq!(outcome.report.reviewed_by, Some(fixture.reviewer));
+        assert_eq!(outcome.report.note.as_deref(), Some("clear violation"));
+        let outbox = outcome
+            .delete_outbox_id
+            .expect("a live message produces a deleted-event outbox");
+        let deleted: Option<time::OffsetDateTime> =
+            sqlx::query_scalar("SELECT deleted_at FROM messages WHERE id = $1")
+                .bind(fixture.message.to_uuid())
+                .fetch_one(&fixture.pool)
+                .await
+                .unwrap();
+        assert!(deleted.is_some());
+        let audit_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)
+               FROM audit_events
+              WHERE workspace_id = $1
+                AND actor_id = $2
+                AND action = 'message.moderated'
+                AND target = $3",
+        )
+        .bind(fixture.workspace.to_uuid())
+        .bind(fixture.reviewer.to_uuid())
+        .bind(fixture.message.to_string())
+        .fetch_one(&fixture.pool)
+        .await
+        .unwrap();
+        assert_eq!(audit_count, 1);
+        let outbox_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM event_outbox WHERE id = $1")
+                .bind(outbox)
+                .fetch_one(&fixture.pool)
+                .await
+                .unwrap();
+        assert_eq!(outbox_count, 1);
 
-        cleanup(&p, msg, r).await;
+        assert!(matches!(
+            fixture
+                .repo
+                .review_authorized(
+                    filed.id,
+                    fixture.workspace,
+                    fixture.reviewer,
+                    true,
+                    None,
+                    None,
+                )
+                .await,
+            Err(Error::NotFound(_))
+        ));
+        let audit_after: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)
+               FROM audit_events
+              WHERE workspace_id = $1
+                AND action = 'message.moderated'
+                AND target = $2",
+        )
+        .bind(fixture.workspace.to_uuid())
+        .bind(fixture.message.to_string())
+        .fetch_one(&fixture.pool)
+        .await
+        .unwrap();
+        assert_eq!(audit_after, 1);
     }
 
     #[tokio::test]
-    #[ignore = "requires live Postgres"]
-    async fn review_keep_transitions_to_kept() {
-        let p = pool();
-        let repo = MessageReportRepo::new(p.clone());
-        let sender = participant(&p).await;
-        let reporter = participant(&p).await;
-        let reviewer = participant(&p).await;
-        let r = room(&p, sender).await;
-        let msg = message(&p, sender, r).await;
-        let ws = default_ws();
-
-        let filed = repo.report(ws, msg, reporter, "maybe").await.unwrap();
-        let changed = repo
-            .review(filed.id, reviewer, false, None)
-            .await
-            .expect("review keep");
-        assert!(changed, "pending -> kept returns true");
-
-        let after = repo.get(filed.id).await.unwrap().expect("present");
-        assert_eq!(after.status, "kept");
-        assert_eq!(after.reviewed_by, Some(reviewer));
-        assert!(after.note.is_none());
-
-        // An unknown report id is a no-op -> false.
-        let missing = repo
-            .review(MessageReportId::new(), reviewer, true, None)
+    #[ignore = "requires DATABASE_URL with migrations applied"]
+    async fn admin_revocation_race_leaves_report_pending_and_message_live() {
+        let fixture = fixture().await;
+        let filed = fixture
+            .repo
+            .report_authorized(fixture.room, fixture.message, fixture.reporter, "race")
             .await
             .unwrap();
-        assert!(!missing, "review of unknown report returns false");
 
-        cleanup(&p, msg, r).await;
-    }
+        let mut revocation = fixture.pool.begin().await.unwrap();
+        crate::ownership::lock_membership_governance(&mut revocation)
+            .await
+            .unwrap();
+        sqlx::query("SELECT id FROM workspaces WHERE id = $1 FOR UPDATE")
+            .bind(fixture.workspace.to_uuid())
+            .execute(&mut *revocation)
+            .await
+            .unwrap();
+        sqlx::query(
+            "DELETE FROM workspace_members
+              WHERE workspace_id = $1 AND participant_id = $2",
+        )
+        .bind(fixture.workspace.to_uuid())
+        .bind(fixture.reviewer.to_uuid())
+        .execute(&mut *revocation)
+        .await
+        .unwrap();
 
-    /// Drop the throwaway message + room so reruns stay self-contained. The report
-    /// rows have NO FK to messages, so they are deleted explicitly first.
-    async fn cleanup(p: &PgPool, msg: MessageId, room: aero_common::RoomId) {
-        sqlx::query("DELETE FROM message_reports WHERE message_id = $1")
-            .bind(msg.to_uuid())
-            .execute(p)
-            .await
-            .ok();
-        sqlx::query("DELETE FROM messages WHERE id = $1")
-            .bind(msg.to_uuid())
-            .execute(p)
-            .await
-            .ok();
-        sqlx::query("DELETE FROM rooms WHERE id = $1")
-            .bind(room.to_uuid())
-            .execute(p)
-            .await
-            .ok();
+        let raced_repo = fixture.repo.clone();
+        let mut raced = tokio::spawn(async move {
+            raced_repo
+                .review_authorized(
+                    filed.id,
+                    fixture.workspace,
+                    fixture.reviewer,
+                    true,
+                    None,
+                    None,
+                )
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut raced)
+                .await
+                .is_err(),
+            "review waits behind the workspace revocation lock"
+        );
+        revocation.commit().await.unwrap();
+        assert!(matches!(raced.await.unwrap(), Err(Error::Forbidden(_))));
+
+        let retained = fixture.repo.get_unscoped(filed.id).await.unwrap().unwrap();
+        assert_eq!(retained.status, "pending");
+        let deleted: Option<time::OffsetDateTime> =
+            sqlx::query_scalar("SELECT deleted_at FROM messages WHERE id = $1")
+                .bind(fixture.message.to_uuid())
+                .fetch_one(&fixture.pool)
+                .await
+                .unwrap();
+        assert!(deleted.is_none());
     }
 }

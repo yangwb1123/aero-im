@@ -79,7 +79,7 @@ def main():
     req("POST", f"/api/workspaces/{W}/members", {"participant_id": Bpid, "role": "member"}, token=A, expect=[200, 204])
     R = req("POST", "/api/rooms", {"kind": "channel", "name": f"w18-{ts}", "workspace_id": W}, token=A)["id"]
     req("POST", f"/api/rooms/{R}/members", {"participant_id": Bpid}, token=A, expect=[200, 204])
-    S = req("POST", "/api/streams", {"title": "w18 stream", "protocol": "rtmp", "room_id": R}, token=A)["stream"]
+    S = req("POST", "/api/streams", {"title": "w18 stream", "protocol": "rtmp", "room_id": R}, token=A)
     Sid = S["id"]
     ok(f"workspace {W[:8]} + channel {R[:8]} + stream {Sid[:8]}")
 

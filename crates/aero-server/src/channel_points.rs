@@ -72,7 +72,9 @@ fn repo(s: &AppState) -> ChannelPointsRepo {
 fn map_redeem_error(e: RedeemError) -> AeroError {
     match e {
         RedeemError::InsufficientPoints => AeroError::Conflict("insufficient points".into()),
-        RedeemError::RewardUnavailable => AeroError::NotFound("reward not found or disabled".into()),
+        RedeemError::RewardUnavailable => {
+            AeroError::NotFound("reward not found or disabled".into())
+        }
         RedeemError::Db(db) => AeroError::from(db),
     }
 }
@@ -136,7 +138,10 @@ async fn list_rewards(
 ) -> ApiResult<Json<serde_json::Value>> {
     let stream = parse_stream(&id_str)?;
     let owner = stream_owner(&s, stream).await?;
-    let rewards = repo(&s).list_rewards(owner).await.map_err(AeroError::from)?;
+    let rewards = repo(&s)
+        .list_rewards(owner)
+        .await
+        .map_err(AeroError::from)?;
     Ok(Json(serde_json::json!({ "rewards": rewards })))
 }
 
@@ -208,10 +213,10 @@ async fn redemption_queue(
     let stream = parse_stream(&id_str)?;
     // Creator OR stream-moderator may read the queue.
     if !crate::stream_moderators::may_moderate(&s, stream, auth.participant_id).await? {
-        return Err(
-            AeroError::Forbidden("only the creator or a moderator may read the queue".into())
-                .into(),
-        );
+        return Err(AeroError::Forbidden(
+            "only the creator or a moderator may read the queue".into(),
+        )
+        .into());
     }
     let owner = stream_owner(&s, stream).await?;
     let status = filter.status.as_deref();
@@ -263,7 +268,9 @@ async fn resolve_redemption(
         .resolve_redemption(redemption_id, status)
         .await
         .map_err(AeroError::from)?;
-    Ok(Json(serde_json::json!({ "resolved": resolved, "status": status })))
+    Ok(Json(
+        serde_json::json!({ "resolved": resolved, "status": status }),
+    ))
 }
 
 #[derive(Deserialize, Serialize)]

@@ -80,16 +80,19 @@ async fn forward_message(
     // able to POST in the destination room. Both go through the single tenant
     // guard (workspace + room membership). `send_message` re-checks destination
     // membership, but asserting here yields a clean 403/404 before we build.
-    s.im.assert_room_access(auth.participant_id, source.room_id).await?;
-    s.im.assert_room_access(auth.participant_id, to_room).await?;
+    s.im.assert_room_access(auth.participant_id, source.room_id)
+        .await?;
+    s.im.assert_room_access(auth.participant_id, to_room)
+        .await?;
 
     let blocks = build_forward_blocks(&source, req.comment.as_deref(), auth.participant_id);
 
-    let message = s
-        .im
-        .send_message(auth.participant_id, to_room, blocks, None, None)
-        .await?;
-    Ok(Json(serde_json::to_value(message).map_err(AeroError::from)?))
+    let message =
+        s.im.send_message(auth.participant_id, to_room, blocks, None, None)
+            .await?;
+    Ok(Json(
+        serde_json::to_value(message).map_err(AeroError::from)?,
+    ))
 }
 
 /// Schema tag carried on the provenance [`Block::Card`] of a forwarded message.
@@ -177,7 +180,10 @@ mod tests {
 
         // No comment ⇒ card is first.
         let Block::Card { schema, payload } = &blocks[0] else {
-            panic!("first block should be the provenance card, got {:?}", blocks[0]);
+            panic!(
+                "first block should be the provenance card, got {:?}",
+                blocks[0]
+            );
         };
         assert_eq!(schema, FORWARDED_SCHEMA);
         assert_eq!(payload["source_message_id"], source.id.to_string());
@@ -191,7 +197,10 @@ mod tests {
     fn original_content_is_included_after_card() {
         let source = sample_source(vec![
             Block::text("first"),
-            Block::Code { lang: "rs".into(), content: "fn main() {}".into() },
+            Block::Code {
+                lang: "rs".into(),
+                content: "fn main() {}".into(),
+            },
             Block::File {
                 blob_id: aero_common::BlobId::new(),
                 kind: FileKind::Document,
@@ -237,7 +246,10 @@ mod tests {
             let blocks = build_forward_blocks(&source, comment, ParticipantId::new());
             // [card, body] — no comment block.
             assert_eq!(blocks.len(), 2, "comment={comment:?}");
-            assert!(matches!(blocks[0], Block::Card { .. }), "comment={comment:?}");
+            assert!(
+                matches!(blocks[0], Block::Card { .. }),
+                "comment={comment:?}"
+            );
             assert!(matches!(&blocks[1], Block::Text { content, .. } if content == "body"));
         }
     }
@@ -249,7 +261,9 @@ mod tests {
         let mentioned = ParticipantId::new();
         let source = sample_source(vec![
             Block::text("hey"),
-            Block::Mention { participant: mentioned },
+            Block::Mention {
+                participant: mentioned,
+            },
             Block::text("see this"),
         ]);
 

@@ -9,6 +9,104 @@ use super::*;
 
 // ============================================================ User handlers
 
+const MAX_USER_NAME_BYTES: usize = 320;
+const MAX_EXTERNAL_ID_BYTES: usize = 512;
+const MAX_DISPLAY_NAME_BYTES: usize = 64;
+const MAX_IDENTITY_ISSUER_BYTES: usize = 2 * 1024;
+
+pub(super) fn map_user_write_error(error: aero_storage::ScimUserWriteError) -> AeroError {
+    match error {
+        aero_storage::ScimUserWriteError::OwnerDeprovision => AeroError::Conflict(
+            "transfer workspace ownership before deprovisioning this user".into(),
+        ),
+        aero_storage::ScimUserWriteError::ChannelOwnerDeprovision => {
+            AeroError::Conflict("transfer channel ownership before deprovisioning this user".into())
+        }
+        aero_storage::ScimUserWriteError::IdentityTombstoned => AeroError::Conflict(
+            "external identity was erased and requires an administrative recovery".into(),
+        ),
+        aero_storage::ScimUserWriteError::IdentitySubjectRequired => AeroError::Invalid(
+            "externalId is required when Snaplink identity binding is enabled".into(),
+        ),
+        aero_storage::ScimUserWriteError::InvalidIdentityIssuer => AeroError::Internal(
+            anyhow::anyhow!("invalid SCIM identity issuer configuration"),
+        ),
+        aero_storage::ScimUserWriteError::IdentitySubjectImmutable => AeroError::Conflict(
+            "externalId is immutable after it is bound to a login identity".into(),
+        ),
+        aero_storage::ScimUserWriteError::IdentityConflict => {
+            AeroError::Conflict("external identity is already linked to another account".into())
+        }
+        aero_storage::ScimUserWriteError::Storage(error) => AeroError::from(error),
+    }
+}
+
+/// When configured, SCIM `externalId` is the stable subject emitted by the
+/// same `IdP` used for interactive OIDC login. Keeping this opt-in avoids
+/// interpreting arbitrary legacy SCIM identifiers as login subjects.
+fn configured_identity_issuer() -> Result<Option<String>, AeroError> {
+    let Some(issuer) = std::env::var("AERO__SCIM__IDENTITY_ISSUER")
+        .ok()
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    validate_identity_issuer(&issuer)?;
+    if let Some(oidc_issuer) = std::env::var("AERO__OIDC__ISSUER")
+        .ok()
+        .filter(|value| !value.is_empty())
+    {
+        if issuer != oidc_issuer {
+            return Err(AeroError::Internal(anyhow::anyhow!(
+                "SCIM identity issuer must exactly match AERO__OIDC__ISSUER"
+            )));
+        }
+    }
+    Ok(Some(issuer))
+}
+
+pub(super) fn validate_identity_issuer(issuer: &str) -> Result<(), AeroError> {
+    if issuer.len() > MAX_IDENTITY_ISSUER_BYTES
+        || issuer != issuer.trim()
+        || issuer.chars().any(char::is_control)
+    {
+        return Err(AeroError::Internal(anyhow::anyhow!(
+            "AERO__SCIM__IDENTITY_ISSUER must be an exact, bounded issuer"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_user_name(raw: &str) -> Result<&str, AeroError> {
+    let value = raw.trim();
+    if value.is_empty() {
+        return Err(AeroError::Invalid("userName is required".into()));
+    }
+    if value.len() > MAX_USER_NAME_BYTES {
+        return Err(AeroError::Invalid("userName is too long".into()));
+    }
+    Ok(value)
+}
+
+fn validate_external_id(value: Option<&str>) -> Result<(), AeroError> {
+    if value.is_some_and(|value| value.len() > MAX_EXTERNAL_ID_BYTES) {
+        return Err(AeroError::Invalid("externalId is too long".into()));
+    }
+    Ok(())
+}
+
+fn normalized_display_name(payload: &ScimUser) -> Result<String, AeroError> {
+    let display = display_name_for(payload);
+    let display = display.trim();
+    if display.is_empty() {
+        return Err(AeroError::Invalid("display name is required".into()));
+    }
+    if display.len() > MAX_DISPLAY_NAME_BYTES {
+        return Err(AeroError::Invalid("display name is too long".into()));
+    }
+    Ok(display.to_owned())
+}
+
 #[derive(Deserialize)]
 pub(super) struct ListUsersQuery {
     filter: Option<String>,
@@ -57,7 +155,12 @@ pub(super) async fn list_users(
 /// Fetch a participant's display name, swallowing errors to `None` (SCIM `name`
 /// is best-effort and must never fail a list/get).
 async fn participant_display_name(s: &AppState, id: ParticipantId) -> Option<String> {
-    s.participants.get(id).await.ok().flatten().map(|p| p.display_name)
+    s.participants
+        .get(id)
+        .await
+        .ok()
+        .flatten()
+        .map(|p| p.display_name)
 }
 
 /// `GET /scim/v2/Users/:id` — fetch one user (404 if not provisioned here).
@@ -97,9 +200,12 @@ pub(super) async fn create_user(
         Ok(w) => w,
         Err(e) => return scim_err(&e),
     };
-    let user_name = payload.user_name.trim();
-    if user_name.is_empty() {
-        return scim_err(&AeroError::Invalid("userName is required".into()));
+    let user_name = match validate_user_name(&payload.user_name) {
+        Ok(value) => value,
+        Err(error) => return scim_err(&error),
+    };
+    if let Err(error) = validate_external_id(payload.external_id.as_deref()) {
+        return scim_err(&error);
     }
     let repo = scim_repo(&s);
 
@@ -107,48 +213,33 @@ pub(super) async fn create_user(
     // the real guard, but this gives the precise SCIM error without a failed insert).
     match repo.find_by_user_name(ws, user_name).await {
         Ok(Some(_)) => {
-            return scim_err(&AeroError::Conflict(format!("userName '{user_name}' exists")))
+            return scim_err(&AeroError::Conflict(format!(
+                "userName '{user_name}' exists"
+            )))
         }
         Ok(None) => {}
         Err(e) => return scim_err(&AeroError::from(e)),
     }
 
-    // Create the global participant. A SCIM-provisioned user has NO local
-    // credentials (login is delegated to the IdP via SSO), so we create a bare
-    // `Human` participant through the credential-less `create_bot` path rather
-    // than `create_human` (which would require an email + password hash).
-    let display = display_name_for(&payload);
-    let participant = match s
-        .participants
-        .create_bot(
-            &display,
-            aero_common::ParticipantKind::Human,
-            None,
-            None,
-        )
-        .await
-    {
-        Ok(p) => p,
-        Err(e) => return scim_err(&AeroError::from(e)),
+    let display = match normalized_display_name(&payload) {
+        Ok(value) => value,
+        Err(error) => return scim_err(&error),
     };
-
-    // Enroll in the workspace as a regular Member.
-    if let Err(e) = s
-        .workspaces
-        .add_member(ws, participant.id, WorkspaceRole::Member)
-        .await
-    {
-        return scim_err(&AeroError::from(e));
-    }
-
-    // Record the SCIM mapping.
+    // A SCIM-provisioned user has no local credentials. When the identity
+    // issuer is configured, `externalId` is resolved through the same canonical
+    // `(issuer, subject)` mapping used by interactive OIDC login.
+    let identity_issuer = match configured_identity_issuer() {
+        Ok(issuer) => issuer,
+        Err(error) => return scim_err(&error),
+    };
     match repo
-        .create_user(
+        .provision_user_with_identity(
             ws,
-            participant.id,
+            &display,
             user_name,
             payload.external_id.as_deref(),
             payload.active,
+            identity_issuer.as_deref(),
         )
         .await
     {
@@ -156,10 +247,10 @@ pub(super) async fn create_user(
             let resp = to_scim_user(&row, Some(&display));
             (StatusCode::CREATED, Json(resp)).into_response()
         }
-        Err(e) if is_unique_violation(&e) => {
-            scim_err(&AeroError::Conflict(format!("userName '{user_name}' exists")))
-        }
-        Err(e) => scim_err(&AeroError::from(e)),
+        Err(aero_storage::ScimUserWriteError::Storage(e)) if is_unique_violation(&e) => scim_err(
+            &AeroError::Conflict(format!("userName '{user_name}' exists")),
+        ),
+        Err(e) => scim_err(&map_user_write_error(e)),
     }
 }
 
@@ -180,39 +271,46 @@ pub(super) async fn put_user(
         Ok(p) => p,
         Err(e) => return scim_err(&e),
     };
-    let user_name = payload.user_name.trim();
-    if user_name.is_empty() {
-        return scim_err(&AeroError::Invalid("userName is required".into()));
+    let user_name = match validate_user_name(&payload.user_name) {
+        Ok(value) => value,
+        Err(error) => return scim_err(&error),
+    };
+    if let Err(error) = validate_external_id(payload.external_id.as_deref()) {
+        return scim_err(&error);
     }
     let repo = scim_repo(&s);
 
-    // Reactivation (active true) restores workspace membership; deactivation
-    // removes it — keep membership consistent with the SCIM `active` flag.
-    apply_active_membership(&s, ws, pid, payload.active).await;
-
-    let display = display_name_for(&payload);
-    // Best-effort profile update (display name).
-    let _ = s
-        .participants
-        .update_profile(pid, Some(&display), None)
-        .await;
-
+    let display = match normalized_display_name(&payload) {
+        Ok(value) => value,
+        Err(error) => return scim_err(&error),
+    };
+    let identity_issuer = match configured_identity_issuer() {
+        Ok(issuer) => issuer,
+        Err(error) => return scim_err(&error),
+    };
     match repo
-        .update_user(
+        .update_user_atomic_with_identity(
             ws,
             pid,
-            Some(user_name),
-            Some(payload.external_id.as_deref()),
-            Some(payload.active),
+            aero_storage::scim::ScimUserUpdate {
+                user_name: Some(user_name),
+                external_id: Some(payload.external_id.as_deref()),
+                active: Some(payload.active),
+                display_name: Some(&display),
+                identity_issuer: identity_issuer.as_deref(),
+            },
         )
         .await
     {
-        Ok(Some(row)) => Json(to_scim_user(&row, Some(&display))).into_response(),
-        Ok(None) => scim_err(&AeroError::NotFound("user".into())),
-        Err(e) if is_unique_violation(&e) => {
-            scim_err(&AeroError::Conflict(format!("userName '{user_name}' exists")))
+        Ok(Some(row)) => {
+            s.participant_cache.invalidate(&pid);
+            Json(to_scim_user(&row, Some(&display))).into_response()
         }
-        Err(e) => scim_err(&AeroError::from(e)),
+        Ok(None) => scim_err(&AeroError::NotFound("user".into())),
+        Err(aero_storage::ScimUserWriteError::Storage(e)) if is_unique_violation(&e) => scim_err(
+            &AeroError::Conflict(format!("userName '{user_name}' exists")),
+        ),
+        Err(e) => scim_err(&map_user_write_error(e)),
     }
 }
 
@@ -249,18 +347,14 @@ pub(super) async fn patch_user(
         Ok(w) => w,
         Err(e) => return scim_err(&e),
     };
+    if let Err(error) = validate_patch_operation_count(patch.operations.len()) {
+        return scim_err(&error);
+    }
     let pid = match parse_participant_id(&id) {
         Ok(p) => p,
         Err(e) => return scim_err(&e),
     };
     let repo = scim_repo(&s);
-
-    // Resolve the existing user first so an unknown id is a clean 404.
-    let existing = match repo.get_user(ws, pid).await {
-        Ok(Some(row)) => row,
-        Ok(None) => return scim_err(&AeroError::NotFound("user".into())),
-        Err(e) => return scim_err(&AeroError::from(e)),
-    };
 
     // Fold the operations into a desired (user_name, external_id, active, name) delta.
     let mut new_user_name: Option<String> = None;
@@ -293,7 +387,11 @@ pub(super) async fn patch_user(
                 if let Some(u) = op.value.get("userName").and_then(serde_json::Value::as_str) {
                     new_user_name = Some(u.to_owned());
                 }
-                if let Some(e) = op.value.get("externalId").and_then(serde_json::Value::as_str) {
+                if let Some(e) = op
+                    .value
+                    .get("externalId")
+                    .and_then(serde_json::Value::as_str)
+                {
                     new_external_id = Some(Some(e.to_owned()));
                 }
             }
@@ -301,57 +399,59 @@ pub(super) async fn patch_user(
         }
     }
 
-    // Keep membership consistent with a changed `active`.
-    if let Some(active) = new_active {
-        apply_active_membership(&s, ws, pid, active).await;
+    if let Some(value) = new_user_name.as_mut() {
+        let normalized = match validate_user_name(value) {
+            Ok(normalized) => normalized.to_owned(),
+            Err(error) => return scim_err(&error),
+        };
+        *value = normalized;
     }
-    if let Some(name) = &new_display {
-        let _ = s.participants.update_profile(pid, Some(name), None).await;
+    if let Some(value) = new_external_id.as_ref().and_then(Option::as_deref) {
+        if let Err(error) = validate_external_id(Some(value)) {
+            return scim_err(&error);
+        }
     }
+    if let Some(value) = new_display.as_mut() {
+        let normalized = value.trim().to_owned();
+        if normalized.is_empty() {
+            return scim_err(&AeroError::Invalid("display name cannot be empty".into()));
+        }
+        if normalized.len() > MAX_DISPLAY_NAME_BYTES {
+            return scim_err(&AeroError::Invalid("display name is too long".into()));
+        }
+        *value = normalized;
+    }
+    let identity_issuer = match configured_identity_issuer() {
+        Ok(issuer) => issuer,
+        Err(error) => return scim_err(&error),
+    };
 
     match repo
-        .update_user(
+        .update_user_atomic_with_identity(
             ws,
             pid,
-            new_user_name.as_deref(),
-            new_external_id.as_ref().map(Option::as_deref),
-            new_active,
+            aero_storage::scim::ScimUserUpdate {
+                user_name: new_user_name.as_deref(),
+                external_id: new_external_id.as_ref().map(Option::as_deref),
+                active: new_active,
+                display_name: new_display.as_deref(),
+                identity_issuer: identity_issuer.as_deref(),
+            },
         )
         .await
     {
         Ok(Some(row)) => {
-            let display = new_display
-                .or(participant_display_name(&s, pid).await);
+            if new_display.is_some() {
+                s.participant_cache.invalidate(&pid);
+            }
+            let display = new_display.or(participant_display_name(&s, pid).await);
             Json(to_scim_user(&row, display.as_deref())).into_response()
         }
         Ok(None) => scim_err(&AeroError::NotFound("user".into())),
-        Err(e) if is_unique_violation(&e) => scim_err(&AeroError::Conflict(
-            "userName collision".to_owned(),
-        )),
-        Err(e) => {
-            // The existing row was found; surface other DB errors as 500.
-            let _ = existing;
-            scim_err(&AeroError::from(e))
+        Err(aero_storage::ScimUserWriteError::Storage(e)) if is_unique_violation(&e) => {
+            scim_err(&AeroError::Conflict("userName collision".to_owned()))
         }
-    }
-}
-
-/// Reconcile workspace membership with the SCIM `active` flag: active ⇒ ensure
-/// member, inactive ⇒ remove membership. Best-effort (errors are logged, not
-/// fatal to the SCIM op, which still updates the row's `active`).
-async fn apply_active_membership(
-    s: &AppState,
-    ws: WorkspaceId,
-    pid: ParticipantId,
-    active: bool,
-) {
-    let result = if active {
-        s.workspaces.add_member(ws, pid, WorkspaceRole::Member).await
-    } else {
-        s.workspaces.remove_member(ws, pid).await
-    };
-    if let Err(e) = result {
-        tracing::warn!(error = ?e, %ws, %pid, active, "scim membership reconcile failed");
+        Err(e) => scim_err(&map_user_write_error(e)),
     }
 }
 
@@ -377,6 +477,6 @@ pub(super) async fn delete_user(
     match repo.delete_user(ws, pid).await {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => scim_err(&AeroError::NotFound("user".into())),
-        Err(e) => scim_err(&AeroError::from(e)),
+        Err(e) => scim_err(&map_user_write_error(e)),
     }
 }

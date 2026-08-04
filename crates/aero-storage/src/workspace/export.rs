@@ -1,13 +1,13 @@
 //! Workspace GDPR export and hard-delete (erasure).
 
 use aero_common::{
-    AuditId, Message, MessageId, ParticipantId, Room, RoomId, RoomKind, Workspace,
-    WorkspaceMember, WorkspaceRole,
+    AuditId, Error, Message, MessageId, ParticipantId, Room, RoomId, RoomKind, Workspace,
+    WorkspaceId, WorkspaceMember, WorkspaceRole,
 };
 
 use crate::audit::AuditEvent;
 
-use super::{WorkspaceRepo, EXPORT_MESSAGES_PER_ROOM, RoomExport, WorkspaceExport};
+use super::{RoomExport, WorkspaceExport, WorkspaceRepo, EXPORT_MESSAGES_PER_ROOM};
 
 impl WorkspaceRepo {
     /// Export a self-contained snapshot of one tenant (GDPR portability).
@@ -19,8 +19,17 @@ impl WorkspaceRepo {
 
         let ws_row = sqlx::query_as::<
             _,
-            (uuid::Uuid, String, String, Option<uuid::Uuid>, time::OffsetDateTime,
-             Option<String>, Option<String>, Option<String>, Option<String>),
+            (
+                uuid::Uuid,
+                String,
+                String,
+                Option<uuid::Uuid>,
+                time::OffsetDateTime,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+            ),
         >(
             r"SELECT id, name, slug, created_by, created_at,
                      logo_url, color_scheme, custom_domain, description
@@ -29,7 +38,18 @@ impl WorkspaceRepo {
         .bind(workspace.to_uuid())
         .fetch_optional(&mut *tx)
         .await?;
-        let Some((id, name, slug, created_by, created_at, logo_url, color_scheme, custom_domain, description)) = ws_row else {
+        let Some((
+            id,
+            name,
+            slug,
+            created_by,
+            created_at,
+            logo_url,
+            color_scheme,
+            custom_domain,
+            description,
+        )) = ws_row
+        else {
             tx.commit().await?;
             return Ok(None);
         };
@@ -67,7 +87,13 @@ impl WorkspaceRepo {
 
         let room_rows = sqlx::query_as::<
             _,
-            (uuid::Uuid, String, Option<String>, uuid::Uuid, time::OffsetDateTime),
+            (
+                uuid::Uuid,
+                String,
+                Option<String>,
+                uuid::Uuid,
+                time::OffsetDateTime,
+            ),
         >(
             r"SELECT id, kind, name, created_by, created_at
                FROM rooms
@@ -100,13 +126,18 @@ impl WorkspaceRepo {
             .fetch_all(&mut *tx)
             .await?;
 
-            let message_cap_hit = i64::try_from(msg_rows.len()).unwrap_or(i64::MAX) > EXPORT_MESSAGES_PER_ROOM;
+            let message_cap_hit =
+                i64::try_from(msg_rows.len()).unwrap_or(i64::MAX) > EXPORT_MESSAGES_PER_ROOM;
             if message_cap_hit {
                 msg_rows.truncate(usize::try_from(EXPORT_MESSAGES_PER_ROOM).unwrap_or(usize::MAX));
             }
             msg_rows.reverse();
             let messages = msg_rows.into_iter().map(Message::from).collect();
-            rooms.push(RoomExport { room, messages, message_cap_hit });
+            rooms.push(RoomExport {
+                room,
+                messages,
+                message_cap_hit,
+            });
         }
 
         let audit_rows = sqlx::query_as::<
@@ -154,86 +185,233 @@ impl WorkspaceRepo {
     }
 
     /// Hard-delete a workspace and everything scoped to it, atomically.
-    pub async fn delete(&self, workspace: aero_common::WorkspaceId) -> Result<bool, sqlx::Error> {
+    pub async fn delete(&self, workspace: WorkspaceId) -> Result<bool, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
 
-        // Several ROOM-scoped tables carry a `room_id` but have NO foreign key to
-        // `rooms` (historical oversight), so the `DELETE FROM rooms` below does NOT
-        // cascade to them — they would be ORPHANED, leaving user content alive after
-        // the tenant is gone. Clear them explicitly first, scoped to this workspace's
-        // rooms. (`legal_holds` deliberately excluded — compliance preservation
-        // records are not auto-destroyed by a tenant delete.)
-        // REGRESSION GUARD: the workspace.rs→workspace/ split gutted this list down to
-        // two tables; the full set is restored below (GDPR erasure completeness — a
-        // dropped table leaves orphaned user content / analytics PII keyed to a gone
-        // tenant). Any room_id-keyed non-FK table added later belongs here.
-        for table in [
-            "message_drafts",
-            "ooo_auto_replies",
-            "recurring_messages",
-            "tasks",
-            "channel_bookmarks",
-            "channel_canvases",
-            "channel_favorites",
-            "channel_notification_prefs",
-            "channel_section_items",
-            "channel_join_requests",
-            "digest_subscriptions",
-            "workspace_default_channels",
-            "scheduled_streams",
-            "stream_recordings",
-        ] {
-            let sql = format!("DELETE FROM {table} WHERE room_id IN (SELECT id FROM rooms WHERE workspace_id = $1)");
-            sqlx::query(&sql)
-                .bind(workspace.to_uuid())
-                .execute(&mut *tx)
-                .await?;
-        }
-
-        // Likewise, WORKSPACE-scoped tables that carry a `workspace_id` with NO FK to
-        // `workspaces` — `DELETE FROM workspaces` (below) does NOT cascade to them, so
-        // they orphan too. Clear them by workspace_id. (`ai_jobs` excluded — transient
-        // queue rows; `legal_holds` excluded — compliance preservation records.)
-        // REGRESSION GUARD: the split kept only `keyword_alerts`; the full set is
-        // restored (esp. `search_click_events` analytics PII, whose cleanup was added
-        // by commit 51759c2 and silently re-dropped by the split). Any workspace_id-
-        // keyed non-FK table added later belongs here (db_test guards keyword_alerts).
-        for table in [
-            "approvals",
-            "channel_sections",
-            "info_barriers",
-            "keyword_alerts",
-            "message_reports",
-            "saved_searches",
-            "search_click_events",
-            "user_groups",
-            "workspace_announcements",
-            "workspace_deactivations",
-            "workspace_mutes",
-            "scheduled_streams",
-            "digest_subscriptions",
-            "workspace_default_channels",
-        ] {
-            let sql = format!("DELETE FROM {table} WHERE workspace_id = $1");
-            sqlx::query(&sql)
-                .bind(workspace.to_uuid())
-                .execute(&mut *tx)
-                .await?;
-        }
-
-        sqlx::query("DELETE FROM rooms WHERE workspace_id = $1")
-            .bind(workspace.to_uuid())
+        // Establish workspace DML intent before taking any child/room row lock.
+        // Migration 0198's low-frequency participant/TOTP fence first takes a
+        // conflicting SHARE table lock and then workspace -> channel rows.  An
+        // explicit ROW EXCLUSIVE table lock makes the two paths serialize at
+        // the table boundary instead of deadlocking as child -> workspace.
+        sqlx::query("LOCK TABLE workspaces IN ROW EXCLUSIVE MODE")
             .execute(&mut *tx)
             .await?;
-
-        let result = sqlx::query("DELETE FROM workspaces WHERE id = $1")
-            .bind(workspace.to_uuid())
-            .execute(&mut *tx)
-            .await?;
-
+        crate::ownership::lock_membership_governance(&mut tx).await?;
+        let exists =
+            sqlx::query_scalar::<_, bool>("SELECT true FROM workspaces WHERE id = $1 FOR UPDATE")
+                .bind(workspace.to_uuid())
+                .fetch_optional(&mut *tx)
+                .await?
+                .is_some();
+        if !exists {
+            tx.commit().await?;
+            return Ok(false);
+        }
+        let deleted = delete_workspace_rows_in_tx(&mut tx, workspace).await?;
         tx.commit().await?;
-        Ok(result.rows_affected() > 0)
+        Ok(deleted)
     }
+
+    /// Hard-delete a workspace only while `actor` remains an effective owner in
+    /// the same transaction as the destructive write.
+    pub async fn delete_authorized(
+        &self,
+        workspace: WorkspaceId,
+        actor: ParticipantId,
+    ) -> Result<bool, Error> {
+        let mut tx = self.pool.begin().await?;
+        // Match the low-level erasure lock boundary before taking any aggregate
+        // row. This serializes with participant/TOTP global governance fences.
+        sqlx::query("LOCK TABLE workspaces IN ROW EXCLUSIVE MODE")
+            .execute(&mut *tx)
+            .await?;
+        crate::ownership::lock_membership_governance(&mut tx).await?;
+        let role = super::authz::assert_effective_admin_in_tx(&mut tx, workspace, actor).await?;
+        if role != WorkspaceRole::Owner {
+            return Err(Error::Forbidden(
+                "workspace deletion requires an effective owner".into(),
+            ));
+        }
+        let deleted = delete_workspace_rows_in_tx(&mut tx, workspace).await?;
+        tx.commit().await?;
+        Ok(deleted)
+    }
+}
+
+async fn delete_workspace_rows_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    workspace: WorkspaceId,
+) -> Result<bool, sqlx::Error> {
+    // Several ROOM-scoped tables carry a `room_id` but have NO foreign key to
+    // `rooms`, so the workspace cascade cannot erase them.
+    for table in [
+        "message_drafts",
+        "ooo_auto_replies",
+        "recurring_messages",
+        "tasks",
+        "channel_bookmarks",
+        "channel_canvases",
+        "channel_favorites",
+        "channel_notification_prefs",
+        "channel_section_items",
+        "channel_join_requests",
+        "digest_subscriptions",
+        "workspace_default_channels",
+        "scheduled_streams",
+        "stream_recordings",
+    ] {
+        let sql = format!(
+            "DELETE FROM {table} WHERE room_id IN \
+             (SELECT id FROM rooms WHERE workspace_id = $1)"
+        );
+        sqlx::query(&sql)
+            .bind(workspace.to_uuid())
+            .execute(&mut **tx)
+            .await?;
+    }
+
+    // Likewise, explicitly clear workspace-scoped historical tables without a
+    // foreign key. Legal holds remain deliberately excluded.
+    for table in [
+        "approvals",
+        "channel_sections",
+        "info_barriers",
+        "keyword_alerts",
+        "message_reports",
+        "saved_searches",
+        "search_click_events",
+        "user_groups",
+        "workspace_announcements",
+        "workspace_deactivations",
+        "workspace_mutes",
+        "scheduled_streams",
+        "digest_subscriptions",
+        "workspace_default_channels",
+    ] {
+        let sql = format!("DELETE FROM {table} WHERE workspace_id = $1");
+        sqlx::query(&sql)
+            .bind(workspace.to_uuid())
+            .execute(&mut **tx)
+            .await?;
+    }
+
+    // Capture the blob set before erasing the installation-owned retention
+    // state. The workspace row is already locked FOR UPDATE, which prevents a
+    // same-workspace machine commit from adding a new ledger entry behind this
+    // snapshot.
+    let integration_blob_ids = sqlx::query_scalar::<_, uuid::Uuid>(
+        r"SELECT DISTINCT ledger.blob_id
+            FROM integration_blob_ledger ledger
+            JOIN integration_installations installation
+              ON installation.id = ledger.installation_id
+           WHERE installation.workspace_id = $1
+           ORDER BY ledger.blob_id",
+    )
+    .bind(workspace.to_uuid())
+    .fetch_all(&mut **tx)
+    .await?;
+
+    // Match the integration retention sweeper's complete lock order: machine
+    // requests -> receipts -> ledger/blob -> GC queue. Deleting these children
+    // explicitly also means the later installation cascade has nothing left to
+    // lock in reverse order.
+    sqlx::query(
+        r"DELETE FROM integration_machine_requests request
+            USING integration_installations installation
+           WHERE request.installation_id = installation.id
+             AND installation.workspace_id = $1",
+    )
+    .bind(workspace.to_uuid())
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        r"DELETE FROM integration_notification_receipts receipt
+            USING integration_installations installation
+           WHERE receipt.installation_id = installation.id
+             AND installation.workspace_id = $1",
+    )
+    .bind(workspace.to_uuid())
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        r"DELETE FROM integration_blob_receipts receipt
+            USING integration_installations installation
+           WHERE receipt.installation_id = installation.id
+             AND installation.workspace_id = $1",
+    )
+    .bind(workspace.to_uuid())
+    .execute(&mut **tx)
+    .await?;
+    let _locked_integration_blobs = sqlx::query_as::<_, (uuid::Uuid, uuid::Uuid)>(
+        r"SELECT ledger.installation_id, ledger.blob_id
+            FROM integration_blob_ledger ledger
+            JOIN integration_installations installation
+              ON installation.id = ledger.installation_id
+            JOIN blobs blob ON blob.id = ledger.blob_id
+           WHERE installation.workspace_id = $1
+           ORDER BY ledger.created_at, ledger.installation_id, ledger.blob_id
+           FOR UPDATE OF ledger, blob",
+    )
+    .bind(workspace.to_uuid())
+    .fetch_all(&mut **tx)
+    .await?;
+    sqlx::query(
+        r"DELETE FROM integration_blob_ledger ledger
+            USING integration_installations installation
+           WHERE ledger.installation_id = installation.id
+             AND installation.workspace_id = $1",
+    )
+    .bind(workspace.to_uuid())
+    .execute(&mut **tx)
+    .await?;
+
+    // Queue installation-owned blobs as one workspace-level set before deleting
+    // installation rows. A row-level BEFORE DELETE trigger cannot safely infer
+    // this for a multi-row DELETE: every installation can still see another
+    // installation in this workspace and all of them could skip the enqueue.
+    // With this workspace's ledger removed, the remaining-reference checks keep
+    // blobs retained elsewhere out of this tenant's cleanup. Never downgrade a
+    // stronger pre-existing erasure request.
+    sqlx::query(
+        r"INSERT INTO blob_gc_queue (blob_id, force_delete)
+          SELECT candidate.blob_id, FALSE
+            FROM unnest($1::uuid[]) AS candidate(blob_id)
+           WHERE NOT EXISTS (
+                     SELECT 1 FROM integration_blob_ledger other
+                      WHERE other.blob_id = candidate.blob_id
+                 )
+             AND NOT EXISTS (
+                     SELECT 1 FROM integration_blob_receipts receipt
+                      WHERE receipt.blob_id = candidate.blob_id
+                 )
+          ON CONFLICT (blob_id) DO UPDATE
+              SET force_delete = blob_gc_queue.force_delete OR EXCLUDED.force_delete",
+    )
+    .bind(&integration_blob_ids)
+    .execute(&mut **tx)
+    .await?;
+
+    // Installations are normally removed by the workspace FK cascade, but
+    // deleting them explicitly first also releases their bot RESTRICT edge and
+    // cascades durable notification receipts before the bot/workspace rows are
+    // considered. This keeps hard deletion valid after an integration has
+    // published messages.
+    sqlx::query("DELETE FROM integration_installations WHERE workspace_id = $1")
+        .bind(workspace.to_uuid())
+        .execute(&mut **tx)
+        .await?;
+
+    sqlx::query("DELETE FROM rooms WHERE workspace_id = $1")
+        .bind(workspace.to_uuid())
+        .execute(&mut **tx)
+        .await?;
+
+    Ok(sqlx::query("DELETE FROM workspaces WHERE id = $1")
+        .bind(workspace.to_uuid())
+        .execute(&mut **tx)
+        .await?
+        .rows_affected()
+        > 0)
 }
 
 fn room_kind_of(s: &str) -> RoomKind {

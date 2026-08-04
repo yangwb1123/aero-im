@@ -33,6 +33,22 @@ use super::crypto::*;
 use super::delivery::*;
 use super::types::*;
 
+#[path = "incoming.rs"]
+mod incoming;
+pub use incoming::IncomingWebhookIds;
+
+#[path = "management.rs"]
+mod management;
+pub use management::WebhookWriteError;
+
+#[cfg(test)]
+#[path = "atomic_tests.rs"]
+mod atomic_tests;
+
+#[cfg(test)]
+#[path = "management_tests.rs"]
+mod management_tests;
+
 // ------------------------------------------------------------------ The repo
 
 #[derive(Clone)]
@@ -48,32 +64,6 @@ impl WebhookRepo {
 
     // ---- Incoming ----
 
-    /// Create an incoming webhook bound to `room` posting as `bot_id`, storing
-    /// only `token_hash`. Returns the generated id.
-    pub async fn create_incoming(
-        &self,
-        room: RoomId,
-        bot_id: ParticipantId,
-        token_hash: &str,
-        label: Option<&str>,
-        created_by: ParticipantId,
-    ) -> Result<WebhookId, sqlx::Error> {
-        let id = WebhookId::new();
-        sqlx::query(
-            r"INSERT INTO incoming_webhooks (id, room_id, bot_id, token_hash, label, created_by)
-               VALUES ($1, $2, $3, $4, $5, $6)",
-        )
-        .bind(id.to_uuid())
-        .bind(room.to_uuid())
-        .bind(bot_id.to_uuid())
-        .bind(token_hash)
-        .bind(label)
-        .bind(created_by.to_uuid())
-        .execute(&self.pool)
-        .await?;
-        Ok(id)
-    }
-
     /// Resolve an incoming webhook by the SHA-256 hash of its presented token.
     /// `None` when no row matches. The `revoked` flag lets the caller reject a
     /// revoked hook with the same 404 it gives an unknown token.
@@ -81,7 +71,15 @@ impl WebhookRepo {
         &self,
         token_hash: &str,
     ) -> Result<Option<IncomingHook>, sqlx::Error> {
-        let row = sqlx::query_as::<_, (uuid::Uuid, uuid::Uuid, uuid::Uuid, Option<time::OffsetDateTime>)>(
+        let row = sqlx::query_as::<
+            _,
+            (
+                uuid::Uuid,
+                uuid::Uuid,
+                uuid::Uuid,
+                Option<time::OffsetDateTime>,
+            ),
+        >(
             r"SELECT id, room_id, bot_id, revoked_at
                FROM incoming_webhooks
                WHERE token_hash = $1",
@@ -104,7 +102,14 @@ impl WebhookRepo {
     ) -> Result<Vec<IncomingHookSummary>, sqlx::Error> {
         let rows = sqlx::query_as::<
             _,
-            (uuid::Uuid, uuid::Uuid, uuid::Uuid, Option<String>, Option<time::OffsetDateTime>, time::OffsetDateTime),
+            (
+                uuid::Uuid,
+                uuid::Uuid,
+                uuid::Uuid,
+                Option<String>,
+                Option<time::OffsetDateTime>,
+                time::OffsetDateTime,
+            ),
         >(
             r"SELECT id, room_id, bot_id, label, revoked_at, created_at
                FROM incoming_webhooks
@@ -116,57 +121,17 @@ impl WebhookRepo {
         .await?;
         Ok(rows
             .into_iter()
-            .map(|(id, room, bot, label, revoked_at, created_at)| IncomingHookSummary {
-                id: WebhookId::from_uuid(id),
-                room_id: RoomId::from_uuid(room),
-                bot_id: ParticipantId::from_uuid(bot),
-                label,
-                revoked: revoked_at.is_some(),
-                created_at,
-            })
+            .map(
+                |(id, room, bot, label, revoked_at, created_at)| IncomingHookSummary {
+                    id: WebhookId::from_uuid(id),
+                    room_id: RoomId::from_uuid(room),
+                    bot_id: ParticipantId::from_uuid(bot),
+                    label,
+                    revoked: revoked_at.is_some(),
+                    created_at,
+                },
+            )
             .collect())
-    }
-
-    /// Soft-revoke an incoming webhook (idempotent). Returns whether a live row
-    /// was flipped.
-    pub async fn revoke_incoming(&self, id: WebhookId) -> Result<bool, sqlx::Error> {
-        let res = sqlx::query(
-            r"UPDATE incoming_webhooks SET revoked_at = now()
-               WHERE id = $1 AND revoked_at IS NULL",
-        )
-        .bind(id.to_uuid())
-        .execute(&self.pool)
-        .await?;
-        Ok(res.rows_affected() > 0)
-    }
-
-    // ---- Outgoing ----
-
-    /// Create an outgoing webhook for `room`. `events` empty ⇒ all events.
-    pub async fn create_outgoing(
-        &self,
-        room: RoomId,
-        url: &str,
-        secret: &str,
-        events: &[String],
-        label: Option<&str>,
-        created_by: ParticipantId,
-    ) -> Result<WebhookId, sqlx::Error> {
-        let id = WebhookId::new();
-        sqlx::query(
-            r"INSERT INTO outgoing_webhooks (id, room_id, url, secret, events, label, created_by)
-               VALUES ($1, $2, $3, $4, $5, $6, $7)",
-        )
-        .bind(id.to_uuid())
-        .bind(room.to_uuid())
-        .bind(url)
-        .bind(secret)
-        .bind(events)
-        .bind(label)
-        .bind(created_by.to_uuid())
-        .execute(&self.pool)
-        .await?;
-        Ok(id)
     }
 
     /// List a room's outgoing webhooks (no secret), newest first.
@@ -176,7 +141,15 @@ impl WebhookRepo {
     ) -> Result<Vec<OutgoingHookSummary>, sqlx::Error> {
         let rows = sqlx::query_as::<
             _,
-            (uuid::Uuid, uuid::Uuid, String, Vec<String>, Option<String>, Option<time::OffsetDateTime>, time::OffsetDateTime),
+            (
+                uuid::Uuid,
+                uuid::Uuid,
+                String,
+                Vec<String>,
+                Option<String>,
+                Option<time::OffsetDateTime>,
+                time::OffsetDateTime,
+            ),
         >(
             r"SELECT id, room_id, url, events, label, revoked_at, created_at
                FROM outgoing_webhooks
@@ -188,15 +161,17 @@ impl WebhookRepo {
         .await?;
         Ok(rows
             .into_iter()
-            .map(|(id, room, url, events, label, revoked_at, created_at)| OutgoingHookSummary {
-                id: WebhookId::from_uuid(id),
-                room_id: RoomId::from_uuid(room),
-                url,
-                events,
-                label,
-                revoked: revoked_at.is_some(),
-                created_at,
-            })
+            .map(
+                |(id, room, url, events, label, revoked_at, created_at)| OutgoingHookSummary {
+                    id: WebhookId::from_uuid(id),
+                    room_id: RoomId::from_uuid(room),
+                    url,
+                    events,
+                    label,
+                    revoked: revoked_at.is_some(),
+                    created_at,
+                },
+            )
             .collect())
     }
 
@@ -208,7 +183,16 @@ impl WebhookRepo {
         room: RoomId,
         event_kind: &str,
     ) -> Result<Vec<OutgoingTarget>, sqlx::Error> {
-        let rows = sqlx::query_as::<_, (uuid::Uuid, String, String, i32, Option<time::OffsetDateTime>)>(
+        let rows = sqlx::query_as::<
+            _,
+            (
+                uuid::Uuid,
+                String,
+                String,
+                i32,
+                Option<time::OffsetDateTime>,
+            ),
+        >(
             r"SELECT id, url, secret, breaker_failures, breaker_open_until
                FROM outgoing_webhooks
                WHERE room_id = $1
@@ -272,8 +256,20 @@ impl WebhookRepo {
     ///
     /// # Errors
     /// Propagates any [`sqlx::Error`].
-    pub async fn outgoing_target(&self, id: WebhookId) -> Result<Option<OutgoingTarget>, sqlx::Error> {
-        let row = sqlx::query_as::<_, (uuid::Uuid, String, String, i32, Option<time::OffsetDateTime>)>(
+    pub async fn outgoing_target(
+        &self,
+        id: WebhookId,
+    ) -> Result<Option<OutgoingTarget>, sqlx::Error> {
+        let row = sqlx::query_as::<
+            _,
+            (
+                uuid::Uuid,
+                String,
+                String,
+                i32,
+                Option<time::OffsetDateTime>,
+            ),
+        >(
             r"SELECT id, url, secret, breaker_failures, breaker_open_until
                FROM outgoing_webhooks
                WHERE id = $1 AND revoked_at IS NULL",
@@ -281,12 +277,14 @@ impl WebhookRepo {
         .bind(id.to_uuid())
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(|(id, url, secret, failures, open_until)| OutgoingTarget {
-            id: WebhookId::from_uuid(id),
-            url,
-            secret,
-            breaker: breaker_from_row(failures, open_until),
-        }))
+        Ok(
+            row.map(|(id, url, secret, failures, open_until)| OutgoingTarget {
+                id: WebhookId::from_uuid(id),
+                url,
+                secret,
+                breaker: breaker_from_row(failures, open_until),
+            }),
+        )
     }
 
     /// Persist a recomputed circuit-breaker state for one endpoint after a
@@ -375,19 +373,6 @@ impl WebhookRepo {
         tx.commit().await?;
         Ok(next)
     }
-
-    /// Soft-revoke an outgoing webhook (idempotent). Returns whether a live row
-    /// was flipped.
-    pub async fn revoke_outgoing(&self, id: WebhookId) -> Result<bool, sqlx::Error> {
-        let res = sqlx::query(
-            r"UPDATE outgoing_webhooks SET revoked_at = now()
-               WHERE id = $1 AND revoked_at IS NULL",
-        )
-        .bind(id.to_uuid())
-        .execute(&self.pool)
-        .await?;
-        Ok(res.rows_affected() > 0)
-    }
 }
 
 #[cfg(test)]
@@ -466,7 +451,9 @@ mod tests {
         assert_eq!(d.header(TIMESTAMP_HEADER), Some(now.to_string().as_str()));
         // Signature header is present and matches re-signing the EXACT body bytes —
         // i.e. a receiver re-running sign_payload over what it received verifies.
-        let sig = d.header(SIGNATURE_HEADER).expect("signature header present");
+        let sig = d
+            .header(SIGNATURE_HEADER)
+            .expect("signature header present");
         assert_eq!(sig, sign_payload("sekret", now, &d.body));
         assert!(sig.starts_with("v0="));
         // The body is the serialized event.
@@ -547,15 +534,29 @@ mod tests {
 
     #[test]
     fn outcome_classifies_status_codes() {
-        assert_eq!(outcome_of(&Ok(DeliveryResponse::new(200))), DeliveryOutcome::Success);
-        assert_eq!(outcome_of(&Ok(DeliveryResponse::new(204))), DeliveryOutcome::Success);
+        assert_eq!(
+            outcome_of(&Ok(DeliveryResponse::new(200))),
+            DeliveryOutcome::Success
+        );
+        assert_eq!(
+            outcome_of(&Ok(DeliveryResponse::new(204))),
+            DeliveryOutcome::Success
+        );
         // A 429 with no Retry-After ⇒ rate-limited with None (default cooldown).
         assert_eq!(
             outcome_of(&Ok(DeliveryResponse::new(429))),
-            DeliveryOutcome::RateLimited { retry_after_secs: None }
+            DeliveryOutcome::RateLimited {
+                retry_after_secs: None
+            }
         );
-        assert_eq!(outcome_of(&Ok(DeliveryResponse::new(500))), DeliveryOutcome::Failure);
-        assert_eq!(outcome_of(&Ok(DeliveryResponse::new(404))), DeliveryOutcome::Failure);
+        assert_eq!(
+            outcome_of(&Ok(DeliveryResponse::new(500))),
+            DeliveryOutcome::Failure
+        );
+        assert_eq!(
+            outcome_of(&Ok(DeliveryResponse::new(404))),
+            DeliveryOutcome::Failure
+        );
         assert_eq!(
             outcome_of(&Err("timeout".to_string())),
             DeliveryOutcome::Failure
@@ -566,13 +567,21 @@ mod tests {
     fn outcome_surfaces_retry_after_on_429() {
         // A 429 carrying a parsed Retry-After flows straight through to the breaker
         // outcome, so the cooldown can be honored exactly (not just the default).
-        let resp = DeliveryResponse { status: 429, retry_after_secs: Some(90) };
+        let resp = DeliveryResponse {
+            status: 429,
+            retry_after_secs: Some(90),
+        };
         assert_eq!(
             outcome_of(&Ok(resp)),
-            DeliveryOutcome::RateLimited { retry_after_secs: Some(90) }
+            DeliveryOutcome::RateLimited {
+                retry_after_secs: Some(90)
+            }
         );
         // A non-429 ignores any (spurious) Retry-After it might carry.
-        let resp = DeliveryResponse { status: 503, retry_after_secs: Some(90) };
+        let resp = DeliveryResponse {
+            status: 503,
+            retry_after_secs: Some(90),
+        };
         assert_eq!(outcome_of(&Ok(resp)), DeliveryOutcome::Failure);
     }
 
@@ -581,12 +590,20 @@ mod tests {
         // End-to-end of the plumbed value: a 429 with Retry-After: 300 makes the
         // breaker open until exactly now + 300 (reusing the breaker-test style).
         let now = 10_000;
-        let resp: Result<DeliveryResponse, String> =
-            Ok(DeliveryResponse { status: 429, retry_after_secs: Some(300) });
+        let resp: Result<DeliveryResponse, String> = Ok(DeliveryResponse {
+            status: 429,
+            retry_after_secs: Some(300),
+        });
         let s = BreakerState::default().after(outcome_of(&resp), now);
         assert_eq!(s.open_until, Some(now + 300));
-        assert!(s.is_open_at(now + 299), "still open just before the deadline");
-        assert!(!s.is_open_at(now + 300), "half-open exactly at now + retry_after");
+        assert!(
+            s.is_open_at(now + 299),
+            "still open just before the deadline"
+        );
+        assert!(
+            !s.is_open_at(now + 300),
+            "half-open exactly at now + retry_after"
+        );
     }
 
     #[test]
@@ -610,15 +627,24 @@ mod tests {
         assert_eq!(s.failures, BREAKER_FAILURE_THRESHOLD);
         assert_eq!(s.open_until, Some(1000 + BREAKER_BASE_COOLDOWN_SECS));
         assert!(s.is_open_at(1000), "open right after tripping");
-        assert!(s.is_open_at(1000 + BREAKER_BASE_COOLDOWN_SECS - 1), "still open mid-cooldown");
-        assert!(!s.is_open_at(1000 + BREAKER_BASE_COOLDOWN_SECS), "half-open once elapsed");
+        assert!(
+            s.is_open_at(1000 + BREAKER_BASE_COOLDOWN_SECS - 1),
+            "still open mid-cooldown"
+        );
+        assert!(
+            !s.is_open_at(1000 + BREAKER_BASE_COOLDOWN_SECS),
+            "half-open once elapsed"
+        );
     }
 
     #[test]
     fn breaker_cooldown_grows_exponentially_and_caps() {
         // One step past threshold is exactly 2× the base.
-        let two = BreakerState { failures: BREAKER_FAILURE_THRESHOLD, open_until: None }
-            .after(DeliveryOutcome::Failure, 0);
+        let two = BreakerState {
+            failures: BREAKER_FAILURE_THRESHOLD,
+            open_until: None,
+        }
+        .after(DeliveryOutcome::Failure, 0);
         assert_eq!(two.open_until, Some(BREAKER_BASE_COOLDOWN_SECS * 2));
         // Drive well past the threshold; the cooldown saturates at the max.
         let mut s = BreakerState::default();
@@ -634,9 +660,18 @@ mod tests {
 
     #[test]
     fn success_fully_closes_the_breaker() {
-        let open = BreakerState { failures: 9, open_until: Some(5000) };
+        let open = BreakerState {
+            failures: 9,
+            open_until: Some(5000),
+        };
         let closed = open.after(DeliveryOutcome::Success, 4000);
-        assert_eq!(closed, BreakerState { failures: 0, open_until: None });
+        assert_eq!(
+            closed,
+            BreakerState {
+                failures: 0,
+                open_until: None
+            }
+        );
         assert!(!closed.is_open_at(4000));
     }
 
@@ -645,7 +680,9 @@ mod tests {
         // A single 429 from a healthy endpoint opens the breaker at once (the server
         // explicitly asked us to slow down) — no need to reach the failure threshold.
         let s = BreakerState::default().after(
-            DeliveryOutcome::RateLimited { retry_after_secs: None },
+            DeliveryOutcome::RateLimited {
+                retry_after_secs: None,
+            },
             2000,
         );
         assert_eq!(s.failures, 1);
@@ -656,13 +693,17 @@ mod tests {
     #[test]
     fn rate_limited_honors_retry_after_when_present() {
         let s = BreakerState::default().after(
-            DeliveryOutcome::RateLimited { retry_after_secs: Some(900) },
+            DeliveryOutcome::RateLimited {
+                retry_after_secs: Some(900),
+            },
             0,
         );
         assert_eq!(s.open_until, Some(900));
         // A retry-after beyond the cap is clamped.
         let capped = BreakerState::default().after(
-            DeliveryOutcome::RateLimited { retry_after_secs: Some(99_999) },
+            DeliveryOutcome::RateLimited {
+                retry_after_secs: Some(99_999),
+            },
             0,
         );
         assert_eq!(capped.open_until, Some(BREAKER_MAX_COOLDOWN_SECS));
@@ -679,7 +720,10 @@ mod tests {
         let elapsed = BREAKER_BASE_COOLDOWN_SECS; // half-open boundary
         assert!(!s.is_open_at(elapsed));
         let reopened = s.after(DeliveryOutcome::Failure, elapsed);
-        assert_eq!(reopened.open_until, Some(elapsed + BREAKER_BASE_COOLDOWN_SECS * 2));
+        assert_eq!(
+            reopened.open_until,
+            Some(elapsed + BREAKER_BASE_COOLDOWN_SECS * 2)
+        );
         assert!(reopened.is_open_at(elapsed));
     }
 
@@ -688,20 +732,40 @@ mod tests {
         // A 429 sets a long cooldown; a (concurrent/stale) generic failure folded on
         // top must NOT walk it back to the shorter generic cooldown — the receiver's
         // explicit back-off survives. Guards the concurrency-race fix.
-        let after_429 = BreakerState::default()
-            .after(DeliveryOutcome::RateLimited { retry_after_secs: Some(3000) }, 0);
+        let after_429 = BreakerState::default().after(
+            DeliveryOutcome::RateLimited {
+                retry_after_secs: Some(3000),
+            },
+            0,
+        );
         assert_eq!(after_429.open_until, Some(3000));
         let after_fail = after_429.after(DeliveryOutcome::Failure, 10);
-        assert_eq!(after_fail.open_until, Some(3000), "longer 429 gate preserved, not shortened");
-        assert!(after_fail.is_open_at(2999), "still open for the full 429 window");
+        assert_eq!(
+            after_fail.open_until,
+            Some(3000),
+            "longer 429 gate preserved, not shortened"
+        );
+        assert!(
+            after_fail.is_open_at(2999),
+            "still open for the full 429 window"
+        );
         // Symmetric: a shorter 429 can't shorten a longer existing generic gate.
         let mut long = BreakerState::default();
         for _ in 0..(BREAKER_FAILURE_THRESHOLD + 6) {
             long = long.after(DeliveryOutcome::Failure, 0); // grows to the cap (3600)
         }
         assert_eq!(long.open_until, Some(BREAKER_MAX_COOLDOWN_SECS));
-        let after_short_429 = long.after(DeliveryOutcome::RateLimited { retry_after_secs: Some(5) }, 0);
-        assert_eq!(after_short_429.open_until, Some(BREAKER_MAX_COOLDOWN_SECS), "kept the longer gate");
+        let after_short_429 = long.after(
+            DeliveryOutcome::RateLimited {
+                retry_after_secs: Some(5),
+            },
+            0,
+        );
+        assert_eq!(
+            after_short_429.open_until,
+            Some(BREAKER_MAX_COOLDOWN_SECS),
+            "kept the longer gate"
+        );
     }
 }
 
@@ -735,22 +799,44 @@ mod db_tests {
             .await
             .expect("insert participant");
         let ws = WorkspaceId::new();
+        let mut tx = p.begin().await.expect("begin fixture transaction");
         sqlx::query("INSERT INTO workspaces (id, name, slug, created_by, created_at) VALUES ($1,$2,$3,$4, now())")
             .bind(ws.to_uuid())
             .bind("WH Test WS")
             .bind(format!("wh-{ws}"))
             .bind(actor.to_uuid())
-            .execute(p)
+            .execute(&mut *tx)
             .await
             .expect("insert workspace");
         let room = RoomId::new();
-        sqlx::query("INSERT INTO rooms (id, kind, created_by, workspace_id, created_at) VALUES ($1,'group',$2,$3, now())")
-            .bind(room.to_uuid())
-            .bind(actor.to_uuid())
-            .bind(ws.to_uuid())
-            .execute(p)
-            .await
-            .expect("insert room");
+        sqlx::query(
+            "INSERT INTO rooms (id, kind, created_by, workspace_id, created_at) VALUES ($1,'group',$2,$3, now())",
+        )
+        .bind(room.to_uuid())
+        .bind(actor.to_uuid())
+        .bind(ws.to_uuid())
+        .execute(&mut *tx)
+        .await
+        .expect("insert room");
+        sqlx::query(
+            "INSERT INTO workspace_members (workspace_id, participant_id, role)
+             VALUES ($1, $2, 'owner')",
+        )
+        .bind(ws.to_uuid())
+        .bind(actor.to_uuid())
+        .execute(&mut *tx)
+        .await
+        .expect("join workspace");
+        sqlx::query(
+            "INSERT INTO room_members (room_id, participant_id, role)
+             VALUES ($1, $2, 'owner')",
+        )
+        .bind(room.to_uuid())
+        .bind(actor.to_uuid())
+        .execute(&mut *tx)
+        .await
+        .expect("join room");
+        tx.commit().await.expect("commit fixture transaction");
         (room, actor)
     }
 
@@ -763,31 +849,54 @@ mod db_tests {
 
         let token = generate_token();
         let hash = hash_token(&token);
-        let id = repo
-            .create_incoming(room, actor, &hash, Some("CI hook"), actor)
+        let created = repo
+            .create_incoming(room, "CI webhook bot", &hash, Some("CI hook"), actor)
             .await
             .unwrap();
 
         // Found by the hash of the presented token, active.
-        let found = repo.find_incoming_by_token_hash(&hash).await.unwrap().expect("hook exists");
-        assert_eq!(found.id, id);
+        let found = repo
+            .find_incoming_by_token_hash(&hash)
+            .await
+            .unwrap()
+            .expect("hook exists");
+        assert_eq!(found.id, created.webhook_id);
         assert_eq!(found.room_id, room);
+        assert_eq!(found.bot_id, created.bot_id);
         assert!(!found.revoked);
 
         // A different token's hash resolves to nothing.
-        assert!(repo.find_incoming_by_token_hash(&hash_token("wrong")).await.unwrap().is_none());
+        assert!(repo
+            .find_incoming_by_token_hash(&hash_token("wrong"))
+            .await
+            .unwrap()
+            .is_none());
 
         // Listing surfaces it (without token/hash).
         let list = repo.list_incoming(room).await.unwrap();
         assert_eq!(list.len(), 1);
-        assert_eq!(list[0].id, id);
+        assert_eq!(list[0].id, created.webhook_id);
 
         // Revoke flips the flag; the lookup now reports revoked.
-        assert!(repo.revoke_incoming(id).await.unwrap());
-        let after = repo.find_incoming_by_token_hash(&hash).await.unwrap().unwrap();
+        assert_eq!(
+            repo.revoke_incoming_and_cleanup(created.webhook_id, actor)
+                .await
+                .unwrap(),
+            (room, created.bot_id)
+        );
+        let after = repo
+            .find_incoming_by_token_hash(&hash)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(after.revoked);
-        // Idempotent: a second revoke flips nothing.
-        assert!(!repo.revoke_incoming(id).await.unwrap());
+        // Idempotent: a second revoke repeats the already-empty cleanup.
+        assert_eq!(
+            repo.revoke_incoming_and_cleanup(created.webhook_id, actor)
+                .await
+                .unwrap(),
+            (room, created.bot_id)
+        );
     }
 
     #[tokio::test]
@@ -799,9 +908,16 @@ mod db_tests {
 
         // One all-events hook, one filtered to {message}.
         let secret_all = generate_secret();
-        repo.create_outgoing(room, "https://all.test", &secret_all, &[], Some("all"), actor)
-            .await
-            .unwrap();
+        repo.create_outgoing(
+            room,
+            "https://all.test",
+            &secret_all,
+            &[],
+            Some("all"),
+            actor,
+        )
+        .await
+        .unwrap();
         let secret_msg = generate_secret();
         let filtered_id = repo
             .create_outgoing(
@@ -820,19 +936,31 @@ mod db_tests {
         assert_eq!(list.len(), 2);
 
         // A "message" event hits both targets.
-        let on_message = repo.list_outgoing_for_room_event(room, "message").await.unwrap();
+        let on_message = repo
+            .list_outgoing_for_room_event(room, "message")
+            .await
+            .unwrap();
         assert_eq!(on_message.len(), 2);
         assert!(on_message.iter().any(|t| t.url == "https://all.test"));
         assert!(on_message.iter().any(|t| t.url == "https://msg.test"));
 
         // A "reaction" event hits only the all-events hook.
-        let on_reaction = repo.list_outgoing_for_room_event(room, "reaction").await.unwrap();
+        let on_reaction = repo
+            .list_outgoing_for_room_event(room, "reaction")
+            .await
+            .unwrap();
         assert_eq!(on_reaction.len(), 1);
         assert_eq!(on_reaction[0].url, "https://all.test");
 
         // Revoking the filtered hook removes it from dispatch.
-        assert!(repo.revoke_outgoing(filtered_id).await.unwrap());
-        let on_message_after = repo.list_outgoing_for_room_event(room, "message").await.unwrap();
+        assert_eq!(
+            repo.revoke_outgoing(filtered_id, actor).await.unwrap(),
+            room
+        );
+        let on_message_after = repo
+            .list_outgoing_for_room_event(room, "message")
+            .await
+            .unwrap();
         assert_eq!(on_message_after.len(), 1);
         assert_eq!(on_message_after[0].url, "https://all.test");
     }
@@ -860,7 +988,10 @@ mod db_tests {
         assert!(!fresh.breaker.is_open_at(1_000_000));
 
         // Open it (5 failures, open until t=2_000_000) and read back via BOTH paths.
-        let open = BreakerState { failures: 5, open_until: Some(2_000_000) };
+        let open = BreakerState {
+            failures: 5,
+            open_until: Some(2_000_000),
+        };
         repo.record_breaker(id, open).await.unwrap();
 
         let via_target = repo.outgoing_target(id).await.unwrap().expect("target");
@@ -868,12 +999,17 @@ mod db_tests {
         assert!(via_target.breaker.is_open_at(1_999_999));
         assert!(!via_target.breaker.is_open_at(2_000_000));
 
-        let via_list = repo.list_outgoing_for_room_event(room, "message").await.unwrap();
+        let via_list = repo
+            .list_outgoing_for_room_event(room, "message")
+            .await
+            .unwrap();
         let hit = via_list.iter().find(|t| t.id == id).expect("listed");
         assert_eq!(hit.breaker, open);
 
         // Close it again (success) → both columns reset.
-        repo.record_breaker(id, BreakerState::default()).await.unwrap();
+        repo.record_breaker(id, BreakerState::default())
+            .await
+            .unwrap();
         let closed = repo.outgoing_target(id).await.unwrap().expect("target");
         assert_eq!(closed.breaker, BreakerState::default());
     }
@@ -889,7 +1025,14 @@ mod db_tests {
         let repo = WebhookRepo::new(p.clone());
         let (room, actor) = fixture(&p).await;
         let id = repo
-            .create_outgoing(room, "https://atomic.test", &generate_secret(), &[], Some("a"), actor)
+            .create_outgoing(
+                room,
+                "https://atomic.test",
+                &generate_secret(),
+                &[],
+                Some("a"),
+                actor,
+            )
             .await
             .unwrap();
 
@@ -897,27 +1040,57 @@ mod db_tests {
         // climbs 1..=THRESHOLD and the breaker opens exactly at the threshold.
         let mut last = BreakerState::default();
         for _ in 0..BREAKER_FAILURE_THRESHOLD {
-            last = repo.apply_breaker_outcome(id, DeliveryOutcome::Failure, 1_000).await.unwrap();
+            last = repo
+                .apply_breaker_outcome(id, DeliveryOutcome::Failure, 1_000)
+                .await
+                .unwrap();
         }
-        assert_eq!(last.failures, BREAKER_FAILURE_THRESHOLD, "N folds → N failures, not 1");
+        assert_eq!(
+            last.failures, BREAKER_FAILURE_THRESHOLD,
+            "N folds → N failures, not 1"
+        );
         assert!(last.is_open_at(1_000), "opened at the threshold");
         // The persisted row matches what the fold returned (it actually wrote).
-        let persisted = repo.outgoing_target(id).await.unwrap().expect("target").breaker;
+        let persisted = repo
+            .outgoing_target(id)
+            .await
+            .unwrap()
+            .expect("target")
+            .breaker;
         assert_eq!(persisted, last);
 
         // A 429 with a long cooldown, then a generic failure: the longer gate must
         // survive the failure fold (anti-shortening, now persisted atomically).
         let rl = repo
-            .apply_breaker_outcome(id, DeliveryOutcome::RateLimited { retry_after_secs: Some(3000) }, 2_000)
+            .apply_breaker_outcome(
+                id,
+                DeliveryOutcome::RateLimited {
+                    retry_after_secs: Some(3000),
+                },
+                2_000,
+            )
             .await
             .unwrap();
         assert_eq!(rl.open_until, Some(2_000 + 3000));
-        let after_fail = repo.apply_breaker_outcome(id, DeliveryOutcome::Failure, 2_010).await.unwrap();
-        assert_eq!(after_fail.open_until, Some(5_000), "429 cooldown not shortened by a later failure");
+        let after_fail = repo
+            .apply_breaker_outcome(id, DeliveryOutcome::Failure, 2_010)
+            .await
+            .unwrap();
+        assert_eq!(
+            after_fail.open_until,
+            Some(5_000),
+            "429 cooldown not shortened by a later failure"
+        );
 
         // Success closes it.
-        let ok = repo.apply_breaker_outcome(id, DeliveryOutcome::Success, 3_000).await.unwrap();
+        let ok = repo
+            .apply_breaker_outcome(id, DeliveryOutcome::Success, 3_000)
+            .await
+            .unwrap();
         assert_eq!(ok, BreakerState::default());
-        assert_eq!(repo.outgoing_target(id).await.unwrap().expect("t").breaker, BreakerState::default());
+        assert_eq!(
+            repo.outgoing_target(id).await.unwrap().expect("t").breaker,
+            BreakerState::default()
+        );
     }
 }

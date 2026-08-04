@@ -154,8 +154,8 @@ impl BlockInteractionRepo {
 #[cfg(test)]
 mod db_tests {
     use super::*;
-    use aero_common::Block;
     use crate::message::{MessageRepo, NewMessage};
+    use aero_common::Block;
 
     fn pool() -> PgPool {
         let url = std::env::var("DATABASE_URL")
@@ -187,7 +187,7 @@ mod db_tests {
         let id = RoomId::new();
         sqlx::query(
             "INSERT INTO rooms (id, kind, name, created_by, created_at, workspace_id)
-             VALUES ($1, 'channel', $2, $3, now(), $4::uuid)",
+             VALUES ($1, 'group', $2, $3, now(), $4::uuid)",
         )
         .bind(id.to_uuid())
         .bind(format!("bi-room-{id}"))

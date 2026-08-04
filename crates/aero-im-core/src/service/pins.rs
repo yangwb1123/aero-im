@@ -31,25 +31,21 @@ impl ImService {
         room: RoomId,
         message: MessageId,
     ) -> Result<bool> {
+        // Fast entry preflight; PinRepo repeats the canonical access decision
+        // under the same transaction as message containment and insertion.
         self.assert_room_access(actor, room).await?;
-        // The message must exist, not be deleted, and belong to this room — else a
-        // member of room A could pin room B's message into their panel.
-        let msg = self
-            .messages
-            .get(message)
-            .await?
-            .filter(|m| m.deleted_at.is_none())
-            .ok_or_else(|| Error::NotFound(format!("message {message}")))?;
-        if msg.room_id != room {
-            return Err(Error::Invalid(format!(
-                "message {message} does not belong to room {room}"
-            )));
-        }
-        let created = self.pins()?.pin(room, message, actor).await?;
+        let created = self.pins()?.pin_authorized(room, message, actor).await?;
+        // The authorized repository returns only after commit, so no event can
+        // advertise a pin that later rolls back.
         if created {
             self.publish_room_event(
                 room,
-                &RoomEvent::Pin { room_id: room, message_id: message, by: actor, op: PinOp::Pin },
+                &RoomEvent::Pin {
+                    room_id: room,
+                    message_id: message,
+                    by: actor,
+                    op: PinOp::Pin,
+                },
             )
             .await;
         }
@@ -65,12 +61,19 @@ impl ImService {
         room: RoomId,
         message: MessageId,
     ) -> Result<bool> {
+        // Fast entry preflight; commit-time authorization remains storage-owned.
         self.assert_room_access(actor, room).await?;
-        let removed = self.pins()?.unpin(room, message).await?;
+        let removed = self.pins()?.unpin_authorized(room, message, actor).await?;
+        // Publish only after the authorized delete committed.
         if removed {
             self.publish_room_event(
                 room,
-                &RoomEvent::Pin { room_id: room, message_id: message, by: actor, op: PinOp::Unpin },
+                &RoomEvent::Pin {
+                    room_id: room,
+                    message_id: message,
+                    by: actor,
+                    op: PinOp::Unpin,
+                },
             )
             .await;
         }
@@ -83,8 +86,10 @@ impl ImService {
         actor: ParticipantId,
         room: RoomId,
     ) -> Result<Vec<PinnedMessage>> {
+        // Keep the public seam's fast preflight, then repeat/hold current access
+        // through the storage read transaction.
         self.assert_room_access(actor, room).await?;
-        Ok(self.pins()?.list_for_room(room).await?)
+        self.pins()?.list_authorized(room, actor).await
     }
 
     /// Broadcast an already-constructed [`RoomEvent`] on the room's subject.

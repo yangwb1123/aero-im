@@ -18,7 +18,7 @@ use std::str::FromStr;
 
 use aero_auth::AuthUser;
 use aero_common::{ApprovalId, Error as AeroError, ParticipantId, WorkspaceId};
-use aero_storage::ApprovalRepo;
+use aero_storage::{ApprovalRepo, ApprovalWriteError};
 use axum::{
     extract::{Path, Query, State},
     routing::{get, post},
@@ -29,18 +29,15 @@ use serde::Deserialize;
 use crate::error::ApiResult;
 use crate::state::AppState;
 
+const MAX_APPROVAL_DETAILS_CHARS: usize = 10_000;
+const MAX_APPROVAL_NOTE_CHARS: usize = 2_000;
+
 /// All approval routes, ready to `.merge` into the gateway router.
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/workspaces/:id/approvals", post(create_approval))
-        .route(
-            "/api/workspaces/:id/approvals/incoming",
-            get(list_incoming),
-        )
-        .route(
-            "/api/workspaces/:id/approvals/outgoing",
-            get(list_outgoing),
-        )
+        .route("/api/workspaces/:id/approvals/incoming", get(list_incoming))
+        .route("/api/workspaces/:id/approvals/outgoing", get(list_outgoing))
         .route("/api/approvals/:aid/approve", post(approve_approval))
         .route("/api/approvals/:aid/deny", post(deny_approval))
 }
@@ -63,6 +60,36 @@ fn parse_participant(s: &str) -> Result<ParticipantId, AeroError> {
         .map_err(|e| AeroError::Invalid(format!("participant id: {e}")))
 }
 
+fn map_approval_write_error(error: ApprovalWriteError) -> AeroError {
+    match error {
+        ApprovalWriteError::Database(error) => AeroError::from(error),
+        ApprovalWriteError::RequesterNotMember => {
+            AeroError::Forbidden("requester is not an active workspace member".into())
+        }
+        ApprovalWriteError::ApproverNotMember => {
+            AeroError::Invalid("approver is not an active workspace member".into())
+        }
+        ApprovalWriteError::NotFound => AeroError::NotFound("approval".into()),
+        ApprovalWriteError::InvalidStatus => {
+            AeroError::Invalid("invalid approval decision status".into())
+        }
+    }
+}
+
+fn normalize_optional_text<'a>(
+    raw: Option<&'a str>,
+    field: &str,
+    max_chars: usize,
+) -> Result<Option<&'a str>, AeroError> {
+    let value = raw.map(str::trim).filter(|value| !value.is_empty());
+    if value.is_some_and(|value| value.chars().count() > max_chars) {
+        return Err(AeroError::Invalid(format!(
+            "{field} too long (max {max_chars} chars)"
+        )));
+    }
+    Ok(value)
+}
+
 /// Assert that `who` is a member of `workspace`, mapping a non-member to the given
 /// error. Mirrors `crate::saved_searches::assert_member`.
 async fn assert_member(
@@ -72,7 +99,7 @@ async fn assert_member(
     on_missing: AeroError,
 ) -> Result<(), AeroError> {
     s.workspaces
-        .member_role(workspace, who)
+        .effective_member_role(workspace, who)
         .await
         .map_err(AeroError::from)?
         .ok_or(on_missing)?;
@@ -127,16 +154,16 @@ async fn create_approval(
     if title.len() > 256 {
         return Err(AeroError::Invalid("title too long".into()).into());
     }
-    let details = req
-        .details
-        .as_deref()
-        .map(str::trim)
-        .filter(|d| !d.is_empty());
+    let details = normalize_optional_text(
+        req.details.as_deref(),
+        "details",
+        MAX_APPROVAL_DETAILS_CHARS,
+    )?;
 
     let id = repo(&s)
         .create(ws, auth.participant_id, approver, title, details)
         .await
-        .map_err(AeroError::from)?;
+        .map_err(map_approval_write_error)?;
     // Re-read so the response carries the full, canonical row (status/created_at).
     let row = repo(&s)
         .get(id)
@@ -172,7 +199,7 @@ async fn list_incoming(
     .await?;
     let status = q.status.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let list = repo(&s)
-        .list_for_approver(auth.participant_id, status)
+        .list_for_approver(ws, auth.participant_id, status)
         .await
         .map_err(AeroError::from)?;
     Ok(Json(serde_json::to_value(list).map_err(AeroError::from)?))
@@ -194,7 +221,7 @@ async fn list_outgoing(
     )
     .await?;
     let list = repo(&s)
-        .list_for_requester(auth.participant_id)
+        .list_for_requester(ws, auth.participant_id)
         .await
         .map_err(AeroError::from)?;
     Ok(Json(serde_json::to_value(list).map_err(AeroError::from)?))
@@ -218,22 +245,11 @@ async fn decide(
     status: &str,
     note: Option<&str>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let note = note.map(str::trim).filter(|n| !n.is_empty());
-    let changed = repo(s)
+    let note = normalize_optional_text(note, "note", MAX_APPROVAL_NOTE_CHARS)?;
+    let appr = repo(s)
         .decide(id, caller, status, note)
         .await
-        .map_err(AeroError::from)?;
-    if !changed {
-        // Either not the approver, unknown id, or already decided — all 404 so a
-        // non-approver can't probe which approvals exist.
-        return Err(AeroError::NotFound(format!("approval {id}")).into());
-    }
-    // Fetch the full approval row for the response and for the post-decision hook.
-    let appr = repo(s)
-        .get(id)
-        .await
-        .map_err(AeroError::from)?
-        .ok_or_else(|| AeroError::NotFound(format!("approval {id}")))?;
+        .map_err(map_approval_write_error)?;
 
     // ROADMAP 集成三: approval-approved → auto-create task (best-effort, non-blocking).
     // When an approval is approved, create a task in the requester's first room in the
@@ -242,32 +258,44 @@ async fn decide(
     // rooms in more than one workspace, and picking an unscoped "first room" could leak
     // the task into an unrelated tenant.
     if status == "approved" {
-        let rooms = s
+        match s
             .rooms
             .rooms_for_in_workspace(appr.requester_id, appr.workspace_id)
             .await
-            .map_err(|e| {
-                tracing::warn!(error = ?e, "failed to look up requester rooms for task creation");
-                AeroError::Internal(anyhow::anyhow!("room lookup"))
-            })?;
-        if let Some(first_room) = rooms.first() {
-            let task_title = format!("[Approved] {}", appr.title);
-            let task_id = aero_storage::TaskRepo::new(s.pg.clone())
-                .create(
-                    first_room.id,
-                    appr.requester_id,
-                    &task_title,
-                    Some(appr.requester_id),
-                    None,
-                    None,
-                )
-                .await;
-            match task_id {
-                Ok(_) => tracing::info!(%id, "auto-created task from approval approval"),
-                Err(e) => tracing::warn!(error = ?e, %id, "auto-create task from approval failed"),
+        {
+            Ok(rooms) => {
+                if let Some(first_room) = rooms.first() {
+                    let task_title = format!("[Approved] {}", appr.title);
+                    let task_id = aero_storage::TaskRepo::new(s.pg.clone())
+                        .create(
+                            first_room.id,
+                            appr.requester_id,
+                            &task_title,
+                            Some(appr.requester_id),
+                            None,
+                            None,
+                        )
+                        .await;
+                    match task_id {
+                        Ok(_) => tracing::info!(%id, "auto-created task from approval approval"),
+                        Err(e) => {
+                            tracing::warn!(error = ?e, %id, "auto-create task from approval failed");
+                        }
+                    }
+                } else {
+                    tracing::warn!(
+                        requester = %appr.requester_id,
+                        "no room found for task creation from approval"
+                    );
+                }
             }
-        } else {
-            tracing::warn!(requester = %appr.requester_id, "no room found for task creation from approval");
+            Err(e) => {
+                tracing::warn!(
+                    error = ?e,
+                    %id,
+                    "failed to look up requester rooms for task creation"
+                );
+            }
         }
     }
 
@@ -298,4 +326,46 @@ async fn deny_approval(
 ) -> ApiResult<Json<serde_json::Value>> {
     let id = parse_approval(&id_str)?;
     decide(&s, auth.participant_id, id, "denied", req.note.as_deref()).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn optional_approval_text_is_trimmed_and_blank_becomes_none() {
+        assert_eq!(
+            normalize_optional_text(Some("  context  "), "details", 20).unwrap(),
+            Some("context")
+        );
+        assert_eq!(
+            normalize_optional_text(Some(" \n "), "details", 20).unwrap(),
+            None
+        );
+        assert_eq!(normalize_optional_text(None, "note", 20).unwrap(), None);
+    }
+
+    #[test]
+    fn approval_details_and_note_have_character_limits() {
+        let details = "界".repeat(MAX_APPROVAL_DETAILS_CHARS);
+        assert_eq!(
+            normalize_optional_text(Some(&details), "details", MAX_APPROVAL_DETAILS_CHARS).unwrap(),
+            Some(details.as_str())
+        );
+        let overlong_details = format!("{details}界");
+        assert!(normalize_optional_text(
+            Some(&overlong_details),
+            "details",
+            MAX_APPROVAL_DETAILS_CHARS
+        )
+        .is_err());
+
+        let note = "n".repeat(MAX_APPROVAL_NOTE_CHARS + 1);
+        assert_eq!(
+            normalize_optional_text(Some(&note), "note", MAX_APPROVAL_NOTE_CHARS)
+                .unwrap_err()
+                .status_code(),
+            400
+        );
+    }
 }

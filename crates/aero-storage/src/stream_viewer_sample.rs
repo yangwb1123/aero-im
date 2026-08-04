@@ -188,7 +188,11 @@ impl StreamViewerSampleRepo {
         .await?
         .rows_affected();
 
-        Ok(RollupOutcome { rolled_up, raw_deleted, rollups_pruned })
+        Ok(RollupOutcome {
+            rolled_up,
+            raw_deleted,
+            rollups_pruned,
+        })
     }
 
     /// Maintain the daily `RANGE` partitions of `stream_viewer_samples`
@@ -210,11 +214,7 @@ impl StreamViewerSampleRepo {
     ///
     /// # Errors
     /// Propagates any [`sqlx::Error`] from the function call.
-    pub async fn ensure_partitions(
-        &self,
-        keep_days: i32,
-        ahead: i32,
-    ) -> Result<(), sqlx::Error> {
+    pub async fn ensure_partitions(&self, keep_days: i32, ahead: i32) -> Result<(), sqlx::Error> {
         sqlx::query("SELECT ensure_stream_viewer_sample_partitions($1, $2)")
             .bind(keep_days)
             .bind(ahead)
@@ -292,7 +292,11 @@ impl StreamViewerSampleRepo {
         // The peak is the avg viewers in the FIRST bucket (offset 0).
         let first_avg = {
             let (sum, cnt) = buckets.get(&0).copied().unwrap_or((0, 1));
-            if cnt == 0 { 1.0 } else { sum as f64 / cnt as f64 }
+            if cnt == 0 {
+                1.0
+            } else {
+                sum as f64 / cnt as f64
+            }
         };
         let peak_viewers = first_avg.max(1.0);
 
@@ -354,7 +358,10 @@ mod db_tests {
         }
         let s = repo.stats(stream).await.expect("stats");
         assert_eq!(s.peak, 10, "peak is the max sample");
-        assert!((s.avg - 6.0).abs() < 1e-9, "avg is the mean: (2+10+6)/3 = 6.0");
+        assert!(
+            (s.avg - 6.0).abs() < 1e-9,
+            "avg is the mean: (2+10+6)/3 = 6.0"
+        );
         assert_eq!(s.samples, 3, "three samples recorded");
 
         // Cleanup: remove the throwaway samples (no FK cascade to lean on).
@@ -395,8 +402,14 @@ mod db_tests {
             .rollup_and_downsample(7, 90)
             .await
             .expect("rollup_and_downsample");
-        assert!(out.rolled_up >= 1, "at least this stream's minute rolled up");
-        assert!(out.raw_deleted >= 3, "the 3 backdated raw samples downsampled away");
+        assert!(
+            out.rolled_up >= 1,
+            "at least this stream's minute rolled up"
+        );
+        assert!(
+            out.raw_deleted >= 3,
+            "the 3 backdated raw samples downsampled away"
+        );
 
         // The per-minute rollup must carry the right aggregate: avg (4+12+8)/3=8,
         // peak 12, count 3.
@@ -408,18 +421,20 @@ mod db_tests {
         .fetch_one(&p)
         .await
         .expect("rollup row exists");
-        assert!((avg - 8.0).abs() < 1e-9, "avg viewers (4+12+8)/3 = 8.0, got {avg}");
+        assert!(
+            (avg - 8.0).abs() < 1e-9,
+            "avg viewers (4+12+8)/3 = 8.0, got {avg}"
+        );
         assert_eq!(peak, 12, "peak viewers");
         assert_eq!(count, 3, "sample count");
 
         // The raw rows are gone (downsampled), but the aggregate survives.
-        let raw_left: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM stream_viewer_samples WHERE stream_id = $1",
-        )
-        .bind(sid)
-        .fetch_one(&p)
-        .await
-        .expect("count raw");
+        let raw_left: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM stream_viewer_samples WHERE stream_id = $1")
+                .bind(sid)
+                .fetch_one(&p)
+                .await
+                .expect("count raw");
         assert_eq!(raw_left, 0, "all backdated raw samples downsampled");
 
         // Cleanup both tables.

@@ -65,12 +65,15 @@ async fn save_message(
         .get(message)
         .await?
         .ok_or_else(|| AeroError::NotFound(format!("message {message}")))?;
-    s.im.assert_room_access(auth.participant_id, msg.room_id).await?;
+    s.im.assert_room_access(auth.participant_id, msg.room_id)
+        .await?;
     let note = req.note.as_deref().map(str::trim).filter(|n| !n.is_empty());
     let created = repo(&s)
         .save(auth.participant_id, message, msg.room_id, note)
         .await?;
-    Ok(Json(serde_json::json!({ "saved": true, "created": created })))
+    Ok(Json(
+        serde_json::json!({ "saved": true, "created": created }),
+    ))
 }
 
 /// `DELETE /api/messages/:id/save` — remove a saved message. Always scoped to the
@@ -82,7 +85,9 @@ async fn unsave_message(
 ) -> ApiResult<Json<serde_json::Value>> {
     let message = parse_message(&id_str)?;
     let removed = repo(&s).unsave(auth.participant_id, message).await?;
-    Ok(Json(serde_json::json!({ "saved": false, "removed": removed })))
+    Ok(Json(
+        serde_json::json!({ "saved": false, "removed": removed }),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -104,7 +109,12 @@ async fn list_saved(
     auth: AuthUser,
     Query(q): Query<SavedQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let collection = match q.collection_id.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+    let collection = match q
+        .collection_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+    {
         Some(c) => Some(
             BookmarkCollectionId::from_str(c)
                 .map_err(|e| AeroError::Invalid(format!("collection id: {e}")))?,

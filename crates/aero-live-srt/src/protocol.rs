@@ -1,7 +1,7 @@
 //! Minimal, hand-rolled SRT (Secure Reliable Transport) wire protocol.
 //!
-//! This implements *just enough* of SRT (HSv5) to accept an **unencrypted**
-//! caller→listener push of an MPEG-TS stream and hand the payload to the tested
+//! This implements *just enough* of SRT (HSv5) to accept a caller→listener
+//! MPEG-TS push (clear or AES-128-CTR protected) and hand the payload to the tested
 //! [`crate::segmenter::MpegTsSegmenter`]. It is deliberately dependency-free
 //! beyond `bytes`/`std` (no `srt-tokio`/`srt-protocol`), so the wire structs are
 //! parsed and serialized by hand here.
@@ -13,8 +13,8 @@
 //! - The 48-byte [`Handshake`] control-information field (CIF): version,
 //!   encryption field, extension field, initial sequence number, MTU, flow
 //!   window, handshake type, SRT socket id, SYN cookie and peer IP.
-//! - The handshake **extension** framing and, specifically, the **StreamID
-//!   (SID)** extension that carries `streamid=` from
+//! - The handshake **extension** framing, including KMREQ/KMRSP key material
+//!   and the **StreamID (SID)** extension that carries `streamid=` from
 //!   `srt://host:port?streamid=KEY` — including the per-32-bit-word byte
 //!   reversal mandated by the SRT spec.
 //! - A small [`HandshakeMachine`] for the listener side of the
@@ -22,7 +22,6 @@
 //!
 //! ## What is intentionally NOT modelled (pending)
 //!
-//! - Encryption (AES / `KMREQ`/`KMRSP`): out of scope — unencrypted only.
 //! - Reliability: ACK/ACKACK/NAK retransmission, RTT estimation and congestion
 //!   control. The v1 data plane assumes best-effort, in-order arrival.
 //! - Packet reordering / loss recovery and the periodic keep-alive timers.
@@ -39,6 +38,8 @@
 #![allow(clippy::doc_markdown)]
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+
+use crate::crypto::{KmKeyFlags, KmMessage, KmMessageType, SrtCrypto};
 
 /// Size of the common SRT packet header in bytes (4 × 32-bit words).
 pub const SRT_HEADER_LEN: usize = 16;
@@ -59,12 +60,16 @@ pub const SRT_MAGIC_CODE: u16 = 0x4A17;
 
 /// Encryption field value meaning "no encryption" (`HS_ENC_CLEAR`).
 pub const HS_ENC_CLEAR: u16 = 0;
+/// Encryption field value advertising AES-128 (`PBKEYLEN=16`).
+pub const HS_ENC_AES128: u16 = 2;
 
 /// Default MTU SRT negotiates (`m_iMSS`), in bytes.
 pub const SRT_DEFAULT_MTU: u32 = 1500;
 
 /// Default flow-window size SRT advertises, in packets.
 pub const SRT_DEFAULT_FLOW_WINDOW: u32 = 8192;
+/// Smallest flow window that can make forward progress.
+const SRT_MIN_FLOW_WINDOW: u32 = 2;
 
 /// Extension-field flag: an `HSREQ`/`HSRSP` block is present (`HS_EXT_HSREQ`).
 pub const HS_EXT_HSREQ: u16 = 0x0001;
@@ -91,6 +96,8 @@ pub enum ControlType {
     Shutdown,
     /// Acknowledgement of an ACK. `0x0006`.
     AckAck,
+    /// SRT user-defined control packet. `0x7FFF`; KMREQ/KMRSP use its subtype.
+    UserDefined,
     /// Any control type we don't special-case, preserved verbatim.
     Other(u16),
 }
@@ -106,6 +113,7 @@ impl ControlType {
             ControlType::Nak => 0x0003,
             ControlType::Shutdown => 0x0005,
             ControlType::AckAck => 0x0006,
+            ControlType::UserDefined => 0x7FFF,
             ControlType::Other(v) => v & 0x7FFF,
         }
     }
@@ -120,6 +128,7 @@ impl ControlType {
             0x0003 => ControlType::Nak,
             0x0005 => ControlType::Shutdown,
             0x0006 => ControlType::AckAck,
+            0x7FFF => ControlType::UserDefined,
             other => ControlType::Other(other),
         }
     }
@@ -210,8 +219,9 @@ impl SrtHeader {
                 subtype,
                 type_specific,
             } => {
-                let w0 =
-                    0x8000_0000 | (u32::from(control_type.code() & 0x7FFF) << 16) | u32::from(subtype);
+                let w0 = 0x8000_0000
+                    | (u32::from(control_type.code() & 0x7FFF) << 16)
+                    | u32::from(subtype);
                 (w0, type_specific)
             }
             PacketKind::Data { seq_no, msg_word } => (seq_no & 0x7FFF_FFFF, msg_word),
@@ -229,6 +239,87 @@ impl SrtHeader {
         self.write_to(&mut b);
         b.freeze()
     }
+}
+
+/// A malformed post-handshake KMREQ/KMRSP user-defined control packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyMaterialControlError {
+    /// KM controls reserve the type-specific word as zero.
+    NonZeroTypeSpecific(u32),
+    /// The CIF is not one exact, supported AES-128 KM message.
+    MalformedPayload,
+}
+
+impl std::fmt::Display for KeyMaterialControlError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NonZeroTypeSpecific(value) => {
+                write!(f, "KM control has non-zero type-specific word {value:#x}")
+            }
+            Self::MalformedPayload => write!(f, "KM control has malformed key material"),
+        }
+    }
+}
+
+impl std::error::Error for KeyMaterialControlError {}
+
+/// Decode an established-session KMREQ/KMRSP control packet.
+///
+/// `Ok(None)` means the packet is not a key-material control. Once the
+/// UserDefined/subtype pair identifies KM, malformed contents are an error
+/// rather than being downgraded to an unrelated control packet.
+pub fn decode_key_material_control(
+    datagram: &[u8],
+) -> Result<Option<KmMessage>, KeyMaterialControlError> {
+    let Some(header) = SrtHeader::parse(datagram) else {
+        return Ok(None);
+    };
+    let (subtype, type_specific) = match header.kind {
+        PacketKind::Control {
+            control_type: ControlType::UserDefined,
+            subtype,
+            type_specific,
+        } if matches!(subtype, SRT_CMD_KMREQ | SRT_CMD_KMRSP) => (subtype, type_specific),
+        _ => return Ok(None),
+    };
+    if type_specific != 0 {
+        return Err(KeyMaterialControlError::NonZeroTypeSpecific(type_specific));
+    }
+    let mut message = KmMessage::decode(&datagram[SRT_HEADER_LEN..])
+        .ok_or(KeyMaterialControlError::MalformedPayload)?;
+    message.msg_type = if subtype == SRT_CMD_KMRSP {
+        KmMessageType::Response
+    } else {
+        KmMessageType::Request
+    };
+    Ok(Some(message))
+}
+
+/// Encode a complete established-session KMREQ/KMRSP user-defined control.
+#[must_use]
+pub fn encode_key_material_control(
+    message: &KmMessage,
+    dest_socket_id: u32,
+    timestamp: u32,
+) -> Bytes {
+    let subtype = match message.msg_type {
+        KmMessageType::Request => SRT_CMD_KMREQ,
+        KmMessageType::Response => SRT_CMD_KMRSP,
+    };
+    let encoded = message.encode();
+    let mut out = BytesMut::with_capacity(SRT_HEADER_LEN + encoded.len());
+    SrtHeader {
+        kind: PacketKind::Control {
+            control_type: ControlType::UserDefined,
+            subtype,
+            type_specific: 0,
+        },
+        timestamp,
+        dest_socket_id,
+    }
+    .write_to(&mut out);
+    out.put_slice(&encoded);
+    out.freeze()
 }
 
 /// SRT handshake "request type" (the 32-bit Handshake Type field).
@@ -331,6 +422,11 @@ pub enum HsExtension {
         recv_tsbpd_delay: u16,
         send_tsbpd_delay: u16,
     },
+    /// `SRT_CMD_KMREQ` (3) / `SRT_CMD_KMRSP` (4): AES key material.
+    ///
+    /// The command direction is represented by [`KmMessage::msg_type`]; the KM
+    /// contents themselves are identical in request and successful response.
+    KeyMaterial(KmMessage),
     /// `SRT_CMD_SID` (5): the StreamID string (the stream key for our ingest).
     StreamId(String),
     /// Any other extension, preserved as `(type, raw-contents)` so it
@@ -342,6 +438,10 @@ pub enum HsExtension {
 const SRT_CMD_HSREQ: u16 = 1;
 /// Extension command type: `SRT_CMD_HSRSP`.
 const SRT_CMD_HSRSP: u16 = 2;
+/// Extension command type: `SRT_CMD_KMREQ`.
+pub const SRT_CMD_KMREQ: u16 = 3;
+/// Extension command type: `SRT_CMD_KMRSP`.
+pub const SRT_CMD_KMRSP: u16 = 4;
 /// Extension command type: `SRT_CMD_SID` (StreamID).
 const SRT_CMD_SID: u16 = 5;
 
@@ -426,6 +526,12 @@ impl Handshake {
         for ext in &self.extensions {
             match ext {
                 HsExtension::HsReq { .. } => flags |= HS_EXT_HSREQ,
+                HsExtension::KeyMaterial(_) => flags |= HS_EXT_KMREQ,
+                HsExtension::Other { ext_type, .. }
+                    if matches!(*ext_type, SRT_CMD_KMREQ | SRT_CMD_KMRSP) =>
+                {
+                    flags |= HS_EXT_KMREQ;
+                }
                 HsExtension::StreamId(_) | HsExtension::Other { .. } => flags |= HS_EXT_CONFIG,
             }
         }
@@ -459,8 +565,10 @@ fn parse_extensions(mut buf: &[u8]) -> Vec<HsExtension> {
         let contents = &buf[4..4 + content_len];
         match ext_type {
             SRT_CMD_HSREQ | SRT_CMD_HSRSP if content_len >= 12 => {
-                let srt_version = u32::from_be_bytes([contents[0], contents[1], contents[2], contents[3]]);
-                let srt_flags = u32::from_be_bytes([contents[4], contents[5], contents[6], contents[7]]);
+                let srt_version =
+                    u32::from_be_bytes([contents[0], contents[1], contents[2], contents[3]]);
+                let srt_flags =
+                    u32::from_be_bytes([contents[4], contents[5], contents[6], contents[7]]);
                 let recv_tsbpd_delay = u16::from_be_bytes([contents[8], contents[9]]);
                 let send_tsbpd_delay = u16::from_be_bytes([contents[10], contents[11]]);
                 out.push(HsExtension::HsReq {
@@ -470,6 +578,24 @@ fn parse_extensions(mut buf: &[u8]) -> Vec<HsExtension> {
                     recv_tsbpd_delay,
                     send_tsbpd_delay,
                 });
+            }
+            SRT_CMD_KMREQ | SRT_CMD_KMRSP => {
+                if let Some(mut km) = KmMessage::decode(contents) {
+                    km.msg_type = if ext_type == SRT_CMD_KMRSP {
+                        KmMessageType::Response
+                    } else {
+                        KmMessageType::Request
+                    };
+                    out.push(HsExtension::KeyMaterial(km));
+                } else {
+                    // Preserve malformed key material so the handshake policy
+                    // can reject it explicitly rather than treating it as
+                    // absent or silently skipping to clear mode.
+                    out.push(HsExtension::Other {
+                        ext_type,
+                        contents: Bytes::copy_from_slice(contents),
+                    });
+                }
             }
             SRT_CMD_SID => {
                 out.push(HsExtension::StreamId(decode_stream_id(contents)));
@@ -496,13 +622,27 @@ fn write_extension(out: &mut BytesMut, ext: &HsExtension) {
             recv_tsbpd_delay,
             send_tsbpd_delay,
         } => {
-            let cmd = if *is_response { SRT_CMD_HSRSP } else { SRT_CMD_HSREQ };
+            let cmd = if *is_response {
+                SRT_CMD_HSRSP
+            } else {
+                SRT_CMD_HSREQ
+            };
             out.put_u16(cmd);
             out.put_u16(3); // 3 words of contents
             out.put_u32(*srt_version);
             out.put_u32(*srt_flags);
             out.put_u16(*recv_tsbpd_delay);
             out.put_u16(*send_tsbpd_delay);
+        }
+        HsExtension::KeyMaterial(km) => {
+            let encoded = km.encode();
+            let cmd = match km.msg_type {
+                KmMessageType::Request => SRT_CMD_KMREQ,
+                KmMessageType::Response => SRT_CMD_KMRSP,
+            };
+            out.put_u16(cmd);
+            out.put_u16(u16::try_from(encoded.len() / 4).unwrap_or(u16::MAX));
+            out.put_slice(&encoded);
         }
         HsExtension::StreamId(sid) => {
             let encoded = encode_stream_id(sid);
@@ -577,6 +717,30 @@ pub enum HandshakeError {
     /// A CONCLUSION carried no StreamID extension, so we can't resolve a stream.
     #[error("conclusion missing streamid extension")]
     MissingStreamId,
+    /// A peer advertised a flow window too small to make forward progress.
+    #[error("invalid SRT flow window {0}; expected at least 2 packets")]
+    InvalidFlowWindow(u32),
+    /// Encryption is configured locally, but the caller did not negotiate it.
+    #[error("encrypted SRT listener requires AES-128 KMREQ negotiation")]
+    EncryptionRequired,
+    /// The caller attempted encryption against a clear-only listener.
+    #[error("caller requested encryption but the SRT listener has no passphrase")]
+    UnexpectedEncryption,
+    /// The caller advertised an encryption mode this listener does not support.
+    #[error("unsupported SRT handshake encryption field {0}")]
+    UnsupportedEncryption(u16),
+    /// The caller declared KMREQ but supplied no valid request extension.
+    #[error("conclusion missing KMREQ key-material extension")]
+    MissingKeyMaterial,
+    /// A KM extension was malformed, duplicated, or used in the wrong direction.
+    #[error("malformed or unexpected SRT key-material extension")]
+    MalformedKeyMaterial,
+    /// The configured passphrase could not unwrap the caller's SEK.
+    #[error("SRT key material does not match the configured passphrase")]
+    BadSecret,
+    /// Only the default passphrase-derived KEKI is supported.
+    #[error("unsupported SRT key-encryption-key index {0}")]
+    UnsupportedKeki(u32),
     /// An unexpected handshake type for the current state.
     #[error("unexpected handshake type for current state")]
     UnexpectedType,
@@ -604,23 +768,31 @@ pub enum HsAction {
     Established {
         stream_id: String,
         agreement: Bytes,
+        /// Maximum receive flow window accepted from the caller, in packets.
+        /// Full ACKs must advertise available capacity no greater than this.
+        flow_window: u32,
+        /// Validated AES-CTR context negotiated from KMREQ, or `None` for a
+        /// clear-mode listener.
+        crypto: Option<SrtCrypto>,
     },
     /// Nothing to do (e.g. a duplicate/unknown packet we safely ignore).
     Ignore,
 }
 
-/// Minimal listener-side SRT (HSv5) handshake driver for the unencrypted case.
+/// Minimal listener-side SRT (HSv5) caller/listener handshake driver.
 ///
 /// Drives the INDUCTION → CONCLUSION exchange:
 /// 1. Caller → INDUCTION (version 4, cookie 0).
 /// 2. Listener → INDUCTION response (version 5, magic `0x4A17`, fresh cookie).
-/// 3. Caller → CONCLUSION (version 5, echoes the cookie, carries HSREQ + SID).
-/// 4. Listener → CONCLUSION response (HSRSP); connection established.
+/// 3. Caller → CONCLUSION (version 5, echoes the cookie, carries HSREQ + SID
+///    and, when configured, an AES-128 KMREQ).
+/// 4. Listener → CONCLUSION response (HSRSP and matching KMRSP); connection
+///    established only after the SEK is successfully unwrapped.
 ///
 /// SYN cookies are minted from the peer address + a coarse (1-minute) clock so a
 /// stale or spoofed CONCLUSION is rejected. The cookie secret/seed and clock are
 /// injected so the machine is deterministic under test.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HandshakeMachine {
     /// Our (listener) SRT socket id, echoed to the caller.
     listener_socket_id: u32,
@@ -631,6 +803,21 @@ pub struct HandshakeMachine {
     issued_cookie: Option<u32>,
     /// The caller's SRT socket id, learned from its INDUCTION.
     peer_socket_id: u32,
+    /// Shared secret required for encrypted mode. Kept out of `Debug`.
+    passphrase: Option<Vec<u8>>,
+}
+
+impl std::fmt::Debug for HandshakeMachine {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HandshakeMachine")
+            .field("listener_socket_id", &self.listener_socket_id)
+            .field("cookie_seed", &"[redacted]")
+            .field("state", &self.state)
+            .field("issued_cookie", &self.issued_cookie)
+            .field("peer_socket_id", &self.peer_socket_id)
+            .field("encryption_required", &self.passphrase.is_some())
+            .finish()
+    }
 }
 
 impl HandshakeMachine {
@@ -646,7 +833,17 @@ impl HandshakeMachine {
             state: HsState::Init,
             issued_cookie: None,
             peer_socket_id: 0,
+            passphrase: None,
         }
+    }
+
+    /// Require AES-128 encryption and validate the caller's KMREQ with
+    /// `passphrase`. Without this builder the machine remains clear-only and
+    /// rejects callers that advertise encryption.
+    #[must_use]
+    pub fn with_passphrase(mut self, passphrase: impl Into<Vec<u8>>) -> Self {
+        self.passphrase = Some(passphrase.into());
+        self
     }
 
     /// Current state of the handshake.
@@ -730,7 +927,8 @@ impl HandshakeMachine {
         if control_type != ControlType::Handshake {
             return Ok(HsAction::Ignore);
         }
-        let hs = Handshake::parse(&datagram[SRT_HEADER_LEN..]).ok_or(HandshakeError::NotHandshake)?;
+        let hs =
+            Handshake::parse(&datagram[SRT_HEADER_LEN..]).ok_or(HandshakeError::NotHandshake)?;
 
         match hs.handshake_type {
             HandshakeType::Induction => self.on_induction(&hs, peer, now_unix),
@@ -749,6 +947,7 @@ impl HandshakeMachine {
         peer: std::net::SocketAddr,
         now_unix: i64,
     ) -> Result<HsAction, HandshakeError> {
+        let flow_window = accepted_flow_window(caller.flow_window)?;
         self.peer_socket_id = caller.srt_socket_id;
         let cookie = self.make_cookie(peer, now_unix);
         self.issued_cookie = Some(cookie);
@@ -756,13 +955,17 @@ impl HandshakeMachine {
 
         let hs = Handshake {
             version: SRT_VERSION_HSV5,
-            encryption_field: HS_ENC_CLEAR,
+            encryption_field: if self.passphrase.is_some() {
+                HS_ENC_AES128
+            } else {
+                HS_ENC_CLEAR
+            },
             // The INDUCTION-response magic lives in the extension field and is
             // NOT an extension block, so set it directly.
             extension_field: SRT_MAGIC_CODE,
             initial_seq_no: caller.initial_seq_no,
             mtu: caller.mtu.min(SRT_DEFAULT_MTU),
-            flow_window: caller.flow_window.min(SRT_DEFAULT_FLOW_WINDOW),
+            flow_window,
             handshake_type: HandshakeType::Induction,
             srt_socket_id: self.listener_socket_id,
             syn_cookie: cookie,
@@ -788,10 +991,13 @@ impl HandshakeMachine {
             .stream_id()
             .ok_or(HandshakeError::MissingStreamId)?
             .to_string();
+        let flow_window = accepted_flow_window(caller.flow_window)?;
         self.peer_socket_id = caller.srt_socket_id;
+        let (crypto, kmrsp) = self.negotiate_crypto(caller)?;
 
-        // Build the CONCLUSION response: mirror the caller, reply with an HSRSP
-        // capability block (unencrypted, so no KMRSP). We don't echo the SID.
+        // Build the CONCLUSION response: mirror the caller and reply with an
+        // HSRSP capability block plus the accepted KM contents as KMRSP for an
+        // encrypted connection. We don't echo the SID.
         let hsrsp = HsExtension::HsReq {
             is_response: true,
             srt_version: srt_version_word(),
@@ -799,25 +1005,97 @@ impl HandshakeMachine {
             recv_tsbpd_delay: caller_recv_delay(caller),
             send_tsbpd_delay: 0,
         };
+        let mut extensions = vec![hsrsp];
+        if let Some(kmrsp) = kmrsp {
+            extensions.push(HsExtension::KeyMaterial(kmrsp));
+        }
         let hs = Handshake {
             version: SRT_VERSION_HSV5,
-            encryption_field: HS_ENC_CLEAR,
+            encryption_field: if crypto.is_some() {
+                HS_ENC_AES128
+            } else {
+                HS_ENC_CLEAR
+            },
             extension_field: 0, // recomputed from `extensions` on serialize
             initial_seq_no: caller.initial_seq_no,
             mtu: caller.mtu.min(SRT_DEFAULT_MTU),
-            flow_window: caller.flow_window.min(SRT_DEFAULT_FLOW_WINDOW),
+            flow_window,
             handshake_type: HandshakeType::Conclusion,
             srt_socket_id: self.listener_socket_id,
             syn_cookie: caller.syn_cookie,
             peer_ip: caller.peer_ip,
-            extensions: vec![hsrsp],
+            extensions,
         };
         let agreement = self.wrap_control(&hs);
         self.state = HsState::Done;
         Ok(HsAction::Established {
             stream_id,
             agreement,
+            flow_window,
+            crypto,
         })
+    }
+
+    /// Enforce the listener's clear/encrypted policy and, for encrypted mode,
+    /// unwrap the caller's SEK before any stream-side effects are allowed.
+    fn negotiate_crypto(
+        &self,
+        caller: &Handshake,
+    ) -> Result<(Option<SrtCrypto>, Option<KmMessage>), HandshakeError> {
+        let malformed_km = caller.extensions.iter().any(|ext| {
+            matches!(
+                ext,
+                HsExtension::Other { ext_type, .. }
+                    if matches!(*ext_type, SRT_CMD_KMREQ | SRT_CMD_KMRSP)
+            )
+        });
+        if malformed_km {
+            return Err(HandshakeError::MalformedKeyMaterial);
+        }
+
+        let key_material: Vec<&KmMessage> = caller
+            .extensions
+            .iter()
+            .filter_map(|ext| match ext {
+                HsExtension::KeyMaterial(km) => Some(km),
+                _ => None,
+            })
+            .collect();
+
+        let Some(passphrase) = self.passphrase.as_deref() else {
+            if caller.encryption_field != HS_ENC_CLEAR || !key_material.is_empty() {
+                return Err(HandshakeError::UnexpectedEncryption);
+            }
+            return Ok((None, None));
+        };
+
+        if caller.encryption_field == HS_ENC_CLEAR {
+            return Err(HandshakeError::EncryptionRequired);
+        }
+        if caller.encryption_field != HS_ENC_AES128 {
+            return Err(HandshakeError::UnsupportedEncryption(
+                caller.encryption_field,
+            ));
+        }
+        if key_material.is_empty() {
+            return Err(HandshakeError::MissingKeyMaterial);
+        }
+        if key_material.len() != 1
+            || key_material[0].msg_type != KmMessageType::Request
+            || key_material[0].key_flags != KmKeyFlags::Even
+        {
+            return Err(HandshakeError::MalformedKeyMaterial);
+        }
+
+        let kmreq = key_material[0];
+        if kmreq.keki != 0 {
+            return Err(HandshakeError::UnsupportedKeki(kmreq.keki));
+        }
+        let crypto =
+            SrtCrypto::from_km_message(kmreq, passphrase).map_err(|_| HandshakeError::BadSecret)?;
+        let mut kmrsp = kmreq.clone();
+        kmrsp.msg_type = KmMessageType::Response;
+        Ok((Some(crypto), Some(kmrsp)))
     }
 
     /// Wrap a handshake CIF in a full SRT control packet (header + CIF), aimed
@@ -851,6 +1129,15 @@ fn srt_version_word() -> u32 {
     0x0001_0500
 }
 
+/// Accept the caller's advertised receive-flight limit without exceeding the
+/// listener's bounded packet capacity.
+fn accepted_flow_window(requested: u32) -> Result<u32, HandshakeError> {
+    if requested < SRT_MIN_FLOW_WINDOW {
+        return Err(HandshakeError::InvalidFlowWindow(requested));
+    }
+    Ok(requested.min(SRT_DEFAULT_FLOW_WINDOW))
+}
+
 /// Echo the caller's negotiated HS flags in our HSRSP (a real implementation
 /// would intersect capabilities; for the unencrypted MPEG-TS path mirroring is
 /// adequate).
@@ -878,7 +1165,6 @@ fn caller_recv_delay(caller: &Handshake) -> u16 {
         })
         .unwrap_or(0)
 }
-
 
 #[cfg(test)]
 mod tests;

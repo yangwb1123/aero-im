@@ -19,7 +19,9 @@
 use std::str::FromStr;
 
 use aero_auth::AuthUser;
-use aero_common::{Error as AeroError, ParticipantId, Result as AeroResult, WorkspaceId, WorkspaceRole};
+use aero_common::{
+    Error as AeroError, ParticipantId, Result as AeroResult, WorkspaceId, WorkspaceRole,
+};
 use aero_storage::UsageReportRepo;
 use axum::{
     extract::{Path, State},
@@ -63,7 +65,7 @@ async fn assert_admin(
 ) -> Result<(), AeroError> {
     let role = s
         .workspaces
-        .member_role(workspace, caller)
+        .effective_member_role(workspace, caller)
         .await
         .map_err(AeroError::from)?
         .ok_or_else(|| AeroError::Forbidden("not a workspace member".into()))?;

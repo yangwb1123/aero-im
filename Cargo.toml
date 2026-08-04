@@ -1,5 +1,15 @@
 [workspace]
 resolver = "2"
+exclude = [
+    "vendor/aero-str0m-msrv/dimpl",
+    "vendor/aero-str0m-msrv/is",
+    "vendor/aero-str0m-msrv/rcgen",
+    "vendor/aero-str0m-msrv/sctp-proto",
+    "vendor/aero-str0m-msrv/str0m",
+    "vendor/aero-str0m-msrv/str0m-proto",
+    "vendor/aero-str0m-msrv/str0m-rust-crypto",
+    "vendor/uppsala-msrv/uppsala",
+]
 members = [
     "crates/aero-common",
     "crates/aero-bus",
@@ -79,7 +89,7 @@ hyper       = { version = "1", features = ["full"] }
 # Serialization
 serde       = { version = "1", features = ["derive"] }
 serde_json  = "1"
-serde_with  = "3"
+serde_with  = "=3.16.1"
 
 # Errors
 thiserror   = "1"
@@ -95,8 +105,8 @@ opentelemetry_sdk  = { version = "0.26", features = ["rt-tokio", "metrics"] }
 
 # Identity / time
 ulid        = { version = "1", features = ["serde"] }
-uuid        = { version = "1", features = ["v4", "v5", "v7", "serde"] }
-time        = { version = "0.3", features = ["serde", "macros", "formatting"] }
+uuid        = { version = "=1.18.1", features = ["v4", "v5", "v7", "serde"] }
+time        = { version = "=0.3.41", features = ["serde", "macros", "formatting"] }
 chrono      = { version = "0.4", features = ["serde"] }
 
 # Persistence
@@ -137,7 +147,7 @@ pretty_assertions = "1"
 
 # Misc
 bytes       = "1"
-url         = { version = "2", features = ["serde"] }
+url         = { version = "=2.5.4", features = ["serde"] }
 itertools   = "0.13"
 parking_lot = "0.12"
 dashmap     = "6"

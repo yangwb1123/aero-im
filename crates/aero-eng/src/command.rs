@@ -49,7 +49,12 @@ impl CommandResult {
     /// Build a success result.
     #[must_use]
     pub fn ok(command: &str, duration: Duration) -> Self {
-        Self { command: command.to_owned(), exit_code: 0, duration, detail: None }
+        Self {
+            command: command.to_owned(),
+            exit_code: 0,
+            duration,
+            detail: None,
+        }
     }
 
     /// Build a failure result.

@@ -9,20 +9,31 @@
 use aero_common::{Block, Message, MessageId, ParticipantId, RoomId};
 use sqlx::PgPool;
 
+pub(crate) mod authorization;
 /// Core CRUD: insert, get, edit, soft-delete, voice transcript, embedding.
 pub mod crud;
+/// Transactional edit/delete plus durable message-aggregate events.
+pub mod events;
+/// Sender-scoped client-message idempotency ledger.
+pub mod idempotency;
+pub mod orig;
 /// Query methods: list_recent, changes_since, list_since, by_sender, etc.
 pub mod query;
+
+#[cfg(test)]
+mod authorization_tests;
+#[cfg(test)]
+mod barrier_tests;
+#[cfg(test)]
+mod reply_scope_tests;
 /// Full-text + vector search across rooms and workspaces.
 pub mod search;
+/// Expiry sweeps: ephemeral + retention.
+pub mod sweep;
 /// Thread operations: replies, summary, participants.
 pub mod thread;
 /// Unread-count aggregation.
 pub mod unread;
-/// Expiry sweeps: ephemeral + retention.
-pub mod sweep;
-pub mod orig;
-/// Original monolithic module (for incremental extraction).
 
 // ---------------------------------------------------------------------------
 // Public types (moved here from the original message.rs so sub-modules can
@@ -46,6 +57,80 @@ pub struct NewMessage {
     pub expires_at: Option<time::OffsetDateTime>,
 }
 
+/// Optional sender-scoped key attached to an outboxed message insert.
+#[derive(Debug, Clone, Copy)]
+pub struct MessageIdempotency {
+    pub client_message_id: uuid::Uuid,
+    pub request_hash: [u8; 32],
+}
+
+impl MessageIdempotency {
+    #[must_use]
+    pub const fn new(client_message_id: uuid::Uuid, request_hash: [u8; 32]) -> Self {
+        Self {
+            client_message_id,
+            request_hash,
+        }
+    }
+}
+
+/// Result of an idempotent message insert.
+#[derive(Debug, Clone)]
+pub enum MessageInsertOutcome {
+    /// This request created the canonical message.
+    Created(Message),
+    /// The same sender/key/payload was already committed.
+    Existing(Message),
+}
+
+impl MessageInsertOutcome {
+    #[must_use]
+    pub fn message(&self) -> &Message {
+        match self {
+            Self::Created(message) | Self::Existing(message) => message,
+        }
+    }
+
+    #[must_use]
+    pub const fn deduplicated(&self) -> bool {
+        matches!(self, Self::Existing(_))
+    }
+
+    #[must_use]
+    pub fn into_message(self) -> Message {
+        match self {
+            Self::Created(message) | Self::Existing(message) => message,
+        }
+    }
+}
+
+/// Atomic message/outbox insert result.
+///
+/// `outbox_id` always identifies the canonical message's retained outbox row,
+/// including when [`outcome`](Self::outcome) is deduplicated.
+#[derive(Debug, Clone)]
+pub struct OutboxedMessageInsert {
+    pub outcome: MessageInsertOutcome,
+    pub outbox_id: uuid::Uuid,
+}
+
+impl OutboxedMessageInsert {
+    #[must_use]
+    pub fn message(&self) -> &Message {
+        self.outcome.message()
+    }
+
+    #[must_use]
+    pub const fn deduplicated(&self) -> bool {
+        self.outcome.deduplicated()
+    }
+
+    #[must_use]
+    pub fn into_message(self) -> Message {
+        self.outcome.into_message()
+    }
+}
+
 /// Search result row carrying the message + a relevance score.
 #[derive(Debug, Clone)]
 pub struct SearchHit {
@@ -59,7 +144,6 @@ impl MessageRepo {
         Self { pool }
     }
 }
-
 
 /// pgvector HNSW `ef_search` to use for a vector query — the size of the
 /// candidate list the index walk maintains.
@@ -169,7 +253,3 @@ impl From<MessageRow> for Message {
         }
     }
 }
-
-
-
-

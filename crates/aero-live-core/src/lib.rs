@@ -12,13 +12,6 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
-/// Best-effort callback fired right after a stream is marked live. Decoupled from
-/// the event bus so this crate needn't depend on `aero-bus`: the server wires a
-/// closure that publishes the go-live event the follower-notification bot fans
-/// out. Without it, RTMP/SRT go-lives would mark the stream live but never notify
-/// followers (only WHIP, which has the bus, did).
-pub type GoLiveHook = Arc<dyn Fn(Ulid) + Send + Sync>;
-
 /// Runtime configuration shared between all live-ingest backends.
 ///
 /// `hls_dir` is the root under which `{stream_id}/index.m3u8` directories live;
@@ -27,9 +20,6 @@ pub type GoLiveHook = Arc<dyn Fn(Ulid) + Send + Sync>;
 pub struct LiveStreamConfig {
     pub hls_dir: PathBuf,
     pub rtmp_listen: SocketAddr,
-    /// Fired (best-effort) when a stream goes live, after `mark_live`. `None` in
-    /// tests / standalone use ⇒ no follower notification.
-    pub go_live: Option<GoLiveHook>,
 }
 
 impl std::fmt::Debug for LiveStreamConfig {
@@ -37,7 +27,6 @@ impl std::fmt::Debug for LiveStreamConfig {
         f.debug_struct("LiveStreamConfig")
             .field("hls_dir", &self.hls_dir)
             .field("rtmp_listen", &self.rtmp_listen)
-            .field("go_live", &self.go_live.as_ref().map(|_| "<hook>"))
             .finish()
     }
 }
@@ -51,7 +40,6 @@ impl LiveStreamConfig {
             rtmp_listen: "0.0.0.0:1935"
                 .parse()
                 .expect("hard-coded RTMP default address parses"),
-            go_live: None,
         }
     }
 
@@ -102,7 +90,7 @@ pub enum IngestEvent {
 }
 
 /// Errors that the ingest pipeline can surface to its caller.
-#[derive(Debug, thiserror::Error)]
+#[derive(thiserror::Error)]
 pub enum LiveError {
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
@@ -110,7 +98,10 @@ pub enum LiveError {
     #[error("database: {0}")]
     Database(#[from] sqlx::Error),
 
-    #[error("unknown stream key: {0}")]
+    // Retain the attempted key for typed handling, but never interpolate it
+    // into Display: ingest errors are routinely written to server logs and the
+    // key is a publisher credential.
+    #[error("unknown stream key")]
     UnknownStreamKey(String),
 
     #[error("protocol error: {0}")]
@@ -118,6 +109,18 @@ pub enum LiveError {
 
     #[error("internal: {0}")]
     Internal(#[from] anyhow::Error),
+}
+
+impl std::fmt::Debug for LiveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(error) => f.debug_tuple("Io").field(error).finish(),
+            Self::Database(error) => f.debug_tuple("Database").field(error).finish(),
+            Self::UnknownStreamKey(_) => f.write_str("UnknownStreamKey([REDACTED])"),
+            Self::Protocol(error) => f.debug_tuple("Protocol").field(error).finish(),
+            Self::Internal(error) => f.debug_tuple("Internal").field(error).finish(),
+        }
+    }
 }
 
 pub type LiveResult<T> = Result<T, LiveError>;
@@ -147,12 +150,27 @@ mod tests {
         let root = PathBuf::from("/var/aero/hls");
         let p = hls_path_for(&root, id);
         assert!(p.starts_with(&root));
-        assert_eq!(p.file_name().and_then(|s| s.to_str()), Some(id.to_string().as_str()));
+        assert_eq!(
+            p.file_name().and_then(|s| s.to_str()),
+            Some(id.to_string().as_str())
+        );
     }
 
     #[test]
     fn local_dev_config_parses() {
         let cfg = LiveStreamConfig::local_dev();
         assert_eq!(cfg.rtmp_listen.port(), 1935);
+    }
+
+    #[test]
+    fn unknown_stream_key_display_redacts_publisher_credential() {
+        let secret = "publisher-secret-that-must-not-reach-logs";
+        let error = LiveError::UnknownStreamKey(secret.to_owned());
+        let rendered = error.to_string();
+        assert_eq!(rendered, "unknown stream key");
+        assert!(!rendered.contains(secret));
+        let debug = format!("{error:?}");
+        assert_eq!(debug, "UnknownStreamKey([REDACTED])");
+        assert!(!debug.contains(secret));
     }
 }

@@ -82,7 +82,9 @@ async fn owned_stream(
         .map_err(AeroError::from)?
         .ok_or_else(|| AeroError::NotFound(format!("stream {stream_id}")))?;
     if stream.owner_id != caller {
-        return Err(AeroError::Forbidden("only the stream owner may do that".into()));
+        return Err(AeroError::Forbidden(
+            "only the stream owner may do that".into(),
+        ));
     }
     Ok(stream)
 }
@@ -168,8 +170,13 @@ async fn set_record(
     let id = parse_stream_id(&id_str)?;
     // Ownership gate (existence + owner) before flipping the flag.
     owned_stream(&s, id, auth.participant_id).await?;
-    repo(&s).set_recording(id, req.on).await.map_err(AeroError::from)?;
-    Ok(Json(serde_json::json!({ "stream_id": id.to_string(), "recording": req.on })))
+    repo(&s)
+        .set_recording(id, req.on)
+        .await
+        .map_err(AeroError::from)?;
+    Ok(Json(
+        serde_json::json!({ "stream_id": id.to_string(), "recording": req.on }),
+    ))
 }
 
 /// `POST /api/streams/:id/vod` — owner: explicitly finalize the stream into a VOD
@@ -229,7 +236,10 @@ async fn list_room_vods(
 ) -> ApiResult<Json<serde_json::Value>> {
     let room = parse_room_id(&id_str)?;
     s.im.assert_room_access(auth.participant_id, room).await?;
-    let vods = repo(&s).list_for_room(room, q.limit).await.map_err(AeroError::from)?;
+    let vods = repo(&s)
+        .list_for_room(room, q.limit)
+        .await
+        .map_err(AeroError::from)?;
     let out: Vec<serde_json::Value> = vods.iter().map(|v| vod_json(&s, v)).collect();
     Ok(Json(serde_json::json!({ "vods": out })))
 }
@@ -258,7 +268,10 @@ async fn delete_vod(
     Path(id_str): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let id = parse_vod_id(&id_str)?;
-    let removed = repo(&s).delete(id, auth.participant_id).await.map_err(AeroError::from)?;
+    let removed = repo(&s)
+        .delete(id, auth.participant_id)
+        .await
+        .map_err(AeroError::from)?;
     if !removed {
         return Err(AeroError::NotFound("vod".into()).into());
     }
@@ -296,7 +309,12 @@ mod tests {
     fn duration_is_whole_seconds_when_both_timestamps_present() {
         let start = OffsetDateTime::UNIX_EPOCH;
         let end = start + time::Duration::seconds(3661);
-        let s = stream_with(StreamStatus::Ended, Some("/hls/x/index.m3u8"), Some(start), Some(end));
+        let s = stream_with(
+            StreamStatus::Ended,
+            Some("/hls/x/index.m3u8"),
+            Some(start),
+            Some(end),
+        );
         assert_eq!(stream_duration_secs(&s), Some(3661));
     }
 
@@ -304,12 +322,22 @@ mod tests {
     fn duration_is_none_when_a_timestamp_is_missing() {
         let start = OffsetDateTime::UNIX_EPOCH;
         assert_eq!(
-            stream_duration_secs(&stream_with(StreamStatus::Live, Some("/hls/x"), Some(start), None)),
+            stream_duration_secs(&stream_with(
+                StreamStatus::Live,
+                Some("/hls/x"),
+                Some(start),
+                None
+            )),
             None,
             "live stream has no end yet"
         );
         assert_eq!(
-            stream_duration_secs(&stream_with(StreamStatus::Ended, Some("/hls/x"), None, Some(start))),
+            stream_duration_secs(&stream_with(
+                StreamStatus::Ended,
+                Some("/hls/x"),
+                None,
+                Some(start)
+            )),
             None,
             "missing start"
         );

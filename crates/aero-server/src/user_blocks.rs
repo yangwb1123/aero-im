@@ -23,7 +23,10 @@ use crate::state::AppState;
 /// All user-block routes, ready to `.merge` into the gateway router.
 pub fn router() -> Router<AppState> {
     Router::new()
-        .route("/api/users/:user_id/block", post(block_user).delete(unblock_user))
+        .route(
+            "/api/users/:user_id/block",
+            post(block_user).delete(unblock_user),
+        )
         .route("/api/me/blocks", get(list_blocks))
 }
 

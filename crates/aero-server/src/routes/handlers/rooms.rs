@@ -16,10 +16,8 @@ const DEFAULT_WORKSPACE_ID: WorkspaceId = WorkspaceId(ulid::Ulid(0));
 /// [`AeroError::Invalid`] when a present id fails to decode as a [`WorkspaceId`].
 fn resolve_workspace_id(requested: Option<&str>) -> AeroResult<WorkspaceId> {
     match requested {
-        Some(raw) => {
-            WorkspaceId::from_str(raw.trim())
-                .map_err(|e| AeroError::Invalid(format!("workspace id: {e}")))
-        }
+        Some(raw) => WorkspaceId::from_str(raw.trim())
+            .map_err(|e| AeroError::Invalid(format!("workspace id: {e}"))),
         None => Ok(DEFAULT_WORKSPACE_ID),
     }
 }
@@ -36,12 +34,22 @@ struct CreateRoomReq {
     workspace_id: Option<String>,
 }
 
+fn validate_generic_room_kind(kind: RoomKind) -> AeroResult<RoomKind> {
+    if kind == RoomKind::Direct {
+        Err(AeroError::Invalid(
+            "direct rooms must be created through /api/dm".into(),
+        ))
+    } else {
+        Ok(kind)
+    }
+}
+
 async fn create_room(
     State(s): State<AppState>,
     auth: AuthUser,
     Json(req): Json<CreateRoomReq>,
 ) -> ApiResult<Response> {
-    let kind = parse_room_kind(&req.kind)?;
+    let kind = validate_generic_room_kind(parse_room_kind(&req.kind)?)?;
     let workspace = resolve_workspace_id(req.workspace_id.as_deref())?;
     // Normalize the name like create_workspace: trim, treat blank as "no name"
     // (DM/group rooms are legitimately unnamed), and cap length so a malformed or
@@ -55,9 +63,13 @@ async fn create_room(
     // Tenant choke point: verifies workspace membership + channel-create privilege
     // and persists `rooms.workspace_id` (fixes the NOT-NULL room-create regression
     // the old `create_room` hit after migration 0006).
-    let room = s
-        .im
-        .create_room_in_workspace(auth.participant_id, workspace, kind, name.map(str::to_owned))
+    let room =
+        s.im.create_room_in_workspace(
+            auth.participant_id,
+            workspace,
+            kind,
+            name.map(str::to_owned),
+        )
         .await?;
     let body = Json(serde_json::to_value(room).map_err(AeroError::from)?).into_response();
     // Per-tenant HTTP metrics (response-extension pass-through): we already
@@ -85,6 +97,15 @@ async fn list_rooms(
         Some(raw) => {
             let ws = WorkspaceId::from_str(raw.trim())
                 .map_err(|e| AeroError::Invalid(format!("workspace id: {e}")))?;
+            // A scoped listing is workspace data even when the caller happens to
+            // have no room edges. Reject retained membership rows that no longer
+            // satisfy account/deactivation/mandatory-2FA policy before querying.
+            crate::routes::helpers::assert_effective_workspace_member(
+                &s,
+                ws,
+                auth.participant_id,
+            )
+            .await?;
             let rooms = s
                 .rooms
                 .rooms_for_in_workspace(auth.participant_id, ws)
@@ -148,7 +169,9 @@ const MAX_HISTORY_LIMIT: i64 = 200;
 /// `[1, MAX_HISTORY_LIMIT]`. Pure, so the cap/floor is unit-tested offline.
 #[must_use]
 fn history_limit(requested: Option<i64>) -> i64 {
-    requested.unwrap_or(DEFAULT_HISTORY_LIMIT).clamp(1, MAX_HISTORY_LIMIT)
+    requested
+        .unwrap_or(DEFAULT_HISTORY_LIMIT)
+        .clamp(1, MAX_HISTORY_LIMIT)
 }
 
 /// Parse an optional `MessageId` cursor query param, mapping a decode failure to
@@ -157,6 +180,47 @@ fn parse_cursor(raw: Option<&str>, field: &str) -> AeroResult<Option<MessageId>>
     raw.map(|s| MessageId::from_str(s.trim()))
         .transpose()
         .map_err(|e| AeroError::Invalid(format!("{field} id: {e}")))
+}
+
+/// Only an explicitly older, backward page tolerates replica lag. The newest
+/// page and forward reconnect catch-up are read-after-write/convergence paths.
+fn history_query_consistency(
+    before: Option<MessageId>,
+    since: Option<MessageId>,
+    has_newer_visible_message: bool,
+) -> aero_storage::QueryConsistency {
+    if before.is_some() && since.is_none() && has_newer_visible_message {
+        aero_storage::QueryConsistency::Eventual
+    } else {
+        aero_storage::QueryConsistency::Strong
+    }
+}
+
+/// Prove on primary that a `before` cursor really denotes an older page.
+///
+/// Merely receiving `before=...` is not enough: a client can send a future ULID,
+/// in which case `id < before` is actually the newest page. Keeping that case on
+/// primary preserves the latest/read-your-writes contract without relying on
+/// callers to choose a truthful cursor.
+async fn has_newer_visible_message(
+    pool: &sqlx::PgPool,
+    room: RoomId,
+    before: MessageId,
+) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        r"SELECT EXISTS(
+              SELECT 1
+                FROM messages
+               WHERE room_id = $1
+                 AND id > $2
+                 AND deleted_at IS NULL
+                 AND (expires_at IS NULL OR expires_at > now())
+          )",
+    )
+    .bind(room.to_uuid())
+    .bind(before.to_uuid())
+    .fetch_one(pool)
+    .await
 }
 
 async fn room_history(
@@ -181,6 +245,7 @@ async fn room_history(
         return Err(AeroError::Invalid("before and since are mutually exclusive".into()).into());
     }
     let since = parse_cursor(q.since.as_deref(), "since")?;
+    let before = parse_cursor(q.before.as_deref(), "before")?;
 
     if let Some(after) = since {
         // Forward catch-up (ROADMAP 方向五). Access already asserted above;
@@ -192,12 +257,42 @@ async fn room_history(
         // discarded and the query hardcoded `LIMIT 500`, so a continuation past 500
         // silently truncated with no signal — messages 501..N were lost for any
         // client that trusted the (incorrect) "returns all" contract.
-        let msgs = s.messages.list_since(room, after, limit).await.map_err(AeroError::from)?;
+        let msgs = s
+            .messages
+            .list_since(room, after, limit)
+            .await
+            .map_err(AeroError::from)?;
         return Ok(Json(serde_json::to_value(msgs).map_err(AeroError::from)?));
     }
 
-    let before = parse_cursor(q.before.as_deref(), "before")?;
-    let msgs = s.im.history(auth.participant_id, room, before, limit).await?;
+    // Full authorization above ran on primary. Only old backward pages go to
+    // the optional replica; the newest page stays strong for read-after-write.
+    let has_newer = match before {
+        Some(cursor) => has_newer_visible_message(&s.pg, room, cursor)
+            .await
+            .map_err(AeroError::from)?,
+        None => false,
+    };
+    let consistency = history_query_consistency(before, since, has_newer);
+    let messages = aero_storage::MessageRepo::new(s.query_router.repo_pool(consistency));
+    let msgs = match messages.list_recent(room, before, limit).await {
+        Ok(messages) => messages,
+        Err(error)
+            if consistency == aero_storage::QueryConsistency::Eventual
+                && s.query_router.has_replica() =>
+        {
+            tracing::warn!(
+                %room,
+                ?error,
+                "history read replica failed; retrying the old page on primary"
+            );
+            s.messages
+                .list_recent(room, before, limit)
+                .await
+                .map_err(AeroError::from)?
+        }
+        Err(error) => return Err(AeroError::from(error).into()),
+    };
     Ok(Json(serde_json::to_value(msgs).map_err(AeroError::from)?))
 }
 
@@ -242,4 +337,3 @@ async fn room_changes(
         .map_err(AeroError::from)?;
     Ok(Json(serde_json::to_value(msgs).map_err(AeroError::from)?))
 }
-

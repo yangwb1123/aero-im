@@ -380,7 +380,7 @@ mod tests {
         // Stream starts at 65534. 65535 arrives first, then 65534 fills the gap.
         let start = u16::MAX - 1; // 65534
         let mut buf: ReorderBuffer<&'static str> = ReorderBuffer::with_start(start, 16);
-        let rmax = push_drain(&mut buf, u16::MAX, "last");    // buffered
+        let rmax = push_drain(&mut buf, u16::MAX, "last"); // buffered
         let rprev = push_drain(&mut buf, u16::MAX - 1, "prev"); // fills gap
         assert_eq!(rmax, vec![], "65535 buffered; 65534 not yet seen");
         // 65534 fills the gap → both drain in order.

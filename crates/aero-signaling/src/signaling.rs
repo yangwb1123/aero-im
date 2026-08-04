@@ -69,10 +69,12 @@ pub fn validate_ice_candidate(candidate: &Value) -> Result<(), SignalingError> {
 
     let cand = obj
         .get("candidate")
-        .ok_or(SignalingError::InvalidCandidate("missing 'candidate' field"))?;
-    let cand_str = cand
-        .as_str()
-        .ok_or(SignalingError::InvalidCandidate("'candidate' is not a string"))?;
+        .ok_or(SignalingError::InvalidCandidate(
+            "missing 'candidate' field",
+        ))?;
+    let cand_str = cand.as_str().ok_or(SignalingError::InvalidCandidate(
+        "'candidate' is not a string",
+    ))?;
     if cand_str.is_empty() {
         return Err(SignalingError::InvalidCandidate("'candidate' is empty"));
     }
@@ -136,7 +138,9 @@ pub fn validate_call_event(ev: &CallEvent) -> Result<(), SignalingError> {
         CallEvent::Ice { candidate, .. } => validate_ice_candidate(candidate),
         CallEvent::End { reason, .. } => {
             if reason.len() > 256 {
-                return Err(SignalingError::Protocol("end reason exceeds 256 bytes".into()));
+                return Err(SignalingError::Protocol(
+                    "end reason exceeds 256 bytes".into(),
+                ));
             }
             Ok(())
         }
@@ -145,13 +149,18 @@ pub fn validate_call_event(ev: &CallEvent) -> Result<(), SignalingError> {
                 return Err(SignalingError::Protocol("caption text is empty".into()));
             }
             if text.len() > 2000 {
-                return Err(SignalingError::Protocol("caption text exceeds 2000 bytes".into()));
+                return Err(SignalingError::Protocol(
+                    "caption text exceeds 2000 bytes".into(),
+                ));
             }
             Ok(())
         }
         // Group-call (P6 mesh) coordination events: membership signals carry no
         // SDP; the per-pair `Offer` does.
-        CallEvent::Join { .. } | CallEvent::Leave { .. } | CallEvent::Roster { .. } => Ok(()),
+        CallEvent::Join { .. }
+        | CallEvent::Leave { .. }
+        | CallEvent::Roster { .. }
+        | CallEvent::SfuPublisher { .. } => Ok(()),
         CallEvent::Offer { sdp, .. } => validate_sdp(sdp),
     }
 }

@@ -64,7 +64,11 @@ pub fn fuse_rankings(
         .map(|(score, id)| {
             let row = rows[&id];
             #[allow(clippy::cast_possible_truncation)]
-            SearchHit { message: row.message.clone(), score: score as f32, headline: None }
+            SearchHit {
+                message: row.message.clone(),
+                score: score as f32,
+                headline: None,
+            }
         })
         .collect()
 }
@@ -108,7 +112,11 @@ mod tests {
     fn empty_fts_degrades_to_vector_order() {
         let vector = vec![hit(30, 0.9), hit(10, 0.8), hit(20, 0.7), hit(40, 0.6)];
         let fused = fuse_rankings(&vector, &[], 3);
-        assert_eq!(ids(&fused), ids(&vector[..3]), "vector order preserved, truncated to k");
+        assert_eq!(
+            ids(&fused),
+            ids(&vector[..3]),
+            "vector order preserved, truncated to k"
+        );
     }
 
     /// Symmetric degrade: empty vector list (e.g. nothing embedded yet) yields
@@ -136,7 +144,10 @@ mod tests {
         let fts = vec![hit(400, 0.8), shared.clone(), hit(500, 0.2)];
 
         let fused = fuse_rankings(&vector, &fts, 10);
-        assert_eq!(fused[0].message.id, shared.message.id, "double-listed hit wins");
+        assert_eq!(
+            fused[0].message.id, shared.message.id,
+            "double-listed hit wins"
+        );
         assert_eq!(fused.len(), 5, "union of distinct candidates");
 
         let expected = 2.0 / (RRF_K + 2.0);
@@ -156,7 +167,10 @@ mod tests {
         let fts = vec![hit(20, 0.7), hit(30, 0.6)];
 
         let fused = fuse_rankings(&vector, &fts, 10);
-        let got: Vec<u64> = fused.iter().map(|h| h.message.id.as_ulid().timestamp_ms()).collect();
+        let got: Vec<u64> = fused
+            .iter()
+            .map(|h| h.message.id.as_ulid().timestamp_ms())
+            .collect();
         // Rank-1 pair first (newer 20 before 10), then rank-2 pair (40 before 30).
         assert_eq!(got, vec![20, 10, 40, 30]);
     }

@@ -1,7 +1,7 @@
 //! AUTHZ GUARDRAIL source-lint (ROADMAP 第三版 方向五 鉴权护栏).
 //!
 //! Tenant isolation in this server lives in per-handler guard calls
-//! (`assert_room_access`, `member_role`, …) — one forgotten call in a new
+//! (`assert_room_access`, `effective_member_role`, …) — one forgotten call in a new
 //! feature is a cross-tenant data leak. This test string-scans every handler
 //! in `src/*.rs`: an `async fn` that takes a `Path<…>` extractor AND parses a
 //! `RoomId`/`WorkspaceId` out of it must contain at least one sanctioned
@@ -35,15 +35,19 @@ const SANCTIONED_GUARDS: &[&str] = &[
     // The canonical tenant guard (ImService): workspace membership + room
     // membership + deactivation + 2FA gates, NotFound on unknown room.
     "assert_room_access(",
-    // Direct room/workspace membership lookup used as a gate.
-    ".is_member(",
-    // Workspace role resolution: `None` for non-members; every caller rejects
-    // on `None` or feeds the role into an RBAC decision.
-    "member_role(",
+    // Channel routes use the canonical room guard above and then require the
+    // exact `RoomKind::Channel`; argument order remains participant, room.
+    "assert_channel_access(",
+    // Effective workspace role resolution also rejects deleted/deactivated
+    // callers and members missing mandatory 2FA.
+    "effective_member_role(",
+    // Shared server helpers over effective_member_role / its batch equivalent.
+    "assert_effective_workspace_member(",
+    "assert_effective_workspace_members(",
     // RBAC check over an already-resolved workspace role (Owner/Admin).
     "can_administer",
     // Per-module "caller must be a workspace member" helpers (the
-    // saved_searches/directory pattern): member_role + Forbidden on None.
+    // saved_searches/directory pattern): effective role + Forbidden on None.
     "assert_member(",
     // Per-module admin gates: assert_admin / assert_admin_or_creator
     // (announcements, deactivation, legal_holds, channel_retention, …).
@@ -52,7 +56,11 @@ const SANCTIONED_GUARDS: &[&str] = &[
     "assert_owner(",
     // join_requests: room-creator-or-workspace-admin decision guard.
     "assert_can_decide(",
-    // workspaces/emoji/guests/invitations…: member_role + Forbidden on
+    // org_chart: selected-workspace effective membership and self/admin
+    // management decisions.
+    "assert_effective_member(",
+    "assert_can_manage(",
+    // workspaces/emoji/guests/invitations…: effective role + Forbidden on
     // non-member, returning the role for a follow-up RBAC check.
     "caller_role(",
     // user_groups: membership guard returning the caller's role.
@@ -62,10 +70,11 @@ const SANCTIONED_GUARDS: &[&str] = &[
     "scim_workspace(",
 ];
 
-/// Sanctioned delegations: `ImService` methods that take the acting
-/// participant FIRST and enforce access INSIDE the service (verified one by
-/// one in `aero-im-core/src/service.rs`). A handler that hands the parsed id
-/// straight to one of these is guarded by construction.
+/// Sanctioned delegations: exact `ImService`/storage methods that bind the
+/// acting participant and enforce access inside the delegated operation,
+/// verified one by one at their definitions. Room-facing service calls keep
+/// the canonical participant-first argument order. A handler that hands the
+/// parsed id straight to one of these is guarded by construction.
 const SERVICE_ENFORCED_CALLS: &[&str] = &[
     // workspace-membership + guest-confinement + private/archived gates.
     ".join_channel(",
@@ -87,6 +96,66 @@ const SERVICE_ENFORCED_CALLS: &[&str] = &[
     ".unpin_message(",
     // room-membership + post-policy + moderation gates.
     ".send_message(",
+    // Workspace guest mutations lock and re-check the caller's current
+    // owner/admin membership, target membership and room tenancy in the same
+    // transaction that writes both workspace/room edges.
+    ".add_guest_authorized(",
+    ".remove_guest_authorized(",
+    // User-group mutations likewise resolve the current workspace role (or
+    // group creator), group tenant and target membership under row locks before
+    // applying the mutation. These names are intentionally exact rather than a
+    // broad `_authorized` marker, so an unrelated method cannot bypass the lint.
+    ".create_authorized(",
+    ".delete_authorized(",
+    ".add_member_authorized(",
+    ".remove_member_authorized(",
+    // Deactivation governance resolves and locks the effective caller role,
+    // target role, hierarchy, and audit event in the storage transaction.
+    ".deactivate_authorized(",
+    ".reactivate_authorized(",
+    // SCIM credential minting and revocation lock the token/workspace and
+    // re-check the effective Owner/Admin before changing durable credentials.
+    ".create_token_authorized(",
+    ".revoke_token_authorized(",
+    // The inventory read takes the same workspace governance lock and performs
+    // the same effective Owner/Admin recheck before returning credential data.
+    ".list_tokens_authorized(",
+    // These service methods delegate to transaction-owned RoomRepo mutations:
+    // workspace -> room -> membership locks, effective-access recheck, update,
+    // then commit. Keep the exact names so a generic setter cannot pass.
+    ".set_channel_slowmode(",
+    ".set_channel_reaction_limit(",
+    // Global session termination locks the workspace and validates an effective
+    // owner plus target membership before revoking the participant's sessions.
+    ".revoke_workspace_member_sessions_authorized(",
+    // Enterprise security settings and allowlist mutations use the shared
+    // workspace governance lock and effective-admin recheck in storage.
+    ".set_require_2fa_authorized(",
+    ".set_region_code_authorized(",
+    ".add_authorized(",
+    ".remove_authorized(",
+    // Rate-tier changes are Owner-only. The storage transaction locks the
+    // workspace and rechecks the actor's current effective owner role before
+    // updating, so the handler intentionally avoids a stale preflight read.
+    ".set_rate_tier_authorized(",
+    // AI DLQ requeue binds job id + workspace and rechecks the current
+    // effective Owner/Admin under the workspace governance lock.
+    ".requeue_for_workspace_authorized(",
+    // Canvas/op/bookmark repositories bind every opaque resource id to the
+    // parsed room and hold canonical effective live-channel access through the
+    // read/write transaction. Keep the exact feature-specific method names.
+    ".create_canvas_authorized(",
+    ".get_canvas_authorized(",
+    ".list_canvases_authorized(",
+    ".update_canvas_authorized(",
+    ".delete_canvas_authorized(",
+    ".append_canvas_op_authorized(",
+    ".list_canvas_ops_authorized(",
+    ".add_channel_bookmark_authorized(",
+    ".get_channel_bookmark_authorized(",
+    ".list_channel_bookmarks_authorized(",
+    ".update_channel_bookmark_authorized(",
+    ".delete_channel_bookmark_authorized(",
 ];
 
 /// Handlers that parse a room/workspace id but legitimately need NO authz
@@ -103,6 +172,15 @@ const ALLOWLIST: &[(&str, &str)] = &[
     ("channel_sections.rs", "add_channel"),
     ("channel_sections.rs", "remove_channel"),
 ];
+
+/// Deliberate raw workspace-role reads. These are target/governance lookups,
+/// never authorization of the current request caller.
+const RAW_MEMBER_ROLE_ALLOWLIST: &[(&str, &str)] = &[];
+
+/// Deliberate raw membership reads. These inspect an internal target, never
+/// authorize an HTTP/WS caller.
+const RAW_IS_MEMBER_ALLOWLIST: &[(&str, &str)] =
+    &[("agent_bot.rs", "state.rooms.is_member(room, bot.id)")];
 
 /// `Some(fn_name)` when `line` starts (column 0) a top-level `async fn`.
 /// Indented fns (impl blocks, nested test modules) are intentionally skipped —
@@ -171,7 +249,11 @@ fn scan_handlers() -> Vec<Candidate> {
                     .iter()
                     .chain(SERVICE_ENFORCED_CALLS)
                     .any(|g| body.contains(g));
-                out.push(Candidate { file: file_name.clone(), name: name.to_owned(), guarded });
+                out.push(Candidate {
+                    file: file_name.clone(),
+                    name: name.to_owned(),
+                    guarded,
+                });
             }
             i = j + 1;
         }
@@ -194,7 +276,9 @@ fn every_room_or_workspace_handler_is_authz_guarded() {
         candidates.len()
     );
     assert!(
-        candidates.iter().any(|c| c.file == "polls.rs" && c.name == "create_poll"),
+        candidates
+            .iter()
+            .any(|c| c.file == "polls.rs" && c.name == "create_poll"),
         "authz lint scanner lost a known-guarded handler (polls.rs::create_poll) — \
          the scan heuristics in tests/authz_lint.rs have rotted; fix the scanner"
     );
@@ -203,7 +287,9 @@ fn every_room_or_workspace_handler_is_authz_guarded() {
     // handler, otherwise the exemption is dead weight (or hiding a rename).
     for (file, name) in ALLOWLIST {
         assert!(
-            candidates.iter().any(|c| c.file == *file && c.name == *name),
+            candidates
+                .iter()
+                .any(|c| c.file == *file && c.name == *name),
             "stale allowlist entry {file}::{name} in tests/authz_lint.rs — the \
              handler no longer exists (or no longer parses a room/workspace id); \
              remove the entry"
@@ -222,13 +308,287 @@ fn every_room_or_workspace_handler_is_authz_guarded() {
         "\nAUTHZ GUARDRAIL: handler(s) take a room/workspace id from the request \
          path but never call a sanctioned authorization guard:\n{}\n\n\
          Fix: call `s.im.assert_room_access(auth.participant_id, room).await?` \
-         (room data), or gate on `s.workspaces.member_role(ws, caller)` / a local \
+         (room data), or gate on `s.workspaces.effective_member_role(ws, caller)` / a local \
          `assert_member`/`assert_admin` helper (workspace data), BEFORE touching \
          tenant data. If the handler is genuinely public or is authorized another \
          way (owner-scoped SQL, token-derived tenant, service-internal gate), add \
          it to ALLOWLIST / SERVICE_ENFORCED_CALLS in tests/authz_lint.rs WITH a \
          comment justifying why.\n",
         offenders.join("\n")
+    );
+}
+
+/// A bare membership role ignores account deletion, workspace deactivation,
+/// and mandatory 2FA. Keep raw reads out of request authorization; the sole
+/// exception is an effective admin inspecting a target membership so they can
+/// revoke that target's sessions even after deactivation.
+#[test]
+fn raw_workspace_role_reads_are_precisely_allowlisted() {
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut pending = vec![src.clone()];
+    let mut sources = Vec::new();
+    while let Some(dir) = pending.pop() {
+        for entry in fs::read_dir(&dir).expect("read server source directory") {
+            let path = entry.expect("source entry").path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                sources.push(path);
+            }
+        }
+    }
+    sources.sort();
+
+    let mut offenders = Vec::new();
+    let mut allowlist_hits = vec![0_usize; RAW_MEMBER_ROLE_ALLOWLIST.len()];
+    for path in sources {
+        let relative = path
+            .strip_prefix(&src)
+            .expect("source path under source root")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let text = fs::read_to_string(&path).expect("read source file");
+        for (line_index, line) in text.lines().enumerate() {
+            if !line.contains(".member_role(") {
+                continue;
+            }
+            let allowed = RAW_MEMBER_ROLE_ALLOWLIST
+                .iter()
+                .enumerate()
+                .find(|(_, (file, needle))| relative == *file && line.contains(needle));
+            if let Some((index, _)) = allowed {
+                allowlist_hits[index] += 1;
+            } else {
+                offenders.push(format!("  {relative}:{}", line_index + 1));
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "\nAUTHZ GUARDRAIL: raw `WorkspaceRepo::member_role` reads are forbidden \
+         in server request paths because they bypass account deletion, workspace \
+         deactivation, and mandatory 2FA:\n{}\n\nUse \
+         `effective_member_role` for the current caller. Add an exception only \
+         for a precisely documented target/governance lookup.\n",
+        offenders.join("\n")
+    );
+    for ((file, needle), hits) in RAW_MEMBER_ROLE_ALLOWLIST.iter().zip(allowlist_hits) {
+        assert_eq!(
+            hits, 1,
+            "raw member-role allowlist entry `{file}` / `{needle}` matched {hits} \
+             times; keep every exception precise and remove stale entries"
+        );
+    }
+}
+
+/// A bare `is_member` result ignores account deletion, workspace deactivation,
+/// and mandatory 2FA. Keep it unavailable as a generic request guard.
+#[test]
+fn raw_membership_reads_are_precisely_allowlisted() {
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut pending = vec![src.clone()];
+    let mut sources = Vec::new();
+    while let Some(dir) = pending.pop() {
+        for entry in fs::read_dir(&dir).expect("read server source directory") {
+            let path = entry.expect("source entry").path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                sources.push(path);
+            }
+        }
+    }
+    sources.sort();
+
+    let mut offenders = Vec::new();
+    let mut allowlist_hits = vec![0_usize; RAW_IS_MEMBER_ALLOWLIST.len()];
+    for path in sources {
+        let relative = path
+            .strip_prefix(&src)
+            .expect("source path under source root")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let text = fs::read_to_string(&path).expect("read source file");
+        for (line_index, line) in text.lines().enumerate() {
+            if !line.contains(".is_member(") {
+                continue;
+            }
+            let allowed = RAW_IS_MEMBER_ALLOWLIST
+                .iter()
+                .enumerate()
+                .find(|(_, (file, needle))| relative == *file && line.contains(needle));
+            if let Some((index, _)) = allowed {
+                allowlist_hits[index] += 1;
+            } else {
+                offenders.push(format!("  {relative}:{}", line_index + 1));
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "\nAUTHZ GUARDRAIL: raw `is_member` reads are not caller authorization; \
+         use `assert_room_access` or `effective_member_role`:\n{}",
+        offenders.join("\n")
+    );
+    for ((file, needle), hits) in RAW_IS_MEMBER_ALLOWLIST.iter().zip(allowlist_hits) {
+        assert_eq!(
+            hits, 1,
+            "raw is-member allowlist `{file}` / `{needle}` matched {hits} times"
+        );
+    }
+}
+
+fn top_level_fn_body<'a>(source: &'a str, name: &str) -> &'a str {
+    let marker = format!("async fn {name}(");
+    let start = source
+        .find(&marker)
+        .unwrap_or_else(|| panic!("missing function {name}"));
+    let rest = &source[start..];
+    let end = rest
+        .find("\n}\n")
+        .unwrap_or_else(|| panic!("missing end of function {name}"));
+    &rest[..end + 2]
+}
+
+/// Pin the ordering on the high-risk room entry points that do not carry a room
+/// id until after find-or-create/listing. This complements the generic path-id
+/// scanner, which cannot infer authorization from `/api/dm`'s body/target shape.
+#[test]
+fn dm_and_room_listing_guards_precede_data_access() {
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let dm = fs::read_to_string(src.join("dm.rs")).unwrap();
+    let group = fs::read_to_string(src.join("group_dm.rs")).unwrap();
+    let rooms = fs::read_to_string(src.join("routes/handlers/rooms.rs")).unwrap();
+    let ws_frame = fs::read_to_string(src.join("ws/ws_impl/frame.rs")).unwrap();
+
+    for (body, guard, access, label) in [
+        (
+            top_level_fn_body(&dm, "open_dm"),
+            "assert_effective_workspace_members(",
+            ".find_or_create_in_workspace(",
+            "open_dm",
+        ),
+        (
+            top_level_fn_body(&dm, "list_dms"),
+            "assert_effective_workspace_member(",
+            ".rooms_for_in_workspace(",
+            "list_dms",
+        ),
+        (
+            top_level_fn_body(&group, "open_group_dm"),
+            "assert_effective_workspace_members(",
+            ".find_or_create_in_workspace(",
+            "open_group_dm",
+        ),
+        (
+            top_level_fn_body(&group, "list_group_dms"),
+            "assert_effective_workspace_member(",
+            ".list_for_participant_in_workspace(",
+            "list_group_dms",
+        ),
+        (
+            top_level_fn_body(&group, "set_group_dm_name"),
+            "assert_room_access(",
+            ".patch_metadata(",
+            "set_group_dm_name",
+        ),
+        (
+            top_level_fn_body(&rooms, "list_rooms"),
+            "assert_effective_workspace_member(",
+            ".rooms_for_in_workspace(",
+            "list_rooms scoped branch",
+        ),
+    ] {
+        let guard_at = body
+            .find(guard)
+            .unwrap_or_else(|| panic!("{label} lost guard {guard}"));
+        let access_at = body
+            .find(access)
+            .unwrap_or_else(|| panic!("{label} lost access marker {access}"));
+        assert!(
+            guard_at < access_at,
+            "{label} must guard before touching room/workspace data"
+        );
+    }
+
+    let join_start = ws_frame.find("ClientFrame::JoinRoom").unwrap();
+    let join_end = ws_frame[join_start..]
+        .find("ClientFrame::SendMessage")
+        .map(|offset| join_start + offset)
+        .unwrap();
+    let join = &ws_frame[join_start..join_end];
+    assert!(
+        join.contains("assert_room_access("),
+        "WS JoinRoom must use the canonical room guard"
+    );
+    assert!(
+        !join.contains(".is_member("),
+        "WS JoinRoom must not fall back to retained room membership"
+    );
+}
+
+/// Pin the exact guards/delegations behind the channel and SCIM handlers that
+/// previously fell through the generic scanner. This prevents a future edit
+/// from retaining only a route-level preflight on a mutation: the setter must
+/// still pass the actor into the transaction-owned service/storage path.
+#[test]
+fn channel_and_scim_handlers_keep_effective_authorization_paths() {
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let channel_roles = fs::read_to_string(src.join("channel_roles.rs")).unwrap();
+    let channels = fs::read_to_string(src.join("channels.rs")).unwrap();
+    let scim = fs::read_to_string(src.join("scim.rs")).unwrap();
+
+    for (body, data_access, label) in [
+        (
+            top_level_fn_body(&channel_roles, "list_roles"),
+            ".members_with_roles(",
+            "channel_roles::list_roles",
+        ),
+        (
+            top_level_fn_body(&channels, "list_topic_history"),
+            ".list(room,",
+            "channels::list_topic_history",
+        ),
+    ] {
+        let guard_at = body
+            .find("assert_channel_access(auth.participant_id, room)")
+            .unwrap_or_else(|| panic!("{label} lost participant-first channel access"));
+        let access_at = body
+            .find(data_access)
+            .unwrap_or_else(|| panic!("{label} lost data-access marker {data_access}"));
+        assert!(
+            guard_at < access_at,
+            "{label} must authorize before reading channel data"
+        );
+    }
+
+    for (handler, authorized_call) in [
+        ("set_slowmode", ".set_channel_slowmode("),
+        ("set_reaction_limit", ".set_channel_reaction_limit("),
+    ] {
+        let body = top_level_fn_body(&channels, handler);
+        let preflight_at = body
+            .find("assert_channel_access(auth.participant_id, room)")
+            .unwrap_or_else(|| panic!("channels::{handler} lost participant-first preflight"));
+        let write_at = body
+            .find(authorized_call)
+            .unwrap_or_else(|| panic!("channels::{handler} lost {authorized_call}"));
+        assert!(
+            preflight_at < write_at,
+            "channels::{handler} must preflight before the transaction-owned write"
+        );
+        assert!(
+            body[write_at..].contains("auth.participant_id, room"),
+            "channels::{handler} must pass actor then room to the authorized service"
+        );
+    }
+
+    let list_tokens = top_level_fn_body(&scim, "list_tokens");
+    assert!(
+        list_tokens.contains(".list_tokens_authorized(ws, auth.participant_id)"),
+        "scim::list_tokens must bind the requested workspace to the effective caller"
     );
 }
 
@@ -251,7 +611,10 @@ fn lint_classifies_synthetic_handlers_correctly() {
 
     for (body, expect_guarded) in [(unguarded, false), (guarded, true)] {
         let sig = &body[..body.find('{').unwrap()];
-        assert!(sig.contains("Path<"), "synthetic handler must look like a handler");
+        assert!(
+            sig.contains("Path<"),
+            "synthetic handler must look like a handler"
+        );
         assert!(
             ROOM_ID_MARKERS.iter().any(|m| body.contains(m)),
             "synthetic handler must parse a room id"

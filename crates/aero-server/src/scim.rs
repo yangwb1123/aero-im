@@ -38,10 +38,9 @@ use std::str::FromStr;
 
 use aero_common::{
     Error as AeroError, ParticipantId, Result as AeroResult, ScimTokenId, UserGroupId, WorkspaceId,
-    WorkspaceRole,
 };
-use aero_storage::scim::{generate_token, hash_token};
-use aero_storage::{ScimRepo, ScimUserRow, UserGroup, UserGroupRepo};
+use aero_storage::scim::{generate_token, hash_token, MAX_SCIM_TOKENS_PER_WORKSPACE};
+use aero_storage::{ScimRepo, ScimTokenWriteError, ScimUserRow, UserGroup, UserGroupRepo};
 use axum::{
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
@@ -57,9 +56,9 @@ use crate::error::ApiResult;
 use crate::state::AppState;
 
 mod groups;
-mod users;
 #[cfg(test)]
 mod tests;
+mod users;
 
 // Re-export the public Group helpers so `crate::scim::slugify_handle` /
 // `crate::scim::parse_group_patch_ops` / `crate::scim::GroupPatchAction` remain
@@ -72,13 +71,27 @@ const SCHEMA_USER: &str = "urn:ietf:params:scim:schemas:core:2.0:User";
 const SCHEMA_GROUP: &str = "urn:ietf:params:scim:schemas:core:2.0:Group";
 const SCHEMA_LIST: &str = "urn:ietf:params:scim:api:messages:2.0:ListResponse";
 const SCHEMA_ERROR: &str = "urn:ietf:params:scim:api:messages:2.0:Error";
+const MAX_SCIM_PATCH_OPERATIONS: usize = 100;
+
+fn validate_patch_operation_count(count: usize) -> AeroResult<()> {
+    if count > MAX_SCIM_PATCH_OPERATIONS {
+        return Err(AeroError::Invalid(format!(
+            "Operations must contain at most {MAX_SCIM_PATCH_OPERATIONS} entries"
+        )));
+    }
+    Ok(())
+}
 
 /// SCIM `name` complex attribute (RFC 7643 §4.1.1).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScimName {
     #[serde(rename = "givenName", default, skip_serializing_if = "Option::is_none")]
     pub given_name: Option<String>,
-    #[serde(rename = "familyName", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "familyName",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub family_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub formatted: Option<String>,
@@ -101,7 +114,11 @@ pub struct ScimMeta {
     pub resource_type: String,
     #[serde(rename = "created", default, skip_serializing_if = "Option::is_none")]
     pub created: Option<String>,
-    #[serde(rename = "lastModified", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "lastModified",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub last_modified: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub location: Option<String>,
@@ -113,7 +130,11 @@ pub struct ScimUser {
     pub schemas: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
-    #[serde(rename = "externalId", default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "externalId",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
     pub external_id: Option<String>,
     #[serde(rename = "userName")]
     pub user_name: String,
@@ -261,7 +282,10 @@ pub fn parse_filter(filter: &str) -> Option<(String, String)> {
 pub fn routes() -> Router<AppState> {
     Router::new()
         // SCIM 2.0 — bearer-token (NOT JWT) authenticated, tenant = the token's workspace.
-        .route("/scim/v2/Users", get(users::list_users).post(users::create_user))
+        .route(
+            "/scim/v2/Users",
+            get(users::list_users).post(users::create_user),
+        )
         .route(
             "/scim/v2/Users/:id",
             get(users::get_user)
@@ -269,7 +293,10 @@ pub fn routes() -> Router<AppState> {
                 .patch(users::patch_user)
                 .delete(users::delete_user),
         )
-        .route("/scim/v2/Groups", get(groups::list_groups).post(groups::create_group))
+        .route(
+            "/scim/v2/Groups",
+            get(groups::list_groups).post(groups::create_group),
+        )
         .route(
             "/scim/v2/Groups/:id",
             get(groups::get_group)
@@ -279,6 +306,7 @@ pub fn routes() -> Router<AppState> {
         )
         // Management — AuthUser + workspace admin. Mint / revoke SCIM tokens.
         .route("/api/workspaces/:id/scim/token", post(mint_token))
+        .route("/api/workspaces/:id/scim/tokens", get(list_tokens))
         .route("/api/scim/tokens/:id", delete(revoke_token))
 }
 
@@ -362,7 +390,8 @@ fn to_scim_user(row: &ScimUserRow, display_name: Option<&str>) -> ScimUser {
 
 /// Best-effort RFC3339 rendering of a timestamp for SCIM `meta`.
 fn rfc3339(t: time::OffsetDateTime) -> Option<String> {
-    t.format(&time::format_description::well_known::Rfc3339).ok()
+    t.format(&time::format_description::well_known::Rfc3339)
+        .ok()
 }
 
 /// Pick a display name for a new participant from the SCIM payload: prefer
@@ -397,24 +426,21 @@ fn is_unique_violation(e: &sqlx::Error) -> bool {
 
 // ============================================================ Token management (AuthUser)
 
-/// Resolve the caller's role in a workspace, rejecting non-members. Mirrors
-/// [`crate::workspaces::caller_role`] (kept local to avoid widening its visibility).
-async fn caller_role(
-    s: &AppState,
-    ws: WorkspaceId,
-    caller: ParticipantId,
-) -> AeroResult<WorkspaceRole> {
-    s.workspaces
-        .member_role(ws, caller)
-        .await
-        .map_err(AeroError::from)?
-        .ok_or_else(|| AeroError::Forbidden("not a workspace member".into()))
-}
-
 #[derive(Deserialize)]
 struct MintTokenReq {
     #[serde(default)]
     label: Option<String>,
+}
+
+fn map_token_write_error(error: ScimTokenWriteError) -> AeroError {
+    match error {
+        ScimTokenWriteError::TokenNotFound => AeroError::NotFound("scim token".into()),
+        ScimTokenWriteError::QuotaExceeded => AeroError::Conflict(format!(
+            "SCIM token quota exceeded (maximum {MAX_SCIM_TOKENS_PER_WORKSPACE} per workspace)"
+        )),
+        ScimTokenWriteError::Governance(error) => error,
+        ScimTokenWriteError::Storage(error) => AeroError::from(error),
+    }
 }
 
 /// `POST /api/workspaces/:id/scim/token` — **admin/owner**: mint a SCIM bearer
@@ -427,23 +453,52 @@ async fn mint_token(
     Path(id): Path<String>,
     Json(req): Json<MintTokenReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let ws = WorkspaceId::from_str(&id)
-        .map_err(|e| AeroError::Invalid(format!("workspace id: {e}")))?;
-    let caller = caller_role(&s, ws, auth.participant_id).await?;
-    if !caller.can_administer() {
-        return Err(AeroError::Forbidden("minting SCIM tokens requires admin".into()).into());
+    let ws =
+        WorkspaceId::from_str(&id).map_err(|e| AeroError::Invalid(format!("workspace id: {e}")))?;
+    let label = req
+        .label
+        .as_deref()
+        .map(str::trim)
+        .filter(|label| !label.is_empty());
+    if label.is_some_and(|label| label.len() > 100) {
+        return Err(AeroError::Invalid("SCIM token label is too long".into()).into());
     }
     let secret = generate_token();
     let id = scim_repo(&s)
-        .create_token(ws, &hash_token(&secret), req.label.as_deref())
+        .create_token_authorized(ws, &hash_token(&secret), label, auth.participant_id)
         .await
-        .map_err(AeroError::from)?;
+        .map_err(map_token_write_error)?;
     Ok(Json(serde_json::json!({
         "id": id,
         "workspace_id": ws,
-        "label": req.label,
+        "label": label,
         // Shown ONCE — clients must store it now; the server keeps only its hash.
         "token": secret,
+    })))
+}
+
+/// `GET /api/workspaces/:id/scim/tokens` — list safe credential metadata.
+///
+/// Effective Owner/Admin access is required and rechecked under the same
+/// workspace lock as the read. The response deliberately omits both bearer
+/// plaintext and token hashes. It returns at most one sentinel row beyond the
+/// normal quota so administrators can detect and revoke a legacy overage.
+async fn list_tokens(
+    State(s): State<AppState>,
+    auth: AuthUser,
+    Path(id): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let ws =
+        WorkspaceId::from_str(&id).map_err(|e| AeroError::Invalid(format!("workspace id: {e}")))?;
+    let tokens = scim_repo(&s)
+        .list_tokens_authorized(ws, auth.participant_id)
+        .await
+        .map_err(map_token_write_error)?;
+    let over_quota = tokens.len() > MAX_SCIM_TOKENS_PER_WORKSPACE;
+    Ok(Json(serde_json::json!({
+        "tokens": tokens,
+        "quota": MAX_SCIM_TOKENS_PER_WORKSPACE,
+        "over_quota": over_quota,
     })))
 }
 
@@ -456,16 +511,9 @@ async fn revoke_token(
 ) -> ApiResult<StatusCode> {
     let token_id = ScimTokenId::from_str(&id)
         .map_err(|e| AeroError::Invalid(format!("scim token id: {e}")))?;
-    let repo = scim_repo(&s);
-    let ws = repo
-        .token_workspace(token_id)
+    scim_repo(&s)
+        .revoke_token_authorized(token_id, auth.participant_id)
         .await
-        .map_err(AeroError::from)?
-        .ok_or_else(|| AeroError::NotFound("scim token".into()))?;
-    let caller = caller_role(&s, ws, auth.participant_id).await?;
-    if !caller.can_administer() {
-        return Err(AeroError::Forbidden("revoking SCIM tokens requires admin".into()).into());
-    }
-    repo.revoke_token(token_id).await.map_err(AeroError::from)?;
+        .map_err(map_token_write_error)?;
     Ok(StatusCode::NO_CONTENT)
 }

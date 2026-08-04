@@ -80,7 +80,9 @@ fn validate_range(start: i64, end: i64) -> Result<(i32, i32), AeroError> {
         return Err(AeroError::Invalid("start_secs must be >= 0".into()));
     }
     if end <= start {
-        return Err(AeroError::Invalid("end_secs must be greater than start_secs".into()));
+        return Err(AeroError::Invalid(
+            "end_secs must be greater than start_secs".into(),
+        ));
     }
     if end - start > MAX_CLIP_SECS {
         return Err(AeroError::Invalid(format!(
@@ -89,7 +91,8 @@ fn validate_range(start: i64, end: i64) -> Result<(i32, i32), AeroError> {
     }
     // Both bounds are in `0..=start+MAX_CLIP_SECS`; the only way to exceed i32 is a
     // huge `start`, which the cast guards against (never panics, maps to Invalid).
-    let start = i32::try_from(start).map_err(|_| AeroError::Invalid("start_secs too large".into()))?;
+    let start =
+        i32::try_from(start).map_err(|_| AeroError::Invalid("start_secs too large".into()))?;
     let end = i32::try_from(end).map_err(|_| AeroError::Invalid("end_secs too large".into()))?;
     Ok((start, end))
 }
@@ -115,7 +118,12 @@ async fn create_clip(
 ) -> ApiResult<Json<serde_json::Value>> {
     let stream = parse_stream(&stream_str)?;
     // The source stream must exist — a clip with no stream could never play back.
-    if s.streams.get(stream).await.map_err(AeroError::from)?.is_none() {
+    if s.streams
+        .get(stream)
+        .await
+        .map_err(AeroError::from)?
+        .is_none()
+    {
         return Err(AeroError::NotFound(format!("stream {stream}")).into());
     }
 
@@ -205,7 +213,9 @@ async fn share_clip(
         .map_err(AeroError::from)?
         .ok_or_else(|| AeroError::NotFound(format!("clip {id}")))?;
     if clip.creator_id != auth.participant_id {
-        return Err(AeroError::Forbidden("only the clip creator may generate a share URL".into()).into());
+        return Err(
+            AeroError::Forbidden("only the clip creator may generate a share URL".into()).into(),
+        );
     }
 
     // Generate a slug if none exists yet; if one already exists, re-read.
@@ -222,12 +232,16 @@ async fn share_clip(
                 .await
                 .map_err(AeroError::from)?
                 .and_then(|c| c.share_slug)
-                .ok_or_else(|| AeroError::Internal(anyhow::anyhow!("share_slug missing after generate")))?
+                .ok_or_else(|| {
+                    AeroError::Internal(anyhow::anyhow!("share_slug missing after generate"))
+                })?
         }
     };
 
     let share_url = format!("/clips/{slug}");
-    Ok(Json(serde_json::json!({ "share_url": share_url, "slug": slug })))
+    Ok(Json(
+        serde_json::json!({ "share_url": share_url, "slug": slug }),
+    ))
 }
 
 /// `GET /clips/:slug` — public, no auth required. Returns clip metadata by

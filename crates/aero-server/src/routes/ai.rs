@@ -9,6 +9,7 @@ use aero_auth::AuthUser;
 use aero_common::{Error as AeroError, RoomId};
 use axum::{
     extract::{Path as AxumPath, Query, State},
+    http::HeaderMap,
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse,
@@ -42,14 +43,25 @@ struct AiSummarizeReq {
 async fn ai_summarize(
     State(s): State<AppState>,
     auth: AuthUser,
+    headers: HeaderMap,
     Json(req): Json<AiSummarizeReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let room = parse_room_id(&req.room_id)?;
     s.im.assert_room_access(auth.participant_id, room).await?;
     let last_n = req.last_n.unwrap_or(50);
-    let ai = s.ai.as_ref().ok_or_else(|| AeroError::Upstream("AI not configured".into()))?;
+    let ai =
+        s.ai.as_ref()
+            .ok_or_else(|| AeroError::Upstream("AI not configured".into()))?;
+    let usage_context = crate::ai_usage::room_request_usage_context(
+        &s,
+        &headers,
+        auth.participant_id,
+        room,
+        &format!("ai_summarize:{room}:{last_n}"),
+    )
+    .await?;
     let summary = ai
-        .summarize_room(room, last_n)
+        .summarize_room_with_usage_context(room, last_n, usage_context)
         .await
         .map_err(|e| AeroError::Upstream(format!("ai: {e}")))?;
     Ok(Json(serde_json::json!({"summary": summary})))
@@ -68,25 +80,42 @@ struct AiAskReq {
 async fn ai_ask(
     State(s): State<AppState>,
     auth: AuthUser,
+    headers: HeaderMap,
     Json(req): Json<AiAskReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let room = parse_room_id(&req.room_id)?;
     s.im.assert_room_access(auth.participant_id, room).await?;
     let k = req.k.unwrap_or(8);
-    let ai = s.ai.as_ref().ok_or_else(|| AeroError::Upstream("AI not configured".into()))?;
-    let answer = if req.agentic.unwrap_or(false) && std::env::var("AERO_AGENTIC_ANSWERS").is_ok() {
-        ai.answer_question_agentic(room, &req.question, 4)
-            .await.map_err(|e| AeroError::Upstream(format!("ai: {e}")))?
+    let ai =
+        s.ai.as_ref()
+            .ok_or_else(|| AeroError::Upstream("AI not configured".into()))?;
+    let agentic = req.agentic.unwrap_or(false) && std::env::var("AERO_AGENTIC_ANSWERS").is_ok();
+    let usage_context = crate::ai_usage::room_request_usage_context(
+        &s,
+        &headers,
+        auth.participant_id,
+        room,
+        &format!("ai_ask:{room}:{k}:{agentic}:{}", req.question),
+    )
+    .await?;
+    let answer = if agentic {
+        ai.answer_question_agentic_with_usage_context(room, &req.question, 4, usage_context)
+            .await
+            .map_err(|e| AeroError::Upstream(format!("ai: {e}")))?
     } else {
-        ai.answer_question(room, &req.question, k)
-            .await.map_err(|e| AeroError::Upstream(format!("ai: {e}")))?
+        ai.answer_question_with_usage_context(room, &req.question, k, usage_context)
+            .await
+            .map_err(|e| AeroError::Upstream(format!("ai: {e}")))?
     };
-    Ok(Json(serde_json::json!({"answer": answer.answer, "citations": answer.citations})))
+    Ok(Json(
+        serde_json::json!({"answer": answer.answer, "citations": answer.citations}),
+    ))
 }
 
 async fn ai_ask_stream(
     State(s): State<AppState>,
     auth: AuthUser,
+    headers: HeaderMap,
     Json(req): Json<AiAskReq>,
 ) -> impl IntoResponse {
     let room = match parse_room_id(&req.room_id) {
@@ -99,39 +128,91 @@ async fn ai_ask_stream(
     let k = req.k.unwrap_or(8);
     let Some(ai) = s.ai.as_ref() else {
         return Sse::new(futures::stream::once(async {
-            Ok::<_, std::convert::Infallible>(Event::default().event("done").data("AI not configured"))
-        })).into_response();
+            Ok::<_, std::convert::Infallible>(
+                Event::default().event("done").data("AI not configured"),
+            )
+        }))
+        .into_response();
     };
     let ai = ai.clone();
-    let (citations, text_stream) = match ai.answer_question_stream(room, &req.question, k).await {
-        Ok(v) => v,
-        Err(e) => return crate::error::ApiError::from(AeroError::Upstream(format!("ai: {e}"))).into_response(),
+    let usage_context = match crate::ai_usage::room_request_usage_context(
+        &s,
+        &headers,
+        auth.participant_id,
+        room,
+        &format!("ai_ask_stream:{room}:{k}:{}", req.question),
+    )
+    .await
+    {
+        Ok(context) => context,
+        Err(error) => return crate::error::ApiError::from(error).into_response(),
     };
-    let citations_json = serde_json::to_string(&citations.iter().map(ToString::to_string).collect::<Vec<_>>())
-        .unwrap_or_else(|_| "[]".to_string());
+    let (citations, text_stream) = match ai
+        .answer_question_stream_with_usage_context(room, &req.question, k, usage_context)
+        .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            return crate::error::ApiError::from(AeroError::Upstream(format!("ai: {e}")))
+                .into_response()
+        }
+    };
+    let citations_json = serde_json::to_string(
+        &citations
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+    )
+    .unwrap_or_else(|_| "[]".to_string());
     let event_stream = futures::stream::once(async {
         Ok::<_, std::convert::Infallible>(Event::default().event("citations").data(citations_json))
     })
     .chain(text_stream.map(|r| match r {
         Ok(text) => Ok(Event::default().event("delta").data(text)),
-        Err(e) => { tracing::warn!(error = %e, "ai stream chunk"); Ok(Event::default().event("error").data(e)) }
+        Err(e) => {
+            tracing::warn!(error = %e, "ai stream chunk");
+            Ok(Event::default().event("error").data(e))
+        }
     }))
     .chain(futures::stream::once(async {
         Ok::<_, std::convert::Infallible>(Event::default().event("done").data(""))
     }));
-    Sse::new(event_stream).keep_alive(KeepAlive::default()).into_response()
+    Sse::new(event_stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
 }
 
 async fn ai_ask_context(
     State(s): State<AppState>,
     auth: AuthUser,
+    headers: HeaderMap,
     Json(req): Json<AiAskReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let room = parse_room_id(&req.room_id)?;
     s.im.assert_room_access(auth.participant_id, room).await?;
     let k = req.k.unwrap_or(8);
-    let ai = s.ai.as_ref().ok_or_else(|| AeroError::Upstream("AI not configured".into()))?;
-    let answer = ai.ask_with_context(auth.participant_id, room, &req.question, k)
-        .await.map_err(|e| AeroError::Upstream(format!("ai: {e}")))?;
-    Ok(Json(serde_json::json!({"answer": answer.answer, "citations": answer.citations})))
+    let ai =
+        s.ai.as_ref()
+            .ok_or_else(|| AeroError::Upstream("AI not configured".into()))?;
+    let usage_context = crate::ai_usage::room_request_usage_context(
+        &s,
+        &headers,
+        auth.participant_id,
+        room,
+        &format!("ai_ask_context:{room}:{k}:{}", req.question),
+    )
+    .await?;
+    let answer = ai
+        .ask_with_context_and_usage_context(
+            auth.participant_id,
+            room,
+            &req.question,
+            k,
+            usage_context,
+        )
+        .await
+        .map_err(|e| AeroError::Upstream(format!("ai: {e}")))?;
+    Ok(Json(
+        serde_json::json!({"answer": answer.answer, "citations": answer.citations}),
+    ))
 }

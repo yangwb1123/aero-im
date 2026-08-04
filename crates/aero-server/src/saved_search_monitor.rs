@@ -1,128 +1,66 @@
 //! Periodic saved-search digest dispatcher (ROADMAP5 方向三).
 //!
 //! A saved search with `notify_new = true` becomes a standing monitor: this
-//! background loop periodically re-runs each such query (membership-scoped as its
-//! owner) and inserts an inbox notification for every match newer than the
-//! search's `last_run_at`, then advances that cursor. So an owner who saved
+//! background loop periodically re-runs each such query (effective-access-scoped as its
+//! owner) and inserts an inbox notification for every match newer than its
+//! independent composite monitor cursor. So an owner who saved
 //! `from:@ops deploy failed` with monitoring on is pinged when a new matching
 //! message arrives — without polling the search themselves.
 //!
 //! The per-search work is factored into [`process_monitored_search`] (free
-//! function over the three repos) so the new-match → notification logic is
-//! db-testable without spinning up the whole server.
+//! function over the storage transaction) so the new-match → notification logic
+//! is db-testable without spinning up the whole server.
 
-use aero_common::NotificationKind;
-use aero_storage::{
-    AdvancedSearchRepo, MonitoredSearch, NotificationRepo, SavedSearchRepo,
-};
+use aero_storage::saved_search::MAX_MONITORED_SEARCH_SCAN_PAGE;
+use aero_storage::{MonitoredSearch, SavedSearchRepo};
 
 /// How many notifications one monitored search may emit per dispatcher tick. A
 /// query that suddenly matches a flood of messages (e.g. just enabled on a busy
-/// term) shouldn't bury the owner's inbox in one go; the cursor still advances
-/// past them, so the excess is simply not notified (the matches remain findable
-/// via the search itself).
+/// term) should not bury the owner's inbox in one go; the composite cursor stops
+/// at the last emitted match and subsequent ticks drain the remainder.
 const MAX_NOTIFICATIONS_PER_RUN: usize = 20;
-
-/// How many top hits to pull from the search before filtering to the new ones.
-const SEARCH_LIMIT: i64 = 100;
 
 /// Re-run one monitored saved search and notify its owner of new matches.
 ///
-/// Returns the number of notifications inserted. On a search whose `last_run_at`
-/// is `None` (monitoring was just enabled), it stamps the baseline and notifies
-/// nothing — so turning monitoring on never backfills the entire history.
-/// Best-effort callers ignore the count; it exists for tests/metrics.
-///
-/// Cursor semantics & a known best-effort edge: the cursor is `created_at`-based.
-/// A message whose inserting transaction sets `created_at` before this run but
-/// COMMITS after the search's MVCC snapshot (a long write transaction) could be
-/// missed when the cursor advances past its timestamp. Chat messages commit
-/// promptly, so this is a rare, accepted limitation of a 5-minute-poll digest —
-/// the match remains findable via the search itself; only the proactive ping is
-/// best-effort. A monotonic-on-commit cursor (message seq) would close it but is
-/// out of scope here.
+/// Returns the number of newly inserted notifications. A newly-enabled search
+/// first stamps a baseline and notifies nothing, so monitoring never backfills
+/// history. Storage row-locks the search and commits stable-id notification
+/// inserts with the `(created_at, message_id)` cursor, making concurrent instances
+/// and crash retries converge.
 ///
 /// # Errors
 /// Propagates a [`sqlx::Error`] from any of the underlying repo calls. The caller
 /// (the dispatcher loop) logs and swallows so one bad search never wedges the run.
 pub async fn process_monitored_search(
-    search_repo: &AdvancedSearchRepo,
-    notifications: &NotificationRepo,
     saved: &SavedSearchRepo,
     item: &MonitoredSearch,
     now: time::OffsetDateTime,
     cap: usize,
 ) -> Result<usize, sqlx::Error> {
-    // First-ever run: set the baseline cursor and notify nothing.
-    let Some(since) = item.last_run_at else {
-        saved.mark_run(item.id, item.owner, now).await?;
-        return Ok(0);
-    };
-
-    // Scope the search to messages created after the cursor by injecting `since`
-    // as the query's `after_ts` lower bound (taking the LATER of the cursor and
-    // any `since:` operator the user already wrote). This is what makes the
-    // monitor correct under load: without it the relevance-ordered top-N could be
-    // entirely OLD high-score matches, hiding a genuinely new one behind the cap.
-    // With it, every hit the search returns is already new, so the cap only ever
-    // trims among new matches.
-    let mut parsed = aero_storage::parse_search_query(&item.query);
-    parsed.after_ts = Some(parsed.after_ts.map_or(since, |user| user.max(since)));
-    let hits = search_repo
-        .search(item.owner, item.workspace, &parsed, SEARCH_LIMIT)
-        .await?;
-
-    // `after_ts` is inclusive (`>= since`); exclude the exact boundary so a
-    // message created at the previous run's instant is never re-notified. Sort
-    // oldest-first so the inbox reads chronologically and the cap (if hit) keeps
-    // the OLDEST unseen — the rest are caught on the next tick (see the cursor
-    // logic below), never silently dropped.
-    let mut fresh: Vec<_> = hits.into_iter().filter(|h| h.message.created_at > since).collect();
-    fresh.sort_by_key(|h| h.message.created_at);
-
-    let capped = fresh.len() > cap;
-    let to_notify: Vec<_> = fresh.into_iter().take(cap).collect();
-    let mut last_notified_at = None;
-    for hit in &to_notify {
-        notifications
-            .insert(
-                item.owner,
-                hit.message.room_id,
-                hit.message.id,
-                NotificationKind::SavedSearch,
-                Some(hit.message.sender_id),
-            )
-            .await?;
-        last_notified_at = Some(hit.message.created_at);
-    }
-
-    // Advance the cursor. Normally to `now` (all new matches drained). But when we
-    // hit the per-run cap, advance ONLY to the last message we actually notified —
-    // so the not-yet-notified newer matches are picked up next tick rather than
-    // skipped over. (`now` would jump past them; the un-notified flood would be
-    // lost.) `last_notified_at` is always Some here when `capped`.
-    let cursor = if capped { last_notified_at.unwrap_or(now) } else { now };
-    saved.mark_run(item.id, item.owner, cursor).await?;
-    Ok(to_notify.len())
+    saved
+        .deliver_monitored_batch(item.id, item.owner, now, cap)
+        .await
 }
 
 /// Background loop: every `interval_secs`, process every monitored saved search.
-/// Best-effort throughout — a per-search error is logged and the loop continues;
-/// it honors the shutdown token. Spawned by the server binary.
+/// The global work-list is complete but scanned in bounded id-keyset pages, so
+/// one query/allocation cannot materialize the full table and higher ids are not
+/// starved. Per-owner enable quotas bound each tenant's contribution, and the
+/// interval's `Skip` policy prevents overlapping runs. Best-effort throughout —
+/// a per-search error is logged and the loop continues; it honors the shutdown
+/// token. Spawned by the server binary.
 pub async fn run_saved_search_monitor(
     state: crate::state::AppState,
     interval_secs: u64,
     cancel: tokio_util::sync::CancellationToken,
 ) {
     let saved = SavedSearchRepo::new(state.pg.clone());
-    let search_repo = AdvancedSearchRepo::new(state.pg.clone());
-    let notifications = NotificationRepo::new(state.pg.clone());
     let mut tick = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     tick.tick().await; // skip the immediate first tick
     tracing::info!(interval_secs, "saved-search monitor started");
 
-    loop {
+    'ticks: loop {
         tokio::select! {
             () = cancel.cancelled() => {
                 tracing::info!("saved-search monitor shutting down");
@@ -131,38 +69,76 @@ pub async fn run_saved_search_monitor(
             _ = tick.tick() => {}
         }
 
-        let monitored = match saved.list_monitored().await {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::warn!(error = ?e, "saved-search monitor: list_monitored failed");
-                continue;
-            }
-        };
-        if monitored.is_empty() {
-            continue;
-        }
-
         let now = time::OffsetDateTime::now_utc();
         let mut total = 0usize;
-        for item in &monitored {
-            match process_monitored_search(
-                &search_repo,
-                &notifications,
-                &saved,
-                item,
-                now,
-                MAX_NOTIFICATIONS_PER_RUN,
-            )
-            .await
-            {
-                Ok(n) => total += n,
-                Err(e) => {
-                    tracing::warn!(error = ?e, saved_search = %item.id, "saved-search monitor: run failed");
+        let mut searches = 0usize;
+        let mut after = None;
+        let scan = tokio::select! {
+            () = cancel.cancelled() => {
+                tracing::info!("saved-search monitor shutting down");
+                return;
+            }
+            result = saved.begin_monitored_scan() => {
+                match result {
+                    Ok(Some(scan)) => scan,
+                    Ok(None) => continue,
+                    Err(e) => {
+                        tracing::warn!(
+                            error = ?e,
+                            "saved-search monitor: begin_monitored_scan failed"
+                        );
+                        continue;
+                    }
                 }
             }
+        };
+        loop {
+            let monitored = tokio::select! {
+                () = cancel.cancelled() => {
+                    tracing::info!("saved-search monitor shutting down");
+                    return;
+                }
+                result = saved.list_monitored_page(
+                    scan,
+                    after,
+                    MAX_MONITORED_SEARCH_SCAN_PAGE,
+                ) => {
+                    match result {
+                        Ok(page) => page,
+                        Err(e) => {
+                            tracing::warn!(
+                                error = ?e,
+                                "saved-search monitor: list_monitored_page failed"
+                            );
+                            continue 'ticks;
+                        }
+                    }
+                }
+            };
+            let Some(last_id) = monitored.last().map(|item| item.id) else {
+                break;
+            };
+            searches += monitored.len();
+            for item in &monitored {
+                if cancel.is_cancelled() {
+                    tracing::info!("saved-search monitor shutting down");
+                    return;
+                }
+                match process_monitored_search(&saved, item, now, MAX_NOTIFICATIONS_PER_RUN).await {
+                    Ok(n) => total += n,
+                    Err(e) => {
+                        tracing::warn!(error = ?e, saved_search = %item.id, "saved-search monitor: run failed");
+                    }
+                }
+            }
+            after = Some(last_id);
         }
         if total > 0 {
-            tracing::info!(notified = total, searches = monitored.len(), "saved-search monitor: new matches notified");
+            tracing::info!(
+                notified = total,
+                searches,
+                "saved-search monitor: new matches notified"
+            );
         }
     }
 }
@@ -174,24 +150,25 @@ pub async fn run_saved_search_monitor(
 ///   cargo test -p aero-server --lib -- --ignored saved_search_monitor
 /// ```
 #[cfg(test)]
-mod db_tests {
-    use super::process_monitored_search;
-    use aero_common::{Block, ParticipantId, RoomId, WorkspaceId};
-    use aero_storage::{
-        AdvancedSearchRepo, MessageRepo, MonitoredSearch, NewMessage, NotificationRepo, PgPool,
-        SavedSearchRepo,
-    };
+#[path = "saved_search_monitor/notification_tests.rs"]
+mod notification_tests;
 
-    fn pool() -> PgPool {
+#[cfg(test)]
+mod db_tests {
+    use super::{process_monitored_search, MAX_MONITORED_SEARCH_SCAN_PAGE};
+    use aero_common::{ParticipantId, RoomId, WorkspaceId};
+    use aero_storage::{MonitoredSearch, NotificationRepo, PgPool, SavedSearchRepo};
+
+    pub(super) fn pool() -> PgPool {
         let url = std::env::var("DATABASE_URL")
             .unwrap_or_else(|_| "postgres://aero:aero_dev_pw@localhost:5432/aero".into());
         sqlx::postgres::PgPoolOptions::new()
-            .max_connections(2)
+            .max_connections(4)
             .connect_lazy(&url)
             .expect("connect_lazy never fails on a well-formed URL")
     }
 
-    async fn participant(p: &PgPool) -> ParticipantId {
+    pub(super) async fn participant(p: &PgPool) -> ParticipantId {
         let id = ParticipantId::new();
         sqlx::query("INSERT INTO participants (id, kind, display_name) VALUES ($1, 'human', $2)")
             .bind(id.to_uuid())
@@ -202,7 +179,46 @@ mod db_tests {
         id
     }
 
-    async fn room(p: &PgPool, creator: ParticipantId, ws: WorkspaceId) -> RoomId {
+    pub(super) async fn workspace(p: &PgPool, creator: ParticipantId) -> WorkspaceId {
+        let id = WorkspaceId::new();
+        let mut tx = p.begin().await.expect("begin workspace fixture");
+        sqlx::query(
+            "INSERT INTO workspaces (id, name, slug, created_by)
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(id.to_uuid())
+        .bind(format!("ssm-workspace-{id}"))
+        .bind(format!("ssm-{id}"))
+        .bind(creator.to_uuid())
+        .execute(&mut *tx)
+        .await
+        .expect("insert workspace");
+        sqlx::query(
+            "INSERT INTO workspace_members
+                 (workspace_id, participant_id, role)
+             VALUES ($1, $2, 'owner')",
+        )
+        .bind(id.to_uuid())
+        .bind(creator.to_uuid())
+        .execute(&mut *tx)
+        .await
+        .expect("insert workspace owner");
+        tx.commit().await.expect("commit workspace fixture");
+        id
+    }
+
+    pub(super) async fn room(p: &PgPool, creator: ParticipantId, ws: WorkspaceId) -> RoomId {
+        sqlx::query(
+            "INSERT INTO workspace_members
+                 (workspace_id, participant_id, role)
+             VALUES ($1, $2, 'member')
+             ON CONFLICT (workspace_id, participant_id) DO NOTHING",
+        )
+        .bind(ws.to_uuid())
+        .bind(creator.to_uuid())
+        .execute(p)
+        .await
+        .expect("join workspace");
         let id = RoomId::new();
         sqlx::query(
             "INSERT INTO rooms (id, kind, name, created_by, workspace_id) VALUES ($1,'group',$2,$3,$4)",
@@ -214,109 +230,75 @@ mod db_tests {
         .execute(p)
         .await
         .expect("insert room");
-        sqlx::query("INSERT INTO room_members (room_id, participant_id, role) VALUES ($1,$2,'member')")
-            .bind(id.to_uuid())
-            .bind(creator.to_uuid())
-            .execute(p)
-            .await
-            .expect("join");
+        sqlx::query(
+            "INSERT INTO room_members (room_id, participant_id, role) VALUES ($1,$2,'member')",
+        )
+        .bind(id.to_uuid())
+        .bind(creator.to_uuid())
+        .execute(p)
+        .await
+        .expect("join");
         id
     }
 
-    /// A monitored search with a prior `last_run_at` notifies the owner of matches
-    /// created AFTER that cursor (and nothing for the first-ever run, which only
-    /// sets the baseline). Verifies the new-match → SavedSearch-notification path.
-    #[tokio::test]
-    #[ignore = "requires live Postgres"]
-    async fn notifies_owner_of_new_matches_since_last_run() {
-        let p = pool();
-        let ws = WorkspaceId(ulid::Ulid(0)); // the default workspace
-        let search_repo = AdvancedSearchRepo::new(p.clone());
-        let notifications = NotificationRepo::new(p.clone());
-        let saved = SavedSearchRepo::new(p.clone());
-        let msgs = MessageRepo::new(p.clone());
+    pub(super) async fn insert_match(
+        p: &PgPool,
+        room: RoomId,
+        sender: ParticipantId,
+        needle: &str,
+        created_at: time::OffsetDateTime,
+    ) -> aero_common::MessageId {
+        let id = aero_common::MessageId::new();
+        let text = format!("{needle} match");
+        sqlx::query(
+            "INSERT INTO messages
+                 (id, room_id, sender_id, blocks, searchable_text, created_at)
+             VALUES ($1, $2, $3, $4::jsonb, $5, $6)",
+        )
+        .bind(id.to_uuid())
+        .bind(room.to_uuid())
+        .bind(sender.to_uuid())
+        .bind(serde_json::json!([{ "type": "text", "content": text }]).to_string())
+        .bind(&text)
+        .bind(created_at)
+        .execute(p)
+        .await
+        .expect("insert matching message");
+        id
+    }
 
-        let owner = participant(&p).await;
-        let r = room(&p, owner, ws).await;
-        let needle = format!("zqssmtoken{}", ParticipantId::new());
-
-        // A matching message exists already (BEFORE the cursor → must NOT notify).
-        let old = msgs
-            .insert(NewMessage {
-                room_id: r,
-                sender_id: owner,
-                blocks: vec![Block::text(format!("{needle} old one"))],
-                reply_to: None,
-                metadata: serde_json::json!({}),
-                expires_at: None,
-            })
+    async fn monitored_page(saved: &SavedSearchRepo) -> Vec<MonitoredSearch> {
+        let scan = saved
+            .begin_monitored_scan()
             .await
-            .expect("insert old");
-
-        let sid = saved.create(owner, ws, "mon", &needle).await.expect("create");
-
-        // First-ever run: baseline only, zero notifications even though `old` matches.
-        let item0 = MonitoredSearch {
-            id: sid,
-            owner,
-            workspace: ws,
-            query: needle.clone(),
-            last_run_at: None,
-        };
-        let now0 = time::OffsetDateTime::now_utc();
-        let n0 = process_monitored_search(&search_repo, &notifications, &saved, &item0, now0, 20)
+            .expect("begin monitored scan")
+            .expect("at least one monitored search");
+        saved
+            .list_monitored_page(scan, None, MAX_MONITORED_SEARCH_SCAN_PAGE)
             .await
-            .expect("baseline run");
-        assert_eq!(n0, 0, "first-ever run only sets the baseline, notifies nothing");
+            .expect("list monitored page")
+    }
 
-        // A NEW matching message arrives after the baseline.
-        let fresh = msgs
-            .insert(NewMessage {
-                room_id: r,
-                sender_id: owner,
-                blocks: vec![Block::text(format!("{needle} brand new"))],
-                reply_to: None,
-                metadata: serde_json::json!({}),
-                expires_at: None,
-            })
+    async fn monitored(saved: &SavedSearchRepo, id: aero_common::SavedSearchId) -> MonitoredSearch {
+        monitored_page(saved)
             .await
-            .expect("insert fresh");
+            .into_iter()
+            .find(|item| item.id == id)
+            .expect("saved search is monitored")
+    }
 
-        // Second run with the baseline as the cursor: notifies for the new match only.
-        let item1 = MonitoredSearch {
-            id: sid,
-            owner,
-            workspace: ws,
-            query: needle.clone(),
-            last_run_at: Some(now0),
-        };
-        let now1 = now0 + time::Duration::seconds(60);
-        let n1 = process_monitored_search(&search_repo, &notifications, &saved, &item1, now1, 20)
-            .await
-            .expect("delta run");
-        assert_eq!(n1, 1, "exactly the one new-since-baseline match notifies");
-
-        // The notification is a SavedSearch kind pointing at the fresh message.
-        let inbox = notifications.list(owner, None, false, Some(50)).await.expect("inbox");
-        assert!(
-            inbox.iter().any(|n| n.message_id == fresh.id
-                && matches!(n.kind, aero_common::NotificationKind::SavedSearch)),
-            "a SavedSearch notification for the fresh match exists",
-        );
-        assert!(
-            !inbox.iter().any(|n| n.message_id == old.id),
-            "the pre-baseline match was never notified",
-        );
-
-        // Cleanup.
-        sqlx::query("DELETE FROM notifications WHERE participant_id = $1").bind(owner.to_uuid()).execute(&p).await.ok();
-        sqlx::query("DELETE FROM saved_searches WHERE participant_id = $1").bind(owner.to_uuid()).execute(&p).await.ok();
-        for m in [old.id, fresh.id] {
-            sqlx::query("DELETE FROM messages WHERE id = $1").bind(m.to_uuid()).execute(&p).await.ok();
-        }
-        sqlx::query("DELETE FROM room_members WHERE room_id = $1").bind(r.to_uuid()).execute(&p).await.ok();
-        sqlx::query("DELETE FROM rooms WHERE id = $1").bind(r.to_uuid()).execute(&p).await.ok();
-        sqlx::query("DELETE FROM participants WHERE id = $1").bind(owner.to_uuid()).execute(&p).await.ok();
+    async fn rewind(p: &PgPool, id: aero_common::SavedSearchId, cursor: time::OffsetDateTime) {
+        sqlx::query(
+            "UPDATE saved_searches
+                SET monitor_cursor_at = $2,
+                    monitor_cursor_message_id = NULL
+              WHERE id = $1",
+        )
+        .bind(id.to_uuid())
+        .bind(cursor)
+        .execute(p)
+        .await
+        .expect("rewind monitor cursor");
     }
 
     /// When more new matches exist than the per-run cap, the run notifies `cap` of
@@ -327,24 +309,22 @@ mod db_tests {
     #[ignore = "requires live Postgres"]
     async fn cap_does_not_silently_drop_matches_drains_over_runs() {
         let p = pool();
-        let ws = WorkspaceId(ulid::Ulid(0));
-        let search_repo = AdvancedSearchRepo::new(p.clone());
         let notifications = NotificationRepo::new(p.clone());
         let saved = SavedSearchRepo::new(p.clone());
-        let msgs = MessageRepo::new(p.clone());
 
         let owner = participant(&p).await;
+        let ws = workspace(&p, owner).await;
         let r = room(&p, owner, ws).await;
         let needle = format!("zqcaptoken{}", ParticipantId::new());
 
         // Baseline cursor: everything below is "new" relative to it.
         let base = time::OffsetDateTime::now_utc();
 
-        // Insert 3 matching messages with strictly increasing created_at (explicit,
-        // so the oldest-first ordering and cursor math are deterministic).
+        // Insert 3 matching messages at the same timestamp. The UUID tiebreaker
+        // must carry the capped cursor across all three without skipping one.
         let mut ids = Vec::new();
         for i in 0..3 {
-            let ts = base + time::Duration::seconds(i64::from(i) + 1);
+            let ts = base + time::Duration::seconds(1);
             let id = aero_common::MessageId::new();
             sqlx::query(
                 "INSERT INTO messages (id, room_id, sender_id, blocks, searchable_text, created_at) \
@@ -362,27 +342,60 @@ mod db_tests {
             ids.push(id);
         }
 
-        let sid = saved.create(owner, ws, "cap", &needle).await.expect("create");
-        // Enable monitoring so the re-read via list_monitored() below finds it.
-        saved.set_notify_new(sid, owner, true).await.expect("enable monitoring");
-        let item = MonitoredSearch { id: sid, owner, workspace: ws, query: needle.clone(), last_run_at: Some(base) };
+        let sid = saved
+            .create(owner, ws, "cap", &needle)
+            .await
+            .expect("create");
+        // Enable monitoring so the paged re-read below finds it.
+        saved
+            .set_notify_new(sid, owner, true)
+            .await
+            .expect("enable monitoring");
+        let baseline_item = monitored_page(&saved)
+            .await
+            .into_iter()
+            .find(|candidate| candidate.id == sid)
+            .expect("monitored");
+        assert_eq!(
+            process_monitored_search(&saved, &baseline_item, base, 2)
+                .await
+                .expect("baseline"),
+            0
+        );
+        let item = MonitoredSearch {
+            id: sid,
+            owner,
+            workspace: ws,
+            query: needle.clone(),
+            cursor_at: Some(base),
+            cursor_message_id: None,
+        };
 
         // Run 1 with cap=2: notifies the 2 OLDEST, cursor advances only to the 2nd.
-        let r1 = process_monitored_search(&search_repo, &notifications, &saved, &item, base + time::Duration::seconds(100), 2)
+        let r1 = process_monitored_search(&saved, &item, base + time::Duration::seconds(100), 2)
             .await
             .expect("run1");
         assert_eq!(r1, 2, "first capped run notifies exactly the cap");
 
         // Re-read the cursor and run again: the 3rd (un-notified) match is caught.
-        let monitored = saved.list_monitored().await.expect("list");
-        let item2 = monitored.into_iter().find(|m| m.id == sid).expect("still monitored");
-        let r2 = process_monitored_search(&search_repo, &notifications, &saved, &item2, base + time::Duration::seconds(200), 2)
+        let monitored = monitored_page(&saved).await;
+        let item2 = monitored
+            .into_iter()
+            .find(|m| m.id == sid)
+            .expect("still monitored");
+        let r2 = process_monitored_search(&saved, &item2, base + time::Duration::seconds(200), 2)
             .await
             .expect("run2");
-        assert_eq!(r2, 1, "the next run drains the remaining match — none dropped");
+        assert_eq!(
+            r2, 1,
+            "the next run drains the remaining match — none dropped"
+        );
 
         // All 3 matches ended up notified across the two runs (no silent loss).
-        let inbox = notifications.list(owner, None, false, Some(50)).await.expect("inbox");
+        let inbox = notifications
+            .list(owner, None, false, Some(50))
+            .await
+            .expect("inbox");
         for id in &ids {
             assert!(
                 inbox.iter().any(|n| n.message_id == *id
@@ -390,15 +403,324 @@ mod db_tests {
                 "match {id} was eventually notified",
             );
         }
+    }
 
-        // Cleanup.
-        sqlx::query("DELETE FROM notifications WHERE participant_id = $1").bind(owner.to_uuid()).execute(&p).await.ok();
-        sqlx::query("DELETE FROM saved_searches WHERE participant_id = $1").bind(owner.to_uuid()).execute(&p).await.ok();
-        for id in &ids {
-            sqlx::query("DELETE FROM messages WHERE id = $1").bind(id.to_uuid()).execute(&p).await.ok();
-        }
-        sqlx::query("DELETE FROM room_members WHERE room_id = $1").bind(r.to_uuid()).execute(&p).await.ok();
-        sqlx::query("DELETE FROM rooms WHERE id = $1").bind(r.to_uuid()).execute(&p).await.ok();
-        sqlx::query("DELETE FROM participants WHERE id = $1").bind(owner.to_uuid()).execute(&p).await.ok();
+    /// Two server instances may race the same stale work-list row. The saved
+    /// search row lock serializes them, while the stable delivery id also makes a
+    /// deliberately rewound (crash-style stale) cursor converge without another
+    /// inbox row.
+    #[tokio::test]
+    #[ignore = "requires live Postgres with migrations through 0188"]
+    async fn concurrent_workers_and_stale_cursor_retry_are_idempotent() {
+        let p = pool();
+        let saved = SavedSearchRepo::new(p.clone());
+        let owner = participant(&p).await;
+        let ws = workspace(&p, owner).await;
+        let room = room(&p, owner, ws).await;
+        let needle = format!("zqconcurrent{}", ParticipantId::new());
+        let sid = saved.create(owner, ws, "race", &needle).await.unwrap();
+        saved.set_notify_new(sid, owner, true).await.unwrap();
+
+        let base = time::OffsetDateTime::now_utc();
+        let item = monitored(&saved, sid).await;
+        assert_eq!(
+            process_monitored_search(&saved, &item, base, 20)
+                .await
+                .unwrap(),
+            0
+        );
+        let message =
+            insert_match(&p, room, owner, &needle, base + time::Duration::seconds(1)).await;
+        let stale = monitored(&saved, sid).await;
+        let repo_a = saved.clone();
+        let repo_b = saved.clone();
+        let item_a = stale.clone();
+        let item_b = stale;
+        let high_water = base + time::Duration::seconds(30);
+        let (first, second) = tokio::join!(
+            process_monitored_search(&repo_a, &item_a, high_water, 20),
+            process_monitored_search(&repo_b, &item_b, high_water, 20),
+        );
+        assert_eq!(
+            first.unwrap() + second.unwrap(),
+            1,
+            "only one racing worker materializes the notification"
+        );
+
+        // Simulate a pre-fix crash window: the notification survived, but the
+        // cursor appears stale. UUIDv5 + the notification unique index must make
+        // the replay a no-op while still repairing cursor progress.
+        rewind(&p, sid, base).await;
+        assert_eq!(
+            process_monitored_search(&saved, &item_a, high_water + time::Duration::seconds(1), 20,)
+                .await
+                .unwrap(),
+            0
+        );
+        let row: (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*), COUNT(delivery_id)
+               FROM notifications
+              WHERE participant_id = $1
+                AND message_id = $2
+                AND kind = 'saved_search'",
+        )
+        .bind(owner.to_uuid())
+        .bind(message.to_uuid())
+        .fetch_one(&p)
+        .await
+        .unwrap();
+        assert_eq!(row, (1, 1), "one durable, stable-id notification remains");
+
+        sqlx::query(
+            "UPDATE saved_search_monitor_deliveries
+                SET delivered_at = CURRENT_TIMESTAMP - INTERVAL '2 days'
+              WHERE saved_search_id = $1",
+        )
+        .bind(sid.to_uuid())
+        .execute(&p)
+        .await
+        .unwrap();
+        process_monitored_search(&saved, &item_a, high_water + time::Duration::seconds(2), 20)
+            .await
+            .unwrap();
+        let ledger_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)
+               FROM saved_search_monitor_deliveries
+              WHERE saved_search_id = $1",
+        )
+        .bind(sid.to_uuid())
+        .fetch_one(&p)
+        .await
+        .unwrap();
+        assert_eq!(ledger_rows, 0, "entries older than 24 hours are swept");
+    }
+
+    /// A message transaction may allocate `created_at` before the monitor's
+    /// snapshot and commit only after the monitor advances its high-water mark.
+    /// The bounded overlap must recover it on the next tick.
+    #[tokio::test]
+    #[ignore = "requires live Postgres with migrations through 0188"]
+    async fn overlap_recovers_message_committed_after_monitor_snapshot() {
+        let p = pool();
+        let saved = SavedSearchRepo::new(p.clone());
+        let owner = participant(&p).await;
+        let ws = workspace(&p, owner).await;
+        let room = room(&p, owner, ws).await;
+        let needle = format!("zqlatecommit{}", ParticipantId::new());
+        let sid = saved.create(owner, ws, "late", &needle).await.unwrap();
+        saved.set_notify_new(sid, owner, true).await.unwrap();
+        let base = time::OffsetDateTime::now_utc();
+        let item = monitored(&saved, sid).await;
+        process_monitored_search(&saved, &item, base, 20)
+            .await
+            .unwrap();
+
+        let message = aero_common::MessageId::new();
+        let text = format!("{needle} delayed");
+        let mut writer = p.begin().await.unwrap();
+        sqlx::query(
+            "INSERT INTO messages
+                 (id, room_id, sender_id, blocks, searchable_text, created_at)
+             VALUES ($1, $2, $3, $4::jsonb, $5, $6)",
+        )
+        .bind(message.to_uuid())
+        .bind(room.to_uuid())
+        .bind(owner.to_uuid())
+        .bind(serde_json::json!([{ "type": "text", "content": text }]).to_string())
+        .bind(&text)
+        .bind(base + time::Duration::seconds(1))
+        .execute(&mut *writer)
+        .await
+        .unwrap();
+
+        let high_water = base + time::Duration::seconds(30);
+        assert_eq!(
+            process_monitored_search(&saved, &item, high_water, 20)
+                .await
+                .unwrap(),
+            0,
+            "the uncommitted message is invisible to this snapshot"
+        );
+        writer.commit().await.unwrap();
+
+        assert_eq!(
+            process_monitored_search(&saved, &item, high_water + time::Duration::seconds(1), 20,)
+                .await
+                .unwrap(),
+            1,
+            "lookback recovers the late commit behind the high-water cursor"
+        );
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)
+               FROM notifications
+              WHERE participant_id = $1
+                AND message_id = $2
+                AND kind = 'saved_search'",
+        )
+        .bind(owner.to_uuid())
+        .bind(message.to_uuid())
+        .fetch_one(&p)
+        .await
+        .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    /// The monitor's search and its final insert both use effective access. Every
+    /// revocation dimension suppresses a pending notification even though the
+    /// saved search and matching message still exist.
+    #[tokio::test]
+    #[ignore = "requires live Postgres with migrations through 0188"]
+    async fn final_insert_rechecks_complete_effective_access() {
+        let p = pool();
+        let saved = SavedSearchRepo::new(p.clone());
+        let manager = participant(&p).await;
+        let owner = participant(&p).await;
+        let ws = workspace(&p, manager).await;
+        let room = room(&p, owner, ws).await;
+        let needle = format!("zqrevoked{}", ParticipantId::new());
+        let sid = saved.create(owner, ws, "revoked", &needle).await.unwrap();
+        saved.set_notify_new(sid, owner, true).await.unwrap();
+        let base = time::OffsetDateTime::now_utc();
+        let item = monitored(&saved, sid).await;
+        process_monitored_search(&saved, &item, base, 20)
+            .await
+            .unwrap();
+        insert_match(&p, room, owner, &needle, base + time::Duration::seconds(1)).await;
+        let high_water = base + time::Duration::seconds(30);
+
+        sqlx::query(
+            "DELETE FROM room_members
+              WHERE room_id = $1 AND participant_id = $2",
+        )
+        .bind(room.to_uuid())
+        .bind(owner.to_uuid())
+        .execute(&p)
+        .await
+        .unwrap();
+        assert_eq!(
+            process_monitored_search(&saved, &item, high_water, 20)
+                .await
+                .unwrap(),
+            0,
+            "room revocation suppresses delivery"
+        );
+        sqlx::query(
+            "INSERT INTO room_members (room_id, participant_id, role)
+             VALUES ($1, $2, 'member')",
+        )
+        .bind(room.to_uuid())
+        .bind(owner.to_uuid())
+        .execute(&p)
+        .await
+        .unwrap();
+
+        rewind(&p, sid, base).await;
+        sqlx::query(
+            "INSERT INTO workspace_deactivations
+                 (workspace_id, participant_id, deactivated_by)
+             VALUES ($1, $2, $3)",
+        )
+        .bind(ws.to_uuid())
+        .bind(owner.to_uuid())
+        .bind(manager.to_uuid())
+        .execute(&p)
+        .await
+        .unwrap();
+        assert_eq!(
+            process_monitored_search(&saved, &item, high_water, 20)
+                .await
+                .unwrap(),
+            0,
+            "workspace deactivation suppresses delivery"
+        );
+        sqlx::query(
+            "DELETE FROM workspace_deactivations
+              WHERE workspace_id = $1 AND participant_id = $2",
+        )
+        .bind(ws.to_uuid())
+        .bind(owner.to_uuid())
+        .execute(&p)
+        .await
+        .unwrap();
+
+        rewind(&p, sid, base).await;
+        sqlx::query(
+            "DELETE FROM workspace_members
+              WHERE workspace_id = $1 AND participant_id = $2",
+        )
+        .bind(ws.to_uuid())
+        .bind(owner.to_uuid())
+        .execute(&p)
+        .await
+        .unwrap();
+        assert_eq!(
+            process_monitored_search(&saved, &item, high_water, 20)
+                .await
+                .unwrap(),
+            0,
+            "workspace membership revocation suppresses delivery"
+        );
+        sqlx::query(
+            "INSERT INTO workspace_members
+                 (workspace_id, participant_id, role)
+             VALUES ($1, $2, 'member')",
+        )
+        .bind(ws.to_uuid())
+        .bind(owner.to_uuid())
+        .execute(&p)
+        .await
+        .unwrap();
+
+        rewind(&p, sid, base).await;
+        sqlx::query(
+            "INSERT INTO totp_secrets (participant_id, secret, activated)
+             VALUES ($1, $2, true)",
+        )
+        .bind(manager.to_uuid())
+        .bind(format!("saved-search-manager-{manager}"))
+        .execute(&p)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE workspaces SET require_2fa = true WHERE id = $1")
+            .bind(ws.to_uuid())
+            .execute(&p)
+            .await
+            .unwrap();
+        assert_eq!(
+            process_monitored_search(&saved, &item, high_water, 20)
+                .await
+                .unwrap(),
+            0,
+            "mandatory 2FA suppresses the unenrolled saved-search owner"
+        );
+        sqlx::query("UPDATE workspaces SET require_2fa = false WHERE id = $1")
+            .bind(ws.to_uuid())
+            .execute(&p)
+            .await
+            .unwrap();
+
+        rewind(&p, sid, base).await;
+        sqlx::query("UPDATE participants SET deleted_at = now() WHERE id = $1")
+            .bind(owner.to_uuid())
+            .execute(&p)
+            .await
+            .unwrap();
+        assert_eq!(
+            process_monitored_search(&saved, &item, high_water, 20)
+                .await
+                .unwrap(),
+            0,
+            "deleted account suppresses delivery"
+        );
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*)
+               FROM notifications
+              WHERE participant_id = $1 AND kind = 'saved_search'",
+        )
+        .bind(owner.to_uuid())
+        .fetch_one(&p)
+        .await
+        .unwrap();
+        assert_eq!(count, 0);
     }
 }

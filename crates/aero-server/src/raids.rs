@@ -14,10 +14,16 @@
 use std::str::FromStr;
 
 use aero_auth::AuthUser;
-use aero_common::{Error as AeroError, ParticipantId, StreamEvent};
-use aero_storage::{RaidRepo, StreamRepo};
+use aero_common::{Error as AeroError, StreamEvent};
+use aero_storage::{
+    raid::{
+        DEFAULT_RAID_HISTORY_LIMIT, MAX_RAID_HISTORY_LIMIT, MAX_RAID_HISTORY_OFFSET,
+        MAX_RAID_MESSAGE_CHARS,
+    },
+    RaidRepo,
+};
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     routing::{get, post},
     Json, Router,
 };
@@ -41,22 +47,6 @@ fn parse_stream(s: &str) -> Result<Ulid, AeroError> {
 
 fn repo(s: &AppState) -> RaidRepo {
     RaidRepo::new(s.pg.clone())
-}
-
-/// Resolve `stream` and assert `caller` owns it. Returns the resolved owner check;
-/// `NotFound` if the stream is unknown, `Forbidden` if the caller is not its owner.
-async fn require_owner(s: &AppState, stream: Ulid, caller: ParticipantId) -> Result<(), AeroError> {
-    let row = StreamRepo::new(s.pg.clone())
-        .get(stream)
-        .await
-        .map_err(AeroError::from)?
-        .ok_or_else(|| AeroError::NotFound(format!("stream {stream}")))?;
-    if row.owner_id != caller {
-        return Err(AeroError::Forbidden(
-            "only the source stream's owner may raid".into(),
-        ));
-    }
-    Ok(())
 }
 
 /// Current viewer count of a stream — cluster-correct from the Redis viewer set,
@@ -92,25 +82,35 @@ async fn launch_raid(
     if source == target {
         return Err(AeroError::Invalid("cannot raid the same stream".into()).into());
     }
-    // Source-owner only.
-    require_owner(&s, source, auth.participant_id).await?;
-    // The target must exist too — a raid to a phantom stream could never resolve.
-    if StreamRepo::new(s.pg.clone())
-        .get(target)
-        .await
-        .map_err(AeroError::from)?
-        .is_none()
+    let message = req
+        .message
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned);
+    if message
+        .as_deref()
+        .is_some_and(|value| value.chars().count() > MAX_RAID_MESSAGE_CHARS)
     {
-        return Err(AeroError::NotFound(format!("target stream {target}")).into());
+        return Err(AeroError::Invalid(format!(
+            "raid message exceeds {MAX_RAID_MESSAGE_CHARS} characters"
+        ))
+        .into());
     }
 
     let count = viewer_count(&s, source).await;
-    let msg = req.message.as_deref();
     let id = repo(&s)
-        .create(source, target, auth.participant_id, i32::try_from(count).unwrap_or(i32::MAX), msg)
+        .create_authorized(
+            source,
+            target,
+            auth.participant_id,
+            i32::try_from(count).unwrap_or(i32::MAX),
+            message.as_deref(),
+        )
         .await?;
 
-    // Tell the source stream's watchers to redirect to the target.
+    // `create_authorized` returns only after commit. Never publish a redirect
+    // for a rejected or rolled-back raid.
     s.live
         .broadcast(&StreamEvent::Raid {
             stream_id: source,
@@ -124,8 +124,16 @@ async fn launch_raid(
         "source_stream": source.to_string(),
         "target_stream": target.to_string(),
         "viewer_count": count,
-        "message": req.message,
+        "message": message,
     })))
+}
+
+#[derive(Deserialize)]
+struct RaidHistoryQuery {
+    #[serde(default)]
+    limit: Option<i64>,
+    #[serde(default)]
+    offset: Option<i64>,
 }
 
 /// `GET /api/streams/:id/raids` — the raids this stream launched, newest first.
@@ -134,10 +142,19 @@ async fn list_raids(
     State(s): State<AppState>,
     _auth: AuthUser,
     Path(id_str): Path<String>,
+    Query(query): Query<RaidHistoryQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let source = parse_stream(&id_str)?;
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_RAID_HISTORY_LIMIT)
+        .clamp(1, MAX_RAID_HISTORY_LIMIT);
+    let offset = query
+        .offset
+        .unwrap_or_default()
+        .clamp(0, MAX_RAID_HISTORY_OFFSET);
     let raids = repo(&s)
-        .list_for_stream(source)
+        .list_for_stream(source, limit, offset)
         .await
         .map_err(AeroError::from)?;
     Ok(Json(serde_json::json!({ "raids": raids })))
@@ -153,5 +170,7 @@ async fn raid_analytics(
         .analytics(auth.participant_id)
         .await
         .map_err(AeroError::from)?;
-    Ok(Json(serde_json::to_value(analytics).map_err(AeroError::from)?))
+    Ok(Json(
+        serde_json::to_value(analytics).map_err(AeroError::from)?,
+    ))
 }

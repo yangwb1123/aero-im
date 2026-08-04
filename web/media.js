@@ -10,6 +10,7 @@
 
 import { api, ApiError } from './api.js';
 import { state, ws, els } from './context.js';
+import { sendOptimistically } from './delivery.js';
 import { toast } from './render.js';
 
 // app-core callbacks, injected by initMedia()
@@ -60,7 +61,6 @@ export function initMedia(deps) {
     const files = Array.from(e.dataTransfer.files || []);
     for (const f of files) {
       // serial to keep order
-      // eslint-disable-next-line no-await-in-loop
       await uploadAndSend(f);
     }
   });
@@ -70,7 +70,7 @@ async function uploadAndSend(file) {
   if (!state.currentRoomId) { toast('请先选择房间', 'error'); return; }
   toast(`上传 ${file.name}…`, 'info');
   try {
-    const blob = await api.uploadBlob(file);
+    const blob = await api.uploadBlob(file, state.currentRoomId);
     const block = {
       type: 'file',
       blob_id: blob.id,
@@ -78,8 +78,11 @@ async function uploadAndSend(file) {
       name: blob.name,
       size: blob.size,
     };
-    optimisticAdd(state.currentRoomId, [block]);
-    ws.sendMessage(state.currentRoomId, [block], null);
+    if (!sendOptimistically(
+      (id) => ws.sendMessage(state.currentRoomId, [block], null, id),
+      (delivery) => optimisticAdd(state.currentRoomId, [block], null, delivery),
+      { kind: 'blocks', roomId: state.currentRoomId, blocks: [block], replyTo: null },
+    )) return;
   } catch (err) {
     if (err instanceof ApiError && err.status === 401) forceReauth();
     else toast(`上传失败:${err.message}`, 'error');
@@ -134,14 +137,18 @@ async function onVoiceStop() {
   toast('上传录音…', 'info');
   try {
     const file = new File([blob], `voice-${Date.now()}.webm`, { type: blob.type });
-    const meta = await api.uploadBlob(file);
+    const meta = await api.uploadBlob(file, state.currentRoomId);
     const voiceBlock = {
       type: 'voice',
       blob_id: meta.id,
       duration_ms: durationMs,
     };
-    optimisticAdd(state.currentRoomId, [voiceBlock]);
-    ws.sendMessage(state.currentRoomId, [voiceBlock], state.replyTo ? state.replyTo.id : null);
+    const replyTo = state.replyTo ? state.replyTo.id : null;
+    if (!sendOptimistically(
+      (id) => ws.sendMessage(state.currentRoomId, [voiceBlock], replyTo, id),
+      (delivery) => optimisticAdd(state.currentRoomId, [voiceBlock], replyTo, delivery),
+      { kind: 'blocks', roomId: state.currentRoomId, blocks: [voiceBlock], replyTo },
+    )) return;
     clearReply();
   } catch (err) {
     if (err instanceof ApiError && err.status === 401) forceReauth();

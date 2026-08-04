@@ -15,8 +15,8 @@
 use std::str::FromStr;
 
 use aero_auth::AuthUser;
-use aero_common::{BlobId, Error as AeroError, FileKind};
 use aero_common::MessageId;
+use aero_common::{BlobId, Error as AeroError, FileKind};
 use aero_storage::{BlobRepo, ExportJobRepo, MessageRepo, NewBlob};
 use axum::{
     extract::{Path, State},
@@ -62,8 +62,8 @@ async fn export_me(
     )
     .map_err(AeroError::from)?;
 
-    let participant = participant
-        .ok_or_else(|| AeroError::Unauthorized("participant not found".into()))?;
+    let participant =
+        participant.ok_or_else(|| AeroError::Unauthorized("participant not found".into()))?;
 
     let exported_at = time::OffsetDateTime::now_utc();
 
@@ -87,7 +87,9 @@ async fn export_async(
         .enqueue(auth.participant_id)
         .await
         .map_err(AeroError::from)?;
-    Ok(Json(serde_json::json!({ "job_id": job_id, "status": "queued" })))
+    Ok(Json(
+        serde_json::json!({ "job_id": job_id, "status": "queued" }),
+    ))
 }
 
 /// `GET /api/me/export/jobs/:id` — poll an async export job.
@@ -103,8 +105,8 @@ async fn export_job_status(
     auth: AuthUser,
     Path(id_str): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let id = uuid::Uuid::from_str(id_str.trim())
-        .map_err(|_| AeroError::Invalid("job id".into()))?;
+    let id =
+        uuid::Uuid::from_str(id_str.trim()).map_err(|_| AeroError::Invalid("job id".into()))?;
     let job = ExportJobRepo::new(s.pg.clone())
         .get(id)
         .await
@@ -118,7 +120,10 @@ async fn export_job_status(
             let expires_at = job
                 .completed_at
                 .map(|c| c + aero_storage::EXPORT_LINK_TTL)
-                .and_then(|t| t.format(&time::format_description::well_known::Rfc3339).ok());
+                .and_then(|t| {
+                    t.format(&time::format_description::well_known::Rfc3339)
+                        .ok()
+                });
             return Ok(Json(serde_json::json!({
                 "status": "done",
                 "download_url": job.blob_id.map(|b| format!("/api/blobs/{b}")),
@@ -127,7 +132,10 @@ async fn export_job_status(
         }
         // Link expired: best-effort GC just THIS archive blob, report expired.
         if let Some(blob) = job.blob_id {
-            if let Err(e) = aero_storage::BlobGcRepo::new(s.pg.clone()).enqueue_one(blob).await {
+            if let Err(e) = aero_storage::BlobGcRepo::new(s.pg.clone())
+                .enqueue_one(blob)
+                .await
+            {
                 warn!(error = ?e, %blob, "export archive GC enqueue failed");
             }
         }
@@ -210,7 +218,9 @@ async fn build_and_store_archive(
             Some(id) => id,
             None => break,
         };
-        let page = msg_repo.by_sender_paged(participant, before, EXPORT_PAGE).await?;
+        let page = msg_repo
+            .by_sender_paged(participant, before, EXPORT_PAGE)
+            .await?;
         if page.is_empty() {
             break;
         }
@@ -220,7 +230,9 @@ async fn build_and_store_archive(
             break; // short page ⇒ done (extend kept it < a full page)
         }
     }
-    let blobs = blob_repo.list_by_owner(participant, EXPORT_BLOB_CAP).await?;
+    let blobs = blob_repo
+        .list_by_owner(participant, EXPORT_BLOB_CAP)
+        .await?;
 
     let archive = serde_json::json!({
         "participant": profile,
@@ -238,10 +250,11 @@ async fn build_and_store_archive(
     };
     let size = bytes.len() as u64;
 
-    // Persist the archive as a participant-owned blob, then write the bytes to
-    // the store (which derives its key from the blob id, same as upload).
-    let blob = blob_repo
-        .create(NewBlob {
+    // Reserve metadata, write the archive, then publish the metadata. A failed
+    // store/finalize step is compensated through the shared blob-GC lifecycle,
+    // so export retries cannot leave a visible row with missing bytes.
+    let reservation = blob_repo
+        .reserve(NewBlob {
             owner_id: participant,
             kind: FileKind::Document,
             name: "aero-export.json".into(),
@@ -251,11 +264,26 @@ async fn build_and_store_archive(
             storage_key: format!("pending:{}", uuid::Uuid::new_v4()),
         })
         .await?;
-    state
-        .blob_store
-        .put(blob.id, bytes.into())
-        .await
-        .map_err(|e| anyhow::anyhow!("archive put: {e}"))?;
+    let key = match state.blob_store.put(reservation.id, bytes.into()).await {
+        Ok(key) => key,
+        Err(error) => {
+            crate::routes::routes::abort_blob_reservation(state, reservation.id).await;
+            return Err(anyhow::anyhow!("archive put: {error}"));
+        }
+    };
+    let blob = match blob_repo.finalize(reservation.id, &key).await {
+        Ok(Some(blob)) => blob,
+        Ok(None) => {
+            crate::routes::routes::abort_blob_reservation(state, reservation.id).await;
+            return Err(anyhow::anyhow!(
+                "archive reservation disappeared before finalize"
+            ));
+        }
+        Err(error) => {
+            crate::routes::routes::abort_blob_reservation(state, reservation.id).await;
+            return Err(error.into());
+        }
+    };
     Ok(blob.id)
 }
 

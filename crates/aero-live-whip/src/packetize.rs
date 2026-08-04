@@ -177,7 +177,11 @@ impl WhepPacketizer {
         // Running byte count for the current pending group: 1 (STAP-A hdr) + sum(2 + len).
         let mut pending_size: usize = stap_hdr;
 
-        let flush_pending = |pending: &mut Vec<&[u8]>, pending_size: &mut usize, packetizer: &mut Self, rtp_ts: u32, out: &mut Vec<RtpPacket>| {
+        let flush_pending = |pending: &mut Vec<&[u8]>,
+                             pending_size: &mut usize,
+                             packetizer: &mut Self,
+                             rtp_ts: u32,
+                             out: &mut Vec<RtpPacket>| {
             match pending.len() {
                 0 => {}
                 1 => {
@@ -423,8 +427,7 @@ mod tests {
         let mut d = H264Depacketizer::new();
         let mut out = BytesMut::new();
         for pkt in pkts {
-            let (_, _, marker, payload) =
-                rtp_parse(&pkt.bytes).expect("valid RTP header");
+            let (_, _, marker, payload) = rtp_parse(&pkt.bytes).expect("valid RTP header");
             d.push(payload, marker, &mut out)?;
         }
         Ok(out)
@@ -457,7 +460,11 @@ mod tests {
         let pkts = p.packetize(&[&nal], 1_800_000);
 
         // Must produce multiple packets.
-        assert!(pkts.len() > 1, "FU-A must fragment; got {} packets", pkts.len());
+        assert!(
+            pkts.len() > 1,
+            "FU-A must fragment; got {} packets",
+            pkts.len()
+        );
 
         // Marker only on the last.
         let n = pkts.len();
@@ -503,7 +510,11 @@ mod tests {
         assert!(pkts.last().unwrap().marker);
 
         let out = depacketize_packets(&pkts).unwrap();
-        let expected = annex_b(&[(0x67, &[0x42, 0x00, 0x1F]), (0x68, &[0xCE]), (0x65, &idr_body)]);
+        let expected = annex_b(&[
+            (0x67, &[0x42, 0x00, 0x1F]),
+            (0x68, &[0xCE]),
+            (0x65, &idr_body),
+        ]);
         assert_eq!(&out[..], &expected[..]);
     }
 
@@ -559,7 +570,11 @@ mod tests {
         let pkts = p.packetize(&[&nal], 0);
         let out = depacketize_packets(&pkts).unwrap();
         let expected = annex_b(&[(0x65, &body)]);
-        assert_eq!(&out[..], &expected[..], "reassembly must equal original NAL");
+        assert_eq!(
+            &out[..],
+            &expected[..],
+            "reassembly must equal original NAL"
+        );
     }
 
     // ---- marker bit ----
@@ -595,8 +610,7 @@ mod tests {
         for (i, pkt) in pkts.iter().enumerate() {
             // Octet 1 of RTP header: bit 7 = marker.
             let marker_in_wire = pkt.bytes[1] & 0x80 != 0;
-            assert_eq!(marker_in_wire, i == n - 1,
-                "wire marker bit at packet {i}");
+            assert_eq!(marker_in_wire, i == n - 1, "wire marker bit at packet {i}");
         }
     }
 

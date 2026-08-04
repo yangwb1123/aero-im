@@ -6,7 +6,8 @@ owns — a `call_caption` client frame is relayed to the room as a
 `call`/`op:"caption"` server frame (with the optional AI translation on final
 lines when a target language is set and ANTHROPIC_API_KEY is configured).
 
-Two WS clients join a room; client A emits a caption; client B must receive it.
+Two WS clients join a room and establish a call; client A emits a caption;
+client B must receive it.
 
 Requires the stack up (Postgres/Redis/NATS) and the server on $AERO_HOST.
 """
@@ -71,9 +72,34 @@ async def main():
             assert json.loads(await wa.recv())["type"] == "welcome"
             await wa.send(json.dumps({"type": "join_room", "room_id": room}))
             await wa.recv()
+            sdp = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nt=0 0\r\n"
+            await wa.send(json.dumps({
+                "type": "call_invite",
+                "room_id": room,
+                "kind": "audio",
+                "sdp": sdp,
+            }))
+            invite = None
+            for _ in range(8):
+                frame = json.loads(await asyncio.wait_for(wb.recv(), timeout=3))
+                event = frame.get("event", {})
+                if frame.get("type") == "call" and event.get("op") == "invite":
+                    invite = event
+                    break
+            if not invite or not invite.get("call_id"):
+                fail(f"B did not receive the call invite: {invite}")
+            call_id = invite["call_id"]
+            await wb.send(json.dumps({
+                "type": "call_answer",
+                "call_id": call_id,
+                "room_id": room,
+                "to": Apid,
+                "sdp": sdp,
+            }))
+            await asyncio.sleep(0.2)
             await wa.send(json.dumps({
                 "type": "call_caption",
-                "call_id": "01KSBZ0000000000000000000A",
+                "call_id": call_id,
                 "room_id": room, "text": "你好世界", "lang": "zh-CN", "is_final": True,
             }))
             got = None
@@ -91,6 +117,11 @@ async def main():
             if got.get("is_final") is not True:
                 fail(f"caption is_final mismatch: {got}")
             ok(f"caption relayed B←A: text={got['text']!r} final={got['is_final']}")
+            await wa.send(json.dumps({
+                "type": "call_end",
+                "call_id": call_id,
+                "room_id": room,
+            }))
 
     print()
     print("\033[1;32m✓ captions (P3) smoke passed\033[0m")

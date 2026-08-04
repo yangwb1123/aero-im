@@ -209,7 +209,7 @@ impl UsageReportRepo {
 #[cfg(test)]
 mod db_tests {
     use super::*;
-    use aero_common::{BlobId, ParticipantId, RoomId, WorkspaceRole};
+    use aero_common::{BlobId, ParticipantId, RoomId, RoomKind, WorkspaceRole};
 
     fn pool() -> PgPool {
         let url = std::env::var("DATABASE_URL")
@@ -233,35 +233,39 @@ mod db_tests {
 
     async fn workspace(p: &PgPool, owner: ParticipantId) -> WorkspaceId {
         let ws = WorkspaceId::new();
+        let mut tx = p.begin().await.expect("begin workspace fixture");
         sqlx::query("INSERT INTO workspaces (id, name, slug, created_by, created_at) VALUES ($1,$2,$3,$4, now())")
             .bind(ws.to_uuid())
             .bind("Usage Test WS")
             .bind(format!("usage-{ws}"))
             .bind(owner.to_uuid())
-            .execute(p)
+            .execute(&mut *tx)
             .await
             .expect("insert workspace");
-        sqlx::query("INSERT INTO workspace_members (workspace_id, participant_id, role, joined_at) VALUES ($1,$2,$3, now())")
-            .bind(ws.to_uuid())
-            .bind(owner.to_uuid())
-            .bind(WorkspaceRole::Owner.as_str())
-            .execute(p)
-            .await
-            .expect("insert workspace member");
+        sqlx::query(
+            "INSERT INTO workspace_members (workspace_id, participant_id, role, joined_at) VALUES ($1,$2,$3, now())",
+        )
+        .bind(ws.to_uuid())
+        .bind(owner.to_uuid())
+        .bind(WorkspaceRole::Owner.as_str())
+        .execute(&mut *tx)
+        .await
+        .expect("insert workspace member");
+        tx.commit().await.expect("commit workspace fixture");
         ws
     }
 
     async fn room_in(p: &PgPool, ws: WorkspaceId, creator: ParticipantId) -> RoomId {
-        let id = RoomId::new();
-        sqlx::query("INSERT INTO rooms (id, kind, name, created_by, created_at, workspace_id) VALUES ($1,'channel',$2,$3, now(), $4)")
-            .bind(id.to_uuid())
-            .bind(format!("usage-room-{id}"))
-            .bind(creator.to_uuid())
-            .bind(ws.to_uuid())
-            .execute(p)
+        crate::RoomRepo::new(p.clone())
+            .create_in_workspace(
+                ws,
+                RoomKind::Channel,
+                Some(format!("usage-room-{}", RoomId::new())),
+                creator,
+            )
             .await
-            .expect("insert room");
-        id
+            .expect("insert room")
+            .id
     }
 
     /// Insert a message in `room`; if `blob` is given, attach a File block that
@@ -269,7 +273,9 @@ mod db_tests {
     async fn insert_message(p: &PgPool, room: RoomId, sender: ParticipantId, blob: Option<BlobId>) {
         let id = aero_common::MessageId::new();
         let blocks = match blob {
-            Some(b) => serde_json::json!([{ "type": "file", "blob_id": b.to_string(), "kind": "image", "name": "f.png", "size": 10 }]),
+            Some(b) => {
+                serde_json::json!([{ "type": "file", "blob_id": b.to_string(), "kind": "image", "name": "f.png", "size": 10 }])
+            }
             None => serde_json::json!([{ "type": "text", "text": "usage body" }]),
         };
         sqlx::query("INSERT INTO messages (id, room_id, sender_id, blocks, searchable_text, created_at) VALUES ($1,$2,$3,$4,$5, now())")
@@ -283,11 +289,17 @@ mod db_tests {
             .expect("insert message");
     }
 
-    async fn insert_blob(p: &PgPool, owner: ParticipantId, size: i64) -> BlobId {
+    async fn insert_blob(
+        p: &PgPool,
+        owner: ParticipantId,
+        workspace: WorkspaceId,
+        size: i64,
+    ) -> BlobId {
         let id = BlobId::new();
-        sqlx::query("INSERT INTO blobs (id, owner_id, kind, name, mime, size, storage_key, created_at) VALUES ($1,$2,'image',$3,'image/png',$4,$5, now())")
+        sqlx::query("INSERT INTO blobs (id, owner_id, workspace_id, kind, name, mime, size, storage_key, created_at) VALUES ($1,$2,$3,'image',$4,'image/png',$5,$6, now())")
             .bind(id.to_uuid())
             .bind(owner.to_uuid())
+            .bind(workspace.to_uuid())
             .bind(format!("blob-{id}.png"))
             .bind(size)
             .bind(format!("key/{id}"))
@@ -329,7 +341,7 @@ mod db_tests {
         let room = room_in(&p, ws, owner).await;
         insert_message(&p, room, owner, None).await;
         insert_message(&p, room, owner, None).await;
-        let blob = insert_blob(&p, owner, 1234).await;
+        let blob = insert_blob(&p, owner, ws, 1234).await;
         insert_message(&p, room, owner, Some(blob)).await;
 
         // Seed: 2 answer jobs (token-accounted) + 1 embed job (no tokens).
@@ -366,10 +378,26 @@ mod db_tests {
         assert_eq!(embed.input_tokens, 0, "embed has no token accounting");
 
         // Cleanup so reruns stay self-contained.
-        sqlx::query("DELETE FROM ai_jobs WHERE workspace_id = $1").bind(ws.to_uuid()).execute(&p).await.ok();
-        sqlx::query("DELETE FROM rooms WHERE workspace_id = $1").bind(ws.to_uuid()).execute(&p).await.ok();
-        sqlx::query("DELETE FROM blobs WHERE id = $1").bind(blob.to_uuid()).execute(&p).await.ok();
-        sqlx::query("DELETE FROM workspaces WHERE id = $1").bind(ws.to_uuid()).execute(&p).await.ok();
+        sqlx::query("DELETE FROM ai_jobs WHERE workspace_id = $1")
+            .bind(ws.to_uuid())
+            .execute(&p)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM rooms WHERE workspace_id = $1")
+            .bind(ws.to_uuid())
+            .execute(&p)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM blobs WHERE id = $1")
+            .bind(blob.to_uuid())
+            .execute(&p)
+            .await
+            .ok();
+        sqlx::query("DELETE FROM workspaces WHERE id = $1")
+            .bind(ws.to_uuid())
+            .execute(&p)
+            .await
+            .ok();
     }
 
     /// A second workspace's data never leaks into the first's report (tenant scope).
@@ -393,7 +421,11 @@ mod db_tests {
         assert_eq!(a.ai_jobs_total, 0, "B's AI jobs don't leak into A");
         assert_eq!(a.ai_input_tokens, 0);
 
-        sqlx::query("DELETE FROM ai_jobs WHERE workspace_id = $1").bind(ws_b.to_uuid()).execute(&p).await.ok();
+        sqlx::query("DELETE FROM ai_jobs WHERE workspace_id = $1")
+            .bind(ws_b.to_uuid())
+            .execute(&p)
+            .await
+            .ok();
         sqlx::query("DELETE FROM rooms WHERE workspace_id = ANY($1)")
             .bind(vec![ws_a.to_uuid(), ws_b.to_uuid()])
             .execute(&p)

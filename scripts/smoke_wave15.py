@@ -64,23 +64,21 @@ def send(room, text, token):
 def main():
     ts = int(time.time())
     say("setup: register alice (owner) + bob (member)")
-    A, A_refresh, Apid = register("alice", ts)
+    A, _A_refresh, Apid = register("alice", ts)
     B, B_refresh, Bpid = register("bob", ts)
     W = req("POST", "/api/workspaces", {"name": f"Wave15 {ts}", "slug": f"w15-{ts}"}, token=A)["id"]
     req("POST", f"/api/workspaces/{W}/members", {"participant_id": Bpid, "role": "member"}, token=A, expect=[200, 204])
     ok(f"workspace {W[:8]} with alice+bob")
 
     # ---------------- Session management ----------------
-    say("session: refresh access token, then logout revokes the refresh token")
+    say("session: refresh rotates tokens and the new access token works")
     rf = req("POST", "/api/auth/refresh", {"refresh_token": B_refresh})
     if not rf or not rf.get("access_token"):
         fail(f"refresh did not return a new access token: {rf}")
-    new_access = rf["access_token"]
-    req("GET", "/api/me", token=new_access, expect=[200])
+    B = rf["access_token"]
+    rotated_refresh = rf["refresh_token"]
+    req("GET", "/api/me", token=B, expect=[200])
     ok("refresh issued a working new access token")
-    req("POST", "/api/auth/logout", {"refresh_token": B_refresh}, token=B, expect=[200, 204])
-    req("POST", "/api/auth/refresh", {"refresh_token": B_refresh}, expect=[401])
-    ok("logout revoked the refresh token (subsequent refresh → 401)")
 
     # ---------------- Advanced search operators ----------------
     say("search operators: from: / in: narrow the cross-room search")
@@ -135,6 +133,12 @@ def main():
     # alice (now non-owner) can no longer transfer
     req("POST", f"/api/rooms/{Rc}/transfer-ownership", {"to": Apid}, token=A, expect=[403])
     ok("former owner can no longer mutate roles (403)")
+
+    say("session: logout revokes the whole refreshed session")
+    req("POST", "/api/auth/logout", {"refresh_token": rotated_refresh}, expect=[200, 204])
+    req("POST", "/api/auth/refresh", {"refresh_token": rotated_refresh}, expect=[401])
+    req("GET", "/api/me", token=B, expect=[401])
+    ok("logout revoked refresh + access for the bound session")
 
     print("\n\033[1;32m✅ Wave-15 smoke PASSED (session mgmt, search operators, AI smart replies, channel roles)\033[0m")
 

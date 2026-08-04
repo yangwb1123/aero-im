@@ -11,35 +11,20 @@
 //!   vectors.
 //! - **AES-CTR data-plane encryption/decryption** — cipher-block counter is
 //!   built from the packet sequence number and the per-message IV carried in the
-//!   KM message, honouring the KK key-flag bits (`00`=clear, `01`=odd, `10`=even)
+//!   KM message, honouring the KK key-flag bits (`00`=clear, `01`=even, `10`=odd)
 //!   in the SRT data-packet header word.
-//!
-//! ## Public API
-//!
-//! | Item | Purpose |
-//! |------|---------|
-//! | [`SrtCrypto`] | Context holding a single active SEK + IV |
-//! | `SrtCrypto::from_passphrase` | Derive KEK from passphrase + 16-byte salt, configure a SEK |
-//! | `SrtCrypto::encrypt_packet` | In-place AES-CTR encrypt of a data payload |
-//! | `SrtCrypto::decrypt_packet` | In-place AES-CTR decrypt of a data payload |
-//! | [`KmMessage`] | KMREQ/KMRSP on-wire structure |
-//! | `KmMessage::encode` | Build the wire form (wraps the SEK) |
-//! | `KmMessage::decode` | Parse and unwrap the SEK from a received KM message |
-//! | [`aes_key_wrap`] / [`aes_key_unwrap`] | Standalone RFC 3394 wrap/unwrap |
-//! | [`pbkdf2_kek`] | Deterministic KEK derivation (exposed for tests) |
 //!
 //! ## KK bit convention
 //!
-//! Bits 25–24 (0-indexed from LSB) of the SRT data-header word-1 carry the `KK`
+//! Bits 28–27 (0-indexed from LSB) of the SRT data-header word-1 carry the `KK`
 //! field.  This crate exposes [`KkFlag`] and `SrtCrypto` honours it:
 //! - `KkFlag::Clear` (`00`) → packet is unencrypted; `encrypt`/`decrypt` are
 //!   no-ops.
-//! - `KkFlag::EvenKey` (`10`) → encrypt/decrypt with the even SEK.
-//! - `KkFlag::OddKey` (`01`) → encrypt/decrypt with the odd SEK.
+//! - `KkFlag::EvenKey` (`01`) → encrypt/decrypt with the even SEK.
+//! - `KkFlag::OddKey` (`10`) → encrypt/decrypt with the odd SEK.
 //!
-//! For simplicity this implementation keeps only **one** active SEK (which is
-//! treated as the even key); the odd-key slot mirrors it so a real peer's KK flag
-//! is always honoured without a second key-exchange round.
+//! [`SrtKeyRotation`] keeps the even/odd receive slots and only exposes a newly
+//! announced slot after a valid post-handshake KMREQ has been unwrapped.
 
 // Lots of SRT-spec names (KK, KMREQ, SEK, PBKDF2, …) that are short and
 // domain-standard; suppressing the doc_markdown lint keeps code readable.
@@ -47,14 +32,18 @@
 
 use std::fmt;
 
-use aes::Aes128;
 use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
+use aes::Aes128;
+
+mod rotation;
+
+pub(crate) use rotation::SrtKeyRotation;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // KK flag
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// The `KK` (key-keying) field in bits 25–24 of the SRT data-header word-1.
+/// The `KK` (key-keying) field in bits 28–27 of the SRT data-header word-1.
 ///
 /// Tells the receiver which of the two possible SEKs was used to encrypt this
 /// packet.
@@ -62,10 +51,12 @@ use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
 pub enum KkFlag {
     /// Packet is unencrypted (`00`).
     Clear = 0b00,
-    /// Encrypted with the odd SEK (`01`).
-    OddKey = 0b01,
-    /// Encrypted with the even SEK (`10`).
-    EvenKey = 0b10,
+    /// Encrypted with the even SEK (`01`).
+    EvenKey = 0b01,
+    /// Encrypted with the odd SEK (`10`).
+    OddKey = 0b10,
+    /// Reserved/invalid on an SRT data packet (`11`).
+    Invalid = 0b11,
 }
 
 impl KkFlag {
@@ -75,9 +66,10 @@ impl KkFlag {
     /// [`crate::protocol::PacketKind::Data::msg_word`].
     #[must_use]
     pub fn from_msg_word(msg_word: u32) -> Self {
-        match (msg_word >> 24) & 0x03 {
-            0b01 => KkFlag::OddKey,
-            0b10 => KkFlag::EvenKey,
+        match (msg_word >> 27) & 0x03 {
+            0b01 => KkFlag::EvenKey,
+            0b10 => KkFlag::OddKey,
+            0b11 => KkFlag::Invalid,
             _ => KkFlag::Clear,
         }
     }
@@ -85,8 +77,8 @@ impl KkFlag {
     /// Set the KK bits in `msg_word`, returning the updated word.
     #[must_use]
     pub fn set_in_msg_word(self, msg_word: u32) -> u32 {
-        let cleared = msg_word & !(0x03 << 24);
-        cleared | ((self as u32) << 24)
+        let cleared = msg_word & !(0x03 << 27);
+        cleared | ((self as u32) << 27)
     }
 }
 
@@ -97,20 +89,22 @@ impl KkFlag {
 /// Number of PBKDF2 iterations SRT uses when deriving the KEK.
 const PBKDF2_ITERATIONS: u32 = 2048;
 
-/// Derive a 16-byte Key Encrypting Key (KEK) from a passphrase and a 16-byte
-/// salt via PBKDF2-HMAC-SHA1 with [`PBKDF2_ITERATIONS`] iterations.
+/// Derive a 16-byte Key Encrypting Key (KEK) from a passphrase and an SRT salt
+/// via PBKDF2-HMAC-SHA1 with [`PBKDF2_ITERATIONS`] iterations.
 ///
 /// This is the algorithm the SRT spec mandates for the `PBKDF2` step in the
-/// Keying Material message exchange.  The output length is always 16 bytes
-/// (AES-128 key).
+/// Keying Material message exchange. Only the least-significant 64 bits (the
+/// final eight bytes in wire order) of the 128-bit KM salt are supplied to
+/// PBKDF2. The output length is always 16 bytes (AES-128 key).
 #[must_use]
 pub fn pbkdf2_kek(passphrase: &[u8], salt: &[u8]) -> [u8; 16] {
     use hmac::Hmac;
     use pbkdf2::pbkdf2;
     use sha1::Sha1;
 
+    let pbkdf_salt = &salt[salt.len().saturating_sub(8)..];
     let mut kek = [0u8; 16];
-    pbkdf2::<Hmac<Sha1>>(passphrase, salt, PBKDF2_ITERATIONS, &mut kek)
+    pbkdf2::<Hmac<Sha1>>(passphrase, pbkdf_salt, PBKDF2_ITERATIONS, &mut kek)
         .expect("PBKDF2 with a fixed 16-byte output never fails");
     kek
 }
@@ -261,6 +255,43 @@ pub enum KmMessageType {
     Response,
 }
 
+/// Which SEK(s) a KM message carries in its two-bit `KK` field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum KmKeyFlags {
+    /// One even SEK.
+    Even = 0b01,
+    /// One odd SEK.
+    Odd = 0b10,
+    /// Both SEKs, wrapped together in even-then-odd order.
+    EvenAndOdd = 0b11,
+}
+
+impl KmKeyFlags {
+    fn from_wire(value: u8) -> Option<Self> {
+        match value {
+            0b01 => Some(Self::Even),
+            0b10 => Some(Self::Odd),
+            0b11 => Some(Self::EvenAndOdd),
+            _ => None,
+        }
+    }
+
+    /// Whether this message includes the requested encrypted data-key slot.
+    #[must_use]
+    pub fn contains(self, flag: KkFlag) -> bool {
+        matches!(
+            (self, flag),
+            (Self::Even | Self::EvenAndOdd, KkFlag::EvenKey)
+                | (Self::Odd | Self::EvenAndOdd, KkFlag::OddKey)
+        )
+    }
+
+    fn key_count(self) -> usize {
+        usize::from(matches!(self, Self::EvenAndOdd)) + 1
+    }
+}
+
 /// Parsed SRT Keying-Material (KM) message.
 ///
 /// Wire layout (simplified from the SRT spec / Haivision reference):
@@ -269,34 +300,38 @@ pub enum KmMessageType {
 ///  0                   1                   2                   3
 ///  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
 /// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-/// |0| Ver |  PT   |    Sign       |     resv    |S| K |KS | Resv  |  Word 0
+/// |S| Ver |  PT   |             Sign             | Resv1 |KK|  Word 0
 /// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 /// |                        KEKI                                   |  Word 1
 /// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-/// |  Cipher   | Auth  |  SE   |    SLen/4     |    KLen/4         |  Word 2
+/// |  Cipher   |  Auth     |    SE      |      Resv2                |  Word 2
+/// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+/// |             Resv3             |    SLen/4    |    KLen/4      |  Word 3
 /// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 /// |                        Salt (variable, SLen bytes)            |
 /// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-/// |              Wrapped Key (variable, KLen+8 bytes)             |
+/// |       Wrapped Key(s) (KLen*n+8 bytes, even before odd)        |
 /// +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 /// ```
 ///
 /// For this implementation:
 /// - `Ver` = 1, `PT` = 2 (KM message), `Sign` = `0x2029` (Haivision magic).
-/// - `Cipher` = 2 (AES-CTR), `Auth` = 0, `SE` = 0.
+/// - `KK` identifies one even key, one odd key, or both keys.
+/// - `Cipher` = 2 (AES-CTR), `Auth` = 0, `SE` = 2 (MPEG-TS/SRT).
 /// - `SLen` = 16 (salt bytes), `KLen` = 16 (AES-128 SEK bytes).
-/// - The wrapped-key field carries the AES-Key-Wrapped SEK (24 bytes for a
-///   16-byte SEK).
+/// - The wrapped-key field is 24 bytes for one SEK and 40 bytes for two.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KmMessage {
     /// Whether this is a KMREQ (request) or KMRSP (response).
     pub msg_type: KmMessageType,
     /// Key Encrypting Key Index (KEKI). Conventionally 0 for passphrase-based.
     pub keki: u32,
+    /// Even/odd slots carried by this message.
+    pub key_flags: KmKeyFlags,
     /// 16-byte salt used for PBKDF2 key derivation.
     pub salt: [u8; 16],
-    /// The wrapped SEK (24 bytes: RFC 3394 wrap of a 16-byte key).
-    pub wrapped_sek: [u8; 24],
+    /// RFC 3394 wrapped SEK bytes (24 bytes for one key, 40 for both).
+    pub wrapped_sek: Vec<u8>,
 }
 
 /// Haivision KM message signature bytes (`Sign` field).
@@ -309,48 +344,57 @@ const KM_PT: u8 = 2;
 const KM_VER: u8 = 1;
 /// Cipher: AES-CTR = 2.
 const KM_CIPHER_AES_CTR: u8 = 2;
-
+/// Stream encapsulation: MPEG-TS over SRT.
+const KM_SE_MPEG_TS_SRT: u8 = 2;
 /// Minimum KM message wire length in bytes.
-/// Header (3 words = 12 bytes) + 16-byte salt + 24-byte wrapped key = 52.
-pub(crate) const KM_MIN_LEN: usize = 52;
+/// Header (4 words = 16 bytes) + 16-byte salt + 24-byte wrapped key = 56.
+pub(crate) const KM_MIN_LEN: usize = 56;
 
 impl KmMessage {
     /// Encode this KM message to bytes suitable for embedding in an SRT
     /// handshake extension or a control packet.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `wrapped_sek` does not match the advertised `key_flags`.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(KM_MIN_LEN);
+        let expected_wrapped_len = self.key_flags.key_count() * 16 + 8;
+        assert_eq!(
+            self.wrapped_sek.len(),
+            expected_wrapped_len,
+            "KM wrapped-key length must match KK flags"
+        );
+        let mut out = Vec::with_capacity(32 + expected_wrapped_len);
 
         // Word 0 byte layout:
-        //   byte 0: Ver<<4 | PT  = 0x12
+        //   byte 0: S(1) | Ver(3) | PT(4) = 0x12
         //   byte 1: Sign[0] = 0x20
         //   byte 2: Sign[1] = 0x29
-        //   byte 3: (S=0)|(K<<3)|(KS<<1)
-        //     K=2 (even key=0b10), KS=2 (128-bit key in 64-bit units)
-        let kk_bits: u8 = 0b10; // even key
-        let byte3: u8 = (kk_bits << 3) | (2u8 << 1); // KS=2 → 128-bit key
 
         out.push((KM_VER << 4) | KM_PT); // byte 0
         out.push(KM_SIGN); // byte 1
         out.push(KM_SIGN2); // byte 2
-        out.push(byte3); // byte 3
+        out.push(self.key_flags as u8); // byte 3
 
         // Word 1: KEKI (4 bytes, big-endian)
         out.extend_from_slice(&self.keki.to_be_bytes());
 
-        // Word 2: Cipher(8) | Auth(4)/SE(4) | SLen/4(8) | KLen/4(8)
-        //   Cipher=2 (AES-CTR), Auth=0, SE=0
-        //   SLen = 16 bytes → SLen/4 = 4
-        //   wrapped_sek = 24 bytes → KLen/4 = 6
+        // Word 2: Cipher(8) | Auth(8) | SE(8) | Resv2(8).
         out.push(KM_CIPHER_AES_CTR); // Cipher
-        out.push(0x00); // Auth | SE (packed: 0)
-        out.push(4); // SLen/4 = 4  (16 bytes)
-        out.push(6); // KLen/4 = 6  (24 bytes wrapped)
+        out.push(0); // Auth
+        out.push(KM_SE_MPEG_TS_SRT); // SE
+        out.push(0); // Resv2
+
+        // Word 3: Resv3(16) | SLen/4(8) | KLen/4(8).
+        out.extend_from_slice(&[0, 0]);
+        out.push(4); // SLen/4 = 4 (16-byte salt)
+        out.push(4); // KLen/4 = 4 (16-byte unwrapped SEK)
 
         // Salt (16 bytes)
         out.extend_from_slice(&self.salt);
 
-        // Wrapped SEK (24 bytes)
+        // Wrapped SEK(s), with even first for a dual-key message.
         out.extend_from_slice(&self.wrapped_sek);
 
         out
@@ -365,51 +409,70 @@ impl KmMessage {
         if buf.len() < KM_MIN_LEN {
             return None;
         }
-        // Byte 0: Ver(4) | PT(4)
-        let ver = buf[0] >> 4;
+        // Byte 0: S(1) | Ver(3) | PT(4)
+        let ver = (buf[0] >> 4) & 0x07;
         let pt = buf[0] & 0x0F;
-        if ver != KM_VER || pt != KM_PT {
+        if buf[0] & 0x80 != 0 || ver != KM_VER || pt != KM_PT {
             return None;
         }
         // Bytes 1-2: Sign
         if buf[1] != KM_SIGN || buf[2] != KM_SIGN2 {
             return None;
         }
-        // Byte 3: S | K | KS (accepted any K)
+        // Byte 3: Resv1(6) | KK(2).
+        if buf[3] & 0xFC != 0 {
+            return None;
+        }
+        let key_flags = KmKeyFlags::from_wire(buf[3] & 0x03)?;
 
         // Word 1: KEKI
         let keki = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
 
-        // Word 2: Cipher | Auth/SE | SLen/4 | KLen/4
-        let cipher = buf[8];
-        if cipher != KM_CIPHER_AES_CTR {
+        // Word 2: Cipher | Auth | SE | Resv2.
+        if buf[8] != KM_CIPHER_AES_CTR
+            || buf[9] != 0
+            || buf[10] != KM_SE_MPEG_TS_SRT
+            || buf[11] != 0
+        {
             return None;
         }
-        let slen_words = usize::from(buf[10]);
-        let klen_words = usize::from(buf[11]);
+        // Word 3: Resv3 | SLen/4 | KLen/4.
+        if buf[12] != 0 || buf[13] != 0 {
+            return None;
+        }
+        let slen_words = usize::from(buf[14]);
+        let klen_words = usize::from(buf[15]);
         let slen = slen_words * 4;
         let klen = klen_words * 4;
 
-        // Validate expected sizes for AES-128: 16-byte salt + 24-byte wrapped key.
-        if slen != 16 || klen != 24 {
+        // AES-128 uses a 16-byte salt and a 16-byte SEK. RFC 3394 adds an
+        // eight-byte integrity value to the wrapped key.
+        if slen != 16 || klen != 16 {
             return None;
         }
-        if buf.len() < 12 + slen + klen {
+        let wrapped_len = key_flags.key_count() * klen + 8;
+        if buf.len() != 16 + slen + wrapped_len {
             return None;
         }
 
         let mut salt = [0u8; 16];
-        salt.copy_from_slice(&buf[12..28]);
-
-        let mut wrapped_sek = [0u8; 24];
-        wrapped_sek.copy_from_slice(&buf[28..52]);
+        salt.copy_from_slice(&buf[16..32]);
 
         Some(KmMessage {
             msg_type: KmMessageType::Request,
             keki,
+            key_flags,
             salt,
-            wrapped_sek,
+            wrapped_sek: buf[32..].to_vec(),
         })
+    }
+
+    /// Return a successful KMRSP that echoes this request's exact key material.
+    #[must_use]
+    pub fn as_response(&self) -> Self {
+        let mut response = self.clone();
+        response.msg_type = KmMessageType::Response;
+        response
     }
 }
 
@@ -421,15 +484,24 @@ impl KmMessage {
 ///
 /// Created via [`SrtCrypto::from_passphrase`] (normal path, caller-supplied SEK)
 /// or [`SrtCrypto::from_raw_sek`] (test/interop path).
-#[derive(Debug, Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SrtCrypto {
     /// 16-byte AES-128 Stream Encrypting Key.
     sek: [u8; 16],
     /// 16-byte salt (stored so we can re-derive the KEK to build KM messages).
     salt: [u8; 16],
     /// 112-bit (14-byte) per-message IV extracted from the KM message.
-    /// Per the SRT spec the IV is the rightmost 112 bits of the salt.
+    /// Per the SRT spec the IV is the most-significant 112 bits of the salt.
     msg_iv: [u8; 14],
+}
+
+impl fmt::Debug for SrtCrypto {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SrtCrypto")
+            .field("sek", &"[redacted]")
+            .field("salt", &self.salt)
+            .finish_non_exhaustive()
+    }
 }
 
 impl SrtCrypto {
@@ -440,9 +512,13 @@ impl SrtCrypto {
     /// `sek` must be 16 bytes (AES-128).
     pub fn from_raw_sek(_passphrase: &[u8], salt: &[u8; 16], sek: [u8; 16]) -> Self {
         let mut msg_iv = [0u8; 14];
-        // The msg IV is the rightmost 112 bits (14 bytes) of the 128-bit salt.
-        msg_iv.copy_from_slice(&salt[2..]);
-        SrtCrypto { sek, salt: *salt, msg_iv }
+        // The msg IV is the most-significant 112 bits (14 bytes) of the salt.
+        msg_iv.copy_from_slice(&salt[..14]);
+        SrtCrypto {
+            sek,
+            salt: *salt,
+            msg_iv,
+        }
     }
 
     /// Create a crypto context by configuring the SEK to use for this session.
@@ -473,49 +549,79 @@ impl SrtCrypto {
     /// `passphrase` is the shared secret used to derive the KEK.
     #[must_use]
     pub fn build_km_message(&self, passphrase: &[u8]) -> KmMessage {
+        self.build_km_message_for(passphrase, KkFlag::EvenKey)
+            .expect("the even flag is valid key material")
+    }
+
+    /// Build a single-slot KMREQ for either the even or odd SEK slot.
+    ///
+    /// Returns `None` for `Clear` and the data-plane-only invalid `KK=11`
+    /// representation.
+    #[must_use]
+    pub fn build_km_message_for(&self, passphrase: &[u8], key_flag: KkFlag) -> Option<KmMessage> {
+        let key_flags = match key_flag {
+            KkFlag::EvenKey => KmKeyFlags::Even,
+            KkFlag::OddKey => KmKeyFlags::Odd,
+            KkFlag::Clear | KkFlag::Invalid => return None,
+        };
         let kek = pbkdf2_kek(passphrase, &self.salt);
-        let wrapped_sek_vec = aes_key_wrap(&kek, &self.sek);
-        let mut wrapped_sek = [0u8; 24];
-        wrapped_sek.copy_from_slice(&wrapped_sek_vec);
-        KmMessage {
+        Some(KmMessage {
             msg_type: KmMessageType::Request,
             keki: 0,
+            key_flags,
             salt: self.salt,
-            wrapped_sek,
+            wrapped_sek: aes_key_wrap(&kek, &self.sek),
+        })
+    }
+
+    /// Build the dual-key KMREQ used during a libsrt pre-announcement window.
+    ///
+    /// Both contexts must share the same salt/KEK. The unwrapped order is
+    /// always even SEK followed by odd SEK, independent of the current active
+    /// slot.
+    #[must_use]
+    pub fn build_dual_km_message(even: &Self, odd: &Self, passphrase: &[u8]) -> Option<KmMessage> {
+        if even.salt != odd.salt {
+            return None;
         }
+        let mut keys = Vec::with_capacity(32);
+        keys.extend_from_slice(&even.sek);
+        keys.extend_from_slice(&odd.sek);
+        let kek = pbkdf2_kek(passphrase, &even.salt);
+        Some(KmMessage {
+            msg_type: KmMessageType::Request,
+            keki: 0,
+            key_flags: KmKeyFlags::EvenAndOdd,
+            salt: even.salt,
+            wrapped_sek: aes_key_wrap(&kek, &keys),
+        })
     }
 
     /// Construct an [`SrtCrypto`] from a received [`KmMessage`] and the shared
     /// passphrase, by re-deriving the KEK and unwrapping the SEK.
-    pub fn from_km_message(
-        km: &KmMessage,
-        passphrase: &[u8],
-    ) -> Result<Self, KeyUnwrapError> {
-        let kek = pbkdf2_kek(passphrase, &km.salt);
-        let sek_vec = aes_key_unwrap(&kek, &km.wrapped_sek)?;
-        if sek_vec.len() != 16 {
-            return Err(KeyUnwrapError::BadLength);
+    pub fn from_km_message(km: &KmMessage, passphrase: &[u8]) -> Result<Self, KeyUnwrapError> {
+        let keys = UnwrappedKmKeys::from_message(km, passphrase)?;
+        match (keys.even, keys.odd) {
+            (Some(key), None) | (None, Some(key)) => Ok(key),
+            _ => Err(KeyUnwrapError::BadLength),
         }
-        let mut sek = [0u8; 16];
-        sek.copy_from_slice(&sek_vec);
-        Ok(Self::from_raw_sek(passphrase, &km.salt, sek))
     }
 
     /// Build the 128-bit AES-CTR counter/IV for a given packet sequence number.
     ///
     /// Per the SRT spec the IV is constructed as:
     /// ```text
-    /// CTR[15:2] = msg_iv (14 bytes, rightmost 112 bits of salt)
-    /// CTR XOR= seq_no in the low 32 bits
+    /// CTR = MSB(112, salt) XOR (packet-index in bytes 10..14), with the
+    /// least-significant 16 bits reserved for the per-packet block counter.
     /// ```
     #[must_use]
     fn build_ctr_iv(&self, seq_no: u32) -> [u8; 16] {
         let mut iv = [0u8; 16];
-        // Upper 2 bytes are zero; lower 14 bytes come from the message IV.
-        iv[2..16].copy_from_slice(&self.msg_iv);
-        // XOR the sequence number into the last 4 bytes (big-endian).
+        iv[..14].copy_from_slice(&self.msg_iv);
+        // SRT places the 32-bit packet index immediately above the 16-bit
+        // block counter, then XORs the upper 112 bits with the salt IV.
         let seq_bytes = seq_no.to_be_bytes();
-        for (iv_byte, seq_byte) in iv[12..].iter_mut().zip(seq_bytes.iter()) {
+        for (iv_byte, seq_byte) in iv[10..14].iter_mut().zip(seq_bytes.iter()) {
             *iv_byte ^= seq_byte;
         }
         iv
@@ -536,6 +642,57 @@ impl SrtCrypto {
     /// decryption are identical operations).
     pub fn decrypt_packet(&self, seq_no: u32, payload: &mut [u8]) {
         self.encrypt_packet(seq_no, payload); // CTR mode: same operation
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct UnwrappedKmKeys {
+    even: Option<SrtCrypto>,
+    odd: Option<SrtCrypto>,
+}
+
+impl UnwrappedKmKeys {
+    fn from_message(km: &KmMessage, passphrase: &[u8]) -> Result<Self, KeyUnwrapError> {
+        let kek = pbkdf2_kek(passphrase, &km.salt);
+        let unwrapped = aes_key_unwrap(&kek, &km.wrapped_sek)?;
+        if unwrapped.len() != km.key_flags.key_count() * 16 {
+            return Err(KeyUnwrapError::BadLength);
+        }
+        let context = |bytes: &[u8]| {
+            let mut sek = [0u8; 16];
+            sek.copy_from_slice(bytes);
+            SrtCrypto::from_raw_sek(passphrase, &km.salt, sek)
+        };
+        Ok(match km.key_flags {
+            KmKeyFlags::Even => Self {
+                even: Some(context(&unwrapped[..16])),
+                odd: None,
+            },
+            KmKeyFlags::Odd => Self {
+                even: None,
+                odd: Some(context(&unwrapped[..16])),
+            },
+            KmKeyFlags::EvenAndOdd => Self {
+                even: Some(context(&unwrapped[..16])),
+                odd: Some(context(&unwrapped[16..32])),
+            },
+        })
+    }
+
+    fn get(&self, flag: KkFlag) -> Option<&SrtCrypto> {
+        match flag {
+            KkFlag::EvenKey => self.even.as_ref(),
+            KkFlag::OddKey => self.odd.as_ref(),
+            KkFlag::Clear | KkFlag::Invalid => None,
+        }
+    }
+
+    fn take(&mut self, flag: KkFlag) -> Option<SrtCrypto> {
+        match flag {
+            KkFlag::EvenKey => self.even.take(),
+            KkFlag::OddKey => self.odd.take(),
+            KkFlag::Clear | KkFlag::Invalid => None,
+        }
     }
 }
 
@@ -565,20 +722,16 @@ fn aes_ctr_xor(key: &[u8; 16], iv: &[u8; 16], data: &mut [u8]) {
         }
         pos += 16;
 
-        // Increment the 128-bit counter (big-endian).
-        increment_counter(&mut counter);
+        // SRT reserves only the least-significant 16 bits for the block
+        // counter. Packet payloads are bounded by the MTU, so it cannot wrap.
+        increment_block_counter(&mut counter);
     }
 }
 
-/// Increment a 16-byte big-endian counter by 1.
-fn increment_counter(counter: &mut [u8; 16]) {
-    for byte in counter.iter_mut().rev() {
-        let (new_val, overflow) = byte.overflowing_add(1);
-        *byte = new_val;
-        if !overflow {
-            break;
-        }
-    }
+/// Increment the least-significant 16-bit SRT block counter by one.
+fn increment_block_counter(counter: &mut [u8; 16]) {
+    let block = u16::from_be_bytes([counter[14], counter[15]]).wrapping_add(1);
+    counter[14..].copy_from_slice(&block.to_be_bytes());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -586,227 +739,4 @@ fn increment_counter(counter: &mut [u8; 16]) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    // ──────────── RFC 3394 AES Key Wrap test vector ─────────────
-    // From RFC 3394 §4.1: "Wrap 128 bits of Key Data with a 128-bit KEK"
-    //
-    //   KEK      = 000102030405060708090A0B0C0D0E0F
-    //   Key Data = 00112233445566778899AABBCCDDEEFF
-    //   Wrapped  = 1FA68B0A8112B447AEF34BD8FB5A7B829D3E862371D2CFE5
-
-    #[test]
-    fn aes_key_wrap_rfc3394_vector() {
-        let kek: [u8; 16] = [
-            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
-            0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
-        ];
-        let key_data: [u8; 16] = [
-            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
-            0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF,
-        ];
-        let expected: [u8; 24] = [
-            0x1F, 0xA6, 0x8B, 0x0A, 0x81, 0x12, 0xB4, 0x47,
-            0xAE, 0xF3, 0x4B, 0xD8, 0xFB, 0x5A, 0x7B, 0x82,
-            0x9D, 0x3E, 0x86, 0x23, 0x71, 0xD2, 0xCF, 0xE5,
-        ];
-        let wrapped = aes_key_wrap(&kek, &key_data);
-        assert_eq!(wrapped.as_slice(), expected.as_slice(), "RFC 3394 §4.1 wrap vector");
-    }
-
-    #[test]
-    fn aes_key_unwrap_rfc3394_vector() {
-        let kek: [u8; 16] = [
-            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
-            0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
-        ];
-        let wrapped: [u8; 24] = [
-            0x1F, 0xA6, 0x8B, 0x0A, 0x81, 0x12, 0xB4, 0x47,
-            0xAE, 0xF3, 0x4B, 0xD8, 0xFB, 0x5A, 0x7B, 0x82,
-            0x9D, 0x3E, 0x86, 0x23, 0x71, 0xD2, 0xCF, 0xE5,
-        ];
-        let expected: [u8; 16] = [
-            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
-            0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF,
-        ];
-        let unwrapped = aes_key_unwrap(&kek, &wrapped).expect("RFC 3394 unwrap must succeed");
-        assert_eq!(unwrapped.as_slice(), expected.as_slice(), "RFC 3394 §4.1 unwrap vector");
-    }
-
-    #[test]
-    fn aes_key_unwrap_bad_integrity_is_detected() {
-        let kek = [0u8; 16];
-        let mut wrapped = aes_key_wrap(&kek, &[0u8; 16]);
-        // Corrupt one byte of the wrapped material.
-        wrapped[5] ^= 0xFF;
-        assert_eq!(
-            aes_key_unwrap(&kek, &wrapped),
-            Err(KeyUnwrapError::IntegrityCheckFailed)
-        );
-    }
-
-    #[test]
-    fn aes_key_unwrap_bad_length_rejected() {
-        let kek = [0u8; 16];
-        // 7 bytes is too short (need at least 24).
-        assert_eq!(aes_key_unwrap(&kek, &[0u8; 7]), Err(KeyUnwrapError::BadLength));
-        // 25 bytes is not a multiple of 8.
-        assert_eq!(aes_key_unwrap(&kek, &[0u8; 25]), Err(KeyUnwrapError::BadLength));
-    }
-
-    // ──────────── PBKDF2 KEK determinism ─────────────
-
-    #[test]
-    fn pbkdf2_kek_is_deterministic() {
-        let pass = b"srt-test-passphrase";
-        let salt = [0xABu8; 16];
-        let k1 = pbkdf2_kek(pass, &salt);
-        let k2 = pbkdf2_kek(pass, &salt);
-        assert_eq!(k1, k2, "PBKDF2 must be deterministic");
-    }
-
-    #[test]
-    fn pbkdf2_kek_changes_with_passphrase_and_salt() {
-        let k1 = pbkdf2_kek(b"pass1", &[0u8; 16]);
-        let k2 = pbkdf2_kek(b"pass2", &[0u8; 16]);
-        let k3 = pbkdf2_kek(b"pass1", &[1u8; 16]);
-        assert_ne!(k1, k2, "different passphrases produce different KEKs");
-        assert_ne!(k1, k3, "different salts produce different KEKs");
-    }
-
-    // ──────────── AES-CTR encrypt → decrypt round-trip ─────────────
-
-    #[test]
-    fn encrypt_decrypt_roundtrip_recovers_plaintext() {
-        let sek = [0x42u8; 16];
-        let salt = [0x55u8; 16];
-        let crypto = SrtCrypto::from_raw_sek(b"passphrase", &salt, sek);
-        let plaintext = b"Hello, SRT world! This is 32byte";
-        let mut data = plaintext.to_vec();
-        crypto.encrypt_packet(42, &mut data);
-        assert_ne!(data.as_slice(), plaintext.as_slice(), "ciphertext differs from plaintext");
-        crypto.decrypt_packet(42, &mut data);
-        assert_eq!(data.as_slice(), plaintext.as_slice(), "decrypt recovers plaintext");
-    }
-
-    #[test]
-    fn encrypt_different_seq_nos_produce_different_ciphertext() {
-        let sek = [0x11u8; 16];
-        let salt = [0x22u8; 16];
-        let crypto = SrtCrypto::from_raw_sek(b"pass", &salt, sek);
-        let mut d1 = b"test payload data".to_vec();
-        let mut d2 = d1.clone();
-        crypto.encrypt_packet(1, &mut d1);
-        crypto.encrypt_packet(2, &mut d2);
-        assert_ne!(d1, d2, "different seq nos → different ciphertext");
-    }
-
-    #[test]
-    fn ctr_is_self_inverse() {
-        // Encrypt twice should recover the original (CTR is self-inverse).
-        let sek = [0xCCu8; 16];
-        let salt = [0xDDu8; 16];
-        let crypto = SrtCrypto::from_raw_sek(b"x", &salt, sek);
-        let original = b"data that wraps around 16 bytes!!".to_vec();
-        let mut buf = original.clone();
-        crypto.encrypt_packet(100, &mut buf);
-        crypto.encrypt_packet(100, &mut buf);
-        assert_eq!(buf, original, "double CTR encryption is identity");
-    }
-
-    #[test]
-    fn encrypt_arbitrary_length_payload() {
-        let sek = [0x01u8; 16];
-        let salt = [0x02u8; 16];
-        let crypto = SrtCrypto::from_raw_sek(b"p", &salt, sek);
-        for len in [0usize, 1, 15, 16, 17, 32, 188] {
-            let original: Vec<u8> = (0..len).map(|i| u8::try_from(i % 256).unwrap()).collect();
-            let mut buf = original.clone();
-            crypto.encrypt_packet(0, &mut buf);
-            crypto.decrypt_packet(0, &mut buf);
-            assert_eq!(buf, original, "round-trip for length {len}");
-        }
-    }
-
-    // ──────────── KM message encode → decode round-trip ─────────────
-
-    #[test]
-    fn km_message_encode_decode_roundtrip() {
-        let sek = [0x77u8; 16];
-        let salt = [0x88u8; 16];
-        let crypto = SrtCrypto::from_raw_sek(b"my-passphrase", &salt, sek);
-        let km = crypto.build_km_message(b"my-passphrase");
-        let encoded = km.encode();
-        assert_eq!(encoded.len(), KM_MIN_LEN, "encoded KM is {KM_MIN_LEN} bytes");
-        let decoded = KmMessage::decode(&encoded).expect("decode must succeed on valid bytes");
-        assert_eq!(decoded.salt, km.salt, "salt round-trips");
-        assert_eq!(decoded.wrapped_sek, km.wrapped_sek, "wrapped_sek round-trips");
-        assert_eq!(decoded.keki, km.keki, "keki round-trips");
-    }
-
-    #[test]
-    fn km_message_decode_rejects_short_buffer() {
-        assert!(KmMessage::decode(&[0u8; KM_MIN_LEN - 1]).is_none());
-        assert!(KmMessage::decode(&[]).is_none());
-    }
-
-    #[test]
-    fn km_message_decode_rejects_bad_signature() {
-        let sek = [0u8; 16];
-        let salt = [0u8; 16];
-        let crypto = SrtCrypto::from_raw_sek(b"p", &salt, sek);
-        let km = crypto.build_km_message(b"p");
-        let mut encoded = km.encode();
-        encoded[1] ^= 0xFF; // corrupt the signature byte
-        assert!(KmMessage::decode(&encoded).is_none());
-    }
-
-    // ──────────── Full passphrase → KM → unwrap SEK round-trip ─────────────
-
-    #[test]
-    fn from_km_message_recovers_sek() {
-        let passphrase = b"secret-passphrase";
-        let salt = [0xABu8; 16];
-        let sek = [0x5Au8; 16];
-
-        // Sender side: build KM message.
-        let sender = SrtCrypto::from_passphrase(passphrase, &salt, sek);
-        let km = sender.build_km_message(passphrase);
-
-        // Receiver side: reconstruct crypto from the KM message.
-        let receiver = SrtCrypto::from_km_message(&km, passphrase)
-            .expect("receiver must unwrap the SEK");
-        assert_eq!(receiver.sek(), sender.sek(), "receiver recovered the same SEK");
-    }
-
-    #[test]
-    fn from_km_message_fails_with_wrong_passphrase() {
-        let salt = [0u8; 16];
-        let sek = [1u8; 16];
-        let sender = SrtCrypto::from_passphrase(b"correct", &salt, sek);
-        let km = sender.build_km_message(b"correct");
-        // Using the wrong passphrase should fail the integrity check.
-        let result = SrtCrypto::from_km_message(&km, b"wrong");
-        assert!(result.is_err(), "wrong passphrase must fail unwrap");
-    }
-
-    // ──────────── KK flag bit manipulation ─────────────
-
-    #[test]
-    fn kk_flag_round_trips_in_msg_word() {
-        for kk in [KkFlag::Clear, KkFlag::EvenKey, KkFlag::OddKey] {
-            let word = kk.set_in_msg_word(0xDEAD_BEEF);
-            let back = KkFlag::from_msg_word(word);
-            assert_eq!(back, kk, "KkFlag {kk:?} must round-trip in msg_word");
-        }
-    }
-
-    #[test]
-    fn kk_flag_does_not_disturb_other_bits() {
-        let original: u32 = 0x0000_0000;
-        let with_even = KkFlag::EvenKey.set_in_msg_word(original);
-        // Bits 25–24 should be 10; all others stay 0.
-        assert_eq!(with_even & !(0x03 << 24), 0, "no other bits modified");
-    }
-}
+mod tests;

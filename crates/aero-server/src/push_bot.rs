@@ -19,17 +19,27 @@
 //! The binary only spawns this listener when at least one platform gateway is
 //! configured ([`PushGateways::any_enabled`]); with push disabled it is inert.
 
-use aero_common::{NotificationKind, ParticipantId, RoomEvent};
+use std::str::FromStr;
+
+use aero_common::{NotificationKind, ParticipantId, RoomEvent, RoomId};
 use aero_push::{PushError, PushPayload};
-use aero_storage::PushTokenRepo;
-use futures::StreamExt;
+use aero_storage::{ConsumerEventReceiptRepo, PushTokenRepo};
+use futures::{stream, StreamExt as _};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use crate::state::AppState;
+use crate::{
+    state::AppState,
+    task_shutdown::{self, NextOrCancelled},
+};
 
 /// Maximum characters of the message body included in the push preview. Keeps
 /// the notification compact and avoids leaking long content into the lock screen.
 const PREVIEW_CHARS: usize = 140;
+/// Bound recipient fan-out for one `NotifyBatch` event.
+const EVENT_RECIPIENT_CONCURRENCY: usize = 8;
+/// Bound upstream provider calls for one recipient.
+const TOKEN_DELIVERY_CONCURRENCY: usize = 4;
 
 /// Run the push-dispatch listener until the bus stream ends. Mirrors
 /// [`crate::ooo_bot::run`]'s signature so the server binary spawns it the same way.
@@ -37,43 +47,97 @@ const PREVIEW_CHARS: usize = 140;
 /// # Errors
 /// Returns an error if subscribing to the event bus fails.
 pub async fn run(state: AppState) -> anyhow::Result<()> {
+    run_until_cancelled(state, CancellationToken::new()).await
+}
+
+/// Run until `cancel` is triggered, finishing and `ACK`ing any event already
+/// received before returning.
+pub async fn run_until_cancelled(state: AppState, cancel: CancellationToken) -> anyhow::Result<()> {
     let bus = state.bus.clone();
+    let receipts = ConsumerEventReceiptRepo::new(state.pg.clone());
     // Resubscribe across NATS reconnects (mirrors `ws::run_bus_listener`); durable
     // consumer "aero-push" resumes from its cursor, every message is acked.
     loop {
-        let mut stream = match bus.subscribe("im.room.*", Some("aero-push")).await {
-            Ok(s) => s,
-            Err(e) => {
+        let subscribed =
+            task_shutdown::subscribe_or_cancelled(&bus, "im.room.*", Some("aero-push"), &cancel)
+                .await;
+        let mut stream = match subscribed {
+            None => return Ok(()),
+            Some(Ok(s)) => s,
+            Some(Err(e)) => {
                 warn!(error = %e, "push_bot subscribe failed; retrying");
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                if task_shutdown::delay_or_cancelled(std::time::Duration::from_secs(1), &cancel)
+                    .await
+                {
+                    return Ok(());
+                }
                 continue;
             }
         };
         info!("push_bot listener started");
-        while let Some(sub) = stream.next().await {
-            match serde_json::from_slice::<RoomEvent>(sub.payload()) {
-                Ok(RoomEvent::Notify { message_id, mentioned, by, kind, .. }) => {
-                    if let Err(e) = handle(&state, message_id, mentioned, by, kind).await {
-                        warn!(error = ?e, "push_bot handle failed");
-                    }
-                }
-                // Batched notify (ROADMAP 方向二): push each recipient individually,
-                // exactly as the old per-recipient Notify events did.
-                Ok(RoomEvent::NotifyBatch { message_id, by, recipients, .. }) => {
-                    for target in recipients {
-                        if let Err(e) =
-                            handle(&state, message_id, target.participant, by, target.kind).await
-                        {
-                            warn!(error = ?e, "push_bot handle failed");
+        loop {
+            let sub = match task_shutdown::next_or_cancelled(&mut stream, &cancel).await {
+                NextOrCancelled::Item(sub) => sub,
+                NextOrCancelled::Ended => break,
+                NextOrCancelled::Cancelled => return Ok(()),
+            };
+            let event = serde_json::from_slice::<RoomEvent>(sub.payload());
+            let handler_state = &state;
+            let _ = crate::consumer_event_receipt::process(
+                &receipts,
+                "aero-push",
+                sub,
+                || async move {
+                    match event {
+                        Ok(RoomEvent::Notify {
+                            message_id,
+                            mentioned,
+                            by,
+                            kind,
+                            ..
+                        }) => handle(handler_state, message_id, mentioned, by, kind).await,
+                        // Batched notify: process every recipient before marking
+                        // the one source event complete.
+                        Ok(RoomEvent::NotifyBatch {
+                            message_id,
+                            by,
+                            recipients,
+                            ..
+                        }) => {
+                            let results = stream::iter(recipients)
+                                .map(|target| {
+                                    handle(
+                                        handler_state,
+                                        message_id,
+                                        target.participant,
+                                        by,
+                                        target.kind,
+                                    )
+                                })
+                                .buffer_unordered(EVENT_RECIPIENT_CONCURRENCY)
+                                .collect::<Vec<_>>()
+                                .await;
+                            // Finish every bounded in-flight recipient before
+                            // settling the source receipt, then surface the first
+                            // lookup error so the whole event remains retryable.
+                            for result in results {
+                                result?;
+                            }
+                            Ok(())
                         }
+                        Ok(_) | Err(_) => Ok(()),
                     }
-                }
-                _ => {}
-            }
-            let _ = sub.ack().await;
+                },
+            )
+            .await;
+        }
+        if cancel.is_cancelled() {
+            return Ok(());
         }
         warn!("push_bot subscription stream ended; resubscribing");
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        if task_shutdown::delay_or_cancelled(std::time::Duration::from_secs(1), &cancel).await {
+            return Ok(());
+        }
     }
 }
 
@@ -94,7 +158,10 @@ async fn handle(
         .map_or_else(|| "Someone".to_string(), |p| p.display_name);
     // Fetch the message once: drives both the body preview and the deep-link room.
     let msg = state.messages.get(message_id).await?;
-    let body = msg.as_ref().map(|m| preview(&m.searchable_text())).unwrap_or_default();
+    let body = msg
+        .as_ref()
+        .map(|m| preview(&m.searchable_text()))
+        .unwrap_or_default();
     let room_id = msg.as_ref().map(|m| m.room_id.to_string());
     let title = match kind {
         NotificationKind::Mention => format!("{sender_name} mentioned you"),
@@ -137,7 +204,29 @@ async fn handle(
 /// [`PushGateways::any_enabled`](crate::state::PushGateways::any_enabled) when they
 /// want a true no-op while push is disabled (this fn still no-ops, but skips the
 /// token lookup that way).
-pub async fn push_to_participant(state: &AppState, recipient: ParticipantId, payload: &PushPayload) {
+pub async fn push_to_participant(
+    state: &AppState,
+    recipient: ParticipantId,
+    payload: &PushPayload,
+) {
+    // Room-scoped pushes carry message/call/task content outside the authenticated
+    // app. Re-check the canonical access guard at the final external-send edge so
+    // a queued notification cannot leak after the recipient was removed,
+    // workspace-deactivated, or fell behind an enforced 2FA policy.
+    if let Some(raw_room) = payload.room_id.as_deref() {
+        let room = match RoomId::from_str(raw_room) {
+            Ok(room) => room,
+            Err(error) => {
+                warn!(%recipient, %raw_room, %error, "push has malformed room id; skipping");
+                return;
+            }
+        };
+        if let Err(error) = state.im.assert_room_access(recipient, room).await {
+            debug!(%recipient, %room, %error, "push recipient no longer has room access; skipping");
+            return;
+        }
+    }
+
     // No registered devices ⇒ nothing to do (the common case for web-only users).
     let token_repo = PushTokenRepo::new(state.pg.clone());
     let tokens = match token_repo.list_for_participant(recipient).await {
@@ -148,23 +237,36 @@ pub async fn push_to_participant(state: &AppState, recipient: ParticipantId, pay
         }
     };
 
-    for t in tokens {
-        let Some(gateway) = state.push.for_platform(&t.platform) else {
-            debug!(platform = %t.platform, "no gateway configured for platform; skipping");
-            continue;
-        };
-        match gateway.send(&t.token, payload).await {
-            Ok(()) => debug!(%recipient, platform = %t.platform, "push delivered"),
-            Err(PushError::Rejected(reason)) => {
-                // Dead/unregistered token — drop it so we stop trying.
-                warn!(%recipient, platform = %t.platform, %reason, "push token rejected; reaping");
-                if let Err(e) = token_repo.unregister(recipient, &t.token).await {
-                    warn!(error = ?e, "failed to reap rejected push token");
+    stream::iter(tokens)
+        .for_each_concurrent(Some(TOKEN_DELIVERY_CONCURRENCY), |token| {
+            let gateway = state.push.for_platform(&token.platform).cloned();
+            let token_repo = token_repo.clone();
+            async move {
+                let Some(gateway) = gateway else {
+                    debug!(platform = %token.platform, "no gateway configured for platform; skipping");
+                    return;
+                };
+                match gateway.send(&token.token, payload).await {
+                    Ok(()) => debug!(%recipient, platform = %token.platform, "push delivered"),
+                    Err(PushError::Rejected(reason)) => {
+                        // Dead/unregistered token — drop it so we stop trying.
+                        warn!(
+                            %recipient,
+                            platform = %token.platform,
+                            %reason,
+                            "push token rejected; reaping"
+                        );
+                        if let Err(e) = token_repo.unregister(recipient, &token.token).await {
+                            warn!(error = ?e, "failed to reap rejected push token");
+                        }
+                    }
+                    Err(e) => {
+                        warn!(%recipient, platform = %token.platform, error = %e, "push send failed");
+                    }
                 }
             }
-            Err(e) => warn!(%recipient, platform = %t.platform, error = %e, "push send failed"),
-        }
-    }
+        })
+        .await;
 }
 
 /// Build a silent, badge-only push: no `title`/`body` (so it does not wake the
@@ -263,7 +365,10 @@ mod tests {
         };
         let fcm = aero_push::fcm_message_json("tok", &payload);
         assert_eq!(fcm["message"]["android"]["collapse_key"], "room:r5");
-        assert_eq!(aero_push::apns_collapse_id(&payload).as_deref(), Some("room:r5"));
+        assert_eq!(
+            aero_push::apns_collapse_id(&payload).as_deref(),
+            Some("room:r5")
+        );
     }
 
     #[test]

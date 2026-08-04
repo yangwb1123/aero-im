@@ -10,12 +10,11 @@
 //! ([`ThreadSubscriptionRepo::message_room`](aero_storage::ThreadSubscriptionRepo::message_room))
 //! then asserts the caller may access it
 //! ([`ImService::assert_room_access`](aero_im_core::ImService::assert_room_access),
-//! mirroring [`crate::routes`]), so a user can only follow a thread in a room they
-//! belong to; unfollowing and listing are owner-scoped at the SQL layer and need
-//! no room-access check (they only ever touch the caller's own subscriptions). The
-//! reply fan-out itself ([`ThreadSubscriptionRepo::subscribers`]) is consumed by
-//! `ImService::dispatch_notifications`, not here. Mounted via [`routes`] and
-//! `.merge`d into the main router.
+//! mirroring [`crate::routes`]), then every mutation repeats the current-access
+//! and live-root check inside its storage transaction. Listings filter revoked
+//! rooms. The reply fan-out itself
+//! ([`ThreadSubscriptionRepo::subscribers`]) is consumed by
+//! `ImService::dispatch_notifications`, not here.
 
 use std::str::FromStr;
 
@@ -89,40 +88,39 @@ async fn follow_thread(
     // so a caller can only ever follow a thread in a room they belong to.
     s.im.assert_room_access(auth.participant_id, room).await?;
     repo(&s)
-        .subscribe(auth.participant_id, message)
-        .await
-        .map_err(AeroError::from)?;
+        .subscribe_authorized(auth.participant_id, message)
+        .await?;
     Ok(Json(serde_json::json!({ "following": true })))
 }
 
 /// `DELETE /api/messages/:id/follow` — unfollow the thread rooted at this message.
-/// Owner-scoped at the SQL layer (only the caller's own subscription is ever
-/// touched), so no room-access check is needed; unfollowing a thread that was
-/// never followed is a no-op. Always reports `following: false`.
+/// Current room access and canonical-root status are checked as a preflight and
+/// again inside the delete transaction. Unfollowing an absent row is a no-op.
 async fn unfollow_thread(
     State(s): State<AppState>,
     auth: AuthUser,
     Path(id_str): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let message = parse_message(&id_str)?;
-    repo(&s)
-        .unsubscribe(auth.participant_id, message)
+    let room = repo(&s)
+        .message_room(message)
         .await
-        .map_err(AeroError::from)?;
+        .map_err(AeroError::from)?
+        .ok_or_else(|| AeroError::NotFound("thread".into()))?;
+    s.im.assert_room_access(auth.participant_id, room).await?;
+    repo(&s)
+        .unsubscribe_authorized(auth.participant_id, message)
+        .await?;
     Ok(Json(serde_json::json!({ "following": false })))
 }
 
 /// `GET /api/me/followed-threads` — the root message ids of the threads the caller
-/// follows, newest first. Always scoped to the caller; no room-access check is
-/// needed since they are the caller's own subscriptions.
+/// follows, newest first, filtered to live roots in currently accessible rooms.
 async fn list_followed_threads(
     State(s): State<AppState>,
     auth: AuthUser,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let threads = repo(&s)
-        .followed_by(auth.participant_id)
-        .await
-        .map_err(AeroError::from)?;
+    let threads = repo(&s).followed_by_accessible(auth.participant_id).await?;
     Ok(Json(serde_json::json!({ "threads": threads })))
 }
 
@@ -153,8 +151,7 @@ async fn set_thread_notif_level(
         "all" | "mentions" | "none" => {}
         other => {
             return Err(AeroError::Invalid(format!(
-                "invalid level {:?}; must be 'all', 'mentions', or 'none'",
-                other
+                "invalid level {other:?}; must be 'all', 'mentions', or 'none'"
             ))
             .into())
         }
@@ -171,7 +168,7 @@ async fn set_thread_notif_level(
     s.im.assert_room_access(auth.participant_id, room).await?;
 
     notif_prefs_repo(&s)
-        .set_level(auth.participant_id, message, &req.level)
+        .set_level_authorized(auth.participant_id, message, &req.level)
         .await?;
 
     Ok(Json(serde_json::json!({
@@ -200,7 +197,7 @@ async fn get_thread_notif_level(
     s.im.assert_room_access(auth.participant_id, room).await?;
 
     let level = notif_prefs_repo(&s)
-        .get_level(auth.participant_id, message)
+        .get_level_authorized(auth.participant_id, message)
         .await?;
 
     Ok(Json(serde_json::json!({ "level": level })))
@@ -220,13 +217,14 @@ async fn list_thread_participants(
     let root = parse_message(&id_str)?;
 
     // Resolve the root message's room; an unknown message id is a 404.
-    let room = repo(&s)
+    let thread_room = repo(&s)
         .message_room(root)
         .await
         .map_err(AeroError::from)?
         .ok_or_else(|| AeroError::NotFound(format!("message {root}")))?;
 
-    s.im.assert_room_access(auth.participant_id, room).await?;
+    s.im.assert_room_access(auth.participant_id, thread_room)
+        .await?;
 
     // Fetch distinct participant ids from the thread.
     let participant_ids = s
@@ -238,11 +236,7 @@ async fn list_thread_participants(
     // Join with participant metadata: display_name + avatar_url.
     let mut participants = Vec::with_capacity(participant_ids.len());
     for pid in &participant_ids {
-        let p = s
-            .participants
-            .get(*pid)
-            .await
-            .map_err(AeroError::from)?;
+        let p = s.participants.get(*pid).await.map_err(AeroError::from)?;
         if let Some(p) = p {
             participants.push(serde_json::json!({
                 "id": p.id,
@@ -262,15 +256,22 @@ fn read_state_repo(s: &AppState) -> ThreadReadStateRepo {
 }
 
 /// `POST /api/messages/:id/read` — mark the thread rooted at `:id` as read
-/// for the caller. Idempotent: re-marking updates the cursor to now().
+/// for the caller. Idempotent: re-marking updates the cursor to `now()`.
 async fn mark_thread_read(
     State(s): State<AppState>,
     auth: AuthUser,
     Path(id_str): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let root = parse_message(&id_str)?;
+    let thread_room = repo(&s)
+        .message_room(root)
+        .await
+        .map_err(AeroError::from)?
+        .ok_or_else(|| AeroError::NotFound("thread".into()))?;
+    s.im.assert_room_access(auth.participant_id, thread_room)
+        .await?;
     read_state_repo(&s)
-        .mark_read(auth.participant_id, root)
+        .mark_read_authorized(auth.participant_id, root)
         .await?;
     Ok(Json(serde_json::json!({ "read": true })))
 }
@@ -283,8 +284,15 @@ async fn get_unread_count(
     Path(id_str): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let root = parse_message(&id_str)?;
+    let thread_room = repo(&s)
+        .message_room(root)
+        .await
+        .map_err(AeroError::from)?
+        .ok_or_else(|| AeroError::NotFound("thread".into()))?;
+    s.im.assert_room_access(auth.participant_id, thread_room)
+        .await?;
     let count = read_state_repo(&s)
-        .unread_count(auth.participant_id, root)
+        .unread_count_authorized(auth.participant_id, root)
         .await?;
     Ok(Json(serde_json::json!({ "unread": count })))
 }

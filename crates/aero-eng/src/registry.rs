@@ -52,7 +52,9 @@ impl CommandRegistry {
     /// Create an empty registry (manual registration via [`add`](Self::add)).
     #[must_use]
     pub fn new() -> Self {
-        Self { commands: Vec::new() }
+        Self {
+            commands: Vec::new(),
+        }
     }
 
     /// Collect all commands registered via `register_command!` (linkme-driven).
@@ -190,8 +192,12 @@ mod tests {
     struct TestCmd;
     #[async_trait]
     impl Command for TestCmd {
-        fn name(&self) -> &'static str { "test-cmd" }
-        fn description(&self) -> &'static str { "A test command" }
+        fn name(&self) -> &'static str {
+            "test-cmd"
+        }
+        fn description(&self) -> &'static str {
+            "A test command"
+        }
         async fn execute(&self, _ctx: &ExecutionContext, _args: &[String]) -> Outcome {
             Outcome::ok("test ok")
         }
@@ -200,8 +206,12 @@ mod tests {
     struct FailCmd;
     #[async_trait]
     impl Command for FailCmd {
-        fn name(&self) -> &'static str { "fail-cmd" }
-        fn description(&self) -> &'static str { "A failing command" }
+        fn name(&self) -> &'static str {
+            "fail-cmd"
+        }
+        fn description(&self) -> &'static str {
+            "A failing command"
+        }
         async fn execute(&self, _ctx: &ExecutionContext, _args: &[String]) -> Outcome {
             Outcome::error("fail")
         }

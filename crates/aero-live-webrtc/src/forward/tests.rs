@@ -9,12 +9,14 @@ fn inbound(mid: &str, seq: u64, ts: u32) -> InboundRtp {
         pt: 96u8.into(),
         seq_no: seq.into(),
         rtp_time: ts,
+        ssrc: 0x0102_0304u32.into(),
         marker: false,
         ext_vals: ExtensionValues::default(),
         wallclock: std::time::Instant::now(),
         payload: vec![0xde, 0xad, 0xbe, 0xef],
         rid: None,
         is_keyframe: false,
+        requires_keyframe: true,
     }
 }
 
@@ -51,7 +53,10 @@ fn on_rtp_skips_subscribers_without_negotiated_outbound_stream() {
     assert_eq!(fwd.peer_count(), 1);
 
     let n = fwd.on_rtp(pubr, &inbound("0", 100, 9000));
-    assert_eq!(n, 0, "no negotiated outbound stream → skipped, not delivered");
+    assert_eq!(
+        n, 0,
+        "no negotiated outbound stream → skipped, not delivered"
+    );
 }
 
 #[test]
@@ -67,9 +72,73 @@ fn remove_peer_unlinks_routing_state() {
     assert_eq!(fwd.on_rtp(ParticipantId::new(), &inbound("0", 1, 0)), 0);
 }
 
+#[test]
+fn production_peer_sink_receives_remapped_rtp_without_owning_the_peer() {
+    #[derive(Default)]
+    struct RecordingSink(parking_lot::Mutex<Vec<InboundRtp>>);
+
+    impl crate::SfuPeerSink for RecordingSink {
+        fn try_write_rtp(&self, packet: InboundRtp) -> bool {
+            self.0.lock().push(packet);
+            true
+        }
+    }
+
+    let fwd = SfuForwarder::new(SfuRouter::new());
+    let call = CallId::new();
+    let publisher = ParticipantId::new();
+    let subscriber = ParticipantId::new();
+    let sink = std::sync::Arc::new(RecordingSink::default());
+    assert!(fwd.attach_peer_sink(call, subscriber, sink.clone()));
+
+    let packet = inbound("publisher-mid", 55, 90_000);
+    let publisher_mid = packet.mid.to_string();
+    let subscriber_mid = crate::canonical_mid("subscriber-mid");
+    fwd.subscribe_call(call, publisher, &publisher_mid, subscriber, &subscriber_mid);
+    assert_ne!(publisher, subscriber);
+    assert_eq!(publisher_mid, "publisher_mid");
+    {
+        let state = fwd.inner.lock();
+        assert_eq!(
+            state.call_tables[&call]
+                .targets(publisher, &publisher_mid)
+                .len(),
+            1
+        );
+        assert!(state.peer_sinks.contains_key(&(call, subscriber)));
+    }
+    assert_eq!(
+        fwd.on_call_rtp(CallId::new(), publisher, &packet),
+        0,
+        "an identical MID in another call must not reach this sink"
+    );
+    assert_eq!(fwd.on_call_rtp(call, publisher, &packet), 1);
+    let written = sink.0.lock();
+    assert_eq!(written.len(), 1);
+    assert_eq!(written[0].mid.to_string(), subscriber_mid);
+    assert_eq!(
+        written[0].ext_vals.mid.map(|mid| mid.to_string()),
+        Some(subscriber_mid)
+    );
+    assert_eq!(
+        *written[0].seq_no, 0,
+        "first remapped packet anchors at zero"
+    );
+    drop(written);
+
+    assert_eq!(
+        fwd.on_call_rtp(call, subscriber, &packet),
+        0,
+        "sendrecv subscription must not echo a participant's own media"
+    );
+    assert!(fwd.detach_peer_sink(call, subscriber));
+    assert_eq!(fwd.peer_count(), 0);
+}
+
 #[tokio::test]
-async fn legacy_forward_rtp_trait_reports_routing() {
+async fn compatibility_forward_rtp_accepts_metadata_complete_bridge_frames() {
     use crate::MediaForwarder;
+    use str0m::media::{MediaKind, Mid};
     let router = SfuRouter::new();
     let call = CallId::new();
     let pubr = ParticipantId::new();
@@ -79,9 +148,22 @@ async fn legacy_forward_rtp_trait_reports_routing() {
     router.add_track(call, "0", pubr);
     router.add_subscription(call, "0", sub);
     let fwd = SfuForwarder::new(router);
-    // Should not panic; routing observed via the SfuRouter.
-    fwd.forward_rtp(call, "0", bytes::Bytes::from_static(b"x")).await;
-    assert_eq!(fwd.router().subscribers_for(call, "0").len(), 1);
+    let mut peer = SfuPeer::new(call, sub);
+    peer.declare_outbound(Mid::from("0"), MediaKind::Video, 0xCAFE_BABE, None);
+    fwd.add_peer(peer);
+    fwd.subscribe("0", sub, "0");
+
+    let bridged = crate::BridgeRtp::from_inbound(pubr, &inbound("0", 7, 9_000));
+    assert_eq!(
+        fwd.on_bridge_rtp(&bridged),
+        1,
+        "typed bridge path writes the peer"
+    );
+
+    // Existing trait-object wrappers still call the byte-shaped method. It now
+    // receives a complete bridge frame and dispatches to the same real path.
+    let frame = bytes::Bytes::from(crate::encode_bridge_frame(&bridged));
+    fwd.forward_rtp(call, "0", frame).await;
 }
 
 // ── Simulcast layer selection ──────────────────────────────────────────────
@@ -119,7 +201,10 @@ fn on_rtp_forwards_only_selected_layer() {
     // No outbound stream, so delivered = 0, but routing ran (not dropped).
     let pkt_low = inbound_simulcast("v0", 1, 0, "low", false);
     let n = fwd.on_rtp(pubr, &pkt_low);
-    assert_eq!(n, 0, "no negotiated stream; layer was forwarded (bootstrap)");
+    assert_eq!(
+        n, 0,
+        "no negotiated stream; layer was forwarded (bootstrap)"
+    );
 
     // --- Request switch to "high" layer.
     let selected = fwd.select_layer(sub, "v0", LayerKind::High);
@@ -138,7 +223,10 @@ fn on_rtp_forwards_only_selected_layer() {
     // What we CAN assert is that the packet was NOT delivered (Drop path).
     let pkt_high_non_kf = inbound_simulcast("v0", 100, 9000, "high", false);
     let n2 = fwd.on_rtp(pubr, &pkt_high_non_kf);
-    assert_eq!(n2, 0, "non-keyframe on pending-switch target must be dropped");
+    assert_eq!(
+        n2, 0,
+        "non-keyframe on pending-switch target must be dropped"
+    );
 
     // "low" packet while waiting for keyframe → still forwarded (Forward decision).
     // Again, delivered = 0 because no real outbound stream, but it was NOT dropped.
@@ -154,7 +242,10 @@ fn on_rtp_forwards_only_selected_layer() {
     let pkt_high_kf = inbound_simulcast("v0", 102, 12000, "high", true);
     let n4 = fwd.on_rtp(pubr, &pkt_high_kf);
     // delivered = 0 (no real stream) but NOT dropped (SwitchAndForward).
-    assert_eq!(n4, 0, "keyframe on target: SwitchAndForward (no real stream)");
+    assert_eq!(
+        n4, 0,
+        "keyframe on target: SwitchAndForward (no real stream)"
+    );
 
     // After switch: "low" packets should now be dropped (active = high).
     // We verify via the selector: a "low" packet goes through ForwardDecision::Drop
@@ -192,7 +283,11 @@ fn subscribe_enqueues_keyframe_request_toward_publisher() {
     fwd.subscribe("v0", sub, "v0");
 
     let reqs = fwd.poll_keyframe_requests();
-    assert_eq!(reqs.len(), 1, "new subscription must trigger keyframe request");
+    assert_eq!(
+        reqs.len(),
+        1,
+        "new subscription must trigger keyframe request"
+    );
     assert_eq!(reqs[0].publisher, pubr);
     assert_eq!(reqs[0].pub_mid, "v0");
     assert!(!reqs[0].use_fir, "new subscriber uses PLI, not FIR");
@@ -208,7 +303,10 @@ fn subscribe_without_registered_publisher_produces_no_keyframe_request() {
     fwd.add_peer(SfuPeer::new(call, sub));
     fwd.subscribe("v0", sub, "v0");
     let reqs = fwd.poll_keyframe_requests();
-    assert!(reqs.is_empty(), "no publisher registered → no keyframe request");
+    assert!(
+        reqs.is_empty(),
+        "no publisher registered → no keyframe request"
+    );
 }
 
 // ── Inbound subscriber RTCP → upstream keyframe request ───────────────────
@@ -231,7 +329,11 @@ fn subscriber_pli_produces_upstream_keyframe_request() {
     // First PLI — should pass gate and be queued.
     fwd.on_subscriber_rtcp(sub, "v0", &buf);
     let reqs = fwd.poll_keyframe_requests();
-    assert_eq!(reqs.len(), 1, "PLI must produce an upstream keyframe request");
+    assert_eq!(
+        reqs.len(),
+        1,
+        "PLI must produce an upstream keyframe request"
+    );
     assert_eq!(reqs[0].publisher, pubr);
     assert_eq!(reqs[0].pub_mid, "v0");
     assert!(!reqs[0].use_fir);
@@ -300,7 +402,10 @@ fn non_simulcast_packet_forwarded_regardless_of_layer_selector() {
     // Packet with no RID — must bypass the layer gate.
     // (0 delivered because no negotiated stream; but routing path executed.)
     let n = fwd.on_rtp(pubr, &inbound("v0", 10, 0));
-    assert_eq!(n, 0, "delivery=0 expected (no outbound stream), not dropped");
+    assert_eq!(
+        n, 0,
+        "delivery=0 expected (no outbound stream), not dropped"
+    );
 }
 
 #[test]
@@ -344,13 +449,22 @@ fn continuous_seq_across_layer_switch_via_forwarder() {
     // Keyframe on "high" → SwitchAndForward.
     // Use seq 40_000 to trigger the source-switch detection in RtpRemapper
     // (delta from 13 = 39_987 > MAX_CONTIGUOUS_FORWARD=32768).
-    fwd.on_rtp(pubr, &inbound_simulcast("v0", 40_000, 4_000_000, "high", true));
+    fwd.on_rtp(
+        pubr,
+        &inbound_simulcast("v0", 40_000, 4_000_000, "high", true),
+    );
 
     // After switch, another "high" packet should continue monotonically.
     // We cannot easily read the remapped seq from outside, but the important
     // thing is this doesn't panic and returns 0 (no outbound stream).
-    let n = fwd.on_rtp(pubr, &inbound_simulcast("v0", 40_001, 4_003_000, "high", false));
-    assert_eq!(n, 0, "continuous forwarding after layer switch (no real stream)");
+    let n = fwd.on_rtp(
+        pubr,
+        &inbound_simulcast("v0", 40_001, 4_003_000, "high", false),
+    );
+    assert_eq!(
+        n, 0,
+        "continuous forwarding after layer switch (no real stream)"
+    );
 }
 
 // ── H.264 keyframe detection drives simulcast switching ───────────────────
@@ -359,13 +473,7 @@ fn continuous_seq_across_layer_switch_via_forwarder() {
 /// byte sequence.  `is_keyframe` is left at `false` (the default); the test
 /// verifies that the forwarder picks it up from the payload, not from the
 /// caller-supplied flag.
-fn inbound_simulcast_h264(
-    mid: &str,
-    seq: u64,
-    ts: u32,
-    rid: &str,
-    payload: Vec<u8>,
-) -> InboundRtp {
+fn inbound_simulcast_h264(mid: &str, seq: u64, ts: u32, rid: &str, payload: Vec<u8>) -> InboundRtp {
     use str0m::media::Mid;
     use str0m::rtp::ExtensionValues;
     InboundRtp {
@@ -373,6 +481,7 @@ fn inbound_simulcast_h264(
         pt: 96u8.into(),
         seq_no: seq.into(),
         rtp_time: ts,
+        ssrc: 0x0102_0304u32.into(),
         marker: false,
         ext_vals: ExtensionValues::default(),
         wallclock: std::time::Instant::now(),
@@ -382,6 +491,7 @@ fn inbound_simulcast_h264(
         // is exercised; in on_rtp tests we populate is_keyframe directly
         // because InboundRtp is constructed by the caller (not from_packet).
         is_keyframe: false,
+        requires_keyframe: true,
     }
 }
 
@@ -590,7 +700,10 @@ use std::time::Duration;
 /// Build a TWCC feedback packet reporting `received` packets with flat
 /// 1 ms deltas followed by `lost` packets, using run-length chunks.
 fn twcc_buf(received: u16, lost: u16) -> Vec<u8> {
-    assert!(received <= 0x1FFF && lost <= 0x1FFF, "run-length chunk limit");
+    assert!(
+        received <= 0x1FFF && lost <= 0x1FFF,
+        "run-length chunk limit"
+    );
     let mut body = Vec::new();
     body.extend_from_slice(&1u32.to_be_bytes()); // sender ssrc
     body.extend_from_slice(&2u32.to_be_bytes()); // media ssrc
@@ -637,7 +750,14 @@ fn bwe_fixture() -> (SfuForwarder, ParticipantId, ParticipantId) {
 
 /// Feed RTP on `rid` every 10 ms over `[from_ms, to_ms)` with payloads
 /// sized to produce `bps` measured throughput.
-fn feed_layer(fwd: &SfuForwarder, pubr: ParticipantId, rid: &str, bps: u64, from_ms: u64, to_ms: u64) {
+fn feed_layer(
+    fwd: &SfuForwarder,
+    pubr: ParticipantId,
+    rid: &str,
+    bps: u64,
+    from_ms: u64,
+    to_ms: u64,
+) {
     let bytes_per_pkt = usize::try_from(bps / 8 / 100).expect("fits");
     let mut seq = u64::from(u32::from_be_bytes([rid.as_bytes()[0], 0, 0, 0])); // distinct seq spaces
     for t in (from_ms..to_ms).step_by(10) {
@@ -663,7 +783,11 @@ fn twcc_loss_backs_off_subscriber_estimate() {
     let (fwd, _pubr, sub) = bwe_fixture();
     // 50% loss → multiplicative decrease from the 600k initial value.
     fwd.on_subscriber_rtcp_at(sub, "v0", &twcc_buf(10, 10), Instant::now(), 0);
-    assert_eq!(fwd.subscriber_estimate_bps(sub), Some(510_000), "600k × 0.85");
+    assert_eq!(
+        fwd.subscriber_estimate_bps(sub),
+        Some(510_000),
+        "600k × 0.85"
+    );
 }
 
 #[test]
@@ -672,9 +796,16 @@ fn forwarded_rtp_measures_per_layer_throughput() {
     assert_eq!(fwd.layer_rate_bps("v0", Rid::from("high")), None);
     feed_layer(&fwd, pubr, "high", 2_000_000, 0, 1_000);
     feed_layer(&fwd, pubr, "low", 200_000, 0, 1_000);
-    let high = fwd.layer_rate_bps("v0", Rid::from("high")).expect("measured");
-    let low = fwd.layer_rate_bps("v0", Rid::from("low")).expect("measured");
-    assert!((1_800_000..=2_200_000).contains(&high), "≈2 Mbps, got {high}");
+    let high = fwd
+        .layer_rate_bps("v0", Rid::from("high"))
+        .expect("measured");
+    let low = fwd
+        .layer_rate_bps("v0", Rid::from("low"))
+        .expect("measured");
+    assert!(
+        (1_800_000..=2_200_000).contains(&high),
+        "≈2 Mbps, got {high}"
+    );
     assert!((180_000..=220_000).contains(&low), "≈200 kbps, got {low}");
 }
 
@@ -838,14 +969,21 @@ fn slowest_subscriber_bounds_publisher_remb() {
     assert_eq!(r1.len(), 1, "first subscriber estimate emits a REMB");
     assert_eq!(r1[0].publisher, pubr);
     assert_eq!(r1[0].pub_mid, "v0");
-    assert_eq!(r1[0].bitrate_bps, 600_000, "fast subscriber bounded by AIMD init");
+    assert_eq!(
+        r1[0].bitrate_bps, 600_000,
+        "fast subscriber bounded by AIMD init"
+    );
 
     // Congested subscriber reports 300 kbps → its estimate clamps to 300k →
     // the aggregate MIN collapses; the publisher is told to slow toward it.
     // Smoothed: 0.3×300k + 0.7×600k = 510k (a 15 % drop, past hysteresis).
     fwd.on_subscriber_rtcp_at(sub1, "v0", &remb_for(300_000), Instant::now(), 0);
     let r2 = fwd.poll_remb_requests();
-    assert_eq!(r2.len(), 1, "the slower subscriber must bound the publisher");
+    assert_eq!(
+        r2.len(),
+        1,
+        "the slower subscriber must bound the publisher"
+    );
     assert_eq!(r2[0].publisher, pubr);
     assert_eq!(r2[0].bitrate_bps, 510_000);
     assert!(
@@ -930,7 +1068,10 @@ fn dropping_slowest_subscriber_lifts_publisher_remb() {
     }
     let _ = fwd.poll_remb_requests(); // drain everything queued so far
     let bounded = fwd.inner.lock().remb_agg["v0"].target_bps().unwrap();
-    assert!(bounded < 400_000, "aggregate settled near the slow subscriber");
+    assert!(
+        bounded < 400_000,
+        "aggregate settled near the slow subscriber"
+    );
 
     // The congested subscriber leaves → only the fast one remains → the
     // aggregate lifts past hysteresis and a higher REMB is enqueued.

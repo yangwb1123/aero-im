@@ -46,8 +46,7 @@ fn repo(s: &AppState) -> SubscriptionTierRepo {
 }
 
 fn parse_participant(s: &str) -> Result<ParticipantId, AeroError> {
-    ParticipantId::from_str(s.trim())
-        .map_err(|e| AeroError::Invalid(format!("creator id: {e}")))
+    ParticipantId::from_str(s.trim()).map_err(|e| AeroError::Invalid(format!("creator id: {e}")))
 }
 
 fn parse_tier_id(s: &str) -> Result<Uuid, AeroError> {

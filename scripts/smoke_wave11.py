@@ -49,9 +49,9 @@ def multipart(field, filename, ctype, payload):
     return boundary, head + payload + f"\r\n--{boundary}--\r\n".encode()
 
 
-def upload(token, filename, ctype, payload):
+def upload(token, room, filename, ctype, payload):
     boundary, body = multipart("file", filename, ctype, payload)
-    r = urllib.request.Request(HOST + "/api/blobs", method="POST", data=body, headers={
+    r = urllib.request.Request(HOST + f"/api/rooms/{room}/blobs", method="POST", data=body, headers={
         "authorization": f"Bearer {token}",
         "content-type": f"multipart/form-data; boundary={boundary}"})
     with urllib.request.urlopen(r) as resp:
@@ -94,6 +94,8 @@ async def ws_send(token, room, blocks, reply_to=None):
             f = json.loads(await asyncio.wait_for(ws.recv(), timeout=3))
             if f.get("type") == "message":
                 return f["message"]
+            if f.get("type") == "error":
+                fail(f"WS send rejected: {f}")
         return None
 
 
@@ -120,7 +122,7 @@ async def main():
 
     # ---------------- Files tab ----------------
     say("files tab: upload + send a file block, then list room files")
-    blob = upload(A, f"doc-{ts}.txt", "text/plain", b"wave11 file payload" * 4)
+    blob = upload(A, R, f"doc-{ts}.txt", "text/plain", b"wave11 file payload" * 4)
     fb = {"type": "file", "blob_id": blob["id"], "kind": "document", "name": blob["name"], "size": blob["size"]}
     if not await ws_send(A, R, [fb]):
         fail("file message not delivered")

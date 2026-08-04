@@ -26,11 +26,13 @@ use std::sync::Arc;
 use aero_common::BlobId;
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::TryStreamExt;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 
-use crate::blob_store::{BlobStore, BlobStoreError, LocalFsBlobStore};
+use crate::aero_vault_blob_store::{AeroVaultBlobStore, AeroVaultConfig};
+use crate::blob_store::{BlobRange, BlobStore, BlobStoreError, BlobStream, LocalFsBlobStore};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -40,6 +42,15 @@ const SERVICE: &str = "s3";
 const AWS4_REQUEST: &str = "aws4_request";
 /// `SigV4` signing algorithm identifier.
 const ALGORITHM: &str = "AWS4-HMAC-SHA256";
+const SSE_KMS_ALGORITHM: &str = "aws:kms";
+const SSE_HEADER: &str = "x-amz-server-side-encryption";
+const SSE_KMS_KEY_ID_HEADER: &str = "x-amz-server-side-encryption-aws-kms-key-id";
+/// KMS ARNs are normally far shorter; this bound also keeps canonical requests
+/// and HTTP headers predictably small.
+const MAX_KMS_KEY_ID_LEN: usize = 2_048;
+const MAX_ACCESS_KEY_LEN: usize = 256;
+const MAX_SECRET_KEY_LEN: usize = 2_048;
+const MAX_REGION_LEN: usize = 64;
 
 // ----------------------------------------------------------------- Config
 
@@ -54,6 +65,9 @@ pub struct S3Config {
     pub endpoint: Option<String>,
     pub access_key: String,
     pub secret_key: String,
+    /// Optional AWS KMS key id, key ARN, alias name, or alias ARN. When set,
+    /// uploads request SSE-KMS and both encryption headers are signed.
+    pub kms_key_id: Option<String>,
 }
 
 /// Manual `Debug` that **redacts the S3 secret key** (ROADMAP 方向三). The
@@ -66,8 +80,12 @@ impl std::fmt::Debug for S3Config {
             .field("bucket", &self.bucket)
             .field("region", &self.region)
             .field("endpoint", &self.endpoint)
-            .field("access_key", &self.access_key)
+            .field("access_key", &"<redacted>")
             .field("secret_key", &"<redacted>")
+            .field(
+                "kms_key_id",
+                &self.kms_key_id.as_ref().map(|_| "<configured>"),
+            )
             .finish()
     }
 }
@@ -75,26 +93,158 @@ impl std::fmt::Debug for S3Config {
 impl S3Config {
     /// Read config from `AERO_S3_*` env vars. Returns `None` when
     /// `AERO_S3_BUCKET` is unset (the store is simply not configured). Region
-    /// defaults to `us-east-1`; the access/secret keys default to empty (an
-    /// anonymous endpoint, mainly useful for read-only public buckets).
+    /// defaults to `us-east-1`. A writable blob backend requires non-empty
+    /// access and secret keys; missing credentials are rejected by
+    /// [`Self::validate`] instead of failing on the first upload.
     #[must_use]
     pub fn from_env() -> Option<Self> {
-        let bucket = std::env::var("AERO_S3_BUCKET").ok()?;
+        Self::try_from_env().ok().flatten()
+    }
+
+    /// Read and validate config from `AERO_S3_*` environment variables.
+    ///
+    /// Unlike [`Self::from_env`], this preserves a validation error so the
+    /// production boot path can fail closed instead of falling back to local
+    /// storage when an explicitly configured KMS key is unsafe.
+    ///
+    /// # Errors
+    /// Returns [`BlobStoreError::Config`] for an invalid
+    /// `AERO_S3_KMS_KEY_ID`.
+    pub fn try_from_env() -> Result<Option<Self>, BlobStoreError> {
+        let Some(bucket) = std::env::var("AERO_S3_BUCKET").ok() else {
+            return Ok(None);
+        };
         if bucket.is_empty() {
-            return None;
+            return Ok(None);
         }
         let region = std::env::var("AERO_S3_REGION").unwrap_or_else(|_| "us-east-1".to_string());
-        let endpoint = std::env::var("AERO_S3_ENDPOINT").ok().filter(|s| !s.is_empty());
+        let endpoint = std::env::var("AERO_S3_ENDPOINT")
+            .ok()
+            .filter(|s| !s.is_empty());
         let access_key = std::env::var("AERO_S3_ACCESS_KEY").unwrap_or_default();
         let secret_key = std::env::var("AERO_S3_SECRET_KEY").unwrap_or_default();
-        Some(Self {
+        let kms_key_id = std::env::var("AERO_S3_KMS_KEY_ID").ok();
+        let cfg = Self {
             bucket,
             region,
             endpoint,
             access_key,
             secret_key,
-        })
+            kms_key_id,
+        };
+        cfg.validate()?;
+        Ok(Some(cfg))
     }
+
+    /// Validate the complete writable S3 configuration.
+    ///
+    /// # Errors
+    /// Returns [`BlobStoreError::Config`] when required addressing/credential
+    /// values are missing or unsafe, a custom endpoint is not a plain HTTP(S)
+    /// origin, or the optional KMS key id is invalid.
+    pub fn validate(&self) -> Result<(), BlobStoreError> {
+        let valid_bucket = (3..=63).contains(&self.bucket.len())
+            && self.bucket == self.bucket.trim()
+            && self.bucket.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'-')
+            })
+            && self
+                .bucket
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphanumeric)
+            && self
+                .bucket
+                .as_bytes()
+                .last()
+                .is_some_and(u8::is_ascii_alphanumeric)
+            && !self.bucket.contains("..");
+        if !valid_bucket {
+            return Err(BlobStoreError::Config(
+                "invalid S3 bucket (must be a trimmed 3..=63 byte DNS-style name)".into(),
+            ));
+        }
+
+        let valid_region = !self.region.is_empty()
+            && self.region.len() <= MAX_REGION_LEN
+            && self.region == self.region.trim()
+            && self
+                .region
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+            && self
+                .region
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphanumeric)
+            && self
+                .region
+                .as_bytes()
+                .last()
+                .is_some_and(u8::is_ascii_alphanumeric);
+        if !valid_region {
+            return Err(BlobStoreError::Config(format!(
+                "invalid S3 region (must be trimmed, 1..={MAX_REGION_LEN} ASCII letters/digits/hyphens)"
+            )));
+        }
+
+        validate_credential("access key", &self.access_key, MAX_ACCESS_KEY_LEN)?;
+        validate_credential("secret key", &self.secret_key, MAX_SECRET_KEY_LEN)?;
+
+        if let Some(endpoint) = &self.endpoint {
+            if endpoint != endpoint.trim() {
+                return Err(BlobStoreError::Config(
+                    "invalid S3 endpoint (must be trimmed)".into(),
+                ));
+            }
+            let parsed = reqwest::Url::parse(endpoint).map_err(|error| {
+                BlobStoreError::Config(format!("invalid S3 endpoint URL: {error}"))
+            })?;
+            if !matches!(parsed.scheme(), "http" | "https")
+                || parsed.host_str().is_none()
+                || !parsed.username().is_empty()
+                || parsed.password().is_some()
+                || parsed.query().is_some()
+                || parsed.fragment().is_some()
+                || parsed.path() != "/"
+            {
+                return Err(BlobStoreError::Config(
+                    "invalid S3 endpoint (expected an HTTP(S) origin without credentials, path, query, or fragment)"
+                        .into(),
+                ));
+            }
+        }
+
+        let Some(key_id) = &self.kms_key_id else {
+            return Ok(());
+        };
+        if key_id.is_empty()
+            || key_id != key_id.trim()
+            || key_id.len() > MAX_KMS_KEY_ID_LEN
+            || !key_id.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'/' | b'_' | b'-')
+            })
+        {
+            return Err(BlobStoreError::Config(format!(
+                "invalid S3 KMS key id (must be trimmed, 1..={MAX_KMS_KEY_ID_LEN} ASCII bytes, \
+                 using only letters, digits, ':', '/', '_', or '-')"
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn validate_credential(label: &str, value: &str, max_len: usize) -> Result<(), BlobStoreError> {
+    if value.is_empty()
+        || value != value.trim()
+        || value.len() > max_len
+        || value.chars().any(char::is_control)
+    {
+        return Err(BlobStoreError::Config(format!(
+            "invalid S3 {label} (must be trimmed, non-empty, control-free, and at most {max_len} bytes)"
+        )));
+    }
+    Ok(())
 }
 
 // ------------------------------------------------------------------ Store
@@ -112,6 +262,16 @@ impl S3BlobStore {
     /// stall a caller.
     #[must_use]
     pub fn new(cfg: S3Config) -> Self {
+        Self::try_new(cfg).expect("invalid S3 configuration")
+    }
+
+    /// Build a store after validating all values that become signed headers.
+    ///
+    /// # Errors
+    /// Returns [`BlobStoreError::Config`] when the S3/KMS configuration is
+    /// unsafe.
+    pub fn try_new(cfg: S3Config) -> Result<Self, BlobStoreError> {
+        cfg.validate()?;
         let client = reqwest::Client::builder()
             .timeout(S3_REQUEST_TIMEOUT)
             .build()
@@ -123,7 +283,7 @@ impl S3BlobStore {
                 tracing::warn!(error = %e, "s3: client builder failed; using default client (per-request timeout still applies)");
                 reqwest::Client::new()
             });
-        Self { cfg, client }
+        Ok(Self { cfg, client })
     }
 
     /// Object key for a blob: `blobs/{id}`.
@@ -170,6 +330,20 @@ impl S3BlobStore {
         object_key: &str,
         payload: &[u8],
     ) -> Result<reqwest::Response, BlobStoreError> {
+        self.send_with_range(method, object_key, payload, None)
+            .await
+    }
+
+    /// Variant of [`Self::send`] that forwards a resolved HTTP byte range to
+    /// S3. `Range` does not need to be part of `SignedHeaders`; S3 permits
+    /// ordinary request headers that are not `x-amz-*` to remain unsigned.
+    async fn send_with_range(
+        &self,
+        method: &str,
+        object_key: &str,
+        payload: &[u8],
+        range: Option<BlobRange>,
+    ) -> Result<reqwest::Response, BlobStoreError> {
         let (url, canonical_path) = self.request_url(object_key);
         let http_method: reqwest::Method = method.parse().map_err(io_other)?;
         // Bounded retry with exponential backoff for transient S3 failures
@@ -182,8 +356,14 @@ impl S3BlobStore {
             // Re-sign per attempt so `amz_date` is fresh — a delayed retry with a
             // stale timestamp would be rejected for clock skew.
             let now = OffsetDateTime::now_utc();
-            let signed =
-                sign_request(&self.cfg, method, &self.host(), &canonical_path, payload, now);
+            let signed = sign_request(
+                &self.cfg,
+                method,
+                &self.host(),
+                &canonical_path,
+                payload,
+                now,
+            );
             let mut req = self
                 .client
                 .request(http_method.clone(), &url)
@@ -192,8 +372,16 @@ impl S3BlobStore {
                 .header("x-amz-date", &signed.amz_date)
                 .header("x-amz-content-sha256", &signed.payload_hash)
                 .header("authorization", &signed.authorization);
+            if let Some(kms_key_id) = &signed.kms_key_id {
+                req = req
+                    .header(SSE_HEADER, SSE_KMS_ALGORITHM)
+                    .header(SSE_KMS_KEY_ID_HEADER, kms_key_id);
+            }
             if method == "PUT" {
                 req = req.body(payload.to_vec());
+            }
+            if let Some(range) = range {
+                req = req.header(reqwest::header::RANGE, range.http_value());
             }
 
             match req.send().await {
@@ -201,6 +389,11 @@ impl S3BlobStore {
                     let status = resp.status();
                     if status == reqwest::StatusCode::NOT_FOUND {
                         return Err(BlobStoreError::NotFound);
+                    }
+                    if range.is_some() && status != reqwest::StatusCode::PARTIAL_CONTENT {
+                        return Err(io_other(format!(
+                            "s3: range request returned unexpected status {status}"
+                        )));
                     }
                     if status.is_success() {
                         return Ok(resp);
@@ -242,6 +435,17 @@ impl BlobStore for S3BlobStore {
         Ok(body)
     }
 
+    async fn get_stream(
+        &self,
+        id: BlobId,
+        range: Option<BlobRange>,
+    ) -> Result<BlobStream, BlobStoreError> {
+        let key = Self::object_key(id);
+        let response = self.send_with_range("GET", &key, &[], range).await?;
+        let stream = response.bytes_stream().map_err(io_other);
+        Ok(Box::pin(stream))
+    }
+
     async fn delete(&self, id: BlobId) -> Result<(), BlobStoreError> {
         let key = Self::object_key(id);
         match self.send("DELETE", &key, &[]).await {
@@ -275,24 +479,23 @@ impl BlobStore for S3BlobStore {
 ///
 /// # Panics
 ///
-/// Panics only if the local directory can't be created (same failure mode as
-/// constructing [`LocalFsBlobStore`] directly at boot).
+/// Panics if the local directory can't be created or an explicitly supplied
+/// KMS key id is unsafe. Production boot uses
+/// [`blob_store_from_env_checked`] to return those configuration failures.
 // `local_dir` is owned per the documented API shape (it mirrors how the bin
 // hands its blob_dir straight to this factory).
 #[allow(clippy::needless_pass_by_value)]
 #[must_use]
 pub fn blob_store_from_env(local_dir: PathBuf) -> Arc<dyn BlobStore> {
-    if std::env::var("AERO_BLOB_BACKEND").as_deref() == Ok("s3") {
-        if let Some(cfg) = S3Config::from_env() {
-            return Arc::new(S3BlobStore::new(cfg));
-        }
-    }
-    Arc::new(LocalFsBlobStore::new(&local_dir).expect("create local blob dir"))
+    blob_store_from_env_checked(local_dir)
+        .unwrap_or_else(|error| panic!("invalid blob-store configuration: {error}"))
+        .0
 }
 
 /// Fail-loud variant of [`blob_store_from_env`] (ROADMAP 第三版 方向五).
 ///
-/// Returns the store **and the active backend label** (`"s3"` / `"local"`). The
+/// Returns the store **and the active backend label** (`"s3"` / `"aero-vault"`
+/// / `"local"`). The
 /// critical difference: when `AERO_BLOB_BACKEND=s3` is set but the S3 config is
 /// incomplete, this returns `Err` instead of silently falling back to local disk
 /// — a misconfigured cluster that thinks it's on S3 but is actually writing to a
@@ -301,22 +504,46 @@ pub fn blob_store_from_env(local_dir: PathBuf) -> Arc<dyn BlobStore> {
 /// abort startup, and the label is surfaced on `/health/ready`.
 ///
 /// # Errors
-/// [`BlobStoreError::Config`] when `AERO_BLOB_BACKEND=s3` but `AERO_S3_BUCKET`
-/// (etc.) is unset, or when the local directory can't be created.
+/// [`BlobStoreError::Config`] when an explicitly selected remote backend is
+/// incomplete/unsafe, the backend name is unknown, or the local directory
+/// cannot be created.
 #[allow(clippy::needless_pass_by_value)]
 pub fn blob_store_from_env_checked(
     local_dir: PathBuf,
 ) -> Result<(Arc<dyn BlobStore>, &'static str), BlobStoreError> {
-    if std::env::var("AERO_BLOB_BACKEND").as_deref() == Ok("s3") {
-        let cfg = S3Config::from_env().ok_or_else(|| {
-            BlobStoreError::Config(
-                "AERO_BLOB_BACKEND=s3 but S3 config is incomplete (set AERO_S3_BUCKET / \
-                 AERO_S3_REGION / AERO_S3_ACCESS_KEY / AERO_S3_SECRET_KEY); refusing to \
-                 silently fall back to local-disk storage"
-                    .into(),
-            )
-        })?;
-        return Ok((Arc::new(S3BlobStore::new(cfg)), "s3"));
+    let backend = std::env::var("AERO_BLOB_BACKEND")
+        .unwrap_or_else(|_| "local".into())
+        .trim()
+        .to_ascii_lowercase();
+    match backend.as_str() {
+        "s3" => {
+            let cfg = S3Config::try_from_env()?.ok_or_else(|| {
+                BlobStoreError::Config(
+                    "AERO_BLOB_BACKEND=s3 but S3 config is incomplete (set AERO_S3_BUCKET / \
+                     AERO_S3_REGION / AERO_S3_ACCESS_KEY / AERO_S3_SECRET_KEY); refusing to \
+                     silently fall back to local-disk storage"
+                        .into(),
+                )
+            })?;
+            return Ok((Arc::new(S3BlobStore::try_new(cfg)?), "s3"));
+        }
+        "vault" | "aero-vault" => {
+            let cfg = AeroVaultConfig::try_from_env()?.ok_or_else(|| {
+                BlobStoreError::Config(
+                    "AERO_BLOB_BACKEND=vault but Aero Vault config is incomplete (set \
+                     AERO_VAULT_URL / AERO_VAULT_TENANT and either AERO_VAULT_BEARER_TOKEN \
+                     or AERO_VAULT_OAUTH_*); refusing to silently fall back to local disk"
+                        .into(),
+                )
+            })?;
+            return Ok((Arc::new(AeroVaultBlobStore::try_new(cfg)?), "aero-vault"));
+        }
+        "" | "local" => {}
+        unknown => {
+            return Err(BlobStoreError::Config(format!(
+                "unknown AERO_BLOB_BACKEND '{unknown}' (expected local, s3, or vault)"
+            )))
+        }
     }
     let local = LocalFsBlobStore::new(&local_dir)
         .map_err(|e| BlobStoreError::Config(format!("create local blob dir: {e}")))?;
@@ -333,6 +560,7 @@ struct SignedRequest {
     amz_date: String,
     payload_hash: String,
     authorization: String,
+    kms_key_id: Option<String>,
 }
 
 /// Lowercase hex SHA-256 of `payload`.
@@ -349,23 +577,40 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
     mac.finalize().into_bytes().to_vec()
 }
 
-/// Build the `SigV4` **canonical request** string for a single-header
-/// (`host;x-amz-content-sha256;x-amz-date`) GET/PUT/DELETE with no query string.
+/// Build the `SigV4` **canonical request** for GET/PUT/DELETE with no query
+/// string. SSE-KMS headers are included in canonical order only for encrypted
+/// PUTs.
 fn canonical_request(
     method: &str,
     canonical_uri: &str,
     host: &str,
     amz_date: &str,
     payload_hash: &str,
+    kms_key_id: Option<&str>,
 ) -> String {
-    // Signed headers (sorted, lowercase): host, x-amz-content-sha256, x-amz-date.
-    let canonical_headers = format!(
-        "host:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\n"
-    );
-    let signed_headers = "host;x-amz-content-sha256;x-amz-date";
-    format!(
-        "{method}\n{canonical_uri}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
-    )
+    let mut canonical_headers =
+        format!("host:{host}\nx-amz-content-sha256:{payload_hash}\nx-amz-date:{amz_date}\n");
+    if let Some(key_id) = kms_key_id {
+        canonical_headers.push_str(SSE_HEADER);
+        canonical_headers.push(':');
+        canonical_headers.push_str(SSE_KMS_ALGORITHM);
+        canonical_headers.push('\n');
+        canonical_headers.push_str(SSE_KMS_KEY_ID_HEADER);
+        canonical_headers.push(':');
+        canonical_headers.push_str(key_id);
+        canonical_headers.push('\n');
+    }
+    let signed_headers = signed_headers(kms_key_id.is_some());
+    format!("{method}\n{canonical_uri}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}")
+}
+
+fn signed_headers(with_kms: bool) -> &'static str {
+    if with_kms {
+        "host;x-amz-content-sha256;x-amz-date;x-amz-server-side-encryption;\
+         x-amz-server-side-encryption-aws-kms-key-id"
+    } else {
+        "host;x-amz-content-sha256;x-amz-date"
+    }
 }
 
 /// Build the `SigV4` **string-to-sign** from a canonical-request hash.
@@ -383,9 +628,7 @@ fn signing_key(secret: &str, date_stamp: &str, region: &str, service: &str) -> V
 
 /// Format an [`OffsetDateTime`] as the `SigV4` `amz_date` (`YYYYMMDDTHHMMSSZ`).
 fn amz_date(ts: OffsetDateTime) -> String {
-    let fmt = time::macros::format_description!(
-        "[year][month][day]T[hour][minute][second]Z"
-    );
+    let fmt = time::macros::format_description!("[year][month][day]T[hour][minute][second]Z");
     ts.format(&fmt).expect("amz-date format is infallible")
 }
 
@@ -409,19 +652,27 @@ fn sign_request(
     let amz_date = amz_date(now);
     let date_stamp = date_stamp(now);
     let payload_hash = sha256_hex(payload);
+    let kms_key_id = (method == "PUT").then(|| cfg.kms_key_id.clone()).flatten();
 
     let scope = format!(
         "{date_stamp}/{region}/{SERVICE}/{AWS4_REQUEST}",
         region = cfg.region
     );
-    let creq = canonical_request(method, canonical_uri, host, &amz_date, &payload_hash);
+    let creq = canonical_request(
+        method,
+        canonical_uri,
+        host,
+        &amz_date,
+        &payload_hash,
+        kms_key_id.as_deref(),
+    );
     let creq_hash = sha256_hex(creq.as_bytes());
     let sts = string_to_sign(&amz_date, &scope, &creq_hash);
 
     let key = signing_key(&cfg.secret_key, &date_stamp, &cfg.region, SERVICE);
     let signature = hex::encode(hmac_sha256(&key, sts.as_bytes()));
 
-    let signed_headers = "host;x-amz-content-sha256;x-amz-date";
+    let signed_headers = signed_headers(kms_key_id.is_some());
     let authorization = format!(
         "{ALGORITHM} Credential={access}/{scope}, SignedHeaders={signed_headers}, Signature={signature}",
         access = cfg.access_key
@@ -432,6 +683,7 @@ fn sign_request(
         amz_date,
         payload_hash,
         authorization,
+        kms_key_id,
     }
 }
 
@@ -468,6 +720,10 @@ fn is_retryable_status(status: reqwest::StatusCode) -> bool {
 // -------------------------------------------------------------------- Tests
 
 #[cfg(test)]
+#[path = "s3_blob_store/range_tests.rs"]
+mod range_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use time::macros::datetime;
@@ -499,15 +755,23 @@ mod tests {
             endpoint: None,
             access_key: EXAMPLE_ACCESS_KEY.into(),
             secret_key: EXAMPLE_SECRET_KEY.into(),
+            kms_key_id: Some("arn:aws:kms:us-east-1:123456789012:key/not-a-secret".into()),
         };
         let dbg = format!("{cfg:?}");
         assert!(
             !dbg.contains(EXAMPLE_SECRET_KEY),
             "secret key must never appear in Debug output:\n{dbg}"
         );
+        assert!(
+            !dbg.contains("arn:aws:kms"),
+            "KMS resource metadata must not appear in Debug output:\n{dbg}"
+        );
         assert!(dbg.contains("<redacted>"), "redaction marker present");
-        // The access key id (an identifier) and bucket stay visible for ops.
-        assert!(dbg.contains(EXAMPLE_ACCESS_KEY) && dbg.contains("my-bucket"));
+        assert!(
+            !dbg.contains(EXAMPLE_ACCESS_KEY),
+            "credential identifiers are redacted too"
+        );
+        assert!(dbg.contains("my-bucket"));
     }
 
     /// `hmac`/`sha2` determinism guard: SHA-256 of the empty string is a fixed,
@@ -554,6 +818,7 @@ mod tests {
             endpoint: None,
             access_key: EXAMPLE_ACCESS_KEY.to_string(),
             secret_key: EXAMPLE_SECRET_KEY.to_string(),
+            kms_key_id: None,
         }
     }
 
@@ -607,6 +872,7 @@ mod tests {
             "examplebucket.s3.amazonaws.com",
             &signed.amz_date,
             &signed.payload_hash,
+            None,
         );
         let creq_hash = sha256_hex(creq.as_bytes());
         assert_eq!(
@@ -623,7 +889,9 @@ mod tests {
         );
 
         assert!(
-            signed.authorization.contains(&format!("Signature={expected_sig}")),
+            signed
+                .authorization
+                .contains(&format!("Signature={expected_sig}")),
             "authorization header must embed the derived signature"
         );
         assert!(signed.authorization.starts_with(ALGORITHM));
@@ -645,6 +913,7 @@ mod tests {
             "examplebucket.s3.amazonaws.com",
             "20130524T000000Z",
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            None,
         );
         let expected = concat!(
             "GET\n",
@@ -658,6 +927,154 @@ mod tests {
             "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
         );
         assert_eq!(creq, expected);
+    }
+
+    #[test]
+    fn kms_put_canonical_request_and_authorization_sign_all_x_amz_headers() {
+        let mut cfg = example_cfg();
+        let kms_key_id = "arn:aws:kms:us-east-1:123456789012:key/1234abcd";
+        cfg.kms_key_id = Some(kms_key_id.to_owned());
+        let now = datetime!(2013-05-24 00:00:00 UTC);
+        let signed = sign_request(
+            &cfg,
+            "PUT",
+            "examplebucket.s3.amazonaws.com",
+            "/test.txt",
+            b"hello",
+            now,
+        );
+        let canonical = canonical_request(
+            "PUT",
+            "/test.txt",
+            "examplebucket.s3.amazonaws.com",
+            &signed.amz_date,
+            &signed.payload_hash,
+            Some(kms_key_id),
+        );
+        let expected = format!(
+            concat!(
+                "PUT\n/test.txt\n\n",
+                "host:examplebucket.s3.amazonaws.com\n",
+                "x-amz-content-sha256:{}\n",
+                "x-amz-date:20130524T000000Z\n",
+                "x-amz-server-side-encryption:aws:kms\n",
+                "x-amz-server-side-encryption-aws-kms-key-id:{}\n\n",
+                "host;x-amz-content-sha256;x-amz-date;",
+                "x-amz-server-side-encryption;",
+                "x-amz-server-side-encryption-aws-kms-key-id\n",
+                "{}"
+            ),
+            signed.payload_hash, kms_key_id, signed.payload_hash
+        );
+        assert_eq!(canonical, expected);
+        assert_eq!(signed.kms_key_id.as_deref(), Some(kms_key_id));
+        assert!(signed.authorization.contains(
+            "SignedHeaders=host;x-amz-content-sha256;x-amz-date;\
+             x-amz-server-side-encryption;\
+             x-amz-server-side-encryption-aws-kms-key-id"
+        ));
+    }
+
+    #[test]
+    fn kms_headers_are_not_signed_or_emitted_for_non_put_methods() {
+        let mut cfg = example_cfg();
+        cfg.kms_key_id = Some("alias/aero-blobs".to_owned());
+        let now = datetime!(2013-05-24 00:00:00 UTC);
+        for method in ["GET", "DELETE"] {
+            let signed = sign_request(
+                &cfg,
+                method,
+                "examplebucket.s3.amazonaws.com",
+                "/test.txt",
+                b"",
+                now,
+            );
+            assert!(signed.kms_key_id.is_none());
+            assert!(signed
+                .authorization
+                .contains("SignedHeaders=host;x-amz-content-sha256;x-amz-date,"));
+            assert!(!signed.authorization.contains(SSE_HEADER));
+        }
+    }
+
+    #[test]
+    fn kms_key_id_validation_accepts_aws_forms_and_rejects_unsafe_values() {
+        for valid in [
+            "1234abcd-12ab-34cd-56ef-1234567890ab",
+            "mrk-1234abcd",
+            "alias/aero_blobs-prod",
+            "arn:aws:kms:us-east-1:123456789012:key/1234abcd",
+            "arn:aws-us-gov:kms:us-gov-west-1:123456789012:alias/aero",
+        ] {
+            let mut cfg = example_cfg();
+            cfg.kms_key_id = Some(valid.to_owned());
+            assert!(cfg.validate().is_ok(), "{valid} should be accepted");
+        }
+
+        for invalid in [
+            "",
+            " alias/aero",
+            "alias/aero ",
+            "alias/aero\r\nx-amz-meta-injected:value",
+            "alias/aero blobs",
+            "alias/aero.blobs",
+        ] {
+            let mut cfg = example_cfg();
+            cfg.kms_key_id = Some(invalid.to_owned());
+            assert!(matches!(cfg.validate(), Err(BlobStoreError::Config(_))));
+        }
+
+        let mut cfg = example_cfg();
+        cfg.kms_key_id = Some("a".repeat(MAX_KMS_KEY_ID_LEN + 1));
+        assert!(matches!(cfg.validate(), Err(BlobStoreError::Config(_))));
+    }
+
+    #[test]
+    fn store_construction_fails_closed_for_invalid_kms_key_id() {
+        let mut cfg = example_cfg();
+        cfg.kms_key_id = Some("alias/aero\r\nx-amz-meta-injected:value".to_owned());
+        assert!(matches!(
+            S3BlobStore::try_new(cfg),
+            Err(BlobStoreError::Config(_))
+        ));
+    }
+
+    #[test]
+    fn writable_config_requires_complete_addressing_and_credentials() {
+        let mutations: [fn(&mut S3Config); 6] = [
+            |cfg: &mut S3Config| cfg.bucket.clear(),
+            |cfg: &mut S3Config| cfg.bucket = "../escape".into(),
+            |cfg: &mut S3Config| cfg.region.clear(),
+            |cfg: &mut S3Config| cfg.access_key.clear(),
+            |cfg: &mut S3Config| cfg.secret_key.clear(),
+            |cfg: &mut S3Config| cfg.secret_key = " injected\nheader".into(),
+        ];
+        for mutate in mutations {
+            let mut cfg = example_cfg();
+            mutate(&mut cfg);
+            assert!(matches!(cfg.validate(), Err(BlobStoreError::Config(_))));
+        }
+    }
+
+    #[test]
+    fn custom_endpoint_must_be_a_plain_http_origin() {
+        for invalid in [
+            "ftp://minio.example.test",
+            "http://user:pass@minio.example.test",
+            "http://minio.example.test/prefix",
+            "http://minio.example.test?query=1",
+            "http://minio.example.test/#fragment",
+        ] {
+            let mut cfg = example_cfg();
+            cfg.endpoint = Some(invalid.into());
+            assert!(
+                matches!(cfg.validate(), Err(BlobStoreError::Config(_))),
+                "{invalid}"
+            );
+        }
+        let mut cfg = example_cfg();
+        cfg.endpoint = Some("http://127.0.0.1:9000".into());
+        assert!(cfg.validate().is_ok());
     }
 
     /// String-to-sign format guard (algorithm, date, scope, creq-hash on four

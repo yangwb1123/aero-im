@@ -53,7 +53,7 @@ async fn assert_member(
     caller: ParticipantId,
 ) -> Result<(), AeroError> {
     s.workspaces
-        .member_role(workspace, caller)
+        .effective_member_role(workspace, caller)
         .await
         .map_err(AeroError::from)?
         .ok_or_else(|| AeroError::Forbidden("not a workspace member".into()))?;
@@ -99,5 +99,7 @@ async fn list_directory(
         )
         .await
         .map_err(AeroError::from)?;
-    Ok(Json(serde_json::to_value(entries).map_err(AeroError::from)?))
+    Ok(Json(
+        serde_json::to_value(entries).map_err(AeroError::from)?,
+    ))
 }

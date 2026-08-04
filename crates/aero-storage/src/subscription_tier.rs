@@ -115,14 +115,12 @@ impl SubscriptionTierRepo {
     /// Delete a tier owned by `creator`. Returns `true` if a row was removed.
     /// The `creator_id` guard makes the delete a no-op for non-owners.
     pub async fn delete(&self, id: Uuid, creator: ParticipantId) -> Result<bool, Error> {
-        let r = sqlx::query(
-            "DELETE FROM subscription_tiers WHERE id = $1 AND creator_id = $2",
-        )
-        .bind(id)
-        .bind(creator.to_uuid())
-        .execute(&self.pg)
-        .await
-        .map_err(Error::from)?;
+        let r = sqlx::query("DELETE FROM subscription_tiers WHERE id = $1 AND creator_id = $2")
+            .bind(id)
+            .bind(creator.to_uuid())
+            .execute(&self.pg)
+            .await
+            .map_err(Error::from)?;
         Ok(r.rows_affected() > 0)
     }
 }

@@ -7,9 +7,10 @@
 
 use std::time::Duration;
 
-use aero_common::{Error, Participant, Result};
+use aero_common::{Error, Participant, ParticipantId, Result, SessionId, WorkspaceId};
 use aero_storage::participant::NewHuman;
-use aero_storage::ParticipantRepo;
+use aero_storage::revoked_token::hash_token;
+use aero_storage::{NewRegistration, ParticipantRepo, RegistrationRepo, SessionRepo};
 use serde::{Deserialize, Serialize};
 
 use crate::bot::SharedBotVerifier;
@@ -34,6 +35,10 @@ pub struct LoginRequest {
 pub struct AuthTokens {
     pub access_token: String,
     pub refresh_token: String,
+    /// Internal stable id shared by both JWTs; intentionally absent from the
+    /// public JSON response because it is already carried in the signed claims.
+    #[serde(skip)]
+    pub session_id: SessionId,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -41,6 +46,9 @@ pub struct RegisterResponse {
     pub participant: Participant,
     pub access_token: String,
     pub refresh_token: String,
+    /// Internal stable id shared by both JWTs.
+    #[serde(skip)]
+    pub session_id: SessionId,
 }
 
 /// Cheap-to-clone (clones share the underlying repo, JWT keys, and — when wired —
@@ -48,6 +56,7 @@ pub struct RegisterResponse {
 #[derive(Clone)]
 pub struct AuthService {
     repo: ParticipantRepo,
+    sessions: SessionRepo,
     jwt: JwtCodec,
     /// Optional hook for Personal Access Token (PAT) auth. When present, the
     /// [`AuthUser`](crate::extractor::AuthUser) extractor accepts an
@@ -74,8 +83,10 @@ impl AuthService {
     /// when starting up directly from `AuthConfig`. PAT auth is off until
     /// [`Self::with_pat_verifier`] is called.
     pub fn new(repo: ParticipantRepo, jwt: JwtCodec) -> Self {
+        let sessions = SessionRepo::new(repo.pool().clone());
         Self {
             repo,
+            sessions,
             jwt,
             pat_verifier: None,
             bot_verifier: None,
@@ -171,11 +182,7 @@ impl AuthService {
     /// * [`Error::Database`] for unexpected SQL errors.
     #[tracing::instrument(skip(self, req), fields(email = %req.email))]
     pub async fn register(&self, req: RegisterRequest) -> Result<RegisterResponse> {
-        validate_email(&req.email)?;
-        validate_password(&req.password)?;
-        if req.display_name.trim().is_empty() {
-            return Err(Error::Invalid("display_name must not be empty".into()));
-        }
+        validate_registration(&req)?;
 
         let phc = password::hash(&req.password)?;
         let participant = match self
@@ -196,6 +203,51 @@ impl AuthService {
             participant,
             access_token: tokens.access_token,
             refresh_token: tokens.refresh_token,
+            session_id: tokens.session_id,
+        })
+    }
+
+    /// Register a first-party account together with its initial tenant
+    /// enrollment and refresh-session inventory.
+    ///
+    /// JWTs are prepared before database mutation; all persistent rows then
+    /// commit through [`RegistrationRepo`] in one transaction. A database failure
+    /// therefore occupies neither the email nor participant id, and a successful
+    /// response can always be revoked through the session inventory it exposes.
+    #[tracing::instrument(
+        skip(self, req, user_agent),
+        fields(email = %req.email, %workspace)
+    )]
+    pub async fn register_enrolled(
+        &self,
+        req: RegisterRequest,
+        workspace: WorkspaceId,
+        user_agent: Option<&str>,
+    ) -> Result<RegisterResponse> {
+        validate_registration(&req)?;
+        let password_hash = password::hash(&req.password)?;
+        let participant_id = ParticipantId::new();
+        let tokens = self.issue_pair(participant_id)?;
+        let refresh_token_hash = hash_token(&tokens.refresh_token);
+        let participant = RegistrationRepo::new(self.repo.pool().clone())
+            .create(NewRegistration {
+                participant_id,
+                email: req.email,
+                display_name: req.display_name,
+                password_hash,
+                workspace_id: workspace,
+                session_id: tokens.session_id,
+                refresh_token_hash,
+                user_agent: user_agent.map(ToOwned::to_owned),
+            })
+            .await
+            .map_err(map_create_error)?;
+
+        Ok(RegisterResponse {
+            participant,
+            access_token: tokens.access_token,
+            refresh_token: tokens.refresh_token,
+            session_id: tokens.session_id,
         })
     }
 
@@ -272,6 +324,7 @@ impl AuthService {
             participant,
             access_token: tokens.access_token,
             refresh_token: tokens.refresh_token,
+            session_id: tokens.session_id,
         })
     }
 
@@ -284,10 +337,28 @@ impl AuthService {
             return Err(Error::Unauthorized("not a refresh token".into()));
         }
         let pid = claims.participant_id()?;
-        let access_token = self.jwt.issue(pid, TokenKind::Access)?;
+        let session_id = match claims.session_id()? {
+            Some(id) => {
+                if !self.sessions.is_active(id, pid).await? {
+                    return Err(Error::Unauthorized("session is not active".into()));
+                }
+                id
+            }
+            None => {
+                let hash = aero_storage::revoked_token::hash_token(refresh_token);
+                self.sessions
+                    .active_id_by_hash(pid, &hash)
+                    .await?
+                    .ok_or_else(|| Error::Unauthorized("refresh session is not active".into()))?
+            }
+        };
+        let access_token = self
+            .jwt
+            .issue_for_session(pid, TokenKind::Access, session_id)?;
         Ok(AuthTokens {
             access_token,
             refresh_token: refresh_token.to_string(),
+            session_id,
         })
     }
 
@@ -295,6 +366,33 @@ impl AuthService {
     /// claims. Used by the [`AuthUser`](crate::extractor::AuthUser) extractor.
     pub fn verify(&self, token: &str) -> Result<Claims> {
         self.jwt.verify(token)
+    }
+
+    /// Verify an access JWT, require its stable `sid`, and require the
+    /// corresponding owner-scoped session row to still be active. Sid-less
+    /// access tokens are rejected: without a session binding, remote/global
+    /// sign-out could not invalidate the token before its expiry.
+    pub async fn verify_access(&self, token: &str) -> Result<Claims> {
+        let claims = self.jwt.verify(token)?;
+        self.assert_access_claims_active(&claims).await?;
+        Ok(claims)
+    }
+
+    /// Validate already-signature-checked claims. Kept crate-visible so the Axum
+    /// extractor can avoid verifying the JWT twice while still distinguishing a
+    /// valid-but-revoked JWT (hard reject) from an opaque PAT/bot candidate.
+    pub(crate) async fn assert_access_claims_active(&self, claims: &Claims) -> Result<()> {
+        if claims.kind != TokenKind::Access {
+            return Err(Error::Unauthorized("not an access token".into()));
+        }
+        let participant = claims.participant_id()?;
+        let session = claims
+            .session_id()?
+            .ok_or_else(|| Error::Unauthorized("access token missing session id".into()))?;
+        if !self.sessions.is_active(session, participant).await? {
+            return Err(Error::Unauthorized("session is not active".into()));
+        }
+        Ok(())
     }
 
     /// Mint a fresh access+refresh token pair for an already-known participant,
@@ -308,6 +406,15 @@ impl AuthService {
     /// verification.
     pub fn issue_for_participant(&self, pid: aero_common::ParticipantId) -> Result<AuthTokens> {
         self.issue_pair(pid)
+    }
+
+    /// Mint a fresh pair for an existing stable session (refresh rotation).
+    pub fn issue_for_session(
+        &self,
+        pid: aero_common::ParticipantId,
+        session_id: SessionId,
+    ) -> Result<AuthTokens> {
+        self.issue_pair_for_session(pid, session_id)
     }
 
     /// Attempt to authenticate a *plaintext* Personal Access Token, returning its
@@ -362,9 +469,22 @@ impl AuthService {
     }
 
     fn issue_pair(&self, pid: aero_common::ParticipantId) -> Result<AuthTokens> {
+        self.issue_pair_for_session(pid, SessionId::new())
+    }
+
+    fn issue_pair_for_session(
+        &self,
+        pid: aero_common::ParticipantId,
+        session_id: SessionId,
+    ) -> Result<AuthTokens> {
         Ok(AuthTokens {
-            access_token: self.jwt.issue(pid, TokenKind::Access)?,
-            refresh_token: self.jwt.issue(pid, TokenKind::Refresh)?,
+            access_token: self
+                .jwt
+                .issue_for_session(pid, TokenKind::Access, session_id)?,
+            refresh_token: self
+                .jwt
+                .issue_for_session(pid, TokenKind::Refresh, session_id)?,
+            session_id,
         })
     }
 }
@@ -396,7 +516,9 @@ fn is_well_formed_pat(token: &str) -> bool {
         return false;
     };
     body.len() == PAT_BODY_HEX_LEN
-        && body.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        && body
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// Is `token` a structurally well-formed bot token?
@@ -423,6 +545,15 @@ fn is_well_formed_bot_token(token: &str) -> bool {
         .is_some_and(|min_len| {
             token.starts_with(aero_storage::BotRepo::TOKEN_PREFIX) && token.len() >= min_len
         })
+}
+
+fn validate_registration(req: &RegisterRequest) -> Result<()> {
+    validate_email(&req.email)?;
+    validate_password(&req.password)?;
+    if req.display_name.trim().is_empty() {
+        return Err(Error::Invalid("display_name must not be empty".into()));
+    }
+    Ok(())
 }
 
 fn validate_email(email: &str) -> Result<()> {
@@ -454,6 +585,33 @@ fn map_create_error(err: sqlx::Error) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::rngs::OsRng;
+    use rsa::pkcs1::EncodeRsaPublicKey;
+    use rsa::pkcs8::EncodePrivateKey;
+    use rsa::RsaPrivateKey;
+
+    fn token_service() -> AuthService {
+        let mut rng = OsRng;
+        let private = RsaPrivateKey::new(&mut rng, 2048).expect("rsa keygen");
+        let public = private.to_public_key();
+        let private_pem = private
+            .to_pkcs8_pem(rsa::pkcs8::LineEnding::LF)
+            .unwrap()
+            .to_string();
+        let public_pem = public.to_pkcs1_pem(rsa::pkcs8::LineEnding::LF).unwrap();
+        let jwt = JwtCodec::from_pem(
+            &private_pem,
+            &public_pem,
+            "aero-im",
+            Duration::from_secs(60),
+            Duration::from_secs(600),
+        )
+        .unwrap();
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://aero:aero_dev_pw@localhost:5432/aero")
+            .unwrap();
+        AuthService::new(ParticipantRepo::new(pool), jwt)
+    }
 
     #[test]
     fn validate_email_rejects_garbage() {
@@ -490,15 +648,30 @@ mod tests {
         // Bare prefix with an empty body.
         assert!(!is_well_formed_pat(prefix));
         // Body one hex char too short / too long.
-        assert!(!is_well_formed_pat(&format!("{prefix}{}", "a".repeat(PAT_BODY_HEX_LEN - 1))));
-        assert!(!is_well_formed_pat(&format!("{prefix}{}", "a".repeat(PAT_BODY_HEX_LEN + 1))));
+        assert!(!is_well_formed_pat(&format!(
+            "{prefix}{}",
+            "a".repeat(PAT_BODY_HEX_LEN - 1)
+        )));
+        assert!(!is_well_formed_pat(&format!(
+            "{prefix}{}",
+            "a".repeat(PAT_BODY_HEX_LEN + 1)
+        )));
         // Correct length but a non-hex character ('g') in the body.
-        assert!(!is_well_formed_pat(&format!("{prefix}{}", "g".repeat(PAT_BODY_HEX_LEN))));
+        assert!(!is_well_formed_pat(&format!(
+            "{prefix}{}",
+            "g".repeat(PAT_BODY_HEX_LEN)
+        )));
         // Correct length and hex digits but uppercase — generate_pat emits
         // lowercase, and hash_pat is case-sensitive, so this could never match.
-        assert!(!is_well_formed_pat(&format!("{prefix}{}", "A".repeat(PAT_BODY_HEX_LEN))));
+        assert!(!is_well_formed_pat(&format!(
+            "{prefix}{}",
+            "A".repeat(PAT_BODY_HEX_LEN)
+        )));
         // A pathologically large blob is rejected on length alone (no hashing).
-        assert!(!is_well_formed_pat(&format!("{prefix}{}", "a".repeat(100_000))));
+        assert!(!is_well_formed_pat(&format!(
+            "{prefix}{}",
+            "a".repeat(100_000)
+        )));
     }
 
     #[test]
@@ -534,7 +707,11 @@ mod tests {
         // what makes the extractor's "try PAT, then bot" ordering safe — a given
         // bearer self-routes to at most one DB lookup.
         let pat = aero_storage::pat::generate_pat();
-        let bot = format!("{}{}", aero_storage::BotRepo::TOKEN_PREFIX, uuid::Uuid::new_v4());
+        let bot = format!(
+            "{}{}",
+            aero_storage::BotRepo::TOKEN_PREFIX,
+            uuid::Uuid::new_v4()
+        );
         assert!(is_well_formed_pat(&pat) && !is_well_formed_bot_token(&pat));
         assert!(is_well_formed_bot_token(&bot) && !is_well_formed_pat(&bot));
     }
@@ -546,5 +723,37 @@ mod tests {
         let body: String = "0123456789abcdef".repeat(PAT_BODY_HEX_LEN / 16);
         assert_eq!(body.len(), PAT_BODY_HEX_LEN);
         assert!(is_well_formed_pat(&format!("{prefix}{body}")));
+    }
+
+    #[tokio::test]
+    async fn issued_auth_pair_shares_session_and_has_distinct_jtis() {
+        let service = token_service();
+        let participant = aero_common::ParticipantId::new();
+        let tokens = service.issue_for_participant(participant).unwrap();
+        let access = service.verify(&tokens.access_token).unwrap();
+        let refresh = service.verify(&tokens.refresh_token).unwrap();
+
+        assert_eq!(access.session_id().unwrap(), Some(tokens.session_id));
+        assert_eq!(refresh.session_id().unwrap(), Some(tokens.session_id));
+        assert_ne!(access.jti, refresh.jti);
+    }
+
+    #[tokio::test]
+    async fn sidless_access_claims_fail_before_session_lookup() {
+        let service = token_service();
+        let claims = Claims {
+            sub: aero_common::ParticipantId::new().to_string(),
+            iss: "aero-im".into(),
+            iat: 1,
+            exp: u64::MAX,
+            kind: TokenKind::Access,
+            sid: None,
+            jti: "legacy".into(),
+        };
+        let error = service
+            .assert_access_claims_active(&claims)
+            .await
+            .expect_err("sid-less access cannot be revoked and must fail closed");
+        assert!(matches!(error, Error::Unauthorized(message) if message.contains("session id")));
     }
 }

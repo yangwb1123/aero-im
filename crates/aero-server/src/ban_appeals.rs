@@ -11,21 +11,23 @@
 //!
 //! Submission is open to the authenticated caller (the storage layer gates it to an
 //! ACTIVE ban for `(stream, caller)` — a non-banned viewer gets a 404/conflict).
-//! Reading + reviewing are creator-or-mod gated via
-//! [`crate::stream_moderators::may_moderate`].
+//! Reading and review authority are checked transactionally by storage under
+//! the canonical stream lock.
 
 use std::str::FromStr;
 
 use aero_auth::AuthUser;
-use aero_common::{BanAppealId, Error as AeroError, ParticipantId};
+use aero_common::{BanAppealId, Error as AeroError};
+use aero_storage::ban_appeals::{
+    DEFAULT_APPEAL_PAGE_SIZE, MAX_APPEAL_DECISION_REASON_CHARS, MAX_APPEAL_REASON_CHARS,
+};
 use aero_storage::{AppealError, BanAppealRepo};
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     routing::post,
     Json, Router,
 };
 use serde::Deserialize;
-use time::OffsetDateTime;
 use ulid::Ulid;
 
 use crate::error::ApiResult;
@@ -57,25 +59,28 @@ fn repo(s: &AppState) -> BanAppealRepo {
 /// Map a storage [`AppealError`] to a clean client-facing API error.
 fn map_appeal_error(e: AppealError) -> AeroError {
     match e {
-        AppealError::NotBanned => {
-            AeroError::Conflict("no active ban to appeal".into())
-        }
+        AppealError::NotBanned => AeroError::Conflict("no active ban to appeal".into()),
+        AppealError::Invalid(message) => AeroError::Invalid(message),
+        AppealError::Access(error) => error,
         AppealError::Db(db) => AeroError::from(db),
     }
 }
 
-/// Assert `caller` may moderate `stream` (its creator or a stream moderator).
-async fn require_moderate(
-    s: &AppState,
-    stream: Ulid,
-    caller: ParticipantId,
-) -> Result<(), AeroError> {
-    if !crate::stream_moderators::may_moderate(s, stream, caller).await? {
-        return Err(AeroError::Forbidden(
-            "only the creator or a moderator may review appeals".into(),
-        ));
+fn validate_reason<'a>(
+    value: &'a str,
+    max_chars: usize,
+    field: &str,
+) -> Result<&'a str, AeroError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(AeroError::Invalid(format!("{field} is empty")));
     }
-    Ok(())
+    if value.chars().count() > max_chars {
+        return Err(AeroError::Invalid(format!(
+            "{field} exceeds {max_chars} characters"
+        )));
+    }
+    Ok(value)
 }
 
 #[derive(Deserialize)]
@@ -93,12 +98,9 @@ async fn submit_appeal(
     Json(req): Json<SubmitReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let stream = parse_stream(&id_str)?;
-    let reason = req.reason.trim();
-    if reason.is_empty() {
-        return Err(AeroError::Invalid("appeal reason is empty".into()).into());
-    }
+    let reason = validate_reason(&req.reason, MAX_APPEAL_REASON_CHARS, "appeal reason")?;
     let id = repo(&s)
-        .submit_appeal(stream, auth.participant_id, reason, OffsetDateTime::now_utc())
+        .submit_appeal(stream, auth.participant_id, reason)
         .await
         .map_err(map_appeal_error)?;
     Ok(Json(serde_json::json!({
@@ -108,16 +110,29 @@ async fn submit_appeal(
     })))
 }
 
+#[derive(Default, Deserialize)]
+struct AppealPage {
+    limit: Option<i64>,
+    offset: Option<i64>,
+}
+
 /// `GET /api/streams/:id/appeals` — the creator/mod reads the stream's pending appeal
 /// queue (oldest first).
 async fn list_appeals(
     State(s): State<AppState>,
     auth: AuthUser,
     Path(id_str): Path<String>,
+    Query(page): Query<AppealPage>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let stream = parse_stream(&id_str)?;
-    require_moderate(&s, stream, auth.participant_id).await?;
-    let appeals = repo(&s).list_pending(stream).await.map_err(AeroError::from)?;
+    let appeals = repo(&s)
+        .list_pending_authorized(
+            stream,
+            auth.participant_id,
+            page.limit.unwrap_or(DEFAULT_APPEAL_PAGE_SIZE),
+            page.offset.unwrap_or(0),
+        )
+        .await?;
     Ok(Json(serde_json::json!({ "appeals": appeals })))
 }
 
@@ -138,22 +153,43 @@ async fn review_appeal(
 ) -> ApiResult<Json<serde_json::Value>> {
     let appeal = parse_appeal(&id_str)?;
     let r = repo(&s);
-    // Resolve the appeal to learn its stream, so we can gate on that stream's
-    // creator/mod authority.
-    let row = r
-        .get(appeal)
-        .await
-        .map_err(AeroError::from)?
-        .ok_or_else(|| AeroError::NotFound(format!("appeal {appeal}")))?;
-    require_moderate(&s, row.stream_id, auth.participant_id).await?;
-
-    let decision_reason = req.reason.as_deref().map(str::trim).filter(|x| !x.is_empty());
+    let decision_reason = req
+        .reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|x| !x.is_empty());
+    if let Some(reason) = decision_reason {
+        validate_reason(
+            reason,
+            MAX_APPEAL_DECISION_REASON_CHARS,
+            "appeal decision reason",
+        )?;
+    }
     let reviewed = r
-        .review(appeal, auth.participant_id, req.approved, decision_reason)
-        .await
-        .map_err(AeroError::from)?;
+        .review_authorized(appeal, auth.participant_id, req.approved, decision_reason)
+        .await?;
     Ok(Json(serde_json::json!({
         "reviewed": reviewed,
         "status": if req.approved { "approved" } else { "denied" },
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn appeal_reason_envelope_uses_unicode_scalars() {
+        assert_eq!(
+            validate_reason("  sorry  ", MAX_APPEAL_REASON_CHARS, "appeal reason").unwrap(),
+            "sorry"
+        );
+        assert!(validate_reason("", MAX_APPEAL_REASON_CHARS, "appeal reason").is_err());
+        assert!(validate_reason(
+            &"界".repeat(MAX_APPEAL_REASON_CHARS + 1),
+            MAX_APPEAL_REASON_CHARS,
+            "appeal reason"
+        )
+        .is_err());
+    }
 }

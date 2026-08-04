@@ -91,9 +91,24 @@ export const api = {
       withAuth: false,
     });
   },
-  login({ email, password }) {
+  login({ email, password, totp, recovery_code }) {
+    const body = { email, password };
+    if (totp && totp.trim()) body.totp = totp.trim();
+    if (recovery_code && recovery_code.trim()) body.recovery_code = recovery_code.trim();
     return request('POST', '/api/auth/login', {
-      body: { email, password },
+      body,
+      withAuth: false,
+    });
+  },
+  refresh(refresh_token) {
+    return request('POST', '/api/auth/refresh', {
+      body: { refresh_token },
+      withAuth: false,
+    });
+  },
+  logout(refresh_token) {
+    return request('POST', '/api/auth/logout', {
+      body: { refresh_token },
       withAuth: false,
     });
   },
@@ -106,6 +121,169 @@ export const api = {
     if (avatar_url !== undefined) body.avatar_url = avatar_url;
     return request('PATCH', '/api/me', { body });
   },
+  twoFactorStatus() {
+    return request('GET', '/api/me/2fa');
+  },
+  twoFactorEnroll() {
+    return request('POST', '/api/me/2fa/enroll');
+  },
+  twoFactorVerify(code) {
+    return request('POST', '/api/me/2fa/verify', { body: { code } });
+  },
+  twoFactorRecoveryCodes(code) {
+    return request('POST', '/api/me/2fa/recovery-codes', { body: { code } });
+  },
+  twoFactorDisable(code = '') {
+    return request('DELETE', '/api/me/2fa', { body: { code } });
+  },
+
+  // ----- enterprise security administration -----
+  listWorkspaces() {
+    return request('GET', '/api/workspaces');
+  },
+  listWorkspaceMembers(workspaceId) {
+    return request('GET', `/api/workspaces/${encodeURIComponent(workspaceId)}/members`);
+  },
+  workspaceSecurity(workspaceId) {
+    return request('GET', `/api/workspaces/${encodeURIComponent(workspaceId)}/security`);
+  },
+  setWorkspaceSecurity(workspaceId, require_2fa) {
+    return request('PUT', `/api/workspaces/${encodeURIComponent(workspaceId)}/security`, {
+      body: { require_2fa: Boolean(require_2fa) },
+    });
+  },
+  workspaceStorageRegion(workspaceId) {
+    return request(
+      'GET',
+      `/api/workspaces/${encodeURIComponent(workspaceId)}/storage-region`,
+    );
+  },
+  setWorkspaceStorageRegion(workspaceId, storage_region) {
+    return request(
+      'PUT',
+      `/api/workspaces/${encodeURIComponent(workspaceId)}/storage-region`,
+      { body: { storage_region } },
+    );
+  },
+  ipAllowlist(workspaceId) {
+    return request('GET', `/api/workspaces/${encodeURIComponent(workspaceId)}/ip-allowlist`);
+  },
+  addIpAllowlist(workspaceId, { cidr, note } = {}) {
+    const body = { cidr };
+    if (note !== undefined) body.note = note;
+    return request('POST', `/api/workspaces/${encodeURIComponent(workspaceId)}/ip-allowlist`, {
+      body,
+    });
+  },
+  removeIpAllowlist(workspaceId, cidr) {
+    return request('DELETE', `/api/workspaces/${encodeURIComponent(workspaceId)}/ip-allowlist`, {
+      body: { cidr },
+    });
+  },
+  mintScimToken(workspaceId, label) {
+    const body = {};
+    if (label !== undefined) body.label = label;
+    return request('POST', `/api/workspaces/${encodeURIComponent(workspaceId)}/scim/token`, {
+      body,
+    });
+  },
+  listScimTokens(workspaceId) {
+    return request('GET', `/api/workspaces/${encodeURIComponent(workspaceId)}/scim/tokens`);
+  },
+  revokeScimToken(tokenId) {
+    return request('DELETE', `/api/scim/tokens/${encodeURIComponent(tokenId)}`);
+  },
+  listAutoModRules(workspaceId) {
+    return request('GET', `/api/workspaces/${encodeURIComponent(workspaceId)}/auto-mod-rules`);
+  },
+  createAutoModRule(workspaceId, { pattern, match_type = 'contains', action = 'block' }) {
+    return request(
+      'POST',
+      `/api/workspaces/${encodeURIComponent(workspaceId)}/auto-mod-rules`,
+      { body: { pattern, match_type, action } },
+    );
+  },
+  deleteAutoModRule(workspaceId, ruleId) {
+    const workspace = encodeURIComponent(workspaceId);
+    const rule = encodeURIComponent(ruleId);
+    return request('DELETE', `/api/workspaces/${workspace}/auto-mod-rules/${rule}`);
+  },
+  listSessions() {
+    return request('GET', '/api/auth/sessions');
+  },
+  revokeSession(sessionId) {
+    return request('DELETE', `/api/auth/sessions/${encodeURIComponent(sessionId)}`);
+  },
+  revokeOtherSessions(currentRefreshToken) {
+    return request('POST', '/api/auth/sessions/revoke-others', {
+      body: { current_refresh_token: currentRefreshToken },
+    });
+  },
+  revokeMemberSessions(workspaceId, participantId) {
+    const ws = encodeURIComponent(workspaceId);
+    const participant = encodeURIComponent(participantId);
+    return request('POST', `/api/workspaces/${ws}/members/${participant}/revoke-sessions`);
+  },
+  samlMetadata() {
+    return request('GET', '/saml/metadata', { withAuth: false });
+  },
+
+  // ----- governance: audit trail + bot platform -----
+  workspaceAudit(workspaceId, filters = {}) {
+    return request('GET', `/api/workspaces/${encodeURIComponent(workspaceId)}/audit`, {
+      query: filters,
+    });
+  },
+  workspaceAuditCsv(workspaceId, filters = {}) {
+    return request('GET', `/api/workspaces/${encodeURIComponent(workspaceId)}/audit/export`, {
+      query: filters,
+    });
+  },
+  listBots() {
+    return request('GET', '/api/bots');
+  },
+  createBot({ name, icon_url, workspace_id } = {}) {
+    const body = { name };
+    if (icon_url) body.icon_url = icon_url;
+    if (workspace_id) body.workspace_id = workspace_id;
+    return request('POST', '/api/bots', { body });
+  },
+  rotateBotToken(botId) {
+    return request('POST', `/api/bots/${encodeURIComponent(botId)}/token`);
+  },
+  listBotSubscriptions(botId) {
+    return request('GET', `/api/bots/${encodeURIComponent(botId)}/subscriptions`);
+  },
+  createBotSubscription(botId, {
+    event_type,
+    filters = {},
+    webhook_url,
+  } = {}) {
+    const body = { event_type, filters };
+    if (webhook_url) body.webhook_url = webhook_url;
+    return request('POST', `/api/bots/${encodeURIComponent(botId)}/subscriptions`, { body });
+  },
+  deleteBotSubscription(botId, subscriptionId) {
+    const bot = encodeURIComponent(botId);
+    const subscription = encodeURIComponent(subscriptionId);
+    return request('DELETE', `/api/bots/${bot}/subscriptions/${subscription}`);
+  },
+  rotateBotSubscriptionSecret(botId, subscriptionId) {
+    const bot = encodeURIComponent(botId);
+    const subscription = encodeURIComponent(subscriptionId);
+    return request('POST', `/api/bots/${bot}/subscriptions/${subscription}/secret`);
+  },
+  listBotDeliveries(botId, limit = 100) {
+    return request('GET', `/api/bots/${encodeURIComponent(botId)}/deliveries`, {
+      query: { limit },
+    });
+  },
+  requeueBotDelivery(botId, deliveryId) {
+    const bot = encodeURIComponent(botId);
+    const delivery = encodeURIComponent(deliveryId);
+    return request('POST', `/api/bots/${bot}/deliveries/${delivery}/requeue`);
+  },
+
   createRoom({ kind, name }) {
     const body = { kind };
     if (name && name.trim()) body.name = name.trim();
@@ -113,6 +291,57 @@ export const api = {
   },
   listRooms() {
     return request('GET', '/api/rooms');
+  },
+  listCanvases(roomId) {
+    return request('GET', `/api/rooms/${encodeURIComponent(roomId)}/canvases`);
+  },
+  createCanvas(roomId, { title, blocks = [] }) {
+    return request('POST', `/api/rooms/${encodeURIComponent(roomId)}/canvases`, {
+      body: { title, blocks },
+    });
+  },
+  getCanvas(roomId, canvasId) {
+    return request(
+      'GET',
+      `/api/rooms/${encodeURIComponent(roomId)}/canvases/${encodeURIComponent(canvasId)}`,
+    );
+  },
+  updateCanvas(roomId, canvasId, {
+    title,
+    blocks,
+    expectedVersion,
+    snapshotOpSeq,
+  } = {}) {
+    const body = {};
+    if (title !== undefined) body.title = title;
+    if (blocks !== undefined) body.blocks = blocks;
+    if (expectedVersion !== undefined) body.expected_version = expectedVersion;
+    if (snapshotOpSeq !== undefined) body.snapshot_op_seq = snapshotOpSeq;
+    return request(
+      'PUT',
+      `/api/rooms/${encodeURIComponent(roomId)}/canvases/${encodeURIComponent(canvasId)}`,
+      { body },
+    );
+  },
+  deleteCanvas(roomId, canvasId) {
+    return request(
+      'DELETE',
+      `/api/rooms/${encodeURIComponent(roomId)}/canvases/${encodeURIComponent(canvasId)}`,
+    );
+  },
+  listCanvasOps(roomId, canvasId, { since = 0, limit = 500 } = {}) {
+    return request(
+      'GET',
+      `/api/rooms/${encodeURIComponent(roomId)}/canvases/${encodeURIComponent(canvasId)}/ops`,
+      { query: { since, limit } },
+    );
+  },
+  appendCanvasOp(roomId, canvasId, op, clientOpId) {
+    return request(
+      'POST',
+      `/api/rooms/${encodeURIComponent(roomId)}/canvases/${encodeURIComponent(canvasId)}/ops`,
+      { body: { client_op_id: clientOpId, op } },
+    );
   },
   addMember(roomId, participantId) {
     return request('POST', `/api/rooms/${encodeURIComponent(roomId)}/members`, {
@@ -149,6 +378,12 @@ export const api = {
     if (value != null && value !== '') body.value = value;
     return request('POST', `/api/messages/${encodeURIComponent(messageId)}/interact`, { body });
   },
+  markMessageSeen(messageId) {
+    return request('POST', `/api/messages/${encodeURIComponent(messageId)}/seen`);
+  },
+  listMessageSeen(messageId) {
+    return request('GET', `/api/messages/${encodeURIComponent(messageId)}/seen`);
+  },
   markRead(roomId, lastMessageId) {
     return request('POST', `/api/rooms/${encodeURIComponent(roomId)}/read`, {
       body: { last_message_id: lastMessageId },
@@ -170,10 +405,13 @@ export const api = {
       body: { query, limit, mode },
     });
   },
-  uploadBlob(file) {
+  uploadBlob(file, roomId = null) {
     const fd = new FormData();
     fd.append('file', file, file.name || 'file');
-    return request('POST', '/api/blobs', { body: fd, raw: true });
+    const path = roomId
+      ? `/api/rooms/${encodeURIComponent(roomId)}/blobs`
+      : '/api/blobs';
+    return request('POST', path, { body: fd, raw: true });
   },
   blobUrl(id) {
     return `/api/blobs/${encodeURIComponent(id)}`;
@@ -231,8 +469,10 @@ export const api = {
   listRoomMembers(roomId) {
     return request('GET', `/api/rooms/${encodeURIComponent(roomId)}/members/list`);
   },
-  createAgent({ display_name, kind = 'bot', avatar_url } = {}) {
-    return request('POST', '/api/agents', { body: { display_name, kind, avatar_url } });
+  createAgent(roomId, { display_name, kind = 'bot', avatar_url } = {}) {
+    const body = { room_id: roomId, display_name, kind };
+    if (avatar_url) body.avatar_url = avatar_url;
+    return request('POST', '/api/agents', { body });
   },
 
   // ----- polls -----
@@ -297,6 +537,11 @@ export const api = {
   unread() {
     return request('GET', '/api/unread');
   },
+  suggestReplies(roomId, { k = 10 } = {}) {
+    return request('POST', `/api/rooms/${encodeURIComponent(roomId)}/suggest-replies`, {
+      body: { k },
+    });
+  },
 
   // ----- pinned messages (Wave 1) -----
   listPins(roomId) {
@@ -332,5 +577,275 @@ export const api = {
     if (description !== undefined) body.description = description;
     if (is_private !== undefined) body.is_private = is_private;
     return request('PATCH', `/api/rooms/${encodeURIComponent(roomId)}/channel`, { body });
+  },
+
+  // ----- productivity + people -----
+  listRoomTasks(roomId, status) {
+    return request('GET', `/api/rooms/${encodeURIComponent(roomId)}/tasks`, {
+      query: { status },
+    });
+  },
+  listMyTasks() { return request('GET', '/api/me/tasks'); },
+  createTask(roomId, body) {
+    return request('POST', `/api/rooms/${encodeURIComponent(roomId)}/tasks`, { body });
+  },
+  updateTask(taskId, body) {
+    return request('PATCH', `/api/tasks/${encodeURIComponent(taskId)}`, { body });
+  },
+  deleteTask(taskId) {
+    return request('DELETE', `/api/tasks/${encodeURIComponent(taskId)}`);
+  },
+  listApprovals(workspaceId, direction = 'incoming', status) {
+    return request(
+      'GET',
+      `/api/workspaces/${encodeURIComponent(workspaceId)}/approvals/${direction}`,
+      { query: { status } },
+    );
+  },
+  createApproval(workspaceId, body) {
+    return request('POST', `/api/workspaces/${encodeURIComponent(workspaceId)}/approvals`, { body });
+  },
+  decideApproval(approvalId, decision, note = null) {
+    return request('POST', `/api/approvals/${encodeURIComponent(approvalId)}/${decision}`, {
+      body: { note },
+    });
+  },
+  listDirectory(workspaceId, { q, title, limit = 50, offset = 0 } = {}) {
+    return request('GET', `/api/workspaces/${encodeURIComponent(workspaceId)}/directory`, {
+      query: { q, title, limit, offset },
+    });
+  },
+  getManager(workspaceId, participantId) {
+    return request(
+      'GET',
+      `/api/workspaces/${encodeURIComponent(workspaceId)}/participants/${encodeURIComponent(participantId)}/manager`,
+    );
+  },
+  setManager(workspaceId, participantId, managerId) {
+    return request(
+      'PUT',
+      `/api/workspaces/${encodeURIComponent(workspaceId)}/participants/${encodeURIComponent(participantId)}/manager`,
+      { body: { manager_id: managerId } },
+    );
+  },
+  clearManager(workspaceId, participantId) {
+    return request(
+      'DELETE',
+      `/api/workspaces/${encodeURIComponent(workspaceId)}/participants/${encodeURIComponent(participantId)}/manager`,
+    );
+  },
+  getDirectReports(workspaceId, participantId) {
+    return request(
+      'GET',
+      `/api/workspaces/${encodeURIComponent(workspaceId)}/participants/${encodeURIComponent(participantId)}/reports`,
+    );
+  },
+  getReportingChain(workspaceId, participantId) {
+    return request(
+      'GET',
+      `/api/workspaces/${encodeURIComponent(workspaceId)}/participants/${encodeURIComponent(participantId)}/chain`,
+    );
+  },
+
+  // ----- scheduled work + saved items -----
+  listScheduled(roomId) {
+    return request('GET', `/api/rooms/${encodeURIComponent(roomId)}/scheduled`);
+  },
+  listAllScheduled() {
+    return request('GET', '/api/scheduled');
+  },
+  createScheduled(roomId, body) {
+    return request('POST', `/api/rooms/${encodeURIComponent(roomId)}/scheduled`, { body });
+  },
+  updateScheduled(roomId, id, body) {
+    if (body === undefined) {
+      return request('PATCH', `/api/scheduled/${encodeURIComponent(roomId)}`, { body: id });
+    }
+    return request(
+      'PATCH',
+      `/api/rooms/${encodeURIComponent(roomId)}/scheduled/${encodeURIComponent(id)}`,
+      { body },
+    );
+  },
+  cancelScheduled(roomId, id) {
+    if (id === undefined) return request('DELETE', `/api/scheduled/${encodeURIComponent(roomId)}`);
+    return request(
+      'DELETE',
+      `/api/rooms/${encodeURIComponent(roomId)}/scheduled/${encodeURIComponent(id)}`,
+    );
+  },
+  retryScheduled(roomId, id) {
+    if (id === undefined) return request('POST', `/api/scheduled/${encodeURIComponent(roomId)}`);
+    return request(
+      'POST',
+      `/api/rooms/${encodeURIComponent(roomId)}/scheduled/${encodeURIComponent(id)}`,
+    );
+  },
+  listRecurring(roomId) {
+    return request('GET', `/api/rooms/${encodeURIComponent(roomId)}/recurring`);
+  },
+  createRecurring(roomId, body) {
+    return request('POST', `/api/rooms/${encodeURIComponent(roomId)}/recurring`, { body });
+  },
+  cancelRecurring(roomId, id) {
+    if (id === undefined) return request('DELETE', `/api/recurring/${encodeURIComponent(roomId)}`);
+    return request(
+      'DELETE',
+      `/api/rooms/${encodeURIComponent(roomId)}/recurring/${encodeURIComponent(id)}`,
+    );
+  },
+  listDigests() { return request('GET', '/api/digests'); },
+  createDigest(body) { return request('POST', '/api/digests', { body }); },
+  deleteDigest(id) { return request('DELETE', `/api/digests/${encodeURIComponent(id)}`); },
+  remindMessage(messageId, when) {
+    return request('POST', `/api/messages/${encodeURIComponent(messageId)}/remind`, {
+      body: { when },
+    });
+  },
+  listMessageReminders(messageId) {
+    return request('GET', `/api/messages/${encodeURIComponent(messageId)}/reminders`);
+  },
+  saveMessage(messageId, note = null) {
+    return request('POST', `/api/messages/${encodeURIComponent(messageId)}/save`, {
+      body: { note },
+    });
+  },
+  unsaveMessage(messageId) {
+    return request('DELETE', `/api/messages/${encodeURIComponent(messageId)}/save`);
+  },
+  listSaved(limit = 100, collectionId = null) {
+    return request('GET', '/api/saved', {
+      query: { limit, collection_id: collectionId },
+    });
+  },
+
+  // ----- workspace community operations -----
+  listUserGroups(workspaceId) {
+    return request('GET', `/api/workspaces/${encodeURIComponent(workspaceId)}/user-groups`);
+  },
+  createUserGroup(workspaceId, body) {
+    return request('POST', `/api/workspaces/${encodeURIComponent(workspaceId)}/user-groups`, { body });
+  },
+  getUserGroup(groupId) {
+    return request('GET', `/api/user-groups/${encodeURIComponent(groupId)}`);
+  },
+  deleteUserGroup(workspaceId, groupId) {
+    return request(
+      'DELETE',
+      `/api/workspaces/${encodeURIComponent(workspaceId)}/user-groups/${encodeURIComponent(groupId)}`,
+    );
+  },
+  setUserGroupMember(workspaceId, groupId, participantId, add = true) {
+    return request(
+      add ? 'PUT' : 'DELETE',
+      `/api/workspaces/${encodeURIComponent(workspaceId)}/user-groups/${encodeURIComponent(groupId)}/members/${encodeURIComponent(participantId)}`,
+    );
+  },
+  requestRoomJoin(roomId) {
+    return request('POST', `/api/rooms/${encodeURIComponent(roomId)}/join-request`);
+  },
+  listJoinRequests(roomId) {
+    return request('GET', `/api/rooms/${encodeURIComponent(roomId)}/join-requests`);
+  },
+  decideJoinRequest(requestId, decision) {
+    return request('POST', `/api/join-requests/${encodeURIComponent(requestId)}/${decision}`);
+  },
+  listAnnouncements(workspaceId) {
+    return request('GET', `/api/workspaces/${encodeURIComponent(workspaceId)}/announcements`);
+  },
+  createAnnouncement(workspaceId, body) {
+    return request('POST', `/api/workspaces/${encodeURIComponent(workspaceId)}/announcements`, { body });
+  },
+  deleteAnnouncement(workspaceId, announcementId) {
+    return request(
+      'DELETE',
+      `/api/workspaces/${encodeURIComponent(workspaceId)}/announcements/${encodeURIComponent(announcementId)}`,
+    );
+  },
+
+  // ----- enterprise compliance administration -----
+  listRoomsForWorkspace(workspaceId) {
+    return request('GET', '/api/rooms', { query: { workspace_id: workspaceId } });
+  },
+  listLegalHolds(workspaceId) {
+    return request('GET', `/api/workspaces/${encodeURIComponent(workspaceId)}/legal-holds`);
+  },
+  createLegalHold(workspaceId, { room_id, reason }) {
+    const body = { reason };
+    if (room_id) body.room_id = room_id;
+    return request('POST', `/api/workspaces/${encodeURIComponent(workspaceId)}/legal-holds`, { body });
+  },
+  releaseLegalHold(holdId) {
+    return request('DELETE', `/api/legal-holds/${encodeURIComponent(holdId)}`);
+  },
+  roomRetention(roomId) {
+    return request('GET', `/api/rooms/${encodeURIComponent(roomId)}/retention`);
+  },
+  setRoomRetention(roomId, days) {
+    return request('PUT', `/api/rooms/${encodeURIComponent(roomId)}/retention`, { body: { days } });
+  },
+  setWorkspaceRetention(workspaceId, days) {
+    return request('PUT', `/api/workspaces/${encodeURIComponent(workspaceId)}/retention`, { body: { days } });
+  },
+  listInformationBarriers(workspaceId) {
+    return request('GET', `/api/workspaces/${encodeURIComponent(workspaceId)}/barriers`);
+  },
+  createInformationBarrier(workspaceId, group_a, group_b) {
+    return request('POST', `/api/workspaces/${encodeURIComponent(workspaceId)}/barriers`, { body: { group_a, group_b } });
+  },
+  deleteInformationBarrier(barrierId) {
+    return request('DELETE', `/api/barriers/${encodeURIComponent(barrierId)}`);
+  },
+  listDeactivatedMembers(workspaceId) {
+    return request('GET', `/api/workspaces/${encodeURIComponent(workspaceId)}/deactivated`);
+  },
+  deactivateMember(workspaceId, participantId) {
+    const workspace = encodeURIComponent(workspaceId);
+    const participant = encodeURIComponent(participantId);
+    return request('POST', `/api/workspaces/${workspace}/members/${participant}/deactivate`);
+  },
+  reactivateMember(workspaceId, participantId) {
+    const workspace = encodeURIComponent(workspaceId);
+    const participant = encodeURIComponent(participantId);
+    return request('POST', `/api/workspaces/${workspace}/members/${participant}/reactivate`);
+  },
+  listInvitations(workspaceId) {
+    return request('GET', `/api/workspaces/${encodeURIComponent(workspaceId)}/invitations`);
+  },
+  createInvitation(workspaceId, body) {
+    return request('POST', `/api/workspaces/${encodeURIComponent(workspaceId)}/invitations`, { body });
+  },
+  revokeInvitation(invitationId) {
+    return request('DELETE', `/api/invitations/${encodeURIComponent(invitationId)}`);
+  },
+  listRoomWebhooks(roomId) {
+    return request('GET', `/api/rooms/${encodeURIComponent(roomId)}/webhooks`);
+  },
+  createIncomingWebhook(roomId, body) {
+    return request('POST', `/api/rooms/${encodeURIComponent(roomId)}/webhooks/incoming`, { body });
+  },
+  createOutgoingWebhook(roomId, body) {
+    return request('POST', `/api/rooms/${encodeURIComponent(roomId)}/webhooks/outgoing`, { body });
+  },
+  revokeIncomingWebhook(webhookId) {
+    return request('DELETE', `/api/webhooks/incoming/${encodeURIComponent(webhookId)}`);
+  },
+  revokeOutgoingWebhook(webhookId) {
+    return request('DELETE', `/api/webhooks/outgoing/${encodeURIComponent(webhookId)}`);
+  },
+  listWebhookDeliveries(webhookId, limit = 100) {
+    return request('GET', `/api/webhooks/${encodeURIComponent(webhookId)}/deliveries`, { query: { limit } });
+  },
+  listWebhookDeadLetters(webhookId, limit = 100) {
+    return request('GET', `/api/webhooks/${encodeURIComponent(webhookId)}/deliveries/dead`, { query: { limit } });
+  },
+  requeueWebhookDelivery(deliveryId) {
+    return request('POST', `/api/webhook-deliveries/${encodeURIComponent(deliveryId)}/requeue`);
+  },
+  exportWorkspace(workspaceId) {
+    return request('GET', `/api/workspaces/${encodeURIComponent(workspaceId)}/export`);
+  },
+  deleteWorkspace(workspaceId) {
+    return request('DELETE', `/api/workspaces/${encodeURIComponent(workspaceId)}`);
   },
 };

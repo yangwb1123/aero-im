@@ -16,7 +16,7 @@
 
 use aero_auth::AuthUser;
 use aero_common::Error as AeroError;
-use aero_storage::{PushPlatform, PushTokenRepo};
+use aero_storage::{PushPlatform, PushTokenRegistrationError, PushTokenRepo, MAX_PUSH_TOKEN_BYTES};
 use axum::{extract::State, http::StatusCode, routing::get, Json, Router};
 use serde::Deserialize;
 
@@ -24,8 +24,12 @@ use crate::error::ApiResult;
 use crate::state::AppState;
 
 pub fn routes() -> Router<AppState> {
-    Router::new()
-        .route("/api/me/push-token", get(list_tokens).post(register_token).delete(unregister_token))
+    Router::new().route(
+        "/api/me/push-token",
+        get(list_tokens)
+            .post(register_token)
+            .delete(unregister_token),
+    )
 }
 
 #[derive(Deserialize)]
@@ -41,16 +45,47 @@ struct UnregisterReq {
     token: String,
 }
 
+fn validate_token(raw: &str) -> Result<&str, AeroError> {
+    let token = raw.trim();
+    if token.is_empty() {
+        return Err(AeroError::Invalid("token must not be empty".into()));
+    }
+    if token.len() > MAX_PUSH_TOKEN_BYTES {
+        return Err(AeroError::Invalid(format!(
+            "token must be at most {MAX_PUSH_TOKEN_BYTES} bytes"
+        )));
+    }
+    Ok(token)
+}
+
+fn map_registration_error(error: PushTokenRegistrationError) -> AeroError {
+    match error {
+        PushTokenRegistrationError::InvalidToken => AeroError::Invalid(format!(
+            "token must be between 1 and {MAX_PUSH_TOKEN_BYTES} bytes"
+        )),
+        PushTokenRegistrationError::QuotaExceeded => {
+            AeroError::Conflict("push token quota exceeded".into())
+        }
+        PushTokenRegistrationError::Db(error) => AeroError::from(error),
+    }
+}
+
+fn token_preview(token: &str) -> String {
+    let head: String = token.chars().take(8).collect();
+    if token.chars().count() > 8 {
+        format!("{head}…")
+    } else {
+        head
+    }
+}
+
 /// `POST /api/me/push-token` — register a device push token.
 async fn register_token(
     State(s): State<AppState>,
     auth: AuthUser,
     Json(req): Json<RegisterReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let token = req.token.trim();
-    if token.is_empty() {
-        return Err(AeroError::Invalid("token must not be empty".into()).into());
-    }
+    let token = validate_token(&req.token)?;
     let platform = PushPlatform::parse(&req.platform)
         .ok_or_else(|| AeroError::Invalid("platform must be 'fcm' or 'apns'".into()))?;
 
@@ -58,7 +93,7 @@ async fn register_token(
     let pt = repo
         .register(auth.participant_id, platform, token)
         .await
-        .map_err(AeroError::from)?;
+        .map_err(map_registration_error)?;
 
     Ok(Json(serde_json::json!({
         "id": pt.id,
@@ -73,10 +108,7 @@ async fn unregister_token(
     auth: AuthUser,
     Json(req): Json<UnregisterReq>,
 ) -> ApiResult<StatusCode> {
-    let token = req.token.trim();
-    if token.is_empty() {
-        return Err(AeroError::Invalid("token must not be empty".into()).into());
-    }
+    let token = validate_token(&req.token)?;
     PushTokenRepo::new(s.pg.clone())
         .unregister(auth.participant_id, token)
         .await
@@ -98,15 +130,10 @@ async fn list_tokens(
     let items: Vec<_> = tokens
         .iter()
         .map(|t| {
-            let preview = if t.token.len() > 8 {
-                format!("{}…", &t.token[..8])
-            } else {
-                t.token.clone()
-            };
             serde_json::json!({
                 "id": t.id,
                 "platform": t.platform,
-                "token_preview": preview,
+                "token_preview": token_preview(&t.token),
                 "registered_at": t.registered_at,
             })
         })
@@ -130,19 +157,18 @@ mod tests {
 
     #[test]
     fn token_preview_truncates_long_tokens() {
-        let token = "abcdefgh12345678".to_string();
-        let preview = if token.len() > 8 {
-            format!("{}…", &token[..8])
-        } else {
-            token.clone()
-        };
-        assert_eq!(preview, "abcdefgh…");
+        assert_eq!(token_preview("abcdefgh12345678"), "abcdefgh…");
+        assert_eq!(token_preview("界界界界界界界界界"), "界界界界界界界界…");
     }
 
     #[test]
     fn short_token_is_not_truncated() {
-        let token = "short".to_string();
-        let preview = if token.len() > 8 { format!("{}…", &token[..8]) } else { token.clone() };
-        assert_eq!(preview, "short");
+        assert_eq!(token_preview("short"), "short");
+    }
+
+    #[test]
+    fn token_validation_uses_bytes() {
+        assert!(validate_token(&"a".repeat(MAX_PUSH_TOKEN_BYTES)).is_ok());
+        assert!(validate_token(&"界".repeat(MAX_PUSH_TOKEN_BYTES / 3 + 1)).is_err());
     }
 }

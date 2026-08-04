@@ -32,6 +32,14 @@
 //! duplicate-ID rejection + strict positional XSW guard, zero system C deps). It
 //! is **off by default** and only runs when the operator sets
 //! `AERO_SAML_EXPERIMENTAL_VERIFY=1`.
+//! Enabling it supports **SP-initiated SSO only**: `/saml/login` records each
+//! AuthnRequest ID in Redis for five minutes, and `/saml/acs` atomically
+//! consumes that ID. The signed assertion must carry matching
+//! `InResponseTo`, `Destination`/bearer `Recipient`, this SP's audience, and a
+//! validity window no wider than ten minutes. A fixed 90-second clock skew is
+//! allowed. Missing/expired/replayed request state, Redis errors, and omitted
+//! conditions all fail closed; IdP-initiated unsolicited responses are not
+//! accepted.
 //!
 //! **SECURITY CAVEAT:** `bergshamra` is **pre-1.0 and has NOT had a third-party
 //! security audit**. A canonicalization / digest / signature-wrapping bug in it
@@ -82,10 +90,10 @@
 //! SAML is **off by default**: [`SamlConfig::from_env`] returns `None` unless the
 //! deployment configures the IdP entity id / SSO URL / certificate.
 
-use aero_common::{Error as AeroError, ParticipantId, WorkspaceId, WorkspaceRole};
-use aero_storage::SsoRepo;
+use aero_common::{Error as AeroError, WorkspaceId};
+use aero_storage::{SsoRepo, SsoResolveError};
 use axum::{
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::header,
     response::{IntoResponse, Redirect, Response},
     routing::{get, post},
@@ -98,10 +106,24 @@ use std::io::Write as _;
 use crate::error::ApiResult;
 use crate::state::AppState;
 
+mod conditions;
+mod request_state;
+#[cfg(any(test, feature = "saml-experimental-bergshamra"))]
+mod signature_policy;
+
+use conditions::{extract_signed_identity, validate_response_conditions};
+use request_state::{consume_request, issue_request};
+#[cfg(feature = "saml-experimental-bergshamra")]
+use signature_policy::validate_signature_profile;
+
 /// The legacy / default workspace every login enrolls into — the all-zero UUID,
 /// matching [`crate::sso`] and `crate::routes::DEFAULT_WORKSPACE_ID` (kept in sync
 /// with migration `0006_workspaces.sql`).
 const DEFAULT_WORKSPACE_ID: WorkspaceId = WorkspaceId(ulid::Ulid(0));
+const MAX_SAML_RESPONSE_B64_BYTES: usize = 1_500_000;
+const MAX_SAML_XML_BYTES: usize = 1024 * 1024;
+const MAX_RELAY_STATE_BYTES: usize = 80;
+const MAX_SAML_FORM_BYTES: usize = 2 * 1024 * 1024;
 
 /// Mount the SAML SP routes. Folded into the main router by
 /// [`crate::routes::build`] via `.merge(crate::saml::routes())`.
@@ -109,7 +131,10 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/saml/metadata", get(metadata))
         .route("/saml/login", get(login))
-        .route("/saml/acs", post(acs))
+        .route(
+            "/saml/acs",
+            post(acs).layer(DefaultBodyLimit::max(MAX_SAML_FORM_BYTES)),
+        )
 }
 
 // ---------------------------------------------------------------------------
@@ -241,8 +266,7 @@ pub fn build_authn_request(cfg: &SamlConfig, id: &str, issue_instant: &str) -> S
 /// small, well-formed XML we generate).
 pub fn redirect_url_for_authn_request(cfg: &SamlConfig, xml: &str) -> Result<String, AeroError> {
     // Raw DEFLATE (no zlib/gzip wrapper) per the SAML HTTP-Redirect binding.
-    let mut enc =
-        flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+    let mut enc = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
     enc.write_all(xml.as_bytes())
         .and_then(|()| enc.flush())
         .map_err(|e| AeroError::Internal(anyhow::anyhow!("saml deflate: {e}")))?;
@@ -252,7 +276,11 @@ pub fn redirect_url_for_authn_request(cfg: &SamlConfig, xml: &str) -> Result<Str
     let b64 = base64::engine::general_purpose::STANDARD.encode(deflated);
 
     // Append SAMLRequest to the IdP SSO URL, preserving any existing query.
-    let sep = if cfg.idp_sso_url.contains('?') { '&' } else { '?' };
+    let sep = if cfg.idp_sso_url.contains('?') {
+        '&'
+    } else {
+        '?'
+    };
     let qs = form_urlencoded::Serializer::new(String::new())
         .append_pair("SAMLRequest", &b64)
         .finish();
@@ -261,11 +289,14 @@ pub fn redirect_url_for_authn_request(cfg: &SamlConfig, xml: &str) -> Result<Str
 
 /// `GET /saml/login` — begin SP-initiated SSO: 302 to the IdP's SSO URL carrying
 /// a freshly minted `AuthnRequest` (HTTP-Redirect binding).
-async fn login() -> Result<Response, crate::error::ApiError> {
+async fn login(State(s): State<AppState>) -> Result<Response, crate::error::ApiError> {
     let cfg = require_config()?;
     // XML-id: must start with a non-digit; ULID is base32 (may start with a digit)
     // so we prefix `_`. Time-ordered + random → a fine request id / replay guard.
     let id = format!("_{}", ulid::Ulid::new());
+    // Correlation is security state, not an optional cache. If Redis is
+    // unavailable, fail closed instead of issuing an untrackable request.
+    issue_request(&s.redis_client, &id).await?;
     let issue_instant = now_rfc3339();
     let xml = build_authn_request(&cfg, &id, &issue_instant);
     let url = redirect_url_for_authn_request(&cfg, &xml)?;
@@ -282,10 +313,10 @@ struct AcsForm {
     /// Base64-encoded `<samlp:Response>` XML.
     #[serde(rename = "SAMLResponse")]
     saml_response: String,
-    /// Opaque relay state the SP set on the AuthnRequest (echoed back). Unused
-    /// here beyond acceptance; carried for binding compliance.
+    /// Opaque relay state echoed by the IdP. We do not issue one, but bound any
+    /// received value to the SAML HTTP binding's 80-byte limit.
     #[serde(rename = "RelayState", default)]
-    _relay_state: Option<String>,
+    relay_state: Option<String>,
 }
 
 /// Identity fields extracted from a `<samlp:Response>` assertion.
@@ -373,33 +404,35 @@ impl SamlAssertion {
 /// # Errors
 /// [`AeroError::Invalid`] on non-base64 input or non-UTF-8 decoded bytes.
 pub fn decode_saml_response(b64: &str) -> Result<String, AeroError> {
+    if b64.len() > MAX_SAML_RESPONSE_B64_BYTES {
+        return Err(AeroError::Invalid(
+            "saml: encoded response exceeds 1.5 MB".into(),
+        ));
+    }
     let compact: String = b64.split_whitespace().collect();
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(compact.as_bytes())
         .map_err(|e| AeroError::Invalid(format!("saml: base64 decode: {e}")))?;
+    if bytes.len() > MAX_SAML_XML_BYTES {
+        return Err(AeroError::Invalid(
+            "saml: decoded response exceeds 1 MiB".into(),
+        ));
+    }
     String::from_utf8(bytes).map_err(|e| AeroError::Invalid(format!("saml: utf8: {e}")))
 }
 
 /// Extract identity fields from a decoded `<samlp:Response>` XML string.
 ///
-/// This is a **lightweight, namespace-agnostic** text scan — *not* a validating
-/// XML parser and *not* a signature check. It exists so the post-verification
-/// JIT path has data to consume the moment verification is wired; its output is
-/// untrusted until [`verify_response_signature`] passes.
+/// This parses the SAML namespaces and consumes identity only from the one
+/// direct `<saml:Assertion>` child. It is still *not* a signature check: callers
+/// must first pass [`verify_response_signature`], which proves that exact
+/// Assertion is covered by a verified signature.
 ///
 /// # Errors
-/// [`AeroError::Invalid`] if no `<NameID>` can be located (a structurally
-/// unusable response).
+/// [`AeroError::Unauthorized`] when the response shape is ambiguous, required
+/// identity fields are missing, or bounded field limits are exceeded.
 pub fn extract_assertion(xml: &str) -> Result<SamlAssertion, AeroError> {
-    let issuer = first_element_text(xml, "Issuer").unwrap_or_default();
-    let name_id = first_element_text(xml, "NameID")
-        .ok_or_else(|| AeroError::Invalid("saml: response has no NameID".into()))?;
-    let attributes = extract_attributes(xml);
-    Ok(SamlAssertion {
-        issuer: issuer.trim().to_owned(),
-        name_id: name_id.trim().to_owned(),
-        attributes,
-    })
+    extract_signed_identity(xml)
 }
 
 /// Opt-in env switch that enables the **experimental** `bergshamra`-backed XML-DSig
@@ -420,6 +453,7 @@ const EXPERIMENTAL_VERIFY_ENV: &str = "AERO_SAML_EXPERIMENTAL_VERIFY";
 /// **Before enabling [`EXPERIMENTAL_VERIFY_ENV`] in production: perform your own
 /// security review of `bergshamra`.** For a hardened deployment, prefer the
 /// audited C path — `xmlsec1` + `samael` — over this experimental verifier.
+#[cfg(feature = "saml-experimental-bergshamra")]
 const BERGSHAMRA_SECURITY_CAVEAT: &str = "\
 EXPERIMENTAL: SAML signatures verified by bergshamra, a pre-1.0, un-audited \
 pure-Rust XML-DSig library. Security-review it yourself before production; \
@@ -476,24 +510,40 @@ pub fn verify_response_signature(cfg: &SamlConfig, xml: &str) -> Result<(), Aero
     // default; the bergshamra path below only runs when an operator opts in.
     if !experimental_verify_enabled() {
         return Err(AeroError::Unauthorized(
-            "saml: signature validation not yet wired (fail-closed: no vetted XML-DSig verifier in this build; set AERO_SAML_EXPERIMENTAL_VERIFY=1 to enable the experimental, UN-AUDITED bergshamra verifier, or install xmlsec1 + enable samael to go live)".into(),
+            "saml: signature validation not yet wired (fail-closed: no vetted XML-DSig verifier in this build; use a reviewed verifier to go live)".into(),
+        ));
+    }
+
+    #[cfg(not(feature = "saml-experimental-bergshamra"))]
+    {
+        let _ = (cfg, xml);
+        return Err(AeroError::Unauthorized(
+            "saml: experimental verifier was not compiled; the default Rust 1.80 build remains fail-closed".into(),
         ));
     }
 
     // ⚠️ SECURITY CAVEAT ⚠️ — everything past here trusts `bergshamra`, a pre-1.0,
     // un-audited pure-Rust XML-DSig library. Security-review it before production;
     // prefer audited xmlsec1+samael. (BERGSHAMRA_SECURITY_CAVEAT)
-    let _ = BERGSHAMRA_SECURITY_CAVEAT; // referenced so the caveat const can't drift unused
-    bergshamra_verify(cfg, xml)
+    #[cfg(feature = "saml-experimental-bergshamra")]
+    {
+        let _ = BERGSHAMRA_SECURITY_CAVEAT;
+        bergshamra_verify(cfg, xml)
+    }
 }
 
 /// The experimental real-verification body. Split out so the gate above reads as
 /// a pure policy decision and this reads as the crypto sequence.
 ///
 /// ⚠️ Trusts the un-audited `bergshamra` crate — see [`BERGSHAMRA_SECURITY_CAVEAT`].
+#[cfg(feature = "saml-experimental-bergshamra")]
 fn bergshamra_verify(cfg: &SamlConfig, xml: &str) -> Result<(), AeroError> {
     use bergshamra::dsig::{verify::verify, DsigContext, VerifyResult};
     use bergshamra::keys::{loader::load_x509_cert_pem, KeysManager};
+
+    // Reject bergshamra's broad URI/transform/algorithm surface before it can
+    // resolve a local file or perform attacker-amplified digest work.
+    validate_signature_profile(xml)?;
 
     // 1. Load the *trusted* IdP signing certificate. This is the only key the
     //    verifier will accept (trusted_keys_only); a cert embedded by an attacker
@@ -543,6 +593,7 @@ fn bergshamra_verify(cfg: &SamlConfig, xml: &str) -> Result<(), AeroError> {
 /// * at least one **digest-verified** `<Reference>` resolved to that very node.
 ///
 /// ⚠️ Uses the un-audited `bergshamra`/`uppsala` parser — see [`BERGSHAMRA_SECURITY_CAVEAT`].
+#[cfg(feature = "saml-experimental-bergshamra")]
 fn enforce_signed_assertion(
     xml: &str,
     references: &[bergshamra::dsig::VerifiedReference],
@@ -569,9 +620,9 @@ fn enforce_signed_assertion(
     };
 
     // A *digest-verified* reference must resolve to that single Assertion node.
-    let covered = references.iter().any(|r| {
-        r.digest_verified && r.resolved_node.is_some_and(|n| n == assertion_node)
-    });
+    let covered = references
+        .iter()
+        .any(|r| r.digest_verified && r.resolved_node.is_some_and(|n| n == assertion_node));
     if !covered {
         return Err(AeroError::Unauthorized(
             "saml: the verified signature does not cover the consumed <Assertion> (signature-wrapping refused)".into(),
@@ -582,8 +633,9 @@ fn enforce_signed_assertion(
 
 /// `POST /saml/acs` — consume the IdP's `SAMLResponse`.
 ///
-/// Flow: decode base64 → **verify XML signature** → extract `NameID`/attributes
-/// → check issuer → JIT-provision → mint our session tokens.
+/// Flow: decode base64 → **verify XML signature** → validate conditions and
+/// signed identity → atomically consume the request id → JIT-provision → mint
+/// our session tokens.
 /// [`verify_response_signature`] is **fail-closed by default** (returns `401` for
 /// every assertion) unless the operator opts into the experimental, un-audited
 /// `bergshamra` verifier via `AERO_SAML_EXPERIMENTAL_VERIFY=1`. The provisioning
@@ -594,6 +646,13 @@ async fn acs(
     Form(form): Form<AcsForm>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let cfg = require_config()?;
+    if form
+        .relay_state
+        .as_ref()
+        .is_some_and(|state| state.len() > MAX_RELAY_STATE_BYTES)
+    {
+        return Err(AeroError::Invalid("saml: RelayState exceeds 80 bytes".into()).into());
+    }
 
     // 1. Decode the base64 SAMLResponse to XML.
     let xml = decode_saml_response(&form.saml_response)?;
@@ -608,7 +667,14 @@ async fn acs(
     // ---- off (default) it is an unreachable staging seam; it is also exercised
     // ---- directly by unit tests.
 
-    // 3. Extract identity and bind it to the configured IdP.
+    // 3. Validate the signed assertion's time window, Audience, bearer
+    //    Recipient, and response/request correlation. The response shell's
+    //    Destination/InResponseTo must match the signed SubjectConfirmationData.
+    let validated = validate_response_conditions(&cfg, &xml, time::OffsetDateTime::now_utc())?;
+
+    // 4. Extract identity from the signed Assertion only and bind it to the IdP.
+    //    Keep all pure structural validation before consuming the one-shot
+    //    request so a malformed response cannot burn a legitimate login attempt.
     let assertion = extract_assertion(&xml)?;
     if assertion.issuer != cfg.idp_entity_id {
         return Err(AeroError::Unauthorized(format!(
@@ -618,37 +684,56 @@ async fn acs(
         .into());
     }
 
-    // 4. Resolve the external identity → internal participant (JIT on first sight).
-    //    Keyed on (IdP entity id, NameID), mirroring the OIDC (issuer, sub) key.
-    let sso = SsoRepo::new(s.participants.pool().clone());
-    let participant_id = match sso
-        .find_participant(&cfg.idp_entity_id, &assertion.name_id)
-        .await
-        .map_err(AeroError::from)?
-    {
-        Some(pid) => pid,
-        None => jit_provision(&s, &sso, &cfg, &assertion).await?,
-    };
+    // 5. Atomically consume the SP-issued request id before any persistent JIT
+    //    side effect. Exactly one concurrent/replayed response crosses this
+    //    boundary; an unknown/expired request or Redis failure fails closed
+    //    without creating an account or issuing a token. A later transient
+    //    backend failure requires starting a fresh SP login.
+    consume_request(&s.redis_client, &validated.request_id).await?;
 
-    // 5. Mint OUR tokens + return the standard envelope (same shape as OIDC SSO).
-    let tokens = s.auth.issue_for_participant(participant_id)?;
+    // 6. Resolve/provision transactionally. Concurrent first responses for the
+    //    same IdP identity collapse onto one canonical participant with no ghost
+    //    account or membership.
+    let sso = SsoRepo::new(s.participants.pool().clone());
+    let participant_id = sso
+        .resolve_or_provision_human(
+            &cfg.idp_entity_id,
+            &assertion.name_id,
+            &assertion.best_display_name(),
+            assertion.email().as_deref(),
+            DEFAULT_WORKSPACE_ID,
+        )
+        .await
+        .map_err(|error| match error {
+            SsoResolveError::InvalidIdentity => {
+                AeroError::Invalid("external identity key is invalid".into())
+            }
+            SsoResolveError::Tombstoned => {
+                AeroError::Forbidden("external identity was deprovisioned".into())
+            }
+            SsoResolveError::Storage(error) => AeroError::from(error),
+        })?;
+
+    // 7. Load the live participant before minting local credentials.
     let participant = s
         .participants
         .get(participant_id)
         .await
         .map_err(AeroError::from)?
         .ok_or_else(|| AeroError::NotFound("participant".into()))?;
-    // Best-effort session record keyed on the refresh-token hash (mirrors OIDC).
+
+    // 8. Mint OUR tokens + return the standard envelope (same shape as OIDC SSO).
+    let tokens = s.auth.issue_for_participant(participant_id)?;
+    // Persist the exact stable id embedded in both JWTs before either token is
+    // released. A missing row would make access-token revocation unenforceable.
     let ua = headers
         .get(axum::http::header::USER_AGENT)
         .and_then(|v| v.to_str().ok());
     let hash = aero_storage::revoked_token::hash_token(&tokens.refresh_token);
-    if let Err(e) = aero_storage::SessionRepo::new(s.participants.pool().clone())
-        .record(participant_id, &hash, ua)
+    aero_storage::SessionRepo::new(s.participants.pool().clone())
+        .record_with_id(participant_id, tokens.session_id, &hash, ua)
         .await
-    {
-        tracing::warn!(error = ?e, %participant_id, "saml acs session record failed");
-    }
+        .map_err(AeroError::from)?;
 
     Ok(Json(serde_json::json!({
         "access_token": tokens.access_token,
@@ -657,44 +742,8 @@ async fn acs(
     })))
 }
 
-/// JIT-provision a participant for a first-seen SAML identity. Mirrors
-/// [`crate::sso::jit_provision`]: create a credential-less human participant,
-/// enroll it into the default workspace, link the external identity.
-async fn jit_provision(
-    s: &AppState,
-    sso: &SsoRepo,
-    cfg: &SamlConfig,
-    assertion: &SamlAssertion,
-) -> Result<ParticipantId, AeroError> {
-    let display_name = assertion.best_display_name();
-    let participant = s
-        .participants
-        .create_bot(
-            &display_name,
-            aero_common::ParticipantKind::Human,
-            None,
-            None,
-        )
-        .await
-        .map_err(AeroError::from)?;
-    s.workspaces
-        .add_member(DEFAULT_WORKSPACE_ID, participant.id, WorkspaceRole::Member)
-        .await
-        .map_err(AeroError::from)?;
-    sso.link(
-        &cfg.idp_entity_id,
-        &assertion.name_id,
-        participant.id,
-        assertion.email().as_deref(),
-    )
-    .await
-    .map_err(AeroError::from)?;
-    Ok(participant.id)
-}
-
 // ---------------------------------------------------------------------------
-// Small XML helpers (intentionally dependency-free; only ever feed UNTRUSTED
-// extraction, never signature verification).
+// Small XML generation helper.
 // ---------------------------------------------------------------------------
 
 /// Escape the five XML predefined entities for safe interpolation into our
@@ -712,113 +761,6 @@ fn xml_escape(s: &str) -> String {
         }
     }
     out
-}
-
-/// Decode the five XML predefined entities and the common numeric forms in
-/// extracted text. Best-effort for the untrusted extraction path.
-fn xml_unescape(s: &str) -> String {
-    s.replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
-        .replace("&#x2F;", "/")
-        .replace("&#47;", "/")
-        // amp last so we don't double-decode (e.g. "&amp;lt;").
-        .replace("&amp;", "&")
-}
-
-/// Local name of an element start-tag token (strips any `ns:` prefix), e.g.
-/// `"saml:NameID"` → `"NameID"`. The token is the text after `<` up to the first
-/// whitespace, `/`, or `>`.
-fn local_name(token: &str) -> &str {
-    let name = token
-        .split(|c: char| c.is_whitespace() || c == '>' || c == '/')
-        .next()
-        .unwrap_or("");
-    name.rsplit(':').next().unwrap_or(name)
-}
-
-/// Return the text content of the first element whose *local* name is `local`
-/// (namespace-prefix-insensitive). Returns the inner text with XML entities
-/// decoded, or `None` if no such (non-self-closing) element exists.
-fn first_element_text(xml: &str, local: &str) -> Option<String> {
-    // `pos` is an ABSOLUTE byte offset into `xml`, advanced past each `<…>` token.
-    let mut pos = 0usize;
-    while let Some(rel) = xml[pos..].find('<') {
-        let lt = pos + rel; // absolute index of this `<`
-        let after = &xml[lt + 1..];
-        // Skip closing tags, comments/CDATA/doctype, declarations/PIs (`?xml`).
-        if after.starts_with('/') || after.starts_with('!') || after.starts_with('?') {
-            pos = lt + 1;
-            continue;
-        }
-        let Some(gt_rel) = after.find('>') else { break };
-        let tag = &after[..gt_rel]; // start-tag inner, e.g. `saml:NameID Format="..."`
-        let self_closing = tag.ends_with('/');
-        let content_start = lt + 1 + gt_rel + 1; // absolute index just past `>`
-        if local_name(tag) == local && !self_closing {
-            // Inner text runs from just past this start-tag's `>` to the next `<`
-            // — sufficient for the leaf text elements we read (NameID / Issuer /
-            // AttributeValue).
-            let inner = &xml[content_start..];
-            let end = inner.find('<').unwrap_or(inner.len());
-            return Some(xml_unescape(inner[..end].trim()));
-        }
-        pos = content_start;
-    }
-    None
-}
-
-/// Extract `(name, first-value)` pairs from `<Attribute Name="…">` elements.
-/// Namespace-prefix-insensitive; reads the first `<AttributeValue>` per attribute.
-fn extract_attributes(xml: &str) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    let mut search_from = 0usize;
-    while let Some(rel) = xml[search_from..].find('<') {
-        let lt = search_from + rel;
-        let after = &xml[lt + 1..];
-        let Some(gt) = after.find('>') else { break };
-        let tag = &after[..gt];
-        search_from = lt + 1 + gt + 1;
-        if local_name(tag) != "Attribute" || tag.ends_with('/') {
-            continue;
-        }
-        // Pull the Name="..." attribute out of the start-tag.
-        let Some(name) = tag_attr_value(tag, "Name") else { continue };
-        // Find the first <AttributeValue> after this start-tag.
-        let region = &xml[search_from..];
-        if let Some(val) = first_element_text(region, "AttributeValue") {
-            out.push((name, val));
-        }
-    }
-    out
-}
-
-/// Extract the value of XML attribute `attr` from a start-tag inner string, e.g.
-/// `tag_attr_value(r#"Attribute Name="email""#, "Name")` → `Some("email")`.
-/// Handles either quote style; whitespace-tolerant around `=`.
-fn tag_attr_value(tag: &str, attr: &str) -> Option<String> {
-    let mut hay = tag;
-    while let Some(pos) = hay.find(attr) {
-        let before_ok = pos == 0
-            || hay[..pos]
-                .chars()
-                .next_back()
-                .is_some_and(|c| c.is_whitespace());
-        let after = hay[pos + attr.len()..].trim_start();
-        if before_ok && after.starts_with('=') {
-            let after_eq = after[1..].trim_start();
-            let quote = after_eq.chars().next()?;
-            if quote == '"' || quote == '\'' {
-                let v = &after_eq[1..];
-                if let Some(end) = v.find(quote) {
-                    return Some(xml_unescape(&v[..end]));
-                }
-            }
-        }
-        hay = &hay[pos + attr.len()..];
-    }
-    None
 }
 
 /// Current UTC instant formatted as SAML expects (RFC 3339, second precision,

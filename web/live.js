@@ -8,7 +8,7 @@
 
 import { api } from './api.js';
 import { state, els, loadingDiv, mutedDiv, openModal, closeModal, setBusy } from './context.js';
-import { toast } from './render.js';
+import { attachHls, toast } from './render.js';
 
 export function initLive() {
   els.btnLivePage.addEventListener('click', async () => {
@@ -22,15 +22,14 @@ export function initLive() {
         const card = document.createElement('div'); card.className = 'live-card';
         const video = document.createElement('video');
         video.controls = true; video.playsInline = true; video.muted = true;
-        const src = `/hls/${s.id}/index.m3u8`;
-        if (window.MediaSource && video.canPlayType('application/vnd.apple.mpegurl')) {
-          video.src = src;
-        } else {
-          // Fallback: just show a placeholder div.
+        const src = s.hls_path || `/hls/${encodeURIComponent(s.id)}/index.m3u8`;
+        if (!attachHls(video, src)) {
+          // hls.js is unavailable or unsupported; retain the direct src fallback
+          // on the hidden video for unusual native implementations.
           video.style.display = 'none';
           const ph = document.createElement('div'); ph.className = 'live-thumb';
           ph.style.cssText = 'display:grid;place-items:center;color:#888;';
-          ph.textContent = '当前浏览器不支持原生 HLS';
+          ph.textContent = '当前浏览器不支持 HLS 播放';
           card.appendChild(ph);
         }
         card.appendChild(video);

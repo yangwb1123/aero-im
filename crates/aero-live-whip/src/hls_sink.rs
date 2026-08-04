@@ -227,7 +227,7 @@ pub fn build_avc_decoder_config(sps: &[u8], pps: &[u8]) -> Option<Bytes> {
     out.put_u8(profile_idc); // AVCProfileIndication
     out.put_u8(constraint_flags); // profile_compatibility
     out.put_u8(level_idc); // AVCLevelIndication
-    // 6 reserved bits set to 1 + lengthSizeMinusOne(2) = 3 → 0xFF.
+                           // 6 reserved bits set to 1 + lengthSizeMinusOne(2) = 3 → 0xFF.
     out.put_u8(0xFC | 0x03);
     // 3 reserved bits set to 1 + numOfSequenceParameterSets(5) = 1 → 0xE1.
     out.put_u8(0xE0 | 0x01);
@@ -396,7 +396,12 @@ impl HlsSink {
     }
 
     /// Push one access unit's NAL units into the muxer as an FLV video tag.
-    fn push_au_to_muxer(&mut self, annex_b: &[u8], pts_90k: u64, keyframe: bool) -> anyhow::Result<()> {
+    fn push_au_to_muxer(
+        &mut self,
+        annex_b: &[u8],
+        pts_90k: u64,
+        keyframe: bool,
+    ) -> anyhow::Result<()> {
         let avcc = annex_b_to_avcc(annex_b);
         // [frame_codec][avc_packet_type=1][cts:i24=0] ++ avcc-nalus.
         // frame_codec: keyframe → 0x17, inter → 0x27 (frame_type<<4 | AVC=7).
@@ -555,7 +560,10 @@ impl HlsSegmentWriter {
             }
         }
         self.writer.finish().await?;
-        debug!(segments = written, "whip-hls: writer finished, manifest finalized");
+        debug!(
+            segments = written,
+            "whip-hls: writer finished, manifest finalized"
+        );
         Ok(written)
     }
 }
@@ -704,8 +712,12 @@ mod tests {
 
         let mut conv = aero_live_hls::FlvToTsConverter::new();
         assert!(!conv.is_ready());
-        conv.push_video_tag(&tag, 0).expect("muxer accepts our avcC");
-        assert!(conv.is_ready(), "muxer should be ready after the seq header");
+        conv.push_video_tag(&tag, 0)
+            .expect("muxer accepts our avcC");
+        assert!(
+            conv.is_ready(),
+            "muxer should be ready after the seq header"
+        );
     }
 
     // ------------------ HlsSink (channel level) ------------------
@@ -734,7 +746,10 @@ mod tests {
             (0x65, &[0x10, 0x20, 0x30]),
         ]);
         sink.on_video_au(kf1, 0).unwrap();
-        assert!(rx.try_recv().is_err(), "first keyframe must not cut a segment");
+        assert!(
+            rx.try_recv().is_err(),
+            "first keyframe must not cut a segment"
+        );
 
         // A P-frame extends the open segment.
         let p = annex_b_au(&[(0x41, &[0x11, 0x22])]);
@@ -757,7 +772,11 @@ mod tests {
         assert_eq!(seg.bytes.len() % 188, 0, "whole TS packets");
         // Duration spans PTS 0 → 6000 ticks = 1/15 s, strictly positive.
         let expected = 6_000.0f32 / 90_000.0;
-        assert!((seg.duration_secs - expected).abs() < 1e-4, "got {}", seg.duration_secs);
+        assert!(
+            (seg.duration_secs - expected).abs() < 1e-4,
+            "got {}",
+            seg.duration_secs
+        );
     }
 
     #[test]
@@ -766,8 +785,12 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut sink = HlsSink::new(tx);
         sink.on_video_au(annex_b_au(&[(0x41, &[0x01])]), 0).unwrap();
-        sink.on_video_au(annex_b_au(&[(0x41, &[0x02])]), 3_000).unwrap();
-        assert!(rx.try_recv().is_err(), "no segment without a leading keyframe");
+        sink.on_video_au(annex_b_au(&[(0x41, &[0x02])]), 3_000)
+            .unwrap();
+        assert!(
+            rx.try_recv().is_err(),
+            "no segment without a leading keyframe"
+        );
         assert_eq!(sink.segments_emitted(), 0);
     }
 
@@ -790,7 +813,8 @@ mod tests {
         };
         let (a, ap) = kf(0);
         sink.on_video_au(a, ap).unwrap();
-        sink.on_video_au(annex_b_au(&[(0x41, &[0x01])]), 3_000).unwrap();
+        sink.on_video_au(annex_b_au(&[(0x41, &[0x01])]), 3_000)
+            .unwrap();
         let (b, bp) = kf(6_000);
         sink.on_video_au(b, bp).unwrap();
         drop(sink); // closes the channel → writer finalizes
@@ -802,6 +826,9 @@ mod tests {
         assert!(manifest.contains("#EXTM3U"));
         assert!(manifest.contains("#EXTINF"));
         assert!(manifest.contains("0.ts"));
-        assert!(manifest.contains("#EXT-X-ENDLIST"), "finalized on sink drop");
+        assert!(
+            manifest.contains("#EXT-X-ENDLIST"),
+            "finalized on sink drop"
+        );
     }
 }

@@ -33,7 +33,10 @@ use crate::state::AppState;
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/streams/:id/hype-train", get(get_hype_train))
-        .route("/api/streams/:id/hype-train/history", get(hype_train_history))
+        .route(
+            "/api/streams/:id/hype-train/history",
+            get(hype_train_history),
+        )
         .route(
             "/api/streams/:id/hype-train/leaderboard",
             get(stream_leaderboard),

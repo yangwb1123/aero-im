@@ -109,6 +109,30 @@ pub struct WhipResource {
     pub answer_sdp: String,
 }
 
+impl WhipResource {
+    /// Build the HTTP resource metadata from a negotiated str0m SDP answer.
+    ///
+    /// Server integrations that keep the real [`WhipSession`] call
+    /// [`WhipSession::accept`] directly, then use this constructor for the
+    /// resource registry and HTTP response. The legacy [`accept_whip_offer`]
+    /// helper delegates here so both signaling paths expose identical metadata.
+    #[must_use]
+    pub fn from_answer(stream_id: Ulid, answer_sdp: String) -> Self {
+        let ice_ufrag = sdp_value(&answer_sdp, "a=ice-ufrag:").unwrap_or_default();
+        let ice_pwd = sdp_value(&answer_sdp, "a=ice-pwd:").unwrap_or_default();
+        let dtls_fingerprint = sdp_value(&answer_sdp, "a=fingerprint:").unwrap_or_default();
+
+        Self {
+            stream_id,
+            resource_id: Ulid::new(),
+            ice_ufrag,
+            ice_pwd,
+            dtls_fingerprint,
+            answer_sdp,
+        }
+    }
+}
+
 /// In-memory registry mapping a stream key → currently-active resource.
 ///
 /// Keeps a single publisher per key; a second WHIP `POST` returns `Conflict`
@@ -183,20 +207,7 @@ pub fn accept_whip_offer(
     let (_session, answer) = WhipSession::accept(offer_sdp, ingest_host, ingest_port)?;
     let answer_sdp = answer.to_sdp_string();
 
-    // Surface the negotiated ICE/DTLS params on the resource for callers that
-    // log or proxy them. They are parsed out of the answer str0m produced.
-    let ice_ufrag = sdp_value(&answer_sdp, "a=ice-ufrag:").unwrap_or_default();
-    let ice_pwd = sdp_value(&answer_sdp, "a=ice-pwd:").unwrap_or_default();
-    let dtls_fingerprint = sdp_value(&answer_sdp, "a=fingerprint:").unwrap_or_default();
-
-    Ok(WhipResource {
-        stream_id: stream.id,
-        resource_id: Ulid::new(),
-        ice_ufrag,
-        ice_pwd,
-        dtls_fingerprint,
-        answer_sdp,
-    })
+    Ok(WhipResource::from_answer(stream.id, answer_sdp))
 }
 
 /// Pull the value following the first `prefix` SDP attribute line (trimmed of

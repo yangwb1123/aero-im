@@ -6,13 +6,13 @@
 //! more than one-shot best-effort:
 //!
 //! * Each `(webhook, event)` send is a [`webhook_delivery_log`] row whose `status`
-//!   walks `pending → delivered | failed → dead`.
+//!   walks `pending → delivered | failed → dead`. A random `claim_token` owns
+//!   every `pending` generation, independently of the HTTP-attempt counter.
 //! * A `failed` row carries a future `next_attempt_at` set by an **exponential
 //!   backoff** schedule ([`backoff_delay`] / [`next_attempt_at`]). A retry loop
 //!   [`claim_due`](WebhookDeliveryRepo::claim_due)s the due ones and re-sends.
 //! * After [`MAX_ATTEMPTS`] the row is parked at `dead` — a dead-letter queue an
-//!   admin can [`list_dead`](WebhookDeliveryRepo::list_dead) and
-//!   [`requeue`](WebhookDeliveryRepo::requeue).
+//!   admin can list and requeue through the transaction-owned authorized APIs.
 //!
 //! ## Testable seam (DB-free, unit-tested)
 //!
@@ -27,12 +27,20 @@ use serde::Serialize;
 use sqlx::PgPool;
 use time::{Duration, OffsetDateTime};
 
+#[path = "webhook_delivery/admin.rs"]
+mod admin;
+
 // ----------------------------------------------------- Pure backoff schedule
 
 /// Maximum number of delivery attempts before a row is parked at `dead`. The
 /// first attempt is attempt 1; once `attempts` reaches this, a further failure
 /// is terminal rather than retried.
 pub const MAX_ATTEMPTS: i32 = 6;
+
+/// A `pending` row older than this is considered abandoned and can be claimed
+/// again. The real sender times out after 10 seconds; one minute leaves ample
+/// settlement headroom while recovering process crashes and DB-outage zombies.
+pub const PENDING_STALE_AFTER_SECS: i64 = 60;
 
 /// Base delay (seconds) for the first retry. Each subsequent retry doubles it.
 const BASE_DELAY_SECS: i64 = 30;
@@ -82,6 +90,18 @@ pub struct WebhookDelivery {
     pub webhook_id: WebhookId,
     /// Opaque correlation id of the delivered event (e.g. the source message id).
     pub event_id: Option<String>,
+    /// Exact bytes sent on the first attempt. Legacy terminal rows created
+    /// before migration 0164 may be `None`; such rows are never claimable.
+    #[serde(skip)]
+    pub request_body: Option<Vec<u8>>,
+    /// Safe unsigned headers replayed with the immutable body. Signature and
+    /// timestamp headers are deliberately regenerated for every retry.
+    #[serde(skip)]
+    pub request_headers: Vec<(String, String)>,
+    /// Unforgeable owner token for the current claim generation. It is internal
+    /// control-plane state and must never be exposed by admin JSON.
+    #[serde(skip)]
+    pub claim_token: uuid::Uuid,
     /// Lifecycle: `pending` | `delivered` | `failed` | `dead`.
     pub status: String,
     pub attempts: i32,
@@ -99,6 +119,9 @@ type DeliveryRow = (
     uuid::Uuid,
     uuid::Uuid,
     Option<String>,
+    Option<Vec<u8>>,
+    sqlx::types::Json<Vec<(String, String)>>,
+    uuid::Uuid,
     String,
     i32,
     Option<i32>,
@@ -109,11 +132,28 @@ type DeliveryRow = (
 );
 
 fn row_to_delivery(r: DeliveryRow) -> WebhookDelivery {
-    let (id, webhook_id, event_id, status, attempts, code, err, next, created, updated) = r;
+    let (
+        id,
+        webhook_id,
+        event_id,
+        request_body,
+        request_headers,
+        claim_token,
+        status,
+        attempts,
+        code,
+        err,
+        next,
+        created,
+        updated,
+    ) = r;
     WebhookDelivery {
         id: WebhookDeliveryId::from_uuid(id),
         webhook_id: WebhookId::from_uuid(webhook_id),
         event_id,
+        request_body,
+        request_headers: request_headers.0,
+        claim_token,
         status,
         attempts,
         last_status_code: code,
@@ -124,7 +164,18 @@ fn row_to_delivery(r: DeliveryRow) -> WebhookDelivery {
     }
 }
 
-/// Largest page [`WebhookDeliveryRepo::list_dead`] / `list_for_webhook` return.
+/// Ownership handle returned when a new delivery row is durably recorded.
+///
+/// The token, not `attempts`, identifies the worker allowed to begin an HTTP
+/// call. `attempts` remains zero until [`WebhookDeliveryRepo::begin_attempt`]
+/// succeeds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WebhookDeliveryClaim {
+    pub id: WebhookDeliveryId,
+    pub claim_token: uuid::Uuid,
+}
+
+/// Largest page the authorized delivery-history APIs return.
 pub const MAX_PAGE: i64 = 200;
 
 /// Clamp a requested page size into `1..=MAX_PAGE` (a `None`/non-positive request
@@ -160,10 +211,7 @@ impl WebhookDeliveryRepo {
     ///
     /// # Errors
     /// Propagates any [`sqlx::Error`].
-    pub async fn sweep_terminal_before(
-        &self,
-        cutoff: OffsetDateTime,
-    ) -> Result<u64, sqlx::Error> {
+    pub async fn sweep_terminal_before(&self, cutoff: OffsetDateTime) -> Result<u64, sqlx::Error> {
         let res = sqlx::query(
             r"DELETE FROM webhook_delivery_log
                WHERE status IN ('delivered','dead') AND updated_at < $1",
@@ -174,13 +222,16 @@ impl WebhookDeliveryRepo {
         Ok(res.rows_affected())
     }
 
-    /// Claim a brand-new delivery attempt in `pending` state with `attempts = 1`
-    /// (the dispatcher records the row as it makes the first send).
+    /// Durably claim a brand-new delivery in `pending` state with `attempts = 0`.
+    ///
+    /// This only reserves ownership; it does **not** represent an HTTP call.
+    /// After endpoint/global permits are acquired, the owner must call
+    /// [`Self::begin_attempt`] with the returned token immediately before POST.
     ///
     /// IDEMPOTENT on `(webhook_id, event_id)` when `event_id` is set: returns
-    /// `Ok(Some(id))` when THIS call claimed the delivery (proceed to POST), or
+    /// `Ok(Some(claim))` when THIS call reserved the delivery, or
     /// `Ok(None)` when a delivery for that event→endpoint was already recorded —
-    /// i.e. a JetStream redelivery — so the caller MUST skip the duplicate POST.
+    /// i.e. a `JetStream` redelivery — so the caller MUST skip the duplicate POST.
     /// A NULL `event_id` is never deduped (no correlation id), so it always claims.
     /// Backed by the partial unique index from migration 0150.
     ///
@@ -190,47 +241,129 @@ impl WebhookDeliveryRepo {
         &self,
         webhook: WebhookId,
         event_id: Option<&str>,
-    ) -> Result<Option<WebhookDeliveryId>, sqlx::Error> {
+        request_body: &[u8],
+        request_headers: &[(String, String)],
+    ) -> Result<Option<WebhookDeliveryClaim>, sqlx::Error> {
         let id = WebhookDeliveryId::new();
-        let row: Option<(uuid::Uuid,)> = sqlx::query_as(
+        let row: Option<(uuid::Uuid, uuid::Uuid)> = sqlx::query_as(
             r"INSERT INTO webhook_delivery_log
-                  (id, webhook_id, event_id, status, attempts, created_at, updated_at)
-               VALUES ($1, $2, $3, 'pending', 1, now(), now())
+                  (id, webhook_id, event_id, request_body, request_headers,
+                   status, attempts, created_at, updated_at)
+               VALUES ($1, $2, $3, $4, $5, 'pending', 0, now(), now())
                ON CONFLICT (webhook_id, event_id) WHERE event_id IS NOT NULL DO NOTHING
-               RETURNING id",
+               RETURNING id, claim_token",
         )
         .bind(id.to_uuid())
         .bind(webhook.to_uuid())
         .bind(event_id)
+        .bind(request_body)
+        .bind(sqlx::types::Json(request_headers))
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map(|_| id))
+        Ok(row.map(|(_, claim_token)| WebhookDeliveryClaim { id, claim_token }))
     }
 
-    /// Mark a delivery `delivered` (a 2xx). Clears any pending retry. Idempotent
-    /// over `status` — re-marking a delivered row is a harmless no-op update.
+    /// Materialize an event for the retry worker without claiming or sending it.
+    ///
+    /// This is used by transactional/outbox producers that must durably persist
+    /// exact request bytes but never perform HTTP on their own path. The row is
+    /// immediately due in `failed` state with `attempts = 0`; [`Self::claim_due`]
+    /// later rotates the token and hands it to a sender. Returns `false` for an
+    /// existing `(webhook_id, event_id)` dedupe key.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] (e.g. an unknown `webhook` FK).
+    pub async fn enqueue(
+        &self,
+        webhook: WebhookId,
+        event_id: Option<&str>,
+        request_body: &[u8],
+        request_headers: &[(String, String)],
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            r"INSERT INTO webhook_delivery_log
+                  (id, webhook_id, event_id, request_body, request_headers,
+                   status, attempts, next_attempt_at, created_at, updated_at)
+               VALUES (
+                   gen_random_uuid(), $1, $2, $3, $4,
+                   'failed', 0, now(), now(), now()
+               )
+               ON CONFLICT (webhook_id, event_id)
+                   WHERE event_id IS NOT NULL DO NOTHING",
+        )
+        .bind(webhook.to_uuid())
+        .bind(event_id)
+        .bind(request_body)
+        .bind(sqlx::types::Json(request_headers))
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Charge one real HTTP attempt to the current claim immediately before the
+    /// request is started.
+    ///
+    /// The token is checked and `updated_at` refreshed atomically, so a worker
+    /// that waited beyond the stale-claim window cannot POST after a successor
+    /// has recovered the row. Returns the new attempt count, or `None` when the
+    /// claim fence was lost. A row at the retry cap cannot begin another call.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`].
+    pub async fn begin_attempt(
+        &self,
+        id: WebhookDeliveryId,
+        claim_token: uuid::Uuid,
+    ) -> Result<Option<i32>, sqlx::Error> {
+        let row: Option<(i32,)> = sqlx::query_as(
+            r"UPDATE webhook_delivery_log
+                  SET attempts = attempts + 1,
+                      updated_at = now()
+                WHERE id = $1
+                  AND status = 'pending'
+                  AND claim_token = $2
+                  AND attempts < $3
+                RETURNING attempts",
+        )
+        .bind(id.to_uuid())
+        .bind(claim_token)
+        .bind(MAX_ATTEMPTS)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(attempts,)| attempts))
+    }
+
+    /// Mark the currently claimed attempt `delivered` (a 2xx). Clears any
+    /// pending retry. A stale worker whose claim was recovered cannot settle a
+    /// successor because every claim receives a fresh, random token.
+    ///
+    /// Returns `false` when the row is no longer the matching pending claim.
     ///
     /// # Errors
     /// Propagates any [`sqlx::Error`].
     pub async fn mark_delivered(
         &self,
         id: WebhookDeliveryId,
+        claim_token: uuid::Uuid,
         status_code: i32,
-    ) -> Result<(), sqlx::Error> {
-        sqlx::query(
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
             r"UPDATE webhook_delivery_log
                   SET status = 'delivered',
-                      last_status_code = $2,
+                      last_status_code = $3,
                       last_error = NULL,
                       next_attempt_at = NULL,
                       updated_at = now()
-                WHERE id = $1",
+                WHERE id = $1
+                  AND status = 'pending'
+                  AND claim_token = $2",
         )
         .bind(id.to_uuid())
+        .bind(claim_token)
         .bind(status_code)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(result.rows_affected() > 0)
     }
 
     /// Record a failed attempt. If `attempts` (the count already made, including
@@ -239,63 +372,111 @@ impl WebhookDeliveryRepo {
     /// [`next_attempt_at`] exponential-backoff schedule (computed in Rust from
     /// `now` so the schedule is the unit-tested pure function, not SQL).
     ///
-    /// `status_code` is the HTTP status of the failed attempt (`None` on a
-    /// transport error); `err` is a short diagnostic.
+    /// `attempts` is the count returned by [`Self::begin_attempt`].
+    /// `claim_token` is the ownership fence. `status_code` is the HTTP status of
+    /// the failed attempt (`None` on a transport error); `err` is a short
+    /// diagnostic. Returns `false` when a newer worker already recovered or
+    /// settled this claim.
     ///
     /// # Errors
     /// Propagates any [`sqlx::Error`].
     pub async fn mark_failed_with_backoff(
         &self,
         id: WebhookDeliveryId,
+        claim_token: uuid::Uuid,
         attempts: i32,
         status_code: Option<i32>,
         err: &str,
-    ) -> Result<(), sqlx::Error> {
+    ) -> Result<bool, sqlx::Error> {
         let now = OffsetDateTime::now_utc();
-        if is_dead_at(attempts) {
+        let result = if is_dead_at(attempts) {
             sqlx::query(
                 r"UPDATE webhook_delivery_log
                       SET status = 'dead',
-                          last_status_code = $2,
-                          last_error = $3,
+                          last_status_code = $4,
+                          last_error = $5,
                           next_attempt_at = NULL,
                           updated_at = now()
-                    WHERE id = $1",
+                    WHERE id = $1
+                      AND status = 'pending'
+                      AND claim_token = $2
+                      AND attempts = $3",
             )
             .bind(id.to_uuid())
+            .bind(claim_token)
+            .bind(attempts)
             .bind(status_code)
             .bind(err)
             .execute(&self.pool)
-            .await?;
+            .await?
         } else {
             let next = next_attempt_at(now, attempts);
             sqlx::query(
                 r"UPDATE webhook_delivery_log
                       SET status = 'failed',
-                          last_status_code = $2,
-                          last_error = $3,
-                          next_attempt_at = $4,
+                          last_status_code = $4,
+                          last_error = $5,
+                          next_attempt_at = $6,
                           updated_at = now()
-                    WHERE id = $1",
+                    WHERE id = $1
+                      AND status = 'pending'
+                      AND claim_token = $2
+                      AND attempts = $3",
             )
             .bind(id.to_uuid())
+            .bind(claim_token)
+            .bind(attempts)
             .bind(status_code)
             .bind(err)
             .bind(next)
             .execute(&self.pool)
-            .await?;
-        }
-        Ok(())
+            .await?
+        };
+        Ok(result.rows_affected() > 0)
     }
 
-    /// Claim up to `limit` `failed` deliveries whose `next_attempt_at <= now`,
-    /// flipping each back to `pending` and bumping `attempts`, returning the
-    /// claimed rows for the retry loop to re-send. Uses `FOR UPDATE SKIP LOCKED`
-    /// so multiple retry workers don't double-send the same row.
+    /// Park the currently claimed generation directly in the DLQ.
     ///
-    /// The returned `attempts` reflects the post-increment count, i.e. the attempt
-    /// number this re-send represents — pass it back to
-    /// [`mark_failed_with_backoff`](Self::mark_failed_with_backoff) if it fails.
+    /// This is reserved for non-retryable persisted-record defects (for
+    /// example, a legacy row without the immutable request body). The
+    /// `claim_token` has the same stale-owner semantics as the ordinary
+    /// settlement methods.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`].
+    pub async fn mark_dead(
+        &self,
+        id: WebhookDeliveryId,
+        claim_token: uuid::Uuid,
+        status_code: Option<i32>,
+        err: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            r"UPDATE webhook_delivery_log
+                  SET status = 'dead',
+                      last_status_code = $3,
+                      last_error = $4,
+                      next_attempt_at = NULL,
+                      updated_at = now()
+                WHERE id = $1
+                  AND status = 'pending'
+                  AND claim_token = $2",
+        )
+        .bind(id.to_uuid())
+        .bind(claim_token)
+        .bind(status_code)
+        .bind(err)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Claim up to `limit` due `failed` deliveries or abandoned `pending`
+    /// deliveries older than [`PENDING_STALE_AFTER_SECS`], flipping each to
+    /// `pending` and rotating `claim_token`. Claiming does **not** increment
+    /// `attempts`; only [`Self::begin_attempt`] does. Stale recovery closes the
+    /// crash/queueing window without charging calls that were never started.
+    /// Uses `FOR UPDATE SKIP LOCKED` so multiple workers don't own one row.
     ///
     /// # Errors
     /// Propagates any [`sqlx::Error`].
@@ -305,26 +486,132 @@ impl WebhookDeliveryRepo {
         limit: i64,
     ) -> Result<Vec<WebhookDelivery>, sqlx::Error> {
         let limit = limit.clamp(1, MAX_PAGE);
+        let stale_before = now - Duration::seconds(PENDING_STALE_AFTER_SECS);
+        let mut tx = self.pool.begin().await?;
+        // If the final permitted call began but its worker died before
+        // settlement, conservatively park it rather than exceed the HTTP-call
+        // budget on recovery.
+        sqlx::query(
+            r"UPDATE webhook_delivery_log
+                  SET status = 'dead',
+                      claim_token = gen_random_uuid(),
+                      last_error = COALESCE(
+                          last_error,
+                          'final HTTP attempt was abandoned before settlement'
+                      ),
+                      next_attempt_at = NULL,
+                      updated_at = $2
+                WHERE status = 'pending'
+                  AND attempts >= $1
+                  AND updated_at <= $3",
+        )
+        .bind(MAX_ATTEMPTS)
+        .bind(now)
+        .bind(stale_before)
+        .execute(&mut *tx)
+        .await?;
         let rows = sqlx::query_as::<_, DeliveryRow>(
             r"UPDATE webhook_delivery_log
-                  SET status = 'pending', attempts = attempts + 1, updated_at = now()
+                  SET status = 'pending',
+                      claim_token = gen_random_uuid(),
+                      next_attempt_at = NULL,
+                      updated_at = $1
                 WHERE id IN (
                     SELECT id FROM webhook_delivery_log
-                     WHERE status = 'failed'
-                       AND next_attempt_at IS NOT NULL
-                       AND next_attempt_at <= $1
-                     ORDER BY next_attempt_at ASC
+                     WHERE (
+                              (status = 'failed'
+                               AND next_attempt_at IS NOT NULL
+                               AND next_attempt_at <= $1)
+                              OR (status = 'pending' AND updated_at <= $3)
+                           )
+                       AND request_body IS NOT NULL
+                       AND attempts < $4
+                     ORDER BY COALESCE(next_attempt_at, updated_at) ASC
                      FOR UPDATE SKIP LOCKED
                      LIMIT $2
                 )
-                RETURNING id, webhook_id, event_id, status, attempts, last_status_code,
-                          last_error, next_attempt_at, created_at, updated_at",
+                RETURNING id, webhook_id, event_id, request_body, request_headers,
+                          claim_token, status, attempts, last_status_code, last_error,
+                          next_attempt_at, created_at, updated_at",
         )
         .bind(now)
         .bind(limit)
-        .fetch_all(&self.pool)
+        .bind(stale_before)
+        .bind(MAX_ATTEMPTS)
+        .fetch_all(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(rows.into_iter().map(row_to_delivery).collect())
+    }
+
+    /// Defer a claimed-but-not-attempted delivery until `not_before`.
+    ///
+    /// This is the explicit path for an open circuit breaker or a transient
+    /// target lookup failure. It is fenced by the claim token and deliberately
+    /// leaves `attempts` unchanged because no HTTP call started. `PostgreSQL`'s
+    /// current time is also a lower bound, so a stale caller cannot create an
+    /// already-overdue loop.
+    ///
+    /// Returns whether this call deferred the still-owned pending row.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`].
+    pub async fn defer_claim(
+        &self,
+        id: WebhookDeliveryId,
+        claim_token: uuid::Uuid,
+        not_before: OffsetDateTime,
+        err: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            r"UPDATE webhook_delivery_log
+                  SET status = 'failed',
+                      last_error = $4,
+                      next_attempt_at = GREATEST($3, now()),
+                      updated_at = now()
+                WHERE id = $1
+                  AND status = 'pending'
+                  AND claim_token = $2",
+        )
+        .bind(id.to_uuid())
+        .bind(claim_token)
+        .bind(not_before)
+        .bind(err)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Return a claimed-but-not-attempted delivery to the retry queue immediately.
+    ///
+    /// Graceful shutdown may arrive after [`Self::claim_due`] has atomically
+    /// moved a batch to `pending`, but before this process has sent every row.
+    /// Releasing those untouched rows prevents a permanent `pending` zombie.
+    /// Claiming never charged an attempt, so the counter is left unchanged.
+    ///
+    /// Returns whether this call released a still-pending row.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`].
+    pub async fn release_claim(
+        &self,
+        id: WebhookDeliveryId,
+        claim_token: uuid::Uuid,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            r"UPDATE webhook_delivery_log
+                  SET status = 'failed',
+                      next_attempt_at = now(),
+                      updated_at = now()
+                WHERE id = $1
+                  AND status = 'pending'
+                  AND claim_token = $2",
+        )
+        .bind(id.to_uuid())
+        .bind(claim_token)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
     }
 
     /// List the dead (DLQ) deliveries for one webhook, newest first, capped via
@@ -332,15 +619,17 @@ impl WebhookDeliveryRepo {
     ///
     /// # Errors
     /// Propagates any [`sqlx::Error`].
-    pub async fn list_dead(
+    #[cfg(test)]
+    pub(crate) async fn list_dead(
         &self,
         webhook: WebhookId,
         limit: Option<i64>,
     ) -> Result<Vec<WebhookDelivery>, sqlx::Error> {
         let limit = clamp_limit(limit);
         let rows = sqlx::query_as::<_, DeliveryRow>(
-            r"SELECT id, webhook_id, event_id, status, attempts, last_status_code,
-                     last_error, next_attempt_at, created_at, updated_at
+            r"SELECT id, webhook_id, event_id, request_body, request_headers,
+                     claim_token, status, attempts, last_status_code, last_error,
+                     next_attempt_at, created_at, updated_at
                FROM webhook_delivery_log
                WHERE webhook_id = $1 AND status = 'dead'
                ORDER BY created_at DESC
@@ -353,69 +642,20 @@ impl WebhookDeliveryRepo {
         Ok(rows.into_iter().map(row_to_delivery).collect())
     }
 
-    /// List a webhook's recent deliveries (any status), newest first, capped via
-    /// [`clamp_limit`]. The full per-hook delivery log for the admin view.
-    ///
-    /// # Errors
-    /// Propagates any [`sqlx::Error`].
-    pub async fn list_for_webhook(
-        &self,
-        webhook: WebhookId,
-        limit: Option<i64>,
-    ) -> Result<Vec<WebhookDelivery>, sqlx::Error> {
-        let limit = clamp_limit(limit);
-        let rows = sqlx::query_as::<_, DeliveryRow>(
-            r"SELECT id, webhook_id, event_id, status, attempts, last_status_code,
-                     last_error, next_attempt_at, created_at, updated_at
-               FROM webhook_delivery_log
-               WHERE webhook_id = $1
-               ORDER BY created_at DESC
-               LIMIT $2",
-        )
-        .bind(webhook.to_uuid())
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows.into_iter().map(row_to_delivery).collect())
-    }
-
-    /// Requeue a dead delivery for a fresh attempt: reset `attempts = 0`, clear
-    /// the error/status, and mark it `failed` due **now** so the retry loop picks
-    /// it up on its next tick. Returns whether a dead row was actually flipped
-    /// (so the caller can 404 a non-dead/unknown id). Only acts on `dead` rows —
-    /// requeuing a live (pending/failed) row is a no-op.
-    ///
-    /// # Errors
-    /// Propagates any [`sqlx::Error`].
-    pub async fn requeue(&self, id: WebhookDeliveryId) -> Result<bool, sqlx::Error> {
-        let res = sqlx::query(
-            r"UPDATE webhook_delivery_log
-                  SET status = 'failed',
-                      attempts = 0,
-                      last_error = NULL,
-                      last_status_code = NULL,
-                      next_attempt_at = now(),
-                      updated_at = now()
-                WHERE id = $1 AND status = 'dead'",
-        )
-        .bind(id.to_uuid())
-        .execute(&self.pool)
-        .await?;
-        Ok(res.rows_affected() > 0)
-    }
-
     /// Look up a single delivery by id (for the admin requeue path to resolve the
     /// owning webhook before authorizing). `None` when no row matches.
     ///
     /// # Errors
     /// Propagates any [`sqlx::Error`].
-    pub async fn get(
+    #[cfg(test)]
+    pub(crate) async fn get(
         &self,
         id: WebhookDeliveryId,
     ) -> Result<Option<WebhookDelivery>, sqlx::Error> {
         let row = sqlx::query_as::<_, DeliveryRow>(
-            r"SELECT id, webhook_id, event_id, status, attempts, last_status_code,
-                     last_error, next_attempt_at, created_at, updated_at
+            r"SELECT id, webhook_id, event_id, request_body, request_headers,
+                     claim_token, status, attempts, last_status_code, last_error,
+                     next_attempt_at, created_at, updated_at
                FROM webhook_delivery_log
                WHERE id = $1",
         )
@@ -427,74 +667,12 @@ impl WebhookDeliveryRepo {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+#[path = "webhook_delivery/tests.rs"]
+mod tests;
 
-    // ----- backoff_delay: doubling, clamped, defensive -----
-
-    #[test]
-    fn backoff_doubles_from_base() {
-        // attempts=1 ⇒ base; each further attempt doubles.
-        assert_eq!(backoff_delay(1), Duration::seconds(30));
-        assert_eq!(backoff_delay(2), Duration::seconds(60));
-        assert_eq!(backoff_delay(3), Duration::seconds(120));
-        assert_eq!(backoff_delay(4), Duration::seconds(240));
-        assert_eq!(backoff_delay(5), Duration::seconds(480));
-        assert_eq!(backoff_delay(6), Duration::seconds(960));
-    }
-
-    #[test]
-    fn backoff_is_clamped_and_monotonic() {
-        // The schedule plateaus at MAX_DELAY_SECS and never decreases.
-        let mut prev = Duration::ZERO;
-        for n in 1..=40 {
-            let d = backoff_delay(n);
-            assert!(d >= prev, "non-decreasing at n={n}");
-            assert!(d <= Duration::seconds(MAX_DELAY_SECS), "clamped at n={n}");
-            prev = d;
-        }
-        // Far past the cap it sits exactly at MAX_DELAY_SECS (no overflow).
-        assert_eq!(backoff_delay(i32::MAX), Duration::seconds(MAX_DELAY_SECS));
-    }
-
-    #[test]
-    fn backoff_defends_non_positive_attempts() {
-        // 0 / negative are treated as the first attempt (base delay), not a panic.
-        assert_eq!(backoff_delay(0), Duration::seconds(30));
-        assert_eq!(backoff_delay(-5), Duration::seconds(30));
-    }
-
-    #[test]
-    fn next_attempt_at_adds_backoff_to_now() {
-        let now = OffsetDateTime::UNIX_EPOCH;
-        assert_eq!(next_attempt_at(now, 1), now + Duration::seconds(30));
-        assert_eq!(next_attempt_at(now, 3), now + Duration::seconds(120));
-    }
-
-    // ----- is_dead_at: cap predicate -----
-
-    #[test]
-    fn is_dead_only_at_or_past_cap() {
-        assert!(!is_dead_at(1));
-        assert!(!is_dead_at(MAX_ATTEMPTS - 1));
-        assert!(is_dead_at(MAX_ATTEMPTS));
-        assert!(is_dead_at(MAX_ATTEMPTS + 1));
-        // The last retryable attempt is MAX_ATTEMPTS - 1; the cap'th failure dies.
-        assert_eq!(MAX_ATTEMPTS, 6);
-    }
-
-    // ----- clamp_limit -----
-
-    #[test]
-    fn clamp_limit_defaults_and_bounds() {
-        assert_eq!(clamp_limit(None), MAX_PAGE);
-        assert_eq!(clamp_limit(Some(0)), MAX_PAGE);
-        assert_eq!(clamp_limit(Some(-3)), MAX_PAGE);
-        assert_eq!(clamp_limit(Some(1)), 1);
-        assert_eq!(clamp_limit(Some(50)), 50);
-        assert_eq!(clamp_limit(Some(10_000)), MAX_PAGE);
-    }
-}
+#[cfg(test)]
+#[path = "webhook_delivery/claim_fencing_tests.rs"]
+mod claim_fencing_tests;
 
 /// PG-gated integration tests (run with a live Postgres + applied migrations):
 ///
@@ -508,7 +686,7 @@ mod db_tests {
     use crate::webhook::{generate_secret, WebhookRepo};
     use aero_common::{ParticipantId, RoomId, WebhookId, WorkspaceId};
 
-    fn pool() -> PgPool {
+    pub(super) fn pool() -> PgPool {
         let url = std::env::var("DATABASE_URL")
             .unwrap_or_else(|_| "postgres://aero:aero_dev_pw@localhost:5432/aero".into());
         sqlx::postgres::PgPoolOptions::new()
@@ -518,7 +696,7 @@ mod db_tests {
     }
 
     // A throwaway workspace + room + an outgoing webhook so the FK is satisfiable.
-    async fn fixture(p: &PgPool) -> WebhookId {
+    pub(super) async fn fixture(p: &PgPool) -> WebhookId {
         let actor = ParticipantId::new();
         sqlx::query("INSERT INTO participants (id, kind, display_name) VALUES ($1, 'human', $2)")
             .bind(actor.to_uuid())
@@ -527,26 +705,94 @@ mod db_tests {
             .await
             .expect("insert participant");
         let ws = WorkspaceId::new();
+        let mut tx = p.begin().await.expect("begin workspace fixture");
         sqlx::query("INSERT INTO workspaces (id, name, slug, created_by, created_at) VALUES ($1,$2,$3,$4, now())")
             .bind(ws.to_uuid())
             .bind("WHD Test WS")
             .bind(format!("whd-{ws}"))
             .bind(actor.to_uuid())
-            .execute(p)
+            .execute(&mut *tx)
             .await
             .expect("insert workspace");
         let room = RoomId::new();
-        sqlx::query("INSERT INTO rooms (id, kind, created_by, workspace_id, created_at) VALUES ($1,'group',$2,$3, now())")
-            .bind(room.to_uuid())
-            .bind(actor.to_uuid())
-            .bind(ws.to_uuid())
-            .execute(p)
-            .await
-            .expect("insert room");
+        sqlx::query(
+            "INSERT INTO rooms (id, kind, created_by, workspace_id, created_at) VALUES ($1,'group',$2,$3, now())",
+        )
+        .bind(room.to_uuid())
+        .bind(actor.to_uuid())
+        .bind(ws.to_uuid())
+        .execute(&mut *tx)
+        .await
+        .expect("insert room");
+        sqlx::query(
+            "INSERT INTO workspace_members (workspace_id, participant_id, role)
+             VALUES ($1, $2, 'owner')",
+        )
+        .bind(ws.to_uuid())
+        .bind(actor.to_uuid())
+        .execute(&mut *tx)
+        .await
+        .expect("join workspace");
+        sqlx::query(
+            "INSERT INTO room_members (room_id, participant_id, role)
+             VALUES ($1, $2, 'owner')",
+        )
+        .bind(room.to_uuid())
+        .bind(actor.to_uuid())
+        .execute(&mut *tx)
+        .await
+        .expect("join room");
+        tx.commit().await.expect("commit workspace fixture");
         WebhookRepo::new(p.clone())
-            .create_outgoing(room, "https://hook.test", &generate_secret(), &[], Some("d"), actor)
+            .create_outgoing(
+                room,
+                "https://hook.test",
+                &generate_secret(),
+                &[],
+                Some("d"),
+                actor,
+            )
             .await
             .expect("create outgoing webhook")
+    }
+
+    pub(super) async fn record_claim(
+        repo: &WebhookDeliveryRepo,
+        hook: WebhookId,
+        event_id: &str,
+    ) -> WebhookDeliveryClaim {
+        repo.record_attempt(hook, Some(event_id), b"{\"kind\":\"test\"}", &[])
+            .await
+            .unwrap()
+            .expect("new delivery claim")
+    }
+
+    pub(super) async fn begin_new_claim(
+        repo: &WebhookDeliveryRepo,
+        claim: WebhookDeliveryClaim,
+    ) -> i32 {
+        repo.begin_attempt(claim.id, claim.claim_token)
+            .await
+            .unwrap()
+            .expect("claim owns attempt")
+    }
+
+    pub(super) async fn begin_retry(repo: &WebhookDeliveryRepo, delivery: &WebhookDelivery) -> i32 {
+        repo.begin_attempt(delivery.id, delivery.claim_token)
+            .await
+            .unwrap()
+            .expect("retry claim owns attempt")
+    }
+
+    pub(super) async fn actor_for_hook(p: &PgPool, hook: WebhookId) -> ParticipantId {
+        let actor = sqlx::query_scalar::<_, uuid::Uuid>(
+            "SELECT created_by FROM outgoing_webhooks WHERE id = $1",
+        )
+        .bind(hook.to_uuid())
+        .fetch_one(p)
+        .await
+        .expect("fixture webhook has an actor");
+        ParticipantId::from_uuid(actor)
     }
 
     /// A failed delivery accrues attempts across the backoff schedule and lands at
@@ -559,32 +805,57 @@ mod db_tests {
         let repo = WebhookDeliveryRepo::new(p.clone());
         let hook = fixture(&p).await;
 
-        // Record the first attempt (attempts = 1, pending).
-        let id = repo.record_attempt(hook, Some("evt-1")).await.unwrap().expect("first claim");
+        // Recording reserves ownership but does not charge an HTTP call.
+        let claim = record_claim(&repo, hook, "evt-1").await;
+        let id = claim.id;
         let row = repo.get(id).await.unwrap().expect("row exists");
         assert_eq!(row.status, "pending");
-        assert_eq!(row.attempts, 1);
+        assert_eq!(row.attempts, 0);
+        let mut claim_token = claim.claim_token;
+        let mut attempts = begin_new_claim(&repo, claim).await;
+        assert_eq!(attempts, 1);
 
         // Fail attempts 1..MAX-1 — each goes to `failed` with a future retry time,
-        // claiming each due row back to bump the attempt count for the next fail.
-        let mut attempts = 1;
+        // then claim without charging and begin the next real HTTP call.
         while attempts < MAX_ATTEMPTS {
-            repo.mark_failed_with_backoff(id, attempts, Some(500), "boom").await.unwrap();
+            assert!(repo
+                .mark_failed_with_backoff(id, claim_token, attempts, Some(500), "boom")
+                .await
+                .unwrap());
             let r = repo.get(id).await.unwrap().unwrap();
             assert_eq!(r.status, "failed", "attempt {attempts} is retryable");
-            assert!(r.next_attempt_at.is_some(), "retryable rows have a next time");
-            // Claim it as due (use a far-future now so it's eligible) to bump attempts.
-            let far = OffsetDateTime::now_utc() + Duration::days(365);
-            let claimed = repo.claim_due(far, 10).await.unwrap();
-            assert!(claimed.iter().any(|d| d.id == id), "due row is claimed");
-            attempts += 1;
+            assert!(
+                r.next_attempt_at.is_some(),
+                "retryable rows have a next time"
+            );
+            let far = OffsetDateTime::now_utc() + Duration::days(365 + i64::from(attempts));
+            let retry = repo
+                .claim_due(far, 10)
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|delivery| delivery.id == id)
+                .expect("due row is claimed");
+            assert_eq!(
+                retry.attempts, attempts,
+                "claiming without HTTP does not charge the counter"
+            );
+            assert_ne!(retry.claim_token, claim_token, "every claim rotates token");
+            claim_token = retry.claim_token;
+            attempts = begin_retry(&repo, &retry).await;
         }
 
         // The cap'th failure parks it at `dead`.
-        repo.mark_failed_with_backoff(id, MAX_ATTEMPTS, Some(500), "final").await.unwrap();
+        assert!(repo
+            .mark_failed_with_backoff(id, claim_token, MAX_ATTEMPTS, Some(500), "final",)
+            .await
+            .unwrap());
         let dead = repo.get(id).await.unwrap().unwrap();
         assert_eq!(dead.status, "dead", "cap reached ⇒ dead");
-        assert!(dead.next_attempt_at.is_none(), "dead rows carry no retry time");
+        assert!(
+            dead.next_attempt_at.is_none(),
+            "dead rows carry no retry time"
+        );
         assert_eq!(dead.last_error.as_deref(), Some("final"));
 
         // It surfaces in the DLQ listing for the hook.
@@ -592,15 +863,152 @@ mod db_tests {
         assert!(dlq.iter().any(|d| d.id == id), "dead row is in the DLQ");
 
         // Requeue resets attempts to 0 and makes it due now (status back to failed).
-        assert!(repo.requeue(id).await.unwrap(), "a dead row is requeued");
+        let dead_token = dead.claim_token;
+        let actor = actor_for_hook(&p, hook).await;
+        repo.requeue_authorized(id, actor)
+            .await
+            .expect("a dead row is requeued");
         let requeued = repo.get(id).await.unwrap().unwrap();
         assert_eq!(requeued.status, "failed");
         assert_eq!(requeued.attempts, 0, "attempts reset");
+        assert_ne!(
+            requeued.claim_token, dead_token,
+            "admin requeue rotates the ownership generation"
+        );
         assert!(requeued.last_error.is_none(), "error cleared");
         assert!(requeued.next_attempt_at.is_some(), "due now");
 
         // Idempotent: requeuing a non-dead row flips nothing.
-        assert!(!repo.requeue(id).await.unwrap(), "second requeue is a no-op");
+        assert!(matches!(
+            repo.requeue_authorized(id, actor).await,
+            Err(aero_common::Error::NotFound(_))
+        ));
+    }
+
+    /// A graceful-shutdown release returns an untouched retry claim to `failed`
+    /// without charging an HTTP attempt that never happened.
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn webhook_delivery_release_claim_restores_retry_state() {
+        let p = pool();
+        let repo = WebhookDeliveryRepo::new(p.clone());
+        let hook = fixture(&p).await;
+        let initial = record_claim(&repo, hook, "evt-release").await;
+        let id = initial.id;
+        let attempts = begin_new_claim(&repo, initial).await;
+        assert!(repo
+            .mark_failed_with_backoff(id, initial.claim_token, attempts, None, "transient",)
+            .await
+            .unwrap());
+
+        let far = OffsetDateTime::now_utc() + Duration::days(365);
+        let claimed = repo.claim_due(far, 10).await.unwrap();
+        let claimed = claimed
+            .into_iter()
+            .find(|delivery| delivery.id == id)
+            .expect("failed row is claimed");
+        assert_eq!(claimed.status, "pending");
+        assert_eq!(claimed.attempts, 1);
+
+        assert!(repo.release_claim(id, claimed.claim_token).await.unwrap());
+        let released = repo.get(id).await.unwrap().expect("released row exists");
+        assert_eq!(released.status, "failed");
+        assert_eq!(released.attempts, 1, "unattempted retry is not charged");
+        assert!(
+            released.next_attempt_at.is_some(),
+            "released row is due again"
+        );
+        assert!(
+            !repo.release_claim(id, claimed.claim_token).await.unwrap(),
+            "release is idempotent"
+        );
+    }
+
+    /// Breaker deferral is queue control, not an HTTP call: it keeps attempts at
+    /// zero and the row cannot be reclaimed before the breaker deadline.
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn webhook_delivery_breaker_defer_preserves_attempts_and_deadline() {
+        let p = pool();
+        let repo = WebhookDeliveryRepo::new(p.clone());
+        let hook = fixture(&p).await;
+        let claim = record_claim(&repo, hook, "evt-breaker-defer").await;
+        // Breaker deadlines are persisted as whole unix seconds.
+        let deadline =
+            OffsetDateTime::from_unix_timestamp(OffsetDateTime::now_utc().unix_timestamp() + 300)
+                .unwrap();
+
+        assert!(repo
+            .defer_claim(
+                claim.id,
+                claim.claim_token,
+                deadline,
+                "circuit breaker open",
+            )
+            .await
+            .unwrap());
+        let deferred = repo.get(claim.id).await.unwrap().unwrap();
+        assert_eq!(deferred.status, "failed");
+        assert_eq!(deferred.attempts, 0);
+        assert!(
+            deferred.next_attempt_at.expect("defer deadline") >= deadline,
+            "SQL deadline must never precede breaker.open_until"
+        );
+        assert!(
+            repo.claim_due(deadline - Duration::seconds(1), 10)
+                .await
+                .unwrap()
+                .iter()
+                .all(|row| row.id != claim.id),
+            "breaker-deferred row is not due early"
+        );
+        let reclaimed = repo
+            .claim_due(deadline + Duration::seconds(1), 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == claim.id)
+            .expect("row is due after breaker deadline");
+        assert_eq!(reclaimed.attempts, 0, "defer did not consume a retry");
+    }
+
+    /// The counter advances exactly when each HTTP call begins: recording and
+    /// retry claiming remain at 0/1, then `begin_attempt` moves 0→1 and 1→2.
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn webhook_delivery_attempts_count_only_begun_http_calls() {
+        let p = pool();
+        let repo = WebhookDeliveryRepo::new(p.clone());
+        let hook = fixture(&p).await;
+        let first = record_claim(&repo, hook, "evt-attempt-count").await;
+        assert_eq!(repo.get(first.id).await.unwrap().unwrap().attempts, 0);
+
+        let first_attempt = begin_new_claim(&repo, first).await;
+        assert_eq!(first_attempt, 1);
+        assert!(repo
+            .mark_failed_with_backoff(
+                first.id,
+                first.claim_token,
+                first_attempt,
+                Some(503),
+                "retry",
+            )
+            .await
+            .unwrap());
+
+        let second = repo
+            .claim_due(OffsetDateTime::now_utc() + Duration::days(365), 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == first.id)
+            .expect("failed row is claimed");
+        assert_eq!(second.attempts, 1, "claim itself is not a call");
+        assert_eq!(begin_retry(&repo, &second).await, 2);
+        assert!(repo
+            .mark_delivered(second.id, second.claim_token, 204)
+            .await
+            .unwrap());
     }
 
     /// A delivered attempt is terminal and never surfaces for retry.
@@ -611,23 +1019,85 @@ mod db_tests {
         let repo = WebhookDeliveryRepo::new(p.clone());
         let hook = fixture(&p).await;
 
-        let id = repo.record_attempt(hook, None).await.unwrap().expect("null event_id always claims");
-        repo.mark_delivered(id, 200).await.unwrap();
+        let claim = repo
+            .record_attempt(hook, None, b"{\"kind\":\"test\"}", &[])
+            .await
+            .unwrap()
+            .expect("null event_id always claims");
+        let id = claim.id;
+        assert_eq!(begin_new_claim(&repo, claim).await, 1);
+        assert!(repo
+            .mark_delivered(id, claim.claim_token, 200)
+            .await
+            .unwrap());
         let row = repo.get(id).await.unwrap().unwrap();
         assert_eq!(row.status, "delivered");
         assert_eq!(row.last_status_code, Some(200));
         assert!(row.next_attempt_at.is_none());
 
         // It is not in the DLQ and not claimed by the retry loop.
-        assert!(repo.list_dead(hook, None).await.unwrap().iter().all(|d| d.id != id));
+        assert!(repo
+            .list_dead(hook, None)
+            .await
+            .unwrap()
+            .iter()
+            .all(|d| d.id != id));
         let far = OffsetDateTime::now_utc() + Duration::days(365);
-        assert!(repo.claim_due(far, 10).await.unwrap().iter().all(|d| d.id != id));
+        assert!(repo
+            .claim_due(far, 10)
+            .await
+            .unwrap()
+            .iter()
+            .all(|d| d.id != id));
     }
 
-    /// JetStream redelivery (or a client retry) of the SAME event to the SAME
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn webhook_delivery_request_is_immutable() {
+        let p = pool();
+        let repo = WebhookDeliveryRepo::new(p.clone());
+        let hook = fixture(&p).await;
+        let claim = repo
+            .record_attempt(
+                hook,
+                Some("evt-immutable"),
+                b"{\"body\":\"original\"}",
+                &[("Content-Type".to_owned(), "application/json".to_owned())],
+            )
+            .await
+            .unwrap()
+            .expect("first attempt claims");
+        let id = claim.id;
+
+        let error = sqlx::query(
+            r"UPDATE webhook_delivery_log
+                  SET request_body = $2
+                WHERE id = $1",
+        )
+        .bind(id.to_uuid())
+        .bind(b"{\"body\":\"changed\"}".as_slice())
+        .execute(&p)
+        .await
+        .expect_err("request body mutation must be rejected");
+        assert_eq!(
+            error
+                .as_database_error()
+                .and_then(sqlx::error::DatabaseError::code)
+                .as_deref(),
+            Some("23514")
+        );
+
+        let stored = repo.get(id).await.unwrap().unwrap();
+        assert_eq!(
+            stored.request_body.as_deref(),
+            Some(b"{\"body\":\"original\"}".as_slice())
+        );
+    }
+
+    /// `JetStream` redelivery (or a client retry) of the SAME event to the SAME
     /// endpoint must NOT trigger a second external POST: `record_attempt` claims
     /// `(webhook_id, event_id)` once (Some), and a redelivery is deduped (None) so
-    /// the dispatcher skips it. NULL event_id (no correlation id) is never deduped.
+    /// the dispatcher skips it. NULL `event_id` (no correlation id) is never deduped.
     /// Guards migration 0150's partial unique index + the ON CONFLICT claim.
     #[tokio::test]
     #[ignore = "requires live Postgres"]
@@ -636,15 +1106,54 @@ mod db_tests {
         let repo = WebhookDeliveryRepo::new(p.clone());
         let hook = fixture(&p).await;
 
-        let first = repo.record_attempt(hook, Some("evt-dup")).await.unwrap();
+        let first = repo
+            .record_attempt(
+                hook,
+                Some("evt-dup"),
+                b"{\"kind\":\"test\"}",
+                &[("Content-Type".to_owned(), "application/json".to_owned())],
+            )
+            .await
+            .unwrap();
         assert!(first.is_some(), "first delivery of an event claims");
-        let second = repo.record_attempt(hook, Some("evt-dup")).await.unwrap();
-        assert!(second.is_none(), "redelivery of the same event must NOT claim again (no duplicate POST)");
-        let other = repo.record_attempt(hook, Some("evt-other")).await.unwrap();
-        assert!(other.is_some(), "a different event for the same hook still claims");
+        let second = repo
+            .record_attempt(hook, Some("evt-dup"), b"{\"kind\":\"changed\"}", &[])
+            .await
+            .unwrap();
+        assert!(
+            second.is_none(),
+            "redelivery of the same event must NOT claim again (no duplicate POST)"
+        );
+        let stored = repo.get(first.unwrap().id).await.unwrap().unwrap();
+        assert_eq!(
+            stored.request_body.as_deref(),
+            Some(b"{\"kind\":\"test\"}".as_slice()),
+            "a dedupe conflict must never replace the immutable original body"
+        );
+        assert_eq!(
+            stored.request_headers,
+            vec![("Content-Type".to_owned(), "application/json".to_owned())]
+        );
+        let other = repo
+            .record_attempt(hook, Some("evt-other"), b"{\"kind\":\"test\"}", &[])
+            .await
+            .unwrap();
+        assert!(
+            other.is_some(),
+            "a different event for the same hook still claims"
+        );
         // NULL event_id carries no correlation id → never deduped.
-        let n1 = repo.record_attempt(hook, None).await.unwrap();
-        let n2 = repo.record_attempt(hook, None).await.unwrap();
-        assert!(n1.is_some() && n2.is_some(), "null event_id always claims (no dedup)");
+        let n1 = repo
+            .record_attempt(hook, None, b"{\"kind\":\"test\"}", &[])
+            .await
+            .unwrap();
+        let n2 = repo
+            .record_attempt(hook, None, b"{\"kind\":\"test\"}", &[])
+            .await
+            .unwrap();
+        assert!(
+            n1.is_some() && n2.is_some(),
+            "null event_id always claims (no dedup)"
+        );
     }
 }

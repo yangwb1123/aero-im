@@ -36,6 +36,19 @@ impl AiBackend for AiServiceAdapter {
             .map_err(|e| e.to_string())
     }
 
+    async fn summarize_room_with_usage_context(
+        &self,
+        room: RoomId,
+        last_n: usize,
+        usage_context: aero_ai::usage::UsageContext,
+    ) -> Result<String, String> {
+        self.inner
+            .summarize_room_with_usage_context(room, last_n, usage_context)
+            .await
+            .map(|(summary, _)| summary)
+            .map_err(|error| error.to_string())
+    }
+
     async fn answer_question(
         &self,
         room: RoomId,
@@ -50,6 +63,24 @@ impl AiBackend for AiServiceAdapter {
         Ok(AiAnswer {
             answer: result.answer,
             citations: result.citations.into_iter().collect::<Vec<MessageId>>(),
+        })
+    }
+
+    async fn answer_question_with_usage_context(
+        &self,
+        room: RoomId,
+        question: &str,
+        k: usize,
+        usage_context: aero_ai::usage::UsageContext,
+    ) -> Result<AiAnswer, String> {
+        let (result, _) = self
+            .inner
+            .answer_question_with_usage_context(room, question, k, usage_context)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(AiAnswer {
+            answer: result.answer,
+            citations: result.citations,
         })
     }
 
@@ -72,6 +103,24 @@ impl AiBackend for AiServiceAdapter {
         })
     }
 
+    async fn answer_question_agentic_with_usage_context(
+        &self,
+        room: RoomId,
+        question: &str,
+        max_iters: usize,
+        usage_context: aero_ai::usage::UsageContext,
+    ) -> Result<AiAnswer, String> {
+        let (result, _) = self
+            .inner
+            .answer_question_agentic_with_context(room, question, max_iters, usage_context)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(AiAnswer {
+            answer: result.answer,
+            citations: result.citations,
+        })
+    }
+
     async fn answer_question_workspace(
         &self,
         participant: ParticipantId,
@@ -90,16 +139,82 @@ impl AiBackend for AiServiceAdapter {
         })
     }
 
+    async fn answer_question_workspace_with_usage_context(
+        &self,
+        participant: ParticipantId,
+        workspace: WorkspaceId,
+        question: &str,
+        k: usize,
+        usage_context: aero_ai::usage::UsageContext,
+    ) -> Result<AiAnswer, String> {
+        let result = self
+            .inner
+            .answer_question_workspace_with_usage_context(
+                participant,
+                workspace,
+                question,
+                k,
+                usage_context,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(AiAnswer {
+            answer: result.answer,
+            citations: result.citations,
+        })
+    }
+
     async fn embed_text(&self, text: &str) -> Result<Vec<f32>, String> {
         self.inner.embed_text(text).await.map_err(|e| e.to_string())
     }
 
+    async fn embed_text_with_usage_context(
+        &self,
+        text: &str,
+        usage_context: aero_ai::usage::UsageContext,
+        operation: &str,
+    ) -> Result<Vec<f32>, String> {
+        self.inner
+            .embed_text_with_context(text, usage_context, operation)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     async fn translate(&self, text: &str, target_lang: &str) -> Result<String, String> {
-        self.inner.translate(text, target_lang).await.map_err(|e| e.to_string())
+        self.inner
+            .translate(text, target_lang)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn translate_with_usage_context(
+        &self,
+        text: &str,
+        target_lang: &str,
+        usage_context: aero_ai::usage::UsageContext,
+    ) -> Result<String, String> {
+        self.inner
+            .translate_with_usage_context(text, target_lang, usage_context)
+            .await
+            .map_err(|error| error.to_string())
     }
 
     async fn summarize_text(&self, text: &str) -> Result<String, String> {
-        self.inner.summarize_text(text).await.map_err(|e| e.to_string())
+        self.inner
+            .summarize_text(text)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn summarize_text_with_usage_context(
+        &self,
+        text: &str,
+        usage_context: aero_ai::usage::UsageContext,
+    ) -> Result<String, String> {
+        self.inner
+            .summarize_text_with_usage_context(text, usage_context)
+            .await
+            .map_err(|error| error.to_string())
     }
 
     async fn summarize_thread(
@@ -113,6 +228,18 @@ impl AiBackend for AiServiceAdapter {
             .map_err(|e| e.to_string())
     }
 
+    async fn summarize_thread_with_usage_context(
+        &self,
+        root: MessageId,
+        max_replies: usize,
+        usage_context: aero_ai::usage::UsageContext,
+    ) -> Result<String, String> {
+        self.inner
+            .summarize_thread_with_usage_context(root, max_replies, usage_context)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     async fn summarize_workspace(
         &self,
         participant: ParticipantId,
@@ -123,6 +250,19 @@ impl AiBackend for AiServiceAdapter {
             .summarize_workspace(participant, workspace, last_n)
             .await
             .map_err(|e| e.to_string())
+    }
+
+    async fn summarize_workspace_with_usage_context(
+        &self,
+        participant: ParticipantId,
+        workspace: WorkspaceId,
+        last_n: usize,
+        usage_context: aero_ai::usage::UsageContext,
+    ) -> Result<String, String> {
+        self.inner
+            .summarize_workspace_with_usage_context(participant, workspace, last_n, usage_context)
+            .await
+            .map_err(|error| error.to_string())
     }
 
     async fn find_expert(
@@ -143,6 +283,36 @@ impl AiBackend for AiServiceAdapter {
                 participant: e.participant,
                 score: e.score,
                 citations: e.citations,
+            })
+            .collect())
+    }
+
+    async fn find_expert_with_usage_context(
+        &self,
+        participant: ParticipantId,
+        workspace: WorkspaceId,
+        topic: &str,
+        k: usize,
+        usage_context: aero_ai::usage::UsageContext,
+    ) -> Result<Vec<AiExpert>, String> {
+        let experts = self
+            .inner
+            .find_expert_with_usage_context(
+                participant,
+                workspace,
+                topic,
+                k,
+                EXPERT_POOL,
+                usage_context,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(experts
+            .into_iter()
+            .map(|expert| AiExpert {
+                participant: expert.participant,
+                score: expert.score,
+                citations: expert.citations,
             })
             .collect())
     }
@@ -187,6 +357,18 @@ impl AiBackend for AiServiceAdapter {
         self.inner.moderate(text).await.map_err(|e| e.to_string())
     }
 
+    async fn moderate_with_context(
+        &self,
+        text: &str,
+        usage_context: aero_ai::usage::UsageContext,
+    ) -> Result<Option<String>, String> {
+        self.inner
+            .moderate_with_usage_context(text, usage_context)
+            .await
+            .map(|(verdict, _)| verdict)
+            .map_err(|error| error.to_string())
+    }
+
     fn has_anthropic(&self) -> bool {
         self.inner.has_anthropic()
     }
@@ -202,12 +384,41 @@ impl AiBackend for AiServiceAdapter {
             .map_err(|e| e.to_string())
     }
 
+    async fn generate_thread_title_with_usage_context(
+        &self,
+        root: MessageId,
+        max_replies: usize,
+        usage_context: aero_ai::usage::UsageContext,
+    ) -> Result<String, String> {
+        self.inner
+            .generate_thread_title_with_usage_context(root, max_replies, usage_context)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     async fn score_sentiment(&self, text: &str) -> Result<AiSentiment, String> {
         let score = self
             .inner
             .score_message_sentiment(text)
             .await
             .map_err(|e| e.to_string())?;
+        Ok(AiSentiment {
+            sentiment: score.sentiment.as_str().to_owned(),
+            toxicity: score.toxicity,
+            tone: score.tone,
+        })
+    }
+
+    async fn score_sentiment_with_usage_context(
+        &self,
+        text: &str,
+        usage_context: aero_ai::usage::UsageContext,
+    ) -> Result<AiSentiment, String> {
+        let score = self
+            .inner
+            .score_message_sentiment_with_usage_context(text, usage_context)
+            .await
+            .map_err(|error| error.to_string())?;
         Ok(AiSentiment {
             sentiment: score.sentiment.as_str().to_owned(),
             toxicity: score.toxicity,
@@ -237,6 +448,30 @@ impl AiBackend for AiServiceAdapter {
         Ok((citations, boxed))
     }
 
+    async fn answer_question_stream_with_usage_context(
+        &self,
+        room: RoomId,
+        question: &str,
+        k: usize,
+        usage_context: aero_ai::usage::UsageContext,
+    ) -> Result<
+        (
+            Vec<MessageId>,
+            Pin<Box<dyn futures::Stream<Item = Result<String, String>> + Send + 'static>>,
+        ),
+        String,
+    > {
+        let (citations, stream) = self
+            .inner
+            .answer_question_stream_with_usage_context(room, question, k, usage_context)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok((
+            citations,
+            Box::pin(stream.map(|result| result.map_err(|error| error.to_string()))),
+        ))
+    }
+
     async fn ask_with_context(
         &self,
         participant: ParticipantId,
@@ -249,6 +484,28 @@ impl AiBackend for AiServiceAdapter {
             .ask_with_context(participant, room, question, k)
             .await
             .map_err(|e| e.to_string())?;
-        Ok(AiAnswer { answer: result.answer, citations: result.citations })
+        Ok(AiAnswer {
+            answer: result.answer,
+            citations: result.citations,
+        })
+    }
+
+    async fn ask_with_context_and_usage_context(
+        &self,
+        participant: ParticipantId,
+        room: RoomId,
+        question: &str,
+        k: usize,
+        usage_context: aero_ai::usage::UsageContext,
+    ) -> Result<AiAnswer, String> {
+        let result = self
+            .inner
+            .ask_with_context_and_usage_context(participant, room, question, k, usage_context)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok(AiAnswer {
+            answer: result.answer,
+            citations: result.citations,
+        })
     }
 }

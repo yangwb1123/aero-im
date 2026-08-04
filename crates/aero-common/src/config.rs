@@ -26,13 +26,32 @@ pub struct AppConfig {
 }
 
 /// Configuration for a single storage region (data residency).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct StorageRegionConfig {
     pub endpoint: Option<String>,
     pub bucket: String,
     pub region: String,
     pub access_key: String,
     pub secret_key: String,
+    /// Optional AWS KMS key id/ARN/alias used for S3 SSE-KMS on uploads.
+    #[serde(default)]
+    pub kms_key_id: Option<String>,
+}
+
+impl std::fmt::Debug for StorageRegionConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StorageRegionConfig")
+            .field("endpoint", &self.endpoint)
+            .field("bucket", &self.bucket)
+            .field("region", &self.region)
+            .field("access_key", &"<redacted>")
+            .field("secret_key", &"<redacted>")
+            .field(
+                "kms_key_id",
+                &self.kms_key_id.as_ref().map(|_| "<configured>"),
+            )
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -58,16 +77,32 @@ fn default_rtmp_listen() -> String {
     "0.0.0.0:1935".into()
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct DatabaseConfig {
     pub url: String,
     #[serde(default = "default_pool_max")]
     pub max_connections: u32,
-    /// Optional read-replica DSN (ROADMAP 方向四). When set, read-only queries are
-    /// routed here to offload the primary; absent ⇒ reads use the primary pool
-    /// (single-pool, unchanged behaviour). Set via `AERO__DATABASE__REPLICA_URL`.
+    /// Optional read-replica DSN (ROADMAP 方向四). Only call sites explicitly
+    /// marked eventual by `QueryRouter` use it; authorization, cross-room and
+    /// read-after-write queries remain on primary. When absent, eventual reads
+    /// also use primary. Set via `AERO__DATABASE__REPLICA_URL`.
     #[serde(default)]
     pub replica_url: Option<String>,
+}
+
+/// Database URLs routinely contain passwords. Keep both primary and replica
+/// DSNs out of logs when an enclosing [`AppConfig`] is formatted with `Debug`.
+impl std::fmt::Debug for DatabaseConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DatabaseConfig")
+            .field("url", &"<redacted>")
+            .field("max_connections", &self.max_connections)
+            .field(
+                "replica_url",
+                &self.replica_url.as_ref().map(|_| "<configured>"),
+            )
+            .finish()
+    }
 }
 
 fn default_pool_max() -> u32 {
@@ -120,7 +155,10 @@ impl std::fmt::Debug for AuthConfig {
             .field("issuer", &self.issuer)
             .field("access_ttl_secs", &self.access_ttl_secs)
             .field("refresh_ttl_secs", &self.refresh_ttl_secs)
-            .field("jwt_additional_public_keys", &self.jwt_additional_public_keys.len())
+            .field(
+                "jwt_additional_public_keys",
+                &self.jwt_additional_public_keys.len(),
+            )
             .finish()
     }
 }
@@ -174,8 +212,8 @@ fn clamp_sample_rate(rate: f64) -> f64 {
 }
 
 /// SMTP configuration for transactional email (password reset, invitation).
-/// When absent (`AERO__EMAIL__*` envs not set), email features fall back to
-/// log-only mode (token printed in server logs for development).
+/// When absent (`AERO__EMAIL__*` envs not set), password-reset requests remain
+/// enumeration-safe no-ops.
 #[derive(Clone, Deserialize)]
 pub struct EmailConfig {
     /// SMTP relay hostname.
@@ -192,10 +230,20 @@ pub struct EmailConfig {
     /// Use STARTTLS (default true; set false for implicit-TLS port 465).
     #[serde(default = "default_smtp_starttls")]
     pub starttls: bool,
+    /// Permit plaintext SMTP only when `host` is localhost or a loopback IP.
+    ///
+    /// This is intended solely for local capture servers such as Mailpit. When
+    /// enabled it overrides `starttls`; non-loopback hosts are rejected.
+    #[serde(default)]
+    pub allow_insecure_localhost: bool,
 }
 
-fn default_smtp_port() -> u16 { 587 }
-fn default_smtp_starttls() -> bool { true }
+fn default_smtp_port() -> u16 {
+    587
+}
+fn default_smtp_starttls() -> bool {
+    true
+}
 
 impl std::fmt::Debug for EmailConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -206,6 +254,7 @@ impl std::fmt::Debug for EmailConfig {
             .field("password", &"<redacted>")
             .field("from", &self.from)
             .field("starttls", &self.starttls)
+            .field("allow_insecure_localhost", &self.allow_insecure_localhost)
             .finish()
     }
 }
@@ -269,6 +318,58 @@ mod tests {
         assert!(dbg.contains("<redacted>"), "redaction marker present");
         // Non-secret fields still render for diagnostics.
         assert!(dbg.contains("aero") && dbg.contains("900"));
+    }
+
+    #[test]
+    fn database_config_debug_redacts_primary_and_replica_credentials() {
+        let cfg = DatabaseConfig {
+            url: "postgres://primary:PRIMARY_SECRET@db/aero".into(),
+            max_connections: 24,
+            replica_url: Some("postgres://replica:REPLICA_SECRET@db-ro/aero".into()),
+        };
+        let dbg = format!("{cfg:?}");
+        assert!(!dbg.contains("PRIMARY_SECRET"));
+        assert!(!dbg.contains("REPLICA_SECRET"));
+        assert!(!dbg.contains("postgres://"));
+        assert!(dbg.contains("<redacted>"));
+        assert!(dbg.contains("<configured>"));
+        assert!(dbg.contains("24"));
+    }
+
+    #[test]
+    fn storage_region_debug_redacts_credentials_and_kms_metadata() {
+        let cfg = StorageRegionConfig {
+            endpoint: Some("https://s3.example.test".into()),
+            bucket: "aero-eu".into(),
+            region: "eu-central-1".into(),
+            access_key: "ACCESS_IDENTIFIER".into(),
+            secret_key: "SECRET_MATERIAL".into(),
+            kms_key_id: Some("arn:aws:kms:eu-central-1:123456789012:key/secret-metadata".into()),
+        };
+        let dbg = format!("{cfg:?}");
+        assert!(!dbg.contains("ACCESS_IDENTIFIER"));
+        assert!(!dbg.contains("SECRET_MATERIAL"));
+        assert!(!dbg.contains("arn:aws:kms"));
+        assert!(dbg.contains("aero-eu"));
+        assert!(dbg.contains("<configured>"));
+    }
+
+    #[test]
+    fn email_config_debug_redacts_password_and_shows_transport_mode() {
+        let cfg = EmailConfig {
+            host: "127.0.0.1".into(),
+            port: 1025,
+            username: String::new(),
+            password: "SMTP_SECRET".into(),
+            from: "noreply@example.test".into(),
+            starttls: false,
+            allow_insecure_localhost: true,
+        };
+        let dbg = format!("{cfg:?}");
+        assert!(!dbg.contains("SMTP_SECRET"));
+        assert!(dbg.contains("<redacted>"));
+        assert!(dbg.contains("allow_insecure_localhost"));
+        assert!(dbg.contains("true"));
     }
 
     #[test]

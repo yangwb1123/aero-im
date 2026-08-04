@@ -8,6 +8,36 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+mod governance;
+mod governance_tx;
+
+/// Maximum bots one participant may own across all workspaces.
+pub const MAX_BOTS_PER_OWNER: i64 = 16;
+/// Maximum event subscriptions retained for one bot.
+pub const MAX_BOT_SUBSCRIPTIONS_PER_BOT: i64 = 32;
+/// Safety-page ceiling for workspace-wide bot listings (many owners may share it).
+pub const MAX_BOTS_PER_WORKSPACE_PAGE: i64 = 200;
+/// Maximum external webhook candidates materialized for one room event.
+pub const MAX_BOT_EVENT_CANDIDATES: usize = 1_024;
+/// Maximum external bot subscriptions retained across one workspace.
+pub const MAX_BOT_EXTERNAL_SUBSCRIPTIONS_PER_WORKSPACE: i64 = 1_024;
+const BOT_EVENT_CANDIDATE_PROBE_LIMIT: i64 = 1_025;
+
+/// A bounded bot/subscription write failed.
+#[derive(Debug, thiserror::Error)]
+pub enum BotWriteError {
+    #[error("bot quota exceeded")]
+    BotQuotaExceeded,
+    #[error("bot subscription quota exceeded")]
+    SubscriptionQuotaExceeded,
+    #[error("workspace external bot subscription quota exceeded")]
+    WorkspaceSubscriptionQuotaExceeded,
+    #[error("external bot subscription requires a canonical workspace scope")]
+    MissingWorkspaceScope,
+    #[error(transparent)]
+    Db(#[from] sqlx::Error),
+}
+
 /// A bot record (storage projection).
 #[derive(Debug, Clone, Serialize)]
 pub struct Bot {
@@ -16,7 +46,7 @@ pub struct Bot {
     pub name: String,
     pub icon_url: Option<String>,
     pub workspace_id: Option<WorkspaceId>,
-    /// `true` when a token has been issued (token_hash is non-NULL).
+    /// `true` when a token has been issued (`token_hash` is non-NULL).
     pub has_token: bool,
     pub created_at: time::OffsetDateTime,
 }
@@ -32,17 +62,33 @@ impl BotRepo {
     }
 
     /// Register a new bot: creates a participant row + bot row atomically.
+    #[cfg(test)]
     pub async fn create(
         &self,
         owner: ParticipantId,
         name: &str,
         icon_url: Option<&str>,
         workspace: Option<WorkspaceId>,
-    ) -> Result<ParticipantId, sqlx::Error> {
+    ) -> Result<ParticipantId, BotWriteError> {
         let bot_id = ParticipantId::new();
         let now = time::OffsetDateTime::now_utc();
 
         let mut tx = self.pool.begin().await?;
+        // Serialize the owner-scoped count + inserts. A hash collision merely
+        // adds harmless contention; it cannot weaken the quota.
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!("aero:bot-owner:{}", owner.to_uuid()))
+            .execute(&mut *tx)
+            .await?;
+        let count = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM bots WHERE owner_id = $1")
+            .bind(owner.to_uuid())
+            .fetch_one(&mut *tx)
+            .await?;
+        if count >= MAX_BOTS_PER_OWNER {
+            tx.commit().await?;
+            return Err(BotWriteError::BotQuotaExceeded);
+        }
+
         sqlx::query(
             r"INSERT INTO participants (id, kind, display_name, created_by, created_at)
                VALUES ($1, 'bot', $2, $3, $4)",
@@ -80,9 +126,11 @@ impl BotRepo {
             r"SELECT id, owner_id, name, icon_url, workspace_id, token_hash IS NOT NULL AS has_token, created_at
                FROM bots
               WHERE workspace_id IS NOT DISTINCT FROM $1
-              ORDER BY created_at DESC",
+              ORDER BY created_at DESC
+              LIMIT $2",
         )
         .bind(workspace.map(|w| w.to_uuid()))
+        .bind(MAX_BOTS_PER_WORKSPACE_PAGE)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(Into::into).collect())
@@ -90,14 +138,16 @@ impl BotRepo {
 
     /// Generate and persist a new bot token. Returns the plaintext token
     /// (the caller must present it to the bot owner — it is never stored).
+    #[cfg(test)]
     pub async fn rotate_token(&self, bot_id: ParticipantId) -> Result<Option<String>, sqlx::Error> {
         let token = format!("bot_{}", uuid::Uuid::new_v4());
         let hash = crate::revoked_token::hash_token(&token);
-        let result = sqlx::query("UPDATE bots SET token_hash = $2, updated_at = now() WHERE id = $1")
-            .bind(bot_id.to_uuid())
-            .bind(&hash)
-            .execute(&self.pool)
-            .await?;
+        let result =
+            sqlx::query("UPDATE bots SET token_hash = $2, updated_at = now() WHERE id = $1")
+                .bind(bot_id.to_uuid())
+                .bind(&hash)
+                .execute(&self.pool)
+                .await?;
         if result.rows_affected() == 0 {
             return Ok(None);
         }
@@ -130,36 +180,94 @@ impl BotRepo {
         Ok(row.map(|(id,)| ParticipantId::from_uuid(id)))
     }
 
-    /// The opaque prefix every minted bot token carries (see [`Self::rotate_token`],
-    /// which mints `bot_<uuid>`). Exposed so the auth extractor can cheaply tell a
-    /// bot token apart from a PAT (`aero_pat_…`) or a JWT before hashing / DB work.
+    /// The opaque prefix every minted bot token carries (see
+    /// [`Self::rotate_token_authorized`]). Exposed so the auth extractor can
+    /// cheaply tell a bot token apart from a PAT or JWT before hashing / DB work.
     pub const TOKEN_PREFIX: &'static str = "bot_";
     // ---------- event subscriptions (方向三) ----------
 
     /// Subscribe a bot to an event type.
+    #[cfg(test)]
     pub async fn subscribe(
         &self,
         bot_id: ParticipantId,
         event_type: &str,
         filters: Option<&serde_json::Value>,
         webhook_url: Option<&str>,
-    ) -> Result<Uuid, sqlx::Error> {
+        webhook_secret: Option<&str>,
+    ) -> Result<Uuid, BotWriteError> {
         let id = Uuid::new_v4();
+        let workspace_scope = if webhook_url.is_some() {
+            Some(
+                filters
+                    .and_then(serde_json::Value::as_object)
+                    .and_then(|object| object.get("workspace_id"))
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|workspace| !workspace.is_empty())
+                    .ok_or(BotWriteError::MissingWorkspaceScope)?
+                    .to_owned(),
+            )
+        } else {
+            None
+        };
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!("aero:bot-subscriptions:{}", bot_id.to_uuid()))
+            .execute(&mut *tx)
+            .await?;
+        let count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM bot_event_subscriptions WHERE bot_id = $1",
+        )
+        .bind(bot_id.to_uuid())
+        .fetch_one(&mut *tx)
+        .await?;
+        if count >= MAX_BOT_SUBSCRIPTIONS_PER_BOT {
+            tx.commit().await?;
+            return Err(BotWriteError::SubscriptionQuotaExceeded);
+        }
+
+        if let Some(workspace_scope) = workspace_scope.as_deref() {
+            // Every external room subscription is projected onto its canonical
+            // workspace by the API. Serialize the workspace-wide count so two
+            // bots cannot concurrently cross the shared fan-out ceiling.
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+                .bind(format!("aero:bot-external-subscriptions:{workspace_scope}"))
+                .execute(&mut *tx)
+                .await?;
+            let workspace_count = sqlx::query_scalar::<_, i64>(
+                r"SELECT COUNT(*)
+                    FROM bot_event_subscriptions
+                   WHERE webhook_url IS NOT NULL
+                     AND scope_workspace_id = $1",
+            )
+            .bind(workspace_scope)
+            .fetch_one(&mut *tx)
+            .await?;
+            if workspace_count >= MAX_BOT_EXTERNAL_SUBSCRIPTIONS_PER_WORKSPACE {
+                tx.commit().await?;
+                return Err(BotWriteError::WorkspaceSubscriptionQuotaExceeded);
+            }
+        }
+
         sqlx::query(
-            r"INSERT INTO bot_event_subscriptions (id, bot_id, event_type, filters, webhook_url)
-               VALUES ($1, $2, $3, $4, $5)",
+            r"INSERT INTO bot_event_subscriptions
+                  (id, bot_id, event_type, filters, webhook_url, webhook_secret)
+               VALUES ($1, $2, $3, COALESCE($4, '{}'::JSONB), $5, $6)",
         )
         .bind(id)
         .bind(bot_id.to_uuid())
         .bind(event_type)
         .bind(filters)
         .bind(webhook_url)
-        .execute(&self.pool)
+        .bind(webhook_secret)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(id)
     }
 
     /// List subscriptions for a bot.
+    #[cfg(test)]
     pub async fn list_subscriptions(
         &self,
         bot_id: ParticipantId,
@@ -168,25 +276,53 @@ impl BotRepo {
             r"SELECT id, bot_id, event_type, filters, webhook_url, created_at
                FROM bot_event_subscriptions
               WHERE bot_id = $1
-              ORDER BY created_at DESC",
+              ORDER BY created_at DESC
+              LIMIT $2",
         )
         .bind(bot_id.to_uuid())
+        .bind(MAX_BOT_SUBSCRIPTIONS_PER_BOT)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(Into::into).collect())
     }
 
     /// Delete a subscription (owner-scoped: only the owning bot's).
+    #[cfg(test)]
     pub async fn delete_subscription(
         &self,
         sub_id: Uuid,
         bot_id: ParticipantId,
     ) -> Result<bool, sqlx::Error> {
+        let result =
+            sqlx::query(r"DELETE FROM bot_event_subscriptions WHERE id = $1 AND bot_id = $2")
+                .bind(sub_id)
+                .bind(bot_id.to_uuid())
+                .execute(&self.pool)
+                .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Replace a webhook-bound subscription's HMAC secret. Owner scoping is
+    /// enforced by `bot_id`; WS-only subscriptions cannot mint a meaningless
+    /// secret. The plaintext is supplied by the API and never exposed by list
+    /// queries, matching the room-webhook secret model.
+    #[cfg(test)]
+    pub async fn rotate_subscription_secret(
+        &self,
+        sub_id: Uuid,
+        bot_id: ParticipantId,
+        secret: &str,
+    ) -> Result<bool, sqlx::Error> {
         let result = sqlx::query(
-            r"DELETE FROM bot_event_subscriptions WHERE id = $1 AND bot_id = $2",
+            r"UPDATE bot_event_subscriptions
+                  SET webhook_secret = $3
+                WHERE id = $1
+                  AND bot_id = $2
+                  AND webhook_url IS NOT NULL",
         )
         .bind(sub_id)
         .bind(bot_id.to_uuid())
+        .bind(secret)
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() > 0)
@@ -200,29 +336,74 @@ impl BotRepo {
     /// (WS-only delivery, no out-of-band endpoint to POST to) are excluded here so
     /// the dispatcher never has to second-guess a missing URL.
     ///
-    /// The per-row `filters` JSON (`{room_id, workspace_id, action_id}`) is
-    /// returned verbatim; the dispatcher applies it (cheap pure predicate) — the
-    /// SQL only narrows by the indexed `event_type` so this stays a single index
-    /// probe regardless of how many distinct rooms have subscribers.
+    /// The generated scope columns are indexed projections of `filters`. The
+    /// query uses them to restrict candidates to this event's room/workspace
+    /// before returning the full JSON for the dispatcher's final pure predicate.
     pub async fn subscriptions_for_event(
         &self,
         event_type: &str,
-    ) -> Result<Vec<MatchedSubscription>, sqlx::Error> {
-        let rows = sqlx::query_as::<_, MatchedSubRow>(
-            r"SELECT s.id, b.id AS bot_id, s.webhook_url, s.filters
+        room_id: aero_common::RoomId,
+        workspace_id: Option<WorkspaceId>,
+    ) -> Result<(Vec<MatchedSubscription>, bool), sqlx::Error> {
+        let mut rows = sqlx::query_as::<_, MatchedSubRow>(
+            r"SELECT s.id, b.id AS bot_id, b.owner_id, s.webhook_url,
+                     s.webhook_secret, s.filters
                FROM bot_event_subscriptions s
                JOIN bots b ON b.id = s.bot_id
               WHERE s.event_type = $1
                 AND s.webhook_url IS NOT NULL
+                AND s.webhook_secret IS NOT NULL
+                AND (
+                    s.scope_room_id = $2
+                    OR (
+                        s.scope_room_id IS NULL
+                        AND s.scope_workspace_id = $3
+                    )
+                )
+                AND EXISTS (
+                    SELECT 1 FROM participants p
+                     WHERE p.id = b.id
+                       AND p.deleted_at IS NULL)
+              ORDER BY s.id
+              LIMIT $4",
+        )
+        .bind(event_type)
+        .bind(room_id.to_string())
+        .bind(workspace_id.map(|workspace| workspace.to_string()))
+        .bind(BOT_EVENT_CANDIDATE_PROBE_LIMIT)
+        .fetch_all(&self.pool)
+        .await?;
+        let truncated = rows.len() > MAX_BOT_EVENT_CANDIDATES;
+        rows.truncate(MAX_BOT_EVENT_CANDIDATES);
+        Ok((rows.into_iter().map(Into::into).collect(), truncated))
+    }
+
+    /// Resolve the current webhook target for one queued subscription delivery.
+    ///
+    /// The target and secret are intentionally read at send time: rotating a
+    /// secret takes effect for retries, while deleting/soft-deleting the bot
+    /// makes the target disappear before any further external request.
+    pub async fn subscription_delivery_target(
+        &self,
+        subscription_id: Uuid,
+    ) -> Result<Option<MatchedSubscription>, sqlx::Error> {
+        let row = sqlx::query_as::<_, MatchedSubRow>(
+            r"SELECT s.id, b.id AS bot_id, b.owner_id, s.webhook_url,
+                     s.webhook_secret, s.filters
+               FROM bot_event_subscriptions s
+               JOIN bots b ON b.id = s.bot_id
+              WHERE s.id = $1
+                AND s.webhook_url IS NOT NULL
+                AND s.webhook_secret IS NOT NULL
                 AND EXISTS (
                     SELECT 1 FROM participants p
                      WHERE p.id = b.id
                        AND p.deleted_at IS NULL)",
         )
-        .bind(event_type)
-        .fetch_all(&self.pool)
+        .bind(subscription_id)
+        .fetch_optional(&self.pool)
         .await?;
-        Ok(rows.into_iter().map(Into::into).collect())
+        Ok(row.map(Into::into))
     }
 
     // ---------- subscription delivery log (方向三 — observability) ----------
@@ -233,8 +414,9 @@ impl BotRepo {
     /// `webhook_url`, so a previously-invisible (warn-and-continue) delivery
     /// becomes observable: which subscription/bot, the event type, the outcome
     /// ([`DeliveryStatus`]), the HTTP status (`None` on a transport error), and a
-    /// short error excerpt. One-shot (no retry/DLQ lifecycle) — `attempts` is
-    /// always 1 today.
+    /// short error excerpt. [`Self::record_delivery_attempt`] records the numbered
+    /// retries from the durable worker; this wrapper retains the original
+    /// single-attempt API for existing callers.
     ///
     /// `bot_id` is denormalized into the row so the owner-scoped listing stays a
     /// single index probe even after the subscription row is gone. The dispatcher
@@ -249,11 +431,35 @@ impl BotRepo {
         http_status: Option<u16>,
         error: Option<&str>,
     ) -> Result<Uuid, sqlx::Error> {
+        self.record_delivery_attempt(
+            subscription_id,
+            bot_id,
+            event_type,
+            status,
+            http_status,
+            error,
+            1,
+        )
+        .await
+    }
+
+    /// Record one numbered attempt from the durable bot-delivery worker.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_delivery_attempt(
+        &self,
+        subscription_id: Uuid,
+        bot_id: ParticipantId,
+        event_type: &str,
+        status: DeliveryStatus,
+        http_status: Option<u16>,
+        error: Option<&str>,
+        attempts: i32,
+    ) -> Result<Uuid, sqlx::Error> {
         let id = Uuid::new_v4();
         sqlx::query(
             r"INSERT INTO bot_subscription_deliveries
                   (id, subscription_id, bot_id, event_type, status, http_status, error, attempts)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, 1)",
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
         )
         .bind(id)
         .bind(subscription_id)
@@ -262,6 +468,7 @@ impl BotRepo {
         .bind(status.as_str())
         .bind(http_status.map(i32::from))
         .bind(error)
+        .bind(attempts.max(1))
         .execute(&self.pool)
         .await?;
         Ok(id)
@@ -270,17 +477,33 @@ impl BotRepo {
     /// List recent delivery records for one subscription, newest first (capped at
     /// `limit`, clamped to a sane ceiling). Owner-authorization is the caller's
     /// responsibility (the routes layer asserts bot ownership first).
+    #[cfg(test)]
     pub async fn list_deliveries_for_subscription(
         &self,
         subscription_id: Uuid,
         limit: i64,
     ) -> Result<Vec<BotDelivery>, sqlx::Error> {
         let rows = sqlx::query_as::<_, BotDeliveryRow>(
-            r"SELECT id, subscription_id, bot_id, event_type, status, http_status, error, attempts, created_at
-               FROM bot_subscription_deliveries
-              WHERE subscription_id = $1
-              ORDER BY created_at DESC
-              LIMIT $2",
+            r"SELECT id, subscription_id, bot_id, event_type, status,
+                     http_status, error, attempts, created_at, event_id
+                FROM (
+                    SELECT d.id, d.subscription_id, d.bot_id, d.event_type,
+                           d.status, d.http_status, d.error, d.attempts,
+                           d.created_at, NULL::UUID AS event_id
+                      FROM bot_subscription_deliveries d
+                     WHERE d.subscription_id = $1
+                    UNION ALL
+                    SELECT q.id, q.subscription_id, q.bot_id, q.event_type,
+                           'dead'::TEXT AS status,
+                           q.last_http_status AS http_status,
+                           q.last_error AS error, q.attempts,
+                           q.completed_at AS created_at, q.event_id
+                      FROM bot_subscription_delivery_outbox q
+                     WHERE q.subscription_id = $1
+                       AND q.status = 'dead'
+                ) AS history
+               ORDER BY created_at DESC
+               LIMIT $2",
         )
         .bind(subscription_id)
         .bind(limit.clamp(1, 500))
@@ -293,17 +516,33 @@ impl BotRepo {
     /// first (capped at `limit`). Backs `GET /api/bots/:id/deliveries`; the
     /// denormalized `bot_id` column means this never re-joins through
     /// `bot_event_subscriptions`.
+    #[cfg(test)]
     pub async fn list_deliveries_for_bot(
         &self,
         bot_id: ParticipantId,
         limit: i64,
     ) -> Result<Vec<BotDelivery>, sqlx::Error> {
         let rows = sqlx::query_as::<_, BotDeliveryRow>(
-            r"SELECT id, subscription_id, bot_id, event_type, status, http_status, error, attempts, created_at
-               FROM bot_subscription_deliveries
-              WHERE bot_id = $1
-              ORDER BY created_at DESC
-              LIMIT $2",
+            r"SELECT id, subscription_id, bot_id, event_type, status,
+                     http_status, error, attempts, created_at, event_id
+                FROM (
+                    SELECT d.id, d.subscription_id, d.bot_id, d.event_type,
+                           d.status, d.http_status, d.error, d.attempts,
+                           d.created_at, NULL::UUID AS event_id
+                      FROM bot_subscription_deliveries d
+                     WHERE d.bot_id = $1
+                    UNION ALL
+                    SELECT q.id, q.subscription_id, q.bot_id, q.event_type,
+                           'dead'::TEXT AS status,
+                           q.last_http_status AS http_status,
+                           q.last_error AS error, q.attempts,
+                           q.completed_at AS created_at, q.event_id
+                      FROM bot_subscription_delivery_outbox q
+                     WHERE q.bot_id = $1
+                       AND q.status = 'dead'
+                ) AS history
+               ORDER BY created_at DESC
+               LIMIT $2",
         )
         .bind(bot_id.to_uuid())
         .bind(limit.clamp(1, 500))
@@ -356,12 +595,16 @@ pub struct BotDelivery {
     pub subscription_id: Uuid,
     pub bot_id: ParticipantId,
     pub event_type: String,
-    /// `"delivered"` or `"failed"` (the CHECK-constrained column value).
+    /// Attempt rows are `"delivered"`/`"failed"`; durable DLQ summary rows are
+    /// `"dead"`.
     pub status: String,
     pub http_status: Option<i32>,
     pub error: Option<String>,
     pub attempts: i32,
     pub created_at: time::OffsetDateTime,
+    /// Present on a durable DLQ summary row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event_id: Option<Uuid>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -375,6 +618,7 @@ struct BotDeliveryRow {
     error: Option<String>,
     attempts: i32,
     created_at: time::OffsetDateTime,
+    event_id: Option<Uuid>,
 }
 
 impl From<BotDeliveryRow> for BotDelivery {
@@ -389,12 +633,14 @@ impl From<BotDeliveryRow> for BotDelivery {
             error: r.error,
             attempts: r.attempts,
             created_at: r.created_at,
+            event_id: r.event_id,
         }
     }
 }
 
 /// One webhook-bound subscription matched by [`BotRepo::subscriptions_for_event`]
-/// — the minimal shape the event dispatcher needs to apply filters and POST.
+/// — the minimal shape the materializer needs to filter and the worker needs to
+/// sign a later POST.
 /// `webhook_url` is guaranteed non-NULL (the query excludes WS-only rows).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MatchedSubscription {
@@ -402,10 +648,20 @@ pub struct MatchedSubscription {
     pub id: Uuid,
     /// The owning bot's participant id.
     pub bot_id: ParticipantId,
+    /// Human participant who owns the bot. Dispatchers must re-authorize this
+    /// identity against the event room at send time so a broad subscription
+    /// cannot leak events across tenants, and access removal/deactivation takes
+    /// effect before an external HTTP request is made.
+    pub owner_id: ParticipantId,
     /// The endpoint to POST the (signed) event to.
     pub webhook_url: String,
+    /// Per-subscription HMAC secret. It is selected only on the delivery path
+    /// and is never exposed by [`BotRepo::list_subscriptions`].
+    pub webhook_secret: String,
     /// The per-subscription filter JSON: `{room_id?, workspace_id?, action_id?}`.
-    /// `{}` (the column default) means "match every event of this type".
+    /// `{}` (the column default) means "match every event of this type" that the
+    /// owner is still authorized to receive; the dispatcher performs that
+    /// canonical room-access check immediately before external delivery.
     pub filters: serde_json::Value,
 }
 
@@ -413,7 +669,9 @@ pub struct MatchedSubscription {
 struct MatchedSubRow {
     id: Uuid,
     bot_id: Uuid,
+    owner_id: Uuid,
     webhook_url: String,
+    webhook_secret: String,
     filters: sqlx::types::Json<serde_json::Value>,
 }
 
@@ -422,7 +680,9 @@ impl From<MatchedSubRow> for MatchedSubscription {
         Self {
             id: r.id,
             bot_id: ParticipantId::from_uuid(r.bot_id),
+            owner_id: ParticipantId::from_uuid(r.owner_id),
             webhook_url: r.webhook_url,
+            webhook_secret: r.webhook_secret,
             filters: r.filters.0,
         }
     }
@@ -496,13 +756,34 @@ mod tests {
         // The dispatcher records `delivered` only for 2xx; everything else
         // (4xx/5xx, and — via the dispatcher's transport-error branch — a missing
         // status) is `failed`. This pure classifier is the single source of truth.
-        assert_eq!(DeliveryStatus::from_http_status(200), DeliveryStatus::Delivered);
-        assert_eq!(DeliveryStatus::from_http_status(204), DeliveryStatus::Delivered);
-        assert_eq!(DeliveryStatus::from_http_status(299), DeliveryStatus::Delivered);
-        assert_eq!(DeliveryStatus::from_http_status(300), DeliveryStatus::Failed);
-        assert_eq!(DeliveryStatus::from_http_status(404), DeliveryStatus::Failed);
-        assert_eq!(DeliveryStatus::from_http_status(500), DeliveryStatus::Failed);
-        assert_eq!(DeliveryStatus::from_http_status(199), DeliveryStatus::Failed);
+        assert_eq!(
+            DeliveryStatus::from_http_status(200),
+            DeliveryStatus::Delivered
+        );
+        assert_eq!(
+            DeliveryStatus::from_http_status(204),
+            DeliveryStatus::Delivered
+        );
+        assert_eq!(
+            DeliveryStatus::from_http_status(299),
+            DeliveryStatus::Delivered
+        );
+        assert_eq!(
+            DeliveryStatus::from_http_status(300),
+            DeliveryStatus::Failed
+        );
+        assert_eq!(
+            DeliveryStatus::from_http_status(404),
+            DeliveryStatus::Failed
+        );
+        assert_eq!(
+            DeliveryStatus::from_http_status(500),
+            DeliveryStatus::Failed
+        );
+        assert_eq!(
+            DeliveryStatus::from_http_status(199),
+            DeliveryStatus::Failed
+        );
     }
 
     #[test]
@@ -533,6 +814,35 @@ mod tests {
         assert!(sample.starts_with(BotRepo::TOKEN_PREFIX));
         assert!(sample.len() > BotRepo::TOKEN_PREFIX.len());
     }
+
+    #[test]
+    fn containment_limits_bound_one_owners_external_fanout() {
+        assert_eq!(MAX_BOTS_PER_OWNER, 16);
+        assert_eq!(MAX_BOT_SUBSCRIPTIONS_PER_BOT, 32);
+        assert_eq!(MAX_BOTS_PER_OWNER * MAX_BOT_SUBSCRIPTIONS_PER_BOT, 512);
+        assert_eq!(MAX_BOTS_PER_WORKSPACE_PAGE, 200);
+        assert_eq!(MAX_BOT_EVENT_CANDIDATES, 1_024);
+        assert_eq!(MAX_BOT_EXTERNAL_SUBSCRIPTIONS_PER_WORKSPACE, 1_024);
+    }
+
+    #[tokio::test]
+    async fn external_subscription_requires_workspace_projection_before_io() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://aero:aero@localhost/aero")
+            .unwrap();
+        let repo = BotRepo::new(pool);
+        let filters = serde_json::json!({ "room_id": aero_common::RoomId::new().to_string() });
+        let result = repo
+            .subscribe(
+                ParticipantId::new(),
+                "message",
+                Some(&filters),
+                Some("https://example.test/hook"),
+                Some("test-secret-0123456789abcdef0123456789"),
+            )
+            .await;
+        assert!(matches!(result, Err(BotWriteError::MissingWorkspaceScope)));
+    }
 }
 
 /// DB-backed tests for [`BotRepo`]. Gated `#[ignore]` so the default `cargo test`
@@ -543,166 +853,5 @@ mod tests {
 ///   cargo test -p aero-storage --lib -- --ignored bot_
 /// ```
 #[cfg(test)]
-mod db_tests {
-    use super::*;
-
-    fn pool() -> PgPool {
-        let url = std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://aero:aero_dev_pw@localhost:5432/aero".into());
-        sqlx::postgres::PgPoolOptions::new()
-            .max_connections(2)
-            .connect_lazy(&url)
-            .expect("connect_lazy never fails on a well-formed URL")
-    }
-
-    async fn new_owner(p: &PgPool) -> ParticipantId {
-        let id = ParticipantId::new();
-        sqlx::query("INSERT INTO participants (id, kind, display_name) VALUES ($1, 'human', $2)")
-            .bind(id.to_uuid())
-            .bind(format!("bot-owner-{id}"))
-            .execute(p)
-            .await
-            .expect("insert owner");
-        id
-    }
-
-    #[tokio::test]
-    #[ignore = "requires live Postgres"]
-    async fn bot_token_verifies_then_rotation_invalidates_old() {
-        let p = pool();
-        let repo = BotRepo::new(p.clone());
-        let owner = new_owner(&p).await;
-        let bot = repo.create(owner, "ci-bot", None, None).await.unwrap();
-
-        let token = repo.rotate_token(bot).await.unwrap().expect("token minted");
-        assert!(token.starts_with(BotRepo::TOKEN_PREFIX), "minted token carries prefix");
-
-        // The active token resolves to the bot's participant id …
-        assert_eq!(repo.verify_token(&token).await.unwrap(), Some(bot));
-        // … an unknown token does not.
-        assert_eq!(repo.verify_token("bot_unknown").await.unwrap(), None);
-
-        // Rotating mints a fresh token and invalidates the old one (only one hash
-        // is stored per bot).
-        let token2 = repo.rotate_token(bot).await.unwrap().expect("re-minted");
-        assert_ne!(token, token2);
-        assert_eq!(repo.verify_token(&token).await.unwrap(), None, "old token dead");
-        assert_eq!(repo.verify_token(&token2).await.unwrap(), Some(bot));
-    }
-
-    #[tokio::test]
-    #[ignore = "requires live Postgres"]
-    async fn deleted_bot_token_does_not_verify() {
-        // The security invariant: once the bot's participant is soft-deleted
-        // (`deleted_at` set), its token must stop authenticating — even though the
-        // `bots` row and its `token_hash` survive.
-        let p = pool();
-        let repo = BotRepo::new(p.clone());
-        let owner = new_owner(&p).await;
-        let bot = repo.create(owner, "doomed-bot", None, None).await.unwrap();
-
-        let token = repo.rotate_token(bot).await.unwrap().expect("token minted");
-        assert_eq!(repo.verify_token(&token).await.unwrap(), Some(bot), "active before delete");
-
-        // Soft-delete the bot's participant row (what `delete_participant` does).
-        sqlx::query("UPDATE participants SET deleted_at = now() WHERE id = $1")
-            .bind(bot.to_uuid())
-            .execute(&p)
-            .await
-            .expect("soft-delete bot participant");
-
-        // The bot row (and its token_hash) is still present …
-        let still_there: Option<(Uuid,)> =
-            sqlx::query_as("SELECT id FROM bots WHERE id = $1 AND token_hash IS NOT NULL")
-                .bind(bot.to_uuid())
-                .fetch_optional(&p)
-                .await
-                .unwrap();
-        assert!(still_there.is_some(), "bots row survives the soft-delete");
-
-        // … but the token must no longer authenticate.
-        assert_eq!(
-            repo.verify_token(&token).await.unwrap(),
-            None,
-            "a deleted bot's token must not authenticate"
-        );
-    }
-
-    #[tokio::test]
-    #[ignore = "requires live Postgres"]
-    async fn delivery_log_records_and_lists_by_subscription_and_bot() {
-        // record_delivery persists a row; the two list paths surface it, newest
-        // first, scoped correctly. Exercises both the success and failure shapes.
-        let p = pool();
-        let repo = BotRepo::new(p.clone());
-        let owner = new_owner(&p).await;
-        let bot = repo.create(owner, "delivery-bot", None, None).await.unwrap();
-        let sub = repo
-            .subscribe(bot, "message", None, Some("https://example.test/hook"))
-            .await
-            .unwrap();
-
-        // A delivered (2xx) attempt …
-        repo.record_delivery(sub, bot, "message", DeliveryStatus::Delivered, Some(200), None)
-            .await
-            .unwrap();
-        // … then a failed (5xx) attempt with an error excerpt.
-        repo.record_delivery(
-            sub,
-            bot,
-            "message",
-            DeliveryStatus::Failed,
-            Some(503),
-            Some("upstream unavailable"),
-        )
-        .await
-        .unwrap();
-
-        let by_sub = repo.list_deliveries_for_subscription(sub, 100).await.unwrap();
-        assert_eq!(by_sub.len(), 2, "both attempts recorded for the subscription");
-        // Newest first: the failed 503 is the most recent.
-        assert_eq!(by_sub[0].status, "failed");
-        assert_eq!(by_sub[0].http_status, Some(503));
-        assert_eq!(by_sub[0].error.as_deref(), Some("upstream unavailable"));
-        assert_eq!(by_sub[1].status, "delivered");
-        assert_eq!(by_sub[1].http_status, Some(200));
-        assert!(by_sub[1].error.is_none());
-
-        let by_bot = repo.list_deliveries_for_bot(bot, 100).await.unwrap();
-        assert_eq!(by_bot.len(), 2, "owner-scoped listing sees both via denormalized bot_id");
-
-        // A different bot sees none of these.
-        let other_owner = new_owner(&p).await;
-        let other_bot = repo.create(other_owner, "other-bot", None, None).await.unwrap();
-        assert!(
-            repo.list_deliveries_for_bot(other_bot, 100).await.unwrap().is_empty(),
-            "delivery log is bot-scoped"
-        );
-    }
-
-    #[tokio::test]
-    #[ignore = "requires live Postgres"]
-    async fn delivery_log_cascades_on_subscription_delete() {
-        // The FK is ON DELETE CASCADE: removing a subscription removes its
-        // delivery rows, so a deleted subscription leaves no orphan log.
-        let p = pool();
-        let repo = BotRepo::new(p.clone());
-        let owner = new_owner(&p).await;
-        let bot = repo.create(owner, "cascade-bot", None, None).await.unwrap();
-        let sub = repo
-            .subscribe(bot, "reaction", None, Some("https://example.test/hook"))
-            .await
-            .unwrap();
-        repo.record_delivery(sub, bot, "reaction", DeliveryStatus::Failed, None, Some("dns"))
-            .await
-            .unwrap();
-        // Transport error ⇒ http_status NULL.
-        let before = repo.list_deliveries_for_subscription(sub, 100).await.unwrap();
-        assert_eq!(before.len(), 1);
-        assert!(before[0].http_status.is_none(), "transport error has no http status");
-
-        assert!(repo.delete_subscription(sub, bot).await.unwrap());
-        let after = repo.list_deliveries_for_subscription(sub, 100).await.unwrap();
-        assert!(after.is_empty(), "delivery rows cascade-deleted with the subscription");
-    }
-}
+#[path = "bot/db_tests.rs"]
+mod db_tests;

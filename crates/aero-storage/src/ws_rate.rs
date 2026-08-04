@@ -42,7 +42,9 @@ pub fn window_key(workspace: WorkspaceId, minute: u64) -> String {
 
 /// Whole seconds since the UNIX epoch, saturating at 0 for a pre-epoch clock.
 fn now_unix_secs() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// Cluster-wide per-workspace fixed-window request counter.
@@ -155,8 +157,12 @@ mod redis_tests {
 
     async fn client() -> RedisClient {
         let url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".into());
-        let c =
-            RedisClient::new(fred::types::RedisConfig::from_url(&url).unwrap(), None, None, None);
+        let c = RedisClient::new(
+            fred::types::RedisConfig::from_url(&url).unwrap(),
+            None,
+            None,
+            None,
+        );
         c.connect();
         c.wait_for_connect().await.unwrap();
         c

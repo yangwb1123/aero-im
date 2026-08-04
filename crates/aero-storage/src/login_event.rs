@@ -102,12 +102,11 @@ impl LoginEventRepo {
     /// # Errors
     /// Propagates any [`sqlx::Error`] from the query.
     pub async fn has_any(&self, participant: ParticipantId) -> Result<bool, sqlx::Error> {
-        let (exists,): (bool,) = sqlx::query_as(
-            r"SELECT EXISTS (SELECT 1 FROM login_events WHERE participant_id = $1)",
-        )
-        .bind(participant.to_uuid())
-        .fetch_one(&self.pool)
-        .await?;
+        let (exists,): (bool,) =
+            sqlx::query_as(r"SELECT EXISTS (SELECT 1 FROM login_events WHERE participant_id = $1)")
+                .bind(participant.to_uuid())
+                .fetch_one(&self.pool)
+                .await?;
         Ok(exists)
     }
 
@@ -136,7 +135,11 @@ impl LoginEventRepo {
         .await?;
         Ok(rows
             .into_iter()
-            .map(|(ip, user_agent, created_at)| LoginEvent { ip, user_agent, created_at })
+            .map(|(ip, user_agent, created_at)| LoginEvent {
+                ip,
+                user_agent,
+                created_at,
+            })
             .collect())
     }
 
@@ -146,10 +149,7 @@ impl LoginEventRepo {
     ///
     /// # Errors
     /// Propagates any [`sqlx::Error`].
-    pub async fn sweep_before(
-        &self,
-        cutoff: time::OffsetDateTime,
-    ) -> Result<u64, sqlx::Error> {
+    pub async fn sweep_before(&self, cutoff: time::OffsetDateTime) -> Result<u64, sqlx::Error> {
         let res = sqlx::query(r"DELETE FROM login_events WHERE created_at < $1")
             .bind(cutoff)
             .execute(&self.pool)
@@ -200,21 +200,40 @@ mod db_tests {
         // alert on a first-ever login), while a specific unseen IP is correctly
         // "not known". A missing IP is always "known" (can't flag the unobservable).
         assert!(!repo.has_any(me).await.expect("has_any empty"));
-        assert!(!repo.is_known_ip(me, Some("1.2.3.4")).await.expect("specific unseen ip"));
-        assert!(repo.is_known_ip(me, None).await.expect("missing ip is known"));
+        assert!(!repo
+            .is_known_ip(me, Some("1.2.3.4"))
+            .await
+            .expect("specific unseen ip"));
+        assert!(repo
+            .is_known_ip(me, None)
+            .await
+            .expect("missing ip is known"));
 
         // First login from 1.2.3.4.
-        repo.record(me, Some("1.2.3.4"), Some("Firefox")).await.expect("record 1");
+        repo.record(me, Some("1.2.3.4"), Some("Firefox"))
+            .await
+            .expect("record 1");
         assert!(repo.has_any(me).await.expect("has_any"));
-        assert!(repo.is_known_ip(me, Some("1.2.3.4")).await.expect("known same"));
+        assert!(repo
+            .is_known_ip(me, Some("1.2.3.4"))
+            .await
+            .expect("known same"));
         // A different IP is NOT yet known — the new-location signal.
-        assert!(!repo.is_known_ip(me, Some("9.9.9.9")).await.expect("known new"));
+        assert!(!repo
+            .is_known_ip(me, Some("9.9.9.9"))
+            .await
+            .expect("known new"));
         // A missing IP is treated as known (can't flag the unobservable).
         assert!(repo.is_known_ip(me, None).await.expect("known none"));
 
         // Second login from the new IP; now it becomes known.
-        repo.record(me, Some("9.9.9.9"), Some("Safari")).await.expect("record 2");
-        assert!(repo.is_known_ip(me, Some("9.9.9.9")).await.expect("known after record"));
+        repo.record(me, Some("9.9.9.9"), Some("Safari"))
+            .await
+            .expect("record 2");
+        assert!(repo
+            .is_known_ip(me, Some("9.9.9.9"))
+            .await
+            .expect("known after record"));
 
         // recent() returns newest-first.
         let hist = repo.recent(me, 10).await.expect("recent");

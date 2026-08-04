@@ -342,7 +342,12 @@ impl AnalyticsRepo {
         .fetch_one(&self.pool)
         .await?;
         let (total_messages, messages_30d, active_users_30d, total_members) = row;
-        Ok(WorkspaceSummary { total_messages, messages_30d, active_users_30d, total_members })
+        Ok(WorkspaceSummary {
+            total_messages,
+            messages_30d,
+            active_users_30d,
+            total_members,
+        })
     }
 
     /// The most-used reactions on messages in `room`, descending by frequency,
@@ -409,7 +414,7 @@ mod tests {
 #[cfg(test)]
 mod db_tests {
     use super::*;
-    use aero_common::{ParticipantId, WorkspaceRole};
+    use aero_common::{ParticipantId, RoomKind, WorkspaceRole};
 
     fn pool() -> PgPool {
         let url = std::env::var("DATABASE_URL")
@@ -436,42 +441,40 @@ mod db_tests {
     /// are deterministic (no other workspace's data leaks in).
     async fn workspace(p: &PgPool, owner: ParticipantId) -> WorkspaceId {
         let ws = WorkspaceId::new();
-        sqlx::query(
-            "INSERT INTO workspaces (id, name, slug, created_by, created_at) VALUES ($1,$2,$3,$4, now())",
-        )
-        .bind(ws.to_uuid())
-        .bind("Analytics Test WS")
-        .bind(format!("analytics-{ws}"))
-        .bind(owner.to_uuid())
-        .execute(p)
-        .await
-        .expect("insert workspace");
+        let mut tx = p.begin().await.expect("begin workspace fixture");
+        sqlx::query("INSERT INTO workspaces (id, name, slug, created_by, created_at) VALUES ($1,$2,$3,$4, now())")
+            .bind(ws.to_uuid())
+            .bind("Analytics Test WS")
+            .bind(format!("analytics-{ws}"))
+            .bind(owner.to_uuid())
+            .execute(&mut *tx)
+            .await
+            .expect("insert workspace");
         sqlx::query(
             "INSERT INTO workspace_members (workspace_id, participant_id, role, joined_at) VALUES ($1,$2,$3, now())",
         )
         .bind(ws.to_uuid())
         .bind(owner.to_uuid())
         .bind(WorkspaceRole::Owner.as_str())
-        .execute(p)
+        .execute(&mut *tx)
         .await
         .expect("insert workspace member");
+        tx.commit().await.expect("commit workspace fixture");
         ws
     }
 
     /// Insert a room directly in `workspace`, created by `creator`.
     async fn room_in(p: &PgPool, ws: WorkspaceId, creator: ParticipantId) -> RoomId {
-        let id = RoomId::new();
-        sqlx::query(
-            "INSERT INTO rooms (id, kind, name, created_by, created_at, workspace_id) VALUES ($1,'channel',$2,$3, now(), $4)",
-        )
-        .bind(id.to_uuid())
-        .bind(format!("analytics-room-{id}"))
-        .bind(creator.to_uuid())
-        .bind(ws.to_uuid())
-        .execute(p)
-        .await
-        .expect("insert room");
-        id
+        crate::RoomRepo::new(p.clone())
+            .create_in_workspace(
+                ws,
+                RoomKind::Channel,
+                Some(format!("analytics-room-{}", RoomId::new())),
+                creator,
+            )
+            .await
+            .expect("insert room")
+            .id
     }
 
     /// Insert one (now-dated) message authored by `sender` in `room`.
@@ -516,7 +519,10 @@ mod db_tests {
         assert_eq!(after.messages_last_7d, 3, "all three are within the week");
         assert_eq!(after.total_rooms, 1, "one room counted");
         assert_eq!(after.total_members, 1, "still one member");
-        assert_eq!(after.active_members_7d, 1, "owner is the lone active author");
+        assert_eq!(
+            after.active_members_7d, 1,
+            "owner is the lone active author"
+        );
 
         // Busiest channels: the seeded room with its three messages.
         let top = repo.top_channels(ws, 10).await.unwrap();
@@ -528,7 +534,9 @@ mod db_tests {
         let total: i64 = timeline.iter().map(|d| d.count).sum();
         assert_eq!(total, 3, "timeline buckets sum to the message total");
         assert!(
-            timeline.iter().all(|d| d.day.len() == 10 && d.day.contains('-')),
+            timeline
+                .iter()
+                .all(|d| d.day.len() == 10 && d.day.contains('-')),
             "each day renders as YYYY-MM-DD"
         );
 

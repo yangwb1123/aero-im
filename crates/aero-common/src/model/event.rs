@@ -7,14 +7,14 @@
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-use crate::ids::{MessageId, ParticipantId, PollId, RoomId};
-use super::message::Message;
+use super::blob::PinOp;
+use super::media::{CallEvent, PollOp};
 use super::message::MembershipOp;
+use super::message::Message;
 use super::message::MessageEnvelope;
 use super::message::ReactionOp;
 use super::notification::{NotificationKind, NotifyTarget};
-use super::blob::PinOp;
-use super::media::{CallEvent, PollOp};
+use crate::ids::{CanvasId, MessageId, ParticipantId, PollId, RoomId};
 
 // ---------- Unified room-scoped event (NATS + WS wire) ----------
 
@@ -112,6 +112,21 @@ pub enum RoomEvent {
         poll_id: PollId,
         op: PollOp,
     },
+    /// One durable append to a channel canvas's operation log. Fans out to all
+    /// effective room members so active editors can apply it immediately; the
+    /// append-only `canvas_ops` table remains the recovery source of truth.
+    ///
+    /// `op_seq` is deliberately distinct from the top-level bus `seq` stamp:
+    /// the former orders one canvas's persisted log, while the latter orders all
+    /// events on `im.room.{room_id}`.
+    CanvasOp {
+        room_id: RoomId,
+        canvas_id: CanvasId,
+        op_id: uuid::Uuid,
+        op_seq: i64,
+        author_id: ParticipantId,
+        op: serde_json::Value,
+    },
     /// A participant acknowledged seeing a SPECIFIC message ("Seen by …"). Fans
     /// out to the whole room so every member's per-message read indicator stays
     /// live. Distinct from [`RoomEvent::Read`], which moves the per-room unread
@@ -170,6 +185,7 @@ impl RoomEvent {
             | RoomEvent::Pin { room_id, .. }
             | RoomEvent::Membership { room_id, .. }
             | RoomEvent::Poll { room_id, .. }
+            | RoomEvent::CanvasOp { room_id, .. }
             | RoomEvent::MessageSeen { room_id, .. }
             | RoomEvent::Interaction { room_id, .. } => Some(*room_id),
             RoomEvent::Call(
@@ -177,7 +193,8 @@ impl RoomEvent {
                 | CallEvent::End { room_id, .. }
                 | CallEvent::Caption { room_id, .. }
                 | CallEvent::Join { room_id, .. }
-                | CallEvent::Leave { room_id, .. },
+                | CallEvent::Leave { room_id, .. }
+                | CallEvent::SfuPublisher { room_id, .. },
             ) => Some(*room_id),
             RoomEvent::Call(
                 CallEvent::Answer { .. }

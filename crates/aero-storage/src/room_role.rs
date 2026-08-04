@@ -1,15 +1,9 @@
-//! Room-role repository — read/mutate a member's `room_members.role`.
+//! Read-only room-role repository over `room_members.role`.
 //!
-//! Backs channel role management (see one's role, see all member roles, change a
-//! member's room role, transfer ownership). It owns no schema of its own: every
-//! method operates over the EXISTING `room_members` table (migration 0001), whose
-//! `role` column is `CHECK (role IN ('owner', 'member', 'admin'))`. Validating a
-//! requested role against that allowed set, and the "who may mutate" policy, live
-//! in the server layer ([`crate`] callers); this repo is the thin SQL seam.
-//!
-//! Purely additive: a NEW [`RoomRoleRepo`]; no existing repo
-//! ([`RoomRepo`](crate::RoomRepo)) is touched. Reads learn table/column names
-//! from `room.rs` but never reuse its queries.
+//! Mutation deliberately lives on the transaction-owned
+//! [`RoomRepo`](crate::RoomRepo) governance methods. Keeping this repository
+//! read-only prevents callers from separating owner authorization, final-owner
+//! validation, and role updates into race-prone independent statements.
 
 use aero_common::{ParticipantId, RoomId};
 use sqlx::PgPool;
@@ -71,47 +65,6 @@ impl RoomRoleRepo {
             .map(|(pid, role)| (ParticipantId::from_uuid(pid), role))
             .collect())
     }
-
-    /// Set `participant`'s role in `room` to `role`. Returns `true` iff a matching
-    /// membership row was updated — `false` when the participant is not a member of
-    /// the room (no row matched). The caller is responsible for validating `role`
-    /// against the allowed set; an unknown value would be rejected by the
-    /// `room_members.role` CHECK constraint as a database error.
-    ///
-    /// # Errors
-    /// Propagates any [`sqlx::Error`] from the update (including a CHECK violation
-    /// for a role outside the allowed set).
-    pub async fn set_role(
-        &self,
-        room: RoomId,
-        participant: ParticipantId,
-        role: &str,
-    ) -> Result<bool, sqlx::Error> {
-        let result = sqlx::query(
-            r"UPDATE room_members SET role = $3 WHERE room_id = $1 AND participant_id = $2",
-        )
-        .bind(room.to_uuid())
-        .bind(participant.to_uuid())
-        .bind(role)
-        .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected() > 0)
-    }
-
-    /// How many members of `room` currently hold the `owner` role. Used to refuse
-    /// demoting the last owner (which would leave the channel ownerless).
-    ///
-    /// # Errors
-    /// Propagates any [`sqlx::Error`] from the query.
-    pub async fn count_owners(&self, room: RoomId) -> Result<i64, sqlx::Error> {
-        let row = sqlx::query_as::<_, (i64,)>(
-            r"SELECT COUNT(*) FROM room_members WHERE room_id = $1 AND role = 'owner'",
-        )
-        .bind(room.to_uuid())
-        .fetch_one(&self.pool)
-        .await?;
-        Ok(row.0)
-    }
 }
 
 /// PG-gated integration tests (run with a live Postgres + applied migrations):
@@ -146,26 +99,35 @@ mod db_tests {
         id
     }
 
-    /// Seed a channel room (in a throwaway workspace) created by `creator`, with no
+    /// Seed a group room (in a throwaway workspace) created by `creator`, with no
     /// auto-enrolled members — the caller adds `room_members` rows explicitly so
     /// role assertions are deterministic.
     async fn channel(p: &PgPool, creator: ParticipantId) -> RoomId {
         let ws = WorkspaceId::new();
+        let mut tx = p.begin().await.expect("begin workspace fixture");
+        sqlx::query("INSERT INTO workspaces (id, name, slug, created_by, created_at) VALUES ($1,$2,$3,$4, now())")
+            .bind(ws.to_uuid())
+            .bind("Room Role Test WS")
+            .bind(format!("room-role-{ws}"))
+            .bind(creator.to_uuid())
+            .execute(&mut *tx)
+            .await
+            .expect("insert workspace");
         sqlx::query(
-            "INSERT INTO workspaces (id, name, slug, created_by, created_at) VALUES ($1,$2,$3,$4, now())",
+            "INSERT INTO workspace_members (workspace_id, participant_id, role)
+             VALUES ($1, $2, 'owner')",
         )
         .bind(ws.to_uuid())
-        .bind("Room Role Test WS")
-        .bind(format!("room-role-{ws}"))
         .bind(creator.to_uuid())
-        .execute(p)
+        .execute(&mut *tx)
         .await
-        .expect("insert workspace");
+        .expect("insert workspace owner");
+        tx.commit().await.expect("commit workspace fixture");
 
         let room = RoomId::new();
         sqlx::query(
             r"INSERT INTO rooms (id, kind, name, created_by, created_at, workspace_id)
-               VALUES ($1, 'channel', $2, $3, now(), $4)",
+               VALUES ($1, 'group', $2, $3, now(), $4)",
         )
         .bind(room.to_uuid())
         .bind(format!("room-role-chan-{room}"))
@@ -209,25 +171,24 @@ mod db_tests {
             "owner present with owner role"
         );
         assert!(
-            members.iter().any(|(pid, r)| *pid == member && r == "member"),
+            members
+                .iter()
+                .any(|(pid, r)| *pid == member && r == "member"),
             "member present with member role"
         );
 
         // role_of resolves each role; a stranger is None.
-        assert_eq!(repo.role_of(room, owner).await.unwrap().as_deref(), Some("owner"));
-        assert_eq!(repo.role_of(room, member).await.unwrap().as_deref(), Some("member"));
-        assert_eq!(repo.role_of(room, ParticipantId::new()).await.unwrap(), None);
-
-        // Exactly one owner so far.
-        assert_eq!(repo.count_owners(room).await.unwrap(), 1);
-
-        // set_role flips a role (member → admin, an allowed value) and reports the
-        // change; a non-member update reports no change.
-        assert!(repo.set_role(room, member, "admin").await.unwrap(), "member role flipped");
-        assert_eq!(repo.role_of(room, member).await.unwrap().as_deref(), Some("admin"));
-        assert!(
-            !repo.set_role(room, ParticipantId::new(), "member").await.unwrap(),
-            "updating a non-member changes nothing"
+        assert_eq!(
+            repo.role_of(room, owner).await.unwrap().as_deref(),
+            Some("owner")
+        );
+        assert_eq!(
+            repo.role_of(room, member).await.unwrap().as_deref(),
+            Some("member")
+        );
+        assert_eq!(
+            repo.role_of(room, ParticipantId::new()).await.unwrap(),
+            None
         );
 
         // Cleanup so reruns stay self-contained (room_members cascades on room delete).

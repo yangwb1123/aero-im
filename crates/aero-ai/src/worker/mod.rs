@@ -44,7 +44,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use aero_common::metrics::Registry;
-use aero_common::{MessageId, RoomId};
+use aero_common::{MessageId, ParticipantId, RoomId, WorkspaceId};
 use aero_storage::{AiJob, AiJobKind};
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -57,6 +57,7 @@ use crate::budget::{CostBudget, KeyedCostBudget};
 use crate::error::{AiError, Result};
 use crate::metrics::{self as ai_metrics, CostModel};
 use crate::service::AiService;
+use crate::usage::{self as ai_usage, UsageSink};
 
 /// Maximum delivery attempts before a job is dead-lettered.
 ///
@@ -178,7 +179,11 @@ impl AiWorker {
     /// Construct a worker with an explicit config (used in tests / embedding).
     #[must_use]
     pub fn with_config(svc: Arc<AiService>, cfg: WorkerConfig) -> Self {
-        Self { svc, cfg, cost_model: CostModel::default() }
+        Self {
+            svc,
+            cfg,
+            cost_model: CostModel::default(),
+        }
     }
 
     /// Override the per-kind cost estimate used for the `AI_COST_MICROS_TOTAL`
@@ -200,7 +205,9 @@ impl AiWorker {
     /// ([`aero_common::metrics::global`]); the `/metrics` route lives in
     /// `aero-server`.
     pub async fn run(&self, shutdown: CancellationToken) {
-        let queue = AiJobQueue { svc: Arc::clone(&self.svc) };
+        let queue = AiJobQueue {
+            svc: Arc::clone(&self.svc),
+        };
         let budget = CostBudget::new(self.cfg.max_calls_per_window, self.cfg.budget_window);
         let keyed = KeyedCostBudget::<uuid::Uuid>::new(
             self.cfg.max_calls_per_window_per_workspace,
@@ -214,6 +221,7 @@ impl AiWorker {
             self.cfg,
             aero_common::metrics::global(),
             &self.cost_model,
+            self.svc.usage_sink().map(Arc::as_ref),
             &shutdown,
         )
         .await;
@@ -279,7 +287,12 @@ impl AiWorker {
                     // `search_tsv` generated column over searchable_text) also
                     // matches the document body. Fail-open: a write failure is
                     // logged but we still embed the folded text below.
-                    match self.svc.messages().update_searchable_text(id, &folded).await {
+                    match self
+                        .svc
+                        .messages()
+                        .update_searchable_text(id, &folded)
+                        .await
+                    {
                         Ok(updated) => tracing::debug!(
                             message_id = %id, updated, doc_len = doc.len(),
                             "embed: folded attachment text into searchable_text"
@@ -295,7 +308,11 @@ impl AiWorker {
             None => text,
         };
 
-        let embedding = self.svc.embed_text(&text).await?;
+        let usage_context = crate::usage::UsageContext::for_job(job.id, job.workspace_id);
+        let embedding = self
+            .svc
+            .embed_text_with_context(&text, usage_context, "voyage_embed_document")
+            .await?;
         let dim = embedding.len();
         let model = self.svc.embedder().model_id().to_string();
 
@@ -304,18 +321,29 @@ impl AiWorker {
             // Message may have been deleted between get() and update — not an error.
             tracing::debug!(message_id = %id, "embed: row missing or deleted at update");
         }
-        Ok(serde_json::json!({ "dim": dim, "model": model, "updated": updated }))
+        Ok(serde_json::json!({
+            "dim": dim,
+            "model": model,
+            "updated": updated,
+            "paid_provider": self.svc.embedder().is_paid_provider(),
+            "usage_accounted": true,
+        }))
     }
 
     async fn handle_summarize(&self, job: &AiJob) -> Result<serde_json::Value> {
         let p: SummarizePayload = serde_json::from_value(job.payload.clone())?;
         let room = parse_room_id(&p.room_id)?;
         let last_n = p.last_n.unwrap_or(50);
-        let (summary, usage) = self.svc.summarize_room_with_usage(room, last_n).await?;
+        let usage_context = crate::usage::UsageContext::for_job(job.id, job.workspace_id);
+        let (summary, usage) = self
+            .svc
+            .summarize_room_with_usage_context(room, last_n, usage_context)
+            .await?;
         let mut result = serde_json::json!({
             "summary": summary,
             "anthropic": self.svc.has_anthropic(),
             "last_n": last_n,
+            "usage_accounted": true,
         });
         attach_usage(&mut result, usage);
         Ok(result)
@@ -323,27 +351,49 @@ impl AiWorker {
 
     async fn handle_moderate(&self, job: &AiJob) -> Result<serde_json::Value> {
         let p: ModeratePayload = serde_json::from_value(job.payload.clone())?;
-        let (verdict, usage) = self.svc.moderate_with_usage(&p.text).await?;
+        let usage_context = crate::usage::UsageContext::for_job(job.id, job.workspace_id);
+        let (verdict, usage) = self
+            .svc
+            .moderate_with_usage_context(&p.text, usage_context)
+            .await?;
         let anthropic = self.svc.has_anthropic();
 
         let mut result = if let Some(reason) = verdict {
             // BLOCK: soft-delete the offending message so it stops being visible.
             if let Some(target) = job.target_id {
                 let id = MessageId::from_uuid(target);
-                match self.svc.messages().soft_delete(id).await {
-                    Ok(true) => {
+                let workspace = job.workspace_id.map(WorkspaceId::from_uuid);
+                let detail = serde_json::json!({
+                    "reason": reason,
+                    "source": "ai_worker",
+                });
+                match self
+                    .svc
+                    .messages()
+                    .soft_delete_outboxed_system(
+                        id,
+                        workspace,
+                        None,
+                        workspace.map(|_| "message.moderated"),
+                        detail,
+                        ParticipantId::nil(),
+                        None,
+                    )
+                    .await
+                {
+                    Ok(Some(_)) => {
                         tracing::info!(message_id = %id, %reason, "moderation: blocked and removed");
                     }
-                    Ok(false) => {
+                    Ok(None) => {
                         // Already deleted by sender or a concurrent job — no-op.
                         tracing::debug!(message_id = %id, "moderation: message already deleted");
                     }
                     Err(e) => {
                         // Removing blocked content is safety-critical: do NOT report
                         // the job a success with the message still visible. Propagate
-                        // so the queue retries (bounded → DLQ). Re-moderation on retry
-                        // re-charges, but transient delete failures are rare and
-                        // leaving flagged content up is the worse outcome.
+                        // so the queue retries (bounded → DLQ). The provider verdict
+                        // is already durably finalized under this job's stable usage
+                        // context, so a retry replays it without a second paid call.
                         tracing::warn!(error = %e, message_id = %id, "moderation: soft_delete failed; retrying job");
                         return Err(e.into());
                     }
@@ -355,11 +405,13 @@ impl AiWorker {
                 "verdict": "block",
                 "reason": reason,
                 "anthropic": anthropic,
+                "usage_accounted": true,
             })
         } else {
             serde_json::json!({
                 "verdict": "safe",
                 "anthropic": anthropic,
+                "usage_accounted": true,
             })
         };
         // Attach the real token usage so the success path charges BILLED cost
@@ -380,9 +432,23 @@ impl AiWorker {
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
         let (answer, usage) = if agentic {
-            self.svc.answer_question_agentic(room, &p.question, 4).await?
+            self.svc
+                .answer_question_agentic_with_context(
+                    room,
+                    &p.question,
+                    4,
+                    crate::usage::UsageContext::for_job(job.id, job.workspace_id),
+                )
+                .await?
         } else {
-            self.svc.answer_question_with_usage(room, &p.question, k).await?
+            self.svc
+                .answer_question_with_usage_context(
+                    room,
+                    &p.question,
+                    k,
+                    crate::usage::UsageContext::for_job(job.id, job.workspace_id),
+                )
+                .await?
         };
         let citations: Vec<String> = answer.citations.iter().map(MessageId::to_string).collect();
         let mut result = serde_json::json!({
@@ -390,6 +456,7 @@ impl AiWorker {
             "citations": citations,
             "anthropic": self.svc.has_anthropic(),
             "agentic": agentic,
+            "usage_accounted": true,
         });
         attach_usage(&mut result, usage);
         Ok(result)
@@ -450,13 +517,9 @@ fn should_skip_embed(searchable_text: &str) -> bool {
 ///   marks with a `skipped` field → unpaid when that field is present.
 /// - `Summarize` / `Answer` always make a completion call on success → paid.
 ///
-/// Only called on the success path: a *failed* call may or may not have been
-/// billed upstream, so we conservatively do not charge it (the budget guard is
-/// the hard per-window ceiling on spend regardless). The metric is a coarse
-/// budget signal, not an invoice — see [`crate::metrics::CostModel`].
 /// Embed real Anthropic token [`Usage`] into a job's result JSON under a `usage`
 /// key, so it is durably recorded by `AiJobRepo::complete` and queryable later
-/// (方向三 — usage is part of the persisted result). A no-op when `usage` is
+/// (usage is part of the persisted result). A no-op when `usage` is
 /// `None` (the heuristic / no-Anthropic path made no paid call).
 fn attach_usage(result: &mut serde_json::Value, usage: Option<Usage>) {
     if let (Some(obj), Some(u)) = (result.as_object_mut(), usage) {
@@ -486,13 +549,25 @@ fn usage_from_result(result: &serde_json::Value) -> Option<Usage> {
 #[must_use]
 fn was_paid(kind: AiJobKind, result: &serde_json::Value) -> bool {
     match kind {
-        // Moderate is paid only when Anthropic was actually called; the handler
-        // records `"anthropic": true/false` in the result for exactly this check.
-        AiJobKind::Moderate => {
-            result.get("anthropic").and_then(|v| v.as_bool()).unwrap_or(false)
-        }
-        AiJobKind::Embed => result.get("skipped").is_none(),
-        AiJobKind::Summarize | AiJobKind::Answer => true,
+        // This is the compatibility finalizer for custom/legacy processors whose
+        // result does not set `usage_accounted`. Provider-aware handlers reserve
+        // and finalize durable usage themselves before returning their result.
+        // Moderate is paid here only when such a processor reports Anthropic use.
+        AiJobKind::Moderate => result
+            .get("anthropic")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        AiJobKind::Embed => result
+            .get("paid_provider")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or_else(|| {
+                result.get("skipped").is_none()
+                    && result.get("model").and_then(serde_json::Value::as_str) != Some("hash-1024")
+            }),
+        AiJobKind::Summarize | AiJobKind::Answer => result
+            .get("anthropic")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
     }
 }
 
@@ -511,6 +586,7 @@ async fn run_loop<Q, P>(
     cfg: WorkerConfig,
     reg: &Registry,
     cost_model: &CostModel,
+    usage_sink: Option<&dyn UsageSink>,
     shutdown: &CancellationToken,
 ) where
     Q: JobQueue + ?Sized,
@@ -623,7 +699,10 @@ async fn run_loop<Q, P>(
         // work for this process. It rises with the claimed batch and returns to 0
         // once the batch has drained.
         ai_metrics::set_queue_depth(reg, to_run.len());
-        process_batch(queue, proc, &sem, to_run, reg, cost_model, shutdown).await;
+        process_batch(
+            queue, proc, &sem, to_run, reg, cost_model, usage_sink, shutdown,
+        )
+        .await;
         ai_metrics::set_queue_depth(reg, 0);
     }
 }
@@ -642,6 +721,7 @@ async fn process_batch<Q, P>(
     jobs: Vec<AiJob>,
     reg: &Registry,
     cost_model: &CostModel,
+    usage_sink: Option<&dyn UsageSink>,
     shutdown: &CancellationToken,
 ) where
     Q: JobQueue + ?Sized,
@@ -676,7 +756,7 @@ async fn process_batch<Q, P>(
         inflight.push(async move {
             // Keep the permit alive for the duration of the task.
             let _permit = permit;
-            run_one(queue, proc, job, reg, cost_model).await;
+            run_one(queue, proc, job, reg, cost_model, usage_sink).await;
         });
     }
 
@@ -695,8 +775,14 @@ where
 /// Drive a single job through dead-letter guard → process → queue state
 /// transition (complete on success, fail/dead-letter on error), recording
 /// duration / cost / outcome metrics into `reg` along the way.
-async fn run_one<Q, P>(queue: &Q, proc: &P, job: AiJob, reg: &Registry, cost_model: &CostModel)
-where
+async fn run_one<Q, P>(
+    queue: &Q,
+    proc: &P,
+    job: AiJob,
+    reg: &Registry,
+    cost_model: &CostModel,
+    usage_sink: Option<&dyn UsageSink>,
+) where
     Q: JobQueue + ?Sized,
     P: JobProcessor + ?Sized,
 {
@@ -744,22 +830,52 @@ where
 
     match disposition {
         Disposition::Done(result) => {
-            // Cost is charged on success only. Prefer the REAL token-based cost
-            // when the handler recorded actual Anthropic usage (方向三); otherwise
-            // fall back to the coarse flat per-kind estimate. `was_paid` still
-            // gates the estimate path so stub/no-op kinds record zero — the usage
-            // path is only taken when a real paid completion reported tokens.
-            if let Some(usage) = usage_from_result(&result) {
-                ai_metrics::record_token_cost(
+            // Provider-aware handlers reserve before the external call, finalize
+            // its durable outcome, and return `usage_accounted=true`. This branch
+            // remains a compatibility finalizer for legacy/custom processors:
+            // prefer reported token usage, otherwise apply the coarse estimate,
+            // with `was_paid` keeping stub/no-op paths at zero.
+            let usage_id = ai_usage::usage_id_for_job(id);
+            let already_accounted = result
+                .get("usage_accounted")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let accounting = if already_accounted {
+                Ok(ai_usage::UsagePersistOutcome::Duplicate)
+            } else if let Some(usage) = usage_from_result(&result) {
+                ai_usage::record_durable_token_cost(
+                    usage_sink,
+                    usage_id,
                     reg,
                     cost_model,
                     kind,
                     workspace_id,
                     usage.input_tokens,
                     usage.output_tokens,
-                );
+                )
+                .await
             } else {
-                ai_metrics::record_cost(reg, cost_model, kind, workspace_id, was_paid(kind, &result));
+                ai_usage::record_durable_cost(
+                    usage_sink,
+                    usage_id,
+                    reg,
+                    cost_model,
+                    kind,
+                    workspace_id,
+                    was_paid(kind, &result),
+                )
+                .await
+            };
+            if let Err(error) = accounting {
+                ai_metrics::record_outcome(reg, kind, ai_metrics::OUTCOME_FAILURE);
+                tracing::error!(
+                    job_id = %id,
+                    usage_id = %usage_id,
+                    error = %error,
+                    "ai worker: compatibility cost finalization failed"
+                );
+                fail_job(queue, id, &format!("usage accounting failed: {error}")).await;
+                return;
             }
             ai_metrics::record_outcome(reg, kind, ai_metrics::OUTCOME_SUCCESS);
             if let Err(e) = queue.complete(id, result).await {

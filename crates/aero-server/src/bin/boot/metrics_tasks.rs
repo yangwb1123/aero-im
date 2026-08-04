@@ -1,9 +1,9 @@
 //! Periodic metrics gauge samplers + cross-node heartbeats.
-use std::sync::Arc;
-use tokio_util::task::TaskTracker;
-use tokio_util::sync::CancellationToken;
 use aero_common::metrics as common_metrics;
 use aero_server::state::AppState;
+use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 pub(crate) fn spawn_all(
     tracker: &TaskTracker,
@@ -18,11 +18,15 @@ pub(crate) fn spawn_all(
     {
         let pool = state.pg.clone();
         let whip = state.whip.clone();
+        let cancel = ai_shutdown.clone();
         tracker.spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
-                tick.tick().await;
+                tokio::select! {
+                    () = cancel.cancelled() => break,
+                    _ = tick.tick() => {}
+                }
                 let size = pool.size();
                 let idle = u32::try_from(pool.num_idle()).unwrap_or(u32::MAX);
                 let in_use = size.saturating_sub(idle);
@@ -42,6 +46,7 @@ pub(crate) fn spawn_all(
     // indexes; fail-open (missing index skipped, query error warns).
     {
         let pool = state.pg.clone();
+        let cancel = ai_shutdown.clone();
         common_metrics::global().register_help(
             aero_server::metrics::INDEX_SIZE_BYTES,
             common_metrics::MetricKind::Gauge,
@@ -56,23 +61,89 @@ pub(crate) fn spawn_all(
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(secs));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
-                tick.tick().await;
+                tokio::select! {
+                    () = cancel.cancelled() => break,
+                    _ = tick.tick() => {}
+                }
                 let reported = aero_server::metrics::sample_index_sizes(&pool).await;
                 tracing::debug!(reported, "index-size gauges sampled");
             }
         });
     }
 
+    // PostgreSQL maintenance/query-efficiency gauges. These query only bounded
+    // schema-owned labels from pg_stat_* and fail open, retaining prior samples
+    // when one statistics view is temporarily unavailable.
+    {
+        let secs = std::env::var("AERO_PG_STATS_SAMPLE_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(60);
+        if secs != 0 {
+            for (name, help) in [
+                (
+                    aero_server::metrics::PG_TABLE_DEAD_TUPLE_RATIO,
+                    "Estimated dead-tuple ratio for a public table (label: table).",
+                ),
+                (
+                    aero_server::metrics::PG_TABLE_SEQ_SCANS_TOTAL,
+                    "PostgreSQL cumulative sequential scans for a public table (label: table).",
+                ),
+                (
+                    aero_server::metrics::PG_INDEX_SCANS_TOTAL,
+                    "PostgreSQL cumulative scans for a public index (label: index).",
+                ),
+                (
+                    aero_server::metrics::PG_IDLE_IN_TRANSACTION_COUNT,
+                    "Sessions currently idle while holding an open transaction.",
+                ),
+                (
+                    aero_server::metrics::PG_IDLE_IN_TRANSACTION_MAX_SECONDS,
+                    "Age in seconds of the oldest idle-in-transaction session.",
+                ),
+            ] {
+                common_metrics::global().register_help(
+                    name,
+                    common_metrics::MetricKind::Gauge,
+                    help,
+                );
+            }
+            let pool = state.pg.clone();
+            let cancel = ai_shutdown.clone();
+            tracker.spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(secs));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tokio::select! {
+                        () = cancel.cancelled() => break,
+                        _ = tick.tick() => {}
+                    }
+                    let sample = aero_server::metrics::sample_pg_health(&pool).await;
+                    tracing::debug!(
+                        tables = sample.tables,
+                        indexes = sample.indexes,
+                        idle_activity = sample.idle_activity,
+                        "PostgreSQL health gauges sampled"
+                    );
+                }
+            });
+        }
+    }
+
     // AI dead-letter queue size gauge
     {
         let dlq_pool = state.pg.clone();
+        let cancel = ai_shutdown.clone();
         tracker.spawn(async move {
             const KINDS: &[&str] = &["embed", "summarize", "moderate", "answer"];
             let repo = aero_storage::AiJobRepo::new(dlq_pool);
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
-                tick.tick().await;
+                tokio::select! {
+                    () = cancel.cancelled() => break,
+                    _ = tick.tick() => {}
+                }
                 for kind in KINDS {
                     match repo.count_dead(Some(kind)).await {
                         Ok(n) => common_metrics::set_gauge_labeled(
@@ -90,15 +161,16 @@ pub(crate) fn spawn_all(
     // NATS consumer backlog gauges
     {
         let js = jetstream.clone();
+        let cancel = ai_shutdown.clone();
         tracker.spawn(async move {
-            const CONSUMERS: &[(&str, &str)] = &[
-                ("IM_MESSAGES", "aero-server"),
-                ("AI_QUEUE", "aero-ai"),
-            ];
+            const CONSUMERS: &[(&str, &str)] = &[("IM_MESSAGES", "aero-server"), ("AI_QUEUE", "aero-ai")];
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
-                tick.tick().await;
+                tokio::select! {
+                    () = cancel.cancelled() => break,
+                    _ = tick.tick() => {}
+                }
                 for (stream, consumer) in CONSUMERS {
                     match js.consumer_pending(stream, consumer).await {
                         Ok(Some(n)) => common_metrics::set_gauge_labeled(
@@ -114,11 +186,37 @@ pub(crate) fn spawn_all(
         });
     }
 
+    // Cross-node media subscriber lease/tombstone cleanup. This remains active
+    // even when call-route heartbeats are explicitly disabled: an idle egress
+    // has no RTP fanout on which to perform lazy pruning.
+    {
+        let subscribers = state.bridge_subscribers.clone();
+        let cancel = ai_shutdown.clone();
+        tracker.spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    () = cancel.cancelled() => break,
+                    _ = tick.tick() => {
+                        let pruned = subscribers.prune_expired();
+                        if pruned > 0 {
+                            tracing::debug!(pruned, "call-bridge subscriber leases pruned");
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     // Call-route heartbeat
     {
         let reg = call_routes.clone();
         let sfu = sfu_router.clone();
         let url = state.public_base_url.clone();
+        let orchestrator = state.call_orchestrator.clone();
+        let supervisor = state.call_supervisor.clone();
+        let call_roster = state.call_roster.clone();
         let cancel = ai_shutdown.clone();
         let secs = std::env::var("AERO_CALL_ROUTE_HEARTBEAT_SECS")
             .ok()
@@ -138,15 +236,80 @@ pub(crate) fn spawn_all(
                         }
                         _ = tick.tick() => {
                             let roster = sfu.roster_snapshot();
+                            let calls = roster
+                                .iter()
+                                .map(|(call, _)| *call)
+                                .collect::<std::collections::HashSet<_>>();
                             let mut refreshed = 0u32;
                             for (call, participant) in roster {
-                                match reg.heartbeat(call, participant, &url).await {
-                                    Ok(()) => refreshed += 1,
+                                let Some(generation) = orchestrator
+                                    .local_leg_generation(call, participant)
+                                    .await
+                                else {
+                                    continue;
+                                };
+                                match reg
+                                    .heartbeat_generation(
+                                        call,
+                                        participant,
+                                        &url,
+                                        generation,
+                                    )
+                                    .await
+                                {
+                                    Ok(true) => refreshed += 1,
+                                    Ok(false) => tracing::debug!(
+                                        %call,
+                                        %participant,
+                                        generation,
+                                        "stale call-route heartbeat rejected"
+                                    ),
                                     Err(e) => tracing::warn!(error = ?e, %call, "call-route heartbeat failed"),
+                                }
+                                match call_roster
+                                    .heartbeat_generation(call, participant, generation)
+                                    .await
+                                {
+                                    Ok(true) => {}
+                                    Ok(false) => tracing::debug!(
+                                        %call,
+                                        %participant,
+                                        generation,
+                                        "stale call-roster heartbeat rejected"
+                                    ),
+                                    Err(e) => tracing::warn!(
+                                        error = ?e,
+                                        %call,
+                                        "call-roster heartbeat failed"
+                                    ),
                                 }
                             }
                             if refreshed > 0 {
                                 tracing::debug!(refreshed, "call-route TTLs refreshed");
+                            }
+                            // The same bounded heartbeat is also the repair loop:
+                            // discover nodes that joined after our local users,
+                            // retry refused/naturally-ended pulls, and remove
+                            // targets that disappeared from the census.
+                            for call in calls {
+                                let Some(topology) = orchestrator.current_topology(call).await else {
+                                    continue;
+                                };
+                                let peers = match topology {
+                                    aero_live_webrtc::CallTopology::ServeLocal => Vec::new(),
+                                    aero_live_webrtc::CallTopology::BridgeTo(peers) => peers,
+                                };
+                                let (spawned, cancelled) =
+                                    supervisor.reconcile_bridges(call, &peers).await;
+                                if spawned > 0 || cancelled > 0 {
+                                    tracing::debug!(
+                                        %call,
+                                        desired = peers.len(),
+                                        spawned,
+                                        cancelled,
+                                        "call-route bridges reconciled"
+                                    );
+                                }
                             }
                         }
                     }

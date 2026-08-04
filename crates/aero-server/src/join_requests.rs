@@ -2,24 +2,20 @@
 //!
 //! A workspace member asks to join a channel they are not yet in; the channel's
 //! creator (its `created_by`) or a workspace admin of the room's workspace then
-//! approves or denies the request. Request lifecycle (create / list / decide) is
-//! owned by [`JoinRequestRepo`](aero_storage::JoinRequestRepo); *granting*
-//! membership on approval reuses the EXISTING
-//! [`RoomRepo::add_member`](aero_storage::RoomRepo) path, so no membership SQL is
-//! duplicated here.
+//! approves or denies the request. Request lifecycle and approval membership
+//! grant are owned by [`JoinRequestRepo`](aero_storage::JoinRequestRepo) in one
+//! authorized transaction.
 //!
 //! The approval gate is a single shared check: the caller passes iff they are the
 //! room's creator OR an Admin/Owner of the room's workspace (resolved from
-//! `room_workspace` + `member_role`); everyone else gets `403`. Creating a
-//! request is open to any authenticated caller, but a caller who is already a
-//! member is rejected `409` (there is nothing to request). Mounted via [`routes`]
-//! and `.merge`d into the main router.
+//! `room_workspace` + effective membership); everyone else gets `403`. Creating
+//! requires effective workspace membership and rejects an existing room member.
 
 use std::str::FromStr;
 
 use aero_auth::AuthUser;
 use aero_common::{Error as AeroError, JoinRequestId, ParticipantId, RoomId};
-use aero_storage::JoinRequestRepo;
+use aero_storage::{JoinRequestRepo, JoinRequestWriteError};
 use axum::{
     extract::{Path, State},
     routing::post,
@@ -33,7 +29,10 @@ use crate::state::AppState;
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/rooms/:id/join-request", post(request_join))
-        .route("/api/rooms/:id/join-requests", axum::routing::get(list_requests))
+        .route(
+            "/api/rooms/:id/join-requests",
+            axum::routing::get(list_requests),
+        )
         .route("/api/join-requests/:rid/approve", post(approve_request))
         .route("/api/join-requests/:rid/deny", post(deny_request))
 }
@@ -52,6 +51,25 @@ fn parse_request(s: &str) -> Result<JoinRequestId, AeroError> {
         .map_err(|e| AeroError::Invalid(format!("join request id: {e}")))
 }
 
+fn map_write_error(error: JoinRequestWriteError) -> AeroError {
+    match error {
+        JoinRequestWriteError::Database(error) => AeroError::from(error),
+        JoinRequestWriteError::NotFound => AeroError::NotFound("join request or channel".into()),
+        JoinRequestWriteError::RequesterNotMember => {
+            AeroError::Forbidden("requester is not an active workspace member".into())
+        }
+        JoinRequestWriteError::AlreadyMember => {
+            AeroError::Conflict("already a member of this channel".into())
+        }
+        JoinRequestWriteError::Forbidden => {
+            AeroError::Forbidden("not allowed to decide this join request".into())
+        }
+        JoinRequestWriteError::InvalidStatus => {
+            AeroError::Invalid("invalid join-request decision".into())
+        }
+    }
+}
+
 /// Assert the caller may approve/deny join requests for `room`: they must be the
 /// room's creator (`rooms.created_by`) OR an Admin/Owner of the room's workspace.
 /// A missing room is `404`; an authenticated non-owner / non-admin is `403`.
@@ -66,53 +84,38 @@ async fn assert_can_decide(
         .await
         .map_err(AeroError::from)?
         .ok_or_else(|| AeroError::NotFound("room".into()))?;
-    if creator == caller {
-        return Ok(());
-    }
-    // Not the creator — fall back to a workspace-admin check on the room's tenant.
     let workspace = s
         .rooms
         .room_workspace(room)
         .await
         .map_err(AeroError::from)?
         .ok_or_else(|| AeroError::NotFound("room".into()))?;
-    let is_admin = s
+    let role = s
         .workspaces
-        .member_role(workspace, caller)
+        .effective_member_role(workspace, caller)
         .await
-        .map_err(AeroError::from)?
-        .is_some_and(aero_common::WorkspaceRole::can_administer);
-    if is_admin {
+        .map_err(AeroError::from)?;
+    if role.is_some_and(|role| creator == caller || role.can_administer()) {
         Ok(())
     } else {
-        Err(AeroError::Forbidden("not the channel owner or a workspace admin".into()))
+        Err(AeroError::Forbidden(
+            "not the channel owner or a workspace admin".into(),
+        ))
     }
 }
 
-/// `POST /api/rooms/:id/join-request` — ask to join the channel. Open to any
-/// authenticated caller, but a caller who is already a member is rejected `409`
-/// (there is nothing to request). Idempotent for an outstanding ask: a repeated
-/// request while one is still pending resolves to the same row. Returns the
-/// created (or existing pending) request.
+/// Ask to join the channel. The caller must be an effective member of its
+/// workspace but not yet a room member. Storage checks both transactionally.
 async fn request_join(
     State(s): State<AppState>,
     auth: AuthUser,
     Path(room_str): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let room = parse_room(&room_str)?;
-    // Already a member ⇒ nothing to request.
-    if s.rooms
-        .is_member(room, auth.participant_id)
-        .await
-        .map_err(AeroError::from)?
-    {
-        return Err(AeroError::Conflict("already a member of this channel".into()).into());
-    }
-
     let id = repo(&s)
-        .create(room, auth.participant_id)
+        .create_authorized(room, auth.participant_id)
         .await
-        .map_err(AeroError::from)?;
+        .map_err(map_write_error)?;
     // Re-read so the response carries the full, canonical row (status/created_at).
     let row = repo(&s)
         .get(id)
@@ -139,10 +142,7 @@ async fn list_requests(
     Ok(Json(serde_json::json!({ "requests": requests })))
 }
 
-/// `POST /api/join-requests/:rid/approve` — approve a pending request: enroll the
-/// requester as a member (via the existing `add_member` path) THEN flip the
-/// request to `approved`. The caller must be the request's room's creator or a
-/// workspace admin (`403` otherwise); an unknown request id is `404`.
+/// Approve a pending request and enroll its requester atomically.
 async fn approve_request(
     State(s): State<AppState>,
     auth: AuthUser,
@@ -150,28 +150,15 @@ async fn approve_request(
 ) -> ApiResult<Json<serde_json::Value>> {
     let id = parse_request(&id_str)?;
     let request = repo(&s)
-        .get(id)
+        .decide_authorized(id, "approved", auth.participant_id)
         .await
-        .map_err(AeroError::from)?
-        .ok_or_else(|| AeroError::NotFound(format!("join request {id}")))?;
-    assert_can_decide(&s, request.room_id, auth.participant_id).await?;
-
-    // Grant membership first (idempotent `ON CONFLICT DO NOTHING`), then record
-    // the decision — so a successful flip always implies the requester is in.
-    s.rooms
-        .add_member(request.room_id, request.requester_id)
-        .await
-        .map_err(AeroError::from)?;
-    repo(&s)
-        .decide(id, "approved", auth.participant_id)
-        .await
-        .map_err(AeroError::from)?;
-    Ok(Json(serde_json::json!({ "approved": true })))
+        .map_err(map_write_error)?;
+    Ok(Json(
+        serde_json::json!({ "approved": true, "request": request }),
+    ))
 }
 
-/// `POST /api/join-requests/:rid/deny` — deny a pending request: flip it to
-/// `denied` without granting membership. The caller must be the request's room's
-/// creator or a workspace admin (`403` otherwise); an unknown request id is `404`.
+/// Deny a pending request without granting membership.
 async fn deny_request(
     State(s): State<AppState>,
     auth: AuthUser,
@@ -179,15 +166,10 @@ async fn deny_request(
 ) -> ApiResult<Json<serde_json::Value>> {
     let id = parse_request(&id_str)?;
     let request = repo(&s)
-        .get(id)
+        .decide_authorized(id, "denied", auth.participant_id)
         .await
-        .map_err(AeroError::from)?
-        .ok_or_else(|| AeroError::NotFound(format!("join request {id}")))?;
-    assert_can_decide(&s, request.room_id, auth.participant_id).await?;
-
-    repo(&s)
-        .decide(id, "denied", auth.participant_id)
-        .await
-        .map_err(AeroError::from)?;
-    Ok(Json(serde_json::json!({ "denied": true })))
+        .map_err(map_write_error)?;
+    Ok(Json(
+        serde_json::json!({ "denied": true, "request": request }),
+    ))
 }

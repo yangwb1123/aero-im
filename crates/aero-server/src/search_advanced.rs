@@ -1,13 +1,14 @@
 //! Advanced cross-room search — Slack-style query operators.
 //!
 //! The structured counterpart to [`crate::search`]: the caller's query may carry
-//! `from:@<id>`, `in:<roomid>`, `before:<msgid>`, and `after:<msgid>` operators
-//! alongside free text. The operators are parsed out
+//! `from:@<id>`, `in:<roomid>`, `before:<msgid>`, `after:<msgid>`,
+//! `since:<timestamp>`, and `until:<timestamp>` operators alongside free text.
+//! The operators are parsed out
 //! ([`parse_search_query`](aero_storage::parse_search_query)) and AND-ed into the
-//! SAME membership-scoped cross-room search as [`crate::search`]
-//! ([`AdvancedSearchRepo`](aero_storage::AdvancedSearchRepo), whose
-//! `JOIN room_members` is the security boundary) — so a hit can never surface a
-//! room the caller isn't in, and there is no post-filter.
+//! SAME effective-access-scoped cross-room search as [`crate::search`]
+//! ([`AdvancedSearchRepo`](aero_storage::AdvancedSearchRepo), whose effective
+//! room/workspace/account/deactivation/2FA joins are the security boundary) —
+//! so a stale room edge can never surface content.
 //!
 //! Purely additive: a thin handler over [`AdvancedSearchRepo`]; no existing repo
 //! or handler is touched. Mounted via [`routes`] and `.merge`d into the main
@@ -17,6 +18,7 @@ use std::str::FromStr;
 
 use aero_auth::AuthUser;
 use aero_common::{Error as AeroError, MessageId, WorkspaceId};
+use aero_storage::search_feedback::normalize_search_query;
 use aero_storage::{parse_search_query, AdvancedSearchRepo, SearchCursor, SearchFeedbackRepo};
 use axum::{extract::State, routing::post, Json, Router};
 use serde::Deserialize;
@@ -42,7 +44,7 @@ const DEFAULT_WORKSPACE_ID: WorkspaceId = WorkspaceId(ulid::Ulid(0));
 
 #[derive(Deserialize)]
 struct AdvancedSearchReq {
-    /// The raw query, free text plus optional `from:`/`in:`/`before:`/`after:`.
+    /// The raw query, free text plus optional structured operators.
     query: String,
     /// Optional tenant scope; absent ⇒ [`DEFAULT_WORKSPACE_ID`].
     #[serde(default)]
@@ -65,24 +67,22 @@ struct AdvancedSearchReq {
 const FACET_TOP: i64 = 10;
 
 /// `POST /api/search/advanced` — full-text search across every room the caller
-/// belongs to, with Slack-style operators AND-ed on. The repository's
-/// `JOIN room_members` is the security boundary; no room the caller isn't in can
-/// appear. Echoes the recognized operators back under `parsed`.
+/// may currently access, with Slack-style operators AND-ed on. The repository's
+/// effective-access joins are the security boundary. Echoes the recognized
+/// operators back under `parsed`.
 async fn search_advanced(
     State(s): State<AppState>,
     auth: AuthUser,
     Json(req): Json<AdvancedSearchReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    if req.query.trim().is_empty() {
-        return Err(AeroError::Invalid("empty query".into()).into());
-    }
+    let normalized_query = normalize_search_query(&req.query)?;
     let workspace = match req.workspace_id.as_deref() {
         Some(raw) => WorkspaceId::from_str(raw.trim())
             .map_err(|e| AeroError::Invalid(format!("workspace id: {e}")))?,
         None => DEFAULT_WORKSPACE_ID,
     };
     let limit = req.limit.unwrap_or(DEFAULT_LIMIT);
-    let parsed = parse_search_query(&req.query);
+    let parsed = parse_search_query(&normalized_query);
     // A malformed cursor decodes to None — treat as the first page rather than error.
     let after = req.cursor.as_deref().and_then(SearchCursor::decode);
 
@@ -121,8 +121,22 @@ async fn search_advanced(
         None
     };
 
+    let result_ids = hits.iter().map(|hit| hit.message.id).collect::<Vec<_>>();
+    let impression = SearchFeedbackRepo::new(s.pg.clone())
+        // Persist the complete normalized request, not only its free-text terms.
+        // Structured operators materially change which ranked set was shown and
+        // therefore belong to the feedback proof.
+        .create_impression(
+            auth.participant_id,
+            workspace,
+            &normalized_query,
+            &result_ids,
+        )
+        .await?;
+
     Ok(Json(serde_json::json!({
-        "query": req.query,
+        "query": normalized_query,
+        "impression_id": impression.id,
         "parsed": {
             "from": parsed.from,
             "in": parsed.in_room,
@@ -144,66 +158,71 @@ async fn search_advanced(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SearchClickReq {
-    /// The raw query whose result list was clicked (echoed from the search call).
-    query: String,
+    /// Server-issued proof returned by `/api/search/advanced`.
+    impression_id: String,
     /// The message id of the clicked result.
     result_id: String,
-    /// The clicked result's 0-based rank in the list (0 = top hit).
-    rank: i32,
 }
 
 /// `POST /api/search/click` — record a search-result click-through, the data
 /// foundation for relevance analytics / learning-to-rank (ROADMAP5 方向三 P2).
-/// Stores the (normalized) query, the opened message, and its rank; aggregates
-/// (CTR / MRR) are computed elsewhere over the log.
+/// The client submits only the server-issued impression and chosen result. The
+/// repository locks and consumes that proof, derives normalized query/rank from
+/// its ordered snapshot, and rechecks current access/canonical workspace before
+/// commit.
 ///
-/// Tenancy: the workspace is **derived from the clicked message's room** (after
-/// verifying the caller is a member of that room), NOT taken from the request —
-/// so a caller can only record a click on a result they could actually see, and
-/// cannot poison another workspace's relevance metrics by spoofing a
-/// `workspace_id`. This mirrors the search path's `JOIN room_members` boundary.
+/// Repeating the same click is deterministic and does not append a second
+/// analytics event. A different second result, expired proof, wrong owner,
+/// non-snapshot result, or revoked access is rejected.
 async fn search_click(
     State(s): State<AppState>,
     auth: AuthUser,
     Json(req): Json<SearchClickReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    let impression_id = uuid::Uuid::parse_str(req.impression_id.trim())
+        .map_err(|e| AeroError::Invalid(format!("impression_id: {e}")))?;
     let result_id = MessageId::from_str(req.result_id.trim())
         .map_err(|e| AeroError::Invalid(format!("result_id: {e}")))?;
 
-    // Resolve the clicked message and verify the caller can see its room. A click
-    // on a result you couldn't have seen is either a stale id or an attempt to
-    // attribute a click to a room/workspace you don't belong to — both rejected.
-    let message = s
-        .messages
-        .get(result_id)
-        .await
-        .map_err(AeroError::from)?
-        .ok_or_else(|| AeroError::NotFound("result message not found".into()))?;
-    if !s
-        .rooms
-        .is_member(message.room_id, auth.participant_id)
-        .await
-        .map_err(AeroError::from)?
-    {
-        return Err(AeroError::Forbidden("not a member of the result's room".into()).into());
+    let receipt = SearchFeedbackRepo::new(s.pg.clone())
+        .record_impression_click(auth.participant_id, impression_id, result_id)
+        .await?;
+
+    Ok(Json(serde_json::json!({
+        "recorded": true,
+        "impression_id": receipt.impression_id,
+        "result_id": receipt.result_id,
+        "rank": receipt.result_rank,
+    })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SearchClickReq;
+
+    #[test]
+    fn click_request_accepts_only_server_proof_and_result() {
+        let impression = uuid::Uuid::new_v4();
+        let result = aero_common::MessageId::new();
+        let parsed: SearchClickReq = serde_json::from_value(serde_json::json!({
+            "impression_id": impression,
+            "result_id": result,
+        }))
+        .unwrap();
+        assert_eq!(parsed.impression_id, impression.to_string());
+        assert_eq!(parsed.result_id, result.to_string());
+
+        assert!(
+            serde_json::from_value::<SearchClickReq>(serde_json::json!({
+                "impression_id": impression,
+                "result_id": result,
+                "query": "forged",
+                "rank": 99,
+            }))
+            .is_err(),
+            "legacy client-supplied relevance attributes are rejected"
+        );
     }
-    // Authoritative workspace: the result's room owns it (unspoofable).
-    let workspace = s
-        .rooms
-        .room_workspace(message.room_id)
-        .await
-        .map_err(AeroError::from)?
-        .unwrap_or(DEFAULT_WORKSPACE_ID);
-
-    // Record the normalized free-text terms (the operators aren't part of the
-    // relevance signal), so CTR aggregates group equivalent queries together.
-    let terms = parse_search_query(&req.query).terms;
-
-    SearchFeedbackRepo::new(s.pg.clone())
-        .record_click(auth.participant_id, workspace, &terms, result_id, req.rank)
-        .await
-        .map_err(AeroError::from)?;
-
-    Ok(Json(serde_json::json!({ "recorded": true })))
 }

@@ -2,9 +2,7 @@
 //!
 //! Extracted from `service.rs` as part of REFACTOR_PLAN.md Step 1c.
 
-use aero_common::{
-    Error, MessageId, ParticipantId, ReadReceipt, Result, RoomEvent, RoomId,
-};
+use aero_common::{MessageId, ParticipantId, ReadReceipt, Result, RoomEvent, RoomId};
 use tracing::instrument;
 
 use crate::ImService;
@@ -18,16 +16,17 @@ impl ImService {
         room: RoomId,
         last_read: MessageId,
     ) -> Result<ReadReceipt> {
-        if !self.rooms.is_member(room, actor).await? {
-            return Err(Error::Forbidden("not a room member".into()));
-        }
-        let receipt = self.receipts.mark_read(room, actor, last_read).await?;
+        self.assert_room_access(actor, room).await?;
+        let receipt = self
+            .receipts
+            .mark_read_authorized(room, actor, last_read)
+            .await?;
         self.publish_room_event(
             room,
             &RoomEvent::Read {
                 room_id: room,
                 participant: actor,
-                last_message_id: last_read,
+                last_message_id: receipt.last_read_message_id,
                 at: receipt.updated_at,
             },
         )
@@ -40,18 +39,15 @@ impl ImService {
     }
 
     /// Broadcast a typing indicator. No persistence.
-    pub async fn typing(
-        &self,
-        actor: ParticipantId,
-        room: RoomId,
-        on: bool,
-    ) -> Result<()> {
-        if !self.rooms.is_member(room, actor).await? {
-            return Err(Error::Forbidden("not a room member".into()));
-        }
+    pub async fn typing(&self, actor: ParticipantId, room: RoomId, on: bool) -> Result<()> {
+        self.assert_room_access(actor, room).await?;
         self.publish_room_event(
             room,
-            &RoomEvent::Typing { room_id: room, participant: actor, on },
+            &RoomEvent::Typing {
+                room_id: room,
+                participant: actor,
+                on,
+            },
         )
         .await;
         Ok(())

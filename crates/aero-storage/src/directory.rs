@@ -257,13 +257,22 @@ mod db_tests {
             .expect("name search finds the member");
         assert_eq!(found.display_name, format!("Ada {tag}"));
         assert_eq!(found.kind, "human");
-        assert_eq!(found.title.as_deref(), Some(format!("Engineer {tag}").as_str()));
+        assert_eq!(
+            found.title.as_deref(),
+            Some(format!("Engineer {tag}").as_str())
+        );
 
         // A title filter narrows: searching the tag across both, then filtering by
         // the engineer's title excludes the designer.
         let both = repo.search(ws, Some(&tag), None, 50, 0).await.unwrap();
-        assert!(both.iter().any(|e| e.participant_id == eng), "engineer in tag set");
-        assert!(both.iter().any(|e| e.participant_id == designer), "designer in tag set");
+        assert!(
+            both.iter().any(|e| e.participant_id == eng),
+            "engineer in tag set"
+        );
+        assert!(
+            both.iter().any(|e| e.participant_id == designer),
+            "designer in tag set"
+        );
 
         let narrowed = repo
             .search(ws, Some(&tag), Some(&format!("Engineer {tag}")), 50, 0)
@@ -303,13 +312,22 @@ mod db_tests {
             .expect("erase");
 
         // Baseline: the active member is still reachable by name.
-        let by_name = repo.search(ws, Some(&format!("Active {tag}")), None, 50, 0).await.unwrap();
-        assert!(by_name.iter().any(|e| e.participant_id == active), "active member is listed");
+        let by_name = repo
+            .search(ws, Some(&format!("Active {tag}")), None, 50, 0)
+            .await
+            .unwrap();
+        assert!(
+            by_name.iter().any(|e| e.participant_id == active),
+            "active member is listed"
+        );
 
         // The erased member must be absent from an UNFILTERED listing (its name is
         // now '[deleted]', so only the deleted_at filter — not the name — excludes it).
         let all = repo.search(ws, None, None, 200, 0).await.unwrap();
-        assert!(all.iter().any(|e| e.participant_id == active), "active member in full listing");
+        assert!(
+            all.iter().any(|e| e.participant_id == active),
+            "active member in full listing"
+        );
         assert!(
             !all.iter().any(|e| e.participant_id == erased),
             "a GDPR-tombstoned member must NOT leak into the directory"

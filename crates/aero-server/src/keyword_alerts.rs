@@ -6,18 +6,17 @@
 //! notification (via [`KeywordAlertRepo::matching_subscribers`](aero_storage::KeywordAlertRepo::matching_subscribers))
 //! is wired separately into `ImService::dispatch_notifications`.
 //!
-//! Thin handlers over [`KeywordAlertRepo`](aero_storage::KeywordAlertRepo): add
-//! and list assert the caller is a member of the workspace (via the shared
-//! [`WorkspaceRepo`](aero_storage::WorkspaceRepo), mirroring
-//! [`crate::saved_searches`]); delete is owner-scoped at the SQL layer (a
-//! non-owner's id resolves to `false` ⇒ `404`). Keywords are normalized
-//! (trimmed + lowercased) and must be 1..=64 chars after normalization. Mounted
-//! via [`routes`] and `.merge`d into the main router.
+//! Thin handlers over [`KeywordAlertRepo`](aero_storage::KeywordAlertRepo).
+//! Storage owns effective workspace authorization and CRUD in one transaction;
+//! delete resolves foreign/unknown opaque ids to the same `404`. Keywords are
+//! normalized (trimmed + lowercased) and must be 1..=64 chars after
+//! normalization. Mounted via [`routes`] and `.merge`d into the main router.
 
 use std::str::FromStr;
 
 use aero_auth::AuthUser;
-use aero_common::{Error as AeroError, KeywordAlertId, ParticipantId, WorkspaceId};
+use aero_common::{Error as AeroError, KeywordAlertId, WorkspaceId};
+use aero_storage::keyword_alert::MAX_KEYWORD_CHARS;
 use aero_storage::{normalize_keyword, KeywordAlertRepo};
 use axum::{
     extract::{Path, Query, State},
@@ -28,9 +27,6 @@ use serde::Deserialize;
 
 use crate::error::ApiResult;
 use crate::state::AppState;
-
-/// Maximum length of a normalized keyword, in chars.
-const MAX_KEYWORD_CHARS: usize = 64;
 
 /// All keyword-alert routes, ready to `.merge` into the gateway router.
 pub fn routes() -> Router<AppState> {
@@ -54,21 +50,6 @@ fn parse_workspace(s: &str) -> Result<WorkspaceId, AeroError> {
 fn parse_keyword_alert(s: &str) -> Result<KeywordAlertId, AeroError> {
     KeywordAlertId::from_str(s.trim())
         .map_err(|e| AeroError::Invalid(format!("keyword alert id: {e}")))
-}
-
-/// Assert the caller is a member of the workspace, rejecting non-members with a
-/// `403`. Mirrors `crate::saved_searches::assert_member`.
-async fn assert_member(
-    s: &AppState,
-    workspace: WorkspaceId,
-    caller: ParticipantId,
-) -> Result<(), AeroError> {
-    s.workspaces
-        .member_role(workspace, caller)
-        .await
-        .map_err(AeroError::from)?
-        .ok_or_else(|| AeroError::Forbidden("not a workspace member".into()))?;
-    Ok(())
 }
 
 /// Validate and normalize a keyword: trim + lowercase, then require it to be
@@ -111,22 +92,11 @@ async fn create_keyword_alert(
     Json(req): Json<CreateKeywordAlertReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let ws = parse_workspace(&req.workspace_id)?;
-    assert_member(&s, ws, auth.participant_id).await?;
     let keyword = validate_keyword(&req.keyword)?;
 
-    let id = repo(&s)
-        .add(auth.participant_id, ws, &keyword)
-        .await
-        .map_err(AeroError::from)?;
-    // Re-read so the response carries the full, canonical row (created_at). The
-    // alert is one of the caller's own, so an owner-scoped list lookup finds it.
     let row = repo(&s)
-        .list_for(auth.participant_id, ws)
-        .await
-        .map_err(AeroError::from)?
-        .into_iter()
-        .find(|a| a.id == id)
-        .ok_or_else(|| AeroError::NotFound("keyword alert".into()))?;
+        .add_authorized(auth.participant_id, ws, &keyword)
+        .await?;
     Ok(Json(serde_json::to_value(row).map_err(AeroError::from)?))
 }
 
@@ -138,11 +108,7 @@ async fn list_keyword_alerts(
     Query(q): Query<ListKeywordAlertsQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let ws = parse_workspace(&q.workspace_id)?;
-    assert_member(&s, ws, auth.participant_id).await?;
-    let alerts = repo(&s)
-        .list_for(auth.participant_id, ws)
-        .await
-        .map_err(AeroError::from)?;
+    let alerts = repo(&s).list_authorized(auth.participant_id, ws).await?;
     Ok(Json(serde_json::to_value(alerts).map_err(AeroError::from)?))
 }
 
@@ -155,13 +121,7 @@ async fn delete_keyword_alert(
     Path(id_str): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let id = parse_keyword_alert(&id_str)?;
-    let removed = repo(&s)
-        .delete(id, auth.participant_id)
-        .await
-        .map_err(AeroError::from)?;
-    if !removed {
-        return Err(AeroError::NotFound(format!("keyword alert {id}")).into());
-    }
+    repo(&s).delete_authorized(id, auth.participant_id).await?;
     Ok(Json(serde_json::json!({ "deleted": true })))
 }
 
@@ -178,7 +138,10 @@ mod tests {
         assert!(validate_keyword("").is_err());
         // Exactly 64 chars is allowed; 65 is rejected.
         let max = "a".repeat(MAX_KEYWORD_CHARS);
-        assert_eq!(validate_keyword(&max).unwrap().chars().count(), MAX_KEYWORD_CHARS);
+        assert_eq!(
+            validate_keyword(&max).unwrap().chars().count(),
+            MAX_KEYWORD_CHARS
+        );
         let over = "a".repeat(MAX_KEYWORD_CHARS + 1);
         assert!(validate_keyword(&over).is_err());
     }

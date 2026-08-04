@@ -23,10 +23,8 @@ impl TempDir {
     /// Create a fresh, empty, process-unique temporary directory.
     pub(crate) fn new() -> std::io::Result<Self> {
         let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "aero-whip-test-{}-{seq}",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("aero-whip-test-{}-{seq}", std::process::id()));
         // Clear any stale directory from a previous aborted run, then recreate.
         let _ = std::fs::remove_dir_all(&path);
         std::fs::create_dir_all(&path)?;

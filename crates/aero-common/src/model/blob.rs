@@ -7,9 +7,9 @@
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-use crate::ids::{BlobId, ParticipantId, RoomId};
 use super::block::FileKind;
 use super::message::Message;
+use crate::ids::{BlobId, ParticipantId, RoomId, WorkspaceId};
 
 // ---------- Pinned messages ----------
 
@@ -38,6 +38,14 @@ pub struct PinnedMessage {
 pub struct Blob {
     pub id: BlobId,
     pub owner_id: ParticipantId,
+    /// Authenticated workspace at reservation time. `None` denotes a legacy or
+    /// explicitly unscoped blob and must not be presented as residency-pinned.
+    #[serde(default)]
+    pub workspace_id: Option<WorkspaceId>,
+    /// Immutable backend code selected at reservation time. Legacy `None`
+    /// values are read from the default backend.
+    #[serde(default)]
+    pub storage_region: Option<String>,
     pub kind: FileKind,
     pub name: String,
     pub mime: String,

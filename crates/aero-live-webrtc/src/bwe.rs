@@ -346,7 +346,10 @@ mod tests {
             bwe.on_twcc(20, 0, 0, i * 100);
         }
         let end = bwe.estimate_bps();
-        assert!(end > start, "estimate must grow on clean feedback: {start} → {end}");
+        assert!(
+            end > start,
+            "estimate must grow on clean feedback: {start} → {end}"
+        );
         // 29 intervals × 100 ms × 200_000 bps/s = 580_000 of growth.
         assert_eq!(end, start + 580_000);
     }
@@ -365,7 +368,7 @@ mod tests {
     fn loss_above_threshold_backs_off_multiplicatively() {
         let mut bwe = BandwidthEstimator::default();
         let before = bwe.estimate_bps(); // 600_000
-        // 2 lost out of 20 = 10% > 5% threshold.
+                                         // 2 lost out of 20 = 10% > 5% threshold.
         bwe.on_twcc(18, 2, 0, 100);
         let after = bwe.estimate_bps();
         assert_eq!(after, 510_000, "600_000 × 0.85");
@@ -447,7 +450,10 @@ mod tests {
         bwe.on_remb(9_000_000, 100);
         bwe.on_remb(9_000_000, 200);
         bwe.on_remb(9_000_000, 300);
-        assert!(bwe.estimate_bps() <= 600_000, "AIMD value rules when REMB is high");
+        assert!(
+            bwe.estimate_bps() <= 600_000,
+            "AIMD value rules when REMB is high"
+        );
         assert!(bwe.estimate_bps() >= 500_000);
     }
 
@@ -498,7 +504,10 @@ mod tests {
         }
         let low = m.rate_bps().unwrap();
         assert!(low < high);
-        assert!(low > 100_000, "EWMA must lag, not jump straight to 100 kbps");
+        assert!(
+            low > 100_000,
+            "EWMA must lag, not jump straight to 100 kbps"
+        );
     }
 
     // ── LayerSwitchPolicy ──────────────────────────────────────────────────────
@@ -538,8 +547,14 @@ mod tests {
         let rates = rates_low_high();
         // On Low, estimate now affords Mid — but not yet for 2 s.
         assert_eq!(p.decide(Some(LayerKind::Low), 1_000_000, &rates, 0), None);
-        assert_eq!(p.decide(Some(LayerKind::Low), 1_000_000, &rates, 1_000), None);
-        assert_eq!(p.decide(Some(LayerKind::Low), 1_000_000, &rates, 1_999), None);
+        assert_eq!(
+            p.decide(Some(LayerKind::Low), 1_000_000, &rates, 1_000),
+            None
+        );
+        assert_eq!(
+            p.decide(Some(LayerKind::Low), 1_000_000, &rates, 1_999),
+            None
+        );
         // 2 s of stable headroom → up-switch fires.
         assert_eq!(
             p.decide(Some(LayerKind::Low), 1_000_000, &rates, 2_000),
@@ -555,8 +570,14 @@ mod tests {
         // Estimate dips back to Low territory → timer must reset.
         assert_eq!(p.decide(Some(LayerKind::Low), 250_000, &rates, 1_000), None);
         // Headroom returns at t=1500; 2 s from *here*, not from t=0.
-        assert_eq!(p.decide(Some(LayerKind::Low), 1_000_000, &rates, 1_500), None);
-        assert_eq!(p.decide(Some(LayerKind::Low), 1_000_000, &rates, 3_000), None);
+        assert_eq!(
+            p.decide(Some(LayerKind::Low), 1_000_000, &rates, 1_500),
+            None
+        );
+        assert_eq!(
+            p.decide(Some(LayerKind::Low), 1_000_000, &rates, 3_000),
+            None
+        );
         assert_eq!(
             p.decide(Some(LayerKind::Low), 1_000_000, &rates, 3_500),
             Some(LayerKind::Mid)
@@ -580,7 +601,10 @@ mod tests {
             (LayerKind::High, None), // never measured — cannot verify it fits
         ];
         assert_eq!(p.decide(Some(LayerKind::Low), 5_000_000, &rates, 0), None);
-        assert_eq!(p.decide(Some(LayerKind::Low), 5_000_000, &rates, 60_000), None);
+        assert_eq!(
+            p.decide(Some(LayerKind::Low), 5_000_000, &rates, 60_000),
+            None
+        );
     }
 
     #[test]

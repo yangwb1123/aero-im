@@ -41,7 +41,10 @@ impl AiContextStore {
     /// a sha-256 of the pre-normalized query (deterministic across nodes, bounded
     /// length, raw question text kept out of the Redis key).
     fn answer_cache_key(room: RoomId, query_norm: &str) -> String {
-        format!("ai:ans:{room}:{}", crate::revoked_token::hash_token(query_norm))
+        format!(
+            "ai:ans:{room}:{}",
+            crate::revoked_token::hash_token(query_norm)
+        )
     }
 
     /// Per-room index of live answer-cache keys, so the whole room can be
@@ -60,7 +63,10 @@ impl AiContextStore {
         room: RoomId,
         query_norm: &str,
     ) -> anyhow::Result<Option<String>> {
-        let v: Option<String> = self.client.get(Self::answer_cache_key(room, query_norm)).await?;
+        let v: Option<String> = self
+            .client
+            .get(Self::answer_cache_key(room, query_norm))
+            .await?;
         Ok(v)
     }
 
@@ -95,7 +101,9 @@ impl AiContextStore {
         // the entry's so it never expires while a live answer remains.
         let idx = Self::answer_keys_set(room);
         self.client.sadd::<(), _, _>(&idx, key).await?;
-        self.client.expire::<(), _>(&idx, ttl_secs.max(1) + 3600).await?;
+        self.client
+            .expire::<(), _>(&idx, ttl_secs.max(1) + 3600)
+            .await?;
         Ok(())
     }
 
@@ -174,7 +182,8 @@ impl AiContextStore {
         // n is caller-controlled (≤ MAX_TURNS = 10); always fits in i64.
         #[allow(clippy::cast_possible_wrap)]
         let start: i64 = -(n as i64);
-        let raw: Vec<String> = self.client
+        let raw: Vec<String> = self
+            .client
             .zrange(&key, start, -1, None, false, None, false)
             .await?;
 
@@ -223,8 +232,14 @@ mod tests {
 
     #[test]
     fn parse_turn_splits_on_sep() {
-        assert_eq!(parse_turn("user\x1FHello there"), Some(("user", "Hello there")));
-        assert_eq!(parse_turn("assistant\x1FI can help!"), Some(("assistant", "I can help!")));
+        assert_eq!(
+            parse_turn("user\x1FHello there"),
+            Some(("user", "Hello there"))
+        );
+        assert_eq!(
+            parse_turn("assistant\x1FI can help!"),
+            Some(("assistant", "I can help!"))
+        );
     }
 
     #[test]
@@ -261,7 +276,12 @@ mod tests {
     async fn redis() -> RedisClient {
         use fred::prelude::ClientLike;
         let url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://localhost:6379".into());
-        let c = RedisClient::new(fred::types::RedisConfig::from_url(&url).unwrap(), None, None, None);
+        let c = RedisClient::new(
+            fred::types::RedisConfig::from_url(&url).unwrap(),
+            None,
+            None,
+            None,
+        );
         c.connect();
         c.wait_for_connect().await.unwrap();
         c
@@ -282,13 +302,20 @@ mod tests {
         // Put in room A → hit in room A, but a MISS in room B (room isolation = no
         // cross-tenant leak, the cache's safety guarantee).
         store.cache_answer_put(room_a, q, val, 60).await.unwrap();
-        assert_eq!(store.cache_answer_get(room_a, q).await.unwrap().as_deref(), Some(val));
+        assert_eq!(
+            store.cache_answer_get(room_a, q).await.unwrap().as_deref(),
+            Some(val)
+        );
         assert!(
             store.cache_answer_get(room_b, q).await.unwrap().is_none(),
             "a cached answer must NOT leak across rooms"
         );
         // A different query in the same room is also a miss.
-        assert!(store.cache_answer_get(room_a, "完全不同的问题").await.unwrap().is_none());
+        assert!(store
+            .cache_answer_get(room_a, "完全不同的问题")
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
@@ -300,18 +327,39 @@ mod tests {
         let val = r#"{"answer":"x","citations":[]}"#;
 
         // Two cached answers in room A, one in room B.
-        store.cache_answer_put(room_a, "q1", val, 300).await.unwrap();
-        store.cache_answer_put(room_a, "q2", val, 300).await.unwrap();
-        store.cache_answer_put(room_b, "q1", val, 300).await.unwrap();
+        store
+            .cache_answer_put(room_a, "q1", val, 300)
+            .await
+            .unwrap();
+        store
+            .cache_answer_put(room_a, "q2", val, 300)
+            .await
+            .unwrap();
+        store
+            .cache_answer_put(room_b, "q1", val, 300)
+            .await
+            .unwrap();
 
         // Invalidating room A removes BOTH its entries (an Edited/Deleted in A),
         // and reports the count; room B is untouched.
         let removed = store.cache_answer_invalidate_room(room_a).await.unwrap();
         assert_eq!(removed, 2, "both room-A answers were invalidated");
-        assert!(store.cache_answer_get(room_a, "q1").await.unwrap().is_none());
-        assert!(store.cache_answer_get(room_a, "q2").await.unwrap().is_none());
+        assert!(store
+            .cache_answer_get(room_a, "q1")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(store
+            .cache_answer_get(room_a, "q2")
+            .await
+            .unwrap()
+            .is_none());
         assert_eq!(
-            store.cache_answer_get(room_b, "q1").await.unwrap().as_deref(),
+            store
+                .cache_answer_get(room_b, "q1")
+                .await
+                .unwrap()
+                .as_deref(),
             Some(val),
             "another room's cache is not touched by an invalidation"
         );

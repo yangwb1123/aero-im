@@ -117,7 +117,10 @@ impl SrtSession {
     ///
     /// Returns the assigned sequence number.
     pub fn send_data(&mut self, payload: Vec<u8>) -> u32 {
-        let Action::SendData { seq_no, payload, .. } = self.reliability.enqueue(payload) else {
+        let Action::SendData {
+            seq_no, payload, ..
+        } = self.reliability.enqueue(payload)
+        else {
             unreachable!("enqueue always returns SendData");
         };
         self.fresh_data.push_back((seq_no, payload));
@@ -156,7 +159,7 @@ impl SrtSession {
                 };
                 self.pacer.on_ack(cif.rtt_us, cif.rttvar_us, now);
                 // type_specific carries the ACK id to echo in the ACKACK.
-                if let Some(action) = self.reliability.on_ack(cif.ack_seq_no, type_specific, now) {
+                if let Some(action) = self.reliability.on_ack(cif.ack_seq_no, type_specific) {
                     self.pending_actions.push(action);
                 }
             }
@@ -168,7 +171,8 @@ impl SrtSession {
                     // were already rejected by on_nak, count them as zero.
                     let span = seq_diff(from, to);
                     if span >= 0 {
-                        lost = lost.saturating_add(usize::try_from(span).unwrap_or(usize::MAX))
+                        lost = lost
+                            .saturating_add(usize::try_from(span).unwrap_or(usize::MAX))
                             .saturating_add(1);
                     }
                 }
@@ -199,12 +203,7 @@ impl SrtSession {
     /// (the caller controls the clock, so tests can fake time).
     ///
     /// Returns the number of packets sent (useful in tests to confirm activity).
-    pub fn pump(
-        &mut self,
-        sink: &mut impl SrtSink,
-        now: Instant,
-        peer_socket_id: u32,
-    ) -> usize {
+    pub fn pump(&mut self, sink: &mut impl SrtSink, now: Instant, peer_socket_id: u32) -> usize {
         let mut sent = 0usize;
 
         // ── 1. Control packets (ACK / NAK / ACKACK) ───────────────────────────
@@ -212,7 +211,7 @@ impl SrtSession {
         // drain_control_packets takes `pending_actions` and serialises each one
         // via encode_control.  SendData actions are silently dropped there (they
         // are not control-plane), which is correct: data is handled below.
-        for pkt in self.drain_control_packets(peer_socket_id) {
+        for pkt in self.drain_control_packets_at(peer_socket_id, now) {
             sink.send(&pkt);
             sent += 1;
         }
@@ -224,7 +223,10 @@ impl SrtSession {
         // benefits more from the missing packet than from new ones) — but
         // both spend from the same pacer budget.
         for action in self.reliability.drain_retransmits() {
-            if let Action::SendData { seq_no, payload, .. } = action {
+            if let Action::SendData {
+                seq_no, payload, ..
+            } = action
+            {
                 self.deferred_retransmits.push_back((seq_no, payload));
             }
         }
@@ -272,7 +274,12 @@ impl SrtSession {
 ///
 /// Fields not tracked by this implementation (PP, O, KK, message number) are
 /// left at zero.
-fn encode_data_packet(seq_no: u32, is_retransmit: bool, dst_socket_id: u32, payload: &[u8]) -> Vec<u8> {
+fn encode_data_packet(
+    seq_no: u32,
+    is_retransmit: bool,
+    dst_socket_id: u32,
+    payload: &[u8],
+) -> Vec<u8> {
     // msg_word: bit 2 (0-indexed from the spec's numbering after the seq field)
     // is the `R` (retransmit) flag in the SRT data header word 1.
     // Per SRT spec §3.1: word 1 = PP(2) | O(1) | KK(2) | R(1) | MsgNo(26).
@@ -474,6 +481,54 @@ mod tests {
         );
     }
 
+    /// RTT sampling starts when `pump` actually emits our full ACK; a matching
+    /// ACKACK from the peer must update the estimator for that ACK id.
+    #[tokio::test]
+    async fn emitted_ack_then_matching_ackack_updates_rtt() {
+        let (mut session, _dir) = fresh_session().await;
+        session
+            .reliability
+            .set_ack_interval(Duration::from_nanos(1));
+        let started_at = Instant::now();
+        let sent_at = started_at + Duration::from_millis(1);
+        session.reliability.on_data(100, started_at);
+        let actions = session.reliability.on_data(101, sent_at);
+        session.pending_actions.extend(actions);
+
+        let mut sink = RecordingSink::default();
+        session.pump(&mut sink, sent_at, 0xCAFE_1234);
+        let ack_id = sink
+            .packets
+            .iter()
+            .find_map(|packet| match SrtHeader::parse(packet)?.kind {
+                PacketKind::Control {
+                    control_type: ControlType::Ack,
+                    type_specific,
+                    ..
+                } => Some(type_specific),
+                _ => None,
+            })
+            .expect("pump emitted a full ACK");
+
+        let ackack = SrtHeader {
+            kind: PacketKind::Control {
+                control_type: ControlType::AckAck,
+                subtype: 0,
+                type_specific: ack_id,
+            },
+            timestamp: 0,
+            dest_socket_id: 1,
+        }
+        .to_bytes();
+        session.handle_control(&ackack, sent_at + Duration::from_millis(50));
+
+        assert_eq!(
+            session.reliability.rtt(),
+            Duration::from_micros(93_750),
+            "100ms initial RTT filtered with a 50ms ACK/ACKACK sample"
+        );
+    }
+
     // ─── Test: received NAK drives sender retransmission ─────────────────────
 
     /// On the sender side: enqueue packets, simulate a NAK, then confirm that
@@ -485,7 +540,11 @@ mod tests {
         let now = Instant::now();
 
         // Enqueue three packets on the sender side.
-        let payloads = [b"packet-0".as_ref(), b"packet-1".as_ref(), b"packet-2".as_ref()];
+        let payloads = [
+            b"packet-0".as_ref(),
+            b"packet-1".as_ref(),
+            b"packet-2".as_ref(),
+        ];
         for p in &payloads {
             session.reliability.enqueue(p.to_vec());
         }
@@ -502,8 +561,7 @@ mod tests {
             .packets
             .iter()
             .filter(|p| {
-                SrtHeader::parse(p)
-                    .is_some_and(|h| matches!(h.kind, PacketKind::Data { .. }))
+                SrtHeader::parse(p).is_some_and(|h| matches!(h.kind, PacketKind::Data { .. }))
             })
             .collect();
 
@@ -526,7 +584,11 @@ mod tests {
             })
             .collect();
         seq_nos.sort_unstable();
-        assert_eq!(seq_nos, vec![0, 1], "retransmitted seq numbers must be 0 and 1");
+        assert_eq!(
+            seq_nos,
+            vec![0, 1],
+            "retransmitted seq numbers must be 0 and 1"
+        );
 
         for pkt in &data_pkts {
             let body = &pkt[SRT_HEADER_LEN..];
@@ -550,7 +612,7 @@ mod tests {
         // Enqueue one packet so the send buffer is non-empty, then receive an ACK.
         session.reliability.enqueue(b"data".to_vec());
         // on_ack returns an Action::SendAckAck which must be queued.
-        let maybe_ackack = session.reliability.on_ack(1, 42, now);
+        let maybe_ackack = session.reliability.on_ack(1, 42);
         // The action goes into pending_actions (mirroring feed_packet flow).
         if let Some(action) = maybe_ackack {
             session.pending_actions.push(action);
@@ -634,7 +696,11 @@ mod tests {
         let PacketKind::Data { msg_word, .. } = hdr.kind else {
             panic!("expected data packet");
         };
-        assert_eq!(msg_word & (1 << 2), 0, "R bit must be clear for a new packet");
+        assert_eq!(
+            msg_word & (1 << 2),
+            0,
+            "R bit must be clear for a new packet"
+        );
     }
 
     // ─── Test: SrtSink blanket impl for closures (ergonomics check) ───────────
@@ -683,7 +749,6 @@ mod tests {
     /// simulate a gap on the receiver (NAK), and confirm retransmission.
     #[test]
     fn reliability_state_nak_retransmit_round_trip() {
-        let now = Instant::now();
         let mut sender = ReliabilityState::new(0);
 
         // Sender enqueues three packets.
@@ -707,7 +772,7 @@ mod tests {
         ));
 
         // Sender receives ACK for all three → send buffer clears.
-        sender.on_ack(3, 1, now);
+        sender.on_ack(3, 1);
         assert_eq!(sender.send_buffer_len(), 0);
     }
 
@@ -728,13 +793,14 @@ mod tests {
             0,
             rtt_us,
             rttvar_us,
+            8192,
         )
         .expect("SendAck encodes to a control packet")
     }
 
     /// Wire-encode a NAK control packet reporting the inclusive loss range.
     fn make_nak_pkt(from: u32, to: u32) -> Vec<u8> {
-        crate::control::encode_control(&Action::SendNak { from, to }, 1, 0, 0, 0)
+        crate::control::encode_control(&Action::SendNak { from, to }, 1, 0, 0, 0, 8192)
             .expect("SendNak encodes to a control packet")
     }
 
@@ -798,7 +864,11 @@ mod tests {
         // Bucket capacity is 4 MTUs: the first 4 packets pass as a burst.
         let mut sink = RecordingSink::default();
         session.pump(&mut sink, t0, 1);
-        assert_eq!(data_seqs(&sink), vec![0, 1, 2, 3], "initial burst absorbed in order");
+        assert_eq!(
+            data_seqs(&sink),
+            vec![0, 1, 2, 3],
+            "initial burst absorbed in order"
+        );
         assert_eq!(
             session.next_send_at(),
             Some(t0 + Duration::from_secs(1)),
@@ -822,7 +892,11 @@ mod tests {
         let mut sink = RecordingSink::default();
         session.pump(&mut sink, t0 + Duration::from_secs(2), 1);
         assert_eq!(data_seqs(&sink), vec![5]);
-        assert_eq!(session.next_send_at(), None, "queue drained — nothing held back");
+        assert_eq!(
+            session.next_send_at(),
+            None,
+            "queue drained — nothing held back"
+        );
     }
 
     // ─── NAK-storm slowdown through handle_control ────────────────────────────
@@ -840,7 +914,11 @@ mod tests {
         // One NAK reporting 10 lost packets (none buffered → no retransmits)
         // crosses the per-window threshold: one multiplicative decrease.
         session.handle_control(&make_nak_pkt(100, 109), t0);
-        assert_eq!(session.current_send_rate(), 1275, "1500 × 85% after one NAK burst");
+        assert_eq!(
+            session.current_send_rate(),
+            1275,
+            "1500 × 85% after one NAK burst"
+        );
 
         // One storm per 100 ms rate window → one more decrease each window,
         // clamping at the 5% floor.
@@ -895,7 +973,10 @@ mod tests {
         );
 
         // 40 ms > 20 ms × 1.25 → congestion: multiplicative decrease.
-        session.handle_control(&make_ack_pkt(2, 8, 40_000, 0), t0 + Duration::from_millis(10));
+        session.handle_control(
+            &make_ack_pkt(2, 8, 40_000, 0),
+            t0 + Duration::from_millis(10),
+        );
         assert_eq!(session.current_send_rate(), 850);
 
         // Both ACKs queued an ACKACK echo; pump must deliver them in order.
@@ -913,7 +994,11 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(ackacks, vec![7, 8], "each ACK id must be echoed as an ACKACK");
+        assert_eq!(
+            ackacks,
+            vec![7, 8],
+            "each ACK id must be echoed as an ACKACK"
+        );
     }
 
     // ─── retransmit priority under a shared budget ────────────────────────────
@@ -939,7 +1024,11 @@ mod tests {
         // the rate stays put) and a fifth fresh packet joins the queue.
         session.handle_control(&make_nak_pkt(0, 1), t0);
         session.send_data(vec![0xAA; MTU_PAYLOAD]); // seq 4
-        assert_eq!(session.current_send_rate(), 1500, "2 NAKs must not back off");
+        assert_eq!(
+            session.current_send_rate(),
+            1500,
+            "2 NAKs must not back off"
+        );
 
         // Budget exhausted: nothing goes out — retransmissions included.
         let mut sink = RecordingSink::default();
@@ -954,7 +1043,11 @@ mod tests {
         for (step, want_seq) in [(1u64, 0u32), (2, 1)] {
             let mut sink = RecordingSink::default();
             session.pump(&mut sink, t0 + Duration::from_secs(step), 1);
-            assert_eq!(data_seqs(&sink), vec![want_seq], "retransmits drain in NAK order");
+            assert_eq!(
+                data_seqs(&sink),
+                vec![want_seq],
+                "retransmits drain in NAK order"
+            );
             let msg_word = sink
                 .packets
                 .iter()
@@ -969,7 +1062,11 @@ mod tests {
         // …then the fresh packet (R bit clear) brings up the rear.
         let mut sink = RecordingSink::default();
         session.pump(&mut sink, t0 + Duration::from_secs(3), 1);
-        assert_eq!(data_seqs(&sink), vec![4], "fresh data must follow the retransmits");
+        assert_eq!(
+            data_seqs(&sink),
+            vec![4],
+            "fresh data must follow the retransmits"
+        );
         let msg_word = sink
             .packets
             .iter()
@@ -978,7 +1075,11 @@ mod tests {
                 _ => None,
             })
             .expect("a data packet was sent");
-        assert_eq!(msg_word & (1 << 2), 0, "fresh data must not carry the R bit");
+        assert_eq!(
+            msg_word & (1 << 2),
+            0,
+            "fresh data must not carry the R bit"
+        );
     }
 
     // ─── handle_control robustness ────────────────────────────────────────────

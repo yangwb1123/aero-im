@@ -10,7 +10,29 @@
 //! Purely additive: a NEW [`BlockRepo`]; no existing repo is touched.
 
 use aero_common::{Error, ParticipantId};
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
+
+/// Serialize every state transition and gated conversation start for an
+/// unordered participant pair.
+///
+/// Callers that also lock a workspace must acquire that workspace first. The
+/// block/unblock paths own only this advisory lock, so the order cannot cycle.
+pub(crate) async fn lock_user_block_pair(
+    tx: &mut Transaction<'_, Postgres>,
+    first: ParticipantId,
+    second: ParticipantId,
+) -> Result<(), sqlx::Error> {
+    let (low, high) = if first.to_uuid() <= second.to_uuid() {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!("aero:user-block:{low}:{high}"))
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
 
 /// Repository for user-level blocking.
 #[derive(Clone)]
@@ -28,19 +50,18 @@ impl BlockRepo {
     ///
     /// # Errors
     /// Propagates any [`sqlx::Error`] from the insert.
-    pub async fn block(
-        &self,
-        blocker: ParticipantId,
-        blocked: ParticipantId,
-    ) -> Result<(), Error> {
-        sqlx::query(
-            "INSERT INTO user_blocks (blocker_id, blocked_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
-        )
-        .bind(blocker.to_uuid())
-        .bind(blocked.to_uuid())
-        .execute(&self.pg)
-        .await
-        .map_err(Error::from)?;
+    pub async fn block(&self, blocker: ParticipantId, blocked: ParticipantId) -> Result<(), Error> {
+        let mut tx = self.pg.begin().await.map_err(Error::from)?;
+        lock_user_block_pair(&mut tx, blocker, blocked)
+            .await
+            .map_err(Error::from)?;
+        sqlx::query("INSERT INTO user_blocks (blocker_id, blocked_id) VALUES ($1, $2) ON CONFLICT DO NOTHING")
+            .bind(blocker.to_uuid())
+            .bind(blocked.to_uuid())
+            .execute(&mut *tx)
+            .await
+            .map_err(Error::from)?;
+        tx.commit().await.map_err(Error::from)?;
         Ok(())
     }
 
@@ -54,14 +75,17 @@ impl BlockRepo {
         blocker: ParticipantId,
         blocked: ParticipantId,
     ) -> Result<(), Error> {
-        sqlx::query(
-            "DELETE FROM user_blocks WHERE blocker_id = $1 AND blocked_id = $2",
-        )
-        .bind(blocker.to_uuid())
-        .bind(blocked.to_uuid())
-        .execute(&self.pg)
-        .await
-        .map_err(Error::from)?;
+        let mut tx = self.pg.begin().await.map_err(Error::from)?;
+        lock_user_block_pair(&mut tx, blocker, blocked)
+            .await
+            .map_err(Error::from)?;
+        sqlx::query("DELETE FROM user_blocks WHERE blocker_id = $1 AND blocked_id = $2")
+            .bind(blocker.to_uuid())
+            .bind(blocked.to_uuid())
+            .execute(&mut *tx)
+            .await
+            .map_err(Error::from)?;
+        tx.commit().await.map_err(Error::from)?;
         Ok(())
     }
 
@@ -89,10 +113,7 @@ impl BlockRepo {
     ///
     /// # Errors
     /// Propagates any [`sqlx::Error`] from the query.
-    pub async fn blocks_for(
-        &self,
-        blocker: ParticipantId,
-    ) -> Result<Vec<ParticipantId>, Error> {
+    pub async fn blocks_for(&self, blocker: ParticipantId) -> Result<Vec<ParticipantId>, Error> {
         let rows: Vec<(uuid::Uuid,)> = sqlx::query_as(
             "SELECT blocked_id FROM user_blocks WHERE blocker_id = $1 ORDER BY created_at DESC",
         )
@@ -100,7 +121,10 @@ impl BlockRepo {
         .fetch_all(&self.pg)
         .await
         .map_err(Error::from)?;
-        Ok(rows.into_iter().map(|(id,)| ParticipantId::from_uuid(id)).collect())
+        Ok(rows
+            .into_iter()
+            .map(|(id,)| ParticipantId::from_uuid(id))
+            .collect())
     }
 
     /// All participants who have blocked `blocked` — used by
@@ -109,18 +133,17 @@ impl BlockRepo {
     ///
     /// # Errors
     /// Propagates any [`sqlx::Error`] from the query.
-    pub async fn blockers_of(
-        &self,
-        blocked: ParticipantId,
-    ) -> Result<Vec<ParticipantId>, Error> {
-        let rows: Vec<(uuid::Uuid,)> = sqlx::query_as(
-            "SELECT blocker_id FROM user_blocks WHERE blocked_id = $1",
-        )
-        .bind(blocked.to_uuid())
-        .fetch_all(&self.pg)
-        .await
-        .map_err(Error::from)?;
-        Ok(rows.into_iter().map(|(id,)| ParticipantId::from_uuid(id)).collect())
+    pub async fn blockers_of(&self, blocked: ParticipantId) -> Result<Vec<ParticipantId>, Error> {
+        let rows: Vec<(uuid::Uuid,)> =
+            sqlx::query_as("SELECT blocker_id FROM user_blocks WHERE blocked_id = $1")
+                .bind(blocked.to_uuid())
+                .fetch_all(&self.pg)
+                .await
+                .map_err(Error::from)?;
+        Ok(rows
+            .into_iter()
+            .map(|(id,)| ParticipantId::from_uuid(id))
+            .collect())
     }
 }
 
@@ -170,7 +193,10 @@ mod db_tests {
         repo.block(alice, bob).await.unwrap();
         // Idempotent.
         repo.block(alice, bob).await.unwrap();
-        assert!(repo.is_blocked(alice, bob).await.unwrap(), "alice blocked bob");
+        assert!(
+            repo.is_blocked(alice, bob).await.unwrap(),
+            "alice blocked bob"
+        );
         assert!(!repo.is_blocked(bob, alice).await.unwrap(), "not symmetric");
 
         // blocks_for and blockers_of.

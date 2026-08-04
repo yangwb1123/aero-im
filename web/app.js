@@ -2,7 +2,7 @@
 // Auth, rooms, messages, optimistic rendering, typing, read, reactions,
 // attachments, search drawer, AI drawer, 1:1 calls, live streaming.
 import { api, auth, ApiError } from './api.js';
-import { onNewMessage } from './smart_replies.js';
+import { initSmartReplies, onNewMessage } from './smart_replies.js';
 import {
   renderMessage,
   renderRoomItem,
@@ -14,16 +14,12 @@ import {
 } from './render.js';
 // Shared spine (state / ws / els / DOM helpers / leaf utils) lives in context.js
 // so extracted domain modules can share the same live singletons.
-import {
-  state, ws, els,
-  cssEscape, loadingDiv, mutedDiv, formatTime, setBusy,
-  openModal, closeModal, scrollToMessage, avatarStyleFromId,
-} from './context.js';
+import { state, ws, els, cssEscape, scrollToMessage, avatarStyleFromId, hasPendingForRoom } from './context.js';
 // Extracted domain modules (see each file header for its public surface).
 import { handleCall, wireCallControls } from './calls.js';
-import { openEmojiPicker, closeEmojiPicker } from './emoji.js';
+import { openEmojiPicker } from './emoji.js';
 import { initSearchAi, restoreAiHistory } from './search.js';
-import { initNotifications, setNotifBadge, bumpNotifBadge, refreshNotifBadge, loadNotifications } from './notifications.js';
+import { initNotifications, bumpNotifBadge, refreshNotifBadge, loadNotifications } from './notifications.js';
 import { initLive } from './live.js';
 import { initMedia } from './media.js';
 import { liveHooks, submitBlockInteraction, clearLiveCards, handleStreamEvent } from './livecards.js';
@@ -32,6 +28,11 @@ import { initModalForms } from './modals.js';
 import { initAuthUi } from './auth_ui.js';
 import { initChrome } from './chrome.js';
 import { installUnhandledRejectionReporting } from './error_reporting.js';
+import { syncRoomSidebar } from './room_sync.js';
+import { initMessageActivity } from './message_activity.js';
+import { clearPendingDelivery, findPendingMatch, initReliableDelivery, pendingTempId, sendOptimistically } from './delivery.js';
+import { refreshWsAccessToken } from './ws_auth.js';
+let wsHooksInstalled = false;
 // ---------- view switching ----------
 function showAuth() { els.viewAuth.hidden = false; els.viewChat.hidden = true; }
 function showChat() { els.viewAuth.hidden = true; els.viewChat.hidden = false; }
@@ -42,6 +43,7 @@ for (const t of els.tabs) {
     for (const p of els.tabPanels) p.hidden = p.dataset.tabPanel !== name;
   });
 }
+document.addEventListener('visibilitychange', () => { if (!document.hidden && state.currentRoomId) clearUnread(state.currentRoomId); });
 function enterChat() {
   showChat();
   const me = state.me;
@@ -49,9 +51,11 @@ function enterChat() {
   els.meEmail.textContent = me.email || me.id || '';
   els.meAvatar.textContent = initialOf(me.display_name || me.email);
   els.meAvatar.setAttribute('style', avatarStyleFromId(me.id));
-  ws.connect(auth.getToken());
   hookWs();
-  refreshRoomsFromServer();
+  ws.connect(auth.getToken(), me.id, {
+    refreshAccessToken: () => refreshWsAccessToken(api, auth, state),
+  });
+  syncRoomSidebar(forceReauth, () => { refreshRoomList(); updateTitleBadge(); });
   api.rtcConfig().then((c) => { state.rtcConfig = c; }).catch(() => {});
   // Load the gift catalog once so stream cards can render the gift bar; if a
   // room was already open, re-render so existing cards pick it up.
@@ -65,22 +69,13 @@ function enterChat() {
   }
   // Seed the bell badge from the persisted unread-notification count.
   refreshNotifBadge();
-  document.addEventListener('visibilitychange', () => {
-    if (!document.hidden && state.currentRoomId) clearUnread(state.currentRoomId);
-  });
-}
-async function refreshRoomsFromServer() {
-  try {
-    const rooms = await api.listRooms();
-    if (Array.isArray(rooms)) {
-      for (const r of rooms) state.rooms.set(r.id, r);
-      refreshRoomList();
-    }
-  } catch (e) { /* ignore */ }
 }
 
 // ---------- ws ----------
 function hookWs() {
+  if (wsHooksInstalled) return;
+  wsHooksInstalled = true;
+  ws.on('auth_expired', forceReauth);
   ws.on('status', (s) => {
     els.wsDot.classList.remove('ws-up', 'ws-down', 'ws-wait');
     if (s === 'up') els.wsDot.classList.add('ws-up');
@@ -98,7 +93,7 @@ function hookWs() {
     // Replay edits/deletes that happened while we were disconnected.
     replayChanges(state.currentRoomId);
   });
-  ws.on('msg:message', (f) => handleIncomingMessage(f.message));
+  ws.on('msg:message', (f) => handleIncomingMessage(f.message, f.client_message_id));
   ws.on('msg:edited', (f) => handleEdited(f.message));
   ws.on('msg:deleted', (f) => handleDeleted(f));
   ws.on('msg:reaction', (f) => handleReaction(f));
@@ -110,88 +105,100 @@ function hookWs() {
   ws.on('msg:membership', (f) => handleMembership(f));
   ws.on('msg:call', (f) => handleCall(f.event));
   ws.on('msg:stream_event', (f) => handleStreamEvent(f.event));
-  // ROADMAP v3 方向一: the WS reconnect backfill replay hit its per-room (or
-  // per-stream) cap — continue fetching the remainder over REST `?since=`.
   ws.on('msg:backfill', (f) => handleBackfillTruncated(f));
-  // ROADMAP v3 方向一: the server dropped frames for us while our queue was
-  // full (slow consumer, drop-only mode) — re-pull what we missed over REST.
   ws.on('msg:resync', () => handleResync());
   ws.on('msg:error', (f) => toast(`服务端:${f.msg || f.code || 'error'}`, 'error'));
   ws.on('msg:pong', () => {});
+  initMessageActivity();
+  initReliableDelivery({
+    ws,
+    getPendingMap: () => state.pendingByTempId,
+    onCanonical: handleIncomingMessage,
+    onRestore: restorePendingDelivery,
+    onPendingChanged: rerenderCurrentRoom,
+  });
 }
 
-// Bound on REST catch-up pagination after a truncated backfill, so a client
-// that has been away for a very long time converges in bounded work (anything
-// older is reachable through normal history scroll-back).
-const CATCHUP_MAX_PAGES = 10;
 const CATCHUP_PAGE_SIZE = 100;
 
-// Continue a server-truncated replay over REST. Room frames carry `room_id`
-// (continue via GET /api/rooms/:id/messages?since=); stream danmaku frames
-// carry `stream_id` (continue via GET /api/streams/:id/chat?since=).
 async function handleBackfillTruncated(f) {
   if (!f || !f.truncated || !f.next_since) return;
-  if (f.room_id) await pullRoomSince(f.room_id, f.next_since, CATCHUP_MAX_PAGES);
-  else if (f.stream_id) await pullStreamChatSince(f.stream_id, f.next_since, CATCHUP_MAX_PAGES);
+  const resumeAcks = ws.pauseDeliveryAcks();
+  let complete = false;
+  try {
+    if (f.room_id) complete = await pullRoomSince(f.room_id, f.next_since);
+    else if (f.stream_id) complete = await pullStreamChatSince(f.stream_id, f.next_since);
+  } finally {
+    resumeAcks(complete);
+  }
 }
 
-// Forward-page a room's messages from `since` (exclusive), feeding each one
-// through the normal incoming-message path (id-dedup, unread badges, render).
-// Stops after `maxPages` pages or the first short page (caught up).
-async function pullRoomSince(roomId, since, maxPages) {
+async function pullRoomSince(roomId, since) {
   let cursor = since;
-  for (let page = 0; page < maxPages && cursor; page++) {
+  while (cursor) {
     let list;
     try { list = await api.listMessages(roomId, { since: cursor, limit: CATCHUP_PAGE_SIZE }); }
-    catch { return; } // best-effort: a failed catch-up page is retried on the next resync
+    catch { return false; }
     const arr = Array.isArray(list) ? list : [];
     for (const m of arr) handleIncomingMessage(m);
-    if (arr.length < CATCHUP_PAGE_SIZE) return; // short page → fully caught up
-    // ULIDs sort lexicographically: advance to the newest id of this page.
-    cursor = arr.reduce((mx, m) => (m?.id && m.id > mx ? m.id : mx), cursor);
+    if (arr.length < CATCHUP_PAGE_SIZE) return true;
+    const next = arr.reduce((mx, m) => (m?.id && m.id > mx ? m.id : mx), cursor);
+    if (next <= cursor) return false;
+    cursor = next;
   }
+  return true;
 }
 
-// Forward-page a stream's danmaku from `since` into its live card.
-async function pullStreamChatSince(streamId, since, maxPages) {
+async function pullStreamChatSince(streamId, since) {
   const ctrl = state.liveCards.get(streamId);
-  if (!ctrl) return; // card unmounted (room switched) — nothing to render into
+  if (!ctrl) return true;
   let cursor = since;
-  const pageSize = 200; // server clamps chat pages to 200
-  for (let page = 0; page < maxPages && cursor; page++) {
+  const pageSize = 200;
+  while (cursor) {
     let r;
     try { r = await api.streamChatList(streamId, pageSize, cursor); }
-    catch { return; }
+    catch { return false; }
     const lines = Array.isArray(r?.chat) ? r.chat : [];
     for (const line of lines) ctrl.addChat(line);
-    if (lines.length < pageSize) return;
-    cursor = lines.reduce((mx, l) => (l?.id && l.id > mx ? l.id : mx), cursor);
+    if (lines.length < pageSize) return true;
+    const next = lines.reduce((mx, l) => (l?.id && l.id > mx ? l.id : mx), cursor);
+    if (next <= cursor) return false;
+    cursor = next;
   }
+  return true;
 }
 
-// Slow-consumer resync: the server dropped an unknown set of frames for this
-// connection, so re-pull every room we hold local state for from its newest
-// known message forward. Messages are the durable record (edits/reactions are
-// re-fetched lazily per room view); a short page bound keeps this cheap.
 async function handleResync() {
   if (state.resyncInFlight) return;
+  // Never guess a v2 prefix with MAX-ULID; reconnect into full ordinal replay.
+  if (ws.supports('delivery_cursor_v2')) { ws.pauseDeliveryAcks()(false); return; }
   state.resyncInFlight = true;
+  const resumeAcks = ws.pauseDeliveryAcks();
+  let complete = true;
   try {
     for (const [roomId, arr] of state.messagesByRoom) {
       const last = arr.length ? arr[arr.length - 1]?.id : null;
-      if (last) await pullRoomSince(roomId, last, 3);
+      if (last && !await pullRoomSince(roomId, last)) {
+        complete = false;
+        break;
+      }
     }
   } finally {
     state.resyncInFlight = false;
+    resumeAcks(complete);
   }
 }
 
-function handleIncomingMessage(m) {
+function handleIncomingMessage(m, clientMessageId = null) {
   if (!m?.id || !m?.room_id) return;
   const isMine = m.sender_id === state.me?.id;
   if (isMine) {
-    const key = findPendingMatch(m);
-    if (key) {
+    const key = clientMessageId
+      ? pendingTempId(clientMessageId)
+      : findPendingMatch(m, state.pendingByTempId, state.me?.id);
+    const pending = key ? state.pendingByTempId.get(key) : null;
+    if (pending) {
+      clearPendingDelivery(pending);
       replaceNodeForMsg(key, m);
       const arr = state.messagesByRoom.get(m.room_id) || [];
       const idx = arr.findIndex((x) => x.id === key);
@@ -470,24 +477,6 @@ function renderTypingBar() {
   renderTypingInto(els.typingBar, names);
 }
 
-function findPendingMatch(serverMsg) {
-  const myPid = state.me?.id;
-  if (serverMsg.sender_id !== myPid) return null;
-  const sText = textOf(serverMsg.blocks);
-  const sT = Date.parse(serverMsg.created_at || '') || Date.now();
-  for (const [tempId, pending] of state.pendingByTempId) {
-    if (pending.sender_id !== myPid) continue;
-    if (textOf(pending.blocks) !== sText) continue;
-    const pT = Date.parse(pending.created_at || '') || Date.now();
-    if (Math.abs(sT - pT) <= 15000) return tempId;
-  }
-  return null;
-}
-function textOf(blocks) {
-  if (!Array.isArray(blocks)) return '';
-  return blocks.map((b) => (b?.type === 'text' ? (b.content ?? '') : '')).join('');
-}
-
 function handlePresence(frame) {
   if (frame.room_id !== state.currentRoomId) return;
   const ids = Array.isArray(frame.online) ? frame.online : [];
@@ -621,7 +610,7 @@ function rerenderCurrentRoom() {
   for (const m of arr) els.msgList.appendChild(renderMsgWithReactions(m));
   for (const [, p] of state.pendingByTempId)
     if (p.room_id === roomId) els.msgList.appendChild(renderMsgWithReactions(p, { pending: true }));
-  els.msgEmpty.hidden = arr.length > 0 || state.pendingByTempId.size > 0;
+  els.msgEmpty.hidden = arr.length > 0 || hasPendingForRoom(roomId);
   for (const m of arr) refreshReactionsFor(m.id);
   refreshReadStrips();
 }
@@ -705,7 +694,7 @@ async function hydrateThreadMuted(rootId, btn) {
     const mine = Boolean(state.me?.id && muters.includes(state.me.id));
     state.threadMuted.set(rootId, mine);
     paintThreadMuteBtn(btn, mine);
-  } catch (_err) {
+  } catch {
     // ignore — keep default glyph, toggle still available
   }
 }
@@ -783,7 +772,7 @@ function beginEditMessage(m) {
 
 function hideEmptyIfNeeded() {
   const arr = state.messagesByRoom.get(state.currentRoomId) || [];
-  els.msgEmpty.hidden = arr.length > 0 || state.pendingByTempId.size > 0;
+  els.msgEmpty.hidden = arr.length > 0 || hasPendingForRoom(state.currentRoomId);
 }
 
 function appendMessageEl(node, { scroll = true } = {}) {
@@ -889,8 +878,12 @@ function submitComposer() {
     const md = mdPrefixed ? raw.slice(4) : raw;
     if (md.trim()) {
       // Optimistic echo as plain text; the real message frame swaps in spans.
-      optimisticAdd(roomId, [{ type: 'text', content: md }], replyTo);
-      ws.sendMarkdown(roomId, md, replyTo);
+      const blocks = [{ type: 'text', content: md }];
+      if (!sendOptimistically(
+        (id) => ws.sendMarkdown(roomId, md, replyTo, null, id),
+        (delivery) => optimisticAdd(roomId, blocks, replyTo, delivery),
+        { kind: 'markdown', roomId, markdown: md, replyTo, expiresAfterSecs: null },
+      )) return;
       ws.typing(roomId, false);
       state.lastTypingSentAt = 0;
       els.composerInput.value = '';
@@ -902,8 +895,11 @@ function submitComposer() {
     return;
   }
   const blocks = composeBlocksFromInput(raw);
-  optimisticAdd(roomId, blocks, replyTo);
-  ws.sendMessage(roomId, blocks, replyTo);
+  if (!sendOptimistically(
+    (id) => ws.sendMessage(roomId, blocks, replyTo, id),
+    (delivery) => optimisticAdd(roomId, blocks, replyTo, delivery),
+    { kind: 'blocks', roomId, blocks, replyTo },
+  )) return;
   ws.typing(roomId, false);
   state.lastTypingSentAt = 0;
   els.composerInput.value = '';
@@ -934,18 +930,27 @@ function composeBlocksFromInput(text) {
   return blocks;
 }
 
-function optimisticAdd(roomId, blocks, replyTo = null) {
-  const tempId = '_pending_' + crypto.randomUUID();
+function optimisticAdd(roomId, blocks, replyTo = null, delivery = {}) {
+  const tempId = pendingTempId(delivery.client_message_id || crypto.randomUUID());
   const pending = {
     id: tempId, room_id: roomId, sender_id: state.me?.id, blocks,
     reply_to: replyTo, metadata: {}, created_at: new Date().toISOString(),
-    edited_at: null, deleted_at: null,
+    edited_at: null, deleted_at: null, ...delivery,
   };
   state.pendingByTempId.set(tempId, pending);
   appendMessageEl(renderMsgWithReactions(pending, { pending: true }), { scroll: true });
   hideEmptyIfNeeded();
+  return pending;
 }
 
+function restorePendingDelivery(pending) {
+  const restored = { ...pending, id: pendingTempId(pending.client_message_id) };
+  state.pendingByTempId.set(restored.id, restored);
+  if (restored.room_id === state.currentRoomId)
+    appendMessageEl(renderMsgWithReactions(restored, { pending: true }), { scroll: true });
+  hideEmptyIfNeeded();
+  return restored;
+}
 // ---------- extracted domain wiring ----------
 // search drawer + AI assistant, notification inbox, and live-streams flows were
 // moved to their own modules; attach their listeners here at module-load time
@@ -954,8 +959,7 @@ function optimisticAdd(roomId, blocks, replyTo = null) {
 initSearchAi();
 initNotifications({ switchRoom });
 initLive();
-// Media (attachments / drag-drop / voice) needs three app-core callbacks; they
-// are hoisted function declarations, so injecting them here is safe at eval time.
+initSmartReplies({ optimisticAdd });
 initMedia({ optimisticAdd, clearReply, forceReauth });
 // Modal-backed forms (profile / new-room / add-member). Callbacks are hoisted.
 initModalForms({ forceReauth, refreshRoomList, switchRoom });
@@ -963,13 +967,11 @@ initModalForms({ forceReauth, refreshRoomList, switchRoom });
 // and `showAuth` are hoisted, so injecting them here is safe at eval time.
 initAuthUi({ enterChat, showAuth });
 initChrome();
-
 // ---------- calls ----------
 // 1:1 + captions + group-mesh call logic now lives in calls.js. The control
 // buttons were wired at module-load time originally; preserve that by attaching
 // them here (same load-time ordering, DOM already present from index.html).
 wireCallControls();
-
 // ---------- utilities ----------
 function forceReauth() {
   toast('会话过期,请重新登录', 'error');
@@ -978,7 +980,6 @@ function forceReauth() {
   ws.close();
   showAuth();
 }
-
 // ---------- bootstrap ----------
 installUnhandledRejectionReporting(toast);
 

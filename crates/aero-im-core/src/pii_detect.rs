@@ -56,7 +56,12 @@ pub struct PiiConfig {
 
 impl Default for PiiConfig {
     fn default() -> Self {
-        Self { ssn: true, credit_card: true, email: true, phone: false }
+        Self {
+            ssn: true,
+            credit_card: true,
+            email: true,
+            phone: false,
+        }
     }
 }
 
@@ -283,7 +288,11 @@ fn contains_phone(text: &str) -> bool {
                 break;
             }
         }
-        let core = if leading_one { digits.saturating_sub(1) } else { digits };
+        let core = if leading_one {
+            digits.saturating_sub(1)
+        } else {
+            digits
+        };
         if core == 10 && seps >= 1 {
             return true;
         }
@@ -346,12 +355,22 @@ impl PiiDetector {
 mod tests {
     use super::*;
 
-    const ALL: PiiConfig = PiiConfig { ssn: true, credit_card: true, email: true, phone: true };
+    const ALL: PiiConfig = PiiConfig {
+        ssn: true,
+        credit_card: true,
+        email: true,
+        phone: true,
+    };
 
     #[test]
     fn luhn_matches_known_test_cards() {
         // Classic Luhn-valid test PANs.
-        for pan in ["4111111111111111", "5500005555555559", "340000000000009", "6011000000000004"] {
+        for pan in [
+            "4111111111111111",
+            "5500005555555559",
+            "340000000000009",
+            "6011000000000004",
+        ] {
             let digits: Vec<u8> = pan.bytes().map(|b| b - b'0').collect();
             assert!(luhn_ok(&digits), "{pan} should be Luhn-valid");
         }
@@ -362,9 +381,18 @@ mod tests {
 
     #[test]
     fn detects_credit_card_with_and_without_separators() {
-        assert_eq!(detect("pay to 4111111111111111 now", &ALL), vec![PiiKind::CreditCard]);
-        assert_eq!(detect("card 4111 1111 1111 1111", &ALL), vec![PiiKind::CreditCard]);
-        assert_eq!(detect("card 4111-1111-1111-1111", &ALL), vec![PiiKind::CreditCard]);
+        assert_eq!(
+            detect("pay to 4111111111111111 now", &ALL),
+            vec![PiiKind::CreditCard]
+        );
+        assert_eq!(
+            detect("card 4111 1111 1111 1111", &ALL),
+            vec![PiiKind::CreditCard]
+        );
+        assert_eq!(
+            detect("card 4111-1111-1111-1111", &ALL),
+            vec![PiiKind::CreditCard]
+        );
     }
 
     #[test]
@@ -399,7 +427,10 @@ mod tests {
 
     #[test]
     fn detects_email() {
-        assert_eq!(detect("reach me at jane.doe+tag@example.co.uk", &ALL), vec![PiiKind::Email]);
+        assert_eq!(
+            detect("reach me at jane.doe+tag@example.co.uk", &ALL),
+            vec![PiiKind::Email]
+        );
         assert!(detect("not_an_email@", &ALL).is_empty(), "no domain");
         assert!(detect("@handle hello", &ALL).is_empty(), "no local part");
         assert!(detect("a@b.c", &ALL).is_empty(), "tld too short");

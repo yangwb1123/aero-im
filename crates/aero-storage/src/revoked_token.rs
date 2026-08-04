@@ -135,10 +135,7 @@ impl RevokedTokenRepo {
     ///
     /// # Errors
     /// Propagates any [`sqlx::Error`] from the delete.
-    pub async fn sweep_before(
-        &self,
-        cutoff: time::OffsetDateTime,
-    ) -> Result<u64, sqlx::Error> {
+    pub async fn sweep_before(&self, cutoff: time::OffsetDateTime) -> Result<u64, sqlx::Error> {
         let res = sqlx::query(r"DELETE FROM revoked_tokens WHERE revoked_at < $1")
             .bind(cutoff)
             .execute(&self.pool)
@@ -163,7 +160,9 @@ mod tests {
         assert_eq!(hash_token("x"), hash_token("x"));
         assert_ne!(hash_token("x"), hash_token("y"));
         assert_eq!(hash_token("anything").len(), 64);
-        assert!(hash_token("anything").bytes().all(|b| b.is_ascii_hexdigit()));
+        assert!(hash_token("anything")
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit()));
     }
 }
 
@@ -235,17 +234,28 @@ mod db_tests {
         let owner = ParticipantId::new();
         let h = hash_token(&format!("revoked-at-test-{owner}"));
 
-        assert!(repo.revoked_at(&h).await.unwrap().is_none(), "unknown hash has no revoked_at");
+        assert!(
+            repo.revoked_at(&h).await.unwrap().is_none(),
+            "unknown hash has no revoked_at"
+        );
 
         repo.revoke(&h, Some(owner)).await.unwrap();
-        let at = repo.revoked_at(&h).await.unwrap().expect("revoked_at present after revoke");
+        let at = repo
+            .revoked_at(&h)
+            .await
+            .unwrap()
+            .expect("revoked_at present after revoke");
         let age = time::OffsetDateTime::now_utc() - at;
         assert!(
             age >= time::Duration::ZERO && age < time::Duration::minutes(5),
             "revoked_at is a recent timestamp (age = {age})",
         );
 
-        sqlx::query("DELETE FROM revoked_tokens WHERE token_hash = $1").bind(&h).execute(&p).await.ok();
+        sqlx::query("DELETE FROM revoked_tokens WHERE token_hash = $1")
+            .bind(&h)
+            .execute(&p)
+            .await
+            .ok();
     }
 
     /// `sweep_before` drops entries whose `revoked_at` predates the cutoff (the
@@ -278,12 +288,21 @@ mod db_tests {
         // is older than the cutoff and is swept; the fresh row is newer and stays.
         let cutoff = time::OffsetDateTime::now_utc() - time::Duration::days(7);
         let swept = repo.sweep_before(cutoff).await.unwrap();
-        assert!(swept >= 1, "the backdated (expired) entry is swept, got {swept}");
+        assert!(
+            swept >= 1,
+            "the backdated (expired) entry is swept, got {swept}"
+        );
 
         // The expired entry is gone; the fresh (possibly-valid) entry is preserved —
         // a revoked-but-not-yet-expired token is never un-blacklisted.
-        assert!(!repo.is_revoked(&old_h).await.unwrap(), "expired entry swept");
-        assert!(repo.is_revoked(&fresh_h).await.unwrap(), "recent entry kept");
+        assert!(
+            !repo.is_revoked(&old_h).await.unwrap(),
+            "expired entry swept"
+        );
+        assert!(
+            repo.is_revoked(&fresh_h).await.unwrap(),
+            "recent entry kept"
+        );
 
         // Cleanup so reruns stay self-contained.
         sqlx::query("DELETE FROM revoked_tokens WHERE token_hash = ANY($1)")

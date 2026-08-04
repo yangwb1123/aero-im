@@ -35,10 +35,14 @@ fn validate_publish_subject(subject: &str) -> Result<(), BusError> {
     // leading/trailing dot or a `..` sequence.
     for token in subject.split('.') {
         if token.is_empty() {
-            return Err(invalid("contains an empty token (leading, trailing, or doubled '.')"));
+            return Err(invalid(
+                "contains an empty token (leading, trailing, or doubled '.')",
+            ));
         }
         if token == "*" || token == ">" {
-            return Err(invalid("contains a wildcard token ('*' or '>'); publish subjects must be concrete"));
+            return Err(invalid(
+                "contains a wildcard token ('*' or '>'); publish subjects must be concrete",
+            ));
         }
         if token.chars().any(|c| c.is_whitespace() || c.is_control()) {
             return Err(invalid("contains whitespace or a control character"));
@@ -46,6 +50,29 @@ fn validate_publish_subject(subject: &str) -> Result<(), BusError> {
     }
 
     Ok(())
+}
+
+/// Validate an idempotent publish request and build its JetStream dedup header.
+///
+/// `Nats-Msg-Id` is scoped to a stream's duplicate window. Retrying the same
+/// logical outbox row with the same id lets the server acknowledge the retry
+/// without storing a second message.
+fn idempotent_publish_headers(subject: &str, message_id: &str) -> BusResult<async_nats::HeaderMap> {
+    validate_publish_subject(subject)?;
+    if message_id.is_empty() {
+        return Err(BusError::InvalidMessageId {
+            reason: "message id is empty",
+        });
+    }
+    let value =
+        message_id
+            .parse::<async_nats::HeaderValue>()
+            .map_err(|_| BusError::InvalidMessageId {
+                reason: "message id contains CR or LF",
+            })?;
+    let mut headers = async_nats::HeaderMap::new();
+    headers.insert(async_nats::header::NATS_MESSAGE_ID, value);
+    Ok(headers)
 }
 
 #[derive(Debug, Clone)]
@@ -57,7 +84,10 @@ pub struct JetStreamConfig {
 
 impl Default for JetStreamConfig {
     fn default() -> Self {
-        Self { url: "nats://127.0.0.1:4222".into(), bootstrap_streams: true }
+        Self {
+            url: "nats://127.0.0.1:4222".into(),
+            bootstrap_streams: true,
+        }
     }
 }
 
@@ -82,17 +112,58 @@ const POISON_MAX_DELIVER: i64 = 16;
 /// this is a backoff-free, bounded redelivery DLQ: at most 16 attempts, each
 /// ≥120s apart.
 const POISON_ACK_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+/// Remove abandoned per-process Hub cursors after a day. They are realtime-only:
+/// a replacement process has no old local sockets and starts at `New`.
+const LOCAL_FANOUT_INACTIVE_THRESHOLD: std::time::Duration =
+    std::time::Duration::from_secs(24 * 60 * 60);
+/// Keep producer message ids for the full retained lifetime of an IM event.
+///
+/// The producer outbox retries without a delivery deadline, so this cannot be
+/// the only idempotency boundary: durable side-effect consumers also persist
+/// completed event receipts. Matching the stream's retention horizon still
+/// guarantees every duplicate that can coexist with its original retained
+/// message is collapsed at the broker before reaching those consumers.
+const IM_MESSAGE_DUPLICATE_WINDOW: std::time::Duration =
+    std::time::Duration::from_secs(7 * 24 * 60 * 60);
+
+fn im_messages_stream_config() -> stream::Config {
+    stream::Config {
+        name: "IM_MESSAGES".into(),
+        subjects: vec!["im.room.*".into()],
+        retention: stream::RetentionPolicy::Limits,
+        max_age: std::time::Duration::from_secs(7 * 24 * 3600),
+        duplicate_window: IM_MESSAGE_DUPLICATE_WINDOW,
+        storage: stream::StorageType::File,
+        ..Default::default()
+    }
+}
 
 /// Build the pull-consumer config with poison-message redelivery bounds.
 ///
 /// Extracted (and unit-tested) so the DLQ guarantee — finite `max_deliver`, a
 /// non-zero `ack_wait` spacing — is verifiable without a live NATS server.
 fn poison_safe_pull_config(subject: &str, durable: Option<&str>) -> consumer::pull::Config {
+    let process_local_fanout = durable.is_some_and(|name| name.starts_with("aero-server-"));
     consumer::pull::Config {
         durable_name: durable.map(str::to_owned),
+        // Ephemeral and per-instance Hub consumers are process-local realtime
+        // fan-out. A newly-created node has no local sockets that could benefit
+        // from replaying days of retained events; clients hydrate history from
+        // PG. Once created, the named durable still resumes its cursor normally.
+        // Queue/work consumers (bots/workers) retain `All` on first creation.
+        deliver_policy: if durable.is_none() || process_local_fanout {
+            consumer::DeliverPolicy::New
+        } else {
+            consumer::DeliverPolicy::All
+        },
         filter_subject: subject.to_owned(),
         max_deliver: POISON_MAX_DELIVER,
         ack_wait: POISON_ACK_WAIT,
+        inactive_threshold: if process_local_fanout {
+            LOCAL_FANOUT_INACTIVE_THRESHOLD
+        } else {
+            std::time::Duration::ZERO
+        },
         ..Default::default()
     }
 }
@@ -144,18 +215,38 @@ impl JetStreamBus {
         }
     }
 
+    /// Publish with JetStream's stream-scoped message-id deduplication and return
+    /// the broker acknowledgment. The public [`EventBus`] method intentionally
+    /// erases the ack details; this helper keeps them available for diagnostics
+    /// and the live-NATS integration test.
+    async fn publish_idempotent_ack(
+        &self,
+        subject: &str,
+        payload: bytes::Bytes,
+        message_id: &str,
+    ) -> BusResult<jetstream::publish::PublishAck> {
+        let headers = idempotent_publish_headers(subject, message_id)?;
+        let ack = self
+            .js
+            .publish_with_headers(subject.to_owned(), headers, payload)
+            .await
+            .map_err(|e| BusError::Nats(e.to_string()))?;
+        ack.await.map_err(|e| BusError::Nats(e.to_string()))
+    }
+
     /// Declare the streams used by the application. Idempotent.
     async fn bootstrap(&self) -> BusResult<()> {
         // Per-room IM messages.
+        let im_messages = im_messages_stream_config();
         self.js
-            .get_or_create_stream(stream::Config {
-                name: "IM_MESSAGES".into(),
-                subjects: vec!["im.room.*".into()],
-                retention: stream::RetentionPolicy::Limits,
-                max_age: std::time::Duration::from_secs(7 * 24 * 3600),
-                storage: stream::StorageType::File,
-                ..Default::default()
-            })
+            .get_or_create_stream(im_messages.clone())
+            .await
+            .map_err(|e| BusError::Nats(e.to_string()))?;
+        // `get_or_create_stream` intentionally leaves an existing stream's
+        // configuration untouched. Apply the desired config so upgrading an
+        // existing cluster receives the longer duplicate window too.
+        self.js
+            .update_stream(im_messages)
             .await
             .map_err(|e| BusError::Nats(e.to_string()))?;
         info!(stream = "IM_MESSAGES", "declared");
@@ -219,6 +310,28 @@ impl EventBus for JetStreamBus {
             .map_err(|e| BusError::Nats(e.to_string()))?;
         ack.await.map_err(|e| BusError::Nats(e.to_string()))?;
         debug!("published");
+        Ok(())
+    }
+
+    #[instrument(
+        skip(self, payload, message_id),
+        fields(subject = %subject, bytes = payload.len())
+    )]
+    async fn publish_idempotent(
+        &self,
+        subject: &str,
+        payload: bytes::Bytes,
+        message_id: &str,
+    ) -> BusResult<()> {
+        let ack = self
+            .publish_idempotent_ack(subject, payload, message_id)
+            .await?;
+        debug!(
+            stream = %ack.stream,
+            sequence = ack.sequence,
+            duplicate = ack.duplicate,
+            "published idempotently"
+        );
         Ok(())
     }
 
@@ -291,7 +404,10 @@ impl Subscription for JsSubscription {
     }
 
     async fn ack(&self) -> BusResult<()> {
-        self.msg.ack().await.map_err(|e| BusError::Nats(e.to_string()))
+        self.msg
+            .ack()
+            .await
+            .map_err(|e| BusError::Nats(e.to_string()))
     }
 
     async fn nack(&self) -> BusResult<()> {
@@ -304,8 +420,92 @@ impl Subscription for JsSubscription {
 
 #[cfg(test)]
 mod tests {
-    use super::{poison_safe_pull_config, validate_publish_subject, BusError, POISON_MAX_DELIVER};
+    use async_nats::jetstream::consumer::DeliverPolicy;
 
+    use super::{
+        idempotent_publish_headers, im_messages_stream_config, poison_safe_pull_config,
+        validate_publish_subject, BusError, JetStreamBus, JetStreamConfig,
+        IM_MESSAGE_DUPLICATE_WINDOW, LOCAL_FANOUT_INACTIVE_THRESHOLD, POISON_MAX_DELIVER,
+    };
+
+    #[test]
+    fn idempotent_publish_builds_exact_nats_message_id_header() {
+        let headers =
+            idempotent_publish_headers("im.room.1", "outbox-01").expect("publish headers");
+        assert_eq!(
+            headers
+                .get(async_nats::header::NATS_MESSAGE_ID)
+                .map(async_nats::HeaderValue::as_str),
+            Some("outbox-01")
+        );
+    }
+
+    #[test]
+    fn idempotent_publish_reuses_subject_validation() {
+        let err = idempotent_publish_headers("im.room.*", "outbox-01").unwrap_err();
+        assert!(matches!(err, BusError::InvalidSubject { .. }));
+    }
+
+    #[test]
+    fn idempotent_publish_rejects_unsafe_message_ids() {
+        assert!(matches!(
+            idempotent_publish_headers("im.room.1", ""),
+            Err(BusError::InvalidMessageId { .. })
+        ));
+        assert!(matches!(
+            idempotent_publish_headers("im.room.1", "outbox\r\ninjected"),
+            Err(BusError::InvalidMessageId { .. })
+        ));
+    }
+
+    #[test]
+    fn im_stream_duplicate_window_covers_outbox_retries() {
+        let config = im_messages_stream_config();
+        assert_eq!(config.duplicate_window, IM_MESSAGE_DUPLICATE_WINDOW);
+        assert_eq!(config.duplicate_window, config.max_age);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live NATS JetStream at AERO__NATS__URL"]
+    async fn live_nats_deduplicates_same_message_id() {
+        let url = std::env::var("AERO__NATS__URL").expect("AERO__NATS__URL");
+        let bus = JetStreamBus::connect(JetStreamConfig {
+            url,
+            bootstrap_streams: true,
+        })
+        .await
+        .expect("connect JetStream");
+        let mut im_stream = bus.js.get_stream("IM_MESSAGES").await.expect("IM_MESSAGES");
+        let info = im_stream.info().await.expect("IM_MESSAGES info");
+        assert_eq!(
+            info.config.duplicate_window, IM_MESSAGE_DUPLICATE_WINDOW,
+            "bootstrap must update an existing stream, not only fresh installs"
+        );
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let subject = format!("im.events.idempotent.{nonce}");
+        let message_id = format!("aero-bus-test-{nonce}");
+        let payload = bytes::Bytes::from_static(b"one logical event");
+
+        let first = bus
+            .publish_idempotent_ack(&subject, payload.clone(), &message_id)
+            .await
+            .expect("first publish");
+        let retry = bus
+            .publish_idempotent_ack(&subject, payload, &message_id)
+            .await
+            .expect("retry publish");
+
+        assert!(!first.duplicate);
+        assert!(retry.duplicate);
+        assert_eq!(retry.sequence, first.sequence);
+
+        if let Ok(stream) = bus.js.get_stream("IM_EVENTS").await {
+            let _ = stream.purge().filter(subject).await;
+        }
+    }
     #[test]
     fn pull_config_bounds_redelivery_for_poison_messages() {
         let cfg = poison_safe_pull_config("im.room.1", Some("aero-server"));
@@ -315,7 +515,11 @@ mod tests {
         // default is unlimited redelivery, so a message that repeatedly crashes
         // its consumer before ack would redeliver forever and crash-loop the
         // node's fan-out. Bounding it parks the poison message instead.
-        assert!(cfg.max_deliver > 0, "max_deliver must bound redelivery, got {}", cfg.max_deliver);
+        assert!(
+            cfg.max_deliver > 0,
+            "max_deliver must bound redelivery, got {}",
+            cfg.max_deliver
+        );
         assert_eq!(cfg.max_deliver, POISON_MAX_DELIVER);
         // A non-zero ack_wait spaces out redelivery so a crash-looping message
         // can't spin a tight hot loop between the bounded attempts.
@@ -326,14 +530,29 @@ mod tests {
     }
 
     #[test]
-    fn pull_config_without_durable_is_ephemeral() {
-        // A `None` durable yields an ephemeral consumer; the redelivery bound
-        // still applies so even an ephemeral fan-out can't poison-loop.
-        let cfg = poison_safe_pull_config("live.stream.x", None);
-        assert!(cfg.durable_name.is_none());
-        assert!(cfg.max_deliver > 0);
+    fn pull_config_with_durable_preserves_all_delivery_policy() {
+        let cfg = poison_safe_pull_config("im.room.1", Some("aero-bot"));
+        assert_eq!(cfg.deliver_policy, DeliverPolicy::All);
     }
 
+    #[test]
+    fn per_instance_hub_durable_starts_at_new_events() {
+        let cfg = poison_safe_pull_config("im.room.1", Some("aero-server-node-a-deadbeef"));
+        assert_eq!(cfg.deliver_policy, DeliverPolicy::New);
+        assert_eq!(cfg.inactive_threshold, LOCAL_FANOUT_INACTIVE_THRESHOLD);
+    }
+
+    #[test]
+    fn pull_config_without_durable_is_ephemeral() {
+        // A `None` durable yields an ephemeral consumer that starts with events
+        // published after it was created; retained history is not replayed.
+        // The redelivery bound still applies so even an ephemeral fan-out can't
+        // poison-loop.
+        let cfg = poison_safe_pull_config("live.stream.x", None);
+        assert!(cfg.durable_name.is_none());
+        assert_eq!(cfg.deliver_policy, DeliverPolicy::New);
+        assert!(cfg.max_deliver > 0);
+    }
 
     #[test]
     fn accepts_well_formed_concrete_subjects() {
@@ -365,7 +584,10 @@ mod tests {
             let err = validate_publish_subject(subject).unwrap_err();
             match err {
                 BusError::InvalidSubject { reason, .. } => {
-                    assert!(reason.contains("empty token"), "subject {subject:?}: {reason}");
+                    assert!(
+                        reason.contains("empty token"),
+                        "subject {subject:?}: {reason}"
+                    );
                 }
                 other => panic!("subject {subject:?}: unexpected error {other:?}"),
             }

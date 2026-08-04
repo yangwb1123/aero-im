@@ -3,18 +3,16 @@
 use std::pin::Pin;
 use std::sync::Arc;
 
+use crate::live::LiveService;
 use aero_auth::AuthService;
 use aero_bus::EventBus;
 use aero_im_core::ImService;
-use aero_live_whip::WhipRegistry;
-
-use crate::live::LiveService;
 use aero_storage::{
-    AiJobRepo, AuditRepo, BlockRepo, BlobRepo, BlobStore, CallRepo, CallRosterStore,
+    AiJobRepo, AuditRepo, BlobRepo, BlobStore, BlockRepo, CallRepo, CallRosterStore,
     DeliveryCursorRepo, KeyPackageRepo, MessageRepo, MlsGroupRepo, NotificationRepo,
-    ParticipantRepo, PgPool, PinRepo,
-    PresenceStore, ReactionRepo, ReceiptRepo, RegionRouter, RoomRepo, StreamRepo,
-    StreamRouteRegistry, StreamViewerStore, ThreadReadStateRepo, TopicHistoryRepo, WorkspaceRepo,
+    ParticipantRepo, PgPool, PinRepo, PresenceStore, ReactionRepo, ReceiptRepo, RegionRouter,
+    RoomRepo, StreamRepo, StreamRouteRegistry, StreamViewerStore, ThreadReadStateRepo,
+    TopicHistoryRepo, WorkspaceRepo,
 };
 use axum::extract::FromRef;
 
@@ -22,6 +20,7 @@ use crate::config::WsConfig;
 use crate::hub::Hub;
 use crate::metrics::MetricsConfig;
 use crate::rate_limit::RateLimiter;
+use crate::whip_media::WhipMediaRegistry;
 
 /// Type-erased handle to whatever AI backend is wired (or `None`).
 /// Concrete type lives in `aero-ai`; we route through this trait to keep the
@@ -33,12 +32,29 @@ pub trait AiBackend: Send + Sync + 'static {
         room: aero_common::RoomId,
         last_n: usize,
     ) -> Result<String, String>;
+    async fn summarize_room_with_usage_context(
+        &self,
+        room: aero_common::RoomId,
+        last_n: usize,
+        _usage_context: aero_ai::usage::UsageContext,
+    ) -> Result<String, String> {
+        self.summarize_room(room, last_n).await
+    }
     async fn answer_question(
         &self,
         room: aero_common::RoomId,
         question: &str,
         k: usize,
     ) -> Result<AiAnswer, String>;
+    async fn answer_question_with_usage_context(
+        &self,
+        room: aero_common::RoomId,
+        question: &str,
+        k: usize,
+        _usage_context: aero_ai::usage::UsageContext,
+    ) -> Result<AiAnswer, String> {
+        self.answer_question(room, question, k).await
+    }
     /// Agentic tool-use answer: a multi-turn Anthropic loop with the message-search
     /// + attachment-read tools (degrades to the one-shot grounded answer without an
     /// LLM key). Reachable from `POST /api/ai/ask {"agentic":true}` (gated by
@@ -53,6 +69,16 @@ pub trait AiBackend: Send + Sync + 'static {
     ) -> Result<AiAnswer, String> {
         self.answer_question(room, question, 8).await
     }
+    async fn answer_question_agentic_with_usage_context(
+        &self,
+        room: aero_common::RoomId,
+        question: &str,
+        max_iters: usize,
+        _usage_context: aero_ai::usage::UsageContext,
+    ) -> Result<AiAnswer, String> {
+        self.answer_question_agentic(room, question, max_iters)
+            .await
+    }
     /// Answer a question across EVERY room the caller belongs to in a workspace
     /// (the "ask your workspace" RAG flow). Retrieval is membership- and
     /// workspace-bounded; degrades without an LLM key exactly like
@@ -64,18 +90,52 @@ pub trait AiBackend: Send + Sync + 'static {
         question: &str,
         k: usize,
     ) -> Result<AiAnswer, String>;
+    async fn answer_question_workspace_with_usage_context(
+        &self,
+        participant: aero_common::ParticipantId,
+        workspace: aero_common::WorkspaceId,
+        question: &str,
+        k: usize,
+        _usage_context: aero_ai::usage::UsageContext,
+    ) -> Result<AiAnswer, String> {
+        self.answer_question_workspace(participant, workspace, question, k)
+            .await
+    }
     /// Compute an embedding for the given text. Used by the search route's
     /// `mode=vector` path. Falls back to a deterministic local hash embedder
     /// when no remote API key is configured.
     async fn embed_text(&self, text: &str) -> Result<Vec<f32>, String>;
+    async fn embed_text_with_usage_context(
+        &self,
+        text: &str,
+        _usage_context: aero_ai::usage::UsageContext,
+        _operation: &str,
+    ) -> Result<Vec<f32>, String> {
+        self.embed_text(text).await
+    }
     /// Translate text into `target_lang`. Used for live call captions (P3).
     /// Echoes the source text when no LLM is configured.
     async fn translate(&self, text: &str, target_lang: &str) -> Result<String, String>;
+    async fn translate_with_usage_context(
+        &self,
+        text: &str,
+        target_lang: &str,
+        _usage_context: aero_ai::usage::UsageContext,
+    ) -> Result<String, String> {
+        self.translate(text, target_lang).await
+    }
     /// Summarize an arbitrary block of text into a short recap + action items.
     /// Used for the post-call meeting recap (the caller joins a call's persisted
     /// transcript lines into one block). Degrades to a heuristic first-lines digest
     /// when no LLM key is configured; never errors on a missing key.
     async fn summarize_text(&self, text: &str) -> Result<String, String>;
+    async fn summarize_text_with_usage_context(
+        &self,
+        text: &str,
+        _usage_context: aero_ai::usage::UsageContext,
+    ) -> Result<String, String> {
+        self.summarize_text(text).await
+    }
     /// Summarize a thread — the flat chain of replies hanging off a root message.
     /// Mirrors [`AiBackend::summarize_room`] but sources the thread's reply chain.
     /// Degrades to a heuristic when no LLM key is configured; never errors on a
@@ -85,6 +145,14 @@ pub trait AiBackend: Send + Sync + 'static {
         root: aero_common::MessageId,
         max_replies: usize,
     ) -> Result<String, String>;
+    async fn summarize_thread_with_usage_context(
+        &self,
+        root: aero_common::MessageId,
+        max_replies: usize,
+        _usage_context: aero_ai::usage::UsageContext,
+    ) -> Result<String, String> {
+        self.summarize_thread(root, max_replies).await
+    }
     /// Summarize recent activity across every channel the caller belongs to within
     /// a workspace (the workspace twin of [`AiBackend::summarize_room`]). Backs the
     /// scheduled workspace digest. Degrades to a heuristic without an LLM key.
@@ -94,6 +162,16 @@ pub trait AiBackend: Send + Sync + 'static {
         workspace: aero_common::WorkspaceId,
         last_n: usize,
     ) -> Result<String, String>;
+    async fn summarize_workspace_with_usage_context(
+        &self,
+        participant: aero_common::ParticipantId,
+        workspace: aero_common::WorkspaceId,
+        last_n: usize,
+        _usage_context: aero_ai::usage::UsageContext,
+    ) -> Result<String, String> {
+        self.summarize_workspace(participant, workspace, last_n)
+            .await
+    }
     /// Rank workspace members by topical authority on `topic` — embed the topic,
     /// run the membership-bounded cross-room vector search, aggregate hits by
     /// author, return the top-`k` experts. Backs `POST /api/workspaces/:id/find-expert`.
@@ -106,6 +184,16 @@ pub trait AiBackend: Send + Sync + 'static {
         topic: &str,
         k: usize,
     ) -> Result<Vec<AiExpert>, String>;
+    async fn find_expert_with_usage_context(
+        &self,
+        participant: aero_common::ParticipantId,
+        workspace: aero_common::WorkspaceId,
+        topic: &str,
+        k: usize,
+        _usage_context: aero_ai::usage::UsageContext,
+    ) -> Result<Vec<AiExpert>, String> {
+        self.find_expert(participant, workspace, topic, k).await
+    }
     /// Rank channel candidates the caller isn't in into "channels to join"
     /// recommendations. `candidates` is the pre-fetched candidate set —
     /// `(room, name, recent_activity)` triples — and ranking is a pure,
@@ -130,6 +218,13 @@ pub trait AiBackend: Send + Sync + 'static {
     /// Moderate a message body (P5). `Some(reason)` blocks, `None` allows.
     /// Returns `None` when no LLM is configured.
     async fn moderate(&self, text: &str) -> Result<Option<String>, String>;
+    async fn moderate_with_context(
+        &self,
+        text: &str,
+        _usage_context: aero_ai::usage::UsageContext,
+    ) -> Result<Option<String>, String> {
+        self.moderate(text).await
+    }
     /// Whether a real Anthropic key is configured, i.e. whether [`Self::moderate`]
     /// makes a PAID upstream call. Lets the moderation pipeline charge the
     /// resulting cost only when a paid call actually happened (ROADMAP 方向四).
@@ -147,12 +242,27 @@ pub trait AiBackend: Send + Sync + 'static {
         root: aero_common::MessageId,
         max_replies: usize,
     ) -> Result<String, String>;
+    async fn generate_thread_title_with_usage_context(
+        &self,
+        root: aero_common::MessageId,
+        max_replies: usize,
+        _usage_context: aero_ai::usage::UsageContext,
+    ) -> Result<String, String> {
+        self.generate_thread_title(root, max_replies).await
+    }
     /// Score a message's affect (additive to the binary [`AiBackend::moderate`]
     /// gate — this never blocks). Returns a coarse sentiment, a `[0.0, 1.0]`
     /// toxicity likelihood, and a short tone label. Degrades SAFELY without an LLM
     /// key to a deterministic keyword/punctuation heuristic; never errors on a
     /// missing key. Backs `POST /api/messages/:id/sentiment`.
     async fn score_sentiment(&self, text: &str) -> Result<AiSentiment, String>;
+    async fn score_sentiment_with_usage_context(
+        &self,
+        text: &str,
+        _usage_context: aero_ai::usage::UsageContext,
+    ) -> Result<AiSentiment, String> {
+        self.score_sentiment(text).await
+    }
     /// Streaming variant of [`AiBackend::answer_question`].
     ///
     /// Returns `(citations, stream)` so the UI can render source chips before
@@ -170,6 +280,21 @@ pub trait AiBackend: Send + Sync + 'static {
         ),
         String,
     >;
+    async fn answer_question_stream_with_usage_context(
+        &self,
+        room: aero_common::RoomId,
+        question: &str,
+        k: usize,
+        _usage_context: aero_ai::usage::UsageContext,
+    ) -> Result<
+        (
+            Vec<aero_common::MessageId>,
+            Pin<Box<dyn futures::Stream<Item = Result<String, String>> + Send + 'static>>,
+        ),
+        String,
+    > {
+        self.answer_question_stream(room, question, k).await
+    }
     /// RAG answer with rolling session context.
     ///
     /// Same as [`AiBackend::answer_question`] but prepends the last few
@@ -182,6 +307,16 @@ pub trait AiBackend: Send + Sync + 'static {
         question: &str,
         k: usize,
     ) -> Result<AiAnswer, String>;
+    async fn ask_with_context_and_usage_context(
+        &self,
+        participant: aero_common::ParticipantId,
+        room: aero_common::RoomId,
+        question: &str,
+        k: usize,
+        _usage_context: aero_ai::usage::UsageContext,
+    ) -> Result<AiAnswer, String> {
+        self.ask_with_context(participant, room, question, k).await
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -242,9 +377,9 @@ pub struct AppState {
     /// inline (`XRepo::new(state.pg.clone())`) without threading a new field
     /// through `AppState` for every addition — repos are cheap `Arc<PgPool>` wrappers.
     pub pg: PgPool,
-    /// Read pool (ROADMAP 方向四): the replica when configured, else a clone of
-    /// `pg`. Read-only handlers (e.g. analytics) use this to offload the primary.
-    pub pg_read: PgPool,
+    /// Consistency-aware primary/read-replica routing. Security and write paths
+    /// continue to use `pg`; only explicitly eventual reads use this seam.
+    pub query_router: aero_storage::QueryRouter,
     pub live: LiveService,
     pub participants: ParticipantRepo,
     /// Per-process TTL cache fronting [`ParticipantRepo::get`] on the hot read
@@ -339,6 +474,10 @@ pub struct AppState {
     /// (ROADMAP 方向三). `/health/live` stays 200 so the pod is drained, not
     /// killed.
     pub shutting_down: Arc<std::sync::atomic::AtomicBool>,
+    /// Process-wide cooperative shutdown signal. Long-running background and
+    /// media tasks share the same token; each WebSocket uses it to send an RFC
+    /// 6455 code 1001 Close before its connection task exits.
+    pub shutdown: tokio_util::sync::CancellationToken,
     /// Per-WORKSPACE request ceiling (ROADMAP3 方向五 — 租户公平): tier limits,
     /// the cluster-wide Redis window counter, and the room→workspace /
     /// workspace→tier TTL resolution caches. Enforced at the high-traffic
@@ -352,13 +491,23 @@ pub struct AppState {
     pub metrics: Arc<MetricsConfig>,
     /// Optional — only present when an Anthropic / Voyage API key is configured.
     pub ai: Option<Arc<dyn AiBackend>>,
-    /// Public-facing base URL (used to render absolute ingest/playback URLs).
+    /// Public-facing HTTP base URL used for WHIP, playback and application links.
     pub public_base_url: String,
-    /// In-memory WHIP registry — keyed by stream id; persisted lifecycle is in PG.
-    pub whip: Arc<WhipRegistry>,
-    /// Configured ingest host:port advertised in SDP candidates.
+    /// Protocol-correct public RTMP/WHIP/SRT endpoints. Media listener ports are
+    /// resolved at boot and never inferred from the HTTP gateway port.
+    pub live_ingest_urls: crate::live::LiveIngestUrls,
+    /// Process-local WHIP/WHEP media lifecycle: resource metadata, one relay per
+    /// publisher, viewer cancellation, and generation-fenced task cleanup.
+    pub whip: Arc<WhipMediaRegistry>,
+    /// Numeric ICE host and preferred UDP port. Each media session binds an
+    /// exclusive socket; collisions fall back to a kernel-assigned port.
     pub ingest_host: String,
     pub ingest_port: u16,
+    /// Shared HLS root used by RTMP, SRT and WHIP (`hls_dir/{stream_id}`).
+    pub hls_dir: std::path::PathBuf,
+    /// Request-originated runtime tasks (media and named webhook delivery) join
+    /// the process-wide graceful-shutdown drain.
+    pub runtime_tasks: tokio_util::task::TaskTracker,
     /// Mobile push gateways (FCM/APNs). `None` per platform when the
     /// corresponding credentials are not configured — the push-dispatch bot
     /// then simply skips that platform (ROADMAP 方向二).

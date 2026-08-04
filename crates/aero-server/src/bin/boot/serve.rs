@@ -1,24 +1,42 @@
 //! Axum router + HTTP server + graceful shutdown.
-use std::net::SocketAddr;
-use std::time::Duration;
 use anyhow::Context;
 use axum::extract::DefaultBodyLimit;
+use std::net::SocketAddr;
+use std::time::Duration;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tower::ServiceBuilder;
 use tower_http::{
     cors::{AllowOrigin, CorsLayer},
     services::ServeDir,
     set_header::SetResponseHeaderLayer,
     timeout::TimeoutLayer,
-    trace::TraceLayer,
+    trace::{MakeSpan, TraceLayer},
 };
-use tokio_util::task::TaskTracker;
-use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{info, warn, Span};
 
 use aero_server::config::GatewayConfig;
 use aero_server::metrics as server_metrics;
 use aero_server::rate_limit;
 use aero_server::state::AppState;
+
+#[derive(Clone, Copy)]
+struct SanitizedHttpMakeSpan;
+
+fn trace_request_path<B>(request: &axum::http::Request<B>) -> &str {
+    request.uri().path()
+}
+
+impl<B> MakeSpan<B> for SanitizedHttpMakeSpan {
+    fn make_span(&mut self, request: &axum::http::Request<B>) -> Span {
+        tracing::info_span!(
+            "request",
+            method = %request.method(),
+            path = %trace_request_path(request),
+            version = ?request.version(),
+        )
+    }
+}
 
 pub(crate) async fn serve(
     state: AppState,
@@ -29,7 +47,8 @@ pub(crate) async fn serve(
     tracker: TaskTracker,
 ) -> anyhow::Result<()> {
     // CORS fail-closed gate
-    if std::env::var("AERO_CORS_REQUIRE_ORIGINS").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+    if std::env::var("AERO_CORS_REQUIRE_ORIGINS")
+        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         && gateway_cfg.cors_allowed_origins.is_empty()
     {
         anyhow::bail!(
@@ -48,8 +67,12 @@ pub(crate) async fn serve(
     let concurrency_layer = (gateway_cfg.max_concurrency > 0)
         .then(|| tower::limit::ConcurrencyLimitLayer::new(gateway_cfg.max_concurrency));
     let middleware = ServiceBuilder::new()
-        .layer(TraceLayer::new_for_http())
-        .layer(axum::middleware::from_fn(server_metrics::http_metrics_layer))
+        // Keep tower-http's response timing/classification callbacks, but never
+        // attach the request query (notably `/ws?token=...`) to the request span.
+        .layer(TraceLayer::new_for_http().make_span_with(SanitizedHttpMakeSpan))
+        .layer(axum::middleware::from_fn(
+            server_metrics::http_metrics_layer,
+        ))
         .layer(cors)
         // Security response headers (ROADMAP 第四次分析·方向三):
         //   X-Frame-Options DENY           → prevent clickjacking
@@ -69,29 +92,37 @@ pub(crate) async fn serve(
             axum::http::header::STRICT_TRANSPORT_SECURITY,
             axum::http::HeaderValue::from_static("max-age=31536000; includeSubDomains"),
         ))
-        .layer(SetResponseHeaderLayer::overriding(
+        // Preserve stricter route-specific policies (the OIDC callback uses
+        // `no-referrer` so its single-use authorization code never appears in a
+        // subsequent same-origin request's Referer header).
+        .layer(SetResponseHeaderLayer::if_not_present(
             axum::http::header::REFERRER_POLICY,
             axum::http::HeaderValue::from_static("strict-origin-when-cross-origin"),
         ))
         .layer(SetResponseHeaderLayer::overriding(
             axum::http::HeaderName::from_static("permissions-policy"),
-            axum::http::HeaderValue::from_static("camera=(), microphone=(), geolocation=()"),
+            // The bundled same-origin web client uses camera/microphone for calls
+            // and voice messages. Keep those capabilities confined to this
+            // origin while continuing to deny geolocation entirely.
+            axum::http::HeaderValue::from_static(
+                "camera=(self), microphone=(self), geolocation=()",
+            ),
         ))
         // Content-Security-Policy (ROADMAP 第四次分析·方向三): opt-in via
         // `AERO_CSP_POLICY` env var. Not set by default because the correct
         // policy depends on the deployment's CDN dependencies. Example for the
         // bundled web app (which loads hls.js from jsdelivr):
         //   default-src 'self'; script-src 'self' https://cdn.jsdelivr.net;
-        //   style-src 'self' 'unsafe-inline'; img-src 'self' data:;
+        //   style-src 'self' 'unsafe-inline';
+        //   img-src 'self' data: https://giphy.com https://*.giphy.com;
         //   connect-src 'self' ws: wss:
-        .option_layer(
-            std::env::var("AERO_CSP_POLICY").ok().map(|policy| {
-                SetResponseHeaderLayer::overriding(
-                    axum::http::header::CONTENT_SECURITY_POLICY,
-                    axum::http::HeaderValue::from_str(&policy).expect("AERO_CSP_POLICY is not a valid header value"),
-                )
-            }),
-        )
+        .option_layer(std::env::var("AERO_CSP_POLICY").ok().map(|policy| {
+            SetResponseHeaderLayer::overriding(
+                axum::http::header::CONTENT_SECURITY_POLICY,
+                axum::http::HeaderValue::from_str(&policy)
+                    .expect("AERO_CSP_POLICY is not a valid header value"),
+            )
+        }))
         .option_layer(concurrency_layer)
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -232,4 +263,23 @@ fn build_cors(cfg: &GatewayConfig) -> CorsLayer {
         .allow_origin(AllowOrigin::list(origins))
         .allow_methods(tower_http::cors::Any)
         .allow_headers(tower_http::cors::Any)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::trace_request_path;
+
+    #[test]
+    fn http_trace_path_excludes_query_and_bearer() {
+        let request = axum::http::Request::builder()
+            .uri("/ws?token=super-secret-bearer&room=abc")
+            .body(())
+            .expect("valid test request");
+
+        let path = trace_request_path(&request);
+        assert_eq!(path, "/ws");
+        assert!(!path.contains("token"));
+        assert!(!path.contains("super-secret-bearer"));
+        assert!(!path.contains("room=abc"));
+    }
 }

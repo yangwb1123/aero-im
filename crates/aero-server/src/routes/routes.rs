@@ -1,21 +1,21 @@
 #![allow(unused_imports)]
 //! HTTP route definitions. WS upgrade lives in `ws::handler`.
-#[allow(unused_imports)]
-use std::str::FromStr;
+use crate::error::ApiResult;
+use crate::metrics;
+use crate::routes::helpers::{merge_hits, parse_room_id, parse_room_kind};
+use crate::state::AppState;
+use crate::ws;
 #[allow(unused_imports)]
 use aero_auth::{AuthUser, LoginRequest, RegisterRequest};
 #[allow(unused_imports)]
-use uuid::Uuid;
-#[allow(unused_imports)]
 use aero_common::{
-    BlobId, Error as AeroError, FileKind, MessageId, ParticipantId, Result as AeroResult, StreamProtocol, StreamStatus, WorkspaceId, WorkspaceRole,
+    BlobId, Error as AeroError, FileKind, MessageId, ParticipantId, Result as AeroResult, RoomId,
+    RoomKind, StreamProtocol, StreamStatus, WorkspaceId, WorkspaceRole,
 };
 #[allow(unused_imports)]
-use aero_live_whip::{accept_whep_offer, accept_whip_offer, SessionError, WhipError};
+use aero_live_whip::{MediaRelay, SessionError, WhepSession, WhipResource, WhipSession};
 #[allow(unused_imports)]
 use aero_storage::blob::NewBlob;
-#[allow(unused_imports)]
-use sha2::Digest;
 #[allow(unused_imports)]
 use axum::{
     extract::{Multipart, Path, Query, State},
@@ -33,13 +33,16 @@ use bytes::Bytes;
 #[allow(unused_imports)]
 use serde::Deserialize;
 #[allow(unused_imports)]
-use tower_http::compression::CompressionLayer;
-use crate::error::ApiResult;
-use crate::metrics;
-use crate::routes::helpers::{merge_hits, parse_room_id, parse_room_kind};
-use crate::state::AppState;
-use crate::ws;
-use crate::routes::reads::{self, mark_read, list_receipts};
+use sha2::Digest;
+#[allow(unused_imports)]
+use std::str::FromStr;
+#[allow(unused_imports)]
+use tower_http::compression::{
+    predicate::{DefaultPredicate, Predicate},
+    CompressionLayer,
+};
+#[allow(unused_imports)]
+use uuid::Uuid;
 /// Opaque correlation ID propagated through request extensions and echoed in
 /// every response as `x-request-id`.  Handlers and middlewares that need to
 /// surface it can extract it from `req.extensions()`.
@@ -48,7 +51,7 @@ pub struct RequestId(pub String);
 /// Middleware: read or generate a `x-request-id` header, attach a
 /// [`RequestId`] extension, and echo the value in the response.
 async fn inject_request_id(mut req: Request<axum::body::Body>, next: Next) -> Response {
-#[allow(unused_imports)]
+    #[allow(unused_imports)]
     use tracing::Instrument as _;
     let id = req
         .headers()
@@ -66,7 +69,11 @@ async fn inject_request_id(mut req: Request<axum::body::Body>, next: Next) -> Re
     // Continue an upstream distributed trace when the caller sends a W3C
     // `traceparent` header, so a request's span (and everything it publishes onto
     // the bus) nests under the caller's trace (ROADMAP5 方向二).
-    if let Some(tp) = req.headers().get("traceparent").and_then(|v| v.to_str().ok()) {
+    if let Some(tp) = req
+        .headers()
+        .get("traceparent")
+        .and_then(|v| v.to_str().ok())
+    {
         aero_common::telemetry::set_span_parent_from_traceparent(&span, tp);
     }
     let mut res = next.run(req).instrument(span).await;
@@ -75,6 +82,21 @@ async fn inject_request_id(mut req: Request<axum::body::Body>, next: Next) -> Re
     }
     res
 }
+
+fn response_compression_layer() -> CompressionLayer<impl Predicate> {
+    CompressionLayer::new().compress_when(DefaultPredicate::new().and(
+        |_: StatusCode,
+         _: axum::http::Version,
+         headers: &axum::http::HeaderMap,
+         _: &axum::http::Extensions| {
+            // A byte-addressable representation must remain the exact bytes
+            // covered by its strong ETag and Range offsets. tower-http otherwise
+            // gzip-compresses eligible 200 responses and removes Accept-Ranges.
+            !headers.contains_key(header::ACCEPT_RANGES)
+        },
+    ))
+}
+
 pub fn build(state: AppState) -> Router {
     let mut router = Router::new()
         // Health probes — extracted to routes/health.rs
@@ -82,21 +104,33 @@ pub fn build(state: AppState) -> Router {
         // Auth
         .route("/api/auth/register", post(auth_register))
         .route("/api/auth/login", post(auth_login))
+        // Backward-compatible recovery entry point. It accepts the same
+        // password-first LoginReq as /login, with `recovery_code` populated.
+        .route("/api/auth/2fa/recover", post(auth_login))
         .route("/api/auth/login-history", get(auth_login_history))
         .route("/api/me", get(me).patch(update_me))
         // Rooms
         .route("/api/rooms", post(create_room).get(list_rooms))
         .route("/api/rooms/:id/members", post(add_member))
-        .route("/api/rooms/:id/messages", get(room_history))
+        .route(
+            "/api/rooms/:id/messages",
+            get(room_history).post(create_message),
+        )
         .route("/api/rooms/:id/changes", get(room_changes))
-        .route("/api/rooms/:id/read", post(mark_read))
-        .route("/api/rooms/:id/receipts", get(list_receipts))
-        .route("/api/rooms/:id/delivery-cursor", get(crate::routes::reads::get_delivery_cursor))
-        .route("/api/rooms/:id/search", post(crate::routes::search::room_search))
+        .route(
+            "/api/rooms/:id/delivery-cursor",
+            get(crate::routes::reads::get_delivery_cursor),
+        )
+        .route(
+            "/api/rooms/:id/search",
+            post(crate::routes::search::room_search),
+        )
         // Messages
         .route(
             "/api/messages/:id",
-            axum::routing::get(get_message).patch(edit_message).delete(delete_message),
+            axum::routing::get(get_message)
+                .patch(edit_message)
+                .delete(delete_message),
         )
         .route("/api/messages/:id/reactions", post(toggle_reaction))
         .route("/api/messages/reactions", post(reactions_batch))
@@ -114,6 +148,7 @@ pub fn build(state: AppState) -> Router {
         .route("/api/threads/:root_message_id/mutes", get(thread_muters))
         // Blobs
         .route("/api/blobs", post(blob_upload))
+        .route("/api/rooms/:id/blobs", post(room_blob_upload))
         .route("/api/blobs/:id", get(blob_download))
         // AI
         .merge(crate::routes::ai::routes())
@@ -121,15 +156,36 @@ pub fn build(state: AppState) -> Router {
         .merge(crate::routes::live::routes())
         // WHIP / WHEP — body is SDP text, response is SDP text
         .route("/whip/:stream_key", post(whip_post))
-        .route("/whip/resource/:stream_key", axum::routing::delete(whip_delete))
+        .route(
+            "/whip/resource/:stream_key",
+            axum::routing::delete(whip_delete),
+        )
         .route("/whep/:stream_id", post(whep_post))
+        .route(
+            "/whep/resource/:stream_id/:viewer_id",
+            axum::routing::delete(whep_delete),
+        )
         // Agents / Bots
         .merge(crate::routes::agents::routes())
         .route("/api/bots", post(bot_create).get(bot_list))
         .route("/api/bots/:id/token", post(bot_rotate_token))
-        .route("/api/bots/:id/subscriptions", get(bot_list_subscriptions).post(bot_create_subscription))
-        .route("/api/bots/:id/subscriptions/:sub_id", axum::routing::delete(bot_delete_subscription))
+        .route(
+            "/api/bots/:id/subscriptions",
+            get(bot_list_subscriptions).post(bot_create_subscription),
+        )
+        .route(
+            "/api/bots/:id/subscriptions/:sub_id",
+            axum::routing::delete(bot_delete_subscription),
+        )
+        .route(
+            "/api/bots/:id/subscriptions/:sub_id/secret",
+            post(bot_rotate_subscription_secret),
+        )
         .route("/api/bots/:id/deliveries", get(bot_list_deliveries))
+        .route(
+            "/api/bots/:id/deliveries/:delivery_id/requeue",
+            post(bot_requeue_delivery),
+        )
         .route("/api/participants", get(search_participants))
         .route("/api/participants/:id", get(get_participant))
         .route("/api/rooms/:id/members/list", get(list_room_members))
@@ -164,6 +220,8 @@ pub fn build(state: AppState) -> Router {
         .merge(crate::scheduled::routes())
         // Workspace invitations / shareable invite links (ROADMAP 方向一).
         .merge(crate::invitations::routes())
+        .merge(crate::identity_migrations::routes())
+        .merge(crate::integrations::routes())
         // Cross-room (workspace-wide) message search, membership-scoped.
         .merge(crate::search::routes())
         // Saved searches: per-user, workspace-scoped named queries — list/run/
@@ -461,7 +519,7 @@ pub fn build(state: AppState) -> Router {
         // ---- ROADMAP11 — bulk unread summary (no migration) ----
         // GET /api/me/unread-summary
         .merge(crate::unread_summary::routes())
-        // ---- internal cross-node call-bridge subscribe (方向五, secret-gated) ----
+        // ---- internal call-bridge subscribe + RTCP feedback (secret-gated) ----
         .merge(crate::call_bridge_subscribe::routes())
         // ---- channel points (mig 0089) ----
         .merge(crate::channel_points::routes())
@@ -498,7 +556,7 @@ pub fn build(state: AppState) -> Router {
     // every response is correlated and eligible for compression.
     router
         .layer(middleware::from_fn(inject_request_id))
-        .layer(CompressionLayer::new())
+        .layer(response_compression_layer())
         .with_state(state)
 }
 
@@ -510,3 +568,8 @@ include!("handlers/blobs.rs");
 include!("handlers/bots.rs");
 include!("handlers/bot_subs.rs");
 include!("handlers/whip.rs");
+
+#[cfg(test)]
+mod tests {
+    include!("routes_tests.rs");
+}

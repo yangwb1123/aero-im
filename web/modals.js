@@ -11,6 +11,7 @@
 import { api, ApiError } from './api.js';
 import { state, els, openModal, closeModal, setBusy } from './context.js';
 import { initialOf, toast } from './render.js';
+import { initTwoFactorUi, refreshTwoFactorStatus } from './twofa.js';
 
 let forceReauth = () => {};
 let refreshRoomList = () => {};
@@ -22,6 +23,7 @@ export function initModalForms(deps) {
     if (typeof deps.refreshRoomList === 'function') refreshRoomList = deps.refreshRoomList;
     if (typeof deps.switchRoom === 'function') switchRoom = deps.switchRoom;
   }
+  initTwoFactorUi({ forceReauth });
 
   // ---------- profile editing ----------
   els.meAvatar.addEventListener('click', () => {
@@ -29,6 +31,7 @@ export function initModalForms(deps) {
     els.formProfile.querySelector('[name="display_name"]').value = state.me.display_name || '';
     els.formProfile.querySelector('[name="avatar_url"]').value = state.me.avatar_url || '';
     openModal(els.modalProfile);
+    refreshTwoFactorStatus();
   });
   els.formProfile.addEventListener('submit', async (e) => {
     e.preventDefault();

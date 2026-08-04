@@ -10,19 +10,24 @@
 //!   ([`RevokedTokenRepo`](aero_storage::RevokedTokenRepo)) before anything is
 //!   minted; a revoked or otherwise invalid token is `401`. The response mirrors
 //!   `auth_login` (`{ access_token, refresh_token, participant }`).
-//! * `POST /api/auth/logout` (auth required) — record the caller's refresh token
-//!   as revoked so it can no longer be refreshed, then `204`. Best-effort and
-//!   idempotent (`ON CONFLICT DO NOTHING`), so a repeated logout is harmless.
+//! * `POST /api/auth/logout` — authenticate with the supplied refresh token,
+//!   revoke it and retire its session, then `204`. This still works after the
+//!   access token expires; the mutation is atomic and idempotent.
 //!
 //! Purely additive: thin handlers over the existing [`AppState::auth`] service and
 //! a NEW revoked-token repo; no existing handler or repo is touched. Mounted via
 //! [`routes`] and `.merge`d into the main router.
 
-use aero_auth::{AuthUser, TokenKind};
+use aero_auth::TokenKind;
 use aero_common::Error as AeroError;
 use aero_storage::revoked_token::{hash_token, RevokedTokenRepo};
 use aero_storage::SessionRepo;
-use axum::{extract::State, http::{HeaderMap, StatusCode}, routing::post, Json, Router};
+use axum::{
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    routing::post,
+    Json, Router,
+};
 use serde::Deserialize;
 
 use crate::error::ApiResult;
@@ -49,6 +54,46 @@ struct RefreshReq {
 /// replayed later is still caught.
 const REFRESH_REUSE_GRACE: time::Duration = time::Duration::seconds(10);
 
+/// Reject a refresh hash already present in the revocation ledger. An older
+/// replay is treated as credential theft and invalidates every session.
+async fn reject_revoked_refresh(
+    s: &AppState,
+    sessions: &SessionRepo,
+    participant: aero_common::ParticipantId,
+    token_hash: &str,
+) -> aero_common::Result<()> {
+    let Some(revoked_at) = RevokedTokenRepo::new(s.pg.clone())
+        .revoked_at(token_hash)
+        .await
+        .map_err(AeroError::from)?
+    else {
+        return Ok(());
+    };
+
+    if time::OffsetDateTime::now_utc() - revoked_at > REFRESH_REUSE_GRACE {
+        let revoked = sessions
+            .revoke_all_and_blacklist(participant)
+            .await
+            .map_err(AeroError::from)?;
+        s.hub.disconnect_participant(participant);
+        crate::session_control::publish_revoke_participant(s, participant).await;
+        tracing::warn!(%participant, revoked, "refresh-token reuse detected; revoked all sessions");
+        return Err(AeroError::Unauthorized(
+            "refresh token reuse detected; all sessions revoked".into(),
+        ));
+    }
+    Err(AeroError::Unauthorized("refresh token revoked".into()))
+}
+
+pub(crate) fn refresh_participant(
+    claims: &aero_auth::Claims,
+) -> aero_common::Result<aero_common::ParticipantId> {
+    if claims.kind != TokenKind::Refresh {
+        return Err(AeroError::Unauthorized("not a refresh token".into()));
+    }
+    claims.participant_id()
+}
+
 /// `POST /api/auth/refresh` — rotate the refresh token and mint a new access
 /// token.
 ///
@@ -70,61 +115,54 @@ async fn refresh(
     // Verify signature and kind FIRST, so the participant can be identified even
     // for a revoked token (a forged token fails here). Any failure → 401.
     let claims = s.auth.verify(token)?;
-    if claims.kind != TokenKind::Refresh {
-        return Err(AeroError::Unauthorized("not a refresh token".into()).into());
-    }
-    let pid = claims.participant_id()?;
+    let pid = refresh_participant(&claims)?;
 
     let old_hash = hash_token(token);
-    let revoked_repo = RevokedTokenRepo::new(s.pg.clone());
     let session_repo = SessionRepo::new(s.pg.clone());
+    // Check before resolving legacy sid-less tokens: once such a token has
+    // rotated, its old hash is no longer active and cannot recover the stable id,
+    // but replay detection must still invalidate the session family.
+    reject_revoked_refresh(&s, &session_repo, pid, &old_hash).await?;
+    let session_id = match claims.session_id()? {
+        Some(session_id) => session_id,
+        None => session_repo
+            .active_id_by_hash(pid, &old_hash)
+            .await
+            .map_err(AeroError::from)?
+            .ok_or_else(|| AeroError::Unauthorized("refresh session is not active".into()))?,
+    };
 
-    // A revoked (logged-out or already-rotated) refresh token is rejected. If it was
-    // rotated only moments ago this is almost certainly a benign retry of a refresh
-    // whose response was lost — just 401. But replaying a token rotated longer ago
-    // (past the grace window) is a token-THEFT signal: the legitimate client holds
-    // the newer token, so revoke EVERY session for the participant (attacker AND
-    // victim must re-authenticate) — OWASP refresh-token-rotation reuse detection.
-    if let Some(revoked_at) = revoked_repo.revoked_at(&old_hash).await.map_err(AeroError::from)? {
-        if time::OffsetDateTime::now_utc() - revoked_at > REFRESH_REUSE_GRACE {
-            if let Ok(hashes) = session_repo.revoke_all_for_participant(pid).await {
-                for h in hashes {
-                    let _ = revoked_repo.revoke(&h, Some(pid)).await;
-                }
-            }
-            tracing::warn!(%pid, "refresh-token reuse detected; revoked all sessions");
-            return Err(AeroError::Unauthorized(
-                "refresh token reuse detected; all sessions revoked".into(),
-            )
-            .into());
-        }
-        return Err(AeroError::Unauthorized("refresh token revoked".into()).into());
-    }
-
-    // Issue a fresh access + refresh token pair (token rotation).
-    let new_tokens = s.auth.issue_for_participant(pid)?;
-    let new_hash = hash_token(&new_tokens.refresh_token);
-
-    // Blacklist the old token immediately — hard failure: if we can't blacklist
-    // it the caller might try to reuse it, so we must not issue the new pair.
-    revoked_repo.revoke(&old_hash, Some(pid)).await.map_err(AeroError::from)?;
-
-    // Retire the old session row and register the new one (best-effort — the
-    // old token is already blacklisted above, so row misses are harmless).
-    if let Err(e) = session_repo.revoke_by_hash(&old_hash, pid).await {
-        tracing::warn!(error = ?e, "failed to retire old session on token rotate");
-    }
-    let ua = headers.get(axum::http::header::USER_AGENT).and_then(|v| v.to_str().ok());
-    if let Err(e) = session_repo.record(pid, &new_hash, ua).await {
-        tracing::warn!(error = ?e, "failed to record new session on token rotate");
-    }
-
+    // Resolve the participant before consuming the old token. A deleted/missing
+    // account must never burn a credential and then fail later.
     let participant = s
         .participants
         .get(pid)
         .await
         .map_err(AeroError::from)?
         .ok_or_else(|| AeroError::Unauthorized("participant missing".into()))?;
+
+    // Tokens are minted in memory first but are returned only if the atomic DB
+    // rotation below wins. A racing loser discards its pair.
+    let new_tokens = s.auth.issue_for_session(pid, session_id)?;
+    let new_hash = hash_token(&new_tokens.refresh_token);
+    let ua = headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|v| v.to_str().ok());
+    let rotation = session_repo
+        .rotate_refresh_token_in_place(pid, session_id, &old_hash, &new_hash, ua)
+        .await
+        .map_err(AeroError::from)?;
+    if rotation == aero_storage::RefreshRotation::UnknownSession {
+        return Err(AeroError::Unauthorized("refresh session is not active".into()).into());
+    }
+    if rotation == aero_storage::RefreshRotation::AlreadyRevoked {
+        // A concurrent winner may blacklist after the pre-check above.
+        reject_revoked_refresh(&s, &session_repo, pid, &old_hash).await?;
+        return Err(AeroError::Internal(anyhow::anyhow!(
+            "refresh rotation reported revocation without a revocation row"
+        ))
+        .into());
+    }
 
     Ok(Json(serde_json::json!({
         "access_token": new_tokens.access_token,
@@ -134,37 +172,44 @@ async fn refresh(
 }
 
 /// `POST /api/auth/logout` — revoke the caller's refresh token so it can no longer
-/// be refreshed, returning `204`. Best-effort and idempotent: re-logging-out the
-/// same token is a no-op. Requires a valid access token (the [`AuthUser`]
-/// extractor); the revocation is attributed to that caller.
-async fn logout(
-    State(s): State<AppState>,
-    auth: AuthUser,
-    Json(req): Json<RefreshReq>,
-) -> ApiResult<StatusCode> {
+/// be refreshed, returning `204`. The body token must be a signed refresh token
+/// whose owner is derived from its signed claims; garbage and access tokens are
+/// rejected. Re-logging-out the same valid token is idempotent and no access JWT
+/// is required, so logout remains possible after access expiry.
+async fn logout(State(s): State<AppState>, Json(req): Json<RefreshReq>) -> ApiResult<StatusCode> {
     let token = req.refresh_token.trim();
     if token.is_empty() {
         return Err(AeroError::Invalid("refresh_token must not be empty".into()).into());
     }
+    let claims = s.auth.verify(token)?;
+    let participant = refresh_participant(&claims)?;
     let hash = hash_token(token);
-    RevokedTokenRepo::new(s.pg.clone())
-        .revoke(&hash, Some(auth.participant_id))
+    let sessions = SessionRepo::new(s.pg.clone());
+    let claimed_session = claims.session_id()?;
+    let active_session = sessions
+        .active_id_by_hash(participant, &hash)
         .await
         .map_err(AeroError::from)?;
-    // Wave 21: also retire the matching active-session row (owner-scoped) so the
-    // logged-out device drops out of the session inventory. Best-effort — the
-    // refresh token is already revoked above, so a session-row miss is harmless.
-    if let Err(e) = SessionRepo::new(s.pg.clone())
-        .revoke_by_hash(&hash, auth.participant_id)
+    if matches!(
+        (claimed_session, active_session),
+        (Some(claimed), Some(active)) if claimed != active
+    ) {
+        return Err(AeroError::Unauthorized("refresh session binding mismatch".into()).into());
+    }
+    let session_id = claimed_session.or(active_session);
+    sessions
+        .revoke_by_hash_and_blacklist(&hash, participant)
         .await
-    {
-        tracing::warn!(error = ?e, "auth session logout revoke failed");
+        .map_err(AeroError::from)?;
+    if let Some(session_id) = session_id {
+        s.hub.disconnect_session(participant, session_id);
+        crate::session_control::publish_revoke_session(&s, participant, session_id).await;
     }
     // Best-effort privileged-operation audit (ROADMAP 方向四). Logout carries no
     // workspace context, so the event is attributed to the all-zero default
     // workspace (uuid nil). The full token hash is never recorded — only a short
     // prefix. A logging failure only warns, never fails the already-done logout.
-    audit_session_revoked(&s, auth.participant_id, &hash).await;
+    audit_session_revoked(&s, participant, &hash).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -172,11 +217,7 @@ async fn logout(
 /// all-zero default workspace (uuid nil) since logout has no tenant context, and
 /// carries only a short prefix of the refresh-token hash (never the full hash).
 /// Best-effort: an append failure is warn-logged and swallowed.
-async fn audit_session_revoked(
-    s: &AppState,
-    actor: aero_common::ParticipantId,
-    token_hash: &str,
-) {
+async fn audit_session_revoked(s: &AppState, actor: aero_common::ParticipantId, token_hash: &str) {
     let workspace = aero_common::WorkspaceId::from_uuid(uuid::Uuid::nil());
     // A short, non-reversible prefix is enough to correlate without exposing the
     // hash itself.
@@ -193,5 +234,28 @@ async fn audit_session_revoked(
         .await
     {
         tracing::warn!(error = ?e, "session.revoked audit append failed");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aero_auth::Claims;
+
+    #[test]
+    fn refresh_credentials_reject_access_tokens() {
+        let participant = aero_common::ParticipantId::new();
+        let mut claims = Claims {
+            sub: participant.to_string(),
+            iss: "aero-im".into(),
+            iat: 1,
+            exp: u64::MAX,
+            kind: TokenKind::Refresh,
+            jti: "test".into(),
+            sid: None,
+        };
+        assert_eq!(refresh_participant(&claims).unwrap(), participant);
+        claims.kind = TokenKind::Access;
+        assert!(refresh_participant(&claims).is_err());
     }
 }

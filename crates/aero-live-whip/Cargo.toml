@@ -29,10 +29,10 @@ uuid.workspace = true
 time.workspace = true
 parking_lot.workspace = true
 
-# WebRTC media plane (P5). sans-IO; pure-Rust crypto backend (`rust-crypto`)
-# avoids native build deps (openssl / aws-lc-rs+nasm) so the crate always
-# compiles in CI without a C toolchain.
-str0m = { version = "0.19", default-features = false, features = ["rust-crypto"] }
+# WebRTC media plane (P5). The str0m DTLS/SRTP path uses its pure-Rust
+# `rust-crypto` backend; unrelated HTTP/storage TLS dependencies in this crate
+# can still select their own native-backed crypto provider.
+str0m = { path = "../../vendor/aero-str0m-msrv/str0m", version = "0.19.0", default-features = false, features = ["rust-crypto"] }
 
 # WHEP upstream relay client: HTTP SDP exchange with a peer node.
 reqwest = { workspace = true }

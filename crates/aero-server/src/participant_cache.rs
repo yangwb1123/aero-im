@@ -112,7 +112,13 @@ impl ParticipantCache {
         crate::metrics::record_participant_cache(false);
         let row = repo.get(pid).await?;
         if let Some(ref p) = row {
-            self.map.insert(pid, CachedEntry { participant: Arc::new(p.clone()), at: now });
+            self.map.insert(
+                pid,
+                CachedEntry {
+                    participant: Arc::new(p.clone()),
+                    at: now,
+                },
+            );
             Ok(Some(Arc::new(p.clone())))
         } else {
             Ok(None)
@@ -200,7 +206,13 @@ mod tests {
             created_at: time::OffsetDateTime::now_utc(),
         };
         // Insert via the internal map directly (simulating a get_or_fetch miss path).
-        cache.map.insert(pid, CachedEntry { participant: Arc::new(p), at: Instant::now() });
+        cache.map.insert(
+            pid,
+            CachedEntry {
+                participant: Arc::new(p),
+                at: Instant::now(),
+            },
+        );
         // The entry should be present.
         assert!(cache.map.get(&pid).is_some());
         assert_eq!(cache.len(), 1);
@@ -230,7 +242,13 @@ mod tests {
         // hit the DB) would make `hits()` stay 0 and fail this assertion.
         let cache = ParticipantCache::new(Duration::from_secs(100));
         let pid = aero_common::ParticipantId::new();
-        cache.map.insert(pid, CachedEntry { participant: Arc::new(sample(pid, "alice")), at: Instant::now() });
+        cache.map.insert(
+            pid,
+            CachedEntry {
+                participant: Arc::new(sample(pid, "alice")),
+                at: Instant::now(),
+            },
+        );
 
         assert_eq!(cache.hits(), 0);
         let got = cache.probe_fresh(pid).expect("fresh entry must be a hit");
@@ -256,7 +274,13 @@ mod tests {
         // An expired entry also misses (TTL 0 ⇒ always stale).
         let stale = ParticipantCache::new(Duration::from_secs(0));
         let spid = aero_common::ParticipantId::new();
-        stale.map.insert(spid, CachedEntry { participant: Arc::new(sample(spid, "bob")), at: Instant::now() });
+        stale.map.insert(
+            spid,
+            CachedEntry {
+                participant: Arc::new(sample(spid, "bob")),
+                at: Instant::now(),
+            },
+        );
         assert!(stale.probe_fresh(spid).is_none(), "expired entry must miss");
         assert_eq!(stale.misses(), 1);
         assert_eq!(stale.hits(), 0);
@@ -266,10 +290,19 @@ mod tests {
     fn invalidate_forces_a_subsequent_miss() {
         let cache = ParticipantCache::new(Duration::from_secs(100));
         let pid = aero_common::ParticipantId::new();
-        cache.map.insert(pid, CachedEntry { participant: Arc::new(sample(pid, "carol")), at: Instant::now() });
+        cache.map.insert(
+            pid,
+            CachedEntry {
+                participant: Arc::new(sample(pid, "carol")),
+                at: Instant::now(),
+            },
+        );
         assert!(cache.probe_fresh(pid).is_some()); // hit
         cache.invalidate(&pid);
-        assert!(cache.probe_fresh(pid).is_none(), "post-invalidate read must miss");
+        assert!(
+            cache.probe_fresh(pid).is_none(),
+            "post-invalidate read must miss"
+        );
     }
 
     #[test]
@@ -284,7 +317,13 @@ mod tests {
             created_by: None,
             created_at: time::OffsetDateTime::now_utc(),
         };
-        cache.map.insert(pid, CachedEntry { participant: Arc::new(p), at: Instant::now() });
+        cache.map.insert(
+            pid,
+            CachedEntry {
+                participant: Arc::new(p),
+                at: Instant::now(),
+            },
+        );
         // Still in the map (we don't evict eagerly), but get_or_fetch would miss.
         assert!(cache.map.get(&pid).is_some());
     }

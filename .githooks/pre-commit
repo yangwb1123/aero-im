@@ -31,7 +31,7 @@ fi
 echo "🔍 Running pre-commit checks..."
 
 # Run only for relevant file changes
-CHANGED_FILES=$(git diff --cached --name-only --diff-filter=ACMR | head -20)
+CHANGED_FILES=$(git diff --cached --name-only --diff-filter=ACMR | sed -n '1,20p')
 
 # If only markdown/docs changed, skip heavy checks
 if echo "$CHANGED_FILES" | grep -qvE '\.(md|txt)$'; then

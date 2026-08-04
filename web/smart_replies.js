@@ -9,21 +9,34 @@
 
 import { api, ApiError } from './api.js';
 import { state, ws } from './context.js';
+import { sendOptimistically } from './delivery.js';
 
 let activeSuggestions = null; // { container, messageId, buttons[] }
+let suggestionGeneration = 0;
+let optimisticAdd = () => null;
+
+export function initSmartReplies(deps = {}) {
+  if (typeof deps.optimisticAdd === 'function') optimisticAdd = deps.optimisticAdd;
+}
 
 /// Fetch suggestions and render them below `messageEl`.
 export async function showSuggestions(roomId, messageId, messageEl) {
   // Clear any previous suggestions
   hideSuggestions();
+  const generation = ++suggestionGeneration;
 
   if (!roomId || !messageEl) return;
 
   try {
-    const res = await api(`/api/rooms/${roomId}/suggest-replies`, {
-      method: 'POST',
-      body: JSON.stringify({ k: 10 }),
-    });
+    const res = await api.suggestReplies(roomId, { k: 10 });
+
+    // Ignore a stale response after switching rooms, rendering a newer message,
+    // or removing the original message node.
+    if (
+      generation !== suggestionGeneration ||
+      state.currentRoomId !== roomId ||
+      !messageEl.isConnected
+    ) return;
 
     if (!res || !res.suggestions) return;
 
@@ -43,6 +56,7 @@ export async function showSuggestions(roomId, messageId, messageEl) {
     const buttons = [];
     for (const text of lines.slice(0, 3)) {
       const btn = document.createElement('button');
+      btn.type = 'button';
       btn.className = 'smart-reply-btn';
       btn.textContent = text.length > 60 ? text.slice(0, 57) + '…' : text;
       btn.style.cssText =
@@ -53,10 +67,12 @@ export async function showSuggestions(roomId, messageId, messageEl) {
       btn.addEventListener('mouseleave', () => { btn.style.background = '#fff'; });
       btn.addEventListener('click', () => {
         // Send the selected reply as a chat message
-        const roomId = state.currentRoom;
-        if (roomId && ws.sendMessage) {
-          ws.sendMessage(roomId, [{ type: 'text', text }]);
-        }
+        const blocks = [{ type: 'text', content: text }];
+        if (!sendOptimistically(
+          (id) => ws.sendMessage(roomId, blocks, null, id),
+          (delivery) => optimisticAdd(roomId, blocks, null, delivery),
+          { kind: 'blocks', roomId, blocks, replyTo: null },
+        )) return;
         hideSuggestions();
       });
       container.appendChild(btn);
@@ -75,6 +91,7 @@ export async function showSuggestions(roomId, messageId, messageEl) {
 
 /// Remove the suggestion buttons.
 export function hideSuggestions() {
+  suggestionGeneration += 1;
   if (activeSuggestions) {
     if (activeSuggestions.container.parentNode) {
       activeSuggestions.container.parentNode.removeChild(activeSuggestions.container);
@@ -86,8 +103,6 @@ export function hideSuggestions() {
 /// Call this from app.js when a new message is rendered.
 /// `messageEl` is the DOM element for the message bubble.
 export function onNewMessage(roomId, messageId, messageEl) {
-  // Only show suggestions for messages from other people
-  if (messageEl && state?.me?.id) {
-    showSuggestions(roomId, messageId, messageEl);
-  }
+  if (!messageEl || messageEl.dataset.senderId === state.me?.id) return;
+  showSuggestions(roomId, messageId, messageEl);
 }

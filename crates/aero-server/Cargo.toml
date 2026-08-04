@@ -6,6 +6,14 @@ rust-version.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+default = []
+# The experimental XML-DSig implementation has transitive dependencies whose
+# current MSRV exceeds Aero IM's Rust 1.80 baseline. Keep it outside the default
+# production/MSRV graph; enabling this feature still requires the explicit
+# runtime env gate and remains unsupported for production security.
+saml-experimental-bergshamra = ["dep:bergshamra"]
+
 [lints]
 workspace = true
 
@@ -34,7 +42,7 @@ aero-im-call.workspace = true
 aero-signaling.workspace = true
 aero-push.workspace = true
 
-fred.workspace = true
+fred = { workspace = true, features = ["i-scripts"] }
 
 sqlx.workspace = true
 
@@ -53,7 +61,7 @@ axum.workspace = true
 tower = { workspace = true, features = ["limit"] }
 tower-http = { workspace = true, features = ["timeout", "compression-gzip", "set-header"] }
 hyper.workspace = true
-lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-rustls-tls"] }
+lettre = { version = "=0.11.18", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-rustls-tls"] }
 
 serde.workspace = true
 serde_json.workspace = true
@@ -68,6 +76,7 @@ dashmap.workspace = true
 parking_lot.workspace = true
 base64 = "0.22"
 sha2 = "0.10"
+rand.workspace = true
 hex = "0.4"
 # SAML 2.0 SP (HTTP-Redirect binding): the AuthnRequest is DEFLATE-compressed
 # (RFC 1951, raw — no zlib/gzip header) then base64+url-encoded. `flate2` is
@@ -75,13 +84,18 @@ hex = "0.4"
 # `url` crate family already in the workspace lockfile.
 flate2 = "1"
 form_urlencoded = "1"
+url.workspace = true
 async-nats.workspace = true
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+# Namespace-aware bounded XML parsing for the fail-closed SAML shell and
+# conditions checks. This is the parser re-exported by bergshamra, depended on
+# directly so the Rust 1.80 default graph does not pull its crypto suite.
+uppsala = { path = "../../vendor/uppsala-msrv/uppsala", version = "0.4.0" }
 # Pure-Rust XML-Security suite (XML-DSig verify + exclusive-C14N + XSW guard),
-# `#![forbid(unsafe_code)]`, zero system C deps. Used ONLY behind the opt-in
-# `AERO_SAML_EXPERIMENTAL_VERIFY` env gate (see `crate::saml`). SECURITY: this is
-# a pre-1.0, NOT third-party-audited crate — see the caveat in `saml.rs`.
-bergshamra = "0.5.1"
+# `#![forbid(unsafe_code)]`, zero system C deps. Used ONLY when both this Cargo
+# feature and `AERO_SAML_EXPERIMENTAL_VERIFY` are enabled. SECURITY: pre-1.0,
+# not third-party audited, and outside the workspace MSRV promise.
+bergshamra = { version = "0.5.1", optional = true }
 
 [dev-dependencies]
 pretty_assertions.workspace = true
@@ -89,6 +103,5 @@ pretty_assertions.workspace = true
 # X.509 cert (rcgen, fed an `rsa`-generated key) and sign a SAML Response with
 # bergshamra, then assert legitimate/tampered/XSW/wrong-cert/unsigned verdicts.
 # All transitively present in the lockfile already; dev-only, never shipped.
-rcgen = "0.14"
+rcgen = "=0.14.7"
 rsa = "0.9"
-rand = "0.8"

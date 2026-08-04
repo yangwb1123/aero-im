@@ -20,6 +20,7 @@ use aero_auth::AuthUser;
 use aero_common::{Error as AeroError, RoomId};
 use axum::{
     extract::{Path, State},
+    http::HeaderMap,
     routing::post,
     Json, Router,
 };
@@ -72,6 +73,7 @@ struct SuggestRepliesReq {
 async fn suggest_replies(
     State(s): State<AppState>,
     auth: AuthUser,
+    headers: HeaderMap,
     Path(room_str): Path<String>,
     Json(req): Json<SuggestRepliesReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
@@ -83,12 +85,19 @@ async fn suggest_replies(
     let k = suggest_k(req.k);
     // Degrade exactly like `POST /api/ai/ask`: `502` when no AI backend is wired;
     // a wired backend answers heuristically when no LLM key is configured.
-    let ai = s
-        .ai
-        .as_ref()
-        .ok_or_else(|| AeroError::Upstream("AI not configured".into()))?;
+    let ai =
+        s.ai.as_ref()
+            .ok_or_else(|| AeroError::Upstream("AI not configured".into()))?;
+    let usage_context = crate::ai_usage::room_request_usage_context(
+        &s,
+        &headers,
+        auth.participant_id,
+        room,
+        &format!("suggest_replies:{room}:{k}"),
+    )
+    .await?;
     let answer = ai
-        .answer_question(room, SUGGEST_PROMPT, k)
+        .answer_question_with_usage_context(room, SUGGEST_PROMPT, k, usage_context)
         .await
         .map_err(|e| AeroError::Upstream(format!("ai: {e}")))?;
     Ok(Json(serde_json::json!({

@@ -2,8 +2,9 @@
 //!
 //! Surfaces a user's active login sessions/devices and lets them revoke one — or
 //! all-others ("sign out everywhere else"). Built on the EXISTING refresh/logout
-//! machinery: login records a session ([`SessionRepo::record`](aero_storage::SessionRepo)
-//! keyed on the refresh-token hash), [`crate::session`] refresh/logout touch and
+//! machinery: login records the JWT's stable session id
+//! ([`SessionRepo::record_with_id`](aero_storage::SessionRepo), keyed on the
+//! refresh-token hash), [`crate::session`] refresh/logout touch and
 //! revoke it, and these handlers add explicit inventory + revocation on top.
 //!
 //! Revoking a session does two things in lock-step: it flips the row's
@@ -22,9 +23,10 @@ use std::str::FromStr;
 
 use aero_auth::{password as auth_password, AuthUser};
 use aero_common::{Error as AeroError, SessionId};
-use aero_storage::revoked_token::{hash_token, RevokedTokenRepo};
+use aero_storage::revoked_token::hash_token;
 use aero_storage::{
-    generate_reset_token, hash_reset_token, ParticipantRepo, PasswordResetRepo, SessionRepo,
+    generate_reset_token, hash_reset_token, ChangePasswordResult, CredentialRotationRepo,
+    ParticipantDeleteError, ParticipantRepo, PasswordResetRepo, ResetPasswordResult, SessionRepo,
 };
 use axum::{
     extract::{Path, State},
@@ -41,7 +43,10 @@ use crate::state::AppState;
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/auth/sessions", get(list_sessions))
-        .route("/api/auth/sessions/:sid", axum::routing::delete(revoke_session))
+        .route(
+            "/api/auth/sessions/:sid",
+            axum::routing::delete(revoke_session),
+        )
         .route("/api/auth/sessions/revoke-others", post(revoke_others))
         .route("/api/auth/change-password", post(change_password))
         .route("/api/auth/change-email", post(change_email))
@@ -70,7 +75,9 @@ async fn list_sessions(
         .list_active(auth.participant_id)
         .await
         .map_err(AeroError::from)?;
-    Ok(Json(serde_json::to_value(sessions).map_err(AeroError::from)?))
+    Ok(Json(
+        serde_json::to_value(sessions).map_err(AeroError::from)?,
+    ))
 }
 
 /// `DELETE /api/auth/sessions/:sid` — revoke one of the caller's own sessions.
@@ -84,32 +91,35 @@ async fn revoke_session(
     Path(id_str): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let id = parse_session(&id_str)?;
-    let hash = repo(&s)
-        .revoke(id, auth.participant_id)
-        .await
-        .map_err(AeroError::from)?
-        .ok_or_else(|| AeroError::NotFound(format!("session {id}")))?;
-    // Belt-and-braces: also blacklist the refresh token so it can't be refreshed,
-    // attributing the revocation to the caller. The hash already came from the
-    // (just-revoked) owner-scoped row.
-    RevokedTokenRepo::new(s.pg.clone())
-        .revoke(&hash, Some(auth.participant_id))
+    let revoked = repo(&s)
+        .revoke_and_blacklist(id, auth.participant_id)
         .await
         .map_err(AeroError::from)?;
+    if !revoked {
+        return Err(AeroError::NotFound(format!("session {id}")).into());
+    }
+    s.hub.disconnect_session(auth.participant_id, id);
+    crate::session_control::publish_revoke_session(&s, auth.participant_id, id).await;
     // Best-effort privileged-operation audit (ROADMAP 方向四). A session revocation
     // is account-scoped with no workspace context, so it is attributed to the
     // all-zero default workspace (uuid nil), with the session id as target. The
     // append already happened; a logging failure only warns, never fails the
     // already-done revocation.
     audit_session_revoked(&s, auth.participant_id, id).await;
-    Ok(Json(serde_json::json!({ "revoked": true, "session_id": id })))
+    Ok(Json(
+        serde_json::json!({ "revoked": true, "session_id": id }),
+    ))
 }
 
 /// Record a `session.revoked` audit event for an explicit session-inventory
 /// revoke. Attributed to the all-zero default workspace (uuid nil) since the
 /// action has no tenant context; the session id is the target. Best-effort: an
 /// append failure is warn-logged and swallowed (the session is already revoked).
-async fn audit_session_revoked(s: &AppState, actor: aero_common::ParticipantId, session: SessionId) {
+async fn audit_session_revoked(
+    s: &AppState,
+    actor: aero_common::ParticipantId,
+    session: SessionId,
+) {
     let workspace = aero_common::WorkspaceId::from_uuid(uuid::Uuid::nil());
     if let Err(e) = s
         .audit
@@ -150,21 +160,33 @@ async fn revoke_others(
     if token.is_empty() {
         return Err(AeroError::Invalid("current_refresh_token must not be empty".into()).into());
     }
-    let keep = hash_token(token);
-    let revoked = repo(&s)
-        .revoke_others(auth.participant_id, &keep)
-        .await
-        .map_err(AeroError::from)?;
-    // Blacklist each revoked refresh token so none can be refreshed. Attribute to
-    // the caller; `revoke` is idempotent (ON CONFLICT DO NOTHING).
-    let blacklist = RevokedTokenRepo::new(s.pg.clone());
-    for hash in &revoked {
-        blacklist
-            .revoke(hash, Some(auth.participant_id))
-            .await
-            .map_err(AeroError::from)?;
+    let claims = s.auth.verify(token)?;
+    if crate::session::refresh_participant(&claims)? != auth.participant_id {
+        return Err(AeroError::Unauthorized("refresh token owner mismatch".into()).into());
     }
-    Ok(Json(serde_json::json!({ "revoked_count": revoked.len() })))
+    let keep = hash_token(token);
+    let sessions = repo(&s);
+    let active_keep_session = sessions
+        .active_id_by_hash(auth.participant_id, &keep)
+        .await
+        .map_err(AeroError::from)?
+        .ok_or_else(|| AeroError::Unauthorized("current refresh session is not active".into()))?;
+    let keep_session = match claims.session_id()? {
+        Some(session_id) if session_id != active_keep_session => {
+            return Err(AeroError::Unauthorized("refresh session binding mismatch".into()).into());
+        }
+        Some(session_id) => session_id,
+        None => active_keep_session,
+    };
+    let revoked_count = sessions
+        .revoke_others_and_blacklist(auth.participant_id, &keep)
+        .await
+        .map_err(AeroError::from)?
+        .ok_or_else(|| AeroError::Unauthorized("current refresh session is not active".into()))?;
+    s.hub
+        .disconnect_other_sessions(auth.participant_id, keep_session);
+    crate::session_control::publish_revoke_others(&s, auth.participant_id, keep_session).await;
+    Ok(Json(serde_json::json!({ "revoked_count": revoked_count })))
 }
 
 #[derive(Deserialize)]
@@ -218,7 +240,9 @@ async fn password_was_recently_used(
         return Ok(true);
     }
     let recent = history.recent(participant).await.map_err(AeroError::from)?;
-    Ok(recent.iter().any(|h| auth_password::verify(candidate, h).is_ok()))
+    Ok(recent
+        .iter()
+        .any(|h| auth_password::verify(candidate, h).is_ok()))
 }
 
 async fn change_password(
@@ -240,39 +264,47 @@ async fn change_password(
     // Validate the new password against the configurable policy (方向五).
     aero_auth::password_policy::validate(&req.new_password).map_err(AeroError::from)?;
     if req.new_password == req.current_password {
-        return Err(AeroError::Invalid("new_password must differ from current_password".into()).into());
+        return Err(
+            AeroError::Invalid("new_password must differ from current_password".into()).into(),
+        );
     }
     // Reuse history (方向五): reject reuse of the current or a recent password.
     let history = aero_storage::PasswordHistoryRepo::new(s.pg.clone());
-    if password_was_recently_used(&req.new_password, &creds.password_hash, &history, auth.participant_id).await? {
-        return Err(AeroError::Invalid("new_password was used recently; choose a different one".into()).into());
+    if password_was_recently_used(
+        &req.new_password,
+        &creds.password_hash,
+        &history,
+        auth.participant_id,
+    )
+    .await?
+    {
+        return Err(AeroError::Invalid(
+            "new_password was used recently; choose a different one".into(),
+        )
+        .into());
     }
 
-    // Hash and store the new password.
+    // Hash and atomically store the new password, retain history, and revoke
+    // every refresh session. The expected hash binds the commit to the
+    // credential verified above, closing a concurrent-password-change race.
     let new_hash = auth_password::hash(&req.new_password)?;
-    participants
-        .update_password_hash(auth.participant_id, &new_hash)
+    let revoked = match CredentialRotationRepo::new(s.pg.clone())
+        .change_password(auth.participant_id, &creds.password_hash, &new_hash)
         .await
-        .map_err(AeroError::from)?;
-    // Record the REPLACED hash so it cannot be reused for the next HISTORY_DEPTH changes.
-    if let Err(e) = history.record(auth.participant_id, &creds.password_hash).await {
-        tracing::warn!(error = ?e, "password history record failed");
-    }
+        .map_err(AeroError::from)?
+    {
+        ChangePasswordResult::Applied { sessions_revoked } => sessions_revoked,
+        ChangePasswordResult::StaleCredentials => {
+            return Err(AeroError::Conflict(
+                "credentials changed while processing the request; sign in again".into(),
+            )
+            .into());
+        }
+    };
+    s.hub.disconnect_participant(auth.participant_id);
+    crate::session_control::publish_revoke_participant(&s, auth.participant_id).await;
 
-    // Revoke all sessions (including the current one) and blacklist their tokens.
-    let revoked = repo(&s)
-        .revoke_all_for_participant(auth.participant_id)
-        .await
-        .map_err(AeroError::from)?;
-    let blacklist = RevokedTokenRepo::new(s.pg.clone());
-    for hash in &revoked {
-        blacklist
-            .revoke(hash, Some(auth.participant_id))
-            .await
-            .map_err(AeroError::from)?;
-    }
-
-    Ok(Json(serde_json::json!({ "sessions_invalidated": revoked.len() })))
+    Ok(Json(serde_json::json!({ "sessions_invalidated": revoked })))
 }
 
 /// `POST /api/auth/change-email` — update the authenticated user's email address.
@@ -310,7 +342,9 @@ async fn change_email(
         return Err(AeroError::Invalid("new_email is not a valid address".into()).into());
     }
     if email == creds.email {
-        return Err(AeroError::Invalid("new_email must differ from the current address".into()).into());
+        return Err(
+            AeroError::Invalid("new_email must differ from the current address".into()).into(),
+        );
     }
 
     participants
@@ -334,9 +368,9 @@ async fn change_email(
 ///
 /// Always returns the same success body regardless of whether the address is
 /// registered — this prevents user-enumeration via error codes. When the address
-/// IS registered, a plaintext reset token is **logged** at INFO level (a real
-/// deployment would instead queue an email containing the token). The token
-/// expires in one hour and is single-use.
+/// IS registered and SMTP is configured, a single-use token is stored and sent
+/// by email. Without a mailer no token is issued: plaintext recovery credentials
+/// are never written to logs.
 async fn forgot_password(
     State(s): State<AppState>,
     Json(req): Json<ForgotPasswordReq>,
@@ -344,7 +378,10 @@ async fn forgot_password(
     let email = req.email.trim().to_ascii_lowercase();
     // Best-effort: look up the participant; silently succeed if not found.
     let participants = ParticipantRepo::new(s.pg.clone());
-    if let Ok(Some(creds)) = participants.find_credentials_by_email(&email).await {
+    if let (Some(mailer), Ok(Some(creds))) = (
+        s.mailer.as_ref(),
+        participants.find_credentials_by_email(&email).await,
+    ) {
         let token = generate_reset_token();
         let hash = hash_reset_token(&token);
         let reset_repo = PasswordResetRepo::new(s.pg.clone());
@@ -356,16 +393,7 @@ async fn forgot_password(
         {
             tracing::warn!("failed to store reset token for {email}: {e}");
         } else {
-            // Send email when SMTP is configured; fall back to log-only.
-            if let Some(ref mailer) = s.mailer {
-                mailer.send_password_reset(&email, &token).await;
-            } else {
-                tracing::info!(
-                    email = %email,
-                    token = %token,
-                    "password reset token issued (log-only; configure AERO__EMAIL__* for production)"
-                );
-            }
+            mailer.send_password_reset(&email, &token).await;
         }
     }
     Ok(Json(serde_json::json!({
@@ -390,11 +418,15 @@ async fn reset_password(
     aero_auth::password_policy::validate(&req.new_password).map_err(AeroError::from)?;
     let hash = hash_reset_token(req.token.trim());
     let reset_repo = PasswordResetRepo::new(s.pg.clone());
+    // Resolve without consuming. The final rotation transaction rechecks and
+    // locks this token before marking it used.
     let participant = reset_repo
-        .consume(&hash)
+        .valid_owner(&hash)
         .await
         .map_err(AeroError::from)?
-        .ok_or_else(|| AeroError::Unauthorized("reset token is invalid, expired, or already used".into()))?;
+        .ok_or_else(|| {
+            AeroError::Unauthorized("reset token is invalid, expired, or already used".into())
+        })?;
 
     let participants = ParticipantRepo::new(s.pg.clone());
     // Reuse history (方向五): even via reset, reject the current or a recent password.
@@ -406,36 +438,45 @@ async fn reset_password(
         .map(|c| c.password_hash);
     if let Some(ref old) = old_hash {
         if password_was_recently_used(&req.new_password, old, &history, participant).await? {
-            return Err(AeroError::Invalid("new_password was used recently; choose a different one".into()).into());
+            return Err(AeroError::Invalid(
+                "new_password was used recently; choose a different one".into(),
+            )
+            .into());
         }
     }
 
+    let old_hash = old_hash
+        .ok_or_else(|| AeroError::Forbidden("no credentials for the reset-token owner".into()))?;
     let new_hash = auth_password::hash(&req.new_password)?;
-    participants
-        .update_password_hash(participant, &new_hash)
+    let (participant, revoked) = match CredentialRotationRepo::new(s.pg.clone())
+        .reset_password(&hash, &old_hash, &new_hash)
         .await
-        .map_err(AeroError::from)?;
-    // Record the replaced hash into reuse history (best-effort).
-    if let Some(old) = old_hash {
-        if let Err(e) = history.record(participant, &old).await {
-            tracing::warn!(error = ?e, "password history record failed");
+        .map_err(AeroError::from)?
+    {
+        ResetPasswordResult::Applied {
+            participant,
+            sessions_revoked,
+        } => (participant, sessions_revoked),
+        ResetPasswordResult::InvalidToken => {
+            return Err(AeroError::Unauthorized(
+                "reset token is invalid, expired, or already used".into(),
+            )
+            .into());
         }
-    }
+        ResetPasswordResult::StaleCredentials => {
+            return Err(AeroError::Conflict(
+                "credentials changed while processing the request; retry with the same token"
+                    .into(),
+            )
+            .into());
+        }
+    };
+    s.hub.disconnect_participant(participant);
+    crate::session_control::publish_revoke_participant(&s, participant).await;
 
-    // Revoke all active sessions and blacklist their tokens.
-    let revoked = repo(&s)
-        .revoke_all_for_participant(participant)
-        .await
-        .map_err(AeroError::from)?;
-    let blacklist = RevokedTokenRepo::new(s.pg.clone());
-    for h in &revoked {
-        blacklist
-            .revoke(h, Some(participant))
-            .await
-            .map_err(AeroError::from)?;
-    }
-
-    Ok(Json(serde_json::json!({ "ok": true, "sessions_invalidated": revoked.len() })))
+    Ok(Json(
+        serde_json::json!({ "ok": true, "sessions_invalidated": revoked }),
+    ))
 }
 
 /// `DELETE /api/me` — permanently delete the caller's account.
@@ -445,10 +486,9 @@ async fn reset_password(
 ///
 /// Steps:
 /// 1. Verify password against the stored hash.
-/// 2. Revoke + blacklist all active sessions so concurrent devices are signed out
-///    before the row vanishes.
-/// 3. Hard-delete the participant row; FK cascades handle credentials,
-///    `room_members`, `auth_sessions`, etc.
+/// 2. In one storage transaction, verify workspace/channel ownership can remain
+///    governed, tombstone the participant, erase PII, and revoke sessions.
+/// 3. After commit, disconnect local sockets and publish cluster revocation.
 /// 4. Returns `204 No Content` on success.
 async fn delete_me(
     State(s): State<AppState>,
@@ -466,30 +506,33 @@ async fn delete_me(
     auth_password::verify(&req.password, &creds.password_hash)
         .map_err(|_| AeroError::Unauthorized("password is incorrect".into()))?;
 
-    // Revoke and blacklist all active sessions so concurrent devices are kicked.
-    let revoked = repo(&s)
-        .revoke_all_for_participant(auth.participant_id)
-        .await
-        .map_err(AeroError::from)?;
-    let blacklist = RevokedTokenRepo::new(s.pg.clone());
-    for hash in &revoked {
-        blacklist
-            .revoke(hash, Some(auth.participant_id))
-            .await
-            .map_err(AeroError::from)?;
-    }
-
     // GDPR erasure: tombstones the participant (UPDATE deleted_at + '[deleted]'
     // name) and explicitly deletes its PII tables — NOT a hard delete, so FK
-    // cascades never fire (the erasure routine deletes them explicitly).
+    // cascades never fire (the erasure routine deletes them explicitly). It also
+    // revokes sessions in the same transaction. Ownership conflicts therefore
+    // leave both the account and its sessions untouched.
     participants
         .delete_participant(auth.participant_id)
         .await
-        .map_err(AeroError::from)?;
+        .map_err(map_participant_delete_error)?;
+    s.hub.disconnect_participant(auth.participant_id);
+    crate::session_control::publish_revoke_participant(&s, auth.participant_id).await;
     // Invalidate the participant cache so OTHER users' next read resolves the
     // '[deleted]' tombstone immediately instead of a stale cached name for up to
     // the 60s TTL — same invalidate-on-write contract update_me honors.
     s.participant_cache.invalidate(&auth.participant_id);
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+fn map_participant_delete_error(error: ParticipantDeleteError) -> AeroError {
+    match error {
+        ParticipantDeleteError::WorkspaceOwnerProtected => AeroError::Conflict(
+            "transfer or demote workspace ownership before deleting your account".into(),
+        ),
+        ParticipantDeleteError::ChannelOwnerProtected(_) => {
+            AeroError::Conflict("transfer channel ownership before deleting your account".into())
+        }
+        ParticipantDeleteError::Storage(error) => AeroError::from(error),
+    }
 }

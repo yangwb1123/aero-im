@@ -10,6 +10,7 @@ use std::str::FromStr;
 
 use aero_auth::AuthUser;
 use aero_common::{Error as AeroError, ParticipantId, RoomId, WorkspaceId};
+use aero_storage::{MAX_CHANNEL_DESCRIPTION_CHARS, MAX_CHANNEL_TOPIC_CHARS};
 use axum::{
     extract::{Path, Query, State},
     routing::{get, patch, post},
@@ -27,7 +28,10 @@ pub fn routes() -> Router<AppState> {
         .route("/api/rooms/:id/join", post(join_channel))
         .route("/api/rooms/:id/leave", post(leave_channel))
         .route("/api/rooms/:id/archive", post(archive_channel))
-        .route("/api/rooms/:id/channel", axum::routing::patch(update_channel))
+        .route(
+            "/api/rooms/:id/channel",
+            axum::routing::patch(update_channel),
+        )
         .route(
             "/api/rooms/:id/post-policy",
             get(get_post_policy).put(set_post_policy),
@@ -37,7 +41,10 @@ pub fn routes() -> Router<AppState> {
         // ROADMAP9: server-side slowmode enforcement.
         .route("/api/rooms/:id/slowmode", patch(set_slowmode))
         // ROADMAP12: per-room reaction spam limit (admin/moderator only).
-        .route("/api/rooms/:id/reaction-limit", axum::routing::patch(set_reaction_limit))
+        .route(
+            "/api/rooms/:id/reaction-limit",
+            axum::routing::patch(set_reaction_limit),
+        )
 }
 
 fn parse_room(s: &str) -> Result<RoomId, AeroError> {
@@ -66,11 +73,12 @@ async fn list_channels(
     Query(params): Query<ListChannelsQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let ws = parse_workspace(&id_str)?;
-    let channels = s
-        .im
-        .list_workspace_channels(auth.participant_id, ws, params.q.as_deref())
-        .await?;
-    Ok(Json(serde_json::to_value(channels).map_err(AeroError::from)?))
+    let channels =
+        s.im.list_workspace_channels(auth.participant_id, ws, params.q.as_deref())
+            .await?;
+    Ok(Json(
+        serde_json::to_value(channels).map_err(AeroError::from)?,
+    ))
 }
 
 /// `POST /api/rooms/:id/join` — join a public, non-archived channel.
@@ -111,7 +119,8 @@ async fn archive_channel(
     Json(req): Json<ArchiveReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let room = parse_room(&room_str)?;
-    s.im.archive_channel(auth.participant_id, room, req.archived).await?;
+    s.im.archive_channel(auth.participant_id, room, req.archived)
+        .await?;
     Ok(Json(serde_json::json!({ "archived": req.archived })))
 }
 
@@ -158,15 +167,42 @@ async fn update_channel(
     let description = req
         .description
         .map(|inner| inner.map(|d| d.trim().to_owned()).filter(|d| !d.is_empty()));
+    if topic
+        .as_ref()
+        .and_then(Option::as_ref)
+        .is_some_and(|value| value.chars().count() > MAX_CHANNEL_TOPIC_CHARS)
+    {
+        return Err(AeroError::Invalid(format!(
+            "topic is too long (max {MAX_CHANNEL_TOPIC_CHARS} chars)"
+        ))
+        .into());
+    }
+    if description
+        .as_ref()
+        .and_then(Option::as_ref)
+        .is_some_and(|value| value.chars().count() > MAX_CHANNEL_DESCRIPTION_CHARS)
+    {
+        return Err(AeroError::Invalid(format!(
+            "description is too long (max {MAX_CHANNEL_DESCRIPTION_CHARS} chars)"
+        ))
+        .into());
+    }
 
     // Snapshot the metadata the request touches BEFORE the setter mutates it, so
     // the post-write diff records true old→new values (compliance audit trail).
     // Best-effort: a read failure simply yields no "before" and is logged later.
+    s.im.assert_channel_access(auth.participant_id, room)
+        .await?;
     let before = read_channel_meta(&s, room).await;
 
-    s.im
-        .set_channel_meta(auth.participant_id, room, topic.clone(), description.clone(), req.is_private)
-        .await?;
+    s.im.set_channel_meta(
+        auth.participant_id,
+        room,
+        topic.clone(),
+        description.clone(),
+        req.is_private,
+    )
+    .await?;
 
     // Diff old-vs-new and emit ONE audit row per PATCH listing only the fields
     // that actually changed. The setter already committed; auditing is
@@ -177,21 +213,6 @@ async fn update_channel(
             let changed = diff_channel_meta(&before, &after);
             if !changed.is_empty() {
                 audit_channel_meta_changed(&s, room, auth.participant_id, changed).await;
-            }
-            // Record a topic history entry whenever the topic changed.
-            if before.topic != after.topic {
-                if let Err(e) = s
-                    .topic_history
-                    .record(
-                        auth.participant_id,
-                        room,
-                        before.topic.as_deref(),
-                        after.topic.as_deref(),
-                    )
-                    .await
-                {
-                    tracing::warn!(error = ?e, %room, "topic_history.record failed (best-effort)");
-                }
             }
         }
     }
@@ -218,10 +239,11 @@ async fn set_post_policy(
 
     // Snapshot the policy BEFORE mutating, so the diff records the true old→new
     // (compliance audit trail). Best-effort: a read failure yields no "before".
+    s.im.assert_channel_access(auth.participant_id, room)
+        .await?;
     let before = read_channel_meta(&s, room).await;
 
-    s.im
-        .set_room_post_policy(auth.participant_id, room, &req.policy)
+    s.im.set_room_post_policy(auth.participant_id, room, &req.policy)
         .await?;
 
     // Audit only when the policy actually changed; one row per PUT. The setter
@@ -273,8 +295,12 @@ async fn list_topic_history(
     Query(q): Query<TopicHistoryQuery>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let room = parse_room(&room_str)?;
-    s.im.assert_room_access(auth.participant_id, room).await?;
-    let entries = s.topic_history.list(room, q.limit.max(1).min(100), q.offset.max(0)).await?;
+    s.im.assert_channel_access(auth.participant_id, room)
+        .await?;
+    let entries = s
+        .topic_history
+        .list(room, q.limit.max(1).min(100), q.offset.max(0))
+        .await?;
     Ok(Json(serde_json::json!({ "history": entries })))
 }
 
@@ -431,29 +457,14 @@ async fn set_slowmode(
     Json(req): Json<SlowmodeReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let room = parse_room(&room_str)?;
-    // Authorisation: caller must be the room creator OR a workspace Admin/Owner.
-    let creator = s.rooms.created_by(room).await?;
-    let workspace = s.rooms.room_workspace(room).await?.ok_or_else(|| {
-        AeroError::NotFound("room not found".into())
-    })?;
-    let is_creator = creator == Some(auth.participant_id);
-    let is_admin = s
-        .workspaces
-        .member_role(workspace, auth.participant_id)
-        .await
-        .ok()
-        .flatten()
-        .map(|r| r.can_administer())
-        .unwrap_or(false);
-    if !is_creator && !is_admin {
-        return Err(AeroError::Forbidden(
-            "must be room creator or workspace admin to set slowmode".into(),
-        )
-        .into());
-    }
+    s.im.assert_channel_access(auth.participant_id, room)
+        .await?;
     let seconds = req.seconds.clamp(0, 21_600);
-    s.rooms.set_slowmode(room, seconds).await?;
-    Ok(Json(serde_json::json!({ "ok": true, "slowmode_seconds": seconds })))
+    s.im.set_channel_slowmode(auth.participant_id, room, seconds)
+        .await?;
+    Ok(Json(
+        serde_json::json!({ "ok": true, "slowmode_seconds": seconds }),
+    ))
 }
 
 // ---------------------------------------- reaction limit (ROADMAP12, migration 0118)
@@ -477,30 +488,16 @@ async fn set_reaction_limit(
     // Validate: if set, must be positive.
     if let Some(cap) = req.max_reactions_per_user {
         if cap < 1 {
-            return Err(AeroError::Invalid("max_reactions_per_user must be a positive integer or null".into()).into());
+            return Err(AeroError::Invalid(
+                "max_reactions_per_user must be a positive integer or null".into(),
+            )
+            .into());
         }
     }
-    // Authorisation: caller must be the room creator OR a workspace Admin/Owner.
-    let creator = s.rooms.created_by(room).await?;
-    let workspace = s.rooms.room_workspace(room).await?.ok_or_else(|| {
-        AeroError::NotFound("room not found".into())
-    })?;
-    let is_creator = creator == Some(auth.participant_id);
-    let is_admin = s
-        .workspaces
-        .member_role(workspace, auth.participant_id)
-        .await
-        .ok()
-        .flatten()
-        .map(|r| r.can_administer())
-        .unwrap_or(false);
-    if !is_creator && !is_admin {
-        return Err(AeroError::Forbidden(
-            "must be room creator or workspace admin to set reaction limit".into(),
-        )
-        .into());
-    }
-    s.rooms.set_max_reactions_per_user(room, req.max_reactions_per_user).await?;
+    s.im.assert_channel_access(auth.participant_id, room)
+        .await?;
+    s.im.set_channel_reaction_limit(auth.participant_id, room, req.max_reactions_per_user)
+        .await?;
     Ok(Json(serde_json::json!({
         "ok": true,
         "max_reactions_per_user": req.max_reactions_per_user
@@ -604,7 +601,7 @@ mod tests {
 #[cfg(test)]
 mod db_tests {
     use super::*;
-    use aero_storage::{AuditRepo, RoomRepo};
+    use aero_storage::{AuditRepo, RoomRepo, WorkspaceRepo};
     use sqlx::PgPool;
 
     fn pool() -> PgPool {
@@ -629,35 +626,30 @@ mod db_tests {
             .await
             .expect("insert participant");
 
-        let ws = WorkspaceId::new();
-        sqlx::query("INSERT INTO workspaces (id, name, slug, created_by, created_at) VALUES ($1,$2,$3,$4, now())")
-            .bind(ws.to_uuid())
-            .bind("Chan Meta WS")
-            .bind(format!("chan-meta-{ws}"))
-            .bind(actor.to_uuid())
-            .execute(p)
+        let ws = WorkspaceRepo::new(p.clone())
+            .create(
+                "Chan Meta WS".into(),
+                format!("chan-meta-{}", WorkspaceId::new()),
+                actor,
+            )
             .await
-            .expect("insert workspace");
+            .expect("insert workspace")
+            .id;
 
-        let room = RoomId::new();
-        sqlx::query(
-            "INSERT INTO rooms (id, kind, name, created_by, workspace_id, is_private) VALUES ($1,'channel',$2,$3,$4, false)",
-        )
-        .bind(room.to_uuid())
-        .bind(format!("chan-meta-room-{room}"))
-        .bind(actor.to_uuid())
-        .bind(ws.to_uuid())
-        .execute(p)
-        .await
-        .expect("insert room");
-        sqlx::query(
-            "INSERT INTO room_members (room_id, participant_id, role, joined_at) VALUES ($1,$2,'owner', now())",
-        )
-        .bind(room.to_uuid())
-        .bind(actor.to_uuid())
-        .execute(p)
-        .await
-        .expect("insert room member");
+        let room = RoomRepo::new(p.clone())
+            .create_in_workspace(
+                ws,
+                aero_common::RoomKind::Channel,
+                Some(format!("chan-meta-room-{}", RoomId::new())),
+                actor,
+            )
+            .await
+            .expect("insert room")
+            .id;
+        RoomRepo::new(p.clone())
+            .set_visibility(room, false)
+            .await
+            .expect("make fixture channel public");
         (ws, room, actor)
     }
 
@@ -702,7 +694,10 @@ mod db_tests {
         assert!(!before.is_private);
 
         rooms.set_topic(room, Some("daily standup")).await.unwrap();
-        rooms.set_description(room, Some("the team channel")).await.unwrap();
+        rooms
+            .set_description(room, Some("the team channel"))
+            .await
+            .unwrap();
         rooms.set_visibility(room, true).await.unwrap();
 
         let after = read_meta(&p, room).await;
@@ -711,7 +706,11 @@ mod db_tests {
         assert!(!changed.is_empty());
 
         // Append the audit row exactly as `audit_channel_meta_changed` does.
-        let workspace = rooms.room_workspace(room).await.unwrap().expect("room has workspace");
+        let workspace = rooms
+            .room_workspace(room)
+            .await
+            .unwrap()
+            .expect("room has workspace");
         assert_eq!(workspace, ws);
         audit
             .append(
@@ -736,7 +735,9 @@ mod db_tests {
         assert_eq!(rows.len(), 1, "one metadata audit row for the room");
         assert_eq!(rows[0].actor_id, Some(actor), "attributed to the editor");
 
-        let logged = rows[0].detail["changed"].as_array().expect("changed is an array");
+        let logged = rows[0].detail["changed"]
+            .as_array()
+            .expect("changed is an array");
         assert_eq!(logged.len(), 3);
         let by_field = |f: &str| -> &serde_json::Value {
             logged
@@ -758,7 +759,10 @@ mod db_tests {
         //     empty diff, so no second audit row is appended ---
         let before2 = read_meta(&p, room).await;
         rooms.set_topic(room, Some("daily standup")).await.unwrap();
-        rooms.set_description(room, Some("the team channel")).await.unwrap();
+        rooms
+            .set_description(room, Some("the team channel"))
+            .await
+            .unwrap();
         rooms.set_visibility(room, true).await.unwrap();
         let after2 = read_meta(&p, room).await;
         let changed2 = diff_channel_meta(&before2, &after2);

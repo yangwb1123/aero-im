@@ -79,7 +79,7 @@ async fn assert_member(
     caller: ParticipantId,
 ) -> Result<(), AeroError> {
     s.workspaces
-        .member_role(workspace, caller)
+        .effective_member_role(workspace, caller)
         .await
         .map_err(AeroError::from)?
         .ok_or_else(|| AeroError::Forbidden("not a workspace member".into()))?;
@@ -109,10 +109,9 @@ async fn recommend_channels(
     assert_member(&s, ws, auth.participant_id).await?;
     let k = rec_k(q.k);
 
-    let ai = s
-        .ai
-        .as_ref()
-        .ok_or_else(|| AeroError::Upstream("AI not configured".into()))?;
+    let ai =
+        s.ai.as_ref()
+            .ok_or_else(|| AeroError::Upstream("AI not configured".into()))?;
 
     let rooms = RoomRepo::new(s.pg.clone());
     let candidates: Vec<(aero_common::RoomId, String, i64)> = rooms
@@ -161,10 +160,9 @@ async fn recommend_people(
     assert_member(&s, ws, auth.participant_id).await?;
     let k = rec_k(q.k);
 
-    let ai = s
-        .ai
-        .as_ref()
-        .ok_or_else(|| AeroError::Upstream("AI not configured".into()))?;
+    let ai =
+        s.ai.as_ref()
+            .ok_or_else(|| AeroError::Upstream("AI not configured".into()))?;
 
     let rooms = RoomRepo::new(s.pg.clone());
     let follows = StreamFollowRepo::new(s.pg.clone());

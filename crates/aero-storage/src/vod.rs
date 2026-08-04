@@ -151,12 +151,11 @@ impl VodRepo {
     /// Delete a VOD, scoped to its owner (a non-owner's delete affects 0 rows).
     /// Returns `true` if a row was removed.
     pub async fn delete(&self, id: VodId, owner: ParticipantId) -> Result<bool, sqlx::Error> {
-        let result =
-            sqlx::query(r"DELETE FROM stream_recordings WHERE id = $1 AND owner_id = $2")
-                .bind(id.to_uuid())
-                .bind(owner.to_uuid())
-                .execute(&self.pool)
-                .await?;
+        let result = sqlx::query(r"DELETE FROM stream_recordings WHERE id = $1 AND owner_id = $2")
+            .bind(id.to_uuid())
+            .bind(owner.to_uuid())
+            .execute(&self.pool)
+            .await?;
         Ok(result.rows_affected() > 0)
     }
 
@@ -277,7 +276,8 @@ mod tests {
 #[cfg(test)]
 mod db_tests {
     use super::*;
-    use aero_common::{ParticipantId, RoomId};
+    use crate::{RoomRepo, WorkspaceRepo};
+    use aero_common::{ParticipantId, RoomId, RoomKind, WorkspaceId};
 
     fn pool() -> PgPool {
         let url = std::env::var("DATABASE_URL")
@@ -288,9 +288,8 @@ mod db_tests {
             .expect("connect_lazy never fails on a well-formed URL")
     }
 
-    /// A self-contained (owner, room, stream) triple so the VOD tests stand alone.
-    /// Returns the owner, the room, and the source stream's id.
-    async fn fixture(p: &PgPool) -> (ParticipantId, RoomId, ulid::Ulid) {
+    /// A self-contained tenant, owner, room, and stream so the VOD tests stand alone.
+    async fn fixture(p: &PgPool) -> (WorkspaceId, ParticipantId, RoomId, ulid::Ulid) {
         let owner = ParticipantId::new();
         sqlx::query("INSERT INTO participants (id, kind, display_name) VALUES ($1,'human',$2)")
             .bind(owner.to_uuid())
@@ -298,17 +297,20 @@ mod db_tests {
             .execute(p)
             .await
             .expect("insert participant");
-        let room = RoomId::new();
-        sqlx::query(
-            "INSERT INTO rooms (id, kind, name, created_by, created_at, workspace_id)
-             VALUES ($1,'channel',$2,$3, now(), '00000000-0000-0000-0000-000000000000')",
-        )
-        .bind(room.to_uuid())
-        .bind("vod-room")
-        .bind(owner.to_uuid())
-        .execute(p)
-        .await
-        .expect("insert room");
+        let workspace = WorkspaceRepo::new(p.clone())
+            .create(
+                format!("VOD workspace {owner}"),
+                format!("vod-{owner}"),
+                owner,
+            )
+            .await
+            .expect("create workspace")
+            .id;
+        let room = RoomRepo::new(p.clone())
+            .create_in_workspace(workspace, RoomKind::Channel, Some("vod-room".into()), owner)
+            .await
+            .expect("insert room")
+            .id;
         let stream_id = ulid::Ulid::new();
         sqlx::query(
             "INSERT INTO streams (id, owner_id, room_id, title, stream_key, status, protocol, created_at)
@@ -322,7 +324,36 @@ mod db_tests {
         .execute(p)
         .await
         .expect("insert stream");
-        (owner, room, stream_id)
+        (workspace, owner, room, stream_id)
+    }
+
+    async fn cleanup(
+        p: &PgPool,
+        workspace: WorkspaceId,
+        owner: ParticipantId,
+        room: RoomId,
+        stream_id: ulid::Ulid,
+    ) {
+        sqlx::query("DELETE FROM streams WHERE id = $1")
+            .bind(uuid::Uuid::from_u128(stream_id.0))
+            .execute(p)
+            .await
+            .expect("delete stream");
+        sqlx::query("DELETE FROM rooms WHERE id = $1")
+            .bind(room.to_uuid())
+            .execute(p)
+            .await
+            .expect("delete room");
+        sqlx::query("DELETE FROM workspaces WHERE id = $1")
+            .bind(workspace.to_uuid())
+            .execute(p)
+            .await
+            .expect("delete workspace");
+        sqlx::query("DELETE FROM participants WHERE id = $1")
+            .bind(owner.to_uuid())
+            .execute(p)
+            .await
+            .expect("delete participant");
     }
 
     #[tokio::test]
@@ -330,7 +361,7 @@ mod db_tests {
     async fn vod_create_list_get_delete_roundtrip() {
         let p = pool();
         let repo = VodRepo::new(p.clone());
-        let (owner, room, stream_id) = fixture(&p).await;
+        let (workspace, owner, room, stream_id) = fixture(&p).await;
 
         let hls = format!("/hls/{stream_id}/index.m3u8");
         let id = repo
@@ -358,10 +389,14 @@ mod db_tests {
 
         // A non-owner delete is a no-op; the owner's delete removes it.
         let stranger = ParticipantId::new();
-        assert!(!repo.delete(id, stranger).await.unwrap(), "non-owner cannot delete");
+        assert!(
+            !repo.delete(id, stranger).await.unwrap(),
+            "non-owner cannot delete"
+        );
         assert!(repo.get(id).await.unwrap().is_some(), "still present");
         assert!(repo.delete(id, owner).await.unwrap(), "owner deletes");
         assert!(repo.get(id).await.unwrap().is_none(), "gone after delete");
+        cleanup(&p, workspace, owner, room, stream_id).await;
     }
 
     #[tokio::test]
@@ -369,11 +404,14 @@ mod db_tests {
     async fn vod_recording_flag_roundtrip() {
         let p = pool();
         let repo = VodRepo::new(p.clone());
-        let (_owner, _room, stream_id) = fixture(&p).await;
+        let (workspace, owner, room, stream_id) = fixture(&p).await;
 
         // Default is false (column default).
         assert_eq!(repo.is_recording(stream_id).await.unwrap(), Some(false));
-        assert!(repo.set_recording(stream_id, true).await.unwrap(), "stream existed");
+        assert!(
+            repo.set_recording(stream_id, true).await.unwrap(),
+            "stream existed"
+        );
         assert_eq!(repo.is_recording(stream_id).await.unwrap(), Some(true));
         assert!(repo.set_recording(stream_id, false).await.unwrap());
         assert_eq!(repo.is_recording(stream_id).await.unwrap(), Some(false));
@@ -382,5 +420,6 @@ mod db_tests {
         let unknown = ulid::Ulid::new();
         assert_eq!(repo.is_recording(unknown).await.unwrap(), None);
         assert!(!repo.set_recording(unknown, true).await.unwrap());
+        cleanup(&p, workspace, owner, room, stream_id).await;
     }
 }

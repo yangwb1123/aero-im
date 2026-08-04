@@ -43,7 +43,12 @@ echo "==> replaying $total migrations from $MIG_DIR"
 
 n=0
 for f in "$MIG_DIR"/*.sql; do
-  if ! target < "$f"; then
+  # sqlx runs each migration in its own transaction unless the migration
+  # explicitly opts out. The repository has no no-transaction migrations, and
+  # several invariants intentionally use LOCK TABLE, which PostgreSQL rejects
+  # outside a transaction block. Stream through stdin so the Docker-backed
+  # PSQL form does not need the host migration path mounted in the container.
+  if ! target --single-transaction --file=- < "$f"; then
     echo "FAIL: migration $(basename "$f") did not apply on a fresh database" >&2
     echo "      (applied $n/$total before failing)" >&2
     exit 1

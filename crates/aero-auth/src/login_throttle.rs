@@ -50,7 +50,11 @@ pub struct LockoutConfig {
 impl Default for LockoutConfig {
     /// 5 failures in 5 minutes → locked for 15 minutes.
     fn default() -> Self {
-        Self { max_failures: 5, window_secs: 300, lockout_secs: 900 }
+        Self {
+            max_failures: 5,
+            window_secs: 300,
+            lockout_secs: 900,
+        }
     }
 }
 
@@ -79,13 +83,25 @@ impl FailureState {
         }
         let within_window = self.count > 0 && now - self.first_failure_at <= cfg.window_secs;
         let count = if within_window { self.count + 1 } else { 1 };
-        let first = if within_window { self.first_failure_at } else { now };
+        let first = if within_window {
+            self.first_failure_at
+        } else {
+            now
+        };
         if count >= cfg.max_failures {
             // Trip the lock and reset the counter so re-locking needs a fresh run
             // of failures after the lockout expires (not a single one).
-            FailureState { count: 0, first_failure_at: 0, locked_until: now + cfg.lockout_secs }
+            FailureState {
+                count: 0,
+                first_failure_at: 0,
+                locked_until: now + cfg.lockout_secs,
+            }
         } else {
-            FailureState { count, first_failure_at: first, locked_until: 0 }
+            FailureState {
+                count,
+                first_failure_at: first,
+                locked_until: 0,
+            }
         }
     }
 }
@@ -178,7 +194,9 @@ impl RedisFailureStore {
         let n: i64 = self.client.incr(&ckey).await?;
         if n == 1 {
             // First failure of the window: arm the sliding-window TTL.
-            self.client.expire::<(), _>(&ckey, self.cfg.window_secs).await?;
+            self.client
+                .expire::<(), _>(&ckey, self.cfg.window_secs)
+                .await?;
         }
         if n >= i64::from(self.cfg.max_failures) {
             // Trip the lock, reset the counter.
@@ -235,14 +253,19 @@ impl LoginThrottle {
     #[must_use]
     pub fn new(cfg: LockoutConfig) -> Self {
         Self {
-            store: Arc::new(InProcessFailureStore { states: Mutex::new(HashMap::new()), cfg }),
+            store: Arc::new(InProcessFailureStore {
+                states: Mutex::new(HashMap::new()),
+                cfg,
+            }),
         }
     }
 
     /// Redis-backed throttle (cross-node aggregation).
     #[must_use]
     pub fn with_redis(cfg: LockoutConfig, client: RedisClient) -> Self {
-        Self { store: Arc::new(RedisFailureStore { client, cfg }) }
+        Self {
+            store: Arc::new(RedisFailureStore { client, cfg }),
+        }
     }
 
     /// Build from `AERO_LOGIN_LOCKOUT*` env, in-process backend. `None` when the
@@ -272,7 +295,9 @@ impl LoginThrottle {
         }
         match (env_truthy("AERO_LOGIN_LOCKOUT_REDIS"), client) {
             (true, Some(c)) => {
-                tracing::info!("login lockout: cross-node Redis backend (AERO_LOGIN_LOCKOUT_REDIS)");
+                tracing::info!(
+                    "login lockout: cross-node Redis backend (AERO_LOGIN_LOCKOUT_REDIS)"
+                );
                 Some(Self::with_redis(cfg, c))
             }
             _ => Some(Self::new(cfg)),
@@ -328,7 +353,11 @@ fn env_i64(name: &str) -> Option<i64> {
 mod tests {
     use super::*;
 
-    const CFG: LockoutConfig = LockoutConfig { max_failures: 3, window_secs: 100, lockout_secs: 600 };
+    const CFG: LockoutConfig = LockoutConfig {
+        max_failures: 3,
+        window_secs: 100,
+        lockout_secs: 600,
+    };
 
     #[test]
     fn stays_unlocked_below_threshold() {
@@ -346,8 +375,14 @@ mod tests {
             s = s.after_failure(t, &CFG);
         }
         assert!(s.is_locked(20), "3rd failure trips the lock");
-        assert!(s.is_locked(20 + CFG.lockout_secs - 1), "still locked mid-window");
-        assert!(!s.is_locked(20 + CFG.lockout_secs), "unlocks once the window passes");
+        assert!(
+            s.is_locked(20 + CFG.lockout_secs - 1),
+            "still locked mid-window"
+        );
+        assert!(
+            !s.is_locked(20 + CFG.lockout_secs),
+            "unlocks once the window passes"
+        );
     }
 
     #[test]
@@ -355,7 +390,7 @@ mod tests {
         let mut s = FailureState::default();
         s = s.after_failure(0, &CFG);
         s = s.after_failure(50, &CFG); // count=2, within window
-        // Next failure is > window_secs after the FIRST → window resets to count 1.
+                                       // Next failure is > window_secs after the FIRST → window resets to count 1.
         s = s.after_failure(0 + CFG.window_secs + 1, &CFG);
         assert_eq!(s.count, 1, "stale window restarts the count");
         assert!(!s.is_locked(CFG.window_secs + 1));
@@ -394,7 +429,10 @@ mod tests {
             t.record_failure("user@x.com", now).await;
         }
         // Case/whitespace-insensitive: the mixed-case lookup sees the lock.
-        assert!(t.is_locked("  User@X.com ", 2).await, "locked after threshold, key-normalized");
+        assert!(
+            t.is_locked("  User@X.com ", 2).await,
+            "locked after threshold, key-normalized"
+        );
         // A success clears the account.
         t.record_success("user@x.com").await;
         assert!(!t.is_locked("user@x.com", 2).await);
@@ -403,7 +441,7 @@ mod tests {
     #[tokio::test]
     async fn sweep_evicts_only_decision_dead_entries() {
         let t = LoginThrottle::new(CFG); // max 3 / window 100 / lockout 600
-        // Account A: one failure (count=1, within window). Account B: locked.
+                                         // Account A: one failure (count=1, within window). Account B: locked.
         t.record_failure("a@x.com", 0).await;
         for now in [0, 1, 2] {
             t.record_failure("b@x.com", now).await;

@@ -17,8 +17,10 @@
 use std::str::FromStr;
 
 use aero_auth::AuthUser;
-use aero_common::{Error as AeroError, ParticipantId, RoomId, WorkspaceId, WorkspaceRole};
-use aero_storage::DefaultChannelRepo;
+use aero_common::{
+    Error as AeroError, ParticipantId, RoomId, RoomKind, WorkspaceId, WorkspaceRole,
+};
+use aero_storage::{DefaultChannelRepo, DefaultChannelWriteError};
 use axum::{
     extract::{Path, State},
     routing::put,
@@ -41,23 +43,30 @@ pub fn routes() -> Router<AppState> {
         )
 }
 
-/// Auto-join `participant` into every default channel of `workspace` (best-effort).
-/// Called from the enroll paths — registration (the default workspace) and
-/// workspace member-add — so a new member lands in the curated channels. A
-/// per-room failure is logged and skipped: onboarding convenience must never fail
-/// the enrollment itself. `add_member` is an idempotent `ON CONFLICT DO NOTHING`.
+/// Auto-join a newly enrolled ordinary member into the workspace's current
+/// default channels (best-effort).
+///
+/// Storage re-locks the workspace and rechecks the target is still a retained,
+/// active, non-guest member in the same transaction as the room inserts. This
+/// prevents a concurrent guest conversion/removal from turning onboarding
+/// convenience into a single-channel guest isolation bypass.
 pub async fn auto_join_defaults(s: &AppState, workspace: WorkspaceId, participant: ParticipantId) {
-    let rooms = match repo(s).list(workspace).await {
+    let rooms = match repo(s)
+        .auto_join_ordinary_member(workspace, participant)
+        .await
+    {
         Ok(rooms) => rooms,
         Err(err) => {
-            tracing::warn!(error = ?err, %workspace, "default-channel lookup failed");
+            tracing::warn!(
+                error = ?err,
+                %workspace,
+                %participant,
+                "default-channel auto-join failed"
+            );
             return;
         }
     };
     for room in rooms {
-        if let Err(err) = s.rooms.add_member(room, participant).await {
-            tracing::warn!(error = ?err, %room, %participant, "auto-join default channel failed");
-        }
         s.room_member_cache.invalidate(&room);
     }
 }
@@ -83,7 +92,7 @@ async fn caller_role(
     caller: ParticipantId,
 ) -> Result<WorkspaceRole, AeroError> {
     s.workspaces
-        .member_role(workspace, caller)
+        .effective_member_role(workspace, caller)
         .await
         .map_err(AeroError::from)?
         .ok_or_else(|| AeroError::Forbidden("not a workspace member".into()))
@@ -101,7 +110,9 @@ async fn assert_admin(
     if role.can_administer() {
         Ok(())
     } else {
-        Err(AeroError::Forbidden("managing default channels requires admin".into()))
+        Err(AeroError::Forbidden(
+            "managing default channels requires admin".into(),
+        ))
     }
 }
 
@@ -113,11 +124,36 @@ async fn assert_room_in_workspace(
     workspace: WorkspaceId,
     room: RoomId,
 ) -> Result<(), AeroError> {
-    let owner = s.rooms.room_workspace(room).await.map_err(AeroError::from)?;
-    if owner == Some(workspace) {
-        Ok(())
+    let owner = s
+        .rooms
+        .room_workspace(room)
+        .await
+        .map_err(AeroError::from)?;
+    if owner != Some(workspace) {
+        Err(AeroError::Invalid(
+            "room does not belong to this workspace".into(),
+        ))
+    } else if s.rooms.room_kind(room).await.map_err(AeroError::from)? != Some(RoomKind::Channel) {
+        Err(AeroError::Invalid("default room must be a channel".into()))
     } else {
-        Err(AeroError::Invalid("room does not belong to this workspace".into()))
+        Ok(())
+    }
+}
+
+fn map_default_channel_write_error(error: DefaultChannelWriteError) -> AeroError {
+    match error {
+        DefaultChannelWriteError::WorkspaceNotFound => AeroError::NotFound("workspace".into()),
+        DefaultChannelWriteError::RoomNotFound => AeroError::NotFound("room".into()),
+        DefaultChannelWriteError::RoomOutsideWorkspace => {
+            AeroError::Invalid("room does not belong to this workspace".into())
+        }
+        DefaultChannelWriteError::NotChannel => {
+            AeroError::Invalid("default room must be a channel".into())
+        }
+        DefaultChannelWriteError::NotAuthorized => {
+            AeroError::Forbidden("managing default channels requires current admin role".into())
+        }
+        DefaultChannelWriteError::Storage(error) => AeroError::from(error),
     }
 }
 
@@ -134,7 +170,10 @@ async fn add_default_channel(
     let room = parse_room(&rid_str)?;
     assert_admin(&s, ws, auth.participant_id).await?;
     assert_room_in_workspace(&s, ws, room).await?;
-    repo(&s).add(ws, room).await.map_err(AeroError::from)?;
+    repo(&s)
+        .add_authorized(ws, auth.participant_id, room)
+        .await
+        .map_err(map_default_channel_write_error)?;
     Ok(Json(serde_json::json!({ "default": true })))
 }
 
@@ -151,7 +190,10 @@ async fn remove_default_channel(
     let room = parse_room(&rid_str)?;
     assert_admin(&s, ws, auth.participant_id).await?;
     assert_room_in_workspace(&s, ws, room).await?;
-    repo(&s).remove(ws, room).await.map_err(AeroError::from)?;
+    repo(&s)
+        .remove_authorized(ws, auth.participant_id, room)
+        .await
+        .map_err(map_default_channel_write_error)?;
     Ok(Json(serde_json::json!({ "default": false })))
 }
 

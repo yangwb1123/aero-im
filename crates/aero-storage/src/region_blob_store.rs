@@ -1,25 +1,28 @@
-//! Region-aware blob store router (ROADMAP 第六版 · 方向五·1).
+//! Region-aware blob storage.
 //!
-//! Wraps a default [`BlobStore`] plus a set of region-specific S3-compatible
-//! backends. Callers that know the workspace's `region_code` call
-//! [`RegionRouter::select`] to pick the right backend before operating on a blob.
-//!
-//! Data residency is **opt-in**: when no `storage_regions` config is provided,
-//! the router contains only the default store, and `select` returns it for any
-//! region — behaviour is byte-identical to a non-regional deployment.
+//! [`RegionRouter`] validates configured backend codes and selects them
+//! fail-closed. [`PersistedRegionBlobStore`] first reads the immutable placement
+//! snapshot on the blob row, so upload, download, transcription, export cleanup,
+//! and GC keep using the same backend even if workspace configuration changes.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::blob_store::BlobStoreError;
+use aero_common::BlobId;
+use async_trait::async_trait;
+use bytes::Bytes;
 
-use crate::blob_store::BlobStore;
+use crate::blob::BlobRepo;
+use crate::blob_store::{BlobRange, BlobStore, BlobStoreError, BlobStream};
+
+/// Canonical code persisted for new blobs placed in the default backend.
+pub const DEFAULT_STORAGE_REGION: &str = "default";
 
 /// A regional blob-store router.
 ///
 /// Holds the default (non-regional) store plus zero or more region-specific
-/// backends. The `select(region_code)` method returns the appropriate store;
-/// unknown/unset region codes fall back to the default.
+/// backends. Unknown non-default codes are rejected instead of silently
+/// violating a residency policy.
 #[derive(Clone)]
 pub struct RegionRouter {
     /// The default blob store (local FS or the primary S3 bucket).
@@ -42,24 +45,65 @@ impl RegionRouter {
     ) -> Result<Self, BlobStoreError> {
         let mut regionals: HashMap<String, Arc<dyn BlobStore>> = HashMap::new();
         for (code, s3cfg) in regions {
-            let store = Arc::new(crate::s3_blob_store::S3BlobStore::new(s3cfg))
-                as Arc<dyn BlobStore>;
+            let store =
+                Arc::new(crate::s3_blob_store::S3BlobStore::try_new(s3cfg)?) as Arc<dyn BlobStore>;
             regionals.insert(code, store);
+        }
+        Self::from_stores(default, regionals)
+    }
+
+    /// Build from already-constructed stores.
+    ///
+    /// This is also useful for deployments that provide a custom `BlobStore`
+    /// implementation rather than S3 and makes routing independently testable.
+    pub fn from_stores(
+        default: Arc<dyn BlobStore>,
+        regionals: HashMap<String, Arc<dyn BlobStore>>,
+    ) -> Result<Self, BlobStoreError> {
+        for code in regionals.keys() {
+            validate_configured_code(code)?;
         }
         Ok(Self { default, regionals })
     }
 
     /// Select the blob store for the given region code.
     ///
-    /// `None` or an unknown region code returns the default store.
-    /// Region codes are matched exactly (case-sensitive, trimmed).
-    #[must_use]
-    pub fn select(&self, region_code: Option<&str>) -> &dyn BlobStore {
-        let code = region_code.map(str::trim).unwrap_or("");
-        if code.is_empty() {
-            return &*self.default;
+    /// `None`, blank legacy values, and `"default"` select the default store.
+    /// Any other code must match configured storage exactly.
+    pub fn select(&self, region_code: Option<&str>) -> Result<&dyn BlobStore, BlobStoreError> {
+        let code = region_code.map_or("", str::trim);
+        if code.is_empty() || code == DEFAULT_STORAGE_REGION {
+            return Ok(&*self.default);
         }
-        self.regionals.get(code).map_or(&*self.default, |s| &**s)
+        self.regionals
+            .get(code)
+            .map(|store| &**store)
+            .ok_or_else(|| {
+                BlobStoreError::Config(format!("storage region `{code}` is not configured"))
+            })
+    }
+
+    /// Validate and canonicalize a mutable workspace setting before snapshotting
+    /// it onto a new blob.
+    pub fn canonical_region_code(
+        &self,
+        region_code: Option<&str>,
+    ) -> Result<String, BlobStoreError> {
+        let code = region_code.map_or("", str::trim);
+        if code.is_empty() || code == DEFAULT_STORAGE_REGION {
+            return Ok(DEFAULT_STORAGE_REGION.to_owned());
+        }
+        self.select(Some(code))?;
+        Ok(code.to_owned())
+    }
+
+    /// Configured codes exposed to the workspace administration API.
+    #[must_use]
+    pub fn configured_region_codes(&self) -> Vec<String> {
+        let mut codes = self.regionals.keys().cloned().collect::<Vec<_>>();
+        codes.sort();
+        codes.insert(0, DEFAULT_STORAGE_REGION.to_owned());
+        codes
     }
 
     /// Reference to the default store (for operations that don't need region
@@ -75,14 +119,94 @@ impl RegionRouter {
         self.regionals.len()
     }
 
-    /// Check health of the default and all regional stores. Fails fast on the
-    /// first error, so a single dead region backend doesn't block others' health.
+    /// Check health of the default and every configured regional store.
     pub async fn health_check(&self) -> Result<(), BlobStoreError> {
-        self.default.health_check().await?;
-        for (_code, store) in &self.regionals {
-            store.health_check().await?;
+        let stores =
+            std::iter::once(&*self.default).chain(self.regionals.values().map(|store| &**store));
+        for result in futures::future::join_all(stores.map(BlobStore::health_check)).await {
+            result?;
         }
         Ok(())
+    }
+}
+
+fn validate_configured_code(code: &str) -> Result<(), BlobStoreError> {
+    if code.is_empty() || code != code.trim() || code == DEFAULT_STORAGE_REGION || code.len() > 16 {
+        return Err(BlobStoreError::Config(format!(
+            "invalid storage region code `{code}` (must be trimmed, 1..=16 bytes, and not `default`)"
+        )));
+    }
+    Ok(())
+}
+
+/// `BlobStore` facade that routes every operation by persisted blob metadata.
+#[derive(Clone)]
+pub struct PersistedRegionBlobStore {
+    blobs: BlobRepo,
+    router: RegionRouter,
+}
+
+impl PersistedRegionBlobStore {
+    #[must_use]
+    pub fn new(blobs: BlobRepo, router: RegionRouter) -> Self {
+        Self { blobs, router }
+    }
+
+    async fn backend(&self, id: BlobId) -> Result<Option<&dyn BlobStore>, BlobStoreError> {
+        let scope = self
+            .blobs
+            .storage_scope(id)
+            .await
+            .map_err(|error| BlobStoreError::Io(std::io::Error::other(error.to_string())))?;
+        scope
+            .map(|scope| self.router.select(scope.storage_region.as_deref()))
+            .transpose()
+    }
+}
+
+#[async_trait]
+impl BlobStore for PersistedRegionBlobStore {
+    async fn put(&self, id: BlobId, bytes: Bytes) -> Result<String, BlobStoreError> {
+        self.backend(id)
+            .await?
+            .ok_or(BlobStoreError::NotFound)?
+            .put(id, bytes)
+            .await
+    }
+
+    async fn get(&self, id: BlobId) -> Result<Bytes, BlobStoreError> {
+        self.backend(id)
+            .await?
+            .ok_or(BlobStoreError::NotFound)?
+            .get(id)
+            .await
+    }
+
+    async fn get_stream(
+        &self,
+        id: BlobId,
+        range: Option<BlobRange>,
+    ) -> Result<BlobStream, BlobStoreError> {
+        self.backend(id)
+            .await?
+            .ok_or(BlobStoreError::NotFound)?
+            .get_stream(id, range)
+            .await
+    }
+
+    async fn delete(&self, id: BlobId) -> Result<(), BlobStoreError> {
+        let Some(store) = self.backend(id).await? else {
+            return Ok(());
+        };
+        store.delete(id).await
+    }
+
+    fn key_for(&self, id: BlobId) -> String {
+        format!("persisted-region:{id}")
+    }
+
+    async fn health_check(&self) -> Result<(), BlobStoreError> {
+        self.router.health_check().await
     }
 }
 
@@ -100,50 +224,54 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn select_unknown_region_falls_back_to_default() {
+    async fn select_unknown_region_is_rejected() {
         let (def, _d) = tmp_store("default");
         let router = RegionRouter::new(def.clone(), HashMap::new()).unwrap();
-        // An unknown code returns the default.
-        let store = router.select(Some("eu-moon-1"));
-        assert!(std::ptr::eq(store as *const dyn BlobStore, &*def as *const dyn BlobStore));
+        assert!(matches!(
+            router.select(Some("eu-moon-1")),
+            Err(BlobStoreError::Config(_))
+        ));
     }
 
     #[tokio::test]
     async fn select_none_returns_default() {
         let (def, _d) = tmp_store("def2");
         let router = RegionRouter::new(def.clone(), HashMap::new()).unwrap();
-        let store = router.select(None);
-        assert!(std::ptr::eq(store as *const dyn BlobStore, &*def as *const dyn BlobStore));
+        let store = router.select(None).unwrap();
+        let id = BlobId::new();
+        store.put(id, Bytes::from_static(b"default")).await.unwrap();
+        assert_eq!(def.get(id).await.unwrap(), Bytes::from_static(b"default"));
     }
 
     #[tokio::test]
     async fn select_known_region_returns_region_store() {
         let (def, _d) = tmp_store("def3");
         let (regional, _r) = tmp_store("regional");
-        let mut regions = HashMap::new();
-        // We can't construct an S3Config in a test w/o env vars, so use a
-        // different test: build with empty regions and verify fallback.
-        // Full regional test requires integration env.
-        let router = RegionRouter::new(def.clone(), regions).unwrap();
-        assert_eq!(router.region_count(), 0);
-        let store = router.default_store();
-        // Just verify we got something.
+        let router = RegionRouter::from_stores(
+            def.clone(),
+            HashMap::from([("eu-west-1".to_owned(), regional.clone())]),
+        )
+        .unwrap();
+        assert_eq!(router.region_count(), 1);
+        let store = router.select(Some("eu-west-1")).unwrap();
         let id = BlobId::new();
         store.put(id, Bytes::from("hello")).await.unwrap();
         let got = store.get(id).await.unwrap();
         assert_eq!(got, Bytes::from("hello"));
+        assert!(matches!(def.get(id).await, Err(BlobStoreError::NotFound)));
         store.delete(id).await.unwrap();
         assert!(matches!(store.get(id).await, Err(BlobStoreError::NotFound)));
     }
 
     #[tokio::test]
-    async fn empty_router_returns_default_for_any_region() {
+    async fn explicit_default_code_returns_default() {
         let (def, _d) = tmp_store("empty");
         let router = RegionRouter::new(def.clone(), HashMap::new()).unwrap();
         assert_eq!(router.region_count(), 0);
-        // Even with a known-looking region code, fallback to default
-        let store = router.select(Some("us-east-1"));
-        assert!(std::ptr::eq(store as *const dyn BlobStore, &*def as *const dyn BlobStore));
+        let store = router.select(Some(DEFAULT_STORAGE_REGION)).unwrap();
+        let id = BlobId::new();
+        store.put(id, Bytes::from_static(b"default")).await.unwrap();
+        assert_eq!(def.get(id).await.unwrap(), Bytes::from_static(b"default"));
     }
 
     #[tokio::test]
@@ -158,7 +286,7 @@ mod tests {
     async fn round_trip_blob_via_select() {
         let (def, _d) = tmp_store("roundtrip");
         let router = RegionRouter::new(def.clone(), HashMap::new()).unwrap();
-        let store = router.select(None);
+        let store = router.select(None).unwrap();
         let id = BlobId::new();
         let data = Bytes::from("round trip test data");
         store.put(id, data.clone()).await.unwrap();

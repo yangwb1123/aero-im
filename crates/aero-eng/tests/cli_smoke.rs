@@ -4,9 +4,16 @@
 use std::process::Command;
 
 fn run_cli(args: &[&str]) -> (i32, String) {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap();
     let binary = root.join("target").join("debug").join("aero-cli");
-    let output = Command::new(&binary).args(args).output().expect("run aero-cli");
+    let output = Command::new(&binary)
+        .args(args)
+        .output()
+        .expect("run aero-cli");
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     (output.status.code().unwrap_or(-1), stdout)
 }
@@ -31,7 +38,10 @@ fn smoke_unknown_command_exit_1() {
 #[ignore = "requires compiled aero-cli binary"]
 fn smoke_doctor_exit_0() {
     let (code, out) = run_cli(&["doctor"]);
-    assert!(code == 0 || code == 1, "doctor should not crash: exit={code}");
+    assert!(
+        code == 0 || code == 1,
+        "doctor should not crash: exit={code}"
+    );
     assert!(out.contains("Rust toolchain"), "doctor checks toolchain");
 }
 

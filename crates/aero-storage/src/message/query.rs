@@ -8,7 +8,108 @@ use aero_common::{Message, MessageId, ParticipantId, RoomId, WorkspaceId};
 use super::MessageRepo;
 use crate::message::orig::MessageRow;
 
+#[derive(sqlx::FromRow)]
+struct DeliveryMessageRow {
+    id: uuid::Uuid,
+    room_id: uuid::Uuid,
+    sender_id: uuid::Uuid,
+    blocks: serde_json::Value,
+    reply_to: Option<uuid::Uuid>,
+    metadata: serde_json::Value,
+    created_at: time::OffsetDateTime,
+    edited_at: Option<time::OffsetDateTime>,
+    deleted_at: Option<time::OffsetDateTime>,
+    expires_at: Option<time::OffsetDateTime>,
+    version: i32,
+    delivery_ordinal: i64,
+}
+
+impl DeliveryMessageRow {
+    fn into_parts(self) -> (Message, i64) {
+        let ordinal = self.delivery_ordinal;
+        (
+            Message {
+                id: MessageId::from_uuid(self.id),
+                room_id: RoomId::from_uuid(self.room_id),
+                sender_id: ParticipantId::from_uuid(self.sender_id),
+                blocks: serde_json::from_value(self.blocks).unwrap_or_default(),
+                reply_to: self.reply_to.map(MessageId::from_uuid),
+                metadata: self.metadata,
+                created_at: self.created_at,
+                edited_at: self.edited_at,
+                deleted_at: self.deleted_at,
+                expires_at: self.expires_at,
+                version: self.version,
+            },
+            ordinal,
+        )
+    }
+}
+
 impl MessageRepo {
+    /// Durable reconnect page ordered by the room's transactional delivery
+    /// ordinal. Unlike message ids, this is a cumulative prefix across
+    /// concurrent writers and outbox relays. Soft-deleted rows are deliberately
+    /// omitted so reconnect can never disclose their retained blocks; ordinal
+    /// gaps are valid and a later visible message may advance across them.
+    pub async fn list_delivery_after(
+        &self,
+        room: RoomId,
+        after_ordinal: i64,
+        limit: i64,
+    ) -> Result<Vec<(Message, i64)>, sqlx::Error> {
+        let rows = sqlx::query_as::<_, DeliveryMessageRow>(
+            r#"SELECT id, room_id, sender_id, blocks, reply_to, metadata,
+                      created_at, edited_at, deleted_at, expires_at, version,
+                      delivery_ordinal
+                FROM messages
+                WHERE room_id = $1
+                  AND delivery_ordinal > $2
+                  AND deleted_at IS NULL
+                  AND (expires_at IS NULL OR expires_at > now())
+                ORDER BY delivery_ordinal
+                LIMIT $3"#,
+        )
+        .bind(room.to_uuid())
+        .bind(after_ordinal.max(0))
+        .bind(limit.clamp(1, 500))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(DeliveryMessageRow::into_parts)
+            .collect())
+    }
+
+    /// Newest bounded seed for a room without a delivery cursor. The result is
+    /// chronological even though the SQL selects the newest ordinals first.
+    pub async fn list_recent_delivery(
+        &self,
+        room: RoomId,
+        limit: i64,
+    ) -> Result<Vec<(Message, i64)>, sqlx::Error> {
+        let mut rows = sqlx::query_as::<_, DeliveryMessageRow>(
+            r#"SELECT id, room_id, sender_id, blocks, reply_to, metadata,
+                      created_at, edited_at, deleted_at, expires_at, version,
+                      delivery_ordinal
+                 FROM messages
+                WHERE room_id = $1
+                  AND deleted_at IS NULL
+                  AND (expires_at IS NULL OR expires_at > now())
+                ORDER BY delivery_ordinal DESC
+                LIMIT $2"#,
+        )
+        .bind(room.to_uuid())
+        .bind(limit.clamp(1, 500))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.reverse();
+        Ok(rows
+            .into_iter()
+            .map(DeliveryMessageRow::into_parts)
+            .collect())
+    }
+
     pub async fn list_recent(
         &self,
         room: RoomId,
@@ -203,8 +304,7 @@ impl MessageRepo {
         // truncates `after`, and signalling only on `before` would tell the client
         // "nothing more" while newer messages stay unloaded. Capture both lengths
         // before the rows are consumed below.
-        let has_more =
-            before.len() >= half_window as usize || after.len() >= half_window as usize;
+        let has_more = before.len() >= half_window as usize || after.len() >= half_window as usize;
         let mut all: Vec<Message> = before.into_iter().map(Message::from).collect();
         all.reverse();
         all.extend(target.into_iter().map(Message::from));
@@ -293,8 +393,24 @@ impl MessageRepo {
                      m.created_at, m.edited_at, m.deleted_at, m.expires_at, m.version
                FROM messages m
                JOIN rooms r ON r.id = m.room_id
-               JOIN room_members rm ON rm.room_id = m.room_id AND rm.participant_id = $1
-               WHERE m.deleted_at IS NULL
+               JOIN workspaces w ON w.id = r.workspace_id
+               JOIN room_members rm
+                 ON rm.room_id = m.room_id AND rm.participant_id = $1
+               JOIN workspace_members wm
+                 ON wm.workspace_id = r.workspace_id AND wm.participant_id = $1
+               JOIN participants viewer
+                 ON viewer.id = $1 AND viewer.deleted_at IS NULL
+               LEFT JOIN workspace_deactivations deactivated
+                 ON deactivated.workspace_id = r.workspace_id
+                AND deactivated.participant_id = $1
+               LEFT JOIN totp_secrets totp ON totp.participant_id = $1
+               WHERE deactivated.participant_id IS NULL
+                 AND (
+                     viewer.kind <> 'human'
+                     OR NOT w.require_2fa
+                     OR COALESCE(totp.activated, false)
+                 )
+                 AND m.deleted_at IS NULL
                  AND (m.expires_at IS NULL OR m.expires_at > now())
                  AND r.workspace_id = $2
                ORDER BY m.id DESC

@@ -257,17 +257,35 @@ mod tests {
     #[test]
     fn within_window_respects_start() {
         let now = t(100);
-        assert!(!within_window(now, Some(t(200)), None), "before start is inactive");
-        assert!(within_window(now, Some(t(100)), None), "exactly at start is active");
-        assert!(within_window(now, Some(t(50)), None), "after start is active");
+        assert!(
+            !within_window(now, Some(t(200)), None),
+            "before start is inactive"
+        );
+        assert!(
+            within_window(now, Some(t(100)), None),
+            "exactly at start is active"
+        );
+        assert!(
+            within_window(now, Some(t(50)), None),
+            "after start is active"
+        );
     }
 
     #[test]
     fn within_window_respects_end() {
         let now = t(100);
-        assert!(within_window(now, None, Some(t(200))), "before end is active");
-        assert!(within_window(now, None, Some(t(100))), "exactly at end is active");
-        assert!(!within_window(now, None, Some(t(50))), "after end is inactive");
+        assert!(
+            within_window(now, None, Some(t(200))),
+            "before end is active"
+        );
+        assert!(
+            within_window(now, None, Some(t(100))),
+            "exactly at end is active"
+        );
+        assert!(
+            !within_window(now, None, Some(t(50))),
+            "after end is inactive"
+        );
     }
 
     #[test]
@@ -332,11 +350,19 @@ mod db_tests {
 
         // Upsert with a future window -> not yet active.
         let future = now + time::Duration::days(1);
-        repo.set(user, "back soon", Some(future), None).await.unwrap();
+        repo.set(user, "back soon", Some(future), None)
+            .await
+            .unwrap();
         let got = repo.get(user).await.unwrap().expect("present");
         assert_eq!(got.message, "back soon");
-        assert!(!repo.is_active(user, now).await.unwrap(), "future window inactive now");
-        assert!(repo.is_active(user, future).await.unwrap(), "active at start");
+        assert!(
+            !repo.is_active(user, now).await.unwrap(),
+            "future window inactive now"
+        );
+        assert!(
+            repo.is_active(user, future).await.unwrap(),
+            "active at start"
+        );
 
         // Clear -> gone; second clear is a no-op.
         assert!(repo.clear(user).await.unwrap());

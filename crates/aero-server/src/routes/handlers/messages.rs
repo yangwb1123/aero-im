@@ -1,6 +1,97 @@
 // ----- Messages -----
 
 #[derive(Deserialize)]
+struct CreateMessageReq {
+    blocks: Vec<aero_common::Block>,
+    #[serde(default)]
+    reply_to: Option<MessageId>,
+    #[serde(default)]
+    expires_after_secs: Option<u64>,
+    /// Body-level equivalent of the standard `Idempotency-Key` header. UUIDs
+    /// are shared with the WebSocket `client_message_id` ledger.
+    #[serde(default)]
+    client_message_id: Option<uuid::Uuid>,
+}
+
+/// `POST /api/rooms/:id/messages` — the REST counterpart of both WS send
+/// frames. Access, workspace rate budget, slow mode, TTL validation,
+/// idempotency, outbox publication, and durable side effects all use the exact
+/// same dispatch function.
+async fn create_message(
+    State(s): State<AppState>,
+    auth: AuthUser,
+    Path(room_str): Path<String>,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<CreateMessageReq>,
+) -> ApiResult<Response> {
+    let room = parse_room_id(&room_str)?;
+    // Keep the route-local tenant guard explicit for authz review/lint. The
+    // shared WS/REST dispatcher repeats it so non-HTTP callers cannot bypass
+    // the invariant.
+    s.im.assert_room_access(auth.participant_id, room).await?;
+    let client_message_id = resolve_message_idempotency_key(&headers, req.client_message_id)?;
+
+    let outcome = crate::ws::send_blocks_frame(
+        &s,
+        auth.participant_id,
+        room,
+        req.blocks,
+        req.reply_to,
+        req.expires_after_secs,
+        client_message_id,
+    )
+    .await?;
+    let status = if outcome.deduplicated {
+        StatusCode::OK
+    } else {
+        StatusCode::CREATED
+    };
+    let location = format!("/api/messages/{}", outcome.message.id);
+    let mut response = (
+        status,
+        Json(serde_json::to_value(&outcome.message).map_err(AeroError::from)?),
+    )
+        .into_response();
+    response.headers_mut().insert(
+        "idempotency-replayed",
+        HeaderValue::from_static(if outcome.deduplicated {
+            "true"
+        } else {
+            "false"
+        }),
+    );
+    if let Ok(value) = HeaderValue::from_str(&location) {
+        response.headers_mut().insert(header::LOCATION, value);
+    }
+    Ok(response)
+}
+
+fn resolve_message_idempotency_key(
+    headers: &axum::http::HeaderMap,
+    body_key: Option<uuid::Uuid>,
+) -> Result<Option<uuid::Uuid>, AeroError> {
+    let header_key = headers
+        .get("idempotency-key")
+        .map(|value| {
+            value
+                .to_str()
+                .map_err(|_| AeroError::Invalid("Idempotency-Key must be an ASCII UUID".into()))
+                .and_then(|value| {
+                    uuid::Uuid::parse_str(value.trim())
+                        .map_err(|_| AeroError::Invalid("Idempotency-Key must be a UUID".into()))
+                })
+        })
+        .transpose()?;
+    match (body_key, header_key) {
+        (Some(body), Some(header)) if body != header => Err(AeroError::Invalid(
+            "client_message_id and Idempotency-Key must match when both are supplied".into(),
+        )),
+        (Some(value), _) | (_, Some(value)) => Ok(Some(value)),
+        (None, None) => Ok(None),
+    }
+}
+
+#[derive(Deserialize)]
 struct EditMessageReq {
     blocks: Vec<aero_common::Block>,
     /// Optimistic-lock check (migration 0157): the `version` the client last
@@ -21,15 +112,16 @@ async fn get_message(
     auth: AuthUser,
     Path(id_str): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let id = MessageId::from_str(&id_str)
-        .map_err(|e| AeroError::Invalid(format!("message id: {e}")))?;
+    let id =
+        MessageId::from_str(&id_str).map_err(|e| AeroError::Invalid(format!("message id: {e}")))?;
     let m = s
         .messages
         .get(id)
         .await?
         .filter(|m| m.deleted_at.is_none())
         .ok_or_else(|| AeroError::NotFound(format!("message {id}")))?;
-    s.im.assert_room_access(auth.participant_id, m.room_id).await?;
+    s.im.assert_room_access(auth.participant_id, m.room_id)
+        .await?;
     Ok(Json(serde_json::to_value(m).map_err(AeroError::from)?))
 }
 
@@ -39,12 +131,19 @@ async fn edit_message(
     Path(id_str): Path<String>,
     Json(req): Json<EditMessageReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let id = MessageId::from_str(&id_str)
-        .map_err(|e| AeroError::Invalid(format!("message id: {e}")))?;
-    let m = s
-        .im
-        .edit_message(auth.participant_id, id, req.blocks, req.expected_version)
-        .await?;
+    let id =
+        MessageId::from_str(&id_str).map_err(|e| AeroError::Invalid(format!("message id: {e}")))?;
+    let room =
+        s.im.assert_message_edit_preflight(auth.participant_id, id)
+            .await?;
+    aero_im_core::validate_blocks(&req.blocks)?;
+    crate::ws_rate::check_ws_rate_room(&s, room).await?;
+    let slowmode =
+        crate::message_send_policy::reserve_slowmode(&s, auth.participant_id, room).await?;
+    let result =
+        s.im.edit_message(auth.participant_id, id, req.blocks, req.expected_version)
+            .await;
+    let m = slowmode.finish(result).await?;
     Ok(Json(serde_json::to_value(m).map_err(AeroError::from)?))
 }
 
@@ -53,70 +152,12 @@ async fn delete_message(
     auth: AuthUser,
     Path(id_str): Path<String>,
 ) -> ApiResult<StatusCode> {
-    let id = MessageId::from_str(&id_str)
-        .map_err(|e| AeroError::Invalid(format!("message id: {e}")))?;
-    let started = std::time::Instant::now();
-
-    // Pre-fetch the message before the delete so the audit trail can record
-    // the room AND a content digest (the blocks are cleared by the soft-delete,
-    // so this is the only chance to capture "what was deleted").
-    let Some(pre) = s.messages.get(id).await.map_err(AeroError::from)? else {
-        return Err(AeroError::NotFound(format!("message {id}")).into());
-    };
-    let room_id = pre.room_id;
-    // Char-boundary-safe 120-char summary so the audit row stays compact.
-    let digest: String = pre.searchable_text().chars().take(120).collect();
-
-    match s.rooms.room_workspace(room_id).await.map_err(AeroError::from)? {
-        // Tenant-owned room: transactional delete + audit (ROADMAP 第三版 方向五
-        // 审计事务化) — if the audit row can't be written the delete rolls back
-        // and the client gets a 5xx, never a silently-unaudited delete.
-        Some(ws) => {
-            // Mirrors `ImService::delete_message` authorization exactly:
-            // re-deleting is an idempotent no-op (checked FIRST, so it never
-            // 403s), then only the sender may delete.
-            if pre.deleted_at.is_some() {
-                return Ok(StatusCode::NO_CONTENT);
-            }
-            if pre.sender_id != auth.participant_id {
-                return Err(AeroError::Forbidden("only sender may delete".into()).into());
-            }
-            let detail = serde_json::json!({ "room_id": room_id, "digest": digest });
-            let deleted = s
-                .messages
-                .soft_delete_audited(id, ws, Some(auth.participant_id), detail)
-                .await
-                .map_err(AeroError::from)?;
-            // `false` = lost a race with a concurrent delete — already gone, so
-            // no event/metric replay (the winner emitted them).
-            if deleted {
-                s.im.broadcast_room_event(
-                    room_id,
-                    aero_common::RoomEvent::Deleted {
-                        room_id,
-                        message_id: id,
-                        by: auth.participant_id,
-                    },
-                )
-                .await;
-                aero_common::metrics::inc_counter(
-                    aero_common::metrics::names::MESSAGES_DELETED_TOTAL,
-                    1,
-                );
-                // Metric parity with `ImService::delete_message`, which times
-                // the legacy (non-audited) path under the same label.
-                aero_common::metrics::observe_histogram_labeled(
-                    aero_common::metrics::names::MESSAGE_PROCESSING_DURATION_SECONDS,
-                    started.elapsed().as_secs_f64(),
-                    &[("op", "delete")],
-                );
-            }
-        }
-        // Legacy room with no owning workspace: there is no audit trail to write
-        // into, so keep the original (service) delete path unchanged.
-        None => s.im.delete_message(auth.participant_id, id).await?,
-    }
-
+    let id =
+        MessageId::from_str(&id_str).map_err(|e| AeroError::Invalid(format!("message id: {e}")))?;
+    // REST and WebSocket deliberately converge on the same service method:
+    // tenant access, author authorization, audit, tombstone, and durable event
+    // append are one invariant instead of two subtly different implementations.
+    s.im.delete_message(auth.participant_id, id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -131,9 +172,11 @@ async fn toggle_reaction(
     Path(id_str): Path<String>,
     Json(req): Json<ToggleReactionReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let id = MessageId::from_str(&id_str)
-        .map_err(|e| AeroError::Invalid(format!("message id: {e}")))?;
-    let op = s.im.toggle_reaction(auth.participant_id, id, &req.emoji).await?;
+    let id =
+        MessageId::from_str(&id_str).map_err(|e| AeroError::Invalid(format!("message id: {e}")))?;
+    let op =
+        s.im.toggle_reaction(auth.participant_id, id, &req.emoji)
+            .await?;
     Ok(Json(serde_json::json!({
         "message_id": id,
         "emoji": req.emoji,
@@ -173,7 +216,9 @@ async fn reactions_batch(
     // (the storage JOIN room_members is the boundary). A message id the caller
     // can't access is silently absent — no cross-room reaction-count / reactor-id
     // leak (IDOR).
-    let summaries = s.im.reactions_for_accessible(auth.participant_id, &ids).await?;
+    let summaries =
+        s.im.reactions_for_accessible(auth.participant_id, &ids)
+            .await?;
     let summaries_json: serde_json::Map<String, serde_json::Value> = summaries
         .into_iter()
         .map(|(mid, list)| {
@@ -186,3 +231,37 @@ async fn reactions_batch(
     Ok(Json(serde_json::Value::Object(summaries_json)))
 }
 
+#[cfg(test)]
+mod create_message_tests {
+    use super::*;
+
+    #[test]
+    fn idempotency_header_and_body_share_one_uuid_contract() {
+        let key = uuid::Uuid::new_v4();
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            "idempotency-key",
+            HeaderValue::from_str(&format!(" {key} ")).unwrap(),
+        );
+        assert_eq!(
+            resolve_message_idempotency_key(&headers, None).unwrap(),
+            Some(key)
+        );
+        assert_eq!(
+            resolve_message_idempotency_key(&headers, Some(key)).unwrap(),
+            Some(key)
+        );
+        assert!(resolve_message_idempotency_key(&headers, Some(uuid::Uuid::new_v4())).is_err());
+    }
+
+    #[test]
+    fn malformed_idempotency_header_is_rejected() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert("idempotency-key", HeaderValue::from_static("not-a-uuid"));
+        assert!(resolve_message_idempotency_key(&headers, None).is_err());
+        assert_eq!(
+            resolve_message_idempotency_key(&axum::http::HeaderMap::new(), None).unwrap(),
+            None
+        );
+    }
+}

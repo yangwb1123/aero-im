@@ -16,6 +16,7 @@ aero-live-core.workspace = true
 aero-live-hls.workspace = true
 
 tokio = { workspace = true, features = ["net", "io-util", "rt", "macros", "sync", "time"] }
+tokio-util.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 tracing.workspace = true
@@ -24,3 +25,6 @@ anyhow.workspace = true
 
 rml_rtmp = "0.8"
 ulid = { workspace = true, features = ["serde", "uuid"] }
+
+[dev-dependencies]
+sqlx.workspace = true

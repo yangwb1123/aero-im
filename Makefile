@@ -54,8 +54,10 @@ test-all: ## cargo test including ignored (requires services)
 	cargo test --workspace -- --include-ignored
 
 .PHONY: fmt
-fmt: ## rustfmt all crates
-	cargo fmt --all
+fmt: ## rustfmt all first-party crates (vendored MSRV snapshots are immutable)
+	@set -e; for manifest in crates/*/Cargo.toml; do \
+		cargo fmt --manifest-path "$$manifest"; \
+	done
 
 .PHONY: lint
 lint: ## clippy

@@ -27,6 +27,7 @@ use aero_auth::AuthUser;
 use aero_common::{Error as AeroError, MessageId};
 use axum::{
     extract::{Path, State},
+    http::HeaderMap,
     routing::post,
     Json, Router,
 };
@@ -58,6 +59,7 @@ fn parse_message(s: &str) -> Result<MessageId, AeroError> {
 async fn thread_title(
     State(s): State<AppState>,
     auth: AuthUser,
+    headers: HeaderMap,
     Path(id_str): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let root_id = parse_message(&id_str)?;
@@ -70,16 +72,24 @@ async fn thread_title(
         .await
         .map_err(AeroError::from)?
         .ok_or_else(|| AeroError::NotFound(format!("message {root_id}")))?;
-    s.im.assert_room_access(auth.participant_id, root.room_id).await?;
+    s.im.assert_room_access(auth.participant_id, root.room_id)
+        .await?;
 
     // Degrade exactly like `POST /api/messages/:id/thread-summary`: `502` when no AI
     // backend is wired; a wired backend heuristically titles when no LLM key is set.
-    let ai = s
-        .ai
-        .as_ref()
-        .ok_or_else(|| AeroError::Upstream("AI not configured".into()))?;
+    let ai =
+        s.ai.as_ref()
+            .ok_or_else(|| AeroError::Upstream("AI not configured".into()))?;
+    let usage_context = crate::ai_usage::room_request_usage_context(
+        &s,
+        &headers,
+        auth.participant_id,
+        root.room_id,
+        &format!("thread_title:{root_id}:{MAX_REPLIES}"),
+    )
+    .await?;
     let title = ai
-        .generate_thread_title(root_id, MAX_REPLIES)
+        .generate_thread_title_with_usage_context(root_id, MAX_REPLIES, usage_context)
         .await
         .map_err(|e| AeroError::Upstream(format!("ai: {e}")))?;
 
@@ -103,7 +113,11 @@ mod db_tests {
 
     async fn pool() -> aero_storage::PgPool {
         let url = std::env::var("DATABASE_URL").expect("DATABASE_URL");
-        PgPoolOptions::new().max_connections(2).connect(&url).await.expect("connect")
+        PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&url)
+            .await
+            .expect("connect")
     }
 
     // Seed a throwaway participant + room (all-zero default workspace) so a message
@@ -165,7 +179,12 @@ mod db_tests {
             .expect("insert root");
         // A reply for context (the heuristic ignores it, but the path still reads it).
         messages
-            .insert(new_msg(room, sender, "agreed, lets schedule it", Some(root_msg.id)))
+            .insert(new_msg(
+                room,
+                sender,
+                "agreed, lets schedule it",
+                Some(root_msg.id),
+            ))
             .await
             .expect("insert reply 1");
 

@@ -299,12 +299,7 @@ impl FlvToTsConverter {
             access_unit.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
             access_unit.extend_from_slice(nalu);
         }
-        let pes = build_pes(
-            STREAM_ID_VIDEO,
-            Some(pts_90k),
-            Some(dts_90k),
-            &access_unit,
-        );
+        let pes = build_pes(STREAM_ID_VIDEO, Some(pts_90k), Some(dts_90k), &access_unit);
         let pcr = if is_keyframe { Some(dts_90k) } else { None };
         let packets = write_pes_into_ts(PID_VIDEO, &mut self.cc_video, &pes, pcr);
         self.pending.extend_from_slice(&packets);
@@ -337,10 +332,7 @@ impl FlvToTsConverter {
         adts.put_u8(0xFF);
         adts.put_u8(0xF1); // MPEG-4, layer 0, protection_absent=1
         adts.put_u8((profile_minus_1 << 6) | (sri << 2) | (chc >> 2));
-        adts.put_u8(
-            ((chc & 0x03) << 6)
-                | (((frame_len >> 11) & 0x03) as u8),
-        );
+        adts.put_u8(((chc & 0x03) << 6) | (((frame_len >> 11) & 0x03) as u8));
         adts.put_u8(((frame_len >> 3) & 0xFF) as u8);
         adts.put_u8((((frame_len & 0x07) << 5) as u8) | 0x1F);
         adts.put_u8(0xFC);
@@ -375,7 +367,7 @@ fn write_pes_into_ts(pid: u16, cc: &mut u8, pes: &[u8], pcr_90k: Option<u64>) ->
             // adaptation_field_length will be 7 (1 flag byte + 6 PCR bytes)
             adaptation.push(7);
             adaptation.push(0x10); // PCR_flag = 1
-            // 33-bit PCR base + 6 reserved bits + 9-bit extension
+                                   // 33-bit PCR base + 6 reserved bits + 9-bit extension
             let base = pcr & ((1u64 << 33) - 1);
             let ext = 0u16; // 9-bit, in 27 MHz / 300 units; 0 is fine
             adaptation.push(((base >> 25) & 0xFF) as u8);
@@ -457,7 +449,11 @@ fn build_pes(stream_id: u8, pts_90k: Option<u64>, dts_90k: Option<u64>, payload:
         0u16
     } else {
         let n = 3 + header_data_len + payload.len();
-        if n > 0xFFFF { 0 } else { n as u16 }
+        if n > 0xFFFF {
+            0
+        } else {
+            n as u16
+        }
     };
     buf.extend_from_slice(&length_field.to_be_bytes());
     buf.push(0x80); // marker bits + flags (no scrambling, no priority, etc.)
@@ -499,14 +495,14 @@ fn write_pat_packet(cc: &mut u8) -> [u8; TS_PACKET_SIZE] {
     // PAT section
     let mut section = Vec::with_capacity(20);
     section.push(0x00); // table_id
-    // section_syntax_indicator=1, '0', reserved '11', section_length(12) — fill later
+                        // section_syntax_indicator=1, '0', reserved '11', section_length(12) — fill later
     section.push(0xB0);
     section.push(0x00); // section_length lo placeholder
     section.extend_from_slice(&1u16.to_be_bytes()); // transport_stream_id
     section.push(0xC1); // reserved(2)=11, version_number(5)=0, current_next=1
     section.push(0x00); // section_number
     section.push(0x00); // last_section_number
-    // program_number=1, program_map_PID=PID_PMT
+                        // program_number=1, program_map_PID=PID_PMT
     section.extend_from_slice(&1u16.to_be_bytes());
     section.extend_from_slice(&((0xE000 | (PID_PMT & 0x1FFF)).to_be_bytes()));
     // section_length = bytes from section_length_lo onward (i.e. after the first 3 bytes)
@@ -553,7 +549,7 @@ fn write_pmt_packet(cc: &mut u8) -> [u8; TS_PACKET_SIZE] {
     section.push(STREAM_TYPE_H264);
     section.extend_from_slice(&((0xE000 | (PID_VIDEO & 0x1FFF)).to_be_bytes()));
     section.extend_from_slice(&0xF000u16.to_be_bytes()); // ES_info_length=0
-    // Audio stream
+                                                         // Audio stream
     section.push(STREAM_TYPE_ADTS_AAC);
     section.extend_from_slice(&((0xE000 | (PID_AUDIO & 0x1FFF)).to_be_bytes()));
     section.extend_from_slice(&0xF000u16.to_be_bytes());
@@ -683,11 +679,18 @@ mod tests {
         let mut c = FlvToTsConverter::new();
         // Pretend ASC: AOT=2, sample_rate_idx=4 (44100), channel_config=2 (stereo)
         let asc = [(2u8 << 3) | (4u8 >> 1), ((4u8 & 1) << 7) | (2u8 << 3)];
-        c.aac = Some(AacCodec { object_type: 2, sample_rate_index: 4, channel_config: 2 });
+        c.aac = Some(AacCodec {
+            object_type: 2,
+            sample_rate_index: 4,
+            channel_config: 2,
+        });
         let _ = asc;
         c.push_aac_raw(&[0x21, 0x10, 0x05], 0).unwrap();
         // Expect at least one TS packet containing ADTS sync 0xFFF
-        let any = c.pending.windows(2).any(|w| w[0] == 0xFF && (w[1] & 0xF0) == 0xF0);
+        let any = c
+            .pending
+            .windows(2)
+            .any(|w| w[0] == 0xFF && (w[1] & 0xF0) == 0xF0);
         assert!(any, "ADTS sync not found");
     }
 
@@ -755,4 +758,3 @@ mod tests {
         );
     }
 }
-

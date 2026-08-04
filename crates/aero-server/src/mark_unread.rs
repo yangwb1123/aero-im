@@ -7,14 +7,11 @@
 //! caller's cursor *just before* a chosen message, so that message and
 //! everything after it count as unread again.
 //!
-//! `POST /api/messages/:id/mark-unread` resolves the target message (`404` if it
-//! does not exist), asserts the caller may access its room, finds the message's
-//! immediate predecessor in that room
-//! ([`MessageRepo::list_recent`](aero_storage::MessageRepo::list_recent) with
-//! `before = target, limit = 1`, which orders newest-first), and sets the
-//! caller's read cursor there via
-//! [`ReceiptRepo::set_cursor`](aero_storage::ReceiptRepo::set_cursor) — `None`
-//! when the target is the room's first message, which clears the receipt so the
+//! `POST /api/messages/:id/mark-unread` resolves the target's canonical room,
+//! locks and rechecks the caller's effective access, finds the immediate visible
+//! predecessor, and changes the cursor in one storage transaction via
+//! [`ReceiptRepo::mark_unread_authorized`](aero_storage::ReceiptRepo::mark_unread_authorized).
+//! `None` when the target is the room's first message clears the receipt so the
 //! whole room re-badges unread. It then best-effort broadcasts a
 //! [`RoomEvent::Read`] on `im.room.{room}` (mirroring
 //! [`ImService::mark_read`](aero_im_core::ImService::mark_read)) so other
@@ -47,15 +44,14 @@ fn parse_message(s: &str) -> Result<MessageId, AeroError> {
 /// `POST /api/messages/:id/mark-unread` — roll the caller's read cursor back to
 /// *before* the given message, so it (and everything newer) re-badges as unread.
 ///
-/// Resolves the message (`404` if unknown), asserts room access, then parks the
-/// caller's read cursor on the message's predecessor (or clears it entirely when
-/// the message is the room's first), and best-effort broadcasts the new read
-/// state to the room. Returns the new cursor.
+/// Resolves the message (`404` if unknown), then transactionally rechecks room
+/// access and parks the caller's read cursor on the message's predecessor (or
+/// clears it entirely when the message is the room's first). Best-effort
+/// broadcasts the new read state to the room and returns the new cursor.
 ///
 /// # Errors
 /// - `404` when the message does not exist.
-/// - `403`/`404` from [`ImService::assert_room_access`] when the caller may not
-///   access the room.
+/// - `403` when the caller may not access the message's room at commit.
 /// - `500` if the storage layer errors.
 async fn mark_unread(
     State(s): State<AppState>,
@@ -63,26 +59,9 @@ async fn mark_unread(
     Path(id_str): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let target = parse_message(&id_str)?;
-    let msg = s
-        .messages
-        .get(target)
-        .await?
-        .ok_or_else(|| AeroError::NotFound(format!("message {target}")))?;
-    let room = msg.room_id;
-    s.im.assert_room_access(auth.participant_id, room).await?;
-
-    // The predecessor is the newest message strictly before `target` in this
-    // room. `None` ⇒ `target` is the room's first message, so the cursor clears
-    // and the whole room re-badges unread.
-    let predecessor = s
-        .messages
-        .list_recent(room, Some(target), 1)
-        .await?
-        .first()
-        .map(|m| m.id);
-
-    s.receipts
-        .set_cursor(room, auth.participant_id, predecessor)
+    let (room, predecessor, updated_at) = s
+        .receipts
+        .mark_unread_authorized(auth.participant_id, target)
         .await?;
 
     // Best-effort: tell the room the caller's read cursor moved (so other
@@ -99,7 +78,7 @@ async fn mark_unread(
                 room_id: room,
                 participant: auth.participant_id,
                 last_message_id: last,
-                at: time::OffsetDateTime::now_utc(),
+                at: updated_at,
             },
         )
         .await;

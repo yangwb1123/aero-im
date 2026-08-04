@@ -57,7 +57,9 @@ fn parse_line(line: &str) -> Vec<Block> {
         if !name.is_empty() {
             // Capture display_name as text + mention marker.
             // The caller resolves ParticipantId from display_name.
-            let mention = Block::Mention { participant: crate::ParticipantId::nil() };
+            let mention = Block::Mention {
+                participant: crate::ParticipantId::nil(),
+            };
             let mut blocks = vec![mention];
             let remainder = trailing.trim();
             if !remainder.is_empty() {
@@ -105,7 +107,11 @@ fn parse_spans(text: &str) -> (String, Vec<Span>) {
                 let inner = &bytes[i + 2..i + 2 + end];
                 stripped.push_str(std::str::from_utf8(inner).unwrap_or(""));
                 let content_end = stripped.len();
-                raw_spans.push(RawSpan { start: content_start, end: content_end, style: SpanStyle::Bold });
+                raw_spans.push(RawSpan {
+                    start: content_start,
+                    end: content_end,
+                    style: SpanStyle::Bold,
+                });
                 i += 2 + end + 2;
                 continue;
             }
@@ -117,7 +123,11 @@ fn parse_spans(text: &str) -> (String, Vec<Span>) {
                 let inner = &bytes[i + 2..i + 2 + end];
                 stripped.push_str(std::str::from_utf8(inner).unwrap_or(""));
                 let content_end = stripped.len();
-                raw_spans.push(RawSpan { start: content_start, end: content_end, style: SpanStyle::Strikethrough });
+                raw_spans.push(RawSpan {
+                    start: content_start,
+                    end: content_end,
+                    style: SpanStyle::Strikethrough,
+                });
                 i += 2 + end + 2;
                 continue;
             }
@@ -133,7 +143,11 @@ fn parse_spans(text: &str) -> (String, Vec<Span>) {
                     let inner = &bytes[i + 1..i + 1 + end];
                     stripped.push_str(std::str::from_utf8(inner).unwrap_or(""));
                     let content_end = stripped.len();
-                    raw_spans.push(RawSpan { start: content_start, end: content_end, style: SpanStyle::Italic });
+                    raw_spans.push(RawSpan {
+                        start: content_start,
+                        end: content_end,
+                        style: SpanStyle::Italic,
+                    });
                     i += 1 + end + 1;
                     continue;
                 }
@@ -146,7 +160,11 @@ fn parse_spans(text: &str) -> (String, Vec<Span>) {
                 let inner = &bytes[i + 1..i + 1 + end];
                 stripped.push_str(std::str::from_utf8(inner).unwrap_or(""));
                 let content_end = stripped.len();
-                raw_spans.push(RawSpan { start: content_start, end: content_end, style: SpanStyle::Code });
+                raw_spans.push(RawSpan {
+                    start: content_start,
+                    end: content_end,
+                    style: SpanStyle::Code,
+                });
                 i += 1 + end + 1;
                 continue;
             }

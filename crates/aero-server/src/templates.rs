@@ -16,7 +16,7 @@
 use std::str::FromStr;
 
 use aero_auth::AuthUser;
-use aero_common::{Block, Error as AeroError, MessageTemplateId, RoomId};
+use aero_common::{Error as AeroError, MessageTemplateId, RoomId};
 use aero_storage::MessageTemplateRepo;
 use axum::{
     extract::{Path, State},
@@ -53,16 +53,6 @@ fn parse_room(s: &str) -> Result<RoomId, AeroError> {
     RoomId::from_str(s.trim()).map_err(|e| AeroError::Invalid(format!("room id: {e}")))
 }
 
-/// Validate the `blocks` payload: it must be a non-empty JSON array. Pure, so the
-/// rule is unit-tested without a database or bus.
-fn validate_blocks(blocks: &serde_json::Value) -> Result<(), AeroError> {
-    match blocks.as_array() {
-        Some(arr) if !arr.is_empty() => Ok(()),
-        Some(_) => Err(AeroError::Invalid("blocks must not be empty".into())),
-        None => Err(AeroError::Invalid("blocks must be an array".into())),
-    }
-}
-
 #[derive(Deserialize)]
 struct CreateTemplateReq {
     /// Human-readable name for the template.
@@ -86,10 +76,11 @@ async fn create_template(
     if name.chars().count() > MAX_NAME_LEN {
         return Err(AeroError::Invalid("name too long".into()).into());
     }
-    validate_blocks(&req.blocks)?;
+    let blocks = crate::deferred_blocks::decode(req.blocks)?;
+    let blocks_json = serde_json::to_value(blocks).map_err(AeroError::from)?;
 
     let id = repo(&s)
-        .create(auth.participant_id, name, &req.blocks)
+        .create(auth.participant_id, name, &blocks_json)
         .await
         .map_err(AeroError::from)?;
     // Re-read so the response carries the full, canonical row (created_at).
@@ -158,29 +149,12 @@ async fn send_template(
         .map_err(AeroError::from)?
         .ok_or_else(|| AeroError::NotFound(format!("template {id}")))?;
 
-    let blocks: Vec<Block> = serde_json::from_value(template.blocks)
-        .map_err(|e| AeroError::Invalid(format!("template blocks: {e}")))?;
+    let blocks = crate::deferred_blocks::decode(template.blocks)?;
 
-    let message = s
-        .im
-        .send_message(auth.participant_id, room, blocks, None, None)
-        .await?;
-    Ok(Json(serde_json::to_value(message).map_err(AeroError::from)?))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A non-empty JSON array is accepted; anything else is rejected `400`.
-    #[test]
-    fn validate_blocks_accepts_non_empty_array_only() {
-        assert!(validate_blocks(&serde_json::json!([{ "type": "text", "content": "hi" }])).is_ok());
-
-        // Empty array, object, string, and null are all rejected.
-        assert!(validate_blocks(&serde_json::json!([])).is_err());
-        assert!(validate_blocks(&serde_json::json!({})).is_err());
-        assert!(validate_blocks(&serde_json::json!("hi")).is_err());
-        assert!(validate_blocks(&serde_json::Value::Null).is_err());
-    }
+    let message =
+        s.im.send_message(auth.participant_id, room, blocks, None, None)
+            .await?;
+    Ok(Json(
+        serde_json::to_value(message).map_err(AeroError::from)?,
+    ))
 }

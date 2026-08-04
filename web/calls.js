@@ -15,6 +15,10 @@
 
 import { state, ws, els, cssEscape } from './context.js';
 import { toast } from './render.js';
+import { browserRtcConfig } from './rtc_config.js';
+import { SFU_CAPABILITY, SfuGroupController } from './sfu_calls.js';
+
+let sfuGroup = null;
 
 // ---------- 1:1 call (WebRTC P2P) ----------
 // Attach the call/gcall control-button listeners. Called once at bootstrap so
@@ -33,6 +37,27 @@ export function wireCallControls() {
   els.callShare.addEventListener('click', () => toggleScreenShare());
   els.callCc.addEventListener('click', () => toggleCaptions());
   els.callCcLang.addEventListener('change', () => { if (state.call) state.call.targetLang = els.callCcLang.value || null; });
+  ws.on('msg:call_sfu_answer', (frame) => sfuGroup?.handleAnswer(frame));
+  ws.on('msg:call_sfu_renegotiate', (frame) => sfuGroup?.handleTopology(frame));
+  ws.on('msg:call_sfu_subscribed', (frame) => sfuGroup?.handleSubscribed(frame));
+  ws.on('msg:welcome', () => {
+    const g = state.gcall;
+    if (!g || g.mode !== 'sfu' || !g.id) return;
+    if (!ws.supports(SFU_CAPABILITY)) {
+      // A rolling downgrade can reconnect this tab to an older gateway. Keep
+      // the call usable through the legacy mesh protocol instead of sending
+      // frames that gateway cannot decode.
+      sfuGroup?.close();
+      g.mode = 'mesh';
+      ws.callJoin(g.roomId, g.kind, g.id);
+      return;
+    }
+    // The server owns the media peer and removes it with the old WS session.
+    // Rejoin idempotently after reconnect so a fresh roster starts a new
+    // generation instead of leaving the browser stuck on a dead peer.
+    sfuGroup?.close();
+    ws.callJoin(g.roomId, g.kind, g.id);
+  });
 }
 
 function toggleTrack(kind) {
@@ -71,10 +96,7 @@ async function startCall(kind) {
 }
 
 function makePeer() {
-  const cfg = state.rtcConfig
-    ? { iceServers: state.rtcConfig.ice_servers || state.rtcConfig.iceServers }
-    : { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
-  const pc = new RTCPeerConnection(cfg);
+  const pc = new RTCPeerConnection(rtcIceConfig());
   pc.addEventListener('icecandidate', (e) => {
     if (!e.candidate || !state.call) return;
     ws.callIce(state.call.id, state.call.roomId, state.call.peer, e.candidate.toJSON());
@@ -138,7 +160,11 @@ export async function handleCall(event) {
     return gcallOnOffer(event);
   }
   // answer/ice belonging to the active group call route to the mesh handlers
-  if (state.gcall && event.call_id === state.gcall.id && (op === 'answer' || op === 'ice')) {
+  if (
+    state.gcall?.mode === 'mesh'
+    && event.call_id === state.gcall.id
+    && (op === 'answer' || op === 'ice')
+  ) {
     return op === 'answer' ? gcallOnAnswer(event) : gcallOnIce(event);
   }
   if (op === 'invite') {
@@ -200,11 +226,11 @@ function endCall(reason) {
   const c = state.call;
   if (!c) { els.callOverlay.hidden = true; return; }
   stopRecognition();
-  try { c.screenTrack?.stop(); } catch {}
-  try { c.pc?.close(); } catch {}
-  try { c.localStream?.getTracks().forEach((t) => t.stop()); } catch {}
+  try { c.screenTrack?.stop(); } catch { /* best-effort cleanup */ }
+  try { c.pc?.close(); } catch { /* best-effort cleanup */ }
+  try { c.localStream?.getTracks().forEach((t) => t.stop()); } catch { /* best-effort cleanup */ }
   if (c.id && c.roomId) {
-    try { ws.callEnd(c.id, c.roomId, reason || 'hangup'); } catch {}
+    try { ws.callEnd(c.id, c.roomId, reason || 'hangup'); } catch { /* socket may be gone */ }
   }
   els.callLocal.srcObject = null;
   els.callRemote.srcObject = null;
@@ -258,7 +284,7 @@ async function toggleScreenShare() {
     }
   } catch (err) {
     toast(`屏幕共享失败:${err.message}`, 'error');
-    try { screenTrack.stop(); } catch {}
+    try { screenTrack.stop(); } catch { /* track may already be ended */ }
     c.screenTrack = null; c.camTrack = null;
     return;
   }
@@ -276,7 +302,7 @@ function stopScreenShare() {
   if (!c || !c.screenTrack) return;
   const screenTrack = c.screenTrack;
   c.screenTrack = null;
-  try { screenTrack.stop(); } catch {}
+  try { screenTrack.stop(); } catch { /* track may already be ended */ }
   const sender = c.pc?.getSenders().find((s) => s.track === screenTrack)
     || c.pc?.getSenders().find((s) => s.track && s.track.kind === 'video');
   if (sender) {
@@ -299,7 +325,7 @@ function toggleCaptions() {
   state.call.srcLang = srcLang;
   state.call.targetLang = els.callCcLang.value || null;
   let recog;
-  try { recog = new SR(); } catch (e) { toast('字幕启动失败', 'error'); return; }
+  try { recog = new SR(); } catch { toast('字幕启动失败', 'error'); return; }
   recog.lang = srcLang;
   recog.continuous = true;
   recog.interimResults = true;
@@ -308,10 +334,10 @@ function toggleCaptions() {
   recog.addEventListener('end', () => {
     // SpeechRecognition stops itself periodically; restart while captions are on.
     if (state.call && state.call.recog === recog) {
-      try { recog.start(); } catch {}
+      try { recog.start(); } catch { /* recognition may already be active */ }
     }
   });
-  try { recog.start(); } catch (e) { toast('字幕启动失败', 'error'); return; }
+  try { recog.start(); } catch { toast('字幕启动失败', 'error'); return; }
   state.call.recog = recog;
   els.callCc.classList.add('active');
   els.callCaptions.hidden = false;
@@ -322,7 +348,7 @@ function stopRecognition() {
   if (c?.recog) {
     const r = c.recog;
     c.recog = null; // prevent the 'end' handler from restarting
-    try { r.stop(); } catch {}
+    try { r.stop(); } catch { /* recognition may already be stopped */ }
   }
   els.callCc?.classList.remove('active');
 }
@@ -380,9 +406,7 @@ function renderCaption(key, name, text, translated, isFinal) {
 // signaling + tracks the roster.
 
 function rtcIceConfig() {
-  return state.rtcConfig
-    ? { iceServers: state.rtcConfig.ice_servers || state.rtcConfig.iceServers }
-    : { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+  return browserRtcConfig(state.rtcConfig);
 }
 
 const gcallPrompted = new Set(); // call_ids we've already offered to join
@@ -399,7 +423,19 @@ async function enterGroupCall(roomId, kind, callId) {
   if (state.call) { toast('请先结束 1:1 通话', 'error'); return; }
   try {
     const localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: kind === 'video' });
-    state.gcall = { id: callId, roomId, kind, localStream, peers: new Map() };
+    const mode = ws.supports(SFU_CAPABILITY) ? 'sfu' : 'mesh';
+    state.gcall = {
+      id: callId,
+      roomId,
+      kind,
+      mode,
+      localStream,
+      peers: new Map(),
+      memberGenerations: new Map(),
+      screenTrack: null,
+      screenStream: null,
+      camTrack: localStream.getVideoTracks()[0] || null,
+    };
     els.gcallGrid.replaceChildren();
     addGcallTile('me', '我', localStream, true);
     els.gcallOverlay.hidden = false;
@@ -475,6 +511,14 @@ async function gcallRenegotiate(peerId) {
 async function gcallOnRoster(ev) {
   if (!state.gcall) return;
   state.gcall.id = ev.call_id;
+  const ownGeneration = callLegGeneration(ev);
+  if (ownGeneration > 0 && state.me?.id) {
+    state.gcall.memberGenerations.set(state.me.id, ownGeneration);
+  }
+  if (state.gcall.mode === 'sfu') {
+    ensureSfuGroup().start();
+    return;
+  }
   for (const m of (ev.members || [])) {
     if (m === state.me?.id) continue;
     // lower id offers; otherwise wait for their offer
@@ -483,18 +527,30 @@ async function gcallOnRoster(ev) {
 }
 
 async function gcallOnJoin(ev) {
-  if (ev.from === state.me?.id) return;
+  const generation = callLegGeneration(ev);
+  if (ev.from === state.me?.id) {
+    if (state.gcall && generation > 0) {
+      state.gcall.memberGenerations.set(ev.from, generation);
+    }
+    return;
+  }
   if (!state.gcall) {
     // Invited to a group call we're not in yet — offer to join.
     promptJoinGroupCall(ev);
     return;
   }
   if (ev.call_id !== state.gcall.id) return;
+  const currentGeneration = state.gcall.memberGenerations.get(ev.from) || 0;
+  if (generation === 0 && currentGeneration > 0) return;
+  if (generation > 0 && generation < currentGeneration) return;
+  if (generation > 0) state.gcall.memberGenerations.set(ev.from, generation);
+  if (state.gcall.mode === 'sfu') return;
   if (String(state.me?.id) < String(ev.from)) await gcallOfferTo(ev.from);
 }
 
 async function gcallOnOffer(ev) {
   if (!state.gcall || ev.call_id !== state.gcall.id) return;
+  if (state.gcall.mode === 'sfu') return;
   if (ev.to !== state.me?.id) return;
   const entry = gcallPeer(ev.from);
   if (!entry) return;
@@ -523,13 +579,27 @@ async function gcallOnIce(ev) {
 
 function gcallOnLeave(ev) {
   if (!state.gcall || ev.call_id !== state.gcall.id) return;
+  const generation = callLegGeneration(ev);
+  const currentGeneration = state.gcall.memberGenerations.get(ev.from) || 0;
+  // Once a generation-aware Join has been observed, a legacy/older Leave can
+  // only be a delayed event from a superseded gateway incarnation.
+  if (generation === 0 && currentGeneration > 0) return;
+  if (generation > 0 && generation < currentGeneration) return;
+  state.gcall.memberGenerations.delete(ev.from);
   removeGcallPeer(ev.from);
+}
+
+function callLegGeneration(ev) {
+  const generation = Number(ev?.leg_generation);
+  return Number.isSafeInteger(generation) && generation > 0 ? generation : 0;
 }
 
 function removeGcallPeer(peerId) {
   const entry = state.gcall?.peers.get(peerId);
   if (!entry) return;
-  try { entry.pc.close(); } catch {}
+  if (state.gcall?.mode !== 'sfu') {
+    try { entry.pc.close(); } catch { /* peer may already be closed */ }
+  }
   state.gcall.peers.delete(peerId);
   const tile = els.gcallGrid.querySelector(`[data-peer="${cssEscape(peerId)}"]`);
   if (tile) tile.remove();
@@ -569,14 +639,23 @@ async function gcallToggleScreenShare() {
   if (!screenTrack) { toast('未获取到屏幕画面', 'error'); return; }
   g.screenTrack = screenTrack;
   g.screenStream = display;
-  g.camTrack = null;
-  for (const [, entry] of g.peers) {
-    const sender = entry.pc.getSenders().find((s) => s.track && s.track.kind === 'video');
-    if (sender) {
-      if (!g.camTrack) g.camTrack = sender.track; // all peers share the same cam track
-      sender.replaceTrack(screenTrack).catch((err) => console.warn('[gcall share]', err));
-    } else {
-      try { entry.pc.addTrack(screenTrack, g.localStream); } catch (err) { console.warn('[gcall share add]', err); }
+  if (g.mode === 'sfu') {
+    try {
+      await ensureSfuGroup().useScreenTrack(screenTrack);
+    } catch (err) {
+      console.warn('[sfu share]', err);
+      toast(`屏幕共享失败:${err.message}`, 'error');
+    }
+  } else {
+    g.camTrack = null;
+    for (const [, entry] of g.peers) {
+      const sender = entry.pc.getSenders().find((s) => s.track && s.track.kind === 'video');
+      if (sender) {
+        if (!g.camTrack) g.camTrack = sender.track; // all peers share the same cam track
+        sender.replaceTrack(screenTrack).catch((err) => console.warn('[gcall share]', err));
+      } else {
+        try { entry.pc.addTrack(screenTrack, g.localStream); } catch (err) { console.warn('[gcall share add]', err); }
+      }
     }
   }
   // Show what we're sharing in our own tile; mark the button active.
@@ -591,13 +670,19 @@ function gcallStopScreenShare() {
   const screenTrack = g.screenTrack;
   g.screenTrack = null;
   g.screenStream = null;
-  try { screenTrack.stop(); } catch {}
-  for (const [, entry] of g.peers) {
-    const sender = entry.pc.getSenders().find((s) => s.track === screenTrack)
-      || entry.pc.getSenders().find((s) => s.track && s.track.kind === 'video');
-    if (sender) sender.replaceTrack(g.camTrack || null).catch((err) => console.warn('[gcall unshare]', err));
+  try { screenTrack.stop(); } catch { /* track may already be ended */ }
+  if (g.mode === 'sfu') {
+    ensureSfuGroup()
+      .restoreCameraTrack(g.camTrack || null)
+      .catch((err) => console.warn('[sfu unshare]', err));
+  } else {
+    for (const [, entry] of g.peers) {
+      const sender = entry.pc.getSenders().find((s) => s.track === screenTrack)
+        || entry.pc.getSenders().find((s) => s.track && s.track.kind === 'video');
+      if (sender) sender.replaceTrack(g.camTrack || null).catch((err) => console.warn('[gcall unshare]', err));
+    }
+    g.camTrack = null;
   }
-  g.camTrack = null;
   addGcallTile('me', '我', g.localStream, true);
   els.gcallShare?.classList.remove('active');
 }
@@ -605,10 +690,14 @@ function gcallStopScreenShare() {
 function leaveGroupCall() {
   const g = state.gcall;
   if (!g) { els.gcallOverlay.hidden = true; return; }
-  if (g.id) { try { ws.callLeave(g.id, g.roomId); } catch {} }
-  try { g.screenTrack?.stop(); } catch {}
-  for (const [, entry] of g.peers) { try { entry.pc.close(); } catch {} }
-  try { g.localStream?.getTracks().forEach((t) => t.stop()); } catch {}
+  if (g.id) { try { ws.callLeave(g.id, g.roomId); } catch { /* socket may be gone */ } }
+  try { g.screenTrack?.stop(); } catch { /* best-effort cleanup */ }
+  if (g.mode === 'sfu') {
+    sfuGroup?.close();
+  } else {
+    for (const [, entry] of g.peers) { try { entry.pc.close(); } catch { /* best-effort cleanup */ } }
+  }
+  try { g.localStream?.getTracks().forEach((t) => t.stop()); } catch { /* best-effort cleanup */ }
   els.gcallGrid.replaceChildren();
   els.gcallShare?.classList.remove('active');
   els.gcallOverlay.hidden = true;
@@ -636,4 +725,49 @@ function addGcallTile(peerId, label, stream, muted) {
 function updateGcallCount() {
   if (!state.gcall) return;
   els.gcallCount.textContent = `${state.gcall.peers.size + 1} 人`;
+}
+
+function ensureSfuGroup() {
+  if (sfuGroup) return sfuGroup;
+  sfuGroup = new SfuGroupController({
+    ws,
+    getCall: () => state.gcall,
+    getSelfId: () => state.me?.id,
+    rtcConfig: rtcIceConfig,
+    onSubscriptions: renderSfuSubscriptions,
+    onConnectionState: (connectionState) => {
+      if (connectionState === 'failed') toast('SFU 媒体连接失败，请重新加入通话', 'error');
+    },
+    onError: (error) => {
+      console.warn('[sfu call]', error);
+      toast(`SFU 协商失败:${error.message}`, 'error');
+    },
+  });
+  return sfuGroup;
+}
+
+function renderSfuSubscriptions(subscriptions) {
+  const g = state.gcall;
+  if (!g || g.mode !== 'sfu') return;
+  const byPublisher = new Map();
+  for (const subscription of subscriptions) {
+    const track = subscription.transceiver?.receiver?.track;
+    if (!track || track.readyState === 'ended') continue;
+    if (!byPublisher.has(subscription.publisher)) byPublisher.set(subscription.publisher, []);
+    byPublisher.get(subscription.publisher).push(track);
+  }
+  for (const peerId of Array.from(g.peers.keys())) {
+    if (byPublisher.has(peerId)) continue;
+    g.peers.delete(peerId);
+    els.gcallGrid
+      .querySelector(`[data-peer="${cssEscape(peerId)}"]`)
+      ?.remove();
+  }
+  for (const [peerId, tracks] of byPublisher) {
+    const stream = new MediaStream(tracks);
+    g.peers.set(peerId, { stream });
+    const name = state.participants.get(peerId)?.display_name || peerId.slice(0, 6);
+    addGcallTile(peerId, name, stream, false);
+  }
+  updateGcallCount();
 }

@@ -60,7 +60,10 @@ impl LinkPreview {
     /// useful but we still want a minimal card / cache entry).
     #[must_use]
     pub fn bare(url: impl Into<String>) -> Self {
-        Self { url: url.into(), ..Self::default() }
+        Self {
+            url: url.into(),
+            ..Self::default()
+        }
     }
 
     /// Whether this preview carries any metadata beyond the URL itself. A preview
@@ -97,7 +100,9 @@ const TRAILING_PUNCT: &[char] = &['.', ',', ')', ']', '}', '"', '\'', '!', '?', 
 pub fn extract_urls(blocks: &[Block]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for block in blocks {
-        let Block::Text { content, .. } = block else { continue };
+        let Block::Text { content, .. } = block else {
+            continue;
+        };
         for token in content.split_whitespace() {
             if let Some(url) = normalize_url(token) {
                 if !out.iter().any(|u| u == &url) {
@@ -319,9 +324,12 @@ fn decode_one_entity(entity: &str) -> Option<char> {
 pub fn preview_to_card(preview: &LinkPreview) -> Block {
     // `LinkPreview`'s Serialize already drops `None` fields, so serializing it is
     // exactly the compact `{url, title?, description?, image?, site_name?}` payload.
-    let payload = serde_json::to_value(preview)
-        .unwrap_or_else(|_| serde_json::json!({ "url": preview.url }));
-    Block::Card { schema: LINK_PREVIEW_SCHEMA.to_string(), payload }
+    let payload =
+        serde_json::to_value(preview).unwrap_or_else(|_| serde_json::json!({ "url": preview.url }));
+    Block::Card {
+        schema: LINK_PREVIEW_SCHEMA.to_string(),
+        payload,
+    }
 }
 
 /// Whether a `Block::Card` already carries a link preview — used by the listener
@@ -372,7 +380,10 @@ impl ReqwestUnfurler {
             .user_agent("aero-im-unfurl/1.0 (+https://github.com/aero-im)")
             .build()
             .unwrap_or_default();
-        Self { client, max_bytes: MAX_BODY_BYTES }
+        Self {
+            client,
+            max_bytes: MAX_BODY_BYTES,
+        }
     }
 }
 
@@ -424,7 +435,9 @@ impl FakeUnfurler {
     /// An unfurler that returns `html` for every URL.
     #[must_use]
     pub fn with_html(html: impl Into<String>) -> Self {
-        Self { html: Some(html.into()) }
+        Self {
+            html: Some(html.into()),
+        }
     }
 
     /// An unfurler that always fails to fetch (returns `None`).
@@ -548,7 +561,9 @@ mod tests {
 
     #[test]
     fn extract_urls_dedups_preserving_first_order() {
-        let blocks = [text("https://x.com then https://y.com then https://x.com again")];
+        let blocks = [text(
+            "https://x.com then https://y.com then https://x.com again",
+        )];
         assert_eq!(
             extract_urls(&blocks),
             vec!["https://x.com".to_string(), "https://y.com".to_string()]
@@ -558,15 +573,24 @@ mod tests {
     #[test]
     fn extract_urls_trims_trailing_punctuation_and_brackets() {
         let blocks = [text("(see https://example.com/path).")];
-        assert_eq!(extract_urls(&blocks), vec!["https://example.com/path".to_string()]);
+        assert_eq!(
+            extract_urls(&blocks),
+            vec!["https://example.com/path".to_string()]
+        );
         let wrapped = [text("<https://example.com>")];
-        assert_eq!(extract_urls(&wrapped), vec!["https://example.com".to_string()]);
+        assert_eq!(
+            extract_urls(&wrapped),
+            vec!["https://example.com".to_string()]
+        );
     }
 
     #[test]
     fn extract_urls_ignores_non_text_blocks_and_non_urls() {
         let blocks = [
-            Block::Code { lang: "rs".into(), content: "let u = \"https://incode.com\";".into() },
+            Block::Code {
+                lang: "rs".into(),
+                content: "let u = \"https://incode.com\";".into(),
+            },
             text("no links here, just ftp://nope.com and bareword.com"),
         ];
         assert!(extract_urls(&blocks).is_empty());
@@ -580,7 +604,10 @@ mod tests {
 
     #[test]
     fn extract_urls_caps_at_max() {
-        let many = (0..20).map(|i| format!("https://h{i}.com")).collect::<Vec<_>>().join(" ");
+        let many = (0..20)
+            .map(|i| format!("https://h{i}.com"))
+            .collect::<Vec<_>>()
+            .join(" ");
         let blocks = [text(&many)];
         assert_eq!(extract_urls(&blocks).len(), MAX_URLS_PER_MESSAGE);
     }
@@ -588,7 +615,10 @@ mod tests {
     #[test]
     fn extract_urls_is_case_insensitive_on_scheme() {
         let blocks = [text("HTTPS://Example.COM/Path")];
-        assert_eq!(extract_urls(&blocks), vec!["HTTPS://Example.COM/Path".to_string()]);
+        assert_eq!(
+            extract_urls(&blocks),
+            vec!["HTTPS://Example.COM/Path".to_string()]
+        );
     }
 
     // ---- parse_og ----
@@ -626,7 +656,10 @@ mod tests {
 
     #[test]
     fn parse_og_tolerates_missing_tags() {
-        let p = parse_og("<html><head></head><body>nothing</body></html>", "https://x.com");
+        let p = parse_og(
+            "<html><head></head><body>nothing</body></html>",
+            "https://x.com",
+        );
         assert_eq!(p.url, "https://x.com");
         assert!(p.title.is_none());
         assert!(!p.has_metadata());
@@ -718,7 +751,10 @@ mod tests {
     fn is_link_preview_card_detects_only_link_previews() {
         let lp = preview_to_card(&LinkPreview::bare("https://x.com"));
         assert!(is_link_preview_card(&lp));
-        let other = Block::Card { schema: "citation".into(), payload: serde_json::json!({}) };
+        let other = Block::Card {
+            schema: "citation".into(),
+            payload: serde_json::json!({}),
+        };
         assert!(!is_link_preview_card(&other));
         assert!(!is_link_preview_card(&Block::text("hi")));
     }
@@ -795,7 +831,10 @@ mod tests {
             .unwrap();
         rt.block_on(async {
             let ok = FakeUnfurler::with_html("<title>X</title>");
-            assert_eq!(ok.fetch("https://x.com").await.as_deref(), Some("<title>X</title>"));
+            assert_eq!(
+                ok.fetch("https://x.com").await.as_deref(),
+                Some("<title>X</title>")
+            );
             let fail = FakeUnfurler::failing();
             assert!(fail.fetch("https://x.com").await.is_none());
         });
@@ -814,7 +853,10 @@ mod tests {
             assert_eq!(urls, vec!["https://example.com/post".to_string()]);
 
             let fetcher = FakeUnfurler::with_html(SAMPLE);
-            let html = fetcher.fetch(&urls[0]).await.expect("fake always returns html");
+            let html = fetcher
+                .fetch(&urls[0])
+                .await
+                .expect("fake always returns html");
             let preview = parse_og(&html, &urls[0]);
             assert!(preview.has_metadata());
             let card = preview_to_card(&preview);
@@ -860,7 +902,10 @@ mod db_tests {
         assert_eq!(got, preview, "put -> get roundtrips the full preview");
 
         // Upsert with new metadata overwrites in place (same url_hash).
-        let updated = LinkPreview { title: Some("New Title".into()), ..preview.clone() };
+        let updated = LinkPreview {
+            title: Some("New Title".into()),
+            ..preview.clone()
+        };
         repo.put(&url, &updated).await.unwrap();
         let got2 = repo.get(&url).await.unwrap().expect("still fresh");
         assert_eq!(got2.title.as_deref(), Some("New Title"));

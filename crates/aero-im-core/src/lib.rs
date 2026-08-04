@@ -22,15 +22,18 @@ mod spam_guard;
 mod validation;
 
 pub use events::ImEvent;
-pub use moderator::{AllowAllModerator, KeywordModerator, Moderator, ModerationVerdict};
+pub use moderator::{
+    moderation_text, AllowAllModerator, KeywordModerator, ModerationVerdict, Moderator,
+};
 pub use pii_detect::{detect as detect_pii, PiiConfig, PiiDetector, PiiKind};
-pub use spam_guard::{SpamDecision, SpamGuard, SpamReason, SpamThresholds};
 pub use seq::{LocalSeqProvider, SeqProvider};
 pub use service::{
     can_access_room, can_create_channel, can_join_public_channel, post_allowed, BusSink, ImService,
+    SendMessageOutcome,
 };
+pub use spam_guard::{SpamDecision, SpamGuard, SpamReason, SpamThresholds};
 pub use validation::{
-    validate_blocks, ValidationError, MAX_BLOCKS, MAX_CODE_BYTES, MAX_TEXT_BYTES,
+    validate_blocks, ValidationError, MAX_BLOCKS, MAX_CODE_BYTES, MAX_MESSAGE_BYTES, MAX_TEXT_BYTES,
 };
 
 #[cfg(test)]

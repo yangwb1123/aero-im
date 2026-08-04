@@ -52,6 +52,11 @@ pub trait Embedder: Send + Sync {
     /// Human-readable model identifier — recorded on completed Embed jobs so
     /// operators can tell which model produced which row.
     fn model_id(&self) -> &str;
+
+    /// Whether a successful call incurs an external provider charge.
+    fn is_paid_provider(&self) -> bool {
+        false
+    }
 }
 
 // ---------- Voyage AI ----------
@@ -71,7 +76,11 @@ impl VoyageEmbedder {
             .timeout(Duration::from_secs(30))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
-        Self { api_key: api_key.into(), model: model.into(), http }
+        Self {
+            api_key: api_key.into(),
+            model: model.into(),
+            http,
+        }
     }
 
     #[must_use]
@@ -80,8 +89,8 @@ impl VoyageEmbedder {
         if key.trim().is_empty() {
             return None;
         }
-        let model = std::env::var(ENV_VOYAGE_MODEL)
-            .unwrap_or_else(|_| VOYAGE_DEFAULT_MODEL.to_string());
+        let model =
+            std::env::var(ENV_VOYAGE_MODEL).unwrap_or_else(|_| VOYAGE_DEFAULT_MODEL.to_string());
         Some(Arc::new(Self::new(key, model)))
     }
 }
@@ -154,6 +163,10 @@ impl Embedder for VoyageEmbedder {
 
     fn model_id(&self) -> &str {
         &self.model
+    }
+
+    fn is_paid_provider(&self) -> bool {
+        true
     }
 }
 
@@ -259,7 +272,10 @@ pub fn default_embedder() -> Arc<dyn Embedder + Send + Sync> {
         tracing::info!(model = v.model_id(), "ai: using Voyage embedder");
         return v;
     }
-    tracing::info!(model = "hash-1024", "ai: using local hash embedder (no VOYAGE_API_KEY)");
+    tracing::info!(
+        model = "hash-1024",
+        "ai: using local hash embedder (no VOYAGE_API_KEY)"
+    );
     Arc::new(HashEmbedder::new())
 }
 
@@ -274,7 +290,10 @@ mod tests {
         let e = HashEmbedder::new();
         let q = e.embed_query("when is the launch").await.unwrap();
         let d = e.embed_one("when is the launch").await.unwrap();
-        assert_eq!(q, d, "HashEmbedder query == document (no asymmetry offline)");
+        assert_eq!(
+            q, d,
+            "HashEmbedder query == document (no asymmetry offline)"
+        );
         assert_eq!(q.len(), EMBED_DIM);
     }
 
@@ -299,7 +318,10 @@ mod tests {
         let e = HashEmbedder::new();
         let v = e.embed_one("hello there friend").await.unwrap();
         let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-        assert!((norm - 1.0).abs() < 1e-5, "vector should be L2-normalized, got norm={norm}");
+        assert!(
+            (norm - 1.0).abs() < 1e-5,
+            "vector should be L2-normalized, got norm={norm}"
+        );
     }
 
     #[tokio::test]
@@ -310,7 +332,10 @@ mod tests {
         // Cosine similarity = dot product since both are unit vectors
         let dot: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
         // Different topics should not be near-identical
-        assert!(dot < 0.9, "expected low similarity for unrelated text, got {dot}");
+        assert!(
+            dot < 0.9,
+            "expected low similarity for unrelated text, got {dot}"
+        );
     }
 
     #[tokio::test]

@@ -248,10 +248,7 @@ mod tests {
 
     #[test]
     fn merge_all_warnings_yields_warning() {
-        let merged = Outcome::merge(&[
-            Outcome::warning(3, "warn1"),
-            Outcome::warning(5, "warn2"),
-        ]);
+        let merged = Outcome::merge(&[Outcome::warning(3, "warn1"), Outcome::warning(5, "warn2")]);
         assert_eq!(merged.severity(), Severity::Warning);
         // Warning does not have is_warning(), check severity directly
         assert!(!merged.is_error());
@@ -284,10 +281,7 @@ mod tests {
 
     #[test]
     fn merge_skip_does_not_change_exit_code_of_error() {
-        let merged = Outcome::merge(&[
-            Outcome::skip("skipped"),
-            Outcome::error("real error"),
-        ]);
+        let merged = Outcome::merge(&[Outcome::skip("skipped"), Outcome::error("real error")]);
         assert!(merged.is_error());
         assert_eq!(merged.exit_code(), 1);
         assert!(merged.message().contains("skipped"));
@@ -345,19 +339,31 @@ mod tests {
             (vec![Severity::Error, Severity::Warning], Severity::Error),
             (vec![Severity::Skip, Severity::Error], Severity::Error),
             (vec![Severity::Error, Severity::Skip], Severity::Error),
-            (vec![Severity::Warning, Severity::Warning], Severity::Warning),
+            (
+                vec![Severity::Warning, Severity::Warning],
+                Severity::Warning,
+            ),
             (vec![Severity::Skip, Severity::Skip], Severity::Skip),
             (vec![Severity::Error, Severity::Error], Severity::Error),
         ];
         for (input, expected) in &cases {
-            let outcomes: Vec<Outcome> = input.iter().map(|s| match s {
-                Severity::Ok => Outcome::ok(""),
-                Severity::Warning => Outcome::warning(1, ""),
-                Severity::Skip => Outcome::skip(""),
-                Severity::Error => Outcome::error(""),
-            }).collect();
+            let outcomes: Vec<Outcome> = input
+                .iter()
+                .map(|s| match s {
+                    Severity::Ok => Outcome::ok(""),
+                    Severity::Warning => Outcome::warning(1, ""),
+                    Severity::Skip => Outcome::skip(""),
+                    Severity::Error => Outcome::error(""),
+                })
+                .collect();
             let merged = Outcome::merge(&outcomes);
-            assert_eq!(merged.severity(), *expected, "merge {:?} should give {:?}", input, expected);
+            assert_eq!(
+                merged.severity(),
+                *expected,
+                "merge {:?} should give {:?}",
+                input,
+                expected
+            );
         }
     }
 
@@ -367,16 +373,29 @@ mod tests {
         use std::time::Duration;
         // Test 100 random duration combinations
         for _ in 0..100 {
-            let n = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() % 10) as usize + 1;
+            let n = (std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+                % 10) as usize
+                + 1;
             let mut total = 0u64;
             let mut outcomes = Vec::new();
             for _ in 0..n {
-                let d = (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() % 1000) as u64;
+                let d = (std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+                    % 1000) as u64;
                 total += d;
                 outcomes.push(Outcome::ok("").with_duration(Duration::from_micros(d)));
             }
             let merged = Outcome::merge(&outcomes);
-            assert_eq!(merged.duration().as_micros() as u64, total, "duration sum mismatch");
+            assert_eq!(
+                merged.duration().as_micros() as u64,
+                total,
+                "duration sum mismatch"
+            );
         }
     }
 
@@ -385,9 +404,13 @@ mod tests {
     fn prop_merge_large_input() {
         let mut outcomes = Vec::with_capacity(1000);
         for i in 0..1000 {
-            outcomes.push(if i % 3 == 0 { Outcome::ok(&i.to_string()) }
-                else if i % 3 == 1 { Outcome::warning(i, &i.to_string()) }
-                else { Outcome::error(&i.to_string()) });
+            outcomes.push(if i % 3 == 0 {
+                Outcome::ok(&i.to_string())
+            } else if i % 3 == 1 {
+                Outcome::warning(i, &i.to_string())
+            } else {
+                Outcome::error(&i.to_string())
+            });
         }
         let merged = Outcome::merge(&outcomes);
         // Should not crash, should have some severity

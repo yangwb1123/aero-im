@@ -46,7 +46,10 @@ const SNIPPET_CHARS: usize = 140;
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/messages/:id/remind", post(remind_about_message))
-        .route("/api/messages/:id/reminders", axum::routing::get(list_reminders))
+        .route(
+            "/api/messages/:id/reminders",
+            axum::routing::get(list_reminders),
+        )
 }
 
 /// First `SNIPPET_CHARS` characters of `text`, truncated on a char boundary so
@@ -94,7 +97,8 @@ async fn remind_about_message(
         .await?
         .ok_or_else(|| AeroError::NotFound(format!("message {mid}")))?;
     // Tenant + room-membership guard before exposing the message's content.
-    s.im.assert_room_access(auth.participant_id, msg.room_id).await?;
+    s.im.assert_room_access(auth.participant_id, msg.room_id)
+        .await?;
 
     let when_raw = req
         .in_
@@ -125,10 +129,17 @@ async fn remind_about_message(
         },
         Block::text(format!("⏰ Reminder about a message: {snip}")),
     ];
+    crate::deferred_blocks::validate(&blocks)?;
 
-    let reminder_id = ScheduledRepo::new(s.pg.clone())
-        .create(msg.room_id, auth.participant_id, &blocks, None, deliver_at)
+    let (reminder_id, canonical_room) = ScheduledRepo::new(s.pg.clone())
+        .create_reminder_authorized(mid, auth.participant_id, &blocks, deliver_at)
         .await?;
+    if canonical_room != msg.room_id {
+        return Err(AeroError::Conflict(
+            "message room identity changed while creating reminder".into(),
+        )
+        .into());
+    }
 
     Ok(Json(serde_json::json!({
         "scheduled": true,
@@ -143,10 +154,10 @@ async fn remind_about_message(
 /// `GET /api/messages/:id/reminders` — the caller's own still-pending reminders in
 /// the message's room (soonest first). Resolves + authorizes the message exactly
 /// like [`remind_about_message`], then reuses
-/// [`ScheduledRepo::list_pending_for_sender`] scoped to that room. Sender-scoped, so
-/// one user never sees another's reminders; the listing is room-wide (it includes
-/// reminders anchored to other messages in the same room, plus plain `/remind`s and
-/// "send later" drafts — there is no per-message filter in the shared scheduler).
+/// [`ScheduledRepo::list_reminders_authorized`] scoped to that message's
+/// canonical room. Sender-scoped, so one user never sees another's reminders;
+/// the listing is room-wide (it includes reminders anchored to other messages
+/// in the same room, plus plain `/remind`s and "send later" drafts).
 async fn list_reminders(
     State(s): State<AppState>,
     auth: AuthUser,
@@ -159,12 +170,15 @@ async fn list_reminders(
         .get(mid)
         .await?
         .ok_or_else(|| AeroError::NotFound(format!("message {mid}")))?;
-    s.im.assert_room_access(auth.participant_id, msg.room_id).await?;
+    s.im.assert_room_access(auth.participant_id, msg.room_id)
+        .await?;
 
     let pending = ScheduledRepo::new(s.pg.clone())
-        .list_pending_for_sender(auth.participant_id, Some(msg.room_id))
+        .list_reminders_authorized(mid, auth.participant_id)
         .await?;
-    Ok(Json(serde_json::to_value(pending).map_err(AeroError::from)?))
+    Ok(Json(
+        serde_json::to_value(pending).map_err(AeroError::from)?,
+    ))
 }
 
 #[cfg(test)]

@@ -22,11 +22,14 @@
 //! [`record_autoreply`]: OutOfOfficeRepo::record_autoreply
 
 use aero_common::{MessageEnvelope, RoomEvent};
-use aero_storage::{DmRepo, OutOfOfficeRepo};
-use futures::StreamExt;
+use aero_storage::{ConsumerEventReceiptRepo, DmRepo, OutOfOfficeRepo};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use crate::state::AppState;
+use crate::{
+    state::AppState,
+    task_shutdown::{self, NextOrCancelled},
+};
 
 /// Run the out-of-office listener until the bus stream ends. Mirrors
 /// [`crate::unfurl_bot::run`]'s signature so the server binary spawns it the same
@@ -35,29 +38,58 @@ use crate::state::AppState;
 /// # Errors
 /// Returns an error if subscribing to the event bus fails.
 pub async fn run(state: AppState) -> anyhow::Result<()> {
+    run_until_cancelled(state, CancellationToken::new()).await
+}
+
+/// Run until `cancel` is triggered, finishing and ACKing any event already
+/// received before returning.
+pub async fn run_until_cancelled(state: AppState, cancel: CancellationToken) -> anyhow::Result<()> {
     let bus = state.bus.clone();
+    let receipts = ConsumerEventReceiptRepo::new(state.pg.clone());
     // Resubscribe across NATS reconnects (mirrors `ws::run_bus_listener`); durable
     // consumer "aero-ooo" resumes from its cursor, every message is acked.
     loop {
-        let mut stream = match bus.subscribe("im.room.*", Some("aero-ooo")).await {
-            Ok(s) => s,
-            Err(e) => {
+        let subscribed =
+            task_shutdown::subscribe_or_cancelled(&bus, "im.room.*", Some("aero-ooo"), &cancel)
+                .await;
+        let mut stream = match subscribed {
+            None => return Ok(()),
+            Some(Ok(s)) => s,
+            Some(Err(e)) => {
                 warn!(error = %e, "ooo_bot subscribe failed; retrying");
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                if task_shutdown::delay_or_cancelled(std::time::Duration::from_secs(1), &cancel)
+                    .await
+                {
+                    return Ok(());
+                }
                 continue;
             }
         };
         info!("ooo_bot listener started");
-        while let Some(sub) = stream.next().await {
-            if let Ok(RoomEvent::Message(env)) = serde_json::from_slice::<RoomEvent>(sub.payload()) {
-                if let Err(e) = handle(&state, env).await {
-                    warn!(error = ?e, "ooo_bot handle failed");
-                }
-            }
-            let _ = sub.ack().await;
+        loop {
+            let sub = match task_shutdown::next_or_cancelled(&mut stream, &cancel).await {
+                NextOrCancelled::Item(sub) => sub,
+                NextOrCancelled::Ended => break,
+                NextOrCancelled::Cancelled => return Ok(()),
+            };
+            let event = serde_json::from_slice::<RoomEvent>(sub.payload());
+            let handler_state = &state;
+            let _ =
+                crate::consumer_event_receipt::process(&receipts, "aero-ooo", sub, || async move {
+                    match event {
+                        Ok(RoomEvent::Message(env)) => handle(handler_state, env).await,
+                        Ok(_) | Err(_) => Ok(()),
+                    }
+                })
+                .await;
+        }
+        if cancel.is_cancelled() {
+            return Ok(());
         }
         warn!("ooo_bot subscription stream ended; resubscribing");
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        if task_shutdown::delay_or_cancelled(std::time::Duration::from_secs(1), &cancel).await {
+            return Ok(());
+        }
     }
 }
 

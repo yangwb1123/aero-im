@@ -10,20 +10,32 @@
 //!
 //! 2. **Users** ([`scim_users`]): a workspace-scoped SCIM identity layered over a
 //!    GLOBAL [`participant`](crate::ParticipantRepo). A SCIM "User" is a
-//!    `participant` + a [`workspace_member`](crate::WorkspaceRepo) of the token's
-//!    workspace + a `scim_users` row carrying `userName` / `externalId` / `active`.
-//!    De-provisioning marks the row inactive **and** removes the workspace
-//!    membership, but never deletes the global participant (they may belong to
-//!    other tenants).
+//!    `participant` + a `scim_users` row carrying `userName` / `externalId` /
+//!    `active`. PATCH `active=false` installs a reversible workspace access fence
+//!    while retaining membership/room topology; DELETE performs final tenant
+//!    deprovisioning and removes those edges. Neither flow deletes the global
+//!    participant because it may belong to other tenants. Aggregate mutations
+//!    are transactional.
 //!
-//! Purely additive: a NEW [`ScimRepo`]; no existing repo is touched. Token
-//! hashing is a pure free function ([`hash_token`]) so it unit-tests offline,
-//! mirroring how the rest of `aero-storage` keeps testable logic separate from
-//! live SQL (Postgres is absent in CI).
+//! Token hashing is a pure free function ([`hash_token`]) so it unit-tests
+//! offline, mirroring how the rest of `aero-storage` keeps testable logic
+//! separate from live SQL.
 
-use aero_common::{ParticipantId, ScimTokenId, WorkspaceId};
-use sha2::{Digest, Sha256};
+use aero_common::{ParticipantId, WorkspaceId};
 use sqlx::PgPool;
+
+use crate::{
+    audit::AuditRepo,
+    sso::{resolve_external_identity_in_tx, SsoResolveError},
+};
+
+mod identity;
+pub use identity::ScimUserUpdate;
+use identity::{bind_existing_participant_identity_in_tx, validated_identity_binding};
+mod tokens;
+pub use tokens::{
+    generate_token, hash_token, ScimTokenRecord, ScimTokenWriteError, MAX_SCIM_TOKENS_PER_WORKSPACE,
+};
 
 /// One provisioned SCIM user row (the workspace-scoped identity over a global
 /// participant). The handler maps this into the RFC 7643 `User` resource.
@@ -38,39 +50,37 @@ pub struct ScimUserRow {
     pub updated_at: time::OffsetDateTime,
 }
 
-/// Generate a high-entropy SCIM bearer secret (256-bit, hex), prefixed `scim_`
-/// so it is recognizable in logs/config. The plaintext is returned to the caller
-/// exactly once at mint time; only its [`hash_token`] is persisted. Lives here
-/// (next to the hash) so the server crate needs no `rand` dependency.
-#[must_use]
-pub fn generate_token() -> String {
-    use rand::RngCore;
-    let mut bytes = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
-    let mut hex = String::with_capacity(bytes.len() * 2 + 5);
-    hex.push_str("scim_");
-    for byte in bytes {
-        use std::fmt::Write as _;
-        let _ = write!(hex, "{byte:02x}");
-    }
-    hex
-}
-
-/// Hash a SCIM bearer token for storage / lookup.
-///
-/// SHA-256 hex. A SCIM token is a long random secret (not a low-entropy
-/// password), so a fast cryptographic digest is the right primitive: it makes
-/// the stored value useless if the table leaks, while keeping the per-request
-/// resolve a single indexed lookup. Pure, so it is unit-tested without a DB.
-#[must_use]
-pub fn hash_token(token: &str) -> String {
-    let digest = Sha256::digest(token.as_bytes());
-    let mut s = String::with_capacity(digest.len() * 2);
-    for byte in digest {
-        use std::fmt::Write as _;
-        let _ = write!(s, "{byte:02x}");
-    }
-    s
+/// Expected aggregate-write failures for a SCIM User.
+#[derive(Debug, thiserror::Error)]
+pub enum ScimUserWriteError {
+    /// Deprovisioning the current workspace owner would strand owner-only
+    /// governance operations. Ownership must be transferred first.
+    #[error("workspace ownership must be transferred before deprovisioning this user")]
+    OwnerDeprovision,
+    /// A workspace-scoped removal would strand a channel owned by this user.
+    #[error("channel ownership must be transferred before deprovisioning this user")]
+    ChannelOwnerDeprovision,
+    /// The stable `IdP` identity was explicitly erased and cannot be recreated by
+    /// an ordinary SCIM retry.
+    #[error("external identity is tombstoned")]
+    IdentityTombstoned,
+    /// Identity-aware SCIM requires the `IdP`'s stable subject in `externalId`.
+    #[error("externalId is required when a SCIM identity issuer is configured")]
+    IdentitySubjectRequired,
+    /// Issuers are protocol identifiers and must be stored exactly as emitted;
+    /// silently trimming a slash would create a second identity namespace.
+    #[error("SCIM identity issuer is invalid")]
+    InvalidIdentityIssuer,
+    /// The stable subject of an identity-bound SCIM user cannot be changed by a
+    /// routine profile PATCH. Rebinding requires a dedicated audited workflow.
+    #[error("externalId is immutable for an identity-bound SCIM user")]
+    IdentitySubjectImmutable,
+    /// The requested issuer/subject is already owned by a different immutable
+    /// participant. Routine SCIM updates never merge or re-point accounts.
+    #[error("external identity is linked to another participant")]
+    IdentityConflict,
+    #[error(transparent)]
+    Storage(#[from] sqlx::Error),
 }
 
 /// Largest page a `list_users` call will return, regardless of requested count.
@@ -108,92 +118,117 @@ impl ScimRepo {
         Self { pool }
     }
 
-    // ----------------------------------------------------------- tokens
-
-    /// Mint a SCIM token for a workspace, storing only its hash. `token_hash`
-    /// must already be [`hash_token`]ed by the caller (the route hashes the
-    /// freshly-generated plaintext and returns the plaintext exactly once).
-    /// Returns the new token's id.
-    pub async fn create_token(
-        &self,
-        workspace: WorkspaceId,
-        token_hash: &str,
-        label: Option<&str>,
-    ) -> Result<ScimTokenId, sqlx::Error> {
-        let id = ScimTokenId::new();
-        sqlx::query(
-            r"INSERT INTO scim_tokens (id, workspace_id, token_hash, label, created_at)
-               VALUES ($1, $2, $3, $4, now())",
-        )
-        .bind(id.to_uuid())
-        .bind(workspace.to_uuid())
-        .bind(token_hash)
-        .bind(label)
-        .execute(&self.pool)
-        .await?;
-        Ok(id)
-    }
-
-    /// Resolve an incoming token hash to its workspace — the SCIM auth check.
-    /// Returns `None` for an unknown OR revoked token (active-only).
-    pub async fn workspace_for_token_hash(
-        &self,
-        token_hash: &str,
-    ) -> Result<Option<WorkspaceId>, sqlx::Error> {
-        let row = sqlx::query_as::<_, (uuid::Uuid,)>(
-            r"SELECT workspace_id FROM scim_tokens
-               WHERE token_hash = $1 AND revoked_at IS NULL",
-        )
-        .bind(token_hash)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row.map(|(w,)| WorkspaceId::from_uuid(w)))
-    }
-
-    /// Revoke a token (idempotent — a no-op if already revoked / absent).
-    /// Returns `true` if a still-active row was revoked by this call.
-    pub async fn revoke_token(&self, id: ScimTokenId) -> Result<bool, sqlx::Error> {
-        let result = sqlx::query(
-            r"UPDATE scim_tokens SET revoked_at = now()
-               WHERE id = $1 AND revoked_at IS NULL",
-        )
-        .bind(id.to_uuid())
-        .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected() > 0)
-    }
-
-    /// The workspace a token id belongs to (regardless of revocation), so the
-    /// management route can authorize a revoke against the caller's workspace.
-    pub async fn token_workspace(
-        &self,
-        id: ScimTokenId,
-    ) -> Result<Option<WorkspaceId>, sqlx::Error> {
-        let row = sqlx::query_as::<_, (uuid::Uuid,)>(
-            r"SELECT workspace_id FROM scim_tokens WHERE id = $1",
-        )
-        .bind(id.to_uuid())
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row.map(|(w,)| WorkspaceId::from_uuid(w)))
-    }
-
     // ------------------------------------------------------------ users
 
-    /// Create the SCIM-user mapping row for an already-created participant. The
-    /// caller is responsible for creating the participant + workspace membership;
-    /// this records the workspace-scoped SCIM identity. A duplicate `userName`
-    /// within the workspace violates the unique index and surfaces as a
-    /// `sqlx::Error` the route maps to `409 Conflict`.
-    pub async fn create_user(
+    /// Provision the complete SCIM user aggregate atomically.
+    ///
+    /// The participant identity, optional active workspace membership, and
+    /// workspace-scoped SCIM mapping either all commit or all roll back. This is
+    /// the route-facing create path: in particular, a concurrent `userName`
+    /// collision cannot leave behind a credential-less participant or workspace
+    /// member.
+    pub async fn provision_user(
         &self,
         workspace: WorkspaceId,
-        participant: ParticipantId,
+        display_name: &str,
         user_name: &str,
         external_id: Option<&str>,
         active: bool,
     ) -> Result<ScimUserRow, sqlx::Error> {
+        match self
+            .provision_user_with_identity(
+                workspace,
+                display_name,
+                user_name,
+                external_id,
+                active,
+                None,
+            )
+            .await
+        {
+            Ok(row) => Ok(row),
+            Err(ScimUserWriteError::Storage(error)) => Err(error),
+            Err(error) => Err(sqlx::Error::Protocol(error.to_string())),
+        }
+    }
+
+    /// Provision a SCIM user and, when `identity_issuer` plus `external_id` are
+    /// present, atomically bind/reuse the same canonical participant used by
+    /// OIDC. This prevents SCIM pre-provisioning followed by first login from
+    /// producing two Aero accounts for one Snaplink subject.
+    pub async fn provision_user_with_identity(
+        &self,
+        workspace: WorkspaceId,
+        display_name: &str,
+        user_name: &str,
+        external_id: Option<&str>,
+        active: bool,
+        identity_issuer: Option<&str>,
+    ) -> Result<ScimUserRow, ScimUserWriteError> {
         let now = time::OffsetDateTime::now_utc();
+        let identity_binding = validated_identity_binding(identity_issuer, external_id)?;
+
+        let mut tx = self.pool.begin().await?;
+        // Account erasure enters the cross-workspace governance fence before
+        // acquiring external-identity and participant locks. Keep the same
+        // order here: workspace → identity → participant. Taking the identity
+        // advisory lock first would deadlock with a concurrent GDPR erasure
+        // that already owns this workspace row.
+        if !lock_scim_workspace(&mut tx, workspace).await? {
+            return Err(ScimUserWriteError::Storage(sqlx::Error::RowNotFound));
+        }
+        let participant = if let Some((issuer, subject)) = identity_binding {
+            match resolve_external_identity_in_tx(&mut tx, issuer, subject, display_name, None)
+                .await
+            {
+                Ok(resolved) => resolved.participant_id,
+                Err(SsoResolveError::InvalidIdentity) => {
+                    return Err(ScimUserWriteError::IdentitySubjectRequired)
+                }
+                Err(SsoResolveError::Tombstoned) => {
+                    return Err(ScimUserWriteError::IdentityTombstoned)
+                }
+                Err(SsoResolveError::Storage(error)) => {
+                    return Err(ScimUserWriteError::Storage(error))
+                }
+            }
+        } else {
+            let participant = ParticipantId::new();
+            sqlx::query(
+                r"INSERT INTO participants
+                     (id, kind, display_name, avatar_url, created_by, created_at)
+                   VALUES ($1, 'human', $2, NULL, NULL, $3)",
+            )
+            .bind(participant.to_uuid())
+            .bind(display_name)
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+            participant
+        };
+
+        // SCIM is authoritative for the current display label even when the
+        // identity was first seen through OIDC.
+        sqlx::query("UPDATE participants SET display_name = $2 WHERE id = $1")
+            .bind(participant.to_uuid())
+            .bind(display_name)
+            .execute(&mut *tx)
+            .await?;
+
+        // Keep the topology for reversible suspension. Effective access is
+        // denied by workspace_deactivations when `active=false`.
+        sqlx::query(
+            r"INSERT INTO workspace_members
+                 (workspace_id, participant_id, role, joined_at)
+               VALUES ($1, $2, 'member', $3)
+               ON CONFLICT (workspace_id, participant_id) DO NOTHING",
+        )
+        .bind(workspace.to_uuid())
+        .bind(participant.to_uuid())
+        .bind(now)
+        .execute(&mut *tx)
+        .await?;
+
         sqlx::query(
             r"INSERT INTO scim_users
                  (workspace_id, participant_id, user_name, external_id, active, created_at, updated_at)
@@ -205,8 +240,55 @@ impl ScimRepo {
         .bind(external_id)
         .bind(active)
         .bind(now)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+
+        if active {
+            // SCIM is authoritative for this workspace-scoped lifecycle. An
+            // identity may already be a manually deactivated member before it
+            // is first materialized as a SCIM resource; reporting `active=true`
+            // while retaining that access fence would create contradictory
+            // control-plane and authorization state.
+            sqlx::query(
+                r"DELETE FROM workspace_deactivations
+                   WHERE workspace_id = $1 AND participant_id = $2",
+            )
+            .bind(workspace.to_uuid())
+            .bind(participant.to_uuid())
+            .execute(&mut *tx)
+            .await?;
+        } else {
+            // The default workspace promotes its first effective member to
+            // owner inside the membership INSERT trigger. Existing external
+            // identities may also already own the target workspace. Detect
+            // either case explicitly so callers receive the stable domain
+            // conflict and every earlier aggregate write rolls back.
+            assert_not_workspace_owner(&mut tx, workspace, participant).await?;
+            sqlx::query(
+                r"INSERT INTO workspace_deactivations
+                      (workspace_id, participant_id, deactivated_by)
+                   VALUES ($1, $2, NULL)
+                   ON CONFLICT (workspace_id, participant_id) DO NOTHING",
+            )
+            .bind(workspace.to_uuid())
+            .bind(participant.to_uuid())
+            .execute(&mut *tx)
+            .await
+            .map_err(map_user_storage_error)?;
+        }
+
+        let target = participant.to_string();
+        AuditRepo::append_in_tx(
+            &mut tx,
+            workspace,
+            None,
+            "scim.user.provision",
+            Some(&target),
+            serde_json::json!({ "active": active, "identity_linked": identity_binding.is_some() }),
+        )
+        .await?;
+
+        tx.commit().await?;
         Ok(ScimUserRow {
             workspace_id: workspace,
             participant_id: participant,
@@ -305,34 +387,138 @@ impl ScimRepo {
         workspace: WorkspaceId,
         participant: ParticipantId,
         active: bool,
-    ) -> Result<Option<ScimUserRow>, sqlx::Error> {
-        let row = sqlx::query_as::<_, ScimUserSqlRow>(
-            r"UPDATE scim_users
-                 SET active = $3, updated_at = now()
-               WHERE workspace_id = $1 AND participant_id = $2
-            RETURNING workspace_id, participant_id, user_name, external_id, active, created_at, updated_at",
-        )
-        .bind(workspace.to_uuid())
-        .bind(participant.to_uuid())
-        .bind(active)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row.map(ScimUserRow::from))
+    ) -> Result<Option<ScimUserRow>, ScimUserWriteError> {
+        self.update_user_atomic(workspace, participant, None, None, Some(active), None)
+            .await
     }
 
-    /// Patch a SCIM user's `userName`, `external_id`, and/or `active`. A `None`
-    /// argument leaves that field unchanged (the inner `Option` of `external_id`
-    /// distinguishes "set to null" from "leave alone"). Returns the updated row,
-    /// or `None` if no such SCIM user exists. A `userName` collision surfaces as
-    /// a `sqlx::Error` (the unique index) the route maps to `409`.
-    pub async fn update_user(
+    /// Atomically patch without interpreting a legacy `external_id` as a login
+    /// identity. Identity-aware HTTP paths should call
+    /// [`Self::update_user_atomic_with_identity`] with their configured issuer.
+    pub async fn update_user_atomic(
         &self,
         workspace: WorkspaceId,
         participant: ParticipantId,
         user_name: Option<&str>,
         external_id: Option<Option<&str>>,
         active: Option<bool>,
-    ) -> Result<Option<ScimUserRow>, sqlx::Error> {
+        display_name: Option<&str>,
+    ) -> Result<Option<ScimUserRow>, ScimUserWriteError> {
+        self.update_user_atomic_with_identity(
+            workspace,
+            participant,
+            ScimUserUpdate {
+                user_name,
+                external_id,
+                active,
+                display_name,
+                identity_issuer: None,
+            },
+        )
+        .await
+    }
+
+    /// Atomically patch a SCIM user's mapping, global display name, active
+    /// workspace access, and configured external-login binding.
+    ///
+    /// The workspace row serializes SCIM aggregate mutations. Its stable
+    /// pre-read lets identity-aware updates acquire the external-identity lock
+    /// before the participant row (workspace → identity → participant), matching
+    /// OIDC JIT, identity migration, and account erasure. Routine PUT/PATCH may
+    /// bind a legacy row's existing `external_id`, but may never use that upgrade
+    /// to replace the subject, merge participants, or revive a tombstone.
+    pub async fn update_user_atomic_with_identity(
+        &self,
+        workspace: WorkspaceId,
+        participant: ParticipantId,
+        update: ScimUserUpdate<'_>,
+    ) -> Result<Option<ScimUserRow>, ScimUserWriteError> {
+        let ScimUserUpdate {
+            user_name,
+            external_id,
+            active,
+            display_name,
+            identity_issuer,
+        } = update;
+        let mut tx = self.pool.begin().await?;
+        if active == Some(false) {
+            crate::ownership::lock_membership_governance(&mut tx).await?;
+        }
+        if !lock_scim_workspace(&mut tx, workspace).await? {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+        // Do not lock the SCIM row ahead of its identity: identity migration
+        // takes identity locks before updating SCIM rows. The workspace lock is
+        // the aggregate serialization fence that keeps this pre-read stable.
+        let previous = sqlx::query_as::<_, (bool, Option<String>)>(
+            r"SELECT active, external_id
+                FROM scim_users
+               WHERE workspace_id = $1 AND participant_id = $2",
+        )
+        .bind(workspace.to_uuid())
+        .bind(participant.to_uuid())
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some((previous_active, previous_external_id)) = previous else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+
+        let identity_linked = if let Some(issuer) = identity_issuer {
+            let (issuer, subject) =
+                validated_identity_binding(Some(issuer), previous_external_id.as_deref())?
+                    .expect("configured issuer produces a binding");
+            // Even an unbound legacy subject is immutable at this boundary.
+            // Allowing PUT/PATCH to choose a different value would silently add
+            // a second login alias instead of performing an audited migration.
+            if external_id.is_some() && external_id.flatten() != previous_external_id.as_deref() {
+                return Err(ScimUserWriteError::IdentitySubjectImmutable);
+            }
+            bind_existing_participant_identity_in_tx(&mut tx, issuer, subject, participant).await?
+        } else {
+            false
+        };
+
+        let participant_active = sqlx::query_scalar::<_, bool>(
+            r"SELECT deleted_at IS NULL
+                FROM participants
+               WHERE id = $1
+               FOR UPDATE",
+        )
+        .bind(participant.to_uuid())
+        .fetch_optional(&mut *tx)
+        .await?
+        .unwrap_or(false);
+        if !participant_active {
+            tx.rollback().await?;
+            return Ok(None);
+        }
+
+        if identity_issuer.is_none() {
+            let identity_bound = sqlx::query_scalar::<_, bool>(
+                r"SELECT EXISTS (
+                       SELECT 1
+                         FROM sso_identities
+                        WHERE participant_id = $1 AND subject = $2
+                   )",
+            )
+            .bind(participant.to_uuid())
+            .bind(previous_external_id.as_deref())
+            .fetch_one(&mut *tx)
+            .await?;
+            if identity_bound
+                && external_id.is_some()
+                && external_id.flatten() != previous_external_id.as_deref()
+            {
+                return Err(ScimUserWriteError::IdentitySubjectImmutable);
+            }
+        }
+
+        if active == Some(false) {
+            assert_not_workspace_owner(&mut tx, workspace, participant).await?;
+        }
+
         let row = sqlx::query_as::<_, ScimUserSqlRow>(
             r"UPDATE scim_users SET
                  user_name   = COALESCE($3, user_name),
@@ -348,37 +534,153 @@ impl ScimRepo {
         .bind(external_id.is_some())
         .bind(external_id.flatten())
         .bind(active)
-        .fetch_optional(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
-        Ok(row.map(ScimUserRow::from))
+
+        if let Some(display_name) = display_name {
+            sqlx::query("UPDATE participants SET display_name = $2 WHERE id = $1")
+                .bind(participant.to_uuid())
+                .bind(display_name)
+                .execute(&mut *tx)
+                .await?;
+        }
+
+        if let Some(active) = active {
+            if active {
+                // Repair legacy inactive SCIM rows that predate reversible
+                // suspension, then remove the effective-access fence.
+                sqlx::query(
+                    r"INSERT INTO workspace_members
+                         (workspace_id, participant_id, role, joined_at)
+                       VALUES ($1, $2, 'member', now())
+                       ON CONFLICT (workspace_id, participant_id) DO NOTHING",
+                )
+                .bind(workspace.to_uuid())
+                .bind(participant.to_uuid())
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query(
+                    r"DELETE FROM workspace_deactivations
+                       WHERE workspace_id = $1 AND participant_id = $2",
+                )
+                .bind(workspace.to_uuid())
+                .bind(participant.to_uuid())
+                .execute(&mut *tx)
+                .await?;
+            } else {
+                // Suspension is reversible: preserve all membership and private
+                // room topology, but install the canonical effective-access
+                // fence used by every room/workspace authorization path.
+                sqlx::query(
+                    r"INSERT INTO workspace_members
+                         (workspace_id, participant_id, role, joined_at)
+                       VALUES ($1, $2, 'member', now())
+                       ON CONFLICT (workspace_id, participant_id) DO NOTHING",
+                )
+                .bind(workspace.to_uuid())
+                .bind(participant.to_uuid())
+                .execute(&mut *tx)
+                .await?;
+                sqlx::query(
+                    r"INSERT INTO workspace_deactivations
+                          (workspace_id, participant_id, deactivated_by)
+                       VALUES ($1, $2, NULL)
+                       ON CONFLICT (workspace_id, participant_id) DO NOTHING",
+                )
+                .bind(workspace.to_uuid())
+                .bind(participant.to_uuid())
+                .execute(&mut *tx)
+                .await
+                .map_err(map_user_storage_error)?;
+            }
+        }
+
+        let target = participant.to_string();
+        let lifecycle_changed = active.is_some_and(|value| value != previous_active);
+        AuditRepo::append_in_tx(
+            &mut tx,
+            workspace,
+            None,
+            if lifecycle_changed {
+                if active == Some(true) {
+                    "scim.user.reactivate"
+                } else {
+                    "scim.user.suspend"
+                }
+            } else {
+                "scim.user.update"
+            },
+            Some(&target),
+            serde_json::json!({
+                "active": row.active,
+                "user_name_changed": user_name.is_some(),
+                "external_id_changed": external_id.is_some(),
+                "display_name_changed": display_name.is_some(),
+                "identity_linked": identity_linked,
+            }),
+        )
+        .await?;
+
+        tx.commit().await?;
+        Ok(Some(ScimUserRow::from(row)))
     }
 
-    /// De-provision a SCIM user: mark the SCIM row inactive AND remove the
-    /// workspace membership, atomically. The global `participant` is **never**
-    /// deleted (they may belong to other tenants). Returns `true` if a SCIM row
-    /// existed and was deactivated.
-    ///
-    /// The SCIM row is kept (not deleted) so the `IdP` can still GET the user by
-    /// the same id and observe `active: false`, and later re-activate them.
+    /// Delete a workspace-scoped SCIM resource and revoke all of its workspace
+    /// and room membership edges atomically. The global participant is retained.
+    /// An id with no SCIM mapping in this workspace returns `false` and cannot
+    /// revoke an ordinary member's access.
     pub async fn delete_user(
         &self,
         workspace: WorkspaceId,
         participant: ParticipantId,
-    ) -> Result<bool, sqlx::Error> {
+    ) -> Result<bool, ScimUserWriteError> {
         let mut tx = self.pool.begin().await?;
+        crate::ownership::lock_membership_governance(&mut tx).await?;
+        if !lock_scim_workspace(&mut tx, workspace).await? {
+            tx.rollback().await?;
+            return Ok(false);
+        }
 
         // RFC 7644 §3.6: DELETE removes the resource — a subsequent GET must 404.
         // So the SCIM mapping row is deleted (distinct from PATCH `active=false`,
         // which keeps the row and is still retrievable). The GLOBAL participant
         // identity is retained — only this workspace's SCIM provisioning + access
         // is revoked.
-        let result = sqlx::query(
-            r"DELETE FROM scim_users WHERE workspace_id = $1 AND participant_id = $2",
+        let exists = sqlx::query_scalar::<_, bool>(
+            r"SELECT true
+                FROM scim_users
+               WHERE workspace_id = $1 AND participant_id = $2
+               FOR UPDATE",
+        )
+        .bind(workspace.to_uuid())
+        .bind(participant.to_uuid())
+        .fetch_optional(&mut *tx)
+        .await?
+        .is_some();
+        if !exists {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        assert_not_workspace_owner(&mut tx, workspace, participant).await?;
+        sqlx::query(r"DELETE FROM scim_users WHERE workspace_id = $1 AND participant_id = $2")
+            .bind(workspace.to_uuid())
+            .bind(participant.to_uuid())
+            .execute(&mut *tx)
+            .await?;
+
+        // Match WorkspaceRepo::remove_member semantics: deprovisioning must not
+        // leave dormant private-room edges that spring back to life if the IdP
+        // later provisions the identity again.
+        sqlx::query(
+            r"DELETE FROM room_members
+               WHERE participant_id = $2
+                 AND room_id IN (SELECT id FROM rooms WHERE workspace_id = $1)",
         )
         .bind(workspace.to_uuid())
         .bind(participant.to_uuid())
         .execute(&mut *tx)
-        .await?;
+        .await
+        .map_err(map_user_storage_error)?;
 
         // Remove the workspace membership (the actual access revocation). No-op
         // if they were not a member; the participant identity is untouched.
@@ -389,11 +691,65 @@ impl ScimRepo {
         .bind(workspace.to_uuid())
         .bind(participant.to_uuid())
         .execute(&mut *tx)
+        .await
+        .map_err(map_user_storage_error)?;
+
+        let target = participant.to_string();
+        AuditRepo::append_in_tx(
+            &mut tx,
+            workspace,
+            None,
+            "scim.user.deprovision",
+            Some(&target),
+            serde_json::json!({}),
+        )
         .await?;
 
         tx.commit().await?;
-        Ok(result.rows_affected() > 0)
+        Ok(true)
     }
+}
+
+fn map_user_storage_error(error: sqlx::Error) -> ScimUserWriteError {
+    if crate::is_channel_effective_owner_violation(&error) {
+        ScimUserWriteError::ChannelOwnerDeprovision
+    } else {
+        ScimUserWriteError::Storage(error)
+    }
+}
+
+async fn lock_scim_workspace(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    workspace: WorkspaceId,
+) -> Result<bool, sqlx::Error> {
+    Ok(
+        sqlx::query_scalar::<_, bool>("SELECT true FROM workspaces WHERE id = $1 FOR UPDATE")
+            .bind(workspace.to_uuid())
+            .fetch_optional(&mut **tx)
+            .await?
+            .is_some(),
+    )
+}
+
+async fn assert_not_workspace_owner(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    workspace: WorkspaceId,
+    participant: ParticipantId,
+) -> Result<(), ScimUserWriteError> {
+    let role = sqlx::query_scalar::<_, String>(
+        r"SELECT role
+            FROM workspace_members
+           WHERE workspace_id = $1 AND participant_id = $2
+           FOR UPDATE",
+    )
+    .bind(workspace.to_uuid())
+    .bind(participant.to_uuid())
+    .fetch_optional(&mut **tx)
+    .await?;
+    if role.as_deref() == Some("owner") {
+        return Err(ScimUserWriteError::OwnerDeprovision);
+    }
+    Ok(())
 }
 
 /// sqlx row shape for `scim_users` decoding.
@@ -423,59 +779,7 @@ impl From<ScimUserSqlRow> for ScimUserRow {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn hash_token_is_stable_hex_sha256() {
-        // Known SHA-256 of the empty string and "abc" (FIPS 180-4 examples).
-        assert_eq!(
-            hash_token(""),
-            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-        );
-        assert_eq!(
-            hash_token("abc"),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-        );
-        // Hex, 64 chars, deterministic.
-        let h = hash_token("a-scim-secret");
-        assert_eq!(h.len(), 64);
-        assert!(h.bytes().all(|b| b.is_ascii_hexdigit()));
-        assert_eq!(h, hash_token("a-scim-secret"));
-        assert_ne!(h, hash_token("a-scim-secre")); // sensitive to input
-    }
-
-    #[test]
-    fn generate_token_is_prefixed_high_entropy_and_hashable() {
-        let a = generate_token();
-        let b = generate_token();
-        assert!(a.starts_with("scim_"));
-        assert_eq!(a.len(), "scim_".len() + 64, "256-bit hex secret");
-        assert_ne!(a, b, "two mints differ");
-        // The generated secret hashes to a stable 64-char hex digest.
-        assert_eq!(hash_token(&a).len(), 64);
-    }
-
-    #[test]
-    fn clamp_count_defaults_and_bounds() {
-        assert_eq!(clamp_count(None), MAX_PAGE);
-        assert_eq!(clamp_count(Some(0)), MAX_PAGE);
-        assert_eq!(clamp_count(Some(-5)), MAX_PAGE);
-        assert_eq!(clamp_count(Some(1)), 1);
-        assert_eq!(clamp_count(Some(50)), 50);
-        assert_eq!(clamp_count(Some(10_000)), MAX_PAGE);
-    }
-
-    #[test]
-    fn start_offset_is_one_based_to_zero_based() {
-        assert_eq!(start_offset(None), 0);
-        assert_eq!(start_offset(Some(0)), 0); // invalid, clamp to first page
-        assert_eq!(start_offset(Some(-3)), 0);
-        assert_eq!(start_offset(Some(1)), 0); // SCIM startIndex is 1-based
-        assert_eq!(start_offset(Some(2)), 1);
-        assert_eq!(start_offset(Some(51)), 50);
-    }
-}
+mod tests;
 
 /// PG-gated integration tests (run with a live Postgres + applied migrations):
 ///
@@ -486,139 +790,11 @@ mod tests {
 ///
 /// They are `#[ignore]` so the default `cargo test` stays hermetic (no DB in CI).
 #[cfg(test)]
-mod db_tests {
-    use super::*;
-    use aero_common::WorkspaceRole;
-    use crate::workspace::WorkspaceRepo;
+#[path = "scim/channel_owner_tests.rs"]
+mod channel_owner_tests;
 
-    fn pool() -> PgPool {
-        let url = std::env::var("DATABASE_URL")
-            .unwrap_or_else(|_| "postgres://aero:aero_dev_pw@localhost:5432/aero".into());
-        sqlx::postgres::PgPoolOptions::new()
-            .max_connections(2)
-            .connect_lazy(&url)
-            .expect("connect_lazy never fails on a well-formed URL")
-    }
+#[cfg(test)]
+mod db_test_support;
 
-    async fn new_participant(p: &PgPool) -> ParticipantId {
-        let id = ParticipantId::new();
-        sqlx::query("INSERT INTO participants (id, kind, display_name) VALUES ($1, 'human', $2)")
-            .bind(id.to_uuid())
-            .bind(format!("scim-user-{id}"))
-            .execute(p)
-            .await
-            .expect("insert participant");
-        id
-    }
-
-    async fn new_workspace(repo: &WorkspaceRepo, owner: ParticipantId) -> WorkspaceId {
-        repo.create("SCIM WS".into(), format!("scim-{}", WorkspaceId::new()), owner)
-            .await
-            .expect("create workspace")
-            .id
-    }
-
-    #[tokio::test]
-    #[ignore = "requires live Postgres"]
-    async fn scim_token_create_resolve_and_revoke() {
-        let p = pool();
-        let scim = ScimRepo::new(p.clone());
-        let ws_repo = WorkspaceRepo::new(p.clone());
-        let owner = new_participant(&p).await;
-        let ws = new_workspace(&ws_repo, owner).await;
-
-        let secret = format!("tok-{}", uuid::Uuid::new_v4());
-        let hash = hash_token(&secret);
-        let id = scim.create_token(ws, &hash, Some("okta")).await.unwrap();
-
-        // The plaintext's hash resolves to the workspace …
-        assert_eq!(scim.workspace_for_token_hash(&hash).await.unwrap(), Some(ws));
-        // … and an unknown hash does not.
-        assert_eq!(scim.workspace_for_token_hash("deadbeef").await.unwrap(), None);
-        assert_eq!(scim.token_workspace(id).await.unwrap(), Some(ws));
-
-        // Revoking takes it out of active resolution.
-        assert!(scim.revoke_token(id).await.unwrap(), "first revoke succeeds");
-        assert_eq!(scim.workspace_for_token_hash(&hash).await.unwrap(), None);
-        assert!(!scim.revoke_token(id).await.unwrap(), "second revoke is a no-op");
-    }
-
-    #[tokio::test]
-    #[ignore = "requires live Postgres"]
-    async fn scim_user_create_list_find_and_deactivate() {
-        let p = pool();
-        let scim = ScimRepo::new(p.clone());
-        let ws_repo = WorkspaceRepo::new(p.clone());
-        let owner = new_participant(&p).await;
-        let ws = new_workspace(&ws_repo, owner).await;
-
-        let participant = new_participant(&p).await;
-        ws_repo.add_member(ws, participant, WorkspaceRole::Member).await.unwrap();
-        let user_name = format!("alice-{participant}@example.com");
-        let created = scim
-            .create_user(ws, participant, &user_name, Some("ext-123"), true)
-            .await
-            .unwrap();
-        assert!(created.active);
-
-        // get + find_by_user_name round-trip.
-        assert_eq!(
-            scim.get_user(ws, participant).await.unwrap().map(|u| u.user_name.clone()),
-            Some(user_name.clone())
-        );
-        let found = scim.find_by_user_name(ws, &user_name).await.unwrap().expect("found");
-        assert_eq!(found.participant_id, participant);
-        assert_eq!(found.external_id.as_deref(), Some("ext-123"));
-
-        // list with the userName filter returns exactly this one, total reflects filter.
-        let (rows, total) = scim
-            .list_users(ws, Some(&user_name), Some(1), Some(50))
-            .await
-            .unwrap();
-        assert_eq!(total, 1, "exactly one matches the filter");
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].participant_id, participant);
-
-        // Deactivate (PATCH active=false): the SCIM row is RETAINED but inactive,
-        // so a subsequent GET still returns it (RFC: an inactive user is valid).
-        let deactivated = scim.set_active(ws, participant, false).await.unwrap().expect("exists");
-        assert!(!deactivated.active, "marked inactive");
-        assert!(
-            scim.get_user(ws, participant).await.unwrap().is_some(),
-            "deactivated row retained for later GET/reactivation"
-        );
-        // …and can be reactivated.
-        let reactivated = scim.set_active(ws, participant, true).await.unwrap().expect("exists");
-        assert!(reactivated.active);
-
-        // Delete (DELETE): the SCIM row is REMOVED (RFC 7644 §3.6 — a later GET
-        // 404s) + membership revoked, but the global participant is retained.
-        assert!(scim.delete_user(ws, participant).await.unwrap(), "row existed");
-        assert!(
-            scim.get_user(ws, participant).await.unwrap().is_none(),
-            "deleted SCIM row is gone (GET would 404)"
-        );
-        assert!(!ws_repo.is_member(ws, participant).await.unwrap(), "membership removed");
-    }
-
-    #[tokio::test]
-    #[ignore = "requires live Postgres"]
-    async fn scim_duplicate_user_name_conflicts() {
-        let p = pool();
-        let scim = ScimRepo::new(p.clone());
-        let ws_repo = WorkspaceRepo::new(p.clone());
-        let owner = new_participant(&p).await;
-        let ws = new_workspace(&ws_repo, owner).await;
-
-        let a = new_participant(&p).await;
-        let b = new_participant(&p).await;
-        let name = format!("dup-{}@example.com", uuid::Uuid::new_v4());
-        scim.create_user(ws, a, &name, None, true).await.unwrap();
-        // A second user with the same userName in the same workspace must fail
-        // (the unique index), which the route maps to 409 Conflict.
-        assert!(
-            scim.create_user(ws, b, &name, None, true).await.is_err(),
-            "duplicate userName within a workspace is rejected"
-        );
-    }
-}
+#[cfg(test)]
+mod db_tests;

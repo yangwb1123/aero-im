@@ -1,17 +1,18 @@
 //! Cross-room (workspace-wide) message search — the global counterpart to the
 //! per-room `POST /api/rooms/:id/search` in [`crate::routes`].
 //!
-//! Searches every room the caller belongs to (Slack-style global search). The
-//! membership scoping is enforced in SQL by
+//! Searches every room the caller may currently access (Slack-style global
+//! search). The authorization scope is enforced in SQL by
 //! [`MessageRepo::search_all_rooms`](aero_storage::MessageRepo::search_all_rooms)
-//! (a `JOIN room_members`), so results can never leak a room the caller isn't in
-//! — there is no post-filter to get wrong. Mounted via [`routes`] and `.merge`d
-//! into the gateway router, mirroring [`crate::collab`].
+//! as the intersection of room/workspace membership, active account state,
+//! workspace deactivation, and mandatory 2FA. Mounted via [`routes`] and
+//! `.merge`d into the gateway router, mirroring [`crate::collab`].
 
 use std::str::FromStr;
 
 use aero_auth::AuthUser;
 use aero_common::{Error as AeroError, WorkspaceId};
+use aero_storage::QueryConsistency;
 use axum::{extract::State, routing::post, Json, Router};
 use serde::Deserialize;
 
@@ -41,7 +42,9 @@ const MAX_SEARCH_LIMIT: i64 = 100;
 /// deterministic, bounded result rather than an unbounded scan or an
 /// accidentally-empty one.
 fn clamp_search_limit(requested: Option<i64>) -> i64 {
-    requested.unwrap_or(DEFAULT_SEARCH_LIMIT).clamp(1, MAX_SEARCH_LIMIT)
+    requested
+        .unwrap_or(DEFAULT_SEARCH_LIMIT)
+        .clamp(1, MAX_SEARCH_LIMIT)
 }
 
 #[derive(Deserialize)]
@@ -57,8 +60,8 @@ struct SearchAllReq {
 }
 
 /// `POST /api/search` — full-text/trigram search across all rooms the caller is
-/// a member of. The repository's `JOIN room_members` is the security boundary;
-/// no room the caller isn't in can appear in the results.
+/// authorized to access. The repository's effective-membership joins are the
+/// security boundary; no stale room edge can surface content.
 async fn search_all(
     State(s): State<AppState>,
     auth: AuthUser,
@@ -69,14 +72,12 @@ async fn search_all(
     }
     let limit = clamp_search_limit(req.limit);
 
-    // ROADMAP 方向四: cross-room search is the heaviest read in the gateway (FTS +
-    // trigram scans with a `JOIN room_members`) and the most replica-friendly —
-    // mild replication lag (a message searchable a few ms late) is acceptable, and
-    // it is NOT a read-your-writes path (unlike `list_since` reconnect backfill,
-    // which must stay on the primary). So route it to the READ pool: the replica
-    // when one is configured, else the primary unchanged (`pg_read == pg`). The
-    // `JOIN room_members` security boundary is identical on either pool.
-    let messages = aero_storage::MessageRepo::new(s.pg_read.clone());
+    // Revocation is security-sensitive: a replica may still carry a removed
+    // workspace membership/deactivation/2FA state. Keep the authorization-bearing
+    // query on the primary. Read replicas are reserved for already-authorized,
+    // staleness-tolerant single-room reads.
+    let messages =
+        aero_storage::MessageRepo::new(s.query_router.repo_pool(QueryConsistency::Strong));
     let hits = match req.workspace_id.as_deref() {
         Some(raw) => {
             let ws = WorkspaceId::from_str(raw.trim())
@@ -116,7 +117,10 @@ mod tests {
     #[test]
     fn search_limit_clamps_to_ceiling() {
         assert_eq!(clamp_search_limit(Some(1_000_000)), MAX_SEARCH_LIMIT);
-        assert_eq!(clamp_search_limit(Some(MAX_SEARCH_LIMIT + 1)), MAX_SEARCH_LIMIT);
+        assert_eq!(
+            clamp_search_limit(Some(MAX_SEARCH_LIMIT + 1)),
+            MAX_SEARCH_LIMIT
+        );
     }
 
     #[test]

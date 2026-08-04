@@ -145,7 +145,11 @@ pub fn verify(secret_b32: &str, code: &str, unix_secs: u64) -> bool {
     // Current step plus ±1; `checked_*` drops out-of-range counters near 0/MAX
     // without a panicking cast. Accumulate with `|` (not `||`) so all candidates
     // are evaluated regardless of an early match.
-    let candidates = [counter.checked_sub(1), Some(counter), counter.checked_add(1)];
+    let candidates = [
+        counter.checked_sub(1),
+        Some(counter),
+        counter.checked_add(1),
+    ];
     let mut matched = false;
     for candidate in candidates.into_iter().flatten() {
         matched |= ct_eq(hotp(&key, candidate).as_bytes(), code.as_bytes());
@@ -189,7 +193,7 @@ mod tests {
     fn verify_accepts_current_and_one_step_skew() {
         let secret = base32_encode(b"12345678901234567890");
         let code = current_code(&secret, 59).expect("valid secret"); // step counter 1
-        // Same step, and one step either side (±30s) all accept the same code.
+                                                                     // Same step, and one step either side (±30s) all accept the same code.
         assert!(verify(&secret, &code, 59), "current step");
         assert!(verify(&secret, &code, 59 + STEP_SECS), "+1 step skew");
         assert!(verify(&secret, &code, 59 - STEP_SECS), "-1 step skew");
@@ -200,7 +204,10 @@ mod tests {
         let secret = base32_encode(b"12345678901234567890");
         let code = current_code(&secret, 59).expect("valid secret");
         // Four steps later (+120s) is outside the ±1-step window.
-        assert!(!verify(&secret, &code, 59 + 120), "far-future step rejected");
+        assert!(
+            !verify(&secret, &code, 59 + 120),
+            "far-future step rejected"
+        );
         // A code that is not the value at any accepted step is rejected.
         let wrong = if code == "000000" { "111111" } else { "000000" };
         assert!(!verify(&secret, wrong, 59), "wrong code rejected");

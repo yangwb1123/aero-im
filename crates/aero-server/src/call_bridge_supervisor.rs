@@ -5,38 +5,35 @@
 //! `join_group_call` resolves a [`CallTopology`]: `BridgeTo(urls)` lists every
 //! *other* node hosting participants, and for **each** such node this node should
 //! pull that node's RTP **once** and fan it into the local SFU — exactly the leg
-//! [`CallBridge`] implements.
+//! [`aero_live_webrtc::CallBridge`] implements.
 //!
 //! This module owns the *lifecycle* of those pulls: a registry of running bridge
 //! tasks keyed by `(call, peer_url)` so that
 //!
-//! - a join yielding `BridgeTo(urls)` spawns one [`CallBridge::run`] task per
+//! - a join yielding `BridgeTo(urls)` spawns one
+//!   [`aero_live_webrtc::CallBridge::run`] task per
 //!   *not-already-bridged* url (idempotent — a re-join with the same census
 //!   never double-spawns),
 //! - the last-local-leave / `end_call` signal cancels and removes every bridge
 //!   task for that call.
 //!
-//! ## What is real vs. the documented seam
+//! ## What is real vs. staging
 //!
-//! Everything here — the registry, spawn-on-`BridgeTo`, idempotent no-double-
-//! spawn, cancel-on-leave — is exercised by the unit tests below against
-//! [`FakeCallUpstream`] / [`LoopbackUpstream`] (no socket, no peer node). The
-//! one thing left to the inter-node transport seam is **how a [`CallUpstream`]
-//! is constructed for a peer url**: the production path performs a `recvonly`
-//! SDP exchange with that node's bridge endpoint and receives RTP over UDP (the
-//! `TODO(real-transport)` on [`CallUpstream`], mirroring `aero-live-whip`'s
-//! `cascade.rs`). The supervisor takes that construction as an injected
-//! [`UpstreamFactory`] trait object, so the *orchestration* is fully built and
-//! tested up to that seam — only the socket-bearing factory is left to wire.
+//! The production [`NodeRtpPullerFactory`] binds the plain-UDP bridge socket,
+//! announces it through the secret-gated subscribe endpoint, decodes framed
+//! RTP, and feeds it into the local forwarder. The matching egress loop frames
+//! local RTP and sends it to current subscribers. Both directions and lifecycle
+//! idempotency are exercised over localhost; a true multi-node deployment with
+//! routable advertised addresses remains a staging check.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use aero_common::CallId;
+use aero_common::{CallId, ParticipantId};
 use aero_live_webrtc::{
-    decode_bridge_frame, encode_bridge_frame, BridgeRtp, CallBridge, CallEgressTap, CallUpstream,
-    MediaForwarder, SfuRouter,
+    encode_bound_bridge_frame_version, encode_bridge_frame, BridgeRtp, CallEgressTap, CallUpstream,
+    MediaForwarder, SfuPeerSink, SfuRouter,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -45,8 +42,25 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
+use crate::sfu_media::{SfuMediaError, SfuMediaRegistry, SfuSessionAnswer};
+
+#[cfg(test)]
+mod egress_tests;
+mod reconcile;
+#[cfg(test)]
+mod reconcile_tests;
+mod sfu;
+mod subscriber_control;
+mod subscribers;
+mod transport;
+#[cfg(test)]
+mod transport_frame_tests;
+pub use subscribers::BridgeSubscriberRegistry;
+pub use transport::NodeRtpPullerFactory;
+
 /// Newtype letting a `Box<dyn CallUpstream>` satisfy the `S: CallUpstream`
-/// generic bound on [`CallBridge`] (a `Box<dyn Trait>` does not auto-implement
+/// generic bound on [`aero_live_webrtc::CallBridge`] (a `Box<dyn Trait>` does
+/// not auto-implement
 /// `Trait`). Pure delegation.
 struct BoxedUpstream(Box<dyn CallUpstream>);
 
@@ -58,14 +72,17 @@ impl CallUpstream for BoxedUpstream {
     fn node_url(&self) -> &str {
         self.0.node_url()
     }
+    fn feedback_sink(&self, participant: ParticipantId) -> Option<Arc<dyn SfuPeerSink>> {
+        self.0.feedback_sink(participant)
+    }
     async fn next_rtp(&mut self) -> Option<BridgeRtp> {
         self.0.next_rtp().await
     }
 }
 
 /// Newtype letting an `Arc<dyn MediaForwarder>` satisfy the `F: MediaForwarder`
-/// generic bound on [`CallBridge`]. Cloning shares the underlying forwarder, so
-/// every bridge fans into the same local SFU forwarder.
+/// generic bound on [`aero_live_webrtc::CallBridge`]. Cloning shares the
+/// underlying forwarder, so every bridge fans into the same local SFU forwarder.
 #[derive(Clone)]
 struct SharedForwarder(Arc<dyn MediaForwarder>);
 
@@ -74,26 +91,51 @@ impl MediaForwarder for SharedForwarder {
     async fn forward_rtp(&self, call: CallId, mid: &str, packet: Bytes) {
         self.0.forward_rtp(call, mid, packet).await;
     }
+
+    async fn forward_bridge_rtp(&self, call: CallId, packet: BridgeRtp) -> usize {
+        self.0.forward_bridge_rtp(call, packet).await
+    }
+
+    fn attach_peer_sink(
+        &self,
+        call: CallId,
+        participant: ParticipantId,
+        sink: Arc<dyn SfuPeerSink>,
+    ) -> bool {
+        self.0.attach_peer_sink(call, participant, sink)
+    }
+
+    fn attach_bridge_peer_sink(
+        &self,
+        call: CallId,
+        participant: ParticipantId,
+        bridge: &str,
+        sink: Arc<dyn SfuPeerSink>,
+    ) -> bool {
+        self.0
+            .attach_bridge_peer_sink(call, participant, bridge, sink)
+    }
+
+    fn detach_bridge_peer_sink(
+        &self,
+        call: CallId,
+        participant: ParticipantId,
+        bridge: &str,
+    ) -> bool {
+        self.0.detach_bridge_peer_sink(call, participant, bridge)
+    }
+
+    fn reset_peer_sink(&self, call: CallId, participant: ParticipantId) -> bool {
+        self.0.reset_peer_sink(call, participant)
+    }
 }
 
 /// Constructs a [`CallUpstream`] that pulls `call`'s remote RTP from the node at
 /// `peer_url`.
 ///
-/// # TODO(real-transport) — documented seam
-///
-/// The production implementation opens a node-to-node RTP puller: resolve the
-/// peer node's bridge endpoint, perform a `recvonly` SDP exchange, complete
-/// ICE/DTLS/SRTP, and yield each received packet attributed to its owning
-/// participant + mid (the seam documented on
-/// [`aero_live_webrtc::CallUpstream`], mirroring `aero-live-whip`'s
-/// `UpstreamSource`). That leg needs a real socket and a second node, so it is
-/// **not unit-testable in this sandbox** — it is left to wire. Returning `None`
-/// (e.g. the peer is unreachable) makes the supervisor skip that bridge for this
-/// join; a later join re-attempts it.
-///
-/// In tests this is a fake that hands back a [`FakeCallUpstream`] /
-/// [`LoopbackUpstream`], proving the supervisor spawns, fans media into the
-/// local [`SfuRouter`], and cancels correctly without any I/O.
+/// Production uses [`NodeRtpPullerFactory`]; tests inject loopback/scripted
+/// factories. Returning `None` (for example when a peer is unreachable) makes
+/// the supervisor skip that bridge, and a later join re-attempts it.
 #[async_trait]
 pub trait UpstreamFactory: Send + Sync {
     /// Build the upstream for `call` pulling from `peer_url`, or `None` when one
@@ -101,201 +143,14 @@ pub trait UpstreamFactory: Send + Sync {
     async fn connect(&self, call: CallId, peer_url: &str) -> Option<Box<dyn CallUpstream>>;
 }
 
-/// The production [`UpstreamFactory`]: the real node-to-node RTP puller.
-///
-/// [`connect`](UpstreamFactory::connect) binds a UDP socket, **announces** its
-/// receive address to the owning node's subscribe endpoint (so that node's
-/// egress starts pushing this call's RTP here), and returns a real
-/// [`UdpRtpUpstream`]. Backend links are trusted, so the media is plain RTP
-/// framed by [`bridge_frame`](aero_live_webrtc::bridge_frame) — DTLS-SRTP is only
-/// on the client leg. The bind → announce → receive → decode → fan-in path is
-/// exercised over localhost (`connect_announces_subscribe_to_the_peer`,
-/// `egress_to_puller_roundtrips_over_localhost`). The remaining staging step is a
-/// real two-node run (a reachable second node + its advertised address); single-
-/// node boot never produces a `BridgeTo`, so this is dormant there.
-#[derive(Clone)]
-pub struct NodeRtpPullerFactory {
-    /// Host other nodes should send this node's bridged RTP to (its reachable
-    /// address; the bound UDP port is appended). From `AERO_BRIDGE_ADVERTISE_HOST`.
-    advertise_host: String,
-    /// Shared cluster secret for the subscribe control call (`Bearer`). `None`
-    /// when unset — the puller still binds and can receive, it just can't announce.
-    secret: Option<String>,
-    /// Reused outbound HTTP client for the subscribe POST.
-    http: reqwest::Client,
-}
-
-impl NodeRtpPullerFactory {
-    /// Build the factory with the address this node advertises to peers and the
-    /// shared cluster secret for the subscribe control call.
-    #[must_use]
-    pub fn new(advertise_host: impl Into<String>, secret: Option<String>) -> Self {
-        Self {
-            advertise_host: advertise_host.into(),
-            secret,
-            http: reqwest::Client::new(),
-        }
-    }
-}
-
-#[async_trait]
-impl UpstreamFactory for NodeRtpPullerFactory {
-    async fn connect(&self, call: CallId, peer_url: &str) -> Option<Box<dyn CallUpstream>> {
-        let up = match UdpRtpUpstream::bind(call, peer_url).await {
-            Ok(up) => up,
-            Err(e) => {
-                debug!(?e, peer_url, "call-bridge: udp puller bind failed; skipping bridge");
-                return None;
-            }
-        };
-        // Announce where to push this call's RTP. Best-effort: a failed announce
-        // just means no media flows yet (a later join re-attempts) — the puller
-        // still binds and can receive.
-        if let Ok(local) = up.local_addr() {
-            let advertised = format!("{}:{}", self.advertise_host, local.port());
-            subscribe_to_peer(&self.http, peer_url, self.secret.as_deref(), call, &advertised).await;
-        }
-        Some(Box::new(up))
-    }
-}
-
-/// Real node-to-node RTP puller over plain UDP (ROADMAP 方向五).
-///
-/// Receives [`bridge_frame`](aero_live_webrtc::bridge_frame)-framed datagrams on
-/// a bound UDP socket — each carrying one remote participant's RTP — and yields
-/// them as [`BridgeRtp`] for the [`CallBridge`] to fan into the local SFU. The
-/// owning node sends frames here (the egress side, addressed via the subscribe
-/// control call that is the documented staging wiring). The receive/decode loop
-/// below is real and unit-tested over localhost.
-struct UdpRtpUpstream {
-    call: CallId,
-    node_url: String,
-    socket: tokio::net::UdpSocket,
-    /// Receive scratch buffer, sized for a jumbo-ish RTP datagram + frame header.
-    buf: Vec<u8>,
-}
-
-impl UdpRtpUpstream {
-    /// Bind an ephemeral UDP socket to receive `call`'s bridged RTP from the node
-    /// at `peer_url`. The bound port is what the peer's egress sends to.
-    async fn bind(call: CallId, peer_url: &str) -> std::io::Result<Self> {
-        let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
-        Ok(Self { call, node_url: peer_url.to_owned(), socket, buf: vec![0u8; 2048] })
-    }
-
-    /// The local address whose port the peer's egress should push frames to.
-    fn local_addr(&self) -> std::io::Result<std::net::SocketAddr> {
-        self.socket.local_addr()
-    }
-}
-
-/// Announce `addr` as where to push `call`'s bridged RTP by POSTing the owning
-/// node's subscribe control endpoint (ROADMAP 方向五). Best-effort: a failed
-/// announce just means no media flows yet (a later join re-attempts); returns
-/// whether the peer accepted the subscription.
-async fn subscribe_to_peer(
-    http: &reqwest::Client,
-    peer_url: &str,
-    secret: Option<&str>,
-    call: CallId,
-    addr: &str,
-) -> bool {
-    let url = format!("{}/api/internal/call-bridge/subscribe", peer_url.trim_end_matches('/'));
-    let mut req = http
-        .post(&url)
-        .json(&serde_json::json!({ "call_id": call.to_string(), "addr": addr }));
-    if let Some(s) = secret {
-        req = req.bearer_auth(s);
-    }
-    match req.send().await {
-        Ok(resp) if resp.status().is_success() => true,
-        Ok(resp) => {
-            debug!(status = %resp.status(), peer_url, "call-bridge: subscribe rejected");
-            false
-        }
-        Err(e) => {
-            debug!(?e, peer_url, "call-bridge: subscribe POST failed");
-            false
-        }
-    }
-}
-
-#[async_trait]
-impl CallUpstream for UdpRtpUpstream {
-    fn call_id(&self) -> CallId {
-        self.call
-    }
-
-    fn node_url(&self) -> &str {
-        &self.node_url
-    }
-
-    async fn next_rtp(&mut self) -> Option<BridgeRtp> {
-        loop {
-            let n = match self.socket.recv(&mut self.buf).await {
-                Ok(n) => n,
-                // Socket closed / fatal error → end of stream; the bridge winds down.
-                Err(e) => {
-                    debug!(?e, node_url = %self.node_url, "call-bridge: udp recv ended");
-                    return None;
-                }
-            };
-            // Drop malformed datagrams and keep receiving — a stray packet must
-            // never tear the bridge down.
-            if let Some(pkt) = decode_bridge_frame(&self.buf[..n]) {
-                return Some(pkt);
-            }
-        }
-    }
-}
-
-/// Registry of pulling-node addresses subscribed to each call's bridged RTP
-/// (ROADMAP 方向五). A puller that connects POSTs its receive address to the
-/// owning node's subscribe control endpoint, which records it here; the call's
-/// [`UdpRtpEgress`] resolves its send targets from this registry per packet, so a
-/// puller that subscribes mid-call starts receiving immediately and one that
-/// leaves stops. Cheap to clone (interior `Arc`).
-#[derive(Clone, Default)]
-pub struct BridgeSubscriberRegistry {
-    inner: Arc<Mutex<HashMap<CallId, std::collections::HashSet<std::net::SocketAddr>>>>,
-}
-
-impl BridgeSubscriberRegistry {
-    /// Register `addr` as a puller for `call` (idempotent).
-    pub fn subscribe(&self, call: CallId, addr: std::net::SocketAddr) {
-        self.inner.lock().entry(call).or_default().insert(addr);
-    }
-
-    /// Remove `addr` from `call`'s pullers; drops the call entry when empty.
-    pub fn unsubscribe(&self, call: CallId, addr: std::net::SocketAddr) {
-        let mut map = self.inner.lock();
-        if let Some(set) = map.get_mut(&call) {
-            set.remove(&addr);
-            if set.is_empty() {
-                map.remove(&call);
-            }
-        }
-    }
-
-    /// The current puller addresses for `call` (empty when none).
-    #[must_use]
-    pub fn subscribers(&self, call: CallId) -> Vec<std::net::SocketAddr> {
-        self.inner
-            .lock()
-            .get(&call)
-            .map(|s| s.iter().copied().collect())
-            .unwrap_or_default()
-    }
-}
-
 /// The send side of the node-to-node bridge (ROADMAP 方向五): the node that OWNS
 /// a call's local publishers relays their RTP to subscribed pulling nodes.
 ///
-/// Taps a [`CallEgressTap`] (every locally-published packet for the call), frames
-/// each via [`encode_bridge_frame`], and pushes it over plain UDP to every
+/// Taps a [`CallEgressTap`] (every locally-published packet for the call), binds
+/// each upgraded puller's frame to its call + generation, and pushes it over UDP
 /// currently-subscribed puller (resolved from a [`BridgeSubscriberRegistry`] per
 /// packet, so subscriptions can change mid-call) — the mirror of
-/// [`UdpRtpUpstream`]. The tap → encode → send loop is real and exercised
+/// [`transport::UdpRtpUpstream`]. The tap → encode → send loop is real and exercised
 /// end-to-end over localhost.
 struct UdpRtpEgress {
     call: CallId,
@@ -307,13 +162,18 @@ impl UdpRtpEgress {
     /// Bind an ephemeral send socket for `call`, resolving targets from `registry`.
     async fn bind(call: CallId, registry: BridgeSubscriberRegistry) -> std::io::Result<Self> {
         let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
-        Ok(Self { call, socket, registry })
+        Ok(Self {
+            call,
+            socket,
+            registry,
+        })
     }
 
     /// Pump every packet from `tap` to the call's current subscribers until the
     /// egress closes (its last local publisher left) or `cancel` fires. A send
     /// error to one subscriber never stops the others or tears the loop down.
     async fn run(self, mut tap: CallEgressTap, cancel: CancellationToken) {
+        let mut announced_targets = HashSet::new();
         loop {
             let pkt = tokio::select! {
                 () = cancel.cancelled() => break,
@@ -322,10 +182,44 @@ impl UdpRtpEgress {
                     None => break, // egress gone → done
                 },
             };
-            let frame = encode_bridge_frame(&pkt);
-            for addr in self.registry.subscribers(self.call) {
-                if let Err(e) = self.socket.send_to(&frame, addr).await {
-                    debug!(?e, %addr, "call-bridge: egress send failed");
+            for target in self.registry.targets(self.call) {
+                if announced_targets.insert((target.addr, target.generation, target.wire_version)) {
+                    debug!(
+                        call = %self.call,
+                        addr = %target.addr,
+                        generation_bound = target.generation.is_some(),
+                        wire_version = ?target.wire_version,
+                        "call-bridge: egress started sending to subscriber"
+                    );
+                }
+                let frame = match (target.generation, target.wire_version) {
+                    (Some(generation), Some(wire_version)) => {
+                        let Some(frame) = encode_bound_bridge_frame_version(
+                            self.call,
+                            generation,
+                            &pkt,
+                            wire_version,
+                        ) else {
+                            debug!(
+                                wire_version,
+                                addr = %target.addr,
+                                "call-bridge: unsupported negotiated wire version"
+                            );
+                            continue;
+                        };
+                        frame
+                    }
+                    (None, None) => encode_bridge_frame(&pkt),
+                    _ => {
+                        debug!(
+                            addr = %target.addr,
+                            "call-bridge: inconsistent subscriber wire metadata"
+                        );
+                        continue;
+                    }
+                };
+                if let Err(e) = self.socket.send_to(&frame, target.addr).await {
+                    debug!(?e, addr = %target.addr, "call-bridge: egress send failed");
                 }
             }
         }
@@ -353,22 +247,59 @@ struct BridgeTask {
 pub struct CallBridgeSupervisor {
     router: SfuRouter,
     forwarder: Arc<dyn MediaForwarder>,
+    /// Server-owned browser media sessions. Each peer is polled by exactly one
+    /// task; the forwarder reaches it through a bounded command sink.
+    media: SfuMediaRegistry,
     factory: Arc<dyn UpstreamFactory>,
     /// Puller subscriptions, shared with the subscribe control endpoint; each
     /// call's egress relay reads its send targets from here (ROADMAP 方向五).
     subscribers: BridgeSubscriberRegistry,
     /// `(call, normalized peer_url) -> running bridge task` (the PULL side).
     active: Arc<Mutex<HashMap<(CallId, String), BridgeTask>>>,
+    /// `(call, normalized peer_url) -> reservation id` while the transport
+    /// handshake is in flight. The id fences cancellation and late future-drop
+    /// cleanup against a replacement reservation for the same key.
+    connecting: Arc<Mutex<HashMap<(CallId, String), u64>>>,
     /// `call -> running egress relay task` (the PUSH side; one per call).
     egress: Arc<Mutex<HashMap<CallId, EgressTask>>>,
+    /// `call -> source epoch + reservation id` while a UDP sender bind is in
+    /// flight. Both values fence a late old bind against a reconnected call.
+    egress_connecting: Arc<Mutex<HashMap<CallId, EgressReservation>>>,
     /// Source of per-task ids (see [`BridgeTask::id`]).
     next_id: Arc<AtomicU64>,
 }
 
 /// One running egress relay task plus its cancellation handle.
 struct EgressTask {
+    id: u64,
+    source_generation: u64,
     cancel: CancellationToken,
     handle: JoinHandle<()>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct EgressReservation {
+    source_generation: u64,
+    id: u64,
+}
+
+/// Exact-match cleanup for a reservation held across an async UDP bind.
+///
+/// Dropping the future at any await point must make the source epoch
+/// immediately retryable; a plain error branch cannot cover cancellation.
+struct EgressReservationGuard {
+    connecting: Arc<Mutex<HashMap<CallId, EgressReservation>>>,
+    call: CallId,
+    reservation: EgressReservation,
+}
+
+impl Drop for EgressReservationGuard {
+    fn drop(&mut self) {
+        let mut connecting = self.connecting.lock();
+        if connecting.get(&self.call) == Some(&self.reservation) {
+            connecting.remove(&self.call);
+        }
+    }
 }
 
 impl CallBridgeSupervisor {
@@ -381,31 +312,64 @@ impl CallBridgeSupervisor {
         factory: Arc<dyn UpstreamFactory>,
         subscribers: BridgeSubscriberRegistry,
     ) -> Self {
+        let media = SfuMediaRegistry::from_env(router.clone(), forwarder.clone());
         Self {
             router,
             forwarder,
+            media,
             factory,
             subscribers,
             active: Arc::new(Mutex::new(HashMap::new())),
+            connecting: Arc::new(Mutex::new(HashMap::new())),
             egress: Arc::new(Mutex::new(HashMap::new())),
+            egress_connecting: Arc::new(Mutex::new(HashMap::new())),
             next_id: Arc::new(AtomicU64::new(0)),
         }
     }
 
-    /// Ensure a single running egress relay for `call` (ROADMAP 方向五): it taps
-    /// `tap` — the call's locally-published RTP — and pushes each packet to the
-    /// call's current cross-node subscribers (resolved from the shared registry).
-    /// Idempotent: with a relay already running this is a no-op and the new `tap`
-    /// is dropped. Returns whether a NEW relay was spawned.
-    ///
-    /// The owning node calls this when a local publisher is active in a call that
-    /// has (or gains) remote subscribers; `tap` comes from the call's
-    /// [`CallEgress`](aero_live_webrtc::CallEgress), which the SFU forward path
-    /// feeds. The relay tears down with the call via [`cancel_call`](Self::cancel_call).
+    /// Ensure the relay consuming one exact media-source epoch. A reconnect
+    /// replaces an older relay; same-epoch calls are idempotent.
+    async fn ensure_egress_generation(
+        &self,
+        call: CallId,
+        source_generation: u64,
+        tap: CallEgressTap,
+    ) -> bool {
+        self.ensure_egress_inner(call, source_generation, tap, true)
+            .await
+    }
+
+    #[cfg(test)]
     pub async fn ensure_egress(&self, call: CallId, tap: CallEgressTap) -> bool {
-        if self.egress.lock().contains_key(&call) {
+        self.ensure_egress_inner(call, 0, tap, false).await
+    }
+
+    async fn ensure_egress_inner(
+        &self,
+        call: CallId,
+        source_generation: u64,
+        tap: CallEgressTap,
+        validate_media_epoch: bool,
+    ) -> bool {
+        let reserve = || self.reserve_egress(call, source_generation);
+        let Some((reservation, replaced)) = (if validate_media_epoch {
+            self.media
+                .with_current_egress_epoch(call, source_generation, reserve)
+                .flatten()
+        } else {
+            reserve()
+        }) else {
             return false;
+        };
+        if let Some(replaced) = replaced {
+            replaced.cancel.cancel();
+            replaced.handle.abort();
         }
+        let _reservation_guard = EgressReservationGuard {
+            connecting: self.egress_connecting.clone(),
+            call,
+            reservation,
+        };
         let sender = match UdpRtpEgress::bind(call, self.subscribers.clone()).await {
             Ok(s) => s,
             Err(e) => {
@@ -413,18 +377,230 @@ impl CallBridgeSupervisor {
                 return false;
             }
         };
-        let cancel = CancellationToken::new();
-        let handle = tokio::spawn(sender.run(tap, cancel.clone()));
-        let mut map = self.egress.lock();
-        // Race guard: another task may have registered while we bound; if so,
-        // cancel ours rather than double-relaying.
-        if map.contains_key(&call) {
-            cancel.cancel();
-            handle.abort();
+        self.spawn_reserved_egress(call, reservation, tap, sender, validate_media_epoch)
+    }
+
+    fn reserve_egress(
+        &self,
+        call: CallId,
+        source_generation: u64,
+    ) -> Option<(EgressReservation, Option<EgressTask>)> {
+        let mut connecting = self.egress_connecting.lock();
+        let mut active = self.egress.lock();
+        if active
+            .get(&call)
+            .is_some_and(|task| task.source_generation == source_generation)
+        {
+            if connecting
+                .get(&call)
+                .is_some_and(|pending| pending.source_generation != source_generation)
+            {
+                connecting.remove(&call);
+            }
+            return None;
+        }
+        if connecting
+            .get(&call)
+            .is_some_and(|pending| pending.source_generation == source_generation)
+        {
+            return None;
+        }
+        let reservation = EgressReservation {
+            source_generation,
+            id: self.next_id.fetch_add(1, Ordering::Relaxed),
+        };
+        connecting.insert(call, reservation);
+        Some((reservation, active.remove(&call)))
+    }
+
+    fn spawn_reserved_egress(
+        &self,
+        call: CallId,
+        reservation: EgressReservation,
+        tap: CallEgressTap,
+        sender: UdpRtpEgress,
+        validate_media_epoch: bool,
+    ) -> bool {
+        let spawn = || self.spawn_reserved_egress_locked(call, reservation, tap, sender);
+        if validate_media_epoch {
+            if let Some(spawned) =
+                self.media
+                    .with_current_egress_epoch(call, reservation.source_generation, spawn)
+            {
+                spawned
+            } else {
+                let mut connecting = self.egress_connecting.lock();
+                if connecting.get(&call) == Some(&reservation) {
+                    connecting.remove(&call);
+                }
+                false
+            }
+        } else {
+            spawn()
+        }
+    }
+
+    fn spawn_reserved_egress_locked(
+        &self,
+        call: CallId,
+        reservation: EgressReservation,
+        tap: CallEgressTap,
+        sender: UdpRtpEgress,
+    ) -> bool {
+        let mut connecting = self.egress_connecting.lock();
+        if connecting.get(&call) != Some(&reservation) {
             return false;
         }
-        map.insert(call, EgressTask { cancel, handle });
+        connecting.remove(&call);
+        let mut active_guard = self.egress.lock();
+        if active_guard
+            .get(&call)
+            .is_some_and(|task| task.source_generation == reservation.source_generation)
+        {
+            return false;
+        }
+        let replaced = active_guard.remove(&call);
+        let id = reservation.id;
+        let source_generation = reservation.source_generation;
+        let cancel = CancellationToken::new();
+        let task_cancel = cancel.clone();
+        let active = self.egress.clone();
+        let subscribers = self.subscribers.clone();
+        let media = self.media.clone();
+        let (registered_tx, registered_rx) = tokio::sync::oneshot::channel();
+        let handle = tokio::spawn(async move {
+            if registered_rx.await.is_err() {
+                return;
+            }
+            sender.run(tap, task_cancel).await;
+            let mut active = active.lock();
+            let removed = active
+                .get(&call)
+                .is_some_and(|task| task.id == id && task.source_generation == source_generation);
+            if removed {
+                active.remove(&call);
+            }
+            drop(active);
+            if removed {
+                let _ = media.with_ended_egress_epoch(call, source_generation, || {
+                    subscribers.clear_call(call);
+                });
+            }
+        });
+        active_guard.insert(
+            call,
+            EgressTask {
+                id,
+                source_generation,
+                cancel,
+                handle,
+            },
+        );
+        drop(active_guard);
+        drop(connecting);
+        if let Some(replaced) = replaced {
+            replaced.cancel.cancel();
+            replaced.handle.abort();
+        }
+        let _ = registered_tx.send(());
         true
+    }
+
+    /// Retry relay creation from the registry's current source. The internal
+    /// subscribe endpoint calls this before admission, so a transient UDP bind
+    /// failure is recoverable without waiting for another browser offer.
+    pub async fn ensure_current_egress(&self, call: CallId) -> bool {
+        let Some((generation, tap)) = self.media.current_egress_tap(call) else {
+            return false;
+        };
+        self.ensure_egress_generation(call, generation, tap).await
+    }
+
+    /// Negotiate and start one browser ⇄ server SFU media leg.
+    ///
+    /// The first session in a call also creates the shared [`CallEgress`] tap
+    /// and starts the real UDP egress relay; later publishers clone the same
+    /// call bus.
+    pub async fn accept_sfu_offer(
+        &self,
+        call: CallId,
+        participant: aero_common::ParticipantId,
+        leg_generation: i64,
+        offer: &str,
+    ) -> Result<SfuSessionAnswer, SfuMediaError> {
+        let started = self
+            .media
+            .start_session(call, participant, leg_generation, offer)
+            .await?;
+        let _ = self
+            .ensure_egress_generation(call, started.egress_generation, started.egress_tap)
+            .await;
+        Ok(started.answer)
+    }
+
+    /// Queue and apply one trickled browser ICE candidate on the session owner.
+    pub async fn add_sfu_ice(
+        &self,
+        call: CallId,
+        participant: aero_common::ParticipantId,
+        candidate: String,
+    ) -> Result<(), SfuMediaError> {
+        self.media
+            .add_remote_candidate(call, participant, candidate)
+            .await
+    }
+
+    /// Remove one browser media leg. The call's egress relay is stopped when it
+    /// was the last local session.
+    pub fn remove_sfu_session(
+        &self,
+        call: CallId,
+        participant: aero_common::ParticipantId,
+    ) -> bool {
+        let removal = self.media.remove_session_with_topology(call, participant);
+        if let Some(generation) = removal.ended_egress_generation {
+            self.cancel_ended_media_epoch(call, generation);
+        }
+        removal.removed
+    }
+
+    /// Remove every SFU media leg for a disconnected participant.
+    pub fn remove_sfu_participant(&self, participant: aero_common::ParticipantId) -> Vec<CallId> {
+        let removed = self.media.remove_participant_with_topology(participant);
+        for (call, _, generation) in &removed {
+            if let Some(generation) = generation {
+                self.cancel_ended_media_epoch(*call, *generation);
+            }
+        }
+        removed.into_iter().map(|(call, _, _)| call).collect()
+    }
+
+    #[must_use]
+    pub fn media_session_count(&self, call: CallId) -> usize {
+        self.media.session_count(call)
+    }
+
+    #[must_use]
+    pub fn has_media_session(&self, call: CallId, participant: aero_common::ParticipantId) -> bool {
+        self.media.has_session(call, participant)
+    }
+
+    /// Whether this process owns the participant's live SFU leg.
+    #[must_use]
+    pub fn has_call_participant(
+        &self,
+        call: CallId,
+        participant: aero_common::ParticipantId,
+    ) -> bool {
+        self.router.local_participants(call).contains(&participant)
+    }
+
+    /// Whether this process currently owns at least one SFU participant for the
+    /// call. Remote bus events are consumed by every node, but only nodes with a
+    /// local island should create bridge pulls.
+    #[must_use]
+    pub fn has_local_call(&self, call: CallId) -> bool {
+        self.router.has_local_participants(call)
     }
 
     /// Whether an egress relay is running for `call`.
@@ -433,10 +609,93 @@ impl CallBridgeSupervisor {
         self.egress.lock().contains_key(&call)
     }
 
+    fn cancel_egress(&self, call: CallId) -> bool {
+        let connecting = self.egress_connecting.lock().remove(&call);
+        let mut active = self.egress.lock();
+        let egress = active.remove(&call);
+        self.subscribers.clear_call(call);
+        drop(active);
+        let Some(egress) = egress else {
+            return connecting.is_some();
+        };
+        egress.cancel.cancel();
+        egress.handle.abort();
+        true
+    }
+
+    /// Tear down pull/push tasks only if `source_generation` is still the
+    /// latest ended local-media epoch. A reconnect commit takes the media lock
+    /// first and therefore fences every stale lifecycle/leave cleanup.
+    pub fn cancel_ended_media_epoch(&self, call: CallId, source_generation: u64) -> usize {
+        self.media
+            .consume_ended_egress_epoch(call, source_generation, || {
+                self.connecting
+                    .lock()
+                    .retain(|(candidate, _), _| *candidate != call);
+                let tasks: Vec<_> = {
+                    let mut active = self.active.lock();
+                    let keys: Vec<_> = active
+                        .keys()
+                        .filter(|(candidate, _)| *candidate == call)
+                        .cloned()
+                        .collect();
+                    keys.into_iter()
+                        .filter_map(|key| active.remove(&key))
+                        .collect()
+                };
+                let count = tasks.len();
+                for task in tasks {
+                    task.cancel.cancel();
+                    task.handle.abort();
+                }
+                // The media lock proves that no current source/session exists
+                // and this is the latest ended epoch, so call-wide cleanup is
+                // safe and also removes any older orphaned reservation.
+                let _ = self.cancel_egress(call);
+                count
+            })
+            .unwrap_or(0)
+    }
+
+    pub(crate) async fn lock_sfu_lifecycle(&self, call: CallId) -> tokio::sync::MutexGuard<'_, ()> {
+        self.media.lock_lifecycle(call).await
+    }
+
+    #[must_use]
+    pub(crate) fn is_current_ended_sfu_session(
+        &self,
+        call: CallId,
+        participant: ParticipantId,
+        generation: u64,
+    ) -> bool {
+        self.media
+            .is_current_ended_session(call, participant, generation)
+    }
+
+    pub(crate) fn invalidate_ended_sfu_session(&self, call: CallId, participant: ParticipantId) {
+        if let Some(generation) = self.media.invalidate_ended_session(call, participant) {
+            self.cancel_ended_media_epoch(call, generation);
+        }
+    }
+
+    pub(crate) fn complete_ended_sfu_session(
+        &self,
+        call: CallId,
+        participant: ParticipantId,
+        generation: u64,
+    ) -> bool {
+        self.media
+            .complete_ended_session(call, participant, generation)
+    }
+
     /// Number of bridge tasks currently registered for `call`.
     #[must_use]
     pub fn bridge_count(&self, call: CallId) -> usize {
-        self.active.lock().keys().filter(|(c, _)| *c == call).count()
+        self.active
+            .lock()
+            .keys()
+            .filter(|(c, _)| *c == call)
+            .count()
     }
 
     /// Total number of bridge tasks across all calls.
@@ -453,82 +712,14 @@ impl CallBridgeSupervisor {
             .contains_key(&(call, normalize_node(peer_url)))
     }
 
-    /// Ensure one running bridge per listed peer node for `call`.
-    ///
-    /// For each url **not already bridged**, asks the [`UpstreamFactory`] for an
-    /// upstream and, on success, spawns a [`CallBridge::run`] task pulling it
-    /// into the local router. Idempotent: urls already bridged are left
-    /// untouched, so a re-join with the same (or a superset) census never
-    /// double-spawns. Trailing slashes are normalized so `http://b` and
-    /// `http://b/` are the same target.
-    ///
-    /// Returns the number of **new** bridges spawned by this call.
-    pub async fn ensure_bridges(&self, call: CallId, peer_urls: &[String]) -> usize {
-        let mut spawned = 0;
-        for raw in peer_urls {
-            let url = normalize_node(raw);
-            if url.is_empty() {
-                continue;
-            }
-            // Idempotency guard: skip a peer we already bridge for this call.
-            if self.active.lock().contains_key(&(call, url.clone())) {
-                continue;
-            }
-            let Some(upstream) = self.factory.connect(call, &url).await else {
-                // No transport right now (single-node boot, or the peer is
-                // unreachable): register nothing; a later join re-attempts it.
-                continue;
-            };
-            self.spawn_bridge(call, url, upstream);
-            spawned += 1;
-        }
-        spawned
-    }
-
-    /// Spawn (and register) one bridge task pulling `upstream` into the router.
-    fn spawn_bridge(&self, call: CallId, peer_url: String, upstream: Box<dyn CallUpstream>) {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let cancel = CancellationToken::new();
-        let bridge = CallBridge::new(
-            BoxedUpstream(upstream),
-            self.router.clone(),
-            SharedForwarder(self.forwarder.clone()),
-        );
-        let task_cancel = cancel.clone();
-        let key_url = peer_url.clone();
-        let active = self.active.clone();
-        let handle = tokio::spawn(async move {
-            // Race the pull loop against cancellation. On either exit the bridge
-            // is dropped: `run` detaches its synthetic peers itself at
-            // end-of-stream; a cancel drops the future, and the self-removal
-            // below sweeps the registry entry so a re-join can re-spawn cleanly.
-            tokio::select! {
-                () = bridge.run() => {
-                    debug!(%call, peer = %key_url, "call-bridge: upstream ended");
-                }
-                () = task_cancel.cancelled() => {
-                    debug!(%call, peer = %key_url, "call-bridge: cancelled");
-                }
-            }
-            // Self-removal on natural end-of-stream. Guard on the stored task id
-            // so a *re-spawn* for the same (call, peer) that landed after this
-            // task isn't evicted by this task's late exit. The cancel path also
-            // reaches here, but `cancel_call`/`cancel_bridge` already removed the
-            // entry, so the id won't match and this is a no-op.
-            let mut guard = active.lock();
-            if guard.get(&(call, key_url.clone())).is_some_and(|t| t.id == id) {
-                guard.remove(&(call, key_url));
-            }
-        });
-        self.active
-            .lock()
-            .insert((call, peer_url), BridgeTask { id, cancel, handle });
-    }
-
     /// Cancel and remove **every** bridge task for `call` — the
     /// last-local-leave / `end_call` teardown. Idempotent: a call with no
     /// bridges is a no-op. Returns the number of bridges cancelled.
     pub fn cancel_call(&self, call: CallId) -> usize {
+        let media_sessions = self.media.remove_call(call);
+        self.connecting
+            .lock()
+            .retain(|(candidate, _), _| *candidate != call);
         let tasks: Vec<((CallId, String), BridgeTask)> = {
             let mut guard = self.active.lock();
             let keys: Vec<(CallId, String)> =
@@ -547,13 +738,14 @@ impl CallBridgeSupervisor {
             debug!(%call, %peer, "call-bridge: torn down");
         }
         // Tear down the call's egress relay (the push side) too, if any.
-        if let Some(eg) = self.egress.lock().remove(&call) {
-            eg.cancel.cancel();
-            eg.handle.abort();
+        if self.cancel_egress(call) {
             debug!(%call, "call-bridge: egress relay torn down");
         }
         if n > 0 {
             debug!(%call, count = n, "call-bridge: all bridges for call cancelled");
+        }
+        if media_sessions > 0 {
+            debug!(%call, count = media_sessions, "SFU media sessions cancelled");
         }
         n
     }
@@ -562,13 +754,14 @@ impl CallBridgeSupervisor {
     /// a bridge was cancelled — used when a census shrinks but the call lives on.
     pub fn cancel_bridge(&self, call: CallId, peer_url: &str) -> bool {
         let key = (call, normalize_node(peer_url));
-        let Some(task) = self.active.lock().remove(&key) else {
-            warn!(%call, peer = %key.1, "call-bridge: cancel of unknown bridge ignored");
-            return false;
-        };
-        task.cancel.cancel();
-        task.handle.abort();
-        true
+        let connecting = self.connecting.lock().remove(&key).is_some();
+        if let Some(task) = self.active.lock().remove(&key) {
+            task.cancel.cancel();
+            task.handle.abort();
+            true
+        } else {
+            connecting
+        }
     }
 }
 
@@ -579,447 +772,4 @@ fn normalize_node(url: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use aero_common::ParticipantId;
-    use aero_live_webrtc::call_bridge::{BridgeRtp, FakeCallUpstream, LoopbackUpstream};
-    use aero_live_webrtc::{CallEgress, NullForwarder, PeerRole};
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    /// A scripted [`UpstreamFactory`]: hands back a [`FakeCallUpstream`] with a
-    /// fixed packet script per connect, counts connect calls, and can be set to
-    /// refuse (return `None`) to model an unreachable peer.
-    struct ScriptedFactory {
-        connects: AtomicUsize,
-        refuse: bool,
-        packets: Vec<BridgeRtp>,
-    }
-
-    impl ScriptedFactory {
-        fn yielding(packets: Vec<BridgeRtp>) -> Arc<Self> {
-            Arc::new(Self { connects: AtomicUsize::new(0), refuse: false, packets })
-        }
-        fn refusing() -> Arc<Self> {
-            Arc::new(Self { connects: AtomicUsize::new(0), refuse: true, packets: Vec::new() })
-        }
-        fn connect_count(&self) -> usize {
-            self.connects.load(Ordering::SeqCst)
-        }
-    }
-
-    #[async_trait]
-    impl UpstreamFactory for ScriptedFactory {
-        async fn connect(&self, call: CallId, peer_url: &str) -> Option<Box<dyn CallUpstream>> {
-            self.connects.fetch_add(1, Ordering::SeqCst);
-            if self.refuse {
-                return None;
-            }
-            Some(Box::new(FakeCallUpstream::new(call, peer_url, self.packets.clone())))
-        }
-    }
-
-    /// A factory whose upstream never ends (an empty `LoopbackUpstream` whose
-    /// egress is held alive) so the bridge task stays running until cancelled —
-    /// lets cancel-on-leave be observed deterministically.
-    struct PendingFactory {
-        // Kept alive so the loopback tap never closes; one egress per peer.
-        egresses: Mutex<Vec<Arc<CallEgress>>>,
-    }
-
-    impl PendingFactory {
-        fn new() -> Arc<Self> {
-            Arc::new(Self { egresses: Mutex::new(Vec::new()) })
-        }
-    }
-
-    #[async_trait]
-    impl UpstreamFactory for PendingFactory {
-        async fn connect(&self, call: CallId, peer_url: &str) -> Option<Box<dyn CallUpstream>> {
-            let egress = Arc::new(CallEgress::new(call));
-            let tap = egress.tap();
-            self.egresses.lock().push(egress);
-            Some(Box::new(LoopbackUpstream::new(peer_url, tap)))
-        }
-    }
-
-    fn key_pkt(p: ParticipantId, mid: &str, byte: u8) -> BridgeRtp {
-        BridgeRtp::new(p, mid, vec![byte], true)
-    }
-
-    fn supervisor(factory: Arc<dyn UpstreamFactory>) -> (CallBridgeSupervisor, SfuRouter) {
-        let router = SfuRouter::new();
-        let fwd: Arc<dyn MediaForwarder> = Arc::new(NullForwarder);
-        let sup = CallBridgeSupervisor::new(
-            router.clone(),
-            fwd,
-            factory,
-            BridgeSubscriberRegistry::default(),
-        );
-        (sup, router)
-    }
-
-    /// The PUSH side end-to-end (ROADMAP 方向五): the supervisor spawns a per-call
-    /// egress relay that pushes the call's locally-published RTP to subscribed
-    /// pullers; idempotent; torn down with the call. Only the SFU feeding the
-    /// CallEgress with real browser RTP is staging — here it is published directly.
-    #[tokio::test]
-    async fn ensure_egress_relays_published_rtp_and_tears_down() {
-        use aero_live_webrtc::CallEgress;
-
-        let registry = BridgeSubscriberRegistry::default();
-        let sup = CallBridgeSupervisor::new(
-            SfuRouter::new(),
-            Arc::new(NullForwarder) as Arc<dyn MediaForwarder>,
-            ScriptedFactory::refusing(),
-            registry.clone(),
-        );
-        let call = CallId::new();
-
-        // A puller subscribes its receive address.
-        let mut puller = UdpRtpUpstream::bind(call, "http://owner").await.unwrap();
-        let puller_addr = std::net::SocketAddr::new(
-            std::net::Ipv4Addr::LOCALHOST.into(),
-            puller.local_addr().unwrap().port(),
-        );
-        registry.subscribe(call, puller_addr);
-
-        // The owning node has the call's CallEgress (fed by the SFU forward path;
-        // here published directly) and ensures the relay.
-        let egress = CallEgress::new(call);
-        assert!(sup.ensure_egress(call, egress.tap()).await, "spawns a new egress relay");
-        assert!(sup.has_egress(call));
-        assert!(!sup.ensure_egress(call, egress.tap()).await, "idempotent while running");
-
-        // A published packet is relayed to the subscribed puller.
-        let pkt = BridgeRtp::new(
-            ParticipantId::new(),
-            "video0",
-            Bytes::from_static(&[0x80, 0x60, 0xCA, 0xFE]),
-            true,
-        );
-        egress.publish(pkt.clone());
-        let got = tokio::time::timeout(std::time::Duration::from_secs(2), puller.next_rtp())
-            .await
-            .expect("puller must receive the relayed packet within 2s");
-        assert_eq!(got, Some(pkt));
-
-        // Ending the call tears the relay down.
-        sup.cancel_call(call);
-        assert!(!sup.has_egress(call), "egress relay removed on call end");
-    }
-
-    #[tokio::test]
-    async fn ensure_bridges_spawns_one_per_unbridged_peer() {
-        let factory = ScriptedFactory::yielding(Vec::new()); // empty script → upstream ends quickly
-        let (sup, _router) = supervisor(factory.clone());
-        let call = CallId::new();
-
-        let spawned = sup
-            .ensure_bridges(call, &["http://b.example".into(), "http://c.example".into()])
-            .await;
-        assert_eq!(spawned, 2, "one bridge spawned per listed peer");
-        assert_eq!(factory.connect_count(), 2, "the factory was consulted once per peer");
-        // Registry reflects both (the empty-script tasks may have already
-        // self-removed; assert via connect_count + a fresh re-ensure being idempotent).
-        sup.cancel_call(call);
-    }
-
-    #[tokio::test]
-    async fn ensure_bridges_is_idempotent_no_double_spawn() {
-        // A never-ending upstream so the entries persist while we re-ensure.
-        let (sup, _router) = supervisor(PendingFactory::new());
-        let call = CallId::new();
-
-        assert_eq!(sup.ensure_bridges(call, &["http://b.example".into()]).await, 1);
-        assert!(sup.is_bridged(call, "http://b.example"));
-        assert_eq!(sup.bridge_count(call), 1);
-
-        // Re-join with the same census — must NOT spawn a second bridge.
-        assert_eq!(
-            sup.ensure_bridges(call, &["http://b.example".into()]).await,
-            0,
-            "already-bridged peer is not re-spawned"
-        );
-        // Trailing-slash variant is the same node → still no new bridge.
-        assert_eq!(
-            sup.ensure_bridges(call, &["http://b.example/".into()]).await,
-            0,
-            "slash variant dedupes to the existing bridge"
-        );
-        assert_eq!(sup.bridge_count(call), 1, "exactly one bridge for the peer");
-
-        // A genuinely new peer in the census DOES spawn.
-        assert_eq!(sup.ensure_bridges(call, &["http://c.example".into()]).await, 1);
-        assert_eq!(sup.bridge_count(call), 2);
-
-        sup.cancel_call(call);
-    }
-
-    #[tokio::test]
-    async fn cancel_call_tears_down_all_bridges_for_that_call() {
-        let (sup, _router) = supervisor(PendingFactory::new());
-        let (call_a, call_b) = (CallId::new(), CallId::new());
-
-        sup.ensure_bridges(call_a, &["http://b.example".into(), "http://c.example".into()]).await;
-        sup.ensure_bridges(call_b, &["http://d.example".into()]).await;
-        assert_eq!(sup.bridge_count(call_a), 2);
-        assert_eq!(sup.bridge_count(call_b), 1);
-        assert_eq!(sup.total_bridges(), 3);
-
-        let cancelled = sup.cancel_call(call_a);
-        assert_eq!(cancelled, 2, "both of call A's bridges torn down");
-        assert_eq!(sup.bridge_count(call_a), 0);
-        assert_eq!(sup.bridge_count(call_b), 1, "call B is untouched");
-
-        // Idempotent: cancelling an already-empty call is a no-op.
-        assert_eq!(sup.cancel_call(call_a), 0);
-
-        sup.cancel_call(call_b);
-    }
-
-    #[tokio::test]
-    async fn cancel_bridge_removes_a_single_peer_leaving_the_rest() {
-        let (sup, _router) = supervisor(PendingFactory::new());
-        let call = CallId::new();
-        sup.ensure_bridges(call, &["http://b.example".into(), "http://c.example".into()]).await;
-        assert_eq!(sup.bridge_count(call), 2);
-
-        assert!(sup.cancel_bridge(call, "http://b.example/"), "slash-insensitive single cancel");
-        assert!(!sup.is_bridged(call, "http://b.example"));
-        assert!(sup.is_bridged(call, "http://c.example"));
-        assert_eq!(sup.bridge_count(call), 1);
-
-        // Cancelling an unknown peer is a harmless false.
-        assert!(!sup.cancel_bridge(call, "http://z.example"));
-
-        sup.cancel_call(call);
-    }
-
-    #[tokio::test]
-    async fn refusing_factory_spawns_nothing() {
-        // Models single-node boot / an unreachable peer: connect() returns None,
-        // so the supervisor stays dormant — no bridge registered, no panic.
-        let factory = ScriptedFactory::refusing();
-        let (sup, _router) = supervisor(factory.clone());
-        let call = CallId::new();
-
-        assert_eq!(sup.ensure_bridges(call, &["http://b.example".into()]).await, 0);
-        assert_eq!(factory.connect_count(), 1, "the factory was consulted");
-        assert_eq!(sup.bridge_count(call), 0, "but nothing was registered");
-        assert!(!sup.is_bridged(call, "http://b.example"));
-    }
-
-    #[test]
-    fn subscriber_registry_tracks_per_call_addresses() {
-        let reg = BridgeSubscriberRegistry::default();
-        let call = CallId::new();
-        let other = CallId::new();
-        let a: std::net::SocketAddr = "127.0.0.1:5000".parse().unwrap();
-        let b: std::net::SocketAddr = "127.0.0.1:5001".parse().unwrap();
-
-        assert!(reg.subscribers(call).is_empty());
-        reg.subscribe(call, a);
-        reg.subscribe(call, b);
-        reg.subscribe(call, a); // idempotent
-        let mut subs = reg.subscribers(call);
-        subs.sort();
-        assert_eq!(subs, vec![a, b]);
-        // Other calls are independent.
-        assert!(reg.subscribers(other).is_empty());
-        // Unsubscribe removes just that address; emptying drops the call entry.
-        reg.unsubscribe(call, a);
-        assert_eq!(reg.subscribers(call), vec![b]);
-        reg.unsubscribe(call, b);
-        assert!(reg.subscribers(call).is_empty());
-    }
-
-    /// `connect` binds a puller AND announces its receive address to the owning
-    /// node's subscribe endpoint (ROADMAP 方向五). Drives the real outbound POST
-    /// against a localhost mock peer and asserts the body + auth are correct —
-    /// the full bind → announce path. Only the two-real-nodes run is staging.
-    #[tokio::test]
-    async fn connect_announces_subscribe_to_the_peer() {
-        use axum::{routing::post, Json, Router};
-
-        // Mock owning node: records the subscribe auth header + body.
-        let seen: Arc<Mutex<Option<(Option<String>, serde_json::Value)>>> =
-            Arc::new(Mutex::new(None));
-        let recorder = seen.clone();
-        let app = Router::new().route(
-            "/api/internal/call-bridge/subscribe",
-            post(move |headers: axum::http::HeaderMap, Json(body): Json<serde_json::Value>| {
-                let recorder = recorder.clone();
-                async move {
-                    let auth = headers
-                        .get(axum::http::header::AUTHORIZATION)
-                        .and_then(|v| v.to_str().ok())
-                        .map(str::to_owned);
-                    *recorder.lock() = Some((auth, body));
-                    axum::http::StatusCode::NO_CONTENT
-                }
-            }),
-        );
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let peer_addr = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-
-        let factory = NodeRtpPullerFactory::new("10.0.0.9", Some("clustersecret".to_owned()));
-        let call = CallId::new();
-        let up = factory.connect(call, &format!("http://{peer_addr}")).await;
-        assert!(up.is_some(), "puller is created even before any media flows");
-
-        // Poll briefly for the async POST to land on the mock peer.
-        let mut got = None;
-        for _ in 0..100 {
-            if let Some(v) = seen.lock().take() {
-                got = Some(v);
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        let (auth, body) = got.expect("peer must receive a subscribe POST");
-        assert_eq!(auth.as_deref(), Some("Bearer clustersecret"), "shared-secret bearer");
-        assert_eq!(body["call_id"], call.to_string(), "the call id");
-        assert!(
-            body["addr"].as_str().unwrap().starts_with("10.0.0.9:"),
-            "advertised host:port, got {}",
-            body["addr"]
-        );
-
-        server.abort();
-    }
-
-    /// The REAL node-to-node UDP puller receives a `bridge_frame`-framed RTP
-    /// datagram over localhost and decodes it back into the original
-    /// [`BridgeRtp`] (ROADMAP 方向五). This exercises the production receive +
-    /// decode path; only the peer-side push address (a control call) is staging.
-    #[tokio::test]
-    async fn udp_puller_receives_and_decodes_a_real_frame() {
-        use aero_live_webrtc::encode_bridge_frame;
-
-        let mut up = UdpRtpUpstream::bind(CallId::new(), "http://peer.example").await.unwrap();
-        let dest = std::net::SocketAddr::new(
-            std::net::Ipv4Addr::LOCALHOST.into(),
-            up.local_addr().unwrap().port(),
-        );
-        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-
-        // A malformed datagram must be skipped (never tears the bridge down)...
-        peer.send_to(b"not-a-bridge-frame", dest).await.unwrap();
-        // ...then a real framed packet is received and decoded intact.
-        let pkt = BridgeRtp::new(
-            ParticipantId::new(),
-            "video0",
-            Bytes::from_static(&[0x80, 0x60, 0x11, 0x22, 0xAB]),
-            true,
-        );
-        peer.send_to(&encode_bridge_frame(&pkt), dest).await.unwrap();
-
-        let got = tokio::time::timeout(std::time::Duration::from_secs(2), up.next_rtp())
-            .await
-            .expect("puller must yield within 2s");
-        assert_eq!(got, Some(pkt));
-        assert_eq!(up.call_id(), up.call);
-        assert_eq!(up.node_url(), "http://peer.example");
-    }
-
-    /// FULL node-to-node bridge wire path over localhost (ROADMAP 方向五): the
-    /// egress taps a [`CallEgress`], frames each packet and pushes it; the puller
-    /// receives and decodes it back to the original [`BridgeRtp`]. This exercises
-    /// BOTH halves (send + receive) end-to-end in-process; only the two-real-nodes
-    /// run + the subscribe control call remain for staging.
-    #[tokio::test]
-    async fn egress_to_puller_roundtrips_over_localhost() {
-        use aero_live_webrtc::CallEgress;
-
-        // Puller binds; the egress is told its address (the subscribe step, done
-        // directly here).
-        let mut puller = UdpRtpUpstream::bind(CallId::new(), "http://owner").await.unwrap();
-        let puller_addr = std::net::SocketAddr::new(
-            std::net::Ipv4Addr::LOCALHOST.into(),
-            puller.local_addr().unwrap().port(),
-        );
-
-        let call = CallId::new();
-        let egress = CallEgress::new(call);
-        let tap = egress.tap();
-        // The puller subscribed its address (the subscribe control call, here
-        // exercised directly through the registry).
-        let registry = BridgeSubscriberRegistry::default();
-        registry.subscribe(call, puller_addr);
-        let sender = UdpRtpEgress::bind(call, registry).await.unwrap();
-        let cancel = CancellationToken::new();
-        let pump = tokio::spawn(sender.run(tap, cancel.clone()));
-
-        // The owning node publishes a packet on the call's egress.
-        let pkt = BridgeRtp::new(
-            ParticipantId::new(),
-            "video0",
-            Bytes::from_static(&[0x80, 0x60, 0xDE, 0xAD, 0xBE, 0xEF]),
-            true,
-        );
-        egress.publish(pkt.clone());
-
-        // The puller on the other node receives and decodes the identical packet.
-        let got = tokio::time::timeout(std::time::Duration::from_secs(2), puller.next_rtp())
-            .await
-            .expect("puller must yield within 2s");
-        assert_eq!(got, Some(pkt));
-
-        cancel.cancel();
-        let _ = pump.await;
-    }
-
-    #[tokio::test]
-    async fn bridge_fans_remote_media_into_the_local_router() {
-        // End-to-end via the loopback wire: an egress on "node A" publishes a
-        // keyframe, the supervisor's bridge pulls it and registers the remote
-        // publisher as a synthetic peer in THIS node's router.
-        let call = CallId::new();
-        let remote = ParticipantId::new();
-        let local_sub = ParticipantId::new();
-
-        let router = SfuRouter::new();
-        let fwd: Arc<dyn MediaForwarder> = Arc::new(NullForwarder);
-        router.add_peer(call, local_sub, PeerRole::Subscriber);
-        router.add_subscription(call, "v0", local_sub);
-
-        // A loopback egress we publish into, then close so the bridge ends and
-        // the assertion observes a settled router state.
-        let egress = CallEgress::new(call);
-        let tap = egress.tap();
-        egress.publish(key_pkt(remote, "v0", 0xAB));
-        drop(egress);
-
-        struct OneShot(Mutex<Option<LoopbackUpstream>>);
-        #[async_trait]
-        impl UpstreamFactory for OneShot {
-            async fn connect(&self, _call: CallId, _peer: &str) -> Option<Box<dyn CallUpstream>> {
-                self.0.lock().take().map(|u| Box::new(u) as Box<dyn CallUpstream>)
-            }
-        }
-        let factory = Arc::new(OneShot(Mutex::new(Some(LoopbackUpstream::new("http://a.example", tap)))));
-        let sup = CallBridgeSupervisor::new(
-            router.clone(),
-            fwd,
-            factory,
-            BridgeSubscriberRegistry::default(),
-        );
-
-        sup.ensure_bridges(call, &["http://a.example".into()]).await;
-        // Let the spawned bridge drain the (already-closed) loopback.
-        for _ in 0..50 {
-            if router.owner_of(call, "v0") == Some(remote) {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        // The bridge ran end-of-stream and detached its synthetic peer, so the
-        // synthetic track is gone again — the observable proof it fanned in.
-        assert!(
-            router.participants(call).contains(&local_sub),
-            "the local subscriber is untouched by the bridge lifecycle"
-        );
-        sup.cancel_call(call);
-    }
-}
+mod tests;

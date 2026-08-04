@@ -12,10 +12,12 @@ use std::collections::HashMap;
 use aero_common::{Error as AeroError, MessageId, ParticipantId};
 use sqlx::PgPool;
 
+use crate::thread_subscription::lock_effective_live_thread_root_in_tx;
+
 /// Repository for per-participant thread read state.
 #[derive(Clone)]
 pub struct ThreadReadStateRepo {
-    pub pg: PgPool,
+    pg: PgPool,
 }
 
 impl ThreadReadStateRepo {
@@ -24,11 +26,12 @@ impl ThreadReadStateRepo {
     }
 
     /// Mark the thread rooted at `root` as read for `participant` (UPSERT).
-    /// Sets / refreshes `last_read_at` to now().
+    /// Sets / refreshes `last_read_at` to `now()`.
     ///
     /// # Errors
     /// Propagates any [`sqlx::Error`] from the upsert.
-    pub async fn mark_read(
+    #[cfg(test)]
+    pub(crate) async fn mark_read(
         &self,
         participant: ParticipantId,
         root: MessageId,
@@ -54,18 +57,21 @@ impl ThreadReadStateRepo {
     ///
     /// # Errors
     /// Propagates any [`sqlx::Error`] from the query.
-    pub async fn unread_count(
+    #[cfg(test)]
+    pub(crate) async fn unread_count(
         &self,
         participant: ParticipantId,
         root: MessageId,
     ) -> Result<i64, AeroError> {
         let row = sqlx::query_as::<_, (i64,)>(
             r"SELECT COUNT(*)
-               FROM messages
-               WHERE reply_to = $1
-                 AND sender_id != $2
-                 AND deleted_at IS NULL
-                 AND created_at > COALESCE(
+               FROM messages AS reply
+               JOIN messages AS root
+                 ON root.id = $1 AND root.room_id = reply.room_id
+               WHERE reply.reply_to = $1
+                 AND reply.sender_id != $2
+                 AND reply.deleted_at IS NULL
+                 AND reply.created_at > COALESCE(
                        (SELECT last_read_at
                           FROM thread_read_state
                          WHERE participant_id = $2
@@ -89,7 +95,8 @@ impl ThreadReadStateRepo {
     ///
     /// # Errors
     /// Propagates any [`sqlx::Error`] from the queries.
-    pub async fn unread_counts_batch(
+    #[cfg(test)]
+    pub(crate) async fn unread_counts_batch(
         &self,
         participant: ParticipantId,
         roots: &[MessageId],
@@ -100,19 +107,22 @@ impl ThreadReadStateRepo {
         let root_uuids: Vec<uuid::Uuid> = roots.iter().map(MessageId::to_uuid).collect();
         // Fetch per-thread unread counts in one aggregated query.
         let rows = sqlx::query_as::<_, (uuid::Uuid, i64)>(
-            r"SELECT m.reply_to, COUNT(*) AS unread
-               FROM messages m
-               WHERE m.reply_to = ANY($1)
-                 AND m.sender_id != $2
-                 AND m.deleted_at IS NULL
-                 AND m.created_at > COALESCE(
+            r"SELECT reply.reply_to, COUNT(*) AS unread
+               FROM messages AS reply
+               JOIN messages AS root
+                 ON root.id = reply.reply_to
+                AND root.room_id = reply.room_id
+               WHERE reply.reply_to = ANY($1)
+                 AND reply.sender_id != $2
+                 AND reply.deleted_at IS NULL
+                 AND reply.created_at > COALESCE(
                        (SELECT trs.last_read_at
                           FROM thread_read_state trs
                          WHERE trs.participant_id = $2
-                           AND trs.root_message_id = m.reply_to),
+                           AND trs.root_message_id = reply.reply_to),
                        TIMESTAMP WITH TIME ZONE 'epoch'
                  )
-               GROUP BY m.reply_to
+               GROUP BY reply.reply_to
                HAVING COUNT(*) > 0",
         )
         .bind(&root_uuids)
@@ -126,12 +136,124 @@ impl ThreadReadStateRepo {
             .map(|(id, count)| (MessageId::from_uuid(id), count))
             .collect())
     }
+
+    /// Mark a live canonical thread read under the caller's current room-access
+    /// fence.
+    ///
+    /// # Errors
+    /// Returns an opaque root/access error or a database error.
+    pub async fn mark_read_authorized(
+        &self,
+        participant: ParticipantId,
+        root: MessageId,
+    ) -> Result<(), AeroError> {
+        let mut tx = self.pg.begin().await?;
+        lock_effective_live_thread_root_in_tx(&mut tx, participant, root).await?;
+        sqlx::query(
+            r"INSERT INTO thread_read_state
+                  (participant_id, root_message_id, last_read_at)
+               VALUES ($1, $2, now())
+               ON CONFLICT (participant_id, root_message_id)
+               DO UPDATE SET last_read_at = now()",
+        )
+        .bind(participant.to_uuid())
+        .bind(root.to_uuid())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Count unread replies under a live-root/current-access fence.
+    ///
+    /// # Errors
+    /// Returns an opaque root/access error or a database error.
+    pub async fn unread_count_authorized(
+        &self,
+        participant: ParticipantId,
+        root: MessageId,
+    ) -> Result<i64, AeroError> {
+        let mut tx = self.pg.begin().await?;
+        lock_effective_live_thread_root_in_tx(&mut tx, participant, root).await?;
+        let count = sqlx::query_scalar::<_, i64>(
+            r"SELECT COUNT(*)
+                FROM messages AS reply
+               WHERE reply.reply_to = $1
+                 AND reply.sender_id != $2
+                 AND reply.deleted_at IS NULL
+                 AND reply.created_at > COALESCE(
+                       (SELECT last_read_at
+                          FROM thread_read_state
+                         WHERE participant_id = $2
+                           AND root_message_id = $1),
+                       TIMESTAMP WITH TIME ZONE 'epoch'
+                 )",
+        )
+        .bind(root.to_uuid())
+        .bind(participant.to_uuid())
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(count)
+    }
+
+    /// Batch-count only live roots in rooms the caller can currently access.
+    /// Roots with no unread replies remain absent from the returned map.
+    ///
+    /// # Errors
+    /// Propagates database errors.
+    pub async fn unread_counts_accessible(
+        &self,
+        participant: ParticipantId,
+        roots: &[MessageId],
+    ) -> Result<HashMap<MessageId, i64>, AeroError> {
+        if roots.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let root_uuids: Vec<uuid::Uuid> = roots.iter().map(MessageId::to_uuid).collect();
+        let rows = sqlx::query_as::<_, (uuid::Uuid, i64)>(
+            r"SELECT reply.reply_to, COUNT(*) AS unread
+                FROM messages AS reply
+                JOIN messages AS root
+                  ON root.id = reply.reply_to
+                 AND root.room_id = reply.room_id
+                 AND root.reply_to IS NULL
+                 AND root.deleted_at IS NULL
+               WHERE reply.reply_to = ANY($1)
+                 AND reply.sender_id != $2
+                 AND reply.deleted_at IS NULL
+                 AND aero_effective_room_access(root.room_id, $2, NULL)
+                 AND reply.created_at > COALESCE(
+                       (SELECT state.last_read_at
+                          FROM thread_read_state AS state
+                         WHERE state.participant_id = $2
+                           AND state.root_message_id = reply.reply_to),
+                       TIMESTAMP WITH TIME ZONE 'epoch'
+                 )
+               GROUP BY reply.reply_to
+              HAVING COUNT(*) > 0",
+        )
+        .bind(&root_uuids)
+        .bind(participant.to_uuid())
+        .fetch_all(&self.pg)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, count)| (MessageId::from_uuid(id), count))
+            .collect())
+    }
 }
 
 #[cfg(test)]
 mod db_tests {
     use super::*;
     use aero_common::{MessageId, ParticipantId};
+
+    struct Fixture {
+        room_id: uuid::Uuid,
+        reader: ParticipantId,
+        sender: ParticipantId,
+    }
 
     fn pool() -> PgPool {
         let url = std::env::var("DATABASE_URL")
@@ -142,28 +264,77 @@ mod db_tests {
             .expect("connect_lazy never fails on a well-formed URL")
     }
 
-    /// Create a throwaway workspace + channel room + participant so messages can
-    /// be inserted. Returns `(room_id, participant_id)` for use in tests.
-    async fn fixture(p: &PgPool) -> (uuid::Uuid, ParticipantId) {
-        let actor = ParticipantId::new();
-        sqlx::query("INSERT INTO participants (id, kind, display_name) VALUES ($1,'human',$2)")
-            .bind(actor.to_uuid())
-            .bind(format!("thread-rs-actor-{actor}"))
-            .execute(p)
+    async fn fixture(p: &PgPool) -> Fixture {
+        let reader = ParticipantId::new();
+        let sender = ParticipantId::new();
+        let workspace_id = uuid::Uuid::new_v4();
+        let room_id = uuid::Uuid::new_v4();
+        let mut tx = p.begin().await.expect("begin thread read-state fixture");
+
+        for participant in [reader, sender] {
+            sqlx::query(
+                "INSERT INTO participants (id, kind, display_name)
+                 VALUES ($1, 'human', $2)",
+            )
+            .bind(participant.to_uuid())
+            .bind(format!("thread-rs-{participant}"))
+            .execute(&mut *tx)
             .await
             .expect("insert participant");
-        let room_id = uuid::Uuid::new_v4();
+        }
+        sqlx::query(
+            "INSERT INTO workspaces (id, name, slug, created_by)
+             VALUES ($1, $2, $3, $4)",
+        )
+        .bind(workspace_id)
+        .bind(format!("Thread read state {workspace_id}"))
+        .bind(format!("thread-read-state-{workspace_id}"))
+        .bind(reader.to_uuid())
+        .execute(&mut *tx)
+        .await
+        .expect("insert workspace");
+        for (participant, role) in [(reader, "owner"), (sender, "member")] {
+            sqlx::query(
+                "INSERT INTO workspace_members (workspace_id, participant_id, role)
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(workspace_id)
+            .bind(participant.to_uuid())
+            .bind(role)
+            .execute(&mut *tx)
+            .await
+            .expect("insert workspace member");
+        }
         sqlx::query(
             "INSERT INTO rooms (id, kind, name, created_by, created_at, workspace_id)
-             VALUES ($1,'channel',$2,$3,now(),'00000000-0000-0000-0000-000000000000')",
+             VALUES ($1, 'group', $2, $3, now(), $4)",
         )
         .bind(room_id)
         .bind(format!("thread-rs-room-{room_id}"))
-        .bind(actor.to_uuid())
-        .execute(p)
+        .bind(reader.to_uuid())
+        .bind(workspace_id)
+        .execute(&mut *tx)
         .await
         .expect("insert room");
-        (room_id, actor)
+        for (participant, role) in [(reader, "owner"), (sender, "member")] {
+            sqlx::query(
+                "INSERT INTO room_members (room_id, participant_id, role)
+                 VALUES ($1, $2, $3)",
+            )
+            .bind(room_id)
+            .bind(participant.to_uuid())
+            .bind(role)
+            .execute(&mut *tx)
+            .await
+            .expect("insert room member");
+        }
+        tx.commit().await.expect("commit thread read-state fixture");
+
+        Fixture {
+            room_id,
+            reader,
+            sender,
+        }
     }
 
     #[tokio::test]
@@ -171,16 +342,11 @@ mod db_tests {
     async fn thread_read_state_mark_and_unread_count() {
         let p = pool();
         let repo = ThreadReadStateRepo::new(p.clone());
-        let (room_id, reader) = fixture(&p).await;
-
-        // A second participant who posts replies.
-        let sender = ParticipantId::new();
-        sqlx::query("INSERT INTO participants (id, kind, display_name) VALUES ($1,'human',$2)")
-            .bind(sender.to_uuid())
-            .bind(format!("thread-rs-sender-{sender}"))
-            .execute(&p)
-            .await
-            .expect("insert sender");
+        let Fixture {
+            room_id,
+            reader,
+            sender,
+        } = fixture(&p).await;
 
         // Root message.
         let root = MessageId::new();
@@ -233,15 +399,11 @@ mod db_tests {
     async fn thread_read_state_unread_counts_batch() {
         let p = pool();
         let repo = ThreadReadStateRepo::new(p.clone());
-        let (room_id, reader) = fixture(&p).await;
-
-        let sender = ParticipantId::new();
-        sqlx::query("INSERT INTO participants (id, kind, display_name) VALUES ($1,'human',$2)")
-            .bind(sender.to_uuid())
-            .bind(format!("thread-rs-batch-sender-{sender}"))
-            .execute(&p)
-            .await
-            .expect("insert sender");
+        let Fixture {
+            room_id,
+            reader,
+            sender,
+        } = fixture(&p).await;
 
         // Two thread roots.
         let root_a = MessageId::new();
@@ -289,7 +451,10 @@ mod db_tests {
             .expect("insert reply_b");
         }
 
-        let map = repo.unread_counts_batch(reader, &[root_a, root_b]).await.unwrap();
+        let map = repo
+            .unread_counts_batch(reader, &[root_a, root_b])
+            .await
+            .unwrap();
         assert_eq!(map.get(&root_a).copied(), Some(1));
         assert_eq!(map.get(&root_b).copied(), Some(3));
 

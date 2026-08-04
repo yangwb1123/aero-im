@@ -17,7 +17,7 @@ use std::str::FromStr;
 
 use aero_auth::AuthUser;
 use aero_common::{ChannelSectionId, Error as AeroError, RoomId, WorkspaceId};
-use aero_storage::ChannelSectionRepo;
+use aero_storage::{channel_section::ChannelSectionAddError, ChannelSectionRepo};
 use axum::{
     extract::{Path, State},
     routing::{get, patch, put},
@@ -56,12 +56,27 @@ fn parse_workspace(s: &str) -> Result<WorkspaceId, AeroError> {
 }
 
 fn parse_section(s: &str) -> Result<ChannelSectionId, AeroError> {
-    ChannelSectionId::from_str(s.trim())
-        .map_err(|e| AeroError::Invalid(format!("section id: {e}")))
+    ChannelSectionId::from_str(s.trim()).map_err(|e| AeroError::Invalid(format!("section id: {e}")))
 }
 
 fn parse_room(s: &str) -> Result<RoomId, AeroError> {
     RoomId::from_str(s.trim()).map_err(|e| AeroError::Invalid(format!("room id: {e}")))
+}
+
+fn map_add_channel_error(error: ChannelSectionAddError) -> AeroError {
+    match error {
+        ChannelSectionAddError::SectionNotFound => AeroError::NotFound("channel section".into()),
+        ChannelSectionAddError::RoomNotFound | ChannelSectionAddError::RoomOutsideWorkspace => {
+            AeroError::NotFound("channel".into())
+        }
+        ChannelSectionAddError::NotChannel => {
+            AeroError::Conflict("section items must reference channels".into())
+        }
+        ChannelSectionAddError::NotAuthorized => {
+            AeroError::Forbidden("channel access was revoked".into())
+        }
+        ChannelSectionAddError::Storage(error) => AeroError::from(error),
+    }
 }
 
 /// Assert the caller is a member of the workspace, rejecting non-members with a
@@ -72,7 +87,7 @@ async fn assert_member(
     caller: aero_common::ParticipantId,
 ) -> Result<(), AeroError> {
     s.workspaces
-        .member_role(workspace, caller)
+        .effective_member_role(workspace, caller)
         .await
         .map_err(AeroError::from)?
         .ok_or_else(|| AeroError::Forbidden("not a workspace member".into()))?;
@@ -124,7 +139,9 @@ async fn list_sections(
         .list_for(auth.participant_id, ws)
         .await
         .map_err(AeroError::from)?;
-    Ok(Json(serde_json::to_value(sections).map_err(AeroError::from)?))
+    Ok(Json(
+        serde_json::to_value(sections).map_err(AeroError::from)?,
+    ))
 }
 
 #[derive(Deserialize)]
@@ -180,11 +197,10 @@ async fn delete_section(
 }
 
 /// `PUT /api/sections/:sid/channels/:rid` — assign a channel to one of the
-/// caller's own sections. Idempotent and owner-scoped at the SQL layer (the
-/// insert resolves the section only when the caller owns it), so targeting a
-/// section the caller doesn't own affects nothing. `created` reports whether a
-/// new assignment was added (vs. the channel already being present, or the
-/// section not being the caller's).
+/// caller's own sections. Idempotent; section ownership, tenant containment,
+/// channel kind, and effective room access are all fenced in the repository
+/// transaction. `created` reports whether a new assignment was added rather
+/// than the channel already being present.
 async fn add_channel(
     State(s): State<AppState>,
     auth: AuthUser,
@@ -195,8 +211,10 @@ async fn add_channel(
     let created = repo(&s)
         .add_channel(id, auth.participant_id, room)
         .await
-        .map_err(AeroError::from)?;
-    Ok(Json(serde_json::json!({ "added": true, "created": created })))
+        .map_err(map_add_channel_error)?;
+    Ok(Json(
+        serde_json::json!({ "added": true, "created": created }),
+    ))
 }
 
 /// `DELETE /api/sections/:sid/channels/:rid` — remove a channel from one of the
@@ -214,4 +232,37 @@ async fn remove_channel(
         .await
         .map_err(AeroError::from)?;
     Ok(Json(serde_json::json!({ "removed": removed })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn add_channel_error_mapping_is_stable_and_opaque() {
+        let missing_room = map_add_channel_error(ChannelSectionAddError::RoomNotFound);
+        let cross_tenant = map_add_channel_error(ChannelSectionAddError::RoomOutsideWorkspace);
+        assert_eq!(missing_room.status_code(), 404);
+        assert_eq!(cross_tenant.status_code(), 404);
+        assert_eq!(missing_room.code(), "not_found");
+        assert_eq!(missing_room.to_string(), cross_tenant.to_string());
+
+        let missing_section = map_add_channel_error(ChannelSectionAddError::SectionNotFound);
+        assert_eq!(missing_section.status_code(), 404);
+        assert_eq!(missing_section.code(), "not_found");
+
+        let not_channel = map_add_channel_error(ChannelSectionAddError::NotChannel);
+        assert_eq!(not_channel.status_code(), 409);
+        assert_eq!(not_channel.code(), "conflict");
+
+        let revoked = map_add_channel_error(ChannelSectionAddError::NotAuthorized);
+        assert_eq!(revoked.status_code(), 403);
+        assert_eq!(revoked.code(), "forbidden");
+
+        let storage = map_add_channel_error(ChannelSectionAddError::Storage(
+            sqlx::Error::Protocol("test".into()),
+        ));
+        assert_eq!(storage.status_code(), 500);
+        assert_eq!(storage.code(), "internal");
+    }
 }

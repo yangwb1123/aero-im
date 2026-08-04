@@ -34,7 +34,9 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route(
             "/api/me/status",
-            get(get_my_status).put(set_my_status).delete(clear_my_status),
+            get(get_my_status)
+                .put(set_my_status)
+                .delete(clear_my_status),
         )
         .route("/api/participants/:id/status", get(get_participant_status))
 }
@@ -92,7 +94,9 @@ impl SetStatusReq {
 /// Trim a string field, mapping empty/whitespace-only to `None` so a cleared
 /// field round-trips as absent rather than an empty string.
 fn clean(v: Option<&str>) -> Option<String> {
-    v.map(str::trim).filter(|s| !s.is_empty()).map(ToOwned::to_owned)
+    v.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 /// `PUT /api/me/status` — set (upsert) the caller's status. An empty body (no
@@ -161,7 +165,9 @@ async fn clear_my_status(
     auth: AuthUser,
 ) -> ApiResult<Json<serde_json::Value>> {
     let removed = repo(&s).clear(auth.participant_id).await?;
-    Ok(Json(serde_json::json!({ "cleared": true, "removed": removed })))
+    Ok(Json(
+        serde_json::json!({ "cleared": true, "removed": removed }),
+    ))
 }
 
 /// `GET /api/participants/:id/status` — another participant's current

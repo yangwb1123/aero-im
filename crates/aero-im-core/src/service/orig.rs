@@ -5,23 +5,21 @@
 //! HTTP/WS handlers stay thin.
 //!
 //! See `docs/specs/2026-05-22-aero-im-design.md` §4.2 for the protocol contract.
-use std::sync::Arc;
-use aero_bus::EventBus;
-use aero_common::{
-    Block, Message, NotificationKind, NotifyTarget, ParticipantId, RoomEvent, RoomId, WorkspaceRole,
-};
-use aero_storage::{
-    AiJobRepo, AutoModRuleRepo, BlockRepo, CallRepo,
-    DeactivationRepo, KeywordAlertRepo, MessageEditRepo, MessageRepo, NotificationBundleRepo,
-    NotificationPrefsRepo, NotificationRepo, ParticipantRepo, PinRepo, ReactionRepo, ReceiptRepo, RoomRepo,
-    ThreadMuteRepo, ThreadNotificationPrefsRepo, ThreadSubscriptionRepo, TotpRepo, UserGroupRepo,
-    WorkspaceMuteRepo, WorkspaceNotifDefaultsRepo, WorkspaceRepo,
-};
-use std::collections::BTreeMap;
-use tracing::warn;
-use crate::service::BusSink;
 use crate::moderator::Moderator;
 use crate::seq::{LocalSeqProvider, SeqProvider};
+use crate::service::BusSink;
+use aero_bus::EventBus;
+use aero_common::{Block, Message, NotificationKind, ParticipantId, RoomId, WorkspaceRole};
+use aero_storage::{
+    AiJobRepo, AutoModRuleRepo, BlockRepo, CallRepo, DeactivationRepo, KeywordAlertRepo,
+    MessageEditRepo, MessageRepo, MessageSideEffectRepo, NotificationBundleRepo,
+    NotificationPrefsRepo, NotificationRepo, ParticipantRepo, PinRepo, ReactionRepo, ReceiptRepo,
+    RoomRepo, ThreadMuteRepo, ThreadNotificationPrefsRepo, ThreadSubscriptionRepo, TotpRepo,
+    UserGroupRepo, WorkspaceMuteRepo, WorkspaceNotifDefaultsRepo, WorkspaceRepo,
+};
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use tracing::warn;
 /// Whether a workspace member holding `role` may create a channel (room) in that
 /// workspace. Members and above may; guests may not. Pure decision function so it
 /// is exhaustively unit-testable without a database.
@@ -53,7 +51,7 @@ pub(crate) fn spam_content_hash(blocks: &[Block]) -> u64 {
     }
     h.finish()
 }
-/// The notification batch a [`RoomEvent::NotifyBatch`] carries — used only to
+/// The notification batch a [`aero_common::RoomEvent::NotifyBatch`] carries — used only to
 /// derive a deterministic `delivery_id`. The same message produces one mention
 /// batch and (separately) one reply batch; they must derive *different*
 /// delivery ids so a recipient legitimately on both is not collapsed.
@@ -78,8 +76,7 @@ impl NotifyBatchKind {
 /// Any constant non-nil UUID works; it just has to be stable across processes
 /// and releases so a redelivered batch derives the same id. (Random v4, minted
 /// once and frozen here.)
-const NOTIFY_DELIVERY_NAMESPACE: uuid::Uuid =
-    uuid::uuid!("6f1d2e3c-9b4a-4d57-8a2e-1c0f7b6a4d9e");
+const NOTIFY_DELIVERY_NAMESPACE: uuid::Uuid = uuid::uuid!("6f1d2e3c-9b4a-4d57-8a2e-1c0f7b6a4d9e");
 
 /// Derive a **deterministic** `delivery_id` for a NotifyBatch from the message
 /// it concerns plus which batch (mention vs reply) it is. The same message's
@@ -96,6 +93,23 @@ pub(crate) fn notify_delivery_id(
     let name = format!("{}:{}", message.to_uuid(), kind.tag());
     uuid::Uuid::new_v5(&NOTIFY_DELIVERY_NAMESPACE, name.as_bytes())
 }
+
+async fn complete_notification_claim(
+    repo: &MessageSideEffectRepo,
+    source: (uuid::Uuid, i32),
+) -> aero_common::Result<()> {
+    if repo
+        .complete(source.0, source.1, time::OffsetDateTime::now_utc())
+        .await?
+    {
+        Ok(())
+    } else {
+        Err(aero_common::Error::Conflict(
+            "notification side-effect lease was superseded".into(),
+        ))
+    }
+}
+
 /// Whether a workspace member may join a channel given (a) it is public
 /// (not private) and (b) it is not archived. Both must hold: a private or
 /// archived channel is not openly joinable. Pure decision function, unit-tested
@@ -155,7 +169,6 @@ pub struct ImService {
     pub(crate) receipts: ReceiptRepo,
     pub(crate) reactions: ReactionRepo,
     pub(crate) calls: CallRepo,
-    pub(crate) ai_jobs: AiJobRepo,
     /// Notification inbox (mentions / thread replies). Optional so the existing
     /// constructors stay signature-compatible; wire it via
     /// [`with_notifications`](ImService::with_notifications) to persist + push
@@ -286,7 +299,7 @@ impl ImService {
         receipts: ReceiptRepo,
         reactions: ReactionRepo,
         calls: CallRepo,
-        ai_jobs: AiJobRepo,
+        _ai_jobs: AiJobRepo,
         bus: Arc<B>,
     ) -> Self {
         let moderator: Arc<dyn Moderator> = match crate::moderator::KeywordModerator::from_env() {
@@ -301,7 +314,6 @@ impl ImService {
             receipts,
             reactions,
             calls,
-            ai_jobs,
             notifications: None,
             notification_bundles: None,
             pins: None,
@@ -489,10 +501,7 @@ impl ImService {
     /// [`dispatch_notifications`](Self::dispatch_notifications). Additive builder;
     /// without it, all thread reply notifications are delivered (fail-open).
     #[must_use]
-    pub fn with_thread_notification_prefs(
-        mut self,
-        repo: ThreadNotificationPrefsRepo,
-    ) -> Self {
+    pub fn with_thread_notification_prefs(mut self, repo: ThreadNotificationPrefsRepo) -> Self {
         self.thread_notification_prefs = Some(repo);
         self
     }
@@ -569,7 +578,9 @@ impl ImService {
         // One-off snooze (Slack "Pause notifications"): suppress while still
         // active, in ADDITION to the recurring window + per-room mute.
         match prefs.get_snooze(recipient).await {
-            Ok(snooze) if aero_storage::notification_prefs::is_snoozed(snooze, now) => return false,
+            Ok(snooze) if aero_storage::notification_prefs::is_snoozed(snooze, now) => {
+                return false
+            }
             Ok(_) => {}
             Err(err) => {
                 warn!(?err, %recipient, "snooze lookup failed; not suppressing");
@@ -589,7 +600,7 @@ impl ImService {
         receipts: ReceiptRepo,
         reactions: ReactionRepo,
         calls: CallRepo,
-        ai_jobs: AiJobRepo,
+        _ai_jobs: AiJobRepo,
         bus: Arc<dyn BusSink>,
     ) -> Self {
         Self {
@@ -600,7 +611,6 @@ impl ImService {
             receipts,
             reactions,
             calls,
-            ai_jobs,
             notifications: None,
             notification_bundles: None,
             pins: None,
@@ -634,18 +644,20 @@ impl ImService {
 
     // ---------------------------------------------------------- internal
 
-    /// Persist + push mention/thread-reply notifications for a freshly-sent
-    /// message. Best-effort: a failure is logged and never blocks the send.
-    /// Runs DETACHED (spawned by [`send_message`](Self::send_message)) so its
-    /// prefs reads and per-recipient Notify publishes stay off the send path.
-    /// No-op when the notification inbox isn't wired
-    /// ([`with_notifications`](Self::with_notifications)). `members` is the room's
-    /// member set — a mention or reply targeting someone outside it (e.g. a stale
-    /// `@`) is skipped, and the sender never notifies themselves. An explicit
-    /// `@`-mention outranks a thread reply for the same recipient.
-    pub(crate) async fn dispatch_notifications(&self, message: &Message, members: &[ParticipantId]) {
+    /// Materialize mention/thread-reply notifications for one durable
+    /// message-side-effect claim. The final inbox/outbox or bundle write
+    /// atomically completes that claim; deterministic delivery ids make any
+    /// earlier projection safe to replay. `members` is an initial candidate
+    /// set; storage locks and revalidates membership again at commit.
+    pub(crate) async fn dispatch_notifications(
+        &self,
+        message: &Message,
+        members: &[ParticipantId],
+        source: (uuid::Uuid, i32),
+    ) -> aero_common::Result<()> {
+        let source_repo = MessageSideEffectRepo::new(self.messages.pool.clone());
         let Some(repo) = self.notifications.as_ref() else {
-            return;
+            return complete_notification_claim(&source_repo, source).await;
         };
         let sender = message.sender_id;
         let room = message.room_id;
@@ -846,7 +858,9 @@ impl ImService {
 
             // Collect mentioned participant ids for the "mentions" level check.
             let mentioned: std::collections::HashSet<ParticipantId> =
-                mentioned_participants(&message.blocks).into_iter().collect();
+                mentioned_participants(&message.blocks)
+                    .into_iter()
+                    .collect();
 
             // ONE batch query for every reply-recipient's thread level instead of
             // an O(R) per-recipient get_level loop (ROADMAP 方向二). Fail-open: a
@@ -856,7 +870,10 @@ impl ImService {
                 .levels_for(root, &reply_recipients)
                 .await
                 .unwrap_or_else(|err| {
-                    warn!(?err, "thread notification level batch lookup failed; delivering");
+                    warn!(
+                        ?err,
+                        "thread notification level batch lookup failed; delivering"
+                    );
                     std::collections::HashMap::new()
                 });
             let mut to_drop: Vec<ParticipantId> = Vec::new();
@@ -884,85 +901,84 @@ impl ImService {
         // O(1) prefs round-trips instead of O(3N). Fail-open like should_notify:
         // a failed batch lookup degrades to "no suppression" (warn + notify),
         // never to a dropped notification.
-        let notifiable: Vec<(ParticipantId, NotificationKind)> = if let Some(prefs) =
-            self.prefs.as_ref()
-        {
-            let ids: Vec<ParticipantId> = targets.keys().copied().collect();
-            let muted = match prefs.muted_set(room, &ids).await {
-                Ok(set) => set,
-                Err(err) => {
-                    warn!(?err, %room, "batch mute lookup failed; not suppressing");
-                    std::collections::HashSet::new()
-                }
+        let notifiable: Vec<(ParticipantId, NotificationKind)> =
+            if let Some(prefs) = self.prefs.as_ref() {
+                let ids: Vec<ParticipantId> = targets.keys().copied().collect();
+                let muted = match prefs.muted_set(room, &ids).await {
+                    Ok(set) => set,
+                    Err(err) => {
+                        warn!(?err, %room, "batch mute lookup failed; not suppressing");
+                        std::collections::HashSet::new()
+                    }
+                };
+                let dnd_rows = match prefs.dnd_snooze_many(&ids).await {
+                    Ok(rows) => rows,
+                    Err(err) => {
+                        warn!(?err, %room, "batch DND/snooze lookup failed; not suppressing");
+                        std::collections::HashMap::new()
+                    }
+                };
+                let now = time::OffsetDateTime::now_utc();
+                targets
+                    .into_iter()
+                    .filter(|(recipient, _)| {
+                        // Absent row == no prefs (DndSnooze::default): always delivers.
+                        let row = dnd_rows.get(recipient).copied().unwrap_or_default();
+                        aero_storage::notification_prefs::should_deliver(
+                            muted.contains(recipient),
+                            row.dnd,
+                            row.snooze_until,
+                            now,
+                        )
+                    })
+                    .collect()
+            } else {
+                targets.into_iter().collect()
             };
-            let dnd_rows = match prefs.dnd_snooze_many(&ids).await {
-                Ok(rows) => rows,
-                Err(err) => {
-                    warn!(?err, %room, "batch DND/snooze lookup failed; not suppressing");
-                    std::collections::HashMap::new()
-                }
-            };
-            let now = time::OffsetDateTime::now_utc();
-            targets
-                .into_iter()
-                .filter(|(recipient, _)| {
-                    // Absent row == no prefs (DndSnooze::default): always delivers.
-                    let row = dnd_rows.get(recipient).copied().unwrap_or_default();
-                    aero_storage::notification_prefs::should_deliver(
-                        muted.contains(recipient),
-                        row.dnd,
-                        row.snooze_until,
-                        now,
-                    )
-                })
-                .collect()
-        } else {
-            targets.into_iter().collect()
-        };
         // Split notifiable into mentions (immediate insert) and replies (bundle).
         let (mentions, replies): (Vec<_>, Vec<_>) = notifiable
             .into_iter()
             .partition(|(_, kind)| matches!(kind, NotificationKind::Mention));
+        let has_mentions = !mentions.is_empty();
+        let has_replies = !replies.is_empty();
 
         // Mentions: insert immediately and publish NotifyBatch.
-        if !mentions.is_empty() {
+        if has_mentions {
             // Deterministic idempotency token: the same message's mention batch
             // always derives the same id, so a redelivered batch de-dups via
             // insert_many's ON CONFLICT (delivery_id, participant_id).
             let delivery_id = notify_delivery_id(message.id, NotifyBatchKind::Mention);
-            if let Err(err) = repo
-                .insert_many(room, message.id, Some(sender), &mentions, Some(delivery_id))
-                .await
+            let completion = (!has_replies).then_some(source);
+            if !repo
+                .insert_many_outboxed(room, message.id, sender, &mentions, delivery_id, completion)
+                .await?
             {
-                warn!(?err, %room, count = mentions.len(), "mention batch persist failed");
-            } else {
-                let recipients: Vec<NotifyTarget> = mentions
-                    .into_iter()
-                    .map(|(participant, kind)| NotifyTarget { participant, kind })
-                    .collect();
-                self.publish_room_event(
-                    room,
-                    &RoomEvent::NotifyBatch {
-                        room_id: room,
-                        message_id: message.id,
-                        by: sender,
-                        delivery_id,
-                        recipients,
-                    },
-                )
-                .await;
+                return Err(aero_common::Error::Conflict(
+                    "notification side-effect lease was superseded".into(),
+                ));
             }
         }
 
         // Replies: defer into notification bundles for periodic aggregation.
         if let Some(bundle_repo) = &self.notification_bundles {
             let thread_root = message.reply_to;
-            for (recipient, kind) in &replies {
-                if let Err(err) = bundle_repo
-                    .insert(*recipient, room, message.id, *kind, Some(sender), thread_root)
-                    .await
+            if has_replies {
+                let delivery_id = notify_delivery_id(message.id, NotifyBatchKind::Reply);
+                if !bundle_repo
+                    .insert_many_idempotent(
+                        room,
+                        message.id,
+                        sender,
+                        thread_root,
+                        &replies,
+                        delivery_id,
+                        Some(source),
+                    )
+                    .await?
                 {
-                    warn!(?err, %recipient, "notification bundle insert failed");
+                    return Err(aero_common::Error::Conflict(
+                        "notification side-effect lease was superseded".into(),
+                    ));
                 }
             }
         } else {
@@ -970,30 +986,28 @@ impl ImService {
             // Reply batch gets its OWN deterministic id (distinct namespace tag
             // from the mention batch) so a recipient on both is not collapsed.
             let delivery_id = notify_delivery_id(message.id, NotifyBatchKind::Reply);
-            if let Err(err) = repo
-                .insert_many(room, message.id, Some(sender), &replies, Some(delivery_id))
-                .await
-            {
-                warn!(?err, %room, count = replies.len(), "reply batch persist failed");
-            } else {
-                let recipients: Vec<NotifyTarget> = replies
-                    .into_iter()
-                    .map(|(participant, kind)| NotifyTarget { participant, kind })
-                    .collect();
-                self.publish_room_event(
-                    room,
-                    &RoomEvent::NotifyBatch {
-                        room_id: room,
-                        message_id: message.id,
-                        by: sender,
+            if has_replies
+                && !repo
+                    .insert_many_outboxed(
+                        room,
+                        message.id,
+                        sender,
+                        &replies,
                         delivery_id,
-                        recipients,
-                    },
-                )
-                .await;
+                        Some(source),
+                    )
+                    .await?
+            {
+                return Err(aero_common::Error::Conflict(
+                    "notification side-effect lease was superseded".into(),
+                ));
             }
         }
-}
+        if !has_mentions && !has_replies {
+            complete_notification_claim(&source_repo, source).await?;
+        }
+        Ok(())
+    }
 
     /// Resolve the recipient set for an `@here` broadcast: the room's *online*
     /// members (Slack semantics) when a presence store is wired, else the full
@@ -1014,8 +1028,10 @@ impl ImService {
         };
         match presence.members(room).await {
             Ok(online) if !online.is_empty() => {
-                let intersected: std::collections::BTreeSet<ParticipantId> =
-                    online.into_iter().filter(|p| member_set.contains(p)).collect();
+                let intersected: std::collections::BTreeSet<ParticipantId> = online
+                    .into_iter()
+                    .filter(|p| member_set.contains(p))
+                    .collect();
                 // An online roster that shares nobody with the room membership is
                 // almost certainly a stale/degraded read, not a genuinely empty
                 // audience — fail open to all members rather than notify no one.
@@ -1037,42 +1053,25 @@ impl ImService {
         }
     }
 
-    /// Flush expired notification bundles and publish NotifyBatch events for
-    /// the resulting aggregated notifications. No-op when the bundle store is
-    /// not wired. Best-effort: failures are logged, never fatal.
+    /// Flush expired notification bundles. Inbox rows and deterministic
+    /// `NotifyBatch` outbox events commit on the repository transaction, so
+    /// there is no lossy post-commit publish gap.
     pub async fn flush_notification_bundles(&self) {
-        let Some(bundle_repo) = &self.notification_bundles else { return };
-        let result = match bundle_repo.flush().await {
-            Ok(r) => r,
+        let Some(bundle_repo) = &self.notification_bundles else {
+            return;
+        };
+        match bundle_repo.flush().await {
+            Ok(result) if result.bundles_consumed > 0 => {
+                tracing::debug!(
+                    bundles = result.bundles_consumed,
+                    notifications = result.notifications_inserted,
+                    "notification bundles flushed with durable events"
+                );
+            }
+            Ok(_) => {}
             Err(e) => {
                 tracing::warn!(error = %e, "notification bundle flush failed");
-                return;
             }
-        };
-        if result.notifications_inserted == 0 {
-            return;
-        }
-        // Group by room and publish one NotifyBatch per room.
-        let mut by_room: std::collections::BTreeMap<RoomId, Vec<NotifyTarget>> =
-            std::collections::BTreeMap::new();
-        for n in &result.inserted {
-            by_room
-                .entry(n.room)
-                .or_default()
-                .push(NotifyTarget { participant: n.participant, kind: n.kind });
-        }
-        for (room, recipients) in &by_room {
-            self.publish_room_event(
-                *room,
-                &RoomEvent::NotifyBatch {
-                    room_id: *room,
-                    message_id: aero_common::MessageId::new(),
-                    by: aero_common::ParticipantId::new(),
-                    delivery_id: aero_common::MessageId::new().to_uuid(),
-                    recipients: recipients.clone(),
-                },
-            )
-            .await;
         }
     }
 }
@@ -1151,7 +1150,6 @@ fn group_handle_tokens(blocks: &[Block]) -> Vec<String> {
     }
     out
 }
-
 
 #[cfg(test)]
 mod tests;

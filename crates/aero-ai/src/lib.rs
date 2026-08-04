@@ -24,14 +24,15 @@ pub mod rerank;
 pub mod service;
 pub mod tier;
 pub mod transcribe;
+pub mod usage;
 pub mod worker;
 
 pub use agent::{run_agent_loop, AgentOutcome, AgentTool, ToolChat};
 pub use anthropic::{AgentTurn, AnthropicClient, ChatMsg, ToolDef, ToolUse, Usage};
 pub use budget::{CostBudget, KeyedCostBudget};
-pub use metrics::CostModel;
 pub use embed::{default_embedder, Embedder, HashEmbedder, VoyageEmbedder, EMBED_DIM};
 pub use error::{AiError, Result};
+pub use metrics::CostModel;
 pub use rerank::fuse_rankings;
 pub use service::{AiService, AnswerResult, ChannelRec, PersonRec, Sentiment, SentimentScore};
 pub use tier::{classify_tier, tier_model, AiTier};

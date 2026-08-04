@@ -10,7 +10,6 @@ import websockets
 
 HOST = os.environ.get("AERO_HOST", "http://localhost:3030")
 WS_HOST = HOST.replace("http://", "ws://").replace("https://", "wss://")
-DEFAULT_WS = "00000000000000000000000000"
 # 1x1 transparent PNG.
 PNG = bytes.fromhex(
     "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4"
@@ -44,13 +43,13 @@ def req(method, path, body=None, token=None, expect=None):
         fail(f"HTTP {e.code} {method} {path}: {e.read().decode(errors='ignore')[:300]}")
 
 
-def upload_blob(token, name, ctype, payload):
+def upload_blob(token, room, name, ctype, payload):
     boundary = "----aerow5" + str(time.time_ns())
     head = (f"--{boundary}\r\n"
             f'content-disposition: form-data; name="file"; filename="{name}"\r\n'
             f"content-type: {ctype}\r\n\r\n").encode()
     tail = f"\r\n--{boundary}--\r\n".encode()
-    r = urllib.request.Request(HOST + "/api/blobs", method="POST", data=head + payload + tail,
+    r = urllib.request.Request(HOST + f"/api/rooms/{room}/blobs", method="POST", data=head + payload + tail,
         headers={"authorization": f"Bearer {token}",
                  "content-type": f"multipart/form-data; boundary={boundary}", "accept": "application/json"})
     with urllib.request.urlopen(r) as resp:
@@ -77,7 +76,19 @@ def main():
     Apid, Bpid = a["participant"]["id"], b["participant"]["id"]
     room = req("POST", "/api/rooms", {"kind": "group", "name": f"w5-{ts}"}, token=A)
     Rid = room["id"]
-    ok(f"setup: alice/bob + room {Rid[:8]}")
+    W = req(
+        "POST",
+        "/api/workspaces",
+        {"name": f"Wave5 {ts}", "slug": f"w5-{ts}"},
+        token=A,
+    )["id"]
+    emoji_room = req(
+        "POST",
+        "/api/rooms",
+        {"kind": "channel", "name": f"w5-assets-{ts}", "workspace_id": W},
+        token=A,
+    )["id"]
+    ok(f"setup: alice/bob + room {Rid[:8]} + owned workspace {W[:8]}")
 
     # ---------------- Personal Access Tokens ----------------
     say("PAT: mint a token; it authenticates GET /api/me (an existing AuthUser route)")
@@ -104,7 +115,7 @@ def main():
 
     # ---------------- Bookmarks ----------------
     say("bookmarks: save a message, list, unsave")
-    msg = asyncio.new_event_loop().run_until_complete(ws_send(A, Rid, [{"type": "text", "content": f"save me {ts}"}]))
+    msg = asyncio.run(ws_send(A, Rid, [{"type": "text", "content": f"save me {ts}"}]))
     Mid = msg["id"]
     req("POST", f"/api/messages/{Mid}/save", {"note": "important"}, token=A)
     saved = req("GET", "/api/saved", token=A)
@@ -117,17 +128,17 @@ def main():
 
     # ---------------- Custom emoji ----------------
     say("emoji: upload a blob, register a custom emoji, list, delete")
-    blob = upload_blob(A, "shipit.png", "image/png", PNG)
+    blob = upload_blob(A, emoji_room, "shipit.png", "image/png", PNG)
     bid = blob["id"]
     name = f"shipit{ts}"
-    em = req("POST", f"/api/workspaces/{DEFAULT_WS}/emoji", {"name": name, "blob_id": bid}, token=A)
+    em = req("POST", f"/api/workspaces/{W}/emoji", {"name": name, "blob_id": bid}, token=A)
     em_id = em.get("id")
     if not em_id: fail(f"emoji create returned no id: {em}")
-    lst = req("GET", f"/api/workspaces/{DEFAULT_WS}/emoji", token=A)
+    lst = req("GET", f"/api/workspaces/{W}/emoji", token=A)
     if not any(e["name"] == name for e in lst): fail(f"emoji not listed: {lst}")
     ok(f"custom emoji :{name}: created + listed")
     say("emoji: duplicate name rejected (409)")
-    req("POST", f"/api/workspaces/{DEFAULT_WS}/emoji", {"name": name, "blob_id": bid}, token=A, expect=409)
+    req("POST", f"/api/workspaces/{W}/emoji", {"name": name, "blob_id": bid}, token=A, expect=409)
     req("DELETE", f"/api/emoji/{em_id}", token=A)
     ok("duplicate rejected; emoji deleted")
 
