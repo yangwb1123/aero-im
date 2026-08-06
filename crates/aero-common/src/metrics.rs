@@ -68,6 +68,8 @@ pub mod names {
     pub const MESSAGES_EDITED_TOTAL: &str = "aero_messages_edited_total";
     /// Counter: messages soft-deleted (successful deletes only).
     pub const MESSAGES_DELETED_TOTAL: &str = "aero_messages_deleted_total";
+    /// Counter: messages recalled (撤回, successful recalls only).
+    pub const MESSAGES_RECALLED_TOTAL: &str = "aero_messages_recalled_total";
     /// Histogram: end-to-end message-mutation latency in seconds, labeled by
     /// `op` (`send` / `edit` / `delete`). Answers "messages per second" and
     /// surfaces hot-path regressions in the IM core.

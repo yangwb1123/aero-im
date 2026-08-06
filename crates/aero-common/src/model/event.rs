@@ -36,6 +36,11 @@ pub enum RoomEvent {
         message_id: MessageId,
         by: ParticipantId,
     },
+    /// A message was recalled (撤回): its content was replaced by the system
+    /// placeholder while the row/history/audit stay intact. Carries the full
+    /// updated message (mirroring [`RoomEvent::Edited`]) so clients render the
+    /// placeholder in place without a refetch.
+    Recalled(Message),
     /// A reaction was toggled.
     Reaction {
         room_id: RoomId,
@@ -175,7 +180,7 @@ impl RoomEvent {
     pub fn room_id(&self) -> Option<RoomId> {
         match self {
             RoomEvent::Message(e) => Some(e.message.room_id),
-            RoomEvent::Edited(m) => Some(m.room_id),
+            RoomEvent::Edited(m) | RoomEvent::Recalled(m) => Some(m.room_id),
             RoomEvent::Deleted { room_id, .. }
             | RoomEvent::Reaction { room_id, .. }
             | RoomEvent::Read { room_id, .. }

@@ -161,6 +161,25 @@ async fn delete_message(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// `POST /api/messages/:id/recall` — recall (撤回) a message: the author or a
+/// room owner/admin replaces its content with the system placeholder, keeps the
+/// row/history/audit, and broadcasts a `Recalled` room event. Same service
+/// method as the WebSocket `recall_message` frame, so tenant access, permission,
+/// audit and the durable event append are one invariant. Returns the updated
+/// message (placeholder blocks + `recalled_at`/`recalled_by`) so the caller can
+/// render it immediately. Stable failures: 404 unknown message, 403 non-member
+/// or non-author member, 409 already recalled / already deleted.
+async fn recall_message(
+    State(s): State<AppState>,
+    auth: AuthUser,
+    Path(id_str): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let id =
+        MessageId::from_str(&id_str).map_err(|e| AeroError::Invalid(format!("message id: {e}")))?;
+    let recalled = s.im.recall_message(auth.participant_id, id).await?;
+    Ok(Json(serde_json::to_value(recalled).map_err(AeroError::from)?))
+}
+
 #[derive(Deserialize)]
 struct ToggleReactionReq {
     emoji: String,

@@ -260,6 +260,23 @@ fn materialize_outbox_payload(
         EventOutboxKind::Notify | EventOutboxKind::Reaction => {
             Ok(current_live.map(|_| row.payload.clone()))
         }
+        EventOutboxKind::Recalled => {
+            // Mirror the Edited semantics: a delayed recall event is suppressed
+            // when a later mutation (delete, or any post-recall version bump)
+            // already superseded it, or when the message is no longer live.
+            let Some(message) = current_live else {
+                return Ok(None);
+            };
+            let original: RoomEvent = serde_json::from_value(row.payload.clone())?;
+            let original_version = match original {
+                RoomEvent::Recalled(message) => message.version,
+                _ => return Ok(None),
+            };
+            if message.version > original_version {
+                return Ok(None);
+            }
+            serde_json::to_value(RoomEvent::Recalled(message.clone())).map(Some)
+        }
     }
 }
 
@@ -358,6 +375,8 @@ mod tests {
             created_at: OffsetDateTime::UNIX_EPOCH,
             edited_at: None,
             deleted_at: None,
+            recalled_at: None,
+            recalled_by: None,
             expires_at: None,
             version,
         }
@@ -465,6 +484,65 @@ mod tests {
         );
         assert!(
             materialize_outbox_payload(&create, Some(&deleted), OffsetDateTime::UNIX_EPOCH)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn recalled_payload_is_delivered_at_version_and_suppressed_when_superseded() {
+        // Gap ① (plan §5.1): the Recalled materialization arm must mirror the
+        // Edited semantics — deliver the placeholder event while the live row
+        // still carries the recall version, suppress it once a later mutation
+        // (post-recall edit would be fenced, but delete/version bump) moved on.
+        let mut recalled = message(2, "[此消息已被撤回]");
+        recalled.recalled_at = Some(OffsetDateTime::UNIX_EPOCH);
+        recalled.recalled_by = Some(ParticipantId::new());
+        let payload = serde_json::to_value(RoomEvent::Recalled(recalled.clone())).unwrap();
+        let recalled_row = row(EventOutboxKind::Recalled, payload.clone());
+
+        // Live row at the same version → the recall event is delivered with the
+        // current (placeholder) blocks, not the send-time original.
+        let materialized = materialize_outbox_payload(
+            &recalled_row,
+            Some(&recalled),
+            OffsetDateTime::UNIX_EPOCH,
+        )
+        .unwrap()
+        .expect("recall at matching version is delivered");
+        let RoomEvent::Recalled(delivered) = serde_json::from_value(materialized).unwrap() else {
+            panic!("recalled event");
+        };
+        assert_eq!(delivered.version, 2);
+        assert!(delivered.recalled_at.is_some());
+        assert_eq!(
+            serde_json::to_value(&delivered.blocks).unwrap(),
+            serde_json::to_value(&recalled.blocks).unwrap(),
+            "materialized recall carries the current placeholder blocks"
+        );
+
+        // A later mutation bumped the version past the recall → suppressed.
+        let mut superseded = recalled.clone();
+        superseded.version = 3;
+        assert!(
+            materialize_outbox_payload(&recalled_row, Some(&superseded), OffsetDateTime::UNIX_EPOCH)
+                .unwrap()
+                .is_none(),
+            "recall superseded by a later mutation is suppressed"
+        );
+
+        // Message tombstoned → suppressed (Deleted frame already conveys it).
+        let mut deleted = recalled.clone();
+        deleted.deleted_at = Some(OffsetDateTime::UNIX_EPOCH);
+        assert!(
+            materialize_outbox_payload(&recalled_row, Some(&deleted), OffsetDateTime::UNIX_EPOCH)
+                .unwrap()
+                .is_none()
+        );
+
+        // Row gone entirely → suppressed.
+        assert!(
+            materialize_outbox_payload(&recalled_row, None, OffsetDateTime::UNIX_EPOCH)
                 .unwrap()
                 .is_none()
         );

@@ -25,6 +25,8 @@ mod authorization_tests;
 #[cfg(test)]
 mod barrier_tests;
 #[cfg(test)]
+mod recall_tests;
+#[cfg(test)]
 mod reply_scope_tests;
 /// Full-text + vector search across rooms and workspaces.
 pub mod search;
@@ -175,6 +177,30 @@ pub(crate) fn attached_blob_ids(blocks_json: &serde_json::Value) -> Vec<aero_com
         .collect()
 }
 
+/// Gate round-3 B1: the recall history snapshot must never carry byte
+/// references. The recall transaction enqueues the original attachment blobs
+/// for GC (attachment bytes are content — removed), while `message_edits` is
+/// invisible to the GC live-reference scan; a snapshot with `blob_id`s would
+/// point at destroyed bytes. `File`/`Voice` blocks become plain text (the
+/// voice transcript survives as text evidence); everything else passes
+/// through untouched.
+pub(crate) fn redact_blocks_for_recall_snapshot(blocks: &[Block]) -> Vec<Block> {
+    blocks
+        .iter()
+        .map(|block| match block {
+            Block::File { .. } => Block::text("[附件已移除]"),
+            Block::Voice {
+                transcript: Some(transcript),
+                ..
+            } => Block::text(transcript.clone()),
+            Block::Voice {
+                transcript: None, ..
+            } => Block::text("[语音已移除]"),
+            other => other.clone(),
+        })
+        .collect()
+}
+
 pub(crate) const EXPORT_SENDER_CAP: i64 = 500;
 
 // ---------- Types shared by sub-modules ----------
@@ -191,6 +217,8 @@ pub(crate) struct ScoredMessageRow {
     created_at: time::OffsetDateTime,
     edited_at: Option<time::OffsetDateTime>,
     deleted_at: Option<time::OffsetDateTime>,
+    recalled_at: Option<time::OffsetDateTime>,
+    recalled_by: Option<uuid::Uuid>,
     expires_at: Option<time::OffsetDateTime>,
     version: i32,
 }
@@ -207,6 +235,8 @@ pub(crate) struct MessageRow {
     pub(crate) created_at: time::OffsetDateTime,
     pub(crate) edited_at: Option<time::OffsetDateTime>,
     pub(crate) deleted_at: Option<time::OffsetDateTime>,
+    pub(crate) recalled_at: Option<time::OffsetDateTime>,
+    pub(crate) recalled_by: Option<uuid::Uuid>,
     pub(crate) expires_at: Option<time::OffsetDateTime>,
     pub(crate) version: i32,
 }
@@ -225,6 +255,8 @@ impl From<ScoredMessageRow> for SearchHit {
                 created_at: r.created_at,
                 edited_at: r.edited_at,
                 deleted_at: r.deleted_at,
+                recalled_at: r.recalled_at,
+                recalled_by: r.recalled_by.map(ParticipantId::from_uuid),
                 expires_at: r.expires_at,
                 version: r.version,
             },
@@ -246,6 +278,8 @@ impl From<MessageRow> for Message {
             created_at: r.created_at,
             edited_at: r.edited_at,
             deleted_at: r.deleted_at,
+            recalled_at: r.recalled_at,
+            recalled_by: r.recalled_by.map(ParticipantId::from_uuid),
             expires_at: r.expires_at,
             version: r.version,
         }

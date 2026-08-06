@@ -28,3 +28,19 @@
 19:53:51 [INFO] ============================================================
 19:53:51 [INFO] -- [1/1] --
 19:53:51 [INFO] >>  pi -p 已批准的组合变更 COMPOSE-2026-017。本仓库（aero-im）职责： 消费 vault.file.notify@1.1（自包含载荷）→ 站内通知送...  [model=default]  [timeout=900s]  [dir=/home/u1/aero-im]
+19:59:40 [INFO] OK  done  [349.2s]  [output=docs/proposals/compose-2026-017-aero-im.md]
+19:59:40 [INFO] VALIDATE: python3 /home/u1/ai-batch-runner/examples/snaplink-platform/scripts/check-no-refusal.py /home/u1/aero-im/docs/proposals/compose-2026-017-aero-im.md.kqbaw9s3.tmp
+19:59:40 [INFO] WROTE /home/u1/aero-im/docs/proposals/compose-2026-017-aero-im.md (validated)
+19:59:40 [INFO] All tasks passed in round 1
+
+========================================================
+  pi-batch execution report
+========================================================
+  total:     1
+  succeeded: 1
+  failed:    0
+  CPU time:  349.2s
+  wall time: 349.2s
+
+  PASS  [ 349.2s] 已批准的组合变更 COMPOSE-2026-017。本仓库（aero-im）职责： 消费 vault.file.noti...
+========================================================

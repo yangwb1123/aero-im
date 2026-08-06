@@ -308,8 +308,14 @@ export class WsClient {
       // move even the legacy `?since=` fallback past the rejected frame.
       if (!applied && msg?.seq != null) this._seqGate.forget(seqScope(msg), msg.seq);
       if (applied) {
-        const mid = msg?.message?.id;
-        if (mid && (!this._lastSeen || mid > this._lastSeen)) this._lastSeen = mid;
+        // Only ordinary room-message frames advance the legacy `?since=`
+        // backfill cursor. Mutations (edited/deleted/recalled) converge via
+        // the `changes_since` replay instead — advancing the cursor on them
+        // could skip a not-yet-fetched create in the legacy backfill.
+        if (msg?.type === 'message') {
+          const mid = msg?.message?.id;
+          if (mid && (!this._lastSeen || mid > this._lastSeen)) this._lastSeen = mid;
+        }
       }
       // Persist ordinary room messages after applying them. Live frames carry a
       // publish-time room seq; database backfill frames use the zero sentinel.
@@ -529,6 +535,9 @@ export class WsClient {
   }
   deleteMessage(id) {
     return this.send({ type: 'delete_message', id });
+  }
+  recallMessage(id) {
+    return this.send({ type: 'recall_message', id });
   }
   react(messageId, emoji) {
     return this.send({ type: 'react', message_id: messageId, emoji });

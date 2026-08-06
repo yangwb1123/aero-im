@@ -31,6 +31,7 @@ pub enum EventOutboxKind {
     Notify,
     Reaction,
     CanvasOp,
+    Recalled,
 }
 
 impl EventOutboxKind {
@@ -43,6 +44,7 @@ impl EventOutboxKind {
             Self::Notify => "notify",
             Self::Reaction => "reaction",
             Self::CanvasOp => "canvas_op",
+            Self::Recalled => "recalled",
         }
     }
 }
@@ -58,6 +60,7 @@ impl TryFrom<&str> for EventOutboxKind {
             "notify" => Ok(Self::Notify),
             "reaction" => Ok(Self::Reaction),
             "canvas_op" => Ok(Self::CanvasOp),
+            "recalled" => Ok(Self::Recalled),
             other => Err(sqlx::Error::Decode(
                 format!("unknown event_outbox event_kind {other:?}").into(),
             )),

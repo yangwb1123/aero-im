@@ -37,9 +37,10 @@ export const state = {
   // muted that thread. Lazily hydrated when the mute button is first hovered/
   // clicked, then kept in sync on each toggle so the bell glyph stays correct.
   threadMuted: new Map(),     // root_message_id -> bool (true = muted)
-  // ROADMAP v3 方向一: last-applied edit timestamp per message id, so an older
-  // Edited event redelivered out of order never clobbers a newer edit.
-  lastEditAt: new Map(),      // message_id -> epoch ms of the applied edit
+  // ROADMAP v3 方向一: last-applied mutation timestamp per message id, so an
+  // older Edited/Recalled event redelivered out of order never clobbers a
+  // newer one (recalls use recalled_at as their order key).
+  lastEditAt: new Map(),      // message_id -> epoch ms of the applied edit/recall
   lastChangeSync: new Map(),  // room_id -> RFC3339 of the last edit/delete replay sync
   resyncInFlight: false,      // collapse bursts of server `resync` frames
   // Call

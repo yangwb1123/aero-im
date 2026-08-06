@@ -13,6 +13,26 @@ use aero_common::{
 use aero_storage::{message::NewMessage, MessageIdempotency};
 use tracing::{instrument, warn, Instrument};
 
+/// Pure recall (撤回) permission decision: the author, or a room owner/admin,
+/// may recall a message. `room_role` is the actor's role in the message's room
+/// (`None` = not a member — unreachable past the room-access guard, kept for a
+/// total function). Kept pure so the full permission matrix is table-driven and
+/// unit-testable without a database; the storage transaction re-checks the same
+/// rule under row locks (this is never authority on its own).
+pub(crate) fn recall_authorized(
+    actor: ParticipantId,
+    sender: ParticipantId,
+    room_role: Option<&str>,
+) -> std::result::Result<(), aero_common::Error> {
+    if actor == sender || matches!(room_role, Some("owner" | "admin")) {
+        Ok(())
+    } else {
+        Err(aero_common::Error::Forbidden(
+            "only author or room admin may recall".into(),
+        ))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SendMessageOutcome {
     pub message: Message,
@@ -366,6 +386,11 @@ impl ImService {
         if existing.deleted_at.is_some() {
             return Err(Error::Conflict("message is deleted".into()));
         }
+        // A recalled message is terminal for user content mutations: its body is
+        // the system placeholder and must not be overwritten back into view.
+        if existing.recalled_at.is_some() {
+            return Err(Error::Conflict("message is recalled".into()));
+        }
         if existing.sender_id != actor {
             return Err(Error::Forbidden("only sender may edit".into()));
         }
@@ -415,6 +440,68 @@ impl ImService {
             &[("op", "delete")],
         );
         Ok(())
+    }
+
+    /// Recall (撤回) a message: the sender — or a room owner/admin — replaces
+    /// its content with the system placeholder while the row, room history and
+    /// audit trail stay intact, then broadcasts a `Recalled` room event so every
+    /// client renders the placeholder.
+    ///
+    /// Stable failure paths, in evaluation order (a caller outside the room must
+    /// never learn anything about the message's state — no existence oracle):
+    /// 1. unknown message → `NotFound`;
+    /// 2. no room access (non-member / cross-workspace) → `Forbidden`;
+    /// 3. already deleted → `Conflict("message is deleted")`;
+    /// 4. already recalled → `Conflict("message is already recalled")`;
+    /// 5. member (not author, not admin/owner) → `Forbidden`.
+    /// The commit-time storage path re-checks access, role and state under row
+    /// locks, so this preflight is UX only, never authority.
+    #[instrument(skip(self), fields(?actor, ?id))]
+    pub async fn recall_message(&self, actor: ParticipantId, id: MessageId) -> Result<Message> {
+        let started = std::time::Instant::now();
+        let existing = self
+            .messages
+            .get(id)
+            .await?
+            .ok_or_else(|| Error::NotFound(format!("message {id}")))?;
+        // Resolve the message's tenant/room first, then apply the shared access
+        // guard before any state check. This prevents a global message id from
+        // becoming an IDOR/oracle across workspaces.
+        self.assert_room_access(actor, existing.room_id).await?;
+        if existing.deleted_at.is_some() {
+            return Err(Error::Conflict("message is deleted".into()));
+        }
+        if existing.recalled_at.is_some() {
+            return Err(Error::Conflict("message is already recalled".into()));
+        }
+        // Author, or room owner/admin. The role is re-checked inside the storage
+        // transaction under locks; this read only produces the stable early 403.
+        let role = aero_storage::RoomRoleRepo::new(self.messages.pool.clone())
+            .role_of(existing.room_id, actor)
+            .await?;
+        recall_authorized(actor, existing.sender_id, role.as_deref())?;
+
+        let traceparent = aero_common::telemetry::current_traceparent();
+        let recalled = self
+            .messages
+            .recall_outboxed_authorized(id, actor, traceparent.as_deref())
+            .await?
+            .ok_or_else(|| Error::Conflict("message recall raced with another mutation".into()))?;
+        if let Err(error) = self.dispatch_event_outbox_id(recalled.outbox_id).await {
+            warn!(
+                ?error,
+                outbox_id = %recalled.outbox_id,
+                message_id = %id,
+                "fast recalled-event outbox dispatch failed"
+            );
+        }
+        metrics::inc_counter(names::MESSAGES_RECALLED_TOTAL, 1);
+        metrics::observe_histogram_labeled(
+            names::MESSAGE_PROCESSING_DURATION_SECONDS,
+            started.elapsed().as_secs_f64(),
+            &[("op", "recall")],
+        );
+        Ok(recalled.message)
     }
 
     /// System action: soft-delete a message flagged by AI moderation.
@@ -511,5 +598,44 @@ mod reply_scope_tests {
             Err(Error::Invalid(message))
                 if message.contains(&parent.to_string()) && message.contains(&room.to_string())
         ));
+    }
+}
+
+#[cfg(test)]
+mod recall_permission_tests {
+    use super::*;
+
+    /// The full recall permission matrix, table-driven: actor kind × room role
+    /// → allow / stable 403. Author always allowed; owner/admin allowed; plain
+    /// member (non-author) forbidden; stranger (None role) forbidden. State
+    /// transitions (already-recalled / deleted) are rejected in
+    /// [`ImService::recall_message`] before this is consulted, so the pure
+    /// function only decides the permission axis.
+    #[test]
+    fn recall_permission_matrix() {
+        let author = ParticipantId::new();
+        let admin = ParticipantId::new();
+        let owner = ParticipantId::new();
+        let member = ParticipantId::new();
+        let stranger = ParticipantId::new();
+
+        let cases: Vec<(&str, ParticipantId, Option<&str>, bool)> = vec![
+            ("author", author, None, true), // author needs no role
+            ("author-as-member", author, Some("member"), true),
+            ("admin", admin, Some("admin"), true),
+            ("owner", owner, Some("owner"), true),
+            ("member-non-author", member, Some("member"), false),
+            ("stranger", stranger, None, false), // no membership edge
+        ];
+        for (label, actor, role, allowed) in cases {
+            match recall_authorized(actor, author, role) {
+                Ok(()) => assert!(allowed, "{label}: expected Forbidden"),
+                Err(Error::Forbidden(msg)) => {
+                    assert!(!allowed, "{label}: expected allow");
+                    assert_eq!(msg, "only author or room admin may recall");
+                }
+                Err(other) => panic!("{label}: unexpected error {other:?}"),
+            }
+        }
     }
 }

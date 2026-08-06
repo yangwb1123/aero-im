@@ -30,8 +30,8 @@ impl MessageRepo {
         let rows = sqlx::query_as::<_, MessageRow>(
             r"SELECT reply.id, reply.room_id, reply.sender_id, reply.blocks,
                       reply.reply_to, reply.metadata, reply.created_at,
-                      reply.edited_at, reply.deleted_at, reply.expires_at,
-                      reply.version
+                      reply.edited_at, reply.deleted_at, reply.recalled_at,
+                      reply.recalled_by, reply.expires_at, reply.version
                FROM messages AS reply
                JOIN messages AS root
                  ON root.id = $1 AND root.room_id = reply.room_id

@@ -22,6 +22,7 @@ use crate::service::ImService;
 use crate::test_util::MockBus;
 
 mod auto_mod_tests;
+mod recall_tests;
 mod room_kind_tests;
 
 fn unique_email(prefix: &str) -> String {

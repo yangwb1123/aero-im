@@ -165,6 +165,8 @@ mod tests {
             created_at: time::OffsetDateTime::now_utc(),
             edited_at: None,
             deleted_at: None,
+            recalled_at: None,
+            recalled_by: None,
             expires_at: None,
             version: 1,
         }

@@ -595,6 +595,7 @@ input, textarea, select, button { font-family: inherit; }
 
 /* deleted / edited */
 .msg.deleted .msg-bubble { font-style: italic; opacity: .6; }
+.msg.recalled .msg-bubble { font-style: italic; opacity: .6; }
 .msg-meta .edited { font-size: 11px; }
 
 /* reactions */

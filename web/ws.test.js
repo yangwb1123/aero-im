@@ -206,6 +206,96 @@ test('message sends carry the caller-provided correlation id', () => {
   }
 });
 
+test('recallMessage sends a recall_message frame with the message id', () => {
+  const previousWebSocket = globalThis.WebSocket;
+  globalThis.WebSocket = { OPEN: 1 };
+  try {
+    const frames = [];
+    const client = new WsClient();
+    client.ws = { readyState: 1, send: (raw) => frames.push(JSON.parse(raw)) };
+
+    assert.equal(client.recallMessage('msg-recall-1'), true);
+    assert.deepEqual(frames, [{ type: 'recall_message', id: 'msg-recall-1' }]);
+  } finally {
+    if (previousWebSocket === undefined) delete globalThis.WebSocket;
+    else globalThis.WebSocket = previousWebSocket;
+  }
+});
+
+test('mutation frames never advance the legacy backfill cursor', () => {
+  // Hygiene (async-reviewer #7): a `recalled` frame — even one the app applies
+  // — must NOT advance the legacy `?since=` cursor. That cursor only gates the
+  // NEW-message backfill; mutations (edited/deleted/recalled) converge via
+  // `changes_since`, and advancing the cursor on them could skip a
+  // not-yet-fetched create for the rest of the session.
+  const previousWebSocket = globalThis.WebSocket;
+  const previousLocation = globalThis.location;
+  const sockets = [];
+  class FakeSocket {
+    static OPEN = 1;
+    constructor() {
+      this.readyState = 0;
+      this.handlers = new Map();
+      sockets.push(this);
+    }
+    addEventListener(event, fn) { this.handlers.set(event, fn); }
+    emit(event, payload = {}) { this.handlers.get(event)?.(payload); }
+    send() {}
+    close() {}
+  }
+  globalThis.WebSocket = FakeSocket;
+  globalThis.location = { protocol: 'https:', host: 'example.test' };
+  let client = null;
+  try {
+    const applied = [];
+    client = new WsClient();
+    client.on('msg:recalled', (frame) => {
+      applied.push(frame.message.id);
+      return true;
+    });
+    client.connect('access-token', 'participant-a');
+    const socket = sockets[0];
+    socket.readyState = FakeSocket.OPEN;
+    socket.emit('open');
+
+    // Recalled frame for a message the client never held: applied by the
+    // handler, but the cursor must not move.
+    socket.emit('message', {
+      data: JSON.stringify({
+        type: 'recalled',
+        message: { id: 'unknown-msg', room_id: 'room-a' },
+      }),
+    });
+    assert.deepEqual(applied, ['unknown-msg']);
+    assert.equal(client._lastSeen, null, 'recalled frame must not move the cursor');
+
+    // An applied recall of a held message: still no cursor movement.
+    socket.emit('message', {
+      data: JSON.stringify({
+        type: 'recalled',
+        message: { id: 'held-msg-1', room_id: 'room-a' },
+      }),
+    });
+    assert.deepEqual(applied, ['unknown-msg', 'held-msg-1']);
+    assert.equal(client._lastSeen, null);
+
+    // Ordinary room-message frames keep advancing it (legacy contract).
+    socket.emit('message', {
+      data: JSON.stringify({
+        type: 'message',
+        message: { id: 'msg-9', room_id: 'room-a' },
+      }),
+    });
+    assert.equal(client._lastSeen, 'msg-9');
+  } finally {
+    client?.close();
+    if (previousWebSocket === undefined) delete globalThis.WebSocket;
+    else globalThis.WebSocket = previousWebSocket;
+    if (previousLocation === undefined) delete globalThis.location;
+    else globalThis.location = previousLocation;
+  }
+});
+
 test('capabilities become visible only when welcome arrives', () => {
   const previousWebSocket = globalThis.WebSocket;
   const previousLocation = globalThis.location;

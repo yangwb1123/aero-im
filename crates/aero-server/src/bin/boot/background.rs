@@ -356,7 +356,7 @@ pub(crate) fn spawn_all(
         let s = state.clone();
         let cancel = ai_shutdown.clone();
         tracker.spawn(async move {
-            if let Err(e) = aero_server::ooo_bot::run_until_cancelled(s, cancel).await {
+            if let Err(e) = Box::pin(aero_server::ooo_bot::run_until_cancelled(s, cancel)).await {
                 tracing::error!(error = ?e, "ooo_bot listener exited");
             }
         });
@@ -415,7 +415,11 @@ pub(crate) fn spawn_all(
         let cache = aero_storage::UnfurlRepo::new(state.pg.clone());
         let cancel = ai_shutdown.clone();
         tracker.spawn(async move {
-            if let Err(e) = aero_server::unfurl_bot::run_until_cancelled(s, cache, cancel).await {
+            if let Err(e) = Box::pin(aero_server::unfurl_bot::run_until_cancelled(
+                s, cache, cancel,
+            ))
+            .await
+            {
                 tracing::error!(error = ?e, "unfurl_bot listener exited");
             }
         });

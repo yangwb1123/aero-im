@@ -130,6 +130,7 @@ pub fn build(state: AppState) -> Router {
                 .patch(edit_message)
                 .delete(delete_message),
         )
+        .route("/api/messages/:id/recall", post(recall_message))
         .route("/api/messages/:id/reactions", post(toggle_reaction))
         .route("/api/messages/reactions", post(reactions_batch))
         // Thread mute (mig 0088): mute/unmute the thread rooted at this message so

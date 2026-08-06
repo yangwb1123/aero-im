@@ -101,6 +101,8 @@ fn client_message_id_and_ack_capability_are_explicit_on_the_wire() {
         created_at: time::OffsetDateTime::now_utc(),
         edited_at: None,
         deleted_at: None,
+        recalled_at: None,
+        recalled_by: None,
         expires_at: None,
         version: 1,
     };

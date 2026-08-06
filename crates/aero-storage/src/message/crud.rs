@@ -102,6 +102,8 @@ impl MessageRepo {
             created_at,
             edited_at: None,
             deleted_at: None,
+            recalled_at: None,
+            recalled_by: None,
             expires_at: new.expires_at,
             version: 1,
         })
@@ -128,7 +130,7 @@ impl MessageRepo {
     /// Fetch a single message by id (including soft-deleted, caller must filter).
     pub async fn get(&self, id: MessageId) -> Result<Option<Message>, sqlx::Error> {
         let row = sqlx::query_as::<_, MessageRow>(
-            r"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at, version
+            r"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, recalled_at, recalled_by, expires_at, version
                FROM messages WHERE id = $1",
         )
         .bind(id.to_uuid())
@@ -175,7 +177,7 @@ impl MessageRepo {
                   SET blocks = $1, searchable_text = $2, edited_at = $3, embedding = NULL,
                       version = version + 1
                WHERE id = $4 AND deleted_at IS NULL AND version = $5
-            RETURNING id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at, version",
+            RETURNING id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, recalled_at, recalled_by, expires_at, version",
         )
         .bind(&blocks_json)
         .bind(&searchable)
@@ -437,7 +439,7 @@ impl MessageRepo {
                  edited_at = NOW(),
                  embedding = NULL
                WHERE id = $1 AND deleted_at IS NULL
-            RETURNING id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at, version",
+            RETURNING id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, recalled_at, recalled_by, expires_at, version",
         )
         .bind(id.to_uuid())
         .bind(transcript)

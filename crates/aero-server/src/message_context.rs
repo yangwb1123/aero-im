@@ -158,6 +158,8 @@ mod tests {
             created_at: datetime!(2026-01-01 00:00:00 UTC),
             edited_at: None,
             deleted_at,
+            recalled_at: None,
+            recalled_by: None,
             expires_at,
             version: 1,
         }

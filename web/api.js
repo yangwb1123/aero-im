@@ -370,6 +370,12 @@ export const api = {
   deleteMessage(id) {
     return request('DELETE', `/api/messages/${encodeURIComponent(id)}`);
   },
+  // Recall (撤回): author or room admin replaces the content with the system
+  // placeholder. Rejects with 409 when already recalled/deleted — callers may
+  // treat that as success (the desired end state is achieved).
+  recallMessage(id) {
+    return request('POST', `/api/messages/${encodeURIComponent(id)}/recall`);
+  },
   toggleReaction(messageId, emoji) {
     return request('POST', `/api/messages/${encodeURIComponent(messageId)}/reactions`, {
       body: { emoji },

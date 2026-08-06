@@ -154,6 +154,9 @@ pub(super) async fn handle_text(
         ClientFrame::DeleteMessage { id } => {
             state.im.delete_message(pid, id).await?;
         }
+        ClientFrame::RecallMessage { id } => {
+            state.im.recall_message(pid, id).await?;
+        }
         ClientFrame::React { message_id, emoji } => {
             state.im.toggle_reaction(pid, message_id, &emoji).await?;
         }

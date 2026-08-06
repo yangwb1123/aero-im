@@ -19,12 +19,13 @@ impl MessageRepo {
         let limit = limit.clamp(1, 100);
         let rows = sqlx::query_as::<_, ScoredMessageRow>(
             r"SELECT id, room_id, sender_id, blocks, reply_to, metadata,
-                      created_at, edited_at, deleted_at, expires_at, version,
+                      created_at, edited_at, deleted_at, recalled_at, recalled_by, expires_at, version,
                       GREATEST(fts_score, trigram_score) AS score
                FROM (
                  -- FTS branch: uses GIN idx_message_search_tsv
                  SELECT m.id, m.room_id, m.sender_id, m.blocks, m.reply_to,
                         m.metadata, m.created_at, m.edited_at, m.deleted_at,
+                        m.recalled_at, m.recalled_by,
                         m.expires_at, m.version,
                         ts_rank(m.search_tsv,
                           websearch_to_tsquery('english', f_unaccent($2))) AS fts_score,
@@ -38,6 +39,7 @@ impl MessageRepo {
                  -- Trigram branch: uses gin_trgm idx_message_searchable_text
                  SELECT m.id, m.room_id, m.sender_id, m.blocks, m.reply_to,
                         m.metadata, m.created_at, m.edited_at, m.deleted_at,
+                        m.recalled_at, m.recalled_by,
                         m.expires_at, m.version,
                         0::real AS fts_score,
                         similarity(m.searchable_text, $2) AS trigram_score
@@ -75,7 +77,7 @@ impl MessageRepo {
         let rows = sqlx::query_as::<_, ScoredMessageRow>(
             r"SELECT
                  m.id, m.room_id, m.sender_id, m.blocks, m.reply_to, m.metadata,
-                 m.created_at, m.edited_at, m.deleted_at, m.expires_at, m.version,
+                 m.created_at, m.edited_at, m.deleted_at, m.recalled_at, m.recalled_by, m.expires_at, m.version,
                  (1 - (m.embedding <=> $2))::real AS score
                FROM messages m
                WHERE m.room_id = $1
@@ -115,7 +117,7 @@ impl MessageRepo {
         let rows = sqlx::query_as::<_, ScoredMessageRow>(
             r"SELECT
                  m.id, m.room_id, m.sender_id, m.blocks, m.reply_to, m.metadata,
-                 m.created_at, m.edited_at, m.deleted_at, m.expires_at, m.version,
+                 m.created_at, m.edited_at, m.deleted_at, m.recalled_at, m.recalled_by, m.expires_at, m.version,
                  GREATEST(
                    ts_rank(m.search_tsv, websearch_to_tsquery('english', f_unaccent($3))),
                    similarity(m.searchable_text, $3)
@@ -155,7 +157,7 @@ impl MessageRepo {
         let rows = sqlx::query_as::<_, ScoredMessageRow>(
             r"SELECT
                  m.id, m.room_id, m.sender_id, m.blocks, m.reply_to, m.metadata,
-                 m.created_at, m.edited_at, m.deleted_at, m.expires_at, m.version,
+                 m.created_at, m.edited_at, m.deleted_at, m.recalled_at, m.recalled_by, m.expires_at, m.version,
                  GREATEST(
                    ts_rank(m.search_tsv, websearch_to_tsquery('english', f_unaccent($2))),
                    similarity(m.searchable_text, $2)
@@ -208,7 +210,7 @@ impl MessageRepo {
         let rows = sqlx::query_as::<_, ScoredMessageRow>(
             r"SELECT
                  m.id, m.room_id, m.sender_id, m.blocks, m.reply_to, m.metadata,
-                 m.created_at, m.edited_at, m.deleted_at, m.expires_at, m.version,
+                 m.created_at, m.edited_at, m.deleted_at, m.recalled_at, m.recalled_by, m.expires_at, m.version,
                  GREATEST(
                    ts_rank(m.search_tsv, websearch_to_tsquery('english', f_unaccent($2))),
                    similarity(m.searchable_text, $2)
@@ -268,7 +270,7 @@ impl MessageRepo {
         let rows = sqlx::query_as::<_, ScoredMessageRow>(
             r"SELECT
                  m.id, m.room_id, m.sender_id, m.blocks, m.reply_to, m.metadata,
-                 m.created_at, m.edited_at, m.deleted_at, m.expires_at, m.version,
+                 m.created_at, m.edited_at, m.deleted_at, m.recalled_at, m.recalled_by, m.expires_at, m.version,
                  (1 - (m.embedding <=> $2))::real AS score
                FROM messages m
                JOIN rooms r ON r.id = m.room_id
@@ -330,7 +332,7 @@ impl MessageRepo {
         let rows = sqlx::query_as::<_, ScoredMessageRow>(
             r"SELECT
                  m.id, m.room_id, m.sender_id, m.blocks, m.reply_to, m.metadata,
-                 m.created_at, m.edited_at, m.deleted_at, m.expires_at, m.version,
+                 m.created_at, m.edited_at, m.deleted_at, m.recalled_at, m.recalled_by, m.expires_at, m.version,
                  GREATEST(
                    ts_rank(m.search_tsv, websearch_to_tsquery('english', f_unaccent($3))),
                    similarity(m.searchable_text, $3)

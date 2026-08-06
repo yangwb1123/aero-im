@@ -145,6 +145,11 @@ pub(crate) enum ClientFrame {
     DeleteMessage {
         id: MessageId,
     },
+    /// Recall (撤回) a message: the author or a room admin/owner replaces its
+    /// content with the system placeholder and broadcasts the updated message.
+    RecallMessage {
+        id: MessageId,
+    },
     /// Toggle a reaction.
     React {
         message_id: MessageId,
@@ -335,6 +340,12 @@ pub(crate) enum ServerFrame<'a> {
         rooms: Vec<DeliveryRoomBarrier>,
     },
     Edited {
+        message: aero_common::Message,
+    },
+    /// A message was recalled (撤回): content replaced by the system placeholder.
+    /// Carries the full updated message so clients render the placeholder in
+    /// place, mirroring [`Self::Edited`].
+    Recalled {
         message: aero_common::Message,
     },
     Deleted {

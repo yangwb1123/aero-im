@@ -1,1 +1,0 @@
-{"pid": 1717581, "start": 1785988431.1601133, "host": "u1-FAEX9", "argv": "pi-batch.py docs/campaigns/tasks-compose-2026-017.yaml --session-mode shared --session-name compose-017-im --no-git-commit --retries 2 --log-file docs/campaigns/run.log", "token": "03b4fdf4c9aa4c22b1559c3f530c8589"}

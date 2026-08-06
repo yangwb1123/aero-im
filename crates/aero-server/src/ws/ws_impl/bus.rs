@@ -452,7 +452,10 @@ async fn handle_room_event_sub(state: &AppState, sub: Box<dyn aero_bus::Subscrip
             // only when an AI backend is configured so non-AI deployments pay
             // nothing (an empty key-index is a no-op regardless).
             if state.ai.is_some()
-                && matches!(event, RoomEvent::Edited(_) | RoomEvent::Deleted { .. })
+                && matches!(
+                    event,
+                    RoomEvent::Edited(_) | RoomEvent::Deleted { .. } | RoomEvent::Recalled(_)
+                )
             {
                 if let Some(rid) = room {
                     let store = aero_storage::AiContextStore::new(state.redis_client.clone());

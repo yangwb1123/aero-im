@@ -106,6 +106,69 @@ test('2FA management uses caller-scoped routes and sends the disable code', asyn
   assert.deepEqual(JSON.parse(requests[3].init.body), { code: '654321' });
 });
 
+test('recallMessage posts to the encoded message recall endpoint', async () => {
+  const previousFetch = globalThis.fetch;
+  const previousStorage = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+  const requests = [];
+  Object.defineProperty(globalThis, 'localStorage', {
+    configurable: true,
+    value: { getItem: () => 'access.jwt' },
+  });
+  globalThis.fetch = async (url, init) => {
+    requests.push({ url, init });
+    return {
+      status: 200,
+      ok: true,
+      headers: { get: () => 'application/json' },
+      json: async () => ({
+        id: 'msg/1',
+        recalled_at: '2026-08-06T00:00:00Z',
+        recalled_by: 'participant-a',
+      }),
+    };
+  };
+  try {
+    const recalled = await api.recallMessage('msg/1');
+    assert.equal(recalled.recalled_at, '2026-08-06T00:00:00Z');
+  } finally {
+    globalThis.fetch = previousFetch;
+    if (previousStorage === undefined) delete globalThis.localStorage;
+    else Object.defineProperty(globalThis, 'localStorage', previousStorage);
+  }
+
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].init.method, 'POST');
+  assert.equal(requests[0].url, '/api/messages/msg%2F1/recall', 'id is path-encoded');
+  assert.equal(requests[0].init.body, undefined, 'recall takes no body');
+});
+
+test('recallMessage surfaces a 409 already-recalled as ApiError for callers to map to success', async () => {
+  const previousFetch = globalThis.fetch;
+  const previousStorage = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+  Object.defineProperty(globalThis, 'localStorage', {
+    configurable: true,
+    value: { getItem: () => 'access.jwt' },
+  });
+  globalThis.fetch = async () => ({
+    status: 409,
+    ok: false,
+    headers: { get: () => 'application/json' },
+    json: async () => ({ code: 'conflict', msg: 'message is already recalled' }),
+  });
+  try {
+    await assert.rejects(
+      api.recallMessage('msg-1'),
+      (error) => error.status === 409
+        && error.body.code === 'conflict'
+        && /already recalled/.test(error.message),
+    );
+  } finally {
+    globalThis.fetch = previousFetch;
+    if (previousStorage === undefined) delete globalThis.localStorage;
+    else Object.defineProperty(globalThis, 'localStorage', previousStorage);
+  }
+});
+
 test('governance wrappers preserve tenant scope, filters, and bot ownership paths', async () => {
   const previousFetch = globalThis.fetch;
   const previousStorage = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
