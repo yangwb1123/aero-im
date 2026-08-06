@@ -12,8 +12,7 @@ import {
   initialOf,
   toast,
 } from './render.js';
-// Shared spine (state / ws / els / DOM helpers / leaf utils) lives in context.js
-// so extracted domain modules can share the same live singletons.
+// Shared spine (state / ws / els / DOM helpers / leaf utils) lives in context.js.
 import { state, ws, els, cssEscape, scrollToMessage, avatarStyleFromId, hasPendingForRoom } from './context.js';
 // Extracted domain modules (see each file header for its public surface).
 import { handleCall, wireCallControls } from './calls.js';
@@ -32,6 +31,7 @@ import { syncRoomSidebar } from './room_sync.js';
 import { initMessageActivity } from './message_activity.js';
 import { clearPendingDelivery, findPendingMatch, initReliableDelivery, pendingTempId, sendOptimistically } from './delivery.js';
 import { refreshWsAccessToken } from './ws_auth.js';
+import { draftComposerCleared, draftRoomSwitched, initDrafts, resetDrafts } from './drafts.js';
 let wsHooksInstalled = false;
 // ---------- view switching ----------
 function showAuth() { els.viewAuth.hidden = false; els.viewChat.hidden = true; }
@@ -57,8 +57,7 @@ function enterChat() {
   });
   syncRoomSidebar(forceReauth, () => { refreshRoomList(); updateTitleBadge(); });
   api.rtcConfig().then((c) => { state.rtcConfig = c; }).catch(() => {});
-  // Load the gift catalog once so stream cards can render the gift bar; if a
-  // room was already open, re-render so existing cards pick it up.
+  // Load the gift catalog once so stream cards can render the gift bar; re-render if a room is open.
   api.liveGifts().then((r) => {
     state.giftCatalog = r?.gifts || [];
     if (state.currentRoomId) rerenderCurrentRoom();
@@ -549,7 +548,7 @@ async function switchRoom(roomId) {
     refreshReadStrips();
   }).catch(() => {});
   // Restore AI conversation history from sessionStorage for this room.
-  restoreAiHistory(roomId);
+  restoreAiHistory(roomId); draftRoomSwitched(roomId);
 }
 
 async function loadHistory(roomId, { initial = false } = {}) {
@@ -891,6 +890,7 @@ function submitComposer() {
       autoGrow(els.composerInput);
       closeMentionMenu();
       clearReply();
+      draftComposerCleared(roomId); // send accepted → the draft is obsolete
     }
     return;
   }
@@ -907,6 +907,7 @@ function submitComposer() {
   autoGrow(els.composerInput);
   closeMentionMenu();
   clearReply();
+  draftComposerCleared(roomId); // send accepted → the draft is obsolete
 }
 
 function composeBlocksFromInput(text) {
@@ -952,28 +953,25 @@ function restorePendingDelivery(pending) {
   return restored;
 }
 // ---------- extracted domain wiring ----------
-// search drawer + AI assistant, notification inbox, and live-streams flows were
-// moved to their own modules; attach their listeners here at module-load time
-// (same ordering as before the split). `switchRoom` is hoisted, so injecting it
-// into notifications is safe at eval time.
+// Search drawer + AI assistant, notification inbox, live-streams, and drafts
+// attach their listeners here at module-load time. `switchRoom` is hoisted.
 initSearchAi();
 initNotifications({ switchRoom });
 initLive();
 initSmartReplies({ optimisticAdd });
 initMedia({ optimisticAdd, clearReply, forceReauth });
-// Modal-backed forms (profile / new-room / add-member). Callbacks are hoisted.
+initDrafts({ state, els, forceReauth, clearReply, renderReplyChip });
+// Modal-backed forms + auth/logout wiring (`enterChat`/`showAuth`/callbacks hoisted).
 initModalForms({ forceReauth, refreshRoomList, switchRoom });
-// Auth form/logout wiring + global modal/drawer dismissal chrome. `enterChat`
-// and `showAuth` are hoisted, so injecting them here is safe at eval time.
-initAuthUi({ enterChat, showAuth });
+initAuthUi({ enterChat, showAuth, onLogout: resetDrafts });
 initChrome();
 // ---------- calls ----------
-// 1:1 + captions + group-mesh call logic now lives in calls.js. The control
-// buttons were wired at module-load time originally; preserve that by attaching
-// them here (same load-time ordering, DOM already present from index.html).
+// 1:1 + captions + group-mesh call logic lives in calls.js; attach its
+// controls here (module-load ordering, DOM already present from index.html).
 wireCallControls();
 // ---------- utilities ----------
 function forceReauth() {
+  resetDrafts(); // session teardown: drop in-memory draft state BEFORE auth.clear() (mirrors the active room under the OLD pid)
   toast('会话过期,请重新登录', 'error');
   auth.clear();
   state.me = null;

@@ -490,6 +490,21 @@ export const api = {
     return request('POST', '/api/agents', { body });
   },
 
+  // ----- per-room composer drafts -----
+  // Server-persisted composer drafts (private to the author; follow across
+  // devices/reloads). One draft per (participant, room); save is an upsert.
+  getDraft(roomId) {
+    return request('GET', `/api/rooms/${encodeURIComponent(roomId)}/draft`);
+  },
+  saveDraft(roomId, { blocks, reply_to } = {}) {
+    const body = { blocks };
+    if (reply_to) body.reply_to = reply_to;
+    return request('PUT', `/api/rooms/${encodeURIComponent(roomId)}/draft`, { body });
+  },
+  deleteDraft(roomId) {
+    return request('DELETE', `/api/rooms/${encodeURIComponent(roomId)}/draft`);
+  },
+
   // ----- polls -----
   // List a room's polls (newest first). `open=true` → only those still open.
   listPolls(roomId, { open = false } = {}) {

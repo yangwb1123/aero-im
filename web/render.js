@@ -919,7 +919,7 @@ export function renderOnlineItem(pid, participant) {
 // ---------- toast ----------
 export function toast(message, kind = 'info', timeout = 3500) {
   const stack = document.getElementById('toast-stack');
-  if (!stack) { console.log(`[toast/${kind}]`, message); return; }
+  if (!stack) return;
   const node = el('div', { className: `toast ${kind}` });
   node.textContent = String(message);
   stack.appendChild(node);

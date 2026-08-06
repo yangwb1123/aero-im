@@ -116,3 +116,73 @@
 ## 2026-08-05 23:49:20 — stage 'gate' — PASS (gate verdict: PASS)
 - task docs/pi-batch/feature-gate.md [ok]
 - evidence: docs/pi-batch/feature-gate.md
+
+## 2026-08-06 02:49:54 — stage 'plan' — PASS
+- task docs/pi-batch/ui-plan.md [ok]: 0. Requirement assessment (run first, as instructed): `python /home/u1/ai-batch-runner/pi-batch.py assess "在 web 前端实现草稿持久化组件：编辑器自动保存与恢复，按房间隔离，防抖保存，发送后清除"` → **frontend_ui / d; 1. Page / feature classification: | 维度 | 值 | 依据 |; 2. Backend contract(已核实,前端以此为准): `drafts.rs` + `draft.rs`:; 3. Module placement & wiring: - **`web/drafts.js`** — 自包含域模块,`polls.js` 模式:index.html 独立 `<script type="module">`,DOM-ready 自初始化;共享 `state/ws/els` 单例走; 新增文件: - **`web/drafts.js`** — 自包含域模块,`polls.js` 模式:index.html 独立 `<script type="module">`,DOM-ready 自初始化;共享 `state/ws/els` 单例走
+- evidence: docs/pi-batch/ui-plan.md
+
+## 2026-08-06 03:49:56 — stage 'implement' — FAIL
+- task docs/pi-batch/ui-implementation.md [FAILED: task timed out]
+- evidence: docs/pi-batch/ui-implementation.md
+
+## 2026-08-06 03:52:07 — stage 'plan' — PASS
+- task docs/pi-batch/ui-plan.md [ok]: 0. Requirement assessment & current tree state: `python /home/u1/ai-batch-runner/pi-batch.py assess ...` → **frontend_ui / demo 档 (S) / risk low / L0_direct**。处方:visual; 1. Page / feature classification: | 维度 | 值 | 依据 |; 2. Backend contract(已核实,以源码为准): `crates/aero-server/src/drafts.rs`(grep 确认路由)+ `crates/aero-storage/src/draft.rs`:; 3. Module placement & wiring: - **`web/drafts.js`**(已在树,451 行)→ 自包含域模块:index.html 独立 `<script type="module">` + DOM-ready 自初始化(polls.js 模式);**不 import; 新增文件: - **`web/drafts.js`**(已在树,451 行)→ 自包含域模块:index.html 独立 `<script type="module">` + DOM-ready 自初始化(polls.js 模式);**不 import
+- evidence: docs/pi-batch/ui-plan.md
+
+## 2026-08-06 04:02:48 — stage 'implement' — FAIL
+- task docs/pi-batch/ui-implementation.md [FAILED: validation failed (exit=1)]
+- evidence: docs/pi-batch/ui-implementation.md
+
+## 2026-08-06 04:19:50 — stage 'review' — PASS
+- task docs/pi-batch/ui-reviews/testing_reviewer.md [ok]: VERDICT: FAIL — blocking test gaps: Store-level logic is genuinely well tested (fake clock, manual deferreds, zero sleeps, per-test isolation, business-resu; Findings: | Sev | Defect pattern | Evidence | Missing test that would catch it |; Risk-coverage matrix: | Risky path | Covered | Where / gap |; Honesty audit: | Claimed command | Result | Audit |
+- task docs/pi-batch/ui-reviews/async_reviewer.md [ok]: Findings: | # | Sev | Defect pattern | Evidence | Root cause | Fix (per decision tables) | Test that catches it |; Verdict: `VERDICT: FAIL - clear-on-send is broken on the primary Enter-send path (F1, headline behavior; sent text resurrects as 
+- task docs/pi-batch/ui-reviews/frontend_engineer.md [ok]: Summary: The drafts feature implementation existed from a prior session that failed validation (timeout + exit=1). This pass **re; 1. Classification & assumptions: IM SPA (web/), chat main view + composer, medium density, low-interruption primary task, medium risk (writes + private d; 2. State model & interaction chain: Per-room `Map` inside `createDraftStore` (pure, node-testable); localStorage mirror keyed `aero_draft_v1:{pid}:{roomId}`; 3. Defect found & fixed (this pass): **Cross-account draft leak**: logout cleared `state` maps but not the drafts module store — a second login in the same S; 4. Verification actually run: - `bash scripts/web-check.sh` — 0 violations
+- task docs/pi-batch/ui-reviews/frontend_engineer.md [ok]
+- task docs/pi-batch/ui-reviews/testing_reviewer.md [ok]
+- task docs/pi-batch/ui-reviews/async_reviewer.md [ok]
+- evidence: docs/pi-batch/ui-reviews/testing_reviewer.md, docs/pi-batch/ui-reviews/async_reviewer.md, docs/pi-batch/ui-reviews/frontend_engineer.md, docs/pi-batch/ui-reviews/frontend_engineer.md, docs/pi-batch/ui-reviews/testing_reviewer.md, docs/pi-batch/ui-reviews/async_reviewer.md
+
+## 2026-08-06 04:22:22 — stage 'gate' — PASS (gate verdict: FAIL)
+- task docs/pi-batch/ui-gate.md [ok]: Gatekeeper verification: **Verified PASS items:**
+- evidence: docs/pi-batch/ui-gate.md
+
+## 2026-08-06 04:27:59 — stage 'plan' — PASS
+- task docs/pi-batch/ui-plan.md [ok]: Key finding — the premise was stale: The tree already contains a full drafts implementation from a prior batch session (`web/drafts.js` 430 lines + `web/draf; Plan (per your required sections): - **Classification**: IM SPA composer sub-feature · main-view embedded component · desktop web · medium density · low mo
+- evidence: docs/pi-batch/ui-plan.md
+
+## 2026-08-06 04:41:50 — stage 'implement' — FAIL
+- task docs/pi-batch/ui-implementation.md [FAILED: validation failed (exit=1)]: Summary: **F1 (BLOCKING) — clear-on-send on Enter**: Fixed by moving the discard to the single send funnel. `app.js` `submitCompo
+- evidence: docs/pi-batch/ui-implementation.md
+
+## 2026-08-06 04:48:04 — stage 'plan' — PASS
+- task docs/pi-batch/ui-plan.md [ok]: 0. 本轮定位（先读，这是与之前轮次的本质区别）: 需求评估已跑：frontend_ui / demo 档（S）/ risk low / L0_direct；处方 specs 已读并应用。**功能代码已完成且在树中、全部门禁通过**——两轮 implement 的 `VALIDATION_F; 1. 页面/功能分类: | 维度 | 值 |; 2. 树状态（本轮已实跑核实）: - **文件**：`web/drafts.js`(244) + `web/drafts_store.js`(293，纯状态) + `web/drafts.test.js`(397) + `web/drafts_restore.test.js; 3. 模块放置（现状，勿改结构）: - `drafts_store.js`：纯逻辑（blocks 转换、`createDraftStore`、`pickRestoreAction`、`resolveReplyTarget`、`shouldDiscardOnSend`、mirr; 4. 状态模型与交互链（已实现，§2 门禁覆盖）: - 状态全在模块内：per-room `Map`（text/replyTo/dirty/inputRev/timer/inflight/status/forbidden/pendingDelete）+ `inflight` 串行链 + `i
+- evidence: docs/pi-batch/ui-plan.md
+
+## 2026-08-06 04:49:11 — stage 'implement' — PASS
+- task docs/pi-batch/ui-implementation.md [ok]: Implement round summary — verify + artifact (no code changes needed): **Verification results (all re-run this round, all green):**
+- evidence: docs/pi-batch/ui-implementation.md
+
+## 2026-08-06 05:57:55 — stage 'review' — FAIL
+- task docs/pi-batch/ui-reviews/frontend_engineer.md [ok]: Round summary — verify + artifact (no code changes needed): **1. Classification (from prior rounds, re-confirmed):** page type = SPA chat workspace (room view); platform = zero-too
+- task docs/pi-batch/ui-reviews/async_reviewer.md [ok]: Checklist coverage: | # | Attack item | Result |; Findings: | # | Sev | Pattern | Evidence | Root cause | Fix (per decision tables) | Catching test |; Verified strengths (non-defects): - **Debounce/serialization**: 800ms coalescing, per-room chain (`enqueue` tail never rejects), `revAtSave` clean-guard —
+- task docs/pi-batch/ui-reviews/qa_lead.md [ok]: 1. Test inventory & commands actually run (this session): | Command | Result |; 2. Requirement-to-test matrix: | # | Requirement | Status | Evidence |; 3. Findings: **F1 — Medium (behavioral bug, empirically confirmed). Re-grant after a save-403 leaves autosave silently dead.**; 4. Prioritized scenario list: 1. **Recovery (High):** 403 → type → re-grant → local restore → autosave resumes (F1 — currently fails); 5. Gaps, flake risks, fixtures, exit criteria: - **CI gaps**: no browser E2E (the "type → Enter-send → GET confirms deleted → switch room → restore" flow is only code-
+- task docs/pi-batch/ui-reviews/code-implementer.md [FAILED: task timed out]
+- task docs/pi-batch/ui-reviews/backend_engineer.md [FAILED: task timed out]
+- evidence: docs/pi-batch/ui-reviews/frontend_engineer.md, docs/pi-batch/ui-reviews/async_reviewer.md, docs/pi-batch/ui-reviews/qa_lead.md, docs/pi-batch/ui-reviews/code-implementer.md, docs/pi-batch/ui-reviews/backend_engineer.md
+
+## 2026-08-06 06:58:55 — stage 'plan' — FAIL
+- task docs/pi-batch/ui-plan.md [FAILED: task timed out]
+- evidence: docs/pi-batch/ui-plan.md
+
+## 2026-08-06 07:47:11 — stage 'review' — PASS
+- task docs/pi-batch/ui-reviews/async_reviewer.md [ok]
+- task docs/pi-batch/ui-reviews/testing_reviewer.md [ok]
+- task docs/pi-batch/ui-reviews/backend_engineer.md [ok]: 1. Analysis: **Module boundary / data ownership** — 草稿 = IM 消息域的私有暂存态，按 AGENTS.md §4.1 配方落地：`migrations/0028`（表）→ `aero-storage/src/d; 2. Implementation（本轮两处真实门禁违规，均修复）: 1. **`web/drafts.test.js` 死锁** — `reauthorize` 测试 `await store.flush('r1')` 等待的 op promise 在 await 之后才 resolve → 永久挂起（上轮; 3. Self-check（命令实测）: | 门禁 | 结果 |
+- task docs/pi-batch/ui-reviews/testing_reviewer.md [ok]
+- task docs/pi-batch/ui-reviews/frontend_engineer.md [ok]
+- task docs/pi-batch/ui-reviews/security_engineer.md [ok]: Verdict: PASS with recommendations: **Prior gate findings (all verified fixed in this session):**
+- evidence: docs/pi-batch/ui-reviews/async_reviewer.md, docs/pi-batch/ui-reviews/testing_reviewer.md, docs/pi-batch/ui-reviews/backend_engineer.md, docs/pi-batch/ui-reviews/testing_reviewer.md, docs/pi-batch/ui-reviews/frontend_engineer.md, docs/pi-batch/ui-reviews/security_engineer.md
+
+## 2026-08-06 07:49:50 — stage 'gate' — PASS (gate verdict: PASS)
+- task docs/pi-batch/ui-gate.md [ok]
+- evidence: docs/pi-batch/ui-gate.md
