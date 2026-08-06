@@ -1,23 +1,17 @@
-Plan written to `docs/pi-batch/message-recall-plan.md`. Summary:
+Plan written to `docs/pi-batch/feature-plan.md` (harness-canonical path). Key points:
 
 ## Assessment
-`pi-batch.py assess` → 处方档 **demo（S）**, workflow **L3_platform**, 产品化 **L2_platform_capability**（多租户信号）。克制规则已吸收：复用 `rooms.workspace_id` 租户边界 + `assert_room_access` 唯一守卫、事件带房间上下文、事务化审计、无新表无新 crate。评估缺失的 main_flow / data_source / error_path / tech_stack 均由本计划补全。
+`pi-batch.py assess` → 处方档 **demo（S）**, workflow **L3_platform**, 产品化 **L2_platform_capability**（多租户信号）; 0 hard rules. Missing main_flow/data_source/error_path/tech_stack are supplied by the plan.
 
-## Key design decisions (verified against code)
-- **Recall = soft state transition, not tombstone**: `messages` + `recalled_at`/`recalled_by` (nullable), blocks → `"[此消息已被撤回]"` placeholder, `searchable_text=''`, `embedding=NULL`, `version+1`. Row/`message_id`/history retained; delete-after-recall still works.
-- **Permission**: author OR room `owner`/`admin` (room roles are exactly `owner/admin/member` per `0001_init.sql`); member non-author → 403. Check order `404 → 403(tenant) → 409(deleted) → 409(recalled) → 403(role)` prevents cross-tenant existence oracles.
-- **Event**: new `RoomEvent::Recalled(Message)` (tuple variant — no `kind` tag collision) → `ServerFrame::Recalled` → `{"type":"recalled","message":{...}}`; fans out via existing outbox → NATS → hub path; bus chokepoint extended for AI answer-cache invalidation.
-- **Audit/history**: pre-recall blocks snapshotted into `message_edits` (editor=recaller) + `audit_log` `message.recalled` row, same transaction as the placeholder UPDATE — reuses `soft_delete_locked_outboxed_in_tx` composition; no new table.
-- **Storage**: `recall_outboxed_authorized` mirrors `soft_delete_outboxed_authorized`: `resolve target → lock_effective_message_write_access → FOR UPDATE row lock → identity/state re-check → in-tx role re-check FOR UPDATE → snapshot+update+blob-GC+audit+outbox, one commit`.
-- **Idempotency**: no new idempotency table — atomic `UPDATE ... WHERE recalled_at IS NULL AND deleted_at IS NULL` under row lock; duplicate recall returns **stable 409** (spec requires already-recalled as a failure path); outbox `event_id` + seq dedup for at-least-once replay.
+## Important context verified up front
+The feature is **already implemented in the working tree** from the prior round (52 files + `migrations/0238_message_recall.sql` + 2 new test files + 2 docs), and I re-ran every gate just now — **all green**: check 0 errors, test --lib 17 suites 0 failed, clippy -D warnings 0, web-check 0, truth-check 0 orphans, file-size 0 violations, plus `test-integration.sh` EXIT 0 and authz_lint 6 passed were verified in the prior round. The harness's implement-stage `VALIDATION_FAILED (exit=1)` therefore needs re-location (possible causes documented in the plan's open items — e.g. checks beyond the task's gate list, or pre-existing unrelated tree changes like `docs/DECISIONS.md`/`.pi-batch.lock` being misattributed).
 
-## Persistence Design (§12 report, done before code)
-Aggregate `Message` state machine (live → recalled → deleted) · 1 migration `0238` (2 nullable columns + `event_outbox_kind_check` drop+add + `messages_partitioned` mirror per 0174 convention) · identity = PK `messages.id` + immutable `(room_id, sender_id)` + no idempotency key · consistency boundary = single tx (9 steps) · no new indexes · deletion = orthogonal tombstone · additive Expand-Migrate-Contract, no backfill.
+## Plan contents (all required sections)
+- **Module boundary & data ownership**: `MessageRepo::recall_outboxed_authorized` (storage, sole writer), `ImService::recall_message` + pure `recall_authorized` (im-core), thin REST/WS handlers (server), types in common; no new crate/table/index/dependency; `RoomRoleRepo` built on the fly from `messages.pool` so `ImService`'s constructor is untouched.
+- **Persistence Design §12**: aggregate state machine `live → recalled → deleted`; single migration `0238` (2 nullable columns + `messages_partitioned` mirror + `event_outbox_kind_check` drop/add); identity = PK `messages.id` + immutable `(room_id, sender_id)` + no idempotency key; 9-step single-transaction consistency boundary (fence → row lock → role re-check `FOR UPDATE` → snapshot → placeholder UPDATE → blob GC → audit → outbox); snapshot fields (`message_edits` + audit digest); concurrency (row lock + WHERE fence + version bump + `UNIQUE(message_id, aggregate_version)`); history/deletion orthogonal; additive Expand–Migrate–Contract.
+- **API contract + stable errors + idempotency**: `POST /api/messages/:id/recall` → 200 + placeholder Message; WS `recall_message`/`recalled` frames; error table with exact stable strings (404/403/409) and fixed check ordering that prevents cross-tenant existence oracles; idempotency = atomic state transition, duplicate → stable 409 (documented retry convention).
+- **Five-layer test plan**: 5 hermetic tests (permission matrix table-driven, serde round-trips, WS frame contract) + 8 PG-gated integration tests (tx contents, cross-workspace isolation, migration schema assertions) + fresh-DB migration replay — all implemented and passing; E2E smoke listed as not executed.
+- **Change radius**: the full 52-file list, including the non-obvious consequences verified during implementation (7 `MessageRow`-family structs + every SELECT list incl. nested subquery projections and `m.`-prefixed columns — a real bug caught by 4 gate tests; `ImEvent::MessageSent` boxed and 3 `Box::pin` fixes for clippy after `Message` grew; `web/app.js` was exactly at the 1000-line HARD limit so handlers were merged into `applyMessageMutation`).
+- **Open items** for the next stage: reproduce the harness validation failure, run the E2E smoke, exercise migration rollback.
 
-## Tests (5 layers)
-Unit (pure `recall_authorized` permission matrix table-driven + serde round-trips) · Contract (frame.rs JSON shape: `type=="recalled"`, placeholder, seq) · Integration `#[ignore]` PG (full tx assertions, cross-workspace isolation, concurrency race) · Migration test (fresh DB + `information_schema` + smoke replay) · E2E smoke (two clients, WS render, 403/409 paths).
-
-## Change radius
-~18 files: 1 new migration, `Message`/`MessageRow` + ~15 `SELECT` lists (sqlx `query_as` requirement), `RoomEvent`/`ServerFrame`/`ClientFrame`/`EventOutboxKind` + all match arms, `materialize_outbox_payload` arm, service + handler + route, 3 web files, metrics. No config/deploy changes, rollback = drop 2 columns.
-
-One decision to flag for the implementer: pre-recall content lands in `message_edits` (shows on the existing edit-history route) — deliberate reuse of the evidence table rather than a new `message_recalls` table; documented in §2 with the rationale.
+No code was written in this round (planning only, per instruction).
