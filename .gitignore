@@ -25,3 +25,10 @@ __pycache__/
 .refactor-baseline
 .refactor-log
 .current-violations
+
+# ai-batch-runner runtime artifacts
+.pi-batch/
+logs/
+docs/archive/
+docs/auto/
+docs/requirements/runs/
