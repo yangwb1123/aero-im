@@ -4,7 +4,11 @@
 //! blocks contain a `Voice { blob_id, transcript: None }`. For each, fetches
 //! the audio bytes from the blob store, calls the configured Transcriber
 //! (`OpenAI` Whisper when `OPENAI_API_KEY` is set, else a placeholder), and then
-//! patches the message in place via `MessageRepo::update_voice_transcript`.
+//! patches the message in place via `MessageRepo::update_voice_transcript_outboxed`
+//! — the transactional, outbox-appending variant (the lockless
+//! `update_voice_transcript` SQL path is test-only). The recall fence for this
+//! path is the row lock + Rust re-check of `recalled_at`, NOT a SQL WHERE
+//! clause; see `message/recall_index_fence_tests.rs`.
 //!
 //! The patched message is re-broadcast as `RoomEvent::Edited` so connected
 //! clients can refresh their UI without re-fetching history.

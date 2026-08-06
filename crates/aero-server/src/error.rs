@@ -30,7 +30,25 @@ impl IntoResponse for ApiError {
         } else {
             tracing::debug!(error = %self.0, "client error");
         }
-        (status, body).into_response()
+        let mut response = (status, body).into_response();
+        // Fixed-window limiters (per-client middleware AND the per-workspace
+        // ws-rate gate) surface 429s through this conversion. Give clients a
+        // Retry-After hint: whole seconds until the current minute window
+        // rolls over (ceil, at least 1). The per-client middleware overrides
+        // this with its token-bucket-exact value afterwards (HeaderMap::insert
+        // replaces), so the more precise hint always wins where available.
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs());
+            let retry_after = 60 - (now_secs % 60);
+            response.headers_mut().insert(
+                "retry-after",
+                axum::http::HeaderValue::from_str(&retry_after.to_string())
+                    .unwrap_or_else(|_| axum::http::HeaderValue::from_static("60")),
+            );
+        }
+        response
     }
 }
 

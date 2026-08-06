@@ -442,6 +442,50 @@ impl ImService {
         Ok(())
     }
 
+    /// Resolve and authorize a recall before an edge spends tenant rate
+    /// capacity. Mirrors [`Self::assert_message_edit_preflight`]: resolves the
+    /// message's room through the shared access guard so the rate gate can
+    /// charge the right workspace (and non-members can never drain a victim's
+    /// budget by spamming message ids), and carries the recall role gate
+    /// (author or room owner/admin — edit's preflight carries its sender gate
+    /// the same way). The role check MUST run here, before the edge charges
+    /// the workspace budget: a doomed recall attempt by a plain member fails
+    /// with `Forbidden` from this preflight and never consumes shared rate
+    /// capacity (gate S1 — the rate gate itself must not be a workspace-wide
+    /// `DoS` amplifier). The eventual [`Self::recall_message`] call repeats every
+    /// check so a concurrent membership, account, or state change cannot turn
+    /// this preflight result into authority.
+    pub async fn assert_message_recall_preflight(
+        &self,
+        actor: ParticipantId,
+        id: MessageId,
+    ) -> Result<RoomId> {
+        let existing = self
+            .messages
+            .get(id)
+            .await?
+            .ok_or_else(|| Error::NotFound(format!("message {id}")))?;
+        // Resolve the message's tenant/room first, then apply the shared access
+        // guard before any state check. This prevents a global message id from
+        // becoming an IDOR/oracle across workspaces.
+        self.assert_room_access(actor, existing.room_id).await?;
+        if existing.deleted_at.is_some() {
+            return Err(Error::Conflict("message is deleted".into()));
+        }
+        if existing.recalled_at.is_some() {
+            return Err(Error::Conflict("message is already recalled".into()));
+        }
+        // Author, or room owner/admin — BEFORE any edge charges rate capacity.
+        // Same stable error `recall_message` returns (the commit-time storage
+        // path re-checks this rule under row locks; this read only produces the
+        // early 403 without spending budget).
+        let role = aero_storage::RoomRoleRepo::new(self.messages.pool.clone())
+            .role_of(existing.room_id, actor)
+            .await?;
+        recall_authorized(actor, existing.sender_id, role.as_deref())?;
+        Ok(existing.room_id)
+    }
+
     /// Recall (撤回) a message: the sender — or a room owner/admin — replaces
     /// its content with the system placeholder while the row, room history and
     /// audit trail stay intact, then broadcasts a `Recalled` room event so every

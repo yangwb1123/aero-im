@@ -25,6 +25,8 @@ mod authorization_tests;
 #[cfg(test)]
 mod barrier_tests;
 #[cfg(test)]
+mod recall_index_fence_tests;
+#[cfg(test)]
 mod recall_tests;
 #[cfg(test)]
 mod reply_scope_tests;

@@ -186,3 +186,43 @@
 ## 2026-08-06 07:49:50 — stage 'gate' — PASS (gate verdict: PASS)
 - task docs/pi-batch/ui-gate.md [ok]
 - evidence: docs/pi-batch/ui-gate.md
+
+## 2026-08-06 08:17:28 — stage 'plan' — PASS
+- task docs/pi-batch/fix-plan.md [ok]: 0. Reproduction (all gates run, baseline green): | Gate | Result |; 1. Root causes (file/line evidence): **F1** — Recall clears the index atomically (`message/authorization.rs:311-321`, `WHERE recalled_at IS NULL AND deleted_; 2. Module boundary / change radius (agent-guardrails.md §2): - **Direct (5 files)**: `aero-storage/src/message/crud.rs` · `aero-storage/src/message/recall_tests.rs` · `aero-im-core/; 3. Exact changes: 1. **F1**: `AND recalled_at IS NULL` added to the 3 lockless UPDATEs in `crud.rs` (keep `deleted_at`); update their doc ; 4. Risk assessment: - **F1 write no-ops on recalled rows**: intended; worker already treats `updated=false` as benign; backfill can't resele
+- evidence: docs/pi-batch/fix-plan.md
+
+## 2026-08-06 08:35:35 — stage 'implement' — FAIL
+- task docs/pi-batch/fix-implementation.md [FAILED: validation failed (exit=1)]
+- evidence: docs/pi-batch/fix-implementation.md
+
+## 2026-08-06 08:40:27 — stage 'plan' — PASS
+- task docs/pi-batch/fix-plan.md [ok]: 0. Reproduction — gates re-run this stage (all green): | Gate | Result |; 1. Root causes (evidence from the actual tree): **F1 — the tree has a RESIDUAL GAP.** The implementer pass landed 3 of 4 `crud.rs` hunks; the `update_voice_transcript` ; 2. Module boundary / change radius: Already in tree (9 files, implementer pass): `crud.rs`, `recall_index_fence_tests.rs` (new), `recall_tests.rs` (Fixture ; 3. Exact changes remaining: 1. **Required**: `crud.rs:445` `update_voice_transcript` → `WHERE id = $1 AND deleted_at IS NULL AND recalled_at IS NULL; 4. Test plan: 1. Fix hunk → deterministic test `recall_fences_late_index_writes` flips red→green (CI, `DATABASE_URL` throwaway DB); ra
+- evidence: docs/pi-batch/fix-plan.md
+
+## 2026-08-06 08:45:17 — stage 'implement' — FAIL
+- task docs/pi-batch/fix-implementation.md [FAILED: validation failed (exit=1)]: What changed (this stage): **Required — the residual gap** (`crates/aero-storage/src/message/crud.rs`):; Gates (all run, all green): | Gate | Result |
+- evidence: docs/pi-batch/fix-implementation.md
+
+## 2026-08-06 09:37:24 — stage 'review' — PASS
+- task docs/pi-batch/fix-reviews/async_reviewer.md [ok]: What I executed (this revision, not the report's claims): | Check | Result |; Attack checklist assessment: 1. **Request frequency** — N/A (no new client-side request sources; recall uses direct POST on explicit button click — c; Findings: | # | Sev | Pattern (defect-patterns.md) | Evidence | Root cause | Fix (decision-table referenced) | Test that catches i; What passed cleanly (no findings): - **F1 fence correctness**: all four content writers are closed (3 lockless SQL fences + 2 transactional lock/re-checks); VERDICT: FAIL - Finding 1 is blocking: the F3 rate gate charges the shared workspace budget before the recall-role check, so any room member can drain the entire workspace's per-minute budget (default 1200/min) with doomed recall attempts on other members' messages — the new gate is itself a repeatable workspace-wide availability drain, and it violates F3's own "same gate shape as edit" invariant (edit's preflight includes its author gate; recall's does not). Finding 2 (unmapped 429) is non-blocking. All F1 fixes, tests, and isolation changes verified correct and green.
+- task docs/pi-batch/fix-reviews/database_architect.md [ok]: Store inventory (durability × stock wiring): | Store | Durability | Stock binary wiring |; Findings (7; none ship-blocking): 1. **Low** — F1 fences verified on all 3 lockless UPDATEs + edit; system-edit paths fence in code under row lock (correc; Verified hot/atomic paths: Recall tx (row lock + one-shot WHERE fence + redacted snapshot + blob GC + audit + outbox at `MAX(aggregate_version)+1` ; Migration safety: 0238 is additive + strict-superset CHECK (old binaries compatible); **rollback not recommended once recalls exist** (wou
+- task docs/pi-batch/fix-reviews/testing_reviewer.md [ok]: 1. Verdict: ```; 2. Findings Table: | Sev | Defect pattern | Missing test | Test that would catch it |; 3. Risk-Coverage Matrix: | Risky path | Covered? | Evidence |; 4. Honesty Audit (completion-evidence): | Claimed command | Re-executed | Result |
+- task docs/pi-batch/fix-reviews/testing_reviewer.md [ok]
+- task docs/pi-batch/fix-reviews/security_engineer.md [ok]: Verdict: **FAIL** — one blocking finding: **S1 (Medium, blocking) — the F3 gate itself is a workspace-wide DoS amplifier.** Verified by code trace, not assertion:; Other findings: - **S2 (Low)** — 429 from the new gate is unmapped in the web client (`app.js:668` special-cases only 409), and `ws_rate; Positive controls verified: F1 fence inventory complete (3 lockless SQL fences + 2 lock+re-check + recall's own one-shot WHERE + backfill fence — no
+- evidence: docs/pi-batch/fix-reviews/async_reviewer.md, docs/pi-batch/fix-reviews/database_architect.md, docs/pi-batch/fix-reviews/testing_reviewer.md, docs/pi-batch/fix-reviews/testing_reviewer.md, docs/pi-batch/fix-reviews/security_engineer.md
+
+## 2026-08-06 09:43:36 — stage 'gate' — PASS (gate verdict: FAIL)
+- task docs/pi-batch/fix-gate.md [ok]: Verified against the repository: **Change set (14 files + 1 new test module, reviewed revision `0bc0838` + worktree):** F1 SQL fences on all lockless ind; Blocking finding: UNRESOLVED (async #1 = security S1): The worktree is line-for-line the reviewed revision — no post-review fix was applied. Code-traced exploit chain confirme; Non-blocking findings also open: - **Low**: 429 unmapped in web client (`app.js:668` special-cases only 409; `api.js` has no 429/Retry-After handling) — 
+- evidence: docs/pi-batch/fix-gate.md
+
+## 2026-08-06 10:14:38 — stage 'review' — PASS
+- task docs/pi-batch/fix-reviews/security_engineer.md [ok]
+- task docs/pi-batch/fix-reviews/async_reviewer.md [ok]
+- task docs/pi-batch/fix-reviews/testing_reviewer.md [ok]
+- task docs/pi-batch/fix-reviews/database_architect.md [ok]
+- task docs/pi-batch/fix-reviews/backend_engineer.md [ok]: 1. Analysis: **Module boundary**: The defect spanned three layers with clear ownership:; 2. Implementation (S1 blocking + all non-blocking findings): | Finding | Fix |; 3. Self-check (architecture.md §8 / evolution.md §6) + verification: - Boundaries clean, dependency direction intact, no cross-module internal access, no DTO/domain/ORM mixing, no new one-i
+- evidence: docs/pi-batch/fix-reviews/security_engineer.md, docs/pi-batch/fix-reviews/async_reviewer.md, docs/pi-batch/fix-reviews/testing_reviewer.md, docs/pi-batch/fix-reviews/database_architect.md, docs/pi-batch/fix-reviews/backend_engineer.md
+
+## 2026-08-06 10:19:39 — stage 'gate' — PASS (gate verdict: PASS)
+- task docs/pi-batch/fix-gate.md [ok]: Round 2 verification summary: **S1 (blocking) — FIXED and independently verified:**
+- evidence: docs/pi-batch/fix-gate.md

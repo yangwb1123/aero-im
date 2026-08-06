@@ -43,15 +43,15 @@ async fn participant(pool: &PgPool, label: &str) -> ParticipantId {
 /// Throwaway workspace + room with deterministic `room_members` rows (role
 /// asserted by the test, not by repo defaults). Cleanup deletes the workspace
 /// (rooms cascade) and participants.
-struct Fixture {
-    pool: PgPool,
-    workspace: WorkspaceId,
-    room: RoomId,
-    author: ParticipantId,
+pub(super) struct Fixture {
+    pub(super) pool: PgPool,
+    pub(super) workspace: WorkspaceId,
+    pub(super) room: RoomId,
+    pub(super) author: ParticipantId,
 }
 
 impl Fixture {
-    async fn create(label: &str) -> Self {
+    pub(super) async fn create(label: &str) -> Self {
         let pool = pool();
         let author = participant(&pool, &format!("recall-{label}-author")).await;
         let workspace = WorkspaceId::new();
@@ -100,7 +100,7 @@ impl Fixture {
         }
     }
 
-    async fn enroll(&self, participant: ParticipantId, role: &str) {
+    pub(super) async fn enroll(&self, participant: ParticipantId, role: &str) {
         sqlx::query(
             "INSERT INTO workspace_members (workspace_id, participant_id, role)
              VALUES ($1, $2, 'member')
@@ -123,7 +123,7 @@ impl Fixture {
         .unwrap();
     }
 
-    async fn insert_message(&self, sender: ParticipantId, body: &str) -> Message {
+    pub(super) async fn insert_message(&self, sender: ParticipantId, body: &str) -> Message {
         MessageRepo::new(self.pool.clone())
             .insert_outboxed(
                 NewMessage {
@@ -144,7 +144,7 @@ impl Fixture {
             .clone()
     }
 
-    async fn cleanup(&self) {
+    pub(super) async fn cleanup(&self) {
         sqlx::query("DELETE FROM workspaces WHERE id = $1")
             .bind(self.workspace.to_uuid())
             .execute(&self.pool)

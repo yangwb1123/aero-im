@@ -85,6 +85,14 @@ async fn racing_block_completes_before_direct_call_can_start() {
         .execute(&pg)
         .await
         .ok();
+    // 0227 owner guard: a raw participant DELETE is rejected while the caller
+    // still owns the magic nil workspace — drop the memberships first so this
+    // cleanup path satisfies `participant_workspace_raw_owner_guard`.
+    sqlx::query("DELETE FROM workspace_members WHERE participant_id = ANY($1)")
+        .bind(vec![caller.to_uuid(), target.to_uuid()])
+        .execute(&pg)
+        .await
+        .unwrap();
     sqlx::query("DELETE FROM participants WHERE id = ANY($1)")
         .bind(vec![caller.to_uuid(), target.to_uuid()])
         .execute(&pg)

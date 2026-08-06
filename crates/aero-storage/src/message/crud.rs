@@ -161,7 +161,10 @@ impl MessageRepo {
     /// Caller has already checked authorization.
     /// `expected_version` is the version the caller read — the UPDATE atomically
     /// increments it. Returns `Err(Conflict)` when another writer got there first.
-    /// Returns `Ok(None)` when the row is missing/soft-deleted.
+    /// Returns `Ok(None)` when the row is missing/soft-deleted/recalled (a
+    /// recalled message is terminal for content: the `WHERE` fence refuses
+    /// `recalled_at` rows so a stale writer can never resurrect the body over
+    /// the placeholder — mirroring the `editable_message` service invariant).
     pub async fn edit(
         &self,
         id: MessageId,
@@ -176,7 +179,7 @@ impl MessageRepo {
             r"UPDATE messages
                   SET blocks = $1, searchable_text = $2, edited_at = $3, embedding = NULL,
                       version = version + 1
-               WHERE id = $4 AND deleted_at IS NULL AND version = $5
+               WHERE id = $4 AND deleted_at IS NULL AND recalled_at IS NULL AND version = $5
             RETURNING id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, recalled_at, recalled_by, expires_at, version",
         )
         .bind(&blocks_json)
@@ -190,10 +193,11 @@ impl MessageRepo {
         if let Some(r) = row {
             Ok(Some(r.into()))
         } else {
-            // Two possibilities: message is missing/deleted, or version mismatch.
-            // Check existence to distinguish.
+            // Two possibilities: message is missing/deleted/recalled, or version
+            // mismatch. Check existence to distinguish.
             let exists = sqlx::query_scalar::<_, bool>(
-                "SELECT EXISTS(SELECT 1 FROM messages WHERE id = $1 AND deleted_at IS NULL)",
+                "SELECT EXISTS(SELECT 1 FROM messages
+                                WHERE id = $1 AND deleted_at IS NULL AND recalled_at IS NULL)",
             )
             .bind(id.to_uuid())
             .fetch_one(&self.pool)
@@ -417,7 +421,11 @@ impl MessageRepo {
     /// Patch transcripts onto the Voice blocks of a message that don't have
     /// one yet. Called by the transcribe bot — bypasses the sender-only edit
     /// check because the AI is acting on behalf of the system.
-    /// Returns the updated message (or None if the row is missing/deleted).
+    /// Returns the updated message (or None if the row is missing/deleted/recalled).
+    /// A recalled message is terminal: its body is the system placeholder, so
+    /// the `WHERE` fence also refuses `recalled_at` rows — a late transcript
+    /// (bot read the message pre-recall) must never resurrect content into
+    /// `searchable_text`/FTS after the recall cleared the index.
     pub async fn update_voice_transcript(
         &self,
         id: MessageId,
@@ -438,7 +446,7 @@ impl MessageRepo {
                  searchable_text = searchable_text || E'\n' || $2,
                  edited_at = NOW(),
                  embedding = NULL
-               WHERE id = $1 AND deleted_at IS NULL
+               WHERE id = $1 AND deleted_at IS NULL AND recalled_at IS NULL
             RETURNING id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, recalled_at, recalled_by, expires_at, version",
         )
         .bind(id.to_uuid())
@@ -449,6 +457,13 @@ impl MessageRepo {
     }
 
     /// Update the embedding column for a message. Called by the AI worker.
+    ///
+    /// The worker reads the message (and pays the provider) *before* this
+    /// write, so recall can commit in between: the `WHERE` fence refuses
+    /// `recalled_at` rows, exactly like the edit fence — a pre-recall worker
+    /// can never write the ORIGINAL vector post-recall (`search_vector`
+    /// returns any non-NULL embedding). Returns `false` when the row is
+    /// missing, soft-deleted, or recalled (caller treats it as benign).
     pub async fn update_embedding(
         &self,
         id: MessageId,
@@ -456,7 +471,8 @@ impl MessageRepo {
     ) -> Result<bool, sqlx::Error> {
         let v = Vector::from(embedding);
         let result = sqlx::query(
-            r"UPDATE messages SET embedding = $1 WHERE id = $2 AND deleted_at IS NULL",
+            r"UPDATE messages SET embedding = $1
+               WHERE id = $2 AND deleted_at IS NULL AND recalled_at IS NULL",
         )
         .bind(v)
         .bind(id.to_uuid())
@@ -475,14 +491,19 @@ impl MessageRepo {
     /// trigger to fire). Does NOT touch `embedding`: the caller (the worker)
     /// writes the embedding for the *same* combined text in the immediately
     /// following step, so nulling it here would be redundant churn. Returns
-    /// whether a live row was updated (`false` if missing / soft-deleted).
+    /// whether a live row was updated (`false` if missing / soft-deleted /
+    /// recalled). A recalled message must stay index-clean: `search_tsv` is a
+    /// STORED generated column, so the `WHERE` fence refusing `recalled_at`
+    /// rows is what stops a pre-recall worker write from re-deriving the
+    /// ORIGINAL text into FTS after the recall cleared it.
     pub async fn update_searchable_text(
         &self,
         id: MessageId,
         searchable_text: &str,
     ) -> Result<bool, sqlx::Error> {
         let result = sqlx::query(
-            r"UPDATE messages SET searchable_text = $1 WHERE id = $2 AND deleted_at IS NULL",
+            r"UPDATE messages SET searchable_text = $1
+               WHERE id = $2 AND deleted_at IS NULL AND recalled_at IS NULL",
         )
         .bind(searchable_text)
         .bind(id.to_uuid())

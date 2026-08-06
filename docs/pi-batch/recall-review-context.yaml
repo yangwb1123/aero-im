@@ -1,0 +1,43 @@
+# Context for the pre-merge feature review of message recall (Round 6).
+project: "Aero IM"
+subsystem: "Message recall (撤回) — REST + WS, placeholder semantics"
+
+files:
+  - crates/aero-im-core/src/service/messages.rs
+  - crates/aero-im-core/src/events.rs
+  - crates/aero-im-core/src/service/outbox.rs
+  - crates/aero-storage/src/message/authorization.rs
+  - crates/aero-storage/src/message/crud.rs
+  - crates/aero-storage/src/message/query.rs
+  - crates/aero-storage/src/message/recall_tests.rs
+  - crates/aero-server/src/routes/handlers/messages.rs
+  - crates/aero-common/src/model/message.rs
+  - crates/aero-common/src/model/event.rs
+  - migrations/0238_message_recall.sql
+  - web/render.js
+  - web/app.js
+
+rfcs:
+  - Aero IM design spec docs/specs/2026-05-22-aero-im-design.md
+  - AGENTS.md (event DAG, outbox invariants)
+
+architecture_summary: |
+  Recall replaces message content with a system placeholder (row/history/
+  audit intact), records recalled_at/recalled_by, and broadcasts a
+  Recalled room event via the transactional event outbox. Permission: the
+  author or a room owner/admin (pure table-driven decision + row-locked
+  storage re-check `recalled_at IS NULL`). Stable failure ordering
+  (404/403/409) with no cross-tenant existence oracle. changes_since
+  replay keys on GREATEST(edited_at, deleted_at, recalled_at); client
+  held-id replay rows route through the mutation funnel; SPA has REST +
+  WS recall entry points with 409→success mapping.
+
+storage: "PostgreSQL (event_outbox + messages partitioned); Redis presence/viewer"
+load_profile: "(not provided)"
+infra: "docker compose local (postgres/redis/nats/jaeger/minio); production cutover pending"
+deployment_target: "(not provided)"
+slo_targets: "(not provided)"
+sprint_goal: "Pre-merge review of the recall feature; verify security, implementation quality and production readiness"
+team_size: "(unknown)"
+sprint_duration: "(unknown)"
+velocity: "(unknown)"

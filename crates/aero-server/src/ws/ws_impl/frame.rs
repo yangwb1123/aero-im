@@ -155,6 +155,13 @@ pub(super) async fn handle_text(
             state.im.delete_message(pid, id).await?;
         }
         ClientFrame::RecallMessage { id } => {
+            // Tenant fairness (ROADMAP3 方向五): recall is a DB-heavy mutation
+            // (~8-10 queries incl. row locks), so it is charged against the
+            // room's workspace budget — after the access-checking preflight
+            // (non-members cannot drain a victim's budget), surfacing as a WS
+            // `error` frame when over. Same gate shape as EditMessage above.
+            let room = state.im.assert_message_recall_preflight(pid, id).await?;
+            crate::ws_rate::check_ws_rate_room(state, room).await?;
             state.im.recall_message(pid, id).await?;
         }
         ClientFrame::React { message_id, emoji } => {

@@ -107,7 +107,7 @@ function hookWs() {
   ws.on('msg:stream_event', (f) => handleStreamEvent(f.event));
   ws.on('msg:backfill', (f) => handleBackfillTruncated(f));
   ws.on('msg:resync', () => handleResync());
-  ws.on('msg:error', (f) => toast(`服务端:${f.msg || f.code || 'error'}`, 'error'));
+  ws.on('msg:error', (f) => toast(f.code === 'rate_limited' ? '操作太频繁,请稍后重试' : `服务端:${f.msg || f.code || 'error'}`, 'error'));
   ws.on('msg:pong', () => {});
   initMessageActivity();
   initReliableDelivery({
@@ -663,10 +663,10 @@ function wireMsgActions(node, m) {
     if (act === 'react') openEmojiPicker(btn, (emoji) => ws.react(m.id, emoji));
     if (act === 'edit') beginEditMessage(m);
     if (act === 'recall') {
-      // 409 = already recalled (double-click / concurrent admin recall): the
-      // msg:recalled broadcast or replay converges the row — treat as success.
+      // 409 = already recalled (converge); 429 = workspace budget exhausted → back off (no auto-retry).
       if (confirm('撤回这条消息?')) api.recallMessage(m.id).catch((err) => {
-        if (err?.status !== 409) toast(`撤回失败:${err?.message || '未知错误'}`, 'error');
+        if (err?.status === 429) toast('撤回太频繁,请稍后重试', 'error');
+        else if (err?.status !== 409) toast(`撤回失败:${err?.message || '未知错误'}`, 'error');
       });
     }
     if (act === 'delete' && confirm('删除这条消息?')) ws.deleteMessage(m.id);

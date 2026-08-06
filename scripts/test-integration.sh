@@ -250,7 +250,8 @@ cargo test --workspace --lib --locked -- \
     --skip migration_0237_backfills_before_installing_destination_guard \
     --skip message_quota_and_snaplink_outboxes_are_transactional \
     --skip scim_inactive_first_nil_workspace_member_rolls_back_owner_bootstrap \
-    --skip db_tests::
+    --skip db_tests::notifications_tests \
+    --skip db_tests::relay_tests
 TEST_EXIT=$?
 set -e
 

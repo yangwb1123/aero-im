@@ -22,7 +22,10 @@
 use crate::hub::WsSender;
 use crate::state::AppState;
 use aero_auth::{Claims, TokenKind};
-use aero_common::metrics::{self, names};
+use aero_common::{
+    metrics::{self, names},
+    Error as AeroError,
+};
 use aero_common::{
     Block, CallEvent, CallId, CallKind, CallMode, CallSession, CanvasId, MembershipOp, MessageId,
     NotificationKind, ParticipantId, PinOp, PollId, PollOp, ReactionOp, RoomId, SessionId,
@@ -765,9 +768,19 @@ async fn run_socket(
                         if let Err(e) =
                             frame::handle_text(&text, &state, pid, &tx, &mut call_generations).await
                         {
+                            // Surface the stable error code (rate_limited /
+                            // forbidden / …) instead of the generic "handler":
+                            // the ws-rate gate rejects over-budget recall/send
+                            // with `RateLimited` and the client must be able to
+                            // tell a back-off-worthy 429 apart from a hard
+                            // failure. Falls back to "handler" when the root
+                            // cause is not an `AeroError` (parse/IO/etc.).
+                            let code = e
+                                .downcast_ref::<AeroError>()
+                                .map_or("handler", |ae| ae.code());
                             let _ = tx.try_send(Message::Text(
                                 serde_json::to_string(&ServerFrame::Error {
-                                    code: "handler",
+                                    code,
                                     msg: e.to_string(),
                                 })
                                 .unwrap_or_default(),

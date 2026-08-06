@@ -318,6 +318,124 @@ fn every_room_or_workspace_handler_is_authz_guarded() {
     );
 }
 
+/// Recursively collect `src/**/*.rs` (skipping `src/bin/` wiring): the recall
+/// entry points live in subdirectories (`routes/handlers/`, `ws/ws_impl/`),
+/// unlike the top-level handlers the authz scan above targets.
+fn collect_src_files() -> Vec<PathBuf> {
+    let src = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    let mut dirs = vec![src];
+    while let Some(dir) = dirs.pop() {
+        for entry in fs::read_dir(&dir).expect("read src dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                if path.file_name().is_some_and(|name| name != "bin") {
+                    dirs.push(path);
+                }
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
+/// Rate-gate regression scan (security review stage 02/06, finding F3): every
+/// entry point that invokes the ~8-10-query recall mutation (WS `handle_text`
+/// arm + REST `recall_message`) must charge the room's workspace rate budget
+/// (`check_ws_rate_room`) first — the same gate shape as edit. A handler that
+/// calls `.recall_message(` without the gate in its body fails this lint, so
+/// the fix cannot silently regress.
+///
+/// Gate S1 (rate-gate `DoS` amplifier, security review round 2): the role gate
+/// lives INSIDE the preflight, so the lint also requires the arm to call
+/// `assert_message_recall_preflight(` and `check_ws_rate_room(` IN THAT ORDER
+/// before the mutation — budget may only be charged for callers the preflight
+/// has already authorized (author or room owner/admin). Reordering or removing
+/// either step fails the lint, pinning "no charge without the role gate".
+///
+/// Hermetic: reads the crate's own sources via `CARGO_MANIFEST_DIR`; no DB,
+/// no network, no extra dependencies.
+#[test]
+fn every_recall_entry_point_charges_ws_rate_budget() {
+    let mut matched = 0;
+    let mut offenders = Vec::new();
+    for path in collect_src_files() {
+        let file_name = path
+            .file_name()
+            .expect("file name")
+            .to_string_lossy()
+            .into_owned();
+        let text = fs::read_to_string(&path).expect("read source file");
+        let lines: Vec<&str> = text.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            if !line.contains(".recall_message(") {
+                continue;
+            }
+            matched += 1;
+            // Enclosing region: the WS `ClientFrame::RecallMessage` arm, or
+            // (REST) the top-level `async fn`, through the call line. Scoping
+            // to the ARM matters: the WS dispatch fn contains other rate-gated
+            // arms (edit), which must not mask a bare recall call.
+            let arm_start = (0..=i)
+                .rev()
+                .find(|&k| lines[k].contains("ClientFrame::RecallMessage"))
+                .unwrap_or_else(|| {
+                    (0..=i)
+                        .rev()
+                        .find(|&k| {
+                            let rest = lines[k]
+                                .strip_prefix("pub(crate) ")
+                                .or_else(|| lines[k].strip_prefix("pub "))
+                                .or_else(|| lines[k].strip_prefix("pub(super) "))
+                                .unwrap_or(lines[k]);
+                            rest.starts_with("async fn ")
+                        })
+                        .expect("recall_message call sits inside a top-level async fn")
+                });
+            let region = lines[arm_start..=i].join("\n");
+            // Gate S1: budget may only be charged AFTER the role-gated
+            // preflight has authorized the caller. `region.find` order check
+            // pins preflight → charge → mutation; removing either step (or
+            // charging before the preflight) fails the lint.
+            let preflight_idx = region.find("assert_message_recall_preflight(");
+            let charge_idx = region.find("check_ws_rate_room(");
+            match (preflight_idx, charge_idx) {
+                (Some(p), Some(c)) if p < c => {}
+                _ => offenders.push(format!(
+                    "  {file_name} (call at line {}): gate chain must be \
+                     `assert_message_recall_preflight` THEN `check_ws_rate_room` \
+                     before `recall_message` (S1: budget may only be charged for \
+                     role-gated callers)",
+                    i + 1
+                )),
+            }
+        }
+    }
+
+    // Scanner self-check: if a refactor breaks the scan, this test must fail
+    // loudly instead of silently linting nothing (2 call sites calibrated: WS
+    // frame arm + REST handler).
+    assert!(
+        matched >= 2,
+        "recall rate-gate scanner matched only {matched} `.recall_message(` call \
+         site(s) (expected >= 2) — the source scan in tests/authz_lint.rs no \
+         longer recognizes the recall entry points; fix the scanner"
+    );
+    assert!(
+        offenders.is_empty(),
+        "\nRATE-GATE GUARDRAIL (F3/S1): handler(s) invoke `recall_message` without \
+         the role-gated charge sequence (preflight → `check_ws_rate_room` → \
+         mutation):\n{}\n\n\
+         Fix: resolve the room via `assert_message_recall_preflight` (which \
+         rejects non-author members with Forbidden BEFORE any charge) and call \
+         `check_ws_rate_room` AFTER it, BEFORE `recall_message` (same shape as \
+         edit).",
+        offenders.join("\n")
+    );
+}
+
 /// A bare membership role ignores account deletion, workspace deactivation,
 /// and mandatory 2FA. Keep raw reads out of request authorization; the sole
 /// exception is an effective admin inspecting a target membership so they can

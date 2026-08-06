@@ -79,3 +79,81 @@ worktree 基线复现 + stash 隔离 + 串行/并行对比，最终定位为 `--
 子串过宽（`ai_job::db_tests` 等 aero-storage 测试被连带跳过，破坏 nil
 workspace 状态机）。教训：`--skip` 过滤必须精确到模块路径，禁止用短子串
 匹配跨 crate 的测试名（已沉淀 docs/rules/drafts 建议）。
+
+---
+
+## Round 2 — Gate S1 (rate-gate DoS amplifier) + non-blocking findings
+
+The gate review (fix-gate.md) FAILED round 1 on the security engineer's S1 /
+async reviewer's Finding 1: `assert_message_recall_preflight` checked room
+access + deleted + recalled but NOT `recall_authorized`, and both entry points
+charged `check_ws_rate_room` between the preflight and the role gate — so a
+non-author room member could drain the shared per-workspace budget (default
+1200/min, shared with send/edit/history/search) with doomed recall attempts
+over an unthrottled WS socket. Closed in this round, plus the Low findings.
+
+### completion_report
+
+```yaml
+completion_report:
+  summary: >
+    S1: the recall role gate (author or room owner/admin) is hoisted INSIDE
+    assert_message_recall_preflight (messages.rs), so a doomed recall by a
+    plain member is Forbidden BEFORE any edge can charge the shared workspace
+    budget — the F3 gate is no longer a DoS amplifier and now truly mirrors
+    edit's preflight shape (edit carries its sender gate). Preflight test
+    extended (member -> Forbidden with the exact message; promoted admin ->
+    resolves the room); mutation-proven non-vacuous (removing the gate makes
+    the test fail at the member assertion). authz_lint F3 scanner hardened to
+    require preflight -> check_ws_rate_room -> recall_message ordering.
+    Behavioral proof: scripts/smoke_recall_rate_gate.py against a live server
+    with AERO_WS_RATE_STANDARD_PER_MIN=3 — 5 doomed member recalls all 403
+    with zero budget consumed (owner's own recall then succeeds), owner's next
+    recall 429 + Retry-After, WS error frame code=rate_limited. S2: REST 429s
+    now carry Retry-After (ApiError fixed-window hint, per-client middleware
+    still overrides with its exact value); WS error frames propagate the
+    stable error code instead of the generic "handler"; web client maps 429 /
+    rate_limited to a back-off toast. Medium test gaps: concurrent race tests
+    for the two transactional outboxed writers (edit_outboxed_system +
+    update_voice_transcript_outboxed, 8 rounds each, final-state invariants
+    hold under any interleaving). transcribe_bot doc drift fixed.
+  changed_files:
+    - crates/aero-im-core/src/service/messages.rs      # role gate in preflight
+    - crates/aero-im-core/src/db_tests/recall_tests.rs # member/admin preflight asserts
+    - crates/aero-server/tests/authz_lint.rs           # S1 ordering pin
+    - crates/aero-server/src/error.rs                  # Retry-After on 429
+    - crates/aero-server/src/ws/ws_impl/mod.rs         # stable WS error codes
+    - crates/aero-server/src/transcribe_bot.rs         # doc drift
+    - crates/aero-storage/src/message/recall_index_fence_tests.rs # 2 race tests
+    - web/app.js                                       # 429/rate_limited mapping
+    - scripts/smoke_recall_rate_gate.py                # behavioral gate smoke
+  commands_executed:
+    - command: "cargo check --workspace --all-targets"
+      result: passed
+    - command: "cargo clippy --workspace --all-targets -- -D warnings"
+      result: passed
+    - command: "cargo test --workspace --lib"
+      result: "passed (319 passed / 606 ignored)"
+    - command: "cargo test -p aero-server --test authz_lint"
+      result: "passed (7/7 incl. every_recall_entry_point_charges_ws_rate_budget)"
+    - command: "storage recall suite on fresh throwaway DB (aero_review_s1, 238 migrations)"
+      result: "passed 14/14 incl. both new outboxed-writer race tests"
+    - command: "im-core recall suite on same DB"
+      result: "passed 4/4 incl. recall_preflight_resolves_room_and_early_errors"
+    - command: "mutation test: role gate removed from preflight"
+      result: "preflight test FAILED at the plain-member assertion (non-vacuous); restored"
+    - command: "bash scripts/test-integration.sh"
+      result: "passed (599 ignored tests on throwaway DBs, DBs dropped)"
+    - command: "bash scripts/web-check.sh / truth-check.sh / file-size-check.sh"
+      result: "passed (0 violations; 0 ORPHAN; app.js 998 lines)"
+    - command: "scripts/smoke_recall_rate_gate.py against live server (AERO_WS_RATE_STANDARD_PER_MIN=3)"
+      result: "passed — conservation proven, REST 429 + Retry-After, WS rate_limited frame"
+  not_executed:
+    - check: none — all gates including the behavioral smoke ran
+  residual_risks:
+    - the live smoke depends on the server being booted with
+      AERO_WS_RATE_STANDARD_PER_MIN=3 (documented in the script header); not
+      part of the hermetic CI gates, matching the smoke harness convention
+    - system-edit/transcript writers remain row-lock + Rust re-check (no SQL
+      WHERE fence); now covered by concurrent race tests under any
+      interleaving

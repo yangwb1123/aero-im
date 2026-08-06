@@ -328,10 +328,14 @@ impl MessageRepo {
             // (e.g. an image/file block with no caption) can never get a meaningful
             // embedding, so without this filter the 300s backfill loop re-selects and
             // re-enqueues it every cycle forever — perpetual embedding-API spend. The
-            // message.rs→message/ split dropped this term; restored.
+            // message.rs→message/ split dropped this term; restored. `recalled_at IS
+            // NULL` is defense-in-depth: recall clears `searchable_text`/`embedding`
+            // atomically, so recalled rows are already excluded — the explicit fence
+            // keeps the backfill safe if that clear ever changes.
             r"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, recalled_at, recalled_by, expires_at, version
                FROM messages
-               WHERE embedding IS NULL AND deleted_at IS NULL AND (expires_at IS NULL OR expires_at > now()) AND searchable_text <> ''
+               WHERE embedding IS NULL AND deleted_at IS NULL AND recalled_at IS NULL
+                 AND (expires_at IS NULL OR expires_at > now()) AND searchable_text <> ''
                ORDER BY created_at ASC
                LIMIT $1",
         )
