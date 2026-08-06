@@ -1,0 +1,28 @@
+{
+  "dominant": {
+    "task_type": "frontend_ui",
+    "score": 4,
+    "matched": [
+      "前端",
+      "组件"
+    ],
+    "platform": "unknown",
+    "profile": "unknown",
+    "confident": true
+  },
+  "route_frontend": true,
+  "frontend_pipeline": "/home/u1/aero-im-batch/frontend-pipeline.yaml",
+  "tasks": [
+    {
+      "task_type": "frontend_ui",
+      "score": 4,
+      "matched": [
+        "前端",
+        "组件"
+      ],
+      "platform": "unknown",
+      "profile": "unknown",
+      "confident": true
+    }
+  ]
+}

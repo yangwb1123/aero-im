@@ -1,0 +1,3 @@
+scale=standard risk=low page_types=none profile=unknown platform=unknown task_type=frontend_ui
+business_terms=前端实现草稿,持久化组件,编辑器自动保,存与恢复
+原文: 在 web 前端实现草稿持久化组件：编辑器自动保存与恢复

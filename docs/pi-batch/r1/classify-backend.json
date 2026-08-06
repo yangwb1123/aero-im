@@ -1,0 +1,34 @@
+{
+  "dominant": {
+    "task_type": "backend",
+    "score": 10,
+    "matched": [
+      "后端",
+      "接口",
+      "服务端",
+      "数据库",
+      "事务"
+    ],
+    "platform": "unknown",
+    "profile": "unknown",
+    "confident": true
+  },
+  "route_frontend": false,
+  "frontend_pipeline": "",
+  "tasks": [
+    {
+      "task_type": "backend",
+      "score": 10,
+      "matched": [
+        "后端",
+        "接口",
+        "服务端",
+        "数据库",
+        "事务"
+      ],
+      "platform": "unknown",
+      "profile": "unknown",
+      "confident": true
+    }
+  ]
+}
