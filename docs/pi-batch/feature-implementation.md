@@ -1,18 +1,19 @@
-# Message Recall (消息撤回) — Implementation Report
+All done. This round's work: re-verified all 5 gate fixes + 3 closed test gaps in-tree, re-ran every gate (all green), wrote the validator-compliant artifact to `docs/pi-batch/feature-implementation.md`, and confirmed `check-completion-report.py` → `COMPLETION: OK`. No code changes were needed this round — the tree was already green; the previous VALIDATION_FAILED was purely the missing YAML completion_report block.
 
-Feature: message recall — author or room owner/admin recalls a message; content
-is replaced with the system placeholder (row/history/audit intact), a `Recalled`
-room event is broadcast, all clients render the placeholder. Multi-tenant
-boundaries enforced (no cross-room/workspace oracle).
+Key evidence this round: cargo check ✅ · clippy -D warnings ✅ · `cargo test --workspace --lib` **2158/0** ✅ · web-check 0 violations ✅ · truth-check 0 orphans ✅ · file-size 0 violations ✅ · `node --test web/*.test.js` **82/0** ✅ · authz_lint 6/6 ✅ · `test-integration.sh` full fresh-DB replay (238 migrations incl. 0238) + 594 ignored tests ✅ · targeted throwaway-DB recall suites **9/9 storage + 28/28 im-core** ✅ · backend-quality 0 violations (674 files) ✅ · completion-report check `COMPLETION: OK` ✅.
 
 ## completion_report
 
 ```yaml
 completion_report:
   summary: >
-    Message recall implemented end to end: REST + WS entry, outbox
-    transactional recall, Recalled room event broadcast, client
-    placeholder rendering, migration 0238, permission matrix tests.
+    Message recall implemented end to end: REST + WS entry, transactional
+    outbox recall (migration 0238), Recalled room event broadcast, client
+    placeholder rendering, permission matrix. All 5 gate defects fixed and
+    regression-tested; all 3 plan test gaps closed; every gate re-run green
+    this round (check/clippy/test 2158, web-check, truth-check,
+    file-size-check, authz_lint 6, test-integration.sh 594, node --test 82,
+    backend-quality 0 violations).
   changed_files:
     - migrations/0238_message_recall.sql
     - crates/aero-common/src/model/message.rs
@@ -24,60 +25,103 @@ completion_report:
     - crates/aero-im-core/src/service/messages.rs
     - crates/aero-im-core/src/service/outbox.rs
     - crates/aero-im-core/src/db_tests.rs
+    - crates/aero-im-core/src/db_tests/recall_tests.rs
+    - crates/aero-storage/src/message/mod.rs
+    - crates/aero-storage/src/message/query.rs
+    - crates/aero-storage/src/message/crud.rs
+    - crates/aero-storage/src/message/events.rs
+    - crates/aero-storage/src/message/authorization.rs
+    - crates/aero-storage/src/message/thread.rs
+    - crates/aero-storage/src/message/sweep.rs
+    - crates/aero-storage/src/message/search.rs
+    - crates/aero-storage/src/message/orig.rs
+    - crates/aero-storage/src/message/idempotency.rs
+    - crates/aero-storage/src/message/recall_tests.rs
+    - crates/aero-storage/src/event_outbox.rs
+    - crates/aero-storage/src/bookmark.rs
+    - crates/aero-storage/src/pin.rs
+    - crates/aero-storage/src/search_query.rs
+    - crates/aero-storage/src/workspace/export.rs
+    - crates/aero-storage/src/integration/debug_tests.rs
     - crates/aero-server/src/routes/handlers/messages.rs
     - crates/aero-server/src/routes/routes.rs
+    - crates/aero-server/src/ws/frame.rs
+    - crates/aero-server/src/ws/ws_impl/mod.rs
+    - crates/aero-server/src/ws/ws_impl/frame.rs
+    - crates/aero-server/src/ws/ws_impl/bus.rs
+    - crates/aero-server/src/ws/ws_impl/tests.rs
     - crates/aero-server/src/bin/boot/background.rs
-    - crates/aero-server/src/broadcast.rs
     - crates/aero-server/src/bot_dispatch.rs
     - crates/aero-server/src/bot_dispatch/tests.rs
+    - crates/aero-server/src/broadcast.rs
     - crates/aero-server/src/conversation_export.rs
     - crates/aero-server/src/forward.rs
     - crates/aero-server/src/message_context.rs
     - crates/aero-server/src/ooo_bot.rs
     - crates/aero-server/src/unfurl_bot.rs
     - crates/aero-server/src/webhooks.rs
+    - crates/aero-server/src/webhooks/tests.rs
     - crates/aero-ai/src/rerank.rs
     - crates/aero-ai/src/service/profile.rs
     - crates/aero-ai/src/service/tests.rs
+    - web/app.js
+    - web/ws.js
+    - web/api.js
     - web/render.js
+    - web/context.js
     - web/style.css
+    - web/ws.test.js
+    - web/api.test.js
+    - web/render_recall.test.js
+    - docs/pi-batch/message-recall-plan.md
+    - docs/pi-batch/feature-plan.md
+    - docs/pi-batch/recall-completion-report.md
+    - docs/pi-batch/feature-implementation.md
   commands_executed:
-    - command: "cargo check --workspace --all-targets"
+    - command: "cd /home/u1/aero-im && cargo check --workspace --all-targets"
       result: passed
-    - command: "cargo clippy --workspace --all-targets -- -D warnings"
+    - command: "cd /home/u1/aero-im && cargo clippy --workspace --all-targets -- -D warnings"
       result: passed
-    - command: "cargo test --workspace --lib"
-      result: passed
-    - command: "bash scripts/web-check.sh"
-      result: passed
-    - command: "bash scripts/truth-check.sh"
-      result: passed
-    - command: "bash scripts/test-integration.sh"
-      result: passed
+    - command: "cd /home/u1/aero-im && cargo test --workspace --lib"
+      result: passed            # 2158 passed, 0 failed
+    - command: "cd /home/u1/aero-im && bash scripts/web-check.sh"
+      result: passed            # 0 violations, 57 files
+    - command: "cd /home/u1/aero-im && bash scripts/truth-check.sh"
+      result: passed            # 0 orphans (3 pre-existing allowlisted UNWIRED builders)
+    - command: "cd /home/u1/aero-im && bash scripts/file-size-check.sh"
+      result: passed            # 0 violations (71 pre-existing WARN)
+    - command: "cd /home/u1/aero-im && bash scripts/test-integration.sh"
+      result: passed            # fresh-DB migration replay (238 migrations incl. 0238) + full ignored suite, EXIT 0
+    - command: "cd /home/u1/aero-im && node --test web/*.test.js"
+      result: passed            # 82 passed, 0 failed
+    - command: "cd /home/u1/aero-im && cargo test --workspace --test authz_lint"
+      result: passed            # 6 passed
+    - command: "cargo test -p aero-storage --lib -- --ignored message::recall (throwaway migrated DB)"
+      result: passed            # 9/9 incl. concurrent race + 3 gate regressions + migration schema
+    - command: "cargo test -p aero-im-core --lib -- --ignored (throwaway migrated DB)"
+      result: passed            # 28 passed, 0 failed incl. 3 recall service tests
+    - command: "cargo run --bin aero-cli -- migrate (throwaway DB)"
+      result: passed            # full 238-migration chain incl. 0238
+    - command: "python /home/u1/ai-batch-runner/scripts/check-backend-quality.py --dir /home/u1/aero-im/crates"
+      result: passed            # 0 violations, 674 files scanned
+    - command: "python /home/u1/ai-batch-runner/scripts/check-completion-report.py docs/pi-batch/feature-implementation.md"
+      result: passed            # COMPLETION: OK
   not_executed:
-    - check: real-browser E2E recall UI flow
-      reason: no browser harness in this environment; client rendering covered by
-        render.js placeholder path + web-check import/syntax gate
+    - check: real-browser E2E recall UI flow (two live WS clients, REST recall roundtrip, reconnect replay)
+      reason: no browser harness in this environment; covered by the WS frame contract test, storage/service integration tests asserting the outbox row and placeholder payload, the hermetic web render path, and web-check static gate
+    - check: migration rollback (DROP COLUMN + CHECK revert)
+      reason: migration is purely additive and reversible; forward path proven on fresh throwaway DBs only
   residual_risks:
-    - recall is terminal for user content (edit blocked after recall); no
-      un-recall path — deliberate, matches Slack-style placeholder semantics
-    - no time limit on recall window — product decision left open (see
-      docs/pi-batch/feature-plan.md)
+    - recall is terminal for user content (edit blocked after recall); no un-recall path — deliberate, matches Slack-style placeholder semantics
+    - no time limit on recall window — product decision left open (see docs/pi-batch/message-recall-plan.md)
+    - web UI exposes the recall affordance to the author only (no room-role context client-side); admin/owner recall works via REST/WS with server-enforced authorization, matching how delete is surfaced
+    - recalled messages remain readable in history/search as placeholder; pre-recall content preserved in message_edits + audit (recall != erasure — product disclosure decision pending)
+    - web/ws.test.js at 831 lines: WARN-level advisory only, under the 1000-line HARD budget
+    - rolling-deploy version skew: old binaries ack-drop unknown 'recalled' events and advance the durable cursor — deploy ordering discipline (upgrade all nodes before recall use) documented in the plan
   assumptions:
-    - recalled placeholder body is immutable; moderation delete still applies
-    - WS frame name `recall_message` mirrors REST route; both share the same
-      service method (single invariant)
+    - moderator maps to the existing room roles owner/admin (role enum is exactly owner/admin/member)
+    - recall is deliberately not silently idempotent: second recall returns stable 409 "message is already recalled"; clients treat 409 as already-effected
+    - attachment bytes of recalled messages are garbage-collected via the existing blob_gc_queue with live-reference check
+    - no new crate, no new third-party dependency, no new table, no new index beyond the 0238 expression-index reissue
+    - working tree left dirty per instructions (no commit); unrelated pre-existing modifications were present before this task and untouched
 ```
-
-## 设计要点（与 plan 对照）
-
-- **权限矩阵**（纯函数 `recall_authorized`，表驱动单测）：作者放行；owner/admin
-  放行；普通成员非作者 403；非成员 403（访问守卫先于状态检查，无存在性 oracle）。
-- **稳定失败路径**（求值顺序）：404 未知消息 → 403 无房间访问 → 409 已删除 →
-  409 已撤回 → 403 无权。存储事务在行锁下重查访问/角色/状态（预检只是 UX）。
-- **持久化**（迁移 0238）：`recalled_at` / `recalled_by` 列 + 占位 body 写入，
-  行/历史/审计完整保留；`recall_outboxed_authorized` 与 event_outbox 同事务，
-  快速 dispatch 失败回落 durable relay（与既有编辑/删除同一不变量）。
-- **事件**：`Recalled` room event 经 `im.room.{id}` 广播，客户端 render.js
-  渲染占位（"此消息已被撤回"）。
-- **指标**：`aero_messages_recalled_total` + 处理耗时直方图（op=recall）。
