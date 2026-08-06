@@ -39,7 +39,7 @@ AI-Native 即时通讯 + 直播平台,Rust 实现。
 | **频道治理** | 公开·私有 / 加入·退出 / 归档 / topic / 发言策略(公告频道) / 侧边栏分组 / 收藏 | ✅ |
 | **用户组 @-usergroups** | 工作区命名成员集，`@handle` 提及扇出到全组(Wave 10) | ✅ |
 | **个性化** | 自定义状态+presence / 资料字段(title·pronouns·tz·phone, Wave 10) / 自定义表情 / 收藏 / 通知偏好(频道静音+DND) / 关键词提醒(Wave 10) | ✅ |
-| **消息生命周期** | 定时发送 / 提醒(消息锚定) / 编辑历史(Wave 10) / 留存策略 / 链接预览(unfurl) | ✅ |
+| **消息生命周期** | 定时发送 / 提醒(消息锚定) / 编辑历史(Wave 10) / 留存策略 / 链接预览(unfurl) / 撤回(作者限时,房主/管理员不受限) | ✅ |
 | **消息可靠性** | 创建/编辑/删除按消息聚合版本写入事务 outbox，严格顺序发布；通知/AI 等后置工作走 durable side-effect jobs；外发 consumer 以 `(consumer,event_id)` receipt 防重；回复及定时/草稿回复由数据库约束固定在同一房间 | ✅ |
 | **事务 / 资源围栏** | 定时与周期消息、MLS 不透明中继、关键词提醒、预测、置顶、直播治理、目标和预约直播均在数据库提交点复检 actor、租户/房间/stream 归属、生命周期与配额，raw SQL 不能绕过关键边界 | ✅ |
 | **离线投递** | 每房事务分配 `delivery_ordinal`；服务端按 `(participant,room)` 持久游标，完整分页回放后发 `delivery_ready` barrier，客户端应用成功后再单调 ACK | ✅ |
@@ -168,6 +168,7 @@ open http://localhost:3030
 | `ANTHROPIC_MODEL` | 默认 `claude-sonnet-4-6` |
 | `VOYAGE_API_KEY` | 启用 Voyage embeddings(1024 维);否则用确定性 HashEmbedder |
 | `AERO_BLOCKED_WORDS` | 逗号分隔,关键词审核(同步预审) |
+| `AERO_RECALL_WINDOW_SECS` | 消息撤回时间窗(默认 86400=24h;`0` 不限,无效值回落默认);仅作者受窗口约束,房主/管理员撤回(审核路径)不受限 |
 | `AERO_AI_MODERATION` | 置位后启用 AI 异步内容审核(经有界预算化队列;需 `ANTHROPIC_API_KEY`) |
 | `AERO_AI_MODERATION_QUEUE` / `_CONCURRENCY` | 审核队列容量(默认 512)/ 工作者数(默认 2) |
 | `AERO_AI_MODERATION_MAX_PER_WINDOW` / `_PER_WS_WINDOW` / `_WINDOW_SECS` | 审核全局/单租户预算窗口(默认 300 / 60 / 60s;超额跳过并计数) |

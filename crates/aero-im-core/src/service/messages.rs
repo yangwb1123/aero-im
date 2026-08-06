@@ -8,7 +8,8 @@ use crate::service::orig::{per_tenant_metrics_enabled, spam_content_hash, WORKSP
 use crate::{moderation_text, validate_blocks, ImService, ModerationVerdict};
 use aero_common::{
     metrics::{self, names},
-    Block, Error, Message, MessageId, ParticipantId, Result, RoomId, RoomKind, WorkspaceId,
+    recall_window_expired, Block, Error, Message, MessageId, ParticipantId, Result, RoomId,
+    RoomKind, WorkspaceId,
 };
 use aero_storage::{message::NewMessage, MessageIdempotency};
 use tracing::{instrument, warn, Instrument};
@@ -31,6 +32,28 @@ pub(crate) fn recall_authorized(
             "only author or room admin may recall".into(),
         ))
     }
+}
+
+/// Default recall window (`AERO_RECALL_WINDOW_SECS` fallback): 24 hours.
+pub(crate) const RECALL_WINDOW_DEFAULT_SECS: i64 = 86_400;
+
+/// Parse an `AERO_RECALL_WINDOW_SECS`-style raw value: `0` → unlimited
+/// (`time::Duration::ZERO`); unset / garbage / negative / overflow → the
+/// 86400s default (repo `env_parse(...).unwrap_or(default)` convention — a
+/// hot-path knob must not brick startup on a typo). Pure so it is
+/// unit-testable without process-global env mutation (parallel-unsafe).
+pub(crate) fn parse_recall_window(raw: Option<&str>) -> time::Duration {
+    match raw.and_then(|v| v.trim().parse::<i64>().ok()) {
+        Some(secs) if secs >= 0 => time::Duration::seconds(secs),
+        _ => time::Duration::seconds(RECALL_WINDOW_DEFAULT_SECS),
+    }
+}
+
+/// Thin env wrapper — read ONCE at [`ImService::new`](crate::ImService::new)
+/// so tests inject exact windows via `with_recall_window` instead of mutating
+/// the process-global env (parallel-unsafe).
+pub(crate) fn recall_window_from_env() -> time::Duration {
+    parse_recall_window(std::env::var("AERO_RECALL_WINDOW_SECS").ok().as_deref())
 }
 
 #[derive(Debug, Clone)]
@@ -452,9 +475,11 @@ impl ImService {
     /// the workspace budget: a doomed recall attempt by a plain member fails
     /// with `Forbidden` from this preflight and never consumes shared rate
     /// capacity (gate S1 — the rate gate itself must not be a workspace-wide
-    /// `DoS` amplifier). The eventual [`Self::recall_message`] call repeats every
-    /// check so a concurrent membership, account, or state change cannot turn
-    /// this preflight result into authority.
+    /// `DoS` amplifier). The author recall-window check runs here for the same
+    /// reason: a window-expired attempt is doomed and must not burn the budget
+    /// either. The eventual [`Self::recall_message`] call repeats every check so
+    /// a concurrent membership, account, or state change cannot turn this
+    /// preflight result into authority.
     pub async fn assert_message_recall_preflight(
         &self,
         actor: ParticipantId,
@@ -483,6 +508,23 @@ impl ImService {
             .role_of(existing.room_id, actor)
             .await?;
         recall_authorized(actor, existing.sender_id, role.as_deref())?;
+        // Recall window (撤回时间窗): author-only — room owner/admin recall is
+        // the moderation path and is exempt. Runs AFTER the role gate so the
+        // window state is never revealed to non-privileged actors, and before
+        // the rate charge (gate S1). The storage transaction re-checks this
+        // against the row-locked snapshot; this read only produces the early
+        // 409. Emits the rejection counter here — the single choke point shared
+        // by REST and WS (the tx-fence boundary-race fraction is not counted).
+        if existing.sender_id == actor
+            && recall_window_expired(
+                existing.created_at,
+                aero_common::time::now_utc(),
+                self.recall_window,
+            )
+        {
+            metrics::inc_counter(names::MESSAGES_RECALL_EXPIRED_TOTAL, 1);
+            return Err(Error::Conflict("recall window expired".into()));
+        }
         Ok(existing.room_id)
     }
 
@@ -497,9 +539,12 @@ impl ImService {
     /// 2. no room access (non-member / cross-workspace) → `Forbidden`;
     /// 3. already deleted → `Conflict("message is deleted")`;
     /// 4. already recalled → `Conflict("message is already recalled")`;
-    /// 5. member (not author, not admin/owner) → `Forbidden`.
-    /// The commit-time storage path re-checks access, role and state under row
-    /// locks, so this preflight is UX only, never authority.
+    /// 5. member (not author, not admin/owner) → `Forbidden`;
+    /// 6. author outside the recall window (`AERO_RECALL_WINDOW_SECS`) →
+    ///    `Conflict("recall window expired")` — room owner/admin recall
+    ///    (moderation path) is exempt.
+    /// The commit-time storage path re-checks access, role, state and the
+    /// window under row locks, so this preflight is UX only, never authority.
     #[instrument(skip(self), fields(?actor, ?id))]
     pub async fn recall_message(&self, actor: ParticipantId, id: MessageId) -> Result<Message> {
         let started = std::time::Instant::now();
@@ -524,11 +569,24 @@ impl ImService {
             .role_of(existing.room_id, actor)
             .await?;
         recall_authorized(actor, existing.sender_id, role.as_deref())?;
+        // Author-only recall window — same rule as the preflight; room
+        // owner/admin recall is exempt. Re-checked inside the storage
+        // transaction under the row lock (authority); this read only produces
+        // the stable early 409 for direct callers.
+        if existing.sender_id == actor
+            && recall_window_expired(
+                existing.created_at,
+                aero_common::time::now_utc(),
+                self.recall_window,
+            )
+        {
+            return Err(Error::Conflict("recall window expired".into()));
+        }
 
         let traceparent = aero_common::telemetry::current_traceparent();
         let recalled = self
             .messages
-            .recall_outboxed_authorized(id, actor, traceparent.as_deref())
+            .recall_outboxed_authorized(id, actor, self.recall_window, traceparent.as_deref())
             .await?
             .ok_or_else(|| Error::Conflict("message recall raced with another mutation".into()))?;
         if let Err(error) = self.dispatch_event_outbox_id(recalled.outbox_id).await {
@@ -681,5 +739,58 @@ mod recall_permission_tests {
                 Err(other) => panic!("{label}: unexpected error {other:?}"),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod recall_window_tests {
+    use super::*;
+
+    #[test]
+    fn parse_recall_window_defaults_and_unlimited() {
+        // Unset → 86400s default.
+        assert_eq!(parse_recall_window(None), time::Duration::seconds(86_400));
+        // 0 = unlimited.
+        assert_eq!(parse_recall_window(Some("0")), time::Duration::ZERO);
+        // Valid values, trimmed.
+        assert_eq!(parse_recall_window(Some("60")), time::Duration::seconds(60));
+        assert_eq!(parse_recall_window(Some(" 60 ")), time::Duration::seconds(60));
+        // Garbage / negative / empty / float / overflow → default fallback.
+        for raw in ["abc", "-5", "1.5", "", "99999999999999999999999"] {
+            assert_eq!(
+                parse_recall_window(Some(raw)),
+                time::Duration::seconds(86_400),
+                "raw={raw:?} must fall back to the default"
+            );
+        }
+    }
+
+    #[test]
+    fn recall_window_boundary_is_inclusive_and_zero_is_unlimited() {
+        let window = time::Duration::seconds(86_400);
+        // Single captured `now` for both sides: t = window exactly → allowed
+        // (inclusive boundary).
+        let now = time::OffsetDateTime::now_utc();
+        assert!(!recall_window_expired(now - window, now, window));
+        // t = window + 1s → expired.
+        assert!(recall_window_expired(
+            now - window - time::Duration::seconds(1),
+            now,
+            window
+        ));
+        // window ZERO = unlimited at any age.
+        assert!(!recall_window_expired(
+            now - time::Duration::days(365),
+            now,
+            time::Duration::ZERO
+        ));
+        // Future created_at (clock skew) → not expired.
+        assert!(!recall_window_expired(
+            now + time::Duration::seconds(60),
+            now,
+            window
+        ));
+        // Just sent → not expired.
+        assert!(!recall_window_expired(now, now, window));
     }
 }

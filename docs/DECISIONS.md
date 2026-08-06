@@ -226,3 +226,86 @@
 ## 2026-08-06 10:19:39 — stage 'gate' — PASS (gate verdict: PASS)
 - task docs/pi-batch/fix-gate.md [ok]: Round 2 verification summary: **S1 (blocking) — FIXED and independently verified:**
 - evidence: docs/pi-batch/fix-gate.md
+
+## 2026-08-06 10:36:50 — stage 'requirements' — PASS
+- task docs/pi-batch/sdlc-requirements.md [ok]
+- evidence: docs/pi-batch/sdlc-requirements.md
+
+## 2026-08-06 10:40:46 — stage 'design' — PASS
+- task docs/pi-batch/sdlc-design.md [ok]
+- evidence: docs/pi-batch/sdlc-design.md
+
+## 2026-08-06 10:56:30 — stage 'adversarial_review' — PASS
+- task docs/pi-batch/sdlc-reviews/async_reviewer.md [ok]: Core async claims — verified sound: - **Race safety (spec §3, §5)**: fence evaluates on the `FOR UPDATE`-locked row (`events.rs:388-405` returns `created_at; Findings: | # | Sev | Defect pattern | Evidence | Root cause | Fix (per decision tables) | Test that catches it |; Non-findings (checked, deliberately not flagged): - **No pending client lock on recall** (defect-pattern #2): acceptable — the tx fence + `recalled_at`-once make double-s; Verdict: `VERDICT: PASS - The design is async-correct: the window fence runs on the FOR UPDATE-locked row with app-clock consiste
+- task docs/pi-batch/sdlc-reviews/security_engineer.md [ok]: Summary: **Checks performed**: `prompts/README.md` isn't in the repo — used the batch-runner copy (`/home/u1/ai-batch-runner/prom
+- task docs/pi-batch/sdlc-reviews/database_architect.md [ok]: What I did: Applied the `database_architect.md` role prompt (found at `/home/u1/ai-batch-runner/prompts/`; there is no `prompts/READ; Verification results: All design claims (V1–V14, F1–F7) **reproduced**, with two strengthened beyond the ledger:; Store inventory (hot vs durable, stock wiring): - **Durable & wired**: PostgreSQL (system of record + `event_outbox` transactional outbox with strict per-message aggreg; Findings (no Critical/High): - **F1 [Low]** silent-fallback env knob → recommend one-line effective-window log at `ImService::new` (ops can't diagnos
+- task docs/pi-batch/sdlc-reviews/testing_reviewer.md [ok]: 1. Verdict: `VERDICT: FAIL - the test plan as written cannot be executed as specified. Two self-defeating tests: (1) the wire msg fo; 2. Findings (top 5 of 10): | # | Sev | Defect | Test that catches it |; 3. Risk-coverage matrix (excerpt): ✅ covered: admin override, author-vs-admin race partition (no sleeps, `tokio::join!`), double-submit converge, precedenc; 4. Honesty audit: - ❌ **False**: §6 wire msg `"recall window expired"` (prefix verified); V10/§9 "15 call sites" (19); F5 "inclusive bound
+- evidence: docs/pi-batch/sdlc-reviews/async_reviewer.md, docs/pi-batch/sdlc-reviews/security_engineer.md, docs/pi-batch/sdlc-reviews/database_architect.md, docs/pi-batch/sdlc-reviews/testing_reviewer.md
+
+## 2026-08-06 11:00:49 — stage 'design_gate' — PASS (gate verdict: PASS)
+- task docs/pi-batch/sdlc-design-gate.md [ok]
+- evidence: docs/pi-batch/sdlc-design-gate.md
+
+## 2026-08-06 11:21:29 — stage 'implement' — FAIL
+- task docs/pi-batch/sdlc-implementation.md [FAILED: validation failed (exit=1)]: Change Report — Message Recall Time Window (撤回时间窗口); Files & symbols: **Production (7 files)**; Command results: - `cargo check --workspace --all-targets` — **clean** (0 errors/warnings); Evidence-backed deviations from the design: 1. **Predicate moved to `aero-common`** (design §5 showed it in `service/messages.rs`): the storage fence can't import i
+- evidence: docs/pi-batch/sdlc-implementation.md
+
+## 2026-08-06 11:23:33 — stage 'requirements' — PASS
+- task docs/pi-batch/sdlc-requirements.md [ok]
+- evidence: docs/pi-batch/sdlc-requirements.md
+
+## 2026-08-06 11:24:36 — stage 'design' — PASS
+- task docs/pi-batch/sdlc-design.md [ok]
+- evidence: docs/pi-batch/sdlc-design.md
+
+## 2026-08-06 11:46:54 — stage 'adversarial_review' — PASS
+- task docs/pi-batch/sdlc-reviews/database_architect.md [ok]: 1. Store inventory (hot vs durable, stock wiring): | Store | Class | Purpose (recall-relevant) | Implementation | Stock-binary wiring | Consistency requirement |; 2. Findings (severity-ordered): - **Evidence**: `migrations/0238_message_recall.sql` — `DROP INDEX IF EXISTS idx_messages_room_mutated;` then `CREATE IN; F1 — Medium: migration 0238 rebuilds `idx_messages_room_mutated` non-concurrently on a hot table: - **Evidence**: `migrations/0238_message_recall.sql` — `DROP INDEX IF EXISTS idx_messages_room_mutated;` then `CREATE IN; F2 — Low: app-clock boundary error bound = inter-instance clock skew: - **Evidence**: `created_at` is app-minted at insert (`crud.rs:71`, `now_utc()`); the fence compares it with the **recal; F3 — Low: `recalled_by` FK relies on the "participants are never hard-deleted" invariant: - **Evidence**: `0238` adds `recalled_by UUID REFERENCES participants(id)` (NO ACTION); GDPR erasure **tombstones** (`pa
+- task docs/pi-batch/sdlc-reviews/testing_reviewer.md [ok]: 1. Verdict: ```; 2. Findings: | # | Sev | Defect pattern | Missing test / exact case |; 3. Risk-coverage matrix: | Risky path | Covered | Evidence |; 4. Honesty audit (claimed vs executed): | Claimed (design §1/§6 gate results) | My re-execution | Verdict |
+- task docs/pi-batch/sdlc-reviews/compliance_officer.md [ok]: Compliance Review — Message Recall Time Window: **Scope**: config knob `AERO_RECALL_WINDOW_SECS`, two-layer window enforcement, 409 contract, metric, web surfacing. No 
+- task docs/pi-batch/sdlc-reviews/security_engineer.md [ok]: 1. Assets, trust boundaries, attacker capabilities, entry points: **Assets touched by the feature**: message rows (`blocks` placeholder, `recalled_at/by`, `version`), `message_edits` evi; 2. Findings (severity-ordered); F1 — Low: WS preflight path is unthrottled; the documented "≤20 rps bounded" bound applies to REST only: - **Evidence**: `frame.rs:163-165` runs `assert_message_recall_preflight` *before* `check_ws_rate_room`; the only limite; F2 — Low: `message_edits` evidence retention means recall ≠ content removal for room members; the rollback runbook overstates irrecoverability: - **Evidence**: `authorization.rs:312-317` snapshots the full pre-recall body into `message_edits` (redaction removes *b; F3 — Low: migration 0238 rebuilds `idx_messages_room_mutated` non-concurrently (deploy-time availability; prerequisite migration, not in this diff): - **Evidence**: `migrations/0238_message_recall.sql` — `DROP INDEX IF EXISTS` then `CREATE INDEX IF NOT EXISTS` (no `CON
+- evidence: docs/pi-batch/sdlc-reviews/database_architect.md, docs/pi-batch/sdlc-reviews/testing_reviewer.md, docs/pi-batch/sdlc-reviews/compliance_officer.md, docs/pi-batch/sdlc-reviews/security_engineer.md
+
+## 2026-08-06 11:48:45 — stage 'design_gate' — PASS (gate verdict: PASS)
+- task docs/pi-batch/sdlc-design-gate.md [ok]
+- evidence: docs/pi-batch/sdlc-design-gate.md
+
+## 2026-08-06 11:54:08 — stage 'implement' — FAIL
+- task docs/pi-batch/sdlc-implementation.md [FAILED: validation failed (exit=1)]: Change Report — Message Recall Time Window (撤回时间窗口): The feature was already implemented and gate-approved in the prior round (spec v2 as-built, design v3, four reviews PASS; Files & symbols (as-built, verified present): **Production**; Command results (fresh re-run this round): | Gate | Result |; Evidence-backed deviations from the design (all gate-approved, recorded in design §1): 1. Predicate relocated to **`aero-common`** (design v2 showed it in `service/messages.rs`) — the storage fence cannot im; Accepted hardening backlog (non-blocking, documented in gate report): WS per-connection frame budget (metric-pump, same class as pre-existing edit preflight — doc corrected at gate), committ
+- evidence: docs/pi-batch/sdlc-implementation.md
+
+## 2026-08-06 11:55:36 — stage 'requirements' — PASS
+- task docs/pi-batch/sdlc-requirements.md [ok]: Scope: 1. `AERO_RECALL_WINDOW_SECS` — plain env (not figment `AERO__SERVER__*`): default **86400** (24h), **0 = unlimited**, in; User stories: - **US1** author in-window: recall works exactly as before (placeholder + 已撤回).; Non-goals: - **No un-recall** — `recalled_at` is a one-shot terminal transition; the window never re-enables recall of a recalled m; Acceptance criteria (all implemented + green): 1. **Unit — config**: unset→86400; `"0"`→unlimited; `"60"`/`" 60 "`→60s; garbage/negative/overflow→86400 — `parse_recall; Migration impact — none (verified, with the WHERE-predicate evaluation): - `migrations/` = **238 before and after**; `created_at` and PK pre-exist; no new column/index/backfill.
+- evidence: docs/pi-batch/sdlc-requirements.md
+
+## 2026-08-06 11:56:07 — stage 'design' — PASS
+- task docs/pi-batch/sdlc-design.md [ok]: §1 Config plumbing: - **Knob**: `AERO_RECALL_WINDOW_SECS`, plain single-underscore env — same class as `AERO_RATE_LIMIT_PER_SEC`/`AERO_BLOCK; §2 Preflight vs row-locked transaction fence — exact SQL predicate: **Shared predicate** (`aero-common/src/model/message.rs:31`): `recall_window_expired(created_at, now, window) = window ≠; §3 409 error contract: - REST: `409` + `{"code":"conflict","msg":"conflict: recall window expired"}` — automatic via `Error::Conflict` Display ; §4 Metrics: `aero_messages_recall_expired_total` (`metrics.rs:78`), emitted **only** in `assert_message_recall_preflight` (`messages; §5 Tests (all implemented, all green): - **Unit (no DB)**: `parse_recall_window_defaults_and_unlimited` (unset/0/60/trim/garbage/negative/overflow); `recall_wi
+- evidence: docs/pi-batch/sdlc-design.md
+
+## 2026-08-06 12:11:51 — stage 'adversarial_review' — PASS
+- task docs/pi-batch/sdlc-reviews/performance_engineer.md [ok]: Summary: **Verdict: PERF PASS.** I verified every perf-relevant claim against the working-tree diff (not just the design doc), an
+- task docs/pi-batch/sdlc-reviews/async_reviewer.md [ok]: Verified-correct (no action): - **No debounce on a submit button** — correct per async-data §2 (submit buttons use a lock, never debounce; none applie; Findings: | # | Sev | Pattern | Evidence | Root cause | Fix (decision-table ref) | Test that catches it |
+- task docs/pi-batch/sdlc-reviews/principal_reviewer.md [ok]: 1. Advisory recommendation: **CONDITIONALLY READY** — one condition: **M1** (web 409 discriminator whitelist inversion) or explicit maintainer accep; 2. Consolidated findings (deduplicated): **Critical/High: none.** No supplied or in-tree reviewer found a blocker.; 3. Trade-off ledger (highlights): | Conflict | Recommendation | Owner |; 4. Preconditions, rollback, monitoring: - **Preconditions**: fix-or-pin M1; re-run gates at release commit (all green in my run); DB-gated suite on fresh 238-mi; 5. Missing reviews / next actions: - Not in pack, in-tree only: security/database/compliance/testing reports (presence + verdicts verified; security F1-F4 
+- task docs/pi-batch/sdlc-reviews/database_architect.md [ok]: Summary: **Prompt rules**: repo has no `prompts/README.md` (confirmed — same as the perf review noted); applied `/home/u1/ai-batc; Store inventory (verified against working tree + boot wiring): - **PostgreSQL** — durable source of truth (messages/outbox/audit/message_edits); wired at boot with retry + `migrate()`; Findings (sorted): - **F1 Medium** — 0238 drops the 0125 index; during mixed-version deploys (0176 supports them) old binaries' `changes_si; Transaction analysis: Recall tx = ~12–16 statements, single tx, window evaluated in-process on the `FOR UPDATE` snapshot (atomic by constructi; Migration sequence: 0238 is additive + idempotent; roll-forward = build → migrate → roll binaries; rollback of the **schema** is lossless, b
+- task docs/pi-batch/sdlc-reviews/qa_lead.md [ok]: What I actually ran (all green): | Gate | Result |; Key verification results: - **13 new tests** (2 unit + 6 storage DB + 4 service DB + 1 server contract) + 6 web tests + 19 updated call sites. Ass; Findings (all bounded): - **F1 Medium** — `recall_errors.js` discriminates by blacklist: any *non-window* 409 → silent `null`. Today's literals ; CI gaps: No automated HTTP-layer E2E, no metric-assert harness, no demotion-race test — all in the design's accepted backlog and 
+- evidence: docs/pi-batch/sdlc-reviews/performance_engineer.md, docs/pi-batch/sdlc-reviews/async_reviewer.md, docs/pi-batch/sdlc-reviews/principal_reviewer.md, docs/pi-batch/sdlc-reviews/database_architect.md, docs/pi-batch/sdlc-reviews/qa_lead.md
+
+## 2026-08-06 12:16:52 — stage 'design_gate' — PASS (gate verdict: PASS)
+- task docs/pi-batch/sdlc-design-gate.md [ok]
+- evidence: docs/pi-batch/sdlc-design-gate.md
+
+## 2026-08-06 12:22:43 — stage 'implement' — FAIL
+- task docs/pi-batch/sdlc-implementation.md [FAILED: validation failed (exit=1)]: Change Report — Message Recall Time Window (撤回时间窗口): Feature is implemented, gate-2-resolved, and this round re-verified the final state and re-ran all six gates fresh. **No; Files & symbols: **Production (9 files)**; Command results (fresh re-run this round): | Gate | Result |; Evidence-backed deviations from the design (all gate-approved): 1. Predicate relocated to `aero-common` (storage cannot import im-core's `pub(crate)` fn).; Accepted backlog (non-blocking, documented in gate report): WS per-connection frame budget (same class as pre-existing edit preflight; alert on rate-of-change), committed E2E smoke
+- evidence: docs/pi-batch/sdlc-implementation.md
+
+## 2026-08-06 12:33:33 — stage 'adversarial_review' — PASS
+- task docs/pi-batch/sdlc-reviews/database_architect.md [ok]
+- task docs/pi-batch/sdlc-reviews/security_engineer.md [ok]
+- task docs/pi-batch/sdlc-reviews/async_reviewer.md [ok]
+- task docs/pi-batch/sdlc-reviews/performance_engineer.md [ok]
+- task docs/pi-batch/sdlc-reviews/testing_reviewer.md [ok]
+- task docs/pi-batch/sdlc-reviews/sre_engineer.md [ok]: Summary: **Verdict: OPS PASS with hardening — no launch blockers.** I verified every operational claim against the working tree (
+- evidence: docs/pi-batch/sdlc-reviews/database_architect.md, docs/pi-batch/sdlc-reviews/security_engineer.md, docs/pi-batch/sdlc-reviews/async_reviewer.md, docs/pi-batch/sdlc-reviews/performance_engineer.md, docs/pi-batch/sdlc-reviews/testing_reviewer.md, docs/pi-batch/sdlc-reviews/sre_engineer.md
+
+## 2026-08-06 12:42:03 — stage 'acceptance' — PASS (gate verdict: PASS)
+- task docs/pi-batch/sdlc-acceptance.md [ok]
+- evidence: docs/pi-batch/sdlc-acceptance.md

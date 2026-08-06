@@ -198,7 +198,7 @@ async fn author_recall_replaces_content_and_records_audit_in_one_tx() {
     let original = fixture.insert_message(fixture.author, "recall me").await;
 
     let recalled = repo
-        .recall_outboxed_authorized(original.id, fixture.author, None)
+        .recall_outboxed_authorized(original.id, fixture.author, time::Duration::ZERO, None)
         .await
         .unwrap()
         .expect("recall succeeds");
@@ -284,7 +284,7 @@ async fn recall_permission_matrix_author_admin_owner_member() {
 
     // Author.
     assert!(repo
-        .recall_outboxed_authorized(message.id, fixture.author, None)
+        .recall_outboxed_authorized(message.id, fixture.author, time::Duration::ZERO, None)
         .await
         .unwrap()
         .is_some());
@@ -292,7 +292,7 @@ async fn recall_permission_matrix_author_admin_owner_member() {
     // Admin recalls a fresh message.
     let message2 = fixture.insert_message(fixture.author, "admin target").await;
     let recalled = repo
-        .recall_outboxed_authorized(message2.id, admin, None)
+        .recall_outboxed_authorized(message2.id, admin, time::Duration::ZERO, None)
         .await
         .unwrap()
         .expect("admin may recall");
@@ -301,7 +301,7 @@ async fn recall_permission_matrix_author_admin_owner_member() {
     // Owner recalls a fresh message.
     let message3 = fixture.insert_message(fixture.author, "owner target").await;
     assert!(repo
-        .recall_outboxed_authorized(message3.id, owner, None)
+        .recall_outboxed_authorized(message3.id, owner, time::Duration::ZERO, None)
         .await
         .unwrap()
         .is_some());
@@ -311,7 +311,7 @@ async fn recall_permission_matrix_author_admin_owner_member() {
         .insert_message(fixture.author, "member target")
         .await;
     let err = repo
-        .recall_outboxed_authorized(message4.id, member, None)
+        .recall_outboxed_authorized(message4.id, member, time::Duration::ZERO, None)
         .await
         .unwrap_err();
     assert!(
@@ -321,7 +321,7 @@ async fn recall_permission_matrix_author_admin_owner_member() {
 
     // Already-recalled → stable Conflict (recall is one-shot, not idempotent).
     let err = repo
-        .recall_outboxed_authorized(message.id, fixture.author, None)
+        .recall_outboxed_authorized(message.id, fixture.author, time::Duration::ZERO, None)
         .await
         .unwrap_err();
     assert!(
@@ -335,7 +335,7 @@ async fn recall_permission_matrix_author_admin_owner_member() {
         .await;
     assert!(repo.soft_delete(message5.id).await.unwrap());
     let err = repo
-        .recall_outboxed_authorized(message5.id, fixture.author, None)
+        .recall_outboxed_authorized(message5.id, fixture.author, time::Duration::ZERO, None)
         .await
         .unwrap_err();
     assert!(
@@ -408,7 +408,7 @@ async fn recall_cannot_cross_workspace_boundaries() {
     .unwrap();
 
     let err = repo
-        .recall_outboxed_authorized(message.id, outsider, None)
+        .recall_outboxed_authorized(message.id, outsider, time::Duration::ZERO, None)
         .await
         .unwrap_err();
     assert!(
@@ -442,7 +442,7 @@ async fn recalled_message_can_still_be_deleted() {
         .await;
 
     assert!(repo
-        .recall_outboxed_authorized(message.id, fixture.author, None)
+        .recall_outboxed_authorized(message.id, fixture.author, time::Duration::ZERO, None)
         .await
         .unwrap()
         .is_some());
@@ -476,7 +476,7 @@ async fn system_edit_after_recall_is_fenced() {
         .await;
 
     let recalled = repo
-        .recall_outboxed_authorized(message.id, fixture.author, None)
+        .recall_outboxed_authorized(message.id, fixture.author, time::Duration::ZERO, None)
         .await
         .unwrap()
         .expect("recall succeeds");
@@ -538,7 +538,7 @@ async fn changes_since_delivers_recalls() {
     let before = time::OffsetDateTime::now_utc();
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     let recalled = repo
-        .recall_outboxed_authorized(message.id, fixture.author, None)
+        .recall_outboxed_authorized(message.id, fixture.author, time::Duration::ZERO, None)
         .await
         .unwrap()
         .expect("recall succeeds");
@@ -585,7 +585,7 @@ async fn partition_backfill_carries_recall_columns() {
     let message = fixture
         .insert_message(fixture.author, "backfill target")
         .await;
-    repo.recall_outboxed_authorized(message.id, fixture.author, None)
+    repo.recall_outboxed_authorized(message.id, fixture.author, time::Duration::ZERO, None)
         .await
         .unwrap()
         .expect("recall succeeds");
@@ -635,8 +635,8 @@ async fn concurrent_double_recall_has_exactly_one_winner() {
         .insert_message(fixture.author, "race target")
         .await;
 
-    let first = repo.recall_outboxed_authorized(message.id, fixture.author, None);
-    let second = repo.recall_outboxed_authorized(message.id, fixture.author, None);
+    let first = repo.recall_outboxed_authorized(message.id, fixture.author, time::Duration::ZERO, None);
+    let second = repo.recall_outboxed_authorized(message.id, fixture.author, time::Duration::ZERO, None);
     let (first, second) = tokio::join!(first, second);
 
     let winners = [&first, &second]
@@ -743,7 +743,7 @@ async fn recall_snapshot_redacts_blob_references_and_gc_proceeds() {
         .message()
         .clone();
 
-    repo.recall_outboxed_authorized(message.id, fixture.author, None)
+    repo.recall_outboxed_authorized(message.id, fixture.author, time::Duration::ZERO, None)
         .await
         .unwrap()
         .expect("recall succeeds");
@@ -792,5 +792,232 @@ async fn recall_snapshot_redacts_blob_references_and_gc_proceeds() {
         serde_json::json!([{ "type": "text", "content": RECALLED_MESSAGE_PLACEHOLDER }])
     );
 
+    fixture.cleanup().await;
+}
+
+/// Recall window (撤回时间窗): enforced for the AUTHOR inside the transaction
+/// against the row-locked snapshot, while room owner/admin recall (moderation)
+/// is exempt. Backdating uses an APP-clock parameter-bound timestamp
+/// (`created_at` is app-minted at insert; DB `now()` would mix clocks).
+#[tokio::test]
+#[ignore = "requires DATABASE_URL with migrations applied"]
+async fn recall_window_expired_author_rejected_admin_override() {
+    let fixture = Fixture::create("window-admin").await;
+    fixture.enroll(fixture.author, "owner").await;
+    let admin = participant(&fixture.pool, "recall-window-admin-admin").await;
+    fixture.enroll(admin, "admin").await;
+    let repo = MessageRepo::new(fixture.pool.clone());
+    let message = fixture.insert_message(fixture.author, "old message").await;
+    sqlx::query("UPDATE messages SET created_at = $1 WHERE id = $2")
+        .bind(aero_common::time::now_utc() - time::Duration::seconds(90 * 60))
+        .bind(message.id.to_uuid())
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+
+    let err = repo
+        .recall_outboxed_authorized(
+            message.id,
+            fixture.author,
+            time::Duration::seconds(3600),
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(&err, Error::Conflict(msg) if msg == "recall window expired"));
+
+    // Admin/owner override: the SAME expired message is recallable.
+    let recalled = repo
+        .recall_outboxed_authorized(message.id, admin, time::Duration::seconds(3600), None)
+        .await
+        .unwrap()
+        .expect("admin recall of an expired message succeeds");
+    assert_eq!(recalled.message.recalled_by, Some(admin));
+    fixture.cleanup().await;
+}
+
+/// Boundary margins (latency-proof): 86399s < 86400s window → allowed;
+/// 86401s > 86400s → expired. The exact `t = window` proof lives in the pure
+/// unit test (`recall_window_tests` in aero-im-core) with a single captured
+/// clock — a real clock makes the exact instant unprovable at this layer.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL with migrations applied"]
+async fn recall_window_boundary_margins() {
+    let fixture = Fixture::create("window-margin").await;
+    fixture.enroll(fixture.author, "owner").await;
+    let repo = MessageRepo::new(fixture.pool.clone());
+
+    let inside = fixture.insert_message(fixture.author, "inside").await;
+    sqlx::query("UPDATE messages SET created_at = $1 WHERE id = $2")
+        .bind(aero_common::time::now_utc() - time::Duration::seconds(86_399))
+        .bind(inside.id.to_uuid())
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+    let recalled = repo
+        .recall_outboxed_authorized(
+            inside.id,
+            fixture.author,
+            time::Duration::seconds(86_400),
+            None,
+        )
+        .await
+        .unwrap()
+        .expect("age 86399s is within the 86400s window");
+    assert_eq!(recalled.message.recalled_by, Some(fixture.author));
+
+    let outside = fixture.insert_message(fixture.author, "outside").await;
+    sqlx::query("UPDATE messages SET created_at = $1 WHERE id = $2")
+        .bind(aero_common::time::now_utc() - time::Duration::seconds(86_401))
+        .bind(outside.id.to_uuid())
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+    let err = repo
+        .recall_outboxed_authorized(
+            outside.id,
+            fixture.author,
+            time::Duration::seconds(86_400),
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(&err, Error::Conflict(msg) if msg == "recall window expired"));
+    fixture.cleanup().await;
+}
+
+/// `AERO_RECALL_WINDOW_SECS=0` = unlimited: any age is recallable.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL with migrations applied"]
+async fn recall_window_zero_is_unlimited() {
+    let fixture = Fixture::create("window-zero").await;
+    fixture.enroll(fixture.author, "owner").await;
+    let repo = MessageRepo::new(fixture.pool.clone());
+    let message = fixture.insert_message(fixture.author, "ancient").await;
+    sqlx::query("UPDATE messages SET created_at = $1 WHERE id = $2")
+        .bind(aero_common::time::now_utc() - time::Duration::days(30))
+        .bind(message.id.to_uuid())
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+
+    let recalled = repo
+        .recall_outboxed_authorized(message.id, fixture.author, time::Duration::ZERO, None)
+        .await
+        .unwrap()
+        .expect("window 0 = unlimited");
+    assert_eq!(recalled.message.recalled_by, Some(fixture.author));
+    fixture.cleanup().await;
+}
+
+/// Boundary race: author (expired) vs admin on the same row. Either interleave
+/// is safe — author-first: author gets the window Conflict (no write), admin
+/// commits; admin-first: author observes `recalled_at` and gets the stable
+/// already-recalled Conflict. Assert the partition, not the order.
+#[tokio::test]
+#[ignore = "requires DATABASE_URL with migrations applied"]
+async fn recall_boundary_race_author_vs_admin() {
+    let fixture = Fixture::create("window-race").await;
+    fixture.enroll(fixture.author, "owner").await;
+    let admin = participant(&fixture.pool, "recall-window-race-admin").await;
+    fixture.enroll(admin, "admin").await;
+    let repo = MessageRepo::new(fixture.pool.clone());
+    let message = fixture.insert_message(fixture.author, "race me").await;
+    sqlx::query("UPDATE messages SET created_at = $1 WHERE id = $2")
+        .bind(aero_common::time::now_utc() - time::Duration::seconds(2 * 86_400))
+        .bind(message.id.to_uuid())
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+
+    let author_fut = repo.recall_outboxed_authorized(
+        message.id,
+        fixture.author,
+        time::Duration::seconds(86_400),
+        None,
+    );
+    let admin_fut = repo.recall_outboxed_authorized(
+        message.id,
+        admin,
+        time::Duration::seconds(86_400),
+        None,
+    );
+    let (author_res, admin_res) = tokio::join!(author_fut, admin_fut);
+
+    let admin_recalled = admin_res
+        .expect("admin recall never errors")
+        .expect("admin recall wins");
+    assert_eq!(admin_recalled.message.recalled_by, Some(admin));
+    let author_err = author_res.expect_err("author recall of an expired message must fail");
+    assert!(
+        matches!(&author_err, Error::Conflict(msg)
+            if msg == "recall window expired" || msg == "message is already recalled"),
+        "author failure must be a stable Conflict, got {author_err:?}"
+    );
+    fixture.cleanup().await;
+}
+
+/// Precedence: state checks (deleted / already-recalled) run before the window
+/// check in both layers — an expired-and-deleted message still reports
+/// "message is deleted".
+#[tokio::test]
+#[ignore = "requires DATABASE_URL with migrations applied"]
+async fn recall_window_precedence_deleted_before_expired() {
+    let fixture = Fixture::create("window-precedence").await;
+    fixture.enroll(fixture.author, "owner").await;
+    let repo = MessageRepo::new(fixture.pool.clone());
+    let message = fixture.insert_message(fixture.author, "old and gone").await;
+    sqlx::query("UPDATE messages SET created_at = $1 WHERE id = $2")
+        .bind(aero_common::time::now_utc() - time::Duration::days(30))
+        .bind(message.id.to_uuid())
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+    repo.soft_delete_outboxed_authorized(message.id, fixture.author, None)
+        .await
+        .unwrap();
+
+    let err = repo
+        .recall_outboxed_authorized(
+            message.id,
+            fixture.author,
+            time::Duration::seconds(3600),
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(&err, Error::Conflict(msg) if msg == "message is deleted"));
+    fixture.cleanup().await;
+}
+
+/// The window state is never leaked to non-privileged actors: a plain member
+/// probing an expired message gets the same Forbidden as a member probing a
+/// fresh one (the role gate precedes the window check).
+#[tokio::test]
+#[ignore = "requires DATABASE_URL with migrations applied"]
+async fn recall_window_no_leak_to_member() {
+    let fixture = Fixture::create("window-leak").await;
+    fixture.enroll(fixture.author, "owner").await;
+    let member = participant(&fixture.pool, "recall-window-leak-member").await;
+    fixture.enroll(member, "member").await;
+    let repo = MessageRepo::new(fixture.pool.clone());
+    let message = fixture.insert_message(fixture.author, "old secret").await;
+    sqlx::query("UPDATE messages SET created_at = $1 WHERE id = $2")
+        .bind(aero_common::time::now_utc() - time::Duration::days(30))
+        .bind(message.id.to_uuid())
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+
+    let err = repo
+        .recall_outboxed_authorized(
+            message.id,
+            member,
+            time::Duration::seconds(3600),
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(&err, Error::Forbidden(msg) if msg == "only author or room admin may recall"));
     fixture.cleanup().await;
 }

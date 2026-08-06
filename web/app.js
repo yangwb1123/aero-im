@@ -27,6 +27,7 @@ import { initModalForms } from './modals.js';
 import { initAuthUi } from './auth_ui.js';
 import { initChrome } from './chrome.js';
 import { installUnhandledRejectionReporting } from './error_reporting.js';
+import { recallErrorToast } from './recall_errors.js';
 import { syncRoomSidebar } from './room_sync.js';
 import { initMessageActivity } from './message_activity.js';
 import { clearPendingDelivery, findPendingMatch, initReliableDelivery, pendingTempId, sendOptimistically } from './delivery.js';
@@ -663,10 +664,13 @@ function wireMsgActions(node, m) {
     if (act === 'react') openEmojiPicker(btn, (emoji) => ws.react(m.id, emoji));
     if (act === 'edit') beginEditMessage(m);
     if (act === 'recall') {
-      // 409 = already recalled (converge); 429 = workspace budget exhausted → back off (no auto-retry).
+      // Window-expired 409 must reach the user; already-recalled/deleted 409s
+      // converge silently; 429 backs off without auto-retry (recall_errors.js);
+      // dead-session 401 follows the app's reauth convention (app.js:600).
       if (confirm('撤回这条消息?')) api.recallMessage(m.id).catch((err) => {
-        if (err?.status === 429) toast('撤回太频繁,请稍后重试', 'error');
-        else if (err?.status !== 409) toast(`撤回失败:${err?.message || '未知错误'}`, 'error');
+        if (err?.status === 401) return forceReauth();
+        const t = recallErrorToast(err);
+        if (t) toast(t.text, t.type);
       });
     }
     if (act === 'delete' && confirm('删除这条消息?')) ws.deleteMessage(m.id);

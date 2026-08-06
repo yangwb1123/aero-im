@@ -169,6 +169,36 @@ test('recallMessage surfaces a 409 already-recalled as ApiError for callers to m
   }
 });
 
+test('recallMessage surfaces a window-expired 409 with the real wire envelope', async () => {
+  const previousFetch = globalThis.fetch;
+  const previousStorage = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+  Object.defineProperty(globalThis, 'localStorage', {
+    configurable: true,
+    value: { getItem: () => 'access.jwt' },
+  });
+  // Real envelope: Error::Conflict Display renders "conflict: <detail>" (see
+  // crates/aero-server/src/error.rs contract test) — an unprefixed mock would
+  // mask the production mismatch and let the 409-swallow regression return.
+  globalThis.fetch = async () => ({
+    status: 409,
+    ok: false,
+    headers: { get: () => 'application/json' },
+    json: async () => ({ code: 'conflict', msg: 'conflict: recall window expired' }),
+  });
+  try {
+    await assert.rejects(
+      api.recallMessage('msg-1'),
+      (error) => error.status === 409
+        && error.body.code === 'conflict'
+        && error.message === 'conflict: recall window expired',
+    );
+  } finally {
+    globalThis.fetch = previousFetch;
+    if (previousStorage === undefined) delete globalThis.localStorage;
+    else Object.defineProperty(globalThis, 'localStorage', previousStorage);
+  }
+});
+
 test('governance wrappers preserve tenant scope, filters, and bot ownership paths', async () => {
   const previousFetch = globalThis.fetch;
   const previousStorage = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');

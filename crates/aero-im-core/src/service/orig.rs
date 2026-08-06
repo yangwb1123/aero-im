@@ -266,6 +266,13 @@ pub struct ImService {
     pub(crate) presence: Option<aero_storage::PresenceStore>,
     pub(crate) bus: Arc<dyn BusSink>,
     pub(crate) moderator: Arc<dyn Moderator>,
+    /// Recall window (撤回时间窗): how long after `created_at` a message's
+    /// author may recall it. `time::Duration::ZERO` = unlimited. Parsed once
+    /// from `AERO_RECALL_WINDOW_SECS` at construction (default 86400s; `0` =
+    /// unlimited; invalid falls back); tests inject exact windows via
+    /// [`with_recall_window`](Self::with_recall_window). Room owner/admin
+    /// recall (moderation path) is never subject to the window.
+    pub(crate) recall_window: time::Duration,
     /// Optional behavioral spam/flood guard (ROADMAP5 方向五). When wired,
     /// [`send_message`](Self::send_message) throttles a sender whose recent send
     /// behaviour (rate / same-content cross-room blast / duplicates) crosses the
@@ -306,6 +313,15 @@ impl ImService {
             Some(m) => Arc::new(m),
             None => Arc::new(crate::moderator::AllowAllModerator),
         };
+        let recall_window = crate::service::messages::recall_window_from_env();
+        // Ops signal (security/db review F1): a typo'd AERO_RECALL_WINDOW_SECS
+        // silently falls back to the default, and `0` disables the window — log
+        // the effective value once so the two states are distinguishable.
+        tracing::info!(
+            recall_window_secs = recall_window.whole_seconds(),
+            recall_window_unlimited = recall_window.is_zero(),
+            "AERO_RECALL_WINDOW_SECS effective value (0 = unlimited)"
+        );
         Self {
             rooms,
             workspaces: None,
@@ -333,6 +349,7 @@ impl ImService {
             presence: None,
             bus: bus as Arc<dyn BusSink>,
             moderator,
+            recall_window,
             spam_guard: None,
             pii_detector: None,
             seq: Arc::new(LocalSeqProvider::new()),
@@ -342,6 +359,15 @@ impl ImService {
     #[must_use]
     pub fn with_moderator(mut self, moderator: Arc<dyn Moderator>) -> Self {
         self.moderator = moderator;
+        self
+    }
+    /// Override the recall window parsed from `AERO_RECALL_WINDOW_SECS`
+    /// (default 86400s; `0` = unlimited). Additive builder mirroring
+    /// [`with_moderator`](Self::with_moderator) so tests inject exact windows
+    /// without touching the process-global env (parallel-unsafe).
+    #[must_use]
+    pub fn with_recall_window(mut self, recall_window: time::Duration) -> Self {
+        self.recall_window = recall_window;
         self
     }
     /// Wire a behavioral spam/flood guard (ROADMAP5 方向五). Additive — without it
@@ -630,6 +656,7 @@ impl ImService {
             presence: None,
             bus,
             moderator: Arc::new(crate::moderator::AllowAllModerator),
+            recall_window: time::Duration::ZERO,
             spam_guard: None,
             pii_detector: None,
             seq: Arc::new(LocalSeqProvider::new()),

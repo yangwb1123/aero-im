@@ -19,6 +19,23 @@ use crate::ids::{MessageId, ParticipantId, RoomId};
 /// `searchable_text` column is cleared (the placeholder is never indexed).
 pub const RECALLED_MESSAGE_PLACEHOLDER: &str = "[此消息已被撤回]";
 
+/// Recall-window (撤回时间窗) rule: a message author may recall while
+/// `now - created_at <= window`; `window == ZERO` means unlimited. Expired iff
+/// strictly older than the window (inclusive boundary — `t = window` is still
+/// recallable, `t = window + 1s` is not). Kept here (leaf crate) so the service
+/// preflight and the storage transaction fence share ONE predicate; both use
+/// [`crate::time::now_utc`] so the comparison is always app-clock on both
+/// sides (`created_at` is app-minted at insert). The fence evaluates this
+/// against the `FOR UPDATE`-locked row, so the boundary is atomic.
+#[must_use]
+pub fn recall_window_expired(
+    created_at: OffsetDateTime,
+    now: OffsetDateTime,
+    window: time::Duration,
+) -> bool {
+    window != time::Duration::ZERO && now - created_at > window
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub id: MessageId,

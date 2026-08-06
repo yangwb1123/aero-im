@@ -1,8 +1,8 @@
 //! Commit-time authorization for user-authored message mutations.
 
 use aero_common::{
-    Block, Error, Message, MessageEditId, MessageId, ParticipantId, RoomEvent, RoomId, WorkspaceId,
-    RECALLED_MESSAGE_PLACEHOLDER,
+    recall_window_expired, Block, Error, Message, MessageEditId, MessageId, ParticipantId,
+    RoomEvent, RoomId, WorkspaceId, RECALLED_MESSAGE_PLACEHOLDER,
 };
 use sqlx::{Postgres, Transaction};
 
@@ -203,10 +203,18 @@ impl MessageRepo {
     /// slip through. Already-recalled and already-deleted messages are rejected
     /// with `Conflict` (recall is a one-shot state transition, deliberately NOT
     /// a silent idempotent no-op like the tombstone path).
+    ///
+    /// `window` is the author recall window (撤回时间窗; `time::Duration::ZERO`
+    /// = unlimited): an author may only recall while `now - created_at <= window`.
+    /// The boundary is evaluated HERE, inside the transaction, against the
+    /// `FOR UPDATE`-locked snapshot — atomic by construction, never only in the
+    /// service preflight. Room owner/admin recall (moderation) is exempt
+    /// (`sender_id == actor` gate).
     pub async fn recall_outboxed_authorized(
         &self,
         id: MessageId,
         actor: ParticipantId,
+        window: time::Duration,
         traceparent: Option<&str>,
     ) -> aero_common::Result<Option<OutboxedMessageRecall>> {
         let mut tx = self.pool.begin().await?;
@@ -241,6 +249,24 @@ impl MessageRepo {
         }
         if existing.recalled_at.is_some() {
             return Err(Error::Conflict("message is already recalled".into()));
+        }
+        // Recall-window fence (撤回时间窗): author-only — room owner/admin
+        // recall is the moderation path and is exempt. Runs AFTER the role and
+        // state gates (the pre-existing role-before-state order must stay; only
+        // this check is appended last), so the window state is never revealed
+        // to non-privileged actors and an expired-and-deleted message still
+        // reports "message is deleted". Evaluated against the row-locked
+        // snapshot (`lock_message_in_tx`, FOR UPDATE) — atomic: no concurrent
+        // recall or role change can interleave between this check and the
+        // UPDATE below. The UPDATE's WHERE fence is deliberately unchanged.
+        if existing.sender_id == actor
+            && recall_window_expired(
+                existing.created_at,
+                aero_common::time::now_utc(),
+                window,
+            )
+        {
+            return Err(Error::Conflict("recall window expired".into()));
         }
 
         let recalled = Self::recall_locked_outboxed_in_tx(

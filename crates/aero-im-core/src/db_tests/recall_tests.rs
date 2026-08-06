@@ -316,3 +316,202 @@ async fn recall_preflight_resolves_room_and_early_errors() {
         .unwrap_err();
     assert!(matches!(&err, Error::Conflict(msg) if msg == "message is already recalled"));
 }
+
+#[tokio::test]
+#[ignore = "requires running Postgres with migrations applied"]
+async fn recall_preflight_window_expired_author() {
+    let pool = pool();
+    let participants = ParticipantRepo::new(pool.clone());
+    let author = new_participant(&participants, "recall-window-svc-author").await;
+    // Window tests build their own service: the shared fixture pins unlimited.
+    let svc = service(pool.clone()).with_recall_window(time::Duration::seconds(60));
+    let room = svc
+        .create_room(
+            author.id,
+            RoomKind::Group,
+            Some("recall window svc room".into()),
+        )
+        .await
+        .unwrap()
+        .id;
+    let sent = svc
+        .send_message(author.id, room, vec![Block::text("old body")], None, None)
+        .await
+        .unwrap();
+    // Backdate created_at with an APP-clock parameter-bound timestamp
+    // (created_at is app-minted; DB now() would mix clocks).
+    sqlx::query("UPDATE messages SET created_at = $1 WHERE id = $2")
+        .bind(aero_common::time::now_utc() - time::Duration::seconds(120))
+        .bind(sent.id.to_uuid())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Preflight rejects BEFORE any rate charge (gate S1).
+    let err = svc
+        .assert_message_recall_preflight(author.id, sent.id)
+        .await
+        .unwrap_err();
+    assert!(matches!(&err, Error::Conflict(msg) if msg == "recall window expired"));
+
+    // The service path returns the same stable 409 and leaves the row live.
+    let err = svc.recall_message(author.id, sent.id).await.unwrap_err();
+    assert!(matches!(&err, Error::Conflict(msg) if msg == "recall window expired"));
+    let live = svc.messages.get(sent.id).await.unwrap().unwrap();
+    assert!(live.recalled_at.is_none(), "expired recall must not mutate the row");
+    assert_eq!(live.blocks.len(), 1);
+}
+
+#[tokio::test]
+#[ignore = "requires running Postgres with migrations applied"]
+async fn recall_preflight_window_admin_exempt() {
+    let pool = pool();
+    let participants = ParticipantRepo::new(pool.clone());
+    let author = new_participant(&participants, "recall-window-svc-author2").await;
+    let svc = service(pool.clone()).with_recall_window(time::Duration::seconds(60));
+    let room = svc
+        .create_room(
+            author.id,
+            RoomKind::Channel,
+            Some("recall window svc room 3".into()),
+        )
+        .await
+        .unwrap()
+        .id;
+    // Promote an admin into the room (same pattern as the permission-matrix test).
+    let (_, admin_id) = room_with_admin("recall-window-svc-admin").await;
+    let rooms = RoomRepo::new(pool.clone());
+    rooms.add_member(room, admin_id).await.unwrap();
+    rooms
+        .change_channel_member_role_authorized(room, author.id, admin_id, RoomMemberRole::Admin)
+        .await
+        .unwrap();
+
+    let sent = svc
+        .send_message(
+            author.id,
+            room,
+            vec![Block::text("admin can recall expired")],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    sqlx::query("UPDATE messages SET created_at = $1 WHERE id = $2")
+        .bind(aero_common::time::now_utc() - time::Duration::seconds(120))
+        .bind(sent.id.to_uuid())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Admin/owner is exempt from the window (moderation path).
+    let room_id = svc
+        .assert_message_recall_preflight(admin_id, sent.id)
+        .await
+        .unwrap();
+    assert_eq!(room_id, room);
+    let recalled = svc.recall_message(admin_id, sent.id).await.unwrap();
+    assert_eq!(recalled.recalled_by, Some(admin_id));
+}
+
+#[tokio::test]
+#[ignore = "requires running Postgres with migrations applied"]
+async fn recall_window_no_leak_to_member_service() {
+    let pool = pool();
+    let participants = ParticipantRepo::new(pool.clone());
+    let author = new_participant(&participants, "recall-window-svc-author3").await;
+    let member = new_participant(&participants, "recall-window-svc-member").await;
+    let svc = service(pool.clone()).with_recall_window(time::Duration::seconds(60));
+    let room = svc
+        .create_room(
+            author.id,
+            RoomKind::Group,
+            Some("recall window svc room 4".into()),
+        )
+        .await
+        .unwrap()
+        .id;
+    svc.add_member(author.id, room, member.id).await.unwrap();
+    let sent = svc
+        .send_message(author.id, room, vec![Block::text("old secret")], None, None)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE messages SET created_at = $1 WHERE id = $2")
+        .bind(aero_common::time::now_utc() - time::Duration::days(30))
+        .bind(sent.id.to_uuid())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Plain member probing an expired message: Forbidden, never the window
+    // string (window state is author/admin-only knowledge).
+    let err = svc.recall_message(member.id, sent.id).await.unwrap_err();
+    assert!(matches!(&err, Error::Forbidden(msg) if msg == "only author or room admin may recall"));
+}
+
+#[tokio::test]
+#[ignore = "requires running Postgres with migrations applied"]
+async fn recall_window_precedence_deleted_before_expired_service() {
+    let pool = pool();
+    let participants = ParticipantRepo::new(pool.clone());
+    let author = new_participant(&participants, "recall-window-svc-author4").await;
+    let svc = service(pool.clone()).with_recall_window(time::Duration::seconds(60));
+    let room = svc
+        .create_room(author.id, RoomKind::Group, Some("recall window svc room 2".into()))
+        .await
+        .unwrap()
+        .id;
+    let sent = svc
+        .send_message(author.id, room, vec![Block::text("old and gone")], None, None)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE messages SET created_at = $1 WHERE id = $2")
+        .bind(aero_common::time::now_utc() - time::Duration::days(30))
+        .bind(sent.id.to_uuid())
+        .execute(&pool)
+        .await
+        .unwrap();
+    svc.delete_message(author.id, sent.id).await.unwrap();
+
+    let err = svc.recall_message(author.id, sent.id).await.unwrap_err();
+    assert!(matches!(&err, Error::Conflict(msg) if msg == "message is deleted"));
+}
+
+#[tokio::test]
+#[ignore = "requires running Postgres with migrations applied"]
+async fn recall_in_window_author_succeeds_with_nonzero_window() {
+    let pool = pool();
+    let participants = ParticipantRepo::new(pool.clone());
+    let author = new_participant(&participants, "recall-window-svc-inwindow").await;
+    let svc = service(pool.clone()).with_recall_window(time::Duration::seconds(60));
+    let room = svc
+        .create_room(
+            author.id,
+            RoomKind::Group,
+            Some("recall window in-window room".into()),
+        )
+        .await
+        .unwrap()
+        .id;
+    let sent = svc
+        .send_message(
+            author.id,
+            room,
+            vec![Block::text("fresh body")],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Fresh message, non-zero window: preflight and recall both succeed.
+    let room_id = svc
+        .assert_message_recall_preflight(author.id, sent.id)
+        .await
+        .unwrap();
+    assert_eq!(room_id, room);
+    let recalled = svc.recall_message(author.id, sent.id).await.unwrap();
+    assert_eq!(recalled.id, sent.id);
+    assert_eq!(recalled.recalled_by, Some(author.id));
+    assert!(recalled.recalled_at.is_some());
+}

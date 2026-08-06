@@ -372,7 +372,10 @@ export const api = {
   },
   // Recall (撤回): author or room admin replaces the content with the system
   // placeholder. Rejects with 409 when already recalled/deleted — callers may
-  // treat that as success (the desired end state is achieved).
+  // treat that as success (the desired end state is achieved). EXCEPT
+  // "recall window expired": that 409 is a rejection, not a success — surface
+  // it (web/recall_errors.js). The wire msg carries the thiserror prefix
+  // ("conflict: recall window expired").
   recallMessage(id) {
     return request('POST', `/api/messages/${encodeURIComponent(id)}/recall`);
   },

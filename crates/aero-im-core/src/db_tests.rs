@@ -25,6 +25,8 @@ use aero_storage::{
 use crate::service::ImService;
 use crate::test_util::MockBus;
 
+// Fully-qualified `time::Duration` used by the recall-window fixture pin.
+
 mod auto_mod_tests;
 mod notifications_tests;
 mod recall_tests;
@@ -61,6 +63,11 @@ fn service(pool: PgPool) -> ImService {
     .with_workspaces(WorkspaceRepo::new(pool.clone()))
     // Blocking guard for 1:1 call/DM (no-op unless a block exists).
     .with_block_repo(BlockRepo::new(pool))
+    // Recall-window hermeticity: `ImService::new` reads AERO_RECALL_WINDOW_SECS
+    // from the process env (parallel-unsafe to mutate in tests); pin unlimited
+    // so the shared fixture is env-independent. Window tests build their own
+    // service with an explicit `with_recall_window(...)`.
+    .with_recall_window(time::Duration::ZERO)
 }
 
 /// Serializes the seed → dispatch → assert critical sections of the three tests

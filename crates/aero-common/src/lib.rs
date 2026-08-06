@@ -44,6 +44,6 @@ pub use model::{
     Reaction, ReactionOp, ReactionSummary, ReadReceipt, Room, RoomEvent, RoomKind, RoomUnread,
     SelectOption, SfuMediaKind, SfuPublishedTrack, SfuPublisherDescription, SfuSubscription, Span,
     SpanStyle, Stream, StreamProtocol, StreamStatus, ThreadSummary, UserStatus, Vod,
-    RECALLED_MESSAGE_PLACEHOLDER,
+    RECALLED_MESSAGE_PLACEHOLDER, recall_window_expired,
 };
 pub use workspace::{Workspace, WorkspaceMember, WorkspaceRole};

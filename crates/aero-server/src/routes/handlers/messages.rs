@@ -168,7 +168,9 @@ async fn delete_message(
 /// audit and the durable event append are one invariant. Returns the updated
 /// message (placeholder blocks + `recalled_at`/`recalled_by`) so the caller can
 /// render it immediately. Stable failures: 404 unknown message, 403 non-member
-/// or non-author member, 409 already recalled / already deleted. Rate-gated
+/// or non-author member, 409 already recalled / already deleted / recall
+/// window expired (author outside `AERO_RECALL_WINDOW_SECS`; room owner/admin
+/// recall is exempt). Rate-gated
 /// like edit: the access-checking preflight resolves the room, then the room's
 /// workspace budget is charged (`check_ws_rate_room`) before the ~8-10 query
 /// mutation runs.

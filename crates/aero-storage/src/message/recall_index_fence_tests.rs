@@ -46,7 +46,7 @@ async fn recall_fences_late_index_writes() {
         .await;
 
     let recalled = repo
-        .recall_outboxed_authorized(message.id, fixture.author, None)
+        .recall_outboxed_authorized(message.id, fixture.author, time::Duration::ZERO, None)
         .await
         .unwrap()
         .expect("recall succeeds");
@@ -116,7 +116,7 @@ async fn concurrent_recall_vs_embed_write_never_resurrects() {
             .insert_message(fixture.author, &format!("race secret {round}"))
             .await;
         let folded_text = format!("folded doc {round}");
-        let recall = repo.recall_outboxed_authorized(message.id, fixture.author, None);
+        let recall = repo.recall_outboxed_authorized(message.id, fixture.author, time::Duration::ZERO, None);
         let embed = repo.update_embedding(message.id, vec![0.5_f32; 1024]);
         let fold = repo.update_searchable_text(message.id, &folded_text);
         let (recalled, embedded, folded) = tokio::join!(recall, embed, fold);
@@ -174,7 +174,7 @@ async fn concurrent_recall_vs_system_edit_never_resurrects() {
         let message = fixture
             .insert_message(fixture.author, &format!("edit race secret {round}"))
             .await;
-        let recall = repo.recall_outboxed_authorized(message.id, fixture.author, None);
+        let recall = repo.recall_outboxed_authorized(message.id, fixture.author, time::Duration::ZERO, None);
         let edit = repo.edit_outboxed_system(
             message.id,
             vec![Block::text(format!("resurrected edit {round}"))],
@@ -251,7 +251,7 @@ async fn concurrent_recall_vs_transcript_write_never_resurrects() {
             .await
             .unwrap();
 
-        let recall = repo.recall_outboxed_authorized(message.id, fixture.author, None);
+        let recall = repo.recall_outboxed_authorized(message.id, fixture.author, time::Duration::ZERO, None);
         let late_transcript = format!("late transcript {round}");
         let transcribe =
             repo.update_voice_transcript_outboxed(message.id, &late_transcript, None);
