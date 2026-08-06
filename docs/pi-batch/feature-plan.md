@@ -1,21 +1,18 @@
-Plan written to `docs/pi-batch/message-recall-plan.md` (v2, supersedes the original). No implementation code written.
+Plan v3 complete. Both plan documents updated, no implementation code written.
 
-## Summary
+## What I did this round
 
-**Assessment**: `pi-batch.py assess` → 处方档 demo(S), 工作流 L3_platform, 产品化 L2_platform_capability, 多租户信号 (0 hard rules). 缺失的 main_flow/data_source/error_path/tech_stack 由计划 §4 补全。
+**1. Assessment** — same prescription: 处方档 demo(S), 工作流 L3_platform, 产品化 L2_platform_capability, 多租户信号, 0 hard rules; missing main_flow/data_source/error_path/tech_stack supplied by plan §4.
 
-**Tree state verified** (I inspected every fix claim against source, not just reviews):
-- 初版实现 59 文件未提交；门禁 REJECTED 的 5 缺陷**已全部修复在树**：
-  1. P1 系统编辑复活 → `events.rs:87/192` 行锁读后 `recalled_at.is_some() → Ok(None)` 双围栏（覆盖 unfurl/transcribe/webhook 全部调用方，同时消除 DS-1 的 relay 静默丢弃）
-  2. P1/P2 replay 不送达 → `query.rs:180-181` 三列 `GREATEST(edited_at, deleted_at, recalled_at)` + 0238 重发 `idx_messages_room_mutated`
-  3. P2 客户端丢占位 → `app.js:219` held-id 行走 `applyChange` 守卫漏斗
-  4. P2 SPA 无入口 → `ws.js:533`/`api.js:376`/`render.js:809`/`app.js:666`（含 409→success 映射）
-  5. HIGH backfill 缺列 → 0238 重发 `backfill_messages_partition`，INSERT/SELECT 双投影含 recall 列
-- 每项都对应树内回归测试（`recall_tests.rs` ×3 门禁回归 + 既有 8 用例 + im-core 3 用例 + frame 契约测试）
+**2. Diagnosed the previous implement-stage `VALIDATION_FAILED (exit=1)` — root cause found, and it's not a code defect.** The pipeline (`/home/u1/aero-im-batch/backend-feature-pipeline.yaml`) validates the implement artifact with 5 validators. I reproduced and isolated the failure:
+- `cargo-check` / `cargo-clippy` / `cargo-test` (repo-scope): **passed**
+- `backendquality`: **passed** (backend-quality.json = 0 violations)
+- **`completion` (`check-completion-report.py {output}`): REJECTED** — the previous round's response ended with a *prose* completion report. The checker mechanically requires a fenced ` ```yaml completion_report: ... ` block (result ∈ passed|failed|not_executed, `not_executed` entries with reasons, non-empty `commands_executed`/`changed_files`, no fabricated-pass phrasing). The temp artifact was deleted and never committed — `feature-implementation.md` still holds the stale first-round report.
 
-**计划发现并列入的 3 个残留测试缺口（必须 failing-test-first）**：
-- ① `materialize_outbox_payload` Recalled 臂无单测（delivered vs suppressed 两分支）
-- ② 并发双撤回竞态无测试（`tokio::join!` 恰一成功一 409、恰一条 outbox）
-- ③ **web 测试零 recall 覆盖**（`web/*.test.js` 全库 grep 无 recall）——ws 帧发送/409→success/按钮可见性矩阵/held-id 漏斗/`_lastSeen` 卫生
+**3. Verified tree state (line-by-line)** — everything from the prior rounds is in place and compiling green (`cargo check --workspace --all-targets` clean): all 5 gate fixes (events.rs dual fences, 3-col `changes_since` + index, app.js held-id funnel, SPA recall entry + 409→success, 0238 backfill reissue), all 3 closed test gaps (Recalled-arm 4-branch unit test, concurrent double-recall race, web recall tests), plus the `_lastSeen` cursor-hygiene fix in `web/ws.js`.
 
-**计划结构**：§0 评估+树状态+门禁裁定表 · §1 模块边界/数据所有权（storage 唯一写者、im-core 编排+纯函数、server 薄壳）· §2 Persistence Design §12 全模板（聚合状态机、0238 单迁移、身份、9 步单事务一致性边界、快照字段、并发、查询+索引、历史、删除、Expand–Migrate–Contract + DS-4 部署纪律）· §4 API 契约+稳定错误表（404→403→409→409→403 固定顺序防 oracle）+ 幂等（原子单迁移、409 即成功约定）· §5 五层测试计划（含门禁回归表）· §6 变更半径 · §7 门禁缺陷 failing-test-first 清单（5 修复已核查 + 3 缺口先写先红）· §8 DoD。
+**4. Wrote plan v3** (no code):
+- **`docs/pi-batch/feature-plan.md`** (the artifact the implementer reads) — root cause, the exact YAML template the final response must end with, and the implementer checklist: re-verify gates → write report to `docs/pi-batch/feature-implementation.md` → run `check-completion-report.py` locally until `COMPLETION: OK` → don't commit.
+- **`docs/pi-batch/message-recall-plan.md` v3** — new §0.4 (validation root cause), §0.3 table with regression tests, §5.1/5.3/5.5 and §7.2 updated to "gaps closed" with test names, §8 DoD extended with **§8.5 产物契约** (artifact path, YAML template, checker hard rules, honest result grading), all stale "先写先红" references reconciled.
+
+**Key message for the implementer round**: the code is done and green — the only thing that failed the harness was the completion-report format. The final response must literally contain the fenced YAML `completion_report:` block (the artifact text is what the validator scans), and the local `check-completion-report.py` gate must exit 0 before finishing.
