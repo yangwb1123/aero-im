@@ -1,19 +1,17 @@
-Compliance re-review complete — written to `docs/pi-batch/feature-reviews/compliance_officer-r2.md` (round-1 file preserved; `prompts/README.md` absent from the repo, so I applied `/home/u1/ai-batch-runner/prompts/README.md` and re-derived every load-bearing claim from current source at the 0238 revision).
+Compliance review complete — written to `docs/pi-batch/feature-reviews/compliance_officer-r3.md` (supersedes r2). 
 
-## What I verified in-tree (not taken from prior reports)
+## Key results
 
-- **Recall tx** (`authorization.rs`): snapshot → placeholder → GC enqueue → 120-char audit digest → outbox, single tx; role re-check under `FOR UPDATE`; final `WHERE recalled_at IS NULL AND deleted_at IS NULL` fence.
-- **GC vs history defect (NEW, Medium — security F1, independently confirmed)**: `enqueue_unreferenced_blobs_in_tx` (`crud.rs:306–340`) and drain-time `has_live_references` (`blob.rs:328`) scan **`messages` only** — `message_edits` (written in the same recall tx with the original `blob_id`s) is invisible to both. Recalled attachment bytes are destroyed within ~60 s while the member-visible `GET /api/messages/:id/history` still serves the snapshot pointing at them. The feature's "snapshot is evidence, not a loss" promise is broken for attachments.
-- **Deferred erasure gap (round-1 F2, re-verified open)**: `participant.rs:644` sweep predicate (`searchable_text <> '' OR embedding IS NOT NULL`) skips recalled rows — recalled-under-hold content survives the post-hold completion sweep forever; zero `recalled` references in `participant.rs`.
-- **`/changes` clamp (NEW, Low — DB F2, confirmed)**: `query.rs:123–134` single-page 200-row clamp → bounded non-delivery of recalls to offline members in high-churn rooms.
-- **Migration timeout (NEW, Low/scale-conditional — DB F1, confirmed)**: `db.rs:31` `statement_timeout=10s` via `after_connect`; boot runs `migrate()` on that pool (`persistence.rs:33`) — 0238's `CREATE INDEX` can abort the chain on prod-sized tables.
-- **Positive controls re-verified**: permission matrix + TOCTOU (9/9 + 28/28 suites), tenant-guard ordering, same-tx audit, minimization on live surfaces, `recalled_by` FK safety under tombstone stance, webhook `Recalled` mapping, `aero_messages_recalled_total` metric.
+**Priming**: `prompts/README.md` does not exist in-repo (verified); applied the shared rules at `/home/u1/ai-batch-runner/prompts/README.md`. All material claims re-derived from current source, not prior reports.
 
-## Output structure (per role prompt)
+**Round-4 delta — both closed, verified in source:**
+- **B1 (was compliance F1, Medium, blocking)**: `redact_blocks_for_recall_snapshot` (`message/mod.rs:187`) is total over the only two blob-carrying `Block` variants; the recall tx (`authorization.rs:288`) snapshots redacted blocks while GC still enqueues the **original** `blob_id`s. The evidence story is now internally consistent — text/transcript evidence retained, byte evidence destroyed, no dangling history refs possible by construction. Regression (10/10 storage recall) asserts zero `"blob_id"` in snapshot + both blobs queued + placeholder row.
+- **B2**: `web/package.json:8` test script includes `render_recall.test.js` → `npm test` 82/0.
 
-1. **Scope statement** — jurisdiction, data classification, framework applicability all marked **unknown** (GDPR Art. 17(3)(e) comment = design intent, not applicability); recall characterized as placeholder-not-erasure.
-2. **Control matrix** — 16 rows (requirement / status / repo evidence / process evidence / gap / owner / validation).
-3. **Findings** — 8 severity-sorted (F1 Medium new, F2 Medium re-verified, F3–F5 Low new/re-verified, F6–F8 carried) + informationals (existence oracle, `recalled_by` stance, DS-4 deploy discipline, no-browser-E2E).
-4. **Audit-readiness** — 5 required documents; next decisions led by P0 F1 fix, F2 predicate extension, product/legal calls on history visibility and recall window, and the jurisdiction declaration.
+**Findings (feature-level, 8)**: 1 new Medium (`message_edits` has no FK/sweep/cutover story — orphans accumulate, DB-architect F2), 1 upgraded Medium (`changes_since` lacks a keyset tie-break — bulk same-timestamp sweeps skip >200 mutations on reconnect, invalidating the "≤200 convergence guaranteed" claim), 1 carried Medium (deferred GDPR erasure net misses recalled rows, `participant.rs:644` — re-verified), 5 carried Low (recall window, disclosure, unthrottled recall + no alert, 120-char audit digest, migration 10s timeout).
 
-No claims of certification made; this is advisory engineering assessment only.
+**Deployment-level (carried, compliance-relevant)**: no backup/restore (High), feature uncommitted so CI never evaluated recall (High), version-skew ack-drop unenforced (Medium), secrets fragment/dev JWT keys (Medium), monitoring unwired (Low).
+
+**Unchanged unknowns**: jurisdiction, data classification, and framework applicability all unknown — GDPR appears only as a design influence in code comments. No compliance or certification claim is made from repository evidence.
+
+**Next decisions**: no P0 remains in feature scope (B1/B2 closed); schedule F3 tie-break (highest-value), F2 erasure predicate, F1 `message_edits` lifecycle; product/legal must decide disclosure of surviving text/transcripts (now the *entire* residual copy post-B1), recall window, and admin-recall surface.

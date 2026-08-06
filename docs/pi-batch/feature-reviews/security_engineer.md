@@ -1,22 +1,25 @@
-Re-review complete — written to `docs/pi-batch/feature-reviews/security_engineer.md` (supersedes the round-1 review). Summary:
+Review complete — written to `docs/pi-batch/feature-reviews/security_engineer.md` (supersedes the round-3 review). I verified the round-4 tree by source inspection plus independent targeted test runs (`redact_blocks_for_recall_snapshot_removes_byte_references` 1/1; web ws/api/render recall suites 26/26).
 
-## Security Engineer Re-Review — Message Recall (post-fix tree)
+## Verdict
 
-**Method**: source-level verification of every authz/tenant/state path (storage tx, im-core service, REST+WS entry, bus listener, webhooks/bots, blob GC, history route, client), cross-checked against AGENTS.md invariants. All claims Verified by inspection; gate greens per implementer evidence (2158 lib tests, 9/9 + 28/28 recall suites, authz_lint 6/6).
+**B1 (recall snapshot ↔ attachment GC dangling reference) is closed — correct by construction, not just by test.**
+- `redact_blocks_for_recall_snapshot` is total over the only two `Block` variants that carry `blob_id` (`File`, `Voice` — verified against the full enum; no other blob-carrying variants exist).
+- GC still enqueues the **original** blob ids in the same tx; the JSONB containment scan runs *after* the placeholder UPDATE, so the recalled row can't hold GC open, and `message_edits` is never scanned — exactly why redaction is the right fix vs. extending the reference scan (which would permanently protect deleted-message bytes).
+- The B1 regression is meaningful: string-level blob-id absence + `"blob_id"` key count 0 + transcript preserved + both blobs enqueued + row == placeholder.
 
-### Bottom line
-No Critical/High findings remain. Round-1 **S1 (content resurrection) and S2 (replay never delivers recalls) are closed**: the fences live inside the only transactions that write the row (`events.rs:84-89` edit, `192-197` transcript — caller-independent, covering unfurl/transcribe/webhook), `changes_since` uses `GREATEST(edited_at, deleted_at, recalled_at)` with a matching reissued index, and the partition backfill projection carries both columns — each with a failing-test-first regression test in-tree.
+**B2 is closed**: `web/package.json` test script now includes `render_recall.test.js`; `npm test` 82/0.
 
-### Findings
-| # | Sev | Finding |
+## Findings (no Critical/High)
+| # | Sev | Item |
 |---|---|---|
-| **F1** | **MED** | **Recall GCs attachment bytes still referenced by the member-visible history snapshot.** `message_edits` (full original blocks incl. `blob_id`s) is written in the same tx that enqueues those blobs for GC (`authorization.rs:288,330`); `has_live_references` (`blob.rs:328`) and the enqueue check scan `messages` only — **not `message_edits`** — and `GET /api/messages/:id/history` is member-accessible for live-but-recalled messages. Bytes are gone within ~60s while history still points at them. Fix: redact File/Voice blocks in the recall snapshot (option 1) or protect `message_edits`-referenced blobs (option 2); regression test specified. |
-| **F2** | LOW | Cross-tenant existence oracle: 404 (unknown) vs 403 (exists-but-inaccessible) — the plan's "防存在性 oracle" claim is inaccurate; state is protected, existence is not. Pre-existing on edit/delete; ULIDs unguessable; optional alignment + doc fix. |
-| **F3** | LOW | Recall unthrottled on both entry points (WS frame has no `check_ws_rate_room`; matches delete precedent); member abuse bounded by send rate; admin mass-recall uncapped/unalerted — documented backlog. |
-| **F4** | INFO | Rolling-deploy poison ack-drop of `kind:"recalled"` on old durable consumers (DS-4 release-note discipline); `recalled_by` outside GDPR erasure (documented compliance decision). |
+| F1 | CLOSED | B1 redaction fix verified end-to-end |
+| F2 | LOW | Cross-tenant existence oracle 404 vs 403 (pre-existing; ULIDs unguessable; doc claim "防存在性 oracle" is inaccurate for existence) |
+| F3 | LOW | Recall unthrottled on both entry points (matches delete precedent; admin mass-recall unalerted) |
+| F4 | INFO | Rolling-deploy ack-drop of `kind:"recalled"` on old binaries — converges on reconnect via 3-column `changes_since` |
+| F5 | INFO (new) | Forward-compat double-parse: future blob-carrying block variants would leak bytes (never destroy) and empty the snapshot on old binaries |
+| F6 | INFO (new) | Card/ToolCall payloads pass redaction untouched; GC containment predicate is pinnable by a Card embedding a known blob uuid (pre-existing on delete path) |
 
-### Abuse-case table (highlights)
-Identity spoofing ✅ (all actors from `AuthUser`) · REST/WS/bus replay ✅ (row-lock + `WHERE recalled_at IS NULL` → stable 409, exactly one outbox row, relay suppression 4-branch unit test) · cross-tenant/IDOR ✅ (`assert_room_access` + commit-time `aero_effective_room_access`, identity re-validated under `FOR UPDATE`, role re-checked on the membership edge — TOCTOU-safe) · proxy/header forgery ✅ (no new header trust; ip_allowlist is global boot middleware) · resource exhaustion ⚠️ F3 · sensitive-data ⚠️ documented decisions (history visibility, audit digest admin-only, placeholder-only everywhere else) · resurrection ✅ closed · XSS ✅ (textContent-only) · migration drift ✅ (additive, index expression == predicate).
+## Key positive controls verified
+Tenant/role TOCTOU closure (role + membership re-checked `FOR UPDATE` in the only write tx, `aero_effective_room_access` includes deactivation + mandatory TOTP); content-resurrection fences inside the system-edit transactions (caller-independent); exactly-one-winner concurrency with stable 409; version-gated relay suppression; member-gated history route; textContent-only client rendering; additive/idempotent migration 0238 with complete backfill projection; no new headers/secrets/dependencies; GDPR-safe `recalled_by` (tombstone keeps FK valid).
 
-### Validation plan
-P0: F1 regression test + redaction/reference-protection fix, re-run storage recall 9/9 + full gates. P1: F2 probe test + doc correction. P2: F3 per-actor cap/alert + DS-4 release note. P3: full gate re-run after any fix.
+**Residual risk to flag for the product/compliance track**: recall ≠ erasure — pre-recall *text* and voice transcripts remain member-visible via `/api/messages/:id/history` (bytes are destroyed, text evidence intentionally retained); disclosure copy is still pending per the plan.
