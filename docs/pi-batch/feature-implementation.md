@@ -1,81 +1,37 @@
-All done. This round's work: re-verified all 5 gate fixes + 3 closed test gaps in-tree, re-ran every gate (all green), wrote the validator-compliant artifact to `docs/pi-batch/feature-implementation.md`, and confirmed `check-completion-report.py` → `COMPLETION: OK`. No code changes were needed this round — the tree was already green; the previous VALIDATION_FAILED was purely the missing YAML completion_report block.
+All gates green, artifact `COMPLETION: OK`. Round-4 summary:
 
-Key evidence this round: cargo check ✅ · clippy -D warnings ✅ · `cargo test --workspace --lib` **2158/0** ✅ · web-check 0 violations ✅ · truth-check 0 orphans ✅ · file-size 0 violations ✅ · `node --test web/*.test.js` **82/0** ✅ · authz_lint 6/6 ✅ · `test-integration.sh` full fresh-DB replay (238 migrations incl. 0238) + 594 ignored tests ✅ · targeted throwaway-DB recall suites **9/9 storage + 28/28 im-core** ✅ · backend-quality 0 violations (674 files) ✅ · completion-report check `COMPLETION: OK` ✅.
+**B1 (blocking, fixed failing-test-first)**: recall history snapshot redaction —
+- *Red first*: hermetic test `redact_blocks_for_recall_snapshot_removes_byte_references` (compile-red: unresolved import) + PG regression `recall_snapshot_redacts_blob_references_and_gc_proceeds` (would fail on leaky snapshot).
+- *Fix*: new pure fn `redact_blocks_for_recall_snapshot` in `message/mod.rs` (File → `[附件已移除]` text; Voice+transcript → transcript text; Voice w/o transcript → `[语音已移除]`; others unchanged; output never contains a `blob_id`); recall tx (`authorization.rs`) now snapshots the redacted blocks into `message_edits` while GC still enqueues the **original** blob ids (bytes removed per plan intent, no leak, no dangling history refs).
+- *Green*: storage recall suite **10/10** on a fresh throwaway DB; test asserts snapshot has no blob_id + transcript kept + GC queue has both blobs + row == placeholder.
+
+**B2**: `web/package.json` test script now includes `render_recall.test.js` → `npm test` **82/0** (previously the file never ran in CI).
+
+**Gates re-run, all passed**: cargo check · clippy `-D warnings` · `cargo test --workspace --lib` **2159/0** · web-check 0 · truth-check 0 · file-size 0 · `node --test web/*.test.js` 82/0 · authz_lint 6/6 · `test-integration.sh` EXIT 0 (fresh-DB 238-migration replay + full ignored suite) · backend-quality 0 violations (674 files) · `check-completion-report.py` → `COMPLETION: OK`. Nothing committed; only feature-scoped files touched.
 
 ## completion_report
 
 ```yaml
 completion_report:
   summary: >
-    Message recall implemented end to end: REST + WS entry, transactional
-    outbox recall (migration 0238), Recalled room event broadcast, client
-    placeholder rendering, permission matrix. All 5 gate defects fixed and
-    regression-tested; all 3 plan test gaps closed; every gate re-run green
-    this round (check/clippy/test 2158, web-check, truth-check,
-    file-size-check, authz_lint 6, test-integration.sh 594, node --test 82,
-    backend-quality 0 violations).
+    Round 4: gate B1/B2 fixes landing on the already-green recall feature.
+    B1: the recall history snapshot is now redacted of byte references
+    (File/Voice blocks become text; voice transcripts survive as text), so the
+    member-visible history trail can never point at attachment bytes that the
+    recall transaction enqueues for GC — fixed failing-test-first (hermetic
+    unit test + PG regression, storage recall suite 10/10). B2: render_recall
+    tests wired into web/package.json test script (npm test 82/0). All gates
+    re-run green: check / clippy -D warnings / lib 2159 / web-check /
+    truth-check / file-size / node glob 82 / authz_lint 6 / test-integration /
+    backend-quality 0.
   changed_files:
-    - migrations/0238_message_recall.sql
-    - crates/aero-common/src/model/message.rs
-    - crates/aero-common/src/model/event.rs
-    - crates/aero-common/src/model/tests.rs
-    - crates/aero-common/src/lib.rs
-    - crates/aero-common/src/metrics.rs
-    - crates/aero-im-core/src/events.rs
-    - crates/aero-im-core/src/service/messages.rs
-    - crates/aero-im-core/src/service/outbox.rs
-    - crates/aero-im-core/src/db_tests.rs
-    - crates/aero-im-core/src/db_tests/recall_tests.rs
     - crates/aero-storage/src/message/mod.rs
-    - crates/aero-storage/src/message/query.rs
-    - crates/aero-storage/src/message/crud.rs
-    - crates/aero-storage/src/message/events.rs
-    - crates/aero-storage/src/message/authorization.rs
-    - crates/aero-storage/src/message/thread.rs
-    - crates/aero-storage/src/message/sweep.rs
-    - crates/aero-storage/src/message/search.rs
     - crates/aero-storage/src/message/orig.rs
-    - crates/aero-storage/src/message/idempotency.rs
+    - crates/aero-storage/src/message/authorization.rs
     - crates/aero-storage/src/message/recall_tests.rs
-    - crates/aero-storage/src/event_outbox.rs
-    - crates/aero-storage/src/bookmark.rs
-    - crates/aero-storage/src/pin.rs
-    - crates/aero-storage/src/search_query.rs
-    - crates/aero-storage/src/workspace/export.rs
-    - crates/aero-storage/src/integration/debug_tests.rs
-    - crates/aero-server/src/routes/handlers/messages.rs
-    - crates/aero-server/src/routes/routes.rs
-    - crates/aero-server/src/ws/frame.rs
-    - crates/aero-server/src/ws/ws_impl/mod.rs
-    - crates/aero-server/src/ws/ws_impl/frame.rs
-    - crates/aero-server/src/ws/ws_impl/bus.rs
-    - crates/aero-server/src/ws/ws_impl/tests.rs
-    - crates/aero-server/src/bin/boot/background.rs
-    - crates/aero-server/src/bot_dispatch.rs
-    - crates/aero-server/src/bot_dispatch/tests.rs
-    - crates/aero-server/src/broadcast.rs
-    - crates/aero-server/src/conversation_export.rs
-    - crates/aero-server/src/forward.rs
-    - crates/aero-server/src/message_context.rs
-    - crates/aero-server/src/ooo_bot.rs
-    - crates/aero-server/src/unfurl_bot.rs
-    - crates/aero-server/src/webhooks.rs
-    - crates/aero-server/src/webhooks/tests.rs
-    - crates/aero-ai/src/rerank.rs
-    - crates/aero-ai/src/service/profile.rs
-    - crates/aero-ai/src/service/tests.rs
-    - web/app.js
-    - web/ws.js
-    - web/api.js
-    - web/render.js
-    - web/context.js
-    - web/style.css
-    - web/ws.test.js
-    - web/api.test.js
-    - web/render_recall.test.js
-    - docs/pi-batch/message-recall-plan.md
+    - web/package.json
     - docs/pi-batch/feature-plan.md
-    - docs/pi-batch/recall-completion-report.md
+    - docs/pi-batch/message-recall-plan.md
     - docs/pi-batch/feature-implementation.md
   commands_executed:
     - command: "cd /home/u1/aero-im && cargo check --workspace --all-targets"
@@ -83,23 +39,25 @@ completion_report:
     - command: "cd /home/u1/aero-im && cargo clippy --workspace --all-targets -- -D warnings"
       result: passed
     - command: "cd /home/u1/aero-im && cargo test --workspace --lib"
-      result: passed            # 2158 passed, 0 failed
+      result: passed            # 2159 passed, 0 failed
     - command: "cd /home/u1/aero-im && bash scripts/web-check.sh"
-      result: passed            # 0 violations, 57 files
+      result: passed            # 0 violations
     - command: "cd /home/u1/aero-im && bash scripts/truth-check.sh"
-      result: passed            # 0 orphans (3 pre-existing allowlisted UNWIRED builders)
+      result: passed            # 0 orphans (3 pre-existing allowlisted UNWIRED)
     - command: "cd /home/u1/aero-im && bash scripts/file-size-check.sh"
       result: passed            # 0 violations (71 pre-existing WARN)
-    - command: "cd /home/u1/aero-im && bash scripts/test-integration.sh"
-      result: passed            # fresh-DB migration replay (238 migrations incl. 0238) + full ignored suite, EXIT 0
-    - command: "cd /home/u1/aero-im && node --test web/*.test.js"
-      result: passed            # 82 passed, 0 failed
     - command: "cd /home/u1/aero-im && cargo test --workspace --test authz_lint"
       result: passed            # 6 passed
+    - command: "cd /home/u1/aero-im && bash scripts/test-integration.sh"
+      result: passed            # fresh-DB 238-migration replay + full ignored suite, EXIT 0
+    - command: "cd /home/u1/aero-im && node --test web/*.test.js"
+      result: passed            # 82 passed, 0 failed
+    - command: "cd /home/u1/aero-im/web && npm test"
+      result: passed            # 82 passed, 0 failed — now includes render_recall.test.js (B2)
     - command: "cargo test -p aero-storage --lib -- --ignored message::recall (throwaway migrated DB)"
-      result: passed            # 9/9 incl. concurrent race + 3 gate regressions + migration schema
-    - command: "cargo test -p aero-im-core --lib -- --ignored (throwaway migrated DB)"
-      result: passed            # 28 passed, 0 failed incl. 3 recall service tests
+      result: passed            # 10/10 incl. recall_snapshot_redacts_blob_references_and_gc_proceeds (B1)
+    - command: "cargo test -p aero-storage --lib redact_blocks_for_recall_snapshot_removes_byte_references"
+      result: passed            # hermetic B1 unit test; went red (unresolved import) before the fn landed
     - command: "cargo run --bin aero-cli -- migrate (throwaway DB)"
       result: passed            # full 238-migration chain incl. 0238
     - command: "python /home/u1/ai-batch-runner/scripts/check-backend-quality.py --dir /home/u1/aero-im/crates"
@@ -107,21 +65,21 @@ completion_report:
     - command: "python /home/u1/ai-batch-runner/scripts/check-completion-report.py docs/pi-batch/feature-implementation.md"
       result: passed            # COMPLETION: OK
   not_executed:
-    - check: real-browser E2E recall UI flow (two live WS clients, REST recall roundtrip, reconnect replay)
-      reason: no browser harness in this environment; covered by the WS frame contract test, storage/service integration tests asserting the outbox row and placeholder payload, the hermetic web render path, and web-check static gate
+    - check: real-browser E2E recall UI flow
+      reason: no browser harness in this environment; covered by the WS frame contract test, storage/service integration tests, hermetic render tests, and web-check static gate
     - check: migration rollback (DROP COLUMN + CHECK revert)
       reason: migration is purely additive and reversible; forward path proven on fresh throwaway DBs only
   residual_risks:
-    - recall is terminal for user content (edit blocked after recall); no un-recall path — deliberate, matches Slack-style placeholder semantics
-    - no time limit on recall window — product decision left open (see docs/pi-batch/message-recall-plan.md)
-    - web UI exposes the recall affordance to the author only (no room-role context client-side); admin/owner recall works via REST/WS with server-enforced authorization, matching how delete is surfaced
-    - recalled messages remain readable in history/search as placeholder; pre-recall content preserved in message_edits + audit (recall != erasure — product disclosure decision pending)
-    - web/ws.test.js at 831 lines: WARN-level advisory only, under the 1000-line HARD budget
-    - rolling-deploy version skew: old binaries ack-drop unknown 'recalled' events and advance the durable cursor — deploy ordering discipline (upgrade all nodes before recall use) documented in the plan
+    - recall is terminal for user content (edit blocked after recall); no un-recall path — deliberate product decision
+    - no time limit on recall window — product decision left open
+    - web UI exposes the recall affordance to the author only; admin/owner recall works via REST/WS server-enforced, matching how delete is surfaced
+    - recalled messages remain readable in history as placeholder; pre-recall text/transcript evidence preserved in message_edits (redacted of byte references per B1); attachment bytes are removed — recall != erasure, product disclosure pending
+    - edit-path snapshots still retain blob_id references (edit never GCs replaced blobs — pre-existing leak, out of feature scope, documented)
+    - rolling-deploy version skew: old binaries ack-drop unknown 'recalled' events — deploy ordering discipline documented
   assumptions:
     - moderator maps to the existing room roles owner/admin (role enum is exactly owner/admin/member)
     - recall is deliberately not silently idempotent: second recall returns stable 409 "message is already recalled"; clients treat 409 as already-effected
-    - attachment bytes of recalled messages are garbage-collected via the existing blob_gc_queue with live-reference check
-    - no new crate, no new third-party dependency, no new table, no new index beyond the 0238 expression-index reissue
-    - working tree left dirty per instructions (no commit); unrelated pre-existing modifications were present before this task and untouched
+    - the redaction marker texts ("[附件已移除]" / "[语音已移除]") are stable product copy
+    - no new crate, no new third-party dependency, no new table, no new index, no schema change this round (B1/B2 are code + test-list only)
+    - working tree left dirty per instructions (no commit); unrelated pre-existing modifications untouched
 ```
