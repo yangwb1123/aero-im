@@ -1,18 +1,16 @@
-Plan v3 complete. Both plan documents updated, no implementation code written.
+Plan v4 complete — both documents updated, no implementation code written.
 
-## What I did this round
+## What this round produced
 
-**1. Assessment** — same prescription: 处方档 demo(S), 工作流 L3_platform, 产品化 L2_platform_capability, 多租户信号, 0 hard rules; missing main_flow/data_source/error_path/tech_stack supplied by plan §4.
+**1. Assessment** — same prescription: demo(S) / L3_platform / L2_platform_capability, 0 hard rules, 多租户 signal.
 
-**2. Diagnosed the previous implement-stage `VALIDATION_FAILED (exit=1)` — root cause found, and it's not a code defect.** The pipeline (`/home/u1/aero-im-batch/backend-feature-pipeline.yaml`) validates the implement artifact with 5 validators. I reproduced and isolated the failure:
-- `cargo-check` / `cargo-clippy` / `cargo-test` (repo-scope): **passed**
-- `backendquality`: **passed** (backend-quality.json = 0 violations)
-- **`completion` (`check-completion-report.py {output}`): REJECTED** — the previous round's response ended with a *prose* completion report. The checker mechanically requires a fenced ` ```yaml completion_report: ... ` block (result ∈ passed|failed|not_executed, `not_executed` entries with reasons, non-empty `commands_executed`/`changed_files`, no fabricated-pass phrasing). The temp artifact was deleted and never committed — `feature-implementation.md` still holds the stale first-round report.
+**2. Gate round-3 verdict incorporated (2 findings, B1 blocking)** — I verified the B1 mechanics directly in source before designing the fix:
+- **B1 (MED/HIGH, recall-specific)**: recall tx snapshots original blocks (incl. `File`/`Voice` `blob_id`s) into `message_edits` then enqueues those same blobs for GC; `enqueue_unreferenced_blobs_in_tx` + drain-time `has_live_references` scan only `messages` — never `message_edits` — while the member-gated history route serves the snapshot for live-recalled rows. Bytes die in ~60s; history points at dead refs. I confirmed it's unique to recall (delete snapshots nothing; edit snapshots but never GCs).
+- **Fix chosen: Option A (snapshot redaction)** — new pure fn `redact_blocks_for_recall_snapshot` (`File` → `[附件已移除]` text block; `Voice{transcript}` → text block with transcript; `Voice{None}` → `[语音已移除]`; others unchanged; output never contains a `blob_id`), used for the `message_edits` insert while GC still enqueues the original bytes (no leak, no dangling refs). **Option B rejected with a decision record**: `message_edits` is retained on tombstone (crud.rs:539), so scanning it would permanently disable delete-path GC and add hot-path scans of an append-only evidence table.
+- **B2 (LOW)**: `web/package.json` `"test"` omits `render_recall.test.js` while CI runs `npm test` → append to the list.
 
-**3. Verified tree state (line-by-line)** — everything from the prior rounds is in place and compiling green (`cargo check --workspace --all-targets` clean): all 5 gate fixes (events.rs dual fences, 3-col `changes_since` + index, app.js held-id funnel, SPA recall entry + 409→success, 0238 backfill reissue), all 3 closed test gaps (Recalled-arm 4-branch unit test, concurrent double-recall race, web recall tests), plus the `_lastSeen` cursor-hygiene fix in `web/ws.js`.
+**3. Failing-test-first recipes (§7.4)** — hermetic redaction-fn unit test (red: fn doesn't exist), PG regression `recall_snapshot_redacts_blob_references_and_gc_proceeds` (red today: snapshot contains blob_ids; asserts snapshot has no blob_id + transcript kept + GC queue still has both blobs + row == placeholder), and the `npm test` wiring check.
 
-**4. Wrote plan v3** (no code):
-- **`docs/pi-batch/feature-plan.md`** (the artifact the implementer reads) — root cause, the exact YAML template the final response must end with, and the implementer checklist: re-verify gates → write report to `docs/pi-batch/feature-implementation.md` → run `check-completion-report.py` locally until `COMPLETION: OK` → don't commit.
-- **`docs/pi-batch/message-recall-plan.md` v3** — new §0.4 (validation root cause), §0.3 table with regression tests, §5.1/5.3/5.5 and §7.2 updated to "gaps closed" with test names, §8 DoD extended with **§8.5 产物契约** (artifact path, YAML template, checker hard rules, honest result grading), all stale "先写先红" references reconciled.
+**4. Plan updates** — `message-recall-plan.md` v4 (§0.5 findings table, §2 Snapshot Fields redaction + decision record, §5.1/5.3/5.5 tests, §6.1 change radius incl. `mod.rs`/`authorization.rs`/`package.json`, §7.4, §8 DoD with storage recall **10/10** + `npm test`); `feature-plan.md` rewritten for the implementer with the checklist, explicit not-in-scope list (gate-dismissed findings), and the §8.5 artifact contract (YAML `completion_report` block + `check-completion-report.py` → `COMPLETION: OK` — the previous VALIDATION_FAILED root cause, still mandatory).
 
-**Key message for the implementer round**: the code is done and green — the only thing that failed the harness was the completion-report format. The final response must literally contain the fenced YAML `completion_report:` block (the artifact text is what the validator scans), and the local `check-completion-report.py` gate must exit 0 before finishing.
+**DoD for the next round**: both B1 regression tests green (storage recall 10/10), `cd web && npm test` green with `render_recall.test.js` included, all gates re-run (check/clippy/lib/web-check/truth-check/file-size/node/authz_lint/test-integration/backend-quality), and the artifact passes the completion validator.
