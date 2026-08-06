@@ -452,7 +452,7 @@ fn parse_agent_turn(raw: &str) -> Result<AgentTurn> {
         match block {
             ContentBlock::Text { text: t } => text.push_str(&t),
             ContentBlock::ToolUse { id, name, input } => {
-                tool_uses.push(ToolUse { id, name, input })
+                tool_uses.push(ToolUse { id, name, input });
             }
             ContentBlock::Other => {}
         }

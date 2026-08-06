@@ -213,11 +213,7 @@ async fn build_and_store_archive(
     // Keyset-page over ALL the participant's messages (uncapped, oldest-first).
     let mut messages = Vec::new();
     let mut cursor = Some(MessageId::from_uuid(uuid::Uuid::max()));
-    loop {
-        let before = match cursor {
-            Some(id) => id,
-            None => break,
-        };
+    while let Some(before) = cursor {
         let page = msg_repo
             .by_sender_paged(participant, before, EXPORT_PAGE)
             .await?;
@@ -226,7 +222,7 @@ async fn build_and_store_archive(
         }
         cursor = page.last().map(|m| m.id);
         messages.extend(page);
-        if messages.len() % (EXPORT_PAGE as usize) != 0 {
+        if messages.len() % usize::try_from(EXPORT_PAGE).expect("EXPORT_PAGE is positive") != 0 {
             break; // short page ⇒ done (extend kept it < a full page)
         }
     }

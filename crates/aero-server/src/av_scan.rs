@@ -352,7 +352,7 @@ mod tests {
         );
         match scanner.scan(eicar.as_bytes()).await {
             ScanVerdict::Infected(name) => {
-                assert!(name.contains("EICAR") || name.contains("Eicar"))
+                assert!(name.contains("EICAR") || name.contains("Eicar"));
             }
             other => panic!("expected EICAR to be Infected, got {other:?}"),
         }

@@ -28,7 +28,7 @@ impl MessageRepo {
     ) -> Result<Vec<Message>, sqlx::Error> {
         let limit = limit.clamp(1, 200);
         let rows = sqlx::query_as::<_, MessageRow>(
-            r#"SELECT reply.id, reply.room_id, reply.sender_id, reply.blocks,
+            r"SELECT reply.id, reply.room_id, reply.sender_id, reply.blocks,
                       reply.reply_to, reply.metadata, reply.created_at,
                       reply.edited_at, reply.deleted_at, reply.expires_at,
                       reply.version
@@ -39,7 +39,7 @@ impl MessageRepo {
                  AND reply.deleted_at IS NULL
                  AND ($2::uuid IS NULL OR reply.id > $2)
                ORDER BY reply.id ASC
-               LIMIT $3"#,
+               LIMIT $3",
         )
         .bind(root.to_uuid())
         .bind(after.map(|m| m.to_uuid()))
@@ -118,12 +118,12 @@ impl MessageRepo {
         // lookups. A roster is a UI affordance, so 500 distinct participants is far
         // beyond what any view renders.
         let rows = sqlx::query_as::<_, (uuid::Uuid,)>(
-            r#"SELECT DISTINCT reply.sender_id
+            r"SELECT DISTINCT reply.sender_id
                FROM messages AS reply
                JOIN messages AS root
                  ON root.id = $1 AND root.room_id = reply.room_id
                WHERE reply.reply_to = $1 AND reply.deleted_at IS NULL
-               LIMIT 500"#,
+               LIMIT 500",
         )
         .bind(root.to_uuid())
         .fetch_all(&self.pool)

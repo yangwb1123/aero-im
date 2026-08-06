@@ -56,9 +56,9 @@ impl Command for ArgCmd {
 
 fn test_registry() -> CommandRegistry {
     CommandRegistry::new()
-        .add(Box::new(OkCmd))
-        .add(Box::new(ErrCmd))
-        .add(Box::new(ArgCmd))
+        .with_command(Box::new(OkCmd))
+        .with_command(Box::new(ErrCmd))
+        .with_command(Box::new(ArgCmd))
 }
 
 #[tokio::test]
@@ -179,7 +179,7 @@ async fn outcome_with_detail_is_preserved() {
 async fn registry_contains_all_added_commands() {
     let reg = test_registry();
     assert_eq!(reg.len(), 3);
-    let names: Vec<&str> = reg.iter().map(|c| c.name()).collect();
+    let names: Vec<&str> = reg.iter().map(aero_eng::Command::name).collect();
     assert!(names.contains(&"ok"));
     assert!(names.contains(&"fail"));
     assert!(names.contains(&"arg-test"));

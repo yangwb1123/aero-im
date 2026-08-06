@@ -553,9 +553,9 @@ fn was_paid(kind: AiJobKind, result: &serde_json::Value) -> bool {
         // result does not set `usage_accounted`. Provider-aware handlers reserve
         // and finalize durable usage themselves before returning their result.
         // Moderate is paid here only when such a processor reports Anthropic use.
-        AiJobKind::Moderate => result
+        AiJobKind::Moderate | AiJobKind::Summarize | AiJobKind::Answer => result
             .get("anthropic")
-            .and_then(|v| v.as_bool())
+            .and_then(serde_json::Value::as_bool)
             .unwrap_or(false),
         AiJobKind::Embed => result
             .get("paid_provider")
@@ -564,10 +564,6 @@ fn was_paid(kind: AiJobKind, result: &serde_json::Value) -> bool {
                 result.get("skipped").is_none()
                     && result.get("model").and_then(serde_json::Value::as_str) != Some("hash-1024")
             }),
-        AiJobKind::Summarize | AiJobKind::Answer => result
-            .get("anthropic")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false),
     }
 }
 
@@ -786,6 +782,10 @@ async fn run_one<Q, P>(
     Q: JobQueue + ?Sized,
     P: JobProcessor + ?Sized,
 {
+    // Process-level timeout (9th analysis 方向五): a stuck Anthropic request
+    // must not occupy a semaphore permit forever. When the timeout fires the
+    // job is marked `failed` (not `dead`) so a retry can claim it next tick.
+    const JOB_TIMEOUT: Duration = Duration::from_secs(120);
     let id = job.id;
     let kind = job.kind;
     let attempts = job.attempts;
@@ -806,11 +806,6 @@ async fn run_one<Q, P>(
     // Time the actual processing — the histogram covers the work whether it
     // succeeds or fails (a slow failure is still a latency signal).
     let started = Instant::now();
-
-    // Process-level timeout (9th analysis 方向五): a stuck Anthropic request
-    // must not occupy a semaphore permit forever. When the timeout fires the
-    // job is marked `failed` (not `dead`) so a retry can claim it next tick.
-    const JOB_TIMEOUT: Duration = Duration::from_secs(120);
     let disposition = match tokio::time::timeout(JOB_TIMEOUT, proc.process(job)).await {
         Ok(result) => {
             ai_metrics::record_duration(reg, kind, started.elapsed().as_secs_f64());

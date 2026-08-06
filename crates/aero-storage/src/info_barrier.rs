@@ -52,7 +52,7 @@ pub struct InfoBarrier {
 /// query so the row decoding stays in one place.
 const COLUMNS: &str = "id, workspace_id, group_a, group_b, created_by, created_at";
 
-#[derive(Debug, Clone, sqlx::FromRow)]
+#[derive(Debug, Clone, Copy, sqlx::FromRow)]
 struct Row {
     id: uuid::Uuid,
     workspace_id: uuid::Uuid,

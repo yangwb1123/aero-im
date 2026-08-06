@@ -234,6 +234,13 @@ pub async fn run_with_config_until_cancelled(
     cfg: ModerationConfig,
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
+    // In-process idempotency for JetStream at-least-once REDELIVERY: the same message
+    // re-delivered (e.g. an ack timeout while this process is alive) would be
+    // re-screened — a SECOND paid `ai.moderate()` call + a second cost-counter
+    // increment + a duplicate `message.moderated` audit row. A bounded recently-seen
+    // set skips the re-screen. (It does not survive a process restart; the per-call
+    // budget admission gate bounds that residual double-charge.)
+    const DEDUP_CAP: usize = 8192;
     let Some(ai) = state.ai.clone() else {
         info!("moderation_bot: no AI backend; not started");
         return Ok(());
@@ -294,13 +301,7 @@ pub async fn run_with_config_until_cancelled(
     // moderation. Durable consumer "aero-moderation" resumes from its cursor; every
     // message is acked (skips are deliberately not redelivered).
     //
-    // In-process idempotency for JetStream at-least-once REDELIVERY: the same message
-    // re-delivered (e.g. an ack timeout while this process is alive) would be
-    // re-screened — a SECOND paid `ai.moderate()` call + a second cost-counter
-    // increment + a duplicate `message.moderated` audit row. A bounded recently-seen
-    // set skips the re-screen. (It does not survive a process restart; the per-call
-    // budget admission gate bounds that residual double-charge.)
-    const DEDUP_CAP: usize = 8192;
+    // (The DEDUP_CAP rationale lives at the fn top with the constant.)
     let mut seen: std::collections::HashSet<aero_common::MessageId> =
         std::collections::HashSet::new();
     let mut seen_order: std::collections::VecDeque<aero_common::MessageId> =

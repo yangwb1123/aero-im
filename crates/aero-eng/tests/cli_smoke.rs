@@ -1,5 +1,5 @@
 //! End-to-end smoke tests for the aero-cli binary.
-//! Run: cargo test --test cli_smoke -- --ignored
+//! Run: cargo test --test `cli_smoke` -- --ignored
 
 use std::process::Command;
 

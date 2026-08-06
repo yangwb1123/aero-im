@@ -67,7 +67,7 @@ pub async fn run_with(
 }
 
 /// Run with an injected transport until `cancel` is triggered, finishing and
-/// ACKing any event already received before returning.
+/// `ACKing` any event already received before returning.
 pub async fn run_with_until_cancelled(
     state: AppState,
     cache: UnfurlRepo,

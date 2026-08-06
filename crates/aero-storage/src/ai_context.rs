@@ -267,7 +267,7 @@ mod tests {
         let a = microsecond_score();
         // Brief busy-wait ensures different system-time samples.
         let mut b = microsecond_score();
-        while b == a {
+        while b <= a {
             b = microsecond_score();
         }
         assert!(b > a);

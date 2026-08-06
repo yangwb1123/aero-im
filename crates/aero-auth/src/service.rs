@@ -337,20 +337,17 @@ impl AuthService {
             return Err(Error::Unauthorized("not a refresh token".into()));
         }
         let pid = claims.participant_id()?;
-        let session_id = match claims.session_id()? {
-            Some(id) => {
-                if !self.sessions.is_active(id, pid).await? {
-                    return Err(Error::Unauthorized("session is not active".into()));
-                }
-                id
+        let session_id = if let Some(id) = claims.session_id()? {
+            if !self.sessions.is_active(id, pid).await? {
+                return Err(Error::Unauthorized("session is not active".into()));
             }
-            None => {
-                let hash = aero_storage::revoked_token::hash_token(refresh_token);
-                self.sessions
-                    .active_id_by_hash(pid, &hash)
-                    .await?
-                    .ok_or_else(|| Error::Unauthorized("refresh session is not active".into()))?
-            }
+            id
+        } else {
+            let hash = aero_storage::revoked_token::hash_token(refresh_token);
+            self.sessions
+                .active_id_by_hash(pid, &hash)
+                .await?
+                .ok_or_else(|| Error::Unauthorized("refresh session is not active".into()))?
         };
         let access_token = self
             .jwt
@@ -400,7 +397,7 @@ impl AuthService {
     ///
     /// This is the entry point for non-password logins that have *already*
     /// authenticated the participant by other means — e.g. the SSO/OIDC flow,
-    /// which validates an external IdP's ID token and then needs *our* tokens for
+    /// which validates an external `IdP`'s ID token and then needs *our* tokens for
     /// the resolved (or JIT-provisioned) participant. It is the same token
     /// material `register`/`login` issue, just decoupled from credential
     /// verification.

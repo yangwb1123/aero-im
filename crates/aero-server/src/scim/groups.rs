@@ -4,7 +4,7 @@
 //! helpers (`scim_workspace`, `scim_repo`, `scim_err`, `rfc3339`,
 //! `parse_filter`, `is_unique_violation`) via `use super::*;`.
 
-use super::*;
+use super::{Deserialize, AppState, UserGroupRepo, AeroResult, UserGroupId, FromStr, AeroError, UserGroup, ParticipantId, ScimGroup, ScimGroupMember, SCHEMA_GROUP, ScimMeta, rfc3339, WorkspaceId, State, Query, HeaderMap, Response, scim_workspace, scim_err, IntoResponse, Json, ScimListResponse, Path, StatusCode, parse_filter, validate_patch_operation_count};
 use aero_storage::user_group::{ScimGroupMutation, ScimGroupWrite, UserGroupWriteError};
 
 // ============================================================ Group handlers
@@ -94,7 +94,7 @@ pub fn slugify_handle(display_name: &str) -> String {
 /// Map a stored [`UserGroup`] + its member participant ids to the RFC 7643
 /// `Group` resource. `members` carry only `value` (the participant id); SCIM
 /// `display` is left `None` (best-effort — populating it would require a
-/// per-member participant lookup the IdP does not need for reconciliation).
+/// per-member participant lookup the `IdP` does not need for reconciliation).
 fn to_scim_group(group: &UserGroup, members: &[ParticipantId]) -> ScimGroup {
     let group_members = members
         .iter()
@@ -162,7 +162,7 @@ fn map_group_write_error(error: UserGroupWriteError) -> AeroError {
     }
 }
 
-fn committed_scim_group(write: ScimGroupWrite) -> ScimGroup {
+fn committed_scim_group(write: &ScimGroupWrite) -> ScimGroup {
     to_scim_group(&write.group, &write.members)
 }
 
@@ -185,7 +185,7 @@ pub(super) async fn list_groups(
         Ok(page) => page,
         Err(e) => return scim_err(&AeroError::from(e)),
     };
-    let resources = page.into_iter().map(committed_scim_group).collect();
+    let resources = page.into_iter().map(|w| committed_scim_group(&w)).collect();
     Json(ScimListResponse::new(resources, total, start_index)).into_response()
 }
 
@@ -258,7 +258,7 @@ pub(super) async fn create_group(
         Ok(g) => g,
         Err(error) => return scim_err(&map_group_write_error(error)),
     };
-    (StatusCode::CREATED, Json(committed_scim_group(group))).into_response()
+    (StatusCode::CREATED, Json(committed_scim_group(&group))).into_response()
 }
 
 /// `PUT /scim/v2/Groups/:id` — replace a group (RFC 7644 §3.5.1): set its
@@ -296,7 +296,7 @@ pub(super) async fn put_group(
         Ok(group) => group,
         Err(error) => return scim_err(&map_group_write_error(error)),
     };
-    Json(committed_scim_group(group)).into_response()
+    Json(committed_scim_group(&group)).into_response()
 }
 
 /// `DELETE /scim/v2/Groups/:id` — delete the group (its memberships cascade).
@@ -373,7 +373,7 @@ pub(super) fn member_values_from(value: &serde_json::Value) -> Vec<String> {
 }
 
 /// Parse a SCIM Group PATCH body into the ordered list of actions we apply.
-/// Supports the member mutations every real IdP sends — `add`/`remove` on the
+/// Supports the member mutations every real `IdP` sends — `add`/`remove` on the
 /// `members` path (RFC 7644 §3.5.2.1/§3.5.2.3), including a targeted
 /// `members[value eq "<id>"]` remove — plus a `replace` of `displayName`.
 /// Unknown ops/paths are skipped (a documented seam). Pure (no I/O).
@@ -477,7 +477,7 @@ pub(super) async fn patch_group(
         Ok(group) => group,
         Err(error) => return scim_err(&map_group_write_error(error)),
     };
-    Json(committed_scim_group(group)).into_response()
+    Json(committed_scim_group(&group)).into_response()
 }
 
 /// Parse the `members[].value`s of a SCIM Group body into typed participant ids,

@@ -113,8 +113,8 @@ impl AiJobRepo {
             AiJobKind::Answer => "answer",
         };
         sqlx::query(
-            r#"INSERT INTO ai_jobs (id, kind, target_id, workspace_id, status, payload, priority)
-               VALUES ($1, $2, $3, $4, 'queued', $5, $6)"#,
+            r"INSERT INTO ai_jobs (id, kind, target_id, workspace_id, status, payload, priority)
+               VALUES ($1, $2, $3, $4, 'queued', $5, $6)",
         )
         .bind(uuid::Uuid::from_u128(id.0))
         .bind(kind_s)
@@ -147,13 +147,13 @@ impl AiJobRepo {
             AiJobKind::Answer => "answer",
         };
         let res = sqlx::query(
-            r#"INSERT INTO ai_jobs (id, kind, target_id, workspace_id, status, payload, priority)
+            r"INSERT INTO ai_jobs (id, kind, target_id, workspace_id, status, payload, priority)
                SELECT $1, $2, $3, $4, 'queued', $5, $6
                 WHERE NOT EXISTS (
                     SELECT 1 FROM ai_jobs
                      WHERE kind = $2 AND target_id = $3
                        AND status IN ('queued', 'running')
-                )"#,
+                )",
         )
         .bind(uuid::Uuid::from_u128(id.0))
         .bind(kind_s)
@@ -171,7 +171,7 @@ impl AiJobRepo {
     pub async fn claim(&self, n: i32) -> Result<Vec<AiJob>, sqlx::Error> {
         let n = n.clamp(1, 64);
         let rows = sqlx::query_as::<_, AiJobRow>(
-            r#"UPDATE ai_jobs SET status = 'running', started_at = NOW(), attempts = attempts + 1
+            r"UPDATE ai_jobs SET status = 'running', started_at = NOW(), attempts = attempts + 1
                 WHERE id IN (
                     SELECT id FROM ai_jobs
                      WHERE status = 'queued'
@@ -181,7 +181,7 @@ impl AiJobRepo {
                      LIMIT $1
                 )
                 RETURNING id, kind, target_id, workspace_id, status, attempts, payload, result,
-                          error, scheduled_at, started_at, finished_at"#,
+                          error, scheduled_at, started_at, finished_at",
         )
         .bind(n)
         .fetch_all(&self.pool)
@@ -191,9 +191,9 @@ impl AiJobRepo {
 
     pub async fn complete(&self, id: Ulid, result: serde_json::Value) -> Result<(), sqlx::Error> {
         sqlx::query(
-            r#"UPDATE ai_jobs
+            r"UPDATE ai_jobs
                   SET status = 'done', result = $2, finished_at = NOW()
-                WHERE id = $1"#,
+                WHERE id = $1",
         )
         .bind(uuid::Uuid::from_u128(id.0))
         .bind(&result)
@@ -204,7 +204,7 @@ impl AiJobRepo {
 
     pub async fn fail(&self, id: Ulid, error: &str, max_attempts: i32) -> Result<(), sqlx::Error> {
         sqlx::query(
-            r#"UPDATE ai_jobs SET
+            r"UPDATE ai_jobs SET
                  status = CASE WHEN attempts >= $3 THEN 'dead' ELSE 'queued' END,
                  error = $2,
                  finished_at = CASE WHEN attempts >= $3 THEN NOW() ELSE NULL END,
@@ -212,7 +212,7 @@ impl AiJobRepo {
                                      THEN scheduled_at
                                      ELSE NOW() + (LEAST(attempts, 5) * INTERVAL '5 seconds')
                                 END
-               WHERE id = $1"#,
+               WHERE id = $1",
         )
         .bind(uuid::Uuid::from_u128(id.0))
         .bind(error)
@@ -536,7 +536,7 @@ mod db_tests {
             .execute(pool)
             .await
             .ok();
-        let workspaces = workspaces.iter().map(|id| id.to_uuid()).collect::<Vec<_>>();
+        let workspaces = workspaces.iter().map(aero_common::WorkspaceId::to_uuid).collect::<Vec<_>>();
         sqlx::query("DELETE FROM workspaces WHERE id = ANY($1)")
             .bind(&workspaces)
             .execute(pool)
@@ -544,7 +544,7 @@ mod db_tests {
             .ok();
         let participants = participants
             .iter()
-            .map(|id| id.to_uuid())
+            .map(aero_common::ParticipantId::to_uuid)
             .collect::<Vec<_>>();
         sqlx::query("DELETE FROM participants WHERE id = ANY($1)")
             .bind(&participants)

@@ -88,7 +88,7 @@ async fn create_tier(
     }
     let benefits = req
         .benefits
-        .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
+        .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::default()));
     let tier = repo(&s)
         .create(creator, name, req.price_cents, benefits)
         .await?;

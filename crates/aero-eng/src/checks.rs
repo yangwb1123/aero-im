@@ -109,6 +109,9 @@ fn detail_json(checked: usize, violations: &[FileViolation]) -> serde_json::Valu
     })
 }
 
+// Private gate helper with a fixed parameter set; grouping into a struct would
+// churn the single call site for no behavioral gain.
+#[allow(clippy::too_many_arguments)]
 fn scan_dir(
     dir: &Path,
     ext: &str,
@@ -141,7 +144,7 @@ fn scan_dir(
             );
         } else if path
             .extension()
-            .map_or(false, |e| e == ext.trim_start_matches('.'))
+            .is_some_and(|e| e == ext.trim_start_matches('.'))
         {
             *checked += 1;
             let lines = line_count(&path);
@@ -289,7 +292,10 @@ pub fn check_deps(root: &Path) -> Outcome {
         let crate_dir = root.join("crates").join(member);
         let cargo_path = crate_dir.join("Cargo.toml");
         if !cargo_path.exists() {
-            violations.push(format!("{member}: Cargo.toml not found at {cargo_path:?}"));
+            violations.push(format!(
+                "{member}: Cargo.toml not found at {}",
+                cargo_path.display()
+            ));
             continue;
         }
         let content = match std::fs::read_to_string(&cargo_path) {
@@ -318,14 +324,11 @@ pub fn check_deps(root: &Path) -> Outcome {
 
             // Find the allowed deps for this crate
             let allowed = ALLOWED_DEPS.iter().find(|(n, _)| *n == member);
-            let allowed_deps = match allowed {
-                Some((_, ad)) => ad,
-                None => {
-                    violations.push(format!(
-                        "{member}: unknown crate (not in architecture rules)"
-                    ));
-                    continue;
-                }
+            let Some((_, allowed_deps)) = allowed else {
+                violations.push(format!(
+                    "{member}: unknown crate (not in architecture rules)"
+                ));
+                continue;
             };
 
             if !allowed_deps.contains(&dep.as_str()) {
@@ -400,7 +403,7 @@ fn parse_workspace_members(content: &str) -> Vec<String> {
 
 /// Extract crate name from a path like `"crates/aero-common"`.
 fn extract_crate_name(path: &str) -> String {
-    path.split('/').last().unwrap_or(path).to_owned()
+    path.split('/').next_back().unwrap_or(path).to_owned()
 }
 
 /// Extract dependency names from a Cargo.toml content.
@@ -435,8 +438,8 @@ fn parse_deps(content: &str) -> Vec<String> {
         if let Some(eq_pos) = trimmed.find('=') {
             let mut name = trimmed[..eq_pos].trim().to_owned();
             // Strip ".workspace" suffix
-            if let Some(stripped) = name.strip_suffix(".workspace") {
-                name = stripped.to_owned();
+            if let Some(stripped_len) = name.strip_suffix(".workspace").map(str::len) {
+                name.truncate(stripped_len);
             }
             // Only internal crates
             if name.starts_with("aero-") {
@@ -516,7 +519,7 @@ fn scan_todos(dir: &Path, todos: &mut Vec<serde_json::Value>) {
                 continue;
             }
             scan_todos(&path, todos);
-        } else if path.extension().map_or(false, |e| e == "rs") {
+        } else if path.extension().is_some_and(|e| e == "rs") {
             if let Ok(content) = std::fs::read_to_string(&path) {
                 for (i, line) in content.lines().enumerate() {
                     let trimmed = line.trim();
@@ -540,7 +543,7 @@ fn scan_todos(dir: &Path, todos: &mut Vec<serde_json::Value>) {
 #[must_use]
 pub fn check_readme(root: &Path) -> Outcome {
     let members = parse_workspace_members(
-        &std::fs::read_to_string(&root.join("Cargo.toml")).unwrap_or_default(),
+        &std::fs::read_to_string(root.join("Cargo.toml")).unwrap_or_default(),
     );
     let mut missing: Vec<String> = Vec::new();
     for m in &members {

@@ -67,8 +67,8 @@ impl StreamRepo {
         };
         let key = new.stream_key.unwrap_or_else(random_key);
         sqlx::query(
-            r#"INSERT INTO streams (id, owner_id, room_id, title, stream_key, status, protocol, created_at)
-               VALUES ($1, $2, $3, $4, $5, 'idle', $6, $7)"#,
+            r"INSERT INTO streams (id, owner_id, room_id, title, stream_key, status, protocol, created_at)
+               VALUES ($1, $2, $3, $4, $5, 'idle', $6, $7)",
         )
         .bind(uuid::Uuid::from_u128(id.0))
         .bind(new.owner_id.to_uuid())
@@ -96,12 +96,12 @@ impl StreamRepo {
         })
     }
 
-    /// Look up by stream_key — used by RTMP ingest at publish-time.
+    /// Look up by `stream_key` — used by RTMP ingest at publish-time.
     pub async fn get_by_key(&self, key: &str) -> Result<Option<Stream>, sqlx::Error> {
         let row = sqlx::query_as::<_, StreamRow>(
-            r#"SELECT id, owner_id, room_id, title, stream_key, status, hls_path, protocol,
+            r"SELECT id, owner_id, room_id, title, stream_key, status, hls_path, protocol,
                       started_at, ended_at, created_at
-               FROM streams WHERE stream_key = $1"#,
+               FROM streams WHERE stream_key = $1",
         )
         .bind(key)
         .fetch_optional(&self.pool)
@@ -111,9 +111,9 @@ impl StreamRepo {
 
     pub async fn get(&self, id: Ulid) -> Result<Option<Stream>, sqlx::Error> {
         let row = sqlx::query_as::<_, StreamRow>(
-            r#"SELECT id, owner_id, room_id, title, stream_key, status, hls_path, protocol,
+            r"SELECT id, owner_id, room_id, title, stream_key, status, hls_path, protocol,
                       started_at, ended_at, created_at
-               FROM streams WHERE id = $1"#,
+               FROM streams WHERE id = $1",
         )
         .bind(uuid::Uuid::from_u128(id.0))
         .fetch_optional(&self.pool)
@@ -262,7 +262,7 @@ impl StreamRepo {
     }
 
     pub async fn mark_ended(&self, id: Ulid) -> Result<(), sqlx::Error> {
-        sqlx::query(r#"UPDATE streams SET status = 'ended', ended_at = NOW() WHERE id = $1"#)
+        sqlx::query(r"UPDATE streams SET status = 'ended', ended_at = NOW() WHERE id = $1")
             .bind(uuid::Uuid::from_u128(id.0))
             .execute(&self.pool)
             .await?;
@@ -271,9 +271,9 @@ impl StreamRepo {
 
     pub async fn list_live(&self) -> Result<Vec<Stream>, sqlx::Error> {
         let rows = sqlx::query_as::<_, StreamRow>(
-            r#"SELECT id, owner_id, room_id, title, stream_key, status, hls_path, protocol,
+            r"SELECT id, owner_id, room_id, title, stream_key, status, hls_path, protocol,
                       started_at, ended_at, created_at
-               FROM streams WHERE status = 'live' ORDER BY started_at DESC NULLS LAST"#,
+               FROM streams WHERE status = 'live' ORDER BY started_at DESC NULLS LAST",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -288,9 +288,10 @@ fn random_key() -> String {
 }
 
 fn hex_encode(b: &[u8]) -> String {
+    use std::fmt::Write as _;
     let mut s = String::with_capacity(b.len() * 2);
     for byte in b {
-        s.push_str(&format!("{byte:02x}"));
+        write!(s, "{byte:02x}").expect("write to String cannot fail");
     }
     s
 }
@@ -310,6 +311,33 @@ struct StreamRow {
     created_at: time::OffsetDateTime,
 }
 
+impl From<StreamRow> for Stream {
+    fn from(r: StreamRow) -> Self {
+        let status = match r.status.as_str() {
+            "live" => StreamStatus::Live,
+            "ended" => StreamStatus::Ended,
+            _ => StreamStatus::Idle,
+        };
+        let protocol = match r.protocol.as_str() {
+            "whip" => StreamProtocol::Whip,
+            "srt" => StreamProtocol::Srt,
+            _ => StreamProtocol::Rtmp,
+        };
+        Self {
+            id: Ulid(r.id.as_u128()),
+            owner_id: ParticipantId::from_uuid(r.owner_id),
+            room_id: r.room_id.map(RoomId::from_uuid),
+            title: r.title,
+            stream_key: r.stream_key,
+            status,
+            hls_path: r.hls_path,
+            protocol,
+            started_at: r.started_at,
+            ended_at: r.ended_at,
+            created_at: r.created_at,
+        }
+    }
+}
 /// PG-gated integration tests (run with a live Postgres + applied migrations):
 ///
 /// ```text
@@ -691,33 +719,5 @@ mod db_tests {
             .execute(&p)
             .await
             .ok();
-    }
-}
-
-impl From<StreamRow> for Stream {
-    fn from(r: StreamRow) -> Self {
-        let status = match r.status.as_str() {
-            "live" => StreamStatus::Live,
-            "ended" => StreamStatus::Ended,
-            _ => StreamStatus::Idle,
-        };
-        let protocol = match r.protocol.as_str() {
-            "whip" => StreamProtocol::Whip,
-            "srt" => StreamProtocol::Srt,
-            _ => StreamProtocol::Rtmp,
-        };
-        Self {
-            id: Ulid(r.id.as_u128()),
-            owner_id: ParticipantId::from_uuid(r.owner_id),
-            room_id: r.room_id.map(RoomId::from_uuid),
-            title: r.title,
-            stream_key: r.stream_key,
-            status,
-            hls_path: r.hls_path,
-            protocol,
-            started_at: r.started_at,
-            ended_at: r.ended_at,
-            created_at: r.created_at,
-        }
     }
 }

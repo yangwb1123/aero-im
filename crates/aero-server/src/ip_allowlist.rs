@@ -385,8 +385,7 @@ async fn add_allowlist(
     let note = req.note.as_deref().map(str::trim).filter(|n| !n.is_empty());
     let entry = IpAllowlistRepo::new(s.pg.clone())
         .add_authorized(ws, &cidr, note, auth.participant_id)
-        .await
-        .map_err(AeroError::from)?;
+        .await?;
     Ok(Json(serde_json::to_value(entry).map_err(AeroError::from)?))
 }
 
@@ -407,8 +406,7 @@ async fn remove_allowlist(
     let cidr = req.cidr.trim();
     let removed = IpAllowlistRepo::new(s.pg.clone())
         .remove_authorized(ws, cidr, auth.participant_id)
-        .await
-        .map_err(AeroError::from)?;
+        .await?;
     if removed {
         Ok(StatusCode::NO_CONTENT)
     } else {

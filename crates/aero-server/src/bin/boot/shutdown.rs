@@ -11,7 +11,7 @@ pub(crate) async fn shutdown_signal(
     let ctrl_c = async {
         tokio::signal::ctrl_c()
             .await
-            .expect("ctrl-c handler failed")
+            .expect("ctrl-c handler failed");
     };
 
     #[cfg(unix)]
@@ -26,7 +26,7 @@ pub(crate) async fn shutdown_signal(
     let terminate = std::future::pending::<()>();
 
     tokio::select! {
-        _ = ctrl_c => {}
+        () = ctrl_c => {}
         _ = terminate => {}
     }
 

@@ -12,12 +12,12 @@ async fn main() {
         println!("aero-eng v{}", env!("CARGO_PKG_VERSION"));
         return;
     }
-    let cmd = args.get(1).map(String::as_str).unwrap_or("help");
+    let cmd = args.get(1).map_or("help", String::as_str);
     let ctx = ExecutionContext::new(std::env::current_dir().unwrap_or_default());
     let mut reg = CommandRegistry::new();
     macro_rules! a {
         ($c:expr) => {
-            reg = reg.add(Box::new($c));
+            reg = reg.with_command(Box::new($c));
         };
     }
     a!(Check_);
@@ -102,12 +102,12 @@ c!(Test_, "test", "Run cargo test (lib)", |_ctx, _args| {
     aero_eng::run::cargo_test_lib().await
 });
 c!(Gate_, "gate", "Run engineering gates", |ctx, args| {
-    let sub = args.get(2).map(|s| s.as_str()).unwrap_or("list");
-    let sd = ctx.root.join("scripts");
-    let f = |n: &str| -> String { sd.join(n).to_string_lossy().to_string() };
     async fn b(p: String, t: u64) -> Outcome {
         aero_eng::run::run_cmd("bash", &[&p], std::time::Duration::from_secs(t)).await
     }
+    let sub = args.get(2).map_or("list", std::string::String::as_str);
+    let sd = ctx.root.join("scripts");
+    let f = |n: &str| -> String { sd.join(n).to_string_lossy().to_string() };
     match sub {
         "list" => Outcome::ok(
             "filesize truth web deps complexity filesize-native deps-native workspace-members todos metadata readme all",
@@ -188,24 +188,27 @@ c!(Gate_, "gate", "Run engineering gates", |ctx, args| {
     }
 });
 c!(Skill_, "skill", "List/view/run skills", |ctx, args| {
-    let sub = args.get(2).map(|s| s.as_str()).unwrap_or("list");
+    let sub = args.get(2).map_or("list", std::string::String::as_str);
     let sk = ctx.root.join("skills");
     match sub {
         "list" => {
             if let Ok(e) = std::fs::read_dir(&sk) {
                 for en in e.flatten() {
                     let n = en.file_name().to_string_lossy().to_string();
-                    if n.ends_with(".md") {
+                    if std::path::Path::new(&n)
+                        .extension()
+                        .is_some_and(|e| e.eq_ignore_ascii_case("md"))
+                    {
                         println!("  {} [doc]", &n[..n.len() - 3]);
                     } else if en.path().is_dir() {
-                        println!("  {} [exec]", n);
+                        println!("  {n} [exec]");
                     }
                 }
             }
             Outcome::ok("")
         }
         "view" => {
-            let n = args.get(3).map(|s| s.as_str()).unwrap_or("");
+            let n = args.get(3).map_or("", std::string::String::as_str);
             let p = sk.join(format!("{n}.md"));
             if p.exists() {
                 println!("{}", std::fs::read_to_string(&p).unwrap_or_default());
@@ -215,7 +218,7 @@ c!(Skill_, "skill", "List/view/run skills", |ctx, args| {
             }
         }
         "run" => {
-            let n = args.get(3).map(|s| s.as_str()).unwrap_or("");
+            let n = args.get(3).map_or("", std::string::String::as_str);
             if n.is_empty() {
                 return Outcome::error("need name");
             }
@@ -256,9 +259,8 @@ c!(
             }
         );
         println!(
-            "  {} Config file     {}",
-            term::info(""),
-            "skip (lightweight binary)"
+            "  {} Config file     skip (lightweight binary)",
+            term::info("")
         );
         let g = std::process::Command::new("git")
             .args(["rev-parse", "--git-dir"])
@@ -272,15 +274,14 @@ c!(
                 .current_dir(&ctx.root)
                 .output()
                 .ok()
-                .map(|o| String::from_utf8_lossy(&o.stdout).lines().count())
-                .unwrap_or(0);
+                .map_or(0, |o| String::from_utf8_lossy(&o.stdout).lines().count());
             println!(
                 "  {} Git status      {}",
                 term::info(""),
                 if d == 0 {
                     term::ok("clean")
                 } else {
-                    term::warn(&format!("{d} dirty"))
+                    term::warn(format!("{d} dirty"))
                 }
             );
         } else {
@@ -304,9 +305,9 @@ c!(
     "Shell completion bash|zsh|fish",
     |_ctx, args| {
         let cmds = "check gate test skill doctor network completion help";
-        match args.get(2).map(|s| s.as_str()).unwrap_or("") {
+        match args.get(2).map_or("", std::string::String::as_str) {
             "bash" => {
-                println!("complete -W '{}' aero-eng", cmds);
+                println!("complete -W '{cmds}' aero-eng");
                 Outcome::ok("")
             }
             "zsh" => {
@@ -314,7 +315,7 @@ c!(
                 Outcome::ok("")
             }
             "fish" => {
-                println!("complete -c aero-eng -f -a '{}'", cmds);
+                println!("complete -c aero-eng -f -a '{cmds}'");
                 Outcome::ok("")
             }
             _ => Outcome::error("usage: completion bash|zsh|fish"),
@@ -328,7 +329,7 @@ c!(
     "Network diagnostics: ping, dns, port",
     |_ctx, args| {
         use aero_eng::term;
-        let sub = args.get(2).map(|s| s.as_str()).unwrap_or("help");
+        let sub = args.get(2).map_or("help", std::string::String::as_str);
         match sub {
             "help" => {
                 println!("network commands:");
@@ -338,7 +339,7 @@ c!(
                 Outcome::ok("")
             }
             "ping" => {
-                let host = args.get(3).map(|s| s.as_str()).unwrap_or("");
+                let host = args.get(3).map_or("", std::string::String::as_str);
                 if host.is_empty() {
                     return Outcome::error("Usage: network ping <host>");
                 }
@@ -364,7 +365,7 @@ c!(
                 }
             }
             "dns" => {
-                let domain = args.get(3).map(|s| s.as_str()).unwrap_or("");
+                let domain = args.get(3).map_or("", std::string::String::as_str);
                 if domain.is_empty() {
                     return Outcome::error("Usage: network dns <domain>");
                 }
@@ -389,7 +390,7 @@ c!(
                 }
             }
             "port" => {
-                let target = args.get(3).map(|s| s.as_str()).unwrap_or("");
+                let target = args.get(3).map_or("", std::string::String::as_str);
                 if target.is_empty() {
                     return Outcome::error("Usage: network port <host:port>");
                 }
@@ -404,17 +405,14 @@ c!(
                 let host = host_port[0];
                 println!("  ▶ Checking {host}:{port}...");
                 let start = std::time::Instant::now();
-                match tokio::net::TcpStream::connect((host, port)).await {
-                    Ok(_) => {
-                        let ms = start.elapsed().as_secs_f64() * 1000.0;
-                        println!("  {} {:.0}ms - port OPEN", term::ok(""), ms);
-                        Outcome::ok("")
-                    }
-                    Err(_) => {
-                        let ms = start.elapsed().as_secs_f64() * 1000.0;
-                        println!("  {} {:.0}ms - port CLOSED/filtered", term::err(""), ms);
-                        Outcome::error("port closed")
-                    }
+                if tokio::net::TcpStream::connect((host, port)).await.is_ok() {
+                    let ms = start.elapsed().as_secs_f64() * 1000.0;
+                    println!("  {} {:.0}ms - port OPEN", term::ok(""), ms);
+                    Outcome::ok("")
+                } else {
+                    let ms = start.elapsed().as_secs_f64() * 1000.0;
+                    println!("  {} {:.0}ms - port CLOSED/filtered", term::err(""), ms);
+                    Outcome::error("port closed")
                 }
             }
             _ => Outcome::error("use: network ping|dns|port|help"),
@@ -442,7 +440,7 @@ c!(
         let mut sp = term::Spinner::new("Outcome::merge x100000");
         sp.tick();
         let start = Instant::now();
-        for _ in 0..100000 {
+        for _ in 0..100_000 {
             let outcomes = vec![O::ok("a"), O::error("b"), O::skip("c")];
             let _ = O::merge(&outcomes);
         }
@@ -568,40 +566,39 @@ c!(
 
         // Project stats
         let crate_count = std::fs::read_dir(ctx.root.join("crates"))
-            .map(|e| e.count())
+            .map(std::iter::Iterator::count)
             .unwrap_or(0);
         let rs_files = count_rs(&ctx.root.join("crates"));
         let mig_count = std::fs::read_dir(ctx.root.join("migrations"))
-            .map(|e| e.count())
+            .map(std::iter::Iterator::count)
             .unwrap_or(0);
         let js_files = std::fs::read_dir(ctx.root.join("web"))
             .map(|e| {
                 e.filter(|e| {
                     e.as_ref()
-                        .map(|e| e.path().extension().map_or(false, |x| x == "js"))
+                        .map(|e| e.path().extension().is_some_and(|x| x == "js"))
                         .unwrap_or(false)
                 })
                 .count()
             })
             .unwrap_or(0);
-        println!("");
+        println!();
         println!("  {} Crates:    {}", term::info(""), crate_count);
         println!("  {} Rust src:  {} files", term::info(""), rs_files);
         println!("  {} Migrations: {} files", term::info(""), mig_count);
         println!("  {} Web:       {} JS files", term::info(""), js_files);
 
         // Test stats (from last run)
-        println!("");
+        println!();
         println!(
-            "  {} Tests {}",
-            term::header(""),
-            "(run 'aero-cli test' to refresh)"
+            "  {} Tests (run 'aero-cli test' to refresh)",
+            term::header("")
         );
         println!("  {} Run: aero-cli test --workspace --lib", term::info(""));
         println!("  {} Integration: aero-cli integration", term::info(""));
 
         // Git
-        println!("");
+        println!();
         let g = std::process::Command::new("git")
             .args(["rev-parse", "--git-dir"])
             .current_dir(&ctx.root)
@@ -628,8 +625,7 @@ c!(
                 .current_dir(&ctx.root)
                 .output()
                 .ok()
-                .map(|o| String::from_utf8_lossy(&o.stdout).lines().count())
-                .unwrap_or(0);
+                .map_or(0, |o| String::from_utf8_lossy(&o.stdout).lines().count());
             println!("  {} Branch:    {}", term::info(""), branch);
             println!("  {} Last:      {}", term::info(""), last);
             println!(
@@ -638,12 +634,12 @@ c!(
                 if dirty == 0 {
                     term::ok("clean")
                 } else {
-                    term::warn(&dirty.to_string())
+                    term::warn(dirty.to_string())
                 }
             );
         }
 
-        println!("");
+        println!();
         println!("  {}", "=".repeat(50));
         Outcome::ok("dashboard")
     }
@@ -664,7 +660,7 @@ fn count_rs(dir: &std::path::Path) -> usize {
                 {
                     n += count_rs(&p);
                 }
-            } else if p.extension().map_or(false, |x| x == "rs") {
+            } else if p.extension().is_some_and(|x| x == "rs") {
                 n += 1;
             }
         }

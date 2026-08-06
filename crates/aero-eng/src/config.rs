@@ -10,21 +10,13 @@ use serde::Deserialize;
 /// Top-level engineering configuration.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct EngineeringConfig {
     pub filesize: FilesizeConfig,
     pub complexity: ComplexityConfig,
     pub check: CheckConfig,
 }
 
-impl Default for EngineeringConfig {
-    fn default() -> Self {
-        Self {
-            filesize: FilesizeConfig::default(),
-            complexity: ComplexityConfig::default(),
-            check: CheckConfig::default(),
-        }
-    }
-}
 
 impl EngineeringConfig {
     /// Load from `engineering.toml` at the project root. Returns defaults if
@@ -130,14 +122,14 @@ mod tests {
 
     #[test]
     fn config_round_trip_via_toml() {
-        let toml_str = r#"
+        let toml_str = r"
 [filesize]
 rust_warn = 500
 rust_hard = 1000
 [complexity]
 warn = 10
 hard = 25
-"#;
+";
         let cfg: EngineeringConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(cfg.filesize.rust_warn, 500);
         assert_eq!(cfg.filesize.rust_hard, 1000);
@@ -149,9 +141,9 @@ hard = 25
 
     #[test]
     fn config_defaults_for_missing_sections() {
-        let toml_str = r#"[filesize]
+        let toml_str = r"[filesize]
 rust_warn = 300
-"#;
+";
         let cfg: EngineeringConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(cfg.filesize.rust_warn, 300);
         // Defaults for unspecified fields

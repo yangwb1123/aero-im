@@ -212,21 +212,21 @@ pub(crate) async fn persist_blob_upload(
         let key = match s.blob_store.put(reservation.id, bytes).await {
             Ok(key) => key,
             Err(error) => {
-                abort_blob_reservation(&s, reservation.id).await;
+                abort_blob_reservation(s, reservation.id).await;
                 return Err(AeroError::Internal(anyhow::anyhow!("blob put: {error}")).into());
             }
         };
         let blob = match s.blobs.finalize(reservation.id, &key).await {
             Ok(Some(blob)) => blob,
             Ok(None) => {
-                abort_blob_reservation(&s, reservation.id).await;
+                abort_blob_reservation(s, reservation.id).await;
                 return Err(AeroError::Internal(anyhow::anyhow!(
                     "blob reservation disappeared before finalize"
                 ))
                 .into());
             }
             Err(error) => {
-                abort_blob_reservation(&s, reservation.id).await;
+                abort_blob_reservation(s, reservation.id).await;
                 return Err(AeroError::from(error).into());
             }
         };

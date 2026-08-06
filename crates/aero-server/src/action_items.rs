@@ -211,7 +211,7 @@ fn map_batch_error(error: ActionItemBatchError) -> AeroError {
     }
 }
 
-fn map_action_item_ai_error(error: String) -> AeroError {
+fn map_action_item_ai_error(error: &str) -> AeroError {
     if error.contains("provider reservation is already active") {
         return AeroError::Conflict(
             "an action-item request with this Idempotency-Key is still in progress; retry it"
@@ -286,7 +286,7 @@ async fn action_items(
     let answer = ai
         .answer_question_with_usage_context(room, EXTRACT_PROMPT, k, usage_context)
         .await
-        .map_err(map_action_item_ai_error)?;
+        .map_err(|e| map_action_item_ai_error(&e))?;
 
     let mut body = serde_json::json!({
         "action_items": answer.answer,
@@ -396,12 +396,11 @@ mod tests {
     fn concurrent_paid_reservation_maps_to_retryable_idempotency_conflict() {
         let error = map_action_item_ai_error(
             "storage: AI usage accounting: provider reservation is already active \
-             (usage_id=00000000-0000-0000-0000-000000000000, kind=answer)"
-                .into(),
+             (usage_id=00000000-0000-0000-0000-000000000000, kind=answer)",
         );
         assert!(matches!(error, AeroError::Conflict(message) if message.contains("retry")));
         assert!(matches!(
-            map_action_item_ai_error("provider timed out".into()),
+            map_action_item_ai_error("provider timed out"),
             AeroError::Upstream(_)
         ));
     }

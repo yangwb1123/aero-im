@@ -1,20 +1,20 @@
 //! Enterprise SSO via **SAML 2.0** — Service Provider (SP) endpoints.
 //!
 //! This complements the OIDC relying-party flow in [`crate::sso`] for the large
-//! installed base of traditional enterprise IdPs (ADFS, Shibboleth, PingFederate,
+//! installed base of traditional enterprise `IdPs` (ADFS, Shibboleth, `PingFederate`,
 //! Okta classic, …) that speak SAML rather than OIDC. The SP exposes three
 //! endpoints, mirroring the OIDC module's *JIT-provisioning* style:
 //!
 //! * `GET  /saml/metadata` — SP metadata XML (entity id, ACS endpoint, binding).
-//! * `GET  /saml/login`    — build an `AuthnRequest` and 302 to the IdP's SSO URL
+//! * `GET  /saml/login`    — build an `AuthnRequest` and 302 to the `IdP`'s SSO URL
 //!   via the **HTTP-Redirect binding** (DEFLATE + base64 + url-encode).
-//! * `POST /saml/acs`      — Assertion Consumer Service: receive the IdP's
+//! * `POST /saml/acs`      — Assertion Consumer Service: receive the `IdP`'s
 //!   `SAMLResponse`, **verify its XML signature**, extract the `NameID` +
 //!   attributes, JIT-provision a participant, and mint *our own* session tokens.
 //!
 //! # ⚠️ Security posture: signature verification is FAIL-CLOSED by default
 //!
-//! The security core of SAML is the **XML digital signature** on the IdP's
+//! The security core of SAML is the **XML digital signature** on the `IdP`'s
 //! assertion (XML-DSig + canonicalization, per the W3C spec). Hand-rolling that
 //! is a notorious source of vulnerabilities (signature-wrapping / XSW, canonical-
 //! ization mismatches, comment-truncation, …) and **must never be faked**.
@@ -33,7 +33,7 @@
 //! is **off by default** and only runs when the operator sets
 //! `AERO_SAML_EXPERIMENTAL_VERIFY=1`.
 //! Enabling it supports **SP-initiated SSO only**: `/saml/login` records each
-//! AuthnRequest ID in Redis for five minutes, and `/saml/acs` atomically
+//! `AuthnRequest` ID in Redis for five minutes, and `/saml/acs` atomically
 //! consumes that ID. The signed assertion must carry matching
 //! `InResponseTo`, `Destination`/bearer `Recipient`, this SP's audience, and a
 //! validity window no wider than ten minutes. A fixed 90-second clock skew is
@@ -51,7 +51,7 @@
 //! ## Pure-Rust XML-DSig survey (2026-06, why still fail-closed)
 //!
 //! The hardest, most security-critical piece is **exclusive C14N**
-//! (`xml-exc-c14n`): a single canonicalization divergence from the IdP's signer
+//! (`xml-exc-c14n`): a single canonicalization divergence from the `IdP`'s signer
 //! is a signature *bypass*, not a benign mismatch. The crypto primitives this
 //! would need (`rsa`, `ring`, `sha2`, `x509-cert`/`x509-parser`, `der`/`spki`)
 //! are already vetted and in the lockfile; the *gap* is a trustworthy C14N +
@@ -76,7 +76,7 @@
 //! either — that is the canonical way to ship a bypassable verifier.
 //!
 //! Therefore this module ships the **non-cryptographic SP skeleton**: every other
-//! part of the flow is real (metadata, AuthnRequest, base64 decode, assertion
+//! part of the flow is real (metadata, `AuthnRequest`, base64 decode, assertion
 //! field extraction, JIT provisioning), but [`verify_response_signature`] is
 //! **fail-closed**: until a vetted XML-DSig verifier is wired in — `samael` with a
 //! system `xmlsec1`, or a pure-Rust suite (e.g. `bergshamra`) once it has matured
@@ -88,7 +88,7 @@
 //! this module ever provisions a session from an *unverified* assertion.
 //!
 //! SAML is **off by default**: [`SamlConfig::from_env`] returns `None` unless the
-//! deployment configures the IdP entity id / SSO URL / certificate.
+//! deployment configures the `IdP` entity id / SSO URL / certificate.
 
 use aero_common::{Error as AeroError, WorkspaceId};
 use aero_storage::{SsoRepo, SsoResolveError};
@@ -141,23 +141,23 @@ pub fn routes() -> Router<AppState> {
 // Configuration
 // ---------------------------------------------------------------------------
 
-/// Static SAML SP ⇄ IdP configuration.
+/// Static SAML SP ⇄ `IdP` configuration.
 ///
 /// `sp_entity_id` and `acs_url` identify *us* (the Service Provider) in metadata
 /// and in the `AuthnRequest`. `idp_entity_id` / `idp_sso_url` / `idp_cert_pem`
-/// describe the trusted IdP — the certificate is the public key the assertion's
+/// describe the trusted `IdP` — the certificate is the public key the assertion's
 /// XML signature is verified against once verification is wired.
 #[derive(Debug, Clone)]
 pub struct SamlConfig {
     /// Our SP entity id (an absolute URI; conventionally the metadata URL).
     pub sp_entity_id: String,
-    /// Our Assertion Consumer Service URL (where the IdP POSTs the `SAMLResponse`).
+    /// Our Assertion Consumer Service URL (where the `IdP` POSTs the `SAMLResponse`).
     pub acs_url: String,
-    /// The trusted IdP's entity id — checked against the response `<Issuer>`.
+    /// The trusted `IdP`'s entity id — checked against the response `<Issuer>`.
     pub idp_entity_id: String,
-    /// The IdP's SingleSignOn service URL (HTTP-Redirect binding target).
+    /// The `IdP`'s `SingleSignOn` service URL (HTTP-Redirect binding target).
     pub idp_sso_url: String,
-    /// The IdP's signing certificate, PEM-encoded (`-----BEGIN CERTIFICATE-----`).
+    /// The `IdP`'s signing certificate, PEM-encoded (`-----BEGIN CERTIFICATE-----`).
     /// This is the trusted key material the XML-DSig verifier checks the response
     /// signature against (the *only* accepted key — inline `<KeyInfo>` keys are
     /// ignored). Used by the opt-in `bergshamra` path; with the verifier off
@@ -206,7 +206,7 @@ fn require_config() -> Result<SamlConfig, AeroError> {
 /// Render this SP's SAML 2.0 metadata document.
 ///
 /// Advertises our entity id, the ACS endpoint with the **HTTP-POST binding**
-/// (how the IdP returns the `SAMLResponse`), and that we want signed assertions
+/// (how the `IdP` returns the `SAMLResponse`), and that we want signed assertions
 /// (`WantAssertionsSigned="true"` — consistent with the fail-closed posture).
 #[must_use]
 pub fn build_sp_metadata(cfg: &SamlConfig) -> String {
@@ -224,7 +224,7 @@ pub fn build_sp_metadata(cfg: &SamlConfig) -> String {
     )
 }
 
-/// `GET /saml/metadata` — return the SP metadata XML for IdP registration.
+/// `GET /saml/metadata` — return the SP metadata XML for `IdP` registration.
 async fn metadata() -> Result<Response, crate::error::ApiError> {
     let cfg = require_config()?;
     let body = build_sp_metadata(&cfg);
@@ -243,7 +243,7 @@ async fn metadata() -> Result<Response, crate::error::ApiError> {
 ///
 /// `id` must be an XML-id (start with a letter; we prefix `_`). `issue_instant`
 /// is RFC-3339 UTC. The request is unsigned (`AuthnRequestsSigned="false"` in our
-/// metadata); the IdP authenticates the *user*, and we trust the *response*
+/// metadata); the `IdP` authenticates the *user*, and we trust the *response*
 /// signature, not the request.
 #[must_use]
 pub fn build_authn_request(cfg: &SamlConfig, id: &str, issue_instant: &str) -> String {
@@ -259,7 +259,7 @@ pub fn build_authn_request(cfg: &SamlConfig, id: &str, issue_instant: &str) -> S
 
 /// Encode an `AuthnRequest` XML for the **HTTP-Redirect binding**: raw DEFLATE
 /// (RFC 1951, no zlib header) → base64 → percent-encode as the `SAMLRequest`
-/// query parameter. Returns the full redirect URL to the IdP.
+/// query parameter. Returns the full redirect URL to the `IdP`.
 ///
 /// # Errors
 /// Returns an error only if DEFLATE compression fails (effectively never for the
@@ -287,7 +287,7 @@ pub fn redirect_url_for_authn_request(cfg: &SamlConfig, xml: &str) -> Result<Str
     Ok(format!("{}{sep}{qs}", cfg.idp_sso_url))
 }
 
-/// `GET /saml/login` — begin SP-initiated SSO: 302 to the IdP's SSO URL carrying
+/// `GET /saml/login` — begin SP-initiated SSO: 302 to the `IdP`'s SSO URL carrying
 /// a freshly minted `AuthnRequest` (HTTP-Redirect binding).
 async fn login(State(s): State<AppState>) -> Result<Response, crate::error::ApiError> {
     let cfg = require_config()?;
@@ -307,13 +307,13 @@ async fn login(State(s): State<AppState>) -> Result<Response, crate::error::ApiE
 // POST /saml/acs — Assertion Consumer Service
 // ---------------------------------------------------------------------------
 
-/// Form body the IdP POSTs to the ACS (HTTP-POST binding).
+/// Form body the `IdP` POSTs to the ACS (HTTP-POST binding).
 #[derive(Deserialize)]
 struct AcsForm {
     /// Base64-encoded `<samlp:Response>` XML.
     #[serde(rename = "SAMLResponse")]
     saml_response: String,
-    /// Opaque relay state echoed by the IdP. We do not issue one, but bound any
+    /// Opaque relay state echoed by the `IdP`. We do not issue one, but bound any
     /// received value to the SAML HTTP binding's 80-byte limit.
     #[serde(rename = "RelayState", default)]
     relay_state: Option<String>,
@@ -325,7 +325,7 @@ struct AcsForm {
 /// these fields are only trustworthy *after* the XML signature has been verified.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SamlAssertion {
-    /// The response `<Issuer>` — must equal the configured IdP entity id.
+    /// The response `<Issuer>` — must equal the configured `IdP` entity id.
     pub issuer: String,
     /// The subject `<NameID>` — the stable per-IdP user identifier.
     pub name_id: String,
@@ -399,7 +399,7 @@ impl SamlAssertion {
 /// Decode a base64 `SAMLResponse` body to its XML string.
 ///
 /// Accepts standard base64 (the HTTP-POST binding uses standard, *not* url-safe);
-/// whitespace/newlines IdPs sometimes insert are stripped first.
+/// whitespace/newlines `IdPs` sometimes insert are stripped first.
 ///
 /// # Errors
 /// [`AeroError::Invalid`] on non-base64 input or non-UTF-8 decoded bytes.
@@ -469,7 +469,7 @@ fn experimental_verify_enabled() -> bool {
         .unwrap_or(false)
 }
 
-/// XML-signature verification gate for the IdP's `<samlp:Response>`.
+/// XML-signature verification gate for the `IdP`'s `<samlp:Response>`.
 ///
 /// # Default posture: **FAIL-CLOSED**
 ///
@@ -487,7 +487,7 @@ fn experimental_verify_enabled() -> bool {
 /// [`BERGSHAMRA_SECURITY_CAVEAT`].
 ///
 /// When enabled, the full XML-DSig verification sequence runs:
-/// 1. Load `cfg.idp_cert_pem` (the trusted IdP signing cert) into a
+/// 1. Load `cfg.idp_cert_pem` (the trusted `IdP` signing cert) into a
 ///    [`KeysManager`](bergshamra::keys::KeysManager).
 /// 2. [`DsigContext::new`](bergshamra::dsig::DsigContext) → hardened defaults:
 ///    `trusted_keys_only = true` (ignore attacker-supplied inline `<KeyInfo>`
@@ -517,9 +517,9 @@ pub fn verify_response_signature(cfg: &SamlConfig, xml: &str) -> Result<(), Aero
     #[cfg(not(feature = "saml-experimental-bergshamra"))]
     {
         let _ = (cfg, xml);
-        return Err(AeroError::Unauthorized(
+        Err(AeroError::Unauthorized(
             "saml: experimental verifier was not compiled; the default Rust 1.80 build remains fail-closed".into(),
-        ));
+        ))
     }
 
     // ⚠️ SECURITY CAVEAT ⚠️ — everything past here trusts `bergshamra`, a pre-1.0,
@@ -631,7 +631,7 @@ fn enforce_signed_assertion(
     Ok(())
 }
 
-/// `POST /saml/acs` — consume the IdP's `SAMLResponse`.
+/// `POST /saml/acs` — consume the `IdP`'s `SAMLResponse`.
 ///
 /// Flow: decode base64 → **verify XML signature** → validate conditions and
 /// signed identity → atomically consume the request id → JIT-provision → mint
@@ -747,7 +747,7 @@ async fn acs(
 // ---------------------------------------------------------------------------
 
 /// Escape the five XML predefined entities for safe interpolation into our
-/// generated documents (metadata / AuthnRequest).
+/// generated documents (metadata / `AuthnRequest`).
 fn xml_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {

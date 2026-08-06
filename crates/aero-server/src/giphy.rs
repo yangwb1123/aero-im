@@ -255,7 +255,12 @@ fn safe_media_url(raw: &str) -> bool {
         && url.password().is_none()
         && (host.eq_ignore_ascii_case("giphy.com")
             || host.to_ascii_lowercase().ends_with(".giphy.com"))
-        && (path.ends_with(".gif") || path.ends_with(".webp"))
+        && (std::path::Path::new(&path)
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("gif"))
+            || std::path::Path::new(&path)
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("webp")))
 }
 
 fn safe_page_url(raw: &str) -> bool {

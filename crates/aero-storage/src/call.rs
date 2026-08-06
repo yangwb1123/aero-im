@@ -34,8 +34,8 @@ impl CallRepo {
 
         let mut tx = self.pool.begin().await?;
         sqlx::query(
-            r#"INSERT INTO call_sessions (id, room_id, initiator, kind, mode, started_at)
-               VALUES ($1, $2, $3, $4, $5, $6)"#,
+            r"INSERT INTO call_sessions (id, room_id, initiator, kind, mode, started_at)
+               VALUES ($1, $2, $3, $4, $5, $6)",
         )
         .bind(id.to_uuid())
         .bind(room.to_uuid())
@@ -47,8 +47,8 @@ impl CallRepo {
         .await?;
 
         sqlx::query(
-            r#"INSERT INTO call_participants (call_id, participant_id, role, joined_at)
-               VALUES ($1, $2, 'caller', $3) ON CONFLICT DO NOTHING"#,
+            r"INSERT INTO call_participants (call_id, participant_id, role, joined_at)
+               VALUES ($1, $2, 'caller', $3) ON CONFLICT DO NOTHING",
         )
         .bind(id.to_uuid())
         .bind(initiator.to_uuid())
@@ -58,8 +58,8 @@ impl CallRepo {
 
         for callee in callees {
             sqlx::query(
-                r#"INSERT INTO call_participants (call_id, participant_id, role, joined_at)
-                   VALUES ($1, $2, 'callee', $3) ON CONFLICT DO NOTHING"#,
+                r"INSERT INTO call_participants (call_id, participant_id, role, joined_at)
+                   VALUES ($1, $2, 'callee', $3) ON CONFLICT DO NOTHING",
             )
             .bind(id.to_uuid())
             .bind(callee.to_uuid())
@@ -147,7 +147,7 @@ impl CallRepo {
         } else {
             Vec::new()
         };
-        callees.sort_unstable_by_key(|participant| participant.to_uuid());
+        callees.sort_unstable_by_key(aero_common::ParticipantId::to_uuid);
 
         if room_kind == "direct" && direct_call_is_blocked(&mut tx, initiator, &callees).await? {
             return Err(Error::Forbidden("blocked".into()));
@@ -411,9 +411,9 @@ impl CallRepo {
     /// event.
     pub async fn end_if_active(&self, id: CallId, reason: &str) -> Result<bool, sqlx::Error> {
         let result = sqlx::query(
-            r#"UPDATE call_sessions
+            r"UPDATE call_sessions
                   SET ended_at = NOW(), end_reason = $2
-               WHERE id = $1 AND ended_at IS NULL"#,
+               WHERE id = $1 AND ended_at IS NULL",
         )
         .bind(id.to_uuid())
         .bind(reason)
@@ -429,10 +429,10 @@ impl CallRepo {
     ) -> Result<Vec<CallSession>, sqlx::Error> {
         let limit = limit.clamp(1, 200);
         let rows = sqlx::query_as::<_, CallRow>(
-            r#"SELECT id, room_id, initiator, kind, mode, started_at, ended_at, end_reason
+            r"SELECT id, room_id, initiator, kind, mode, started_at, ended_at, end_reason
                FROM call_sessions WHERE room_id = $1
                ORDER BY started_at DESC
-               LIMIT $2"#,
+               LIMIT $2",
         )
         .bind(room.to_uuid())
         .bind(limit)
@@ -795,7 +795,7 @@ async fn direct_call_is_blocked(
     }
     let callee_ids = callees
         .iter()
-        .map(|participant| participant.to_uuid())
+        .map(aero_common::ParticipantId::to_uuid)
         .collect::<Vec<_>>();
     sqlx::query_scalar(
         r"SELECT EXISTS (
@@ -929,7 +929,7 @@ pub(crate) async fn lock_authorized_active_call(
             authorized_participants.push(recipient);
         }
     }
-    authorized_participants.sort_unstable_by_key(|participant| participant.to_uuid());
+    authorized_participants.sort_unstable_by_key(aero_common::ParticipantId::to_uuid);
     for participant in &authorized_participants {
         lock_effective_call_room(tx, expected_room, *participant).await?;
     }
@@ -949,7 +949,7 @@ pub(crate) async fn lock_authorized_active_call(
 
     let participant_ids = authorized_participants
         .iter()
-        .map(|participant| participant.to_uuid())
+        .map(aero_common::ParticipantId::to_uuid)
         .collect::<Vec<_>>();
     let active_legs = sqlx::query_as::<_, (uuid::Uuid, Option<time::OffsetDateTime>)>(
         r"SELECT participant_id, left_at

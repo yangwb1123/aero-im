@@ -5,20 +5,29 @@
 //!
 //! Spec references:
 //! - ISO/IEC 13818-1 (MPEG-2 Systems / TS)
-//! - ISO/IEC 14496-15 (AVC file format — AVCDecoderConfigurationRecord)
-//! - ISO/IEC 14496-3 (AAC AudioSpecificConfig)
+//! - ISO/IEC 14496-15 (AVC file format — `AVCDecoderConfigurationRecord`)
+//! - ISO/IEC 14496-3 (AAC `AudioSpecificConfig`)
 //! - Adobe FLV File Format Specification v10 (Annex E)
 //!
 //! Layout notes
 //! ------------
 //! - PAT @ PID 0x0000, PMT @ PID 0x1000, video PES @ PID 0x100,
 //!   audio PES @ PID 0x101.
-//! - Video stream_type = 0x1B (H.264), audio = 0x0F (ADTS AAC).
+//! - Video `stream_type` = 0x1B (H.264), audio = 0x0F (ADTS AAC).
 //! - PCR is carried in the video adaptation field at each new keyframe.
 //! - PTS/DTS in 90 kHz units.
 //! - AVCC length-prefixed NALUs are converted to Annex-B start-code form;
 //!   SPS+PPS are prepended to each keyframe access unit (HLS requirement).
 //! - AAC raw is wrapped in ADTS (7-byte header) for `aac_es_id_3` PIDs.
+//!
+//! This module is a bit-packing muxer: narrowing casts into fixed-width protocol
+//! fields are the intended operation (values are masked to the target width
+//! first), so truncation/sign/wrap casts are allowed module-wide.
+#![allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss
+)]
 
 use bytes::{BufMut, Bytes, BytesMut};
 
@@ -186,10 +195,10 @@ impl FlvToTsConverter {
         }
         // skip configurationVersion(1) profile(1) profile_compat(1) level(1)
         let length_size_minus_one = body[4] & 0x03;
-        let num_sps = body[5] & 0x1F;
+        let sps_count = body[5] & 0x1F;
         let mut p = 6;
-        let mut sps = Vec::with_capacity(num_sps as usize);
-        for _ in 0..num_sps {
+        let mut sps = Vec::with_capacity(sps_count as usize);
+        for _ in 0..sps_count {
             if p + 2 > body.len() {
                 return Err(MuxError::AvcConfig("truncated sps len"));
             }
@@ -204,10 +213,10 @@ impl FlvToTsConverter {
         if p >= body.len() {
             return Err(MuxError::AvcConfig("missing pps count"));
         }
-        let num_pps = body[p];
+        let pps_count = body[p];
         p += 1;
-        let mut pps = Vec::with_capacity(num_pps as usize);
-        for _ in 0..num_pps {
+        let mut pps = Vec::with_capacity(pps_count as usize);
+        for _ in 0..pps_count {
             if p + 2 > body.len() {
                 return Err(MuxError::AvcConfig("truncated pps len"));
             }
@@ -349,13 +358,13 @@ impl FlvToTsConverter {
 // ---------------- TS packet helpers ----------------
 
 fn write_pes_into_ts(pid: u16, cc: &mut u8, pes: &[u8], pcr_90k: Option<u64>) -> Vec<u8> {
-    let mut out = Vec::with_capacity(((pes.len() + 183) / 184) * TS_PACKET_SIZE);
+    let mut out = Vec::with_capacity(pes.len().div_ceil(184) * TS_PACKET_SIZE);
     let mut offset = 0;
     let mut first = true;
     while offset < pes.len() {
         let mut pkt = [0u8; TS_PACKET_SIZE];
         pkt[0] = TS_SYNC_BYTE;
-        pkt[1] = (((first as u8) & 1) << 6) | ((pid >> 8) & 0x1F) as u8;
+        pkt[1] = ((u8::from(first) & 1) << 6) | ((pid >> 8) & 0x1F) as u8;
         pkt[2] = (pid & 0xFF) as u8;
         let cc_val = *cc & 0x0F;
         *cc = cc.wrapping_add(1) & 0x0F;
@@ -397,18 +406,14 @@ fn write_pes_into_ts(pid: u16, cc: &mut u8, pes: &[u8], pcr_90k: Option<u64>) ->
                 } else {
                     adaptation.push((need_stuffing - 1) as u8);
                     adaptation.push(0x00); // no flags
-                    for _ in 0..(need_stuffing - 2) {
-                        adaptation.push(0xFF);
-                    }
+                    adaptation.resize(adaptation.len() + (need_stuffing - 2), 0xFF);
                 }
             } else {
                 // Extend existing adaptation by adding stuffing bytes.
                 if let Some(first_len) = adaptation.get_mut(0) {
                     *first_len = first_len.wrapping_add(need_stuffing as u8);
                 }
-                for _ in 0..need_stuffing {
-                    adaptation.push(0xFF);
-                }
+                adaptation.resize(adaptation.len() + need_stuffing, 0xFF);
             }
         }
         pkt[3] = (afc << 4) | cc_val;
@@ -457,7 +462,7 @@ fn build_pes(stream_id: u8, pts_90k: Option<u64>, dts_90k: Option<u64>, payload:
     };
     buf.extend_from_slice(&length_field.to_be_bytes());
     buf.push(0x80); // marker bits + flags (no scrambling, no priority, etc.)
-    buf.push((pts_dts_flags << 6) | 0x00); // PTS_DTS_flags + other flags
+    buf.push(pts_dts_flags << 6); // PTS_DTS_flags + other flags
     buf.push(header_data_len as u8);
     match pts_dts_flags {
         0b11 => {
@@ -571,10 +576,10 @@ fn write_pmt_packet(cc: &mut u8) -> [u8; TS_PACKET_SIZE] {
 }
 
 fn read_i24_be(b: &[u8]) -> i32 {
-    let v = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | (b[2] as u32);
+    let v = (u32::from(b[0]) << 16) | (u32::from(b[1]) << 8) | u32::from(b[2]);
     // sign-extend from 24 bits
-    if v & 0x00800000 != 0 {
-        (v | 0xFF000000) as i32
+    if v & 0x0080_0000 != 0 {
+        (v | 0xFF00_0000) as i32
     } else {
         v as i32
     }
@@ -584,7 +589,7 @@ fn read_i24_be(b: &[u8]) -> i32 {
 fn mpeg2_crc32(data: &[u8]) -> u32 {
     let mut crc: u32 = 0xFFFF_FFFF;
     for &b in data {
-        let mut x = (b as u32) << 24;
+        let mut x = u32::from(b) << 24;
         for _ in 0..8 {
             let bit = (crc ^ x) & 0x8000_0000;
             crc <<= 1;
@@ -613,10 +618,10 @@ impl FlvToTsConverter {
 #[must_use]
 pub fn empty_ts_segment() -> Bytes {
     let mut pat_cc = 0u8;
-    let mut pmt_cc = 0u8;
+    let mut pmt_counter = 0u8;
     let mut out = BytesMut::with_capacity(2 * TS_PACKET_SIZE);
     out.extend_from_slice(&write_pat_packet(&mut pat_cc));
-    out.extend_from_slice(&write_pmt_packet(&mut pmt_cc));
+    out.extend_from_slice(&write_pmt_packet(&mut pmt_counter));
     out.freeze()
 }
 
@@ -678,7 +683,7 @@ mod tests {
     fn aac_adts_wrap_has_correct_sync() {
         let mut c = FlvToTsConverter::new();
         // Pretend ASC: AOT=2, sample_rate_idx=4 (44100), channel_config=2 (stereo)
-        let asc = [(2u8 << 3) | (4u8 >> 1), ((4u8 & 1) << 7) | (2u8 << 3)];
+        let asc = [(2u8 << 3) | (4u8 >> 1), (2u8 << 3)];
         c.aac = Some(AacCodec {
             object_type: 2,
             sample_rate_index: 4,

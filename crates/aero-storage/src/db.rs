@@ -52,6 +52,9 @@ pub async fn connect_pg(url: &str, max_conns: u32) -> Result<PgPool, sqlx::Error
 /// Adding a migration requires rebuilding the executable before invoking this
 /// function; an already-built binary cannot discover a new SQL file at runtime.
 pub async fn migrate(pool: &PgPool) -> Result<(), sqlx::migrate::MigrateError> {
+    // The embedded migrations array is macro-generated static data; the lint
+    // misreads it as a stack array.
+    #[allow(clippy::large_stack_arrays)]
     sqlx::migrate!("../../migrations").run(pool).await
 }
 

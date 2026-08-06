@@ -45,19 +45,19 @@ impl BlockRepo {
         Self { pg }
     }
 
-    /// Block `blocked` from the perspective of `blocker`. Idempotent: re-blocking
+    /// Block `target` from the perspective of `blocker`. Idempotent: re-blocking
     /// is a no-op (the existing row is kept).
     ///
     /// # Errors
     /// Propagates any [`sqlx::Error`] from the insert.
-    pub async fn block(&self, blocker: ParticipantId, blocked: ParticipantId) -> Result<(), Error> {
+    pub async fn block(&self, blocker: ParticipantId, target: ParticipantId) -> Result<(), Error> {
         let mut tx = self.pg.begin().await.map_err(Error::from)?;
-        lock_user_block_pair(&mut tx, blocker, blocked)
+        lock_user_block_pair(&mut tx, blocker, target)
             .await
             .map_err(Error::from)?;
         sqlx::query("INSERT INTO user_blocks (blocker_id, blocked_id) VALUES ($1, $2) ON CONFLICT DO NOTHING")
             .bind(blocker.to_uuid())
-            .bind(blocked.to_uuid())
+            .bind(target.to_uuid())
             .execute(&mut *tx)
             .await
             .map_err(Error::from)?;
@@ -65,7 +65,7 @@ impl BlockRepo {
         Ok(())
     }
 
-    /// Unblock `blocked` for `blocker`. Idempotent: unblocking a participant who
+    /// Unblock `target` for `blocker`. Idempotent: unblocking a participant who
     /// was never blocked is a no-op.
     ///
     /// # Errors
@@ -73,15 +73,15 @@ impl BlockRepo {
     pub async fn unblock(
         &self,
         blocker: ParticipantId,
-        blocked: ParticipantId,
+        target: ParticipantId,
     ) -> Result<(), Error> {
         let mut tx = self.pg.begin().await.map_err(Error::from)?;
-        lock_user_block_pair(&mut tx, blocker, blocked)
+        lock_user_block_pair(&mut tx, blocker, target)
             .await
             .map_err(Error::from)?;
         sqlx::query("DELETE FROM user_blocks WHERE blocker_id = $1 AND blocked_id = $2")
             .bind(blocker.to_uuid())
-            .bind(blocked.to_uuid())
+            .bind(target.to_uuid())
             .execute(&mut *tx)
             .await
             .map_err(Error::from)?;
@@ -89,20 +89,20 @@ impl BlockRepo {
         Ok(())
     }
 
-    /// Whether `blocker` has blocked `blocked`.
+    /// Whether `blocker` has blocked `target`.
     ///
     /// # Errors
     /// Propagates any [`sqlx::Error`] from the query.
     pub async fn is_blocked(
         &self,
         blocker: ParticipantId,
-        blocked: ParticipantId,
+        target: ParticipantId,
     ) -> Result<bool, Error> {
         let (exists,): (bool,) = sqlx::query_as(
             "SELECT EXISTS(SELECT 1 FROM user_blocks WHERE blocker_id = $1 AND blocked_id = $2)",
         )
         .bind(blocker.to_uuid())
-        .bind(blocked.to_uuid())
+        .bind(target.to_uuid())
         .fetch_one(&self.pg)
         .await
         .map_err(Error::from)?;

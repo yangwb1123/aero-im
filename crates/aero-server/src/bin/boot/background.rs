@@ -1,5 +1,5 @@
 //! Background tasks: sweeps, heartbeats, bots, dispatchers.
-//! Spawned AFTER AppState is built; all hold the shutdown token.
+//! Spawned AFTER `AppState` is built; all hold the shutdown token.
 use aero_server::state::AppState;
 use aero_storage::MessageRepo;
 use std::sync::Arc;

@@ -259,8 +259,8 @@ mod db_tests {
         // add_clip → list_clips shows them ordered
         repo.add_clip(cid, clip1, 0).await.unwrap();
         repo.add_clip(cid, clip2, 1).await.unwrap();
-        let clips = repo.list_clips(cid).await.unwrap();
-        assert_eq!(clips, vec![clip1, clip2]);
+        let listed = repo.list_clips(cid).await.unwrap();
+        assert_eq!(listed, vec![clip1, clip2]);
 
         // remove_clip
         assert!(repo.remove_clip(cid, clip1).await.unwrap());
@@ -268,8 +268,8 @@ mod db_tests {
             !repo.remove_clip(cid, clip1).await.unwrap(),
             "second remove is no-op"
         );
-        let clips = repo.list_clips(cid).await.unwrap();
-        assert_eq!(clips, vec![clip2]);
+        let listed = repo.list_clips(cid).await.unwrap();
+        assert_eq!(listed, vec![clip2]);
 
         // delete (scoped to creator)
         assert!(

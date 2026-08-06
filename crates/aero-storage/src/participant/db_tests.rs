@@ -42,7 +42,7 @@ async fn room(p: &PgPool, creator: ParticipantId) -> RoomId {
 }
 
 /// GDPR right-to-erasure must null the pgvector `embedding` alongside
-/// blocks/searchable_text — a retained semantic vector is re-identifiable.
+/// `blocks/searchable_text` — a retained semantic vector is re-identifiable.
 /// Guards the participant.rs erasure UPDATE against dropping `embedding = NULL`.
 #[tokio::test]
 #[ignore = "requires live Postgres"]
@@ -259,7 +259,7 @@ async fn deferred_sweep_erases_after_hold_release() {
 }
 
 /// GDPR erasure must remove the participant's OWN identity PII: tombstone
-/// display_name + clear avatar_url, and hard-delete credentials (login email +
+/// `display_name` + clear `avatar_url`, and hard-delete credentials (login email +
 /// hash), the profile (phone/status), and SSO identities. A surviving
 /// name/email/phone would defeat right-to-erasure.
 #[tokio::test]

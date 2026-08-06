@@ -1,4 +1,4 @@
-//! NATS JetStream implementation of [`EventBus`].
+//! NATS `JetStream` implementation of [`EventBus`].
 
 use async_nats::jetstream::{self, consumer, stream};
 use async_trait::async_trait;
@@ -52,7 +52,7 @@ fn validate_publish_subject(subject: &str) -> Result<(), BusError> {
     Ok(())
 }
 
-/// Validate an idempotent publish request and build its JetStream dedup header.
+/// Validate an idempotent publish request and build its `JetStream` dedup header.
 ///
 /// `Nats-Msg-Id` is scoped to a stream's duplicate window. Retrying the same
 /// logical outbox row with the same id lets the server acknowledge the retry
@@ -205,9 +205,8 @@ impl JetStreamBus {
         stream_name: &str,
         consumer_name: &str,
     ) -> BusResult<Option<u64>> {
-        let stream = match self.js.get_stream(stream_name).await {
-            Ok(s) => s,
-            Err(_) => return Ok(None),
+        let Ok(stream) = self.js.get_stream(stream_name).await else {
+            return Ok(None);
         };
         match stream.consumer_info(consumer_name).await {
             Ok(info) => Ok(Some(info.num_pending)),
@@ -215,7 +214,7 @@ impl JetStreamBus {
         }
     }
 
-    /// Publish with JetStream's stream-scoped message-id deduplication and return
+    /// Publish with `JetStream`'s stream-scoped message-id deduplication and return
     /// the broker acknowledgment. The public [`EventBus`] method intentionally
     /// erases the ack details; this helper keeps them available for diagnostics
     /// and the live-NATS integration test.

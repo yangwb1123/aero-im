@@ -255,8 +255,13 @@ fn unix_now() -> u64 {
 /// here (the RSA signature is), so SHA-1 (already a dependency) is sufficient.
 fn key_id(public_pem: &str) -> String {
     use sha1::{Digest, Sha1};
+    use std::fmt::Write as _;
     let digest = Sha1::digest(public_pem.trim().as_bytes());
-    digest.iter().take(8).map(|b| format!("{b:02x}")).collect()
+    let mut out = String::with_capacity(16);
+    for b in digest.iter().take(8) {
+        write!(out, "{b:02x}").expect("write to String cannot fail");
+    }
+    out
 }
 
 #[cfg(test)]
@@ -330,7 +335,8 @@ mod tests {
 
         // Rotate: key B active, key A retained as an extra verifier.
         let codec_b =
-            JwtCodec::from_pems(&priv_b, &pub_b, &[pub_a.clone()], "aero-im", acc, refr).unwrap();
+            JwtCodec::from_pems(&priv_b, &pub_b, std::slice::from_ref(&pub_a), "aero-im", acc, refr)
+                .unwrap();
         assert_eq!(
             codec_b.verify(&token_a).unwrap().participant_id().unwrap(),
             pid,

@@ -1,6 +1,6 @@
 //! Tests only — types and functions moved to `mod.rs`.
 //!
-//! Part of REFACTOR_PLAN.md Step 2.
+//! Part of `REFACTOR_PLAN.md` Step 2.
 
 // Re-export items from parent so sub-modules using `crate::message::orig::*` still work.
 pub(crate) use super::{
@@ -48,8 +48,8 @@ mod tests {
         .unwrap();
         let ids = attached_blob_ids(&blocks_val);
         assert_eq!(ids.len(), 2, "should find both file and voice blob ids");
-        assert!(ids.iter().any(|id| *id == b1));
-        assert!(ids.iter().any(|id| *id == b2));
+        assert!(ids.contains(&b1));
+        assert!(ids.contains(&b2));
     }
 
     #[test]
@@ -361,8 +361,7 @@ mod db_tests {
         let my_count: u32 = counts
             .iter()
             .find(|(rid, _)| *rid == r)
-            .map(|(_, c)| *c)
-            .unwrap_or(0);
+            .map_or(0, |(_, c)| *c);
         assert!(
             my_count >= 2,
             "should see at least 2 unread: got {my_count}"
@@ -381,8 +380,7 @@ mod db_tests {
         let remaining: u32 = counts2
             .iter()
             .find(|(rid, _)| *rid == r)
-            .map(|(_, c)| *c)
-            .unwrap_or(0);
+            .map_or(0, |(_, c)| *c);
         assert!(remaining < my_count, "should decrease after marking read");
 
         // Cleanup.

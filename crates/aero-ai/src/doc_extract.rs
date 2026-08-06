@@ -257,7 +257,6 @@ fn xml_to_text(xml: &[u8]) -> String {
             match local {
                 // open → collect; close → stop; self-closing `<w:t/>` → no-op (empty).
                 "t" if !is_self_closing => in_text = !is_close,
-                "t" => {}
                 "p" | "br" | "cr" => {
                     if !out.ends_with('\n') {
                         out.push('\n');

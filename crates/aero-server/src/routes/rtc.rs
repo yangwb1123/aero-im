@@ -16,10 +16,10 @@ async fn rtc_config(_auth: AuthUser) -> ApiResult<Json<serde_json::Value>> {
 }
 
 fn rtc_config_payload() -> serde_json::Value {
-    rtc_config_payload_from(aero_signaling::default_rtc_config_from_env())
+    rtc_config_payload_from(&aero_signaling::default_rtc_config_from_env())
 }
 
-fn rtc_config_payload_from(config: aero_signaling::RtcConfig) -> serde_json::Value {
+fn rtc_config_payload_from(config: &aero_signaling::RtcConfig) -> serde_json::Value {
     serde_json::json!({
         "ice_servers": config.ice_servers,
         "ice_transport_policy": config.ice_transport_policy,
@@ -34,7 +34,7 @@ mod tests {
 
     #[test]
     fn payload_preserves_relay_policy_and_turn_credentials() {
-        let payload = rtc_config_payload_from(RtcConfig {
+        let payload = rtc_config_payload_from(&RtcConfig {
             ice_servers: vec![IceServer::turn(
                 "turn:127.0.0.1:3478",
                 "local-user",

@@ -290,6 +290,9 @@ impl StreamViewerSampleRepo {
         }
 
         // The peak is the avg viewers in the FIRST bucket (offset 0).
+        // Viewer counts are far below 2^53, so the i64→f64 narrowing is exact
+        // in practice — a deliberate statistics cast.
+        #[allow(clippy::cast_precision_loss)]
         let first_avg = {
             let (sum, cnt) = buckets.get(&0).copied().unwrap_or((0, 1));
             if cnt == 0 {
@@ -300,6 +303,7 @@ impl StreamViewerSampleRepo {
         };
         let peak_viewers = first_avg.max(1.0);
 
+        #[allow(clippy::cast_precision_loss)] // see first_avg above
         let curve: Vec<RetentionPoint> = buckets
             .into_iter()
             .map(|(bucket_idx, (sum, cnt))| {

@@ -33,6 +33,8 @@ pub(crate) fn spawn_all(
                 let max = pool.options().get_max_connections();
                 common_metrics::set_gauge(common_metrics::names::DB_POOL_SIZE, f64::from(max));
                 common_metrics::set_gauge(common_metrics::names::DB_POOL_IN_USE, f64::from(in_use));
+                // Gauge counts are far below 2^53; the narrowing is exact in practice.
+                #[allow(clippy::cast_precision_loss)]
                 common_metrics::set_gauge(
                     common_metrics::names::LIVE_WHIP_SESSIONS,
                     whip.active_sessions() as f64,
@@ -146,11 +148,16 @@ pub(crate) fn spawn_all(
                 }
                 for kind in KINDS {
                     match repo.count_dead(Some(kind)).await {
-                        Ok(n) => common_metrics::set_gauge_labeled(
-                            common_metrics::names::AI_DEAD_LETTER_QUEUE_SIZE,
-                            n as f64,
-                            &[("kind", kind)],
-                        ),
+                        Ok(n) => {
+                            // Gauge counts are far below 2^53; the narrowing is exact in practice.
+                            #[allow(clippy::cast_precision_loss)]
+                            let gauge = n as f64;
+                            common_metrics::set_gauge_labeled(
+                                common_metrics::names::AI_DEAD_LETTER_QUEUE_SIZE,
+                                gauge,
+                                &[("kind", kind)],
+                            );
+                        }
                         Err(e) => tracing::warn!(error = %e, %kind, "ai dlq count query failed"),
                     }
                 }
@@ -173,11 +180,16 @@ pub(crate) fn spawn_all(
                 }
                 for (stream, consumer) in CONSUMERS {
                     match js.consumer_pending(stream, consumer).await {
-                        Ok(Some(n)) => common_metrics::set_gauge_labeled(
-                            common_metrics::names::NATS_CONSUMER_PENDING_MESSAGES,
-                            n as f64,
-                            &[("stream", *stream), ("consumer", *consumer)],
-                        ),
+                        Ok(Some(n)) => {
+                            // Gauge counts are far below 2^53; the narrowing is exact in practice.
+                            #[allow(clippy::cast_precision_loss)]
+                            let gauge = n as f64;
+                            common_metrics::set_gauge_labeled(
+                                common_metrics::names::NATS_CONSUMER_PENDING_MESSAGES,
+                                gauge,
+                                &[("stream", *stream), ("consumer", *consumer)],
+                            );
+                        }
                         Ok(None) => {}
                         Err(e) => tracing::warn!(error = %e, %stream, %consumer, "consumer_pending query failed"),
                     }

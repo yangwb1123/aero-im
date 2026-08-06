@@ -166,7 +166,7 @@ pub(crate) fn breaker_from_row(
 ) -> BreakerState {
     BreakerState {
         failures: u32::try_from(failures).unwrap_or(0),
-        open_until: open_until.map(|t| t.unix_timestamp()),
+        open_until: open_until.map(time::OffsetDateTime::unix_timestamp),
     }
 }
 

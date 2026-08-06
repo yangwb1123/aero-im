@@ -1,9 +1,9 @@
 //! MLS (Messaging Layer Security) opaque-bytes relay endpoints.
 //!
-//! The server acts as a transparent relay for MLS KeyPackages and group state:
-//! clients run OpenMLS and upload/download encrypted blobs that the server
+//! The server acts as a transparent relay for MLS `KeyPackages` and group state:
+//! clients run `OpenMLS` and upload/download encrypted blobs that the server
 //! cannot decrypt. Membership gating is enforced by room access checks.
-//! Split from the monolithic `routes.rs` (REFACTOR_PLAN.md Step 7 clean-up).
+//! Split from the monolithic `routes.rs` (`REFACTOR_PLAN.md` Step 7 clean-up).
 
 use std::str::FromStr;
 
@@ -40,7 +40,7 @@ pub fn routes() -> Router<AppState> {
 #[derive(Deserialize)]
 struct PublishKpReq {
     ciphersuite: String,
-    /// Base64-encoded KeyPackage bytes.
+    /// Base64-encoded `KeyPackage` bytes.
     payload_b64: String,
 }
 
@@ -78,8 +78,8 @@ fn validate_group_id(bytes: Vec<u8>) -> Result<aero_common::mls::MlsGroupId, Aer
     Ok(aero_common::mls::MlsGroupId::new(bytes))
 }
 
-/// `POST /api/mls/key-packages` — publish a KeyPackage for the current user.
-/// The payload is an opaque MLS KeyPackage byte blob (base64-encoded).
+/// `POST /api/mls/key-packages` — publish a `KeyPackage` for the current user.
+/// The payload is an opaque MLS `KeyPackage` byte blob (base64-encoded).
 async fn mls_publish_kp(
     State(s): State<AppState>,
     auth: AuthUser,

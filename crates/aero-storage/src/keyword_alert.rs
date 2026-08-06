@@ -120,23 +120,20 @@ impl KeywordAlertRepo {
             .bind(&normalized)
             .fetch_optional(&mut *tx)
             .await?;
-        let row = match inserted {
-            Some(row) => row,
-            None => {
-                let select_sql = format!(
-                    "SELECT {COLUMNS}
-                       FROM keyword_alerts
-                      WHERE participant_id = $1
-                        AND workspace_id = $2
-                        AND keyword = $3"
-                );
-                sqlx::query_as::<_, Row>(&select_sql)
-                    .bind(participant.to_uuid())
-                    .bind(workspace.to_uuid())
-                    .bind(&normalized)
-                    .fetch_one(&mut *tx)
-                    .await?
-            }
+        let row = if let Some(row) = inserted { row } else {
+            let select_sql = format!(
+                "SELECT {COLUMNS}
+                   FROM keyword_alerts
+                  WHERE participant_id = $1
+                    AND workspace_id = $2
+                    AND keyword = $3"
+            );
+            sqlx::query_as::<_, Row>(&select_sql)
+                .bind(participant.to_uuid())
+                .bind(workspace.to_uuid())
+                .bind(&normalized)
+                .fetch_one(&mut *tx)
+                .await?
         };
         let alert = row_to_model(row);
         tx.commit().await?;

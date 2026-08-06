@@ -3,7 +3,7 @@
 //! Subscribes to `im.room.*`, watches for incoming `RoomEvent::Message`s whose
 //! blocks contain a `Voice { blob_id, transcript: None }`. For each, fetches
 //! the audio bytes from the blob store, calls the configured Transcriber
-//! (OpenAI Whisper when `OPENAI_API_KEY` is set, else a placeholder), and then
+//! (`OpenAI` Whisper when `OPENAI_API_KEY` is set, else a placeholder), and then
 //! patches the message in place via `MessageRepo::update_voice_transcript`.
 //!
 //! The patched message is re-broadcast as `RoomEvent::Edited` so connected
@@ -27,7 +27,7 @@ pub async fn run(state: AppState, ai: Arc<AiService>) -> anyhow::Result<()> {
     run_until_cancelled(state, ai, CancellationToken::new()).await
 }
 
-/// Run until `cancel` is triggered, finishing and ACKing any event already
+/// Run until `cancel` is triggered, finishing and `ACKing` any event already
 /// received before returning.
 pub async fn run_until_cancelled(
     state: AppState,

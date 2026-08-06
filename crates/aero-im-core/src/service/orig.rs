@@ -72,13 +72,13 @@ impl NotifyBatchKind {
     }
 }
 
-/// A fixed, private namespace UUID for deriving NotifyBatch idempotency tokens.
+/// A fixed, private namespace UUID for deriving `NotifyBatch` idempotency tokens.
 /// Any constant non-nil UUID works; it just has to be stable across processes
 /// and releases so a redelivered batch derives the same id. (Random v4, minted
 /// once and frozen here.)
 const NOTIFY_DELIVERY_NAMESPACE: uuid::Uuid = uuid::uuid!("6f1d2e3c-9b4a-4d57-8a2e-1c0f7b6a4d9e");
 
-/// Derive a **deterministic** `delivery_id` for a NotifyBatch from the message
+/// Derive a **deterministic** `delivery_id` for a `NotifyBatch` from the message
 /// it concerns plus which batch (mention vs reply) it is. The same message's
 /// same batch always derives the same UUID, so a NATS redelivery after a
 /// consumer crash produces an identical `delivery_id` and
@@ -177,7 +177,7 @@ pub struct ImService {
     /// Notification bundle queue (ROADMAP7 方向三). Optional builder
     /// ([`with_notification_bundles`](Self::with_notification_bundles));
     /// when present, reply notifications are deferred into bundle rows
-    /// and periodically flushed as AggregateReply.
+    /// and periodically flushed as `AggregateReply`.
     pub(crate) notification_bundles: Option<NotificationBundleRepo>,
     /// Pinned-messages store. Optional builder ([`with_pins`](ImService::with_pins));
     /// the pin/unpin/list methods return an internal error if it isn't wired.

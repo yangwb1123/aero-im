@@ -76,9 +76,9 @@ impl MessageRepo {
         let searchable = searchable_of(&new.blocks);
 
         sqlx::query(
-            r#"INSERT INTO messages
+            r"INSERT INTO messages
                  (id, room_id, sender_id, blocks, reply_to, metadata, searchable_text, created_at, expires_at)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"#,
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
         )
         .bind(id.to_uuid())
         .bind(new.room_id.to_uuid())
@@ -128,8 +128,8 @@ impl MessageRepo {
     /// Fetch a single message by id (including soft-deleted, caller must filter).
     pub async fn get(&self, id: MessageId) -> Result<Option<Message>, sqlx::Error> {
         let row = sqlx::query_as::<_, MessageRow>(
-            r#"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at, version
-               FROM messages WHERE id = $1"#,
+            r"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at, version
+               FROM messages WHERE id = $1",
         )
         .bind(id.to_uuid())
         .fetch_optional(&self.pool)
@@ -147,12 +147,12 @@ impl MessageRepo {
     /// need to distinguish missing from un-embedded use `get` separately.
     pub async fn has_embedding(&self, id: MessageId) -> Result<bool, sqlx::Error> {
         let row = sqlx::query_as::<_, (bool,)>(
-            r#"SELECT embedding IS NOT NULL FROM messages WHERE id = $1"#,
+            r"SELECT embedding IS NOT NULL FROM messages WHERE id = $1",
         )
         .bind(id.to_uuid())
         .fetch_optional(&self.pool)
         .await?;
-        Ok(row.map_or(false, |(present,)| present))
+        Ok(row.is_some_and(|(present,)| present))
     }
 
     /// Update message blocks with optimistic locking (migration 0157).
@@ -171,11 +171,11 @@ impl MessageRepo {
         let edited_at = time::OffsetDateTime::now_utc();
 
         let row = sqlx::query_as::<_, MessageRow>(
-            r#"UPDATE messages
+            r"UPDATE messages
                   SET blocks = $1, searchable_text = $2, edited_at = $3, embedding = NULL,
                       version = version + 1
                WHERE id = $4 AND deleted_at IS NULL AND version = $5
-            RETURNING id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at, version"#,
+            RETURNING id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at, version",
         )
         .bind(&blocks_json)
         .bind(&searchable)
@@ -185,31 +185,30 @@ impl MessageRepo {
         .fetch_optional(&self.pool)
         .await?;
 
-        match row {
-            Some(r) => Ok(Some(r.into())),
+        if let Some(r) = row {
+            Ok(Some(r.into()))
+        } else {
             // Two possibilities: message is missing/deleted, or version mismatch.
             // Check existence to distinguish.
-            None => {
-                let exists = sqlx::query_scalar::<_, bool>(
-                    "SELECT EXISTS(SELECT 1 FROM messages WHERE id = $1 AND deleted_at IS NULL)",
-                )
-                .bind(id.to_uuid())
-                .fetch_one(&self.pool)
-                .await?;
-                if exists {
-                    Err(aero_common::Error::Conflict(
-                        "message was edited concurrently; reload and retry".into(),
-                    ))
-                } else {
-                    Ok(None)
-                }
+            let exists = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM messages WHERE id = $1 AND deleted_at IS NULL)",
+            )
+            .bind(id.to_uuid())
+            .fetch_one(&self.pool)
+            .await?;
+            if exists {
+                Err(aero_common::Error::Conflict(
+                    "message was edited concurrently; reload and retry".into(),
+                ))
+            } else {
+                Ok(None)
             }
         }
     }
 
     /// Read the current version of a non-deleted message. Returns `None` when
     /// the message is missing or soft-deleted. Used by callers to obtain the
-    /// expected_version for [`edit`](Self::edit).
+    /// `expected_version` for [`edit`](Self::edit).
     pub async fn get_version(&self, id: MessageId) -> Result<Option<i32>, sqlx::Error> {
         sqlx::query_scalar::<_, i32>(
             "SELECT version FROM messages WHERE id = $1 AND deleted_at IS NULL",
@@ -258,9 +257,9 @@ impl MessageRepo {
         let blob_ids = attached_blob_ids(&blocks_json);
 
         sqlx::query(
-            r#"UPDATE messages
+            r"UPDATE messages
                   SET deleted_at = NOW(), blocks = '[]'::jsonb, searchable_text = '', embedding = NULL
-               WHERE id = $1 AND deleted_at IS NULL"#,
+               WHERE id = $1 AND deleted_at IS NULL",
         )
         .bind(id.to_uuid())
         .execute(&mut **tx)
@@ -312,7 +311,7 @@ impl MessageRepo {
             .collect::<std::collections::HashSet<_>>()
             .into_iter()
             .collect();
-        unique.sort_unstable_by_key(|blob| blob.to_uuid());
+        unique.sort_unstable_by_key(aero_common::BlobId::to_uuid);
         for blob in unique {
             let exists = sqlx::query_scalar::<_, uuid::Uuid>(
                 "SELECT id FROM blobs WHERE id = $1 FOR UPDATE",
@@ -423,7 +422,7 @@ impl MessageRepo {
         transcript: &str,
     ) -> Result<Option<Message>, sqlx::Error> {
         let row = sqlx::query_as::<_, MessageRow>(
-            r#"UPDATE messages SET
+            r"UPDATE messages SET
                  blocks = (
                    SELECT jsonb_agg(
                      CASE WHEN elem->>'type' = 'voice'
@@ -438,7 +437,7 @@ impl MessageRepo {
                  edited_at = NOW(),
                  embedding = NULL
                WHERE id = $1 AND deleted_at IS NULL
-            RETURNING id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at, version"#,
+            RETURNING id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at, version",
         )
         .bind(id.to_uuid())
         .bind(transcript)
@@ -455,7 +454,7 @@ impl MessageRepo {
     ) -> Result<bool, sqlx::Error> {
         let v = Vector::from(embedding);
         let result = sqlx::query(
-            r#"UPDATE messages SET embedding = $1 WHERE id = $2 AND deleted_at IS NULL"#,
+            r"UPDATE messages SET embedding = $1 WHERE id = $2 AND deleted_at IS NULL",
         )
         .bind(v)
         .bind(id.to_uuid())
@@ -481,7 +480,7 @@ impl MessageRepo {
         searchable_text: &str,
     ) -> Result<bool, sqlx::Error> {
         let result = sqlx::query(
-            r#"UPDATE messages SET searchable_text = $1 WHERE id = $2 AND deleted_at IS NULL"#,
+            r"UPDATE messages SET searchable_text = $1 WHERE id = $2 AND deleted_at IS NULL",
         )
         .bind(searchable_text)
         .bind(id.to_uuid())

@@ -105,7 +105,7 @@ struct EditMessageReq {
 
 /// `GET /api/messages/:id` — fetch a single (non-deleted) message, gated on the
 /// caller's access to its room. Backs deep-links/permalinks and matches the
-/// operation the OpenAPI spec advertises. 404 when the message is missing or
+/// operation the `OpenAPI` spec advertises. 404 when the message is missing or
 /// soft-deleted; 403 when the caller can't see its room.
 async fn get_message(
     State(s): State<AppState>,

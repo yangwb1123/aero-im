@@ -56,9 +56,9 @@ pub(crate) async fn list_receipts(
 
 /// `GET /api/rooms/:id/delivery-cursor` — the caller's persisted DELIVERY cursor
 /// for this room (ROADMAP 方向三·A): the Last-Known-Good `(message_id, seq)` the
-/// client has ACKed receiving. Lets a client fetch its LKG over REST (e.g. an
+/// client has `ACKed` receiving. Lets a client fetch its LKG over REST (e.g. an
 /// offline-first client priming before opening the socket). Returns `null` when
-/// the caller has never ACKed in the room. Member-gated via `assert_room_access`.
+/// the caller has never `ACKed` in the room. Member-gated via `assert_room_access`.
 pub(crate) async fn get_delivery_cursor(
     State(s): State<AppState>,
     auth: AuthUser,

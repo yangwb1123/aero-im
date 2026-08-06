@@ -350,8 +350,8 @@ impl SfuPeer {
     fn resolve_packet_route(
         &mut self,
         ssrc: Ssrc,
-        signalled_mid: Option<Mid>,
-        signalled_rid: Option<Rid>,
+        media_mid: Option<Mid>,
+        stream_rid: Option<Rid>,
     ) -> (Mid, Option<Rid>) {
         // str0m already owns the bounded SSRC lifecycle and normalizes RTX to
         // its primary stream. Reuse that authoritative mapping when browsers
@@ -362,10 +362,10 @@ impl SfuPeer {
             .stream_rx(&ssrc)
             .map(|stream| (stream.mid(), stream.rid()));
         (
-            signalled_mid
+            media_mid
                 .or_else(|| negotiated.map(|(mid, _)| mid))
                 .unwrap_or_else(mid_fallback),
-            signalled_rid.or_else(|| negotiated.and_then(|(_, rid)| rid)),
+            stream_rid.or_else(|| negotiated.and_then(|(_, rid)| rid)),
         )
     }
 
@@ -500,17 +500,17 @@ mod tests {
     fn negotiated_stream_restores_mid_and_rid_for_extensionless_packets() {
         let mut peer = SfuPeer::new(CallId::new(), ParticipantId::new());
         let video_ssrc = Ssrc::from(0x0102_0304);
-        let video_mid = Mid::from("video-track");
-        let video_rid = Rid::from("high");
+        let track_mid = Mid::from("video-track");
+        let payload_rid = Rid::from("high");
         {
             let mut api = peer.rtc.direct_api();
-            api.declare_media(video_mid, MediaKind::Video);
-            api.expect_stream_rx(video_ssrc, None, video_mid, Some(video_rid));
+            api.declare_media(track_mid, MediaKind::Video);
+            api.expect_stream_rx(video_ssrc, None, track_mid, Some(payload_rid));
         }
 
         assert_eq!(
             peer.resolve_packet_route(video_ssrc, None, None),
-            (video_mid, Some(video_rid)),
+            (track_mid, Some(payload_rid)),
             "str0m's bounded stream mapping restores omitted routing extensions"
         );
         assert_eq!(

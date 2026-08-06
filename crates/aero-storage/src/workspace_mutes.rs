@@ -106,7 +106,7 @@ impl WorkspaceMuteRepo {
         if participants.is_empty() {
             return Ok(std::collections::HashSet::new());
         }
-        let ids: Vec<uuid::Uuid> = participants.iter().map(|p| p.to_uuid()).collect();
+        let ids: Vec<uuid::Uuid> = participants.iter().map(aero_common::ParticipantId::to_uuid).collect();
         let rows = sqlx::query_as::<_, (uuid::Uuid,)>(
             r"SELECT participant_id FROM workspace_mutes
                WHERE workspace_id = $1 AND participant_id = ANY($2)",

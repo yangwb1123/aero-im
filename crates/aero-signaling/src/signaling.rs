@@ -134,7 +134,7 @@ pub fn validate_call_event(ev: &CallEvent) -> Result<(), SignalingError> {
             }
             validate_sdp(sdp)
         }
-        CallEvent::Answer { sdp, .. } => validate_sdp(sdp),
+        CallEvent::Answer { sdp, .. } | CallEvent::Offer { sdp, .. } => validate_sdp(sdp),
         CallEvent::Ice { candidate, .. } => validate_ice_candidate(candidate),
         CallEvent::End { reason, .. } => {
             if reason.len() > 256 {
@@ -161,6 +161,5 @@ pub fn validate_call_event(ev: &CallEvent) -> Result<(), SignalingError> {
         | CallEvent::Leave { .. }
         | CallEvent::Roster { .. }
         | CallEvent::SfuPublisher { .. } => Ok(()),
-        CallEvent::Offer { sdp, .. } => validate_sdp(sdp),
     }
 }

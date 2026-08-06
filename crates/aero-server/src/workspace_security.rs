@@ -70,8 +70,7 @@ async fn set_security(
     let ws = parse_workspace(&ws_str)?;
     s.workspaces
         .set_require_2fa_authorized(ws, req.require_2fa, auth.participant_id)
-        .await
-        .map_err(AeroError::from)?;
+        .await?;
     Ok(Json(serde_json::json!({ "require_2fa": req.require_2fa })))
 }
 
@@ -161,8 +160,7 @@ async fn set_storage_region(
     if !s
         .workspaces
         .set_region_code_authorized(ws, stored, auth.participant_id)
-        .await
-        .map_err(AeroError::from)?
+        .await?
     {
         return Err(AeroError::NotFound("workspace".into()).into());
     }

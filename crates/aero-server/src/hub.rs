@@ -390,7 +390,7 @@ impl Hub {
     pub fn stream_viewer_count(&self, stream_id: Ulid) -> u32 {
         self.stream_watchers
             .get(&stream_id)
-            .map_or(0, |e| e.len() as u32)
+            .map_or(0, |e| u32::try_from(e.len()).unwrap_or(u32::MAX))
     }
 
     /// Send a JSON-serializable payload to every connection of every recipient.
@@ -412,18 +412,19 @@ impl Hub {
     /// the message is dropped (slow-consumer policy) and, when configured, the
     /// connection is disconnected and pruned. Closed connections are pruned too.
     pub fn fan_out_raw(&self, recipients: &[ParticipantId], text: &str) {
-        Self::fan_out_arc_inner(self, recipients, Arc::from(text.to_owned()));
+        Self::fan_out_arc_inner(self, recipients, &Arc::from(text.to_owned()));
     }
 
     /// Like [`fan_out_raw`] but takes a pre-built `Arc<String>` so the caller
     /// pays the serialization/ownership cost exactly once; the fan-out loop
     /// shares the text via cheap Arc clones (ROADMAP 第二次分析·方向五).
+    #[allow(clippy::needless_pass_by_value)] // Arc ownership is the public contract
     pub fn fan_out_arc(&self, recipients: &[ParticipantId], text: Arc<String>) {
-        Self::fan_out_arc_inner(self, recipients, text);
+        Self::fan_out_arc_inner(self, recipients, &text);
     }
 
     /// Shared implementation for both `fan_out_raw` and `fan_out_arc`.
-    fn fan_out_arc_inner(&self, recipients: &[ParticipantId], text: Arc<String>) {
+    fn fan_out_arc_inner(&self, recipients: &[ParticipantId], text: &Arc<String>) {
         for pid in recipients {
             let _participant_guard = self.participant_locks.lock(*pid);
             // `get_mut` so we can prune dead/laggy senders in place. The write
@@ -451,7 +452,7 @@ impl Hub {
                         }
                     }
                 }
-                match tx.try_send(axum::extract::ws::Message::Text((*text).clone())) {
+                match tx.try_send(axum::extract::ws::Message::Text((**text).clone())) {
                     Ok(()) => {}
                     Err(TrySendError::Full(_)) => {
                         // Slow consumer: drop this frame. Optionally evict.

@@ -8,7 +8,7 @@ use super::MessageRepo;
 
 impl MessageRepo {
     /// Delete expired ephemeral messages (those with `expires_at <= NOW()`) and
-    /// return their (id, room_id) pairs so the caller can emit Deleted frames. The
+    /// return their (id, `room_id`) pairs so the caller can emit Deleted frames. The
     /// read queries (`query.rs` / `search.rs`) ALSO filter `expires_at > now()`, so
     /// an expired message is invisible the instant it lapses; this sweep is the
     /// eventual hard-delete that reclaims the row + announces the Deleted event.

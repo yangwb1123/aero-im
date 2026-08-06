@@ -262,7 +262,7 @@ async fn change_password(
         .map_err(|_| AeroError::Unauthorized("current_password is incorrect".into()))?;
 
     // Validate the new password against the configurable policy (方向五).
-    aero_auth::password_policy::validate(&req.new_password).map_err(AeroError::from)?;
+    aero_auth::password_policy::validate(&req.new_password)?;
     if req.new_password == req.current_password {
         return Err(
             AeroError::Invalid("new_password must differ from current_password".into()).into(),
@@ -415,7 +415,7 @@ async fn reset_password(
     Json(req): Json<ResetPasswordReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
     // Validate the new password against the configurable policy (方向五).
-    aero_auth::password_policy::validate(&req.new_password).map_err(AeroError::from)?;
+    aero_auth::password_policy::validate(&req.new_password)?;
     let hash = hash_reset_token(req.token.trim());
     let reset_repo = PasswordResetRepo::new(s.pg.clone());
     // Resolve without consuming. The final rotation transaction rechecks and

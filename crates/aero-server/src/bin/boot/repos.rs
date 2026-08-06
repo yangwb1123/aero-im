@@ -4,7 +4,7 @@ use std::sync::Arc;
 use aero_live_webrtc::{MediaForwarder, SfuForwarder, SfuRouter};
 use aero_storage::RedisCache;
 
-/// Thin wrapper around all repos so main() doesn't need 40 `let` statements.
+/// Thin wrapper around all repos so `main()` doesn't need 40 `let` statements.
 pub(crate) struct Repos {
     pub(crate) participants: aero_storage::ParticipantRepo,
     pub(crate) rooms: aero_storage::RoomRepo,
@@ -40,7 +40,7 @@ pub(crate) struct Repos {
     pub(crate) seq_store: Arc<aero_storage::SeqStore>,
 }
 
-pub(crate) fn new(pg: sqlx::PgPool, cache: &RedisCache) -> Repos {
+pub(crate) fn new(pg: &sqlx::PgPool, cache: &RedisCache) -> Repos {
     let sfu_router = SfuRouter::new();
     let sfu_forwarder_concrete = Arc::new(SfuForwarder::new(sfu_router.clone()));
     let sfu_forwarder: Arc<dyn MediaForwarder> = sfu_forwarder_concrete.clone();

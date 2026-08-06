@@ -1,4 +1,4 @@
-//! Event bus abstraction over NATS JetStream.
+//! Event bus abstraction over NATS `JetStream`.
 //!
 //! Two layers:
 //! 1. `EventBus` trait — generic publish/subscribe that hides NATS specifics.

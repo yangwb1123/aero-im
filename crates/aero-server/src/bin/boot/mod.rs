@@ -7,13 +7,13 @@
 //! - `services` — Auth, IM, Live, AI service construction
 //! - `ingest` — RTMP + SRT ingest spawning
 //! - `orchestration` — call orchestrator + bridge supervisor
-//! - `state_builder` — AppState composition
+//! - `state_builder` — `AppState` composition
 //! - `background` — bots, dispatchers, webhook loops, blob GC
 //! - `metrics_tasks` — gauge samplers + cross-node heartbeats
 //! - `retention` — message retention + data-lifecycle sweeps
 //! - `serve` — Axum router + HTTP server + graceful shutdown
 //! - `shutdown` — SIGTERM/Ctrl-C handler
-//! - `helpers` — connect_with_retry, build_push_gateways, srt_backing_rtmp_addr
+//! - `helpers` — `connect_with_retry`, `build_push_gateways`, `srt_backing_rtmp_addr`
 
 mod background;
 mod helpers;

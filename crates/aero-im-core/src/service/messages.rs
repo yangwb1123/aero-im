@@ -69,6 +69,9 @@ impl ImService {
     /// Sender-confirmed message send using a stable client UUID. A retry with
     /// the same sender/key/payload returns the canonical message without
     /// publishing or dispatching any side effect again.
+    // Internal service method with a fixed signature; grouping params into a
+    // struct would churn the callers for no behavioral gain.
+    #[allow(clippy::too_many_arguments)]
     pub async fn send_message_idempotent(
         &self,
         sender: ParticipantId,

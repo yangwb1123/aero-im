@@ -61,18 +61,18 @@ impl CommandRegistry {
     /// Falls back to an empty registry if the linkme feature is disabled.
     #[must_use]
     pub fn collect() -> Self {
-        let reg = Self::new();
+        
         // Statically registered commands (from register_command! invocations).
         // Since we don't want to pull in linkme as a dependency, we use a
-        // simpler approach: the binary calls `reg.add(...)` for each command.
+        // simpler approach: the binary calls `reg.with_command(...)` for each command.
         // This is kept as a manual registration API for now — see the `eng`
         // binary entry point.
-        reg
+        Self::new()
     }
 
     /// Register one command. Chainable, consumes and returns self.
     #[must_use]
-    pub fn add(mut self, cmd: Box<dyn Command>) -> Self {
+    pub fn with_command(mut self, cmd: Box<dyn Command>) -> Self {
         self.commands.push(cmd);
         self
     }
@@ -137,7 +137,7 @@ impl CommandRegistry {
         for cmd in &self.commands {
             println!("  {:20} {}", cmd.name(), cmd.description());
         }
-        println!("  {:20} {}", "help", "Show this help message");
+        println!("  {:20} Show this help message", "help");
         println!();
     }
 
@@ -173,7 +173,7 @@ impl Default for CommandRegistry {
 #[macro_export]
 macro_rules! register_command {
     ($ty:ty) => {
-        // Place the command into the registry — binary calls registry.add()
+        // Place the command into the registry — binary calls registry.with_command()
         // manually. This macro just ensures the type is importable.
         // In a future version with linkme, this would be:
         // #[linkme::distributed_slice(COMMANDS)]
@@ -220,7 +220,7 @@ mod tests {
     #[tokio::test]
     async fn registry_execute_found_command() {
         let mut reg = CommandRegistry::new();
-        reg = reg.add(Box::new(TestCmd));
+        reg = reg.with_command(Box::new(TestCmd));
         let result = reg.execute("test-cmd", &["test-cmd".into()]).await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap().command, "test-cmd");
@@ -236,7 +236,7 @@ mod tests {
     #[tokio::test]
     async fn registry_execute_with_multiple_commands() {
         let mut reg = CommandRegistry::new();
-        reg = reg.add(Box::new(TestCmd)).add(Box::new(FailCmd));
+        reg = reg.with_command(Box::new(TestCmd)).with_command(Box::new(FailCmd));
         let ok_result = reg.execute("test-cmd", &["test-cmd".into()]).await;
         assert!(ok_result.is_ok());
         let fail_result = reg.execute("fail-cmd", &["fail-cmd".into()]).await;
@@ -247,9 +247,9 @@ mod tests {
     async fn registry_len_tracks_commands() {
         let mut reg = CommandRegistry::new();
         assert_eq!(reg.len(), 0);
-        reg = reg.add(Box::new(TestCmd));
+        reg = reg.with_command(Box::new(TestCmd));
         assert_eq!(reg.len(), 1);
-        reg = reg.add(Box::new(FailCmd));
+        reg = reg.with_command(Box::new(FailCmd));
         assert_eq!(reg.len(), 2);
     }
 
@@ -269,9 +269,9 @@ mod tests {
 
     #[tokio::test]
     async fn registry_print_help_does_not_panic() {
-        let reg = CommandRegistry::new().add(Box::new(TestCmd));
+        let reg = CommandRegistry::new().with_command(Box::new(TestCmd));
         // print_help should not panic
         reg.print_help();
-        assert!(reg.len() > 0);
+        assert!(!reg.is_empty());
     }
 }

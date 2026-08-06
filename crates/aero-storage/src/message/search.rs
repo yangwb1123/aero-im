@@ -18,7 +18,7 @@ impl MessageRepo {
     ) -> Result<Vec<SearchHit>, sqlx::Error> {
         let limit = limit.clamp(1, 100);
         let rows = sqlx::query_as::<_, ScoredMessageRow>(
-            r#"SELECT id, room_id, sender_id, blocks, reply_to, metadata,
+            r"SELECT id, room_id, sender_id, blocks, reply_to, metadata,
                       created_at, edited_at, deleted_at, expires_at, version,
                       GREATEST(fts_score, trigram_score) AS score
                FROM (
@@ -48,7 +48,7 @@ impl MessageRepo {
                    AND m.searchable_text % $2
                ) sub
                ORDER BY score DESC, id DESC
-               LIMIT $3"#,
+               LIMIT $3",
         )
         .bind(room.to_uuid())
         .bind(query)
@@ -73,7 +73,7 @@ impl MessageRepo {
             .execute(&mut *tx)
             .await?;
         let rows = sqlx::query_as::<_, ScoredMessageRow>(
-            r#"SELECT
+            r"SELECT
                  m.id, m.room_id, m.sender_id, m.blocks, m.reply_to, m.metadata,
                  m.created_at, m.edited_at, m.deleted_at, m.expires_at, m.version,
                  (1 - (m.embedding <=> $2))::real AS score
@@ -82,7 +82,7 @@ impl MessageRepo {
                  AND m.deleted_at IS NULL AND (m.expires_at IS NULL OR m.expires_at > now())
                  AND m.embedding IS NOT NULL
                ORDER BY m.embedding <=> $2
-               LIMIT $3"#,
+               LIMIT $3",
         )
         .bind(room.to_uuid())
         .bind(v)
@@ -113,7 +113,7 @@ impl MessageRepo {
     ) -> Result<Vec<SearchHit>, sqlx::Error> {
         let limit = limit.clamp(1, 1000);
         let rows = sqlx::query_as::<_, ScoredMessageRow>(
-            r#"SELECT
+            r"SELECT
                  m.id, m.room_id, m.sender_id, m.blocks, m.reply_to, m.metadata,
                  m.created_at, m.edited_at, m.deleted_at, m.expires_at, m.version,
                  GREATEST(
@@ -129,7 +129,7 @@ impl MessageRepo {
                  )
                  AND ($4::uuid IS NULL OR m.sender_id = $4::uuid)
                ORDER BY score DESC, m.id DESC
-               LIMIT $2"#,
+               LIMIT $2",
         )
         .bind(room.to_uuid())
         .bind(limit)
@@ -153,7 +153,7 @@ impl MessageRepo {
     ) -> Result<Vec<SearchHit>, sqlx::Error> {
         let limit = limit.clamp(1, 100);
         let rows = sqlx::query_as::<_, ScoredMessageRow>(
-            r#"SELECT
+            r"SELECT
                  m.id, m.room_id, m.sender_id, m.blocks, m.reply_to, m.metadata,
                  m.created_at, m.edited_at, m.deleted_at, m.expires_at, m.version,
                  GREATEST(
@@ -185,7 +185,7 @@ impl MessageRepo {
                    OR m.searchable_text % $2
                  )
                ORDER BY score DESC, m.id DESC
-               LIMIT $3"#,
+               LIMIT $3",
         )
         .bind(pid.to_uuid())
         .bind(query)
@@ -206,7 +206,7 @@ impl MessageRepo {
     ) -> Result<Vec<SearchHit>, sqlx::Error> {
         let limit = limit.clamp(1, 100);
         let rows = sqlx::query_as::<_, ScoredMessageRow>(
-            r#"SELECT
+            r"SELECT
                  m.id, m.room_id, m.sender_id, m.blocks, m.reply_to, m.metadata,
                  m.created_at, m.edited_at, m.deleted_at, m.expires_at, m.version,
                  GREATEST(
@@ -239,7 +239,7 @@ impl MessageRepo {
                    OR m.searchable_text % $2
                  )
                ORDER BY score DESC, m.id DESC
-               LIMIT $3"#,
+               LIMIT $3",
         )
         .bind(pid.to_uuid())
         .bind(query)
@@ -266,7 +266,7 @@ impl MessageRepo {
             .execute(&mut *tx)
             .await?;
         let rows = sqlx::query_as::<_, ScoredMessageRow>(
-            r#"SELECT
+            r"SELECT
                  m.id, m.room_id, m.sender_id, m.blocks, m.reply_to, m.metadata,
                  m.created_at, m.edited_at, m.deleted_at, m.expires_at, m.version,
                  (1 - (m.embedding <=> $2))::real AS score
@@ -293,7 +293,7 @@ impl MessageRepo {
                  AND m.deleted_at IS NULL AND (m.expires_at IS NULL OR m.expires_at > now())
                  AND m.embedding IS NOT NULL
                ORDER BY m.embedding <=> $2
-               LIMIT $3"#,
+               LIMIT $3",
         )
         .bind(pid.to_uuid())
         .bind(v)
@@ -328,7 +328,7 @@ impl MessageRepo {
     ) -> Result<Vec<SearchHit>, sqlx::Error> {
         let limit = limit.clamp(1, 1000);
         let rows = sqlx::query_as::<_, ScoredMessageRow>(
-            r#"SELECT
+            r"SELECT
                  m.id, m.room_id, m.sender_id, m.blocks, m.reply_to, m.metadata,
                  m.created_at, m.edited_at, m.deleted_at, m.expires_at, m.version,
                  GREATEST(
@@ -362,7 +362,7 @@ impl MessageRepo {
                  )
                  AND ($4::uuid IS NULL OR m.sender_id = $4::uuid)
                ORDER BY score DESC, m.id DESC
-               LIMIT $2"#,
+               LIMIT $2",
         )
         .bind(pid.to_uuid())
         .bind(limit)

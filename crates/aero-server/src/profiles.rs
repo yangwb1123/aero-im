@@ -182,7 +182,7 @@ struct PatchStatusReq {
     /// Status text (e.g. "On vacation"). Absent or null clears it.
     #[serde(default)]
     status_text: Option<String>,
-    /// Emoji shorthand (e.g. ":palm_tree:"). Absent or null clears it.
+    /// Emoji shorthand (e.g. ":`palm_tree`:"). Absent or null clears it.
     #[serde(default)]
     status_emoji: Option<String>,
     /// Auto-expire after this many minutes from now. Absent or null = never.
@@ -235,7 +235,7 @@ async fn patch_profile_status(
             "participant_id": auth.participant_id,
             "status_text": text,
             "status_emoji": emoji,
-            "status_expires_at": expires_at.map(|t| t.unix_timestamp()),
+            "status_expires_at": expires_at.map(time::OffsetDateTime::unix_timestamp),
         }))),
     }
 }

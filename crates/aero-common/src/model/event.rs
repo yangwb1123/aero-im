@@ -82,9 +82,9 @@ pub enum RoomEvent {
         room_id: RoomId,
         message_id: MessageId,
         by: ParticipantId,
-        /// Idempotency token: each NotifyBatch publish carries a unique ULID so
+        /// Idempotency token: each `NotifyBatch` publish carries a unique `ULID` so
         /// a redelivery after a consumer crash produces zero duplicate
-        /// notifications (ON CONFLICT on (delivery_id, participant_id)).
+        /// notifications (ON CONFLICT on (`delivery_id`, `participant_id`)).
         delivery_id: uuid::Uuid,
         recipients: Vec<NotifyTarget>,
     },
@@ -187,8 +187,8 @@ impl RoomEvent {
             | RoomEvent::Poll { room_id, .. }
             | RoomEvent::CanvasOp { room_id, .. }
             | RoomEvent::MessageSeen { room_id, .. }
-            | RoomEvent::Interaction { room_id, .. } => Some(*room_id),
-            RoomEvent::Call(
+            | RoomEvent::Interaction { room_id, .. }
+            | RoomEvent::Call(
                 CallEvent::Invite { room_id, .. }
                 | CallEvent::End { room_id, .. }
                 | CallEvent::Caption { room_id, .. }

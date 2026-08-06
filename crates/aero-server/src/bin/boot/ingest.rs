@@ -42,7 +42,7 @@ pub(crate) fn from_server_cfg(cfg: &aero_common::config::AppConfig) -> IngestCon
 
 pub(crate) fn spawn(
     tracker: &TaskTracker,
-    streams: aero_storage::StreamRepo,
+    streams: &aero_storage::StreamRepo,
     cfg: IngestConfig,
     shutdown: &CancellationToken,
 ) -> Arc<LiveStreamConfig> {

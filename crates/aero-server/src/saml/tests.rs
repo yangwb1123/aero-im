@@ -50,6 +50,7 @@ fn authn_request_has_required_attributes() {
 
 #[test]
 fn redirect_url_roundtrips_through_deflate_base64() {
+    use std::io::Read as _;
     let c = cfg();
     let xml = build_authn_request(&c, "_id1", "2026-06-19T00:00:00Z");
     let url = redirect_url_for_authn_request(&c, &xml).expect("encode");
@@ -63,7 +64,6 @@ fn redirect_url_roundtrips_through_deflate_base64() {
     let raw = base64::engine::general_purpose::STANDARD
         .decode(value.as_bytes())
         .expect("base64");
-    use std::io::Read as _;
     let mut inflated = String::new();
     flate2::read::DeflateDecoder::new(&raw[..])
         .read_to_string(&mut inflated)
@@ -371,7 +371,7 @@ static VERIFY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// Run `f` with the experimental-verify switch forced to `on`/`off`, restoring
 /// the prior value afterward. Holds [`VERIFY_ENV_LOCK`] for the duration.
 fn with_experimental_verify<R>(on: bool, f: impl FnOnce() -> R) -> R {
-    let _guard = VERIFY_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = VERIFY_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let saved = std::env::var(EXPERIMENTAL_VERIFY_ENV).ok();
     if on {
         std::env::set_var(EXPERIMENTAL_VERIFY_ENV, "1");

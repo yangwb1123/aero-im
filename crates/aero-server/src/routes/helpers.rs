@@ -18,7 +18,7 @@ pub(crate) fn parse_room_kind(s: &str) -> AeroResult<RoomKind> {
     }
 }
 
-/// Merge two SearchHit lists (FTS + vector). Dedupes by message id, takes the
+/// Merge two `SearchHit` lists (FTS + vector). Dedupes by message id, takes the
 /// max score per id, returns top `limit` ordered by score desc.
 pub(crate) fn merge_hits(
     a: Vec<aero_storage::SearchHit>,
@@ -42,7 +42,7 @@ pub(crate) fn merge_hits(
             .partial_cmp(&x.score)
             .unwrap_or(std::cmp::Ordering::Equal)
     });
-    let limit = limit.clamp(1, 100) as usize;
+    let limit = usize::try_from(limit.clamp(1, 100)).expect("clamped to 1..=100");
     out.truncate(limit);
     out
 }

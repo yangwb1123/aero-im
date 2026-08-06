@@ -177,8 +177,8 @@ impl ReceiptRepo {
     /// All receipts for a room (one per participant who's read anything).
     pub async fn list_for_room(&self, room: RoomId) -> Result<Vec<ReadReceipt>, sqlx::Error> {
         let rows = sqlx::query_as::<_, (uuid::Uuid, uuid::Uuid, uuid::Uuid, time::OffsetDateTime)>(
-            r#"SELECT room_id, participant_id, last_read_message_id, updated_at
-               FROM read_receipts WHERE room_id = $1"#,
+            r"SELECT room_id, participant_id, last_read_message_id, updated_at
+               FROM read_receipts WHERE room_id = $1",
         )
         .bind(room.to_uuid())
         .fetch_all(&self.pool)
@@ -200,8 +200,8 @@ impl ReceiptRepo {
         participant: ParticipantId,
     ) -> Result<Option<ReadReceipt>, sqlx::Error> {
         let row = sqlx::query_as::<_, (uuid::Uuid, time::OffsetDateTime)>(
-            r#"SELECT last_read_message_id, updated_at
-               FROM read_receipts WHERE room_id = $1 AND participant_id = $2"#,
+            r"SELECT last_read_message_id, updated_at
+               FROM read_receipts WHERE room_id = $1 AND participant_id = $2",
         )
         .bind(room.to_uuid())
         .bind(participant.to_uuid())
@@ -224,12 +224,12 @@ async fn mark_read_in_tx(
 ) -> Result<ReadReceipt, sqlx::Error> {
     let now = time::OffsetDateTime::now_utc();
     sqlx::query(
-        r#"INSERT INTO read_receipts (room_id, participant_id, last_read_message_id, updated_at)
+        r"INSERT INTO read_receipts (room_id, participant_id, last_read_message_id, updated_at)
            VALUES ($1, $2, $3, $4)
            ON CONFLICT (room_id, participant_id) DO UPDATE
            SET last_read_message_id = EXCLUDED.last_read_message_id,
                updated_at = EXCLUDED.updated_at
-           WHERE EXCLUDED.last_read_message_id > read_receipts.last_read_message_id"#,
+           WHERE EXCLUDED.last_read_message_id > read_receipts.last_read_message_id",
     )
     .bind(room.to_uuid())
     .bind(participant.to_uuid())

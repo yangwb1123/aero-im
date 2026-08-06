@@ -221,6 +221,6 @@ async fn list_clips(
         return Err(AeroError::NotFound(format!("collection {id}")).into());
     }
     let clips = repo(&s).list_clips(id).await.map_err(AeroError::from)?;
-    let clip_strs: Vec<String> = clips.iter().map(|c| c.to_string()).collect();
+    let clip_strs: Vec<String> = clips.iter().map(std::string::ToString::to_string).collect();
     Ok(Json(serde_json::json!({ "clips": clip_strs })))
 }

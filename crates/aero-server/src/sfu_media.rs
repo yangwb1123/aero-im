@@ -317,7 +317,9 @@ impl SfuMediaRegistry {
     fn lifecycle_lock_index(call: CallId) -> usize {
         let mut hasher = DefaultHasher::new();
         call.hash(&mut hasher);
-        (hasher.finish() as usize) % LIFECYCLE_LOCK_STRIPES
+        // u64→usize narrows only on 32-bit targets; a zero stripe is a safe
+        // fallback for a hash index.
+        usize::try_from(hasher.finish()).unwrap_or(0) % LIFECYCLE_LOCK_STRIPES
     }
 
     pub(crate) async fn lock_lifecycle(&self, call: CallId) -> tokio::sync::MutexGuard<'_, ()> {

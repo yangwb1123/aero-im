@@ -81,7 +81,7 @@ pub fn parse_search_query(raw: &str) -> ParsedQuery {
             }
         } else if let Some(v) = token.strip_prefix("since:") {
             let dt_str = if v.len() == 10 {
-                format!("{}T00:00:00Z", v)
+                format!("{v}T00:00:00Z")
             } else {
                 v.to_owned()
             };
@@ -93,7 +93,7 @@ pub fn parse_search_query(raw: &str) -> ParsedQuery {
             }
         } else if let Some(v) = token.strip_prefix("until:") {
             let dt_str = if v.len() == 10 {
-                format!("{}T23:59:59Z", v)
+                format!("{v}T23:59:59Z")
             } else {
                 v.to_owned()
             };

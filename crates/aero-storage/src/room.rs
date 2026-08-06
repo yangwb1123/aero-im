@@ -63,8 +63,8 @@ impl RoomRepo {
         // rooms into. `rooms.workspace_id` is NOT NULL with no DB default, so this
         // bind is required; tenant-aware callers use `create_in_workspace`.
         sqlx::query(
-            r#"INSERT INTO rooms (id, kind, name, created_by, created_at, workspace_id)
-               VALUES ($1, $2, $3, $4, $5, $6)"#,
+            r"INSERT INTO rooms (id, kind, name, created_by, created_at, workspace_id)
+               VALUES ($1, $2, $3, $4, $5, $6)",
         )
         .bind(id.to_uuid())
         .bind(kind_s)
@@ -76,8 +76,8 @@ impl RoomRepo {
         .await?;
 
         sqlx::query(
-            r#"INSERT INTO room_members (room_id, participant_id, role, joined_at)
-               VALUES ($1, $2, 'owner', $3)"#,
+            r"INSERT INTO room_members (room_id, participant_id, role, joined_at)
+               VALUES ($1, $2, 'owner', $3)",
         )
         .bind(id.to_uuid())
         .bind(created_by.to_uuid())
@@ -118,9 +118,9 @@ impl RoomRepo {
             ));
         }
         sqlx::query(
-            r#"INSERT INTO room_members (room_id, participant_id, role, joined_at)
+            r"INSERT INTO room_members (room_id, participant_id, role, joined_at)
                VALUES ($1, $2, 'member', NOW())
-               ON CONFLICT DO NOTHING"#,
+               ON CONFLICT DO NOTHING",
         )
         .bind(room.to_uuid())
         .bind(member.to_uuid())
@@ -136,7 +136,7 @@ impl RoomRepo {
         member: ParticipantId,
     ) -> Result<bool, sqlx::Error> {
         let row = sqlx::query_as::<_, (i64,)>(
-            r#"SELECT COUNT(*) FROM room_members WHERE room_id=$1 AND participant_id=$2"#,
+            r"SELECT COUNT(*) FROM room_members WHERE room_id=$1 AND participant_id=$2",
         )
         .bind(room.to_uuid())
         .bind(member.to_uuid())
@@ -147,7 +147,7 @@ impl RoomRepo {
 
     pub async fn members(&self, room: RoomId) -> Result<Vec<ParticipantId>, sqlx::Error> {
         let rows = sqlx::query_as::<_, (uuid::Uuid,)>(
-            r#"SELECT participant_id FROM room_members WHERE room_id=$1"#,
+            r"SELECT participant_id FROM room_members WHERE room_id=$1",
         )
         .bind(room.to_uuid())
         .fetch_all(&self.pool)
@@ -214,7 +214,7 @@ impl RoomRepo {
                 time::OffsetDateTime,
             ),
         >(
-            r#"SELECT r.id, r.kind, r.name, r.created_by, r.created_at
+            r"SELECT r.id, r.kind, r.name, r.created_by, r.created_at
                FROM rooms r
                JOIN room_members m
                  ON m.room_id = r.id
@@ -238,7 +238,7 @@ impl RoomRepo {
                      OR NOT w.require_2fa
                      OR COALESCE(totp.activated, false)
                  )
-               ORDER BY r.created_at DESC"#,
+               ORDER BY r.created_at DESC",
         )
         .bind(participant.to_uuid())
         .fetch_all(&self.pool)
@@ -799,7 +799,7 @@ impl RoomRepo {
             .bind(room.to_uuid())
             .fetch_optional(&self.pool)
             .await?;
-        Ok(row.map(|(s,)| s).unwrap_or(0))
+        Ok(row.map_or(0, |(s,)| s))
     }
 
     /// Remove a participant from a room (used by channel leave). Idempotent: a

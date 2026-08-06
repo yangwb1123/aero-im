@@ -1,6 +1,6 @@
 //! Message repository — CRUD, search, thread queries, sweep.
 //!
-//! Split from monolithic `message.rs` (1819 lines) as part of REFACTOR_PLAN.md
+//! Split from monolithic `message.rs` (1819 lines) as part of `REFACTOR_PLAN.md`
 //! Step 2. Each method group lives in its own sub-module.
 //!
 //! The struct definitions (`MessageRepo`, `NewMessage`, `SearchHit`) and
@@ -176,8 +176,6 @@ pub(crate) fn attached_blob_ids(blocks_json: &serde_json::Value) -> Vec<aero_com
 }
 
 pub(crate) const EXPORT_SENDER_CAP: i64 = 500;
-
-/// Maximum rows returned by [`MessageRepo::by_sender`] (personal GDPR export).
 
 // ---------- Types shared by sub-modules ----------
 

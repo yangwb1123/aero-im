@@ -1,13 +1,13 @@
 //! JSON frame serialization for WebSocket messages.
 //!
-//! Extracted from `ws/ws_impl.rs` as part of REFACTOR_PLAN.md Step 4.
+//! Extracted from `ws/ws_impl.rs` as part of `REFACTOR_PLAN.md` Step 4.
 //! Uses `ServerFrame` and `Message` from the parent module.
 
 use aero_common::{NotificationKind, RoomEvent};
 
 use super::ws_impl::ServerFrame;
 
-/// Stamp a bus seq onto a ServerFrame JSON value and serialize.
+/// Stamp a bus seq onto a `ServerFrame` JSON value and serialize.
 fn stamped_frame_json(frame: &ServerFrame<'_>, seq: Option<u64>) -> String {
     match serde_json::to_value(frame) {
         Ok(mut value) => {

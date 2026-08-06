@@ -582,12 +582,12 @@ fn make_docx(body_xml: &[u8]) -> Vec<u8> {
 }
 
 /// End-to-end of the *pure* indexing logic: real docx bytes → `extract_text`
-/// (via doc_extract) → folded into a message's searchable text. This is exactly
+/// (via `doc_extract`) → folded into a message's searchable text. This is exactly
 /// what the worker persists into `searchable_text` + embeds, minus the blob read.
 #[test]
 fn docx_body_is_extracted_and_folded_into_message_searchable_text() {
     let docx = make_docx(
-        br#"<w:document><w:body><w:p><w:r><w:t>Migration runbook: rotate the TLS cert before Friday</w:t></w:r></w:p></w:body></w:document>"#,
+        br"<w:document><w:body><w:p><w:r><w:t>Migration runbook: rotate the TLS cert before Friday</w:t></w:r></w:p></w:body></w:document>",
     );
     // The same extractor the worker uses on the blob bytes.
     let doc_text = extract_text(&docx, MAX_ATTACHMENT_BYTES).expect("docx extracts");

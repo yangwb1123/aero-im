@@ -20,7 +20,7 @@
 //! }
 //!
 //! # async fn example() {
-//! let reg = CommandRegistry::new().add(Box::new(HelloCmd));
+//! let reg = CommandRegistry::new().with_command(Box::new(HelloCmd));
 //! let result = reg.execute("hello", &["hello".into()]).await;
 //! assert!(result.is_ok());
 //! # }
@@ -66,7 +66,7 @@ pub mod term;
 /// Unlike snaplink's exit-code-sum approach, this preserves the full structured outcome.
 pub async fn dispatch(args: &[String]) -> RegistryResult {
     let registry = CommandRegistry::collect();
-    let cmd_name = args.first().map(String::as_str).unwrap_or("help");
+    let cmd_name = args.first().map_or("help", String::as_str);
     registry.execute(cmd_name, args).await
 }
 

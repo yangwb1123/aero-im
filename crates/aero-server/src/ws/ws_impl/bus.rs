@@ -1,7 +1,7 @@
 //! Background bus listeners and their per-message handlers. Subscribes to
 //! `im.room.*` / `live.stream.*`, fans each decoded event into the local Hub,
 //! and shuts down cooperatively through a shared cancellation token.
-use super::*;
+use super::{warn, info, debug, AppState, Arc, ParticipantId, metrics, names, StreamEvent, ServerFrame};
 use crate::ws::frame;
 use futures::{Stream, StreamExt};
 use sha2::{Digest, Sha256};
@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 /// (NATS reconnect/drop) or a subscribe call fails. Short — fan-out is offline
 /// until we reconnect — but non-zero so a hard-down NATS can't spin a tight loop.
 const BUS_RESUBSCRIBE_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
-/// Conservative cap for a JetStream durable consumer name. Names emitted here
+/// Conservative cap for a `JetStream` durable consumer name. Names emitted here
 /// use only ASCII letters, digits, `_`, and `-`, and therefore are safe as both
 /// NATS consumer names and log fields.
 const NATS_DURABLE_NAME_MAX_BYTES: usize = 128;
@@ -56,7 +56,7 @@ async fn backoff_or_cancelled(duration: std::time::Duration, cancel: &Cancellati
 }
 
 /// ACK a handled or deterministically-dropped message. An ACK transport failure
-/// is observable and intentionally otherwise non-fatal: JetStream will redeliver
+/// is observable and intentionally otherwise non-fatal: `JetStream` will redeliver
 /// after `ack_wait`, preserving at-least-once delivery.
 async fn ack_or_warn(sub: Box<dyn aero_bus::Subscription + Send>, disposition: &'static str) {
     if let Err(e) = sub.ack().await {
@@ -497,7 +497,7 @@ async fn handle_room_event_sub(state: &AppState, sub: Box<dyn aero_bus::Subscrip
                     "type": "message",
                     "message": env.message,
                 });
-                state.hub.fan_out_raw(&*recipients, &frame.to_string());
+                state.hub.fan_out_raw(&recipients, &frame.to_string());
                 ack_or_warn(sub, "legacy_message_fanned_out").await;
                 return;
             }

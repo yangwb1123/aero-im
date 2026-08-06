@@ -12,6 +12,7 @@
 //! creator-scoped and rechecks effective tenant access while holding the row
 //! lock. Mounted via [`routes`] and `.merge`d into the main router.
 
+use std::fmt::Write as _;
 use std::str::FromStr;
 
 use aero_auth::AuthUser;
@@ -304,13 +305,15 @@ async fn workspace_schedule_ics(
         // Default duration: 1 hour.
         let dtend = fmt_ics_dt(stream.scheduled_for + time::Duration::hours(1));
         ics.push_str("BEGIN:VEVENT\r\n");
-        ics.push_str(&format!("UID:{}@aero\r\n", stream.id));
-        ics.push_str(&format!("SUMMARY:{}\r\n", ics_escape(&stream.title)));
-        ics.push_str(&format!("DTSTART:{dtstart}\r\n"));
-        ics.push_str(&format!("DTEND:{dtend}\r\n"));
+        write!(ics, "UID:{}@aero\r\n", stream.id).expect("write to String cannot fail");
+        write!(ics, "SUMMARY:{}\r\n", ics_escape(&stream.title))
+            .expect("write to String cannot fail");
+        write!(ics, "DTSTART:{dtstart}\r\n").expect("write to String cannot fail");
+        write!(ics, "DTEND:{dtend}\r\n").expect("write to String cannot fail");
         if let Some(desc) = &stream.description {
             if !desc.is_empty() {
-                ics.push_str(&format!("DESCRIPTION:{}\r\n", ics_escape(desc)));
+                write!(ics, "DESCRIPTION:{}\r\n", ics_escape(desc))
+                    .expect("write to String cannot fail");
             }
         }
         ics.push_str("END:VEVENT\r\n");

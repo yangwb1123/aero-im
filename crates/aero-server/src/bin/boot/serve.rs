@@ -198,7 +198,7 @@ pub(crate) async fn serve(
                         // lockout config, so it takes a unix-seconds `now`.
                         let now_unix = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_secs() as i64)
+                            .map(|d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
                             .unwrap_or(0);
                         let throttle_evicted = sweep_state.auth.sweep_login_throttle(now_unix).await;
                         if throttle_evicted > 0 {

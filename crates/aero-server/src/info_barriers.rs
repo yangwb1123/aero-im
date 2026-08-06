@@ -124,8 +124,7 @@ async fn create_barrier(
 
     let id = repo(&s)
         .create_authorized(ws, group_a, group_b, auth.participant_id)
-        .await
-        .map_err(AeroError::from)?;
+        .await?;
     // Re-read so the response carries the full, canonical row (created_at etc.).
     let row = repo(&s)
         .get(id)
@@ -159,8 +158,7 @@ async fn delete_barrier(
     let id = parse_barrier(&id_str)?;
     let removed = repo(&s)
         .delete_authorized(id, auth.participant_id)
-        .await
-        .map_err(AeroError::from)?;
+        .await?;
     if !removed {
         return Err(AeroError::NotFound(format!("barrier {id}")).into());
     }

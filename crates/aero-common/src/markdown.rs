@@ -6,7 +6,7 @@
 //! free — hand-rolled byte scanner matching the codebase style (see
 //! [`aero_im_core::pii_detect`] and [`aero_server::content_sniff`]).
 //!
-//! ## Scope (CommonMark subset)
+//! ## Scope (`CommonMark` subset)
 //! | Input             | Output                        |
 //! |-------------------|-------------------------------|
 //! | `**bold**`        | `Span { style: Bold, … }`     |
@@ -19,7 +19,7 @@
 //! ## Deliberately NOT supported
 //! * Headings, lists, blockquotes, images, tables, HTML — out of chat scope.
 //! * Nested spans (e.g. `**bold *and italic***`) — the innermost wins.
-//! * `_italic_` — ambiguous with snake_case, skipped.
+//! * `_italic_` — ambiguous with `snake_case`, skipped.
 //! * `__bold__` — ambiguous with dunder, skipped.
 //! * Multi-line blocks — `\n` becomes a plain Block boundary (one Block per line).
 //!
@@ -27,7 +27,7 @@
 //! A single empty/missing input line yields `Vec::new()` (not one empty text block).
 //! A line with no recognised formatting yields one `Block::Text { spans: [] }`
 //! with the content verbatim. `@mention`s resolve to `Block::Mention` on a
-//! best-effort basis: only `display_name` is parsed (ParticipantId lookup is the
+//! best-effort basis: only `display_name` is parsed (`ParticipantId` lookup is the
 //! caller's responsibility).
 //!
 //! Pure, unit-tested without any I/O.
@@ -42,7 +42,7 @@ pub fn parse_markdown_to_blocks(md: &str) -> Vec<Block> {
     md.lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
-        .flat_map(|line| parse_line(line))
+        .flat_map(parse_line)
         .collect()
 }
 
@@ -84,9 +84,6 @@ fn parse_line(line: &str) -> Vec<Block> {
 /// `content`, and adjust offsets accordingly.
 #[must_use]
 fn parse_spans(text: &str) -> (String, Vec<Span>) {
-    let bytes = text.as_bytes();
-    let len = bytes.len();
-
     // Phase 1: collect all span ranges and their stripped text positions.
     #[derive(Debug)]
     struct RawSpan {
@@ -94,6 +91,9 @@ fn parse_spans(text: &str) -> (String, Vec<Span>) {
         end: usize,   // in the stripped content
         style: SpanStyle,
     }
+
+    let bytes = text.as_bytes();
+    let len = bytes.len();
 
     let mut stripped = String::with_capacity(len);
     let mut raw_spans: Vec<RawSpan> = Vec::new();
@@ -200,6 +200,9 @@ fn parse_spans(text: &str) -> (String, Vec<Span>) {
     }
 
     // Phase 2: convert RawSpan → Span with correct offsets.
+    // Span offsets are u32 by wire-format design; inputs are chat lines bounded
+    // far below u32::MAX, so the usize → u32 narrowing is safe.
+    #[allow(clippy::cast_possible_truncation)]
     let spans: Vec<Span> = raw_spans
         .into_iter()
         .map(|r| Span {
@@ -244,7 +247,7 @@ mod tests {
                 assert_eq!(spans[0].end, 11);
                 assert!(matches!(spans[0].style, SpanStyle::Bold));
             }
-            other => assert!(false, "expected text block, got {other:?}"),
+            other => panic!("expected text block, got {other:?}"),
         }
     }
 
@@ -257,7 +260,7 @@ mod tests {
             assert_eq!(spans.len(), 1);
             assert!(matches!(spans[0].style, SpanStyle::Italic));
         } else {
-            assert!(false, "expected text block");
+            panic!("expected text block");
         }
     }
 
@@ -269,7 +272,7 @@ mod tests {
             assert_eq!(content, "use let x = 1; here");
             assert!(matches!(spans[0].style, SpanStyle::Code));
         } else {
-            assert!(false, "expected text block");
+            panic!("expected text block");
         }
     }
 
@@ -281,7 +284,7 @@ mod tests {
             assert_eq!(content, "old news update");
             assert!(matches!(spans[0].style, SpanStyle::Strikethrough));
         } else {
-            assert!(false, "expected text block");
+            panic!("expected text block");
         }
     }
 
@@ -294,10 +297,10 @@ mod tests {
             assert_eq!(spans.len(), 1);
             match &spans[0].style {
                 SpanStyle::Link { href } => assert_eq!(href, "https://aero.im/docs"),
-                other => assert!(false, "expected Link, got {other:?}"),
+                other => panic!("expected Link, got {other:?}"),
             }
         } else {
-            assert!(false, "expected text block");
+            panic!("expected text block");
         }
     }
 
@@ -311,7 +314,7 @@ mod tests {
             assert_eq!(content, "bold and italic and strike");
             assert_eq!(spans.len(), 3);
         } else {
-            assert!(false, "expected text block");
+            panic!("expected text block");
         }
     }
 
@@ -349,7 +352,7 @@ mod tests {
                 assert_eq!(content, "hello world");
                 assert!(spans.is_empty());
             }
-            other => assert!(false, "expected text, got {other:?}"),
+            other => panic!("expected text, got {other:?}"),
         }
     }
 
@@ -362,7 +365,7 @@ mod tests {
             assert_eq!(content, "hello **world");
             assert!(spans.is_empty());
         } else {
-            assert!(false, "expected text block");
+            panic!("expected text block");
         }
     }
 
@@ -377,7 +380,7 @@ mod tests {
         if let Block::Text { content, spans: _ } = &blocks[0] {
             assert_eq!(content, "snake_case");
         } else {
-            assert!(false, "expected text block");
+            panic!("expected text block");
         }
     }
 
@@ -388,7 +391,7 @@ mod tests {
         if let Block::Text { content, .. } = &blocks[0] {
             assert_eq!(content, "line one");
         } else {
-            assert!(false, "expected text");
+            panic!("expected text");
         }
     }
 
@@ -400,7 +403,7 @@ mod tests {
             assert_eq!(content, "[text] no parens");
             assert!(spans.is_empty());
         } else {
-            assert!(false, "expected text block");
+            panic!("expected text block");
         }
     }
 
@@ -413,7 +416,7 @@ mod tests {
             assert_eq!(content, "****");
             assert!(spans.is_empty());
         } else {
-            assert!(false, "expected text block");
+            panic!("expected text block");
         }
     }
 }

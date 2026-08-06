@@ -112,7 +112,7 @@ pub fn build_delivery_from_bytes(
     retry_headers: &[(String, String)],
     now: i64,
 ) -> Delivery {
-    let signature = sign_payload(secret, now, &body);
+    let signature = sign_payload(secret, now, body);
     let mut headers: Vec<_> = retry_headers
         .iter()
         .filter(|(name, _)| is_retry_header(name))
@@ -190,7 +190,7 @@ impl DnsLookup for SystemDns {
     async fn lookup(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>, String> {
         tokio::net::lookup_host((host, port))
             .await
-            .map(|addresses| addresses.collect())
+            .map(std::iter::Iterator::collect)
             .map_err(|error| format!("webhook host does not resolve: {error}"))
     }
 }
@@ -250,6 +250,9 @@ fn parse_webhook_url(raw: &str) -> Result<reqwest::Url, String> {
         .trim_matches(['[', ']'])
         .trim_end_matches('.')
         .to_ascii_lowercase();
+    // `normalized` was already lowercased above, so these suffix comparisons are
+    // effectively case-insensitive.
+    #[allow(clippy::case_sensitive_file_extension_comparisons)]
     if normalized == "localhost"
         || normalized.ends_with(".localhost")
         || normalized.ends_with(".local")

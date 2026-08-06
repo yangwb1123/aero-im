@@ -50,8 +50,7 @@ async fn block_user(
     }
     s.blocks
         .block(auth.participant_id, target)
-        .await
-        .map_err(AeroError::from)?;
+        .await?;
     Ok(StatusCode::OK)
 }
 
@@ -66,8 +65,7 @@ async fn unblock_user(
     let target = parse_participant(&target_str)?;
     s.blocks
         .unblock(auth.participant_id, target)
-        .await
-        .map_err(AeroError::from)?;
+        .await?;
     Ok(StatusCode::OK)
 }
 
@@ -82,8 +80,7 @@ async fn list_blocks(
     let blocked = s
         .blocks
         .blocks_for(auth.participant_id)
-        .await
-        .map_err(AeroError::from)?;
+        .await?;
     let ids: Vec<String> = blocked.into_iter().map(|p| p.to_string()).collect();
     Ok(Json(serde_json::json!({ "blocks": ids })))
 }

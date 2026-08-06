@@ -497,12 +497,11 @@ async fn bot_delivery_requeue_rolls_back_when_audit_append_fails() {
         "CREATE FUNCTION {function}() RETURNS trigger LANGUAGE plpgsql AS $$
          BEGIN
              IF NEW.action = 'bot.delivery.requeued'
-                AND NEW.target = '{}' THEN
+                AND NEW.target = '{delivery}' THEN
                  RAISE EXCEPTION 'injected bot audit failure';
              END IF;
              RETURN NEW;
-         END $$",
-        delivery
+         END $$"
     ))
     .execute(&pool)
     .await
