@@ -1,17 +1,21 @@
-Plan written to `docs/pi-batch/feature-plan.md` (harness-canonical path). Key points:
+Plan written to `docs/pi-batch/message-recall-plan.md` (v2, supersedes the original). No implementation code written.
 
-## Assessment
-`pi-batch.py assess` → 处方档 **demo（S）**, workflow **L3_platform**, 产品化 **L2_platform_capability**（多租户信号）; 0 hard rules. Missing main_flow/data_source/error_path/tech_stack are supplied by the plan.
+## Summary
 
-## Important context verified up front
-The feature is **already implemented in the working tree** from the prior round (52 files + `migrations/0238_message_recall.sql` + 2 new test files + 2 docs), and I re-ran every gate just now — **all green**: check 0 errors, test --lib 17 suites 0 failed, clippy -D warnings 0, web-check 0, truth-check 0 orphans, file-size 0 violations, plus `test-integration.sh` EXIT 0 and authz_lint 6 passed were verified in the prior round. The harness's implement-stage `VALIDATION_FAILED (exit=1)` therefore needs re-location (possible causes documented in the plan's open items — e.g. checks beyond the task's gate list, or pre-existing unrelated tree changes like `docs/DECISIONS.md`/`.pi-batch.lock` being misattributed).
+**Assessment**: `pi-batch.py assess` → 处方档 demo(S), 工作流 L3_platform, 产品化 L2_platform_capability, 多租户信号 (0 hard rules). 缺失的 main_flow/data_source/error_path/tech_stack 由计划 §4 补全。
 
-## Plan contents (all required sections)
-- **Module boundary & data ownership**: `MessageRepo::recall_outboxed_authorized` (storage, sole writer), `ImService::recall_message` + pure `recall_authorized` (im-core), thin REST/WS handlers (server), types in common; no new crate/table/index/dependency; `RoomRoleRepo` built on the fly from `messages.pool` so `ImService`'s constructor is untouched.
-- **Persistence Design §12**: aggregate state machine `live → recalled → deleted`; single migration `0238` (2 nullable columns + `messages_partitioned` mirror + `event_outbox_kind_check` drop/add); identity = PK `messages.id` + immutable `(room_id, sender_id)` + no idempotency key; 9-step single-transaction consistency boundary (fence → row lock → role re-check `FOR UPDATE` → snapshot → placeholder UPDATE → blob GC → audit → outbox); snapshot fields (`message_edits` + audit digest); concurrency (row lock + WHERE fence + version bump + `UNIQUE(message_id, aggregate_version)`); history/deletion orthogonal; additive Expand–Migrate–Contract.
-- **API contract + stable errors + idempotency**: `POST /api/messages/:id/recall` → 200 + placeholder Message; WS `recall_message`/`recalled` frames; error table with exact stable strings (404/403/409) and fixed check ordering that prevents cross-tenant existence oracles; idempotency = atomic state transition, duplicate → stable 409 (documented retry convention).
-- **Five-layer test plan**: 5 hermetic tests (permission matrix table-driven, serde round-trips, WS frame contract) + 8 PG-gated integration tests (tx contents, cross-workspace isolation, migration schema assertions) + fresh-DB migration replay — all implemented and passing; E2E smoke listed as not executed.
-- **Change radius**: the full 52-file list, including the non-obvious consequences verified during implementation (7 `MessageRow`-family structs + every SELECT list incl. nested subquery projections and `m.`-prefixed columns — a real bug caught by 4 gate tests; `ImEvent::MessageSent` boxed and 3 `Box::pin` fixes for clippy after `Message` grew; `web/app.js` was exactly at the 1000-line HARD limit so handlers were merged into `applyMessageMutation`).
-- **Open items** for the next stage: reproduce the harness validation failure, run the E2E smoke, exercise migration rollback.
+**Tree state verified** (I inspected every fix claim against source, not just reviews):
+- 初版实现 59 文件未提交；门禁 REJECTED 的 5 缺陷**已全部修复在树**：
+  1. P1 系统编辑复活 → `events.rs:87/192` 行锁读后 `recalled_at.is_some() → Ok(None)` 双围栏（覆盖 unfurl/transcribe/webhook 全部调用方，同时消除 DS-1 的 relay 静默丢弃）
+  2. P1/P2 replay 不送达 → `query.rs:180-181` 三列 `GREATEST(edited_at, deleted_at, recalled_at)` + 0238 重发 `idx_messages_room_mutated`
+  3. P2 客户端丢占位 → `app.js:219` held-id 行走 `applyChange` 守卫漏斗
+  4. P2 SPA 无入口 → `ws.js:533`/`api.js:376`/`render.js:809`/`app.js:666`（含 409→success 映射）
+  5. HIGH backfill 缺列 → 0238 重发 `backfill_messages_partition`，INSERT/SELECT 双投影含 recall 列
+- 每项都对应树内回归测试（`recall_tests.rs` ×3 门禁回归 + 既有 8 用例 + im-core 3 用例 + frame 契约测试）
 
-No code was written in this round (planning only, per instruction).
+**计划发现并列入的 3 个残留测试缺口（必须 failing-test-first）**：
+- ① `materialize_outbox_payload` Recalled 臂无单测（delivered vs suppressed 两分支）
+- ② 并发双撤回竞态无测试（`tokio::join!` 恰一成功一 409、恰一条 outbox）
+- ③ **web 测试零 recall 覆盖**（`web/*.test.js` 全库 grep 无 recall）——ws 帧发送/409→success/按钮可见性矩阵/held-id 漏斗/`_lastSeen` 卫生
+
+**计划结构**：§0 评估+树状态+门禁裁定表 · §1 模块边界/数据所有权（storage 唯一写者、im-core 编排+纯函数、server 薄壳）· §2 Persistence Design §12 全模板（聚合状态机、0238 单迁移、身份、9 步单事务一致性边界、快照字段、并发、查询+索引、历史、删除、Expand–Migrate–Contract + DS-4 部署纪律）· §4 API 契约+稳定错误表（404→403→409→409→403 固定顺序防 oracle）+ 幂等（原子单迁移、409 即成功约定）· §5 五层测试计划（含门禁回归表）· §6 变更半径 · §7 门禁缺陷 failing-test-first 清单（5 修复已核查 + 3 缺口先写先红）· §8 DoD。
