@@ -1,0 +1,12 @@
+Spec written to `docs/requirements/2026-08-06-message-recall-time-window.req.md` (repo req-doc convention). Key evidence-backed conclusions:
+
+**Current state**: Recall is fully shipped (commit `3f7f165`) — `ImService::recall_message` (REST `POST /api/messages/:id/recall` + WS `recall_message` frame converge on it), with a row-locked transaction (`lock_message_in_tx` `FOR UPDATE` → `recall_role_allowed_in_tx` → `recall_locked_outboxed_in_tx` UPDATE with `recalled_at IS NULL AND deleted_at IS NULL` fence). `AERO_RECALL_WINDOW_SECS` appears **nowhere** in the tree — window is unimplemented.
+
+**Design decisions pinned in the spec**:
+- **Boundary**: inclusive expiry — allowed iff `age <= window`; `t=window` succeeds, `t=window+1s` → 409 (makes the required test pair meaningful). Window anchored to `created_at` (app-side `now_utc()`, `crud.rs:71`), not edit time.
+- **Two-layer enforcement**: preflight 409 *before* the workspace rate gate (gate S1 doomed-attempt principle, `messages.rs:455-470`) + authority re-check inside the tx on the row-locked snapshot. Admin/owner bypass = check only fires when `actor == sender_id`.
+- **Migration impact: none**. No new column/index; the `FOR UPDATE` row lock already makes an app-level check atomic. A pure-SQL `WHERE` predicate alternative was **evaluated and rejected** (duplicates role logic in SQL, mixes DB/app clocks, adds nothing over the lock). Impact is signature-only: `recall_outboxed_authorized` gains a `window` param (~10 mechanical call sites), `ImService` gains `with_recall_window` builder mirroring `with_moderator`.
+- **Compatibility**: reuses the existing 409/`code:"conflict"` envelope (REST `error.rs:31-37`, WS `frame.rs:523`). Flagged the one real hazard: `web/api.js:374` documents "callers may treat 409 as success" — window-expired is *not* success, so the web recall affordance must surface the msg (safe degradation, no data loss).
+- **Error precedence pinned**: NotFound → 403 access → 409 deleted → 409 already-recalled → 403 role → **409 window expired** (state checks before window, so an expired-and-deleted message still says "deleted").
+
+Acceptance covers config parsing (0/unset/garbage fallback via `env_parse` convention), pure boundary predicate, admin-override + transaction-fence integration tests (backdating via raw SQL `UPDATE messages SET created_at = now() - interval '25 hours'`), a `tokio::join!` author-vs-admin boundary race, and doc deliverables (`.env.example`, README env table + feature matrix, new `docs/recall-window.md` sibling of `snaplink-commercial.md`).
