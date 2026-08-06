@@ -1,52 +1,53 @@
-Plan persisted to `docs/pi-batch/fix-plan-recall-f1-f3.md`. Here it is in full:
+# Fix Plan — Recall F1 + F3 (r6 revision)
 
----
-
-# Fix Plan — Recall F1 (index resurrection) + F3 (rate gate bypass)
-
-## 0. Reproduction (all gates run, baseline green)
+## 0. Reproduction — gates re-run this stage (all green)
 
 | Gate | Result |
 |---|---|
 | `cargo check --workspace --all-targets` | ✅ clean |
 | `cargo clippy --workspace --all-targets -- -D warnings` | ✅ clean |
-| `cargo test --workspace --lib` | ✅ 319 passed / 0 failed / 602 ignored (DB/Redis-gated) |
+| `cargo test --workspace --lib` | ✅ all suites ok (storage 319/604-ignored, im-core 82/46, server 655/15, 0 failures) |
+| `cargo test -p aero-server --test authz_lint` | ✅ 7 passed |
 | `bash scripts/web-check.sh` | ✅ 0 violations |
-| `bash scripts/truth-check.sh` | ✅ 0 ORPHAN; 3 UNWIRED = pre-existing allowlisted seams (`with_hls_dir`/`with_cost_model`/`with_rtmp_listen`, AGENTS.md §4.4) |
+| `bash scripts/truth-check.sh` | ✅ 0 ORPHAN, 3 pre-existing allowlisted UNWIRED |
+| `bash scripts/file-size-check.sh` | ✅ 0 violations |
 
-No code modified in this stage.
+## 1. Root causes (evidence from the actual tree)
 
-## 1. Root causes (file/line evidence)
+**F1 — the tree has a RESIDUAL GAP.** The implementer pass landed 3 of 4 `crud.rs` hunks; the `update_voice_transcript` WHERE hunk was silently dropped while its doc comment (claiming the fence) did land:
 
-**F1** — Recall clears the index atomically (`message/authorization.rs:311-321`, `WHERE recalled_at IS NULL AND deleted_at IS NULL`), but three **lockless worker index UPDATEs** fence only `deleted_at`:
-- `crud.rs:459` `update_embedding` → `WHERE id = $2 AND deleted_at IS NULL` — post-recall write re-populates `embedding`; vector search (`search.rs:81-86`, `AND m.embedding IS NOT NULL`) resurfaces original content.
-- `crud.rs:485` `update_searchable_text` → same WHERE — `search_tsv` is a STORED generated column, so FTS (`search.rs:25-37`) re-derives original text.
-- `crud.rs:427` `update_voice_transcript` → appends transcript to `searchable_text`, same WHERE (zero production callers today; fence anyway).
+| Site (current line) | Statement | Status |
+|---|---|---|
+| `crud.rs:470` `update_embedding` | `WHERE id = $2 AND deleted_at IS NULL AND recalled_at IS NULL` | ✅ fenced |
+| `crud.rs:501` `update_searchable_text` | same | ✅ fenced |
+| `crud.rs:445` `update_voice_transcript` | `WHERE id = $1 AND deleted_at IS NULL` — **no `recalled_at`** | ❌ **GAP** |
+| `events.rs` row-locked edit/transcript paths | Rust `recalled_at.is_some()` under `FOR UPDATE` | ✅ safe |
+| `authorization.rs:311-321` recall UPDATE | `AND recalled_at IS NULL AND deleted_at IS NULL` | ✅ model fence |
 
-Race: the AI worker reads without a lock and writes later as separate statements — `aero-ai/src/worker/mod.rs:293` (`update_searchable_text`) and `:319` (`update_embedding`) after `get`/`extract_attachment_text`/`embed_text_with_context`. A recall committing in between wins the clear; the worker's later UPDATE overwrites it (last-writer-wins). The row-locked paths (`events.rs:69-75` edit, `:194-200` `update_voice_transcript_outboxed` — the one transcribe_bot actually uses) are safe because they Rust-check `recalled_at` under `FOR UPDATE`; for lockless writes **the WHERE clause is the fence**, exactly like `authorization.rs:319`. I verified every other `UPDATE messages` in the workspace is a tombstone/erasure that clears index columns (`participant.rs:545,636`, `sweep.rs:36`, `delivery_cursor.rs:406`, `message_edit.rs:285`, `bookmark.rs:269`) — not F1 targets.
+Consequence: a post-recall `update_voice_transcript` still matches and appends `searchable_text = searchable_text || E'\n' || $2` → the STORED `search_tsv` re-derives → transcript text resurfaces in FTS after recall cleared the index. The worker race (read pre-recall at `aero-ai/worker/mod.rs:293/319`, write post-recall) is exactly the review's F1.
 
-**F3** — WS `RecallMessage` arm (`ws/ws_impl/frame.rs:157-159`) and REST handler (`routes/handlers/messages.rs:172-180`) call `im.recall_message` bare; edit's arms (`frame.rs:139-152`, `messages.rs:128-145`) do `assert_message_edit_preflight` → `check_ws_rate_room` → `reserve_slowmode`. `recall_message` (`im-core/service/messages.rs:460`) costs ~8-10 queries incl. row locks with no per-workspace ceiling. `check_ws_rate_room` (`ws_rate.rs:345`) documents "call only after `assert_room_access`" so non-members can't drain a victim's budget — hence a recall preflight is needed (none exists; grep = 0).
+**The failing-first repro already exists**: `recall_index_fence_tests.rs::recall_fences_late_index_writes` asserts `update_voice_transcript(...).is_none()` post-recall + `searchable_text == ''` — **fails on a live DB against the current tree**, passes after the hunk.
 
-## 2. Module boundary / change radius (agent-guardrails.md §2)
+**F3 — verified fully fixed**: `assert_message_recall_preflight` (`im-core/service/messages.rs:452`), WS arm gate (`frame.rs:163-164`), REST gate (`messages.rs:184-186`), hermetic `authz_lint` rule (negative-verified on both entry points). Slowmode deliberately excluded per plan.
 
-- **Direct (5 files)**: `aero-storage/src/message/crud.rs` · `aero-storage/src/message/recall_tests.rs` · `aero-im-core/src/service/messages.rs` · `aero-server/src/ws/ws_impl/frame.rs` · `aero-server/src/routes/handlers/messages.rs` (+ optional `aero-server/tests/authz_lint.rs`).
-- **Indirect**: aero-ai worker writes silently no-op on recalled rows (no worker change); search can no longer surface recalled content (intended).
-- **No signature changes, no migration, no config/event changes, no new deps.** Rollback = revert 5 files. No DRY refactor of the gate sequence (edit already duplicates it per arm; guardrails §3).
+## 2. Module boundary / change radius
 
-## 3. Exact changes
+Already in tree (9 files, implementer pass): `crud.rs`, `recall_index_fence_tests.rs` (new), `recall_tests.rs` (Fixture `pub(super)`), `message/mod.rs`, `im-core/service/messages.rs`, `im-core/db_tests/recall_tests.rs`, `ws/ws_impl/frame.rs`, `routes/handlers/messages.rs`, `tests/authz_lint.rs`. **Remaining: 1 required hunk** (+2 optional hardening). No signature/migration/config changes; rollback = revert files.
 
-1. **F1**: `AND recalled_at IS NULL` added to the 3 lockless UPDATEs in `crud.rs` (keep `deleted_at`); update their doc comments. Optional hardening: same predicate on `list_without_embedding` (`query.rs:324`, already excluded via `searchable_text <> ''`).
-2. **F1 tests** (`recall_tests.rs`, DB-gated like existing 10): `recall_fences_late_index_writes` — recall first, then all three writes must return `false`/`None` with row/version untouched; `concurrent_recall_vs_embed_write_never_resurrects` — N≈8 × `tokio::join!(recall, update_embedding, update_searchable_text)` with invariant `recalled_at IS NOT NULL ⇒ embedding IS NULL AND searchable_text = ''` (atomic thanks to the WHERE fence; fails without it).
-3. **F3**: new `ImService::assert_message_recall_preflight(actor, id) -> Result<RoomId>` (get → `assert_room_access` → early deleted/recalled Conflicts; commit path remains authority). WS arm + REST handler each prepend `assert_message_recall_preflight` → `check_ws_rate_room` → `recall_message`.
-4. **Slowmode decision**: `check_ws_rate_room` only — the review's fix text names exactly that for WS and the REST edit path uses the identical call. `reserve_slowmode` deliberately **not** applied: it gates posting cadence off `messages.created_at` + Redis reservation, which would block legitimate instant typo-recalls in slow-mode rooms and add PG+Redis cost per attempt. Flagged as a product decision; 2 lines to flip.
-5. **F3 tests**: DB-gated im-core test for the preflight; optional hermetic `authz_lint.rs` scan rule ("recall handlers must contain `check_ws_rate_room(`") to keep the gate from regressing.
+## 3. Exact changes remaining
 
-## 4. Risk assessment
+1. **Required**: `crud.rs:445` `update_voice_transcript` → `WHERE id = $1 AND deleted_at IS NULL AND recalled_at IS NULL` (makes SQL match the in-tree doc comment; zero production callers so no runtime behavior change).
+2. **Recommended hardening** (same "EVERY index-update UPDATE" rule): `crud.rs:176` `edit()` → add `AND recalled_at IS NULL` (legacy path, zero callers, aligns with `editable_message`'s recalled-terminal invariant); `query.rs:324` `list_without_embedding` → explicit `AND recalled_at IS NULL` (already excluded via `searchable_text <> ''`).
 
-- **F1 write no-ops on recalled rows**: intended; worker already treats `updated=false` as benign; backfill can't reselect recalled rows; existing 10 recall DB tests unchanged → race tests + recall suite protect.
-- **Missed index path**: inventory is complete (verified exhaustively); optional search-side `AND m.recalled_at IS NULL` as defense-in-depth.
-- **F3 preflight adds ~2-3 queries**: same profile as edit's preflight; unknown/non-member/terminal targets are rejected *before* charging so they can't drain budget; tier ceilings are generous (1200-6000/min, Redis fail-open); 429/error-frame is the documented counted outcome.
-- **Legit recall bursts now capped**: same exposure edit already has; ceilings are tier-configurable.
-- **No lints disabled, no fences weakened**; all five gates must stay green post-fix, plus the new DB-gated tests on a throwaway DB (`DATABASE_URL=... cargo test -p aero-storage --lib -- --ignored message::recall`).
+## 4. Test plan
 
-The review's concrete asks (F1 `recalled_at IS NULL` on every index-update UPDATE + race test; F3 same gate as edit on both entry points) are met with zero migration and a 5-file radius.
+1. Fix hunk → deterministic test `recall_fences_late_index_writes` flips red→green (CI, `DATABASE_URL` throwaway DB); race test `concurrent_recall_vs_embed_write_never_resurrects` proves the atomic invariant.
+2. DB-gated: `cargo test -p aero-storage --lib -- --ignored message::recall` (10 existing + 2 new) + im-core preflight test.
+3. Hermetic gates (currently green, must stay green): check / clippy `-D warnings` / `--lib` tests / authz_lint / web-check / truth-check / file-size.
+
+## 5. Risk assessment
+
+- **Top risk**: the gap ships because the doc comment already claims the fence — the deterministic test blocks it in CI.
+- Fenced writes silently no-op on recalled rows (intended; worker treats `updated=false` as benign); `edit()` fence is zero-risk (dead path); F3 429s match edit's existing exposure (generous tier ceilings, fail-open Redis); DB-gated tests unrun in sandbox (CI required); lint self-check fails loudly on scan drift.
+
+No code modified this stage; plan persisted to `docs/pi-batch/fix-plan.md`.
