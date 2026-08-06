@@ -199,6 +199,11 @@ if [ -z "$SKIP_DB_CREATE" ]; then
         "$SCIM_NIL_WORKSPACE_INTEGRATION_DB" \
         "scim_inactive_first_nil_workspace_member_rolls_back_owner_bootstrap" \
         "SCIM dormant nil-workspace regression"
+    # Notification fan-out suite (AT-1…AT-7): owns a fresh throwaway DB with
+    # its own migration + required Redis presence leg; the shared main-DB run
+    # below must --skip db_tests:: (its relay loops claim global state).
+    echo "▶ Running notification fan-out integration suite (fresh DB + Redis presence leg)..."
+    bash scripts/test-notification-fanout.sh
 else
     echo "▶ SKIP_DB_CREATE set: fresh-DB migration regressions are skipped"
 fi
@@ -228,7 +233,10 @@ cargo run --bin aero-cli -- migrate 2>&1 | tail -1
 echo "✓ Migrations applied"
 
 # Step 4: Run the remaining integration tests. Self-migrating regressions
-# are always excluded here because this database is deliberately non-empty.
+# are always excluded here because this database is deliberately non-empty;
+# db_tests:: (aero-im-core) is excluded because it runs on its own fresh
+# throwaway DB in the notification fan-out step above (its relay loops claim
+# global state and need serial, isolated execution).
 echo "▶ Running integration tests..."
 echo ""
 set +e
@@ -241,7 +249,8 @@ cargo test --workspace --lib --locked -- \
     --skip migration_0233_backfills_and_constrains_human_identity_issuer \
     --skip migration_0237_backfills_before_installing_destination_guard \
     --skip message_quota_and_snaplink_outboxes_are_transactional \
-    --skip scim_inactive_first_nil_workspace_member_rolls_back_owner_bootstrap
+    --skip scim_inactive_first_nil_workspace_member_rolls_back_owner_bootstrap \
+    --skip db_tests::
 TEST_EXIT=$?
 set -e
 

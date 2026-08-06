@@ -138,11 +138,22 @@ jobs:
           psql -h localhost -U aero -d postgres -c "DROP DATABASE aero_rollout_smoke WITH (FORCE);"
         env:
           PGPASSWORD: aero
+      # Notification fan-out suite (AT-1…AT-7): fresh throwaway DB of its own
+      # (aero_test_notif_<pid>), build-before-migrate, both URL pairs, and a
+      # REQUIRED Redis presence leg (redis service above). Also fails closed on
+      # AERO_BLOCKED_WORDS / AERO_PII_GUARD* / AERO_AI_* env leakage.
+      - name: Notification fan-out DB-gated suite
+        run: bash scripts/test-notification-fanout.sh
+        env:
+          DATABASE_URL: postgres://aero:aero@localhost:5432
+          REDIS_URL: redis://localhost:6379
+          AERO__REDIS__URL: redis://localhost:6379
       - run: |
           cargo test --workspace --lib --locked -- \
             --ignored --test-threads=1 \
             --skip eicar_is_reported_infected_against_real_clamd \
-            --skip rolling_upgrade_fences_are_atomic_before_0176_reasserts_them
+            --skip rolling_upgrade_fences_are_atomic_before_0176_reasserts_them \
+            --skip db_tests::
         env:
           DATABASE_URL: postgres://aero:aero@localhost:5432/aero
           REDIS_URL: redis://localhost:6379
