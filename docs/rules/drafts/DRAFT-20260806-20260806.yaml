@@ -1,0 +1,29 @@
+id: DRAFT-20260806
+title: 'cargo test --skip 过滤子串过宽事故：test-integration.sh 用 --skip db_tests:: 意图排除 aero-im-'
+category: backend
+severity: error
+scope:
+  languages: []
+  paths:
+  - src/**
+trigger:
+  operations: []
+rationale: 'Observed failure: cargo test --skip 过滤子串过宽事故：test-integration.sh 用 --skip
+  db_tests:: 意图排除 aero-im-core 新增模块，但子串匹配同时跳过了 aero-storage 的 ai_job::db_tests / receipt::db_tests
+  等既有测试，破坏批次内 nil-workspace 状态机，导致 3 个顺序依赖集成测试（call/dm/group_dm）暴露失败。基线 worktree 复现
+  + git stash 隔离 + 串行/并行对比后定位。教训：--skip 过滤必须精确到完整模块路径（--skip db_tests::notifications_tests），禁止用短子串跨
+  crate 匹配。. Root-cause analysis is required before this draft can be promoted (edit
+  requirements/forbidden/verification with the actual RCA).'
+requirements: []
+forbidden: []
+exceptions:
+- condition: ''
+verification:
+  static: []
+  tests: []
+examples:
+  good: []
+  bad: []
+owner: ''
+version: 0.1.0
+status: draft

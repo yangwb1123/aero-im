@@ -1,0 +1,29 @@
+id: DRAFT-20260806
+title: agent 完成报告反复不合规事故：5 个 implement 轮次（recall/drafts/sdlc）的 agent 输出均未按 completion_r
+category: backend
+severity: error
+scope:
+  languages: []
+  paths:
+  - src/**
+trigger:
+  operations: []
+rationale: 'Observed failure: agent 完成报告反复不合规事故：5 个 implement 轮次（recall/drafts/sdlc）的
+  agent 输出均未按 completion_report YAML schema 书写（缺 completion_report 顶层键、result 枚举错误、not_executed
+  缺 reason），completion 门禁全部拒绝并重试，浪费 3-5 次模型调用/轮次。教训：implement 提示词必须内嵌 completion_report
+  完整 schema 示例（含 commands_executed/not_executed/changed_files/residual_risks/assumptions
+  与 result 枚举），或由编排者按真实命令证据补写。. Root-cause analysis is required before this draft
+  can be promoted (edit requirements/forbidden/verification with the actual RCA).'
+requirements: []
+forbidden: []
+exceptions:
+- condition: ''
+verification:
+  static: []
+  tests: []
+examples:
+  good: []
+  bad: []
+owner: ''
+version: 0.1.0
+status: draft
