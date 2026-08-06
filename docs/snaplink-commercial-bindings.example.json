@@ -1,0 +1,15 @@
+{
+  "version": 2,
+  "bindings": [
+    {
+      "workspace_id": "01K00000000000000000000000",
+      "tenant_id": "tenant-acme",
+      "billing_client_id": "aero-im-acme-billing",
+      "billing_client_secret_env": "AERO_SNAPLINK_ACME_BILLING_CLIENT_SECRET",
+      "audit_client_id": "aero-im-acme-audit",
+      "audit_client_secret_env": "AERO_SNAPLINK_ACME_AUDIT_CLIENT_SECRET",
+      "revision": 1,
+      "enabled": true
+    }
+  ]
+}

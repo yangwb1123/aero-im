@@ -103,6 +103,7 @@ pub mod search_advanced;
 pub mod session;
 pub mod session_control;
 pub mod smart_replies;
+pub mod snaplink_commercial;
 
 // ---- Wave 16 ----
 pub mod analytics;

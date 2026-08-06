@@ -31,13 +31,32 @@ pub enum Error {
     Upstream(String),
 
     #[error("database: {0}")]
-    Database(#[from] sqlx::Error),
+    Database(sqlx::Error),
 
     #[error("serde: {0}")]
     Serde(#[from] serde_json::Error),
 
     #[error("internal: {0}")]
     Internal(#[from] anyhow::Error),
+}
+
+impl From<sqlx::Error> for Error {
+    fn from(error: sqlx::Error) -> Self {
+        let constraint = match &error {
+            sqlx::Error::Database(database) => database.constraint(),
+            _ => None,
+        };
+        match constraint {
+            Some("snaplink_binding_required" | "snaplink_entitlement_required") => {
+                Self::Upstream("commercial entitlement projection is unavailable".into())
+            }
+            Some("snaplink_feature_disabled") => {
+                Self::Forbidden("feature is not enabled for this workspace".into())
+            }
+            Some("snaplink_quota_exceeded") => Self::RateLimited,
+            _ => Self::Database(error),
+        }
+    }
 }
 
 impl Error {

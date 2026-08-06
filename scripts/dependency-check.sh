@@ -4,8 +4,6 @@
 set -euo pipefail
 
 violations=0
-PATTERN='aero-[a-z-]+'
-
 echo "=== Dependency Check ==="
 
 # aero-common 必须为叶子（不能依赖任何其他 aero crate）
@@ -35,7 +33,11 @@ check_deps() {
         exclude="$exclude|$a"
     done
 
-    DEPS=$(grep -oE "$PATTERN" "$path" 2>/dev/null | grep -vE "^($exclude)$" | sort -u || true)
+    # Parse dependency keys only. Grepping the entire TOML also sees vendor
+    # paths such as `vendor/aero-str0m-msrv`, which are not workspace crates.
+    DEPS=$(sed -nE \
+        's/^[[:space:]]*(aero-[a-z0-9-]+)[[:space:]]*(\.|=).*$/\1/p' \
+        "$path" | grep -vE "^($exclude)$" | sort -u || true)
     if [ -n "$DEPS" ]; then
         echo "    ❌ $crate 依赖了: $(echo "$DEPS" | tr '\n' ' ')"
         return 1

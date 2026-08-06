@@ -199,6 +199,7 @@ open http://localhost:3030
 | `AERO_VAULT_*` | `AERO_BLOB_BACKEND=vault` 时将附件字节写入 Aero Vault；支持 Snaplink client_credentials 短期机器令牌、稳定 BlobId 幂等上传、Range 下载与 GC 硬删除，配置不完整时启动失败 |
 | `AERO_DEPENDENCY_BIND_HOST` | Docker Compose 中 PostgreSQL/Redis/NATS/Jaeger/MinIO 的宿主机绑定地址，安全默认 `127.0.0.1`；仅在防火墙与认证私网齐备时覆盖 |
 | `AERO__INTEGRATIONS__ISSUER` / `AERO__INTEGRATIONS__AUDIENCE` / `AERO__INTEGRATIONS__JWKS_URI` | 外部 ERP/worker 的 Snaplink RFC 9068 access-token 信任边界；issuer/JWKS 可回落 OIDC 配置，API audience 必须显式配置，token 须含 `aero.notify.publish` scope |
+| `AERO_SNAPLINK_COMMERCIAL_*` | 可选的 Snaplink Billing Entitlement 投影、月度消息/通知计量和 Audit Governance durable relay；按工作区 client_credentials/source binding，细节见 `docs/snaplink-commercial.md` |
 | `AERO_AUDIT_SIGNING_KEY` | 可选 HMAC-SHA256 审计 CSV 签名；响应通过 `x-audit-signature` 暴露防篡改校验值 |
 | `AERO_AGENTIC_ANSWERS` | 置位后 AI 问答走「能动」工具循环(模型自驱动房间检索 search→refine→answer);默认关闭(单次检索更省) |
 | `AERO_LOGIN_LOCKOUT` | 置位后启用按账户登录失败锁定(默认关闭;与 per-IP 限流 + 2FA 叠加) |
@@ -279,6 +280,7 @@ ffmpeg -re -i sample.mp4 -c:v libx264 -c:a aac -f flv rtmp://localhost/live/<str
 - 机器调用：`POST /api/integrations/v1/installations/:installation_id/notifications`；要求 Snaplink `client_credentials` Bearer、`aero.notify.publish` scope 和 UUID `Idempotency-Key`，可投递到白名单房间或 `{type:"snaplink_user",subject}` 的规范 1:1 DM
 - 机器附件：`POST /api/integrations/v1/installations/:installation_id/blobs` 须带 UUID `Idempotency-Key`，并从互斥的 `X-Aero-Room-Id` / `X-Aero-Snaplink-Subject` 选择一个目标头上传 multipart `file`，再在通知 `blocks` 中引用返回的 `blob_id`；稳定 subject 不进入 URL，配置 `AERO_BLOB_BACKEND=vault` 时字节落 Aero Vault，Aero IM 仅保留授权与元数据
 - 完整接入、重试、账号迁移与多实例伸缩说明见 [`docs/snaplink-integrations.md`](docs/snaplink-integrations.md)
+- 商业套餐 feature/额度、usage fact、Audit Governance 和灾备说明见 [`docs/snaplink-commercial.md`](docs/snaplink-commercial.md)
 
 ### Participants / Agents
 - `GET /api/participants?q=...` `GET /api/participants/:id`

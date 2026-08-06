@@ -13,6 +13,8 @@ use tokio_util::sync::CancellationToken;
 pub(crate) struct StateDeps {
     pub(crate) auth: aero_auth::AuthService,
     pub(crate) im: Arc<aero_im_core::ImService>,
+    pub(crate) snaplink_commercial:
+        Option<Arc<aero_server::snaplink_commercial::SnaplinkCommercialRuntime>>,
     pub(crate) live: aero_server::live::LiveService,
     pub(crate) ai_service: Option<Arc<aero_ai::AiService>>,
     pub(crate) pg: sqlx::PgPool,
@@ -76,6 +78,7 @@ pub(crate) fn build(d: StateDeps) -> AppState {
     AppState {
         auth: d.auth,
         im: d.im,
+        snaplink_commercial: d.snaplink_commercial,
         pg: d.pg,
         query_router: d.query_router,
         live: d.live,

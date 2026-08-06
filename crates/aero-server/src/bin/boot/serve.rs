@@ -236,7 +236,7 @@ pub(crate) async fn serve(
         std::env::var("AERO_TASK_DRAIN_SECS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(10),
+            .unwrap_or(30),
     );
     if tokio::time::timeout(drain, tracker.wait()).await.is_err() {
         tracing::warn!(

@@ -76,6 +76,7 @@ dashmap.workspace = true
 parking_lot.workspace = true
 base64 = "0.22"
 sha2 = "0.10"
+hmac = "0.12"
 rand.workspace = true
 hex = "0.4"
 # SAML 2.0 SP (HTTP-Redirect binding): the AuthnRequest is DEFLATE-compressed

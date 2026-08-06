@@ -373,6 +373,10 @@ pub struct AiSentiment {
 pub struct AppState {
     pub auth: AuthService,
     pub im: Arc<ImService>,
+    /// Optional Snaplink commercial projector and durable usage/audit relay.
+    /// Readiness consults its local entitlement projection, never live central
+    /// reachability; liveness remains independent.
+    pub snaplink_commercial: Option<Arc<crate::snaplink_commercial::SnaplinkCommercialRuntime>>,
     /// Shared Postgres pool. Lets feature modules construct their own repositories
     /// inline (`XRepo::new(state.pg.clone())`) without threading a new field
     /// through `AppState` for every addition — repos are cheap `Arc<PgPool>` wrappers.

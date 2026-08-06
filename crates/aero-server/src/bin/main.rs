@@ -48,6 +48,12 @@ async fn main() -> anyhow::Result<()> {
 
     // ---------- Persistence ----------
     let persistence = boot::connect_persistence(&cfg, connect_attempts).await?;
+    let snaplink_commercial =
+        aero_server::snaplink_commercial::SnaplinkCommercialRuntime::from_env(
+            persistence.pg.clone(),
+        )
+        .await
+        .context("initialize Snaplink commercial integration")?;
 
     // ---------- Repos ----------
     let repos = boot::build_repos(persistence.pg.clone(), &persistence.cache);
@@ -178,6 +184,7 @@ async fn main() -> anyhow::Result<()> {
     let state = boot::build_state(boot::StateDeps {
         auth: services.auth,
         im: services.im,
+        snaplink_commercial: snaplink_commercial.clone(),
         live: services.live,
         ai_service: Some(services.ai_service.clone()),
         pg: persistence.pg.clone(),
@@ -231,6 +238,9 @@ async fn main() -> anyhow::Result<()> {
 
     // ---------- Background tasks ----------
     boot::spawn_background(&tracker, &state, &ai_shutdown, &services.ai_service);
+    if let Some(runtime) = snaplink_commercial {
+        runtime.spawn(&tracker, ai_shutdown.clone());
+    }
 
     // ---------- Metrics + heartbeats ----------
     boot::spawn_metrics_tasks(

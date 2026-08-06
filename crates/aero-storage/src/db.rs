@@ -692,4 +692,5 @@ mod migration_tests {
 
     mod bot_membership;
     mod integration_user_issuer;
+    mod snaplink_commercial;
 }

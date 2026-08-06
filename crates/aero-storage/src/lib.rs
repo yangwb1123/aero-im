@@ -58,6 +58,9 @@ pub mod scheduled;
 pub mod scheduled_stream;
 pub mod scim;
 pub mod seq;
+pub mod snaplink_commercial;
+#[cfg(test)]
+mod snaplink_commercial_db_tests;
 pub mod sso;
 pub mod stream;
 pub mod stream_chat_settings;
@@ -233,6 +236,11 @@ pub use scim::{
     MAX_SCIM_TOKENS_PER_WORKSPACE,
 };
 pub use seq::SeqStore;
+pub use snaplink_commercial::{
+    commercial_delivery_backoff, ProjectionOutcome, SnaplinkBindingSpec, SnaplinkCommercialRepo,
+    SnaplinkDeliveryClaim, SnaplinkDeliveryDestination, SnaplinkEntitlementProjection,
+    SnaplinkLimitProjection,
+};
 pub use sso::{SsoRepo, SsoResolveError};
 pub use stream::{NewStream, StreamRepo, StreamWriteError};
 pub use stream_chat_settings::{slow_mode_violation, StreamChatSettings, StreamChatSettingsRepo};

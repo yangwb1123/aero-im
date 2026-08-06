@@ -356,6 +356,7 @@ dependencies = [
  "fred",
  "futures",
  "hex",
+ "hmac 0.12.1",
  "hyper",
  "lettre",
  "parking_lot",

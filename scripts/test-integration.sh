@@ -26,6 +26,10 @@ SKIP_DB_CREATE="${SKIP_DB_CREATE:-}"
 ROLLING_REGRESSION_DB="aero_migration_rolling_$$"
 MIGRATION_0192_DB="aero_migration_0192_$$"
 BOT_MEMBERSHIP_REGRESSION_DB="aero_migration_0228_$$"
+INTEGRATION_USER_ISSUER_REGRESSION_DB="aero_migration_0233_$$"
+SNAPLINK_CREDENTIAL_REGRESSION_DB="aero_migration_0237_$$"
+SNAPLINK_COMMERCIAL_INTEGRATION_DB="aero_snaplink_commercial_$$"
+SCIM_NIL_WORKSPACE_INTEGRATION_DB="aero_scim_nil_workspace_$$"
 
 assert_disposable_db_name() {
     local variable_name="$1"
@@ -40,6 +44,10 @@ assert_disposable_db_name "SMOKE_DB" "$SMOKE_DB"
 assert_disposable_db_name "rolling regression database" "$ROLLING_REGRESSION_DB"
 assert_disposable_db_name "0192 regression database" "$MIGRATION_0192_DB"
 assert_disposable_db_name "0228 regression database" "$BOT_MEMBERSHIP_REGRESSION_DB"
+assert_disposable_db_name "0233 regression database" "$INTEGRATION_USER_ISSUER_REGRESSION_DB"
+assert_disposable_db_name "0237 regression database" "$SNAPLINK_CREDENTIAL_REGRESSION_DB"
+assert_disposable_db_name "Snaplink commercial integration database" "$SNAPLINK_COMMERCIAL_INTEGRATION_DB"
+assert_disposable_db_name "SCIM nil-workspace integration database" "$SCIM_NIL_WORKSPACE_INTEGRATION_DB"
 
 # Parse host and user from BASE_URL for psql
 PSQL_ARGS="${BASE_URL#postgres://}"
@@ -136,6 +144,27 @@ run_migration_regression() {
     echo "✓ ${label} passed and database dropped"
 }
 
+run_migrated_integration() {
+    local database_name="$1"
+    local test_name="$2"
+    local label="$3"
+    local integration_url="${BASE_URL}/${database_name}"
+
+    echo "▶ Creating fresh database for ${label}: ${database_name}"
+    create_throwaway_database "$database_name"
+    echo "▶ Migrating database for ${label}..."
+    DATABASE_URL="$integration_url" \
+        AERO__DATABASE__URL="$integration_url" \
+        cargo run --bin aero-cli -- migrate 2>&1 | tail -1
+    echo "▶ Running ${label}..."
+    DATABASE_URL="$integration_url" \
+        AERO__DATABASE__URL="$integration_url" \
+        cargo test -p aero-storage --lib --locked \
+            "$test_name" -- --ignored --test-threads=1
+    drop_created_database "$database_name"
+    echo "✓ ${label} passed and database dropped"
+}
+
 echo "=== Aero IM Integration Tests ==="
 echo "Target: postgresql://${PSQL_USER}@${PSQL_HOST}:${PSQL_PORT}/${SMOKE_DB}"
 echo ""
@@ -154,6 +183,22 @@ if [ -z "$SKIP_DB_CREATE" ]; then
         "$BOT_MEMBERSHIP_REGRESSION_DB" \
         "migration_0228_backfills_workspace_bot_membership" \
         "migration 0228 bot-membership regression"
+    run_migration_regression \
+        "$INTEGRATION_USER_ISSUER_REGRESSION_DB" \
+        "migration_0233_backfills_and_constrains_human_identity_issuer" \
+        "migration 0233 integration-user-issuer regression"
+    run_migration_regression \
+        "$SNAPLINK_CREDENTIAL_REGRESSION_DB" \
+        "migration_0237_backfills_before_installing_destination_guard" \
+        "migration 0237 Snaplink credential regression"
+    run_migrated_integration \
+        "$SNAPLINK_COMMERCIAL_INTEGRATION_DB" \
+        "message_quota_and_snaplink_outboxes_are_transactional" \
+        "Snaplink commercial quota and outbox integration"
+    run_migrated_integration \
+        "$SCIM_NIL_WORKSPACE_INTEGRATION_DB" \
+        "scim_inactive_first_nil_workspace_member_rolls_back_owner_bootstrap" \
+        "SCIM dormant nil-workspace regression"
 else
     echo "▶ SKIP_DB_CREATE set: fresh-DB migration regressions are skipped"
 fi
@@ -192,7 +237,11 @@ cargo test --workspace --lib --locked -- \
     --skip eicar_is_reported_infected_against_real_clamd \
     --skip rolling_upgrade_fences_are_atomic_before_0176_reasserts_them \
     --skip migration_0192_repairs_attempted_cross_room_scheduled_replies \
-    --skip migration_0228_backfills_workspace_bot_membership
+    --skip migration_0228_backfills_workspace_bot_membership \
+    --skip migration_0233_backfills_and_constrains_human_identity_issuer \
+    --skip migration_0237_backfills_before_installing_destination_guard \
+    --skip message_quota_and_snaplink_outboxes_are_transactional \
+    --skip scim_inactive_first_nil_workspace_member_rolls_back_owner_bootstrap
 TEST_EXIT=$?
 set -e
 

@@ -62,6 +62,22 @@ async fn probe_deps(s: &AppState) -> (&'static str, &'static str, &'static str, 
     (pg, redis, nats, blob)
 }
 
+/// Commercial readiness is based on the durable local projection. A reachable
+/// central service is intentionally not a probe dependency: accepted tenants
+/// continue during a short billing/audit outage, while missing or expired
+/// first projections remain fail-closed.
+async fn probe_commercial(s: &AppState) -> &'static str {
+    let Some(runtime) = &s.snaplink_commercial else {
+        return "disabled";
+    };
+    match tokio::time::timeout(std::time::Duration::from_secs(2), runtime.ready()).await {
+        Ok(Ok(true)) => "ok",
+        Ok(Ok(false)) => "not_ready",
+        Ok(Err(_)) => "fail",
+        Err(_) => "timeout",
+    }
+}
+
 /// Probe the default and every configured regional blob backend.
 ///
 /// This must run even when the default backend is local: a deployment may pair
@@ -84,7 +100,9 @@ async fn probe_blob(s: &AppState) -> &'static str {
 /// body's `status` is `"ok"` only when every dependency probes healthy.
 async fn health(State(s): State<AppState>) -> Json<serde_json::Value> {
     let (pg, redis, nats, blob) = probe_deps(&s).await;
-    let overall = if pg == "ok" && redis == "ok" && nats == "ok" && blob == "ok" {
+    let commercial = probe_commercial(&s).await;
+    let commercial_ok = matches!(commercial, "ok" | "disabled");
+    let overall = if pg == "ok" && redis == "ok" && nats == "ok" && blob == "ok" && commercial_ok {
         "ok"
     } else {
         "degraded"
@@ -97,6 +115,7 @@ async fn health(State(s): State<AppState>) -> Json<serde_json::Value> {
             "redis": redis,
             "nats": nats,
             "blob": blob,
+            "snaplink_commercial": commercial,
         },
         // Surface the active blob backend (s3/local) so operators can confirm
         // storage is wired as intended.
@@ -159,7 +178,12 @@ async fn health_ready(State(s): State<AppState>) -> impl axum::response::IntoRes
         );
     }
     let (pg, redis, nats, blob) = probe_deps(&s).await;
-    let deps_ok = pg == "ok" && redis == "ok" && nats == "ok" && blob == "ok";
+    let commercial = probe_commercial(&s).await;
+    let deps_ok = pg == "ok"
+        && redis == "ok"
+        && nats == "ok"
+        && blob == "ok"
+        && matches!(commercial, "ok" | "disabled");
     let (status, state) = readiness_decision(false, deps_ok);
     (
         status,
@@ -170,6 +194,7 @@ async fn health_ready(State(s): State<AppState>) -> impl axum::response::IntoRes
                 "redis": redis,
                 "nats": nats,
                 "blob": blob,
+                "snaplink_commercial": commercial,
             },
             "version": env!("CARGO_PKG_VERSION"),
         })),
