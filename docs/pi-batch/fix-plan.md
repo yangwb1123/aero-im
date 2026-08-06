@@ -1,83 +1,74 @@
-All evidence gathered. Here is the complete fix plan.
+All reproduction and evidence gathering complete. Here is the fix plan.
 
 ---
 
 # Fix Plan: aero-common clippy gate (`-D warnings`)
 
-## 0. Reproduced baseline (exact commands, run against /home/u1/aero-im)
+## ⚠️ State finding (must-read before the plan)
 
-| Gate | Result |
+The task premise — *"clippy currently errors on crates/aero-common: 16 errors in lib + 29 in lib-test"* — describes the **pre-fix state**. The working tree already contains the complete fix from the prior implement stage (uncommitted, per batch rules: `git status` shows exactly the 7 planned files modified; the `[aero-im-batch] Stage: plan/implement` commits contain only docs artifacts `docs/pi-batch/fix-plan.md` / `fix-implementation.md`). Reproduction against the **actual current state**:
+
+| Gate | Current result |
 |---|---|
-| `cargo check --workspace --all-targets` | ✅ PASS (9.45s) |
-| `cargo clippy --workspace --all-targets -- -D warnings` | ❌ **FAIL** — `aero-common` lib: **16 errors**, lib-test: **29 errors** |
-| `cargo test --workspace --lib` | ✅ PASS — 318 passed, 0 failed, 592 ignored |
-| `bash scripts/web-check.sh` | ✅ PASS — 0 violations |
-| `scripts/truth-check.sh` / `scripts/file-size-check.sh` | ✅ PASS (0 orphans / 0 violations) — extra AGENTS.md §4.3 gates |
+| `cargo check --workspace --all-targets` | ✅ PASS |
+| `cargo clippy --workspace --all-targets -- -D warnings` | ❌ fails — but **0 hits in aero-common**; fails on the pre-existing downstream backlog (aero-storage 203 sites, aero-eng 29, aero-bus 6, aero-signaling 1; compilation halts at aero-storage) |
+| `cargo clippy -p aero-common --all-targets -- -D warnings` | ✅ PASS (0 errors — the crate-scoped gate is green) |
+| `cargo test --workspace --lib` | ✅ PASS (318 passed, 0 failed, 592 ignored) |
+| `bash scripts/web-check.sh` | ✅ PASS (0 violations) |
 
-The 16 vs 29 split is fully explained: **29 unique lint hits**; 13 of them live inside `#[cfg(test)] mod tests` of `markdown.rs`, so the lib target reports only the 16 non-test hits and the lib-test target reports all 29. The "17 errors" seen when linting other crates (`cargo clippy -p aero-server …`) are just aero-common's errors **propagated through the dependency graph** (verified: same 16 aero-common locations). `aero-push` (no aero-common dep) shows 0. **The entire gate failure is confined to `crates/aero-common`.**
+**Conclusion: no further code changes are needed.** The remaining work is verification + commit of the already-applied 7-file diff. The plan below documents root causes, the applied change radius, and the honest boundary of the workspace gate.
 
-## 1. Root causes (file:line evidence from `/tmp/clippy_full.log`)
+## 1. Root causes (evidence)
 
-**8 lint classes, 29 hits, 7 files — all pre-existing style backlog, no single regression:**
+The failure was 8 clippy lint classes × **29 unique sites**, all in `crates/aero-common/src` (16 lib + 29 lib-test = 29 unique; the 13 extra lib-test errors are the `#[cfg(test)]`-only hits). All are pre-existing style backlog, no single regression, no behavior bug:
 
-| Class | Count | Sites (clippy 1.93.0 evidence) |
+| Class | Count | Sites (clippy 1.93.0 output, anchored in applied diff) |
 |---|---|---|
-| `assertions_on_constants` | 13 | `markdown.rs:247,260,272,284,297,300,314,352,365,380,391,403,416` — all `assert!(false, "…")` failure branches inside `#[cfg(test)] mod tests` (starts line 241) |
-| `doc_markdown` | 8 | `markdown.rs:9` (`CommonMark`), `:22` (`snake_case`), `:30` (`ParticipantId`); `mls.rs:29` (`KeyPackage`); `model/mod.rs:3` (`REFACTOR_PLAN.md`); `model/event.rs:85` (`ULID`), `:87:44` (`delivery_id`), `:87:57` (`participant_id`) |
-| `match_same_arms` | 2 | `model/block.rs:146` — `Text\|Code => Some(content)` vs `Thought { hidden: false } => Some(content)`; `model/event.rs:179` — 12 flat `room_id` variants vs `Call(Invite\|End\|Caption\|Join\|Leave\|SfuPublisher)` both `Some(*room_id)` |
-| `cast_possible_truncation` | 2 | `markdown.rs:206-207` — `r.start as u32`, `r.end as u32` (RawSpan is `usize`, `Span.start/end` are `u32` wire-format, `model/block.rs:15`) |
-| `derivable_impls` | 1 | `model/media.rs:89` — manual `impl Default for CallMode` returning `Self::P2p` |
-| `result_large_err` | 1 | `config.rs:283` — `pub fn load() -> Result<Self, figment::Error>`; `figment::Error` ≥ 208 bytes |
-| `redundant_closure` | 1 | `markdown.rs:45` — `.flat_map(|line| parse_line(line))` |
-| `items_after_statements` | 1 | `markdown.rs:92` — `struct RawSpan` declared after `let bytes`/`let len` statements inside `parse_spans` |
+| `assertions_on_constants` | 13 | `markdown.rs` `#[cfg(test)] mod tests`: `bold`, `italic`, `code`, `strikethrough`, `link`, `multiple_formats_in_one_line`, `plain_text_passes_through`, `unclosed_delimiter_is_literal`, `asterisk_in_word_not_italic`, `multi_line`, `link_no_href_is_literal`, `quadruple_asterisk_is_literal` — old test-failure idiom `assert!(false, "…")` |
+| `doc_markdown` | 8 | `markdown.rs` module docs (`CommonMark`, `snake_case`, `ParticipantId`); `mls.rs` (`KeyPackage`); `model/mod.rs` (`REFACTOR_PLAN.md`); `model/event.rs` `NotifyBatch` docs (`NotifyBatch`, `ULID`, `delivery_id`, `participant_id`) — identifiers written without backticks |
+| `match_same_arms` | 2 | `model/block.rs` `Block::searchable_text` (`Text\|Code` vs `Thought{hidden:false}` both `Some(content)`); `model/event.rs` `RoomEvent::room_id` (12 flat room_id variants vs `Call(Invite\|End\|Caption\|Join\|Leave\|SfuPublisher)` both `Some(*room_id)`) |
+| `cast_possible_truncation` | 2 | `markdown.rs` Phase-2 `RawSpan`→`Span` conversion (`r.start as u32`, `r.end as u32`; `Span.start/end` are u32 by wire-format design) |
+| `derivable_impls` | 1 | `model/media.rs` manual `impl Default for CallMode` returning `Self::P2p` |
+| `result_large_err` | 1 | `config.rs` `AppConfig::load() -> Result<Self, figment::Error>` (`figment::Error` ≥ 208 bytes) |
+| `redundant_closure` | 1 | `markdown.rs` `parse_markdown_to_blocks`: `.flat_map(|line| parse_line(line))` |
+| `items_after_statements` | 1 | `markdown.rs` `parse_spans`: `struct RawSpan` declared after `let bytes`/`let len` |
 
-**Why they exist:** historical doc style (words like `snake_case`/`ULID` written without backticks), pre-derive-Default era manual impl, `assert!(false)` as an old test-failure idiom, and deliberate `usize→u32` narrowing for the `Span` wire format. CI comment in `.github/workflows/ci.yml` (job `check`) confirms the repo knowingly carries a clippy backlog: *"The workspace intentionally carries a documented clippy backlog; the repository gates prohibit new warnings rather than pretending the existing backlog can be promoted to hard errors."* This task = eliminate the aero-common slice of that backlog.
+CI context (`.github/workflows/ci.yml`, job `check`): *"The workspace intentionally carries a documented clippy backlog; the repository gates prohibit new warnings rather than pretending the existing backlog can be promoted to hard errors."* — CI runs clippy **without** `-D warnings`.
 
 ## 2. Module boundary & change radius (per `backend-specs/agent-guardrails.md` §2)
 
-- **直接修改文件**: 7 files, all under `crates/aero-common/src/`:
-  `markdown.rs`, `config.rs`, `mls.rs`, `model/mod.rs`, `model/block.rs`, `model/event.rs`, `model/media.rs`
-- **间接影响模块**: none — `aero-common` is the leaf crate; no runtime behavior changes anywhere
-- **公共接口变化**: **none** (config.rs keeps `Result<Self, figment::Error>` signature; `CallMode` keeps identical `Default` semantics; match-arm merges are semantically identical bodies)
-- **数据库/事件/配置/部署变化**: none. **回滚方式**: revert the single commit / `git checkout` the 7 files.
+- **直接修改文件**: 7 files, all under `crates/aero-common/src/` — `markdown.rs`, `config.rs`, `mls.rs`, `model/mod.rs`, `model/block.rs`, `model/event.rs`, `model/media.rs` (diff: 40 insertions, 38 deletions — verified in tree)
+- **间接影响模块**: none — aero-common is the leaf crate; zero runtime behavior change
+- **公共接口变化**: **none** — `AppConfig::load` signature kept (`Result<Self, figment::Error>`); `CallMode` derives identical `Default`; arm merges are identical bodies; `panic!` ≡ `assert!(false,…)` semantics
+- **数据库/事件/配置/部署变化**: none. **回滚方式**: `git checkout --` the 7 files (or revert the eventual commit)
+- **Not touched**: root `Cargo.toml` lints, `web/`, any other crate, no crate-level `#[allow]` (only targeted allows, house style — in-crate precedent `metrics.rs`)
 
-## 3. Exact files/symbols to change
+## 3. Exact files/symbols (as applied in the working tree — verified by `git diff`)
 
-1. **`markdown.rs`** (20 hits — bulk of the work)
-   - 13× `assert!(false, …)` → `panic!("…")` in `mod tests` — keep every message string verbatim (`"expected text block, got {other:?}"`, `"expected Link, got {other:?}"`, `"expected text block"`, `"expected text"`). Idiomatic, identical runtime semantics (both panic; `assert!` is not compiled out in release).
-   - L45 `.flat_map(|line| parse_line(line))` → `.flat_map(parse_line)` (eta-reduction).
-   - L92: move `struct RawSpan` to the top of `parse_spans`'s body (before `let bytes`/`let len`); keep the `#[derive(Debug)]` and comments.
-   - L206-207: `#[allow(clippy::cast_possible_truncation)]` on the `.map(|r| …)` closure (or the fn) with the in-crate precedent comment style (`metrics.rs:737` uses exactly this allow). Rationale: `Span` is u32 by wire-format design; `try_from` would add error handling to an infallible path and `unwrap_or(u32::MAX)` would silently corrupt offsets.
-   - L9, L22, L30 doc comments: add backticks — `` `CommonMark` ``, `` `snake_case` ``, `` `ParticipantId` ``.
-2. **`config.rs`** L283: `#[allow(clippy::result_large_err)]` + one-line comment on `AppConfig::load()`. Recommended over `Box<figment::Error>`: keeps the public signature; zero caller churn (verified callers: `aero-server/src/bin/main.rs:31`, `aero-cli.rs:64`, `aero-cli.rs:559` all use anyhow `.context()`/`is_ok()` which would still compile with Box since `figment::Error` is Send+Sync — `Tag` is `u64`, all fields are — but the allow is the minimal, risk-free option).
-3. **`mls.rs`** L29: `` `KeyPackage` `` backticks.
-4. **`model/mod.rs`** L3: `` `REFACTOR_PLAN.md` `` backticks.
-5. **`model/block.rs`** L146: merge arms — `Self::Text { content, .. } | Self::Code { content, .. } | Self::Thought { content, hidden: false } => Some(content)` (guard `hidden: false` preserved; binding types identical).
-6. **`model/event.rs`** L179: merge `RoomEvent::Call(CallEvent::Invite { room_id, .. } | CallEvent::End { room_id, .. } | CallEvent::Caption { room_id, .. } | CallEvent::Join { room_id, .. } | CallEvent::Leave { room_id, .. } | CallEvent::SfuPublisher { room_id, .. })` into the flat `Some(*room_id)` arm (per clippy's own suggestion); `Call(Answer|Ice|Roster|Offer) => None` arm untouched. L85/87: backticks on `ULID`, `delivery_id`, `participant_id`.
-7. **`model/media.rs`** L89: remove manual impl; add `Default` to the existing `#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]` and `#[default]` on `P2p` (MSRV 1.80 ≫ 1.62 required; serde `rename_all` unaffected).
+1. **`markdown.rs`** — module doc backticks (3); `.flat_map(parse_line)`; `struct RawSpan` hoisted above statements in `parse_spans`; `#[allow(clippy::cast_possible_truncation)]` on the Phase-2 `let spans` statement with rationale comment; 13× `panic!("…")` with messages preserved verbatim.
+2. **`config.rs`** — `#[allow(clippy::result_large_err)]` + comment on `AppConfig::load` (keeps public signature; 3 callers in aero-server bins untouched).
+3. **`mls.rs`** — `` `KeyPackage` `` in doc comment.
+4. **`model/mod.rs`** — `` `REFACTOR_PLAN.md` `` in module doc.
+5. **`model/block.rs`** — `Block::searchable_text`: merge `Thought{hidden:false}` into the `Text|Code` arm (guard preserved).
+6. **`model/event.rs`** — `NotifyBatch` field docs backticks; `RoomEvent::room_id`: merge `Call(Invite|End|Caption|Join|Leave|SfuPublisher)` into the flat `Some(*room_id)` arm (`Call(Answer|Ice|Roster|Offer) => None` untouched).
+7. **`model/media.rs`** — `CallMode`: `Default` added to derive + `#[default]` on `P2p`, manual impl removed.
 
-**Explicitly NOT changed**: root `Cargo.toml` lints, `web/`, any other crate, any `#[allow]` at crate level (targeted allows only, matching house style).
+## 4. Test plan
 
-## 4. Test plan (in order)
+Already executed (all pass): `cargo clippy -p aero-common --all-targets -- -D warnings` (0 errors) · `cargo check --workspace --all-targets` · `cargo test --workspace --lib` (318 passed) · `cargo test -p aero-server --test authz_lint` (6 passed, from implement stage) · `scripts/web-check.sh` (0 violations) · `scripts/truth-check.sh` (0 orphans) · `scripts/file-size-check.sh` (0 violations) · workspace clippy non-`-D`: aero-common contributes **0 warnings**, workspace total 680→649 (delta = exactly the removed aero-common lines; **no new warnings anywhere**).
 
-1. `cargo clippy -p aero-common --all-targets -- -D warnings` → **0 errors** (the crate-scoped gate; this is the true definition of done).
-2. `cargo check --workspace --all-targets` → clean.
-3. `cargo test --workspace --lib` → 318 passed, 0 failed — the 13 touched `markdown.rs` parser tests exercise the changed `panic!` branches' happy paths; failure branches are unreachable in green runs.
-4. `cargo clippy --workspace --all-targets` (no `-D`) → aero-common contributes **0 warnings** (29 fewer); verify no new warnings anywhere.
-5. `bash scripts/web-check.sh`, `scripts/truth-check.sh`, `scripts/file-size-check.sh` → unchanged (0 violations).
-6. `cargo test -p aero-server --test authz_lint` — CI-protected source lint; unaffected but part of AGENTS.md §4.3 提交前必过.
+**Remaining action**: commit the 7-file diff (currently uncommitted in the working tree for review).
 
 ## 5. Risk assessment
 
 | Risk | Likelihood | Mitigation / gates |
 |---|---|---|
-| **Workspace-wide `-D warnings` still red after fix** — after aero-common, the gate will fail on the next backlogged crate (`aero-storage` ~203 warnings, `aero-server` ~200, `aero-cli` 40, … ~680 total). | Certain | This is the documented, accepted backlog (CI runs clippy **without** `-D warnings`; AGENTS.md §4.3 requires "别新增警告" not "零 backlog"). Must be stated honestly in the PR: green = crate-scoped `-D` + workspace warning-count parity. Clearing 680 downstream warnings is a separate effort, out of "minimal changes" scope. |
-| `panic!` vs `assert!(false)` semantic drift | None | Identical panic behavior; messages preserved; only in `#[cfg(test)]`. |
-| Match-arm merge changes semantics | Very low | Bodies identical by definition of the lint; guards (`hidden: false`) and the `None` arm kept; `RoomId` is `Copy` so `*room_id` unchanged. 318 lib tests + parser tests re-verify. |
-| `derive(Default)` changes `CallMode` behavior | None | Derive output is literally `Self::P2p`; MSRV 1.80 fine. |
-| `#[allow]` hides future real truncation/large-err bugs | Low | `Span` offsets are bounded by chat-line input limits (server-side caps); allow is the established in-crate pattern (`metrics.rs:737`, `aero-live-whip/relay.rs`, `aero-ai/embed.rs`). |
-| config.rs signature change ripple | Avoided | Allow chosen over `Box<figment::Error>` → zero caller impact (3 verified call sites). |
-| Downstream compile breakage | None | All changes internal to aero-common's own code; no public API, schema, event, or config change. |
-| CI gates protecting us | — | `cargo check --all-targets`, `cargo test --workspace --lib` + `authz_lint` + `aero-cli gate all` (truth/file-size checks) all run in CI; the per-crate `-D warnings` clippy run is the new stricter local bar. |
+| Workspace-wide `-D warnings` still red after this fix | Certain | Fails on the documented pre-existing backlog (aero-storage 203, aero-eng 29, aero-bus 6, aero-signaling 1, plus aero-server/aero-cli/aero-live-* masked behind aero-storage's halt). CI deliberately runs clippy without `-D`; AGENTS.md §4.3 requires "别新增警告" (no new warnings), not zero backlog. Must be stated honestly in the commit/PR: green bar = crate-scoped `-D` + workspace warning parity. Clearing ~649 downstream warnings is a separate effort. |
+| `panic!` vs `assert!(false)` drift | None | Identical panic semantics; messages preserved; test-only. |
+| Arm-merge semantic change | Very low | Bodies identical by lint definition; guards (`hidden: false`) and `None` arm kept; `RoomId` is `Copy`. 318 lib tests re-verify. |
+| `derive(Default)` change | None | Literally `Self::P2p`; MSRV 1.80 ≫ 1.62. |
+| Targeted `#[allow]`s hide future bugs | Low | `Span` offsets bounded by chat-line caps; config load once at boot; comments in code; in-crate precedent (`metrics.rs`). |
+| Working-tree fix silently lost / double-applied | Low | Batch flow: verify the 7-file diff is present before commit; do not re-apply edits (would fail on oldText mismatch). |
+| CI gates protecting us | — | `cargo check --all-targets`, `cargo test --workspace --lib` + `authz_lint` + `aero-cli gate all` (truth/file-size) all green; per-crate `-D` clippy is the stricter local bar. |
 
-**Net change**: 7 files in `crates/aero-common/src`, ~40 lines touched, zero behavior/API/schema/config changes, no new dependencies, fully revertible by reverting one commit.
+**Bottom line**: the aero-common clippy backlog is already fully fixed in the working tree (29/29 sites, 7 files, zero behavior change). No further code modification is required — the plan's remaining step is commit + the honest boundary note that workspace-wide `-D warnings` will continue to fail on the documented downstream backlog.
