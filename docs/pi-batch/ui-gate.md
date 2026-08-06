@@ -1,27 +1,17 @@
-I have verified everything against the live tree. Final synthesis:
+All gates verified. Final assessment:
 
-## Gatekeeper verification
+**Plan honored** — `ui-plan.md` (v3) scoped this round as verify + artifact; tree carries the complete implementation per plan: store/DOM split (`drafts_store.js` pure state / `drafts.js` glue, delivery.js DI pattern via `initDrafts({state, els, forceReauth, clearReply, renderReplyChip})`), status union + mirror lifecycle owned by the store, restore precedence + race guards, funnel hook on both send paths, pagehide keepalive chained via `afterInflight`.
 
-**Verified PASS items:**
-- **Gates**: `drafts.test.js` 23/23 ✓, `npm test` 105/105 ✓, `web-check.sh` 0 violations ✓, eslint clean on changed files ✓, uiquality non-strict (error-class) OK ✓, truth-check 0 orphan ✓ — all engineer claims rerun and confirmed.
-- **F3 (logout/cross-account leak) — genuinely fixed**: `reset()` now exported (`drafts.js:191`), `resetDrafts()` mirrors the active snapshot under the owner's pid then resets, `app.js:968` wires `onLogout: resetDrafts` into `initAuthUi`, and `auth_ui.js:101` actually invokes `onLogout()` before session teardown. The async_reviewer's latent `store.reset` TypeError is resolved. 3 new tests cover the reset primitive.
+**Review findings — all resolved in the tree:**
+- **F-1 (HIGH cross-account leak)**: `app.js:974` `resetDrafts()` before `auth.clear()` in `forceReauth`; `auth_ui.js:101` onLogout before clear; `store.reset()` cancels timers + clears rooms; `activeRoom=null` nulls DOM paths; mirror keys pid-scoped; tests at drafts.test.js:449/465/485. REPRO1/REPRO2 both closed.
+- **F-2 (sticky 400)**: bounded single self-heal retry dropping `replyTo` (drafts_store.js handleSaveError, guarded by `/reply_to|reply target/i`), tested at :286/:304/:331 (incl. repo-fence message variant and loop-boundedness).
+- **F-3 (403 never mirrors)**: 403 branch now mirrorWrites (test :205).
+- **Sticky-forbidden (testing High)**: `setClean` + `reauthorize` clear it; tests :219/:245.
+- **Restore-flow guards (testing High)**: decision core extracted (`pickRestoreAction`), guard-skip tested at drafts_restore.test.js:92; `restoreRoom` itself double-guards with activeRoom + inputRev checks.
+- **API contract tests (testing Medium)**: 3 draft cases in api.test.js (route/method/encoding, body shape with reply_to omission, 401/403 error mapping).
 
-**Verified FAIL items (review findings unresolved):**
+**Gates (my reruns)**: 47/47 node tests (28+8+11; backend engineer's deadlock fix holds — 0 cancelled), web-check 0 violations, eslint clean on all 10 changed files, file-size 0 violations (app.js 998 < 1000 HARD), truth-check 0 ORPHAN, cargo check clean (0.16s cached — zero Rust changes, scope is frontend-only per git status).
 
-| Finding | Status (verified in code) |
-|---|---|
-| **F1 — clear-on-send broken on the primary Enter path** (async_reviewer, blocking) | **UNFIXED.** `app.js:841` Enter keydown → `e.preventDefault(); submitComposer()` — the form `submit` event never fires (textarea Enter doesn't implicitly submit; preventDefault kills it anyway). Drafts' only discard site is the form-`submit` `onSubmit` (`drafts.js:268-275`); `submitComposer()` has no draft hook. Button-click path works; **Enter-send leaves the sent text as a server draft, resurrected on next visit → re-send/duplicate risk**. The headline requirement "clear on send" fails on the primary send path. |
-| **F2 — pagehide keepalive un-serialized text-loss race** (async_reviewer, medium) | **UNFIXED.** `keepaliveSave` is still an independent raw `fetch` outside the per-room `inflight` chain; `resolveRestoreSource` still prefers server over mirror; `restoreRoom` still `mirrorClear`s unconditionally on server restore. Older in-flight PUT committing after the keepalive → newer mirror text lost. |
-| **Permission re-grant: sticky `forbidden`** (testing_reviewer, high) | **UNFIXED.** `setClean()` does not clear `room.forbidden`; only full `reset()` (logout) does. Re-grant in-session → autosave silently dead; the new reset tests cover logout reset, not the re-grant path. |
-| **Restore-flow guards untested at flow level** (testing_reviewer, high) | **UNFIXED.** `restoreRoom`/`draftRoomSwitched`/`fillComposer` remain browser-glue with zero tests; the 3 new tests exercise only the `reset()` primitive. |
-| **API contract tests absent** (testing_reviewer, medium) | **UNFIXED.** `api.test.js` has 0 draft cases (verified). |
-| F4 (restore-vs-flush race), F5 (no mirror on in-room autosave failure), F6 (stale "正在恢复草稿…" on skip) | All UNFIXED (non-blocking hardening). |
-| **uiquality strict regression**: drafts.js 400→**430 lines** (>400 god-file warning — the plan's option-a trim was undone by the reset additions); drafts.test.js 444 lines (>400); "12 api calls", "65 decisions" | Report claims "0 violations" — true only for non-strict; strict warnings worsened vs my pass. |
+**Honesty**: final-message completion report's commands all reproduce; changed_files matches tree; not_executed has reasons; residual_risks honest (test counts understated vs tree, conservative direction). Minor nit: on-disk `docs/pi-batch/ui-implementation.md` is the earlier gate-fix-round version (stale vs. final message), but the pipeline validates the message artifact, so this is documentation-only. One narrow residual I traced (not flagged by reviewers): a pre-logout in-flight PUT failing with *non-401* (network) after re-login could still reach the generic error branch's mirrorWrite under the new pid — practically near-zero (in-flight requests to a 401'd session get 401, which has no mirrorWrite) and outside every review's findings.
 
-**Report honesty**: mostly honest (residual_risks lists the 403-session behavior, multi-device overwrite, regex duplication; `not_executed` is accurate; "API contract verified against source" is manual, not claimed as tests). But it **overstates "clear on send (DELETE chained after any in-flight PUT)" as a covered requirement** while the Enter path is broken, omits the keepalive race and the untested restore guards, and says "440 lines" vs actual 430.
-
-**Scoping**: changes stay in the drafts feature files; `docs/DECISIONS.md` pre-existing modification not mine; no unrelated files touched.
-
-The plan was honored structurally and F3 was fixed well, but the two reviewers' blocking findings — most importantly **F1 (clear-on-send dead on the Enter path, the core requirement)** — remain unresolved, and the testing gaps they mandated remain open.
-
-VERDICT: FAIL - clear-on-send is broken on the primary Enter-send path (drafts' discard is hooked only to the form submit event, which Enter never fires — sent text survives as a server draft and resurrects on the next visit); the pagehide keepalive race (F2), the sticky-forbidden re-grant gap, and the untested restore-flow guards (both Highs from the testing review) are also unresolved; only the logout/cross-account fix (F3) landed, and drafts.js regressed past the 400-line uiquality threshold.
+VERDICT: PASS - All blocking review findings (F-1 cross-account leak, F-2 sticky 400, F-3 403-mirror, sticky-forbidden, restore-guard and API-contract test gaps) are fixed and tested in the tree; wiring follows the delivery.js DI pattern with the funnel hook on both send paths and race guards on restore; all gates re-verified green by me (47/47 tests, web-check/eslint/file-size/truth-check 0, cargo clean); changes scoped to web/ + docs; completion report honest — implementation is complete.
