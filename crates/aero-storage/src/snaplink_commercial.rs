@@ -458,7 +458,8 @@ async fn require_complete_workspace_coverage(
             FROM workspaces workspace
             LEFT JOIN snaplink_commercial_bindings binding
               ON binding.workspace_id = workspace.id AND binding.enabled
-           WHERE binding.workspace_id IS NULL",
+           WHERE binding.workspace_id IS NULL
+             AND workspace.id <> '00000000-0000-0000-0000-000000000000'",
     )
     .fetch_one(&mut **tx)
     .await?;
