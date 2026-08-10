@@ -4,8 +4,9 @@ Shared-machine lesson (LESSONS.md D3): locks only tell you a repo is
 held, not WHO runs WHAT. Every pi-batch process registers itself under
 ~/.pi-batch/runs/<pid>.json (one file per process — no cross-process
 write contention), heartbeats its last activity every 60s via a daemon
-thread, and unregisters on exit. `pi-batch ps` lists live runs across
-all repositories and users on this host.
+thread, and unregisters on exit. When the home directory is read-only,
+the registry deterministically falls back to a per-user runtime/temp
+directory. `pi-batch ps` lists live runs across the user's repositories.
 
 Lock-free read path: list_runs() only scans and stat()s files; a stale
 file (dead pid) is reported with status=dead and can be pruned.
@@ -16,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -28,8 +30,39 @@ _heartbeat_stop = threading.Event()
 
 
 def _registry_dir() -> Path:
-    _REGISTRY_DIR.mkdir(parents=True, exist_ok=True)
+    for candidate in _registry_candidates():
+        if _prepare_registry_dir(candidate):
+            return candidate
     return _REGISTRY_DIR
+
+
+def _registry_candidates() -> list[Path]:
+    candidates = [_REGISTRY_DIR]
+    runtime_dir = os.environ.get("XDG_RUNTIME_DIR", "").strip()
+    if runtime_dir:
+        candidates.append(Path(runtime_dir) / "pi-batch" / "runs")
+    user_id = os.getuid() if hasattr(os, "getuid") else os.getpid()
+    candidates.append(Path(tempfile.gettempdir()) / f"pi-batch-runs-{user_id}")
+    return list(dict.fromkeys(candidates))
+
+
+def _prepare_registry_dir(path: Path) -> bool:
+    probe = path / (f".write-probe-{os.getpid()}-"
+                    f"{threading.get_ident()}-{time.time_ns()}")
+    descriptor: int | None = None
+    try:
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        descriptor = os.open(probe, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        return True
+    except OSError:
+        return False
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        try:
+            probe.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _redacted_argv(argv: list) -> list:
@@ -68,8 +101,13 @@ def register_run(mode: str, repo: str, session_name: str = "",
     }
     if extra:
         meta.update(extra)
-    _own_path = _registry_dir() / f"{os.getpid()}.json"
-    _write_atomic(_own_path, meta)
+    path = _registry_dir() / f"{os.getpid()}.json"
+    try:
+        _write_atomic(path, meta)
+    except OSError:
+        _own_path = None
+        return path
+    _own_path = path
     _heartbeat_stop.clear()
     threading.Thread(target=_heartbeat_loop, daemon=True).start()
     return _own_path
@@ -97,6 +135,7 @@ def unregister() -> None:
         try:
             _own_path.unlink(missing_ok=True)
         except OSError:
+        # best-effort I/O：失败不阻塞主流程（已验证有意）
             pass
         _own_path = None
 
@@ -113,9 +152,15 @@ def _patch_own(meta: dict) -> None:
 
 
 def _write_atomic(path: Path, meta: dict) -> None:
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
-    os.replace(tmp, path)
+    tmp = path.with_name(f".{path.name}.{threading.get_ident()}.tmp")
+    try:
+        tmp.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _heartbeat_loop() -> None:
@@ -128,7 +173,7 @@ def list_runs() -> list[dict]:
     Entries whose pid is dead are returned with status='dead' so callers
     can show or prune them."""
     runs: list[dict] = []
-    directory = _REGISTRY_DIR
+    directory = _registry_dir()
     if not directory.is_dir():
         return runs
     for path in sorted(directory.glob("*.json")):
@@ -152,6 +197,7 @@ def prune_dead() -> int:
                 Path(run["_file"]).unlink(missing_ok=True)
                 removed += 1
             except OSError:
+            # best-effort I/O：失败不阻塞主流程（已验证有意）
                 pass
     return removed
 

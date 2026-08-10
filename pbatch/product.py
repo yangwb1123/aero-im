@@ -24,7 +24,13 @@ from __future__ import annotations
 
 from typing import Optional
 
+from . import config
+from .config import log
 from .relevance import _keyword_hit
+# Module-level rule_matcher import is cycle-safe ONLY because
+# rule_matcher.domain_for lazy-imports this module (never at module
+# level) — do not add a module-level import there.
+from .rule_matcher import TIER_ORDER, load_registry
 
 LEVELS = ("L0_local_feature", "L1_reusable_module", "L2_platform_capability",
           "L3_product_feature")
@@ -47,6 +53,9 @@ _PRODUCT_SIGNALS = {
         "internal", "demo",
     ],
 }
+
+_OPEN_SOURCE_SIGNALS = ("开源", "open source", "open-source", "oss")
+_BROAD_PRODUCT_SIGNALS = {"产品", "product"}
 
 # Scenario keyword -> implicit-requirement question chains (QUESTIONS to
 # confirm with the requester, never features to implement silently).
@@ -81,24 +90,54 @@ _SCENARIOS = {
     ),
 }
 
-# Product spec files by level (L0 gets none — restraint).
-_SPECS_BY_LEVEL = {
-    "L0_local_feature": [],
-    "L1_reusable_module": ["product-specs/product-thinking.md",
-                           "product-specs/completion-evidence.md"],
-    "L2_platform_capability": ["product-specs/product-thinking.md",
-                               "product-specs/commercial-readiness.md",
-                               "product-specs/completion-evidence.md"],
-    "L3_product_feature": ["product-specs/product-thinking.md",
-                           "product-specs/commercial-readiness.md",
-                           "product-specs/open-source-readiness.md",
-                           "product-specs/completion-evidence.md"],
-}
+# Product spec files by level, derived from the product registry
+# (product-specs/rules.yaml) instead of a hardcoded literal: every rule
+# with min_tier <= the level's tier contributes its files (declaration
+# order, deduplicated). Fail closed: a missing/empty registry yields []
+# per level (never a fallback to hardcoded lists).
+# Level -> tier mapping: L1=demo, L2=standard, L3=production; L0 -> no tier.
+_LEVEL_TIERS = {"L1_reusable_module": "demo",
+                "L2_platform_capability": "standard",
+                "L3_product_feature": "production"}
+
+
+def _derive_specs_by_level() -> dict:
+    """Per-level spec lists derived from the product rule registry."""
+    reg = load_registry(domain="product")
+    if not reg.get("rules"):
+        log.warning("product registry missing/empty; product specs empty")
+        return {level: [] for level in LEVELS}
+    derived = {"L0_local_feature": []}
+    for level, tier in _LEVEL_TIERS.items():
+        rank = TIER_ORDER[tier]
+        files, seen = [], set()
+        for rule in reg["rules"].values():
+            if TIER_ORDER.get(rule.get("min_tier", "standard"), 1) <= rank:
+                for file in rule.get("files", []):
+                    if file not in seen:
+                        seen.add(file)
+                        files.append(file)
+        derived[level] = files
+    return derived
+
+
+_SPECS_BY_LEVEL = _derive_specs_by_level()
 
 
 def productization_level(text: str) -> tuple:
     """(level, evidence): the highest signal level matched; default L0."""
     lowered = (text or "").lower()
+    local_hits = tuple(str(term) for term in _PRODUCT_SIGNALS[LEVELS[0]]
+                       if _keyword_hit(lowered, str(term)))
+    explicit_higher = [
+        str(term)
+        for level in LEVELS[1:]
+        for term in _PRODUCT_SIGNALS[level]
+        if term not in _BROAD_PRODUCT_SIGNALS
+        and _keyword_hit(lowered, str(term))
+    ]
+    if local_hits and not explicit_higher:
+        return LEVELS[0], local_hits
     for level in reversed(LEVELS):
         terms = _PRODUCT_SIGNALS.get(level, [])
         matched = tuple(str(t) for t in terms if _keyword_hit(lowered, str(t)))
@@ -123,6 +162,11 @@ def product_manifest(text: str, level: Optional[str] = None) -> dict:
     Returns {level, evidence, scenarios, specs, restraint_notes}."""
     resolved, evidence = productization_level(text) if level is None else (level, ())
     scenarios = scenario_questions(text) if resolved != "L0_local_feature" else []
+    specs = list(_SPECS_BY_LEVEL.get(resolved, []))
+    open_source = any(_keyword_hit((text or "").lower(), signal)
+                      for signal in _OPEN_SOURCE_SIGNALS)
+    if not open_source and "product-specs/open-source-readiness.md" in specs:
+        specs.remove("product-specs/open-source-readiness.md")
     notes = []
     if resolved == "L0_local_feature":
         notes.append("L0 小工具需求：禁止产品化结构，只实现需求本身（克制原则）")
@@ -133,11 +177,14 @@ def product_manifest(text: str, level: Optional[str] = None) -> dict:
                      "插件市场禁止提前设计")
     if scenarios:
         notes.append("推演出的隐含需求是待确认问题，不得未经确认直接实现")
+    if resolved == "L3_product_feature" and not open_source:
+        notes.append("未检测到开源意图：刻意不加载 open-source readiness")
     return {
         "level": resolved,
         "evidence": list(evidence),
         "scenarios": scenarios,
-        "specs": _SPECS_BY_LEVEL.get(resolved, []),
+        "specs": specs,
+        "asset_root": config.TOOL_ROOT,
         "restraint_notes": notes,
     }
 

@@ -20,7 +20,10 @@ def load_tasks(source: str) -> list[Task]:
     """
     path = Path(source)
     if not path.exists():
-        return [Task(prompt=source)]
+        if path.suffix.lower() in {".yaml", ".yml", ".json"}:
+            log.error("Structured task file not found: %s", source)
+            sys.exit(1)
+        return [task_from_prompt(source)]
 
     base_dir = str(path.parent) if path.parent else "."
     try:
@@ -55,7 +58,14 @@ def load_tasks(source: str) -> list[Task]:
             sys.exit(1)
 
     # Plain text prompt
-    return [Task(prompt=raw.strip())]
+    return [task_from_prompt(raw.strip(), base_dir)]
+
+
+def task_from_prompt(prompt: str, base_dir: str = "", output: str = "") -> Task:
+    """Create one task and resolve bounded @file references consistently."""
+    task = Task(prompt=prompt, output=output)
+    task.prompt = task.resolve_prompt(base_dir or str(Path.cwd()))
+    return task
 
 
 def _tasks_from_data(data, base_dir: str, source: str) -> list[Task]:
@@ -83,14 +93,20 @@ def _tasks_from_data(data, base_dir: str, source: str) -> list[Task]:
 def _task_data_error(value) -> str:
     if not isinstance(value, dict):
         return " must be a mapping"
+    unknown = sorted(set(value) - set(Task.__dataclass_fields__))
+    if unknown:
+        return " has unknown field(s): " + ", ".join(unknown)
     prompt = value.get("prompt")
     timeout = value.get("timeout", AGENT_DEFAULT_TIMEOUT)
     if not isinstance(prompt, str) or not prompt.strip():
         return ".prompt must be a non-empty string"
     if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout < 1:
         return ".timeout must be an integer >= 1"
-    if not isinstance(value.get("env", {}), dict):
-        return ".env must be a mapping"
+    env = value.get("env", {})
+    if not isinstance(env, dict) or not all(
+            isinstance(key, str) and isinstance(item, str)
+            for key, item in env.items()):
+        return ".env must map strings to strings"
     if value.get("validate") is not None and not isinstance(value.get("validate"), str):
         return ".validate must be a string or null"
     if "memory" in value and not isinstance(value["memory"], dict):

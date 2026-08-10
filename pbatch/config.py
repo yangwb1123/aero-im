@@ -1,15 +1,20 @@
-"""Declarative configuration for pi-batch: pi-batch.yaml resolution,
-agent defaults, session flags, and the named validator registry."""
+"""Declarative pi-batch defaults, adapters and validator registry."""
 
 from __future__ import annotations
 
 import logging
 import os
 import re
-import sys
+import shutil
 from functools import lru_cache
 from pathlib import Path
 from typing import NamedTuple, Optional
+
+from .assets import (PACKAGE_ROOT, TOOL_ROOT, asset_candidates, expand_validator_registry,
+                     is_tool_asset, placeholder_values, resolve_asset_path)
+from .config_device import _bool_setting, load_device_fabric
+from .config_values import _choice_setting, _float_setting, _int_setting, _string_setting
+from .validator_schema import schema_validator_command
 
 try:
     import yaml
@@ -35,6 +40,7 @@ def _find_batch_config() -> Optional[dict]:
         candidates.append(Path(script_dir) / "pi-batch.yaml")
     candidates.append(Path(__file__).resolve().parent / "pi-batch.yaml")
     candidates.append(Path("pi-batch.yaml"))
+    candidates.append(Path(TOOL_ROOT) / "pi-batch.yaml")
     for p in candidates:
         if not p.exists():
             continue
@@ -42,7 +48,6 @@ def _find_batch_config() -> Optional[dict]:
         if isinstance(data, dict):
             return data
     return None
-
 
 def _load_batch_config(path: str = "pi-batch.yaml") -> dict:
     """Optional defaults for pi-batch. Missing file -> {} (built-in defaults
@@ -52,9 +57,34 @@ def _load_batch_config(path: str = "pi-batch.yaml") -> dict:
     data = _find_batch_config()
     return data if data is not None else {}
 
+def _find_user_config() -> dict:
+    """用户级配置（分层低优先层；项目 pi-batch.yaml 覆盖之）。"""
+    from . import user_dirs
+    if not yaml:
+        return {}
+    path = user_dirs.user_settings_path()
+    if not path.exists():
+        return {}
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except (OSError, ValueError):
+        log.warning("User settings %s unreadable; ignoring", path)
+        return {}
+    return data if isinstance(data, dict) else {}
 
-_BATCH_CFG = _load_batch_config()
+def _merge_config(project: dict, user: dict) -> dict:
+    """项目配置覆盖用户配置（节内键级合并）。"""
+    merged: dict = {}
+    for section_name in set(project) | set(user):
+        proj = project.get(section_name, {})
+        usr = user.get(section_name, {})
+        if isinstance(proj, dict) and isinstance(usr, dict):
+            merged[section_name] = {**usr, **proj}
+        else:
+            merged[section_name] = proj if section_name in project else usr
+    return merged
 
+_BATCH_CFG = _merge_config(_load_batch_config(), _find_user_config())
 
 def _section(name: str) -> dict:
     """Return a mapping config section, falling back on malformed input."""
@@ -64,65 +94,6 @@ def _section(name: str) -> dict:
     log.warning("Config section '%s' must be a mapping; using defaults", name)
     return {}
 
-
-def _int_setting(section: dict, key: str, default: int,
-                 minimum: Optional[int] = None) -> int:
-    """Read an integer without letting YAML type/value mistakes abort import."""
-    value = section.get(key, default)
-    try:
-        if isinstance(value, bool):
-            raise ValueError
-        parsed = int(value)
-    except (TypeError, ValueError):
-        log.warning("Config value '%s' must be an integer; using %d", key, default)
-        return default
-    if minimum is not None and parsed < minimum:
-        log.warning("Config value '%s' must be >= %d; using %d", key, minimum, default)
-        return default
-    return parsed
-
-
-def _choice_setting(section: dict, key: str, default: str,
-                    choices: tuple[str, ...]) -> str:
-    """Normalize a small string enum, with a usable argparse-safe default."""
-    value = str(section.get(key, default)).lower()
-    if value in choices:
-        return value
-    log.warning("Config value '%s' must be one of %s; using %s",
-                key, ", ".join(choices), default)
-    return default
-
-
-def _string_setting(section: dict, key: str, default: str,
-                    allow_empty: bool = True) -> str:
-    """Read a scalar string and reject YAML null/collection surprises."""
-    value = section.get(key, default)
-    if isinstance(value, str) and (allow_empty or value):
-        return value
-    kind = "a string" if allow_empty else "a non-empty string"
-    log.warning("Config value '%s' must be %s; using %s", key, kind, default)
-    return default
-
-
-def _float_setting(section: dict, key: str, default: float,
-                   minimum: Optional[float] = None,
-                   maximum: Optional[float] = None) -> float:
-    """Read a ratio-like float without letting YAML surprises abort import."""
-    value = section.get(key, default)
-    try:
-        if isinstance(value, bool):
-            raise ValueError
-        parsed = float(value)
-    except (TypeError, ValueError):
-        log.warning("Config value '%s' must be a number; using %s", key, default)
-        return default
-    if (minimum is not None and parsed < minimum) or (maximum is not None and parsed > maximum):
-        log.warning("Config value '%s' must be within [%s, %s]; using %s",
-                    key, minimum, maximum, default)
-        return default
-    return parsed
-
-
 _AGENT_CFG = _section("agent")
 # Optional per-agent override sections: agent.agents.<bin>.* win over the
 # global agent.* settings for that binary (G line: claude/codex/gemini have
@@ -130,7 +101,6 @@ _AGENT_CFG = _section("agent")
 _AGENTS_CFG = _AGENT_CFG.get("agents")
 if not isinstance(_AGENTS_CFG, dict):
     _AGENTS_CFG = {}
-
 
 def _agent_section(bin_name: str) -> dict:
     """Per-agent config section for a binary name (agent.agents.<bin>),
@@ -140,7 +110,89 @@ def _agent_section(bin_name: str) -> dict:
     section = _AGENTS_CFG.get(bin_name)
     return section if isinstance(section, dict) else {}
 
+_DEFAULT_ARGUMENT_FLAGS = {
+    "prompt": ("-p",),
+    "model": ("--model",),
+    "provider": ("--provider",),
+    "thinking": ("--thinking",),
+    "tools": ("--tools",),
+    "exclude_tools": ("--exclude-tools",),
+}
 
+
+def _argument_tokens(value, default: tuple, label: str) -> tuple:
+    """Normalize one adapter flag without shell-splitting untrusted config.
+
+    An empty string/list disables an optional flag. For ``prompt`` it means
+    the prompt is positional, which is required by CLIs such as Codex.
+    """
+    if isinstance(value, str):
+        return (value,) if value else ()
+    if isinstance(value, (list, tuple)) and all(
+            isinstance(token, str) and token for token in value):
+        return tuple(value)
+    log.warning("Config argument_flags.%s must be a string or string list; using defaults",
+                label)
+    return default
+
+
+def agent_argument_flags(bin_name: str = "") -> dict[str, tuple]:
+    """Resolve the argv adapter for an agent binary.
+
+    Precedence is agent.agents.<bin>.argument_flags > agent.argument_flags >
+    the historical pi-compatible flag contract. Per-key merging keeps a
+    small override backwards compatible with the existing defaults.
+    """
+    global_flags = _AGENT_CFG.get("argument_flags")
+    global_flags = global_flags if isinstance(global_flags, dict) else {}
+    local_flags = _agent_section(bin_name or AGENT_BIN).get("argument_flags")
+    local_flags = local_flags if isinstance(local_flags, dict) else {}
+    resolved = {}
+    for key, default in _DEFAULT_ARGUMENT_FLAGS.items():
+        value = local_flags.get(key, global_flags.get(key, default))
+        resolved[key] = _argument_tokens(value, default, key)
+    return resolved
+
+
+def build_agent_argv(bin_name: str, prompt: str, *, model: str = "",
+                     provider: str = "", thinking: str = "", tools: str = "",
+                     exclude_tools: str = "",
+                     session_flags: Optional[list] = None) -> list[str]:
+    """Build an agent argv from the configured adapter, without a shell."""
+    flags = agent_argument_flags(bin_name)
+    cmd = [bin_name, *flags["prompt"], prompt]
+    for key, value in (("model", model), ("provider", provider),
+                       ("thinking", thinking), ("tools", tools),
+                       ("exclude_tools", exclude_tools)):
+        if not value:
+            continue
+        if not flags[key]:
+            raise ValueError(
+                f"agent adapter for {bin_name!r} does not support {key}")
+        cmd.extend([*flags[key], value])
+    if session_flags:
+        cmd.extend(session_flags)
+    return cmd
+
+
+def agent_prompt_index(bin_name: str = "") -> int:
+    """Index of the prompt value in argv built by :func:`build_agent_argv`."""
+    return 1 + len(agent_argument_flags(bin_name or AGENT_BIN)["prompt"])
+
+
+def agent_preflight_errors(bin_name: str) -> list[str]:
+    """Return adapter/executable errors before logs, locks or agents start."""
+    name = str(bin_name or "").strip()
+    if not name:
+        return ["agent binary is empty"]
+    errors = []
+    if shutil.which(name) is None:
+        errors.append(f"agent executable not found or not executable: {name}")
+    try:
+        agent_argument_flags(name)
+    except (TypeError, ValueError) as exc:
+        errors.append(f"invalid adapter for {name}: {exc}")
+    return errors
 # Default provider/CLI failure signatures (G line). Per-agent overrides:
 #   agent.error_patterns: [...]      (all agents)
 #   agent.agents.<bin>.error_patterns: [...]   (one binary)
@@ -190,11 +242,9 @@ _DEFAULT_ERROR_PATTERNS = (
     r"(?im)^fatal:",
 )
 
-
 @lru_cache(maxsize=16)
 def _compile_patterns(patterns: tuple) -> tuple:
     return tuple(re.compile(pattern, re.IGNORECASE) for pattern in patterns)
-
 
 def agent_error_patterns(bin_name: str = "") -> tuple:
     """Failure-signature patterns for the current agent binary: per-agent
@@ -218,6 +268,7 @@ def agent_error_patterns(bin_name: str = "") -> tuple:
         return ()
     return _compile_patterns(patterns)
 _COMMIT_CFG = _section("commit")
+_PROJECT_CFG = _section("project")
 _LOGGING_CFG = _section("logging")
 _SESSION_CFG = _section("session")
 _OUTPUT_CFG = _section("output")
@@ -230,19 +281,24 @@ _MEMORY_CFG = _section("memory")
 _CLASSIFIER_CFG = _section("classifier")
 _LIMITS_CFG = _section("limits")
 
-
 AGENT_BIN = _string_setting(_AGENT_CFG, "bin", "pi", allow_empty=False)
-
-
 AGENT_DEFAULT_MODEL = _string_setting(_AGENT_CFG, "default_model", "")
-
-
 AGENT_DEFAULT_TIMEOUT = _int_setting(_AGENT_CFG, "default_timeout", 900, 1)
-
-
 AGENT_DEFAULT_WORKERS = _int_setting(_AGENT_CFG, "default_workers", 4, 1)
 
 
+PROJECT_FRONTEND_ROOT = _string_setting(
+    _PROJECT_CFG, "frontend_root", "src", allow_empty=False)
+PROJECT_BACKEND_ROOT = _string_setting(
+    _PROJECT_CFG, "backend_root", "src", allow_empty=False)
+PROJECT_REPORT_ROOT = _string_setting(
+    _PROJECT_CFG, "report_root", "docs", allow_empty=False)
+
+
+def command_placeholder_values(cwd: str) -> dict[str, str]:
+    """Resolved, unquoted values for validator/stage command placeholders."""
+    return placeholder_values(cwd, PROJECT_FRONTEND_ROOT, PROJECT_BACKEND_ROOT,
+                              PROJECT_REPORT_ROOT)
 COMMIT_PREFIX_DEFAULT = _string_setting(_COMMIT_CFG, "prefix", "[pi-batch]")
 
 # T3 (7x24 governance): log rotation thresholds; --log-max-bytes /
@@ -328,6 +384,18 @@ RATE_LIMIT_PROVIDERS = {
 }
 
 
+# Each fabric capability remains independently off by default. Loading the
+# module never implies scanning, execution, migration, or installation.
+_DEVICE_FABRIC = load_device_fabric(_section("device_fabric"))
+DEVICE_FABRIC_ENABLED = _DEVICE_FABRIC.enabled
+DEVICE_FABRIC_MODE = _DEVICE_FABRIC.mode
+DEVICE_FABRIC_LAN_SCAN = _DEVICE_FABRIC.lan_scan
+DEVICE_FABRIC_BENCHMARK = _DEVICE_FABRIC.benchmark
+DEVICE_FABRIC_AUTO_INSTALL = _DEVICE_FABRIC.auto_install
+DEVICE_FABRIC_APPROVAL_REQUIRED = _DEVICE_FABRIC.approval_required
+DEVICE_FABRIC_STATIC = _DEVICE_FABRIC.static
+DEVICE_FABRIC_CLUSTERS = _DEVICE_FABRIC.clusters
+
 # Task type classifier (pbatch/classifier.py): deterministic keyword gate
 # that runs BEFORE execution and routes frontend UI tasks to the UI
 # generation pipeline (--classify / `pi-batch.py classify`).
@@ -343,14 +411,16 @@ CLASSIFIER_MIN_SCORE = _int_setting(_CLASSIFIER_CFG, "min_score", 2, 1)
 # Route when this share of a batch's tasks classify as frontend UI.
 CLASSIFIER_FRONTEND_RATIO = _float_setting(
     _CLASSIFIER_CFG, "frontend_ratio", 0.5, 0.0, 1.0)
-
+CLASSIFIER_BACKEND_RATIO = _float_setting(
+    _CLASSIFIER_CFG, "backend_ratio", 0.5, 0.0, 1.0)
+CLASSIFIER_TIE_POLICY = _choice_setting(
+    _CLASSIFIER_CFG, "tie_policy", "frontend", ("plain", "frontend", "backend"))
 
 _DEFAULT_SESSION_FLAGS = {
     "start": ["--session-id", "{session}", "--name", "{name}"],
     "continue": ["--session-id", "{session}"],
     "fork": ["--fork", "{session}"],
 }
-
 
 def agent_session_flags(key: str, session_id: str, session_name: str,
                         bin_name: str = "") -> list:
@@ -371,11 +441,9 @@ def agent_session_flags(key: str, session_id: str, session_name: str,
         flags = _DEFAULT_SESSION_FLAGS[key]
     return [f.replace("{session}", session_id).replace("{name}", session_name) for f in flags]
 
-
 def _session_flags(key: str, session_id: str, session_name: str) -> list:
     """Backward-compatible alias resolving flags for the configured bin."""
     return agent_session_flags(key, session_id, session_name)
-
 
 def _load_validators() -> dict:
     """Read the named validators registry from pi-batch.yaml (like the
@@ -384,12 +452,13 @@ def _load_validators() -> dict:
     data = _find_batch_config()
     if not data:
         return {}
-    v = data.get("validators")
-    return dict(v) if isinstance(v, dict) else {}
-
+    registry = data.get("validators")
+    if not isinstance(registry, dict):
+        return {}
+    return expand_validator_registry(
+        registry, PROJECT_FRONTEND_ROOT, PROJECT_BACKEND_ROOT, PROJECT_REPORT_ROOT)
 
 VALIDATORS = _load_validators()
-
 
 class ValidatorSpec(NamedTuple):
     """One resolved validator entry.
@@ -405,7 +474,6 @@ class ValidatorSpec(NamedTuple):
     cmd: str
     judge: bool = False
     scope: str = "file"
-
 
 def _validator_spec(entry) -> Optional[ValidatorSpec]:
     """Normalize one registry entry: a string command, or a mapping with
@@ -426,21 +494,17 @@ def _validator_spec(entry) -> Optional[ValidatorSpec]:
                 "mapping; skipping %r", entry)
     return None
 
-
 VALIDATOR_SPECS: dict = {name: spec for name, entry in VALIDATORS.items()
                          if (spec := _validator_spec(entry)) is not None}
 
-
 def _resolve_validator_specs(value: str) -> list:
-    """Expand a comma-separated list into ValidatorSpecs: registry names are
-    replaced by their pi-batch.yaml spec (cmd/judge/scope), anything else is
-    used as a raw file-scoped shell command. Empty value -> no validation."""
+    """Resolve registry names, jsonschema=PATH, and raw commands."""
     out = []
     for item in [x.strip() for x in (value or "").split(",") if x.strip()]:
         spec = VALIDATOR_SPECS.get(item)
-        out.append(spec if spec is not None else ValidatorSpec(cmd=item))
+        command = schema_validator_command(item)
+        out.append(spec if spec is not None else ValidatorSpec(cmd=command or item))
     return out
-
 
 def _resolve_validators(value: str) -> list:
     """Backward-compatible alias: command strings only (judge/scope ignored)."""

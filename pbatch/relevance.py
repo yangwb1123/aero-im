@@ -55,7 +55,8 @@ def load_role_keywords(path: str = "") -> dict:
     """Load a role keyword map; malformed or absent files disable scoring."""
     if not yaml:
         return {}
-    candidates = [Path(path)] if path else _default_keyword_paths()
+    candidates = ([Path(path), Path(config.resolve_asset_path(path))]
+                  if path else _default_keyword_paths())
     for candidate in candidates:
         try:
             data = yaml.safe_load(read_text_bounded(

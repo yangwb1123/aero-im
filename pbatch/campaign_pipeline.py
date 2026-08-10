@@ -1,6 +1,7 @@
 """Pipeline materialization and isolated implementation for campaigns."""
 
 from __future__ import annotations
+from pbatch.pipeline_status import PipelineStatus
 
 import json
 import os
@@ -15,7 +16,17 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .campaign_models import CampaignSettings, Direction, safe_slug
-from .campaign_state import digest, file_digest, tree_digest
+from .campaign_state import (digest, file_digest, git_worktree_evidence,
+                             tool_digest, tree_digest)
+from .campaign_worktree import (_git_failure,
+                                _sync_worktree_baseline,
+                                _validate_existing_worktree,
+                                ensure_worktree as _ensure_worktree,
+                                finalize_worktree as _finalize_worktree,
+                                git_ok as _git_ok, git_path as _git_path,
+                                git_text as _git_text,
+                                isolated_status as _isolated_status,
+                                run_git as _run_git)
 from . import config
 from .config import log, yaml
 from .pipeline import load_pipeline, run_pipeline
@@ -35,11 +46,15 @@ class PipelineOutcome:
     evidence: list[str]
     branch: str = ""
     commit: str = ""
+    baseline_commit: str = ""
+    clean_commit: str = ""
+    dirty_evidence: list[str] | None = None
+    dirty_digest: str = ""
 
 
 def direction_fingerprint(root: Path, settings: CampaignSettings, direction: Direction,
                           analysis_path: Path, snapshot: dict, model: str, provider: str) -> str:
-    template = settings.path(root, settings.pipeline_template)
+    template = _pipeline_template(root, settings)
     return digest({
         "version": 1,
         "direction": direction.raw or direction.title,
@@ -47,6 +62,7 @@ def direction_fingerprint(root: Path, settings: CampaignSettings, direction: Dir
         "pipeline": file_digest(template),
         "resources": _pipeline_resources(root, template),
         "runner_config": file_digest(root / "pi-batch.yaml"),
+        "tool": tool_digest(),
         "campaign": {
             "name": settings.name,
             "maximum": settings.max_directions,
@@ -62,7 +78,7 @@ def direction_fingerprint(root: Path, settings: CampaignSettings, direction: Dir
 def materialize_pipeline(root: Path, settings: CampaignSettings, direction: Direction,
                          analysis_path: Path) -> Path:
     """Create a direction-scoped pipeline without output/decision collisions."""
-    template = settings.path(root, settings.pipeline_template)
+    template = _pipeline_template(root, settings)
     if not template.is_file() or template.is_symlink():
         raise ValueError(f"pipeline template is missing or unsafe: {template}")
     if not yaml:
@@ -75,9 +91,74 @@ def materialize_pipeline(root: Path, settings: CampaignSettings, direction: Dire
     _scope_pipeline_outputs(data, root, run_dir)
     if not _replace_requirement_prompt(data["stages"], settings, direction, analysis_path):
         raise ValueError(f"requirement stage '{settings.requirement_stage}' not found")
+    _inject_prior_gate_feedback(data["stages"], run_dir)
     pipeline_path = run_dir / "pipeline.yaml"
     _atomic_yaml(pipeline_path, data)
     return pipeline_path
+
+
+_FEEDBACK_MAX_BYTES = 24 * 1024
+_FEEDBACK_MAX_FILES = 6
+
+
+def _prior_gate_feedback(run_dir: Path) -> str:
+    """Collect gate verdicts + reason lines from earlier attempts of this
+    direction (same run_dir). Real-world lesson (aero-vault round 2): a
+    GATE_REJECTED direction was retried from scratch and the design agent
+    never saw the previous verdicts, so the same gaps re-occurred. The
+    coordinator now folds prior verdicts into the retry prompts so the
+    feedback loop is automatic instead of a template-text hack."""
+    if not run_dir.is_dir():
+        return ""
+    blocks: list[str] = []
+    total = 0
+    for path in sorted(run_dir.rglob("*.md")):
+        name = path.name
+        if not any(key in name for key in ("gate", "verdict", "acceptance", "decision")):
+            continue
+        try:
+            text = read_text_bounded(path, _FEEDBACK_MAX_BYTES, "prior gate feedback")
+        except (OSError, ValueError):
+            continue
+        lines = text.splitlines()
+        for idx, line in enumerate(lines):
+            if "VERDICT" not in line.upper():
+                continue
+            block = [line.strip()]
+            for follow in lines[idx + 1:idx + 26]:
+                stripped = follow.strip()
+                if not stripped:
+                    break
+                block.append(stripped[:300])
+            chunk = "\n".join(block)
+            if len(chunk) + total > _FEEDBACK_MAX_BYTES or len(blocks) >= _FEEDBACK_MAX_FILES:
+                break
+            blocks.append(chunk)
+            total += len(chunk)
+        if len(blocks) >= _FEEDBACK_MAX_FILES:
+            break
+    return "\n\n".join(blocks)
+
+
+def _inject_prior_gate_feedback(stages: list, run_dir: Path) -> None:
+    """Append previous gate verdicts to requirements/design/implement prompts
+    so a retry addresses every outstanding finding (bounded, advisory)."""
+    feedback = _prior_gate_feedback(run_dir)
+    if not feedback:
+        return
+    note = (
+        "\n\nPREVIOUS ATTEMPT FEEDBACK — an earlier run of this direction was "
+        "rejected. Verify and address EVERY finding below with evidence (code, "
+        "tests, or an explicit disposition); the gate will re-check them:\n"
+        + feedback
+    )
+    for stage in stages:
+        if stage.get("name") in ("design", "implement"):
+            for task in stage.get("tasks", []):
+                if task.get("prompt"):
+                    task["prompt"] += note
+        if stage.get("from_prompt"):
+            stage["from_prompt"] += note
 
 
 def _scope_pipeline_outputs(data: dict, root: Path, run_dir: Path) -> None:
@@ -110,12 +191,22 @@ def _output_name(value: str, fallback: str) -> str:
 
 def _repository_resource(root: Path, value: str) -> Path:
     path = Path(value)
-    resolved = path.resolve() if path.is_absolute() else (root / path).resolve()
+    local = path.resolve() if path.is_absolute() else (root / path).resolve()
+    resolved = (local if local.exists() else
+                Path(config.resolve_asset_path(value, str(root))))
     try:
         resolved.relative_to(root.resolve())
     except ValueError as exc:
-        raise ValueError(f"pipeline resource escapes repository: {value}") from exc
+        if not config.is_tool_asset(resolved):
+            raise ValueError(f"pipeline resource escapes repository: {value}") from exc
     return resolved
+
+
+def _pipeline_template(root: Path, settings: CampaignSettings) -> Path:
+    local = settings.path(root, settings.pipeline_template)
+    if local.exists():
+        return local
+    return Path(config.resolve_asset_path(settings.pipeline_template, str(root)))
 
 
 def _pipeline_resources(root: Path, template: Path) -> dict:
@@ -148,7 +239,12 @@ def _replace_requirement_prompt(stages: list, settings: CampaignSettings,
             f"Selected direction:\n{payload}\n\n"
             f"Source analysis: {analysis_path}\n"
             "Verify every cited file/symbol against the repository. Preserve the supplied acceptance "
-            "checks and make them testable. Do not expand scope beyond this direction."
+            "checks and make them testable. Do not expand scope beyond this direction.\n"
+            "Output the COMPLETE specification as your final response text — the entire spec body, "
+            "not a summary or pointer. Do NOT use the write tool for the deliverable (the runner "
+            "captures your final response to the output file; a write-tool file gets overwritten "
+            "by your response). After producing the full spec, STOP — do not run cleanup, "
+            "re-verification, or any further commands."
         )
         return True
     return False
@@ -165,13 +261,53 @@ def _atomic_yaml(path: Path, data: dict) -> None:
         try:
             os.unlink(name)
         except OSError:
-            pass
+            pass  # stale worktree cleanup best-effort
+
+
+def _write_wreckage_report(root: Path, pipeline_path: Path) -> None:
+    """Snapshot what a failed direction left in the worktree so a human can
+    take over without re-deriving the diff.
+
+    Real-world lesson (forge-os campaign): the implement stage TIMEOUTed and
+    the campaign process was later killed; ~28 modified files remained with no
+    manifest of which were touched, whether they build, or what the agent was
+    mid-way through. The wreckage report records the porcelain status and
+    diff --stat at failure time (best-effort; a non-git or busy tree just
+    yields no report).
+    """
+    try:
+        status = subprocess.run(["git", "-C", str(root), "status", "--porcelain=v1"],
+                                capture_output=True, text=True, timeout=30, check=False)
+        stat = subprocess.run(["git", "-C", str(root), "diff", "--stat"],
+                              capture_output=True, text=True, timeout=30, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return
+    if status.returncode != 0 or not status.stdout.strip():
+        return
+    lines = [
+        "# Implement wreckage (uncommitted worktree changes at failure)",
+        "",
+        "Status: " + ", ".join(sorted(set(line[:2] for line in
+                                          status.stdout.splitlines() if line.strip()))),
+        "",
+        "```",
+        status.stdout.rstrip(),
+        "```",
+    ]
+    if stat.returncode == 0 and stat.stdout.strip():
+        lines += ["", "## diff --stat", "", "```", stat.stdout.rstrip(), "```"]
+    try:
+        (pipeline_path.parent / "wreckage.md").write_text(
+            "\n".join(lines) + "\n", encoding="utf-8")
+    except OSError:
+        pass
 
 
 def run_direction(root: Path, settings: CampaignSettings, direction: Direction,
                   analysis_path: Path, model: str = "", provider: str = "",
                   timeout: int = 0, reuse: bool = False) -> PipelineOutcome:
     start = time.monotonic()
+    baseline = _git_text(root, ["rev-parse", "HEAD"])
     pipeline_path = materialize_pipeline(root, settings, direction, analysis_path)
     pipeline = load_pipeline(str(pipeline_path))
     for stage in pipeline.stages:
@@ -182,7 +318,15 @@ def run_direction(root: Path, settings: CampaignSettings, direction: Direction,
         session_name=f"campaign-{direction.direction_id}", fingerprint_mode=reuse)
     status, reason = classify_pipeline(results, failed, pipeline)
     evidence = _artifact_evidence(pipeline_path, results)
-    return PipelineOutcome(direction, status, reason, time.monotonic() - start, evidence)
+    if status != PipelineStatus.PASSED:
+        _write_wreckage_report(root, pipeline_path)
+    repository = git_worktree_evidence(root)
+    return PipelineOutcome(
+        direction, status, reason, time.monotonic() - start, evidence,
+        commit=repository["head_commit"], baseline_commit=baseline,
+        clean_commit=repository["clean_commit"],
+        dirty_evidence=repository["dirty_evidence"],
+        dirty_digest=repository["dirty_digest"])
 
 
 def _artifact_evidence(pipeline_path: Path, results: list) -> list[str]:
@@ -204,13 +348,13 @@ def _artifact_evidence(pipeline_path: Path, results: list) -> list[str]:
 
 def classify_pipeline(results: list, failed: list[str], pipeline) -> tuple[str, str]:
     if not failed and all(result.success for result in results):
-        return "PASSED", ""
+        return PipelineStatus.PASSED, ""
     failed_set = set(failed)
     if any(stage.gate and stage.name in failed_set for stage in pipeline.stages):
-        return "GATE_REJECTED", "gate verdict was not PASS"
+        return PipelineStatus.GATE_REJECTED, "gate verdict was not PASS"
     if any(result.validation_ok is False for result in results):
-        return "VALIDATION_FAILED", "engineering validator rejected an artifact"
-    return "PIPELINE_FAILED", ", ".join(failed) or "one or more tasks failed"
+        return PipelineStatus.VALIDATION_FAILED, "engineering validator rejected an artifact"
+    return PipelineStatus.PIPELINE_FAILED, ", ".join(failed) or "one or more tasks failed"
 
 
 def parallel_ready(root: Path) -> tuple[bool, str]:
@@ -234,29 +378,36 @@ def run_directions_isolated(root: Path, settings: CampaignSettings,
     prepared = []
     for direction, analysis in items:
         try:
-            worktree, branch = _ensure_worktree(root, settings, direction)
-            prepared.append((direction, analysis, worktree, branch))
+            worktree, branch, baseline = _ensure_worktree(root, settings, direction)
+            prepared.append((direction, analysis, worktree, branch, baseline))
         except Exception as exc:
             outcomes.append(PipelineOutcome(direction, "PIPELINE_FAILED", str(exc), 0, []))
     with ThreadPoolExecutor(max_workers=jobs) as pool:
         futures = [pool.submit(_safe_worktree_run, settings, direction, analysis,
-                               worktree, branch, agent_args)
-                   for direction, analysis, worktree, branch in prepared]
+                               worktree, branch, baseline, agent_args)
+                   for direction, analysis, worktree, branch, baseline in prepared]
         for future in as_completed(futures):
             outcomes.append(future.result())
     return outcomes
 
 
 def _safe_worktree_run(settings: CampaignSettings, direction: Direction, analysis_path: Path,
-                       worktree: Path, branch: str, agent_args: list[str]) -> PipelineOutcome:
+                       worktree: Path, branch: str, baseline: str,
+                       agent_args: list[str]) -> PipelineOutcome:
     try:
-        return _run_in_worktree(settings, direction, analysis_path, worktree, branch, agent_args)
+        return _run_in_worktree(
+            settings, direction, analysis_path, worktree, branch, baseline, agent_args)
     except Exception as exc:
-        return PipelineOutcome(direction, "PIPELINE_FAILED", str(exc), 0, [str(worktree)], branch)
+        repository = git_worktree_evidence(worktree)
+        return PipelineOutcome(
+            direction, "PIPELINE_FAILED", str(exc), 0, [str(worktree)], branch,
+            repository["head_commit"], baseline, repository["clean_commit"],
+            repository["dirty_evidence"], repository["dirty_digest"])
 
 
 def _run_in_worktree(settings: CampaignSettings, direction: Direction, analysis_path: Path,
-                     worktree: Path, branch: str, agent_args: list[str]) -> PipelineOutcome:
+                     worktree: Path, branch: str, baseline: str,
+                     agent_args: list[str]) -> PipelineOutcome:
     start = time.monotonic()
     local_analysis = worktree / ".pi-batch" / "campaign" / f"{direction.direction_id}-analysis.json"
     local_analysis.parent.mkdir(parents=True, exist_ok=True)
@@ -265,8 +416,13 @@ def _run_in_worktree(settings: CampaignSettings, direction: Direction, analysis_
     pipeline_path = materialize_pipeline(worktree, settings, direction, local_analysis)
     logfile = worktree / "logs" / f"campaign-{direction.direction_id}.log"
     logfile.parent.mkdir(parents=True, exist_ok=True)
-    cmd = [sys.executable, str(worktree / "pi-batch.py"), str(pipeline_path),
-           "--reuse", "--reuse-fingerprint", "--log-file", str(logfile), *agent_args]
+    local_entrypoint = worktree / "pi-batch.py"
+    tool_entrypoint = Path(config.TOOL_ROOT) / "pi-batch.py"
+    entrypoint = local_entrypoint if local_entrypoint.is_file() else tool_entrypoint
+    runner = ([sys.executable, str(entrypoint)] if entrypoint.is_file()
+              else [sys.executable, "-m", "pbatch"])
+    cmd = [*runner, str(pipeline_path), "--reuse", "--reuse-fingerprint",
+           "--log-file", str(logfile), *agent_args]
     # The child RotatingFileHandler is the sole logfile writer. Redirecting
     # its stdout to the same path created duplicate records and unsafe
     # concurrent rotation; isolated model bodies remain in artifacts/sessions.
@@ -284,62 +440,21 @@ def _run_in_worktree(settings: CampaignSettings, direction: Direction, analysis_
     finally:
         with _ACTIVE_LOCK:
             _ACTIVE_PIPELINES.discard(proc)
-    commit = _git_text(worktree, ["rev-parse", "HEAD"])
-    status = "PIPELINE_FAILED" if timed_out else _isolated_status(returncode, logfile)
+    status = PipelineStatus.PIPELINE_FAILED if timed_out else _isolated_status(returncode, logfile)
     reason = (f"isolated pipeline timed out after {settings.pipeline_timeout}s"
               if timed_out else
               ("" if returncode == 0 else f"isolated pipeline exited {returncode}"))
+    repository = git_worktree_evidence(worktree)
+    if returncode == 0 and not timed_out:
+        reason, repository = _finalize_worktree(
+            worktree, branch, baseline, direction.direction_id)
+        if reason:
+            status = PipelineStatus.PIPELINE_FAILED
     evidence = [str(worktree), str(pipeline_path), str(logfile)]
-    return PipelineOutcome(direction, status, reason, time.monotonic() - start,
-                           evidence, branch, commit)
-
-
-def _isolated_status(returncode: int, logfile: Path) -> str:
-    if returncode == 0:
-        return "PASSED"
-    try:
-        tail = logfile.read_text(encoding="utf-8")[-100_000:]
-    except OSError:
-        tail = ""
-    if "GATE REJECTED" in tail:
-        return "GATE_REJECTED"
-    if "VALIDATION FAILED" in tail:
-        return "VALIDATION_FAILED"
-    return "PIPELINE_FAILED"
-
-
-def _ensure_worktree(root: Path, settings: CampaignSettings,
-                     direction: Direction) -> tuple[Path, str]:
-    campaign_id = safe_slug(settings.name)
-    base = settings.path(root, settings.worktree_root) / campaign_id
-    worktree = base / direction.direction_id
-    branch = f"pbatch-campaign/{campaign_id}/{direction.direction_id}"
-    if (worktree / ".git").exists():
-        actual = _git_text(worktree, ["branch", "--show-current"])
-        if actual != branch:
-            raise RuntimeError(f"worktree branch mismatch: expected {branch}, found {actual}")
-        return worktree, branch
-    worktree.parent.mkdir(parents=True, exist_ok=True)
-    exists = bool(_git_text(root, ["show-ref", "--verify", f"refs/heads/{branch}"]))
-    args = ["worktree", "add", str(worktree), branch] if exists else [
-        "worktree", "add", "-b", branch, str(worktree), "HEAD"]
-    try:
-        proc = subprocess.run(["git", "-C", str(root), *args], capture_output=True,
-                              text=True, timeout=30, check=False)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        raise RuntimeError(f"git worktree add failed: {exc}") from exc
-    if proc.returncode != 0:
-        raise RuntimeError(f"git worktree add failed: {proc.stderr.strip()}")
-    return worktree, branch
-
-
-def _git_text(root: Path, args: list[str]) -> str:
-    try:
-        proc = subprocess.run(["git", "-C", str(root), *args], capture_output=True,
-                              text=True, timeout=30, check=False)
-    except (OSError, subprocess.TimeoutExpired):
-        return ""
-    return proc.stdout.strip() if proc.returncode == 0 else ""
+    return PipelineOutcome(
+        direction, status, reason, time.monotonic() - start, evidence, branch,
+        repository["head_commit"], baseline, repository["clean_commit"],
+        repository["dirty_evidence"], repository["dirty_digest"])
 
 
 def _kill_pipeline_group(proc: subprocess.Popen) -> None:
@@ -350,10 +465,12 @@ def _kill_pipeline_group(proc: subprocess.Popen) -> None:
         try:
             proc.kill()
         except OSError:
-            pass
+            pass  # best-effort：进程可能已随组退出
+
     try:
         proc.wait(timeout=1)
     except (subprocess.TimeoutExpired, ChildProcessError):
+    # 子进程已死/超时：清理路径（已验证有意）
         pass
 
 

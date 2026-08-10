@@ -30,6 +30,10 @@ stages:
     max_roles_per_iteration: 3
     relevance_enabled: true
     relevance_min_score: 2
+    meta_role_retries: 2      # provider 抖动时角色失败可重试（campaign 实战：6 个方向
+                              # 死于 meta 角色 exited 1，重试 1 次不够）
+    meta_max_failed_roles: 1  # 重试后仍失败的角色允许 1 个缺席——缺失审查由
+                              # design_gate 兜底（fail-closed 不变）
 
   - name: design_gate
     from_outputs:

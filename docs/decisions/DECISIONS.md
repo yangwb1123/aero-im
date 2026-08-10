@@ -90,3 +90,33 @@
   supervisor that re-spawns (rejected — heavier, same effect as the inline loop).
 - **Test gap:** no regression test — `run_bus_listener` needs a full `AppState` and
   aero-server has no test-AppState harness (see TODO.md tech debt).
+
+## ADR-005 — audit_governance_outbox 终态行保留清扫：显式推迟（跟踪项）
+
+- **Date:** 2026-08-08
+- **Status:** PENDING (needs human — tracked follow-up; trigger criteria in
+  `docs/design/2026-08-08-aero-audit-connector-b5-4-fail-closed-operational.design.md` §8 D7)
+- **Decision:** 不在 B5-4 fail-closed operational slice 内实施 `audit_governance_outbox`
+  终态行（status 2 delivered / status 3 dead）的保留清扫；显式推迟并本 ADR 跟踪。
+- **Reason:** (1) 该 slice 是零迁移、只读采样面（AC1 钉「no state mutation」，§3 红线
+  「不改 0239 触发器 / 零新迁移」）——清扫是写路径迁移 + 新 sweeper + 表语义变更，
+  属后续 slice；(2) status 2/3 是终态且全仓无 sweeper GC 这张表（`bin/boot/retention.rs`
+  17+ 清扫零 outbox 表；连接器仅测试 teardown DELETE；0241 只 insert），累计行数随
+  部署年龄无上界增长，任何 O(累计表) 查询都会随年龄退化（sql_perf 复核系统性 flag）；
+  (3) 推迟可接受：B5-4 设计已把 30s 采样主路径改为 presence 探针 + partial-index
+  计数（成本 ∝ due 集合，不随累计行数），全量精确计数摊销到 env 可配慢节奏
+  （`AERO__SERVER__AUDIT_OUTBOX_FULL_SAMPLE_SECS` 默认 600s），唯一 O(表) 余项是
+  dead=0 时的 heap 早退探针（零迁移地板，每 30s 每实例一次 bounded heap pass）。
+- **Impact（触发阈值，达到即拉前实施）：** outbox heap ≥ 1M 行（≈1 GB）/ 慢节奏全量
+  > 1s / dead 探针 > 500ms——按部署年龄监控 `aero_audit_outbox_status` 与采样耗时。
+- **实施草图（后续 slice）：** 新迁移 partial index `(status, created_at)`（0239 现有
+  两个 partial index 只覆盖 status IN (0,1)，status 2/3 无索引，DELETE 谓词无索引支撑
+  即又是 O(表)）+ retention 清扫链（`bin/boot/retention.rs` 既有 set-based sweep 模式）
+  批量 DELETE：delivered 超窗删除（建议 30d，投递即终态、重放无价值——审计记录本体在
+  `audit_events`，已有 365d 分区清扫）；dead 保留审查窗（建议 ≥90d——dead 行是
+  fail-closed 触发器与取证证据，删除必须滞后 ops 响应时间）；可用哨兵串识别
+  `audit sink rejected the service identity (HTTP 403)` 行供人工复盘。
+- **Alternatives:** (a) 30s 主路径直接全量 GROUP BY（否决——首个 O(累计表) 30s 查询，
+  且是唯一永不清扫的表，缓存污染 live path）；(b) 维护计数器镜像 `snaplink_usage_counters`
+  先例（记录为更重方案，仅当探针仍太贵时）；(c) 加 `(status)` 索引（迁移，与清扫同属
+  后续 slice，届时一并做）。

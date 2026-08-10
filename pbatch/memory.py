@@ -19,11 +19,18 @@ from . import session
 from .index_io import scan_events
 from .memory_io import bounded_lines, cap_manifest
 from .memory_policy import classify_prompt
+from .memory_records import (
+    message_view as _message_view,
+    redact as _redact,
+    redact_content as _redact_content,
+    redact_index_event as _redact_index_event,
+    session_entry as _session_entry,
+)
 
 _INDEX_LOCK = threading.Lock()
 _ID_LOCK = threading.Lock()
 _ID_SEQUENCE = 0
-_SECRET_RE = re.compile(r"(?i)(api[_-]?key|token|password|secret)\s*[:=]\s*([^\s,;]+)")
+_INGEST_BATCH_SIZE = 128
 
 def memory_enabled(agent_bin: str | None = None) -> bool:
     mode = str(config.MEMORY_MODE).lower()
@@ -75,7 +82,7 @@ def append_event(event: dict, cwd: str = "", override: str = "") -> Path:
     if path.is_symlink():
         raise ValueError(f"refusing symlink memory index: {path}")
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = dict(event)
+    payload = _redact_index_event(event)
     payload.setdefault("ts", datetime.now(timezone.utc).isoformat(timespec="seconds"))
     line = json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n"
     size = len(line.encode("utf-8"))
@@ -161,7 +168,9 @@ def record_campaign(event: dict, cwd: str = "") -> None:
     if not memory_enabled():
         return
     fields = ("campaign", "module", "direction_id", "direction", "status",
-              "reason", "evidence", "elapsed", "branch", "commit")
+              "reason", "evidence", "elapsed", "branch", "commit",
+              "head_commit", "baseline_commit", "clean_commit",
+              "dirty_evidence", "dirty_digest")
     payload = {}
     for key in fields:
         value = event.get(key)
@@ -239,20 +248,19 @@ def ingest_sessions(cwd: str = "", directory: str = "", override: str = "") -> d
     source = Path(directory) if directory else session.SESSIONS_DIR / session.workdir_key(cwd)
     if not source.is_dir() or source.is_symlink():
         return {"imported": 0, "skipped": 0, "source": str(source), "missing": True}
-    known = {(item.get("raw_session"), item.get("raw_size"), item.get("raw_mtime_ns"))
-             for item in iter_events(cwd, override) if item.get("type") == "session_import"}
     imported = skipped = 0
-    for path in sorted(source.glob("*.jsonl")):
-        if not path.is_file() or path.is_symlink():
-            continue
-        stat = path.stat()
-        identity = (str(path), stat.st_size, stat.st_mtime_ns)
-        if identity in known:
-            skipped += 1
-            continue
-        entry = _session_entry(path, stat.st_size, stat.st_mtime_ns)
-        append_event(entry, cwd, override)
-        imported += 1
+    batch = []
+    for candidate in _session_candidates(source):
+        batch.append(candidate)
+        if len(batch) == _INGEST_BATCH_SIZE:
+            added, unchanged = _ingest_batch(batch, cwd, override)
+            imported += added
+            skipped += unchanged
+            batch.clear()
+    if batch:
+        added, unchanged = _ingest_batch(batch, cwd, override)
+        imported += added
+        skipped += unchanged
     return {"imported": imported, "skipped": skipped, "source": str(source)}
 def memory_manifest(prompt: str, cwd: str = "", mode_hint: str = "") -> str:
     if not memory_enabled():
@@ -337,136 +345,55 @@ def _public_event(item: dict) -> dict:
               "artifacts", "campaign", "module", "direction_id", "direction", "evidence")
     extra = ("message_count", "roles", "total_tokens", "cost", "raw_size",
              "observed_verdict", "observed_failure")
-    return {key: item[key] for key in (*fields, *extra) if item.get(key) not in (None, "", [])}
+    public = {key: item[key] for key in (*fields, *extra)
+              if item.get(key) not in (None, "", [])}
+    return _redact_content(public)
 
 
-def _session_entry(path: Path, size: int, mtime_ns: int) -> dict:
-    summary = {"session_id": "", "session_name": "", "cwd": "",
-               "roles": {}, "message_count": 0, "total_tokens": 0, "cost": 0.0,
-               "user_text": "", "observed_verdict": "", "observed_failure": ""}
+def _session_candidates(source: Path):
+    """Stream regular session files without materializing the directory."""
     try:
-        for line in bounded_lines(path, config.SESSION_LINE_MAX_BYTES):
-            if line is not None:
-                _fold_session_line(summary, line)
+        with os.scandir(source) as entries:
+            for item in entries:
+                if not item.name.endswith(".jsonl"):
+                    continue
+                try:
+                    if not item.is_file(follow_symlinks=False):
+                        continue
+                    stat = item.stat(follow_symlinks=False)
+                    yield Path(item.path).resolve(), stat.st_size, stat.st_mtime_ns
+                except OSError:
+                    continue
     except OSError:
-        pass
-    profile = classify_prompt(summary["user_text"])
-    verdict = summary["observed_verdict"]
-    failure = summary["observed_failure"]
-    status = "FAILED_OBSERVED" if failure else ("GATE_PASS_OBSERVED" if verdict == "PASS" else "IMPORTED")
-    if not failure and verdict in ("FAIL", "REJECT"):
-        status = "GATE_REJECTED_OBSERVED"
-    return {"type": "session_import", "session_id": summary["session_id"],
-            "session_name": summary["session_name"], "status": status,
-            "mode": profile["mode"], "domains": profile["domains"],
-            "prompt_excerpt": _redact(" ".join(summary["user_text"].split())[:240]),
-            "message_count": summary["message_count"], "roles": summary["roles"],
-            "total_tokens": summary["total_tokens"], "cost": summary["cost"],
-            "observed_verdict": verdict, "observed_failure": _redact(failure),
-            "reason": _redact(failure),
-            "raw_session": str(path.resolve()),
-            "raw_size": size, "raw_mtime_ns": mtime_ns, "cwd": summary["cwd"]}
-
-
-def _fold_session_line(summary: dict, line: str) -> None:
-    try:
-        item = json.loads(line)
-    except ValueError:
         return
-    if item.get("type") == "session":
-        summary["session_id"] = str(item.get("id", summary["session_id"]))[:256]
-        summary["cwd"] = str(item.get("cwd", summary["cwd"]))[:1024]
-    if item.get("type") == "session_info":
-        summary["session_name"] = str(item.get("name", ""))[:256]
-    message = item.get("message")
-    if item.get("type") != "message" or not isinstance(message, dict):
-        _fold_observed_failure(summary, item)
-        return
-    _fold_observed_failure(summary, message)
-    role = str(message.get("role", "unknown"))[:64]
-    summary["message_count"] += 1
-    _fold_role(summary, role)
-    text = _content_text(message.get("content"))
-    if role == "user" and len(summary["user_text"]) < 8192:
-        summary["user_text"] = (summary["user_text"] + "\n" + text)[:8192]
-    _fold_usage(summary, message.get("usage"))
-    if role == "assistant":
-        verdicts = [value.upper() for value in re.findall(
-            r"(?im)^\s*VERDICT\s*:\s*(PASS|FAIL|REJECT)\b", text)]
-        if "REJECT" in verdicts:
-            summary["observed_verdict"] = "REJECT"
-        elif "FAIL" in verdicts:
-            summary["observed_verdict"] = "FAIL"
-        elif "PASS" in verdicts and summary["observed_verdict"] not in ("FAIL", "REJECT"):
-            summary["observed_verdict"] = "PASS"
 
 
-def _fold_observed_failure(summary: dict, message: dict) -> None:
-    if summary["observed_failure"]:
-        return
-    error = message.get("errorMessage")
-    if isinstance(error, str) and error.strip():
-        summary["observed_failure"] = error.strip()[:500]
-    elif message.get("stopReason") == "error":
-        summary["observed_failure"] = "stopReason=error"
+def _latest_imports(paths: set[str], cwd: str, override: str) -> dict:
+    """Find only the latest identity for a bounded batch of session paths."""
+    latest = {}
+    for item in _reverse_events(cwd, override):
+        raw = item.get("raw_session")
+        if item.get("type") != "session_import" or raw not in paths or raw in latest:
+            continue
+        latest[raw] = (raw, item.get("raw_size"), item.get("raw_mtime_ns"))
+        if len(latest) == len(paths):
+            break
+    return latest
 
 
-def _fold_role(summary: dict, role: str) -> None:
-    roles = summary["roles"]
-    if role in roles:
-        roles[role] += 1
-    elif len(roles) < 32:
-        roles[role] = 1
-def _content_text(content) -> str:
-    if isinstance(content, str):
-        return content
-    if not isinstance(content, list):
-        return ""
-    values = []
-    for item in content:
-        if isinstance(item, dict) and isinstance(item.get("text"), str):
-            values.append(item["text"])
-    return "\n".join(values)
-def _fold_usage(summary: dict, usage) -> None:
-    if not isinstance(usage, dict):
-        return
-    total = usage.get("totalTokens", usage.get("total", 0))
-    if isinstance(total, (int, float)):
-        summary["total_tokens"] += total
-    cost = usage.get("cost", {})
-    value = cost.get("total", 0) if isinstance(cost, dict) else 0
-    if isinstance(value, (int, float)):
-        summary["cost"] += value
-
-
-def _message_view(line: str, redact: bool = True) -> dict | None:
-    try:
-        item = json.loads(line)
-    except ValueError:
-        return None
-    if item.get("type") != "message" or not isinstance(item.get("message"), dict):
-        return None
-    message = item["message"]
-    content = _redact_content(message.get("content", "")) if redact else message.get("content", "")
-    return {"role": message.get("role", ""), "content": content,
-            "usage": message.get("usage")}
-
-
-def _redact(value: str) -> str:
-    return _SECRET_RE.sub(lambda match: f"{match.group(1)}=[REDACTED]", value)
-
-
-def _redact_content(content):
-    if isinstance(content, str):
-        return _redact(content)
-    if not isinstance(content, list):
-        return content
-    result = []
-    for item in content:
-        if isinstance(item, dict) and isinstance(item.get("text"), str):
-            item = dict(item, text=_redact(item["text"]))
-        result.append(item)
-    return result
+def _ingest_batch(batch: list[tuple[Path, int, int]], cwd: str,
+                  override: str) -> tuple[int, int]:
+    paths = {str(path) for path, _, _ in batch}
+    latest = _latest_imports(paths, cwd, override)
+    imported = skipped = 0
+    for path, size, mtime_ns in batch:
+        identity = (str(path), size, mtime_ns)
+        if latest.get(str(path)) == identity:
+            skipped += 1
+            continue
+        append_event(_session_entry(path, size, mtime_ns), cwd, override)
+        imported += 1
+    return imported, skipped
 
 
 def _file_hash(path: Path | None) -> str:

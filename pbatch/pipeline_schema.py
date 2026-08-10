@@ -3,13 +3,34 @@
 from __future__ import annotations
 
 
+_TOP_LEVEL_FIELDS = frozenset(("stages", "decision_log", "archive_dir", "git_commit"))
+_STAGE_FIELDS = frozenset((
+    "name", "model", "provider", "from_dir", "from_outputs", "suffix",
+    "output_suffix", "mode", "workers", "aggregate", "validate",
+    "validate_cmd", "meta", "meta_prompt", "role_dir", "role_keywords",
+    "output_dir", "max_iterations", "max_roles_per_iteration", "meta_timeout",
+    "relevance_enabled", "relevance_min_score", "meta_max_failed_roles",
+    "meta_role_retries", "gate", "gate_fix_rounds", "gate_fix_prompt",
+    "gate_fix_validate", "approval", "from_prompt", "output", "tasks",
+    "commands", "commands_parallel", "command_timeout",
+    "command_output_max_bytes", "cwd", "git_commit", "commit_message",
+    "or_tasks",
+))
+_TASK_FIELDS = frozenset((
+    "prompt", "prompt_template", "output", "model", "provider", "thinking",
+    "tools", "exclude_tools", "cwd", "timeout", "env", "validate",
+    # `role` is descriptive metadata used by the shipped pipeline templates.
+    # `validate_cmd` is the legacy spelling of the task-level `validate` alias.
+    "role", "validate_cmd",
+))
 _STRING_FIELDS = ("model", "provider", "from_dir", "suffix", "output_suffix",
                   "meta_prompt", "role_dir", "role_keywords", "output_dir",
-                  "from_prompt", "output", "cwd", "commit_message")
+                  "from_prompt", "output", "cwd", "commit_message",
+                  "gate_fix_prompt")
 _BOOL_FIELDS = ("aggregate", "meta", "relevance_enabled", "gate", "approval",
-                "commands_parallel", "git_commit")
+                "commands_parallel", "git_commit", "or_tasks")
 _TASK_STRING_FIELDS = ("prompt", "prompt_template", "output", "model", "provider",
-                       "thinking", "tools", "exclude_tools", "cwd")
+                       "thinking", "tools", "exclude_tools", "cwd", "role")
 _NULLABLE_TASK_STRINGS = ("model", "provider", "thinking", "tools", "exclude_tools")
 
 
@@ -20,7 +41,7 @@ def validate_pipeline(data) -> list[str]:
     stages = data.get("stages")
     if not isinstance(stages, list) or not stages:
         return ["stages must be a non-empty list"]
-    errors = []
+    errors = _unknown_field_errors(data, _TOP_LEVEL_FIELDS, "top level")
     for key in ("decision_log", "archive_dir"):
         if key in data and not isinstance(data[key], str):
             errors.append(f"{key} must be a string")
@@ -49,6 +70,7 @@ def _validate_stage(stage, index: int, seen: set[str]) -> tuple[list[str], str]:
     if name and name in seen:
         errors.append(f"{label}.name duplicates earlier stage '{name}'")
     prefix = f"stage '{name}'" if name else label
+    errors.extend(_unknown_field_errors(stage, _STAGE_FIELDS, prefix))
     errors.extend(_field_errors(stage, prefix))
     errors.extend(_source_errors(stage, prefix, seen))
     errors.extend(_task_errors(stage.get("tasks", []), prefix))
@@ -65,16 +87,18 @@ def _field_errors(stage: dict, prefix: str) -> list[str]:
     for key, minimum in (("workers", 1), ("max_iterations", 1),
                          ("max_roles_per_iteration", 1), ("relevance_min_score", 0),
                          ("command_timeout", 1), ("command_output_max_bytes", 1),
-                         ("meta_timeout", 1)):
+                         ("meta_timeout", 0), ("meta_max_failed_roles", 0),
+                         ("meta_role_retries", 0), ("gate_fix_rounds", 0)):
         value = stage.get(key, minimum)
         if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
             errors.append(f"{prefix}.{key} must be an integer >= {minimum}")
     commands = stage.get("commands", [])
     if not isinstance(commands, list) or not all(isinstance(item, str) for item in commands):
         errors.append(f"{prefix}.commands must be a string list")
-    validate = stage.get("validate_cmd", stage.get("validate"))
-    if validate is not None and not isinstance(validate, str):
-        errors.append(f"{prefix}.validate must be a string or null")
+    for key in ("validate", "validate_cmd", "gate_fix_validate"):
+        value = stage.get(key)
+        if value is not None and not isinstance(value, str):
+            errors.append(f"{prefix}.{key} must be a string or null")
     return errors
 
 
@@ -103,6 +127,9 @@ def _source_contract(stage: dict, prefix: str, from_outputs) -> list[str]:
         sources = sum(bool(stage.get(key)) for key in ("from_prompt", "from_dir", "from_outputs"))
         if sources != 1:
             errors.append(f"{prefix} requires exactly one input source")
+        if stage.get("or_tasks") and not stage.get("tasks"):
+            errors.append(f"{prefix} or_tasks stage requires a 'tasks' "
+                          "candidate list")
         if stage.get("from_prompt") and not stage.get("output"):
             errors.append(f"{prefix} from_prompt requires output")
         if from_outputs and not stage.get("tasks"):
@@ -123,17 +150,38 @@ def _task_errors(tasks, prefix: str) -> list[str]:
     errors = []
     for index, task in enumerate(tasks, 1):
         label = f"{prefix}.tasks[{index}]"
-        if not isinstance(task, dict):
-            errors.append(f"{label} must be a mapping")
-            continue
-        errors.extend(f"{label}.{key} must be a string" for key in _TASK_STRING_FIELDS
-                      if key in task and not isinstance(task[key], str)
-                      and not (key in _NULLABLE_TASK_STRINGS and task[key] is None))
-        timeout = task.get("timeout", 1)
-        if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout < 1:
-            errors.append(f"{label}.timeout must be an integer >= 1")
-        if "env" in task and not isinstance(task["env"], dict):
-            errors.append(f"{label}.env must be a mapping")
-        if "validate" in task and task["validate"] is not None and not isinstance(task["validate"], str):
-            errors.append(f"{label}.validate must be a string or null")
+        errors.extend(_one_task_errors(task, label))
     return errors
+
+
+def _one_task_errors(task, label: str) -> list[str]:
+    if not isinstance(task, dict):
+        return [f"{label} must be a mapping"]
+    errors = _unknown_field_errors(task, _TASK_FIELDS, label)
+    errors.extend(f"{label}.{key} must be a string" for key in _TASK_STRING_FIELDS
+                  if key in task and not isinstance(task[key], str)
+                  and not (key in _NULLABLE_TASK_STRINGS and task[key] is None))
+    if not any(isinstance(task.get(key), str) and task[key].strip()
+               for key in ("prompt", "prompt_template")):
+        errors.append(f"{label} requires a non-empty prompt or prompt_template")
+    timeout = task.get("timeout", 1)
+    if isinstance(timeout, bool) or not isinstance(timeout, int) or timeout < 1:
+        errors.append(f"{label}.timeout must be an integer >= 1")
+    if "env" in task and not _valid_env(task["env"]):
+        errors.append(f"{label}.env must map strings to strings")
+    for key in ("validate", "validate_cmd"):
+        if key in task and task[key] is not None and not isinstance(task[key], str):
+            errors.append(f"{label}.{key} must be a string or null")
+    return errors
+
+
+def _valid_env(value) -> bool:
+    return isinstance(value, dict) and all(
+        isinstance(key, str) and isinstance(item, str)
+        for key, item in value.items())
+
+
+def _unknown_field_errors(value: dict, allowed: frozenset, prefix: str) -> list[str]:
+    """Reject misspelled/unsupported declarative fields before execution."""
+    return [f"{prefix} has unknown field '{key}'"
+            for key in value if key not in allowed]

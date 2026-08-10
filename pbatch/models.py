@@ -41,8 +41,15 @@ class Stage:
                            # 0 = inherit CLI/global timeout)
     relevance_enabled: bool = True  # inject keyword-based role suggestions
     relevance_min_score: int = 0  # 0 keeps backward-compatible advisory-only scoring
+    meta_max_failed_roles: int = 0  # meta 角色允许失败数（0 = 任一失败即阶段失败）
+    meta_role_retries: int = 1  # 角色任务失败/超时自动重试次数
     gate: bool = False  # verdict gate: output must contain VERDICT: PASS/FAIL/REJECT; FAIL/REJECT blocks later stages
+    gate_fix_rounds: int = 0  # gate FAIL 后自动修复轮数（0 = 关闭，保持 fail-closed halt）
+    gate_fix_prompt: str = ""  # 修复指令模板（{reason}/{findings} 占位符；空 = 默认指令）
+    gate_fix_validate: Optional[str] = None  # 修复任务验证器（None = 继承 gate 阶段 validate_cmd）
     approval: bool = False  # T12c: human approval point after the stage (D5)
+    or_tasks: bool = False  # P7: 任务模板是 OR 候选——按序执行，第一个通过
+                           # （含验证器）者胜出，其余跳过；全部失败则阶段失败
     from_prompt: str = ""  # one-sentence starting prompt instead of from_dir files
     output: str = ""  # output file for the from_prompt task (required with from_prompt)
     tasks: list = field(default_factory=list)
@@ -117,20 +124,10 @@ class Task:
     memory: dict = field(default_factory=dict)  # stage/role/task metadata for the memory index
 
     def to_cmd(self, session_flags: Optional[list] = None) -> list[str]:
-        cmd = [config.AGENT_BIN, "-p", self.prompt]
-        if self.model:
-            cmd.extend(["--model", self.model])
-        if self.provider:
-            cmd.extend(["--provider", self.provider])
-        if self.thinking:
-            cmd.extend(["--thinking", self.thinking])
-        if self.tools:
-            cmd.extend(["--tools", self.tools])
-        if self.exclude_tools:
-            cmd.extend(["--exclude-tools", self.exclude_tools])
-        if session_flags:
-            cmd.extend(session_flags)
-        return cmd
+        return config.build_agent_argv(
+            config.AGENT_BIN, self.prompt, model=self.model,
+            provider=self.provider, thinking=self.thinking, tools=self.tools,
+            exclude_tools=self.exclude_tools, session_flags=session_flags)
 
     def workdir(self) -> str:
         return self.cwd or os.getcwd()
@@ -164,14 +161,10 @@ class Task:
             fpath = Path(match.group(1))
             if not fpath.is_absolute():
                 fpath = Path(base_dir) / fpath
-            try:
-                if fpath.exists():
-                    return read_text_bounded(fpath, config.INPUT_MAX_BYTES,
-                                             "prompt reference")
-            except ValueError as exc:
-                log.warning("prompt reference rejected: %s", exc)
-            log.warning("referenced file not found: %s", fpath)
-            return match.group(0)
+            if not fpath.is_file():
+                raise ValueError(f"prompt reference not found: {fpath}")
+            return read_text_bounded(fpath, config.INPUT_MAX_BYTES,
+                                     "prompt reference")
 
         # Only path-like references with a known extension are resolved so
         # that event versions like vault.file.deleted@1.1 stay literal.

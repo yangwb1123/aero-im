@@ -24,6 +24,7 @@ from typing import Optional
 
 from . import config
 from .config import AGENT_DEFAULT_WORKERS, _resolve_validators, log
+from .context_inject import add_task_context_paths, prepare_task_context
 from .evidence import combine_outputs
 from .models import Stage, Task, TaskResult
 from .relevance import (constrain_role_plan, format_suggestions,
@@ -56,12 +57,19 @@ Deliverables:
 """
 
 
+def _role_base(role_dir: str) -> Path:
+    path = Path(role_dir)
+    if not path.is_absolute() and not path.exists():
+        path = Path(config.resolve_asset_path(role_dir))
+    return path.resolve()
+
+
 def _available_roles(role_dir: str) -> list:
     """List role template names (file stems) inside role_dir; empty when the
     dir is missing (meta stages may still run with ad-hoc roles only)."""
     if not role_dir:
         return []
-    base = Path(role_dir).resolve()
+    base = _role_base(role_dir)
     if not base.is_dir():
         return []
     return sorted(p.stem for p in base.glob("*.md") if p.stem != "README")
@@ -75,7 +83,7 @@ def _load_role_template(role_dir: str, role: str) -> Optional[str]:
     resolve() refuses symlinks that point outside role_dir."""
     if not role_dir:
         return None
-    base = Path(role_dir).resolve()
+    base = _role_base(role_dir)
     if not base.is_dir():
         return None
     target = (base / (role + ".md")).resolve()
@@ -133,11 +141,11 @@ def _parse_role_plan(stdout: str) -> list:
     against role_dir) or an ad-hoc role {"role": ..., "task": ...}. Unparseable
     output -> [] (treat as 'no more roles needed')."""
     arr = _extract_json_array(stdout)
+    plan = []
     if arr:
         try:
             data = json.loads(arr)
             if isinstance(data, list):
-                plan = []
                 for item in data:
                     if isinstance(item, str) and item.strip():
                         plan.append({"role": item.strip(), "task": ""})
@@ -155,12 +163,11 @@ def _parse_role_plan(stdout: str) -> list:
 def _run_meta_stage(stage: Stage, stage_outputs: dict, model_override: str = "", timeout_override: int = 0,
                     validate_cmd: str = "", session_name: str = "", reuse: bool = False,
                     reuse_legacy: bool = False,
-                    fingerprint_mode: bool = False) -> tuple[list[TaskResult], bool]:
-    """Dynamic role orchestration: ask the agent which roles the current
-    deliverables still need, execute each chosen role against the aggregated
-    inputs, fold the role deliverables back into the evidence, and iterate
-    until the orchestrator reports no more roles or max_iterations is
-    reached (self-optimizing: the role set is discovered at run time)."""
+                    fingerprint_mode: bool = False,
+                    original_prompt: str = "") -> tuple[list[TaskResult], bool]:
+    """Dynamic role orchestration: orchestrator picks roles per iteration,
+    role outputs fold back into evidence until no more roles or
+    max_iterations (self-optimizing role set)."""
     raw_sources = stage.from_outputs if isinstance(stage.from_outputs, (list, tuple)) else [stage.from_outputs]
     source_names = [str(name).strip() for name in raw_sources if str(name).strip()]
     missing = [name for name in source_names if name not in stage_outputs]
@@ -171,10 +178,7 @@ def _run_meta_stage(stage: Stage, stage_outputs: dict, model_override: str = "",
         log.error("Meta stage '%s' requires output_dir for role deliverables", stage.name)
         return [], False
 
-    upstream = []
-    for name in source_names:
-        upstream.extend(stage_outputs.get(name, []))
-    evidence_outputs = list(upstream)
+    evidence_outputs = [p for name in source_names for p in stage_outputs.get(name, [])]
     combined = combine_outputs(evidence_outputs)
     if not combined:
         log.warning("No upstream outputs available for meta stage '%s'", stage.name)
@@ -193,23 +197,33 @@ def _run_meta_stage(stage: Stage, stage_outputs: dict, model_override: str = "",
             stage, combined, role_names, model_override, timeout_override,
             validate_cmd, iteration, all_results, role_outputs,
             evidence_outputs, session_name, reuse, reuse_legacy,
-            fingerprint_mode)
+            fingerprint_mode, original_prompt)
         if done or not ok:
             break
 
     stage_outputs[stage.name] = role_outputs
-    return all_results, all(r.success for r in all_results)
+    # meta_max_failed_roles: 允许 N 个角色失败而阶段仍成功（审查缺失由
+    # 后续 gate 兜底）；默认 0 = 任一角色失败即阶段失败（fail-closed）。
+    failed_roles = sum(1 for r in all_results if not r.success)
+    stage_ok = failed_roles <= stage.meta_max_failed_roles
+    if not stage_ok:
+        log.error("META stage '%s': %d role task(s) failed (limit %d)",
+                  stage.name, failed_roles, stage.meta_max_failed_roles)
+    return all_results, stage_ok
 
 def _run_meta_iteration(stage: Stage, combined: str, role_names: list, model_override: str, timeout_override: int,
                         validate_cmd: str, iteration: int, all_results: list, role_outputs: list,
                         evidence_outputs: list, session_name: str = "", reuse: bool = False,
                         reuse_legacy: bool = False,
-                        fingerprint_mode: bool = False) -> tuple[bool, bool, str]:
+                        fingerprint_mode: bool = False,
+                        original_prompt: str = "") -> tuple[bool, bool, str]:
     """Run one orchestrator/role round and fold its evidence into context.
     Returns (done, ok, combined); done stops the expansion loop."""
     log.info("META iteration %d/%d for stage '%s' (roles available: %s)",
              iteration, stage.max_iterations, stage.name, ", ".join(role_names) or "(none)")
-    meta_task = _build_meta_prompt_task(stage, role_names, combined, model_override, timeout_override)
+    meta_task = _build_meta_prompt_task(stage, role_names, combined, model_override, timeout_override,
+                                        original_prompt)
+    add_task_context_paths(meta_task, evidence_outputs, strict=False)
     meta_result = run_task(meta_task, session_name=session_name)
     record_task(meta_result)
     if not meta_result.success:
@@ -221,34 +235,101 @@ def _run_meta_iteration(stage: Stage, combined: str, role_names: list, model_ove
         return True, True, combined
     log.info("META orchestrator selected %d role(s)", len(roles))
 
-    role_tasks, iteration_ok = _build_role_tasks(stage, roles, combined, model_override, timeout_override)
+    role_tasks, _ = _build_role_tasks(
+        stage, roles, combined, model_override, timeout_override,
+        evidence_outputs)
+    failed = _run_role_batch(stage, role_tasks, validate_cmd, session_name,
+                             reuse, reuse_legacy, fingerprint_mode,
+                             all_results, role_outputs, evidence_outputs)
+    combined = combine_outputs(evidence_outputs)
+    # Each configured retry is an additional real attempt (G2 lesson).
+    if failed and stage.meta_role_retries > 0:
+        failed = _retry_failed_roles(
+            stage, failed, role_outputs, evidence_outputs, validate_cmd,
+            session_name, stage.meta_role_retries)
+        combined = combine_outputs(evidence_outputs)
+    if failed and stage.meta_max_failed_roles <= 0:
+        log.warning("META stage '%s': some role tasks failed in iteration %d", stage.name, iteration)
+        return True, False, combined
+    if failed:
+        log.warning("META stage '%s': %d role task(s) failed in iteration %d (within allowance %d)",
+                    stage.name, sum(1 for r in all_results if not r.success), iteration,
+                    stage.meta_max_failed_roles)
+    return False, True, combined
 
+
+def _run_role_batch(stage: Stage, role_tasks: list, validate_cmd: str, session_name: str,
+                    reuse: bool, reuse_legacy: bool, fingerprint_mode: bool,
+                    all_results: list, role_outputs: list,
+                    evidence_outputs: list) -> list:
+    """Execute one iteration and return only its failed results."""
+    failed = []
     with ThreadPoolExecutor(max_workers=max(1, stage.workers or AGENT_DEFAULT_WORKERS)) as pool:
         futures = [pool.submit(
             _run_role_task, item, validate_cmd, session_name, reuse,
             reuse_legacy, fingerprint_mode) for item in role_tasks]
         for fut in as_completed(futures):
-            role, result = fut.result()
+            _, result = fut.result()
             all_results.append(result)
             if not result.success:
-                iteration_ok = False
+                failed.append(result)
             out_path = result.task.output_path()
             if result.success and out_path and out_path.exists():
                 role_outputs.append(str(out_path))
                 evidence_outputs.append(str(out_path))
-    combined = combine_outputs(evidence_outputs)
-    if not iteration_ok:
-        log.warning("META stage '%s': some role tasks failed in iteration %d", stage.name, iteration)
-        return True, False, combined
-    return False, True, combined
+    return failed
+
+
+def _retry_failed_roles(stage: Stage, failed_results: list, role_outputs: list,
+                        evidence_outputs: list, validate_cmd: str,
+                        session_name: str, retries: int) -> list:
+    """Retry this iteration's failures up to the configured attempt count."""
+    still_failed = []
+    for result in failed_results:
+        task = result.task
+        retry = result
+        for attempt in range(1, retries + 1):
+            log.info("META retry %d/%d role '%s' after %s", attempt,
+                     retries, task.output_path(), retry.reason)
+            retry = run_task(task, parallel=True, session_name=session_name)
+            if retry.success:
+                retry.success = _save_validated(task, retry, validate_cmd)
+                if not retry.success:
+                    retry.reason = "validation failed"
+            record_task(retry)
+            if retry.success:
+                break
+        if retry.success:
+            result.success = True
+            result.returncode = 0
+            result.reason = "retried"
+            result.stdout = retry.stdout
+            out_path = task.output_path()
+            if out_path and out_path.exists() and str(out_path) not in role_outputs:
+                role_outputs.append(str(out_path))
+                evidence_outputs.append(str(out_path))
+        else:
+            result.reason = retry.reason
+            result.returncode = retry.returncode
+            still_failed.append(result)
+            log.warning("META retry for '%s' failed again: %s", task.output_path(), retry.reason)
+    return still_failed
 
 
 def _run_role_task(item, validate_cmd: str, session_name: str, reuse: bool,
                    reuse_legacy: bool, fingerprint_mode: bool):
     """Execute or freshness-reuse one role selected by the orchestrator."""
     role, task = item
+    try:
+        prepare_task_context(task)
+    except ValueError as exc:
+        result = TaskResult(task, False, returncode=-1,
+                            reason=f"context injection rejected: {exc}")
+        record_task(result)
+        return role, result
     output = str(task.output_path())
-    expected = (reuse_fp(task.prompt, output, validate_cmd, task.model, task.provider)
+    expected = (reuse_fp(task.prompt, output, validate_cmd, task.model,
+                         task.provider, task.workdir())
                 if fingerprint_mode else None)
     if reuse and reuse_decision(
             output, validate_cmd, task.workdir(), reuse_legacy, expected):
@@ -261,7 +342,8 @@ def _run_role_task(item, validate_cmd: str, session_name: str, reuse: bool,
         if not result.success:
             result.reason = "validation failed"
         elif fingerprint_mode:
-            write_sidecar(output, task.prompt, validate_cmd, task.model, task.provider)
+            write_sidecar(output, task.prompt, validate_cmd, task.model,
+                          task.provider, task.workdir())
     record_task(result)
     return role, result
 
@@ -279,11 +361,12 @@ def _select_roles(stage: Stage, combined: str, role_names: list, stdout: str) ->
     return roles
 
 
-def _build_meta_prompt_task(stage: Stage, role_names: list, combined: str, model_override: str, timeout_override: int) -> Task:
+def _build_meta_prompt_task(stage: Stage, role_names: list, combined: str, model_override: str, timeout_override: int,
+                            original_prompt: str = "") -> Task:
     """Assemble the orchestrator prompt (custom meta_prompt or the default,
-    with {roles}/{role_suggestions}/{max_roles}/{input_content} placeholders)
-    as a task. Custom prompts without {role_suggestions} receive the block
-    as an appended policy hint."""
+    with {roles}/{role_suggestions}/{max_roles}/{input_content}/{prompt}
+    placeholders) as a task. Custom prompts without {role_suggestions}
+    receive the block as an appended policy hint."""
     meta_prompt = (stage.meta_prompt or _DEFAULT_META_PROMPT)
     keywords = load_role_keywords(stage.role_keywords) if stage.relevance_enabled else {}
     suggestions = format_suggestions(score_roles(combined, role_names, keywords))
@@ -294,6 +377,7 @@ def _build_meta_prompt_task(stage: Stage, role_names: list, combined: str, model
         meta_prompt += "\n\n" + suggestions
     meta_prompt = meta_prompt.replace("{max_roles}", str(max(1, stage.max_roles_per_iteration)))
     meta_prompt = meta_prompt.replace("{input_content}", combined)
+    meta_prompt = meta_prompt.replace("{prompt}", original_prompt)
     task = Task(prompt=meta_prompt, cwd=stage.cwd)
     task.memory = {"stage": stage.name, "role": "orchestrator"}
     task.model = stage.model or task.model
@@ -307,7 +391,9 @@ def _build_meta_prompt_task(stage: Stage, role_names: list, combined: str, model
     return task
 
 
-def _build_role_tasks(stage: Stage, roles: list, combined: str, model_override: str, timeout_override: int) -> tuple[list, bool]:
+def _build_role_tasks(stage: Stage, roles: list, combined: str,
+                      model_override: str, timeout_override: int,
+                      evidence_outputs=()) -> tuple[list, bool]:
     """Turn the orchestrator plan into tasks: ad-hoc roles ({"role",
     "task"}) get their task description plus the current context; named
     roles load the role_dir template. Output names are sanitized (the
@@ -339,6 +425,7 @@ def _build_role_tasks(stage: Stage, roles: list, combined: str, model_override: 
         out_path = Path(stage.output_dir) / f"{safe_name}.md"
         task = Task(prompt=prompt, output=str(out_path), cwd=stage.cwd)
         task.memory = {"stage": stage.name, "role": role}
+        add_task_context_paths(task, evidence_outputs, strict=False)
         task.model = stage.model or task.model
         task.provider = stage.provider or task.provider
         if model_override:
@@ -355,8 +442,9 @@ def _build_role_tasks(stage: Stage, roles: list, combined: str, model_override: 
 def run_meta_stage(stage: Stage, stage_outputs: dict, model_override: str = "", timeout_override: int = 0,
                    validate_cmd: str = "", session_name: str = "", reuse: bool = False,
                    reuse_legacy: bool = False,
-                   fingerprint_mode: bool = False) -> tuple[list, bool]:
+                   fingerprint_mode: bool = False,
+                   original_prompt: str = "") -> tuple[list, bool]:
     """Public entry: dynamic role orchestration (see module docstring)."""
     return _run_meta_stage(
         stage, stage_outputs, model_override, timeout_override, validate_cmd,
-        session_name, reuse, reuse_legacy, fingerprint_mode)
+        session_name, reuse, reuse_legacy, fingerprint_mode, original_prompt)

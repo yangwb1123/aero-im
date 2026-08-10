@@ -65,7 +65,10 @@ DIMENSIONS = [
       "test", "checklist"]),
     ("tech_stack", "技术栈",
      ["tsx", "react", "vue", "flutter", "dart", "typescript", "ts",
-      "antd", "技术栈", "框架", "组件库"]),
+      "antd", "go", "golang", "python", "java", "kotlin", "rust",
+      "node", "node.js", "nodejs", "javascript", "js", "c#", ".net",
+      "php", "ruby", "spring", "spring boot", "fastapi", "django",
+      "flask", "gin", "nestjs", "技术栈", "框架", "组件库"]),
 ]
 
 _SCALE_TIERS = {"S": "demo", "M": "standard", "L": "production"}
@@ -77,7 +80,7 @@ _SUGGESTIONS = {
     "permission": "未提及权限：审批/删除等敏感操作的可见性无法评估",
     "error_path": "未提及异常路径：失败恢复与重试策略无法设计",
     "acceptance": "未提及验收标准：完成定义缺失，无法判定交付",
-    "tech_stack": "未指定技术栈：平台适配（tsx/dart/vue）为假设",
+    "tech_stack": "未指定技术栈：平台适配（前端框架/后端语言与框架）为假设",
 }
 
 
@@ -147,6 +150,79 @@ def workflow_level(text: str, registry: Optional[dict] = None,
             "suggestion": WORKFLOW_SUGGESTIONS[level]}
 
 
+def _registry_rule_item(rule_id: str, rule: dict, matched: dict) -> dict:
+    """Materialize a registry rule that the matcher skipped only by tier."""
+    profile = matched.get("profile", "")
+    template = rule.get("files_template")
+    files = ([str(template).replace("{profile}", profile)]
+             if template and profile else list(rule.get("files", [])))
+    return {
+        "id": rule_id,
+        "tier": rule.get("min_tier", "standard"),
+        "required": True,
+        "description": rule.get("description", ""),
+        "files": files,
+        "evidence": {
+            "scale": [], "page_types": matched.get("page_types", []),
+            "risk": "high", "profile": profile,
+            "prescription_override": "required_when_risk",
+        },
+    }
+
+
+def _with_risk_rules(matched: dict, registry: dict) -> list[dict]:
+    """Risk-mandated rules override scale tier in every specification domain."""
+    rules = [dict(item) for item in matched.get("rules", [])]
+    if matched.get("risk") != "high":
+        return rules
+    present = {item["id"] for item in rules}
+    skipped = {item["id"]: item.get("reason", "")
+               for item in matched.get("skipped", [])}
+    recovered = []
+    for rule_id, rule in registry.get("rules", {}).items():
+        if rule_id in present or not rule.get("required_when_risk"):
+            continue
+        if not skipped.get(rule_id, "").startswith("tier below required"):
+            continue
+        recovered.append(_registry_rule_item(rule_id, rule, matched))
+    insert_at = next((i for i, item in enumerate(rules)
+                      if not item.get("required")), len(rules))
+    return rules[:insert_at] + recovered + rules[insert_at:]
+
+
+def _prescription_policy(matched: dict, registry: dict, effective: str,
+                         scale: str) -> tuple[list[dict], list[dict]]:
+    """Apply the scale cap and backend risk invariant to any rule manifest."""
+    rank = TIER_ORDER.get(effective, 1)
+    selected, not_selected = [], []
+    for item in _with_risk_rules(matched, registry):
+        rule = registry.get("rules", {}).get(item["id"], {})
+        risk_only = bool(rule.get("required_when_risk"))
+        if risk_only and matched.get("risk") != "high":
+            reason = "该规则仅适用于高风险需求，本需求风险评估为 low"
+        elif risk_only:
+            selected.append({**item, "required": True})
+            continue
+        elif TIER_ORDER.get(item.get("tier", "standard"), 1) <= rank:
+            selected.append(item)
+            continue
+        else:
+            reason = (f"需求评估为 {effective} 档（规模 {scale}），"
+                      f"该规则需要 {item.get('tier', 'standard')} 档")
+        not_selected.append({"id": item["id"], "tier": item.get("tier", "standard"),
+                             "reason": reason})
+    return selected, not_selected
+
+
+def _merge_not_selected(*groups: list[dict]) -> list[dict]:
+    """Stable de-duplication keeps the restraint report deterministic."""
+    merged = {}
+    for group in groups:
+        for item in group:
+            merged.setdefault(item["id"], item)
+    return list(merged.values())
+
+
 def prescription(text: str, registry: Optional[dict] = None) -> dict:
     """The minimal necessary rule set for THIS requirement.
 
@@ -159,17 +235,8 @@ def prescription(text: str, registry: Optional[dict] = None) -> dict:
     cls = classify_text(text)
     scale = scale_signal(text, reg)
     effective = _SCALE_TIERS.get(scale, "standard")
-    rank = TIER_ORDER.get(effective, 1)
-    selected, not_selected = [], []
-    for item in matched["rules"]:
-        if TIER_ORDER.get(item["tier"], 1) <= rank:
-            selected.append(item)
-        else:
-            not_selected.append({
-                "id": item["id"], "tier": item["tier"],
-                "reason": f"需求评估为 {effective} 档（规模 {scale}），"
-                          f"该规则需要 {item['tier']} 档",
-            })
+    selected, not_selected = _prescription_policy(
+        matched, reg, effective, scale)
     dimensions = assess_dimensions(text)
     present = [name for name, _, ok in dimensions if ok]
     missing = [name for name, _, ok in dimensions if not ok]
@@ -178,6 +245,8 @@ def prescription(text: str, registry: Optional[dict] = None) -> dict:
         "classification": {
             "task_type": cls.task_type,
             "profile": matched["profile"], "platform": cls.platform,
+            "system_type": cls.system_type,
+            "system_evidence": list(cls.system_evidence),
         },
         "product": product_manifest(text),
         "workflow": workflow_level(text, reg, None),
@@ -201,6 +270,7 @@ def format_assessment(assessment: dict) -> str:
     lines.append(
         f"画像: {cls['task_type'] or 'unknown'} "
         f"[{cls['platform'] or '-'}/{cls['profile'] or 'generic'}] | "
+        f"系统 {cls['system_type']} | "
         f"匹配档 {assessment['matched_tier']} → 处方档 "
         f"{assessment['effective_tier']}（规模 {assessment['scale']}）| "
         f"风险 {assessment['risk']}")
@@ -226,7 +296,62 @@ def format_assessment(assessment: dict) -> str:
             lines.append(f"- {item['id']}: {item['reason']}")
     for suggestion in assessment["suggestions"]:
         lines.append(f"建议补充: {suggestion}")
+    lines.append(_focus_advice(assessment))
     return "\n".join(lines)
+
+
+def _focus_advice(assessment: dict) -> str:
+    """产品思维 Attention Ranking：按需求形态给出 3 秒视觉焦点建议。
+
+    源自 design-intelligence/01（Who→Why→What→How）与 /03
+    （信息优先级：核心指标→异常→趋势→详细）。
+    """
+    text = (assessment.get("requirement") or "").lower()
+    system_type = assessment["classification"].get("system_type", "")
+    focus = "核心指标大数字 + 趋势（如达成率/金额，headline 大字号 + 环比）"
+    if system_type == "state-machine":
+        focus = "待办/异常置顶（如待审批 N 项，色编码 + 处理入口）"
+    elif system_type == "realtime":
+        focus = "实时状态色块（正常/警告/异常大色区，语义色）"
+    elif system_type == "search":
+        focus = "搜索框 + 即时聚合上下文（名称/数量/风险）"
+    elif system_type == "optimization":
+        focus = "目标指标大数字 + 约束/瓶颈摘要"
+    elif "审批" in text or "工作台" in text or "dashboard" in text:
+        focus = "异常优先：异常/待办置顶 + 大数字核心指标"
+    return (f"视觉焦点建议（3 秒规则）: {focus} —— 重要数据占大空间、"
+            "高对比；异常优先置顶；普通数据降权（design-intelligence/03）")
+
+
+def _parse_llm_selection(raw: str) -> dict:
+    """Validate the two-sided selection shape before policy reconciliation."""
+    selection = json.loads(raw)
+    if not isinstance(selection, dict):
+        raise ValueError("top level must be an object")
+    for key in ("apply", "skip"):
+        value = selection.get(key, [])
+        if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+            raise ValueError(f"{key} must be a string list")
+    return selection
+
+
+def _apply_llm_selection(text: str, assessment: dict, registry: dict,
+                         selection: dict) -> None:
+    """Reconcile LLM advice, then re-apply assessor tier/risk invariants."""
+    base = match_rules(text, classification=classify_text(text), registry=registry)
+    constrained = {**base, "rules": assessment["prescription"]}
+    reconciled = reconcile(constrained, selection.get("apply", []),
+                           selection.get("skip", []), registry)
+    selected, rejected = _prescription_policy(
+        reconciled, registry, assessment["effective_tier"], assessment["scale"])
+    assessment["prescription"] = selected
+    assessment["not_selected"] = _merge_not_selected(
+        assessment["not_selected"], rejected)
+    assessment["provenance"] = reconciled["provenance"]
+    assessment["dropped"] = reconciled["dropped"] + [
+        {"id": item["id"], "reason": "assessor-policy: " + item["reason"]}
+        for item in rejected if item["id"] in reconciled.get("llm_apply", [])
+    ]
 
 
 def format_execution_prompt(assessment: dict) -> str:
@@ -238,6 +363,8 @@ def format_execution_prompt(assessment: dict) -> str:
         f"CLASSIFICATION: {assessment['classification']['task_type']} "
         f"[{assessment['classification']['platform'] or '-'}/"
         f"{assessment['classification']['profile'] or 'generic'}]",
+        f"SYSTEM_TYPE: {assessment['classification']['system_type']} "
+        f"(evidence: {', '.join(assessment['classification']['system_evidence']) or '-'})",
     ]
     product = assessment["product"]
     lines.append(f"PRODUCTIZATION: {product['level']} — implicit-requirement "
@@ -261,13 +388,52 @@ def format_execution_prompt(assessment: dict) -> str:
     return "\n".join(lines)
 
 
+def _assess_text(args, parser) -> str:
+    """需求文本来源：--file 或位置参数（有界读取）。"""
+    if args.file:
+        try:
+            return read_text_bounded(Path(args.file), config.INPUT_MAX_BYTES,
+                                     "assess source")
+        except ValueError as exc:
+            parser.error(str(exc))
+    text = " ".join(args.task)
+    if not text.strip():
+        parser.error("Provide a requirement (positional text or --file)")
+    return text
+
+
+def _assess_registry(text: str, override: str, parser):
+    """Load the selected domain registry, failing through argparse."""
+    try:
+        return (load_registry(override, domain=domain_for(text))
+                if override else load_registry(domain=domain_for(text)))
+    except ValueError as exc:
+        parser.error(str(exc))
+
+
+def print_profile_block(assessment: dict) -> None:
+    """画像 + 假设记录的人类可读输出（assess 文本模式尾部）。"""
+    from .profile import format_profile
+    print("")
+    print(format_profile(assessment["task_profile"]))
+    records = assessment.get("assumptions") or []
+    if not records:
+        return
+    print("")
+    print("## 假设记录（待确认问题 → 处理决策）")
+    for record in records:
+        print(f"- 风险{record['assumption_risk']:.2f} "
+              f"{record['statement']} → {record['verification_plan']} "
+              f"[{record['status']}]")
+
+
 def assess_main(argv: list) -> None:
     """`pi-batch assess "<requirement>" [--json] [--llm-json '...']`."""
     import argparse
     parser = argparse.ArgumentParser(
         prog="pi-batch.py assess",
         description="Evaluate a requirement (completeness, scale, risk) and "
-                    "prescribe the minimal necessary ui-spec rules.")
+                    "prescribe the minimal necessary domain rules.")
     parser.add_argument("task", nargs="*", default=[], help="requirement text")
     parser.add_argument("--file", default="",
                         help="read the requirement from FILE (markdown/txt)")
@@ -279,28 +445,23 @@ def assess_main(argv: list) -> None:
                         help='LLM selection JSON {"apply":[],"skip":[]} to reconcile')
     parser.add_argument("--registry", default="", help="rule registry YAML override")
     args = parser.parse_args(argv)
-    if args.file:
-        from .text_io import read_text_bounded
-        text = read_text_bounded(Path(args.file), config.INPUT_MAX_BYTES,
-                                 "assess source")
-    else:
-        text = " ".join(args.task)
-    if not text.strip():
-        parser.error("Provide a requirement (positional text or --file)")
-    registry = load_registry(args.registry) if args.registry else None
+    text = _assess_text(args, parser)
+    registry = _assess_registry(text, args.registry, parser)
     assessment = prescription(text, registry)
     if args.llm_json:
         try:
-            selection = json.loads(args.llm_json)
+            selection = _parse_llm_selection(args.llm_json)
         except Exception as exc:
             log.error("Invalid --llm-json: %s", exc)
             sys.exit(2)
-        matched = reconcile(match_rules(text, registry=registry),
-                            selection.get("apply", []),
-                            selection.get("skip", []), registry)
-        assessment["prescription"] = matched["rules"]
-        assessment["provenance"] = matched["provenance"]
-        assessment["dropped"] = matched["dropped"]
+        _apply_llm_selection(text, assessment, registry, selection)
+    # Multi-dimensional profile, discretion envelope and explicit
+    # assumptions are additive metadata; the assessor's tier/risk policy
+    # above remains authoritative for the prescribed rule set.
+    # P1/P3/P4：多维画像 + 裁量包络 + 假设记录（惰性导入避免循环依赖）
+    from .profile import assumption_records, task_profile
+    assessment["task_profile"] = task_profile(text, registry)
+    assessment["assumptions"] = assumption_records(text)
     if args.json:
         print(json.dumps(assessment, ensure_ascii=False, indent=2))
         return
@@ -308,3 +469,4 @@ def assess_main(argv: list) -> None:
         print(format_execution_prompt(assessment))
         return
     print(format_assessment(assessment))
+    print_profile_block(assessment)
