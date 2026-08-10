@@ -360,9 +360,7 @@ mod tests {
             assert_eq!(
                 merged.severity(),
                 *expected,
-                "merge {:?} should give {:?}",
-                input,
-                expected
+                "merge {input:?} should give {expected:?}"
             );
         }
     }
@@ -392,8 +390,8 @@ mod tests {
             }
             let merged = Outcome::merge(&outcomes);
             assert_eq!(
-                merged.duration().as_micros() as u64,
-                total,
+                merged.duration().as_micros(),
+                u128::from(total),
                 "duration sum mismatch"
             );
         }
@@ -405,18 +403,18 @@ mod tests {
         let mut outcomes = Vec::with_capacity(1000);
         for i in 0..1000 {
             outcomes.push(if i % 3 == 0 {
-                Outcome::ok(&i.to_string())
+                Outcome::ok(i.to_string())
             } else if i % 3 == 1 {
-                Outcome::warning(i, &i.to_string())
+                Outcome::warning(i, i.to_string())
             } else {
-                Outcome::error(&i.to_string())
+                Outcome::error(i.to_string())
             });
         }
         let merged = Outcome::merge(&outcomes);
         // Should not crash, should have some severity
         assert!(merged.severity() == Severity::Error || merged.severity() == Severity::Warning);
         // Message should contain at least some of the inputs
-        assert!(merged.message().len() > 0);
+        assert!(!merged.message().is_empty());
     }
 
     /// Empty merge returns Ok with zero duration.

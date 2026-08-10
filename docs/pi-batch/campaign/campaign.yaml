@@ -1,0 +1,60 @@
+# Aero IM 项目级 Campaign：模块发现 → 方向评分 → 完整实现。
+# 运行：cd /home/u1/aero-im && PBATCH_SCRIPT_DIR=/home/u1/aero-im-batch \
+#   python /home/u1/ai-batch-runner/pi-batch.py campaign --config /home/u1/aero-im-batch/campaign.yaml
+name: aero-im-improvements
+
+discovery:
+  roots:
+    - crates
+    - web
+  exclude:
+    - vendor
+    - node_modules
+    - target
+    - tests
+    - docs
+    - scripts
+    - migrations
+    - skills
+    - .git
+    - .pi-batch
+    - __pycache__
+    - monitoring
+    - data
+    - secrets
+  max_depth: 1
+
+analysis:
+  jobs: 4
+  retries: 2
+  candidate_limit: 3
+  prompt: |
+    Analyze module '{module}' at {module_path} in the Aero IM repository
+    (Rust workspace + vanilla JS SPA). Return ONLY a JSON array with at
+    most {candidate_limit} high-value improvement directions, sorted by
+    value. Each object must contain: title, problem, value (1-10),
+    risk_reduction (1-10), effort (1-10), confidence (1-10), evidence
+    (existing file/symbol paths), and acceptance (testable checks).
+    Do not modify code. Claims without repository evidence must be
+    identified as proposed, not verified.
+
+selection:
+  max_directions: 1
+  minimum_score: 0
+
+implementation:
+  pipeline: docs/pi-batch/campaign/campaign-pipeline.yaml
+  requirement_stage: requirements
+  concurrency: 1
+  timeout: 14400
+  worktree_root: .pi-batch/worktrees
+
+state:
+  output_dir: docs/auto
+  state_file: docs/auto/state.jsonl
+  summary_file: docs/auto/SUMMARY.md
+  line_max_bytes: 262144
+
+estimates:
+  analysis_minutes: 3
+  pipeline_minutes: 20

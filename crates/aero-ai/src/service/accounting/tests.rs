@@ -183,7 +183,7 @@ impl Embedder for PaidEmbedder {
         EMBED_DIM
     }
 
-    fn model_id(&self) -> &str {
+    fn model_id(&self) -> &'static str {
         "paid-test"
     }
 
@@ -224,7 +224,7 @@ impl Embedder for FailingPaidEmbedder {
         EMBED_DIM
     }
 
-    fn model_id(&self) -> &str {
+    fn model_id(&self) -> &'static str {
         "failing-paid-test"
     }
 
@@ -245,7 +245,7 @@ impl Embedder for AmbiguousPaidEmbedder {
         EMBED_DIM
     }
 
-    fn model_id(&self) -> &str {
+    fn model_id(&self) -> &'static str {
         "ambiguous-paid-test"
     }
 

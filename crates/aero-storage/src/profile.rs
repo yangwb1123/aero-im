@@ -36,7 +36,7 @@ pub struct Profile {
     pub phone: Option<String>,
     /// Free-form status text (e.g. "Out of office"), if set.
     pub status_text: Option<String>,
-    /// Emoji shorthand for the custom status (e.g. ":palm_tree:"), if set.
+    /// Emoji shorthand for the custom status (e.g. ":`palm_tree`:"), if set.
     /// Added by migration 0121.
     pub status_emoji: Option<String>,
     /// Optional auto-expiry for the custom status. `None` means never expires.
@@ -136,7 +136,7 @@ impl ProfileRepo {
     }
 
     /// Update only the core profile fields (title, pronouns, timezone, phone,
-    /// status_text) without touching the emoji / expires_at status columns that
+    /// `status_text`) without touching the emoji / `expires_at` status columns that
     /// [`set_status`](Self::set_status) manages. Preserves the new columns on
     /// conflict so a `PUT /api/me/profile` call does not accidentally wipe a
     /// status set via `PATCH /api/me/profile/status`.

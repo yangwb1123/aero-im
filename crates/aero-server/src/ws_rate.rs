@@ -456,8 +456,7 @@ async fn set_rate_tier(
     })?;
     s.workspaces
         .set_rate_tier_authorized(ws, tier.as_str(), auth.participant_id)
-        .await
-        .map_err(AeroError::from)?;
+        .await?;
     s.ws_rate.note_tier(ws, tier);
     // Best-effort audit (observability, not a transactional invariant).
     if let Err(e) = s

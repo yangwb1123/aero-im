@@ -26,7 +26,7 @@ async fn racing_block_completes_before_direct_call_can_start() {
     let pg = pool();
     let workspace = aero_common::WorkspaceId::from_uuid(uuid::Uuid::nil());
     let caller = participant(&pg, "caller").await;
-    let callee = participant(&pg, "callee").await;
+    let target = participant(&pg, "callee").await;
     sqlx::query(
         r"INSERT INTO workspace_members
               (workspace_id, participant_id, role, joined_at)
@@ -35,22 +35,22 @@ async fn racing_block_completes_before_direct_call_can_start() {
     )
     .bind(workspace.to_uuid())
     .bind(caller.to_uuid())
-    .bind(callee.to_uuid())
+    .bind(target.to_uuid())
     .execute(&pg)
     .await
     .unwrap();
     let room = crate::DmRepo::new(pg.clone())
-        .find_or_create_in_workspace(workspace, caller, callee)
+        .find_or_create_in_workspace(workspace, caller, target)
         .await
         .unwrap()
         .id;
 
     let mut blocking = pg.begin().await.unwrap();
-    crate::user_blocks::lock_user_block_pair(&mut blocking, caller, callee)
+    crate::user_blocks::lock_user_block_pair(&mut blocking, caller, target)
         .await
         .unwrap();
     sqlx::query("INSERT INTO user_blocks (blocker_id, blocked_id) VALUES ($1, $2)")
-        .bind(callee.to_uuid())
+        .bind(target.to_uuid())
         .bind(caller.to_uuid())
         .execute(&mut *blocking)
         .await
@@ -85,8 +85,16 @@ async fn racing_block_completes_before_direct_call_can_start() {
         .execute(&pg)
         .await
         .ok();
+    // 0227 owner guard: a raw participant DELETE is rejected while the caller
+    // still owns the magic nil workspace — drop the memberships first so this
+    // cleanup path satisfies `participant_workspace_raw_owner_guard`.
+    sqlx::query("DELETE FROM workspace_members WHERE participant_id = ANY($1)")
+        .bind(vec![caller.to_uuid(), target.to_uuid()])
+        .execute(&pg)
+        .await
+        .unwrap();
     sqlx::query("DELETE FROM participants WHERE id = ANY($1)")
-        .bind(vec![caller.to_uuid(), callee.to_uuid()])
+        .bind(vec![caller.to_uuid(), target.to_uuid()])
         .execute(&pg)
         .await
         .unwrap();

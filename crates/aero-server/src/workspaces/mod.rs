@@ -504,13 +504,13 @@ async fn export_audit_csv(
     Path(id_str): Path<String>,
     Query(q): Query<AuditQuery>,
 ) -> ApiResult<axum::response::Response> {
+    use axum::http::{header, HeaderMap, HeaderName, HeaderValue};
     use axum::response::IntoResponse;
     let ws = parse_workspace_id(&id_str)?;
     let caller = caller_role(&s.workspaces, ws, auth.participant_id).await?;
     authorize_view_audit(caller)?;
     let events = resolve_audit_events(&s, ws, &q).await?;
     let csv = aero_storage::events_to_csv(&events);
-    use axum::http::{header, HeaderMap, HeaderName, HeaderValue};
     let mut headers = HeaderMap::new();
     headers.insert(
         header::CONTENT_TYPE,
@@ -613,8 +613,7 @@ async fn update_workspace(
     let workspace = s
         .workspaces
         .update_name_authorized(ws, &name, auth.participant_id)
-        .await
-        .map_err(AeroError::from)?;
+        .await?;
 
     audit(
         &s,
@@ -640,8 +639,7 @@ async fn delete_workspace(
     let deleted = s
         .workspaces
         .delete_authorized(ws, auth.participant_id)
-        .await
-        .map_err(AeroError::from)?;
+        .await?;
     if !deleted {
         // Raced with another deleter between the role check and the delete.
         return Err(AeroError::NotFound("workspace".into()).into());
@@ -677,8 +675,7 @@ async fn set_retention(
         .map_err(|n| AeroError::Invalid(format!("retention days must be >= 1, got {n}")))?;
     s.workspaces
         .set_retention_authorized(ws, req.days, auth.participant_id)
-        .await
-        .map_err(AeroError::from)?;
+        .await?;
     audit(
         &s,
         ws,
@@ -907,8 +904,7 @@ async fn update_branding(
             req.description.as_deref(),
             auth.participant_id,
         )
-        .await
-        .map_err(AeroError::from)?;
+        .await?;
 
     audit(
         &s,
@@ -960,8 +956,7 @@ async fn get_notif_defaults(
     let repo = WorkspaceNotifDefaultsRepo::new(s.pg.clone());
     let level = repo
         .get(ws)
-        .await
-        .map_err(AeroError::from)?
+        .await?
         .unwrap_or_else(|| "all".to_owned());
     Ok(Json(serde_json::json!({ "default_level": level })))
 }
@@ -983,8 +978,7 @@ async fn set_notif_defaults(
     }
     let repo = WorkspaceNotifDefaultsRepo::new(s.pg.clone());
     repo.set_authorized(ws, &req.default_level, auth.participant_id)
-        .await
-        .map_err(AeroError::from)?;
+        .await?;
     Ok(Json(
         serde_json::json!({ "ok": true, "default_level": req.default_level }),
     ))

@@ -361,8 +361,11 @@ async fn close_poll(
                 .iter()
                 .enumerate()
                 .map(|(i, opt)| {
+                    // Ratio of two counts ×100 is bounded to 0..=100, so the
+                    // f64→u32 narrowing cannot truncate or wrap meaningful data.
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                     let pct = if total_votes > 0 {
-                        (tally.get(i).copied().unwrap_or(0) as f64 / total_votes as f64 * 100.0)
+                        (f64::from(tally.get(i).copied().unwrap_or(0)) / f64::from(total_votes) * 100.0)
                             as u32
                     } else {
                         0
@@ -387,7 +390,7 @@ async fn close_poll(
             match approval_id {
                 Ok(_) => tracing::info!(%poll_id, "auto-created approval from poll close"),
                 Err(e) => {
-                    tracing::warn!(error = ?e, %poll_id, "auto-create approval from poll failed")
+                    tracing::warn!(error = ?e, %poll_id, "auto-create approval from poll failed");
                 }
             }
         }

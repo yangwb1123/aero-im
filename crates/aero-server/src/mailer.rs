@@ -59,16 +59,14 @@ pub fn build_mailer(cfg: Option<&aero_common::config::EmailConfig>) -> Option<Ma
     let from: Mailbox = ec
         .from
         .parse()
-        .map_err(|e| {
+        .inspect_err(|&e| {
             warn!(from = %ec.from, error = ?e, "invalid email.from address");
-            e
         })
         .ok()?;
 
     let security = smtp_security(ec)
-        .map_err(|error| {
+        .inspect_err(|&error| {
             warn!(host = %ec.host, error, "refusing unsafe SMTP configuration");
-            error
         })
         .ok()?;
     let builder = match security {
@@ -150,7 +148,7 @@ impl Mailer {
         };
         match self.transport.send(email).await {
             Ok(r) => {
-                tracing::info!(to = to_addr, response = ?r.message().collect::<Vec<_>>(), "password reset email sent")
+                tracing::info!(to = to_addr, response = ?r.message().collect::<Vec<_>>(), "password reset email sent");
             }
             Err(e) => warn!(to = to_addr, error = ?e, "failed to send password reset email"),
         }

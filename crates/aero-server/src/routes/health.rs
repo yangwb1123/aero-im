@@ -1,6 +1,6 @@
 //! Health-check endpoints: liveness, readiness, combined probe.
 //!
-//! Split from the monolithic `routes.rs` (REFACTOR_PLAN.md Step 7 clean-up).
+//! Split from the monolithic `routes.rs` (`REFACTOR_PLAN.md` Step 7 clean-up).
 //! See also `crate::metrics::metrics_handler` for the Prometheus `/metrics`
 //! endpoint.
 
@@ -36,7 +36,7 @@ async fn probe_deps(s: &AppState) -> (&'static str, &'static str, &'static str, 
     let redis_ok =
         tokio::time::timeout(Duration::from_secs(2), async { s.presence.ping().await }).await;
     let redis = match redis_ok {
-        Ok(Ok(_)) => "ok",
+        Ok(Ok(())) => "ok",
         Ok(Err(_)) => "fail",
         Err(_) => "timeout",
     };
@@ -53,7 +53,7 @@ async fn probe_deps(s: &AppState) -> (&'static str, &'static str, &'static str, 
     })
     .await;
     let nats = match nats_ok {
-        Ok(Ok(_)) => "ok",
+        Ok(Ok(())) => "ok",
         Ok(Err(_)) => "fail",
         Err(_) => "timeout",
     };

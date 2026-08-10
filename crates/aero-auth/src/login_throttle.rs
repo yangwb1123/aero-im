@@ -24,7 +24,7 @@
 //!   same account across nodes is aggregated and locked out cluster-wide rather
 //!   than starting fresh on each node. Strictly **fail-open** — any Redis error
 //!   treats the account as *not* locked and silently drops the failure record, so
-//!   a Redis outage degrades to "no lockout", never to a self-inflicted DoS that
+//!   a Redis outage degrades to "no lockout", never to a self-inflicted `DoS` that
 //!   locks legitimate users out. Uses a TTL-based sliding window (Redis server
 //!   time) rather than the in-process explicit `first_failure_at` window; the two
 //!   are behaviourally equivalent for the threshold semantics that matter here.
@@ -391,7 +391,7 @@ mod tests {
         s = s.after_failure(0, &CFG);
         s = s.after_failure(50, &CFG); // count=2, within window
                                        // Next failure is > window_secs after the FIRST → window resets to count 1.
-        s = s.after_failure(0 + CFG.window_secs + 1, &CFG);
+        s = s.after_failure(CFG.window_secs + 1, &CFG);
         assert_eq!(s.count, 1, "stale window restarts the count");
         assert!(!s.is_locked(CFG.window_secs + 1));
     }

@@ -16,6 +16,7 @@ import { snaplinkPasswordLogin, SnaplinkMfaRequired } from './snaplink_auth.js';
 
 let enterChat = () => {};
 let showAuth = () => {};
+let onLogout = () => {};
 let authConfig = { login_page: 'both', snaplink: null };
 let loginPageMode = 'both';
 let authConfigReady = Promise.resolve();
@@ -24,6 +25,7 @@ export function initAuthUi(deps) {
   if (deps) {
     if (typeof deps.enterChat === 'function') enterChat = deps.enterChat;
     if (typeof deps.showAuth === 'function') showAuth = deps.showAuth;
+    if (typeof deps.onLogout === 'function') onLogout = deps.onLogout;
   }
 
   if (els.btnSso) {
@@ -96,6 +98,7 @@ export function initAuthUi(deps) {
   });
 
   els.btnLogout.addEventListener('click', async () => {
+    onLogout(); // drop in-memory draft state before the session is torn down
     const refreshToken = auth.getRefresh();
     // Start revocation before clearing localStorage. The refresh token itself
     // authenticates logout, so this remains valid even if the access JWT expired.

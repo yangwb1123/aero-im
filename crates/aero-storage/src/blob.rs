@@ -74,10 +74,10 @@ impl BlobRepo {
         };
         let size_i = i64::try_from(new.size).unwrap_or(i64::MAX);
         sqlx::query(
-            r#"INSERT INTO blobs
+            r"INSERT INTO blobs
                  (id, owner_id, workspace_id, storage_region, kind, name, mime,
                   size, sha256, storage_key, created_at, finalized_at)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NULL)"#,
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NULL)",
         )
         .bind(id.to_uuid())
         .bind(new.owner_id.to_uuid())
@@ -120,7 +120,7 @@ impl BlobRepo {
         storage_key: &str,
     ) -> Result<Option<Blob>, sqlx::Error> {
         let row = sqlx::query_as::<_, BlobRow>(
-            r#"UPDATE blobs AS b
+            r"UPDATE blobs AS b
                   SET storage_key = $2,
                       finalized_at = now()
                 WHERE id = $1
@@ -129,7 +129,7 @@ impl BlobRepo {
                       SELECT 1 FROM blob_gc_queue q WHERE q.blob_id = b.id
                   )
             RETURNING id, owner_id, workspace_id, storage_region, kind, name,
-                      mime, size, sha256, storage_key, created_at, finalized_at"#,
+                      mime, size, sha256, storage_key, created_at, finalized_at",
         )
         .bind(id.to_uuid())
         .bind(storage_key)
@@ -150,14 +150,14 @@ impl BlobRepo {
 
     pub async fn get(&self, id: BlobId) -> Result<Option<Blob>, sqlx::Error> {
         let row = sqlx::query_as::<_, BlobRow>(
-            r#"SELECT id, owner_id, workspace_id, storage_region, kind, name,
+            r"SELECT id, owner_id, workspace_id, storage_region, kind, name,
                       mime, size, sha256, storage_key, created_at, finalized_at
                FROM blobs b
                WHERE id = $1
                  AND finalized_at IS NOT NULL
                  AND NOT EXISTS (
                      SELECT 1 FROM blob_gc_queue q WHERE q.blob_id = b.id
-                 )"#,
+                 )",
         )
         .bind(id.to_uuid())
         .fetch_optional(&self.pool)

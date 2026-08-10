@@ -1,6 +1,6 @@
 //! Core domain types — mirrors the SQL schema in `migrations/`.
 //!
-//! Split from monolithic `model_impl.rs` (1552 lines) as part of REFACTOR_PLAN.md.
+//! Split from monolithic `model_impl.rs` (1552 lines) as part of `REFACTOR_PLAN.md`.
 //! Sub-modules each own a domain concern; `pub use *` preserves the flat public API.
 
 pub mod blob;

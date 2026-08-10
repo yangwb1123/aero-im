@@ -26,7 +26,7 @@ impl MlsGroupId {
     }
 }
 
-/// A KeyPackage as published by a participant; consumed by anyone adding them
+/// A `KeyPackage` as published by a participant; consumed by anyone adding them
 /// to a group.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KeyPackage {

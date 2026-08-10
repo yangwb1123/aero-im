@@ -10,6 +10,7 @@ pub mod ts;
 
 pub use ts::{empty_ts_segment, FlvToTsConverter, MuxError};
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use bytes::Bytes;
@@ -95,6 +96,7 @@ impl HlsWriter {
 
     /// Override the segment file extension. Useful for passthrough placeholder
     /// mode where operators may want `.bin` for debugging.
+    #[must_use]
     pub fn with_segment_ext(mut self, ext: impl Into<String>) -> Self {
         self.segment_ext = ext.into();
         self
@@ -125,7 +127,8 @@ impl HlsWriter {
         if self.finalized {
             return Err(HlsError::Finalized);
         }
-        if !(duration_secs > 0.0) {
+        // NaN fails `partial_cmp` (None), so this rejects NaN just like `!(x > 0.0)`.
+        if duration_secs.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater) {
             return Err(HlsError::Invalid("duration_secs must be > 0".to_string()));
         }
 
@@ -174,19 +177,19 @@ impl HlsWriter {
         let mut buf = String::with_capacity(256 + self.window.len() * 64);
         buf.push_str("#EXTM3U\n");
         buf.push_str("#EXT-X-VERSION:3\n");
-        buf.push_str(&format!(
-            "#EXT-X-TARGETDURATION:{}\n",
-            self.target_duration_secs
-        ));
-        buf.push_str(&format!("#EXT-X-MEDIA-SEQUENCE:{}\n", self.media_sequence));
-        if !end {
+        writeln!(buf, "#EXT-X-TARGETDURATION:{}", self.target_duration_secs)
+            .expect("write to String cannot fail");
+        writeln!(buf, "#EXT-X-MEDIA-SEQUENCE:{}", self.media_sequence)
+            .expect("write to String cannot fail");
+        if end {
+            buf.push_str("#EXT-X-PLAYLIST-TYPE:VOD\n");
+        } else {
             // Live: hint to players that this is a sliding window.
             buf.push_str("#EXT-X-PLAYLIST-TYPE:EVENT\n");
-        } else {
-            buf.push_str("#EXT-X-PLAYLIST-TYPE:VOD\n");
         }
         for entry in &self.window {
-            buf.push_str(&format!("#EXTINF:{:.3},\n", entry.duration_secs));
+            writeln!(buf, "#EXTINF:{:.3},", entry.duration_secs)
+                .expect("write to String cannot fail");
             buf.push_str(&entry.file_name);
             buf.push('\n');
         }
@@ -260,6 +263,8 @@ mod tests {
 
         // Push more than the live window worth of segments.
         for i in 0..(LIVE_WINDOW_SEGMENTS as u64 + 3) {
+            // Test payload: arbitrary 4 bytes; value is content-irrelevant.
+            #[allow(clippy::cast_possible_truncation)]
             writer
                 .push_segment(Bytes::from(vec![i as u8; 4]), 2.0)
                 .await

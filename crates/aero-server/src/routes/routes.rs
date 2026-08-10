@@ -56,9 +56,7 @@ async fn inject_request_id(mut req: Request<axum::body::Body>, next: Next) -> Re
     let id = req
         .headers()
         .get("x-request-id")
-        .and_then(|v| v.to_str().ok())
-        .map(String::from)
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        .and_then(|v| v.to_str().ok()).map_or_else(|| uuid::Uuid::new_v4().to_string(), String::from);
     req.extensions_mut().insert(RequestId(id.clone()));
     // Handle the request inside a span carrying `request_id`, so every structured
     // log line emitted while serving it is tagged with the same id echoed back in
@@ -132,6 +130,7 @@ pub fn build(state: AppState) -> Router {
                 .patch(edit_message)
                 .delete(delete_message),
         )
+        .route("/api/messages/:id/recall", post(recall_message))
         .route("/api/messages/:id/reactions", post(toggle_reaction))
         .route("/api/messages/reactions", post(reactions_batch))
         // Thread mute (mig 0088): mute/unmute the thread rooted at this message so

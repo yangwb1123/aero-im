@@ -7,7 +7,7 @@
 //! ## Flush semantics
 //!
 //! `flush()` selects all bundles older than `delay`, groups them by
-//! (participant_id, room_id, thread_root), and for each group:
+//! (`participant_id`, `room_id`, `thread_root`), and for each group:
 //!
 //! - **Count > 1**: inserts one `AggregateReply` notification with
 //!   `aggregate_count = N`. The last `message_id` in the group becomes the
@@ -83,6 +83,9 @@ impl NotificationBundleRepo {
     /// Batch-insert one message's reply bundles with a deterministic delivery
     /// id. Replays after a side-effect worker crash are collapsed by the partial
     /// unique index from migration 0165.
+    // Internal repo method with a fixed signature; grouping params into a struct
+    // would churn the single caller (ImService) for no behavioral gain.
+    #[allow(clippy::too_many_arguments)]
     pub async fn insert_many_idempotent(
         &self,
         room: RoomId,
@@ -212,7 +215,7 @@ impl NotificationBundleRepo {
                ORDER BY participant_id, room_id, thread_root, created_at
                FOR UPDATE SKIP LOCKED",
         )
-        .bind(self.deadline.as_secs() as f64)
+        .bind(self.deadline.as_secs_f64())
         .fetch_all(&mut *tx)
         .await?;
 
@@ -496,13 +499,13 @@ mod tests {
         let second = uuid::Uuid::new_v4();
         let participant = uuid::Uuid::new_v4();
         let room = uuid::Uuid::new_v4();
-        let root = Some(uuid::Uuid::new_v4());
-        let forward = bundle_delivery_id(&[first, second], participant, room, root);
-        let reverse = bundle_delivery_id(&[second, first], participant, room, root);
+        let thread_root = Some(uuid::Uuid::new_v4());
+        let forward = bundle_delivery_id(&[first, second], participant, room, thread_root);
+        let reverse = bundle_delivery_id(&[second, first], participant, room, thread_root);
         assert_eq!(forward, reverse);
         assert_ne!(
             forward,
-            bundle_delivery_id(&[first, second], uuid::Uuid::new_v4(), room, root)
+            bundle_delivery_id(&[first, second], uuid::Uuid::new_v4(), room, thread_root)
         );
         assert_ne!(
             forward,
@@ -653,13 +656,13 @@ mod tests {
                 WHERE delivery_id = ANY($2)",
         )
         .bind(first_delivery)
-        .bind(&[first_delivery, second_delivery])
+        .bind([first_delivery, second_delivery])
         .execute(&pool)
         .await
         .unwrap();
         let bundle_ids: Vec<uuid::Uuid> =
             sqlx::query_scalar("SELECT id FROM notification_bundles WHERE delivery_id = ANY($1)")
-                .bind(&[first_delivery, second_delivery])
+                .bind([first_delivery, second_delivery])
                 .fetch_all(&pool)
                 .await
                 .unwrap();
@@ -831,7 +834,7 @@ mod tests {
             .await
             .ok();
         sqlx::query("DELETE FROM participants WHERE id = ANY($1)")
-            .bind(&[
+            .bind([
                 actor_one.id.to_uuid(),
                 actor_two.id.to_uuid(),
                 recipient.id.to_uuid(),

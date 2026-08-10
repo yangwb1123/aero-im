@@ -303,7 +303,7 @@ impl HypeTrainRepo {
         );
         let rows = sqlx::query_as::<_, SessionRow>(&sql)
             .bind(Uuid::from_u128(stream.0))
-            .bind(limit.max(1).min(100))
+            .bind(limit.clamp(1, 100))
             .bind(offset.max(0))
             .fetch_all(&self.pool)
             .await?;
@@ -359,7 +359,7 @@ impl HypeTrainRepo {
               LIMIT $2",
         )
         .bind(session_id)
-        .bind(limit.max(1).min(100))
+        .bind(limit.clamp(1, 100))
         .fetch_all(&self.pool)
         .await
     }
@@ -494,6 +494,8 @@ mod db_tests {
     #[tokio::test]
     #[ignore = "requires live Postgres"]
     async fn concurrent_contributions_do_not_lose_updates() {
+        const N: usize = 10;
+        const UNITS: u32 = 2;
         // A pool with enough connections that the concurrent calls genuinely
         // contend (a 2-conn cap would mask the race by serializing at the pool).
         let url = std::env::var("DATABASE_URL")
@@ -512,8 +514,6 @@ mod db_tests {
             .await
             .unwrap();
 
-        const N: usize = 10;
-        const UNITS: u32 = 2;
         let mut parts = Vec::new();
         for _ in 0..N {
             parts.push(participant(&p).await);

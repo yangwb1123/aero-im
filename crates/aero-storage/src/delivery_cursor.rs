@@ -2,10 +2,10 @@
 //! 方向三·A · 每用户持久投递台账).
 //!
 //! One row per (participant, room) holding the Last-Known-Good delivery point:
-//! the newest message the client has durably ACKed receiving, its durable
+//! the newest message the client has durably `ACKed` receiving, its durable
 //! per-room `last_delivery_ordinal`, plus `last_seq` (a diagnostic bus
 //! de-duplication high-water mark). Reconnect is keyed only by the ordinal,
-//! never by `last_seq` or MAX(message_id): concurrent ULIDs are identifiers
+//! never by `last_seq` or `MAX(message_id)`: concurrent ULIDs are identifiers
 //! rather than a contiguous delivery log.
 //!
 //! Distinct from [`ReceiptRepo`](crate::ReceiptRepo) (the *seen* cursor, advanced
@@ -99,7 +99,7 @@ impl DeliveryCursorRepo {
         Ok(res.rows_affected() > 0)
     }
 
-    /// The (participant, room) cursor, or `None` when the client has never ACKed
+    /// The (participant, room) cursor, or `None` when the client has never `ACKed`
     /// in that room.
     ///
     /// # Errors
@@ -130,7 +130,7 @@ impl DeliveryCursorRepo {
     }
 
     /// Every room cursor for `participant` — the reconnect seed set (one row per
-    /// room the client has ACKed in). Rooms with no cursor are simply absent.
+    /// room the client has `ACKed` in). Rooms with no cursor are simply absent.
     ///
     /// # Errors
     /// Propagates any [`sqlx::Error`].

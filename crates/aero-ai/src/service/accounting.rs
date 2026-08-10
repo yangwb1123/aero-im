@@ -462,6 +462,9 @@ impl AiService {
         }
     }
 
+    // Internal accounting helper with a fixed signature; grouping params into a
+    // struct would churn the single caller for no behavioral gain.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn complete_accounted(
         &self,
         client: &AnthropicClient,

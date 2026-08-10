@@ -148,8 +148,7 @@ async fn create_announcement(
             auth.participant_id,
             resolve_expiry(req.expires_in_secs, OffsetDateTime::now_utc())?,
         )
-        .await
-        .map_err(AeroError::from)?;
+        .await?;
     Ok(Json(serde_json::to_value(row).map_err(AeroError::from)?))
 }
 
@@ -165,8 +164,7 @@ async fn list_announcements(
     caller_role(&s, ws, auth.participant_id).await?;
     let active = repo(&s)
         .list_active_authorized(ws, auth.participant_id, OffsetDateTime::now_utc())
-        .await
-        .map_err(AeroError::from)?;
+        .await?;
     Ok(Json(serde_json::to_value(active).map_err(AeroError::from)?))
 }
 
@@ -183,8 +181,7 @@ async fn delete_announcement(
     assert_admin(&s, ws, auth.participant_id).await?;
     repo(&s)
         .delete_authorized(id, ws, auth.participant_id)
-        .await
-        .map_err(AeroError::from)?;
+        .await?;
     Ok(Json(serde_json::json!({ "deleted": true })))
 }
 

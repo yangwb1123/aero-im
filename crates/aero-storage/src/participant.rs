@@ -53,8 +53,8 @@ impl ParticipantRepo {
         let created_at = time::OffsetDateTime::now_utc();
 
         sqlx::query(
-            r#"INSERT INTO participants (id, kind, display_name, avatar_url, created_by, created_at)
-               VALUES ($1, 'human', $2, NULL, NULL, $3)"#,
+            r"INSERT INTO participants (id, kind, display_name, avatar_url, created_by, created_at)
+               VALUES ($1, 'human', $2, NULL, NULL, $3)",
         )
         .bind(id.to_uuid())
         .bind(&new.display_name)
@@ -63,8 +63,8 @@ impl ParticipantRepo {
         .await?;
 
         sqlx::query(
-            r#"INSERT INTO credentials (participant_id, email, password_hash, created_at)
-               VALUES ($1, $2, $3, $4)"#,
+            r"INSERT INTO credentials (participant_id, email, password_hash, created_at)
+               VALUES ($1, $2, $3, $4)",
         )
         .bind(id.to_uuid())
         // Store the email TRIMMED so it matches the login lookup, which trims +
@@ -103,7 +103,7 @@ impl ParticipantRepo {
         // intended case-insensitive `citext = citext` comparison. (Regression:
         // smoke_wave23 non-member login with a mixed-case email.)
         let row = sqlx::query_as::<_, (uuid::Uuid, String, String)>(
-            r#"SELECT participant_id, email, password_hash FROM credentials WHERE email = $1::citext"#,
+            r"SELECT participant_id, email, password_hash FROM credentials WHERE email = $1::citext",
         )
         // Trim to match how the email is normalized on the write path (see
         // `create_human`): the column is whitespace-SENSITIVE even as `citext`.
@@ -126,7 +126,7 @@ impl ParticipantRepo {
         participant_id: ParticipantId,
     ) -> Result<Option<CredentialRecord>, sqlx::Error> {
         let row = sqlx::query_as::<_, (uuid::Uuid, String, String)>(
-            r#"SELECT participant_id, email, password_hash FROM credentials WHERE participant_id = $1"#,
+            r"SELECT participant_id, email, password_hash FROM credentials WHERE participant_id = $1",
         )
         .bind(participant_id.to_uuid())
         .fetch_optional(&self.pool)
@@ -169,7 +169,7 @@ impl ParticipantRepo {
     /// 1. Mark `participants.deleted_at = NOW()` (keeps the row for FK integrity)
     ///    and tombstone its own PII: `display_name = '[deleted]'`, `avatar_url = NULL`.
     /// 2. Hard-delete the satellite PII tables (`credentials` — login email + hash,
-    ///    `participant_profiles` — phone/status/pronouns, `sso_identities` — IdP
+    ///    `participant_profiles` — phone/status/pronouns, `sso_identities` — `IdP`
     ///    email/subject) and unsent authored content not in the message ledger
     ///    (`message_drafts`, `out_of_office` text, `scheduled_messages`); nothing
     ///    references them, so they are removed outright.
@@ -683,7 +683,7 @@ impl ParticipantRepo {
         new_hash: &str,
     ) -> Result<bool, sqlx::Error> {
         let rows =
-            sqlx::query(r#"UPDATE credentials SET password_hash = $1 WHERE participant_id = $2"#)
+            sqlx::query(r"UPDATE credentials SET password_hash = $1 WHERE participant_id = $2")
                 .bind(new_hash)
                 .bind(participant_id.to_uuid())
                 .execute(&self.pool)
@@ -691,8 +691,8 @@ impl ParticipantRepo {
         Ok(rows.rows_affected() > 0)
     }
 
-    /// Substring search over display_name + credentials.email. Returns up to
-    /// `limit` participants ordered by display_name. Excludes soft-removed rows.
+    /// Substring search over `display_name` + credentials.email. Returns up to
+    /// `limit` participants ordered by `display_name`. Excludes soft-removed rows.
     pub async fn search(&self, query: &str, limit: i64) -> Result<Vec<Participant>, sqlx::Error> {
         let q = query.trim();
         if q.is_empty() {
@@ -711,12 +711,12 @@ impl ParticipantRepo {
                 time::OffsetDateTime,
             ),
         >(
-            r#"SELECT DISTINCT p.id, p.kind, p.display_name, p.avatar_url, p.created_by, p.created_at
+            r"SELECT DISTINCT p.id, p.kind, p.display_name, p.avatar_url, p.created_by, p.created_at
                FROM participants p
                LEFT JOIN credentials c ON c.participant_id = p.id
                WHERE p.deleted_at IS NULL AND (p.display_name ILIKE $1 OR c.email ILIKE $1)
                ORDER BY p.display_name ASC
-               LIMIT $2"#,
+               LIMIT $2",
         )
         .bind(&pattern)
         .bind(limit)
@@ -757,10 +757,10 @@ impl ParticipantRepo {
                 time::OffsetDateTime,
             ),
         >(
-            r#"SELECT p.id, p.kind, p.display_name, p.avatar_url, p.created_by, p.created_at
+            r"SELECT p.id, p.kind, p.display_name, p.avatar_url, p.created_by, p.created_at
                FROM participants p
                JOIN room_members m ON m.participant_id = p.id
-               WHERE m.room_id = $1 AND p.kind IN ('bot','agent') AND p.deleted_at IS NULL"#,
+               WHERE m.room_id = $1 AND p.kind IN ('bot','agent') AND p.deleted_at IS NULL",
         )
         .bind(room.to_uuid())
         .fetch_all(&self.pool)
@@ -785,7 +785,7 @@ impl ParticipantRepo {
             .collect())
     }
 
-    /// Patch display_name and/or avatar_url. Passing `None` for a field leaves
+    /// Patch `display_name` and/or `avatar_url`. Passing `None` for a field leaves
     /// it unchanged. Returns the updated row.
     pub async fn update_profile(
         &self,
@@ -804,14 +804,14 @@ impl ParticipantRepo {
                 time::OffsetDateTime,
             ),
         >(
-            r#"UPDATE participants SET
+            r"UPDATE participants SET
                  display_name = COALESCE($2, display_name),
                  avatar_url   = CASE
                                   WHEN $3::boolean THEN $4
                                   ELSE avatar_url
                                 END
                WHERE id = $1
-            RETURNING id, kind, display_name, avatar_url, created_by, created_at"#,
+            RETURNING id, kind, display_name, avatar_url, created_by, created_at",
         )
         .bind(id.to_uuid())
         .bind(display_name)
@@ -912,8 +912,8 @@ impl ParticipantRepo {
                 time::OffsetDateTime,
             ),
         >(
-            r#"SELECT id, kind, display_name, avatar_url, created_by, created_at
-               FROM participants WHERE id = $1 AND deleted_at IS NULL"#,
+            r"SELECT id, kind, display_name, avatar_url, created_by, created_at
+               FROM participants WHERE id = $1 AND deleted_at IS NULL",
         )
         .bind(id.to_uuid())
         .fetch_optional(&self.pool)

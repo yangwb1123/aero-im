@@ -27,7 +27,7 @@ pub const DEFAULT_TTL: Duration = Duration::from_secs(30);
 /// Redis key for a shard of a stream's viewer sorted set.
 #[must_use]
 fn viewer_shard_key(stream: Ulid, pid: ParticipantId) -> String {
-    let shard = pid.to_uuid().as_bytes()[15] as u64;
+    let shard = u64::from(pid.to_uuid().as_bytes()[15]);
     format!("live:viewers:stream:{stream}:shard:{shard}")
 }
 
@@ -444,15 +444,15 @@ mod tests {
 
     #[test]
     fn epoch_secs_is_whole_seconds_and_never_panics() {
-        assert_eq!(epoch_secs(UNIX_EPOCH), 0.0);
+        assert!((epoch_secs(UNIX_EPOCH) - 0.0).abs() < 1e-9);
         let t = UNIX_EPOCH + Duration::from_millis(1_500);
-        assert_eq!(epoch_secs(t), 1.0);
+        assert!((epoch_secs(t) - 1.0).abs() < 1e-9);
     }
 
     #[test]
     fn stale_threshold_saturates_at_zero() {
-        assert_eq!(stale_threshold(10.0, Duration::from_secs(45)), 0.0);
-        assert_eq!(stale_threshold(100.0, Duration::from_secs(45)), 55.0);
+        assert!((stale_threshold(10.0, Duration::from_secs(45)) - 0.0).abs() < 1e-9);
+        assert!((stale_threshold(100.0, Duration::from_secs(45)) - 55.0).abs() < 1e-9);
     }
 
     #[test]

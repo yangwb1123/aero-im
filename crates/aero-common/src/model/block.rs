@@ -143,15 +143,16 @@ impl Block {
     #[must_use]
     pub fn searchable_text(&self) -> Option<&str> {
         match self {
-            Self::Text { content, .. } | Self::Code { content, .. } => Some(content),
+            Self::Text { content, .. }
+            | Self::Code { content, .. }
+            | Self::Thought {
+                content,
+                hidden: false,
+            } => Some(content),
             Self::Voice {
                 transcript: Some(t),
                 ..
             } => Some(t),
-            Self::Thought {
-                content,
-                hidden: false,
-            } => Some(content),
             Self::Button { label, .. } => Some(label),
             // Index the attachment's file name so a message carrying e.g.
             // "deploy-runbook.pdf" is findable by name (ROADMAP5 方向三: file search

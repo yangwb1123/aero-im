@@ -22,7 +22,10 @@
 use crate::hub::WsSender;
 use crate::state::AppState;
 use aero_auth::{Claims, TokenKind};
-use aero_common::metrics::{self, names};
+use aero_common::{
+    metrics::{self, names},
+    Error as AeroError,
+};
 use aero_common::{
     Block, CallEvent, CallId, CallKind, CallMode, CallSession, CanvasId, MembershipOp, MessageId,
     NotificationKind, ParticipantId, PinOp, PollId, PollOp, ReactionOp, RoomId, SessionId,
@@ -145,6 +148,11 @@ pub(crate) enum ClientFrame {
     DeleteMessage {
         id: MessageId,
     },
+    /// Recall (撤回) a message: the author or a room admin/owner replaces its
+    /// content with the system placeholder and broadcasts the updated message.
+    RecallMessage {
+        id: MessageId,
+    },
     /// Toggle a reaction.
     React {
         message_id: MessageId,
@@ -166,7 +174,7 @@ pub(crate) enum ClientFrame {
         message_id: MessageId,
         /// Durable per-room creation order. Required for cursor v2; an omitted
         /// value is a legacy ACK and is deliberately ignored rather than
-        /// reviving the unsafe MAX(message_id) cursor.
+        /// reviving the unsafe `MAX(message_id)` cursor.
         #[serde(default)]
         delivery_ordinal: Option<i64>,
         seq: i64,
@@ -335,6 +343,12 @@ pub(crate) enum ServerFrame<'a> {
         rooms: Vec<DeliveryRoomBarrier>,
     },
     Edited {
+        message: aero_common::Message,
+    },
+    /// A message was recalled (撤回): content replaced by the system placeholder.
+    /// Carries the full updated message so clients render the placeholder in
+    /// place, mirroring [`Self::Edited`].
+    Recalled {
         message: aero_common::Message,
     },
     Deleted {
@@ -515,9 +529,8 @@ pub async fn handler(
 ) -> impl IntoResponse {
     // Capture Query's rejection so its detailed serde error (which is allowed to
     // contain request data) is never rendered or logged by Axum.
-    let Query(p) = match query {
-        Ok(query) => query,
-        Err(_) => return invalid_ws_query_response(),
+    let Ok(Query(p)) = query else {
+        return invalid_ws_query_response();
     };
     let access_token = match select_access_token(&headers, p.token) {
         Ok(token) => token,
@@ -530,12 +543,9 @@ pub async fn handler(
                 .into_response();
         }
     };
-    let claims = match state.auth.verify_access(access_token.expose()).await {
-        Ok(c) => c,
-        Err(_) => {
-            warn!("ws auth failed");
-            return (axum::http::StatusCode::UNAUTHORIZED, "invalid token").into_response();
-        }
+    let Ok(claims) = state.auth.verify_access(access_token.expose()).await else {
+        warn!("ws auth failed");
+        return (axum::http::StatusCode::UNAUTHORIZED, "invalid token").into_response();
     };
     let pid: ParticipantId = match access_participant(&claims) {
         Ok(p) => p,
@@ -589,6 +599,9 @@ pub async fn handler(
     })
 }
 #[instrument(skip(socket, state, since), fields(%pid))]
+// Internal handler with a fixed signature; grouping params into a struct would
+// churn every call site for no behavioral gain.
+#[allow(clippy::too_many_arguments)]
 async fn run_socket(
     socket: axum::extract::ws::WebSocket,
     state: AppState,
@@ -755,9 +768,19 @@ async fn run_socket(
                         if let Err(e) =
                             frame::handle_text(&text, &state, pid, &tx, &mut call_generations).await
                         {
+                            // Surface the stable error code (rate_limited /
+                            // forbidden / …) instead of the generic "handler":
+                            // the ws-rate gate rejects over-budget recall/send
+                            // with `RateLimited` and the client must be able to
+                            // tell a back-off-worthy 429 apart from a hard
+                            // failure. Falls back to "handler" when the root
+                            // cause is not an `AeroError` (parse/IO/etc.).
+                            let code = e
+                                .downcast_ref::<AeroError>()
+                                .map_or("handler", |ae| ae.code());
                             let _ = tx.try_send(Message::Text(
                                 serde_json::to_string(&ServerFrame::Error {
-                                    code: "handler",
+                                    code,
                                     msg: e.to_string(),
                                 })
                                 .unwrap_or_default(),
@@ -777,7 +800,7 @@ async fn run_socket(
                             .unwrap_or_default(),
                         ));
                     }
-                    _ => {}
+                    Message::Pong(_) => {}
                 }
             }
         }
@@ -829,7 +852,7 @@ async fn cleanup_connection_call_generations(
         // departure. Retry transient failures briefly; local media is removed
         // for safety even when persistence remains unavailable.
         let mut durable_room = None;
-        for attempt in 1..=3 {
+        for attempt in 1u32..=3 {
             let call = match state.calls.get(call_id).await {
                 Ok(call) => call,
                 Err(error) => {
@@ -841,7 +864,7 @@ async fn cleanup_connection_call_generations(
                         "disconnect: canonical call lookup failed"
                     );
                     if attempt < 3 {
-                        tokio::time::sleep(std::time::Duration::from_millis(100 * attempt as u64))
+                        tokio::time::sleep(std::time::Duration::from_millis(100 * u64::from(attempt)))
                             .await;
                         continue;
                     }
@@ -860,9 +883,8 @@ async fn cleanup_connection_call_generations(
                     durable_room = Some(call.room_id);
                     break;
                 }
-                Err(aero_common::Error::Conflict(_))
-                | Err(aero_common::Error::NotFound(_))
-                | Err(aero_common::Error::Forbidden(_)) => break,
+                Err(aero_common::Error::Conflict(_) | aero_common::Error::NotFound(_) |
+aero_common::Error::Forbidden(_)) => break,
                 Err(error) => {
                     warn!(
                         %call_id,
@@ -872,7 +894,7 @@ async fn cleanup_connection_call_generations(
                         "disconnect: durable SFU leave failed"
                     );
                     if attempt < 3 {
-                        tokio::time::sleep(std::time::Duration::from_millis(100 * attempt as u64))
+                        tokio::time::sleep(std::time::Duration::from_millis(100 * u64::from(attempt)))
                             .await;
                     }
                 }
@@ -935,13 +957,13 @@ async fn retry_leave(
     pid: aero_common::ParticipantId,
 ) -> Result<(), anyhow::Error> {
     let mut last_err = None;
-    for attempt in 1..=3 {
+    for attempt in 1u32..=3 {
         match presence.leave(room, pid).await {
             Ok(()) => return Ok(()),
             Err(e) => {
                 last_err = Some(e);
                 if attempt < 3 {
-                    tokio::time::sleep(std::time::Duration::from_millis(100 * attempt as u64))
+                    tokio::time::sleep(std::time::Duration::from_millis(100 * u64::from(attempt)))
                         .await;
                 }
             }

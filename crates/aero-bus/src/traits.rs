@@ -42,7 +42,7 @@ pub trait Subscription: Send {
 
 #[async_trait]
 pub trait EventBus: Send + Sync {
-    /// Publish raw bytes to a subject. Must be persisted on JetStream.
+    /// Publish raw bytes to a subject. Must be persisted on `JetStream`.
     async fn publish(&self, subject: &str, payload: bytes::Bytes) -> BusResult<()>;
 
     /// Publish one logical message with a stable idempotency key.

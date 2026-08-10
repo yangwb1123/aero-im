@@ -8,10 +8,53 @@ use crate::service::orig::{per_tenant_metrics_enabled, spam_content_hash, WORKSP
 use crate::{moderation_text, validate_blocks, ImService, ModerationVerdict};
 use aero_common::{
     metrics::{self, names},
-    Block, Error, Message, MessageId, ParticipantId, Result, RoomId, RoomKind, WorkspaceId,
+    recall_window_expired, Block, Error, Message, MessageId, ParticipantId, Result, RoomId,
+    RoomKind, WorkspaceId,
 };
 use aero_storage::{message::NewMessage, MessageIdempotency};
 use tracing::{instrument, warn, Instrument};
+
+/// Pure recall (撤回) permission decision: the author, or a room owner/admin,
+/// may recall a message. `room_role` is the actor's role in the message's room
+/// (`None` = not a member — unreachable past the room-access guard, kept for a
+/// total function). Kept pure so the full permission matrix is table-driven and
+/// unit-testable without a database; the storage transaction re-checks the same
+/// rule under row locks (this is never authority on its own).
+pub(crate) fn recall_authorized(
+    actor: ParticipantId,
+    sender: ParticipantId,
+    room_role: Option<&str>,
+) -> std::result::Result<(), aero_common::Error> {
+    if actor == sender || matches!(room_role, Some("owner" | "admin")) {
+        Ok(())
+    } else {
+        Err(aero_common::Error::Forbidden(
+            "only author or room admin may recall".into(),
+        ))
+    }
+}
+
+/// Default recall window (`AERO_RECALL_WINDOW_SECS` fallback): 24 hours.
+pub(crate) const RECALL_WINDOW_DEFAULT_SECS: i64 = 86_400;
+
+/// Parse an `AERO_RECALL_WINDOW_SECS`-style raw value: `0` → unlimited
+/// (`time::Duration::ZERO`); unset / garbage / negative / overflow → the
+/// 86400s default (repo `env_parse(...).unwrap_or(default)` convention — a
+/// hot-path knob must not brick startup on a typo). Pure so it is
+/// unit-testable without process-global env mutation (parallel-unsafe).
+pub(crate) fn parse_recall_window(raw: Option<&str>) -> time::Duration {
+    match raw.and_then(|v| v.trim().parse::<i64>().ok()) {
+        Some(secs) if secs >= 0 => time::Duration::seconds(secs),
+        _ => time::Duration::seconds(RECALL_WINDOW_DEFAULT_SECS),
+    }
+}
+
+/// Thin env wrapper — read ONCE at [`ImService::new`](crate::ImService::new)
+/// so tests inject exact windows via `with_recall_window` instead of mutating
+/// the process-global env (parallel-unsafe).
+pub(crate) fn recall_window_from_env() -> time::Duration {
+    parse_recall_window(std::env::var("AERO_RECALL_WINDOW_SECS").ok().as_deref())
+}
 
 #[derive(Debug, Clone)]
 pub struct SendMessageOutcome {
@@ -69,6 +112,9 @@ impl ImService {
     /// Sender-confirmed message send using a stable client UUID. A retry with
     /// the same sender/key/payload returns the canonical message without
     /// publishing or dispatching any side effect again.
+    // Internal service method with a fixed signature; grouping params into a
+    // struct would churn the callers for no behavioral gain.
+    #[allow(clippy::too_many_arguments)]
     pub async fn send_message_idempotent(
         &self,
         sender: ParticipantId,
@@ -363,6 +409,11 @@ impl ImService {
         if existing.deleted_at.is_some() {
             return Err(Error::Conflict("message is deleted".into()));
         }
+        // A recalled message is terminal for user content mutations: its body is
+        // the system placeholder and must not be overwritten back into view.
+        if existing.recalled_at.is_some() {
+            return Err(Error::Conflict("message is recalled".into()));
+        }
         if existing.sender_id != actor {
             return Err(Error::Forbidden("only sender may edit".into()));
         }
@@ -412,6 +463,147 @@ impl ImService {
             &[("op", "delete")],
         );
         Ok(())
+    }
+
+    /// Resolve and authorize a recall before an edge spends tenant rate
+    /// capacity. Mirrors [`Self::assert_message_edit_preflight`]: resolves the
+    /// message's room through the shared access guard so the rate gate can
+    /// charge the right workspace (and non-members can never drain a victim's
+    /// budget by spamming message ids), and carries the recall role gate
+    /// (author or room owner/admin — edit's preflight carries its sender gate
+    /// the same way). The role check MUST run here, before the edge charges
+    /// the workspace budget: a doomed recall attempt by a plain member fails
+    /// with `Forbidden` from this preflight and never consumes shared rate
+    /// capacity (gate S1 — the rate gate itself must not be a workspace-wide
+    /// `DoS` amplifier). The author recall-window check runs here for the same
+    /// reason: a window-expired attempt is doomed and must not burn the budget
+    /// either. The eventual [`Self::recall_message`] call repeats every check so
+    /// a concurrent membership, account, or state change cannot turn this
+    /// preflight result into authority.
+    pub async fn assert_message_recall_preflight(
+        &self,
+        actor: ParticipantId,
+        id: MessageId,
+    ) -> Result<RoomId> {
+        let existing = self
+            .messages
+            .get(id)
+            .await?
+            .ok_or_else(|| Error::NotFound(format!("message {id}")))?;
+        // Resolve the message's tenant/room first, then apply the shared access
+        // guard before any state check. This prevents a global message id from
+        // becoming an IDOR/oracle across workspaces.
+        self.assert_room_access(actor, existing.room_id).await?;
+        if existing.deleted_at.is_some() {
+            return Err(Error::Conflict("message is deleted".into()));
+        }
+        if existing.recalled_at.is_some() {
+            return Err(Error::Conflict("message is already recalled".into()));
+        }
+        // Author, or room owner/admin — BEFORE any edge charges rate capacity.
+        // Same stable error `recall_message` returns (the commit-time storage
+        // path re-checks this rule under row locks; this read only produces the
+        // early 403 without spending budget).
+        let role = aero_storage::RoomRoleRepo::new(self.messages.pool.clone())
+            .role_of(existing.room_id, actor)
+            .await?;
+        recall_authorized(actor, existing.sender_id, role.as_deref())?;
+        // Recall window (撤回时间窗): author-only — room owner/admin recall is
+        // the moderation path and is exempt. Runs AFTER the role gate so the
+        // window state is never revealed to non-privileged actors, and before
+        // the rate charge (gate S1). The storage transaction re-checks this
+        // against the row-locked snapshot; this read only produces the early
+        // 409. Emits the rejection counter here — the single choke point shared
+        // by REST and WS (the tx-fence boundary-race fraction is not counted).
+        if existing.sender_id == actor
+            && recall_window_expired(
+                existing.created_at,
+                aero_common::time::now_utc(),
+                self.recall_window,
+            )
+        {
+            metrics::inc_counter(names::MESSAGES_RECALL_EXPIRED_TOTAL, 1);
+            return Err(Error::Conflict("recall window expired".into()));
+        }
+        Ok(existing.room_id)
+    }
+
+    /// Recall (撤回) a message: the sender — or a room owner/admin — replaces
+    /// its content with the system placeholder while the row, room history and
+    /// audit trail stay intact, then broadcasts a `Recalled` room event so every
+    /// client renders the placeholder.
+    ///
+    /// Stable failure paths, in evaluation order (a caller outside the room must
+    /// never learn anything about the message's state — no existence oracle):
+    /// 1. unknown message → `NotFound`;
+    /// 2. no room access (non-member / cross-workspace) → `Forbidden`;
+    /// 3. already deleted → `Conflict("message is deleted")`;
+    /// 4. already recalled → `Conflict("message is already recalled")`;
+    /// 5. member (not author, not admin/owner) → `Forbidden`;
+    /// 6. author outside the recall window (`AERO_RECALL_WINDOW_SECS`) →
+    ///    `Conflict("recall window expired")` — room owner/admin recall
+    ///    (moderation path) is exempt.
+    /// The commit-time storage path re-checks access, role, state and the
+    /// window under row locks, so this preflight is UX only, never authority.
+    #[instrument(skip(self), fields(?actor, ?id))]
+    pub async fn recall_message(&self, actor: ParticipantId, id: MessageId) -> Result<Message> {
+        let started = std::time::Instant::now();
+        let existing = self
+            .messages
+            .get(id)
+            .await?
+            .ok_or_else(|| Error::NotFound(format!("message {id}")))?;
+        // Resolve the message's tenant/room first, then apply the shared access
+        // guard before any state check. This prevents a global message id from
+        // becoming an IDOR/oracle across workspaces.
+        self.assert_room_access(actor, existing.room_id).await?;
+        if existing.deleted_at.is_some() {
+            return Err(Error::Conflict("message is deleted".into()));
+        }
+        if existing.recalled_at.is_some() {
+            return Err(Error::Conflict("message is already recalled".into()));
+        }
+        // Author, or room owner/admin. The role is re-checked inside the storage
+        // transaction under locks; this read only produces the stable early 403.
+        let role = aero_storage::RoomRoleRepo::new(self.messages.pool.clone())
+            .role_of(existing.room_id, actor)
+            .await?;
+        recall_authorized(actor, existing.sender_id, role.as_deref())?;
+        // Author-only recall window — same rule as the preflight; room
+        // owner/admin recall is exempt. Re-checked inside the storage
+        // transaction under the row lock (authority); this read only produces
+        // the stable early 409 for direct callers.
+        if existing.sender_id == actor
+            && recall_window_expired(
+                existing.created_at,
+                aero_common::time::now_utc(),
+                self.recall_window,
+            )
+        {
+            return Err(Error::Conflict("recall window expired".into()));
+        }
+
+        let traceparent = aero_common::telemetry::current_traceparent();
+        let recalled = self
+            .messages
+            .recall_outboxed_authorized(id, actor, self.recall_window, traceparent.as_deref())
+            .await?
+            .ok_or_else(|| Error::Conflict("message recall raced with another mutation".into()))?;
+        if let Err(error) = self.dispatch_event_outbox_id(recalled.outbox_id).await {
+            warn!(
+                ?error,
+                outbox_id = %recalled.outbox_id,
+                message_id = %id,
+                "fast recalled-event outbox dispatch failed"
+            );
+        }
+        metrics::inc_counter(names::MESSAGES_RECALLED_TOTAL, 1);
+        metrics::observe_histogram_labeled(
+            names::MESSAGE_PROCESSING_DURATION_SECONDS,
+            started.elapsed().as_secs_f64(),
+            &[("op", "recall")],
+        );
+        Ok(recalled.message)
     }
 
     /// System action: soft-delete a message flagged by AI moderation.
@@ -508,5 +700,97 @@ mod reply_scope_tests {
             Err(Error::Invalid(message))
                 if message.contains(&parent.to_string()) && message.contains(&room.to_string())
         ));
+    }
+}
+
+#[cfg(test)]
+mod recall_permission_tests {
+    use super::*;
+
+    /// The full recall permission matrix, table-driven: actor kind × room role
+    /// → allow / stable 403. Author always allowed; owner/admin allowed; plain
+    /// member (non-author) forbidden; stranger (None role) forbidden. State
+    /// transitions (already-recalled / deleted) are rejected in
+    /// [`ImService::recall_message`] before this is consulted, so the pure
+    /// function only decides the permission axis.
+    #[test]
+    fn recall_permission_matrix() {
+        let author = ParticipantId::new();
+        let admin = ParticipantId::new();
+        let owner = ParticipantId::new();
+        let member = ParticipantId::new();
+        let stranger = ParticipantId::new();
+
+        let cases: Vec<(&str, ParticipantId, Option<&str>, bool)> = vec![
+            ("author", author, None, true), // author needs no role
+            ("author-as-member", author, Some("member"), true),
+            ("admin", admin, Some("admin"), true),
+            ("owner", owner, Some("owner"), true),
+            ("member-non-author", member, Some("member"), false),
+            ("stranger", stranger, None, false), // no membership edge
+        ];
+        for (label, actor, role, allowed) in cases {
+            match recall_authorized(actor, author, role) {
+                Ok(()) => assert!(allowed, "{label}: expected Forbidden"),
+                Err(Error::Forbidden(msg)) => {
+                    assert!(!allowed, "{label}: expected allow");
+                    assert_eq!(msg, "only author or room admin may recall");
+                }
+                Err(other) => panic!("{label}: unexpected error {other:?}"),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod recall_window_tests {
+    use super::*;
+
+    #[test]
+    fn parse_recall_window_defaults_and_unlimited() {
+        // Unset → 86400s default.
+        assert_eq!(parse_recall_window(None), time::Duration::seconds(86_400));
+        // 0 = unlimited.
+        assert_eq!(parse_recall_window(Some("0")), time::Duration::ZERO);
+        // Valid values, trimmed.
+        assert_eq!(parse_recall_window(Some("60")), time::Duration::seconds(60));
+        assert_eq!(parse_recall_window(Some(" 60 ")), time::Duration::seconds(60));
+        // Garbage / negative / empty / float / overflow → default fallback.
+        for raw in ["abc", "-5", "1.5", "", "99999999999999999999999"] {
+            assert_eq!(
+                parse_recall_window(Some(raw)),
+                time::Duration::seconds(86_400),
+                "raw={raw:?} must fall back to the default"
+            );
+        }
+    }
+
+    #[test]
+    fn recall_window_boundary_is_inclusive_and_zero_is_unlimited() {
+        let window = time::Duration::seconds(86_400);
+        // Single captured `now` for both sides: t = window exactly → allowed
+        // (inclusive boundary).
+        let now = time::OffsetDateTime::now_utc();
+        assert!(!recall_window_expired(now - window, now, window));
+        // t = window + 1s → expired.
+        assert!(recall_window_expired(
+            now - window - time::Duration::seconds(1),
+            now,
+            window
+        ));
+        // window ZERO = unlimited at any age.
+        assert!(!recall_window_expired(
+            now - time::Duration::days(365),
+            now,
+            time::Duration::ZERO
+        ));
+        // Future created_at (clock skew) → not expired.
+        assert!(!recall_window_expired(
+            now + time::Duration::seconds(60),
+            now,
+            window
+        ));
+        // Just sent → not expired.
+        assert!(!recall_window_expired(now, now, window));
     }
 }

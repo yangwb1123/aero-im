@@ -19,6 +19,8 @@ struct DeliveryMessageRow {
     created_at: time::OffsetDateTime,
     edited_at: Option<time::OffsetDateTime>,
     deleted_at: Option<time::OffsetDateTime>,
+    recalled_at: Option<time::OffsetDateTime>,
+    recalled_by: Option<uuid::Uuid>,
     expires_at: Option<time::OffsetDateTime>,
     version: i32,
     delivery_ordinal: i64,
@@ -38,6 +40,8 @@ impl DeliveryMessageRow {
                 created_at: self.created_at,
                 edited_at: self.edited_at,
                 deleted_at: self.deleted_at,
+                recalled_at: self.recalled_at,
+                recalled_by: self.recalled_by.map(ParticipantId::from_uuid),
                 expires_at: self.expires_at,
                 version: self.version,
             },
@@ -59,8 +63,8 @@ impl MessageRepo {
         limit: i64,
     ) -> Result<Vec<(Message, i64)>, sqlx::Error> {
         let rows = sqlx::query_as::<_, DeliveryMessageRow>(
-            r#"SELECT id, room_id, sender_id, blocks, reply_to, metadata,
-                      created_at, edited_at, deleted_at, expires_at, version,
+            r"SELECT id, room_id, sender_id, blocks, reply_to, metadata,
+                      created_at, edited_at, deleted_at, recalled_at, recalled_by, expires_at, version,
                       delivery_ordinal
                 FROM messages
                 WHERE room_id = $1
@@ -68,7 +72,7 @@ impl MessageRepo {
                   AND deleted_at IS NULL
                   AND (expires_at IS NULL OR expires_at > now())
                 ORDER BY delivery_ordinal
-                LIMIT $3"#,
+                LIMIT $3",
         )
         .bind(room.to_uuid())
         .bind(after_ordinal.max(0))
@@ -89,15 +93,15 @@ impl MessageRepo {
         limit: i64,
     ) -> Result<Vec<(Message, i64)>, sqlx::Error> {
         let mut rows = sqlx::query_as::<_, DeliveryMessageRow>(
-            r#"SELECT id, room_id, sender_id, blocks, reply_to, metadata,
-                      created_at, edited_at, deleted_at, expires_at, version,
+            r"SELECT id, room_id, sender_id, blocks, reply_to, metadata,
+                      created_at, edited_at, deleted_at, recalled_at, recalled_by, expires_at, version,
                       delivery_ordinal
                  FROM messages
                 WHERE room_id = $1
                   AND deleted_at IS NULL
                   AND (expires_at IS NULL OR expires_at > now())
                 ORDER BY delivery_ordinal DESC
-                LIMIT $2"#,
+                LIMIT $2",
         )
         .bind(room.to_uuid())
         .bind(limit.clamp(1, 500))
@@ -119,11 +123,11 @@ impl MessageRepo {
         let limit = limit.clamp(1, 200);
         let rows = if let Some(b) = before {
             sqlx::query_as::<_, MessageRow>(
-                r#"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at, version
+                r"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, recalled_at, recalled_by, expires_at, version
                    FROM messages
                    WHERE room_id = $1 AND id < $2 AND deleted_at IS NULL AND (expires_at IS NULL OR expires_at > now())
                    ORDER BY id DESC
-                   LIMIT $3"#,
+                   LIMIT $3",
             )
             .bind(room.to_uuid())
             .bind(b.to_uuid())
@@ -132,11 +136,11 @@ impl MessageRepo {
             .await?
         } else {
             sqlx::query_as::<_, MessageRow>(
-                r#"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at, version
+                r"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, recalled_at, recalled_by, expires_at, version
                    FROM messages
                    WHERE room_id = $1 AND deleted_at IS NULL AND (expires_at IS NULL OR expires_at > now())
                    ORDER BY id DESC
-                   LIMIT $2"#,
+                   LIMIT $2",
             )
             .bind(room.to_uuid())
             .bind(limit)
@@ -146,14 +150,17 @@ impl MessageRepo {
         Ok(rows.into_iter().map(Message::from).collect())
     }
 
-    /// Messages **edited or deleted** since the `since` instant (ROADMAP 方向一
-    /// change-replay): a client offline during an edit/delete to a message it
-    /// already holds converges on those mutations on reconnect. Ordered
-    /// oldest-change-first. `GREATEST(edited_at, deleted_at)` is the latest mutation
-    /// instant (NULL-ignoring), so the predicate ≡ `edited_at > since OR deleted_at >
-    /// since` (index-backed by migration 0125). TOMBSTONES ARE INCLUDED (no
-    /// `deleted_at IS NULL` filter) — a populated `deleted_at` tells the caller to
-    /// remove the message, otherwise replace it.
+    /// Messages **edited, deleted, or recalled** since the `since` instant
+    /// (ROADMAP 方向一 change-replay): a client offline during an edit/delete/
+    /// recall to a message it already holds converges on those mutations on
+    /// reconnect. Ordered oldest-change-first. `GREATEST(edited_at, deleted_at,
+    /// recalled_at)` is the latest mutation instant (NULL-ignoring), so the
+    /// predicate ≡ `edited_at > since OR deleted_at > since OR recalled_at >
+    /// since` (index-backed by migration 0238's reissued 0125 expression index).
+    /// Recall does NOT bump `edited_at`, so omitting `recalled_at` here would
+    /// leave offline clients showing pre-recall content forever. TOMBSTONES ARE
+    /// INCLUDED (no `deleted_at IS NULL` filter) — a populated `deleted_at`
+    /// tells the caller to remove the message, otherwise replace it.
     ///
     /// REGRESSION GUARD: the `message.rs`→`message/` split rewrote this into an
     /// id-keyed, tombstone-EXCLUDING keyset (that is the PII-scan shape — now
@@ -168,11 +175,11 @@ impl MessageRepo {
     ) -> Result<Vec<Message>, sqlx::Error> {
         let limit = limit.clamp(1, 200);
         let rows: Vec<MessageRow> = sqlx::query_as(
-            r#"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at, version
+            r"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, recalled_at, recalled_by, expires_at, version
                FROM messages
-               WHERE room_id = $1 AND GREATEST(edited_at, deleted_at) > $2
-               ORDER BY GREATEST(edited_at, deleted_at) ASC
-               LIMIT $3"#,
+               WHERE room_id = $1 AND GREATEST(edited_at, deleted_at, recalled_at) > $2
+               ORDER BY GREATEST(edited_at, deleted_at, recalled_at) ASC
+               LIMIT $3",
         )
         .bind(room.to_uuid())
         .bind(since)
@@ -196,11 +203,11 @@ impl MessageRepo {
         let limit = limit.clamp(1, 200);
         let rows: Vec<MessageRow> = if let Some(r) = room {
             sqlx::query_as(
-                r#"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at, version
+                r"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, recalled_at, recalled_by, expires_at, version
                    FROM messages
                    WHERE room_id = $1 AND id > $2 AND deleted_at IS NULL AND (expires_at IS NULL OR expires_at > now())
                    ORDER BY id
-                   LIMIT $3"#,
+                   LIMIT $3",
             )
             .bind(r.to_uuid())
             .bind(after.to_uuid())
@@ -209,11 +216,11 @@ impl MessageRepo {
             .await?
         } else {
             sqlx::query_as(
-                r#"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at, version
+                r"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, recalled_at, recalled_by, expires_at, version
                    FROM messages
                    WHERE id > $1 AND deleted_at IS NULL AND (expires_at IS NULL OR expires_at > now())
                    ORDER BY id
-                   LIMIT $2"#,
+                   LIMIT $2",
             )
             .bind(after.to_uuid())
             .bind(limit)
@@ -240,12 +247,12 @@ impl MessageRepo {
         limit: i64,
     ) -> Result<Vec<Message>, sqlx::Error> {
         let rows: Vec<MessageRow> = sqlx::query_as(
-            r#"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at, version
+            r"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, recalled_at, recalled_by, expires_at, version
                FROM messages
                WHERE room_id = $1 AND id > $2
                  AND (expires_at IS NULL OR expires_at > now())
                ORDER BY id
-               LIMIT $3"#,
+               LIMIT $3",
         )
         .bind(room.to_uuid())
         .bind(since.to_uuid())
@@ -264,11 +271,11 @@ impl MessageRepo {
     ) -> Result<(Vec<Message>, bool), sqlx::Error> {
         let half_window = half_window.clamp(1, 100);
         let before: Vec<MessageRow> = sqlx::query_as(
-            r#"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at, version
+            r"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, recalled_at, recalled_by, expires_at, version
                FROM messages
                WHERE room_id = $1 AND id < $2 AND deleted_at IS NULL AND (expires_at IS NULL OR expires_at > now())
                ORDER BY id DESC
-               LIMIT $3"#,
+               LIMIT $3",
         )
         .bind(room.to_uuid())
         .bind(around.to_uuid())
@@ -279,20 +286,20 @@ impl MessageRepo {
         // fetched only the before/after windows and dropped this, so the permalink
         // "jump to message" context omitted its own target. Restored.
         let target: Option<MessageRow> = sqlx::query_as(
-            r#"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at, version
+            r"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, recalled_at, recalled_by, expires_at, version
                FROM messages
-               WHERE room_id = $1 AND id = $2 AND deleted_at IS NULL AND (expires_at IS NULL OR expires_at > now())"#,
+               WHERE room_id = $1 AND id = $2 AND deleted_at IS NULL AND (expires_at IS NULL OR expires_at > now())",
         )
         .bind(room.to_uuid())
         .bind(around.to_uuid())
         .fetch_optional(&self.pool)
         .await?;
         let after: Vec<MessageRow> = sqlx::query_as(
-            r#"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at, version
+            r"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, recalled_at, recalled_by, expires_at, version
                FROM messages
                WHERE room_id = $1 AND id > $2 AND deleted_at IS NULL AND (expires_at IS NULL OR expires_at > now())
                ORDER BY id
-               LIMIT $3"#,
+               LIMIT $3",
         )
         .bind(room.to_uuid())
         .bind(around.to_uuid())
@@ -304,7 +311,8 @@ impl MessageRepo {
         // truncates `after`, and signalling only on `before` would tell the client
         // "nothing more" while newer messages stay unloaded. Capture both lengths
         // before the rows are consumed below.
-        let has_more = before.len() >= half_window as usize || after.len() >= half_window as usize;
+        let half_window = usize::try_from(half_window).expect("window is non-negative");
+        let has_more = before.len() >= half_window || after.len() >= half_window;
         let mut all: Vec<Message> = before.into_iter().map(Message::from).collect();
         all.reverse();
         all.extend(target.into_iter().map(Message::from));
@@ -320,12 +328,16 @@ impl MessageRepo {
             // (e.g. an image/file block with no caption) can never get a meaningful
             // embedding, so without this filter the 300s backfill loop re-selects and
             // re-enqueues it every cycle forever — perpetual embedding-API spend. The
-            // message.rs→message/ split dropped this term; restored.
-            r#"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at, version
+            // message.rs→message/ split dropped this term; restored. `recalled_at IS
+            // NULL` is defense-in-depth: recall clears `searchable_text`/`embedding`
+            // atomically, so recalled rows are already excluded — the explicit fence
+            // keeps the backfill safe if that clear ever changes.
+            r"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, recalled_at, recalled_by, expires_at, version
                FROM messages
-               WHERE embedding IS NULL AND deleted_at IS NULL AND (expires_at IS NULL OR expires_at > now()) AND searchable_text <> ''
+               WHERE embedding IS NULL AND deleted_at IS NULL AND recalled_at IS NULL
+                 AND (expires_at IS NULL OR expires_at > now()) AND searchable_text <> ''
                ORDER BY created_at ASC
-               LIMIT $1"#,
+               LIMIT $1",
         )
         .bind(limit)
         .fetch_all(&self.pool)
@@ -341,11 +353,11 @@ impl MessageRepo {
     ) -> Result<Vec<Message>, sqlx::Error> {
         let limit = limit.clamp(1, crate::message::orig::EXPORT_SENDER_CAP);
         let rows = sqlx::query_as::<_, MessageRow>(
-            r#"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at, version
+            r"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, recalled_at, recalled_by, expires_at, version
                FROM messages
                WHERE sender_id = $1 AND deleted_at IS NULL AND (expires_at IS NULL OR expires_at > now())
                ORDER BY id DESC
-               LIMIT $2"#,
+               LIMIT $2",
         )
         .bind(sender.to_uuid())
         .bind(limit)
@@ -364,11 +376,11 @@ impl MessageRepo {
     ) -> Result<Vec<Message>, sqlx::Error> {
         let limit = limit.clamp(1, 500);
         let rows = sqlx::query_as::<_, MessageRow>(
-            r#"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at, version
+            r"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, recalled_at, recalled_by, expires_at, version
                FROM messages
                WHERE sender_id = $1 AND id < $2
                ORDER BY id DESC
-               LIMIT $3"#,
+               LIMIT $3",
         )
         .bind(sender.to_uuid())
         .bind(before.to_uuid())
@@ -389,8 +401,8 @@ impl MessageRepo {
     ) -> Result<Vec<Message>, sqlx::Error> {
         let limit = limit.clamp(1, 200);
         let rows = sqlx::query_as::<_, MessageRow>(
-            r#"SELECT m.id, m.room_id, m.sender_id, m.blocks, m.reply_to, m.metadata,
-                     m.created_at, m.edited_at, m.deleted_at, m.expires_at, m.version
+            r"SELECT m.id, m.room_id, m.sender_id, m.blocks, m.reply_to, m.metadata,
+                     m.created_at, m.edited_at, m.deleted_at, m.recalled_at, m.recalled_by, m.expires_at, m.version
                FROM messages m
                JOIN rooms r ON r.id = m.room_id
                JOIN workspaces w ON w.id = r.workspace_id
@@ -414,7 +426,7 @@ impl MessageRepo {
                  AND (m.expires_at IS NULL OR m.expires_at > now())
                  AND r.workspace_id = $2
                ORDER BY m.id DESC
-               LIMIT $3"#,
+               LIMIT $3",
         )
         .bind(participant.to_uuid())
         .bind(workspace.to_uuid())

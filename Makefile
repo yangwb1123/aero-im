@@ -90,8 +90,12 @@ ci: ## Full CI pipeline: check + gates
 	cargo run --bin aero-cli -- gate all
 
 .PHONY: ci-full
-ci-full: ci ## Full CI + integration tests (requires PostgreSQL)
+ci-full: ci ## Full CI + integration tests (requires PostgreSQL + Redis)
 	bash scripts/test-integration.sh
+
+.PHONY: test-notification-fanout
+test-notification-fanout: ## notification fan-out DB-gated suite (throwaway DB + required Redis presence leg)
+	@bash scripts/test-notification-fanout.sh
 
 .PHONY: dev
 dev: ## Start development environment

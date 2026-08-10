@@ -28,7 +28,7 @@ export function initLive() {
           // on the hidden video for unusual native implementations.
           video.style.display = 'none';
           const ph = document.createElement('div'); ph.className = 'live-thumb';
-          ph.style.cssText = 'display:grid;place-items:center;color:#888;';
+          ph.style.cssText = 'display:grid;place-items:center;color:var(--text-mute);';
           ph.textContent = '当前浏览器不支持 HLS 播放';
           card.appendChild(ph);
         }

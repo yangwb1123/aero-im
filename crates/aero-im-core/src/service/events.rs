@@ -5,7 +5,6 @@
 use aero_bus::{traits::BusError, EventBus};
 use aero_common::{metrics, ParticipantId, RoomEvent, RoomId};
 use async_trait::async_trait;
-use bytes;
 use tracing::warn;
 use uuid::Uuid;
 

@@ -115,29 +115,26 @@ where
         // wrong-kind, malformed claims, and especially a revoked session are hard
         // rejects and MUST NOT fall through to PAT/bot verification. Only a value
         // that is not a valid JWT at all may be considered an opaque credential.
-        let user = match svc.verify(token) {
-            Ok(claims) => {
-                svc.assert_access_claims_active(&claims)
+        let user = if let Ok(claims) = svc.verify(token) {
+            svc.assert_access_claims_active(&claims)
+                .await
+                .map_err(|_| AuthRejection::new("invalid, expired, or revoked token"))?;
+            auth_user_from_access_claims(&claims)
+                .map_err(|_| AuthRejection::new("invalid access-token claims"))?
+        } else {
+            // PAT and bot tokens have disjoint, self-gating prefixes, so at
+            // most one storage lookup runs for a given opaque bearer.
+            let pid = match svc.verify_pat(token).await {
+                Some(owner) => owner,
+                None => svc
+                    .verify_bot_token(token)
                     .await
-                    .map_err(|_| AuthRejection::new("invalid, expired, or revoked token"))?;
-                auth_user_from_access_claims(&claims)
-                    .map_err(|_| AuthRejection::new("invalid access-token claims"))?
-            }
-            Err(_) => {
-                // PAT and bot tokens have disjoint, self-gating prefixes, so at
-                // most one storage lookup runs for a given opaque bearer.
-                let pid = match svc.verify_pat(token).await {
-                    Some(owner) => owner,
-                    None => svc
-                        .verify_bot_token(token)
-                        .await
-                        .ok_or_else(|| AuthRejection::new("invalid or expired token"))?,
-                };
-                AuthUser {
-                    participant_id: pid,
-                    session_id: None,
-                    exp: None,
-                }
+                    .ok_or_else(|| AuthRejection::new("invalid or expired token"))?,
+            };
+            AuthUser {
+                participant_id: pid,
+                session_id: None,
+                exp: None,
             }
         };
 

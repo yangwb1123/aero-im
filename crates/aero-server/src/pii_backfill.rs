@@ -172,7 +172,7 @@ pub async fn run_backfill_scan(
         if page.is_empty() {
             break;
         }
-        cursor = page.last().map(|m| m.id).unwrap_or(cursor);
+        cursor = page.last().map_or(cursor, |m| m.id);
         scanned += page.len() as u64;
 
         let items: Vec<ScanItem> = page
@@ -189,7 +189,7 @@ pub async fn run_backfill_scan(
         total_findings += findings.len() as u64;
 
         // A short page means we've reached the end of history.
-        if page.len() < PAGE_SIZE as usize {
+        if page.len() < usize::try_from(PAGE_SIZE).expect("PAGE_SIZE is positive") {
             break;
         }
 

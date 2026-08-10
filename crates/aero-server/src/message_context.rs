@@ -73,8 +73,8 @@ fn target_is_visible(message: &Message, now: time::OffsetDateTime) -> bool {
 }
 
 fn context_response_value(
-    target: Message,
-    messages: Vec<Message>,
+    target: &Message,
+    messages: &[Message],
     has_more: bool,
 ) -> serde_json::Value {
     serde_json::json!({
@@ -135,7 +135,7 @@ async fn message_context(
         }
         Err(error) => return Err(AeroError::from(error).into()),
     };
-    Ok(Json(context_response_value(target, messages, has_more)))
+    Ok(Json(context_response_value(&target, &messages, has_more)))
 }
 
 #[cfg(test)]
@@ -158,6 +158,8 @@ mod tests {
             created_at: datetime!(2026-01-01 00:00:00 UTC),
             edited_at: None,
             deleted_at,
+            recalled_at: None,
+            recalled_by: None,
             expires_at,
             version: 1,
         }
@@ -206,7 +208,7 @@ mod tests {
     fn context_response_keeps_messages_as_an_array_and_exposes_has_more() {
         let target = message(None, None);
         let context = message(None, None);
-        let value = context_response_value(target, vec![context], true);
+        let value = context_response_value(&target, std::slice::from_ref(&context), true);
 
         assert!(value["messages"].is_array());
         assert_eq!(value["messages"].as_array().map(Vec::len), Some(1));

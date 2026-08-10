@@ -99,6 +99,14 @@ async fn committed_or_racing_block_prevents_dm_creation() {
             .await
             .unwrap();
     assert_eq!(direct_rooms, 0);
+    // 0227 owner guard: drop memberships first so the raw participant DELETE
+    // satisfies `participant_workspace_raw_owner_guard` (same pattern as
+    // call/security_tests.rs).
+    sqlx::query("DELETE FROM workspace_members WHERE participant_id = ANY($1)")
+        .bind(vec![alice.to_uuid(), bob.to_uuid()])
+        .execute(&pg)
+        .await
+        .unwrap();
     sqlx::query("DELETE FROM participants WHERE id = ANY($1)")
         .bind(vec![alice.to_uuid(), bob.to_uuid()])
         .execute(&pg)

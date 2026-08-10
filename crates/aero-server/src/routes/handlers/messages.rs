@@ -105,7 +105,7 @@ struct EditMessageReq {
 
 /// `GET /api/messages/:id` — fetch a single (non-deleted) message, gated on the
 /// caller's access to its room. Backs deep-links/permalinks and matches the
-/// operation the OpenAPI spec advertises. 404 when the message is missing or
+/// operation the `OpenAPI` spec advertises. 404 when the message is missing or
 /// soft-deleted; 403 when the caller can't see its room.
 async fn get_message(
     State(s): State<AppState>,
@@ -159,6 +159,35 @@ async fn delete_message(
     // append are one invariant instead of two subtly different implementations.
     s.im.delete_message(auth.participant_id, id).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// `POST /api/messages/:id/recall` — recall (撤回) a message: the author or a
+/// room owner/admin replaces its content with the system placeholder, keeps the
+/// row/history/audit, and broadcasts a `Recalled` room event. Same service
+/// method as the WebSocket `recall_message` frame, so tenant access, permission,
+/// audit and the durable event append are one invariant. Returns the updated
+/// message (placeholder blocks + `recalled_at`/`recalled_by`) so the caller can
+/// render it immediately. Stable failures: 404 unknown message, 403 non-member
+/// or non-author member, 409 already recalled / already deleted / recall
+/// window expired (author outside `AERO_RECALL_WINDOW_SECS`; room owner/admin
+/// recall is exempt). Rate-gated
+/// like edit: the access-checking preflight resolves the room, then the room's
+/// workspace budget is charged (`check_ws_rate_room`) before the ~8-10 query
+/// mutation runs.
+async fn recall_message(
+    State(s): State<AppState>,
+    auth: AuthUser,
+    Path(id_str): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let id =
+        MessageId::from_str(&id_str).map_err(|e| AeroError::Invalid(format!("message id: {e}")))?;
+    let room = s
+        .im
+        .assert_message_recall_preflight(auth.participant_id, id)
+        .await?;
+    crate::ws_rate::check_ws_rate_room(&s, room).await?;
+    let recalled = s.im.recall_message(auth.participant_id, id).await?;
+    Ok(Json(serde_json::to_value(recalled).map_err(AeroError::from)?))
 }
 
 #[derive(Deserialize)]

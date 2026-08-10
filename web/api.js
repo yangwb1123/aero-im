@@ -370,6 +370,15 @@ export const api = {
   deleteMessage(id) {
     return request('DELETE', `/api/messages/${encodeURIComponent(id)}`);
   },
+  // Recall (撤回): author or room admin replaces the content with the system
+  // placeholder. Rejects with 409 when already recalled/deleted — callers may
+  // treat that as success (the desired end state is achieved). EXCEPT
+  // "recall window expired": that 409 is a rejection, not a success — surface
+  // it (web/recall_errors.js). The wire msg carries the thiserror prefix
+  // ("conflict: recall window expired").
+  recallMessage(id) {
+    return request('POST', `/api/messages/${encodeURIComponent(id)}/recall`);
+  },
   toggleReaction(messageId, emoji) {
     return request('POST', `/api/messages/${encodeURIComponent(messageId)}/reactions`, {
       body: { emoji },
@@ -482,6 +491,21 @@ export const api = {
     const body = { room_id: roomId, display_name, kind };
     if (avatar_url) body.avatar_url = avatar_url;
     return request('POST', '/api/agents', { body });
+  },
+
+  // ----- per-room composer drafts -----
+  // Server-persisted composer drafts (private to the author; follow across
+  // devices/reloads). One draft per (participant, room); save is an upsert.
+  getDraft(roomId) {
+    return request('GET', `/api/rooms/${encodeURIComponent(roomId)}/draft`);
+  },
+  saveDraft(roomId, { blocks, reply_to } = {}) {
+    const body = { blocks };
+    if (reply_to) body.reply_to = reply_to;
+    return request('PUT', `/api/rooms/${encodeURIComponent(roomId)}/draft`, { body });
+  },
+  deleteDraft(roomId) {
+    return request('DELETE', `/api/rooms/${encodeURIComponent(roomId)}/draft`);
   },
 
   // ----- polls -----

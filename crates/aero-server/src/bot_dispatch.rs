@@ -51,6 +51,7 @@ fn event_type(event: &RoomEvent) -> &'static str {
     match event {
         RoomEvent::Message(_) => "message",
         RoomEvent::Edited(_) => "edited",
+        RoomEvent::Recalled(_) => "recalled",
         RoomEvent::Deleted { .. } => "deleted",
         RoomEvent::Reaction { .. } => "reaction",
         RoomEvent::Read { .. } => "read",

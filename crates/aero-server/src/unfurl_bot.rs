@@ -43,7 +43,7 @@ use crate::{
 /// (constructed by the binary from the shared pool); the real [`ReqwestUnfurler`]
 /// is used for the live fetch.
 pub async fn run(state: AppState, cache: UnfurlRepo) -> anyhow::Result<()> {
-    run_until_cancelled(state, cache, CancellationToken::new()).await
+    Box::pin(run_until_cancelled(state, cache, CancellationToken::new())).await
 }
 
 /// Run with the production transport until `cancel` is triggered.
@@ -67,7 +67,7 @@ pub async fn run_with(
 }
 
 /// Run with an injected transport until `cancel` is triggered, finishing and
-/// ACKing any event already received before returning.
+/// `ACKing` any event already received before returning.
 pub async fn run_with_until_cancelled(
     state: AppState,
     cache: UnfurlRepo,

@@ -280,6 +280,9 @@ impl TelemetryConfig {
 
 impl AppConfig {
     /// Load from `config.toml` (optional) + `AERO__SECTION__KEY` env vars.
+    // figment::Error is 200+ bytes (clippy::result_large_err); config load runs
+    // once at boot, so keep the concrete error type instead of boxing it.
+    #[allow(clippy::result_large_err)]
     pub fn load() -> Result<Self, figment::Error> {
         let _ = dotenvy::dotenv();
         let mut cfg: Self = Figment::new()

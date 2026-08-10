@@ -747,7 +747,7 @@ impl PredictionRepo {
               LIMIT $2 OFFSET $3",
         )
         .bind(viewer.to_uuid())
-        .bind(limit.max(1).min(100))
+        .bind(limit.clamp(1, 100))
         .bind(offset.max(0))
         .fetch_all(&self.pool)
         .await

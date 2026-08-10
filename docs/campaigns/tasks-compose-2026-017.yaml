@@ -1,0 +1,15 @@
+tasks:
+- prompt: '已批准的组合变更 COMPOSE-2026-017。本仓库（aero-im）职责：
+
+    消费 vault.file.notify@1.1（自包含载荷）→ 站内通知送达文件所有者；
+
+    通知失败 best_effort_async（delivery-status 记录，不回滚删除）。
+
+    输出提案文档：事件消费契约（schema 版本/幂等键/重试/死信）、通知模板、
+
+    与既有附件/审核消息链路的关系。不修改代码。
+
+    '
+  output: docs/proposals/compose-2026-017-aero-im.md
+  validate: python3 /home/u1/ai-batch-runner/examples/snaplink-platform/scripts/check-no-refusal.py
+    {output}

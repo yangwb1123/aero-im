@@ -94,6 +94,8 @@ mod tests {
                 created_at: time::OffsetDateTime::UNIX_EPOCH,
                 edited_at: None,
                 deleted_at: None,
+                recalled_at: None,
+                recalled_by: None,
                 expires_at: None,
                 version: 1,
             },
@@ -189,7 +191,7 @@ mod tests {
     #[test]
     fn overlapping_hit_is_deduplicated() {
         let shared = hit(9, 0.5);
-        let fused = fuse_rankings(&[shared.clone()], &[shared.clone()], 10);
+        let fused = fuse_rankings(std::slice::from_ref(&shared), std::slice::from_ref(&shared), 10);
         assert_eq!(fused.len(), 1);
         assert_eq!(fused[0].message.id, shared.message.id);
     }

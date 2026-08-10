@@ -1,6 +1,6 @@
-//! AiService — the high-level AI facade.
+//! `AiService` — the high-level AI facade.
 //!
-//! Split from monolithic `service.rs` (2011 lines) as part of REFACTOR_PLAN.md
+//! Split from monolithic `service.rs` (2011 lines) as part of `REFACTOR_PLAN.md`
 //! Step 3. The main `impl AiService` blocks live in sub-modules.
 
 #![allow(unused_imports)]

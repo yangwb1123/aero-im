@@ -438,7 +438,7 @@ fn resolve_client_ip(
 }
 
 /// Cluster-wide rate check (ROADMAP 第二次分析·方向二): a Redis INCR with a
-/// per-minute expiry keyed on the same [`ClientKey`] the local DashMap uses.
+/// per-minute expiry keyed on the same [`ClientKey`] the local `DashMap` uses.
 ///
 /// The ceiling is [`RateLimiter::per_minute_capacity`] of the SAME limiter
 /// selected for this request's path, so a single instance's traffic never
@@ -455,10 +455,10 @@ async fn check_cluster_rate(state: &AppState, key: &ClientKey, limiter: &RateLim
     // the Redis connection logic and trait imports (ROADMAP 第二次分析·方向二).
     let key_str = match key {
         ClientKey::Participant(pid) => format!("rl:p:{}", pid.to_uuid()),
-        ClientKey::Ip(ip) => format!("rl:i:{}", ip),
+        ClientKey::Ip(ip) => format!("rl:i:{ip}"),
     };
     let store = aero_storage::WsRateStore::new(state.redis_client.clone());
-    let k = format!("{}:{}", key_str, window);
+    let k = format!("{key_str}:{window}");
     let ceiling = limiter.per_minute_capacity();
     match store.incr_raw(k).await {
         Ok(n) => {

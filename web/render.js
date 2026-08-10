@@ -708,6 +708,7 @@ export function renderMessage(m, mePid, participants, opts = {}) {
   const sender = participants.get(m.sender_id);
   const senderName = sender?.display_name || (isSelf ? '我' : shortId(m.sender_id));
   const isDeleted = Boolean(m.deleted_at);
+  const isRecalled = Boolean(m.recalled_at);
   const deliveryStatus = opts.pending ? m.delivery_status : null;
 
   const wrap = el('div', {
@@ -716,7 +717,8 @@ export function renderMessage(m, mePid, participants, opts = {}) {
       (isSelf ? ' self' : '') +
       (opts.pending ? ' pending' : '') +
       (deliveryStatus === 'failed' ? ' failed' : '') +
-      (isDeleted ? ' deleted' : ''),
+      (isDeleted ? ' deleted' : '') +
+      (isRecalled ? ' recalled' : ''),
     dataset: {
       msgId: m.id,
       senderId: m.sender_id || '',
@@ -735,6 +737,9 @@ export function renderMessage(m, mePid, participants, opts = {}) {
   meta.appendChild(timeEl);
   if (m.edited_at) {
     meta.appendChild(el('span', { className: 'edited muted', text: '· 已编辑' }));
+  }
+  if (m.recalled_at) {
+    meta.appendChild(el('span', { className: 'recalled muted', text: '· 已撤回' }));
   }
   if (deliveryStatus) {
     const labels = {
@@ -765,6 +770,9 @@ export function renderMessage(m, mePid, participants, opts = {}) {
   if (isDeleted) {
     bubble.appendChild(el('span', { className: 'muted', text: '消息已删除' }));
   } else {
+    // A recalled message carries the server-authored system placeholder in its
+    // blocks; render them (muted by the .recalled bubble class) so the recall
+    // reads as a placeholder, not as a deleted message.
     bubble.appendChild(buildBlocks(m.blocks, {
       participants,
       live: opts.live,
@@ -775,7 +783,8 @@ export function renderMessage(m, mePid, participants, opts = {}) {
 
   // hover actions row (right-aligned mini buttons for owner; reactions for all)
   const actions = el('div', { className: 'msg-actions' });
-  if (!isDeleted) {
+  // Recalled messages are terminal for content: no react/reply/edit/recall.
+  if (!isDeleted && !isRecalled) {
     const btnReact = el('button', { className: 'msg-act', attrs: { title: '反应' } });
     btnReact.textContent = '☺';
     btnReact.dataset.action = 'react';
@@ -795,10 +804,14 @@ export function renderMessage(m, mePid, participants, opts = {}) {
       const btnEdit = el('button', { className: 'msg-act', attrs: { title: '编辑' } });
       btnEdit.textContent = '✏';
       btnEdit.dataset.action = 'edit';
+      const btnRecall = el('button', { className: 'msg-act', attrs: { title: '撤回' } });
+      btnRecall.textContent = '↶';
+      btnRecall.dataset.action = 'recall';
       const btnDel = el('button', { className: 'msg-act', attrs: { title: '删除' } });
       btnDel.textContent = '🗑';
       btnDel.dataset.action = 'delete';
       actions.appendChild(btnEdit);
+      actions.appendChild(btnRecall);
       actions.appendChild(btnDel);
     }
   }
@@ -906,7 +919,7 @@ export function renderOnlineItem(pid, participant) {
 // ---------- toast ----------
 export function toast(message, kind = 'info', timeout = 3500) {
   const stack = document.getElementById('toast-stack');
-  if (!stack) { console.log(`[toast/${kind}]`, message); return; }
+  if (!stack) return;
   const node = el('div', { className: `toast ${kind}` });
   node.textContent = String(message);
   stack.appendChild(node);

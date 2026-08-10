@@ -163,7 +163,7 @@ impl ActivityStore for InProcessActivityStore {
     fn sweep_idle(&self, now: Instant) -> usize {
         let before = self.senders.len();
         self.senders.retain(|_, act| {
-            act.events.back().map_or(false, |(t, _, _)| {
+            act.events.back().is_some_and(|(t, _, _)| {
                 now.duration_since(*t) <= self.thresholds.window
             })
         });
@@ -208,6 +208,9 @@ impl RedisActivityStore {
     /// Whole-millisecond epoch clock for sorted-set scores (cross-node, unlike
     /// `Instant`). Saturates at 0 for a pre-epoch clock.
     fn now_millis() -> f64 {
+        // Millis timestamps (~1.7e12) are far below 2^53, so the u128→f64
+        // narrowing is exact in practice — a deliberate clock cast.
+        #[allow(clippy::cast_precision_loss)]
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0.0, |d| d.as_millis() as f64)
@@ -232,6 +235,9 @@ impl RedisActivityStore {
         member: &str,
         now_ms: f64,
     ) -> Result<i64, fred::error::RedisError> {
+        // Millis timestamps are far below 2^53, so the u128→f64 narrowing is
+        // exact in practice — a deliberate clock cast.
+        #[allow(clippy::cast_precision_loss)]
         let floor = now_ms - (self.thresholds.window.as_millis() as f64);
         // Evict members older than the window before counting. Use an f64 score
         // bound — fred's String bound does NOT understand Redis's `(` exclusive
@@ -560,7 +566,7 @@ mod redis_tests {
         let g = SpamGuard::with_redis(thresholds(), client().await);
         let sender = ParticipantId::new();
         let t0 = Instant::now();
-        let hash = 0xc0ff_eeu64;
+        let hash = 0x00c0_ffee_u64;
         for _ in 0..3 {
             assert_eq!(
                 g.record(sender, RoomId::new(), hash, t0).await,

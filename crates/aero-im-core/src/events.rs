@@ -13,7 +13,9 @@ use serde::{Deserialize, Serialize};
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ImEvent {
     /// A message was persisted. Also broadcast on `im.room.{id}` as a `RoomEvent::Message`.
-    MessageSent(MessageEnvelope),
+    /// Boxed: `Message` grew recall fields; the variant is wire-only (never
+    /// constructed in-process), and `Box` is serde-transparent on the wire.
+    MessageSent(Box<MessageEnvelope>),
 
     /// A new room was created.
     RoomCreated(Room),

@@ -38,10 +38,10 @@ use crate::{
 /// # Errors
 /// Returns an error if subscribing to the event bus fails.
 pub async fn run(state: AppState) -> anyhow::Result<()> {
-    run_until_cancelled(state, CancellationToken::new()).await
+    Box::pin(run_until_cancelled(state, CancellationToken::new())).await
 }
 
-/// Run until `cancel` is triggered, finishing and ACKing any event already
+/// Run until `cancel` is triggered, finishing and `ACKing` any event already
 /// received before returning.
 pub async fn run_until_cancelled(state: AppState, cancel: CancellationToken) -> anyhow::Result<()> {
     let bus = state.bus.clone();

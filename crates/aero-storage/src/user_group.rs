@@ -404,7 +404,7 @@ impl UserGroupRepo {
     /// Participants being added are validated and locked before the first rename
     /// or membership mutation. Removes deliberately do not require a current
     /// workspace membership: deprovisioning removes that membership first, and a
-    /// later IdP Group PATCH must still be able to clean the stale group edge.
+    /// later `IdP` Group PATCH must still be able to clean the stale group edge.
     /// A later failure can therefore never expose a prefix of the PATCH operations.
     pub async fn patch_scim_group(
         &self,

@@ -1,13 +1,13 @@
 //! JSON frame serialization for WebSocket messages.
 //!
-//! Extracted from `ws/ws_impl.rs` as part of REFACTOR_PLAN.md Step 4.
+//! Extracted from `ws/ws_impl.rs` as part of `REFACTOR_PLAN.md` Step 4.
 //! Uses `ServerFrame` and `Message` from the parent module.
 
 use aero_common::{NotificationKind, RoomEvent};
 
 use super::ws_impl::ServerFrame;
 
-/// Stamp a bus seq onto a ServerFrame JSON value and serialize.
+/// Stamp a bus seq onto a `ServerFrame` JSON value and serialize.
 fn stamped_frame_json(frame: &ServerFrame<'_>, seq: Option<u64>) -> String {
     match serde_json::to_value(frame) {
         Ok(mut value) => {
@@ -27,6 +27,7 @@ pub fn room_event_to_frame_json(event: &RoomEvent, seq: Option<u64>) -> String {
             client_message_id: env.client_message_id,
         },
         RoomEvent::Edited(m) => ServerFrame::Edited { message: m },
+        RoomEvent::Recalled(m) => ServerFrame::Recalled { message: m },
         RoomEvent::Deleted {
             room_id,
             message_id,
@@ -219,4 +220,66 @@ mod tests {
         assert_eq!(frame["op_seq"], 23, "durable per-canvas recovery cursor");
         assert_eq!(frame["op"]["type"], "insert");
     }
+}
+
+/// Contract test (acceptance point): a `Recalled` room event must serialize
+/// to the exact WS wire shape the web client renders — `type:"recalled"`,
+/// the full updated message with the system placeholder body, `recalled_at`
+/// / `recalled_by` present, and the bus `seq` stamped — and must not be
+/// confused with the `edited` frame.
+#[test]
+fn recalled_frame_shape_carries_placeholder_message() {
+    use aero_common::{Block, Message, MessageId, ParticipantId, RECALLED_MESSAGE_PLACEHOLDER};
+
+    let recalled_at = time::OffsetDateTime::now_utc();
+    let message = Message {
+        id: MessageId::new(),
+        room_id: aero_common::RoomId::new(),
+        sender_id: ParticipantId::new(),
+        blocks: vec![Block::text(RECALLED_MESSAGE_PLACEHOLDER)],
+        reply_to: None,
+        metadata: serde_json::Value::Null,
+        created_at: time::OffsetDateTime::UNIX_EPOCH,
+        edited_at: None,
+        deleted_at: None,
+        recalled_at: Some(recalled_at),
+        recalled_by: Some(ParticipantId::new()),
+        expires_at: None,
+        version: 2,
+    };
+    let frame: serde_json::Value = serde_json::from_str(&room_event_to_frame_json(
+        &aero_common::RoomEvent::Recalled(message.clone()),
+        Some(7),
+    ))
+    .unwrap();
+
+    assert_eq!(frame["type"], "recalled", "frame discriminant");
+    assert_eq!(frame["seq"], 7, "bus seq stamped for at-least-once dedup");
+    assert_eq!(frame["message"]["id"], message.id.to_string());
+    assert_eq!(frame["message"]["room_id"], message.room_id.to_string());
+    assert_eq!(
+        frame["message"]["blocks"][0]["content"], RECALLED_MESSAGE_PLACEHOLDER,
+        "clients render the placeholder directly from the event"
+    );
+    assert!(
+        frame["message"]["recalled_at"].is_string(),
+        "recalled_at serialized (RFC3339)"
+    );
+    assert_eq!(
+        frame["message"]["recalled_by"],
+        message.recalled_by.unwrap().to_string()
+    );
+    assert_eq!(frame["message"]["version"], 2);
+    assert!(
+        frame["message"]["deleted_at"].is_null(),
+        "recall is not a tombstone"
+    );
+
+    // The `edited` frame must remain distinguishable.
+    let edited: serde_json::Value = serde_json::from_str(&room_event_to_frame_json(
+        &aero_common::RoomEvent::Edited(message),
+        None,
+    ))
+    .unwrap();
+    assert_eq!(edited["type"], "edited");
 }

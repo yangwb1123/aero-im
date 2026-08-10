@@ -1,11 +1,11 @@
-//! ImService — the IM business facade.
+//! `ImService` — the IM business facade.
 //!
 //! This module is split into sub-modules by business domain:
 //! - [`messages`] — send, edit, delete, moderate-delete
 //! - [`orig`] — remaining methods (room, reactions, reads, notifications, etc.)
 //!
 //! The original monolithic `service.rs` was split to keep each file under 800
-//! lines (REFACTOR_PLAN.md Step 1).
+//! lines (`REFACTOR_PLAN.md` Step 1).
 
 /// Message operations: send, edit, delete, moderate-delete.
 pub(crate) mod messages;

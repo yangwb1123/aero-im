@@ -68,9 +68,9 @@ async fn call_session_missed_detection() {
     let p = pool();
     let repo = CallRepo::new(p.clone());
     let caller = participant(&p, "caller").await;
-    let callee = participant(&p, "callee").await;
+    let target = participant(&p, "callee").await;
     let r = room(&p, caller).await;
-    add_room_member(&p, r, callee).await;
+    add_room_member(&p, r, target).await;
     let call_id = CallId::new();
     repo.start(
         call_id,
@@ -78,7 +78,7 @@ async fn call_session_missed_detection() {
         caller,
         CallKind::Audio,
         CallMode::P2p,
-        &[callee],
+        &[target],
     )
     .await
     .expect("start call");
@@ -90,7 +90,7 @@ async fn call_session_missed_detection() {
         .unwrap()
         .expect("unanswered");
     assert_eq!(un.0, caller, "initiator");
-    assert_eq!(un.1, vec![callee], "callees");
+    assert_eq!(un.1, vec![target], "callees");
 
     // Answered → no longer a missed call.
     repo.mark_answered(call_id).await.unwrap();
@@ -111,7 +111,7 @@ async fn call_session_missed_detection() {
         .await
         .ok();
     sqlx::query("DELETE FROM participants WHERE id = ANY($1)")
-        .bind(vec![caller.to_uuid(), callee.to_uuid()])
+        .bind(vec![caller.to_uuid(), target.to_uuid()])
         .execute(&p)
         .await
         .ok();
@@ -457,19 +457,19 @@ async fn call_authorization_and_room_containment_are_commit_time_invariants() {
     let p = pool();
     let repo = CallRepo::new(p.clone());
     let caller = participant(&p, "authorized-caller").await;
-    let callee = participant(&p, "authorized-callee").await;
+    let target = participant(&p, "authorized-callee").await;
     let outsider = participant(&p, "authorized-outsider").await;
     let r = room(&p, caller).await;
-    add_room_member(&p, r, callee).await;
+    add_room_member(&p, r, target).await;
 
     let call_id = CallId::new();
     let (_, callees) = repo
         .start_authorized(call_id, r, caller, CallKind::Audio, CallMode::P2p)
         .await
         .expect("authorized call start");
-    assert_eq!(callees, vec![callee]);
+    assert_eq!(callees, vec![target]);
 
-    repo.answer_authorized(call_id, callee, caller, r)
+    repo.answer_authorized(call_id, target, caller, r)
         .await
         .expect("active callee may answer caller");
     assert!(matches!(
@@ -500,16 +500,16 @@ async fn call_authorization_and_room_containment_are_commit_time_invariants() {
           WHERE room_id = $1 AND participant_id = $2",
     )
     .bind(r.to_uuid())
-    .bind(callee.to_uuid())
+    .bind(target.to_uuid())
     .execute(&p)
     .await
     .expect("revoke room membership");
     assert!(
-        !repo.is_participant(call_id, callee).await.unwrap(),
+        !repo.is_participant(call_id, target).await.unwrap(),
         "room leave closes the durable call leg in the same transaction"
     );
     assert!(matches!(
-        repo.authorize_active(call_id, callee, r, None, None).await,
+        repo.authorize_active(call_id, target, r, None, None).await,
         Err(Error::Forbidden(_))
     ));
 
@@ -524,7 +524,7 @@ async fn call_authorization_and_room_containment_are_commit_time_invariants() {
         .await
         .ok();
     sqlx::query("DELETE FROM participants WHERE id = ANY($1)")
-        .bind(vec![caller.to_uuid(), callee.to_uuid(), outsider.to_uuid()])
+        .bind(vec![caller.to_uuid(), target.to_uuid(), outsider.to_uuid()])
         .execute(&p)
         .await
         .ok();

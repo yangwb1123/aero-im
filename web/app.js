@@ -12,8 +12,7 @@ import {
   initialOf,
   toast,
 } from './render.js';
-// Shared spine (state / ws / els / DOM helpers / leaf utils) lives in context.js
-// so extracted domain modules can share the same live singletons.
+// Shared spine (state / ws / els / DOM helpers / leaf utils) lives in context.js.
 import { state, ws, els, cssEscape, scrollToMessage, avatarStyleFromId, hasPendingForRoom } from './context.js';
 // Extracted domain modules (see each file header for its public surface).
 import { handleCall, wireCallControls } from './calls.js';
@@ -28,10 +27,12 @@ import { initModalForms } from './modals.js';
 import { initAuthUi } from './auth_ui.js';
 import { initChrome } from './chrome.js';
 import { installUnhandledRejectionReporting } from './error_reporting.js';
+import { recallErrorToast } from './recall_errors.js';
 import { syncRoomSidebar } from './room_sync.js';
 import { initMessageActivity } from './message_activity.js';
 import { clearPendingDelivery, findPendingMatch, initReliableDelivery, pendingTempId, sendOptimistically } from './delivery.js';
 import { refreshWsAccessToken } from './ws_auth.js';
+import { draftComposerCleared, draftRoomSwitched, initDrafts, resetDrafts } from './drafts.js';
 let wsHooksInstalled = false;
 // ---------- view switching ----------
 function showAuth() { els.viewAuth.hidden = false; els.viewChat.hidden = true; }
@@ -57,8 +58,7 @@ function enterChat() {
   });
   syncRoomSidebar(forceReauth, () => { refreshRoomList(); updateTitleBadge(); });
   api.rtcConfig().then((c) => { state.rtcConfig = c; }).catch(() => {});
-  // Load the gift catalog once so stream cards can render the gift bar; if a
-  // room was already open, re-render so existing cards pick it up.
+  // Load the gift catalog once so stream cards can render the gift bar; re-render if a room is open.
   api.liveGifts().then((r) => {
     state.giftCatalog = r?.gifts || [];
     if (state.currentRoomId) rerenderCurrentRoom();
@@ -95,6 +95,7 @@ function hookWs() {
   });
   ws.on('msg:message', (f) => handleIncomingMessage(f.message, f.client_message_id));
   ws.on('msg:edited', (f) => handleEdited(f.message));
+  ws.on('msg:recalled', (f) => handleRecalled(f.message));
   ws.on('msg:deleted', (f) => handleDeleted(f));
   ws.on('msg:reaction', (f) => handleReaction(f));
   ws.on('msg:read', (f) => handleReadReceipt(f));
@@ -107,7 +108,7 @@ function hookWs() {
   ws.on('msg:stream_event', (f) => handleStreamEvent(f.event));
   ws.on('msg:backfill', (f) => handleBackfillTruncated(f));
   ws.on('msg:resync', () => handleResync());
-  ws.on('msg:error', (f) => toast(`服务端:${f.msg || f.code || 'error'}`, 'error'));
+  ws.on('msg:error', (f) => toast(f.code === 'rate_limited' ? '操作太频繁,请稍后重试' : `服务端:${f.msg || f.code || 'error'}`, 'error'));
   ws.on('msg:pong', () => {});
   initMessageActivity();
   initReliableDelivery({
@@ -211,14 +212,18 @@ function handleIncomingMessage(m, clientMessageId = null) {
     }
   }
   const arr = state.messagesByRoom.get(m.room_id) || [];
-  if (arr.some((x) => x.id === m.id)) return;
+  const held = arr.find((x) => x.id === m.id);
+  if (held) {
+    // Held-message mutation row (reconnect backfill) → converge via the same
+    // guarded funnel; identical redeliveries are dropped.
+    if (m.deleted_at || m.recalled_at || m.edited_at) applyChange(m);
+    return;
+  }
   arr.push(m);
   state.messagesByRoom.set(m.room_id, arr);
   const isCurrent = m.room_id === state.currentRoomId;
   const tabFocused = !document.hidden;
   if (isCurrent && tabFocused) {
-    appendMessageEl(renderMsgWithReactions(m), { scroll: true });
-    hideEmptyIfNeeded();
     maybeMarkRead(m);
     // Show smart reply suggestions for other people's messages
     if (!isMine && els.msgList.lastElementChild) {
@@ -227,11 +232,10 @@ function handleIncomingMessage(m, clientMessageId = null) {
   } else {
     bumpUnread(m.room_id);
     if (!isMine) notify(m);
-    if (isCurrent) {
-      // Tab is hidden but room is active — still append, just don't mark read.
-      appendMessageEl(renderMsgWithReactions(m), { scroll: true });
-      hideEmptyIfNeeded();
-    }
+  }
+  if (isCurrent) {
+    appendMessageEl(renderMsgWithReactions(m), { scroll: true });
+    hideEmptyIfNeeded();
   }
 }
 
@@ -257,8 +261,7 @@ function updateTitleBadge() {
 }
 
 function notify(m) {
-  if (!('Notification' in window)) return;
-  if (Notification.permission !== 'granted') return;
+  if (!('Notification' in window) || Notification.permission !== 'granted') return;
   const sender = state.participants.get(m.sender_id);
   const title = (sender?.display_name || 'New message') + ' · Aero IM';
   const body = (m.blocks || []).map((b) => b?.content || '').join(' ').slice(0, 80) || '[attachment]';
@@ -279,8 +282,7 @@ function handleNotify(f) {
   const room = state.rooms.get(f.room_id);
   const where = room?.name ? `「${room.name}」` : '';
   toast(`${who} 在${where}${verb}`, 'info');
-  // A new durable inbox entry just landed → bump the bell badge in real time.
-  // If the inbox drawer is open, re-pull so the new row appears immediately.
+  // A new durable inbox entry just landed → bump the bell badge and re-pull if open.
   bumpNotifBadge();
   if (els.drawerNotif && !els.drawerNotif.hidden) loadNotifications();
   if ('Notification' in window && Notification.permission === 'granted') {
@@ -299,40 +301,37 @@ function handlePin(f) {
   toast(f.op === 'pin' ? '一条消息被置顶' : '取消了一条置顶', 'info');
 }
 
-function handleEdited(m) {
+function handleEdited(m) { applyMessageMutation(m, m.edited_at); }
+function handleRecalled(m) { applyMessageMutation(m, m.recalled_at); }
+
+/// Out-of-order + resurrect-guarded replacement for Edited/Recalled events
+/// (mutation timestamp = order key; stale-after-Delete never resurrects).
+function applyMessageMutation(m, stamp) {
   if (!m?.id || !m?.room_id) return;
-  // ROADMAP v3 方向一: ignore an edit older than one we already applied (an
-  // at-least-once redelivery or cross-instance replay can arrive out of order;
-  // edits carry no id of their own, so the edit timestamp is the order key).
-  const ts = Date.parse(m.edited_at || '') || 0;
+  const ts = Date.parse(stamp || '') || 0;
   const prev = state.lastEditAt.get(m.id) || 0;
   if (ts && prev && ts < prev) return;
   if (ts) state.lastEditAt.set(m.id, ts);
   const arr = state.messagesByRoom.get(m.room_id) || [];
   const idx = arr.findIndex((x) => x.id === m.id);
   if (idx >= 0) {
-    // Resurrect guard (ROADMAP 方向一): a stale Edited arriving AFTER a Delete
-    // (out-of-order redelivery, or a change-replay that interleaves with the
-    // live stream) must not bring a deleted message back onto the screen.
-    if (arr[idx].deleted_at) return;
+    if (arr[idx].deleted_at) return; // resurrect guard: never un-tombstone
     arr[idx] = m;
   }
   state.messagesByRoom.set(m.room_id, arr);
   if (m.room_id === state.currentRoomId) replaceNodeForMsg(m.id, m);
 }
 
-/// Apply one change-replay row: a tombstone (populated `deleted_at`) removes the
-/// message, otherwise it is treated as an edit. Reuses the live handlers so the
-/// resurrect guard and out-of-order edit guard apply identically (ROADMAP 方向一).
+/// Change-replay: tombstone → remove, recall → placeholder, else edit.
 function applyChange(m) {
   if (!m?.id || !m?.room_id) return;
   if (m.deleted_at) handleDeleted({ room_id: m.room_id, message_id: m.id });
+  else if (m.recalled_at) handleRecalled(m);
   else handleEdited(m);
 }
 
-/// On reconnect, replay edits/deletes that landed while we were offline: the
-/// message backfill (`?since=<id>`) only returns NEW messages, never mutations
-/// to messages the client already holds (ROADMAP 方向一). Best-effort.
+/// On reconnect, replay edits/deletes/recalls that landed while we were
+/// offline (backfill only returns NEW messages). Best-effort.
 async function replayChanges(roomId) {
   const since = state.lastChangeSync.get(roomId);
   if (!since) return;
@@ -550,7 +549,7 @@ async function switchRoom(roomId) {
     refreshReadStrips();
   }).catch(() => {});
   // Restore AI conversation history from sessionStorage for this room.
-  restoreAiHistory(roomId);
+  restoreAiHistory(roomId); draftRoomSwitched(roomId);
 }
 
 async function loadHistory(roomId, { initial = false } = {}) {
@@ -647,14 +646,12 @@ function refreshReactionsFor(mid) {
 }
 
 // ---------- live interactivity (P11 弹幕 + 礼物) ----------
-// Live-card plumbing (watch/unwatch, gift backlog, stream events, interactive
-// blocks) extracted to livecards.js. The message-DOM helpers below stay here.
+// Live-card plumbing extracted to livecards.js; message-DOM helpers stay here.
 
 function wireMsgActions(node, m) {
   const actions = node.querySelector('.msg-actions');
   if (!actions) return;
-  // Reflect any already-known thread-mute state onto the bell glyph, and lazily
-  // hydrate the true state from the server the first time the row is hovered.
+  // Reflect any already-known thread-mute state; hydrate lazily on first hover.
   const muteBtn = actions.querySelector('.msg-act-mute');
   if (muteBtn) {
     paintThreadMuteBtn(muteBtn, state.threadMuted.get(m.id));
@@ -666,16 +663,24 @@ function wireMsgActions(node, m) {
     const act = btn.dataset.action;
     if (act === 'react') openEmojiPicker(btn, (emoji) => ws.react(m.id, emoji));
     if (act === 'edit') beginEditMessage(m);
-    if (act === 'delete') {
-      if (confirm('删除这条消息?')) ws.deleteMessage(m.id);
+    if (act === 'recall') {
+      // Window-expired 409 must reach the user; already-recalled/deleted 409s
+      // converge silently; 429 backs off without auto-retry (recall_errors.js);
+      // dead-session 401 follows the app's reauth convention (app.js:600).
+      if (confirm('撤回这条消息?')) api.recallMessage(m.id).catch((err) => {
+        if (err?.status === 401) return forceReauth();
+        const t = recallErrorToast(err);
+        if (t) toast(t.text, t.type);
+      });
     }
+    if (act === 'delete' && confirm('删除这条消息?')) ws.deleteMessage(m.id);
     if (act === 'reply') beginReply(m);
     if (act === 'mute-thread') toggleThreadMute(m.id, btn);
   });
 }
 
-// Paint the bell glyph + tooltip on a thread-mute button from a known state.
-// `muted === undefined` means "unknown yet" — leave the default (not-muted) bell.
+// Paint the bell glyph + tooltip on a thread-mute button from a known state
+// (`muted === undefined` = unknown — leave the default not-muted bell).
 function paintThreadMuteBtn(btn, muted) {
   if (!btn) return;
   btn.textContent = muted ? '🔕' : '🔔';
@@ -683,9 +688,8 @@ function paintThreadMuteBtn(btn, muted) {
   btn.classList.toggle('muted', Boolean(muted));
 }
 
-// Lazily fetch this thread's muters and derive whether *we* muted it, then cache
-// the result and repaint the button. Best-effort: a failed fetch leaves the
-// default glyph (the toggle still works regardless).
+// Lazily fetch this thread's muters and repaint the bell; best-effort (a
+// failed fetch leaves the default glyph — the toggle still works regardless).
 async function hydrateThreadMuted(rootId, btn) {
   if (state.threadMuted.has(rootId)) return; // already known
   try {
@@ -699,9 +703,8 @@ async function hydrateThreadMuted(rootId, btn) {
   }
 }
 
-// Toggle the caller's mute on the thread rooted at `rootId`. Optimistically flips
-// the cached state + glyph, calls the matching endpoint, and reconciles from the
-// server's authoritative `muted` flag (rolling back on error).
+// Toggle the caller's mute on the thread rooted at `rootId`; optimistic flip
+// + server reconciliation (rolls back on error).
 async function toggleThreadMute(rootId, btn) {
   const currentlyMuted = Boolean(state.threadMuted.get(rootId));
   const next = !currentlyMuted;
@@ -891,6 +894,7 @@ function submitComposer() {
       autoGrow(els.composerInput);
       closeMentionMenu();
       clearReply();
+      draftComposerCleared(roomId); // send accepted → the draft is obsolete
     }
     return;
   }
@@ -907,6 +911,7 @@ function submitComposer() {
   autoGrow(els.composerInput);
   closeMentionMenu();
   clearReply();
+  draftComposerCleared(roomId); // send accepted → the draft is obsolete
 }
 
 function composeBlocksFromInput(text) {
@@ -952,28 +957,25 @@ function restorePendingDelivery(pending) {
   return restored;
 }
 // ---------- extracted domain wiring ----------
-// search drawer + AI assistant, notification inbox, and live-streams flows were
-// moved to their own modules; attach their listeners here at module-load time
-// (same ordering as before the split). `switchRoom` is hoisted, so injecting it
-// into notifications is safe at eval time.
+// Search drawer + AI assistant, notification inbox, live-streams, and drafts
+// attach their listeners here at module-load time. `switchRoom` is hoisted.
 initSearchAi();
 initNotifications({ switchRoom });
 initLive();
 initSmartReplies({ optimisticAdd });
 initMedia({ optimisticAdd, clearReply, forceReauth });
-// Modal-backed forms (profile / new-room / add-member). Callbacks are hoisted.
+initDrafts({ state, els, forceReauth, clearReply, renderReplyChip });
+// Modal-backed forms + auth/logout wiring (`enterChat`/`showAuth`/callbacks hoisted).
 initModalForms({ forceReauth, refreshRoomList, switchRoom });
-// Auth form/logout wiring + global modal/drawer dismissal chrome. `enterChat`
-// and `showAuth` are hoisted, so injecting them here is safe at eval time.
-initAuthUi({ enterChat, showAuth });
+initAuthUi({ enterChat, showAuth, onLogout: resetDrafts });
 initChrome();
 // ---------- calls ----------
-// 1:1 + captions + group-mesh call logic now lives in calls.js. The control
-// buttons were wired at module-load time originally; preserve that by attaching
-// them here (same load-time ordering, DOM already present from index.html).
+// 1:1 + captions + group-mesh call logic lives in calls.js; attach its
+// controls here (module-load ordering, DOM already present from index.html).
 wireCallControls();
 // ---------- utilities ----------
 function forceReauth() {
+  resetDrafts(); // session teardown: drop in-memory draft state BEFORE auth.clear() (mirrors the active room under the OLD pid)
   toast('会话过期,请重新登录', 'error');
   auth.clear();
   state.me = null;

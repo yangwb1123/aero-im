@@ -138,8 +138,7 @@ async fn create_hold(
 
     let id = repo(&s)
         .create_authorized(ws, room, reason, auth.participant_id)
-        .await
-        .map_err(AeroError::from)?;
+        .await?;
     // Re-read so the response carries the full, canonical row (created_at etc.).
     let row = repo(&s)
         .get(id)
@@ -173,8 +172,7 @@ async fn release_hold(
     let id = parse_hold(&id_str)?;
     let released = repo(&s)
         .release_authorized(id, auth.participant_id)
-        .await
-        .map_err(AeroError::from)?;
+        .await?;
     if !released {
         return Err(AeroError::NotFound(format!("active legal hold {id}")).into());
     }

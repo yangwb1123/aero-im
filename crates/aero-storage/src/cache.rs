@@ -44,7 +44,9 @@ impl Cache for RedisCache {
             .set::<(), _, _>(
                 key,
                 value,
-                Some(Expiration::EX(ttl.as_secs() as i64)),
+                Some(Expiration::EX(
+                    i64::try_from(ttl.as_secs()).unwrap_or(i64::MAX),
+                )),
                 None,
                 false,
             )

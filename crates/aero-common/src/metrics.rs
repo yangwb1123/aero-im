@@ -68,6 +68,14 @@ pub mod names {
     pub const MESSAGES_EDITED_TOTAL: &str = "aero_messages_edited_total";
     /// Counter: messages soft-deleted (successful deletes only).
     pub const MESSAGES_DELETED_TOTAL: &str = "aero_messages_deleted_total";
+    /// Counter: messages recalled (撤回, successful recalls only).
+    pub const MESSAGES_RECALLED_TOTAL: &str = "aero_messages_recalled_total";
+    /// Counter: recall attempts rejected by the author recall window
+    /// (409 "recall window expired"). Emitted at the preflight — the single
+    /// choke point shared by REST and WS — so each rejected attempt counts
+    /// once (the tx-fence rejection at the exact boundary race is not counted;
+    /// storage emits no metrics).
+    pub const MESSAGES_RECALL_EXPIRED_TOTAL: &str = "aero_messages_recall_expired_total";
     /// Histogram: end-to-end message-mutation latency in seconds, labeled by
     /// `op` (`send` / `edit` / `delete`). Answers "messages per second" and
     /// surfaces hot-path regressions in the IM core.

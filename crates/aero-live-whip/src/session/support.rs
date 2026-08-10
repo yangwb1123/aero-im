@@ -84,7 +84,7 @@ pub(super) fn accept(
 /// Normalize SDP fields that are descriptive rather than transport semantics.
 ///
 /// str0m 0.19 accepts only its own or `-` values for the origin username and
-/// session name, while interoperable WHIP publishers such as FFmpeg 8 emit
+/// session name, while interoperable WHIP publishers such as `FFmpeg` 8 emit
 /// legal values like `o=FFmpeg …` and `s=FFmpegPublishSession`. Replacing only
 /// those two labels preserves the origin id/version, ICE, DTLS, media, codec,
 /// SSRC and direction attributes.

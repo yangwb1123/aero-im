@@ -51,7 +51,7 @@ export async function showSuggestions(roomId, messageId, messageEl) {
     // Create suggestion container
     const container = document.createElement('div');
     container.className = 'smart-replies';
-    container.style.cssText = 'display:flex;gap:6px;flex-wrap:wrap;margin-top:6px;';
+    container.style.cssText = 'display:flex;gap:8px;flex-wrap:wrap;margin-top:8px;';
 
     const buttons = [];
     for (const text of lines.slice(0, 3)) {
@@ -60,8 +60,8 @@ export async function showSuggestions(roomId, messageId, messageEl) {
       btn.className = 'smart-reply-btn';
       btn.textContent = text.length > 60 ? text.slice(0, 57) + '…' : text;
       btn.style.cssText =
-        'padding:4px 10px;border:1px solid #ccc;border-radius:12px;' +
-        'background:#fff;cursor:pointer;font-size:12px;color:#333;' +
+        'padding:4px 10px;border:1px solid var(--line);border-radius:12px;' +
+        'background:var(--bg);cursor:pointer;font-size:12px;color:var(--text);' +
         'transition:background .15s;';
       btn.addEventListener('mouseenter', () => { btn.style.background = '#e8f4fd'; });
       btn.addEventListener('mouseleave', () => { btn.style.background = '#fff'; });

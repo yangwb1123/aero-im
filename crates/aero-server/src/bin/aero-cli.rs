@@ -10,12 +10,12 @@ async fn main() {
         println!("aero-cli v{}", env!("CARGO_PKG_VERSION"));
         return;
     }
-    let cmd = args.get(1).map(String::as_str).unwrap_or("help");
+    let cmd = args.get(1).map_or("help", String::as_str);
     let ctx = ExecutionContext::new(std::env::current_dir().unwrap_or_default());
     let mut reg = CommandRegistry::new();
     macro_rules! a {
         ($c:expr) => {
-            reg = reg.add(Box::new($c));
+            reg = reg.with_command(Box::new($c));
         };
     }
     a!(Migrate);
@@ -145,24 +145,22 @@ c!(
     "migrate",
     "Apply pending DB migrations",
     |_ctx, _args| {
-        let c = match load_cfg().await {
-            Some(c) => c,
-            None => return Outcome::error("config required"),
+        let Some(c) = load_cfg().await else {
+            return Outcome::error("config required");
         };
         let p = match aero_storage::connect_pg(&c.database.url, 4).await {
             Ok(p) => p,
             Err(e) => return Outcome::error(format!("db: {e}")),
         };
         match aero_storage::migrate(&p).await {
-            Ok(_) => Outcome::ok("✓ ok"),
+            Ok(()) => Outcome::ok("✓ ok"),
             Err(e) => Outcome::error(format!("{e}")),
         }
     }
 );
 c!(Health, "health", "Probe PG/Redis/NATS", |_ctx, _args| {
-    let c = match load_cfg().await {
-        Some(c) => c,
-        None => return Outcome::error("config required"),
+    let Some(c) = load_cfg().await else {
+        return Outcome::error("config required");
     };
     let mut ok = true;
     let mut v = vec![];
@@ -221,9 +219,8 @@ c!(AiTest, "ai-test", "Exercise AI backends", |_ctx, _args| {
     Outcome::ok("done")
 });
 c!(Streams, "streams", "List live streams", |_ctx, _args| {
-    let c = match load_cfg().await {
-        Some(c) => c,
-        None => return Outcome::error("config required"),
+    let Some(c) = load_cfg().await else {
+        return Outcome::error("config required");
     };
     let p = match aero_storage::connect_pg(&c.database.url, 2).await {
         Ok(p) => p,
@@ -244,12 +241,12 @@ c!(Test_, "test", "Run cargo test", |_ctx, _args| {
     aero_eng::run::cargo_test_lib().await
 });
 c!(WsPing, "ws-ping", "WS ping", |_ctx, _args| {
+    use futures::{SinkExt, StreamExt};
     let t = std::env::var("AERO_TOKEN").unwrap_or_default();
     if t.is_empty() {
         return Outcome::error("set AERO_TOKEN");
     }
     let h = std::env::var("AERO_HOST").unwrap_or_else(|_| "ws://localhost:3030".into());
-    use futures::{SinkExt, StreamExt};
     let request = match ws_ping_request(&h, &t) {
         Ok(request) => request,
         Err(error) => return Outcome::error(error),
@@ -392,14 +389,18 @@ mod tests {
     }
 }
 c!(Smoke_, "smoke", "List/run smoke tests", |ctx, args| {
-    let sub = args.get(2).map(|s| s.as_str()).unwrap_or("list");
+    let sub = args.get(2).map_or("list", std::string::String::as_str);
     let sd = ctx.root.join("scripts");
     let mut sm: Vec<String> = vec![];
     if let Ok(e) = std::fs::read_dir(&sd) {
         for en in e.flatten() {
             let n = en.file_name().to_string_lossy().to_string();
-            if n.starts_with("smoke_") && (n.ends_with(".py") || n.ends_with(".sh")) {
-                sm.push(
+            if n.starts_with("smoke_") {
+                let ext = std::path::Path::new(&n).extension();
+                if ext.is_some_and(|e| e.eq_ignore_ascii_case("py"))
+                    || ext.is_some_and(|e| e.eq_ignore_ascii_case("sh"))
+                {
+                    sm.push(
                     n.strip_prefix("smoke_")
                         .unwrap_or(&n)
                         .strip_suffix(".py")
@@ -407,6 +408,7 @@ c!(Smoke_, "smoke", "List/run smoke tests", |ctx, args| {
                         .unwrap_or(&n)
                         .to_owned(),
                 );
+                }
             }
         }
     }
@@ -419,7 +421,7 @@ c!(Smoke_, "smoke", "List/run smoke tests", |ctx, args| {
             Outcome::ok("")
         }
         "run" => {
-            let name = args.get(3).map(|s| s.as_str()).unwrap_or("");
+            let name = args.get(3).map_or("", std::string::String::as_str);
             if name.is_empty() {
                 return Outcome::error("need name");
             }
@@ -436,12 +438,12 @@ c!(Smoke_, "smoke", "List/run smoke tests", |ctx, args| {
     }
 });
 c!(Gate_, "gate", "Run gates (shell + native)", |ctx, args| {
-    let sub = args.get(2).map(|s| s.as_str()).unwrap_or("list");
-    let sd = ctx.root.join("scripts");
-    let file = |n: &str| -> String { sd.join(n).to_string_lossy().to_string() };
     async fn bash(p: String, t: u64) -> Outcome {
         aero_eng::run::run_cmd("bash", &[&p], std::time::Duration::from_secs(t)).await
     }
+    let sub = args.get(2).map_or("list", std::string::String::as_str);
+    let sd = ctx.root.join("scripts");
+    let file = |n: &str| -> String { sd.join(n).to_string_lossy().to_string() };
     match sub {
         "list" => Outcome::ok("filesize truth web deps complexity filesize-native deps-native workspace-members todos metadata readme all"),
         "filesize" => bash(file("file-size-check.sh"),60).await, "truth" => bash(file("truth-check.sh"),60).await,
@@ -486,24 +488,27 @@ c!(Gate_, "gate", "Run gates (shell + native)", |ctx, args| {
     }
 });
 c!(Skill_, "skill", "List/view/run skills", |ctx, args| {
-    let sub = args.get(2).map(|s| s.as_str()).unwrap_or("list");
+    let sub = args.get(2).map_or("list", std::string::String::as_str);
     let sk = ctx.root.join("skills");
     match sub {
         "list" => {
             if let Ok(e) = std::fs::read_dir(&sk) {
                 for en in e.flatten() {
                     let n = en.file_name().to_string_lossy().to_string();
-                    if n.ends_with(".md") {
+                    if std::path::Path::new(&n)
+                        .extension()
+                        .is_some_and(|e| e.eq_ignore_ascii_case("md"))
+                    {
                         println!("  {} [doc]", &n[..n.len() - 3]);
                     } else if en.path().is_dir() {
-                        println!("  {} [exec]", n);
+                        println!("  {n} [exec]");
                     }
                 }
             }
             Outcome::ok("")
         }
         "view" => {
-            let n = args.get(3).map(|s| s.as_str()).unwrap_or("");
+            let n = args.get(3).map_or("", std::string::String::as_str);
             let p = sk.join(format!("{n}.md"));
             if p.exists() {
                 println!("{}", std::fs::read_to_string(&p).unwrap_or_default());
@@ -513,7 +518,7 @@ c!(Skill_, "skill", "List/view/run skills", |ctx, args| {
             }
         }
         "run" => {
-            let n = args.get(3).map(|s| s.as_str()).unwrap_or("");
+            let n = args.get(3).map_or("", std::string::String::as_str);
             if n.is_empty() {
                 return Outcome::error("need name");
             }
@@ -578,15 +583,14 @@ c!(
                 .current_dir(&ctx.root)
                 .output()
                 .ok()
-                .map(|o| String::from_utf8_lossy(&o.stdout).lines().count())
-                .unwrap_or(0);
+                .map_or(0, |o| String::from_utf8_lossy(&o.stdout).lines().count());
             println!(
                 "  {} Git status      {}",
                 term::info(""),
                 if d == 0 {
                     term::ok("clean")
                 } else {
-                    term::warn(&format!("{d} dirty"))
+                    term::warn(format!("{d} dirty"))
                 }
             );
         } else {
@@ -600,12 +604,9 @@ c!(
         println!(
             "  {} Migrations      {}",
             term::info(""),
-            match m {
-                Ok(e) => term::ok(&format!("{} files", e.count())),
-                Err(_) => {
-                    ok = false;
-                    term::err("not found")
-                }
+            if let Ok(e) = m { term::ok(format!("{} files", e.count())) } else {
+                ok = false;
+                term::err("not found")
             }
         );
         if ok {
@@ -649,16 +650,15 @@ c!(Dev_, "dev", "Start dev environment", |ctx, args| {
     }
     let mut sp = term::Spinner::new("migrate");
     sp.tick();
-    let c = match load_cfg().await {
-        Some(c) => c,
-        None => return Outcome::error("config required"),
+    let Some(c) = load_cfg().await else {
+        return Outcome::error("config required");
     };
     let p = match aero_storage::connect_pg(&c.database.url, 4).await {
         Ok(p) => p,
         Err(e) => return Outcome::error(format!("db: {e}")),
     };
     match aero_storage::migrate(&p).await {
-        Ok(_) => sp.done("ok"),
+        Ok(()) => sp.done("ok"),
         Err(e) => return Outcome::error(format!("{e}")),
     }
     println!("\n{}", term::ok("ready"));
@@ -683,9 +683,9 @@ c!(
     "Shell completion bash|zsh|fish",
     |_ctx, args| {
         let cmds = "migrate health ai-test streams ws-ping check smoke gate test skill doctor completion dev integration help";
-        match args.get(2).map(|s| s.as_str()).unwrap_or("") {
+        match args.get(2).map_or("", std::string::String::as_str) {
             "bash" => {
-                println!("complete -W '{}' aero-cli", cmds);
+                println!("complete -W '{cmds}' aero-cli");
                 Outcome::ok("")
             }
             "zsh" => {
@@ -693,7 +693,7 @@ c!(
                 Outcome::ok("")
             }
             "fish" => {
-                println!("complete -c aero-cli -f -a '{}'", cmds);
+                println!("complete -c aero-cli -f -a '{cmds}'");
                 Outcome::ok("")
             }
             _ => Outcome::error("usage: completion bash|zsh|fish"),

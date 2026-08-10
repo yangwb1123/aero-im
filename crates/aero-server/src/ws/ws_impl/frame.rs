@@ -1,6 +1,11 @@
 //! Per-frame WebSocket handlers: the `ClientFrame` dispatch (`handle_text`)
 //! and the shared structured/Markdown send dispatch (`send_blocks_frame`).
-use super::*;
+use super::{
+    warn, debug, AppState, CallId, ParticipantId, RoomId, Block, MessageId, mpsc, Message,
+    ClientFrame, ServerFrame, CallMode, active_call_for_frame, CallEvent, same_lang,
+    joinable_call_for_frame, call_peers_excluding, Ulid, StreamEvent, truncation_cursor,
+    stream_viewer_count,
+};
 use std::collections::HashMap;
 
 mod call_lifecycle;
@@ -148,6 +153,16 @@ pub(super) async fn handle_text(
         }
         ClientFrame::DeleteMessage { id } => {
             state.im.delete_message(pid, id).await?;
+        }
+        ClientFrame::RecallMessage { id } => {
+            // Tenant fairness (ROADMAP3 方向五): recall is a DB-heavy mutation
+            // (~8-10 queries incl. row locks), so it is charged against the
+            // room's workspace budget — after the access-checking preflight
+            // (non-members cannot drain a victim's budget), surfacing as a WS
+            // `error` frame when over. Same gate shape as EditMessage above.
+            let room = state.im.assert_message_recall_preflight(pid, id).await?;
+            crate::ws_rate::check_ws_rate_room(state, room).await?;
+            state.im.recall_message(pid, id).await?;
         }
         ClientFrame::React { message_id, emoji } => {
             state.im.toggle_reaction(pid, message_id, &emoji).await?;

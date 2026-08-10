@@ -1,6 +1,6 @@
 //! Per-tenant AI usage route plus crash-recoverable outbox relay.
 //!
-//! Paid paths await a fenced PostgreSQL reservation before contacting a provider.
+//! Paid paths await a fenced `PostgreSQL` reservation before contacting a provider.
 //! Success finalizes the actual charge, ordinary failure cancels it, and expired
 //! ambiguity is conservatively charged. A leased background relay moves ready
 //! events to the query-compatible ledger without a lossy in-memory channel.

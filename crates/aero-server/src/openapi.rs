@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use crate::state::AppState;
 
-/// Router fragment for the OpenAPI spec endpoint.
+/// Router fragment for the `OpenAPI` spec endpoint.
 ///
 /// Merges into the main router in `routes::build`.  No state is needed; the
 /// spec is fully static.  Typed as `Router<AppState>` so it merges cleanly

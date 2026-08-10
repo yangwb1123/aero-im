@@ -15,17 +15,17 @@ pub(crate) struct Orchestration {
 }
 
 pub(crate) fn build(
-    calls: CallRepo,
-    sfu_router: SfuRouter,
+    calls: &CallRepo,
+    sfu_router: &SfuRouter,
     sfu_forwarder: Arc<dyn MediaForwarder>,
-    call_routes: Arc<CallRouteRegistry>,
-    public_base_url: String,
+    call_routes: &Arc<CallRouteRegistry>,
+    public_base_url: &str,
     default_host: String,
 ) -> Orchestration {
     let call_orchestrator = Arc::new(
         CallOrchestrator::new(calls.clone())
             .with_sfu(sfu_router.clone())
-            .with_call_routes(call_routes.clone(), public_base_url.clone()),
+            .with_call_routes(call_routes.clone(), public_base_url.to_owned()),
     );
 
     // Fall back to the configured server host (NOT a hardcoded "localhost"): in a

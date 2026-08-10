@@ -319,7 +319,7 @@ pub(crate) fn parse_profile_verdict(raw: &str) -> ExtractedProfile {
                     }
                 }
             }
-            "SUMMARY" => out.summary = rest.to_owned(),
+            "SUMMARY" => rest.clone_into(&mut out.summary),
             _ => {}
         }
     }
@@ -347,7 +347,7 @@ pub(crate) fn heuristic_profile(messages: &[Message]) -> ExtractedProfile {
         for tok in text.split(|c: char| !c.is_alphanumeric()) {
             let tok = tok.trim().to_lowercase();
             // Skip very short tokens and pure numbers — they're noise as "topics".
-            if tok.chars().count() < 4 || tok.chars().all(|c| c.is_numeric()) {
+            if tok.chars().count() < 4 || tok.chars().all(char::is_numeric) {
                 continue;
             }
             *freq.entry(tok).or_insert(0) += 1;
@@ -394,6 +394,8 @@ mod tests {
             created_at: OffsetDateTime::UNIX_EPOCH,
             edited_at: None,
             deleted_at: None,
+            recalled_at: None,
+            recalled_by: None,
             expires_at: None,
             version: 1,
         }
@@ -476,8 +478,10 @@ mod tests {
 
     #[test]
     fn topics_and_preferences_json_shapes() {
-        let mut p = ExtractedProfile::default();
-        p.topics = vec!["x".into(), "y".into()];
+        let mut p = ExtractedProfile {
+            topics: vec!["x".into(), "y".into()],
+            ..ExtractedProfile::default()
+        };
         p.preferences.insert("tone".into(), "concise".into());
         assert_eq!(p.topics_json(), serde_json::json!(["x", "y"]));
         assert_eq!(

@@ -114,7 +114,7 @@ impl BookmarkRepo {
             r"SELECT
                  b.room_id, b.note, b.created_at AS saved_at,
                  m.id, m.sender_id, m.blocks, m.reply_to, m.metadata,
-                 m.created_at, m.edited_at, m.deleted_at, m.expires_at, m.version
+                 m.created_at, m.edited_at, m.deleted_at, m.recalled_at, m.recalled_by, m.expires_at, m.version
                FROM bookmarks b
                JOIN messages m ON m.id = b.message_id
                WHERE b.participant_id = $1 AND m.deleted_at IS NULL
@@ -148,7 +148,7 @@ impl BookmarkRepo {
             r"SELECT
                  b.room_id, b.note, b.created_at AS saved_at,
                  m.id, m.sender_id, m.blocks, m.reply_to, m.metadata,
-                 m.created_at, m.edited_at, m.deleted_at, m.expires_at, m.version
+                 m.created_at, m.edited_at, m.deleted_at, m.recalled_at, m.recalled_by, m.expires_at, m.version
                FROM bookmarks b
                JOIN messages m ON m.id = b.message_id
                WHERE b.participant_id = $1
@@ -179,6 +179,8 @@ struct SavedRow {
     created_at: time::OffsetDateTime,
     edited_at: Option<time::OffsetDateTime>,
     deleted_at: Option<time::OffsetDateTime>,
+    recalled_at: Option<time::OffsetDateTime>,
+    recalled_by: Option<uuid::Uuid>,
     expires_at: Option<time::OffsetDateTime>,
     version: i32,
 }
@@ -199,6 +201,8 @@ impl From<SavedRow> for SavedMessage {
                 created_at: r.created_at,
                 edited_at: r.edited_at,
                 deleted_at: r.deleted_at,
+                recalled_at: r.recalled_at,
+                recalled_by: r.recalled_by.map(ParticipantId::from_uuid),
                 expires_at: r.expires_at,
                 version: r.version,
             },

@@ -90,11 +90,11 @@ pub const INDEX_SIZE_BYTES: &str = "aero_index_size_bytes";
 /// Gauge: estimated dead-tuple ratio for each public application table.
 /// Label cardinality is bounded by the deployed schema (`table`).
 pub const PG_TABLE_DEAD_TUPLE_RATIO: &str = "aero_pg_table_dead_tuple_ratio";
-/// Gauge: cumulative sequential scans reported by PostgreSQL for each public
-/// application table. It is sampled as a gauge because PostgreSQL may reset its
+/// Gauge: cumulative sequential scans reported by `PostgreSQL` for each public
+/// application table. It is sampled as a gauge because `PostgreSQL` may reset its
 /// statistics after restart.
 pub const PG_TABLE_SEQ_SCANS_TOTAL: &str = "aero_pg_table_seq_scans_total";
-/// Gauge: cumulative index scans reported by PostgreSQL for each public index.
+/// Gauge: cumulative index scans reported by `PostgreSQL` for each public index.
 /// Label cardinality is bounded by the deployed schema (`index`).
 pub const PG_INDEX_SCANS_TOTAL: &str = "aero_pg_index_scans_total";
 /// Gauge: sessions currently idle while holding an open transaction.
@@ -182,7 +182,7 @@ pub async fn sample_index_sizes(pool: &sqlx::PgPool) -> usize {
     reported
 }
 
-/// Counts successfully sampled PostgreSQL health series. Query failures leave
+/// Counts successfully sampled `PostgreSQL` health series. Query failures leave
 /// the previous gauge values untouched so a transient monitoring failure never
 /// fabricates a healthy zero.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -192,7 +192,7 @@ pub struct PgHealthSample {
     pub idle_activity: bool,
 }
 
-/// Sample PostgreSQL maintenance and query-efficiency signals from the
+/// Sample `PostgreSQL` maintenance and query-efficiency signals from the
 /// statistics views. Every query is read-only and restricted to the `public`
 /// schema; metric labels therefore come only from deployed relation names, not
 /// request data.
@@ -743,12 +743,12 @@ mod tests {
 
     #[tokio::test]
     async fn http_metrics_layer_passes_stamped_response_through_unchanged() {
-        // A handler stamps the marker; the layer must still return the response
-        // intact (status + marker) regardless of the env flag's cached value.
-        let ws = WorkspaceId(ulid::Ulid(7));
         async fn stamped() -> Response {
             super::attach_workspace_label("ok".into_response(), WorkspaceId(ulid::Ulid(7)))
         }
+        // A handler stamps the marker; the layer must still return the response
+        // intact (status + marker) regardless of the env flag's cached value.
+        let ws = WorkspaceId(ulid::Ulid(7));
         let app: Router = Router::new()
             .route("/probe-ws", get(stamped))
             .layer(axum::middleware::from_fn(http_metrics_layer));

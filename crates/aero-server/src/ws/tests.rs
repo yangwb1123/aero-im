@@ -1,5 +1,3 @@
-#[cfg(test)]
-mod tests {
     use crate::ws::ws_impl::{
         access_participant, authoritative_count, backfill_room_ids, cursor_backfill_plan,
         initial_backfill_page, parse_resume_cursor, same_lang, truncation_cursor, ClientFrame,
@@ -39,7 +37,7 @@ mod tests {
         .expect("parse watch_stream without since");
         match without {
             ClientFrame::WatchStream { since, .. } => assert!(since.is_none()),
-            _ => assert!(false, "expected WatchStream"),
+            _ => panic!("expected WatchStream"),
         }
         // With `since` → carried through so the watch handler can replay catch-up.
         let with: ClientFrame = serde_json::from_str(
@@ -50,7 +48,7 @@ mod tests {
             ClientFrame::WatchStream { since, .. } => {
                 assert_eq!(since.as_deref(), Some("01ARZ3NDEKTSV4RRFFQ69G5FZZ"));
             }
-            _ => assert!(false, "expected WatchStream"),
+            _ => panic!("expected WatchStream"),
         }
     }
 
@@ -197,4 +195,3 @@ mod tests {
         // No last id (empty replay) can never produce a cursor.
         assert_eq!(truncation_cursor::<MessageId>(200, 200, None), None);
     }
-}

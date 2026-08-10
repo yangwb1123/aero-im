@@ -18,8 +18,8 @@
 //!
 //! Each video/audio FLV tag body is fed through [`FlvToTsConverter`]
 //! (in `aero-live-hls`), which:
-//! 1. Extracts SPS/PPS from the first AVCDecoderConfigurationRecord and
-//!    AAC AudioSpecificConfig.
+//! 1. Extracts SPS/PPS from the first `AVCDecoderConfigurationRecord` and
+//!    AAC `AudioSpecificConfig`.
 //! 2. Converts AVCC NALUs → Annex-B (with AUD + SPS/PPS prepended on each
 //!    keyframe), AAC raw → ADTS frames.
 //! 3. Wraps access units in PES packets with 90 kHz PTS/DTS.
@@ -241,8 +241,13 @@ impl RtmpIngest {
                     let cfg = cfg.clone();
                     let connection_cancel = cancel.clone();
                     connections.spawn(async move {
-                        if let Err(error) =
-                            handle_connection(socket, repo, cfg, connection_cancel).await
+                        if let Err(error) = Box::pin(handle_connection(
+                            socket,
+                            repo,
+                            cfg,
+                            connection_cancel,
+                        ))
+                        .await
                         {
                             warn!(%error, %peer, "RTMP connection ended with error");
                         }
@@ -350,7 +355,8 @@ async fn handle_connection(
 
     // 4) Publish loop.
     let stream_id = publish.stream_id;
-    let publish_result = run_publish_loop(socket, session, buf, publish, &cfg, &cancel).await;
+    let publish_result =
+        Box::pin(run_publish_loop(socket, session, buf, publish, &cfg, &cancel)).await;
 
     // 5) Mark the row ended regardless of how the publish loop exited.
     if let Err(e) = repo.mark_ended(stream_id).await {
@@ -395,8 +401,9 @@ async fn forward_session_results(
 ) -> LiveResult<bool> {
     match process_results(socket, session, results, repo, cfg).await? {
         ProcessOutcome::Continue => Ok(true),
-        ProcessOutcome::Disconnect => Ok(false),
-        ProcessOutcome::Publishing(_) => Ok(false), // unreachable in practice
+        // `Publishing` is unreachable here (this fn is only reached after the
+        // publish negotiation succeeded), kept for exhaustiveness.
+        ProcessOutcome::Disconnect | ProcessOutcome::Publishing(_) => Ok(false),
     }
 }
 
@@ -467,108 +474,104 @@ async fn process_results(
                         outcome = ProcessOutcome::Disconnect;
                         continue;
                     }
-                    match repo
+                    if let Some(stream) = repo
                         .get_by_key(&stream_key)
                         .await
-                        .map_err(LiveError::Database)?
-                    {
-                        Some(stream) => {
-                            let hls_url = hls_url_for(stream.id);
-                            let transition = repo
-                                .mark_live(stream.id, &hls_url)
-                                .await
-                                .map_err(LiveError::Database)?;
-                            let refusal = match transition {
-                                MarkLiveOutcome::Started(_) => None,
-                                MarkLiveOutcome::AlreadyLive => {
-                                    Some("Stream already has an active publisher")
-                                }
-                                MarkLiveOutcome::NotFound => Some("Unknown stream key"),
-                            };
-                            if let Some(description) = refusal {
-                                warn!(
-                                    stream_id = %stream.id,
-                                    %description,
-                                    "rejecting competing RTMP publisher"
-                                );
-                                let more = session
-                                    .reject_request(
-                                        request_id,
-                                        "NetStream.Publish.BadName",
-                                        description,
-                                    )
-                                    .map_err(|e| {
-                                        LiveError::Protocol(format!("reject publish: {e:?}"))
-                                    })?;
-                                for r in more {
-                                    if let ServerSessionResult::OutboundResponse(p) = r {
-                                        socket
-                                            .write_all(&p.bytes)
-                                            .await
-                                            .map_err(LiveError::from)?;
-                                    }
-                                }
-                                outcome = ProcessOutcome::Disconnect;
-                                continue;
+                        .map_err(LiveError::Database)? {
+                        let hls_url = hls_url_for(stream.id);
+                        let transition = repo
+                            .mark_live(stream.id, &hls_url)
+                            .await
+                            .map_err(LiveError::Database)?;
+                        let refusal = match transition {
+                            MarkLiveOutcome::Started(_) => None,
+                            MarkLiveOutcome::AlreadyLive => {
+                                Some("Stream already has an active publisher")
                             }
-                            let dir = hls_path_for(&cfg.hls_dir, stream.id);
-                            let segment_duration_secs = u32::try_from(SEGMENT_DURATION_SECS)
-                                .expect("RTMP segment duration must fit in u32");
-                            let hls = match HlsWriter::new(dir, segment_duration_secs).await {
-                                Ok(hls) => hls.with_segment_ext(DEFAULT_SEGMENT_EXT),
-                                Err(error) => {
-                                    if let Err(mark_error) = repo.mark_ended(stream.id).await {
-                                        warn!(
-                                            %mark_error,
-                                            stream_id = %stream.id,
-                                            "failed to roll back live state after HLS init error"
-                                        );
-                                    }
-                                    return Err(LiveError::Internal(anyhow::anyhow!(
-                                        "hls writer init: {error}"
-                                    )));
-                                }
-                            };
-
-                            info!(
-                                stream_id = %stream.id,
-                                "RTMP publisher accepted; emitting MPEG-TS segments"
-                            );
-
-                            let more = session.accept_request(request_id).map_err(|e| {
-                                LiveError::Protocol(format!("accept publish: {e:?}"))
-                            })?;
-                            for r in more {
-                                if let ServerSessionResult::OutboundResponse(p) = r {
-                                    socket.write_all(&p.bytes).await.map_err(LiveError::from)?;
-                                }
-                            }
-                            outcome = ProcessOutcome::Publishing(PublishContext {
-                                stream_id: stream.id,
-                                hls,
-                            });
-                        }
-                        None => {
+                            MarkLiveOutcome::NotFound => Some("Unknown stream key"),
+                        };
+                        if let Some(description) = refusal {
                             warn!(
-                                stream_key_len = stream_key.len(),
-                                "rejecting publish: unknown stream key"
+                                stream_id = %stream.id,
+                                %description,
+                                "rejecting competing RTMP publisher"
                             );
                             let more = session
                                 .reject_request(
                                     request_id,
-                                    "NetStream.Publish.Start",
-                                    "Unknown stream key",
+                                    "NetStream.Publish.BadName",
+                                    description,
                                 )
                                 .map_err(|e| {
                                     LiveError::Protocol(format!("reject publish: {e:?}"))
                                 })?;
                             for r in more {
                                 if let ServerSessionResult::OutboundResponse(p) = r {
-                                    socket.write_all(&p.bytes).await.map_err(LiveError::from)?;
+                                    socket
+                                        .write_all(&p.bytes)
+                                        .await
+                                        .map_err(LiveError::from)?;
                                 }
                             }
                             outcome = ProcessOutcome::Disconnect;
+                            continue;
                         }
+                        let dir = hls_path_for(&cfg.hls_dir, stream.id);
+                        let segment_duration_secs = u32::try_from(SEGMENT_DURATION_SECS)
+                            .expect("RTMP segment duration must fit in u32");
+                        let hls = match HlsWriter::new(dir, segment_duration_secs).await {
+                            Ok(hls) => hls.with_segment_ext(DEFAULT_SEGMENT_EXT),
+                            Err(error) => {
+                                if let Err(mark_error) = repo.mark_ended(stream.id).await {
+                                    warn!(
+                                        %mark_error,
+                                        stream_id = %stream.id,
+                                        "failed to roll back live state after HLS init error"
+                                    );
+                                }
+                                return Err(LiveError::Internal(anyhow::anyhow!(
+                                    "hls writer init: {error}"
+                                )));
+                            }
+                        };
+
+                        info!(
+                            stream_id = %stream.id,
+                            "RTMP publisher accepted; emitting MPEG-TS segments"
+                        );
+
+                        let more = session.accept_request(request_id).map_err(|e| {
+                            LiveError::Protocol(format!("accept publish: {e:?}"))
+                        })?;
+                        for r in more {
+                            if let ServerSessionResult::OutboundResponse(p) = r {
+                                socket.write_all(&p.bytes).await.map_err(LiveError::from)?;
+                            }
+                        }
+                        outcome = ProcessOutcome::Publishing(PublishContext {
+                            stream_id: stream.id,
+                            hls,
+                        });
+                    } else {
+                        warn!(
+                            stream_key_len = stream_key.len(),
+                            "rejecting publish: unknown stream key"
+                        );
+                        let more = session
+                            .reject_request(
+                                request_id,
+                                "NetStream.Publish.Start",
+                                "Unknown stream key",
+                            )
+                            .map_err(|e| {
+                                LiveError::Protocol(format!("reject publish: {e:?}"))
+                            })?;
+                        for r in more {
+                            if let ServerSessionResult::OutboundResponse(p) = r {
+                                socket.write_all(&p.bytes).await.map_err(LiveError::from)?;
+                            }
+                        }
+                        outcome = ProcessOutcome::Disconnect;
                     }
                 }
                 ServerSessionEvent::PlayStreamRequested { request_id, .. } => {
@@ -597,6 +600,10 @@ async fn process_results(
 ///
 /// It owns the socket, the session, and the HLS writer until the publisher
 /// disconnects, the connection errors, or it explicitly closes the stream.
+// The 8 KiB read buffer is owned by this future by design (it must live across
+// awaits); the future itself is boxed at the call site, so the by-value
+// argument costs a move, not a stack copy.
+#[allow(clippy::large_types_passed_by_value)]
 async fn run_publish_loop(
     mut socket: TcpStream,
     mut session: ServerSession,
@@ -620,36 +627,33 @@ async fn run_publish_loop(
         loop {
             tokio::select! {
                 maybe = rx.recv() => {
-                    match maybe {
-                        Some(chunk) => {
-                            buffer_bytes = buffer_bytes.saturating_add(chunk.data.len());
-                            if buffer_bytes > MAX_SEGMENT_BUFFER_BYTES {
-                                warn!(buffer_bytes, "RTMP segment buffer overflow — dropping current window");
-                                mux = FlvToTsConverter::new();
-                                buffer_bytes = 0;
-                                segment_start = Instant::now();
-                                continue;
-                            }
-                            let res = match chunk.kind {
-                                FLV_TAG_VIDEO => mux.push_video_tag(&chunk.data, chunk.timestamp_ms),
-                                FLV_TAG_AUDIO => mux.push_audio_tag(&chunk.data, chunk.timestamp_ms),
-                                _ => Ok(()),
-                            };
-                            if let Err(e) = res {
-                                warn!(error = ?e, "TS muxer dropped a tag");
-                            }
+                    if let Some(chunk) = maybe {
+                        buffer_bytes = buffer_bytes.saturating_add(chunk.data.len());
+                        if buffer_bytes > MAX_SEGMENT_BUFFER_BYTES {
+                            warn!(buffer_bytes, "RTMP segment buffer overflow — dropping current window");
+                            mux = FlvToTsConverter::new();
+                            buffer_bytes = 0;
+                            segment_start = Instant::now();
+                            continue;
                         }
-                        None => {
-                            // Sender dropped — flush whatever remains and exit.
-                            if mux.has_segment_data() {
-                                let elapsed = segment_start.elapsed().as_secs_f32().max(0.001);
-                                flush_ts_segment(&mut hls, &mut mux, elapsed).await;
-                            }
-                            if let Err(e) = hls.finish().await {
-                                warn!(error = %e, %stream_id, "hls finish failed");
-                            }
-                            break;
+                        let res = match chunk.kind {
+                            FLV_TAG_VIDEO => mux.push_video_tag(&chunk.data, chunk.timestamp_ms),
+                            FLV_TAG_AUDIO => mux.push_audio_tag(&chunk.data, chunk.timestamp_ms),
+                            _ => Ok(()),
+                        };
+                        if let Err(e) = res {
+                            warn!(error = ?e, "TS muxer dropped a tag");
                         }
+                    } else {
+                        // Sender dropped — flush whatever remains and exit.
+                        if mux.has_segment_data() {
+                            let elapsed = segment_start.elapsed().as_secs_f32().max(0.001);
+                            flush_ts_segment(&mut hls, &mut mux, elapsed).await;
+                        }
+                        if let Err(e) = hls.finish().await {
+                            warn!(error = %e, %stream_id, "hls finish failed");
+                        }
+                        break;
                     }
                 }
                 _ = ticker.tick() => {
@@ -772,7 +776,7 @@ struct MediaChunk {
 }
 
 /// Drain the converter's pending TS bytes (prepending PAT+PMT) and hand them
-/// to the HLS writer. The converter keeps codec config + saw_first_keyframe
+/// to the HLS writer. The converter keeps codec config + `saw_first_keyframe`
 /// state across segments so subsequent calls remain valid TS.
 async fn flush_ts_segment(hls: &mut HlsWriter, mux: &mut FlvToTsConverter, duration_secs: f32) {
     if !mux.has_segment_data() {

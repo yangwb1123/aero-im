@@ -276,7 +276,7 @@ mod tests {
         assert!(validate_signature_profile(&weak).is_err());
 
         let xpath = PROFILE.replace(
-            r#"<ds:Transforms>"#,
+            r"<ds:Transforms>",
             r#"<ds:Transforms><ds:Transform Algorithm="http://www.w3.org/TR/1999/REC-xpath-19991116"><ds:XPath>//*</ds:XPath></ds:Transform>"#,
         );
         assert!(validate_signature_profile(&xpath).is_err());
@@ -285,7 +285,7 @@ mod tests {
     #[test]
     fn rejects_multiple_references_before_any_digest_work() {
         let duplicate = PROFILE.replace(
-            r#"</ds:SignedInfo>"#,
+            r"</ds:SignedInfo>",
             r##"<ds:Reference URI="#assertion-1"><ds:Transforms><ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/><ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/></ds:Transforms><ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/><ds:DigestValue>digest</ds:DigestValue></ds:Reference></ds:SignedInfo>"##,
         );
         assert!(validate_signature_profile(&duplicate).is_err());

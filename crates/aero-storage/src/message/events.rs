@@ -24,6 +24,15 @@ pub struct OutboxedMessageDelete {
     pub outbox_id: uuid::Uuid,
 }
 
+/// A committed recall (撤回) and the outbox row appended in the same
+/// transaction. The message carries the system placeholder blocks plus
+/// `recalled_at`/`recalled_by`.
+#[derive(Debug, Clone)]
+pub struct OutboxedMessageRecall {
+    pub message: Message,
+    pub outbox_id: uuid::Uuid,
+}
+
 impl MessageRepo {
     /// Apply a trusted system edit and append `RoomEvent::Edited` atomically.
     ///
@@ -72,6 +81,12 @@ impl MessageRepo {
         if existing.deleted_at.is_some() {
             return Ok(None);
         }
+        // A recalled message is terminal for content: its body is the system
+        // placeholder. System editors (unfurl/transcribe) must NOT resurrect the
+        // original blocks post-recall — fence here, not only in the user path.
+        if existing.recalled_at.is_some() {
+            return Ok(None);
+        }
         if existing.version != expected_version {
             return Err(Error::Conflict(
                 "message was edited concurrently; reload and retry".into(),
@@ -116,7 +131,7 @@ impl MessageRepo {
                   AND deleted_at IS NULL
                   AND version = $5
             RETURNING id, room_id, sender_id, blocks, reply_to, metadata,
-                      created_at, edited_at, deleted_at, expires_at, version",
+                      created_at, edited_at, deleted_at, recalled_at, recalled_by, expires_at, version",
         )
         .bind(blocks_json)
         .bind(searchable)
@@ -172,6 +187,12 @@ impl MessageRepo {
             tx.rollback().await?;
             return Ok(None);
         }
+        // Recalled messages carry the placeholder body (no Voice block): skip
+        // them explicitly so a late transcript can never rewrite recall state.
+        if message.recalled_at.is_some() {
+            tx.rollback().await?;
+            return Ok(None);
+        }
         let mut changed = false;
         for block in &mut message.blocks {
             if let Block::Voice {
@@ -202,7 +223,7 @@ impl MessageRepo {
                       version = version + 1
                 WHERE id = $3 AND deleted_at IS NULL
             RETURNING id, room_id, sender_id, blocks, reply_to, metadata,
-                      created_at, edited_at, deleted_at, expires_at, version",
+                      created_at, edited_at, deleted_at, recalled_at, recalled_by, expires_at, version",
         )
         .bind(blocks_json)
         .bind(searchable)
@@ -370,7 +391,7 @@ impl MessageRepo {
     ) -> Result<Option<Message>, sqlx::Error> {
         let row = sqlx::query_as::<_, MessageRow>(
             r"SELECT id, room_id, sender_id, blocks, reply_to, metadata,
-                     created_at, edited_at, deleted_at, expires_at, version
+                     created_at, edited_at, deleted_at, recalled_at, recalled_by, expires_at, version
                 FROM messages
                WHERE id = $1
                FOR UPDATE",

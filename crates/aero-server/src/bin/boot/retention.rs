@@ -564,19 +564,6 @@ async fn sweep_viewer_samples(pool: &sqlx::PgPool, raw_days: i32, rollup_days: i
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::effective_revoked_token_retention_days;
-
-    #[test]
-    fn revoked_token_retention_covers_refresh_ttl_and_margin() {
-        assert_eq!(effective_revoked_token_retention_days(8, 86_400), 8);
-        assert_eq!(effective_revoked_token_retention_days(2, 8 * 86_400), 9);
-        assert_eq!(effective_revoked_token_retention_days(1, 86_401), 3);
-        assert_eq!(effective_revoked_token_retention_days(0, u64::MAX), 0);
-    }
-}
-
 /// Maintain the daily `RANGE` partitions of `stream_viewer_samples` (migration
 /// 0144): pre-create the next few days' partitions and drop ones older than the
 /// retention window. `keep_days` is the raw-sample retention plus a margin so a
@@ -599,5 +586,18 @@ async fn sweep_viewer_partitions(pool: &sqlx::PgPool, raw_days: i32) {
     {
         Ok(()) => {}
         Err(e) => warn!(error = ?e, "viewer-sample partition maintenance failed"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::effective_revoked_token_retention_days;
+
+    #[test]
+    fn revoked_token_retention_covers_refresh_ttl_and_margin() {
+        assert_eq!(effective_revoked_token_retention_days(8, 86_400), 8);
+        assert_eq!(effective_revoked_token_retention_days(2, 8 * 86_400), 9);
+        assert_eq!(effective_revoked_token_retention_days(1, 86_401), 3);
+        assert_eq!(effective_revoked_token_retention_days(0, u64::MAX), 0);
     }
 }

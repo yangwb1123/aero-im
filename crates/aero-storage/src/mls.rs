@@ -1,4 +1,4 @@
-//! MLS storage — KeyPackage publish/fetch and group state persistence.
+//! MLS storage — `KeyPackage` publish/fetch and group state persistence.
 //!
 //! Server is **not** an MLS participant; it stores opaque payloads and routes
 //! handshake messages. The cryptographic library (openmls) lives client-side.
@@ -15,7 +15,7 @@ pub const MAX_MLS_GROUP_ID_BYTES: usize = 255;
 pub const MAX_MLS_CIPHERSUITE_BYTES: usize = 128;
 /// Maximum opaque persisted group-state size accepted by production writes.
 pub const MAX_MLS_GROUP_STATE_BYTES: usize = 1024 * 1024;
-/// Maximum opaque KeyPackage payload accepted by the HTTP relay.
+/// Maximum opaque `KeyPackage` payload accepted by the HTTP relay.
 pub const MAX_MLS_KEY_PACKAGE_BYTES: usize = 16 * 1024;
 
 #[derive(Clone)]
@@ -37,8 +37,8 @@ impl KeyPackageRepo {
         let id = uuid::Uuid::new_v4();
         let created_at = time::OffsetDateTime::now_utc();
         sqlx::query(
-            r#"INSERT INTO mls_key_packages (id, participant_id, ciphersuite, payload, created_at)
-               VALUES ($1, $2, $3, $4, $5)"#,
+            r"INSERT INTO mls_key_packages (id, participant_id, ciphersuite, payload, created_at)
+               VALUES ($1, $2, $3, $4, $5)",
         )
         .bind(id)
         .bind(participant.to_uuid())
@@ -57,7 +57,7 @@ impl KeyPackageRepo {
         })
     }
 
-    /// Atomically consume one of the caller's own unused KeyPackages.
+    /// Atomically consume one of the caller's own unused `KeyPackages`.
     ///
     /// This preserves the legacy non-room endpoint without allowing an
     /// authenticated caller to drain another participant's packages.
@@ -77,7 +77,7 @@ impl KeyPackageRepo {
         Ok(package)
     }
 
-    /// Atomically consume a target's unused KeyPackage while both participants
+    /// Atomically consume a target's unused `KeyPackage` while both participants
     /// retain effective access to the canonical room.
     ///
     /// Participant authorization edges are locked in UUID order. This makes
@@ -137,8 +137,8 @@ impl KeyPackageRepo {
 
     pub async fn pending_count(&self, target: ParticipantId) -> Result<i64, sqlx::Error> {
         let (n,) = sqlx::query_as::<_, (i64,)>(
-            r#"SELECT COUNT(*) FROM mls_key_packages
-               WHERE participant_id = $1 AND consumed_at IS NULL"#,
+            r"SELECT COUNT(*) FROM mls_key_packages
+               WHERE participant_id = $1 AND consumed_at IS NULL",
         )
         .bind(target.to_uuid())
         .fetch_one(&self.pool)
@@ -152,7 +152,7 @@ async fn claim_one_in_tx(
     target: ParticipantId,
 ) -> Result<Option<KeyPackage>, sqlx::Error> {
     let row = sqlx::query_as::<_, KpRow>(
-        r#"UPDATE mls_key_packages
+        r"UPDATE mls_key_packages
               SET consumed_at = NOW()
             WHERE id = (
                 SELECT id FROM mls_key_packages
@@ -161,7 +161,7 @@ async fn claim_one_in_tx(
                  FOR UPDATE SKIP LOCKED
                  LIMIT 1
             )
-            RETURNING id, participant_id, ciphersuite, payload, created_at, consumed_at"#,
+            RETURNING id, participant_id, ciphersuite, payload, created_at, consumed_at",
     )
     .bind(target.to_uuid())
     .fetch_optional(&mut **tx)
@@ -245,10 +245,10 @@ impl MlsGroupRepo {
 
         if !existed {
             sqlx::query(
-                r#"INSERT INTO mls_groups
+                r"INSERT INTO mls_groups
                        (group_id, room_id, ciphersuite, epoch, state, updated_at, updated_by)
                    VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP, $6)
-                   ON CONFLICT (group_id) DO NOTHING"#,
+                   ON CONFLICT (group_id) DO NOTHING",
             )
             .bind(group.group_id.as_bytes())
             .bind(requested_room.to_uuid())
@@ -283,12 +283,12 @@ impl MlsGroupRepo {
         }
 
         let updated = sqlx::query(
-            r#"UPDATE mls_groups
+            r"UPDATE mls_groups
                   SET epoch = $2,
                       state = $3,
                       updated_at = CURRENT_TIMESTAMP,
                       updated_by = $4
-                WHERE group_id = $1"#,
+                WHERE group_id = $1",
         )
         .bind(group.group_id.as_bytes())
         .bind(epoch)
@@ -330,10 +330,10 @@ impl MlsGroupRepo {
         assert_effective_room_access(&mut tx, room, actor).await?;
 
         let row = sqlx::query_as::<_, GroupRow>(
-            r#"SELECT group_id, room_id, ciphersuite, epoch, state, updated_at
+            r"SELECT group_id, room_id, ciphersuite, epoch, state, updated_at
                  FROM mls_groups
                 WHERE group_id = $1
-                FOR SHARE"#,
+                FOR SHARE",
         )
         .bind(group_id.as_bytes())
         .fetch_optional(&mut *tx)
@@ -354,12 +354,12 @@ impl MlsGroupRepo {
     pub async fn upsert(&self, group: &MlsGroupState) -> Result<(), sqlx::Error> {
         let epoch_i = i64::try_from(group.epoch).unwrap_or(i64::MAX);
         sqlx::query(
-            r#"INSERT INTO mls_groups (group_id, room_id, ciphersuite, epoch, state, updated_at)
+            r"INSERT INTO mls_groups (group_id, room_id, ciphersuite, epoch, state, updated_at)
                VALUES ($1, $2, $3, $4, $5, $6)
                ON CONFLICT (group_id) DO UPDATE
                    SET epoch = EXCLUDED.epoch,
                        state = EXCLUDED.state,
-                       updated_at = EXCLUDED.updated_at"#,
+                       updated_at = EXCLUDED.updated_at",
         )
         .bind(group.group_id.as_bytes())
         .bind(group.room_id.map(|r| r.to_uuid()))
@@ -376,8 +376,8 @@ impl MlsGroupRepo {
     #[cfg(test)]
     pub async fn get(&self, group_id: &MlsGroupId) -> Result<Option<MlsGroupState>, sqlx::Error> {
         let row = sqlx::query_as::<_, GroupRow>(
-            r#"SELECT group_id, room_id, ciphersuite, epoch, state, updated_at
-               FROM mls_groups WHERE group_id = $1"#,
+            r"SELECT group_id, room_id, ciphersuite, epoch, state, updated_at
+               FROM mls_groups WHERE group_id = $1",
         )
         .bind(group_id.as_bytes())
         .fetch_optional(&self.pool)
@@ -452,10 +452,10 @@ async fn fetch_group_for_update(
     group_id: &MlsGroupId,
 ) -> Result<Option<GroupRow>, sqlx::Error> {
     sqlx::query_as::<_, GroupRow>(
-        r#"SELECT group_id, room_id, ciphersuite, epoch, state, updated_at
+        r"SELECT group_id, room_id, ciphersuite, epoch, state, updated_at
              FROM mls_groups
             WHERE group_id = $1
-            FOR UPDATE"#,
+            FOR UPDATE",
     )
     .bind(group_id.as_bytes())
     .fetch_optional(&mut **tx)

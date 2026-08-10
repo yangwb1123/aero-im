@@ -28,7 +28,7 @@ fn is_color() -> bool {
     }
     // Probe: is stdout a terminal?
     let supported = std::io::IsTerminal::is_terminal(&std::io::stdout());
-    CACHED.store(if supported { 1 } else { 0 }, Ordering::Relaxed);
+    CACHED.store(u8::from(supported), Ordering::Relaxed);
     supported
 }
 
@@ -81,7 +81,7 @@ pub fn fmt_duration(secs: f64) -> String {
     if secs < 1.0 {
         format!("{:.0}ms", secs * 1000.0)
     } else if secs < 60.0 {
-        format!("{:.1}s", secs)
+        format!("{secs:.1}s")
     } else {
         let m = (secs / 60.0).floor();
         let s = secs - m * 60.0;
@@ -201,7 +201,7 @@ mod tests {
     #[test]
     fn fmt_duration_minutes() {
         let s = fmt_duration(125.0);
-        assert!(s.contains("m") || s.contains("s"));
+        assert!(s.contains('m') || s.contains('s'));
     }
 
     #[test]
@@ -209,7 +209,7 @@ mod tests {
         let d = std::time::Duration::from_secs(5);
         let s = summary_line("✓", "test", d, "passed");
         assert!(s.contains("test"));
-        assert!(s.contains("5"));
+        assert!(s.contains('5'));
     }
 
     #[test]

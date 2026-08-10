@@ -1,6 +1,6 @@
 //! Workspace repository — tenant CRUD, membership, GDPR export/deletion, retention.
 //!
-//! Split from monolithic `workspace.rs` (1750 lines) as part of REFACTOR_PLAN.md Step 5.
+//! Split from monolithic `workspace.rs` (1750 lines) as part of `REFACTOR_PLAN.md` Step 5.
 //! Route-facing membership mutations use the transaction-owned helpers in
 //! [`members`] and [`guests`], which lock the workspace and canonical member
 //! rows before rechecking RBAC, final-owner, tenancy, and single-channel guest

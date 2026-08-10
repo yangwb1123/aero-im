@@ -106,6 +106,99 @@ test('2FA management uses caller-scoped routes and sends the disable code', asyn
   assert.deepEqual(JSON.parse(requests[3].init.body), { code: '654321' });
 });
 
+test('recallMessage posts to the encoded message recall endpoint', async () => {
+  const previousFetch = globalThis.fetch;
+  const previousStorage = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+  const requests = [];
+  Object.defineProperty(globalThis, 'localStorage', {
+    configurable: true,
+    value: { getItem: () => 'access.jwt' },
+  });
+  globalThis.fetch = async (url, init) => {
+    requests.push({ url, init });
+    return {
+      status: 200,
+      ok: true,
+      headers: { get: () => 'application/json' },
+      json: async () => ({
+        id: 'msg/1',
+        recalled_at: '2026-08-06T00:00:00Z',
+        recalled_by: 'participant-a',
+      }),
+    };
+  };
+  try {
+    const recalled = await api.recallMessage('msg/1');
+    assert.equal(recalled.recalled_at, '2026-08-06T00:00:00Z');
+  } finally {
+    globalThis.fetch = previousFetch;
+    if (previousStorage === undefined) delete globalThis.localStorage;
+    else Object.defineProperty(globalThis, 'localStorage', previousStorage);
+  }
+
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].init.method, 'POST');
+  assert.equal(requests[0].url, '/api/messages/msg%2F1/recall', 'id is path-encoded');
+  assert.equal(requests[0].init.body, undefined, 'recall takes no body');
+});
+
+test('recallMessage surfaces a 409 already-recalled as ApiError for callers to map to success', async () => {
+  const previousFetch = globalThis.fetch;
+  const previousStorage = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+  Object.defineProperty(globalThis, 'localStorage', {
+    configurable: true,
+    value: { getItem: () => 'access.jwt' },
+  });
+  globalThis.fetch = async () => ({
+    status: 409,
+    ok: false,
+    headers: { get: () => 'application/json' },
+    json: async () => ({ code: 'conflict', msg: 'message is already recalled' }),
+  });
+  try {
+    await assert.rejects(
+      api.recallMessage('msg-1'),
+      (error) => error.status === 409
+        && error.body.code === 'conflict'
+        && /already recalled/.test(error.message),
+    );
+  } finally {
+    globalThis.fetch = previousFetch;
+    if (previousStorage === undefined) delete globalThis.localStorage;
+    else Object.defineProperty(globalThis, 'localStorage', previousStorage);
+  }
+});
+
+test('recallMessage surfaces a window-expired 409 with the real wire envelope', async () => {
+  const previousFetch = globalThis.fetch;
+  const previousStorage = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+  Object.defineProperty(globalThis, 'localStorage', {
+    configurable: true,
+    value: { getItem: () => 'access.jwt' },
+  });
+  // Real envelope: Error::Conflict Display renders "conflict: <detail>" (see
+  // crates/aero-server/src/error.rs contract test) — an unprefixed mock would
+  // mask the production mismatch and let the 409-swallow regression return.
+  globalThis.fetch = async () => ({
+    status: 409,
+    ok: false,
+    headers: { get: () => 'application/json' },
+    json: async () => ({ code: 'conflict', msg: 'conflict: recall window expired' }),
+  });
+  try {
+    await assert.rejects(
+      api.recallMessage('msg-1'),
+      (error) => error.status === 409
+        && error.body.code === 'conflict'
+        && error.message === 'conflict: recall window expired',
+    );
+  } finally {
+    globalThis.fetch = previousFetch;
+    if (previousStorage === undefined) delete globalThis.localStorage;
+    else Object.defineProperty(globalThis, 'localStorage', previousStorage);
+  }
+});
+
 test('governance wrappers preserve tenant scope, filters, and bot ownership paths', async () => {
   const previousFetch = globalThis.fetch;
   const previousStorage = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
@@ -264,4 +357,66 @@ test('productivity wrappers preserve room and workspace scope', async () => {
   ]);
   assert.deepEqual(JSON.parse(requests[2].init.body), { manager_id: 'manager /1' });
   assert.deepEqual(JSON.parse(requests[8].init.body), { when: '2h' });
+});
+
+// ---------- composer drafts (per-room, private to the author) ----------
+
+async function withDraftFetch(responder, fn) {
+  const previousFetch = globalThis.fetch;
+  const previousStorage = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
+  const requests = [];
+  Object.defineProperty(globalThis, 'localStorage', {
+    configurable: true,
+    value: { getItem: () => 'access.jwt' },
+  });
+  globalThis.fetch = async (url, init) => {
+    requests.push({ url, init });
+    return typeof responder === 'function' ? responder(url, init) : responder;
+  };
+  try {
+    await fn(requests);
+  } finally {
+    globalThis.fetch = previousFetch;
+    if (previousStorage === undefined) delete globalThis.localStorage;
+    else Object.defineProperty(globalThis, 'localStorage', previousStorage);
+  }
+}
+
+const okJson = (data) => ({ status: 200, ok: true, headers: { get: () => 'application/json' }, json: async () => data });
+const errJson = (status, msg) => ({ status, ok: false, headers: { get: () => 'application/json' }, json: async () => ({ code: `err-${status}`, msg }) });
+
+test('draft endpoints use the per-room routes with encoded ids', async () => {
+  await withDraftFetch(okJson({ saved: true }), async (requests) => {
+    await api.getDraft('room /1');
+    await api.saveDraft('room /1', { blocks: [{ type: 'text', content: 'hi' }], reply_to: 'm/1' });
+    await api.deleteDraft('room /1');
+    assert.deepEqual(requests.map((r) => [r.init.method, r.url]), [
+      ['GET', '/api/rooms/room%20%2F1/draft'],
+      ['PUT', '/api/rooms/room%20%2F1/draft'],
+      ['DELETE', '/api/rooms/room%20%2F1/draft'],
+    ]);
+    assert.equal(requests[0].init.body, undefined, 'GET takes no body');
+    assert.deepEqual(JSON.parse(requests[1].init.body), {
+      blocks: [{ type: 'text', content: 'hi' }], reply_to: 'm/1',
+    });
+  });
+});
+
+test('saveDraft omits reply_to when absent and passes blocks through', async () => {
+  await withDraftFetch(okJson({ saved: true }), async (requests) => {
+    await api.saveDraft('room-1', { blocks: [{ type: 'text', content: 'plain' }] });
+    assert.deepEqual(JSON.parse(requests[0].init.body), { blocks: [{ type: 'text', content: 'plain' }] });
+  });
+});
+
+test('draft errors surface as ApiError with status (401/403/409)', async () => {
+  const checks = await Promise.all([401, 403, 409].map((status) => (
+    withDraftFetch(errJson(status, `draft ${status}`), async () => {
+      await assert.rejects(
+        api.getDraft('room-1'),
+        (error) => error.status === status && /draft/.test(error.message),
+      );
+    })
+  )));
+  assert.equal(checks.length, 3);
 });

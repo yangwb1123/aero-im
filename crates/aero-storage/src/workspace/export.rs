@@ -115,7 +115,7 @@ impl WorkspaceRepo {
             };
             let probe = EXPORT_MESSAGES_PER_ROOM + 1;
             let mut msg_rows = sqlx::query_as::<_, ExportMessageRow>(
-                r"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, expires_at, version
+                r"SELECT id, room_id, sender_id, blocks, reply_to, metadata, created_at, edited_at, deleted_at, recalled_at, recalled_by, expires_at, version
                    FROM messages
                    WHERE room_id = $1 AND deleted_at IS NULL
                    ORDER BY id DESC
@@ -433,6 +433,8 @@ struct ExportMessageRow {
     created_at: time::OffsetDateTime,
     edited_at: Option<time::OffsetDateTime>,
     deleted_at: Option<time::OffsetDateTime>,
+    recalled_at: Option<time::OffsetDateTime>,
+    recalled_by: Option<uuid::Uuid>,
     expires_at: Option<time::OffsetDateTime>,
     version: i32,
 }
@@ -450,6 +452,8 @@ impl From<ExportMessageRow> for Message {
             created_at: r.created_at,
             edited_at: r.edited_at,
             deleted_at: r.deleted_at,
+            recalled_at: r.recalled_at,
+            recalled_by: r.recalled_by.map(ParticipantId::from_uuid),
             expires_at: r.expires_at,
             version: r.version,
         }

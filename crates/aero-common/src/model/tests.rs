@@ -206,6 +206,8 @@ fn interactive_block_labels_are_searchable() {
         created_at: OffsetDateTime::UNIX_EPOCH,
         edited_at: None,
         deleted_at: None,
+        recalled_at: None,
+        recalled_by: None,
         expires_at: None,
         version: 1,
     };
@@ -484,6 +486,8 @@ fn searchable_text_concatenates_blocks() {
         created_at: time::OffsetDateTime::now_utc(),
         edited_at: None,
         deleted_at: None,
+        recalled_at: None,
+        recalled_by: None,
         expires_at: None,
         version: 1,
     };
@@ -510,6 +514,8 @@ fn file_attachment_name_is_searchable() {
         created_at: time::OffsetDateTime::now_utc(),
         edited_at: None,
         deleted_at: None,
+        recalled_at: None,
+        recalled_by: None,
         expires_at: None,
         version: 1,
     };
@@ -614,4 +620,90 @@ fn user_status_json_roundtrip() {
     assert_eq!(back.emoji.as_deref(), Some(":palm_tree:"));
     assert_eq!(back.presence, Presence::Away);
     assert!(back.expires_at.is_none());
+}
+
+// ---------- Recall (撤回) ----------
+
+/// `RoomEvent::Recalled` is a tuple variant carrying the full updated message:
+/// wire tag must be `recalled`, the placeholder body must round-trip, and the
+/// accessors must fan out to the whole room (`explicit_recipients` empty) and
+/// resolve the room from the carried message.
+#[test]
+fn recalled_event_roundtrips_and_fans_to_room() {
+    let m = Message {
+        id: MessageId::new(),
+        room_id: RoomId::new(),
+        sender_id: ParticipantId::new(),
+        blocks: vec![Block::text(RECALLED_MESSAGE_PLACEHOLDER)],
+        reply_to: None,
+        metadata: serde_json::Value::Null,
+        created_at: time::OffsetDateTime::now_utc(),
+        edited_at: None,
+        deleted_at: None,
+        recalled_at: Some(time::OffsetDateTime::now_utc()),
+        recalled_by: Some(ParticipantId::new()),
+        expires_at: None,
+        version: 2,
+    };
+    let ev = RoomEvent::Recalled(m.clone());
+    let j = serde_json::to_string(&ev).unwrap();
+    assert!(
+        j.contains("\"kind\":\"recalled\""),
+        "wire tag is the snake_case discriminant: {j}"
+    );
+    let back: RoomEvent = serde_json::from_str(&j).unwrap();
+    let RoomEvent::Recalled(back_m) = back else {
+        panic!("expected Recalled variant");
+    };
+    assert_eq!(back_m.id, m.id);
+    assert_eq!(
+        serde_json::to_value(&back_m.blocks).unwrap(),
+        serde_json::to_value(&m.blocks).unwrap(),
+        "placeholder blocks round-trip"
+    );
+    assert_eq!(back_m.recalled_at, m.recalled_at);
+    assert_eq!(back_m.recalled_by, m.recalled_by);
+    assert_eq!(back_m.version, 2);
+    assert!(
+        ev.explicit_recipients().is_empty(),
+        "recall fans out to all room members"
+    );
+    assert_eq!(ev.room_id(), Some(m.room_id));
+    assert!(m.recalled());
+}
+
+/// Pre-recall JSON (no `recalled_*` fields) must keep deserializing: the new
+/// fields are additive and optional, so old clients/rows are untouched.
+#[test]
+fn message_deserializes_without_recall_fields() {
+    let j = r#"{"id":"01HZXZY0Z0Z0Z0Z0Z0Z0Z0Z0Z0","room_id":"01HZXZY0Z0Z0Z0Z0Z0Z0Z0Z0Z0","sender_id":"01HZXZY0Z0Z0Z0Z0Z0Z0Z0Z0Z0","blocks":[{"type":"text","content":"hi"}],"created_at":"2026-01-01T00:00:00Z","version":1}"#;
+    let m: Message = serde_json::from_str(j).unwrap();
+    assert!(!m.recalled());
+    assert!(m.recalled_at.is_none());
+    assert!(m.recalled_by.is_none());
+}
+
+/// The system placeholder is a single plain text block; a recalled message's
+/// searchable projection is the placeholder text (the DB clears the dedicated
+/// `searchable_text` column, so the placeholder never reaches FTS).
+#[test]
+fn recalled_placeholder_is_single_text_block() {
+    let blocks = vec![Block::text(RECALLED_MESSAGE_PLACEHOLDER)];
+    let m = Message {
+        id: MessageId::new(),
+        room_id: RoomId::new(),
+        sender_id: ParticipantId::new(),
+        blocks,
+        reply_to: None,
+        metadata: serde_json::Value::Null,
+        created_at: time::OffsetDateTime::now_utc(),
+        edited_at: None,
+        deleted_at: None,
+        recalled_at: Some(time::OffsetDateTime::now_utc()),
+        recalled_by: Some(ParticipantId::new()),
+        expires_at: None,
+        version: 1,
+    };
+    assert_eq!(m.searchable_text(), RECALLED_MESSAGE_PLACEHOLDER);
+    assert!(!RECALLED_MESSAGE_PLACEHOLDER.is_empty());
 }

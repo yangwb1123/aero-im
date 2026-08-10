@@ -299,7 +299,7 @@ async fn list_topic_history(
         .await?;
     let entries = s
         .topic_history
-        .list(room, q.limit.max(1).min(100), q.offset.max(0))
+        .list(room, q.limit.clamp(1, 100), q.offset.max(0))
         .await?;
     Ok(Json(serde_json::json!({ "history": entries })))
 }

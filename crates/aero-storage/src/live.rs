@@ -37,8 +37,8 @@ impl LiveRepo {
         let id = Ulid::new();
         let created_at = OffsetDateTime::now_utc();
         sqlx::query(
-            r#"INSERT INTO stream_chat (id, stream_id, sender_id, body, is_subscriber, created_at)
-               VALUES ($1, $2, $3, $4, $5, $6)"#,
+            r"INSERT INTO stream_chat (id, stream_id, sender_id, body, is_subscriber, created_at)
+               VALUES ($1, $2, $3, $4, $5, $6)",
         )
         .bind(Uuid::from_u128(id.0))
         .bind(Uuid::from_u128(stream_id.0))
@@ -61,13 +61,13 @@ impl LiveRepo {
         // so the store never streams an unbounded danmaku backlog.
         let limit = limit.clamp(1, 200);
         let rows = sqlx::query_as::<_, ChatRow>(
-            r#"SELECT c.id, c.stream_id, c.sender_id, p.display_name AS sender_name,
+            r"SELECT c.id, c.stream_id, c.sender_id, p.display_name AS sender_name,
                       c.body, c.is_subscriber, c.created_at
                FROM stream_chat c
                JOIN participants p ON p.id = c.sender_id
                WHERE c.stream_id = $1
                ORDER BY c.created_at DESC
-               LIMIT $2"#,
+               LIMIT $2",
         )
         .bind(Uuid::from_u128(stream_id.0))
         .bind(limit)
@@ -94,13 +94,13 @@ impl LiveRepo {
         };
         let limit = limit.clamp(1, 200);
         let rows = sqlx::query_as::<_, ChatRow>(
-            r#"SELECT c.id, c.stream_id, c.sender_id, p.display_name AS sender_name,
+            r"SELECT c.id, c.stream_id, c.sender_id, p.display_name AS sender_name,
                       c.body, c.is_subscriber, c.created_at
                FROM stream_chat c
                JOIN participants p ON p.id = c.sender_id
                WHERE c.stream_id = $1 AND c.id > $2
                ORDER BY c.id ASC
-               LIMIT $3"#,
+               LIMIT $3",
         )
         .bind(Uuid::from_u128(stream_id.0))
         .bind(Uuid::from_u128(cursor.0))
@@ -135,12 +135,12 @@ impl LiveRepo {
         // WHERE idempotency_key IS NOT NULL, so a NULL key never conflicts and the
         // insert always proceeds. RETURNING yields no row on a dedup hit.
         let inserted: Option<(Uuid,)> = sqlx::query_as(
-            r#"INSERT INTO stream_gifts
+            r"INSERT INTO stream_gifts
                  (id, stream_id, sender_id, gift_id, qty, coins, created_at, idempotency_key)
                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                ON CONFLICT (sender_id, idempotency_key) WHERE idempotency_key IS NOT NULL
                DO NOTHING
-               RETURNING id"#,
+               RETURNING id",
         )
         .bind(Uuid::from_u128(id.0))
         .bind(Uuid::from_u128(stream_id.0))
@@ -157,8 +157,8 @@ impl LiveRepo {
         }
         // Dedup hit — return the original gift so the caller stays consistent.
         let (orig_id, orig_at): (Uuid, OffsetDateTime) = sqlx::query_as(
-            r#"SELECT id, created_at FROM stream_gifts
-               WHERE sender_id = $1 AND idempotency_key = $2"#,
+            r"SELECT id, created_at FROM stream_gifts
+               WHERE sender_id = $1 AND idempotency_key = $2",
         )
         .bind(sender_id.to_uuid())
         .bind(idempotency_key)
@@ -176,13 +176,13 @@ impl LiveRepo {
         // Defense in depth: bound the gift backlog the store will stream.
         let limit = limit.clamp(1, 200);
         let rows = sqlx::query_as::<_, GiftRow>(
-            r#"SELECT g.id, g.stream_id, g.sender_id, p.display_name AS sender_name,
+            r"SELECT g.id, g.stream_id, g.sender_id, p.display_name AS sender_name,
                       g.gift_id, g.qty, g.coins, g.created_at
                FROM stream_gifts g
                JOIN participants p ON p.id = g.sender_id
                WHERE g.stream_id = $1
                ORDER BY g.created_at DESC
-               LIMIT $2"#,
+               LIMIT $2",
         )
         .bind(Uuid::from_u128(stream_id.0))
         .bind(limit)
@@ -206,13 +206,13 @@ impl LiveRepo {
         };
         let limit = limit.clamp(1, 200);
         let rows = sqlx::query_as::<_, GiftRow>(
-            r#"SELECT g.id, g.stream_id, g.sender_id, p.display_name AS sender_name,
+            r"SELECT g.id, g.stream_id, g.sender_id, p.display_name AS sender_name,
                       g.gift_id, g.qty, g.coins, g.created_at
                FROM stream_gifts g
                JOIN participants p ON p.id = g.sender_id
                WHERE g.stream_id = $1 AND g.id > $2
                ORDER BY g.id ASC
-               LIMIT $3"#,
+               LIMIT $3",
         )
         .bind(Uuid::from_u128(stream_id.0))
         .bind(Uuid::from_u128(cursor.0))
@@ -229,7 +229,7 @@ impl LiveRepo {
         limit: i64,
     ) -> Result<Vec<GiftLeaderRow>, sqlx::Error> {
         let rows = sqlx::query_as::<_, LeaderRow>(
-            r#"SELECT g.sender_id,
+            r"SELECT g.sender_id,
                       p.display_name AS sender_name,
                       SUM(g.coins)::BIGINT AS total_coins,
                       SUM(g.qty)::BIGINT   AS total_qty
@@ -238,7 +238,7 @@ impl LiveRepo {
                WHERE g.stream_id = $1
                GROUP BY g.sender_id, p.display_name
                ORDER BY total_coins DESC
-               LIMIT $2"#,
+               LIMIT $2",
         )
         .bind(Uuid::from_u128(stream_id.0))
         .bind(limit)
@@ -249,8 +249,9 @@ impl LiveRepo {
             .map(|r| GiftLeaderRow {
                 sender_id: ParticipantId::from_uuid(r.sender_id),
                 sender_name: r.sender_name,
-                total_coins: r.total_coins.max(0) as u64,
-                total_qty: r.total_qty.max(0) as u64,
+                total_coins: u64::try_from(r.total_coins.max(0))
+                    .expect("max(0) is non-negative"),
+                total_qty: u64::try_from(r.total_qty.max(0)).expect("max(0) is non-negative"),
             })
             .collect())
     }
@@ -296,9 +297,7 @@ struct GiftRow {
 /// Map a stored gift row to the wire type, enriching name/icon from the catalog
 /// (falling back gracefully if the catalog changed since the gift was sent).
 fn gift_line(r: GiftRow) -> StreamGiftLine {
-    let (name, icon) = gift_by_id(&r.gift_id)
-        .map(|g| (g.name, g.icon))
-        .unwrap_or_else(|| (r.gift_id.clone(), "🎁".to_owned()));
+    let (name, icon) = gift_by_id(&r.gift_id).map_or_else(|| (r.gift_id.clone(), "🎁".to_owned()), |g| (g.name, g.icon));
     StreamGiftLine {
         id: Ulid(r.id.as_u128()),
         stream_id: Ulid(r.stream_id.as_u128()),
@@ -307,8 +306,8 @@ fn gift_line(r: GiftRow) -> StreamGiftLine {
         gift_id: r.gift_id,
         gift_name: name,
         gift_icon: icon,
-        qty: r.qty.max(0) as u32,
-        coins: r.coins.max(0) as u64,
+        qty: u32::try_from(r.qty.max(0)).expect("max(0) is non-negative"),
+        coins: u64::try_from(r.coins.max(0)).expect("max(0) is non-negative"),
         created_at: r.created_at,
     }
 }

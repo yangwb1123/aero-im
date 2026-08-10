@@ -153,9 +153,7 @@ pub(super) async fn backfill_from_cursors(
     close: &CancellationToken,
     summarize: bool,
 ) -> Option<Vec<DeliveryRoomBarrier>> {
-    let Some(rooms) = effective_backfill_rooms(state, pid).await else {
-        return None;
-    };
+    let rooms = effective_backfill_rooms(state, pid).await?;
     let cursors = match state.delivery_cursors.cursors_for(pid).await {
         Ok(cursors) => cursors,
         Err(error) => {

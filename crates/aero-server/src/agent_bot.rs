@@ -24,10 +24,12 @@ use crate::{
 };
 
 pub async fn run(state: AppState, ai: Arc<AiService>) -> anyhow::Result<()> {
-    run_until_cancelled(state, ai, CancellationToken::new()).await
+    // The listener future embeds a sizable state machine; box it so the task
+    // stack stays small.
+    Box::pin(run_until_cancelled(state, ai, CancellationToken::new())).await
 }
 
-/// Run until `cancel` is triggered, finishing and ACKing any event already
+/// Run until `cancel` is triggered, finishing and `ACKing` any event already
 /// received before returning.
 pub async fn run_until_cancelled(
     state: AppState,
@@ -67,11 +69,15 @@ pub async fn run_until_cancelled(
             let handler_state = &state;
             let handler_ai = &ai;
             let _ =
-                crate::consumer_event_receipt::process(&receipts, "aero-bot", sub, || async move {
-                    match event {
-                        Ok(RoomEvent::Message(env)) => handle(handler_state, handler_ai, env).await,
-                        Ok(_) | Err(_) => Ok(()),
-                    }
+                crate::consumer_event_receipt::process(&receipts, "aero-bot", sub, || {
+                    Box::pin(async move {
+                        match event {
+                            Ok(RoomEvent::Message(env)) => {
+                                handle(handler_state, handler_ai, env).await
+                            }
+                            Ok(_) | Err(_) => Ok(()),
+                        }
+                    })
                 })
                 .await;
         }
@@ -110,9 +116,8 @@ async fn handle(state: &AppState, ai: &Arc<AiService>, env: MessageEnvelope) -> 
         .map(|value| value.to_uuid());
 
     for mention in mentions {
-        let bot = match participants.get(mention).await? {
-            Some(p) => p,
-            None => continue,
+        let Some(bot) = participants.get(mention).await? else {
+            continue;
         };
         if !matches!(bot.kind, ParticipantKind::Bot | ParticipantKind::Agent) {
             continue;
@@ -156,7 +161,7 @@ async fn handle(state: &AppState, ai: &Arc<AiService>, env: MessageEnvelope) -> 
         if !answer.citations.is_empty() {
             let payload = serde_json::json!({
                 "title": "引用",
-                "body": answer.citations.iter().map(|m| m.to_string()).collect::<Vec<_>>().join(", "),
+                "body": answer.citations.iter().map(std::string::ToString::to_string).collect::<Vec<_>>().join(", "),
             });
             blocks.push(Block::Card {
                 schema: "citation".into(),

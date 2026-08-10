@@ -11,7 +11,7 @@ use aero_common::{
 };
 
 /// The new `send_markdown` frame deserializes with the documented field set
-/// (markdown text + optional reply_to / expires_after_secs) and is distinct
+/// (markdown text + optional `reply_to` / `expires_after_secs`) and is distinct
 /// from `send_message`. Pure serde round-trip — no I/O, no `AppState`.
 #[test]
 fn send_markdown_frame_deserializes() {
@@ -101,6 +101,8 @@ fn client_message_id_and_ack_capability_are_explicit_on_the_wire() {
         created_at: time::OffsetDateTime::now_utc(),
         edited_at: None,
         deleted_at: None,
+        recalled_at: None,
+        recalled_by: None,
         expires_at: None,
         version: 1,
     };
@@ -211,7 +213,7 @@ fn send_markdown_body_parses_to_expected_blocks() {
 }
 
 /// @mention follow-up contract: a leading `@name` parses to a nil-id
-/// `Block::Mention` marker (display-name → ParticipantId resolution is a
+/// `Block::Mention` marker (display-name → `ParticipantId` resolution is a
 /// deferred follow-up), and any trailing text still lands verbatim so the
 /// message body is never lost.
 #[test]

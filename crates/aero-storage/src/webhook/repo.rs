@@ -28,10 +28,10 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 
-use super::breaker::*;
+use super::breaker::{breaker_from_row, BreakerState, DeliveryOutcome};
 use super::crypto::*;
-use super::delivery::*;
-use super::types::*;
+use super::delivery::WebhookSender;
+use super::types::{IncomingHook, IncomingHookSummary, OutgoingHookSummary, OutgoingTarget};
 
 #[path = "incoming.rs"]
 mod incoming;
@@ -378,6 +378,14 @@ impl WebhookRepo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::webhook::breaker::{
+        event_matches, outcome_of, BREAKER_BASE_COOLDOWN_SECS, BREAKER_FAILURE_THRESHOLD,
+        BREAKER_MAX_COOLDOWN_SECS, BREAKER_RATE_LIMIT_COOLDOWN_SECS,
+    };
+    use crate::webhook::delivery::{
+        build_delivery, parse_retry_after, DeliveryResponse, FakeSender, SIGNATURE_HEADER,
+        TIMESTAMP_HEADER,
+    };
 
     // ----- sign_payload: stable, known-vector, body-sensitive -----
 
@@ -779,6 +787,7 @@ mod tests {
 mod db_tests {
     use super::*;
     use aero_common::{ParticipantId, RoomId, WorkspaceId};
+    use crate::webhook::breaker::{BREAKER_BASE_COOLDOWN_SECS, BREAKER_FAILURE_THRESHOLD};
 
     fn pool() -> PgPool {
         let url = std::env::var("DATABASE_URL")
@@ -966,7 +975,7 @@ mod db_tests {
     }
 
     /// The circuit-breaker columns (0129) round-trip: a fresh hook loads closed
-    /// (0 failures, no open_until); `record_breaker` persists an open state that
+    /// (0 failures, no `open_until`); `record_breaker` persists an open state that
     /// both load paths (`list_outgoing_for_room_event` + `outgoing_target`) read
     /// back; a subsequent close clears it.
     #[tokio::test]

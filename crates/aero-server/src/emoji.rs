@@ -121,8 +121,7 @@ async fn create_emoji(
     let repo = EmojiRepo::new(s.participants.pool().clone());
     let emoji = repo
         .create_authorized(ws, name, blob_id, auth.participant_id)
-        .await
-        .map_err(AeroError::from)?;
+        .await?;
     Ok((
         StatusCode::CREATED,
         Json(serde_json::to_value(emoji).map_err(AeroError::from)?),
@@ -139,7 +138,6 @@ async fn delete_emoji(
     let id = parse_emoji_id(&id_str)?;
     let repo = EmojiRepo::new(s.participants.pool().clone());
     repo.delete_authorized(id, auth.participant_id)
-        .await
-        .map_err(AeroError::from)?;
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }

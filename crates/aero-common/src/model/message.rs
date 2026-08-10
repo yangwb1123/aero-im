@@ -12,6 +12,30 @@ use crate::ids::{MessageId, ParticipantId, RoomId};
 
 // ---------- Message ----------
 
+/// Canonical system placeholder body written by a recall (撤回): the message
+/// row survives with `recalled_at`/`recalled_by` set and this single text block
+/// replacing the original content, so history/audit stay intact while the
+/// original words are gone. Stored verbatim in `messages.blocks`; the
+/// `searchable_text` column is cleared (the placeholder is never indexed).
+pub const RECALLED_MESSAGE_PLACEHOLDER: &str = "[此消息已被撤回]";
+
+/// Recall-window (撤回时间窗) rule: a message author may recall while
+/// `now - created_at <= window`; `window == ZERO` means unlimited. Expired iff
+/// strictly older than the window (inclusive boundary — `t = window` is still
+/// recallable, `t = window + 1s` is not). Kept here (leaf crate) so the service
+/// preflight and the storage transaction fence share ONE predicate; both use
+/// [`crate::time::now_utc`] so the comparison is always app-clock on both
+/// sides (`created_at` is app-minted at insert). The fence evaluates this
+/// against the `FOR UPDATE`-locked row, so the boundary is atomic.
+#[must_use]
+pub fn recall_window_expired(
+    created_at: OffsetDateTime,
+    now: OffsetDateTime,
+    window: time::Duration,
+) -> bool {
+    window != time::Duration::ZERO && now - created_at > window
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Message {
     pub id: MessageId,
@@ -28,6 +52,14 @@ pub struct Message {
     pub edited_at: Option<OffsetDateTime>,
     #[serde(default, with = "time::serde::rfc3339::option")]
     pub deleted_at: Option<OffsetDateTime>,
+    /// When the message was recalled (撤回): content replaced by the system
+    /// placeholder. `None` = not recalled. Orthogonal to `deleted_at` (a
+    /// recalled message can still be tombstoned afterwards).
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub recalled_at: Option<OffsetDateTime>,
+    /// Who recalled the message (the author, or a room admin/owner).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recalled_by: Option<ParticipantId>,
     #[serde(default, with = "time::serde::rfc3339::option")]
     pub expires_at: Option<OffsetDateTime>,
     /// Optimistic-lock counter (migration 0157): starts at 1, incremented on
@@ -46,6 +78,14 @@ fn default_message_version() -> i32 {
 }
 
 impl Message {
+    /// Whether this message has been recalled (content replaced by the system
+    /// placeholder). A recalled message is still visible in room history; it is
+    /// just no longer editable by anyone.
+    #[must_use]
+    pub fn recalled(&self) -> bool {
+        self.recalled_at.is_some()
+    }
+
     /// Concatenated searchable text used for embedding/full-text index. Folds in
     /// each block's primary [`searchable_text`](Block::searchable_text) plus any
     /// [`extra_searchable_text`](Block::extra_searchable_text) (e.g. `Select`

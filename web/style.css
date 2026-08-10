@@ -420,6 +420,18 @@ input, textarea, select, button { font-family: inherit; }
 }
 .composer.offline textarea { border-color: rgba(245, 158, 11, .55); }
 
+/* server-persisted composer draft indicator (drafts.js) */
+.composer-draft-status {
+  padding: 8px 16px;
+  border-top: 1px solid var(--line);
+  color: var(--text-mute);
+  font-size: 12px;
+  text-align: center;
+}
+.composer-draft-status.saved { color: var(--ok); }
+.composer-draft-status.error { color: var(--danger); cursor: pointer; }
+.composer-draft-status.error:hover { text-decoration: underline; }
+
 /* right pane */
 .online-list { padding: 8px; overflow-y: auto; flex: 1; }
 .online-item {
@@ -595,6 +607,7 @@ input, textarea, select, button { font-family: inherit; }
 
 /* deleted / edited */
 .msg.deleted .msg-bubble { font-style: italic; opacity: .6; }
+.msg.recalled .msg-bubble { font-style: italic; opacity: .6; }
 .msg-meta .edited { font-size: 11px; }
 
 /* reactions */

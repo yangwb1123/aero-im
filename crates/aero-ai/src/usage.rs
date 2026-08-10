@@ -237,6 +237,9 @@ pub async fn record_durable_cost(
     persist_and_record(sink, usage_id, reg, kind, workspace, micros).await
 }
 
+// Internal accounting helper with a fixed parameter set; a context struct would
+// churn both callers for no behavioral gain.
+#[allow(clippy::too_many_arguments)]
 pub async fn record_durable_token_cost(
     sink: Option<&dyn UsageSink>,
     usage_id: uuid::Uuid,
@@ -246,8 +249,7 @@ pub async fn record_durable_token_cost(
     workspace: Option<uuid::Uuid>,
     input_tokens: u32,
     output_tokens: u32,
-) -> Result<UsagePersistOutcome, String> {
-    persist_and_record(
+) -> Result<UsagePersistOutcome, String> {    persist_and_record(
         sink,
         usage_id,
         reg,

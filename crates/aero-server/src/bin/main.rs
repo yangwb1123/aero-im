@@ -56,7 +56,7 @@ async fn main() -> anyhow::Result<()> {
         .context("initialize Snaplink commercial integration")?;
 
     // ---------- Repos ----------
-    let repos = boot::build_repos(persistence.pg.clone(), &persistence.cache);
+    let repos = boot::build_repos(&persistence.pg, &persistence.cache);
     // Snapshot-based regional routing is the single BlobStore surface handed to
     // HTTP, AI, export, transcription, and GC. It resolves each operation from
     // the blob row rather than the workspace's mutable current setting.
@@ -135,15 +135,15 @@ async fn main() -> anyhow::Result<()> {
         ingest_cfg.rtmp,
         ingest_cfg.srt_listen(),
     );
-    let _live_cfg = boot::spawn_ingest(&tracker, repos.streams.clone(), ingest_cfg, &ai_shutdown);
+    let _live_cfg = boot::spawn_ingest(&tracker, &repos.streams, ingest_cfg, &ai_shutdown);
 
     // ---------- Orchestration ----------
     let orchestration = boot::build_orchestration(
-        repos.calls.clone(),
-        repos.sfu_router.clone(),
+        &repos.calls,
+        &repos.sfu_router,
         repos.sfu_forwarder.clone(),
-        Arc::new(repos.call_routes.clone()),
-        public_base_url.clone(),
+        &Arc::new(repos.call_routes.clone()),
+        &public_base_url,
         cfg.server.host.clone(),
     );
 

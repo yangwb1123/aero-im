@@ -170,7 +170,7 @@ impl ParticipantCache {
     /// served without ever touching a repo), `None` when absent or expired (the
     /// path that would fall through to the DB). Bumps the same hit/miss counters
     /// as the real method so the "fresh read does not touch the DB" invariant is
-    /// asserted offline (no PgPool / tokio needed).
+    /// asserted offline (no `PgPool` / tokio needed).
     fn probe_fresh(&self, pid: aero_common::ParticipantId) -> Option<Arc<Participant>> {
         let now = Instant::now();
         if let Some(entry) = self.map.get(&pid) {

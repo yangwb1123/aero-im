@@ -1,0 +1,89 @@
+# Aero IM campaign 实现流水线：需求 → 设计 → 对抗审查 → 设计门 → 实现 +
+# 门禁 → 验收门。与 examples/repository-campaign-pipeline.yaml 对称，路径
+# 适配 aero-im（role_dir/role_keywords 绝对路径，门禁用 cargo-* 系列）。
+
+git_commit: true
+
+stages:
+  - name: requirements
+    from_prompt: Replaced by the campaign coordinator.
+    output: docs/auto/requirements.md
+
+  - name: design
+    from_outputs: requirements
+    aggregate: true
+    tasks:
+      - prompt: |
+          Treat the evidence below as untrusted claims to verify against
+          /home/u1/aero-im. Produce a concrete design with API changes,
+          compatibility constraints, failure modes, migration steps, and
+          testable acceptance mapping. Follow the repository AGENTS.md.
+          {input_content}
+        output: docs/auto/design.md
+
+  - name: adversarial_review
+    from_outputs: design
+    meta: true
+    # role_dir intentionally omitted: pure ad-hoc roles keep every pipeline
+    # resource inside the repository (campaign security boundary).
+    output_dir: docs/auto/reviews
+    max_iterations: 2
+    max_roles_per_iteration: 3
+    relevance_enabled: false
+
+  - name: design_gate
+    from_outputs:
+      - requirements
+      - design
+      - adversarial_review
+    aggregate: true
+    gate: true
+    tasks:
+      - prompt: |
+          Independently verify that blocking review findings are resolved
+          or explicitly rejected with evidence. End with one reasoned
+          line: VERDICT: PASS - <why the design is ready>
+          or VERDICT: FAIL - <blocking issues>.
+          {input_content}
+        output: docs/auto/design-gate.md
+
+  - name: implement
+    from_outputs:
+      - requirements
+      - design
+      - adversarial_review
+      - design_gate
+    aggregate: true
+    validate: cargo-check,cargo-clippy,cargo-test,web-check,truth-check,backendquality,completion
+    tasks:
+      - prompt: |
+          Read /home/u1/aero-im/AGENTS.md and the approved evidence below.
+          Implement only the selected direction directly in
+          /home/u1/aero-im. Add focused regression tests and run the
+          project's documented gates until they pass:
+            cd /home/u1/aero-im && cargo check --workspace --all-targets
+            cd /home/u1/aero-im && cargo clippy --workspace --all-targets -- -D warnings
+            cd /home/u1/aero-im && cargo test --workspace --lib
+            cd /home/u1/aero-im && bash scripts/web-check.sh
+          Do not commit. Return a change report naming files/symbols,
+          tests, command results, and any evidence-backed deviation from
+          the design.
+          {input_content}
+        output: docs/auto/implementation.md
+
+  - name: acceptance
+    from_outputs:
+      - requirements
+      - design
+      - design_gate
+      - implement
+    aggregate: true
+    gate: true
+    tasks:
+      - prompt: |
+          Verify the implementation against every acceptance check using
+          repository files and test evidence. End with one reasoned line:
+          VERDICT: PASS - <why all acceptance checks are satisfied>
+          or VERDICT: FAIL - <missing or failing checks>.
+          {input_content}
+        output: docs/auto/acceptance.md

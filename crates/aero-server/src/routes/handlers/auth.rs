@@ -164,7 +164,7 @@ async fn auth_login(
             .map_err(AeroError::from)?
             .ok_or_else(|| AeroError::Internal(anyhow::anyhow!("2FA activated without a secret")))?;
         let now = u64::try_from(time::OffsetDateTime::now_utc().unix_timestamp()).unwrap_or(0);
-        let totp_code = submitted_totp.as_deref().map(str::trim).unwrap_or("");
+        let totp_code = submitted_totp.as_deref().map_or("", str::trim);
         let totp_valid = aero_auth::totp::verify(&secret, totp_code, now);
         if !totp_valid {
             if let Some(code) = recovery_code.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
@@ -261,9 +261,12 @@ struct UpdateMeReq {
     display_name: Option<String>,
     /// Outer Option = field present; inner Option = nullable on the wire.
     #[serde(default, deserialize_with = "deserialize_optional_field")]
+    #[allow(clippy::option_option)] // deliberate wire-format triple-state, see above
     avatar_url: Option<Option<String>>,
 }
 
+// Triple-state wire format (absent / null / value); see `UpdateMeReq`.
+#[allow(clippy::option_option)]
 fn deserialize_optional_field<'de, D, T>(d: D) -> std::result::Result<Option<Option<T>>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -277,7 +280,7 @@ async fn update_me(
     auth: AuthUser,
     Json(req): Json<UpdateMeReq>,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let name = req.display_name.as_deref().map(|n| n.trim()).filter(|n| !n.is_empty());
+    let name = req.display_name.as_deref().map(str::trim).filter(|n| !n.is_empty());
     if let Some(n) = name {
         if n.len() > 64 {
             return Err(AeroError::Invalid("display_name too long".into()).into());

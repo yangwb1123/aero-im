@@ -104,14 +104,14 @@ impl NotificationRepo {
     /// across the batch; only `participant` + `kind` vary. Returns the row count.
     /// A no-op (Ok(0)) for an empty `recipients`.
     ///
-    /// `delivery_id` is the NotifyBatch idempotency token (mig 0137). When
+    /// `delivery_id` is the `NotifyBatch` idempotency token (mig 0137). When
     /// `Some`, every row carries it and the insert is `ON CONFLICT
     /// (delivery_id, participant_id) WHERE delivery_id IS NOT NULL DO NOTHING`,
     /// so a redelivered batch (same deterministic `delivery_id`) re-expanded
     /// into the same recipients yields zero new rows for anyone already
     /// notified — matching the partial unique index. When `None`, rows get a
     /// NULL `delivery_id` and never participate in de-duplication (the legacy
-    /// behaviour, preserved for any caller outside the NotifyBatch path).
+    /// behaviour, preserved for any caller outside the `NotifyBatch` path).
     pub async fn insert_many(
         &self,
         room: RoomId,
@@ -607,10 +607,10 @@ mod db_tests {
         assert_eq!(after, before - 1, "unread count drops by one");
     }
 
-    /// A NotifyBatch redelivered after a consumer crash re-expands into the same
+    /// A `NotifyBatch` redelivered after a consumer crash re-expands into the same
     /// recipients with the SAME deterministic `delivery_id`; the partial unique
     /// index + `ON CONFLICT (delivery_id, participant_id) DO NOTHING` must keep
-    /// exactly one row per (delivery_id, participant) — mig 0137 idempotency.
+    /// exactly one row per (`delivery_id`, participant) — mig 0137 idempotency.
     #[tokio::test]
     #[ignore = "requires live Postgres"]
     async fn notif_insert_many_dedups_on_delivery_id() {

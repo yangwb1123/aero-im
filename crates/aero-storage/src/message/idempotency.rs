@@ -352,6 +352,8 @@ mod tests {
             created_at: time::OffsetDateTime::UNIX_EPOCH,
             edited_at: None,
             deleted_at: None,
+            recalled_at: None,
+            recalled_by: None,
             expires_at: None,
             version: 1,
         };
@@ -666,7 +668,7 @@ mod db_tests {
         assert_ne!(other_outcome.message().id, canonical);
 
         sqlx::query("DELETE FROM message_send_keys WHERE sender_id = ANY($1)")
-            .bind(&[sender.id.to_uuid(), other.id.to_uuid()])
+            .bind([sender.id.to_uuid(), other.id.to_uuid()])
             .execute(&pool)
             .await
             .ok();
@@ -686,7 +688,7 @@ mod db_tests {
             .await
             .ok();
         sqlx::query("DELETE FROM participants WHERE id = ANY($1)")
-            .bind(&[sender.id.to_uuid(), other.id.to_uuid()])
+            .bind([sender.id.to_uuid(), other.id.to_uuid()])
             .execute(&pool)
             .await
             .ok();
@@ -1008,17 +1010,17 @@ mod db_tests {
             .await
             .ok();
         sqlx::query("DELETE FROM blob_gc_queue WHERE blob_id IN (SELECT id FROM blobs WHERE owner_id = ANY($1))")
-            .bind(&[sender.id.to_uuid(), owner.id.to_uuid()])
+            .bind([sender.id.to_uuid(), owner.id.to_uuid()])
             .execute(&pool)
             .await
             .ok();
         sqlx::query("DELETE FROM blobs WHERE owner_id = ANY($1)")
-            .bind(&[sender.id.to_uuid(), owner.id.to_uuid()])
+            .bind([sender.id.to_uuid(), owner.id.to_uuid()])
             .execute(&pool)
             .await
             .ok();
         sqlx::query("DELETE FROM participants WHERE id = ANY($1)")
-            .bind(&[sender.id.to_uuid(), owner.id.to_uuid()])
+            .bind([sender.id.to_uuid(), owner.id.to_uuid()])
             .execute(&pool)
             .await
             .ok();

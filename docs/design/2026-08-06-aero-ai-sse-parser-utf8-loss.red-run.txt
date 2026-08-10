@@ -1,0 +1,74 @@
+   Compiling aero-ai v0.1.0 (/home/u1/aero-im/crates/aero-ai)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.14s
+     Running unittests src/lib.rs (target/debug/deps/aero_ai-87a3767bbf5ccdd1)
+
+running 11 tests
+test anthropic::tests::sse_parser_buffers_across_chunks ... ok
+test anthropic::tests::sse_parser_emoji_split_four_pushes ... FAILED
+test anthropic::tests::sse_parser_cjk_split_two_chunks ... FAILED
+test anthropic::tests::sse_parser_corrupt_mid_stream_warns_and_retains_prefix ... FAILED
+test anthropic::tests::sse_parser_cjk_split_three_chunks ... FAILED
+test anthropic::tests::sse_parser_empty_bytes_push ... FAILED
+test anthropic::tests::sse_parser_extracts_text_delta ... ok
+test anthropic::tests::sse_parser_ignores_non_delta_events ... ok
+test anthropic::tests::sse_parser_ignores_non_text_delta_type ... ok
+test anthropic::tests::sse_parser_queues_multiple_chunks ... ok
+test anthropic::tests::sse_parser_property_every_split_offset ... FAILED
+
+failures:
+
+---- anthropic::tests::sse_parser_emoji_split_four_pushes stdout ----
+
+thread 'anthropic::tests::sse_parser_emoji_split_four_pushes' (672057) panicked at crates/aero-ai/src/anthropic.rs:1091:9:
+assertion `left == right` failed
+  left: None
+ right: Some("😀")
+
+---- anthropic::tests::sse_parser_cjk_split_two_chunks stdout ----
+
+thread 'anthropic::tests::sse_parser_cjk_split_two_chunks' (672055) panicked at crates/aero-ai/src/anthropic.rs:1005:9:
+assertion `left == right` failed
+  left: None
+ right: Some("中文")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- anthropic::tests::sse_parser_corrupt_mid_stream_warns_and_retains_prefix stdout ----
+
+thread 'anthropic::tests::sse_parser_corrupt_mid_stream_warns_and_retains_prefix' (672056) panicked at crates/aero-ai/src/anthropic.rs:1195:9:
+assertion `left == right` failed: corruption must never be silent
+  left: 0
+ right: 1
+
+---- anthropic::tests::sse_parser_cjk_split_three_chunks stdout ----
+
+thread 'anthropic::tests::sse_parser_cjk_split_three_chunks' (672054) panicked at crates/aero-ai/src/anthropic.rs:1040:9:
+assertion `left == right` failed
+  left: None
+ right: Some("中文")
+
+---- anthropic::tests::sse_parser_empty_bytes_push stdout ----
+
+thread 'anthropic::tests::sse_parser_empty_bytes_push' (672058) panicked at crates/aero-ai/src/anthropic.rs:1132:9:
+assertion `left == right` failed
+  left: []
+ right: ["中文"]
+
+---- anthropic::tests::sse_parser_property_every_split_offset stdout ----
+
+thread 'anthropic::tests::sse_parser_property_every_split_offset' (672062) panicked at crates/aero-ai/src/anthropic.rs:1067:13:
+assertion `left == right` failed: split at byte 101: text lost or garbled
+  left: ""
+ right: "中文😀文B"
+
+
+failures:
+    anthropic::tests::sse_parser_cjk_split_three_chunks
+    anthropic::tests::sse_parser_cjk_split_two_chunks
+    anthropic::tests::sse_parser_corrupt_mid_stream_warns_and_retains_prefix
+    anthropic::tests::sse_parser_emoji_split_four_pushes
+    anthropic::tests::sse_parser_empty_bytes_push
+    anthropic::tests::sse_parser_property_every_split_offset
+
+test result: FAILED. 5 passed; 6 failed; 0 ignored; 0 measured; 187 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p aero-ai --lib`

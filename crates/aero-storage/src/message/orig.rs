@@ -1,6 +1,6 @@
 //! Tests only — types and functions moved to `mod.rs`.
 //!
-//! Part of REFACTOR_PLAN.md Step 2.
+//! Part of `REFACTOR_PLAN.md` Step 2.
 
 // Re-export items from parent so sub-modules using `crate::message::orig::*` still work.
 pub(crate) use super::{
@@ -48,8 +48,8 @@ mod tests {
         .unwrap();
         let ids = attached_blob_ids(&blocks_val);
         assert_eq!(ids.len(), 2, "should find both file and voice blob ids");
-        assert!(ids.iter().any(|id| *id == b1));
-        assert!(ids.iter().any(|id| *id == b2));
+        assert!(ids.contains(&b1));
+        assert!(ids.contains(&b2));
     }
 
     #[test]
@@ -59,6 +59,73 @@ mod tests {
         );
         assert!(attached_blob_ids(&serde_json::Value::Null).is_empty());
         assert!(attached_blob_ids(&serde_json::json!("not an array")).is_empty());
+    }
+
+    /// Gate round-3 B1 (failing-test-first): the recall history snapshot must
+    /// never carry byte references (`blob_id`) — the recall tx enqueues those
+    /// blobs for GC, and `message_edits` is invisible to the GC live-reference
+    /// scan, so a snapshot with `blob_id`s would point at destroyed bytes.
+    #[test]
+    fn redact_blocks_for_recall_snapshot_removes_byte_references() {
+        use aero_common::{BlobId, FileKind};
+        use super::super::redact_blocks_for_recall_snapshot;
+
+        let file_blob = BlobId::new();
+        let voice_blob = BlobId::new();
+        let blocks = vec![
+            aero_common::Block::text("keep me"),
+            aero_common::Block::File {
+                blob_id: file_blob,
+                kind: FileKind::Document,
+                name: "f.txt".into(),
+                size: 100,
+            },
+            aero_common::Block::Voice {
+                blob_id: voice_blob,
+                duration_ms: 5000,
+                transcript: Some("spoken words".into()),
+            },
+            aero_common::Block::Voice {
+                blob_id: BlobId::new(),
+                duration_ms: 3000,
+                transcript: None,
+            },
+        ];
+
+        let redacted = redact_blocks_for_recall_snapshot(&blocks);
+
+        // File → marker text, no byte reference.
+        assert!(
+            matches!(&redacted[1], aero_common::Block::Text { content, .. } if content == "[附件已移除]"),
+            "file block becomes the attachment-removed marker"
+        );
+        // Voice with transcript → the transcript survives as text evidence.
+        assert!(
+            matches!(&redacted[2], aero_common::Block::Text { content, .. } if content == "spoken words"),
+            "voice transcript is preserved as text"
+        );
+        // Voice without transcript → marker.
+        assert!(
+            matches!(&redacted[3], aero_common::Block::Text { content, .. } if content == "[语音已移除]"),
+            "voice without transcript becomes the voice-removed marker"
+        );
+        // Non-attachment blocks pass through untouched.
+        assert_eq!(
+            serde_json::to_value(&redacted[0]).unwrap(),
+            serde_json::to_value(aero_common::Block::text("keep me")).unwrap()
+        );
+
+        // The serialized snapshot must contain no byte reference at all.
+        let json = serde_json::to_value(&redacted).unwrap();
+        assert!(
+            !json.to_string().contains(&file_blob.to_string()),
+            "file blob_id must not leak into the snapshot"
+        );
+        assert!(
+            !json.to_string().contains(&voice_blob.to_string()),
+            "voice blob_id must not leak into the snapshot"
+        );
+        assert_eq!(json.to_string().matches("\"blob_id\"").count(), 0);
     }
 }
 
@@ -361,8 +428,7 @@ mod db_tests {
         let my_count: u32 = counts
             .iter()
             .find(|(rid, _)| *rid == r)
-            .map(|(_, c)| *c)
-            .unwrap_or(0);
+            .map_or(0, |(_, c)| *c);
         assert!(
             my_count >= 2,
             "should see at least 2 unread: got {my_count}"
@@ -381,8 +447,7 @@ mod db_tests {
         let remaining: u32 = counts2
             .iter()
             .find(|(rid, _)| *rid == r)
-            .map(|(_, c)| *c)
-            .unwrap_or(0);
+            .map_or(0, |(_, c)| *c);
         assert!(remaining < my_count, "should decrease after marking read");
 
         // Cleanup.

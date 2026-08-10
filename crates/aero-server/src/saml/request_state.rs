@@ -1,4 +1,4 @@
-//! Short-lived, single-use SAML AuthnRequest correlation state.
+//! Short-lived, single-use SAML `AuthnRequest` correlation state.
 
 use aero_common::Error as AeroError;
 use fred::{

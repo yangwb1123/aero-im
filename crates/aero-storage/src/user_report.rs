@@ -45,7 +45,7 @@ impl UserReportRepo {
         Self { pg }
     }
 
-    /// File a report from `reporter` against `reported`.
+    /// File a report from `reporter` against `target`.
     ///
     /// For a workspace-scoped report, both participants must retain effective
     /// access to that workspace through commit. The workspace and membership
@@ -65,11 +65,11 @@ impl UserReportRepo {
     pub async fn create_authorized(
         &self,
         reporter: ParticipantId,
-        reported: ParticipantId,
+        target: ParticipantId,
         workspace: Option<WorkspaceId>,
         reason: &str,
     ) -> Result<Option<Uuid>, Error> {
-        if reporter == reported {
+        if reporter == target {
             return Err(Error::Invalid("cannot report yourself".into()));
         }
         if reason.len() > 2_000 {
@@ -92,8 +92,8 @@ impl UserReportRepo {
             // Opposing A→B and B→A reports must acquire membership locks in the
             // same order. The shared helper also rechecks deletion,
             // deactivation, and mandatory-2FA state under locks.
-            let mut participants = [reporter, reported];
-            participants.sort_by_key(|participant| participant.to_uuid());
+            let mut participants = [reporter, target];
+            participants.sort_by_key(aero_common::ParticipantId::to_uuid);
             for participant in participants {
                 if !crate::workspace::members::effective_workspace_access_in_tx(
                     &mut tx,
@@ -108,7 +108,7 @@ impl UserReportRepo {
                 }
             }
         } else {
-            lock_active_participants(&mut tx, reporter, reported).await?;
+            lock_active_participants(&mut tx, reporter, target).await?;
         }
 
         let row: Option<(Uuid,)> = sqlx::query_as(
@@ -118,7 +118,7 @@ impl UserReportRepo {
              RETURNING id",
         )
         .bind(reporter.to_uuid())
-        .bind(reported.to_uuid())
+        .bind(target.to_uuid())
         .bind(workspace.map(|w| w.to_uuid()))
         .bind(reason)
         .fetch_optional(&mut *tx)
@@ -221,9 +221,9 @@ fn valid_resolution_status(status: &str) -> bool {
 async fn lock_active_participants(
     tx: &mut Transaction<'_, Postgres>,
     reporter: ParticipantId,
-    reported: ParticipantId,
+    target: ParticipantId,
 ) -> Result<(), Error> {
-    let mut ids = [reporter.to_uuid(), reported.to_uuid()];
+    let mut ids = [reporter.to_uuid(), target.to_uuid()];
     ids.sort_unstable();
     let active = sqlx::query_scalar::<_, Uuid>(
         "SELECT id
@@ -313,7 +313,7 @@ mod db_tests {
         let owner = participant(&pool, "owner").await;
         let admin = participant(&pool, "admin").await;
         let reporter = participant(&pool, "reporter").await;
-        let reported = participant(&pool, "reported").await;
+        let target = participant(&pool, "reported").await;
         let other_owner = participant(&pool, "other-owner").await;
         let outsider = participant(&pool, "outsider").await;
         let deleted = participant(&pool, "deleted").await;
@@ -339,7 +339,7 @@ mod db_tests {
         for (member, role) in [
             (admin, WorkspaceRole::Admin),
             (reporter, WorkspaceRole::Member),
-            (reported, WorkspaceRole::Member),
+            (target, WorkspaceRole::Member),
         ] {
             workspaces
                 .add_member(workspace, member, role)
@@ -352,13 +352,13 @@ mod db_tests {
             .unwrap();
 
         let scoped = reports
-            .create_authorized(reporter, reported, Some(workspace), "tenant report")
+            .create_authorized(reporter, target, Some(workspace), "tenant report")
             .await
             .unwrap()
             .expect("first workspace report is inserted");
         assert!(
             reports
-                .create_authorized(reporter, reported, Some(workspace), "duplicate")
+                .create_authorized(reporter, target, Some(workspace), "duplicate")
                 .await
                 .unwrap()
                 .is_none(),

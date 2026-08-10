@@ -12,16 +12,25 @@
 
 use std::sync::Arc;
 
-use aero_common::{Block, CallKind, CallMode, RoomKind, WorkspaceRole};
+use aero_common::{
+    Block, CallKind, CallMode, MessageId, ParticipantId, RoomId, RoomKind, WorkspaceRole,
+};
 use aero_storage::{
-    db::PgPool, AiJobRepo, BlockRepo, CallRepo, DmRepo, GroupDmRepo, MessageRepo, ParticipantRepo,
-    ReactionRepo, ReceiptRepo, RoomRepo, WorkspaceRepo,
+    db::PgPool, AiJobRepo, BlockRepo, CallRepo, DmRepo, GroupDmRepo, MessageRepo,
+    NotificationBundleRepo, NotificationPrefsRepo, NotificationRepo, ParticipantRepo, ReactionRepo,
+    ReceiptRepo, RoomRepo, ThreadMuteRepo, ThreadNotificationPrefsRepo, ThreadSubscriptionRepo,
+    WorkspaceMuteRepo, WorkspaceRepo,
 };
 
 use crate::service::ImService;
 use crate::test_util::MockBus;
 
+// Fully-qualified `time::Duration` used by the recall-window fixture pin.
+
 mod auto_mod_tests;
+mod notifications_tests;
+mod recall_tests;
+mod relay_tests;
 mod room_kind_tests;
 
 fn unique_email(prefix: &str) -> String {
@@ -54,6 +63,254 @@ fn service(pool: PgPool) -> ImService {
     .with_workspaces(WorkspaceRepo::new(pool.clone()))
     // Blocking guard for 1:1 call/DM (no-op unless a block exists).
     .with_block_repo(BlockRepo::new(pool))
+    // Recall-window hermeticity: `ImService::new` reads AERO_RECALL_WINDOW_SECS
+    // from the process env (parallel-unsafe to mutate in tests); pin unlimited
+    // so the shared fixture is env-independent. Window tests build their own
+    // service with an explicit `with_recall_window(...)`.
+    .with_recall_window(time::Duration::ZERO)
+}
+
+/// Serializes the seed → dispatch → assert critical sections of the three tests
+/// that create globally-claimable DUE side-effect jobs (AT-2, AT-6b, AT-7). The
+/// relay loops claim GLOBAL state (`claim_due` without a message filter), so a
+/// concurrent batch could steal another test's re-armed/seeded jobs mid-test and
+/// skew exact return-value assertions (design §5.6). A std mutex held across
+/// awaits is fine here: only these tests contend, there is no re-entrancy, and
+/// the runbook additionally runs the suite with `--test-threads=1`.
+static BATCH_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Fresh participants + a group room whose creator is `members[0]` and who adds
+/// every other member. Returns (members, room).
+async fn group_room(
+    pool: &PgPool,
+    svc: &ImService,
+    prefix: &str,
+    n: usize,
+) -> (Vec<aero_common::Participant>, RoomId) {
+    let participants = ParticipantRepo::new(pool.clone());
+    let mut members = Vec::new();
+    for i in 0..n {
+        members.push(new_participant(&participants, &format!("{prefix}-p{i}")).await);
+    }
+    let room = svc
+        .create_room(members[0].id, RoomKind::Group, None)
+        .await
+        .unwrap()
+        .id;
+    for member in &members[1..] {
+        svc.add_member(members[0].id, room, member.id).await.unwrap();
+    }
+    (members, room)
+}
+
+/// Service with the full notification stack wired (mention/reply fan-out and
+/// every suppression store). `bundles=false` omits `NotificationBundleRepo` so
+/// reply notifications land immediately instead of deferring into bundles.
+/// Returns the `MockBus` for publish assertions.
+fn notification_service(pool: PgPool, bundles: bool) -> (ImService, Arc<MockBus>) {
+    let bus = Arc::new(MockBus::default());
+    let svc = ImService::new(
+        RoomRepo::new(pool.clone()),
+        MessageRepo::new(pool.clone()),
+        ParticipantRepo::new(pool.clone()),
+        ReceiptRepo::new(pool.clone()),
+        ReactionRepo::new(pool.clone()),
+        CallRepo::new(pool.clone()),
+        AiJobRepo::new(pool.clone()),
+        bus.clone(),
+    )
+    .with_workspaces(WorkspaceRepo::new(pool.clone()))
+    .with_notifications(NotificationRepo::new(pool.clone()))
+    .with_notification_prefs(NotificationPrefsRepo::new(pool.clone()))
+    .with_block_repo(BlockRepo::new(pool.clone()))
+    .with_workspace_mutes(WorkspaceMuteRepo::new(pool.clone()))
+    .with_thread_subs(ThreadSubscriptionRepo::new(pool.clone()))
+    .with_thread_mutes(ThreadMuteRepo::new(pool.clone()))
+    .with_thread_notification_prefs(ThreadNotificationPrefsRepo::new(pool.clone()));
+    let svc = if bundles {
+        svc.with_notification_bundles(NotificationBundleRepo::new(pool))
+    } else {
+        svc
+    };
+    (svc, bus)
+}
+
+// ---------------------------------------------------------------------------
+// Raw-SQL seeding + assertion helpers for the notification fan-out suite
+// (design §3.2). Raw SQL is used only to seed state the public API cannot
+// create: `NotificationPrefsRepo::mute`/`unmute` and
+// `MessageSideEffectRepo::insert_in_tx` are `#[cfg(test)] pub(crate)` in
+// aero-storage (unreachable from a dependency crate), so mute rows and
+// synthetic/re-armed side-effect jobs are seeded here. Every count is
+// message-scoped so the tests are immune to stray rows from other tests/rooms.
+// ---------------------------------------------------------------------------
+
+/// Seed a per-room mute (`channel_mutes`); mirrors `NotificationPrefsRepo::mute`.
+async fn insert_channel_mute(pool: &PgPool, participant: ParticipantId, room: RoomId) {
+    sqlx::query(
+        "INSERT INTO channel_mutes (participant_id, room_id, created_at)
+         VALUES ($1, $2, now())",
+    )
+    .bind(participant.to_uuid())
+    .bind(room.to_uuid())
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// Simulate a crash-redelivery of a completed side-effect job: re-arm the SAME
+/// row (`message_side_effect_jobs` dedups `ON CONFLICT (message_id,
+/// mutation_version, kind)`, so redelivery is a re-claim, never a re-insert).
+/// Returns `rows_affected` — callers MUST assert 1: a re-arm matching 0 rows (job
+/// already completed by the fast path) would otherwise let AT-2/AT-7 pass
+/// without exercising the redelivery at all (vacuity guard, design §4 C3).
+async fn rearm_side_effect_job(pool: &PgPool, job_id: uuid::Uuid) -> u64 {
+    sqlx::query(
+        "UPDATE message_side_effect_jobs
+            SET completed_at = NULL,
+                claimed_at = NULL,
+                last_error = NULL,
+                attempts = attempts + 1,
+                available_at = now() - interval '1 minute'
+          WHERE id = $1",
+    )
+    .bind(job_id)
+    .execute(pool)
+    .await
+    .unwrap()
+    .rows_affected()
+}
+
+/// Seed a synthetic due side-effect job (`kind` ∈ notifications|embed|moderate).
+/// Plain INSERT (no ON CONFLICT): a UNIQUE (`message_id`, `mutation_version`, `kind`)
+/// collision errors loudly instead of silently no-op'ing.
+async fn insert_side_effect_job(
+    pool: &PgPool,
+    message_id: MessageId,
+    mutation_version: i32,
+    kind: &str,
+) -> uuid::Uuid {
+    let id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO message_side_effect_jobs (id, message_id, mutation_version, kind)
+         VALUES ($1, $2, $3, $4)",
+    )
+    .bind(id)
+    .bind(message_id.to_uuid())
+    .bind(mutation_version)
+    .bind(kind)
+    .execute(pool)
+    .await
+    .unwrap();
+    id
+}
+
+/// Seed a message row OUTSIDE `ImService` (no outbox row, no side-effect jobs) so
+/// a test can install the *only* dispatch driver it wants (AT-6b). `version` 1;
+/// `delivery_ordinal` is auto-assigned by the BEFORE-INSERT trigger (mig 0174).
+async fn insert_message_row(
+    pool: &PgPool,
+    room: RoomId,
+    sender: ParticipantId,
+    blocks: Vec<Block>,
+) -> MessageId {
+    let id = MessageId::new();
+    sqlx::query(
+        "INSERT INTO messages (id, room_id, sender_id, blocks, version)
+         VALUES ($1, $2, $3, $4::jsonb, 1)",
+    )
+    .bind(id.to_uuid())
+    .bind(room.to_uuid())
+    .bind(sender.to_uuid())
+    .bind(serde_json::to_value(&blocks).unwrap())
+    .execute(pool)
+    .await
+    .unwrap();
+    id
+}
+
+async fn count_notifications(
+    pool: &PgPool,
+    message_id: MessageId,
+    participant: Option<ParticipantId>,
+) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM notifications
+          WHERE message_id = $1
+            AND ($2::uuid IS NULL OR participant_id = $2)",
+    )
+    .bind(message_id.to_uuid())
+    .bind(participant.map(|p| p.to_uuid()))
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// `event_kind = 'notify'` — lowercase, per the DB CHECK (mig 0163) and
+/// `EventOutboxKind::Notify => "notify"` (design correction D1).
+async fn count_notify_outbox(pool: &PgPool, message_id: MessageId) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM event_outbox
+          WHERE message_id = $1 AND event_kind = 'notify'",
+    )
+    .bind(message_id.to_uuid())
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+async fn count_bundles(pool: &PgPool, message_id: MessageId) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM notification_bundles WHERE message_id = $1")
+        .bind(message_id.to_uuid())
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// `ai_jobs` has NO `message_id` column (mig 0002) — only `target_id`; filter on
+/// `target_id` exactly as the production query does (`message_side_effect.rs:538`).
+async fn count_ai_jobs(pool: &PgPool, message_id: MessageId) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM ai_jobs
+          WHERE target_id = $1 AND kind IN ('embed', 'moderate')",
+    )
+    .bind(message_id.to_uuid())
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// The not-yet-published Notify outbox row for a message: (`event_id`, `payload`).
+/// For notify rows `event_id` IS the deterministic `delivery_id` — the insert
+/// passes it as the idempotency key (`insert_idempotent_in_tx`, `event_outbox.rs`).
+async fn pending_notify_outbox(
+    pool: &PgPool,
+    message_id: MessageId,
+) -> Option<(uuid::Uuid, serde_json::Value)> {
+    sqlx::query_as::<_, (uuid::Uuid, serde_json::Value)>(
+        "SELECT event_id, payload FROM event_outbox
+          WHERE message_id = $1 AND event_kind = 'notify' AND published_at IS NULL
+          ORDER BY aggregate_version
+          LIMIT 1",
+    )
+    .bind(message_id.to_uuid())
+    .fetch_optional(pool)
+    .await
+    .unwrap()
+}
+
+/// (`completed_at`, `attempts`, `last_error`) for one side-effect job row.
+async fn side_effect_job_state(
+    pool: &PgPool,
+    job_id: uuid::Uuid,
+) -> (Option<time::OffsetDateTime>, i32, Option<String>) {
+    sqlx::query_as::<_, (Option<time::OffsetDateTime>, i32, Option<String>)>(
+        "SELECT completed_at, attempts, last_error FROM message_side_effect_jobs WHERE id = $1",
+    )
+    .bind(job_id)
+    .fetch_one(pool)
+    .await
+    .unwrap()
 }
 
 async fn new_participant(participants: &ParticipantRepo, prefix: &str) -> aero_common::Participant {

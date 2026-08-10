@@ -20,6 +20,7 @@
 use aero_common::{ParticipantId, WorkspaceId};
 use serde::Serialize;
 use sqlx::PgPool;
+use std::fmt::Write as _;
 
 /// One directory row — a workspace member's public-facing identity + profile.
 ///
@@ -131,18 +132,22 @@ impl DirectoryRepo {
         );
         let mut idx = 2;
         if query.is_some() {
-            sql.push_str(&format!(" AND p.display_name ILIKE '%'||${idx}||'%'"));
+            write!(sql, " AND p.display_name ILIKE '%'||${idx}||'%'")
+                .expect("write to String cannot fail");
             idx += 1;
         }
         if title.is_some() {
-            sql.push_str(&format!(" AND pp.title ILIKE '%'||${idx}||'%'"));
+            write!(sql, " AND pp.title ILIKE '%'||${idx}||'%'")
+                .expect("write to String cannot fail");
             idx += 1;
         }
-        sql.push_str(&format!(
+        write!(
+            sql,
             " ORDER BY p.display_name ASC, p.id ASC LIMIT ${} OFFSET ${}",
             idx,
             idx + 1
-        ));
+        )
+        .expect("write to String cannot fail");
 
         let mut q = sqlx::query_as::<_, Row>(&sql).bind(workspace.to_uuid());
         if let Some(needle) = query {
@@ -292,8 +297,8 @@ mod db_tests {
     }
 
     /// A GDPR-erased member must NOT appear in the directory. Erasure tombstones
-    /// the participant (UPDATE deleted_at, display_name='[deleted]') and leaves the
-    /// workspace_members row intact (the FK cascade never fires on a tombstone), so
+    /// the participant (UPDATE `deleted_at`, `display_name`='[deleted]') and leaves the
+    /// `workspace_members` row intact (the FK cascade never fires on a tombstone), so
     /// only the query's `deleted_at IS NULL` filter keeps the '[deleted]' row out.
     #[tokio::test]
     #[ignore = "requires live Postgres"]

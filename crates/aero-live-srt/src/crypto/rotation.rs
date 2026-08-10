@@ -41,9 +41,9 @@ impl SrtKeyRotation {
         self.passphrase = Some(passphrase);
     }
 
-    fn slot<'a>(&'a self, even: &'a Option<SrtCrypto>, flag: KkFlag) -> Option<&'a SrtCrypto> {
+    fn slot<'a>(&'a self, even: Option<&'a SrtCrypto>, flag: KkFlag) -> Option<&'a SrtCrypto> {
         match flag {
-            KkFlag::EvenKey => even.as_ref(),
+            KkFlag::EvenKey => even,
             KkFlag::OddKey => self.odd.as_ref(),
             KkFlag::Clear | KkFlag::Invalid => None,
         }
@@ -72,7 +72,7 @@ impl SrtKeyRotation {
             .map_err(|error| format!("KMREQ key unwrap failed: {error}"))?;
         let target = opposite_key(self.active);
         let active = self
-            .slot(even, self.active)
+            .slot(even.as_ref(), self.active)
             .ok_or_else(|| "active SRT key slot is missing".to_string())?;
         if !km.key_flags.contains(target) {
             return Err("KMREQ does not carry the next alternating key slot".into());
@@ -90,7 +90,7 @@ impl SrtKeyRotation {
         }
         if target_key == *active
             || self
-                .slot(even, target)
+                .slot(even.as_ref(), target)
                 .is_some_and(|old| old == &target_key)
         {
             return Err("KMREQ attempted to reuse an existing SEK".into());
@@ -112,6 +112,10 @@ impl SrtKeyRotation {
     }
 
     /// Decrypt with the lifecycle-approved slot and promote a pending slot.
+    // Keeps `&Option<SrtCrypto>`: the sole caller passes `&self.crypto` while
+    // calling `&mut self`, which an `Option<&SrtCrypto>` parameter could not
+    // express without a borrow conflict.
+    #[allow(clippy::ref_option)]
     pub(crate) fn decrypt(
         &mut self,
         even: &Option<SrtCrypto>,
@@ -126,7 +130,7 @@ impl SrtKeyRotation {
         if flag != self.active && !pending && !previous {
             return Err(format!("SRT {flag:?} packet has no lifecycle-approved key"));
         }
-        self.slot(even, flag)
+        self.slot(even.as_ref(), flag)
             .ok_or_else(|| format!("SRT {flag:?} key slot is missing"))?
             .decrypt_packet(seq_no, payload);
         if pending {

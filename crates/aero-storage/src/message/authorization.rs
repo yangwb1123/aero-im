@@ -1,10 +1,14 @@
 //! Commit-time authorization for user-authored message mutations.
 
-use aero_common::{Block, Error, MessageId, ParticipantId, RoomId, WorkspaceId};
+use aero_common::{
+    recall_window_expired, Block, Error, Message, MessageEditId, MessageId, ParticipantId,
+    RoomEvent, RoomId, WorkspaceId, RECALLED_MESSAGE_PLACEHOLDER,
+};
 use sqlx::{Postgres, Transaction};
 
-use super::events::{OutboxedMessageDelete, OutboxedMessageEdit};
+use super::events::{OutboxedMessageDelete, OutboxedMessageEdit, OutboxedMessageRecall};
 use super::MessageRepo;
+use crate::event_outbox::{EventOutboxKind, EventOutboxRepo};
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum PostPolicy {
@@ -162,6 +166,232 @@ async fn resolve_message_target(
     .fetch_optional(&mut **tx)
     .await?;
     Ok(target.map(|(room, sender)| (RoomId::from_uuid(room), ParticipantId::from_uuid(sender))))
+}
+
+/// Whether `actor` may recall a message in `room`: the author, or a room
+/// owner/admin. Re-checked under the caller's room write fence with a row lock
+/// on the membership edge, so a concurrent role change cannot slip through the
+/// authorization (TOCTOU guard — the preflight read is never authority).
+async fn recall_role_allowed_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    room: RoomId,
+    actor: ParticipantId,
+    sender: ParticipantId,
+) -> Result<bool, sqlx::Error> {
+    if actor == sender {
+        return Ok(true);
+    }
+    let role = sqlx::query_scalar::<_, String>(
+        "SELECT role FROM room_members WHERE room_id = $1 AND participant_id = $2 FOR UPDATE",
+    )
+    .bind(room.to_uuid())
+    .bind(actor.to_uuid())
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(matches!(role.as_deref(), Some("owner" | "admin")))
+}
+
+impl MessageRepo {
+    /// User-authorized recall path (撤回).
+    ///
+    /// Recall replaces a live message's content with the system placeholder
+    /// while keeping the row (`message_id` / room history / audit). Authorization
+    /// mirrors the delete path: effective room access is fenced first, then the
+    /// message row is locked and its immutable identity re-validated. Unlike
+    /// delete, recall is permitted for the sender OR a room owner/admin — the
+    /// room role is re-checked under the lock so a concurrent demotion cannot
+    /// slip through. Already-recalled and already-deleted messages are rejected
+    /// with `Conflict` (recall is a one-shot state transition, deliberately NOT
+    /// a silent idempotent no-op like the tombstone path).
+    ///
+    /// `window` is the author recall window (撤回时间窗; `time::Duration::ZERO`
+    /// = unlimited): an author may only recall while `now - created_at <= window`.
+    /// The boundary is evaluated HERE, inside the transaction, against the
+    /// `FOR UPDATE`-locked snapshot — atomic by construction, never only in the
+    /// service preflight. Room owner/admin recall (moderation) is exempt
+    /// (`sender_id == actor` gate).
+    pub async fn recall_outboxed_authorized(
+        &self,
+        id: MessageId,
+        actor: ParticipantId,
+        window: time::Duration,
+        traceparent: Option<&str>,
+    ) -> aero_common::Result<Option<OutboxedMessageRecall>> {
+        let mut tx = self.pool.begin().await?;
+        let Some((resolved_room, resolved_sender)) = resolve_message_target(&mut tx, id).await?
+        else {
+            return Ok(None);
+        };
+        let Some(access) =
+            lock_effective_message_write_access(&mut tx, resolved_room, actor, PostPolicy::Ignore)
+                .await?
+        else {
+            return Err(Error::Forbidden(
+                "message recall authority was revoked before commit".into(),
+            ));
+        };
+
+        let Some(existing) = Self::lock_message_in_tx(&mut tx, id).await? else {
+            return Ok(None);
+        };
+        if existing.room_id != resolved_room || existing.sender_id != resolved_sender {
+            return Err(Error::Conflict(
+                "message identity changed concurrently; reload and retry".into(),
+            ));
+        }
+        if !recall_role_allowed_in_tx(&mut tx, resolved_room, actor, existing.sender_id).await? {
+            return Err(Error::Forbidden(
+                "only author or room admin may recall".into(),
+            ));
+        }
+        if existing.deleted_at.is_some() {
+            return Err(Error::Conflict("message is deleted".into()));
+        }
+        if existing.recalled_at.is_some() {
+            return Err(Error::Conflict("message is already recalled".into()));
+        }
+        // Recall-window fence (撤回时间窗): author-only — room owner/admin
+        // recall is the moderation path and is exempt. Runs AFTER the role and
+        // state gates (the pre-existing role-before-state order must stay; only
+        // this check is appended last), so the window state is never revealed
+        // to non-privileged actors and an expired-and-deleted message still
+        // reports "message is deleted". Evaluated against the row-locked
+        // snapshot (`lock_message_in_tx`, FOR UPDATE) — atomic: no concurrent
+        // recall or role change can interleave between this check and the
+        // UPDATE below. The UPDATE's WHERE fence is deliberately unchanged.
+        if existing.sender_id == actor
+            && recall_window_expired(
+                existing.created_at,
+                aero_common::time::now_utc(),
+                window,
+            )
+        {
+            return Err(Error::Conflict("recall window expired".into()));
+        }
+
+        let recalled = Self::recall_locked_outboxed_in_tx(
+            &mut tx,
+            existing,
+            Some(access.workspace),
+            actor,
+            traceparent,
+        )
+        .await?;
+        if recalled.is_some() {
+            tx.commit().await?;
+        }
+        Ok(recalled)
+    }
+
+    /// Transaction-scoped body of the recall: snapshot the original blocks into
+    /// `message_edits`, replace `blocks` with the system placeholder, clear
+    /// search/embedding, record `recalled_at`/`recalled_by`, bump the version,
+    /// enqueue now-unreferenced attachment blobs for GC, append the
+    /// `message.recalled` audit row, and append the `Recalled` room event — all
+    /// in the caller's transaction. Returns `None` without writing when the
+    /// message is missing or already in a terminal state (the caller's row lock
+    /// makes this unreachable in practice; the `WHERE` clause is the final
+    /// fence).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn recall_locked_outboxed_in_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        existing: Message,
+        workspace: Option<WorkspaceId>,
+        actor: ParticipantId,
+        traceparent: Option<&str>,
+    ) -> Result<Option<OutboxedMessageRecall>, sqlx::Error> {
+        let id = existing.id;
+        let digest: String = existing.searchable_text().chars().take(120).collect();
+        let prior_blocks =
+            serde_json::to_value(&existing.blocks).map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+        // GC targets: the ORIGINAL attachment blobs (bytes are content —
+        // removed by the recall). The snapshot below is redacted so history
+        // can never reference the destroyed bytes.
+        let blob_ids = super::attached_blob_ids(&prior_blocks);
+        // Gate round-3 B1: the history snapshot carries NO byte references
+        // (`message_edits` is invisible to the blob-GC live-reference scan;
+        // text/transcript evidence is preserved, attachment bytes are not).
+        let snapshot_blocks = super::redact_blocks_for_recall_snapshot(&existing.blocks);
+        let snapshot = serde_json::to_value(&snapshot_blocks)
+            .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+
+        // Snapshot the original content before replacing it: the pre-recall body
+        // stays reviewable through the message edit-history route (evidence, not
+        // a loss). `editor_id` records WHO recalled.
+        let history_id = MessageEditId::new();
+        sqlx::query(
+            r"INSERT INTO message_edits (id, message_id, editor_id, blocks)
+              VALUES ($1, $2, $3, $4)",
+        )
+        .bind(history_id.to_uuid())
+        .bind(id.to_uuid())
+        .bind(actor.to_uuid())
+        .bind(&snapshot)
+        .execute(&mut **tx)
+        .await?;
+
+        let placeholder = serde_json::to_value(vec![Block::text(RECALLED_MESSAGE_PLACEHOLDER)])
+            .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+        let recalled_at = time::OffsetDateTime::now_utc();
+        let row = sqlx::query_as::<_, super::MessageRow>(
+            r"UPDATE messages
+                  SET blocks = $1,
+                      searchable_text = '',
+                      embedding = NULL,
+                      recalled_at = $2,
+                      recalled_by = $3,
+                      version = version + 1
+                WHERE id = $4
+                  AND recalled_at IS NULL
+                  AND deleted_at IS NULL
+            RETURNING id, room_id, sender_id, blocks, reply_to, metadata,
+                      created_at, edited_at, deleted_at, recalled_at, recalled_by,
+                      expires_at, version",
+        )
+        .bind(&placeholder)
+        .bind(recalled_at)
+        .bind(actor.to_uuid())
+        .bind(id.to_uuid())
+        .fetch_optional(&mut **tx)
+        .await?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let message = Message::from(row);
+
+        // Attachment bytes are content: once the placeholder replaces the only
+        // live reference, they become garbage (unless another live message still
+        // references the same deduped blob).
+        Self::enqueue_unreferenced_blobs_in_tx(tx, &blob_ids).await?;
+
+        if let Some(workspace) = workspace {
+            crate::audit::AuditRepo::append_in_tx(
+                tx,
+                workspace,
+                Some(actor),
+                "message.recalled",
+                Some(&id.to_string()),
+                serde_json::json!({
+                    "room_id": existing.room_id,
+                    "digest": digest,
+                }),
+            )
+            .await?;
+        }
+
+        let room_id = existing.room_id;
+        let outbox_id = EventOutboxRepo::insert_room_event_in_tx(
+            tx,
+            id,
+            room_id,
+            EventOutboxKind::Recalled,
+            &RoomEvent::Recalled(message.clone()),
+            traceparent.map(str::to_owned),
+            None,
+        )
+        .await?;
+        Ok(Some(OutboxedMessageRecall { message, outbox_id }))
+    }
 }
 
 impl MessageRepo {

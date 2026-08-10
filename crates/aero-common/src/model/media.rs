@@ -79,17 +79,12 @@ pub enum CallKind {
     Video,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CallMode {
+    #[default]
     P2p,
     Sfu,
-}
-
-impl Default for CallMode {
-    fn default() -> Self {
-        Self::P2p
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

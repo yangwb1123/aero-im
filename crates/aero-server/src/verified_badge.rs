@@ -72,7 +72,7 @@ async fn set_verified(
 /// `GET /api/participants/:id/verified` — check whether a participant is verified.
 /// Any authenticated user may query this. Surfaced as a thin supplemental endpoint;
 /// the main participant GET already returns the full profile but does not yet
-/// include is_verified (the column is new). This endpoint bridges that gap.
+/// include `is_verified` (the column is new). This endpoint bridges that gap.
 pub async fn get_verified_status(
     State(s): State<AppState>,
     _auth: AuthUser,
