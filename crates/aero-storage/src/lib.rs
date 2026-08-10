@@ -8,6 +8,7 @@ pub mod ai_context;
 pub mod ai_job;
 pub mod ai_usage;
 pub mod audit;
+pub mod audit_governance;
 pub mod blob;
 pub mod blob_store;
 pub mod block_interaction;

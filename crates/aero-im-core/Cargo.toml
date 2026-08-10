@@ -38,6 +38,14 @@ bytes.workspace = true
 fred.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "sync", "net", "time", "io-util"] }
 pretty_assertions.workspace = true
 sqlx.workspace = true
+# G1 (end-to-end drill suite): the governance drill module runs the REAL
+# `AuditRelay`/`PgOutboxRepo`/`StubSink` over write-path rows. No cycle —
+# aero-audit-connector depends only on aero-common/aero-auth; reqwest is
+# needed for `RelayConfig`'s `reqwest::Url` fields (`StubSink::token_url()`
+# returns String). Both are workspace-pinned / lockfile-resident — zero new
+# supply-chain entries.
+aero-audit-connector.workspace = true
+reqwest.workspace = true

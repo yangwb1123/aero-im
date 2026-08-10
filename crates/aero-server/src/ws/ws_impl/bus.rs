@@ -1,7 +1,9 @@
 //! Background bus listeners and their per-message handlers. Subscribes to
 //! `im.room.*` / `live.stream.*`, fans each decoded event into the local Hub,
 //! and shuts down cooperatively through a shared cancellation token.
-use super::{warn, info, debug, AppState, Arc, ParticipantId, metrics, names, StreamEvent, ServerFrame};
+use super::{
+    debug, info, metrics, names, warn, AppState, Arc, ParticipantId, ServerFrame, StreamEvent,
+};
 use crate::ws::frame;
 use futures::{Stream, StreamExt};
 use sha2::{Digest, Sha256};

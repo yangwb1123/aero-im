@@ -170,9 +170,7 @@ async fn release_hold(
     Path(id_str): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let id = parse_hold(&id_str)?;
-    let released = repo(&s)
-        .release_authorized(id, auth.participant_id)
-        .await?;
+    let released = repo(&s).release_authorized(id, auth.participant_id).await?;
     if !released {
         return Err(AeroError::NotFound(format!("active legal hold {id}")).into());
     }

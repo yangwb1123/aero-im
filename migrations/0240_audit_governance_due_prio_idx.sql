@@ -1,0 +1,31 @@
+-- Migration 0240: governance due-priority partial index (B5-3).
+--
+-- Discharges the handoff recorded at 0239:44 ("B5-3 extends ORDER BY with
+-- priority; the index change is B5-3's, not this slice's"). The claim query
+-- (crates/aero-audit-connector/src/pg.rs, `claim_due`) already carries the
+-- `priority DESC` leading term (B5-3 fold-in, P1 resolution) — ORDER BY
+-- `(priority DESC, available_at, created_at, event_id)` — and this index
+-- matches that ORDER BY exactly: LIMIT pushdown, no per-tick full Sort of
+-- the due set, only LIMIT rows locked (B5-3 design §5.1; the deferred
+-- alternative would make every claim tick O(due-set) under sustained sink
+-- backlog).
+--
+-- Rolling-deploy posture (B5-3 design §5.2): 0239's audit_governance_due_idx
+-- (FIFO ORDER BY shape) is deliberately KEPT while old FIFO binaries drain —
+-- both partial indexes coexist and each ORDER BY shape is served by its
+-- matching index. The legacy index is dropped by a later cleanup migration
+-- (B5-3 design decision D5), never in this one. Additive + idempotent
+-- (IF NOT EXISTS); the table is moderation-only with budget-bounded
+-- producers, so the second partial index's write amplification is
+-- negligible.
+--
+-- Rolling-deploy posture (B5-3 design §5.2): 0239's audit_governance_due_idx
+-- is deliberately KEPT while old FIFO binaries drain — both partial indexes
+-- coexist and each ORDER BY shape is served by its matching index. The
+-- legacy index is dropped by a later cleanup migration (B5-3 design decision
+-- D5), never in this one. Additive + idempotent (IF NOT EXISTS); the table
+-- is moderation-only with budget-bounded producers, so the second partial
+-- index's write amplification is negligible.
+CREATE INDEX IF NOT EXISTS audit_governance_due_prio_idx
+    ON audit_governance_outbox (priority DESC, available_at, created_at, event_id)
+    WHERE status IN (0, 1);

@@ -60,7 +60,8 @@ pub const AI_MODERATION_CALLS_TOTAL: &str = "aero_ai_moderation_calls_total";
 /// Counter: flagged verdicts (calls that returned a block reason).
 pub const AI_MODERATION_FLAGGED_TOTAL: &str = "aero_ai_moderation_flagged_total";
 /// Counter: messages NOT screened, labeled by `reason`
-/// (`queue_full` / `queue_closed` / `global_budget` / `workspace_budget`).
+/// (`queue_full` / `queue_closed` / `global_budget` / `workspace_budget` /
+/// `workspace_unresolvable`).
 pub const AI_MODERATION_SKIPPED_TOTAL: &str = "aero_ai_moderation_skipped_total";
 
 /// Tunables for the moderation pipeline, sourced from `AERO_AI_MODERATION_*`
@@ -150,6 +151,11 @@ enum SkipReason {
     GlobalBudget,
     /// The message's workspace exhausted its per-tenant window.
     WorkspaceBudget,
+    /// The room's workspace could not be resolved, so a flagged message must
+    /// NOT be deleted un-audited (R-D1 parity — `moderate_delete(None)` would
+    /// commit the soft delete + `Deleted` broadcast with ZERO `audit_events`
+    /// rows). The message stays visible; fail-closed content safety.
+    WorkspaceUnresolvable,
 }
 
 impl SkipReason {
@@ -159,6 +165,7 @@ impl SkipReason {
             Self::QueueClosed => "queue_closed",
             Self::GlobalBudget => "global_budget",
             Self::WorkspaceBudget => "workspace_budget",
+            Self::WorkspaceUnresolvable => "workspace_unresolvable",
         }
     }
 }
@@ -460,16 +467,20 @@ async fn process(
     match verdict {
         Ok(Some(reason)) => {
             metrics::inc_counter(AI_MODERATION_FLAGGED_TOTAL, 1);
-            // Capture the digest from the queued text — the soft-delete clears
-            // the blocks, so this is the reviewable record of what was removed.
-            // The delete + `message.moderated` audit row now commit together
-            // inside `moderate_delete` (transactional, 方向五 审计事务化), so there
-            // is no longer a separate best-effort audit append that could be lost
-            // after a successful delete.
             let digest = content_digest(&job.text);
+            // R-D1 parity (`aero-ai` worker `moderation_delete_workspace`):
+            // refuse the delete when the room's workspace is unresolvable. The
+            // audit action is derived from the workspace, so `None` would commit
+            // the removal with zero `audit_events` + zero governance rows (0239
+            // never fires) — an invisible, un-audited removal. The message stays
+            // visible, same fail-closed terminal as the 0239 binding RAISE.
+            let Some(workspace) = workspace else {
+                record_skip(SkipReason::WorkspaceUnresolvable, job.message_id);
+                return;
+            };
             if let Err(e) = state
                 .im
-                .moderate_delete(job.message_id, workspace, &reason, &digest)
+                .moderate_delete(job.message_id, Some(workspace), &reason, &digest)
                 .await
             {
                 warn!(error = ?e, message_id = %job.message_id, "moderate_delete failed");

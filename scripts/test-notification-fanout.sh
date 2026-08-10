@@ -74,17 +74,29 @@ assert_clean_env() {
 # fail the gate, not silently skip AT-4c).
 # ---------------------------------------------------------------------------
 assert_redis_reachable() {
+    # Parse REDIS_URL defensively: strip scheme + userinfo + path FIRST, then
+    # validate host/port against a strict character class BEFORE they reach a
+    # shell string — the probe below is `bash -c "exec 3<>/dev/tcp/..."`, and an
+    # unvalidated value is a command-injection vector (verified live: a
+    # `$(touch …)` suffix executes even with the port closed). Userinfo is
+    # never probed and never echoed (no credential leak into stderr/logs).
     local host_port="${REDIS_URL#redis://}"
     host_port="${host_port%%/*}"
+    host_port="${host_port##*@}"
     local host="${host_port%%:*}"
     local port="${host_port#*:}"
     [ "$port" = "$host_port" ] && port=6379
+    if [[ ! "$host" =~ ^[A-Za-z0-9.-]+$ ]] || [[ ! "$port" =~ ^[0-9]{1,5}$ ]] \
+            || [ "$port" -lt 1 ] || [ "$port" -gt 65535 ]; then
+        echo "Redis presence leg is REQUIRED: unparseable REDIS_URL (expected redis://host:port; got host='${host}' port='${port}')" >&2
+        exit 2
+    fi
     if command -v timeout >/dev/null 2>&1; then
         timeout 3 bash -c "exec 3<>/dev/tcp/${host}/${port}" 2>/dev/null
     else
         bash -c "exec 3<>/dev/tcp/${host}/${port}" 2>/dev/null
     fi || {
-        echo "Redis presence leg is REQUIRED: could not connect to ${host}:${port} (REDIS_URL=${REDIS_URL})" >&2
+        echo "Redis presence leg is REQUIRED: could not connect to ${host}:${port}" >&2
         echo "start it (e.g. docker compose up -d redis) and retry" >&2
         exit 2
     }

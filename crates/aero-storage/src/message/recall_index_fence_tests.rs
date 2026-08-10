@@ -76,13 +76,12 @@ async fn recall_fences_late_index_writes() {
     );
 
     // The recall's cleared index state survives all three late writes.
-    let (searchable, embedding): (String, Option<pgvector::Vector>) = sqlx::query_as(
-        "SELECT searchable_text, embedding FROM messages WHERE id = $1",
-    )
-    .bind(message.id.to_uuid())
-    .fetch_one(&fixture.pool)
-    .await
-    .unwrap();
+    let (searchable, embedding): (String, Option<pgvector::Vector>) =
+        sqlx::query_as("SELECT searchable_text, embedding FROM messages WHERE id = $1")
+            .bind(message.id.to_uuid())
+            .fetch_one(&fixture.pool)
+            .await
+            .unwrap();
     assert!(searchable.is_empty(), "FTS source stays cleared");
     assert!(embedding.is_none(), "vector stays cleared");
     let stored = repo.get(message.id).await.unwrap().unwrap();
@@ -116,21 +115,24 @@ async fn concurrent_recall_vs_embed_write_never_resurrects() {
             .insert_message(fixture.author, &format!("race secret {round}"))
             .await;
         let folded_text = format!("folded doc {round}");
-        let recall = repo.recall_outboxed_authorized(message.id, fixture.author, time::Duration::ZERO, None);
+        let recall =
+            repo.recall_outboxed_authorized(message.id, fixture.author, time::Duration::ZERO, None);
         let embed = repo.update_embedding(message.id, vec![0.5_f32; 1024]);
         let fold = repo.update_searchable_text(message.id, &folded_text);
         let (recalled, embedded, folded) = tokio::join!(recall, embed, fold);
-        assert!(recalled.unwrap().is_some(), "recall wins on a fresh message");
+        assert!(
+            recalled.unwrap().is_some(),
+            "recall wins on a fresh message"
+        );
         let _ = embedded.unwrap();
         let _ = folded.unwrap();
 
-        let (searchable, embedding): (String, Option<pgvector::Vector>) = sqlx::query_as(
-            "SELECT searchable_text, embedding FROM messages WHERE id = $1",
-        )
-        .bind(message.id.to_uuid())
-        .fetch_one(&fixture.pool)
-        .await
-        .unwrap();
+        let (searchable, embedding): (String, Option<pgvector::Vector>) =
+            sqlx::query_as("SELECT searchable_text, embedding FROM messages WHERE id = $1")
+                .bind(message.id.to_uuid())
+                .fetch_one(&fixture.pool)
+                .await
+                .unwrap();
         assert!(
             searchable.is_empty(),
             "round {round}: recalled row must never carry FTS text"
@@ -174,7 +176,8 @@ async fn concurrent_recall_vs_system_edit_never_resurrects() {
         let message = fixture
             .insert_message(fixture.author, &format!("edit race secret {round}"))
             .await;
-        let recall = repo.recall_outboxed_authorized(message.id, fixture.author, time::Duration::ZERO, None);
+        let recall =
+            repo.recall_outboxed_authorized(message.id, fixture.author, time::Duration::ZERO, None);
         let edit = repo.edit_outboxed_system(
             message.id,
             vec![Block::text(format!("resurrected edit {round}"))],
@@ -191,13 +194,12 @@ async fn concurrent_recall_vs_system_edit_never_resurrects() {
         // committed before the recall — both must converge to the placeholder.
         let _ = edited.unwrap();
 
-        let (searchable, embedding): (String, Option<pgvector::Vector>) = sqlx::query_as(
-            "SELECT searchable_text, embedding FROM messages WHERE id = $1",
-        )
-        .bind(message.id.to_uuid())
-        .fetch_one(&fixture.pool)
-        .await
-        .unwrap();
+        let (searchable, embedding): (String, Option<pgvector::Vector>) =
+            sqlx::query_as("SELECT searchable_text, embedding FROM messages WHERE id = $1")
+                .bind(message.id.to_uuid())
+                .fetch_one(&fixture.pool)
+                .await
+                .unwrap();
         assert!(
             searchable.is_empty(),
             "round {round}: system edit must never resurrect FTS text"
@@ -251,10 +253,10 @@ async fn concurrent_recall_vs_transcript_write_never_resurrects() {
             .await
             .unwrap();
 
-        let recall = repo.recall_outboxed_authorized(message.id, fixture.author, time::Duration::ZERO, None);
+        let recall =
+            repo.recall_outboxed_authorized(message.id, fixture.author, time::Duration::ZERO, None);
         let late_transcript = format!("late transcript {round}");
-        let transcribe =
-            repo.update_voice_transcript_outboxed(message.id, &late_transcript, None);
+        let transcribe = repo.update_voice_transcript_outboxed(message.id, &late_transcript, None);
         let (recalled, transcripted) = tokio::join!(recall, transcribe);
         assert!(
             recalled.unwrap().is_some(),
@@ -263,13 +265,12 @@ async fn concurrent_recall_vs_transcript_write_never_resurrects() {
         // Either fenced (None) or committed before the recall — both converge.
         let _ = transcripted.unwrap();
 
-        let (searchable, embedding): (String, Option<pgvector::Vector>) = sqlx::query_as(
-            "SELECT searchable_text, embedding FROM messages WHERE id = $1",
-        )
-        .bind(message.id.to_uuid())
-        .fetch_one(&fixture.pool)
-        .await
-        .unwrap();
+        let (searchable, embedding): (String, Option<pgvector::Vector>) =
+            sqlx::query_as("SELECT searchable_text, embedding FROM messages WHERE id = $1")
+                .bind(message.id.to_uuid())
+                .fetch_one(&fixture.pool)
+                .await
+                .unwrap();
         assert!(
             searchable.is_empty(),
             "round {round}: transcript write must never resurrect FTS text"

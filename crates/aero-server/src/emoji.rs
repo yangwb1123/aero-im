@@ -137,7 +137,6 @@ async fn delete_emoji(
 ) -> ApiResult<StatusCode> {
     let id = parse_emoji_id(&id_str)?;
     let repo = EmojiRepo::new(s.participants.pool().clone());
-    repo.delete_authorized(id, auth.participant_id)
-        .await?;
+    repo.delete_authorized(id, auth.participant_id).await?;
     Ok(StatusCode::NO_CONTENT)
 }

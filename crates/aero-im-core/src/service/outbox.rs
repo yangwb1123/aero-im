@@ -503,13 +503,10 @@ mod tests {
 
         // Live row at the same version → the recall event is delivered with the
         // current (placeholder) blocks, not the send-time original.
-        let materialized = materialize_outbox_payload(
-            &recalled_row,
-            Some(&recalled),
-            OffsetDateTime::UNIX_EPOCH,
-        )
-        .unwrap()
-        .expect("recall at matching version is delivered");
+        let materialized =
+            materialize_outbox_payload(&recalled_row, Some(&recalled), OffsetDateTime::UNIX_EPOCH)
+                .unwrap()
+                .expect("recall at matching version is delivered");
         let RoomEvent::Recalled(delivered) = serde_json::from_value(materialized).unwrap() else {
             panic!("recalled event");
         };
@@ -525,20 +522,26 @@ mod tests {
         let mut superseded = recalled.clone();
         superseded.version = 3;
         assert!(
-            materialize_outbox_payload(&recalled_row, Some(&superseded), OffsetDateTime::UNIX_EPOCH)
-                .unwrap()
-                .is_none(),
+            materialize_outbox_payload(
+                &recalled_row,
+                Some(&superseded),
+                OffsetDateTime::UNIX_EPOCH
+            )
+            .unwrap()
+            .is_none(),
             "recall superseded by a later mutation is suppressed"
         );
 
         // Message tombstoned → suppressed (Deleted frame already conveys it).
         let mut deleted = recalled.clone();
         deleted.deleted_at = Some(OffsetDateTime::UNIX_EPOCH);
-        assert!(
-            materialize_outbox_payload(&recalled_row, Some(&deleted), OffsetDateTime::UNIX_EPOCH)
-                .unwrap()
-                .is_none()
-        );
+        assert!(materialize_outbox_payload(
+            &recalled_row,
+            Some(&deleted),
+            OffsetDateTime::UNIX_EPOCH
+        )
+        .unwrap()
+        .is_none());
 
         // Row gone entirely → suppressed.
         assert!(

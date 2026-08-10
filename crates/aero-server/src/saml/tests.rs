@@ -371,7 +371,9 @@ static VERIFY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// Run `f` with the experimental-verify switch forced to `on`/`off`, restoring
 /// the prior value afterward. Holds [`VERIFY_ENV_LOCK`] for the duration.
 fn with_experimental_verify<R>(on: bool, f: impl FnOnce() -> R) -> R {
-    let _guard = VERIFY_ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _guard = VERIFY_ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let saved = std::env::var(EXPERIMENTAL_VERIFY_ENV).ok();
     if on {
         std::env::set_var(EXPERIMENTAL_VERIFY_ENV, "1");

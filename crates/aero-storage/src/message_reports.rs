@@ -369,7 +369,9 @@ impl MessageReportRepo {
 mod db_tests {
     use std::time::Duration;
 
-    use aero_common::{Block, RoomKind, WorkspaceRole};
+    use aero_common::{
+        Block, RoomKind, WorkspaceRole, GOVERNANCE_CLASS_ADMIN, MODERATION_OUTBOUND_ACTION,
+    };
 
     use super::*;
     use crate::message::{MessageRepo, NewMessage};
@@ -382,6 +384,73 @@ mod db_tests {
             .max_connections(4)
             .connect_lazy(&url)
             .expect("valid DATABASE_URL")
+    }
+
+    // Private mirrors of `audit_governance::db_tests` seeding (same-crate
+    // but sibling-module-private; the design prescribes a mirror rather than
+    // widening visibility). `enable_enforcement_with_binding` flips the
+    // GLOBAL `snaplink_commercial_runtime.enabled` singleton + seeds an
+    // enabled binding + active entitlement projection for `ws` — the 0239
+    // governance trigger's Gate 1/Gate 2 prerequisites, and the 0235
+    // metering trigger's prerequisite (it RAISEs P0001 on unbound message
+    // INSERTs while the singleton is ON).
+    async fn enable_enforcement_with_binding(p: &PgPool, ws: WorkspaceId) {
+        sqlx::query(
+            "UPDATE snaplink_commercial_runtime
+                SET enabled = TRUE, updated_at = clock_timestamp()
+              WHERE singleton",
+        )
+        .execute(p)
+        .await
+        .expect("enable commercial enforcement");
+        sqlx::query(
+            "INSERT INTO snaplink_commercial_bindings
+                   (workspace_id, tenant_id, client_id, audit_client_id, source_system,
+                    revision, enabled)
+             VALUES ($1, $2, $3, $4, $5, 1, TRUE)
+             ON CONFLICT (workspace_id) DO NOTHING",
+        )
+        .bind(ws.to_uuid())
+        .bind(format!("tenant-{ws}"))
+        .bind(format!("client-{ws}"))
+        .bind(format!("audit-client-{ws}"))
+        .bind(format!("source-{ws}"))
+        .execute(p)
+        .await
+        .expect("seed enabled binding");
+        sqlx::query(
+            "INSERT INTO snaplink_entitlement_projections
+                   (workspace_id, tenant_id, revision, active, im_enabled,
+                    notifications_enabled, messages_soft, messages_hard,
+                    messages_unlimited, notifications_soft, notifications_hard,
+                    notifications_unlimited, effective_at, generated_at)
+             VALUES ($1, $2, 1, TRUE, TRUE, TRUE, 0, 0, TRUE, 0, 0, TRUE,
+                     clock_timestamp(), clock_timestamp())
+             ON CONFLICT (workspace_id) DO NOTHING",
+        )
+        .bind(ws.to_uuid())
+        .bind(format!("tenant-{ws}"))
+        .execute(p)
+        .await
+        .expect("seed active entitlement projection");
+    }
+
+    /// Restore the fresh-DB default (`snaplink_commercial_runtime.enabled =
+    /// FALSE`, 0235) after a leg that flipped it on. The singleton is GLOBAL
+    /// — the harness runs the whole ignored suite on one shared DB, so a
+    /// test that leaves the switch on makes every later unbound message
+    /// INSERT raise P0001 (0235 metering). Must be the LAST statement of any
+    /// enforcement-flipping test (mirror of the start-of-test defensive
+    /// re-assert below).
+    async fn restore_enforcement_disabled(p: &PgPool) {
+        sqlx::query(
+            "UPDATE snaplink_commercial_runtime
+                SET enabled = FALSE, updated_at = clock_timestamp()
+              WHERE singleton",
+        )
+        .execute(p)
+        .await
+        .expect("restore enforcement disabled (fresh-DB default)");
     }
 
     async fn participant(p: &PgPool, label: &str) -> ParticipantId {
@@ -510,6 +579,11 @@ mod db_tests {
     #[tokio::test]
     #[ignore = "requires DATABASE_URL with migrations applied"]
     async fn report_authorization_binds_room_message_and_workspace() {
+        // Start-of-test defensive re-assert (F1 backstop): a panicked
+        // enforcement-flipping test may have left the GLOBAL singleton ON —
+        // this fixture's unbound message INSERT would raise P0001 (0235
+        // metering) otherwise.
+        restore_enforcement_disabled(&pool()).await;
         let fixture = fixture().await;
         let filed = fixture
             .repo
@@ -587,6 +661,13 @@ mod db_tests {
     #[tokio::test]
     #[ignore = "requires DATABASE_URL with migrations applied"]
     async fn remove_review_commits_decision_delete_audit_and_outbox_once() {
+        // Start-of-test defensive re-assert (F1 backstop): the global
+        // `snaplink_commercial_runtime.enabled` singleton may have been left
+        // ON by a panicked earlier test/drill — the fixture's unbound
+        // message INSERTs need enforcement OFF at entry (0235 metering
+        // raises P0001 otherwise). The restore is mirrored as the LAST
+        // statement of this test (order-independence on the shared DB).
+        restore_enforcement_disabled(&pool()).await;
         let fixture = fixture().await;
         let filed = fixture
             .repo
@@ -668,11 +749,109 @@ mod db_tests {
         .await
         .unwrap();
         assert_eq!(audit_after, 1);
+
+        // --- R3 parity legs (enforcement ON + enabled binding): the review
+        // seam's governance enqueue, end-to-end through the REAL 0239
+        // trigger — exactly one governance row, event_id 1:1, shape
+        // (0, GOVERNANCE_CLASS_ADMIN, 100), payload action =
+        // MODERATION_OUTBOUND_ACTION, and the REVIEWER (not system) as the
+        // audit actor — the in-tx actor differential the AiWorker seam
+        // cannot produce. Enforcement + binding are seeded AFTER the fixture
+        // (whose unbound INSERTs must commit under OFF); the existing legs
+        // above are untouched (they run under the fresh-DB default).
+        enable_enforcement_with_binding(&fixture.pool, fixture.workspace).await;
+        let msg2 = message(&fixture.pool, fixture.reporter, fixture.room).await;
+        let filed2 = fixture
+            .repo
+            .report_authorized(fixture.room, msg2, fixture.reporter, "parity")
+            .await
+            .unwrap();
+        let outcome2 = fixture
+            .repo
+            .review_authorized(
+                filed2.id,
+                fixture.workspace,
+                fixture.reviewer,
+                true,
+                Some("parity leg"),
+                Some("00-message-report-parity"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome2.report.status, "removed");
+        assert!(
+            outcome2.delete_outbox_id.is_some(),
+            "a live message produces a deleted-event outbox"
+        );
+
+        // Exactly one audit row, actor = the REVIEWER (differential vs the
+        // system-actor moderation seam).
+        let audit2: (String, Option<String>, serde_json::Value) = sqlx::query_as(
+            "SELECT id::text, actor_id::text, detail
+               FROM audit_events
+              WHERE workspace_id = $1 AND action = 'message.moderated' AND target = $2",
+        )
+        .bind(fixture.workspace.to_uuid())
+        .bind(msg2.to_string())
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("parity audit row");
+        assert_eq!(
+            audit2.1.as_deref(),
+            Some(fixture.reviewer.to_uuid().to_string().as_str()),
+            "audit actor = the reviewing admin, never system (UUID spelling)"
+        );
+
+        // Exactly one governance row, event_id 1:1 with the audit row (the
+        // join is scoped: the entry DB is shared with other governance
+        // tests, so full-table counts would be order-dependent).
+        let gov2: (String, i32, String, i16, serde_json::Value) = sqlx::query_as(
+            "SELECT g.event_id::text, g.status, g.class, g.priority, g.payload
+               FROM audit_governance_outbox g
+               JOIN audit_events a ON a.id = g.event_id
+              WHERE a.workspace_id = $1 AND a.action = 'message.moderated' AND a.target = $2",
+        )
+        .bind(fixture.workspace.to_uuid())
+        .bind(msg2.to_string())
+        .fetch_one(&fixture.pool)
+        .await
+        .expect("exactly one governance row for the review-seam deletion");
+        assert_eq!(gov2.0, audit2.0, "event_id 1:1 with audit_events.id");
+        assert_eq!(gov2.1, 0, "status 0 = enqueued (0239 normative)");
+        assert_eq!(
+            gov2.2, GOVERNANCE_CLASS_ADMIN,
+            "class 'admin' (const-imported cross-slice pin)"
+        );
+        assert_eq!(
+            gov2.3, 100,
+            "priority 100 (GOVERNANCE_PRIORITY_MODERATION normative)"
+        );
+        assert_eq!(
+            gov2.4["action"], MODERATION_OUTBOUND_ACTION,
+            "payload action = leaf MODERATION_OUTBOUND_ACTION (const pin)"
+        );
+        assert_eq!(gov2.4["event_id"], audit2.0, "payload event_id mirrors");
+        assert_eq!(
+            gov2.4["actor"]["type"], "participant",
+            "review-seam actor type is participant, never system"
+        );
+        assert_eq!(
+            gov2.4["actor"]["id"], fixture.reviewer.to_uuid().to_string(),
+            "payload actor id = the reviewer (UUID spelling, 0239 actor_id::text)"
+        );
+
+        // Restore the fresh-DB default LAST — the singleton is global and
+        // this entry's DB may be shared (0235 metering raises P0001 on later
+        // unbound message INSERTs).
+        restore_enforcement_disabled(&fixture.pool).await;
     }
 
     #[tokio::test]
     #[ignore = "requires DATABASE_URL with migrations applied"]
     async fn admin_revocation_race_leaves_report_pending_and_message_live() {
+        // Start-of-test defensive re-assert (F1 backstop) — see
+        // report_authorization_binds_room_message_and_workspace.
+        restore_enforcement_disabled(&pool()).await;
         let fixture = fixture().await;
         let filed = fixture
             .repo

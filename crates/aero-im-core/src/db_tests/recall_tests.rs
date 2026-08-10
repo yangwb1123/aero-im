@@ -253,7 +253,9 @@ async fn recall_preflight_resolves_room_and_early_errors() {
         .await
         .unwrap()
         .id;
-    svc.add_member(author.id, chan_room, member.id).await.unwrap();
+    svc.add_member(author.id, chan_room, member.id)
+        .await
+        .unwrap();
     let third = svc
         .send_message(
             author.id,
@@ -288,7 +290,10 @@ async fn recall_preflight_resolves_room_and_early_errors() {
         .assert_message_recall_preflight(member.id, third.id)
         .await
         .unwrap();
-    assert_eq!(resolved, chan_room, "admin recaller passes the preflight role gate");
+    assert_eq!(
+        resolved, chan_room,
+        "admin recaller passes the preflight role gate"
+    );
 
     // Deleted message → the stable 409.
     let second = svc
@@ -358,7 +363,10 @@ async fn recall_preflight_window_expired_author() {
     let err = svc.recall_message(author.id, sent.id).await.unwrap_err();
     assert!(matches!(&err, Error::Conflict(msg) if msg == "recall window expired"));
     let live = svc.messages.get(sent.id).await.unwrap().unwrap();
-    assert!(live.recalled_at.is_none(), "expired recall must not mutate the row");
+    assert!(
+        live.recalled_at.is_none(),
+        "expired recall must not mutate the row"
+    );
     assert_eq!(live.blocks.len(), 1);
 }
 
@@ -457,12 +465,22 @@ async fn recall_window_precedence_deleted_before_expired_service() {
     let author = new_participant(&participants, "recall-window-svc-author4").await;
     let svc = service(pool.clone()).with_recall_window(time::Duration::seconds(60));
     let room = svc
-        .create_room(author.id, RoomKind::Group, Some("recall window svc room 2".into()))
+        .create_room(
+            author.id,
+            RoomKind::Group,
+            Some("recall window svc room 2".into()),
+        )
         .await
         .unwrap()
         .id;
     let sent = svc
-        .send_message(author.id, room, vec![Block::text("old and gone")], None, None)
+        .send_message(
+            author.id,
+            room,
+            vec![Block::text("old and gone")],
+            None,
+            None,
+        )
         .await
         .unwrap();
     sqlx::query("UPDATE messages SET created_at = $1 WHERE id = $2")
@@ -494,13 +512,7 @@ async fn recall_in_window_author_succeeds_with_nonzero_window() {
         .unwrap()
         .id;
     let sent = svc
-        .send_message(
-            author.id,
-            room,
-            vec![Block::text("fresh body")],
-            None,
-            None,
-        )
+        .send_message(author.id, room, vec![Block::text("fresh body")], None, None)
         .await
         .unwrap();
 

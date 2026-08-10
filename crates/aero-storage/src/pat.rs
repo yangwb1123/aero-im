@@ -101,6 +101,11 @@ impl PatRepo {
     /// already be [`hash_pat`]ed by the caller (the route hashes the freshly
     /// generated plaintext and returns the plaintext exactly once). `expires_at`
     /// of `None` means the token never expires. Returns the new token's id.
+    ///
+    /// Security-event audit: the mint commits with an `auth.pat.create` row in
+    /// the SAME transaction (same-fate — a failed audit insert rolls the token
+    /// back; a committed token always has its audit row). Account-level event:
+    /// workspace = the nil default tenant.
     pub async fn create(
         &self,
         participant: ParticipantId,
@@ -110,6 +115,7 @@ impl PatRepo {
         expires_at: Option<time::OffsetDateTime>,
     ) -> Result<PatId, sqlx::Error> {
         let id = PatId::new();
+        let mut tx = self.pool.begin().await?;
         sqlx::query(
             r"INSERT INTO pat_tokens (id, participant_id, token_hash, name, scopes, expires_at, created_at)
                VALUES ($1, $2, $3, $4, $5, $6, now())",
@@ -120,8 +126,22 @@ impl PatRepo {
         .bind(name)
         .bind(scopes)
         .bind(expires_at)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        crate::AuditRepo::append_in_tx(
+            &mut tx,
+            aero_common::WorkspaceId::nil(),
+            Some(participant),
+            "auth.pat.create",
+            Some(&id.to_string()),
+            serde_json::json!({
+                "name": name,
+                "scopes": scopes,
+                "expires_at": expires_at,
+            }),
+        )
+        .await?;
+        tx.commit().await?;
         Ok(id)
     }
 
@@ -187,16 +207,34 @@ impl PatRepo {
     /// absent, or owned by someone else). Owner-scoped: the `participant_id`
     /// predicate means one participant can never revoke another's token. Returns
     /// `true` if a still-active row that the caller owns was revoked by this call.
+    ///
+    /// Security-event audit: a successful (rows-affected) revoke commits an
+    /// `auth.pat.revoke` row in the SAME transaction (same-fate); a no-op
+    /// revoke (non-owned / already revoked) commits nothing and audits nothing.
     pub async fn revoke(&self, id: PatId, participant: ParticipantId) -> Result<bool, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
         let result = sqlx::query(
             r"UPDATE pat_tokens SET revoked_at = now()
                WHERE id = $1 AND participant_id = $2 AND revoked_at IS NULL",
         )
         .bind(id.to_uuid())
         .bind(participant.to_uuid())
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
-        Ok(result.rows_affected() > 0)
+        let revoked = result.rows_affected() > 0;
+        if revoked {
+            crate::AuditRepo::append_in_tx(
+                &mut tx,
+                aero_common::WorkspaceId::nil(),
+                Some(participant),
+                "auth.pat.revoke",
+                Some(&id.to_string()),
+                serde_json::json!({ "id": id.to_string() }),
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(revoked)
     }
 }
 
@@ -337,6 +375,69 @@ mod db_tests {
         assert!(
             !repo.revoke(id, owner).await.unwrap(),
             "second revoke is a no-op"
+        );
+
+        // Security-event audit (AC1b): the mint committed exactly one
+        // `auth.pat.create` row (nil workspace, actor = owner, target = the
+        // token id, detail per R1); the owner revoke committed exactly one
+        // `auth.pat.revoke` row; the non-owner attempt and the second (no-op)
+        // revoke added ZERO rows — counts scoped by actor_id (the sibling
+        // `pat_expired_token_does_not_verify` test mints its own tokens).
+        let create: (String, String, String, Option<String>, serde_json::Value) =
+            sqlx::query_as(
+                "SELECT workspace_id::text, actor_id::text, target, detail->>'expires_at', detail
+                   FROM audit_events
+                  WHERE action = 'auth.pat.create' AND actor_id = $1",
+            )
+            .bind(owner.to_uuid())
+            .fetch_one(&p)
+            .await
+            .expect("exactly one auth.pat.create row");
+        assert_eq!(create.0, "00000000-0000-0000-0000-000000000000", "nil workspace");
+        assert_eq!(create.1, owner.to_uuid().to_string(), "actor = owner");
+        assert_eq!(create.2, id.to_string(), "target = the PAT id");
+        assert_eq!(create.4["name"], "ci");
+        assert_eq!(create.4["scopes"], serde_json::json!(["read", "write"]));
+        assert!(create.3.is_none(), "expires_at null when absent");
+        let create_total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_events WHERE action = 'auth.pat.create' AND actor_id = $1",
+        )
+        .bind(owner.to_uuid())
+        .fetch_one(&p)
+        .await
+        .unwrap();
+        assert_eq!(create_total, 1, "one create row per mint");
+        let create_other: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_events WHERE action = 'auth.pat.create' AND actor_id = $1",
+        )
+        .bind(other.to_uuid())
+        .fetch_one(&p)
+        .await
+        .unwrap();
+        assert_eq!(create_other, 0, "the non-owner minted nothing");
+
+        let revoke: (String, String, String) = sqlx::query_as(
+            "SELECT workspace_id::text, actor_id::text, detail->>'id'
+               FROM audit_events
+              WHERE action = 'auth.pat.revoke' AND actor_id = $1",
+        )
+        .bind(owner.to_uuid())
+        .fetch_one(&p)
+        .await
+        .expect("exactly one auth.pat.revoke row");
+        assert_eq!(revoke.0, "00000000-0000-0000-0000-000000000000", "nil workspace");
+        assert_eq!(revoke.1, owner.to_uuid().to_string(), "actor = owner");
+        assert_eq!(revoke.2, id.to_string(), "detail.id = the revoked token id");
+        let revoke_total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_events WHERE action = 'auth.pat.revoke' AND actor_id = $1",
+        )
+        .bind(owner.to_uuid())
+        .fetch_one(&p)
+        .await
+        .unwrap();
+        assert_eq!(
+            revoke_total, 1,
+            "non-owner attempt and second revoke are no-ops: revoke count stays 1"
         );
     }
 

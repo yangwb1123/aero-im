@@ -60,6 +60,8 @@ check_deps "aero-live-srt" "aero-common,aero-live-core,aero-live-hls,aero-storag
 check_deps "aero-im-core" "aero-common,aero-bus,aero-storage,aero-auth,aero-signaling" || violations=$((violations + 1))
 check_deps "aero-im-call" "aero-common,aero-storage,aero-signaling,aero-live-webrtc" || violations=$((violations + 1))
 check_deps "aero-ai" "aero-common,aero-storage,aero-bus" || violations=$((violations + 1))
+check_deps "aero-cli" "aero-eng" || violations=$((violations + 1))
+check_deps "aero-audit-connector" "aero-common,aero-auth" || violations=$((violations + 1))
 
 # 检查是否有 crate 依赖了 aero-server（禁止反向依赖）
 echo "  检查反向依赖（任何 crate → aero-server）?"

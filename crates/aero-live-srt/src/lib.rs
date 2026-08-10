@@ -1135,6 +1135,8 @@ pub async fn resolve_stream(
 }
 
 #[cfg(test)]
+mod isolation_tests;
+#[cfg(test)]
 mod rotation_tests;
 #[cfg(test)]
 mod tests;

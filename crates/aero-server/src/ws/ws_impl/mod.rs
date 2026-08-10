@@ -864,8 +864,10 @@ async fn cleanup_connection_call_generations(
                         "disconnect: canonical call lookup failed"
                     );
                     if attempt < 3 {
-                        tokio::time::sleep(std::time::Duration::from_millis(100 * u64::from(attempt)))
-                            .await;
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            100 * u64::from(attempt),
+                        ))
+                        .await;
                         continue;
                     }
                     break;
@@ -883,8 +885,11 @@ async fn cleanup_connection_call_generations(
                     durable_room = Some(call.room_id);
                     break;
                 }
-                Err(aero_common::Error::Conflict(_) | aero_common::Error::NotFound(_) |
-aero_common::Error::Forbidden(_)) => break,
+                Err(
+                    aero_common::Error::Conflict(_)
+                    | aero_common::Error::NotFound(_)
+                    | aero_common::Error::Forbidden(_),
+                ) => break,
                 Err(error) => {
                     warn!(
                         %call_id,
@@ -894,8 +899,10 @@ aero_common::Error::Forbidden(_)) => break,
                         "disconnect: durable SFU leave failed"
                     );
                     if attempt < 3 {
-                        tokio::time::sleep(std::time::Duration::from_millis(100 * u64::from(attempt)))
-                            .await;
+                        tokio::time::sleep(std::time::Duration::from_millis(
+                            100 * u64::from(attempt),
+                        ))
+                        .await;
                     }
                 }
             }

@@ -33,6 +33,7 @@ aero-storage.workspace = true
 aero-auth.workspace = true
 aero-im-core.workspace = true
 aero-ai.workspace = true
+aero-audit-connector.workspace = true
 aero-live-core.workspace = true
 aero-live-rtmp.workspace = true
 aero-live-srt.workspace = true

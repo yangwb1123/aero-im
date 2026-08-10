@@ -119,7 +119,9 @@ async fn at1_mention_fans_out_to_inbox_and_deterministic_notify_outbox() {
     let mut recipient_ids: Vec<ParticipantId> = recipients.iter().map(|r| r.participant).collect();
     recipient_ids.sort();
     assert_eq!(recipient_ids, [bob.id, carol.id]);
-    assert!(recipients.iter().all(|r| r.kind == NotificationKind::Mention));
+    assert!(recipients
+        .iter()
+        .all(|r| r.kind == NotificationKind::Mention));
 }
 
 /// AT-2: redelivery with the same deterministic `delivery_id` de-dups. Simulate a
@@ -159,12 +161,13 @@ async fn at2_redelivery_with_same_delivery_id_dedups() {
     assert_eq!(count_notifications(&pool, msg.id, None).await, 2);
     assert_eq!(count_notify_outbox(&pool, msg.id).await, 1);
 
-    let job_id: uuid::Uuid =
-        sqlx::query_scalar("SELECT id FROM message_side_effect_jobs WHERE message_id = $1 AND kind = 'notifications'")
-            .bind(msg.id.to_uuid())
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let job_id: uuid::Uuid = sqlx::query_scalar(
+        "SELECT id FROM message_side_effect_jobs WHERE message_id = $1 AND kind = 'notifications'",
+    )
+    .bind(msg.id.to_uuid())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
 
     // The re-arm → dispatch → assert section runs under BATCH_SERIAL: the
     // re-armed job is globally claimable and AT-6b/AT-7's global batch could
@@ -191,7 +194,10 @@ async fn at2_redelivery_with_same_delivery_id_dedups() {
     assert_eq!(count_notify_outbox(&pool, msg.id).await, 1);
     let (completed_at, _attempts, last_error) = side_effect_job_state(&pool, job_id).await;
     assert!(completed_at.is_some(), "redelivered job completed");
-    assert!(last_error.is_none(), "redelivery must not fail: {last_error:?}");
+    assert!(
+        last_error.is_none(),
+        "redelivery must not fail: {last_error:?}"
+    );
 }
 
 /// AT-2b: the empty-target completion branch. Every plain, unmentioned message —
@@ -214,17 +220,23 @@ async fn at2b_empty_target_message_completes_claim_without_rows() {
     assert_eq!(count_notifications(&pool, plain.id, None).await, 0);
     assert_eq!(count_notify_outbox(&pool, plain.id).await, 0);
     assert_eq!(count_bundles(&pool, plain.id).await, 0);
-    let plain_job: uuid::Uuid =
-        sqlx::query_scalar("SELECT id FROM message_side_effect_jobs WHERE message_id = $1 AND kind = 'notifications'")
-            .bind(plain.id.to_uuid())
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let plain_job: uuid::Uuid = sqlx::query_scalar(
+        "SELECT id FROM message_side_effect_jobs WHERE message_id = $1 AND kind = 'notifications'",
+    )
+    .bind(plain.id.to_uuid())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     let (completed_at, _, last_error) = side_effect_job_state(&pool, plain_job).await;
     assert!(completed_at.is_some(), "plain-message claim completed");
-    assert!(last_error.is_none(), "plain-message claim must not fail: {last_error:?}");
+    assert!(
+        last_error.is_none(),
+        "plain-message claim must not fail: {last_error:?}"
+    );
     assert_eq!(
-        svc.dispatch_message_side_effects_for(plain.id).await.unwrap(),
+        svc.dispatch_message_side_effects_for(plain.id)
+            .await
+            .unwrap(),
         0,
         "nothing due for the plain message"
     );
@@ -243,17 +255,23 @@ async fn at2b_empty_target_message_completes_claim_without_rows() {
         .unwrap();
     assert_eq!(count_notifications(&pool, muted.id, None).await, 0);
     assert_eq!(count_notify_outbox(&pool, muted.id).await, 0);
-    let muted_job: uuid::Uuid =
-        sqlx::query_scalar("SELECT id FROM message_side_effect_jobs WHERE message_id = $1 AND kind = 'notifications'")
-            .bind(muted.id.to_uuid())
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let muted_job: uuid::Uuid = sqlx::query_scalar(
+        "SELECT id FROM message_side_effect_jobs WHERE message_id = $1 AND kind = 'notifications'",
+    )
+    .bind(muted.id.to_uuid())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     let (completed_at, _, last_error) = side_effect_job_state(&pool, muted_job).await;
     assert!(completed_at.is_some(), "filtered-to-empty claim completed");
-    assert!(last_error.is_none(), "filtered-to-empty claim must not fail: {last_error:?}");
+    assert!(
+        last_error.is_none(),
+        "filtered-to-empty claim must not fail: {last_error:?}"
+    );
     assert_eq!(
-        svc.dispatch_message_side_effects_for(muted.id).await.unwrap(),
+        svc.dispatch_message_side_effects_for(muted.id)
+            .await
+            .unwrap(),
         0
     );
 }
@@ -274,17 +292,29 @@ async fn at3_reply_notifications_bundle_vs_immediate_routing() {
         .await
         .unwrap();
     let reply = svc
-        .send_message(bob.id, room, vec![Block::text("reply")], Some(root_msg.id), None)
+        .send_message(
+            bob.id,
+            room,
+            vec![Block::text("reply")],
+            Some(root_msg.id),
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(count_notifications(&pool, reply.id, None).await, 1);
-    assert_eq!(count_notifications(&pool, reply.id, Some(alice.id)).await, 1);
+    assert_eq!(
+        count_notifications(&pool, reply.id, Some(alice.id)).await,
+        1
+    );
     assert_eq!(count_notify_outbox(&pool, reply.id).await, 1);
     assert_eq!(count_bundles(&pool, reply.id).await, 0);
     let (event_id, _) = pending_notify_outbox(&pool, reply.id)
         .await
         .expect("immediate reply has an outbox row");
-    assert_eq!(event_id, notify_delivery_id(reply.id, NotifyBatchKind::Reply));
+    assert_eq!(
+        event_id,
+        notify_delivery_id(reply.id, NotifyBatchKind::Reply)
+    );
 
     // --- Bundled (bundles=true): reply defers into notification_bundles. ---
     let (svc, _bus) = notification_service(pool.clone(), true);
@@ -295,7 +325,13 @@ async fn at3_reply_notifications_bundle_vs_immediate_routing() {
         .await
         .unwrap();
     let reply = svc
-        .send_message(bob.id, room, vec![Block::text("reply")], Some(root_msg.id), None)
+        .send_message(
+            bob.id,
+            room,
+            vec![Block::text("reply")],
+            Some(root_msg.id),
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(count_notifications(&pool, reply.id, None).await, 0);
@@ -321,15 +357,19 @@ async fn at3_reply_notifications_bundle_vs_immediate_routing() {
         bundle_delivery_id,
         Some(notify_delivery_id(reply.id, NotifyBatchKind::Reply))
     );
-    let job_id: uuid::Uuid =
-        sqlx::query_scalar("SELECT id FROM message_side_effect_jobs WHERE message_id = $1 AND kind = 'notifications'")
-            .bind(reply.id.to_uuid())
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let job_id: uuid::Uuid = sqlx::query_scalar(
+        "SELECT id FROM message_side_effect_jobs WHERE message_id = $1 AND kind = 'notifications'",
+    )
+    .bind(reply.id.to_uuid())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     let (completed_at, _, last_error) = side_effect_job_state(&pool, job_id).await;
     assert!(completed_at.is_some(), "bundle insert completed the claim");
-    assert!(last_error.is_none(), "bundle insert must not fail: {last_error:?}");
+    assert!(
+        last_error.is_none(),
+        "bundle insert must not fail: {last_error:?}"
+    );
 
     // --- Mixed mention + reply with bundles wired. ---
     let carol = new_participant(&ParticipantRepo::new(pool.clone()), "at3c-carol").await;
@@ -351,7 +391,10 @@ async fn at3_reply_notifications_bundle_vs_immediate_routing() {
         .unwrap();
     // Mention → notifications (immediate); reply → notification_bundles.
     assert_eq!(count_notifications(&pool, mixed.id, None).await, 1);
-    assert_eq!(count_notifications(&pool, mixed.id, Some(carol.id)).await, 1);
+    assert_eq!(
+        count_notifications(&pool, mixed.id, Some(carol.id)).await,
+        1
+    );
     assert_eq!(count_bundles(&pool, mixed.id).await, 1);
     // Exactly ONE outbox notify row (the mention batch): the bundle insert
     // writes NO outbox row — only flush() does (design correction C2).
@@ -605,20 +648,36 @@ async fn at5f_thread_mute_suppresses_only_the_muter() {
         .await
         .unwrap();
     let subs = ThreadSubscriptionRepo::new(pool.clone());
-    subs.subscribe_authorized(carol.id, root_msg.id).await.unwrap();
-    subs.subscribe_authorized(dave.id, root_msg.id).await.unwrap();
+    subs.subscribe_authorized(carol.id, root_msg.id)
+        .await
+        .unwrap();
+    subs.subscribe_authorized(dave.id, root_msg.id)
+        .await
+        .unwrap();
     ThreadMuteRepo::new(pool.clone())
         .mute_authorized(carol.id, root_msg.id)
         .await
         .unwrap();
 
     let reply = svc
-        .send_message(bob.id, room, vec![Block::text("reply")], Some(root_msg.id), None)
+        .send_message(
+            bob.id,
+            room,
+            vec![Block::text("reply")],
+            Some(root_msg.id),
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(count_notifications(&pool, reply.id, None).await, 2);
-    assert_eq!(count_notifications(&pool, reply.id, Some(alice.id)).await, 1);
-    assert_eq!(count_notifications(&pool, reply.id, Some(carol.id)).await, 0);
+    assert_eq!(
+        count_notifications(&pool, reply.id, Some(alice.id)).await,
+        1
+    );
+    assert_eq!(
+        count_notifications(&pool, reply.id, Some(carol.id)).await,
+        0
+    );
     assert_eq!(count_notifications(&pool, reply.id, Some(dave.id)).await, 1);
 }
 
@@ -638,10 +697,17 @@ async fn at5g_thread_level_suppresses_per_recipient() {
         .await
         .unwrap();
     let subs = ThreadSubscriptionRepo::new(pool.clone());
-    subs.subscribe_authorized(carol.id, root_msg.id).await.unwrap();
-    subs.subscribe_authorized(dave.id, root_msg.id).await.unwrap();
+    subs.subscribe_authorized(carol.id, root_msg.id)
+        .await
+        .unwrap();
+    subs.subscribe_authorized(dave.id, root_msg.id)
+        .await
+        .unwrap();
     let levels = ThreadNotificationPrefsRepo::new(pool.clone());
-    levels.set_level_authorized(dave.id, root_msg.id, "none").await.unwrap();
+    levels
+        .set_level_authorized(dave.id, root_msg.id, "none")
+        .await
+        .unwrap();
     levels
         .set_level_authorized(carol.id, root_msg.id, "mentions")
         .await
@@ -650,12 +716,24 @@ async fn at5g_thread_level_suppresses_per_recipient() {
     // Reply WITHOUT mentioning carol: "mentions" drops her, "none" drops dave,
     // alice (root author, default "all") keeps the notification.
     let quiet = svc
-        .send_message(bob.id, room, vec![Block::text("quiet reply")], Some(root_msg.id), None)
+        .send_message(
+            bob.id,
+            room,
+            vec![Block::text("quiet reply")],
+            Some(root_msg.id),
+            None,
+        )
         .await
         .unwrap();
     assert_eq!(count_notifications(&pool, quiet.id, None).await, 1);
-    assert_eq!(count_notifications(&pool, quiet.id, Some(alice.id)).await, 1);
-    assert_eq!(count_notifications(&pool, quiet.id, Some(carol.id)).await, 0);
+    assert_eq!(
+        count_notifications(&pool, quiet.id, Some(alice.id)).await,
+        1
+    );
+    assert_eq!(
+        count_notifications(&pool, quiet.id, Some(carol.id)).await,
+        0
+    );
     assert_eq!(count_notifications(&pool, quiet.id, Some(dave.id)).await, 0);
 
     // Positive control: a reply MENTIONING carol delivers to her ("mentions"

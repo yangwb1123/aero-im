@@ -4,7 +4,12 @@
 //! helpers (`scim_workspace`, `scim_repo`, `scim_err`, `rfc3339`,
 //! `parse_filter`, `is_unique_violation`) via `use super::*;`.
 
-use super::{Deserialize, AppState, UserGroupRepo, AeroResult, UserGroupId, FromStr, AeroError, UserGroup, ParticipantId, ScimGroup, ScimGroupMember, SCHEMA_GROUP, ScimMeta, rfc3339, WorkspaceId, State, Query, HeaderMap, Response, scim_workspace, scim_err, IntoResponse, Json, ScimListResponse, Path, StatusCode, parse_filter, validate_patch_operation_count};
+use super::{
+    parse_filter, rfc3339, scim_err, scim_workspace, validate_patch_operation_count, AeroError,
+    AeroResult, AppState, Deserialize, FromStr, HeaderMap, IntoResponse, Json, ParticipantId, Path,
+    Query, Response, ScimGroup, ScimGroupMember, ScimListResponse, ScimMeta, State, StatusCode,
+    UserGroup, UserGroupId, UserGroupRepo, WorkspaceId, SCHEMA_GROUP,
+};
 use aero_storage::user_group::{ScimGroupMutation, ScimGroupWrite, UserGroupWriteError};
 
 // ============================================================ Group handlers

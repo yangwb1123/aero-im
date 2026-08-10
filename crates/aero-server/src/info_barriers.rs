@@ -156,9 +156,7 @@ async fn delete_barrier(
     Path(id_str): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let id = parse_barrier(&id_str)?;
-    let removed = repo(&s)
-        .delete_authorized(id, auth.participant_id)
-        .await?;
+    let removed = repo(&s).delete_authorized(id, auth.participant_id).await?;
     if !removed {
         return Err(AeroError::NotFound(format!("barrier {id}")).into());
     }

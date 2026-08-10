@@ -144,6 +144,13 @@ impl ParticipantRepo {
     /// credentials row exists for that participant (bots/agents). Propagates a
     /// unique-constraint violation as-is so callers can map it to `409 Conflict`.
     ///
+    /// Security-event audit: a successful change commits an `auth.email.changed`
+    /// row in the SAME transaction (same-fate — the login identifier rewrite is
+    /// the audited fact; a `UniqueViolation` still propagates through the tx so
+    /// the handler's 409 mapping is unchanged). A zero-rows-affected call (no
+    /// credentials row) audits nothing. Account-level event: workspace = the nil
+    /// default tenant.
+    ///
     /// # Errors
     /// Propagates any [`sqlx::Error`] from the update, including a
     /// `UniqueViolation` if `new_email` is already taken by another account.
@@ -152,14 +159,28 @@ impl ParticipantRepo {
         participant_id: ParticipantId,
         new_email: &str,
     ) -> Result<bool, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
         let rows = sqlx::query("UPDATE credentials SET email = $1 WHERE participant_id = $2")
             // Trim so a changed address stays consistent with the trimmed login lookup
             // (mirrors `create_human`; `citext` is case- but not whitespace-insensitive).
             .bind(new_email.trim())
             .bind(participant_id.to_uuid())
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
-        Ok(rows.rows_affected() > 0)
+        let changed = rows.rows_affected() > 0;
+        if changed {
+            crate::AuditRepo::append_in_tx(
+                &mut tx,
+                aero_common::WorkspaceId::nil(),
+                Some(participant_id),
+                "auth.email.changed",
+                Some(&participant_id.to_string()),
+                serde_json::json!({}),
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(changed)
     }
 
     /// GDPR-compliant account deletion: soft-delete the participant and

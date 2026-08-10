@@ -62,6 +62,19 @@ impl CredentialRotationRepo {
         replace_password_and_record_history(&mut tx, participant, &current_hash, new_hash).await?;
         invalidate_reset_tokens(&mut tx, participant).await?;
         let sessions_revoked = revoke_all_sessions(&mut tx, participant).await?;
+        // Security-event audit: the change commits an `auth.password.changed`
+        // row in the SAME transaction (same-fate). A `StaleCredentials` no-op
+        // above commits nothing and audits nothing. Account-level event:
+        // workspace = the nil default tenant.
+        crate::AuditRepo::append_in_tx(
+            &mut tx,
+            aero_common::WorkspaceId::nil(),
+            Some(participant),
+            "auth.password.changed",
+            Some(&participant.to_string()),
+            serde_json::json!({}),
+        )
+        .await?;
         tx.commit().await?;
         Ok(ChangePasswordResult::Applied { sessions_revoked })
     }
@@ -147,6 +160,19 @@ impl CredentialRotationRepo {
 
         replace_password_and_record_history(&mut tx, participant, &current_hash, new_hash).await?;
         let sessions_revoked = revoke_all_sessions(&mut tx, participant).await?;
+        // Security-event audit: the reset commits an `auth.password.reset` row
+        // in the SAME transaction (same-fate — a failed audit insert rolls
+        // back token consumption too, so the user retries with the same
+        // token). `InvalidToken`/`StaleCredentials` no-ops audit nothing.
+        crate::AuditRepo::append_in_tx(
+            &mut tx,
+            aero_common::WorkspaceId::nil(),
+            Some(participant),
+            "auth.password.reset",
+            Some(&participant.to_string()),
+            serde_json::json!({}),
+        )
+        .await?;
         tx.commit().await?;
         Ok(ResetPasswordResult::Applied {
             participant,
@@ -348,11 +374,114 @@ mod tests {
         ));
         assert!(!usable(&pool, "reset-token-three").await);
 
+        // Security-event audit (AC1d): the Applied reset committed exactly one
+        // `auth.password.reset` row and the Applied change exactly one
+        // `auth.password.changed` row (nil workspace, actor = target =
+        // participant); the later `InvalidToken` reset (no-op) added ZERO rows.
+        // Counts scoped by actor_id (the sibling deadlock test applies its own
+        // reset).
+        let reset: (String, String, String) = sqlx::query_as(
+            "SELECT workspace_id::text, actor_id::text, target
+               FROM audit_events
+              WHERE action = 'auth.password.reset' AND actor_id = $1",
+        )
+        .bind(participant.to_uuid())
+        .fetch_one(&pool)
+        .await
+        .expect("exactly one auth.password.reset row");
+        assert_eq!(reset.0, "00000000-0000-0000-0000-000000000000", "nil workspace");
+        assert_eq!(reset.1, participant.to_uuid().to_string(), "actor = participant");
+        assert_eq!(reset.2, participant.to_string(), "target = participant");
+        let changed: (String, String, String) = sqlx::query_as(
+            "SELECT workspace_id::text, actor_id::text, target
+               FROM audit_events
+              WHERE action = 'auth.password.changed' AND actor_id = $1",
+        )
+        .bind(participant.to_uuid())
+        .fetch_one(&pool)
+        .await
+        .expect("exactly one auth.password.changed row");
+        assert_eq!(changed.0, "00000000-0000-0000-0000-000000000000", "nil workspace");
+        assert_eq!(changed.1, participant.to_uuid().to_string(), "actor = participant");
+        assert_eq!(changed.2, participant.to_string(), "target = participant");
+        let reset_total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_events WHERE action = 'auth.password.reset' AND actor_id = $1",
+        )
+        .bind(participant.to_uuid())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            reset_total, 1,
+            "the InvalidToken no-op reset adds no audit row (count still 1)"
+        );
+
+        // Cleanup (FK NO ACTION, 0007): audit rows reference the participant.
+        sqlx::query("DELETE FROM audit_events WHERE actor_id = $1")
+            .bind(participant.to_uuid())
+            .execute(&pool)
+            .await
+            .expect("delete audit rows before the participant");
         sqlx::query("DELETE FROM participants WHERE id = $1")
             .bind(participant.to_uuid())
             .execute(&pool)
             .await
-            .unwrap();
+            .expect("delete participant");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires DATABASE_URL with migrations applied"]
+    async fn stale_credentials_audits_nothing() {
+        let pool = pool();
+        let participant = fixture(&pool).await;
+        let repo = CredentialRotationRepo::new(pool.clone());
+
+        // A concurrent password change has rotated the hash behind the caller:
+        // the expected-current-hash binding fails → `StaleCredentials`, zero
+        // rows mutated, and ZERO audit rows (a no-op commits nothing and
+        // audits nothing).
+        assert_eq!(
+            repo.change_password(participant, "hash-not-current", "hash-stale")
+                .await
+                .unwrap(),
+            ChangePasswordResult::StaleCredentials
+        );
+        let changed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_events WHERE action = 'auth.password.changed' AND actor_id = $1",
+        )
+        .bind(participant.to_uuid())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(changed, 0, "StaleCredentials audits nothing");
+        let reset: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_events WHERE action = 'auth.password.reset' AND actor_id = $1",
+        )
+        .bind(participant.to_uuid())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(reset, 0);
+        let stored: (String,) = sqlx::query_as(
+            "SELECT password_hash FROM credentials WHERE participant_id = $1",
+        )
+        .bind(participant.to_uuid())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(stored.0, "hash-old", "credential unchanged");
+
+        // Cleanup (FK NO ACTION, 0007).
+        sqlx::query("DELETE FROM audit_events WHERE actor_id = $1")
+            .bind(participant.to_uuid())
+            .execute(&pool)
+            .await
+            .expect("delete audit rows before the participant");
+        sqlx::query("DELETE FROM participants WHERE id = $1")
+            .bind(participant.to_uuid())
+            .execute(&pool)
+            .await
+            .expect("delete participant");
     }
 
     #[tokio::test]
@@ -381,10 +510,16 @@ mod tests {
         assert!(!usable(&pool, &token_a).await);
         assert!(!usable(&pool, &token_b).await);
 
+        // Cleanup (FK NO ACTION, 0007): audit rows reference the participant.
+        sqlx::query("DELETE FROM audit_events WHERE actor_id = $1")
+            .bind(participant.to_uuid())
+            .execute(&pool)
+            .await
+            .expect("delete audit rows before the participant");
         sqlx::query("DELETE FROM participants WHERE id = $1")
             .bind(participant.to_uuid())
             .execute(&pool)
             .await
-            .unwrap();
+            .expect("delete participant");
     }
 }

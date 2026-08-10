@@ -615,6 +615,19 @@ impl ImService {
         reason: &str,
         digest: &str,
     ) -> Result<()> {
+        // R-D1 (B5-1, parity with the aero-ai worker's
+        // `moderation_delete_workspace`): refuse `None` — the audit action is
+        // derived from the workspace, so deleting with `None` would commit the
+        // soft delete + `Deleted` broadcast with ZERO `audit_events` rows (the
+        // 0239 governance enqueue never fires) — an invisible, un-audited
+        // removal and the only route around the otherwise fail-closed binding
+        // RAISE. The caller keeps the message visible instead.
+        let workspace = workspace.ok_or_else(|| {
+            Error::Invalid(
+                "moderate_delete requires a workspace; refusing un-audited delete (R-D1)"
+                    .to_owned(),
+            )
+        })?;
         let existing = self
             .messages
             .get(message_id)
@@ -631,9 +644,9 @@ impl ImService {
             .messages
             .soft_delete_outboxed_system(
                 message_id,
-                workspace,
+                Some(workspace),
                 None,
-                workspace.map(|_| "message.moderated"),
+                Some("message.moderated"),
                 detail,
                 ParticipantId::nil(),
                 traceparent.as_deref(),
@@ -754,7 +767,10 @@ mod recall_window_tests {
         assert_eq!(parse_recall_window(Some("0")), time::Duration::ZERO);
         // Valid values, trimmed.
         assert_eq!(parse_recall_window(Some("60")), time::Duration::seconds(60));
-        assert_eq!(parse_recall_window(Some(" 60 ")), time::Duration::seconds(60));
+        assert_eq!(
+            parse_recall_window(Some(" 60 ")),
+            time::Duration::seconds(60)
+        );
         // Garbage / negative / empty / float / overflow → default fallback.
         for raw in ["abc", "-5", "1.5", "", "99999999999999999999999"] {
             assert_eq!(

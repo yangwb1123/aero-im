@@ -5,7 +5,12 @@
 //! `display_name_for`, `parse_participant_id`, `is_unique_violation`) via
 //! `use super::*;`.
 
-use super::{Deserialize, AeroError, ScimUser, display_name_for, State, Query, AppState, HeaderMap, Response, scim_workspace, scim_err, parse_filter, scim_repo, to_scim_user, IntoResponse, Json, ScimListResponse, ParticipantId, Path, parse_participant_id, StatusCode, is_unique_violation, validate_patch_operation_count};
+use super::{
+    display_name_for, is_unique_violation, parse_filter, parse_participant_id, scim_err, scim_repo,
+    scim_workspace, to_scim_user, validate_patch_operation_count, AeroError, AppState, Deserialize,
+    HeaderMap, IntoResponse, Json, ParticipantId, Path, Query, Response, ScimListResponse,
+    ScimUser, State, StatusCode,
+};
 
 // ============================================================ User handlers
 

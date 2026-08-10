@@ -437,7 +437,11 @@ fn sse_parser_empty_bytes_push() {
     let mut with_empty = SseParser::default();
     with_empty.push_bytes(&Bytes::from(c1.clone()));
     with_empty.push_bytes(&Bytes::new());
-    assert_eq!(with_empty.tail, vec![0xE4], "empty push must not grow the tail");
+    assert_eq!(
+        with_empty.tail,
+        vec![0xE4],
+        "empty push must not grow the tail"
+    );
     with_empty.push_bytes(&Bytes::from(c2.clone()));
 
     let mut control = SseParser::default();
@@ -484,8 +488,7 @@ impl tracing::Subscriber for WarnCounter {
 
     fn event(&self, event: &tracing::Event<'_>) {
         if event.metadata().level() == &tracing::Level::WARN {
-            self.warns
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.warns.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
@@ -513,7 +516,10 @@ fn sse_parser_corrupt_mid_stream_warns_and_retains_prefix() {
         p.buffer.contains("\"text\":\"A"),
         "valid prefix before the invalid byte must be retained"
     );
-    assert!(p.tail.is_empty(), "corruption must not leave a retained tail");
+    assert!(
+        p.tail.is_empty(),
+        "corruption must not leave a retained tail"
+    );
     // State stays consistent: a subsequent good chunk still parses.
     p.push_bytes(&Bytes::from_static(
         b"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"X\"}}\n\n",

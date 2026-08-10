@@ -28,6 +28,7 @@ use crate::test_util::MockBus;
 // Fully-qualified `time::Duration` used by the recall-window fixture pin.
 
 mod auto_mod_tests;
+mod governance_drill_tests;
 mod notifications_tests;
 mod recall_tests;
 mod relay_tests;
@@ -98,7 +99,9 @@ async fn group_room(
         .unwrap()
         .id;
     for member in &members[1..] {
-        svc.add_member(members[0].id, room, member.id).await.unwrap();
+        svc.add_member(members[0].id, room, member.id)
+            .await
+            .unwrap();
     }
     (members, room)
 }

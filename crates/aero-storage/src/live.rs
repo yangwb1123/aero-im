@@ -249,8 +249,7 @@ impl LiveRepo {
             .map(|r| GiftLeaderRow {
                 sender_id: ParticipantId::from_uuid(r.sender_id),
                 sender_name: r.sender_name,
-                total_coins: u64::try_from(r.total_coins.max(0))
-                    .expect("max(0) is non-negative"),
+                total_coins: u64::try_from(r.total_coins.max(0)).expect("max(0) is non-negative"),
                 total_qty: u64::try_from(r.total_qty.max(0)).expect("max(0) is non-negative"),
             })
             .collect())
@@ -297,7 +296,10 @@ struct GiftRow {
 /// Map a stored gift row to the wire type, enriching name/icon from the catalog
 /// (falling back gracefully if the catalog changed since the gift was sent).
 fn gift_line(r: GiftRow) -> StreamGiftLine {
-    let (name, icon) = gift_by_id(&r.gift_id).map_or_else(|| (r.gift_id.clone(), "🎁".to_owned()), |g| (g.name, g.icon));
+    let (name, icon) = gift_by_id(&r.gift_id).map_or_else(
+        || (r.gift_id.clone(), "🎁".to_owned()),
+        |g| (g.name, g.icon),
+    );
     StreamGiftLine {
         id: Ulid(r.id.as_u128()),
         stream_id: Ulid(r.stream_id.as_u128()),

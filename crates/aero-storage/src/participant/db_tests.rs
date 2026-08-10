@@ -809,3 +809,81 @@ async fn erasure_anonymises_edit_evidence_and_respects_legal_hold() {
         "released payload derivative is removed"
     );
 }
+
+/// `AC1f`: `ParticipantRepo::update_email` (POST /api/auth/change-email — the
+/// password-gated login-identifier rewrite) commits exactly one
+/// `auth.email.changed` row (nil workspace, actor = target = participant) in
+/// the SAME transaction as the UPDATE; an unknown `participant_id` (zero rows
+/// affected) audits nothing. (An identical-address call is NOT the negative:
+/// the UPDATE is unconditional, so it returns `rows_affected == 1` and DOES
+/// audit — the login-identifier rewrite is the audited fact.)
+#[tokio::test]
+#[ignore = "requires live Postgres"]
+async fn update_email_audits_email_change() {
+    let p = pool();
+    let repo = ParticipantRepo::new(p.clone());
+
+    let id = ParticipantId::new();
+    sqlx::query("INSERT INTO participants (id, kind, display_name) VALUES ($1, 'human', $2)")
+        .bind(id.to_uuid())
+        .bind(format!("email-change-{id}"))
+        .execute(&p)
+        .await
+        .expect("insert participant");
+    let old_email = format!("old-{id}@example.test");
+    sqlx::query("INSERT INTO credentials (participant_id, email, password_hash) VALUES ($1, $2, 'h')")
+        .bind(id.to_uuid())
+        .bind(&old_email)
+        .execute(&p)
+        .await
+        .expect("insert credentials");
+
+    // Positive: the change commits with exactly one audit row.
+    let new_email = format!("new-{id}@example.test");
+    assert!(repo.update_email(id, &new_email).await.expect("update"));
+    let row: (String, String, String) = sqlx::query_as(
+        "SELECT workspace_id::text, actor_id::text, target
+           FROM audit_events
+          WHERE action = 'auth.email.changed' AND actor_id = $1",
+    )
+    .bind(id.to_uuid())
+    .fetch_one(&p)
+    .await
+    .expect("exactly one auth.email.changed row");
+    assert_eq!(row.0, "00000000-0000-0000-0000-000000000000", "nil workspace");
+    assert_eq!(row.1, id.to_uuid().to_string(), "actor = participant");
+    assert_eq!(row.2, id.to_string(), "target = participant");
+    let stored: String = sqlx::query_scalar("SELECT email FROM credentials WHERE participant_id = $1")
+        .bind(id.to_uuid())
+        .fetch_one(&p)
+        .await
+        .unwrap();
+    assert_eq!(stored, new_email, "credentials.email == new value");
+
+    // Negative: unknown participant → false, zero rows affected, zero audit.
+    let ghost = ParticipantId::new();
+    assert!(
+        !repo.update_email(ghost, "ghost@example.test").await.expect("no-op"),
+        "unknown participant is a no-op"
+    );
+    let total: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_events WHERE action = 'auth.email.changed' AND actor_id = $1",
+    )
+    .bind(id.to_uuid())
+    .fetch_one(&p)
+    .await
+    .unwrap();
+    assert_eq!(total, 1, "the no-op adds no audit row");
+
+    // Cleanup (FK NO ACTION, 0007): audit rows reference the participant.
+    sqlx::query("DELETE FROM audit_events WHERE actor_id = $1")
+        .bind(id.to_uuid())
+        .execute(&p)
+        .await
+        .expect("delete audit rows before the participant");
+    sqlx::query("DELETE FROM participants WHERE id = $1")
+        .bind(id.to_uuid())
+        .execute(&p)
+        .await
+        .expect("delete participant");
+}

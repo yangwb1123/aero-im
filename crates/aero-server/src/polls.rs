@@ -365,8 +365,8 @@ async fn close_poll(
                     // f64→u32 narrowing cannot truncate or wrap meaningful data.
                     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
                     let pct = if total_votes > 0 {
-                        (f64::from(tally.get(i).copied().unwrap_or(0)) / f64::from(total_votes) * 100.0)
-                            as u32
+                        (f64::from(tally.get(i).copied().unwrap_or(0)) / f64::from(total_votes)
+                            * 100.0) as u32
                     } else {
                         0
                     };

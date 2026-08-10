@@ -954,10 +954,7 @@ async fn get_notif_defaults(
         return Err(AeroError::Forbidden("not a workspace member".into()).into());
     }
     let repo = WorkspaceNotifDefaultsRepo::new(s.pg.clone());
-    let level = repo
-        .get(ws)
-        .await?
-        .unwrap_or_else(|| "all".to_owned());
+    let level = repo.get(ws).await?.unwrap_or_else(|| "all".to_owned());
     Ok(Json(serde_json::json!({ "default_level": level })))
 }
 

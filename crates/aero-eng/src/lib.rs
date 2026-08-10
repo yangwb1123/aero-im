@@ -47,8 +47,10 @@ pub use registry::CommandRegistry;
 pub use registry::DispatchResult;
 pub use registry::RegistryResult;
 
+pub mod audit_provision;
 pub mod checks;
 pub mod command;
+mod commands;
 pub mod config;
 pub mod context;
 pub mod outcome;

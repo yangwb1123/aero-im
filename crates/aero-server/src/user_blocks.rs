@@ -48,9 +48,7 @@ async fn block_user(
     if target == auth.participant_id {
         return Err(AeroError::Invalid("cannot block yourself".into()).into());
     }
-    s.blocks
-        .block(auth.participant_id, target)
-        .await?;
+    s.blocks.block(auth.participant_id, target).await?;
     Ok(StatusCode::OK)
 }
 
@@ -63,9 +61,7 @@ async fn unblock_user(
     Path(target_str): Path<String>,
 ) -> ApiResult<StatusCode> {
     let target = parse_participant(&target_str)?;
-    s.blocks
-        .unblock(auth.participant_id, target)
-        .await?;
+    s.blocks.unblock(auth.participant_id, target).await?;
     Ok(StatusCode::OK)
 }
 
@@ -77,10 +73,7 @@ async fn list_blocks(
     State(s): State<AppState>,
     auth: AuthUser,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let blocked = s
-        .blocks
-        .blocks_for(auth.participant_id)
-        .await?;
+    let blocked = s.blocks.blocks_for(auth.participant_id).await?;
     let ids: Vec<String> = blocked.into_iter().map(|p| p.to_string()).collect();
     Ok(Json(serde_json::json!({ "blocks": ids })))
 }

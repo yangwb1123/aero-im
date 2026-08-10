@@ -274,7 +274,8 @@ impl LiveService {
         Ok(self
             .participants
             .get(who)
-            .await?.map_or_else(|| who.to_string(), |p| p.display_name))
+            .await?
+            .map_or_else(|| who.to_string(), |p| p.display_name))
     }
 
     // ---------------------------------------------------------- danmaku

@@ -139,6 +139,28 @@ impl SsoRepo {
         if resolved.newly_provisioned {
             ensure_workspace_membership(&mut tx, workspace, resolved.participant_id.to_uuid())
                 .await?;
+            // Security-event audit: JIT provisioning creates an account — the
+            // same event class as first-party registration, so it reuses the
+            // `auth.register` token with `detail.provisioning = "sso_jit"` +
+            // IdP provenance ("account created" stays single-token; detail
+            // carries provenance for class-level filtering). Same-fate: the row
+            // commits/rolls back with the account. Subsequent logins of the
+            // SAME identity are NOT audited (not an account-creation event).
+            crate::AuditRepo::append_in_tx(
+                &mut tx,
+                workspace,
+                Some(resolved.participant_id),
+                "auth.register",
+                Some(&resolved.participant_id.to_string()),
+                serde_json::json!({
+                    "provisioning": "sso_jit",
+                    "issuer": issuer,
+                    "subject": subject,
+                    "display_name": display_name,
+                    "email": email,
+                }),
+            )
+            .await?;
         }
         tx.commit().await?;
         Ok(resolved.participant_id)
@@ -488,6 +510,12 @@ mod db_tests {
         .expect("count canonical memberships");
         assert_eq!(membership_count.0, 1);
 
+        // Cleanup (FK NO ACTION, 0007): audit rows reference the participants.
+        sqlx::query("DELETE FROM audit_events WHERE actor_id = $1")
+            .bind(first.to_uuid())
+            .execute(&p)
+            .await
+            .expect("delete audit rows before the participant");
         sqlx::query("DELETE FROM sso_identities WHERE issuer = $1 AND subject = $2")
             .bind(&issuer)
             .bind(&subject)
@@ -498,7 +526,7 @@ mod db_tests {
             .bind(first.to_uuid())
             .execute(&p)
             .await
-            .ok();
+            .expect("delete participant");
     }
 
     #[tokio::test]
@@ -733,6 +761,12 @@ mod db_tests {
             "repeat SSO login must not undo an administrator's removal"
         );
 
+        // Cleanup (FK NO ACTION, 0007): audit rows reference the participant.
+        sqlx::query("DELETE FROM audit_events WHERE actor_id = $1")
+            .bind(participant.to_uuid())
+            .execute(&p)
+            .await
+            .expect("delete audit rows before the participant");
         sqlx::query("DELETE FROM sso_identities WHERE issuer = $1 AND subject = $2")
             .bind(&issuer)
             .bind(&subject)
@@ -743,6 +777,95 @@ mod db_tests {
             .bind(participant.to_uuid())
             .execute(&p)
             .await
+            .expect("delete participant");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres"]
+    async fn sso_jit_provisioning_audits_account_creation_once() {
+        let p = pool();
+        let repo = SsoRepo::new(p.clone());
+        let marker = ParticipantId::new().to_string();
+        let issuer = format!("https://idp.jit-audit.example/{marker}");
+        let subject = format!("subject-{marker}");
+        let display_name = format!("sso-jit-audit-{marker}");
+
+        // First call (new identity) → account created: exactly one
+        // `auth.register` row with `provisioning = "sso_jit"` provenance in
+        // the IdP workspace (nil in tests), actor = target = the new
+        // participant (AC1g). Count scoped by actor + provisioning — sibling
+        // tests provision their own accounts.
+        let participant = repo
+            .resolve_or_provision_human(
+                &issuer,
+                &subject,
+                &display_name,
+                Some("jit@example.com"),
+                default_workspace(),
+            )
+            .await
+            .expect("first JIT login");
+        let row: (String, String, String, String, String, String) = sqlx::query_as(
+            "SELECT workspace_id::text, actor_id::text, target, \
+                    detail->>'provisioning', detail->>'issuer', detail->>'subject' \
+               FROM audit_events
+              WHERE action = 'auth.register' AND actor_id = $1 \
+                AND detail->>'provisioning' = 'sso_jit'",
+        )
+        .bind(participant.to_uuid())
+        .fetch_one(&p)
+        .await
+        .expect("exactly one sso_jit auth.register row");
+        assert_eq!(
+            row.0,
+            default_workspace().to_uuid().to_string(),
+            "workspace = the IdP workspace (nil UUID)"
+        );
+        assert_eq!(row.1, participant.to_uuid().to_string(), "actor = the new participant");
+        assert_eq!(row.2, participant.to_string(), "target = the new participant");
+        assert_eq!(row.3, "sso_jit");
+        assert_eq!(row.4, issuer);
+        assert_eq!(row.5, subject);
+
+        // Second call (existing identity) → NOT an account-creation event:
+        // zero new rows (count stays 1).
+        let resolved = repo
+            .resolve_or_provision_human(
+                &issuer,
+                &subject,
+                "ignored repeat name",
+                None,
+                default_workspace(),
+            )
+            .await
+            .expect("repeat JIT login");
+        assert_eq!(resolved, participant);
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_events WHERE action = 'auth.register' AND actor_id = $1 \
+              AND detail->>'provisioning' = 'sso_jit'",
+        )
+        .bind(participant.to_uuid())
+        .fetch_one(&p)
+        .await
+        .unwrap();
+        assert_eq!(total, 1, "repeat login of an existing identity audits nothing");
+
+        // Cleanup (FK NO ACTION, 0007): audit rows reference the participant.
+        sqlx::query("DELETE FROM audit_events WHERE actor_id = $1")
+            .bind(participant.to_uuid())
+            .execute(&p)
+            .await
+            .expect("delete audit rows before the participant");
+        sqlx::query("DELETE FROM sso_identities WHERE issuer = $1 AND subject = $2")
+            .bind(&issuer)
+            .bind(&subject)
+            .execute(&p)
+            .await
             .ok();
+        sqlx::query("DELETE FROM participants WHERE id = $1")
+            .bind(participant.to_uuid())
+            .execute(&p)
+            .await
+            .expect("delete participant");
     }
 }

@@ -56,7 +56,8 @@ async fn inject_request_id(mut req: Request<axum::body::Body>, next: Next) -> Re
     let id = req
         .headers()
         .get("x-request-id")
-        .and_then(|v| v.to_str().ok()).map_or_else(|| uuid::Uuid::new_v4().to_string(), String::from);
+        .and_then(|v| v.to_str().ok())
+        .map_or_else(|| uuid::Uuid::new_v4().to_string(), String::from);
     req.extensions_mut().insert(RequestId(id.clone()));
     // Handle the request inside a span carrying `request_id`, so every structured
     // log line emitted while serving it is tagged with the same id echoed back in

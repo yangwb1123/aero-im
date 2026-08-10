@@ -1,0 +1,67 @@
+# aero-im B5 批次实施 campaign（Outbox + Rust relay）
+# 前置：docs/proposals/audit-contract-batch-aero-im.md；B1 核心已由 sink 仓实现
+name: aero-im-b5-outbox-relay
+
+discovery:
+  roots:
+    - crates
+    - migrations
+  exclude:
+    - testdata
+    - gen
+    - generated
+    - mock
+    - tests
+    - docs
+    - examples
+    - logs
+    - vendor
+    - target
+    - .git
+    - .pi-batch
+    - __pycache__
+  max_depth: 2
+  fallback_top_level: true
+
+analysis:
+  jobs: 4
+  retries: 2
+  candidate_limit: 3
+  prompt: |
+    Analyze module '{module}' at {module_path} of aero-im (Rust IM/live
+    platform). An approved contract (audit v2.1, GATE PASSED) assigns
+    batch B5: (1) outbox + in-tx audit writes for message.*/room.*/
+    admin.* operations (status 0/1/2/3 DDL, same transaction, high-volume
+    events via L1 aggregation), (2) a Rust relay connector crate (aero-id
+    pattern: lease/backoff/422→dead-terminal, client_credentials + claim
+    contract, scope audit:event:write), (3) moderation priority
+    (admin.content.flag / admin.moderation.action before backlog),
+    (4) scope provisioning (grant audit:event:write only after relay
+    works; fail-closed without relay). Return ONLY a JSON array with at
+    most {candidate_limit} high-value directions toward B5, sorted by
+    value. Each object must contain: title, problem, value (1-10),
+    risk_reduction (1-10), effort (1-10), confidence (1-10), evidence
+    (existing file/symbol paths), and acceptance (testable checks
+    mapping to T-11/37-tests/moderation priority). Do not modify code.
+    Claims without repository evidence must be identified as proposed.
+
+selection:
+  max_directions: 2
+  minimum_score: 0
+
+implementation:
+  pipeline: examples/repository-campaign-pipeline.yaml
+  requirement_stage: requirements
+  concurrency: 1
+  timeout: 14400
+  worktree_root: .pi-batch/worktrees
+
+state:
+  output_dir: docs/auto
+  state_file: docs/auto/state.jsonl
+  summary_file: docs/auto/SUMMARY.md
+  line_max_bytes: 262144
+
+estimates:
+  analysis_minutes: 3
+  pipeline_minutes: 25

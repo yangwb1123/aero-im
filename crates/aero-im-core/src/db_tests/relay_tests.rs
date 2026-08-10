@@ -92,9 +92,7 @@ async fn at6a_outbox_relay_publishes_and_marks_notify_row() {
         .filter(|(s, _)| s == &subject)
         .filter_map(|(_, bytes)| serde_json::from_slice::<serde_json::Value>(bytes).ok())
         .filter(|value| {
-            value
-                .get("event_id")
-                .and_then(serde_json::Value::as_str)
+            value.get("event_id").and_then(serde_json::Value::as_str)
                 == Some(delivery_id_str.as_str())
         })
         .collect();
@@ -149,7 +147,10 @@ async fn at6b_side_effect_relay_completes_seeded_claims() {
     );
     let (completed_at, _, last_error) = side_effect_job_state(&pool, job).await;
     assert!(completed_at.is_some(), "seeded job completed");
-    assert!(last_error.is_none(), "seeded job must not fail: {last_error:?}");
+    assert!(
+        last_error.is_none(),
+        "seeded job must not fail: {last_error:?}"
+    );
     assert_eq!(count_notifications(&pool, msg, None).await, 1);
     assert_eq!(count_notifications(&pool, msg, Some(bob.id)).await, 1);
     assert_eq!(
@@ -173,12 +174,12 @@ async fn at6b_side_effect_relay_completes_seeded_claims() {
     );
     let (completed_at, _, last_error) = side_effect_job_state(&pool, deleted_job).await;
     assert!(completed_at.is_some(), "deleted-message claim completed");
-    assert!(last_error.is_none(), "deleted-message claim must not fail: {last_error:?}");
-    assert_eq!(count_notifications(&pool, deleted_msg, None).await, 0);
-    assert_eq!(
-        svc.dispatch_message_side_effect_batch(10).await.unwrap(),
-        0
+    assert!(
+        last_error.is_none(),
+        "deleted-message claim must not fail: {last_error:?}"
     );
+    assert_eq!(count_notifications(&pool, deleted_msg, None).await, 0);
+    assert_eq!(svc.dispatch_message_side_effect_batch(10).await.unwrap(), 0);
 }
 
 /// AT-7: a stale (pre-edit) side-effect job completes WITHOUT spending on AI:
@@ -278,7 +279,10 @@ async fn at7_stale_side_effect_version_completes_without_spending() {
     // The stale v1 job completed (version guard) without failing…
     let (completed_at, _, last_error) = side_effect_job_state(&pool, stale_v1_embed).await;
     assert!(completed_at.is_some(), "stale v1 job completed");
-    assert!(last_error.is_none(), "stale v1 job must not fail: {last_error:?}");
+    assert!(
+        last_error.is_none(),
+        "stale v1 job must not fail: {last_error:?}"
+    );
     // …and the fresh v2 pair enqueued: delta exactly 2, not 3 (a removed
     // version guard would spend on the stale text and yield delta 3).
     assert_eq!(count_ai_jobs(&pool, msg.id).await - ai_before, 2);

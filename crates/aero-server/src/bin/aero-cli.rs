@@ -401,13 +401,13 @@ c!(Smoke_, "smoke", "List/run smoke tests", |ctx, args| {
                     || ext.is_some_and(|e| e.eq_ignore_ascii_case("sh"))
                 {
                     sm.push(
-                    n.strip_prefix("smoke_")
-                        .unwrap_or(&n)
-                        .strip_suffix(".py")
-                        .or_else(|| n.strip_suffix(".sh"))
-                        .unwrap_or(&n)
-                        .to_owned(),
-                );
+                        n.strip_prefix("smoke_")
+                            .unwrap_or(&n)
+                            .strip_suffix(".py")
+                            .or_else(|| n.strip_suffix(".sh"))
+                            .unwrap_or(&n)
+                            .to_owned(),
+                    );
                 }
             }
         }
@@ -604,7 +604,9 @@ c!(
         println!(
             "  {} Migrations      {}",
             term::info(""),
-            if let Ok(e) = m { term::ok(format!("{} files", e.count())) } else {
+            if let Ok(e) = m {
+                term::ok(format!("{} files", e.count()))
+            } else {
                 ok = false;
                 term::err("not found")
             }

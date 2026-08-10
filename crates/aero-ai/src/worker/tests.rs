@@ -120,6 +120,30 @@ fn over_attempt_cap_boundary() {
 
 // ---------- (4) idempotency ----------
 
+/// R-D1 (B5-1 governance closeout): a moderation finalize whose workspace
+/// cannot be resolved must REFUSE to delete — the audit action is derived from
+/// the workspace, so `None` would commit the soft delete + `Deleted` broadcast
+/// with zero `audit_events` rows (the 0236 governance trigger never fires ⇒
+/// zero governance rows). The handler propagates the `Err` to the retry path
+/// → bounded DLQ; the provider verdict is durably finalized, so the retry
+/// replays without a second paid call.
+#[test]
+fn moderation_delete_workspace_refuses_none_fail_closed() {
+    let job = mk_job(AiJobKind::Moderate, 0);
+    assert!(
+        moderation_delete_workspace(&job).is_err(),
+        "workspace_id=None must refuse the delete (R-D1), never silently skip the audit"
+    );
+
+    let mut with_ws = job;
+    with_ws.workspace_id = Some(uuid::Uuid::new_v4());
+    let ws = moderation_delete_workspace(&with_ws).expect("resolvable workspace succeeds");
+    assert_eq!(
+        ws,
+        WorkspaceId::from_uuid(with_ws.workspace_id.expect("set above"))
+    );
+}
+
 #[test]
 fn should_skip_embed_for_nothing_to_embed() {
     // Empty / whitespace-only → idempotent no-op, no paid call.

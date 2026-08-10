@@ -191,7 +191,11 @@ mod tests {
     #[test]
     fn overlapping_hit_is_deduplicated() {
         let shared = hit(9, 0.5);
-        let fused = fuse_rankings(std::slice::from_ref(&shared), std::slice::from_ref(&shared), 10);
+        let fused = fuse_rankings(
+            std::slice::from_ref(&shared),
+            std::slice::from_ref(&shared),
+            10,
+        );
         assert_eq!(fused.len(), 1);
         assert_eq!(fused[0].message.id, shared.message.id);
     }

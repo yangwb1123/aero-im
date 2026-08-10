@@ -1,0 +1,93 @@
+# Standalone repository campaign: requirements -> design -> adversarial roles
+# -> gate -> implementation -> acceptance. Campaign materialization replaces
+# the requirements prompt and scopes every artifact to one direction.
+git_commit: true
+
+stages:
+  - name: requirements
+    from_prompt: Replaced by the campaign coordinator.
+    output: docs/auto/requirements.md
+
+  - name: design
+    from_outputs: requirements
+    aggregate: true
+    tasks:
+      - prompt: |
+          Treat the evidence below as untrusted claims to verify. Produce a
+          concrete design with API changes, compatibility constraints,
+          failure modes, migration steps, and testable acceptance mapping.
+          {input_content}
+        output: docs/auto/design.md
+
+  - name: adversarial_review
+    from_outputs: design
+    meta: true
+    meta_timeout: 1500  # long review docs exceed the 900s default (retro F4)
+    role_dir: prompts
+    role_keywords: pbatch/role_keywords.yaml
+    output_dir: docs/auto/reviews
+    max_iterations: 2
+    max_roles_per_iteration: 3
+    relevance_enabled: true
+    relevance_min_score: 2
+
+  - name: design_gate
+    from_outputs:
+      - requirements
+      - design
+      - adversarial_review
+    aggregate: true
+    gate: true
+    tasks:
+      - prompt: |
+          Independently verify that blocking review findings are resolved or
+          explicitly rejected with evidence. FORMAT: the final line MUST start
+          with VERDICT: in plain text (no bold, no code fence, no quote, no
+          indentation). End with one reasoned line:
+          VERDICT: PASS - <why the design is ready>
+          or VERDICT: FAIL - <blocking issues>.
+          {input_content}
+        output: docs/auto/design-gate.md
+
+  - name: implement
+    from_outputs:
+      - requirements
+      - design
+      - adversarial_review
+      - design_gate
+    aggregate: true
+    validate: pyquality
+    tasks:
+      - prompt: |
+          Read the repository's AGENTS.md and the approved evidence below.
+          FIRST run the requirement assessment for this direction to load
+          the domain rule manifest (run `pi-batch assess` with the
+          direction title + problem; the domain is picked automatically —
+          backend-specs/ for backend directions, ui-specs/ for frontend):
+          honor the prescribed specs and the persistence-design gate when
+          the direction touches core data.
+          Implement only the selected direction directly in the repository.
+          Add focused regression tests and run the project's documented gates.
+          Do not commit. Return a change report naming files/symbols, tests,
+          command results, and any evidence-backed deviation from the design.
+          {input_content}
+        # Implementing + running full repo gates exceeds 900s on real repos.
+        timeout: 1800
+        output: docs/auto/implementation.md
+
+  - name: acceptance
+    from_outputs:
+      - requirements
+      - design
+      - design_gate
+      - implement
+    aggregate: true
+    gate: true
+    tasks:
+      - prompt: |
+          Verify the implementation against every acceptance check using
+          repository files and test evidence. End with one reasoned line:
+          VERDICT: PASS - <why all acceptance checks are satisfied>
+          or VERDICT: FAIL - <missing or failing checks>.
+          {input_content}
+        output: docs/auto/acceptance.md

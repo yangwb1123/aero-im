@@ -254,6 +254,8 @@ const ALLOWED_DEPS: &[(&str, &[&str])] = &[
     ),
     ("aero-push", &["aero-common"]),
     ("aero-eng", &["aero-common", "serde", "tokio"]), // engineering CLI framework
+    ("aero-cli", &["aero-eng"]),                      // engineering CLI framework consumer
+    ("aero-audit-connector", &["aero-common", "aero-auth"]), // audit relay connector
 ];
 
 /// The root crate that may depend on everything.
@@ -791,6 +793,65 @@ aero-common.workspace = true
         assert!(
             outcome.is_error(),
             "leaf → storage should be illegal: {outcome}"
+        );
+    }
+
+    #[test]
+    fn allowed_deps_admits_aero_cli_and_audit_connector() {
+        // Regression (AC4 deps-audit gap): aero-cli and aero-audit-connector must be
+        // in ALLOWED_DEPS with exactly their real internal deps. The reverse check is
+        // advisory, so over-allowlisting is silent — exact equality is the discipline.
+        let entry = |name: &str| ALLOWED_DEPS.iter().find(|(n, _)| *n == name);
+        assert_eq!(
+            entry("aero-cli"),
+            Some(&("aero-cli", &["aero-eng"][..])),
+            "aero-cli whitelist must exactly match crates/aero-cli/Cargo.toml deps"
+        );
+        assert_eq!(
+            entry("aero-audit-connector"),
+            Some(&("aero-audit-connector", &["aero-common", "aero-auth"][..])),
+            "connector whitelist must be the corrected values, not stale &[]"
+        );
+    }
+
+    #[test]
+    fn check_deps_ok_for_newly_registered_members() {
+        // Regression (AC4): a member absent from ALLOWED_DEPS was invisible to the
+        // audit — every internal dep fired "unknown crate". Registering the member
+        // must move it to the normal ILLEGAL/OK path instead.
+        let dir = tmp_dir();
+        let root = dir.path();
+        write_cargo(
+            &root.join("Cargo.toml"),
+            r#"
+[workspace]
+members = ["crates/aero-cli", "crates/aero-audit-connector"]
+"#,
+        );
+        // aero-cli depends on aero-eng (allowed); connector on aero-common/aero-auth (allowed)
+        write_cargo(
+            &root.join("crates/aero-cli/Cargo.toml"),
+            r#"
+[package]
+name = "aero-cli"
+[dependencies]
+aero-eng.workspace = true
+"#,
+        );
+        write_cargo(
+            &root.join("crates/aero-audit-connector/Cargo.toml"),
+            r#"
+[package]
+name = "aero-audit-connector"
+[dependencies]
+aero-common.workspace = true
+aero-auth.workspace = true
+"#,
+        );
+        let outcome = check_deps(root);
+        assert!(
+            outcome.is_ok(),
+            "registered members with allowed deps must pass: {outcome}"
         );
     }
 

@@ -355,8 +355,10 @@ async fn handle_connection(
 
     // 4) Publish loop.
     let stream_id = publish.stream_id;
-    let publish_result =
-        Box::pin(run_publish_loop(socket, session, buf, publish, &cfg, &cancel)).await;
+    let publish_result = Box::pin(run_publish_loop(
+        socket, session, buf, publish, &cfg, &cancel,
+    ))
+    .await;
 
     // 5) Mark the row ended regardless of how the publish loop exited.
     if let Err(e) = repo.mark_ended(stream_id).await {
@@ -477,7 +479,8 @@ async fn process_results(
                     if let Some(stream) = repo
                         .get_by_key(&stream_key)
                         .await
-                        .map_err(LiveError::Database)? {
+                        .map_err(LiveError::Database)?
+                    {
                         let hls_url = hls_url_for(stream.id);
                         let transition = repo
                             .mark_live(stream.id, &hls_url)
@@ -507,10 +510,7 @@ async fn process_results(
                                 })?;
                             for r in more {
                                 if let ServerSessionResult::OutboundResponse(p) = r {
-                                    socket
-                                        .write_all(&p.bytes)
-                                        .await
-                                        .map_err(LiveError::from)?;
+                                    socket.write_all(&p.bytes).await.map_err(LiveError::from)?;
                                 }
                             }
                             outcome = ProcessOutcome::Disconnect;
@@ -540,9 +540,9 @@ async fn process_results(
                             "RTMP publisher accepted; emitting MPEG-TS segments"
                         );
 
-                        let more = session.accept_request(request_id).map_err(|e| {
-                            LiveError::Protocol(format!("accept publish: {e:?}"))
-                        })?;
+                        let more = session
+                            .accept_request(request_id)
+                            .map_err(|e| LiveError::Protocol(format!("accept publish: {e:?}")))?;
                         for r in more {
                             if let ServerSessionResult::OutboundResponse(p) = r {
                                 socket.write_all(&p.bytes).await.map_err(LiveError::from)?;
@@ -563,9 +563,7 @@ async fn process_results(
                                 "NetStream.Publish.Start",
                                 "Unknown stream key",
                             )
-                            .map_err(|e| {
-                                LiveError::Protocol(format!("reject publish: {e:?}"))
-                            })?;
+                            .map_err(|e| LiveError::Protocol(format!("reject publish: {e:?}")))?;
                         for r in more {
                             if let ServerSessionResult::OutboundResponse(p) = r {
                                 socket.write_all(&p.bytes).await.map_err(LiveError::from)?;

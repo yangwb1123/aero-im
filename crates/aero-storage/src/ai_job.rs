@@ -536,7 +536,10 @@ mod db_tests {
             .execute(pool)
             .await
             .ok();
-        let workspaces = workspaces.iter().map(aero_common::WorkspaceId::to_uuid).collect::<Vec<_>>();
+        let workspaces = workspaces
+            .iter()
+            .map(aero_common::WorkspaceId::to_uuid)
+            .collect::<Vec<_>>();
         sqlx::query("DELETE FROM workspaces WHERE id = ANY($1)")
             .bind(&workspaces)
             .execute(pool)

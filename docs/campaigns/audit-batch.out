@@ -1,0 +1,25 @@
+05:32:30 [INFO] 
+05:32:30 [INFO] ============================================================
+05:32:30 [INFO] ROUND 1 of 1
+05:32:30 [INFO] ============================================================
+05:32:30 [WARNING] RESIDUE: orphaned agent pid 2607166 from marker 55e89865bb539a80.start in /home/u1/aero-im is STILL RUNNING (previous run was killed; this call is still billing). Kill it with: kill -9 2607166  (or rerun with --kill-orphans)
+05:32:30 [WARNING] RESIDUE: orphaned agent pid 2607165 from marker cdc596482d5a4c3c.start in /home/u1/aero-im is STILL RUNNING (previous run was killed; this call is still billing). Kill it with: kill -9 2607165  (or rerun with --kill-orphans)
+05:32:30 [WARNING] referenced file not found: docs/campaigns/docs/campaigns/implementation-gate.md
+05:32:30 [INFO] -- [1/1] --
+05:32:30 [INFO] >>  pi -p 已批准的审计契约 v2 包（GATE PASSED）进入实施阶段。阅读批次清单： @docs/campaigns/implementation-gate.md ...  [model=default]  [timeout=900s]  [dir=/home/u1/aero-im]
+05:41:00 [INFO] OK  done  [509.8s]  [output=docs/proposals/audit-contract-batch-aero-im.md]
+05:41:00 [INFO] VALIDATE: python3 /home/u1/ai-batch-runner/scripts/check-no-refusal.py /home/u1/aero-im/docs/proposals/audit-contract-batch-aero-im.md.flvdqvkb.tmp
+05:41:00 [INFO] WROTE /home/u1/aero-im/docs/proposals/audit-contract-batch-aero-im.md (validated)
+05:41:00 [INFO] All tasks passed in round 1
+
+========================================================
+  pi-batch execution report
+========================================================
+  total:     1
+  succeeded: 1
+  failed:    0
+  CPU time:  509.8s
+  wall time: 509.8s
+
+  PASS  [ 509.8s] 已批准的审计契约 v2 包（GATE PASSED）进入实施阶段。阅读批次清单： @docs/campaigns/imp...
+========================================================

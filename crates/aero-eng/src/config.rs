@@ -17,7 +17,6 @@ pub struct EngineeringConfig {
     pub check: CheckConfig,
 }
 
-
 impl EngineeringConfig {
     /// Load from `engineering.toml` at the project root. Returns defaults if
     /// the file is missing or unparseable.

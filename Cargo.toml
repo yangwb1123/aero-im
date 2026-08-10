@@ -26,6 +26,7 @@ members = [
     "crates/aero-live-srt",
     "crates/aero-ai",
     "crates/aero-push",
+    "crates/aero-audit-connector",
     "crates/aero-server",
     "crates/aero-eng",
     "crates/aero-cli",
@@ -73,6 +74,7 @@ aero-live-webrtc= { path = "crates/aero-live-webrtc" }
 aero-live-srt   = { path = "crates/aero-live-srt" }
 aero-ai         = { path = "crates/aero-ai" }
 aero-push       = { path = "crates/aero-push" }
+aero-audit-connector = { path = "crates/aero-audit-connector" }
 
 # Runtime
 tokio       = { version = "1.40", features = ["full"] }

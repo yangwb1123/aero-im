@@ -1,18 +1,14 @@
-//! [`CommandRegistry`] — compile-time auto-discovery of commands.
+//! [`CommandRegistry`] — auto-registration of commands.
 //!
-//! Uses the [`linkme`] crate's distributed slice to collect all statically
-//! registered [`Command`] trait objects into a single registry. Each command
-//! struct calls [`register_command!`] at module level, which appends its
-//! constructor to a global slice collected by [`CommandRegistry::collect`].
+//! Built-in commands are defined in [`crate::commands`] via the
+//! [`register_command!`] macro and returned by `commands::all()` in
+//! registration order. [`CommandRegistry::collect`] builds the registry from
+//! that list; `help`, `names()` and `completion_words()` are all derived
+//! from the same single source of truth, so the three can never drift.
 //!
-//! This replaces snaplink's manual `COMMANDS` dict — adding a new command
-//! requires only defining the struct + impl + one `register_command!` line.
-//!
-//! **Alternative (no linkme dependency):** The same pattern can be achieved
-//! with a manual `Vec` populated in the binary's `main()` — simpler but
-//! requires manual registration. This module supports both: [`collect`]
-//! scans the global slice (when `linkme` feature is active), and a manual
-//! builder is available via [`CommandRegistry::new`].
+//! Binaries may instead compose a custom registry via
+//! [`CommandRegistry::from_commands`] / [`with_command`](Self::with_command)
+//! (no `linkme` distributed slice — commands are an ordinary `Vec`).
 
 use crate::command::Command;
 use crate::context::ExecutionContext;
@@ -57,17 +53,30 @@ impl CommandRegistry {
         }
     }
 
-    /// Collect all commands registered via `register_command!` (linkme-driven).
-    /// Falls back to an empty registry if the linkme feature is disabled.
+    /// Collect all built-in commands registered via `register_command!`.
+    ///
+    /// Equivalent to `from_commands(commands::all())`; duplicate names are
+    /// deduplicated first-wins.
     #[must_use]
     pub fn collect() -> Self {
-        
-        // Statically registered commands (from register_command! invocations).
-        // Since we don't want to pull in linkme as a dependency, we use a
-        // simpler approach: the binary calls `reg.with_command(...)` for each command.
-        // This is kept as a manual registration API for now — see the `eng`
-        // binary entry point.
-        Self::new()
+        Self::from_commands(crate::commands::all())
+    }
+
+    /// Build a registry from an explicit command list (Path A seam for
+    /// downstream binaries that do not want the built-in set).
+    ///
+    /// Registration order is preserved (it is the help/completion order);
+    /// duplicate names are deduplicated first-wins.
+    #[must_use]
+    pub fn from_commands(commands: Vec<Box<dyn Command>>) -> Self {
+        let mut seen = std::collections::HashSet::new();
+        let mut deduped = Vec::with_capacity(commands.len());
+        for cmd in commands {
+            if seen.insert(cmd.name()) {
+                deduped.push(cmd);
+            }
+        }
+        Self { commands: deduped }
     }
 
     /// Register one command. Chainable, consumes and returns self.
@@ -129,16 +138,41 @@ impl CommandRegistry {
 
     /// Print help text listing all registered commands.
     pub fn print_help(&self) {
-        println!("Aero Engineering CLI");
-        println!();
-        println!("Usage: aero-cli <command> [options]");
-        println!();
-        println!("Commands:");
+        print!("{}", self.help_text());
+    }
+
+    /// Full help text: header, usage, and every command in registration
+    /// order, plus the `help` pseudo-command. Single source for help output.
+    #[must_use]
+    pub fn help_text(&self) -> String {
+        use std::fmt::Write as _;
+        let mut s = String::new();
+        let _ = writeln!(s, "Aero Engineering CLI");
+        let _ = writeln!(s);
+        let _ = writeln!(s, "Usage: aero-cli <command> [options]");
+        let _ = writeln!(s);
+        let _ = writeln!(s, "Commands:");
         for cmd in &self.commands {
-            println!("  {:20} {}", cmd.name(), cmd.description());
+            let _ = writeln!(s, "  {:20} {}", cmd.name(), cmd.description());
         }
-        println!("  {:20} Show this help message", "help");
-        println!();
+        let _ = writeln!(s, "  {:20} Show this help message", "help");
+        let _ = writeln!(s);
+        s
+    }
+
+    /// Command names in registration order.
+    #[must_use]
+    pub fn names(&self) -> Vec<&'static str> {
+        self.commands.iter().map(|c| c.name()).collect()
+    }
+
+    /// Shell-completion word list: every command name plus `help`,
+    /// space-joined, in registration order.
+    #[must_use]
+    pub fn completion_words(&self) -> String {
+        let mut words: Vec<&str> = self.names();
+        words.push("help");
+        words.join(" ")
     }
 
     /// Number of registered commands.
@@ -165,19 +199,31 @@ impl Default for CommandRegistry {
     }
 }
 
-/// Macro to register a command type. The type must implement [`Command`] + `Default`.
+/// Define a command struct implementing [`Command`] + `Default`-constructible.
 ///
 /// ```ignore
-/// register_command!(MigrateCmd);
+/// register_command!(
+///     MigrateCmd,
+///     "migrate",
+///     "Run database migrations",
+///     |ctx, args| { Outcome::ok("migrated") }
+/// );
 /// ```
+///
+/// The generated unit struct implements [`Command`] with the given name,
+/// description, and async body. Built-in commands live in
+/// [`crate::commands`]; add the struct to `commands::all()` for it to be
+/// collected by [`CommandRegistry::collect`].
 #[macro_export]
 macro_rules! register_command {
-    ($ty:ty) => {
-        // Place the command into the registry — binary calls registry.with_command()
-        // manually. This macro just ensures the type is importable.
-        // In a future version with linkme, this would be:
-        // #[linkme::distributed_slice(COMMANDS)]
-        // static REGISTER: fn() -> Box<dyn Command> = || Box::new(<$ty>::default());
+    ($s:ident, $n:expr, $d:expr, |$ctx:ident, $args:ident| $e:block) => {
+        pub(crate) struct $s;
+        #[async_trait::async_trait]
+        impl $crate::command::Command for $s {
+            fn name(&self) -> &'static str { $n }
+            fn description(&self) -> &'static str { $d }
+            async fn execute(&self, $ctx: &$crate::context::ExecutionContext, $args: &[String]) -> $crate::outcome::Outcome $e
+        }
     };
 }
 
@@ -217,6 +263,22 @@ mod tests {
         }
     }
 
+    /// Duplicate of [`TestCmd`] (same name, different description) to verify
+    /// first-wins dedupe.
+    struct TestCmdDup;
+    #[async_trait]
+    impl Command for TestCmdDup {
+        fn name(&self) -> &'static str {
+            "test-cmd"
+        }
+        fn description(&self) -> &'static str {
+            "A duplicate test command"
+        }
+        async fn execute(&self, _ctx: &ExecutionContext, _args: &[String]) -> Outcome {
+            Outcome::ok("dup")
+        }
+    }
+
     #[tokio::test]
     async fn registry_execute_found_command() {
         let mut reg = CommandRegistry::new();
@@ -236,7 +298,9 @@ mod tests {
     #[tokio::test]
     async fn registry_execute_with_multiple_commands() {
         let mut reg = CommandRegistry::new();
-        reg = reg.with_command(Box::new(TestCmd)).with_command(Box::new(FailCmd));
+        reg = reg
+            .with_command(Box::new(TestCmd))
+            .with_command(Box::new(FailCmd));
         let ok_result = reg.execute("test-cmd", &["test-cmd".into()]).await;
         assert!(ok_result.is_ok());
         let fail_result = reg.execute("fail-cmd", &["fail-cmd".into()]).await;
@@ -273,5 +337,83 @@ mod tests {
         // print_help should not panic
         reg.print_help();
         assert!(!reg.is_empty());
+    }
+
+    #[test]
+    fn from_commands_dedupes_first_wins() {
+        let reg = CommandRegistry::from_commands(vec![
+            Box::new(TestCmd),
+            Box::new(TestCmdDup),
+            Box::new(FailCmd),
+        ]);
+        assert_eq!(reg.len(), 2, "duplicate name must be dropped");
+        let names = reg.names();
+        assert_eq!(names, vec!["test-cmd", "fail-cmd"]);
+        // First registration wins: description is TestCmd's, not TestCmdDup's.
+        let test_cmd = reg.iter().find(|c| c.name() == "test-cmd").unwrap();
+        assert_eq!(test_cmd.description(), "A test command");
+    }
+
+    #[test]
+    fn from_commands_preserves_registration_order() {
+        let reg = CommandRegistry::from_commands(vec![Box::new(FailCmd), Box::new(TestCmd)]);
+        assert_eq!(reg.names(), vec!["fail-cmd", "test-cmd"]);
+    }
+
+    #[test]
+    fn names_returns_registration_order() {
+        let reg = CommandRegistry::new()
+            .with_command(Box::new(TestCmd))
+            .with_command(Box::new(FailCmd));
+        assert_eq!(reg.names(), vec!["test-cmd", "fail-cmd"]);
+    }
+
+    #[test]
+    fn completion_words_covers_names_and_help() {
+        let reg = CommandRegistry::new()
+            .with_command(Box::new(TestCmd))
+            .with_command(Box::new(FailCmd));
+        assert_eq!(reg.completion_words(), "test-cmd fail-cmd help");
+    }
+
+    #[test]
+    fn help_text_lists_commands_in_order_and_help() {
+        let reg = CommandRegistry::new()
+            .with_command(Box::new(FailCmd))
+            .with_command(Box::new(TestCmd));
+        let help = reg.help_text();
+        assert!(help.starts_with("Aero Engineering CLI\n"));
+        assert!(help.contains("Usage: aero-cli <command> [options]"));
+        let fail_pos = help.find("  fail-cmd").expect("fail-cmd listed");
+        let test_pos = help.find("  test-cmd").expect("test-cmd listed");
+        assert!(fail_pos < test_pos, "help must follow registration order");
+        assert!(help.contains("  help                 Show this help message"));
+    }
+
+    #[test]
+    fn collect_builds_builtin_registry() {
+        let reg = CommandRegistry::collect();
+        assert!(
+            !reg.is_empty(),
+            "collect() must return the built-in commands"
+        );
+        let names = reg.names();
+        // The parity invariant's anchor set: these names were historically
+        // hand-maintained in a completion literal that omitted bench/dashboard.
+        for expected in [
+            "check",
+            "gate",
+            "test",
+            "integration",
+            "skill",
+            "doctor",
+            "completion",
+            "network",
+            "audit-provision-check",
+            "bench",
+            "dashboard",
+        ] {
+            assert!(names.contains(&expected), "collect() missing {expected}");
+        }
     }
 }

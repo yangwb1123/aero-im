@@ -163,9 +163,9 @@ impl ActivityStore for InProcessActivityStore {
     fn sweep_idle(&self, now: Instant) -> usize {
         let before = self.senders.len();
         self.senders.retain(|_, act| {
-            act.events.back().is_some_and(|(t, _, _)| {
-                now.duration_since(*t) <= self.thresholds.window
-            })
+            act.events
+                .back()
+                .is_some_and(|(t, _, _)| now.duration_since(*t) <= self.thresholds.window)
         });
         before.saturating_sub(self.senders.len())
     }

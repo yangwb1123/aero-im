@@ -70,6 +70,20 @@ pub async fn cargo_clippy() -> Outcome {
     .await
 }
 
+/// Run the integration harness (`scripts/test-integration.sh`) with a default
+/// 30-minute timeout (mirrors `cargo_test_lib`; the harness owns fresh-DB
+/// migration regressions, the drill suites, and the full ignored workspace
+/// suite — and must be run from the repository root, same constraint as the
+/// `gate` arms).
+pub async fn test_integration() -> Outcome {
+    run_cmd(
+        "bash",
+        &["scripts/test-integration.sh"],
+        Duration::from_secs(1800),
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -134,5 +148,18 @@ mod tests {
         let o = crate::run::cargo_check().await;
         // Should either succeed or fail gracefully - not panic
         assert!(o.is_ok() || o.is_error(), "cargo check should not panic");
+    }
+
+    #[test]
+    fn test_integration_script_is_present() {
+        // The integration wrapper targets `scripts/test-integration.sh`
+        // relative to the repository root (CWD constraint). Guard the path
+        // contract so a rename/move breaks this unit suite instead of the
+        // gate silently running nothing.
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../");
+        assert!(
+            repo_root.join("scripts/test-integration.sh").exists(),
+            "scripts/test-integration.sh must exist at the repository root"
+        );
     }
 }

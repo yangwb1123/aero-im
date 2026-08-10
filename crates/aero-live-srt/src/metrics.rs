@@ -137,17 +137,35 @@ mod tests {
     fn session_counter_add_remove_is_balanced() {
         // Relative assertions only: the underlying atomic is process-wide, so we
         // measure deltas against the current base rather than absolute values.
-        let base = SessionCounter::current();
+        //
+        // Other tests legitimately establish sessions concurrently (the
+        // listener datagram-path tests drive the established arm, which calls
+        // `SessionCounter::added`), so a foreign add/remove can land inside a
+        // single measurement window and trip a relative assert. Retry until we
+        // observe a clean window; each attempt nets to zero (2 adds + 2
+        // removes), so retries are safe. A persistent mismatch would indicate a
+        // real counter leak.
+        for _ in 0..100 {
+            let base = SessionCounter::current();
 
-        SessionCounter::added();
-        SessionCounter::added();
-        assert_eq!(SessionCounter::current(), base + 2);
+            SessionCounter::added();
+            SessionCounter::added();
+            let after_adds = SessionCounter::current();
 
-        SessionCounter::removed();
-        assert_eq!(SessionCounter::current(), base + 1);
+            SessionCounter::removed();
+            let after_remove = SessionCounter::current();
 
-        SessionCounter::removed();
-        assert_eq!(SessionCounter::current(), base, "adds and removes balance");
+            SessionCounter::removed();
+            let after_removes = SessionCounter::current();
+
+            if after_adds == base + 2 && after_remove == base + 1 && after_removes == base {
+                return; // clean window: adds and removes balance
+            }
+        }
+        panic!(
+            "active-session counter moved concurrently in every measurement window \
+             (a real leak would fail this consistently)"
+        );
     }
 
     #[test]

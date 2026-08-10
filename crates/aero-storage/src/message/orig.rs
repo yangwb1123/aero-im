@@ -67,8 +67,8 @@ mod tests {
     /// scan, so a snapshot with `blob_id`s would point at destroyed bytes.
     #[test]
     fn redact_blocks_for_recall_snapshot_removes_byte_references() {
-        use aero_common::{BlobId, FileKind};
         use super::super::redact_blocks_for_recall_snapshot;
+        use aero_common::{BlobId, FileKind};
 
         let file_blob = BlobId::new();
         let voice_blob = BlobId::new();

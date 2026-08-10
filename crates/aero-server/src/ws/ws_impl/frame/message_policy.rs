@@ -1,4 +1,4 @@
-use super::{RoomId, Block, MessageId};
+use super::{Block, MessageId, RoomId};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 

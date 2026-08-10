@@ -249,7 +249,8 @@ pub async fn record_durable_token_cost(
     workspace: Option<uuid::Uuid>,
     input_tokens: u32,
     output_tokens: u32,
-) -> Result<UsagePersistOutcome, String> {    persist_and_record(
+) -> Result<UsagePersistOutcome, String> {
+    persist_and_record(
         sink,
         usage_id,
         reg,

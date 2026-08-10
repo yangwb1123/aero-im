@@ -1,6 +1,7 @@
+use aero_common::model::client_credentials::is_valid_identity_component;
 use serde::Deserialize;
 
-use super::{valid_identity_component, OidcClaims, OidcConfig, OidcError};
+use super::{OidcClaims, OidcConfig, OidcError};
 
 /// Signed claims used only while validating an ID token.
 ///
@@ -52,7 +53,7 @@ impl TokenAudience {
 
 impl SignedOidcClaims {
     pub(super) fn into_verified(self, cfg: &OidcConfig) -> Result<OidcClaims, OidcError> {
-        if !valid_identity_component(&self.sub) {
+        if !is_valid_identity_component(&self.sub) {
             return Err(OidcError::Invalid("subject claim is invalid".into()));
         }
         // `Validation::set_audience` already rejects a token that does not

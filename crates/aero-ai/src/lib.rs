@@ -19,6 +19,7 @@ pub mod budget;
 pub mod doc_extract;
 pub mod embed;
 pub mod error;
+pub mod governance;
 pub mod metrics;
 pub mod rerank;
 pub mod service;
@@ -32,6 +33,10 @@ pub use anthropic::{AgentTurn, AnthropicClient, ChatMsg, ToolDef, ToolUse, Usage
 pub use budget::{CostBudget, KeyedCostBudget};
 pub use embed::{default_embedder, Embedder, HashEmbedder, VoyageEmbedder, EMBED_DIM};
 pub use error::{AiError, Result};
+pub use governance::{
+    governance_lane_for, is_admin_class, GovernanceLane, GOVERNANCE_CLASS_ADMIN,
+    GOVERNANCE_PRIORITY_MODERATION, MODERATION_OUTBOUND_ACTION,
+};
 pub use metrics::CostModel;
 pub use rerank::fuse_rankings;
 pub use service::{AiService, AnswerResult, ChannelRec, PersonRec, Sentiment, SentimentScore};

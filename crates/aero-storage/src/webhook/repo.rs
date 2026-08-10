@@ -786,8 +786,8 @@ mod tests {
 #[cfg(test)]
 mod db_tests {
     use super::*;
-    use aero_common::{ParticipantId, RoomId, WorkspaceId};
     use crate::webhook::breaker::{BREAKER_BASE_COOLDOWN_SECS, BREAKER_FAILURE_THRESHOLD};
+    use aero_common::{ParticipantId, RoomId, WorkspaceId};
 
     fn pool() -> PgPool {
         let url = std::env::var("DATABASE_URL")

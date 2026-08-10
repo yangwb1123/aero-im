@@ -1,0 +1,44 @@
+[package]
+name = "aero-audit-connector"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+aero-common.workspace = true
+aero-auth.workspace = true
+
+jsonwebtoken.workspace = true
+# Stub key material lives in the lib API (`SinkBehavior.signing_key`), so rsa
+# is a regular dependency (workspace-pinned 0.9, already in the lockfile).
+rsa.workspace = true
+rand.workspace = true
+
+tokio.workspace = true
+tokio-util.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+
+reqwest.workspace = true
+sqlx.workspace = true
+
+serde.workspace = true
+serde_json.workspace = true
+
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+
+time.workspace = true
+uuid.workspace = true
+# Unverified JWT claim payload decode (base64url). Already pinned at 0.22 by the
+# server and aero-live-srt crates — zero new supply-chain entries.
+base64 = "0.22"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "net", "io-util", "sync", "time"] }

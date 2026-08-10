@@ -1,12 +1,18 @@
 use super::*;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use jsonwebtoken::{encode, EncodingKey, Header};
 use rand::rngs::OsRng;
 use rsa::pkcs1::EncodeRsaPublicKey;
 use rsa::pkcs8::EncodePrivateKey;
+use rsa::traits::PublicKeyParts;
 use rsa::RsaPrivateKey;
+use serde_json::json;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::Barrier;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpListener;
+use tokio::sync::{Barrier, Mutex};
 
 /// Claims as the `IdP` would mint them. Mirrors [`OidcClaims`] plus the
 /// registered `iss`/`aud`/`exp`/`iat` that `jsonwebtoken` validates.
@@ -342,7 +348,7 @@ async fn accepts_client_credentials_at_jwt_with_scopes_array() {
 
     assert_eq!(claims.sub, "erp-production");
     assert_eq!(claims.client_id, "erp-production");
-    assert_eq!(claims.jti, "access-token-1");
+    assert_eq!(claims.jti.as_deref(), Some("access-token-1"));
     assert!(claims.granted_scopes().contains("aero.notify.publish"));
 }
 
@@ -793,4 +799,264 @@ async fn jwks_provider_rejects_unsafe_uri_before_network_fetch() {
     assert_eq!(error, "jwks URI rejected by policy");
     assert!(!error.contains("remote.example.test"));
     assert!(!error.contains("private-path"));
+}
+
+// ---------------------------------------------------------------------------
+// D5 / D10 — fallible key-resolution plane (connector dual-plane contract).
+// ---------------------------------------------------------------------------
+
+fn rsa_keypair_with_kid(kid: &str) -> (RsaPrivateKey, String) {
+    let mut rng = OsRng;
+    (
+        RsaPrivateKey::new(&mut rng, 2048).expect("rsa keygen"),
+        kid.to_owned(),
+    )
+}
+
+fn jwks_document(keys: &[(RsaPrivateKey, String)]) -> Vec<u8> {
+    let set: Vec<serde_json::Value> = keys
+        .iter()
+        .map(|(key, kid)| {
+            let public = key.to_public_key();
+            json!({
+                "kty": "RSA",
+                "kid": kid,
+                "alg": "RS256",
+                "use": "sig",
+                "n": URL_SAFE_NO_PAD.encode(public.n().to_bytes_be()),
+                "e": URL_SAFE_NO_PAD.encode(public.e().to_bytes_be()),
+            })
+        })
+        .collect();
+    serde_json::to_vec(&json!({ "keys": set })).expect("jwks json")
+}
+
+/// Minimal loopback HTTP JWKS server for the D10 tests: serves the current
+/// (swappable) key set and counts every fetch request.
+async fn start_jwks_server(
+    keys: Arc<Mutex<Vec<(RsaPrivateKey, String)>>>,
+    requests: Arc<AtomicUsize>,
+) -> std::io::Result<(std::net::SocketAddr, tokio::task::JoinHandle<()>)> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let keys = keys.clone();
+            let requests = requests.clone();
+            tokio::spawn(async move {
+                let _ = serve_jwks_request(&mut stream, &keys, &requests).await;
+            });
+        }
+    });
+    Ok((addr, handle))
+}
+
+async fn serve_jwks_request(
+    stream: &mut tokio::net::TcpStream,
+    keys: &Mutex<Vec<(RsaPrivateKey, String)>>,
+    requests: &AtomicUsize,
+) -> std::io::Result<()> {
+    let mut buffer = Vec::new();
+    let mut byte = [0_u8; 1];
+    loop {
+        stream.read_exact(&mut byte).await?;
+        buffer.push(byte[0]);
+        if buffer.ends_with(b"\r\n\r\n") {
+            break;
+        }
+        if buffer.len() > 8192 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "test server request too large",
+            ));
+        }
+    }
+    requests.fetch_add(1, Ordering::SeqCst);
+    let body = jwks_document(&keys.lock().await);
+    let header = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(header.as_bytes()).await?;
+    stream.write_all(&body).await?;
+    stream.flush().await
+}
+
+/// The additive fallible face must leave every existing provider
+/// behavior-identical: `StaticKeyProvider` uses the default delegating impl —
+/// a hit is `Ok(Some)`, a genuine miss is `Ok(None)`, never `Err`.
+#[tokio::test]
+async fn fallible_default_delegates_for_static_provider() {
+    let (_, decoding) = keypair();
+    let single = StaticKeyProvider::single(decoding.clone());
+    assert!(single
+        .decoding_key_fallible(None, Algorithm::RS256)
+        .await
+        .expect("fallible single hit")
+        .is_some());
+    assert!(single
+        .decoding_key_fallible(Some("any-kid"), Algorithm::RS256)
+        .await
+        .expect("fallible single fallback hit")
+        .is_some());
+    let keyed = StaticKeyProvider::with_keyed(vec![("tagged".into(), decoding)]);
+    assert!(keyed
+        .decoding_key_fallible(Some("other"), Algorithm::RS256)
+        .await
+        .expect("fallible keyed miss must be Ok(None), never Err")
+        .is_none());
+}
+
+/// Mechanism failure (JWKS unreachable / policy-rejected) must surface as
+/// `Err` on the fallible face — the connector's transient plane — never as
+/// `Ok(None)` (which the connector reads as the permanent unknown-kid plane).
+#[tokio::test]
+async fn jwks_fetch_failure_is_fallible_err() {
+    let provider = JwksKeyProvider::new("http://remote.example.test/private-path");
+    match provider
+        .decoding_key_fallible(Some("kid-1"), Algorithm::RS256)
+        .await
+    {
+        Ok(_) => panic!("policy-rejected URI must be a fallible Err"),
+        Err(error) => assert_eq!(error, "jwks URI rejected by policy"),
+    }
+}
+
+/// A genuine unknown kid (served set contains other keys, refresh happened)
+/// is `Ok(None)` — the permanent plane — while a known kid and a no-kid
+/// single-key lookup resolve normally through the same fallible face.
+#[tokio::test]
+async fn jwks_unknown_kid_is_ok_none_never_err() {
+    let (key_a, kid_a) = rsa_keypair_with_kid("key-a");
+    let keys = Arc::new(Mutex::new(vec![(key_a, kid_a.clone())]));
+    let requests = Arc::new(AtomicUsize::new(0));
+    let (addr, _server) = start_jwks_server(keys, requests)
+        .await
+        .expect("bind jwks server");
+    let provider = JwksKeyProvider::new(format!("http://127.0.0.1:{}/jwks", addr.port()));
+    assert!(provider
+        .decoding_key_fallible(Some(&kid_a), Algorithm::RS256)
+        .await
+        .expect("served kid resolves")
+        .is_some());
+    assert!(provider
+        .decoding_key_fallible(Some("key-b"), Algorithm::RS256)
+        .await
+        .expect("unknown kid must be Ok(None), never Err")
+        .is_none());
+    // No-kid lookup against a single-key set resolves (single-compatible-key rule).
+    assert!(provider
+        .decoding_key_fallible(None, Algorithm::RS256)
+        .await
+        .expect("no-kid single-key resolves")
+        .is_some());
+}
+
+/// D10 discriminator: a same-kid retry inside the 10s unknown-kid throttle
+/// window gets exactly ONE bypass refresh (per (kid, window)); a second
+/// in-window same-kid retry and any new-kid miss stay throttled (fail-closed).
+#[tokio::test]
+async fn same_kid_retry_bypasses_unknown_kid_throttle_once() {
+    let (key_a, kid_a) = rsa_keypair_with_kid("key-a");
+    let (key_b, kid_b) = rsa_keypair_with_kid("key-b");
+    let keys = Arc::new(Mutex::new(vec![(key_a.clone(), kid_a.clone())]));
+    let requests = Arc::new(AtomicUsize::new(0));
+    let (addr, _server) = start_jwks_server(keys.clone(), requests.clone())
+        .await
+        .expect("bind jwks server");
+    let provider = JwksKeyProvider::new(format!("http://127.0.0.1:{}/jwks", addr.port()));
+
+    // Warm the cache with the served key (one ordinary fetch).
+    assert!(provider
+        .decoding_key_fallible(Some(&kid_a), Algorithm::RS256)
+        .await
+        .expect("warm hit")
+        .is_some());
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+
+    // The IdP rotated to key-b but the endpoint still serves {A} (lag): the
+    // unknown-kid refresh runs and misses — Ok(None) (permanent plane), and
+    // the 10s throttle window is now consumed.
+    assert!(provider
+        .decoding_key_fallible(Some(&kid_b), Algorithm::RS256)
+        .await
+        .expect("lagging miss")
+        .is_none());
+    assert_eq!(requests.load(Ordering::SeqCst), 2);
+
+    // The endpoint catches up and serves {A, B}: a same-kid retry inside the
+    // window gets exactly ONE bypass refresh — warm + ordinary refresh + one
+    // bypass = 3 fetches (the design's "首次普通 + 一次绕过" miss-path count).
+    *keys.lock().await = vec![
+        (key_a.clone(), kid_a.clone()),
+        (key_b.clone(), kid_b.clone()),
+    ];
+    assert!(provider
+        .decoding_key_fallible(Some(&kid_b), Algorithm::RS256)
+        .await
+        .expect("bypass hit")
+        .is_some());
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        3,
+        "same-kid retry must bypass the throttle exactly once"
+    );
+
+    // A NEW kid never bypasses: even with the throttle window still open, a
+    // key-c miss must not fetch again (the cache still holds {A,B}).
+    let (_key_c, kid_c) = rsa_keypair_with_kid("key-c");
+    assert!(provider
+        .decoding_key_fallible(Some(&kid_c), Algorithm::RS256)
+        .await
+        .expect("new-kid miss")
+        .is_none());
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        3,
+        "a new kid must not bypass the throttle"
+    );
+
+    // Consumed-bypass bound: a fresh provider with a lagging endpoint — the
+    // same kid misses twice in-window (ordinary + one bypass), and a third
+    // in-window retry must NOT fetch again (once per (kid, window)).
+    let keys2 = Arc::new(Mutex::new(vec![(key_a.clone(), kid_a.clone())]));
+    let requests2 = Arc::new(AtomicUsize::new(0));
+    let (addr2, _server2) = start_jwks_server(keys2, requests2.clone())
+        .await
+        .expect("bind second jwks server");
+    let provider2 = JwksKeyProvider::new(format!("http://127.0.0.1:{}/jwks", addr2.port()));
+    assert!(provider2
+        .decoding_key_fallible(Some(&kid_b), Algorithm::RS256)
+        .await
+        .expect("miss 1")
+        .is_none());
+    assert_eq!(
+        requests2.load(Ordering::SeqCst),
+        2,
+        "initial fetch + refresh"
+    );
+    assert!(provider2
+        .decoding_key_fallible(Some(&kid_b), Algorithm::RS256)
+        .await
+        .expect("bypass miss")
+        .is_none());
+    assert_eq!(
+        requests2.load(Ordering::SeqCst),
+        3,
+        "same-kid retry consumes exactly one bypass"
+    );
+    assert!(provider2
+        .decoding_key_fallible(Some(&kid_b), Algorithm::RS256)
+        .await
+        .expect("no re-bypass")
+        .is_none());
+    assert_eq!(
+        requests2.load(Ordering::SeqCst),
+        3,
+        "a second in-window same-kid retry must not bypass again"
+    );
 }

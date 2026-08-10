@@ -9,6 +9,8 @@
 use aero_common::{Participant, ParticipantId, ParticipantKind, SessionId, WorkspaceId};
 use sqlx::PgPool;
 
+use crate::AuditRepo;
+
 #[derive(Debug, Clone)]
 pub struct NewRegistration {
     pub participant_id: ParticipantId,
@@ -106,6 +108,25 @@ impl RegistrationRepo {
         .execute(&mut *tx)
         .await?;
 
+        // Security-event audit (auth slice direction): the account-creation
+        // event rides the SAME transaction — same-fate. A failed audit insert
+        // aborts registration exactly like any other failed statement, leaving
+        // zero rows of either kind; a committed registration always has its
+        // audit row (actor/target = the new participant; the FK resolves
+        // against the participant inserted above in this tx).
+        AuditRepo::append_in_tx(
+            &mut tx,
+            new.workspace_id,
+            Some(new.participant_id),
+            "auth.register",
+            Some(&new.participant_id.to_string()),
+            serde_json::json!({
+                "email": new.email.trim(),
+                "user_agent": new.user_agent,
+            }),
+        )
+        .await?;
+
         tx.commit().await?;
         Ok(Participant {
             id: new.participant_id,
@@ -191,6 +212,89 @@ mod db_tests {
             (participant_count, credential_count, session_count),
             (0, 0, 0)
         );
+        // Same-fate audit (AC1 negative): the forced FK failure must also leave
+        // zero `auth.register` audit rows for the attempted id — no orphan
+        // audit without an account. Scoped by actor (the shared-DB suite runs
+        // other registration tests that legitimately emit register rows).
+        let audit_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_events WHERE action = 'auth.register' AND actor_id = $1",
+        )
+        .bind(participant.to_uuid())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            audit_count, 0,
+            "a failed registration must not leave an orphan auth.register audit row"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires live Postgres with migrations"]
+    async fn successful_registration_audits_auth_register_once() {
+        let pool = pool();
+        let repo = RegistrationRepo::new(pool.clone());
+        let participant = ParticipantId::new();
+        let session = SessionId::new();
+        let email = format!("audited-register-{participant}@example.test");
+        repo.create(NewRegistration {
+            participant_id: participant,
+            email: email.clone(),
+            display_name: "Audited Register".into(),
+            password_hash: "test-hash".into(),
+            workspace_id: WorkspaceId::nil(),
+            session_id: session,
+            refresh_token_hash: format!("refresh-{session}"),
+            user_agent: Some("registration-test".into()),
+        })
+        .await
+        .expect("registration commits");
+
+        // Exactly one `auth.register` row, workspace/actor/target/detail per R1.
+        let row: (String, String, String, String, Option<String>, String) = sqlx::query_as(
+            "SELECT workspace_id::text, actor_id::text, target, detail->>'email', \
+                    detail->>'user_agent', action
+               FROM audit_events
+              WHERE action = 'auth.register' AND actor_id = $1",
+        )
+        .bind(participant.to_uuid())
+        .fetch_one(&pool)
+        .await
+        .expect("exactly one auth.register row");
+        assert_eq!(
+            row.0,
+            WorkspaceId::nil().to_uuid().to_string(),
+            "workspace = the registration workspace (nil UUID)"
+        );
+        assert_eq!(
+            row.1,
+            participant.to_uuid().to_string(),
+            "actor = the new participant"
+        );
+        assert_eq!(row.2, participant.to_string(), "target = the new participant");
+        assert_eq!(row.3, email, "detail.email = the registration email");
+        assert_eq!(row.4.as_deref(), Some("registration-test"), "detail.user_agent");
+        assert_eq!(row.5, "auth.register");
+        let total: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM audit_events WHERE action = 'auth.register' AND actor_id = $1",
+        )
+        .bind(participant.to_uuid())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(total, 1, "exactly one audit row per registration");
+
+        // Cleanup (FK NO ACTION, 0007): audit rows reference the participant.
+        sqlx::query("DELETE FROM audit_events WHERE actor_id = $1")
+            .bind(participant.to_uuid())
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM participants WHERE id = $1")
+            .bind(participant.to_uuid())
+            .execute(&pool)
+            .await
+            .unwrap();
     }
 
     async fn participant(pool: &PgPool, label: &str) -> ParticipantId {

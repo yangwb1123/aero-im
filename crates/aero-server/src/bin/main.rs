@@ -242,6 +242,29 @@ async fn main() -> anyhow::Result<()> {
         runtime.spawn(&tracker, ai_shutdown.clone());
     }
 
+    // ---------- Audit connector relay (B5-2) ----------
+    // Presence-gated on AERO_AUDIT_TOKEN_ENDPOINT; any AERO_AUDIT_* variable
+    // set while incomplete is a boot error (fail-loud). The relay claims only
+    // the B5-1 governance outbox through the OutboxRepo seam and never touches
+    // the v1 snaplink_delivery_outbox table; booting before the 0239 table
+    // lands degrades to logged claim errors, not a crash.
+    match aero_audit_connector::config::RelayConfig::from_env() {
+        Ok(Some(relay_cfg)) => {
+            let repo: Arc<dyn aero_audit_connector::outbox::OutboxRepo> = Arc::new(
+                aero_audit_connector::pg::PgOutboxRepo::new(persistence.pg.clone()),
+            );
+            let client = aero_audit_connector::client::AuditClient::new(relay_cfg.clone())
+                .context("initialize audit connector client")?;
+            let relay = aero_audit_connector::relay::AuditRelay::new(repo, client, relay_cfg);
+            tracker.spawn(relay.spawn(ai_shutdown.clone()));
+            info!("audit connector relay enabled");
+        }
+        Ok(None) => {}
+        Err(error) => {
+            return Err(error).context("initialize audit connector relay");
+        }
+    }
+
     // ---------- Metrics + heartbeats ----------
     boot::spawn_metrics_tasks(
         &tracker,

@@ -2,7 +2,7 @@
 
 use aero_common::{
     recall_window_expired, Block, Error, Message, MessageEditId, MessageId, ParticipantId,
-    RoomEvent, RoomId, WorkspaceId, RECALLED_MESSAGE_PLACEHOLDER,
+    RoomEvent, RoomId, WorkspaceId, LOCAL_ACTION_MESSAGE_RECALLED, RECALLED_MESSAGE_PLACEHOLDER,
 };
 use sqlx::{Postgres, Transaction};
 
@@ -260,11 +260,7 @@ impl MessageRepo {
         // recall or role change can interleave between this check and the
         // UPDATE below. The UPDATE's WHERE fence is deliberately unchanged.
         if existing.sender_id == actor
-            && recall_window_expired(
-                existing.created_at,
-                aero_common::time::now_utc(),
-                window,
-            )
+            && recall_window_expired(existing.created_at, aero_common::time::now_utc(), window)
         {
             return Err(Error::Conflict("recall window expired".into()));
         }
@@ -312,8 +308,8 @@ impl MessageRepo {
         // (`message_edits` is invisible to the blob-GC live-reference scan;
         // text/transcript evidence is preserved, attachment bytes are not).
         let snapshot_blocks = super::redact_blocks_for_recall_snapshot(&existing.blocks);
-        let snapshot = serde_json::to_value(&snapshot_blocks)
-            .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+        let snapshot =
+            serde_json::to_value(&snapshot_blocks).map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
 
         // Snapshot the original content before replacing it: the pre-recall body
         // stays reviewable through the message edit-history route (evidence, not
@@ -369,7 +365,7 @@ impl MessageRepo {
                 tx,
                 workspace,
                 Some(actor),
-                "message.recalled",
+                LOCAL_ACTION_MESSAGE_RECALLED,
                 Some(&id.to_string()),
                 serde_json::json!({
                     "room_id": existing.room_id,

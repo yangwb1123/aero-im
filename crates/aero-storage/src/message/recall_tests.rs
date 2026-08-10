@@ -9,7 +9,7 @@
 //! ```
 
 use aero_common::{
-    Block, BlobId, Error, FileKind, Message, MessageId, ParticipantId, RoomId, WorkspaceId,
+    BlobId, Block, Error, FileKind, Message, MessageId, ParticipantId, RoomId, WorkspaceId,
     RECALLED_MESSAGE_PLACEHOLDER,
 };
 use sqlx::PgPool;
@@ -543,10 +543,7 @@ async fn changes_since_delivers_recalls() {
         .unwrap()
         .expect("recall succeeds");
 
-    let changes = repo
-        .changes_since(fixture.room, before, 100)
-        .await
-        .unwrap();
+    let changes = repo.changes_since(fixture.room, before, 100).await.unwrap();
     let hit = changes
         .iter()
         .find(|m| m.id == message.id)
@@ -562,7 +559,9 @@ async fn changes_since_delivers_recalls() {
     assert_eq!(hit.edited_at, None, "recall must not bump edited_at");
 
     // Sanity: an ordinary message created before `since` is not reported.
-    let other = fixture.insert_message(fixture.author, "older sibling").await;
+    let other = fixture
+        .insert_message(fixture.author, "older sibling")
+        .await;
     assert!(
         !changes.iter().any(|m| m.id == other.id),
         "created-before-since messages are not changes"
@@ -596,23 +595,20 @@ async fn partition_backfill_carries_recall_columns() {
     // every other test's data too — including rows the blob-scope fence tests
     // deliberately leave with cross-workspace references, which the shadow's
     // `messages_enforce_blob_workspace_scope` trigger then rejects.
-    let (rows, _last): (i64, uuid::Uuid) = sqlx::query_as(
-        "SELECT rows_copied, last_id FROM backfill_messages_partition(5000, $1)",
-    )
-    .bind(backfill_from.to_uuid())
-    .fetch_one(&fixture.pool)
-    .await
-    .unwrap();
+    let (rows, _last): (i64, uuid::Uuid) =
+        sqlx::query_as("SELECT rows_copied, last_id FROM backfill_messages_partition(5000, $1)")
+            .bind(backfill_from.to_uuid())
+            .fetch_one(&fixture.pool)
+            .await
+            .unwrap();
     assert!(rows >= 1, "backfill copied the fixture message");
 
     let (recalled_at, recalled_by): (Option<time::OffsetDateTime>, Option<uuid::Uuid>) =
-        sqlx::query_as(
-            "SELECT recalled_at, recalled_by FROM messages_partitioned WHERE id = $1",
-        )
-        .bind(message.id.to_uuid())
-        .fetch_one(&fixture.pool)
-        .await
-        .unwrap();
+        sqlx::query_as("SELECT recalled_at, recalled_by FROM messages_partitioned WHERE id = $1")
+            .bind(message.id.to_uuid())
+            .fetch_one(&fixture.pool)
+            .await
+            .unwrap();
     assert!(
         recalled_at.is_some() && recalled_by == Some(fixture.author.to_uuid()),
         "shadow row carries recall state through the cutover backfill"
@@ -631,12 +627,12 @@ async fn concurrent_double_recall_has_exactly_one_winner() {
     let fixture = Fixture::create("race").await;
     fixture.enroll(fixture.author, "owner").await;
     let repo = MessageRepo::new(fixture.pool.clone());
-    let message = fixture
-        .insert_message(fixture.author, "race target")
-        .await;
+    let message = fixture.insert_message(fixture.author, "race target").await;
 
-    let first = repo.recall_outboxed_authorized(message.id, fixture.author, time::Duration::ZERO, None);
-    let second = repo.recall_outboxed_authorized(message.id, fixture.author, time::Duration::ZERO, None);
+    let first =
+        repo.recall_outboxed_authorized(message.id, fixture.author, time::Duration::ZERO, None);
+    let second =
+        repo.recall_outboxed_authorized(message.id, fixture.author, time::Duration::ZERO, None);
     let (first, second) = tokio::join!(first, second);
 
     let winners = [&first, &second]
@@ -650,7 +646,10 @@ async fn concurrent_double_recall_has_exactly_one_winner() {
         })
         .count();
     assert_eq!(winners, 1, "exactly one recall wins the race");
-    assert_eq!(conflicts, 1, "the loser gets the stable already-recalled Conflict");
+    assert_eq!(
+        conflicts, 1,
+        "the loser gets the stable already-recalled Conflict"
+    );
 
     let stored = repo.get(message.id).await.unwrap().unwrap();
     assert_eq!(
@@ -658,7 +657,11 @@ async fn concurrent_double_recall_has_exactly_one_winner() {
         serde_json::json!([{ "type": "text", "content": RECALLED_MESSAGE_PLACEHOLDER }]),
         "placeholder body"
     );
-    assert_eq!(stored.version, message.version + 1, "exactly one version bump");
+    assert_eq!(
+        stored.version,
+        message.version + 1,
+        "exactly one version bump"
+    );
 
     // Exactly one durable outbox row for the recall, at the new version.
     let outbox_rows: i64 = sqlx::query_scalar(
@@ -936,12 +939,8 @@ async fn recall_boundary_race_author_vs_admin() {
         time::Duration::seconds(86_400),
         None,
     );
-    let admin_fut = repo.recall_outboxed_authorized(
-        message.id,
-        admin,
-        time::Duration::seconds(86_400),
-        None,
-    );
+    let admin_fut =
+        repo.recall_outboxed_authorized(message.id, admin, time::Duration::seconds(86_400), None);
     let (author_res, admin_res) = tokio::join!(author_fut, admin_fut);
 
     let admin_recalled = admin_res
@@ -1010,12 +1009,7 @@ async fn recall_window_no_leak_to_member() {
         .unwrap();
 
     let err = repo
-        .recall_outboxed_authorized(
-            message.id,
-            member,
-            time::Duration::seconds(3600),
-            None,
-        )
+        .recall_outboxed_authorized(message.id, member, time::Duration::seconds(3600), None)
         .await
         .unwrap_err();
     assert!(matches!(&err, Error::Forbidden(msg) if msg == "only author or room admin may recall"));

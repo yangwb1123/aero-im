@@ -27,6 +27,8 @@ time.workspace = true
 
 jsonwebtoken.workspace = true
 uuid.workspace = true
+# JWT payload/JWK base64url (same pin as the server and the audit connector).
+base64 = "0.22"
 argon2.workspace = true
 password-hash.workspace = true
 rand.workspace = true
@@ -51,4 +53,4 @@ sqlx.workspace = true
 fred.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["macros", "rt", "net", "io-util"] }

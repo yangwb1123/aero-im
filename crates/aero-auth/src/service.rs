@@ -10,9 +10,10 @@ use std::time::Duration;
 use aero_common::{Error, Participant, ParticipantId, Result, SessionId, WorkspaceId};
 use aero_storage::participant::NewHuman;
 use aero_storage::revoked_token::hash_token;
-use aero_storage::{NewRegistration, ParticipantRepo, RegistrationRepo, SessionRepo};
+use aero_storage::{AuditRepo, NewRegistration, ParticipantRepo, RegistrationRepo, SessionRepo};
 use serde::{Deserialize, Serialize};
 
+use crate::audit_tokens::{AUTH_LOGIN_FAILED, AUTH_LOGIN_LOCKED};
 use crate::bot::SharedBotVerifier;
 use crate::jwt::{Claims, JwtCodec, TokenKind};
 use crate::password;
@@ -262,25 +263,42 @@ impl AuthService {
         // password hash, and fold the outcome (auth failure vs success) back into
         // the throttle. Only `Unauthorized` outcomes count as failures — a DB error
         // is not the user's fault and must not march them toward a lockout.
-        let Some(throttle) = self.login_throttle.clone() else {
-            return self.login_inner(req).await;
-        };
+        //
+        // Security-event audit: every `Unauthorized` outcome emits an
+        // `auth.login.failed` row, and the lockout-reject path emits
+        // `auth.login.locked` — best-effort (`let _` + warn), so the audit can
+        // never alter the login outcome, and funneled through ONE emission point
+        // per event class so the throttle-less early return cannot skip the trail
+        // (the throttle is a config; the audit trail is not).
         let account = req.email.clone();
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
-        if throttle.is_locked(&account, now).await {
-            return Err(Error::Unauthorized(
-                "account temporarily locked after repeated failed logins".into(),
-            ));
-        }
-        let result = self.login_inner(req).await;
-        // Record a FAILURE here for a bad password. SUCCESS is deliberately NOT
-        // recorded yet: a post-password gate (2FA, enforced by the HTTP layer) may
-        // still reject this attempt. Recording success now would clear the failure
-        // counter before 2FA is checked, letting an attacker who holds the password
-        // brute-force the second factor with the lockout permanently reset. The
-        // caller MUST call [`finalize_login`] once all gates have run.
+        let result = match self.login_throttle.clone() {
+            Some(throttle) if throttle.is_locked(&account, now).await => {
+                self.audit_login_event(AUTH_LOGIN_LOCKED, &account, "locked")
+                    .await;
+                return Err(Error::Unauthorized(
+                    "account temporarily locked after repeated failed logins".into(),
+                ));
+            }
+            Some(throttle) => {
+                let result = self.login_inner(req).await;
+                // Record a FAILURE here for a bad password. SUCCESS is deliberately
+                // NOT recorded yet: a post-password gate (2FA, enforced by the HTTP
+                // layer) may still reject this attempt. Recording success now would
+                // clear the failure counter before 2FA is checked, letting an
+                // attacker who holds the password brute-force the second factor with
+                // the lockout permanently reset. The caller MUST call
+                // [`finalize_login`] once all gates have run.
+                if let Err(Error::Unauthorized(_)) = &result {
+                    throttle.record_failure(&account, now).await;
+                }
+                result
+            }
+            None => self.login_inner(req).await,
+        };
         if let Err(Error::Unauthorized(_)) = &result {
-            throttle.record_failure(&account, now).await;
+            self.audit_login_event(AUTH_LOGIN_FAILED, &account, "invalid_credentials")
+                .await;
         }
         result
     }
@@ -290,7 +308,17 @@ impl AuthService {
     /// failure counter; `success = false` records a failure so a wrong second
     /// factor advances the lockout exactly like a wrong password. No-op when the
     /// throttle is disabled. See the deferral rationale in [`login`](Self::login).
+    ///
+    /// Security-event audit: a `success = false` outcome emits an
+    /// `auth.login.failed` row with `reason = "2fa_failed"` — BEFORE the throttle
+    /// early-return, so the trail is throttle-independent (a wrong second factor
+    /// is an account-takeover signal regardless of config). `success = true` is
+    /// deliberately silent (durable `login_events` already records successes).
     pub async fn finalize_login(&self, account: &str, success: bool) {
+        if !success {
+            self.audit_login_event(AUTH_LOGIN_FAILED, account, "2fa_failed")
+                .await;
+        }
         let Some(throttle) = self.login_throttle.clone() else {
             return;
         };
@@ -299,6 +327,43 @@ impl AuthService {
         } else {
             let now = time::OffsetDateTime::now_utc().unix_timestamp();
             throttle.record_failure(account, now).await;
+        }
+    }
+
+    /// Best-effort `auth.login.*` audit append (workspace nil, actor None — the
+    /// account is not resolvable on the failure path; the 0239 envelope CASE
+    /// yields `{id: "system", type: "system"}`).
+    ///
+    /// Fail-open invariant (mirrors `record_login_event`'s "Never fails the
+    /// login"): the `Result` is discarded — a storage hiccup must never turn a
+    /// login attempt into a 500, and must never march an account toward/away
+    /// from a lockout. The loss is made LOUD: a structured `tracing::warn!`
+    /// carrying `token`/`account`/`reason` keeps the log stream a reconstructable
+    /// fallback trail, and `aero_audit_append_failed_total{token}` makes the
+    /// silent-loss window operationally visible. (`audit_events` and the durable
+    /// `login_failures` brute-force trail share the same PG, so at-least-once
+    /// staging would need a second store — deliberately not added; the handler
+    /// over-records `login_failures` on any `Err` including DB errors while the
+    /// audit trail under-records by design — documented divergence, not a bug.)
+    async fn audit_login_event(&self, token: &str, account: &str, reason: &str) {
+        let detail = serde_json::json!({ "email": account, "reason": reason });
+        if let Err(e) = AuditRepo::new(self.repo.pool().clone())
+            .append(WorkspaceId::nil(), None, token, None, detail)
+            .await
+        {
+            tracing::warn!(
+                error = %e, token, account, reason,
+                "auth audit append failed (login outcome unaffected)"
+            );
+            // Literal metric name: single emit site today (keeps the 3-crate
+            // footprint); promote to `aero_common::metrics::names` if a second
+            // emit site appears. `inc_counter_labeled` auto-creates the series
+            // on first use.
+            aero_common::metrics::inc_counter_labeled(
+                "aero_audit_append_failed_total",
+                1,
+                &[("token", token)],
+            );
         }
     }
 

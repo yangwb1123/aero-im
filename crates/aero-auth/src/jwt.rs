@@ -334,9 +334,15 @@ mod tests {
         );
 
         // Rotate: key B active, key A retained as an extra verifier.
-        let codec_b =
-            JwtCodec::from_pems(&priv_b, &pub_b, std::slice::from_ref(&pub_a), "aero-im", acc, refr)
-                .unwrap();
+        let codec_b = JwtCodec::from_pems(
+            &priv_b,
+            &pub_b,
+            std::slice::from_ref(&pub_a),
+            "aero-im",
+            acc,
+            refr,
+        )
+        .unwrap();
         assert_eq!(
             codec_b.verify(&token_a).unwrap().participant_id().unwrap(),
             pid,

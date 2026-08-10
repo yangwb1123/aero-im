@@ -45,6 +45,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "aero-audit-connector"
+version = "0.1.0"
+dependencies = [
+ "aero-auth",
+ "aero-common",
+ "anyhow",
+ "async-trait",
+ "base64",
+ "futures",
+ "jsonwebtoken",
+ "rand 0.8.6",
+ "reqwest",
+ "rsa",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "thiserror 1.0.69",
+ "time",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "aero-auth"
 version = "0.1.0"
 dependencies = [
@@ -54,6 +79,7 @@ dependencies = [
  "argon2",
  "async-trait",
  "axum",
+ "base64",
  "fred",
  "futures",
  "hmac 0.12.1",
@@ -164,6 +190,7 @@ dependencies = [
 name = "aero-im-core"
 version = "0.1.0"
 dependencies = [
+ "aero-audit-connector",
  "aero-bus",
  "aero-common",
  "aero-storage",
@@ -174,6 +201,7 @@ dependencies = [
  "fred",
  "futures",
  "pretty_assertions",
+ "reqwest",
  "serde",
  "serde_json",
  "sqlx",
@@ -329,6 +357,7 @@ name = "aero-server"
 version = "0.1.0"
 dependencies = [
  "aero-ai",
+ "aero-audit-connector",
  "aero-auth",
  "aero-bus",
  "aero-common",

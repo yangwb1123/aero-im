@@ -1,5 +1,10 @@
 #![allow(unused_imports)]
-use super::tools::{first_extractable_file, MAX_ATTACHMENT_BYTES, extract_text, render_transcript, SUMMARIZE_SYSTEM_PROMPT, heuristic_summary, RETRIEVAL_POOL, render_context, ANSWER_SYSTEM_PROMPT, SearchMessagesTool, ReadAttachmentTool, AGENT_SYSTEM_PROMPT, THREAD_TITLE_SYSTEM_PROMPT, clean_title, heuristic_title, rank_experts, rank_channels, rank_people};
+use super::tools::{
+    clean_title, extract_text, first_extractable_file, heuristic_summary, heuristic_title,
+    rank_channels, rank_experts, rank_people, render_context, render_transcript,
+    ReadAttachmentTool, SearchMessagesTool, AGENT_SYSTEM_PROMPT, ANSWER_SYSTEM_PROMPT,
+    MAX_ATTACHMENT_BYTES, RETRIEVAL_POOL, SUMMARIZE_SYSTEM_PROMPT, THREAD_TITLE_SYSTEM_PROMPT,
+};
 use super::{AiService, AnswerResult, ChannelRec, Expert, PersonRec, Sentiment, SentimentScore};
 use crate::anthropic::{AnthropicClient, ChatMsg, Usage};
 use crate::embed::{default_embedder, Embedder};

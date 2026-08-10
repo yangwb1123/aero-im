@@ -20,6 +20,12 @@
 # 待 participant_cache / notification_bundle 接线后（见 docs/sprint），可折入 check-harness。
 set -euo pipefail
 
+# §3 claim-contract guard（AC4 字面量/类型/usage 单源）住在可 source 的库里；
+# 本脚本只负责接线 + 把违规数折入退出码（F5：`exit orphan + guard`）。
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/truth-check-lib.sh"
+
 orphan_violations=0
 unwired_warnings=0
 
@@ -198,8 +204,18 @@ for name in "${!def_loc[@]}"; do
 done
 
 echo ""
+
+# ---------------------------------------------------------------------------
+# 3. claim-contract guard（AC4 字面量/类型/usage 单源，硬违规计入 exit）
+#    实现见 scripts/truth-check-lib.sh（sourceable）；负例自测见
+#    scripts/test-claim-contract-guard.sh。
+# ---------------------------------------------------------------------------
+echo ""
+claim_guard_scan "$(pwd)" || true
+
+echo ""
 echo "---"
-echo "结果: ${orphan_violations} 个 ORPHAN, ${unwired_warnings} 个 UNWIRED"
+echo "结果: ${orphan_violations} 个 ORPHAN, ${unwired_warnings} 个 UNWIRED, ${CLAIM_GUARD_VIOLATIONS} 个 CLAIM-GUARD"
 echo ""
 if [ "$orphan_violations" -gt 0 ]; then
     echo "ORPHAN 为硬违规：上述源文件写了但未 mod 声明，不参与编译（死代码）。"
@@ -207,6 +223,10 @@ fi
 if [ "$unwired_warnings" -gt 0 ]; then
     echo "UNWIRED 为警告（不计入 exit 码）：builder 有定义但零调用方，疑似未接线。"
 fi
+if [ "$CLAIM_GUARD_VIOLATIONS" -gt 0 ]; then
+    echo "CLAIM-GUARD 为硬违规：claim 字面量/类型/usage 脱离了 leaf 单源（见 truth-check-lib.sh 的 allowlist 契约理由）。"
+fi
 
 # ORPHAN 是硬违规计入 exit；UNWIRED 仅警告，不阻断。
-exit "$orphan_violations"
+# claim-contract guard 违规与 ORPHAN 一样折入 exit（F5 修正：字面量违规只打印不阻断 = 静默漂移）。
+exit $((orphan_violations + CLAIM_GUARD_VIOLATIONS))

@@ -120,7 +120,9 @@ impl KeywordAlertRepo {
             .bind(&normalized)
             .fetch_optional(&mut *tx)
             .await?;
-        let row = if let Some(row) = inserted { row } else {
+        let row = if let Some(row) = inserted {
+            row
+        } else {
             let select_sql = format!(
                 "SELECT {COLUMNS}
                    FROM keyword_alerts

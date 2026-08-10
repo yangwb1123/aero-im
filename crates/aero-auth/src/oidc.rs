@@ -18,6 +18,13 @@
 //! OIDC is **off by default**: [`OidcConfig::from_env`] returns `None` unless the
 //! deployment explicitly configures an issuer/audience/JWKS URI.
 
+use aero_common::model::client_credentials::{
+    is_valid_identity_component, CLAIM_AUD, CLAIM_CLIENT_ID, CLAIM_IAT, CLAIM_ISS, CLAIM_JTI,
+    CLAIM_SUB, TOKEN_TYPE_AT_JWT, TOKEN_TYPE_AT_JWT_APPLICATION,
+};
+pub use aero_common::model::client_credentials::{
+    ClientCredentialsClaims, ClientCredentialsTokenConfig,
+};
 use futures::StreamExt as _;
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use serde::{Deserialize, Serialize};
@@ -242,6 +249,20 @@ pub enum OidcError {
 #[axum::async_trait]
 pub trait KeyProvider: Send + Sync {
     async fn decoding_key(&self, kid: Option<&str>, algorithm: Algorithm) -> Option<DecodingKey>;
+
+    /// Fallible resolution: `Err` = the key-source *mechanism* is unavailable
+    /// (JWKS fetch/refresh failure — the connector maps this to its transient
+    /// plane); `Ok(None)` = no compatible key exists (genuine unknown-kid —
+    /// the connector maps this to its permanent plane). The default impl
+    /// delegates to [`Self::decoding_key`], so every existing provider is
+    /// behavior-identical.
+    async fn decoding_key_fallible(
+        &self,
+        kid: Option<&str>,
+        algorithm: Algorithm,
+    ) -> Result<Option<DecodingKey>, String> {
+        Ok(self.decoding_key(kid, algorithm).await)
+    }
 }
 
 /// In-memory key provider holding one or more known keys.
@@ -359,39 +380,11 @@ fn valid_id_token_type(kind: Option<&str>) -> bool {
     }
 }
 
-/// Verification policy for a Snaplink OAuth client-credentials access token.
-#[derive(Debug, Clone)]
-pub struct ClientCredentialsTokenConfig {
-    pub issuer: String,
-    pub audience: String,
-    pub required_scopes: Vec<String>,
-}
-
-/// Trusted machine identity extracted from a validated access token.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ClientCredentialsClaims {
-    pub sub: String,
-    pub client_id: String,
-    pub iat: u64,
-    pub jti: String,
-    #[serde(default)]
-    pub scopes: Vec<String>,
-    #[serde(default)]
-    pub scope: Option<String>,
-}
-
-impl ClientCredentialsClaims {
-    /// Normalized union of Snaplink's `scopes` array and the standard OAuth
-    /// space-delimited `scope` compatibility claim.
-    #[must_use]
-    pub fn granted_scopes(&self) -> std::collections::BTreeSet<&str> {
-        self.scopes
-            .iter()
-            .map(String::as_str)
-            .chain(self.scope.iter().flat_map(|scope| scope.split_whitespace()))
-            .collect()
-    }
-}
+// Validation policy and claims type for Snaplink OAuth client-credentials
+// access tokens now live in the aero-common leaf
+// (`aero_common::model::client_credentials` — the single source of truth)
+// and are re-exported here unchanged, preserving the `aero_auth::*` public
+// API. This module keeps the validator itself.
 
 /// Validate a Snaplink RFC 9068 access token minted by `client_credentials`.
 /// This is deliberately separate from [`validate_id_token`]: it requires an
@@ -412,8 +405,8 @@ pub async fn validate_client_credentials_token(
     if !matches!(
         header.typ.as_deref(),
         Some(kind)
-            if kind.eq_ignore_ascii_case("at+jwt")
-                || kind.eq_ignore_ascii_case("application/at+jwt")
+            if kind.eq_ignore_ascii_case(TOKEN_TYPE_AT_JWT)
+                || kind.eq_ignore_ascii_case(TOKEN_TYPE_AT_JWT_APPLICATION)
     ) {
         return Err(OidcError::Invalid(
             "token is not an RFC 9068 access token".into(),
@@ -436,44 +429,59 @@ pub async fn validate_client_credentials_token(
     validation.validate_exp = true;
     validation.validate_nbf = true;
     validation.leeway = LEEWAY_SECS;
-    for claim in ["iss", "aud", "exp", "nbf", "iat", "jti", "sub", "client_id"] {
+    for claim in [
+        CLAIM_ISS,
+        CLAIM_AUD,
+        // exp/nbf are outside the unified four-claim contract (F6): the
+        // connector keeps its when-present Value checks, so their spelling
+        // stays local to this loop.
+        "exp",
+        "nbf",
+        CLAIM_IAT,
+        CLAIM_JTI,
+        CLAIM_SUB,
+        CLAIM_CLIENT_ID,
+    ] {
         validation.required_spec_claims.insert(claim.to_owned());
     }
     let claims = decode::<ClientCredentialsClaims>(token, &key, &validation)
         .map(|data| data.claims)
         .map_err(|e| OidcError::Invalid(e.to_string()))?;
-    if !valid_identity_component(&claims.sub)
-        || !valid_identity_component(&claims.client_id)
-        || claims.sub != claims.client_id
+    if !is_valid_identity_component(&claims.sub)
+        || !is_valid_identity_component(&claims.client_id)
+        || !claims.subject_is_client_id()
     {
         return Err(OidcError::Invalid(
             "token is not a client_credentials machine identity".into(),
         ));
     }
-    if claims.iat > jsonwebtoken::get_current_timestamp().saturating_add(LEEWAY_SECS) {
+    // jsonwebtoken's `required_spec_claims` only enforces the claims its own
+    // validator knows (exp/sub/iss/aud/nbf — hardcoded match in
+    // validation.rs; anything else is `_ => continue`), so iat/jti presence
+    // was never enforced by it — it was enforced structurally by the
+    // non-Option serde fields. With `iat: Option<u64>` that structural
+    // enforcement is gone, so presence must be re-asserted here explicitly:
+    // a missing iat is a fail-closed rejection (never accepted as "no
+    // issued-at").
+    if !claims
+        .iat
+        .is_some_and(|iat| iat <= jsonwebtoken::get_current_timestamp().saturating_add(LEEWAY_SECS))
+    {
         return Err(OidcError::Invalid(
-            "token issued-at time is in the future".into(),
+            "token issued-at time is missing or in the future".into(),
         ));
     }
-    if claims.jti.is_empty() || claims.jti.len() > 1_024 || claims.jti.chars().any(char::is_control)
-    {
+    if !claims.jti.as_deref().is_some_and(|jti| {
+        !jti.is_empty() && jti.len() <= 1_024 && !jti.chars().any(char::is_control)
+    }) {
         return Err(OidcError::Invalid("token id is invalid".into()));
     }
-    let granted = claims.granted_scopes();
-    if cfg
-        .required_scopes
-        .iter()
-        .any(|required| !granted.contains(required.as_str()))
-    {
+    if !claims.has_required_scopes(cfg) {
         return Err(OidcError::Invalid(
             "token lacks a required application scope".into(),
         ));
     }
     Ok(claims)
-}
-
-fn valid_identity_component(value: &str) -> bool {
-    !value.is_empty() && value == value.trim() && !value.chars().any(char::is_control)
 }
 
 // ---------- Live JWKS-backed key provider (the documented network seam) ----------
@@ -539,10 +547,26 @@ struct CachedJwks {
     expires_at: Instant,
 }
 
+/// D10/AM-5 single-slot record of the most recent unknown-kid miss. A retry
+/// for the *same* kid inside the refresh window gets exactly one bypass
+/// refresh (so a JWKS endpoint that lags the `IdP`'s signing-key rotation by
+/// one requeue backoff can still recover before the row deads); a retry for a
+/// *different* kid — or a second retry for the same kid in the same window —
+/// stays throttled (fail-closed). The single slot being overwritten by an
+/// interleaved different kid deliberately denies the earlier kid its bypass.
+#[derive(Debug)]
+struct MissedKid {
+    kid: String,
+    at: Instant,
+    /// Whether the one bypass for this (kid, window) was already consumed.
+    bypassed: bool,
+}
+
 #[derive(Default)]
 struct JwksCacheState {
     entry: Option<CachedJwks>,
     last_unknown_kid_refresh: Option<Instant>,
+    last_missed_kid: Option<MissedKid>,
 }
 
 impl JwksCacheState {
@@ -661,6 +685,13 @@ impl JwksKeyProvider {
                 .map(|entry| entry.set.clone())
                 .ok_or_else(|| "jwks unknown-kid refresh throttled".to_owned());
         }
+        self.fetch_and_store(&mut state).await
+    }
+
+    /// Fetch and store a fresh set under the cache mutex (shared by the
+    /// ordinary refresh and the D10 same-kid bypass — behavior-preserving
+    /// extraction of `cached_set`'s tail).
+    async fn fetch_and_store(&self, state: &mut JwksCacheState) -> Result<JwkSet, String> {
         let set = self.fetch().await?;
         state.entry = Some(CachedJwks {
             set: set.clone(),
@@ -740,6 +771,86 @@ impl KeyProvider for JwksKeyProvider {
             }
         };
         key_from_set(&refreshed, kid, algorithm)
+    }
+
+    async fn decoding_key_fallible(
+        &self,
+        kid: Option<&str>,
+        algorithm: Algorithm,
+    ) -> Result<Option<DecodingKey>, String> {
+        let cached = self.cached_set(false).await?;
+        if let Some(key) = key_from_set(&cached, kid, algorithm) {
+            self.cache.lock().await.last_missed_kid = None;
+            return Ok(Some(key));
+        }
+        // No-kid lookups resolve against the single-key rule; a throttled
+        // refresh can never produce a bypass (the bypass is kid-scoped).
+        let Some(kid) = kid else {
+            let refreshed = self.cached_set(true).await?;
+            return Ok(key_from_set(&refreshed, None, algorithm));
+        };
+
+        // Record the miss and detect a same-kid retry inside the window that
+        // has not yet consumed its one bypass. The record is preserved (not
+        // re-seeded) for an in-window same-kid retry so the `bypassed` flag
+        // survives and the once-per-(kid, window) bound holds.
+        let now = Instant::now();
+        let mut state = self.cache.lock().await;
+        let same_kid_retry = matches!(
+            state.last_missed_kid.as_ref(),
+            Some(missed)
+                if missed.kid == kid
+                    && now.saturating_duration_since(missed.at)
+                        < UNKNOWN_KID_REFRESH_MIN_INTERVAL
+                    && !missed.bypassed
+        );
+        if !same_kid_retry {
+            // Preserve a consumed bypass for the same kid inside the same
+            // window: re-seeding must never re-arm the once-per-(kid, window)
+            // bypass. A window that expired (or a different kid) re-arms.
+            let consumed = state.last_missed_kid.as_ref().is_some_and(|missed| {
+                missed.kid == kid
+                    && now.saturating_duration_since(missed.at) < UNKNOWN_KID_REFRESH_MIN_INTERVAL
+                    && missed.bypassed
+            });
+            state.last_missed_kid = Some(MissedKid {
+                kid: kid.to_owned(),
+                at: now,
+                bypassed: consumed,
+            });
+        }
+        drop(state);
+
+        // Normal refresh path: reserve succeeds (new fetch, fresh set) or the
+        // throttled stale set is returned as `Ok`. Only the latter — a
+        // same-kid retry whose refresh was throttled — earns the one bypass.
+        let refreshed = self.cached_set(true).await?;
+        if let Some(key) = key_from_set(&refreshed, Some(kid), algorithm) {
+            return Ok(Some(key));
+        }
+        if same_kid_retry {
+            let mut state = self.cache.lock().await;
+            if state
+                .last_missed_kid
+                .as_ref()
+                .is_some_and(|missed| missed.kid == kid && !missed.bypassed)
+            {
+                let missed = state
+                    .last_missed_kid
+                    .as_mut()
+                    .expect("just checked the record");
+                missed.bypassed = true;
+                missed.at = now;
+                // Force-occupy the refresh window: the bypass counts against
+                // the same per-provider 10s budget as an ordinary refresh, so
+                // the storm bound only widens from 1 to 2 fetches per window
+                // (AM-5). The timestamp is recorded before I/O.
+                state.last_unknown_kid_refresh = Some(now);
+                let set = self.fetch_and_store(&mut state).await?;
+                return Ok(key_from_set(&set, Some(kid), algorithm));
+            }
+        }
+        Ok(None)
     }
 }
 

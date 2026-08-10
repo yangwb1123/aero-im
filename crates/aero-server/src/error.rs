@@ -66,8 +66,7 @@ mod tests {
     /// pinned here so a reworded variant can never silently break the client.
     #[tokio::test]
     async fn conflict_renders_thiserror_prefix_and_409() {
-        let response =
-            ApiError(Error::Conflict("recall window expired".into())).into_response();
+        let response = ApiError(Error::Conflict("recall window expired".into())).into_response();
         assert_eq!(response.status(), StatusCode::CONFLICT);
         let bytes = to_bytes(response.into_body(), 1024).await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();

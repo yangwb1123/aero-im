@@ -55,6 +55,7 @@ use ulid::Ulid;
 use crate::anthropic::Usage;
 use crate::budget::{CostBudget, KeyedCostBudget};
 use crate::error::{AiError, Result};
+use crate::governance::LOCAL_ACTION_MODERATED;
 use crate::metrics::{self as ai_metrics, CostModel};
 use crate::service::AiService;
 use crate::usage::{self as ai_usage, UsageSink};
@@ -167,6 +168,25 @@ pub struct AiWorker {
     svc: Arc<AiService>,
     cfg: WorkerConfig,
     cost_model: CostModel,
+}
+
+/// Resolve the workspace a moderation finalize must delete under — FAIL-CLOSED
+/// (B5-1 R-D1). The audit action is derived from the workspace, so deleting
+/// with `None` would commit the soft delete + `Deleted` broadcast with ZERO
+/// `audit_events` rows (the 0236 governance trigger never fires) — an
+/// invisible, un-audited removal and the only route around the otherwise
+/// fail-closed binding RAISE. Refuse instead: the caller propagates `Err` to
+/// the existing retry path → bounded DLQ, and the provider verdict is already
+/// durably finalized under the job's stable usage context, so the retry
+/// replays it without a second paid call. Pure, so unit-testable without a DB
+/// (mirrors the `should_skip_embed` decision pattern).
+fn moderation_delete_workspace(job: &AiJob) -> Result<WorkspaceId> {
+    job.workspace_id.map(WorkspaceId::from_uuid).ok_or_else(|| {
+        AiError::Invalid(format!(
+            "moderation job {} has no workspace_id; refusing un-audited delete (R-D1)",
+            job.id
+        ))
+    })
 }
 
 impl AiWorker {
@@ -362,7 +382,11 @@ impl AiWorker {
             // BLOCK: soft-delete the offending message so it stops being visible.
             if let Some(target) = job.target_id {
                 let id = MessageId::from_uuid(target);
-                let workspace = job.workspace_id.map(WorkspaceId::from_uuid);
+                // R-D1 (B5-1): refuse to delete when the workspace cannot be
+                // resolved — `audit_action` is derived from the workspace, so
+                // `None` would commit the removal with zero audit + zero
+                // governance rows. Propagate Err → retry → bounded DLQ.
+                let workspace = moderation_delete_workspace(job)?;
                 let detail = serde_json::json!({
                     "reason": reason,
                     "source": "ai_worker",
@@ -372,9 +396,9 @@ impl AiWorker {
                     .messages()
                     .soft_delete_outboxed_system(
                         id,
-                        workspace,
+                        Some(workspace),
                         None,
-                        workspace.map(|_| "message.moderated"),
+                        Some(LOCAL_ACTION_MODERATED),
                         detail,
                         ParticipantId::nil(),
                         None,

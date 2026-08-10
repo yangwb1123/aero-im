@@ -68,18 +68,15 @@ pub async fn run_until_cancelled(
             let event = serde_json::from_slice::<RoomEvent>(sub.payload());
             let handler_state = &state;
             let handler_ai = &ai;
-            let _ =
-                crate::consumer_event_receipt::process(&receipts, "aero-bot", sub, || {
-                    Box::pin(async move {
-                        match event {
-                            Ok(RoomEvent::Message(env)) => {
-                                handle(handler_state, handler_ai, env).await
-                            }
-                            Ok(_) | Err(_) => Ok(()),
-                        }
-                    })
+            let _ = crate::consumer_event_receipt::process(&receipts, "aero-bot", sub, || {
+                Box::pin(async move {
+                    match event {
+                        Ok(RoomEvent::Message(env)) => handle(handler_state, handler_ai, env).await,
+                        Ok(_) | Err(_) => Ok(()),
+                    }
                 })
-                .await;
+            })
+            .await;
         }
         if cancel.is_cancelled() {
             return Ok(());
