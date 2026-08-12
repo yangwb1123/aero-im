@@ -37,6 +37,12 @@
 //!      spill) → exactly 1 spill row (`spill = 'true'`, `count = 1`, own
 //!      deterministic key, `payload.event_id` = own PK). Re-run the parity
 //!      query → `SUM = N+1 == COUNT = N+1`.
+//!   5. Leg 2 (B5-1 producer seam): the seed-vs-service gap is CLOSED — N
+//!      `message.create` rows are produced through the REAL send path
+//!      (`MessageRepo::insert_outboxed`, the S1 seam) into a self-isolated
+//!      ws2/actor2 fixture; the ws-scoped parity query asserts
+//!      `SUM == COUNT == N`. A dropped S1 append yields `COUNT = 0 ≠ N` → red
+//!      (the leg can never be vacuous-green).
 //!
 //! Exit 0 PASS / non-zero FAIL naming the diverging lane + window / exit 2
 //! SKIP when `audit_governance_outbox` or `aero_enqueue_l1_aggregate_audit`
@@ -121,6 +127,14 @@ async fn run() -> anyhow::Result<()> {
         .execute(&pool)
         .await
         .context("insert drill participant")?;
+    // G-F1: migration 0200's `workspace_birth_owner_commit_guard`
+    // (DEFERRABLE INITIALLY DEFERRED, AFTER INSERT ON workspaces) raises
+    // 23514 at commit unless the workspace retains a non-guest owner
+    // membership edge. The guard's own design comment (0200) permits only a
+    // TWO-STATEMENT transaction (workspace row + owner edge, then commit); a
+    // raw autocommit workspace birth is rejected — two separate autocommit
+    // executes therefore still trip it. Wrap the pair in one explicit tx.
+    let mut ws_tx = pool.begin().await.context("begin workspace fixture tx")?;
     sqlx::query(
         "INSERT INTO workspaces (id, name, slug, created_by, created_at)
          VALUES ($1, $2, $3, $4, now())",
@@ -129,9 +143,19 @@ async fn run() -> anyhow::Result<()> {
     .bind("L1 Parity Drill WS")
     .bind(format!("l1-parity-{ws}"))
     .bind(actor)
-    .execute(&pool)
+    .execute(&mut *ws_tx)
     .await
     .context("insert drill workspace")?;
+    sqlx::query(
+        "INSERT INTO workspace_members (workspace_id, participant_id, role, joined_at)
+         VALUES ($1, $2, 'owner', now())",
+    )
+    .bind(ws)
+    .bind(actor)
+    .execute(&mut *ws_tx)
+    .await
+    .context("insert drill workspace owner edge")?;
+    ws_tx.commit().await.context("commit drill workspace fixture")?;
 
     // Fixed created_at captured ONCE: every seeded row lands in the SAME
     // window (single clock domain, server-stamped semantics).
@@ -266,6 +290,108 @@ async fn run() -> anyhow::Result<()> {
         "parity after spill leg: SUM(count) = {sum} == COUNT(mapped) = {count} \
          (window {window_key} delivered at count {rows} + spill {spill_key} count 1)"
     );
+
+    // --- Leg 2 (B5-1 producer seam): rows through the REAL send path ---
+    // Self-isolated ws2/actor2 fixture via direct SQL (leg-1 style). The
+    // fixture must NOT use the authorized room-create path — it would
+    // self-produce a room.create audit row (and its own 0245 outbox row),
+    // which the message-class parity query ignores, but the seam assertions
+    // below are cleaner from a bare fixture. Enforcement stays OFF (fresh-DB
+    // default), so sends commit unconditionally.
+    let ws2 = Uuid::new_v4();
+    let actor2 = Uuid::new_v4();
+    let room2 = Uuid::new_v4();
+    sqlx::query("INSERT INTO participants (id, kind, display_name) VALUES ($1, 'human', $2)")
+        .bind(actor2)
+        .bind(format!("l1-parity-service-{ws2}"))
+        .execute(&pool)
+        .await
+        .context("insert leg-2 participant")?;
+    // Same G-F1 discipline as leg 1: the 0200 deferred owner guard rejects a
+    // raw autocommit workspace birth — wrap workspace + owner edge in one tx.
+    let mut ws2_tx = pool.begin().await.context("begin leg-2 workspace fixture tx")?;
+    sqlx::query(
+        "INSERT INTO workspaces (id, name, slug, created_by, created_at)
+         VALUES ($1, $2, $3, $4, now())",
+    )
+    .bind(ws2)
+    .bind("L1 Parity Service Path WS")
+    .bind(format!("l1-parity-service-{ws2}"))
+    .bind(actor2)
+    .execute(&mut *ws2_tx)
+    .await
+    .context("insert leg-2 workspace")?;
+    sqlx::query(
+        "INSERT INTO workspace_members (workspace_id, participant_id, role, joined_at)
+         VALUES ($1, $2, 'owner', now())",
+    )
+    .bind(ws2)
+    .bind(actor2)
+    .execute(&mut *ws2_tx)
+    .await
+    .context("insert leg-2 workspace owner edge")?;
+    ws2_tx.commit().await.context("commit leg-2 workspace fixture")?;
+    sqlx::query(
+        "INSERT INTO rooms (id, kind, name, created_by, created_at, workspace_id)
+         VALUES ($1, 'group', $2, $3, now(), $4)",
+    )
+    .bind(room2)
+    .bind(format!("l1-parity-service-room-{ws2}"))
+    .bind(actor2)
+    .bind(ws2)
+    .execute(&pool)
+    .await
+    .context("insert leg-2 room")?;
+    sqlx::query(
+        "INSERT INTO room_members (room_id, participant_id, role, joined_at)
+         VALUES ($1, $2, 'owner', now())",
+    )
+    .bind(room2)
+    .bind(actor2)
+    .execute(&pool)
+    .await
+    .context("insert leg-2 room owner edge")?;
+
+    let repo = aero_storage::message::MessageRepo::new(pool.clone());
+    for _ in 0..rows {
+        repo.insert_outboxed(
+            aero_storage::message::NewMessage {
+                room_id: aero_common::RoomId::from_uuid(room2),
+                sender_id: aero_common::ParticipantId::from_uuid(actor2),
+                blocks: vec![aero_common::Block::text("l1-parity-drill")],
+                reply_to: None,
+                metadata: serde_json::Value::Null,
+                expires_at: None,
+            },
+            None,
+            Vec::new(),
+            None,
+        )
+        .await
+        .context("service-path send (S1 message.create seam)")?;
+    }
+    println!(
+        "leg 2: {rows} message.create rows through the real send path (ws2 = {ws2})"
+    );
+
+    let cutoff2 = retention_cutoff_epoch(&pool, retention_days).await?;
+    let (sum2, count2) = parity(&pool, &ws2, cutoff2).await?;
+    if sum2 != count2 {
+        anyhow::bail!(
+            "leg-2 parity broken: SUM(count) = {sum2} != COUNT(mapped audit) = {count2} \
+             — a dropped S1 append or a drifted allowlist"
+        );
+    }
+    if sum2 != rows {
+        anyhow::bail!(
+            "leg 2 must re-balance to SUM = COUNT = {rows}; got {sum2} \
+             (the S1 seam produced fewer audit rows than sends — vacuous-green guard)"
+        );
+    }
+    println!(
+        "leg-2 parity: SUM(count) = {sum2} == COUNT(mapped) = {count2} == {rows} \
+         (rows produced through the real send path)"
+    );
     println!("drill: l1-aggregation-parity: PASS");
     Ok(())
 }
@@ -276,7 +402,7 @@ async fn run() -> anyhow::Result<()> {
 /// `created_at < now - AERO__SERVER__AUDIT_RETENTION_DAYS`, default 365).
 async fn retention_cutoff_epoch(pool: &PgPool, retention_days: i64) -> anyhow::Result<i64> {
     let epoch: f64 = sqlx::query_scalar(
-        "SELECT extract(epoch FROM (now() - make_interval(days => $1)))",
+        "SELECT extract(epoch FROM (now() - make_interval(days => $1::int)))::float8",
     )
     .bind(retention_days)
     .fetch_one(pool)
@@ -299,10 +425,11 @@ async fn parity(pool: &PgPool, ws: &Uuid, cutoff_epoch: i64) -> anyhow::Result<(
             FROM audit_governance_outbox
            WHERE class = 'message'
              AND ((payload->>'aggregated') = 'true' OR (payload->>'spill') = 'true')
+             AND payload->>'aggregate_id' = $1::text
              AND floor(extract(epoch FROM (payload->>'window_start')::timestamptz) / 60) * 60
                  >= $2",
     )
-    .bind(ws.to_string())
+    .bind(*ws)
     .bind(cutoff_epoch)
     .fetch_one(pool)
     .await
@@ -314,7 +441,7 @@ async fn parity(pool: &PgPool, ws: &Uuid, cutoff_epoch: i64) -> anyhow::Result<(
              AND action IN ($2, $3)
              AND floor(extract(epoch FROM created_at) / 60) * 60 >= $4",
     )
-    .bind(ws.to_string())
+    .bind(*ws)
     .bind(LOCAL_ACTION_MESSAGE_CREATE)
     .bind(LOCAL_ACTION_MESSAGE_EDIT)
     .bind(cutoff_epoch)

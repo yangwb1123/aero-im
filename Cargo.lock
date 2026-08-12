@@ -51,6 +51,7 @@ version = "0.1.0"
 dependencies = [
  "aero-auth",
  "aero-common",
+ "aero-storage",
  "anyhow",
  "async-trait",
  "base64",

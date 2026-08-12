@@ -1,6 +1,9 @@
 //! Sender-scoped client-message idempotency and atomic message outbox writes.
 
-use aero_common::{Error, Message, MessageEnvelope, MessageId, ParticipantId, Result, RoomEvent};
+use aero_common::{
+    Error, Message, MessageEnvelope, MessageId, ParticipantId, Result, RoomEvent,
+    LOCAL_ACTION_MESSAGE_CREATE,
+};
 
 use super::{
     MessageIdempotency, MessageInsertOutcome, MessageRepo, NewMessage, OutboxedMessageInsert,
@@ -15,15 +18,14 @@ async fn lock_effective_sender_room_access(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     room: aero_common::RoomId,
     sender: ParticipantId,
-) -> Result<bool> {
-    Ok(super::authorization::lock_effective_message_write_access(
+) -> Result<Option<super::authorization::LockedRoomWriteAccess>, sqlx::Error> {
+    super::authorization::lock_effective_message_write_access(
         tx,
         room,
         sender,
         super::authorization::PostPolicy::Enforce,
     )
-    .await?
-    .is_some())
+    .await
 }
 
 impl MessageRepo {
@@ -97,7 +99,10 @@ impl MessageRepo {
         let sender = new.sender_id;
         let room = new.room_id;
         let mut tx = self.pool.begin().await?;
-        if !lock_effective_sender_room_access(&mut tx, room, sender).await? {
+        if lock_effective_sender_room_access(&mut tx, room, sender)
+            .await?
+            .is_none()
+        {
             tx.rollback().await?;
             return Err(Error::Forbidden(
                 "room access or posting authority was revoked before the message could commit"
@@ -179,13 +184,13 @@ impl MessageRepo {
         let sender = new.sender_id;
         let room = new.room_id;
         let mut tx = self.pool.begin().await?;
-        if !lock_effective_sender_room_access(&mut tx, room, sender).await? {
+        let Some(access) = lock_effective_sender_room_access(&mut tx, room, sender).await? else {
             tx.rollback().await?;
             return Err(Error::Forbidden(
                 "room access or posting authority was revoked before the message could commit"
                     .into(),
             ));
-        }
+        };
         if !Self::lock_reply_parent_in_tx(&mut tx, new.reply_to, room).await? {
             tx.rollback().await?;
             return Err(Error::Invalid(
@@ -227,6 +232,21 @@ impl MessageRepo {
                 MessageSideEffectKind::Embed,
                 MessageSideEffectKind::Moderate,
             ],
+        )
+        .await?;
+
+        // B5-1 S1: the message.create audit row rides this transaction so the
+        // message, its outbox row, and the audit record commit (or roll back)
+        // atomically. The 0242 AFTER INSERT trigger then materializes the L1
+        // governance window/spill row in the same tx. Idempotent replay and
+        // claim-loser rollback below write zero audit rows (no domain change).
+        let _audit_id = crate::audit::AuditRepo::append_in_tx(
+            &mut tx,
+            access.workspace,
+            Some(sender),
+            LOCAL_ACTION_MESSAGE_CREATE,
+            Some(&message.id.to_string()),
+            serde_json::json!({ "room_id": message.room_id }),
         )
         .await?;
 

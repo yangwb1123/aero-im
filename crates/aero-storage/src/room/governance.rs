@@ -1,6 +1,9 @@
 //! Transaction-owned room membership and channel administration.
 
-use aero_common::{ParticipantId, Room, RoomId, RoomKind, WorkspaceId, WorkspaceRole};
+use aero_common::{
+    ParticipantId, Room, RoomId, RoomKind, WorkspaceId, WorkspaceRole, LOCAL_ACTION_ROOM_ARCHIVED,
+    LOCAL_ACTION_ROOM_CREATE,
+};
 
 use super::RoomRepo;
 
@@ -151,6 +154,26 @@ impl RoomRepo {
         .bind(creator.to_uuid())
         .bind(created_at)
         .execute(&mut *tx)
+        .await
+        .map_err(map_storage_error)?;
+        // B5-1 S3: the room.create audit row rides the same transaction as
+        // the room + owner edge. The 0245 AFTER INSERT trigger materializes
+        // the 1:1 class 'room' outbox row in the same tx (commit ⇔ exactly 1
+        // audit row + 1 outbox row). Detail carries only server-derived/
+        // route-validated fields (room_id, kind) — the unvalidated `name`
+        // argument is deliberately excluded (G-SEC2). `RoomKind::Direct` was
+        // rejected above, so DM creation structurally never reaches this seam.
+        crate::audit::AuditRepo::append_in_tx(
+            &mut tx,
+            workspace,
+            Some(creator),
+            LOCAL_ACTION_ROOM_CREATE,
+            Some(&id.to_string()),
+            serde_json::json!({
+                "room_id": id,
+                "kind": super::room_kind_str(kind),
+            }),
+        )
         .await
         .map_err(map_storage_error)?;
         tx.commit().await.map_err(map_storage_error)?;
@@ -409,6 +432,21 @@ impl RoomRepo {
                 .execute(&mut *tx)
                 .await?,
         )?;
+        // B5-1 S4: the room.archived audit row rides the same transaction.
+        // `update_one` guarantees exactly one row was updated, so every
+        // successful archive/unarchive produces exactly one audit row (same
+        // token, `detail.archived` carries the new flag); the 0245 trigger
+        // materializes the 1:1 class 'room' outbox row in the same tx.
+        crate::audit::AuditRepo::append_in_tx(
+            &mut tx,
+            workspace,
+            Some(caller),
+            LOCAL_ACTION_ROOM_ARCHIVED,
+            Some(&room.to_string()),
+            serde_json::json!({ "room_id": room, "archived": archived }),
+        )
+        .await
+        .map_err(map_storage_error)?;
         tx.commit().await?;
         Ok(())
     }

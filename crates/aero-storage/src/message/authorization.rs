@@ -2,7 +2,8 @@
 
 use aero_common::{
     recall_window_expired, Block, Error, Message, MessageEditId, MessageId, ParticipantId,
-    RoomEvent, RoomId, WorkspaceId, LOCAL_ACTION_MESSAGE_RECALLED, RECALLED_MESSAGE_PLACEHOLDER,
+    RoomEvent, RoomId, WorkspaceId, LOCAL_ACTION_MESSAGE_EDIT, LOCAL_ACTION_MESSAGE_RECALLED,
+    RECALLED_MESSAGE_PLACEHOLDER,
 };
 use sqlx::{Postgres, Transaction};
 
@@ -410,14 +411,18 @@ impl MessageRepo {
         else {
             return Ok(None);
         };
-        if lock_effective_message_write_access(&mut tx, resolved_room, actor, PostPolicy::Enforce)
-            .await?
-            .is_none()
-        {
+        let Some(access) = lock_effective_message_write_access(
+            &mut tx,
+            resolved_room,
+            actor,
+            PostPolicy::Enforce,
+        )
+        .await?
+        else {
             return Err(Error::Forbidden(
                 "message edit authority was revoked before commit".into(),
             ));
-        }
+        };
 
         let Some(existing) = Self::lock_message_in_tx(&mut tx, id).await? else {
             return Ok(None);
@@ -441,6 +446,20 @@ impl MessageRepo {
         )
         .await?;
         if edited.is_some() {
+            // B5-1 S2: the message.edit audit row rides the same transaction
+            // as the edit (commit ⇔ exactly 1 audit row + 1 L1 window/spill
+            // outbox row via the 0242 AFTER INSERT trigger). `Ok(None)` paths
+            // (version conflict / deleted / recalled) return before this
+            // append — zero audit rows for no domain change.
+            let _audit_id = crate::audit::AuditRepo::append_in_tx(
+                &mut tx,
+                access.workspace,
+                Some(actor),
+                LOCAL_ACTION_MESSAGE_EDIT,
+                Some(&id.to_string()),
+                serde_json::json!({ "room_id": resolved_room }),
+            )
+            .await?;
             tx.commit().await?;
         }
         Ok(edited)

@@ -12,6 +12,13 @@ workspace = true
 [dependencies]
 aero-common.workspace = true
 aero-auth.workspace = true
+# B5-1 R9 drill leg 2: the `aero-audit-l1-parity-drill` bin drives the REAL
+# `MessageRepo::insert_outboxed` send path (S1 seam). Regular dependency, not
+# dev: the harness runs the drill via `cargo run --bin`, which excludes
+# dev-dependencies (aero-cli precedent: it lives in aero-server, where
+# aero-storage is a regular dep). Acyclic — aero-storage depends only on
+# aero-common + infra.
+aero-storage.workspace = true
 
 jsonwebtoken.workspace = true
 # Stub key material lives in the lib API (`SinkBehavior.signing_key`), so rsa
