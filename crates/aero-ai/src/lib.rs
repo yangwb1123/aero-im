@@ -28,6 +28,9 @@ pub mod transcribe;
 pub mod usage;
 pub mod worker;
 
+#[cfg(test)]
+mod db_tests;
+
 pub use agent::{run_agent_loop, AgentOutcome, AgentTool, ToolChat};
 pub use anthropic::{AgentTurn, AnthropicClient, ChatMsg, ToolDef, ToolUse, Usage};
 pub use budget::{CostBudget, KeyedCostBudget};

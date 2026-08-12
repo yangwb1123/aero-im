@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # B5 acceptance-gate pin material for scripts/test-integration.sh (G6 总装门):
 #
-#   * B5_CONTRACT_TEST_LIST — the 39/39 named contract-test slots (AC1 of
+#   * B5_CONTRACT_TEST_LIST — the 40/40 named contract-test slots (AC1 of
 #     docs/requirements/2026-08-07-aero-cli-b5-acceptance-gate-harness.req.md).
 #     18 in-repo-executable names + 21 out-of-repo slots tagged [PROPOSED]
 #     (docs/proposals/audit-contract-batch-aero-im.md :13 — the v2 contract
@@ -20,7 +20,7 @@
 # Sourced by scripts/test-integration.sh and exercised standalone by
 # scripts/test-b5-pin-guard.sh (pure bash — no database, no services).
 
-# 39 slots: 18 executed + 21 [PROPOSED]. The executed slots' verdict sources:
+# 40 slots: 19 executed + 21 [PROPOSED]. The executed slots' verdict sources:
 #   cargo-test filters (run_migration_regression / run_migrated_integration —
 #   empty-filter guarded, ≥1 test must actually run), 0239-gated B5-1 entries,
 #   the A3 / T-11 / moderation-priority drill sections, the notification
@@ -37,6 +37,7 @@ B5_CONTRACT_TEST_LIST=(
     scim_inactive_first_nil_workspace_member_rolls_back_owner_bootstrap
     audit_governance::
     moderation_finalize_outbox_parity
+    moderation_finalize_drill
     a3-relay-drill
     t11-fail-closed
     moderation-priority-drill
@@ -87,8 +88,8 @@ b5_check() {
 assert_b5_contract_pin() {
     local log_file="$1"
     local count=${#B5_CONTRACT_TEST_LIST[@]}
-    if [ "$count" -ne 39 ]; then
-        echo "✗ B5 contract pin: 39/${count} (expected exactly 39 named slots)" >&2
+    if [ "$count" -ne 40 ]; then
+        echo "✗ B5 contract pin: 40/${count} (expected exactly 40 named slots)" >&2
         return 1
     fi
     local -A seen=()
@@ -130,7 +131,7 @@ assert_b5_contract_pin() {
     else
         echo "B5 pin: verdict evidence degraded (SKIP_DB_CREATE); count/format/dupe/vacuous checks still enforced"
     fi
-    echo "B5 contract pin: 39/39 (${executed} executed, ${proposed} [PROPOSED]): PASS"
+    echo "B5 contract pin: 40/40 (${executed} executed, ${proposed} [PROPOSED]): PASS"
 }
 
 # F4 stub-reachability pin (merged B5-2 design §6 step 7): the test stub

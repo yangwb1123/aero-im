@@ -33,6 +33,7 @@ SCIM_NIL_WORKSPACE_INTEGRATION_DB="aero_scim_nil_workspace_$$"
 AUDIT_CONNECTOR_INTEGRATION_DB="aero_audit_connector_$$"
 AUDIT_GOVERNANCE_INTEGRATION_DB="aero_audit_governance_$$"
 MODERATION_FINALIZE_PARITY_INTEGRATION_DB="aero_moderation_finalize_parity_$$"
+MODERATION_FINALIZE_DRILL_DB="aero_moderation_finalize_drill_$$"
 T11_DRILL_DB="aero_t11_drill_$$"
 PRIORITY_DRILL_DB="aero_priority_drill_$$"
 AUDIT_PROVISION_DB="aero_audit_provision_$$"
@@ -61,6 +62,7 @@ assert_disposable_db_name "SCIM nil-workspace integration database" "$SCIM_NIL_W
 assert_disposable_db_name "audit connector integration database" "$AUDIT_CONNECTOR_INTEGRATION_DB"
 assert_disposable_db_name "audit governance integration database" "$AUDIT_GOVERNANCE_INTEGRATION_DB"
 assert_disposable_db_name "moderation finalize parity integration database" "$MODERATION_FINALIZE_PARITY_INTEGRATION_DB"
+assert_disposable_db_name "moderation finalize drill database" "$MODERATION_FINALIZE_DRILL_DB"
 assert_disposable_db_name "T-11 fail-closed drill database" "$T11_DRILL_DB"
 assert_disposable_db_name "moderation priority drill database" "$PRIORITY_DRILL_DB"
 assert_disposable_db_name "audit provision leg B database" "$AUDIT_PROVISION_DB"
@@ -185,6 +187,7 @@ run_migrated_integration() {
     local database_name="$1"
     local test_name="$2"
     local label="$3"
+    local crate_name="${4:-aero-storage}"
     local integration_url="${BASE_URL}/${database_name}"
     local test_output=""
 
@@ -197,7 +200,7 @@ run_migrated_integration() {
     echo "▶ Running ${label}..."
     if test_output=$(DATABASE_URL="$integration_url" \
             AERO__DATABASE__URL="$integration_url" \
-            cargo test -p aero-storage --lib --locked \
+            cargo test -p "$crate_name" --lib --locked \
                 "$test_name" -- --ignored --test-threads=1 2>&1); then
         :
     else
@@ -327,10 +330,16 @@ if [ -z "$SKIP_DB_CREATE" ]; then
             "$MODERATION_FINALIZE_PARITY_INTEGRATION_DB" \
             "moderation_finalize_outbox_parity" \
             "moderation finalize outbox parity"
+        run_migrated_integration \
+            "$MODERATION_FINALIZE_DRILL_DB" \
+            "moderation_finalize_drill" \
+            "ai-worker moderation finalize drill db_tests" \
+            "aero-ai"
     else
         echo "▶ Skipping B5-1 governance entries: migrations/0239_audit_governance_outbox.sql (B5-1 storage slice) has not landed"
         b5_check "audit_governance::" "SKIP (0239 not landed)"
         b5_check "moderation_finalize_outbox_parity" "SKIP (0239 not landed)"
+        b5_check "moderation_finalize_drill" "SKIP (0239 not landed)"
     fi
     # A3 relay drill (B5-2): throwaway DB → migrate → seed N governance rows →
     # run the connector relay against a stub audit sink → assert
@@ -704,11 +713,13 @@ echo "✓ Migrations applied"
 # Step 4: Run the remaining integration tests. Self-migrating regressions
 # are always excluded here because this database is deliberately non-empty;
 # the aero-im-core `db_tests::notifications_tests`/`relay_tests` and B5
-# `audit_governance::` + `db_tests::governance_drill_tests` suites are
+# `audit_governance::` + `db_tests::governance_drill_tests` +
+# `db_tests::moderation_finalize_drill_tests` suites are
 # excluded because each runs on its OWN fresh throwaway DB (the
 # notification fan-out step above runs the whole aero-im-core `db_tests::`
-# module; the B5-1 named slot runs `audit_governance::`). The last two are
-# additionally load-bearing on the shared main DB: both flip the GLOBAL
+# module; the B5-1 named slots run `audit_governance::` and the aero-ai
+# moderation-finalize drill). The last three are
+# additionally load-bearing on the shared main DB: all flip the GLOBAL
 # `snaplink_commercial_runtime.enabled` singleton (aero-im-core drills hold
 # it ON through 1.2 s sleeps) and TRUNCATE `audit_governance_outbox` — with
 # the aero-storage and aero-im-core binaries running CONCURRENTLY on the one
@@ -740,6 +751,7 @@ cargo test --workspace --lib --locked --jobs 1 -- \
     --skip scim_inactive_first_nil_workspace_member_rolls_back_owner_bootstrap \
     --skip audit_governance \
     --skip db_tests::governance_drill_tests \
+    --skip db_tests::moderation_finalize_drill_tests \
     --skip db_tests::notifications_tests \
     --skip db_tests::relay_tests
 TEST_EXIT=$?

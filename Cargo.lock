@@ -22,6 +22,7 @@ dependencies = [
 name = "aero-ai"
 version = "0.1.0"
 dependencies = [
+ "aero-audit-connector",
  "aero-bus",
  "aero-common",
  "aero-storage",

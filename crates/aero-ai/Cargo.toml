@@ -40,4 +40,8 @@ uuid.workspace = true
 
 [dev-dependencies]
 pretty_assertions.workspace = true
-tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "net", "io-util", "time"] }
+# Drill-only: `PgOutboxRepo`/`OutboxRepo` for the admin-lane claim parity
+# assert (connector depends only on aero-common + aero-auth — no cycle;
+# im-core's governance drill suite is the precedent).
+aero-audit-connector.workspace = true
