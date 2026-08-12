@@ -318,3 +318,29 @@ for _ in 0..rows {
 - **窗口跨越**：`_send_merge` 精确断言 1 window 行 count=2——毫秒级间隔对 60s 窗，实际不可达；万一红可重试（SUM 守恒断言始终成立）。
 - **并行批次协调**：仓内 in-flight aero-ai db_tests 拆批（untracked）与 aero-storage 拆分**不相交**；集成时 `git reset --hard master` 校准基线 + 手接共享文件（AGENTS §4.1）；最终全量门禁会同时验两批。
 - **仓外 "37/37" 文本**：不变更、不重议（E6）；本批只钉仓内子集（命名槽位 + drill）。
+
+---
+
+## 8. design-resolved（design_gate VERDICT: FAIL 后修正，2026-08-12；与 run artifact §7 一致）
+
+设计门（design_gate）以 FAIL 拦下，四个阻塞点逐条在仓内实证并修正如下，全部并入实施范围：
+
+1. **G-F1（HIGH，已实证）**：`aero-audit-l1-parity-drill` leg-1 fixture 裸 `INSERT INTO workspaces`
+   无 `workspace_members` 行，被 0200 `workspace_birth_owner_commit_guard`（DEFERRABLE INITIALLY
+   DEFERRED，AFTER INSERT ON workspaces，commit 时 RAISE 23514）拦下——一次性库复现
+   `Error: insert drill workspace … must retain at least one effective non-guest owner before commit`，
+   harness `l1-aggregation-drill` 槽今日即红。修正：**leg-1 fixture 增加 owner 边**
+   （workspaces INSERT 后同风格 `INSERT INTO workspace_members (workspace_id, participant_id, role, joined_at)
+   VALUES ($1, $2, 'owner', now())`；schema 见 0006:38-45）。「leg 1 逐字节不变」冻结仅为此一行解除。
+2. **G-F2（HIGH，代码检视）**：`parity()` SUM 查询文本只引用 `$2`，首个 `.bind(ws)` 是死绑定 →
+   SUM 跨 workspace 全局、COUNT 按 ws 收口。0242 已把 `aggregate_id` 写入 window/spill envelope，
+   修正为 SUM WHERE 增 `AND payload->>'aggregate_id' = $1`，使 ws 绑定生效。leg 2 复用**修正后**的
+   ws 作用域 `parity()`（非逐字复用）。
+3. **G-R1（结构）**：producer 测试改放 `audit_governance/db_tests/producer.rs`（`mod db_tests` 内部，
+   `use super::*;` 可达私有 helper；兄弟模块不可达）；测试计数 15→**16**（lanes 域补
+   `room_lane_never_merged_into_l1_window` :2463）。
+4. **G-SEC**：新增三个边界钉测试（`…_integration_notification_carved_out` / `…_message_deleted_unmapped` /
+   `…_dm_create_carved_out`），钉 audited-but-unmapped 契约（R-D2 + 0245 header）与 F-2 DM 出范围裁决；
+   S3 room.create audit detail **去掉未校验的 `"name"`**（payload 仅 `room_id` + `kind`）。
+
+实施顺序并入 §6：R1 拆模块 → 前置 drill 补丁（G-F1/G-F2，throwaway 库重跑 drill 绿）→ R2+S1 → S2 → S3+S4 → R8（含 G-SEC 钉）→ R9 leg 2 → 全链门禁。
