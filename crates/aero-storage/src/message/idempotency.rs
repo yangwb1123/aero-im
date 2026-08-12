@@ -1,4 +1,12 @@
 //! Sender-scoped client-message idempotency and atomic message outbox writes.
+//!
+//! **B5-1 latent audit-boundary tripwires (D-5):** `insert_idempotent`
+//! (this file), `MessageRepo::insert` (`message/crud.rs`), and
+//! `RoomRepo::create` / `RoomRepo::create_in_workspace` (`room.rs`) have
+//! ZERO production callers today (test-only). If any is ever wired to a
+//! production path it MUST append the corresponding `LOCAL_ACTION_*` audit
+//! row in-tx (the B5-1 R2 helper change already covers `insert_idempotent`'s
+//! `lock_effective_sender_room_access` call site).
 
 use aero_common::{
     Error, Message, MessageEnvelope, MessageId, ParticipantId, Result, RoomEvent,
