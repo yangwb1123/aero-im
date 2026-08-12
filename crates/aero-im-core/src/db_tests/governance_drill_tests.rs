@@ -159,6 +159,32 @@ async fn seed_governance_enforcement(pool: &PgPool, ws: WorkspaceId) -> String {
     source
 }
 
+/// Scrub the B5-1 producer-seam rows the drills' own setup produces: the
+/// write paths now append `message.create` / `room.create` audit rows whose
+/// AFTER INSERT triggers (0242 / 0245) enqueue class-'message' / class-'room'
+/// outbox rows in the SAME tx (priority 10). The drills scope to the
+/// MODERATION lane (class 'admin', priority 100) — every whole-table count /
+/// claim assertion (R3 set-parity, R5–R8 exact claims, R9 zero-governance
+/// refusal, R11–R14 crash-window single-row claims) assumes the outbox holds
+/// only the drill's moderation rows. Run right after write-path setup, before
+/// any assertion; the moderation rows are untouched. The 0241 reconciler is
+/// `message.moderated`-token-keyed only, so the scrubbed-out seam audit rows
+/// are never backfilled.
+async fn scrub_seam_rows(pool: &PgPool) {
+    sqlx::query("DELETE FROM audit_governance_outbox WHERE class <> 'admin'")
+        .execute(pool)
+        .await
+        .expect("scrub seam-produced outbox rows");
+    sqlx::query(
+        "DELETE FROM audit_events
+          WHERE action IN ('room.create', 'room.archived')
+            AND workspace_id IS NOT NULL",
+    )
+    .execute(pool)
+    .await
+    .expect("scrub seam-produced room audit rows");
+}
+
 /// Restore the fresh-DB default (`enabled = FALSE`, 0235) after a drill that
 /// flipped the global singleton on — a drill that leaves it ON makes every
 /// later message INSERT in the shared DB raise P0001 (0235 metering).
@@ -254,6 +280,10 @@ async fn write_path_rows(
         event_ids.push(moderated_row(pool, svc, ws, msg.id).await);
         message_ids.push(msg.id);
     }
+    // The seam's own room.create / message.create outbox rows (0245 / 0242)
+    // ride the same write-path txs — scrub them so the outbox holds exactly
+    // the moderation rows every drill count/claim asserts against.
+    scrub_seam_rows(pool).await;
     DrillRows {
         ws,
         source,

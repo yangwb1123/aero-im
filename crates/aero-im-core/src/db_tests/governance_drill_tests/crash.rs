@@ -44,6 +44,12 @@ async fn drill_moderate_delete_none_workspace_refuses_like_rd1() {
         .expect("send message")
         .id;
 
+    // The seam's own room.create + message.create rows (0245/0242) are
+    // enqueued by this setup — scrub them so the refusal half below can
+    // assert a pristine zero-governance table (the drill scopes to the
+    // moderation lane).
+    scrub_seam_rows(&pool).await;
+
     // Refusal half (enforcement OFF ⇒ only the R-D1 guard can reject).
     let err = svc
         .moderate_delete(msg, None, "drill", "drill-digest")
