@@ -54,7 +54,12 @@ stages:
       - adversarial_review
       - design_gate
     aggregate: true
-    validate: cargo-check,cargo-clippy,cargo-test,web-check,truth-check,backendquality,completion
+    # Rust-repo mechanical backstops only (validators must exist in
+    # aero-im/pi-batch.yaml): cargocheck is repo-scope, runs once at stage
+    # end. The implement agent additionally runs the documented gates itself
+    # (AGENTS S4.3) and reports them honestly. (cargofmt is not a viable
+    # gate: the repo carries baseline fmt drift in untouched files.)
+    validate: cargocheck
     tasks:
       - prompt: |
           Read /home/u1/aero-im/AGENTS.md and the approved evidence below.

@@ -30,7 +30,7 @@
 use std::collections::HashSet;
 
 use aero_audit_connector::{outbox::OutboxRepo, pg::PgOutboxRepo};
-use aero_common::{AuditId, LOCAL_ACTION_MODERATED, MODERATION_OUTBOUND_ACTION, WorkspaceId};
+use aero_common::{AuditId, WorkspaceId, LOCAL_ACTION_MODERATED, MODERATION_OUTBOUND_ACTION};
 use aero_storage::{AiJob, AiJobKind, AiJobRepo, AiJobStatus};
 use sqlx::postgres::PgPoolOptions;
 
@@ -72,13 +72,19 @@ async fn drill_moderation_finalize_commits_atomically() {
         .fetch_one(&pool)
         .await
         .expect("job priority row");
-    assert_eq!(priority, 10, "priority_for(Moderate)=10 (ASC lower-first lane)");
+    assert_eq!(
+        priority, 10,
+        "priority_for(Moderate)=10 (ASC lower-first lane)"
+    );
 
     // 2. Claim — identity assert: a foreign queued job (crashed prior run)
     //    must fail loudly here, not skew the drill.
     let claimed = jobs.claim(1).await.expect("claim moderation job");
     assert_eq!(claimed.len(), 1, "exactly one job claimed");
-    assert_eq!(claimed[0].id, job_id, "claimed job identity == enqueued job");
+    assert_eq!(
+        claimed[0].id, job_id,
+        "claimed job identity == enqueued job"
+    );
     assert_eq!(claimed[0].attempts, 1, "attempts incremented to 1");
     assert_eq!(claimed[0].status, AiJobStatus::Running, "claimed → running");
 
@@ -128,8 +134,14 @@ async fn drill_moderation_finalize_commits_atomically() {
     assert!(deleted_at.is_some(), "deleted_at set");
     assert_eq!(blocks, serde_json::json!([]), "blocks emptied");
     assert_eq!(version, 2, "version bumped 1 → 2 and stays 2 after replay");
-    assert!(embedding_null, "embedding nulled from the pre-seeded vector");
-    assert_eq!(searchable_text, "", "searchable_text emptied from pre-seeded text");
+    assert!(
+        embedding_null,
+        "embedding nulled from the pre-seeded vector"
+    );
+    assert_eq!(
+        searchable_text, "",
+        "searchable_text emptied from pre-seeded text"
+    );
 
     let (audit_id, actor_id, detail): (uuid::Uuid, Option<uuid::Uuid>, serde_json::Value) =
         sqlx::query_as(
@@ -143,7 +155,10 @@ async fn drill_moderation_finalize_commits_atomically() {
         .fetch_one(&mut *tx)
         .await
         .expect("exactly one audit row (replay did not double-append)");
-    assert!(actor_id.is_none(), "system actor (worker passes audit_actor = None)");
+    assert!(
+        actor_id.is_none(),
+        "system actor (worker passes audit_actor = None)"
+    );
     assert_eq!(detail["reason"], "drill-reason");
     assert_eq!(detail["source"], "ai_worker");
 
@@ -166,8 +181,7 @@ async fn drill_moderation_finalize_commits_atomically() {
     assert_eq!(outbox_priority, 100, "GOVERNANCE_PRIORITY_MODERATION");
     assert_eq!(delivery_mode, "push", "0239 delivery_mode default");
     assert_eq!(
-        payload["action"],
-        MODERATION_OUTBOUND_ACTION,
+        payload["action"], MODERATION_OUTBOUND_ACTION,
         "outbound action asserted via the leaf const, never a literal"
     );
     assert_eq!(payload["event_id"], audit_id.to_string());
@@ -342,14 +356,19 @@ async fn drill_moderation_lane_preempts_backlog_claim() {
         .await
         .expect("second claim");
     let second_set: HashSet<AuditId> = second.iter().map(|c| c.event_id).collect();
-    let expected: HashSet<AuditId> =
-        backlog_ids.iter().map(|&id| AuditId::from_uuid(id)).collect();
+    let expected: HashSet<AuditId> = backlog_ids
+        .iter()
+        .map(|&id| AuditId::from_uuid(id))
+        .collect();
     assert_eq!(
         second.len(),
         BACKLOG_SEED_COUNT,
         "second claim drains exactly the {BACKLOG_SEED_COUNT} backlog rows"
     );
-    assert_eq!(second_set, expected, "set-parity with the seeded backlog set");
+    assert_eq!(
+        second_set, expected,
+        "set-parity with the seeded backlog set"
+    );
     assert!(
         !second_set.contains(&AuditId::from_uuid(admin_id)),
         "admin row excluded by the pinned 3600s lease"
@@ -412,7 +431,10 @@ async fn drill_moderation_finalize_abort_leaves_zero_rows() {
     .fetch_one(&pool)
     .await
     .expect("binding count");
-    assert_eq!(binding_count, 0, "pre-state: workspace has no enabled binding");
+    assert_eq!(
+        binding_count, 0,
+        "pre-state: workspace has no enabled binding"
+    );
     // Gate 1 only: runtime singleton ON, binding absent → Gate 2 fail-closed.
     sqlx::query(
         "UPDATE snaplink_commercial_runtime
@@ -457,16 +479,17 @@ async fn drill_moderation_finalize_abort_leaves_zero_rows() {
 
     // Zero durable artifacts — the whole single tx rolled back.
     let (deleted_at, version, searchable_text): (Option<time::OffsetDateTime>, i32, String) =
-        sqlx::query_as(
-            "SELECT deleted_at, version, searchable_text FROM messages WHERE id = $1",
-        )
-        .bind(fx.msg.to_uuid())
-        .fetch_one(&pool)
-        .await
-        .expect("message row");
+        sqlx::query_as("SELECT deleted_at, version, searchable_text FROM messages WHERE id = $1")
+            .bind(fx.msg.to_uuid())
+            .fetch_one(&pool)
+            .await
+            .expect("message row");
     assert!(deleted_at.is_none(), "message still visible");
     assert_eq!(version, 1, "version untouched");
-    assert_eq!(searchable_text, "pre-drill visible text", "searchable_text untouched");
+    assert_eq!(
+        searchable_text, "pre-drill visible text",
+        "searchable_text untouched"
+    );
     let (audit_count,): (i64,) = sqlx::query_as(
         "SELECT count(*) FROM audit_events
           WHERE action = $1 AND target = $2::text",
@@ -645,7 +668,9 @@ async fn drill_moderation_block_without_target_id_noop() {
     // The warn! branch fires and falls through to the same result builder —
     // no delete, no audit, no outbox; pinned by the absence of any DB
     // interaction (lazy pool never connects).
-    let result = run_processed(&worker, job).await.expect("warn + Ok, no delete");
+    let result = run_processed(&worker, job)
+        .await
+        .expect("warn + Ok, no delete");
     assert_eq!(result["verdict"], "block");
     assert!(result["reason"].is_string());
 }

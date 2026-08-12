@@ -70,14 +70,13 @@ async fn window_key_for(
     ws: WorkspaceId,
     created_at: time::OffsetDateTime,
 ) -> uuid::Uuid {
-    let window_epoch: i64 = sqlx::query_scalar(
-        "SELECT floor(extract(epoch FROM $1::timestamptz) / $2)::bigint",
-    )
-    .bind(created_at)
-    .bind(L1_WINDOW_SECONDS)
-    .fetch_one(p)
-    .await
-    .expect("window epoch");
+    let window_epoch: i64 =
+        sqlx::query_scalar("SELECT floor(extract(epoch FROM $1::timestamptz) / $2)::bigint")
+            .bind(created_at)
+            .bind(L1_WINDOW_SECONDS)
+            .fetch_one(p)
+            .await
+            .expect("window epoch");
     sqlx::query_scalar("SELECT md5($1)::uuid")
         .bind(format!(
             "{}|{}|{}",
@@ -129,18 +128,25 @@ async fn moderation_finalize_outbox_parity_send() {
     // Exactly 1 message-class window row (0242): aggregated, count 1, class
     // message, priority 10, status 0, attempts 0, last_error NULL, T-11
     // claim predicate selects it.
-    let window: (uuid::Uuid, String, i16, i32, i64, Option<String>, serde_json::Value) =
-        sqlx::query_as(
-            "SELECT event_id, class, priority, status, attempts, last_error, payload
+    let window: (
+        uuid::Uuid,
+        String,
+        i16,
+        i32,
+        i64,
+        Option<String>,
+        serde_json::Value,
+    ) = sqlx::query_as(
+        "SELECT event_id, class, priority, status, attempts, last_error, payload
                FROM audit_governance_outbox
               WHERE payload->>'aggregate_id' = $1
                 AND class = 'message'
                 AND (payload->>'aggregated') = 'true'",
-        )
-        .bind(ws.to_uuid().to_string())
-        .fetch_one(&p)
-        .await
-        .expect("one window row for the send");
+    )
+    .bind(ws.to_uuid().to_string())
+    .fetch_one(&p)
+    .await
+    .expect("one window row for the send");
     assert_eq!(window.1, GOVERNANCE_CLASS_MESSAGE, "class message");
     assert_eq!(window.2, 10, "priority 10 = GOVERNANCE_PRIORITY_BACKLOG");
     assert_eq!(window.3, 0, "status 0 (pending, T-11 shape)");
@@ -152,7 +158,10 @@ async fn moderation_finalize_outbox_parity_send() {
         "window count 1"
     );
     assert_eq!(
-        window.6.get("aggregated").and_then(serde_json::Value::as_bool),
+        window
+            .6
+            .get("aggregated")
+            .and_then(serde_json::Value::as_bool),
         Some(true)
     );
     assert_eq!(
@@ -161,7 +170,10 @@ async fn moderation_finalize_outbox_parity_send() {
         "envelope action = message.batch"
     );
     assert_eq!(
-        window.6.get("source_system").and_then(serde_json::Value::as_str),
+        window
+            .6
+            .get("source_system")
+            .and_then(serde_json::Value::as_str),
         Some(AUDIT_SOURCE_SYSTEM),
         "source_system written by the trigger"
     );
@@ -182,13 +194,11 @@ async fn moderation_finalize_outbox_parity_send() {
     assert!(claimable, "the window row is claimable (T-11 shape)");
 
     // 1 event_outbox row for the message.
-    let outbox: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM event_outbox WHERE message_id = $1",
-    )
-    .bind(message.id.to_uuid())
-    .fetch_one(&p)
-    .await
-    .expect("event_outbox count");
+    let outbox: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM event_outbox WHERE message_id = $1")
+        .bind(message.id.to_uuid())
+        .fetch_one(&p)
+        .await
+        .expect("event_outbox count");
     assert_eq!(outbox, 1, "one event_outbox row per send");
 }
 
@@ -251,7 +261,11 @@ async fn moderation_finalize_outbox_parity_send_merge() {
     .fetch_one(&p)
     .await
     .expect("window row for the recomputed key");
-    assert_eq!((count, status), (2, 0), "exactly 1 window row, count merged to 2");
+    assert_eq!(
+        (count, status),
+        (2, 0),
+        "exactly 1 window row, count merged to 2"
+    );
 
     // SUM conservation over the ws message-class rows always holds.
     let sum: i64 = sqlx::query_scalar(
@@ -300,15 +314,19 @@ async fn moderation_finalize_outbox_parity_send_replay() {
         .expect("replay resolves the canonical message");
     assert_eq!(first.message().id, replay.message().id);
 
-    let message_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM messages WHERE room_id = $1",
-    )
-    .bind(room.to_uuid())
-    .fetch_one(&p)
-    .await
-    .expect("message count");
-    let audit_count = audit_rows_for(&p, ws, LOCAL_ACTION_MESSAGE_CREATE).await.len();
-    assert_eq!((message_count, audit_count), (1, 1), "replay is a zero-write no-op");
+    let message_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE room_id = $1")
+        .bind(room.to_uuid())
+        .fetch_one(&p)
+        .await
+        .expect("message count");
+    let audit_count = audit_rows_for(&p, ws, LOCAL_ACTION_MESSAGE_CREATE)
+        .await
+        .len();
+    assert_eq!(
+        (message_count, audit_count),
+        (1, 1),
+        "replay is a zero-write no-op"
+    );
     let sum: i64 = sqlx::query_scalar(
         "SELECT COALESCE(SUM((payload->>'count')::bigint), 0)::bigint
            FROM audit_governance_outbox
@@ -352,27 +370,23 @@ async fn moderation_finalize_outbox_parity_send_rollback() {
     // before the audit append; 0236 would raise at the append — same outcome).
     assert!(matches!(err, aero_common::Error::Upstream(_)));
 
-    let message_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM messages WHERE room_id = $1",
-    )
-    .bind(room.to_uuid())
-    .fetch_one(&p)
-    .await
-    .expect("message count");
-    let outbox_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM event_outbox WHERE subject = $1",
-    )
-    .bind(format!("im.room.{room}"))
-    .fetch_one(&p)
-    .await
-    .expect("event_outbox count");
-    let audit_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM audit_events WHERE workspace_id = $1",
-    )
-    .bind(ws.to_uuid())
-    .fetch_one(&p)
-    .await
-    .expect("audit count");
+    let message_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE room_id = $1")
+        .bind(room.to_uuid())
+        .fetch_one(&p)
+        .await
+        .expect("message count");
+    let outbox_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM event_outbox WHERE subject = $1")
+            .bind(format!("im.room.{room}"))
+            .fetch_one(&p)
+            .await
+            .expect("event_outbox count");
+    let audit_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM audit_events WHERE workspace_id = $1")
+            .bind(ws.to_uuid())
+            .fetch_one(&p)
+            .await
+            .expect("audit count");
     let governance_count = governance_rows_for(&p, ws).await;
     assert_eq!(
         (message_count, outbox_count, audit_count, governance_count),
@@ -458,7 +472,9 @@ async fn moderation_finalize_outbox_parity_edit() {
         .await
         .expect_err("stale edit is rejected by the version fence");
     assert!(matches!(conflict, aero_common::Error::Conflict(_)));
-    let edit_rows_after = audit_rows_for(&p, ws, LOCAL_ACTION_MESSAGE_EDIT).await.len();
+    let edit_rows_after = audit_rows_for(&p, ws, LOCAL_ACTION_MESSAGE_EDIT)
+        .await
+        .len();
     assert_eq!(edit_rows_after, 1, "no audit row for a rejected edit");
 }
 
@@ -474,7 +490,12 @@ async fn moderation_finalize_outbox_parity_room_create() {
     let (ws, actor) = fixture(&p).await;
     let repo = crate::room::RoomRepo::new(p.clone());
     let room = repo
-        .create_in_workspace_authorized(ws, RoomKind::Channel, Some("audited channel".into()), actor)
+        .create_in_workspace_authorized(
+            ws,
+            RoomKind::Channel,
+            Some("audited channel".into()),
+            actor,
+        )
         .await
         .expect("room.create commits");
 
@@ -528,7 +549,9 @@ async fn moderation_finalize_outbox_parity_room_create() {
         "envelope event_id"
     );
     assert_eq!(
-        payload.get("idempotency_key").and_then(serde_json::Value::as_str),
+        payload
+            .get("idempotency_key")
+            .and_then(serde_json::Value::as_str),
         Some(audit_id.to_string().as_str()),
         "idempotency_key == event_id"
     );
@@ -585,7 +608,11 @@ async fn moderation_finalize_outbox_parity_room_archive() {
     .fetch_all(&p)
     .await
     .expect("archive flags");
-    assert_eq!(archived, vec![true, false], "detail.archived carries the new flag");
+    assert_eq!(
+        archived,
+        vec![true, false],
+        "detail.archived carries the new flag"
+    );
 
     let governance: i64 = sqlx::query_scalar(
         "SELECT COUNT(*)::bigint FROM audit_governance_outbox
@@ -636,13 +663,11 @@ async fn moderation_finalize_outbox_parity_room_create_rollback() {
         "the 0236 audit-channel RAISE constraint surfaces"
     );
 
-    let rooms: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM rooms WHERE workspace_id = $1",
-    )
-    .bind(ws.to_uuid())
-    .fetch_one(&p)
-    .await
-    .expect("rooms count");
+    let rooms: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rooms WHERE workspace_id = $1")
+        .bind(ws.to_uuid())
+        .fetch_one(&p)
+        .await
+        .expect("rooms count");
     let members: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM room_members rm
           JOIN rooms r ON r.id = rm.room_id
@@ -652,13 +677,12 @@ async fn moderation_finalize_outbox_parity_room_create_rollback() {
     .fetch_one(&p)
     .await
     .expect("room_members count");
-    let audit: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM audit_events WHERE workspace_id = $1",
-    )
-    .bind(ws.to_uuid())
-    .fetch_one(&p)
-    .await
-    .expect("audit count");
+    let audit: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM audit_events WHERE workspace_id = $1")
+            .bind(ws.to_uuid())
+            .fetch_one(&p)
+            .await
+            .expect("audit count");
     let governance = governance_rows_for(&p, ws).await;
     assert_eq!(
         (rooms, members, audit, governance),
@@ -730,7 +754,10 @@ async fn moderation_finalize_outbox_parity_integration_notification_carved_out()
         })
         .await
         .expect("publish commits");
-    assert_eq!(published.message.room_id, room, "publish created the message in the target room");
+    assert_eq!(
+        published.message.room_id, room,
+        "publish created the message in the target room"
+    );
 
     // Exactly 1 audit row, actor NULL (machine actor), zero outbox rows.
     let audit_count: i64 = sqlx::query_scalar(
@@ -754,7 +781,10 @@ async fn moderation_finalize_outbox_parity_integration_notification_carved_out()
     .expect("actor null probe");
     assert!(actor_null, "integration audit actor is NULL (machine path)");
     let governance = governance_rows_for(&p, ws).await;
-    assert_eq!(governance, 0, "integration.notification.published is carved out of the governance outbox");
+    assert_eq!(
+        governance, 0,
+        "integration.notification.published is carved out of the governance outbox"
+    );
 }
 
 /// `message.deleted` is audited in-tx but R-D2-unmapped: the audit row is
@@ -792,7 +822,10 @@ async fn moderation_finalize_outbox_parity_message_deleted_unmapped() {
     let deleted_rows = audit_rows_for(&p, ws, "message.deleted").await;
     assert_eq!(deleted_rows.len(), 1, "message.deleted is audited in-tx");
     let after = governance_rows_for(&p, ws).await;
-    assert_eq!(after, 1, "no outbox row for message.deleted (R-D2 unmapped)");
+    assert_eq!(
+        after, 1,
+        "no outbox row for message.deleted (R-D2 unmapped)"
+    );
     let deleted_outbox: i64 = sqlx::query_scalar(
         "SELECT COUNT(*)::bigint FROM audit_governance_outbox
           WHERE payload->>'aggregate_id' = $1 AND payload->>'action' = 'message.deleted'",
@@ -801,7 +834,10 @@ async fn moderation_finalize_outbox_parity_message_deleted_unmapped() {
     .fetch_one(&p)
     .await
     .expect("deleted outbox count");
-    assert_eq!(deleted_outbox, 0, "no 1:1 row carries the message.deleted action");
+    assert_eq!(
+        deleted_outbox, 0,
+        "no 1:1 row carries the message.deleted action"
+    );
 }
 
 /// DM creation is structurally carved out: `create_in_workspace_authorized`
@@ -822,20 +858,17 @@ async fn moderation_finalize_outbox_parity_dm_create_carved_out() {
         err,
         crate::room::RoomMembershipWriteError::FixedMembership
     ));
-    let rooms: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM rooms WHERE workspace_id = $1",
-    )
-    .bind(ws.to_uuid())
-    .fetch_one(&p)
-    .await
-    .expect("rooms count");
-    let audit: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM audit_events WHERE workspace_id = $1",
-    )
-    .bind(ws.to_uuid())
-    .fetch_one(&p)
-    .await
-    .expect("audit count");
+    let rooms: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rooms WHERE workspace_id = $1")
+        .bind(ws.to_uuid())
+        .fetch_one(&p)
+        .await
+        .expect("rooms count");
+    let audit: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM audit_events WHERE workspace_id = $1")
+            .bind(ws.to_uuid())
+            .fetch_one(&p)
+            .await
+            .expect("audit count");
     let governance = governance_rows_for(&p, ws).await;
     assert_eq!(
         (rooms, audit, governance),

@@ -22,8 +22,7 @@ use std::sync::{Arc, Mutex};
 
 use aero_common::{Block, MessageId, ParticipantId, RoomKind, WorkspaceId};
 use aero_storage::{
-    db::PgPool, AiJob, AiJobRepo, MessageRepo, NewMessage, ParticipantRepo, RoomRepo,
-    WorkspaceRepo,
+    db::PgPool, AiJob, AiJobRepo, MessageRepo, NewMessage, ParticipantRepo, RoomRepo, WorkspaceRepo,
 };
 use sqlx::postgres::PgPoolOptions;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -35,8 +34,7 @@ use crate::error::{AiError, Result};
 use crate::service::AiService;
 use crate::transcribe::default_transcriber;
 use crate::usage::{
-    UsageEvent, UsageOutcome, UsagePersistOutcome, UsageReservation, UsageReserveOutcome,
-    UsageSink,
+    UsageEvent, UsageOutcome, UsagePersistOutcome, UsageReservation, UsageReserveOutcome, UsageSink,
 };
 use crate::worker::{AiWorker, JobProcessor};
 

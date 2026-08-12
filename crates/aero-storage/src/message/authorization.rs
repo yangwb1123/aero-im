@@ -411,13 +411,9 @@ impl MessageRepo {
         else {
             return Ok(None);
         };
-        let Some(access) = lock_effective_message_write_access(
-            &mut tx,
-            resolved_room,
-            actor,
-            PostPolicy::Enforce,
-        )
-        .await?
+        let Some(access) =
+            lock_effective_message_write_access(&mut tx, resolved_room, actor, PostPolicy::Enforce)
+                .await?
         else {
             return Err(Error::Forbidden(
                 "message edit authority was revoked before commit".into(),

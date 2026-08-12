@@ -155,12 +155,17 @@ async fn run() -> anyhow::Result<()> {
     .execute(&mut *ws_tx)
     .await
     .context("insert drill workspace owner edge")?;
-    ws_tx.commit().await.context("commit drill workspace fixture")?;
+    ws_tx
+        .commit()
+        .await
+        .context("commit drill workspace fixture")?;
 
     // Fixed created_at captured ONCE: every seeded row lands in the SAME
     // window (single clock domain, server-stamped semantics).
-    let fixed_ts: time::OffsetDateTime =
-        sqlx::query_scalar("SELECT now()").fetch_one(&pool).await.context("capture fixed ts")?;
+    let fixed_ts: time::OffsetDateTime = sqlx::query_scalar("SELECT now()")
+        .fetch_one(&pool)
+        .await
+        .context("capture fixed ts")?;
 
     // --- Self-seed through the trigger (non-vacuity) ---
     for _ in 0..rows {
@@ -269,9 +274,7 @@ async fn run() -> anyhow::Result<()> {
         || spill_payload["source_system"] != AUDIT_SOURCE_SYSTEM
         || spill_payload["action"] != AGGREGATED_MESSAGE_ACTION
     {
-        anyhow::bail!(
-            "spill row payload drifted: {spill_payload:?}"
-        );
+        anyhow::bail!("spill row payload drifted: {spill_payload:?}");
     }
 
     let (sum, count) = parity(&pool, &ws, cutoff_epoch).await?;
@@ -309,7 +312,10 @@ async fn run() -> anyhow::Result<()> {
         .context("insert leg-2 participant")?;
     // Same G-F1 discipline as leg 1: the 0200 deferred owner guard rejects a
     // raw autocommit workspace birth — wrap workspace + owner edge in one tx.
-    let mut ws2_tx = pool.begin().await.context("begin leg-2 workspace fixture tx")?;
+    let mut ws2_tx = pool
+        .begin()
+        .await
+        .context("begin leg-2 workspace fixture tx")?;
     sqlx::query(
         "INSERT INTO workspaces (id, name, slug, created_by, created_at)
          VALUES ($1, $2, $3, $4, now())",
@@ -330,7 +336,10 @@ async fn run() -> anyhow::Result<()> {
     .execute(&mut *ws2_tx)
     .await
     .context("insert leg-2 workspace owner edge")?;
-    ws2_tx.commit().await.context("commit leg-2 workspace fixture")?;
+    ws2_tx
+        .commit()
+        .await
+        .context("commit leg-2 workspace fixture")?;
     sqlx::query(
         "INSERT INTO rooms (id, kind, name, created_by, created_at, workspace_id)
          VALUES ($1, 'group', $2, $3, now(), $4)",
@@ -370,9 +379,7 @@ async fn run() -> anyhow::Result<()> {
         .await
         .context("service-path send (S1 message.create seam)")?;
     }
-    println!(
-        "leg 2: {rows} message.create rows through the real send path (ws2 = {ws2})"
-    );
+    println!("leg 2: {rows} message.create rows through the real send path (ws2 = {ws2})");
 
     let cutoff2 = retention_cutoff_epoch(&pool, retention_days).await?;
     let (sum2, count2) = parity(&pool, &ws2, cutoff2).await?;
