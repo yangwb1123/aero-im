@@ -377,9 +377,19 @@ Pre-merge checklist (AGENTS.md §4.3): `cargo check --workspace` clean ·
 | D5 | Legacy `due_idx` cleanup | **Later slice (P4)** | Drop only after P2 completes + ≥ one full lease + retention window (no old binary can return); same slice updates the aero-storage schema-shape test. Owner: B5-1 storage. Until then both partial indexes coexist (F10). |
 | D6 | Status-3 dead-row visibility | **Document + gauge spec; no admin API this slice** | `ai_jobs` has an admin DLQ surface; the governance outbox has none — dead rows are DB-only today. This slice documents the runbook (gauges, alert, manual requeue SQL); an admin DLQ route mirroring `ai_dlq` is a recorded follow-up option. |
 
-### 7.1 D-CAP — anti-starvation cap (scheduled, drill-verified)
+### 7.1 D-CAP — anti-starvation cap (landed 2026-08-15, drill-verified)
 
-- **Status**: scheduled deliverable — converted from an open item (was F6 /
+- **Status**: **landed** — implemented by the B5-3 D-CAP slice
+  (`docs/design/2026-08-15-aero-ai-b5-3-dcap-min-service-floor.design.md`,
+  requirements `docs/auto/runs/add-the-b5-3-anti-starvation-cap-to-claim-due-pe-2cb2a2b1/artifacts/requirements-10762e10/requirements.md`):
+  `PgOutboxRepo::claim_due` (crates/aero-audit-connector/src/pg.rs) claims
+  two arms in one statement (arm A = top `limit − K`, arm B = `K`
+  earliest-due MIN-priority rows with `NOT EXISTS` exclusion),
+  `relay::min_service_floor` pins `K = min(max(1, batch/20), batch − 1)`,
+  and `FakeOutbox` mirrors the set. No migration, no env/config, no
+  state-machine change — the identity property keeps the claimed set
+  byte-identical to the uncapped top-`limit` set while the high lane is
+  underfull. Converted from an open item (was F6 /
   `docs/design/2026-08-06-aero-ai-b5-1-governance-lane-design.md:181`).
 - **Trigger condition (the gate)**: the first slice that populates the
   priority-10 lane — **L1 aggregation** ([PROPOSED], B5-1 design §5 step 4).
@@ -402,12 +412,20 @@ Pre-merge checklist (AGENTS.md §4.3): `cargo check --workspace` clean ·
   underfull, arm B's backfill makes the claimed set **identical to the
   uncapped top-batch** — the existing drill (1 moderation + 99 backlog in
   round 1) stays green unchanged.
-- **Verification (drill-verified)**: (a) existing `aero-audit-priority-drill`
-  stays green (regression leg, membership oracle); (b) new sibling drill
-  `aero-audit-min-service-drill`: seed the high lane ≥ batch sustained +
-  backlog; assert every tick claims exactly K backlog rows until the high
-  lane drains, and backlog drains at ≥ K/tick; (c) PG test: sustained mixed
-  lanes, batch 100, each batch contains exactly K backlog rows.
+- **Verification (drill-verified)**: (a) the existing `aero-audit-priority-drill`
+  stays green (regression leg, membership oracle); (b) the drill now carries
+  a **second, self-isolating starvation phase** — per the direction's
+  acceptance the leg landed **as an extended phase of
+  `aero-audit-priority-drill`** (`starvation-round1-split-95-5` /
+  `starvation-cross-batch-quota` / `starvation-drain-700` PASS lines), not
+  as the sibling-named `aero-audit-min-service-drill` (which stays a
+  historical reference only): seed the high lane ≥ batch sustained (600
+  admin > `MAX_CLAIM`) + 100 backlog; assert every tick claims exactly `K`
+  backlog rows until the high lane drains, and backlog drains at ≥ K/tick;
+  (c) PG test `sustained_mixed_lanes_reserve_min_service_floor_each_round`
+  (batch 100, two rounds, exactly `K` backlog rows each) — landed with the
+  **corrected 190-admin seed** (the spec's 120-admin variant is an
+  arithmetic bug: round 2 would claim 60 rows, not 95/5).
 - **Why not now**: the priority-10 lane has **zero producers** today (0239's
   trigger maps only `message.moderated`; every other token passes through)
   and moderation production is budget-bounded (≤ ~60 finalizes/min) against

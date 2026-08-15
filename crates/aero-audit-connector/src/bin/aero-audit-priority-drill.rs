@@ -39,6 +39,14 @@
 //!
 //! Exits 2 with a clear message when the 0239 table is absent (B5-1 not yet
 //! landed); the test-integration.sh section is gated on the migration file.
+//!
+//! Phase 2 (B5-3 D-CAP starvation leg): after the parity-502 drain, the
+//! drill self-isolates again (same TRUNCATE gate), seeds a 600-row
+//! priority-100 flood (earliest `available_at`) + 100 priority-10 backlog
+//! rows (latest), and asserts the minimum-service floor — round-1 split
+//! 95/5, per-round quota through round 5, then a full 700-row drain
+//! (`starvation-round1-split-95-5` / `starvation-cross-batch-quota` /
+//! `starvation-drain-700` PASS lines).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -89,6 +97,26 @@ const AUTH_ROWS: i64 = 1;
 const MODERATION_ROWS: i64 = 1;
 const TOTAL_ROWS: i64 = BACKLOG_ROWS + AUTH_ROWS + MODERATION_ROWS;
 const BATCH_SIZE: i64 = 100;
+
+/// Phase 2 (D-CAP): admin flood size — exceeds `MAX_CLAIM = 500` so even
+/// the maximum claim clamp cannot drain it in one round.
+const STARVATION_ADMIN_ROWS: i64 = 600;
+/// Phase 2: backlog lane size (the direction's "100 backlog rows").
+const STARVATION_BACKLOG_ROWS: i64 = 100;
+/// Phase 2: the per-tick minimum service floor at the drill's batch size —
+/// `min_service_floor(BATCH_SIZE)` = 5 at batch 100. Asserted by the
+/// `starvation_floor_matches_production_batch` unit test, never hardcoded
+/// blindly (D8′ style).
+const STARVATION_K: i64 = 5;
+
+/// D8′ destructive-gate predicate shared by both phases: a non-empty
+/// outbox requires the explicit opt-in `AERO_PRIORITY_DRILL_ALLOW_TRUNCATE
+/// == "1"` (fail-closed — "true"/"yes"/absent refuse). Pure, so the gate
+/// is unit-tested without a DB.
+#[must_use]
+fn truncate_gate_allows(n: i64, allow_truncate: Option<&str>) -> bool {
+    n == 0 || allow_truncate == Some("1")
+}
 
 fn main() -> anyhow::Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -384,11 +412,216 @@ async fn run() -> anyhow::Result<()> {
     }
     println!("drill: parity-502: PASS");
 
+    // Phase 2: B5-3 D-CAP starvation leg — a sustained priority-100 flood
+    // must never starve the priority-10 backlog lane (self-isolating
+    // TRUNCATE + seed + per-round floor asserts, see phase2_starvation).
+    phase2_starvation(&pool, &relay).await?;
+
     // Round-1 batch membership (above) is the ordering oracle — the
     // full-drain strict-first assert was removed per D3 (heap-order RETURNING
     // makes delivery *firstness* executor-dependent; parity-501 already
     // proves the moderation row was delivered exactly once).
     stub.shutdown();
+    Ok(())
+}
+
+/// B5-3 D-CAP starvation leg (phase 2): after the moderation-precedence
+/// phase, self-isolate with the same destructive gate, seed a 600-row admin
+/// flood (priority 100, earliest `available_at`) plus 100 backlog rows
+/// (priority 10, latest), and assert the floor: exactly
+/// `STARVATION_K` = `min_service_floor(BATCH_SIZE)` backlog rows per round
+/// while the flood persists, then a full 700-row drain within
+/// [`MAX_ROUNDS`].
+async fn phase2_starvation(pool: &PgPool, relay: &AuditRelay) -> anyhow::Result<()> {
+    // Self-isolating destructive gate (drill precedent): after phase 1 the
+    // table holds 502 rows, so the env check is meaningful even on a
+    // previously-empty DB — a direct invocation without the opt-in REFUSEs
+    // here (exit 1) instead of silently truncating phase-1 rows.
+    let mut tx = pool.begin().await.context("begin phase-2 gate tx")?;
+    sqlx::query("LOCK TABLE audit_governance_outbox IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *tx)
+        .await
+        .context("lock outbox for the phase-2 gate")?;
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*)::bigint FROM audit_governance_outbox")
+        .fetch_one(&mut *tx)
+        .await
+        .context("count outbox rows in the phase-2 gate")?;
+    if !truncate_gate_allows(
+        n,
+        std::env::var("AERO_PRIORITY_DRILL_ALLOW_TRUNCATE").ok().as_deref(),
+    ) {
+        tx.rollback().await?;
+        eprintln!(
+            "aero-audit-priority-drill: REFUSED (phase 2) — audit_governance_outbox has {n} \
+             row(s); the phase-2 starvation leg TRUNCATEs the table. Re-run with \
+             AERO_PRIORITY_DRILL_ALLOW_TRUNCATE=1 (throwaway DB only)"
+        );
+        std::process::exit(1);
+    }
+    sqlx::query("TRUNCATE audit_governance_outbox")
+        .execute(&mut *tx)
+        .await
+        .context("reset the governance outbox (phase-2 TRUNCATE)")?;
+    tx.commit().await?;
+
+    // Seed the admin flood FIRST (earliest `available_at`) and the backlog
+    // LAST (latest) — FIFO can never explain low-lane progress.
+    let mut seeded = Vec::new();
+    for i in 0..STARVATION_ADMIN_ROWS {
+        let event_id = Uuid::new_v4();
+        sqlx::query(
+            r"INSERT INTO audit_governance_outbox
+                    (event_id, payload, available_at, attempts, status, priority, class)
+              VALUES ($1, $2, clock_timestamp(), 0, 0, $3, 'admin')",
+        )
+        .bind(event_id)
+        .bind(json!({
+            "event_id": event_id.to_string(),
+            "source_system": "aero-im.source",
+        }))
+        .bind(MODERATION_PRIORITY)
+        .execute(pool)
+        .await
+        .with_context(|| format!("seed starvation admin row {i}"))?;
+        seeded.push(event_id);
+    }
+    for i in 0..STARVATION_BACKLOG_ROWS {
+        let event_id = Uuid::new_v4();
+        sqlx::query(
+            r"INSERT INTO audit_governance_outbox
+                    (event_id, payload, available_at, attempts, status, priority, class)
+              VALUES ($1, $2, clock_timestamp(), 0, 0, $3, 'message')",
+        )
+        .bind(event_id)
+        .bind(json!({
+            "event_id": event_id.to_string(),
+            "source_system": "aero-im.source",
+        }))
+        .bind(BACKLOG_PRIORITY)
+        .execute(pool)
+        .await
+        .with_context(|| format!("seed starvation backlog row {i}"))?;
+        seeded.push(event_id);
+    }
+    println!(
+        "seeded {STARVATION_ADMIN_ROWS} admin flood rows (priority {MODERATION_PRIORITY}) \
+         then {STARVATION_BACKLOG_ROWS} backlog rows (priority {BACKLOG_PRIORITY})"
+    );
+
+    // Round 1: claimed == 100, split exactly 95 admin / 5 backlog — the
+    // pinned D-CAP batch split (arm A `BATCH_SIZE − STARVATION_K` / arm B
+    // `STARVATION_K`).
+    let claimed = relay
+        .dispatch_batch()
+        .await
+        .context("dispatch starvation round 1")?;
+    if claimed != usize::try_from(BATCH_SIZE).expect("small batch size") {
+        anyhow::bail!("starvation round 1 claimed {claimed}, expected {BATCH_SIZE}");
+    }
+    let admin_delivered: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM audit_governance_outbox WHERE status = 2 AND priority = 100",
+    )
+    .fetch_one(pool)
+    .await
+    .context("count round-1 delivered admin rows")?;
+    let backlog_delivered: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM audit_governance_outbox WHERE status = 2 AND priority = 10",
+    )
+    .fetch_one(pool)
+    .await
+    .context("count round-1 delivered backlog rows")?;
+    if admin_delivered != BATCH_SIZE - STARVATION_K || backlog_delivered != STARVATION_K {
+        anyhow::bail!(
+            "starvation round 1 split {admin_delivered} admin / {backlog_delivered} backlog, \
+             expected {} / {STARVATION_K}",
+            BATCH_SIZE - STARVATION_K
+        );
+    }
+    println!("drill: starvation-round1-split-95-5: PASS");
+
+    // Rounds 2-5: the quota is per-round, not a round-1 artifact — after
+    // round 5 exactly 25 backlog rows are delivered while 125 admin rows
+    // are still pending (the flood outlives the low lane's progress).
+    for round in 2..=5 {
+        let claimed = relay
+            .dispatch_batch()
+            .await
+            .context("dispatch a starvation quota round")?;
+        if claimed != usize::try_from(BATCH_SIZE).expect("small batch size") {
+            anyhow::bail!("starvation round {round} claimed {claimed}, expected {BATCH_SIZE}");
+        }
+    }
+    let backlog_at_5: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM audit_governance_outbox WHERE status = 2 AND priority = 10",
+    )
+    .fetch_one(pool)
+    .await
+    .context("count backlog delivered after round 5")?;
+    let admin_pending_at_5: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM audit_governance_outbox \
+         WHERE status IN (0, 1) AND priority = 100",
+    )
+    .fetch_one(pool)
+    .await
+    .context("count admin pending after round 5")?;
+    if backlog_at_5 != STARVATION_K * 5 {
+        anyhow::bail!(
+            "after round 5: backlog delivered {backlog_at_5}, expected {}",
+            STARVATION_K * 5
+        );
+    }
+    let expected_admin_pending = STARVATION_ADMIN_ROWS - 5 * (BATCH_SIZE - STARVATION_K);
+    if admin_pending_at_5 != expected_admin_pending || admin_pending_at_5 <= 0 {
+        anyhow::bail!(
+            "after round 5: admin pending {admin_pending_at_5}, expected {expected_admin_pending} > 0"
+        );
+    }
+    println!("drill: starvation-cross-batch-quota: PASS");
+
+    // Drain: rounds 6..=MAX_ROUNDS (precomputed: rounds 1-6 @ 95/5, round 7
+    // @ 30 admin + 70 backlog, round 8 empty → 7 non-empty ≤ MAX_ROUNDS).
+    for round in 6..=MAX_ROUNDS {
+        let claimed = relay
+            .dispatch_batch()
+            .await
+            .context("dispatch a starvation drain round")?;
+        if claimed == 0 {
+            break;
+        }
+        if round == MAX_ROUNDS {
+            anyhow::bail!("starvation leg did not drain within {MAX_ROUNDS} rounds");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    let delivered: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM audit_governance_outbox WHERE status = 2",
+    )
+    .fetch_one(pool)
+    .await
+    .context("count delivered starvation rows")?;
+    if delivered != STARVATION_ADMIN_ROWS + STARVATION_BACKLOG_ROWS {
+        anyhow::bail!(
+            "starvation drain delivered {delivered}, expected {}",
+            STARVATION_ADMIN_ROWS + STARVATION_BACKLOG_ROWS
+        );
+    }
+    let delivered_ids: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT event_id FROM audit_governance_outbox WHERE status = 2 ORDER BY event_id",
+    )
+    .fetch_all(pool)
+    .await
+    .context("list delivered starvation event ids")?;
+    let mut expected = seeded.clone();
+    expected.sort_unstable();
+    if delivered_ids != expected {
+        anyhow::bail!(
+            "starvation event_id parity mismatch: delivered {} vs seeded {}",
+            delivered_ids.len(),
+            expected.len()
+        );
+    }
+    println!("drill: starvation-drain-700: PASS");
     Ok(())
 }
 
@@ -412,5 +645,34 @@ mod tests {
     #[test]
     fn leaf_action_is_inside_the_contract_vocabulary() {
         assert!(MODERATION_OUTBOUND_ACTIONS.contains(&MODERATION_ACTION));
+    }
+
+    /// B5-3 D-CAP: the pinned starvation floor must equal the production
+    /// floor at the drill's batch size — `STARVATION_K` is asserted, never
+    /// hardcoded blindly (D8′ style).
+    #[test]
+    fn starvation_floor_matches_production_batch() {
+        assert_eq!(
+            STARVATION_K,
+            aero_audit_connector::relay::min_service_floor(BATCH_SIZE)
+        );
+    }
+
+    /// The destructive gate is fail-closed: only the exact opt-in string
+    /// "1" allows a TRUNCATE over a non-empty outbox (shared by both
+    /// phases; "true"/"yes"/absent refuse).
+    #[test]
+    fn truncate_gate_requires_the_exact_opt_in() {
+        assert!(truncate_gate_allows(0, None), "empty table needs no opt-in");
+        assert!(truncate_gate_allows(0, Some("0")));
+        assert!(
+            !truncate_gate_allows(502, None),
+            "non-empty outbox refuses without the opt-in"
+        );
+        assert!(
+            !truncate_gate_allows(502, Some("true")),
+            "only the exact string '1' allows"
+        );
+        assert!(truncate_gate_allows(502, Some("1")));
     }
 }

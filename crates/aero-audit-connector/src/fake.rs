@@ -12,7 +12,7 @@
 //! structurally impossible).
 
 use std::cmp::Reverse;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use serde_json::Value;
 use std::sync::Mutex;
@@ -22,7 +22,7 @@ use uuid::Uuid;
 use aero_common::AuditId;
 
 use crate::outbox::{Claim, Error, OutboxRepo};
-use crate::relay::{audit_backoff, clamped_lease, truncate_error};
+use crate::relay::{audit_backoff, clamped_lease, min_service_floor, truncate_error, MAX_CLAIM};
 
 /// Terminal/retry status of a fake row, mirroring the B5-1 0239 status enum
 /// (0=enqueued, 1=claimed, 2=delivered, 3=dead).
@@ -220,19 +220,43 @@ impl OutboxRepo for FakeOutbox {
         due.sort_by_key(|(id, available_at, created_at, priority)| {
             (Reverse(*priority), *available_at, *created_at, *id)
         });
+        // B5-3 D-CAP two-arm mirror of the PG claim CTE (pg.rs): arm A takes
+        // the top `limit − K` rows of the total order; arm B takes the `K`
+        // earliest-due rows of the lowest-priority lane NOT already selected
+        // by arm A (the PG `NOT EXISTS` exclusion — an overlap would
+        // double-claim a row). The claimed set is identical to the uncapped
+        // top-`limit` set whenever the high lane is underfull.
+        let limit = limit.clamp(1, MAX_CLAIM); // parity with PG (QA F4: limit 0 → 1 row)
+        let floor = min_service_floor(limit);
+        let head_take = usize::try_from(limit - floor).unwrap_or(usize::MAX);
+        let floor_take = usize::try_from(floor).unwrap_or(usize::MAX);
+        let mut selected: HashSet<AuditId> = HashSet::new();
+        for (id, _, _, _) in due.iter().take(head_take) {
+            selected.insert(*id);
+        }
+        if let Some(min_priority) = due.iter().map(|(_, _, _, priority)| *priority).min() {
+            let arm_b_ids: Vec<AuditId> = due
+                .iter()
+                .filter(|(id, _, _, priority)| {
+                    *priority == min_priority && !selected.contains(id)
+                })
+                .take(floor_take)
+                .map(|(id, ..)| *id)
+                .collect();
+            selected.extend(arm_b_ids);
+        }
         let mut claims = Vec::new();
-        let take = usize::try_from(limit.max(0)).unwrap_or(usize::MAX);
-        for (id, _, _, _) in due.into_iter().take(take) {
+        for (id, _, _, _) in due.iter().filter(|(id, ..)| selected.contains(id)) {
             let row = state
                 .rows
-                .get_mut(&id)
+                .get_mut(id)
                 .expect("due row ids come from the same map");
             row.status = FakeStatus::Claimed;
             row.attempts += 1;
             row.claim_token = Some(Uuid::new_v4());
             row.lease_expires_at = Some(lease_expires_at);
             claims.push(Claim {
-                event_id: id,
+                event_id: *id,
                 claim_token: row.claim_token.expect("claim token was just rotated"),
                 lease_expires_at: row.lease_expires_at.expect("lease was just assigned"),
                 attempts: row.attempts,
@@ -316,5 +340,190 @@ impl OutboxRepo for FakeOutbox {
         row.lease_expires_at = None;
         row.last_error = Some(truncate_error(error));
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    fn t0() -> OffsetDateTime {
+        OffsetDateTime::now_utc()
+    }
+
+    /// QA F2 — fake two-arm split: 20 admin (priority 100) + 8 backlog
+    /// (priority 10), `claim_due(lease, 10)` → exactly 9 admin (arm A) +
+    /// 1 backlog (arm B, the earliest-due low-lane row), set-disjoint, all
+    /// `attempts == 1`, distinct tokens, and the remaining 18 rows
+    /// untouched. Mirrors the PG split the relay-level tests ride on.
+    #[tokio::test]
+    async fn two_arm_claim_reserves_min_priority_floor() {
+        let fake = FakeOutbox::new();
+        let t0 = t0();
+        fake.set_now(Some(t0)).await;
+        let mut admin = Vec::new();
+        for j in 0..20 {
+            let id = AuditId::from_uuid(Uuid::new_v4());
+            fake.insert_lane(
+                id,
+                json!({"n": j}),
+                t0 - Duration::seconds(200) + Duration::seconds(100 + j),
+                100,
+                "admin".into(),
+            )
+            .await;
+            admin.push(id);
+        }
+        let mut backlog = Vec::new();
+        for i in 0..8 {
+            let id = AuditId::from_uuid(Uuid::new_v4());
+            fake.insert_lane(
+                id,
+                json!({"n": i}),
+                t0 - Duration::seconds(200) + Duration::seconds(i),
+                10,
+                "message".into(),
+            )
+            .await;
+            backlog.push(id);
+        }
+
+        let claimed = fake.claim_due(Duration::seconds(30), 10).await.expect("claim");
+        assert_eq!(claimed.len(), 10);
+        let admin_claims: Vec<_> = claimed.iter().filter(|c| c.priority == 100).collect();
+        let backlog_claims: Vec<_> = claimed.iter().filter(|c| c.priority == 10).collect();
+        assert_eq!(admin_claims.len(), 9, "arm A = top 9 admin rows");
+        assert_eq!(backlog_claims.len(), 1, "arm B = 1 low-lane slot");
+        assert_eq!(
+            backlog_claims[0].event_id, backlog[0],
+            "arm B takes the earliest-due backlog row"
+        );
+        let ids: HashSet<AuditId> = claimed.iter().map(|c| c.event_id).collect();
+        assert_eq!(ids.len(), 10, "claims are set-disjoint (no arm overlap)");
+        assert!(claimed.iter().all(|c| c.attempts == 1));
+        let tokens: HashSet<Uuid> = claimed.iter().map(|c| c.claim_token).collect();
+        assert_eq!(tokens.len(), 10, "every claim rotates a distinct token");
+        for id in admin.into_iter().chain(backlog) {
+            if !ids.contains(&id) {
+                let row = fake.row(id).await.expect("remaining row");
+                assert_eq!(row.status, FakeStatus::Ready, "unclaimed rows stay untouched");
+                assert_eq!(row.attempts, 0);
+            }
+        }
+    }
+
+    /// QA F2 — identity property: 3 admin + 20 backlog, `claim_due(lease,
+    /// 10)` → the claimed set is byte-identical to the uncapped top-10 of
+    /// the total order (3 admin + 7 earliest backlog). Arm B only fills
+    /// rows the total order would not have reached.
+    #[tokio::test]
+    async fn two_arm_identity_when_high_lane_underfull() {
+        let fake = FakeOutbox::new();
+        let t0 = t0();
+        fake.set_now(Some(t0)).await;
+        let mut admin = Vec::new();
+        for j in 0..3 {
+            let id = AuditId::from_uuid(Uuid::new_v4());
+            fake.insert_lane(
+                id,
+                json!({"n": j}),
+                t0 - Duration::seconds(200) + Duration::seconds(100 + j),
+                100,
+                "admin".into(),
+            )
+            .await;
+            admin.push(id);
+        }
+        let mut backlog = Vec::new();
+        for i in 0..20 {
+            let id = AuditId::from_uuid(Uuid::new_v4());
+            fake.insert_lane(
+                id,
+                json!({"n": i}),
+                t0 - Duration::seconds(200) + Duration::seconds(i),
+                10,
+                "message".into(),
+            )
+            .await;
+            backlog.push(id);
+        }
+
+        let claimed = fake.claim_due(Duration::seconds(30), 10).await.expect("claim");
+        let mut expected: HashSet<AuditId> = admin.into_iter().collect();
+        expected.extend(backlog.into_iter().take(7));
+        let claimed_ids: HashSet<AuditId> = claimed.iter().map(|c| c.event_id).collect();
+        assert_eq!(
+            claimed_ids, expected,
+            "high lane underfull → claimed set == uncapped top-10"
+        );
+    }
+
+    /// QA F4 — clamp parity with PG: `claim_due(lease, 0)` clamps to batch
+    /// 1 (K = 0 → empty arm B) and claims exactly one row.
+    #[tokio::test]
+    async fn claim_due_zero_limit_clamps_to_one() {
+        let fake = FakeOutbox::new();
+        let t0 = t0();
+        fake.set_now(Some(t0)).await;
+        let id = AuditId::from_uuid(Uuid::new_v4());
+        fake.insert(id, json!({"n": 1}), t0).await;
+        let claimed = fake.claim_due(Duration::seconds(30), 0).await.expect("claim");
+        assert_eq!(claimed.len(), 1, "limit 0 clamps to batch 1 (PG parity)");
+        assert_eq!(claimed[0].event_id, id);
+        assert_eq!(claimed[0].attempts, 1);
+    }
+
+    /// QA scenario 11 — requeued-low-lane recovery: a low-lane row parked
+    /// 1s in the future (backoff) is not claimable while not due — arm B
+    /// backfills from the MIN lane (admin, no throughput tax) — and once
+    /// due it re-enters the claim under the still-pending admin flood via
+    /// arm B's 1-slot floor, never starved.
+    #[tokio::test]
+    async fn requeued_low_lane_row_enters_arm_b_when_due() {
+        let fake = FakeOutbox::new();
+        let t0 = t0();
+        fake.set_now(Some(t0)).await;
+        for j in 0..20 {
+            let id = AuditId::from_uuid(Uuid::new_v4());
+            fake.insert_lane(
+                id,
+                json!({"n": j}),
+                t0 - Duration::seconds(200) + Duration::seconds(100 + j),
+                100,
+                "admin".into(),
+            )
+            .await;
+        }
+        let low = AuditId::from_uuid(Uuid::new_v4());
+        fake.insert_lane(low, json!({"n": "low"}), t0 + Duration::seconds(1), 10, "message".into())
+            .await;
+
+        // Round 1: the low row is not due yet — arm B backfills admin from
+        // the MIN lane, so the batch is still full (9 arm A + 1 arm B).
+        let round1 = fake.claim_due(Duration::seconds(30), 10).await.expect("round 1");
+        assert_eq!(round1.len(), 10);
+        assert!(
+            round1.iter().all(|c| c.priority == 100),
+            "low lane not due → arm B backfills admin (no throughput tax)"
+        );
+
+        // Clock advance: the requeued low row is due; under the still-pending
+        // admin flood it must be claimed via arm B (1 slot), not starved.
+        fake.set_now(Some(t0 + Duration::seconds(1))).await;
+        let round2 = fake.claim_due(Duration::seconds(30), 10).await.expect("round 2");
+        assert_eq!(round2.len(), 10);
+        assert_eq!(
+            round2.iter().filter(|c| c.priority == 100).count(),
+            9,
+            "arm A stays admin-first"
+        );
+        assert_eq!(round2.iter().filter(|c| c.priority == 10).count(), 1);
+        assert_eq!(
+            round2.iter().find(|c| c.priority == 10).map(|c| c.event_id),
+            Some(low),
+            "the requeued low-lane row re-enters the claim once due"
+        );
     }
 }

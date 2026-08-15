@@ -577,6 +577,13 @@ if [ -z "$SKIP_DB_CREATE" ]; then
                 cat "$PRIORITY_DRILL_LOG" >&2
                 exit 1
             }
+            # B5-3 D-CAP starvation leg (additive): the drill's phase-2
+            # 700-row drain must be observable in the gate.
+            grep -q "drill: starvation-drain-700: PASS" "$PRIORITY_DRILL_LOG" || {
+                echo "✗ priority drill: missing 'drill: starvation-drain-700: PASS'" >&2
+                cat "$PRIORITY_DRILL_LOG" >&2
+                exit 1
+            }
             cat "$PRIORITY_DRILL_LOG"   # drill 的 PASS 行保持可见
             b5_check "moderation-priority-drill" "PASS"
         elif [ "$PRIORITY_DRILL_RC" -eq 2 ]; then

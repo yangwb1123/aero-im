@@ -63,20 +63,20 @@ CLAIM_ALLOWLIST=(
     # aero-auth oidc.rs — id_token (OIDC Core / RFC 7519) contract + Debug
     # labels. The cc-token sites (pre-migration :429/:430/:453) are NOT here:
     # they now reference CLAIM_* / TOKEN_TYPE_* constants.
-    'crates/aero-auth/src/oidc.rs:173:"sub"'   # Debug formatter field label — OidcClaims (id_token struct) Debug impl, PII redaction
-    'crates/aero-auth/src/oidc.rs:182:"iat"'   # Debug formatter field label — same impl
-    'crates/aero-auth/src/oidc.rs:365:"iss"'   # id_token set_required_spec_claims — RFC 7519/OIDC Core id_token contract (different wire contract)
-    'crates/aero-auth/src/oidc.rs:365:"aud"'   # id_token set_required_spec_claims — same
-    'crates/aero-auth/src/oidc.rs:365:"sub"'   # id_token set_required_spec_claims — same
+    'crates/aero-auth/src/oidc.rs:175:"sub"'   # Debug formatter field label — OidcClaims (id_token struct) Debug impl, PII redaction
+    'crates/aero-auth/src/oidc.rs:184:"iat"'   # Debug formatter field label — same impl
+    'crates/aero-auth/src/oidc.rs:367:"iss"'   # id_token set_required_spec_claims — RFC 7519/OIDC Core id_token contract (different wire contract)
+    'crates/aero-auth/src/oidc.rs:367:"aud"'   # id_token set_required_spec_claims — same
+    'crates/aero-auth/src/oidc.rs:367:"sub"'   # id_token set_required_spec_claims — same
     # audit connector client.rs — RFC 6749 §4.4 token-request form param in
     # request_token (wire contract, not claims validation).
-    'crates/aero-audit-connector/src/client.rs:445:"scope"'
+    'crates/aero-audit-connector/src/client.rs:448:"scope"'
     # relay.rs — #[tokio::test] fixture JSON (claim-drift test data).
-    'crates/aero-audit-connector/src/relay.rs:464:"iss"'
-    'crates/aero-audit-connector/src/relay.rs:465:"aud"'
-    'crates/aero-audit-connector/src/relay.rs:466:"scope"'
-    'crates/aero-audit-connector/src/relay.rs:467:"sub"'
-    'crates/aero-audit-connector/src/relay.rs:468:"client_id"'
+    'crates/aero-audit-connector/src/relay.rs:479:"iss"'
+    'crates/aero-audit-connector/src/relay.rs:480:"aud"'
+    'crates/aero-audit-connector/src/relay.rs:481:"scope"'
+    'crates/aero-audit-connector/src/relay.rs:482:"sub"'
+    'crates/aero-audit-connector/src/relay.rs:483:"client_id"'
     # extractor.rs — #[cfg(test)] Claims test-struct fixture field values.
     'crates/aero-auth/src/extractor.rs:173:"jti"'
     'crates/aero-auth/src/extractor.rs:191:"jti"'
@@ -115,9 +115,14 @@ CLAIM_ALLOWLIST=(
     'crates/aero-storage/src/integration.rs:546:"client_id"'
     'crates/aero-storage/src/integration/support.rs:295:"client_id"'
     'crates/aero-storage/src/integration/machine.rs:546:"client_id"'
+    # pat.rs — PAT token-response JSON field name "scopes" (plural; different
+    # wire contract than the RFC 9068 singular "scope" claim — substring-guard
+    # false positive on the token-response plural field).
+    'crates/aero-storage/src/pat.rs:139:"scopes"'
+    'crates/aero-storage/src/pat.rs:400:"scopes"'
     # live.rs — chat-line label "sub" in #[tokio::test] (pure vocabulary
     # false positive: a subscriber/non-subscriber chat line, not a claim).
-    'crates/aero-storage/src/live.rs:582:"sub"'
+    'crates/aero-storage/src/live.rs:584:"sub"'
 )
 
 # Whole-file exemptions (skip rules 1).
@@ -135,8 +140,8 @@ CLAIM_AUDIT_FILE="crates/aero-common/src/model/audit.rs"
 # Stale entries (file:line no longer containing the literal) warn → re-pin,
 # exactly like the CLAIM_ALLOWLIST mechanism.
 AUDIT_FLAG_ALLOWLIST=(
-    'crates/aero-audit-connector/src/bin/aero-audit-priority-drill.rs:77'
-    'crates/aero-audit-connector/src/bin/aero-audit-priority-drill.rs:379'
+    'crates/aero-audit-connector/src/bin/aero-audit-priority-drill.rs:89'
+    'crates/aero-audit-connector/src/bin/aero-audit-priority-drill.rs:639'
 )
 
 # L1 allowlist-token guard (rule 3e) — F2 closure for migration 0242's

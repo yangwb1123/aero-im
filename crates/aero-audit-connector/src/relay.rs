@@ -33,6 +33,11 @@ pub const MAX_LEASE_SECONDS: i64 = 86_400;
 pub const MAX_BACKOFF_SECONDS: i64 = 300;
 /// Batch claim upper bound (clone of `AiUsageRepo::MAX_CLAIM`).
 pub const MAX_CLAIM: i64 = 500;
+/// Per-tick minimum service floor divisor (D-CAP, design §7.1): the
+/// lowest-priority lane is guaranteed `max(1, batch / 20)` claim slots per
+/// round. Config-visible constant pattern (clone of [`MAX_CLAIM`]); no env
+/// var, no `RelayConfig` field.
+pub const MIN_SERVICE_BATCH_DIVISOR: i64 = 20;
 /// `last_error` truncation (clone of `AiUsageRepo::MAX_ERROR_CHARS`).
 pub const MAX_ERROR_CHARS: usize = 2_048;
 
@@ -60,6 +65,19 @@ pub fn audit_backoff(attempts: i64) -> Duration {
         .unwrap_or(MAX_BACKOFF_SECONDS)
         .min(MAX_BACKOFF_SECONDS);
     Duration::seconds(seconds)
+}
+
+/// K = per-tick minimum service floor for the lowest-priority lane:
+/// `min(max(1, b / MIN_SERVICE_BATCH_DIVISOR), b − 1)` where `b =
+/// batch.clamp(1, MAX_CLAIM)`. The `b − 1` upper clamp keeps the floor
+/// strictly below the batch so arm A (top `limit − K`) is never empty: at
+/// the degenerate `batch = 1` the floor is 0 and the claim degenerates to
+/// today's uncapped top-1 (precedence preserved, never inverted). Pure +
+/// total — no clock, no DB, no panic on any i64 input.
+#[must_use]
+pub fn min_service_floor(batch: i64) -> i64 {
+    let b = batch.clamp(1, MAX_CLAIM);
+    (b / MIN_SERVICE_BATCH_DIVISOR).max(1).min(b - 1)
 }
 
 /// Clamp a lease into `[1s, MAX_LEASE_SECONDS]` (clone of `clamped_lease`).
@@ -494,6 +512,49 @@ mod tests {
         assert!(!is_dead_at(1), "attempt 1 must requeue (≤1 retry)");
         assert!(is_dead_at(PERMANENT_DEAD_AT), "attempt 2 must be dead");
         assert!(is_dead_at(i64::MAX), "any count past the threshold is dead");
+    }
+
+    /// B5-3 D-CAP AC2 — the minimum-service floor is pure, total, and pinned:
+    /// `(0)→0, (1)→0, (2)→1, (20)→1, (21)→1, (25)→1, (40)→2, (100)→5,
+    /// (500)→25, (i64::MAX)→25` plus the QA F5 negative pin `(i64::MIN)→0`
+    /// (clamp → batch 1 → K = 0). Over the whole relay domain `[1,
+    /// MAX_CLAIM]` the floor stays below the batch (arm A never empty) and
+    /// the batch splits pin the arm sizes (95/5 at 100, 475/25 at 500,
+    /// 24/1 at 25).
+    #[test]
+    fn min_service_floor_is_pinned_and_total() {
+        use super::{min_service_floor, MAX_CLAIM};
+        let pins = [
+            (i64::MIN, 0),
+            (0, 0),
+            (1, 0),
+            (2, 1),
+            (20, 1),
+            (21, 1),
+            (25, 1),
+            (40, 2),
+            (100, 5),
+            (500, 25),
+            (i64::MAX, 25),
+        ];
+        for (batch, expected) in pins {
+            assert_eq!(
+                min_service_floor(batch),
+                expected,
+                "min_service_floor({batch})"
+            );
+        }
+        for batch in 1..=MAX_CLAIM {
+            let floor = min_service_floor(batch);
+            assert!(
+                floor < batch,
+                "K({batch}) = {floor} must stay below the batch (arm A never empty)"
+            );
+        }
+        assert_eq!(min_service_floor(100), 5, "batch 100 → K = 5");
+        assert_eq!(100 - min_service_floor(100), 95, "batch 100 → arm A 95");
+        assert_eq!(500 - min_service_floor(500), 475, "batch 500 → arm A 475");
+        assert_eq!(25 - min_service_floor(25), 24, "batch 25 → arm A 24");
     }
 
     #[test]

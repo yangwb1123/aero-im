@@ -77,6 +77,14 @@ pub trait OutboxRepo: Send + Sync {
     /// repository's own clock (single clock domain — never a
     /// caller-supplied `now`, which could skew against the fences).
     /// The returned `Claim` carries the row's `priority`/`class` lane.
+    ///
+    /// B5-3 D-CAP (anti-starvation cap): the claimed set is two arms in one
+    /// statement. Arm A takes the top `limit − K` rows of the total order;
+    /// arm B takes the `K` earliest-due rows of the lowest-priority lane
+    /// (today: priority 10 backlog) not already selected by arm A, where
+    /// `K = min_service_floor(limit)`. Each claim round therefore reserves
+    /// `K` slots for the lowest-priority lane; the claimed set equals the
+    /// uncapped top-`limit` set whenever the high lane is underfull.
     async fn claim_due(&self, lease: Duration, limit: i64) -> Result<Vec<Claim>, Error>;
 
     /// Fenced acknowledgement. Returns `false` (never an error) when the

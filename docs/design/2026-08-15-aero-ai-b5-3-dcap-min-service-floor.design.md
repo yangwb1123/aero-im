@@ -32,7 +32,7 @@ The requirements spec was treated as untrusted and every citable claim re-checke
 | S3 | Degenerate: batch=1 → K=0, arm B `LIMIT 0` | **1 row claimed**, precedence preserved |
 | S4 | Regression exact (mirrors pg.rs:546 test: inverted `created_at`, later admin) | **{10 admin} ∪ {15 earliest-available_at backlog}** — the test's expected set, byte-for-byte |
 | S5 | Sustained: 200 admin + 40 backlog, batch 100, two sequential claims | **Round 1: 95a+5b; round 2: 95a+5b** (190a+10b total) — proves the R6 shape works with ≥190 admin |
-| S6 | `EXPLAIN` (1400 rows) | Arm A: `Index Scan using audit_governance_due_prio_idx` (0240); arm B: `Index Scan Backward` (MIN) + `Index Scan` + `Nested Loop Anti Join` on the **materialized** arm-a CTE. **No Seq Scan, no new index needed.** |
+| S6 | `EXPLAIN` (1400 rows) | Arm A: `Index Scan using audit_governance_due_prio_idx` (0240); arm B: `Index Scan Backward` (MIN) + `Index Scan` + `Nested Loop Anti Join` on the **materialized** arm-a CTE. **No Seq Scan, no new index needed.** Plan-shape caveat: the pure Index-Scan shape is planner-dependent until ~100k rows (at 1400 rows a Bitmap Heap Scan + Sort was observed); the MIN backward walk is O(leased low-lane) worst case — measured 28.7 ms at 100k fully-leased rows, ~350× inside the 10 s statement timeout, no correctness impact. |
 
 Baseline before design: `cargo check -p aero-audit-connector` clean; `cargo test -p aero-audit-connector --lib` 14 passed / 3 ignored (PG-gated) — the three `#[ignore]` tests are the regression surface for AC3.
 
@@ -79,7 +79,7 @@ let floor = min_service_floor(limit);          // K
 let arm_a_limit = limit - floor;               // ≥ 1 always (K ≤ limit − 1)
 // ...
 let rows = sqlx::query_as::<_, ClaimRow>(
-    r"WITH arm_a AS (
+    r"WITH arm_a AS MATERIALIZED (
           SELECT candidate.event_id
             FROM audit_governance_outbox AS candidate
            WHERE candidate.status IN (0, 1)
@@ -135,10 +135,10 @@ let rows = sqlx::query_as::<_, ClaimRow>(
 ```
 
 Design points (all probe-verified):
-- **Arm A** = top `limit − K` of the total order `(priority DESC, available_at, created_at, event_id)` — exactly today's query with a smaller limit.
+- **Arm A** = top `limit − K` of the total order `(priority DESC, available_at, created_at, event_id)` — exactly today's query with a smaller limit. `MATERIALIZED` is pinned explicitly (async-reviewer F1): PG already materializes a `FOR UPDATE` CTE (it cannot be inlined), but the pin makes the single-evaluation guarantee explicit — an inlining refactor would open a narrow double-claim window.
 - **Arm B** = `K` earliest-due rows (FIFO tie-break) of the **lowest-priority lane** — `priority = MIN(priority)` over the claimable set, scalar subquery carrying the identical WHERE filters — **not already selected by arm A** (`NOT EXISTS` anti-join). The exclusion is load-bearing: `SKIP LOCKED` does not dedupe arms within one statement (self-locks are invisible to skip).
 - The three WHERE fragments (arm A, arm B, MIN subquery) are textual copies of today's filter — the filter contract is unchanged.
-- **Result invariants**: `|claimed| ≤ limit`; `|claimed| = limit` whenever high-lane due ≥ `limit − K` and low-lane due ≥ K (flood: exactly `K` low + `limit − K` high); low-lane due < K → `limit − K + low_due` (bounded slack ≤ K, reclaimed next tick by the drain loop — **arm-B slack is NOT refilled from the total order**, keeping the identity property exact); identity: high-lane due ≤ `limit − K` → claimed set **identical to today's uncapped top-`limit` set** (probe S2/S4).
+- **Result invariants**: `|claimed| ≤ limit`; `|claimed| = limit` whenever high-lane due ≥ `limit − K` and low-lane due ≥ K (flood: exactly `K` low + `limit − K` high); low-lane due < K → `limit − K + low_due` (bounded slack ≤ K, reclaimed next tick by the drain loop — **arm-B slack is NOT refilled from the total order**, keeping the identity property exact); **`low_due = 0` exception** (DB-architect F4): with zero low-lane rows due, arm B's `MIN(priority)` lane IS the high lane, so arm B backfills admin rows — the batch stays full at `limit` with **no throughput tax** (probe E3: 500 admin + 0 backlog → 100 claimed/tick, identical to today's top-100); identity: high-lane due ≤ `limit − K` → claimed set **identical to today's uncapped top-`limit` set** (probe S2/S4). **Snapshot-relative semantics** (async-reviewer F2/F4): the "exactly K low per round" invariant is per-statement against that statement's snapshot — under concurrent claimers one statement's arm B can be diluted to 0 (SKIP LOCKED skips rows another statement already locked); the *aggregate* floor (≥ min(K, low supply) per window) holds by conservation, and cross-statement arm overlap is excluded at the lock step, not by the anti-join.
 
 ### 2.3 `outbox.rs` — trait contract doc (outbox.rs:72-80)
 
@@ -222,7 +222,7 @@ Phase 1 (seed, round-1 assert, `moderation-in-first-batch`, vocabulary pin, `dra
 | Arm-A/arm-B overlap (missing `NOT EXISTS`) | `SKIP LOCKED` does not dedupe within one statement (self-locks); a row could appear in both arms → wrong split (backlog < K), potential double-count in `claimable`. | The exclusion is structural (§2.2); pinned by drill `starvation-round1-split-95-5` and R6's disjointness assert (round-2 set ∩ round-1 set = ∅). Probe S1: 100 distinct ids. |
 | K ≥ batch (precedence inversion) | At `batch = 1`, a floor of 1 would empty arm A and let a low-priority row preempt the top-1. | `b − 1` upper clamp → `K(1) = 0`, arm B `LIMIT 0` (valid SQL, probe S3). Unit-pinned (AC2). |
 | Non-total floor fn | Panic/UB on extreme input (i64::MAX). | Pure + total by construction; pinned by unit tests incl. `(i64::MAX) → 25`. |
-| Underfull low lane (low due < K) | Batch claims `limit − K + low_due < limit` (bounded slack ≤ K). | Relay `run`/`shutdown_drain` loop until 0 reclaims next tick; no row stranded. Rejected alternative (fill slack from total order) kept out to preserve the identity property. |
+| Underfull low lane (low due < K) | Batch claims `limit − K + low_due < limit` (bounded slack ≤ K) — **except `low_due = 0`**: an empty low lane backfills from the MIN lane (the high lane), so the batch stays full with no throughput tax (probe E3). | Relay `run`/`shutdown_drain` loop until 0 reclaims next tick; no row stranded. Rejected alternative (fill slack from total order) kept out to preserve the identity property. |
 | Mid-lane starvation (3+ lane values) | The floor protects only the **MIN** lane; a hypothetical priority-50 lane could still starve under a 100-flood. | Documented limitation: today exactly two lane values (10/100); a future lane lands via migration + this design's MIN-lane generalization (the SQL is already MIN-driven, not hardcoded to 10). |
 | SQL drift between the 3 WHERE copies | Arm A / arm B / MIN subquery filters could diverge. | R6 + regression tests pin the set semantics; the filters are textual copies of today's single filter (status IN (0,1), due, lease). |
 | Drill phase-2 gate bypass | Phase 2 TRUNCATE running without the env opt-in (e.g., direct invocation against an empty DB where phase-1's gate passes vacuously). | Phase 2 repeats the LOCK+COUNT+env check (`AERO_PRIORITY_DRILL_ALLOW_TRUNCATE == "1"`), refusing exit 1 with the same REFUSED message. |

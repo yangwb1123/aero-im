@@ -24,7 +24,7 @@ use uuid::Uuid;
 use aero_common::{AuditId, OutboxStatus};
 
 use crate::outbox::{Claim, Error, OutboxRepo};
-use crate::relay::{audit_backoff, clamped_lease, truncate_error, MAX_CLAIM};
+use crate::relay::{audit_backoff, clamped_lease, min_service_floor, truncate_error, MAX_CLAIM};
 
 /// Governance outbox status enum — B5-1 0239 DDL normative values, derived
 /// from the leaf vocabulary (`aero_common::model::audit::OutboxStatus`). The
@@ -101,10 +101,23 @@ impl OutboxRepo for PgOutboxRepo {
         // `now` here would let |app−DB skew| >= lease mint an already-expired
         // lease whose fence always fails while the claim filter never
         // re-exposes the row — the claim→POST→fence-fail livelock.
+        //
+        // B5-3 D-CAP (anti-starvation cap): the claimed set is two arms in
+        // one statement. Arm A claims the top `limit − K` rows of the total
+        // order `(priority DESC, available_at, created_at, event_id)`; arm B
+        // claims the `K` earliest-due rows of the lowest-priority lane
+        // (`priority = MIN(priority)`, today 10) NOT already selected by arm
+        // A — the `NOT EXISTS` exclusion is load-bearing (`SKIP LOCKED` does
+        // not dedupe arms within one statement); `MATERIALIZED` pins arm A's
+        // single evaluation. Flood → low lane served ≥ K rows/round; high
+        // lane underfull → set identical to today's uncapped top-`limit`.
+        // Snapshot-relative: under concurrent claimers one statement's arm B
+        // can be diluted, but the aggregate floor holds by conservation.
         let lease_secs = clamped_lease(lease).whole_seconds();
         let limit = limit.clamp(1, MAX_CLAIM);
+        let floor = min_service_floor(limit);
         let rows = sqlx::query_as::<_, ClaimRow>(
-            r"WITH claimable AS (
+            r"WITH arm_a AS MATERIALIZED (
                   SELECT candidate.event_id
                     FROM audit_governance_outbox AS candidate
                    WHERE candidate.status IN (0, 1)
@@ -117,12 +130,45 @@ impl OutboxRepo for PgOutboxRepo {
                             candidate.created_at, candidate.event_id
                    FOR UPDATE SKIP LOCKED
                    LIMIT $1
+              ),
+              arm_b AS (
+                  SELECT candidate.event_id
+                    FROM audit_governance_outbox AS candidate
+                   WHERE candidate.status IN (0, 1)
+                     AND candidate.available_at <= clock_timestamp()
+                     AND (
+                           candidate.lease_expires_at IS NULL
+                           OR candidate.lease_expires_at <= clock_timestamp()
+                     )
+                     AND candidate.priority = (
+                           SELECT MIN(priority)
+                             FROM audit_governance_outbox
+                            WHERE status IN (0, 1)
+                              AND available_at <= clock_timestamp()
+                              AND (
+                                    lease_expires_at IS NULL
+                                    OR lease_expires_at <= clock_timestamp()
+                              )
+                     )
+                     AND NOT EXISTS (
+                           SELECT 1 FROM arm_a
+                            WHERE arm_a.event_id = candidate.event_id
+                     )
+                   ORDER BY candidate.available_at, candidate.created_at,
+                            candidate.event_id
+                   FOR UPDATE SKIP LOCKED
+                   LIMIT $2
+              ),
+              claimable AS (
+                  SELECT event_id FROM arm_a
+                  UNION ALL
+                  SELECT event_id FROM arm_b
               )
               UPDATE audit_governance_outbox AS outbox
                  SET status = 1,
                      claim_token = gen_random_uuid(),
                      lease_expires_at = clock_timestamp()
-                                        + make_interval(secs => $2),
+                                        + make_interval(secs => $3),
                      attempts = outbox.attempts + 1
                 FROM claimable
                WHERE outbox.event_id = claimable.event_id
@@ -130,8 +176,9 @@ impl OutboxRepo for PgOutboxRepo {
                      outbox.lease_expires_at, outbox.payload,
                      outbox.priority, outbox.class",
         )
-        .bind(limit)
-        .bind(lease_secs)
+        .bind(limit - floor) // $1: arm A = top (limit − K); K ≤ limit − 1 so this is ≥ 1
+        .bind(floor)         // $2: arm B = K (0 is valid: LIMIT 0 → empty arm B)
+        .bind(lease_secs)    // $3: lease minted on the DB clock
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(Into::into).collect())
@@ -631,5 +678,117 @@ mod tests {
                 .await
                 .expect("clean up seeded row");
         }
+    }
+
+    /// Seed one due row at `available_at = t0 + offset` (t0 = now − 200s).
+    async fn seed(pool: &PgPool, priority: i16, offset: i64) -> Uuid {
+        let event_id = Uuid::new_v4();
+        sqlx::query(
+            r"INSERT INTO audit_governance_outbox (event_id, payload, status, attempts, priority, available_at, created_at)
+              VALUES ($1, $2, 0, 0, $3, clock_timestamp() - make_interval(secs => 200) + make_interval(secs => $4),
+                      clock_timestamp() - make_interval(secs => 200))",
+        )
+        .bind(event_id)
+        .bind(json!({"event_id": event_id.to_string(), "source_system": "aero-im.source"}))
+        .bind(priority)
+        .bind(offset)
+        .execute(pool)
+        .await
+        .expect("seed governance row");
+        event_id
+    }
+
+    /// B5-3 AC3.1 — sustained mixed lanes at batch 100: each round reserves
+    /// K = `min_service_floor(100)` = 5 low-lane slots (190 admin + 40 backlog
+    /// — corrected seed; two claims: 95 admin / 5 backlog, disjoint).
+    #[tokio::test]
+    #[ignore = "requires live Postgres (DATABASE_URL)"]
+    async fn sustained_mixed_lanes_reserve_min_service_floor_each_round() {
+        let url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must point at a throwaway Postgres");
+        let pool = pool(&url);
+        ensure_outbox_table(&pool).await;
+        sqlx::query("TRUNCATE audit_governance_outbox").execute(&pool).await.expect("reset");
+        let mut backlog = Vec::new();
+        for i in 0..40 { backlog.push(seed(&pool, 10, i).await); }
+        let mut admin = Vec::new();
+        for j in 0..190 { admin.push(seed(&pool, 100, j).await); }
+        let repo = PgOutboxRepo::new(pool.clone());
+        let round1 = repo.claim_due(Duration::seconds(30), 100).await.expect("round 1");
+        let round2 = repo.claim_due(Duration::seconds(30), 100).await.expect("round 2");
+        let split = |claims: &[Claim]| {
+            (
+                claims.iter().filter(|c| c.priority == 100).count(),
+                claims.iter().filter(|c| c.priority == 10).count(),
+            )
+        };
+        assert_eq!(split(&round1), (95, 5), "round 1 must split 95 admin / 5 backlog");
+        assert_eq!(split(&round2), (95, 5), "round 2 must split 95 admin / 5 backlog");
+        let set1: HashSet<AuditId> = round1.iter().map(|c| c.event_id).collect();
+        let set2: HashSet<AuditId> = round2.iter().map(|c| c.event_id).collect();
+        assert!(set1.is_disjoint(&set2), "round 2 disjoint from round 1 (no arm overlap)");
+        let admin_ids: HashSet<AuditId> = admin.iter().map(|id| AuditId::from_uuid(*id)).collect();
+        let backlog_ids: HashSet<AuditId> = backlog.iter().map(|id| AuditId::from_uuid(*id)).collect();
+        let union: HashSet<AuditId> = set1.union(&set2).copied().collect();
+        assert_eq!(union.intersection(&admin_ids).count(), 190, "all 190 admin claimed");
+        assert_eq!(
+            union.intersection(&backlog_ids).count(),
+            10,
+            "10 backlog rows claimed (5 per round)"
+        );
+    }
+
+    /// QA F3 — mixed-lane arm-B contention: two sessions × limit 25 vs 60
+    /// admin + 2 backlog; the 2-row low lane is served only by arm B — SKIP
+    /// LOCKED keeps claims disjoint (attempts == 1) with 2 low rows in 50.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires live Postgres (DATABASE_URL)"]
+    async fn mixed_lane_arm_b_contention_stays_disjoint() {
+        let url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must point at a throwaway Postgres");
+        let pool_a = pool(&url);
+        let pool_b = pool(&url);
+        ensure_outbox_table(&pool_a).await;
+        sqlx::query("TRUNCATE audit_governance_outbox").execute(&pool_a).await.expect("reset");
+        for _ in 0..60 { seed(&pool_a, 100, 0).await; }
+        let mut backlog = Vec::new();
+        for i in 0..2 { backlog.push(seed(&pool_a, 10, i).await); }
+        let session_a = PgOutboxRepo::new(pool_a.clone());
+        let session_b = PgOutboxRepo::new(pool_b.clone());
+        let barrier = Arc::new(Barrier::new(2));
+        let claim = |session: PgOutboxRepo, barrier: Arc<Barrier>| async move {
+            barrier.wait().await;
+            session.claim_due(Duration::seconds(30), LIMIT).await.expect("concurrent claim")
+        };
+        let claimed_a = tokio::spawn(claim(session_a.clone(), Arc::clone(&barrier)));
+        let claimed_b = tokio::spawn(claim(session_b.clone(), Arc::clone(&barrier)));
+        let (claimed_a, claimed_b) = tokio::join!(claimed_a, claimed_b);
+        let (claimed_a, claimed_b) = (claimed_a.expect("A"), claimed_b.expect("B"));
+        assert_eq!(claimed_a.len(), 25, "session A claims 25");
+        assert_eq!(claimed_b.len(), 25, "session B claims 25");
+        let ids_a: HashSet<AuditId> = claimed_a.iter().map(|c| c.event_id).collect();
+        let ids_b: HashSet<AuditId> = claimed_b.iter().map(|c| c.event_id).collect();
+        assert!(ids_a.is_disjoint(&ids_b), "zero double-claims");
+        let union: HashSet<AuditId> = ids_a.union(&ids_b).copied().collect();
+        let backlog_ids: HashSet<AuditId> = backlog.iter().map(|id| AuditId::from_uuid(*id)).collect();
+        assert_eq!(union.intersection(&backlog_ids).count(), 2, "both low rows claimed once");
+        assert!(claimed_a.iter().chain(&claimed_b).all(|c| c.attempts == 1), "attempts == 1");
+    }
+
+    /// QA F4 — clamp parity: `claim_due(0)` clamps to batch 1 (K = 0, arm
+    /// B `LIMIT 0`), claiming exactly one row (fake parity pin).
+    #[tokio::test]
+    #[ignore = "requires live Postgres (DATABASE_URL)"]
+    async fn claim_due_zero_limit_clamps_to_one() {
+        let url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must point at a throwaway Postgres");
+        let pool = pool(&url);
+        ensure_outbox_table(&pool).await;
+        sqlx::query("TRUNCATE audit_governance_outbox").execute(&pool).await.expect("reset");
+        let event_id = seed(&pool, 10, 0).await;
+        let repo = PgOutboxRepo::new(pool.clone());
+        let claimed = repo.claim_due(Duration::seconds(30), 0).await.expect("zero-limit claim");
+        assert_eq!(claimed.len(), 1, "limit 0 clamps to batch 1 (K = 0)");
+        assert_eq!(claimed[0].event_id, AuditId::from_uuid(event_id));
     }
 }
