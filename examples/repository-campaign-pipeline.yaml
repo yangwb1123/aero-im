@@ -60,7 +60,10 @@ stages:
       - adversarial_review
       - design_gate
     aggregate: true
-    validate: pyquality
+    # Rust-repo backstop: cargocheck (repo-scope, runs once at stage
+    # end). pyquality always fails on this repo (2172 pre-existing
+    # violations in scripts/smoke_*.py).
+    validate: cargocheck
     tasks:
       - prompt: |
           Read the repository's AGENTS.md and the approved evidence below.
