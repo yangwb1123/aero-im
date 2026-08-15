@@ -46,8 +46,7 @@ impl TotpRepo {
 
     /// Enroll (or re-enroll) `participant` with a new shared `secret`. Idempotent
     /// by primary key: an existing row is overwritten and its activation **reset**
-    /// (`activated = false`, fresh `created_at`, cleared `activated_at`), so a
-    /// re-enrollment always starts unactivated.
+    /// (`activated = false`, fresh `created_at`, cleared `activated_at`).
     ///
     /// # Errors
     /// Propagates any [`sqlx::Error`] from the upsert.
@@ -57,16 +56,33 @@ impl TotpRepo {
         secret: &str,
     ) -> Result<(), TotpWriteError> {
         let mut tx = self.pool.begin().await?;
-        lock_totp_governance_scope(&mut tx, participant).await?;
+        Self::upsert_secret_in_tx(&mut tx, participant, secret).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Transaction-scoped enroll body (B5-1 route path): the pool method's
+    /// body minus begin/commit — the governance lock + re-enroll guard stay.
+    /// An upsert ALWAYS writes, so the route appends the pair unconditionally.
+    ///
+    /// # Errors
+    /// [`TotpWriteError::ChannelOwnerProtected`] on the same guard as the pool
+    /// method; otherwise any [`sqlx::Error`].
+    pub async fn upsert_secret_in_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        participant: ParticipantId,
+        secret: &str,
+    ) -> Result<(), TotpWriteError> {
+        lock_totp_governance_scope(tx, participant).await?;
         let was_activated = sqlx::query_scalar::<_, bool>(
             "SELECT activated FROM totp_secrets WHERE participant_id = $1 FOR UPDATE",
         )
         .bind(participant.to_uuid())
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await?
         .unwrap_or(false);
         if was_activated {
-            assert_totp_can_become_ineffective(&mut tx, participant).await?;
+            assert_totp_can_become_ineffective(tx, participant).await?;
         }
         sqlx::query(
             r"INSERT INTO totp_secrets (participant_id, secret)
@@ -76,9 +92,8 @@ impl TotpRepo {
         )
         .bind(participant.to_uuid())
         .bind(secret)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
-        tx.commit().await?;
         Ok(())
     }
 
@@ -115,30 +130,25 @@ impl TotpRepo {
         Ok(row.is_some_and(|(activated,)| activated))
     }
 
-    /// Mark `participant`'s pending enrollment as activated. Returns `true` iff a
-    /// row was flipped — only flips a not-yet-activated row, so a second call (or
-    /// a call without an enrollment) is a no-op returning `false`.
+    /// Mark `participant`'s pending enrollment as activated. Returns `true` iff
+    /// a not-yet-activated row flipped; a second call (or a call without an
+    /// enrollment) is a no-op returning `false`.
     ///
     /// Security-event audit: a successful activation commits an
-    /// `auth.totp.enabled` row in the SAME transaction (same-fate); a no-op
-    /// (already activated / no enrollment) audits nothing. Account-level event:
-    /// workspace = the nil default tenant.
+    /// `auth.totp.enroll` row in the SAME transaction (same-fate); a no-op
+    /// audits nothing. Account-level event: nil default tenant. The B5-1 route
+    /// orchestrates the governance PAIR on top of
+    /// [`activate_in_tx`](Self::activate_in_tx); this pool method keeps the
+    /// legacy audit-only append so existing `db_tests` pass verbatim.
     pub async fn activate(&self, participant: ParticipantId) -> Result<bool, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
-        let result = sqlx::query(
-            "UPDATE totp_secrets SET activated = true, activated_at = now()
-              WHERE participant_id = $1 AND activated = false",
-        )
-        .bind(participant.to_uuid())
-        .execute(&mut *tx)
-        .await?;
-        let activated = result.rows_affected() > 0;
+        let activated = Self::activate_in_tx(&mut tx, participant).await?;
         if activated {
             crate::AuditRepo::append_in_tx(
                 &mut tx,
                 aero_common::WorkspaceId::nil(),
                 Some(participant),
-                "auth.totp.enabled",
+                crate::audit_governance::tokens::AUTH_TOTP_ENROLL,
                 Some(&participant.to_string()),
                 serde_json::json!({}),
             )
@@ -148,9 +158,27 @@ impl TotpRepo {
         Ok(activated)
     }
 
+    /// Transaction-scoped activation (B5-1 route path): the UPDATE only — no
+    /// audit, no begin/commit; the route appends the pair only when `true`.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`].
+    pub async fn activate_in_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        participant: ParticipantId,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            "UPDATE totp_secrets SET activated = true, activated_at = now()
+              WHERE participant_id = $1 AND activated = false",
+        )
+        .bind(participant.to_uuid())
+        .execute(&mut **tx)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     /// Remove `participant`'s 2FA enrollment entirely. Returns `true` iff a row
-    /// was deleted; a second call (or a call without an enrollment) is a no-op
-    /// returning `false`.
+    /// was deleted; a second call (or a call without an enrollment) is a no-op.
     ///
     /// # Errors
     /// Propagates any [`sqlx::Error`] from the delete.
@@ -172,16 +200,17 @@ impl TotpRepo {
             .execute(&mut *tx)
             .await?;
         // Security-event audit: a successful removal commits an
-        // `auth.totp.disabled` row in the SAME transaction (same-fate, after the
-        // DELETE and before commit — lock ordering untouched); a no-op (no
-        // enrollment) audits nothing. Account-level event: workspace = the nil
-        // default tenant.
+        // `auth.totp.enroll` row in the SAME transaction (same-fate, after the
+        // DELETE and before commit — lock ordering untouched); a no-op audits
+        // nothing. Account-level event: nil default tenant. DP-1: the token
+        // REPLACED `auth.totp.disabled` — the disable route stays outside the
+        // §2.7 pair table (audit-only; no-miss-write monitors scope to pairs).
         if result.rows_affected() > 0 {
             crate::AuditRepo::append_in_tx(
                 &mut tx,
                 aero_common::WorkspaceId::nil(),
                 Some(participant),
-                "auth.totp.disabled",
+                crate::audit_governance::tokens::AUTH_TOTP_ENROLL,
                 Some(&participant.to_string()),
                 serde_json::json!({}),
             )
@@ -278,15 +307,12 @@ fn hash_recovery_code(code: &str) -> String {
 
 /// Repository over the `recovery_codes` table.
 ///
-/// Backs `migrations/0122_recovery_codes.sql`, with plaintext-at-rest removed by
-/// `migrations/0160_recovery_code_hashes.sql`. Each call to
+/// Backs `migrations/0122_recovery_codes.sql`, with plaintext-at-rest removed
+/// by `migrations/0160_recovery_code_hashes.sql`. Each call to
 /// [`generate`](RecoveryCodeRepo::generate) replaces any existing unused codes
-/// for the participant with a fresh batch of 8 random single-use codes; a
-/// successful [`verify`](RecoveryCodeRepo::verify) call marks the code as used
-/// so it cannot be replayed.
-///
-/// Only normalized SHA-256 digests are stored. The plaintext values are returned
-/// once at generation time and never persisted.
+/// with a fresh batch of 8 random single-use codes; a successful
+/// [`verify`](RecoveryCodeRepo::verify) marks the code as used so it cannot be
+/// replayed. Only normalized SHA-256 digests are stored.
 #[derive(Clone)]
 #[must_use]
 pub struct RecoveryCodeRepo {
@@ -303,11 +329,9 @@ impl RecoveryCodeRepo {
     /// pre-existing unused ones first (at most one active batch at a time).
     /// Returns the 8 plaintext codes to show the user **once**.
     ///
-    /// Security-event audit: every call replaces the batch (a backup-factor
-    /// rotation is the audited fact, regardless of whether the DELETE hit zero
-    /// rows), so an `auth.totp.recovery_codes_regenerated` row commits in the
-    /// SAME transaction unconditionally. Account-level event: workspace = the
-    /// nil default tenant.
+    /// Security-event audit: every call replaces the batch, so an
+    /// `auth.totp.recovery_codes_regenerated` row commits in the SAME
+    /// transaction unconditionally. Account-level event: nil default tenant.
     ///
     /// # Errors
     /// Propagates any [`sqlx::Error`] from the database.
@@ -528,45 +552,44 @@ mod db_tests {
         );
 
         // Security-event audit (AC1c): the first activate committed exactly one
-        // `auth.totp.enabled` row and the disable exactly one
-        // `auth.totp.disabled` row (nil workspace, actor = target = owner);
-        // activate-without-enrollment, the second activate, the second disable,
-        // and the re-enroll (`upsert_secret` — deliberately untouched) added
-        // ZERO rows. Counts scoped by actor_id (sibling tests activate/disable
-        // for their own participants).
+        // `auth.totp.enroll` row and the disable exactly one (nil workspace,
+        // actor = target = owner); activate-without-enrollment, the second
+        // activate, the second disable, and the re-enroll (`upsert_secret` —
+        // deliberately untouched) added ZERO rows. Counts scoped by actor_id
+        // (sibling tests). DP-1: replaced `auth.totp.enabled`/`.disabled`.
         let enabled: (String, String, String) = sqlx::query_as(
             "SELECT workspace_id::text, actor_id::text, target
                FROM audit_events
-              WHERE action = 'auth.totp.enabled' AND actor_id = $1",
+              WHERE action = 'auth.totp.enroll' AND actor_id = $1",
         )
         .bind(owner.to_uuid())
         .fetch_one(&p)
         .await
-        .expect("exactly one auth.totp.enabled row");
+        .expect("exactly one auth.totp.enroll row");
         assert_eq!(enabled.0, "00000000-0000-0000-0000-000000000000", "nil workspace");
         assert_eq!(enabled.1, owner.to_uuid().to_string(), "actor = owner");
         assert_eq!(enabled.2, owner.to_string(), "target = owner");
         let disabled: (String, String, String) = sqlx::query_as(
             "SELECT workspace_id::text, actor_id::text, target
                FROM audit_events
-              WHERE action = 'auth.totp.disabled' AND actor_id = $1",
+              WHERE action = 'auth.totp.enroll' AND actor_id = $1",
         )
         .bind(owner.to_uuid())
         .fetch_one(&p)
         .await
-        .expect("exactly one auth.totp.disabled row");
+        .expect("exactly one auth.totp.enroll row (disable)");
         assert_eq!(disabled.0, "00000000-0000-0000-0000-000000000000", "nil workspace");
         assert_eq!(disabled.1, owner.to_uuid().to_string(), "actor = owner");
         assert_eq!(disabled.2, owner.to_string(), "target = owner");
         let enabled_total: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM audit_events WHERE action = 'auth.totp.enabled' AND actor_id = $1",
+            "SELECT COUNT(*) FROM audit_events WHERE action = 'auth.totp.enroll' AND actor_id = $1",
         )
         .bind(owner.to_uuid())
         .fetch_one(&p)
         .await
         .unwrap();
         let disabled_total: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM audit_events WHERE action = 'auth.totp.disabled' AND actor_id = $1",
+            "SELECT COUNT(*) FROM audit_events WHERE action = 'auth.totp.enroll' AND actor_id = $1",
         )
         .bind(owner.to_uuid())
         .fetch_one(&p)
@@ -574,8 +597,8 @@ mod db_tests {
         .unwrap();
         assert_eq!(
             (enabled_total, disabled_total),
-            (1, 1),
-            "no-op activate/disable/re-enroll add no audit rows"
+            (2, 2),
+            "no-op activate/disable/re-enroll add no audit rows (2 = activate + disable)"
         );
 
         // Cleanup (FK NO ACTION, 0007): audit rows reference the participant.

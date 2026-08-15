@@ -210,6 +210,19 @@ impl SnaplinkCommercialRepo {
         Ok(())
     }
 
+    /// Whether `workspace` has an enabled commercial binding (D13 anchor for
+    /// the F1 regression pair — the 0236 v1 trigger's binding lookup outcome
+    /// for the auth pair's workspace).
+    pub async fn has_enabled_binding(&self, workspace: WorkspaceId) -> Result<bool, sqlx::Error> {
+        sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM snaplink_commercial_bindings
+                             WHERE workspace_id = $1 AND enabled)",
+        )
+        .bind(workspace.to_uuid())
+        .fetch_one(&self.pool)
+        .await
+    }
+
     pub async fn require_disabled(&self) -> Result<(), sqlx::Error> {
         let enabled = sqlx::query_scalar::<_, bool>(
             "SELECT enabled FROM snaplink_commercial_runtime WHERE singleton",

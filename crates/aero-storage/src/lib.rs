@@ -336,7 +336,7 @@ pub use password_reset::{
     generate_token as generate_reset_token, hash_reset_token, PasswordResetRepo,
     DEFAULT_TTL as RESET_TOKEN_TTL,
 };
-pub use registration::{NewRegistration, RegistrationRepo};
+pub use registration::{NewRegistration, NewRegistrationAudit, RegistrationRepo};
 
 // ---- ROADMAP 方向二 — mobile push ----
 pub mod push_token;

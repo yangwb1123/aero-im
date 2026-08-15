@@ -304,6 +304,70 @@ pub(crate) fn spawn_all(
         });
     }
 
+    // L1 auth.login.failure aggregation (B5-1 auth slice): closed-bucket scan
+    // over login_failures → one governance outbox row per bucket (class
+    // 'message', priority 10, deterministic v5 event_id, envelope top-level
+    // "aggregated": true). Env `AERO__SERVER__LOGIN_FAILURE_L1_AGGREGATE_SECS`
+    // (default 30, 0 disables; env-only like LOGIN_FAILURE_RETENTION_DAYS — no
+    // config.toml key). The timer NEVER deletes base rows (forensic retention;
+    // the retention sweep owns deletion — D11: disabling this while retention
+    // runs permanently loses that window's v2 signal; reopening within the
+    // retention window self-heals via the pull-scan backfill).
+    {
+        let l1_aggregate_secs = std::env::var("AERO__SERVER__LOGIN_FAILURE_L1_AGGREGATE_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(30);
+        if l1_aggregate_secs != 0 {
+            let repo = aero_storage::audit_governance::AuditGovernanceOutboxRepo::new(
+                state.pg.clone(),
+            );
+            let cancel = ai_shutdown.clone();
+            tracker.spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(
+                    l1_aggregate_secs,
+                ));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tokio::select! {
+                        () = cancel.cancelled() => break,
+                        _ = tick.tick() => {}
+                    }
+                    match repo
+                        .aggregate_login_failure_buckets(i64::try_from(l1_aggregate_secs).unwrap_or(30))
+                        .await
+                    {
+                        Ok(inserted) if inserted > 0 => {
+                            tracing::info!(inserted, "L1 login-failure buckets aggregated");
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::warn!(error = %e, "L1 login-failure aggregation failed");
+                        }
+                    }
+                }
+            });
+        } else {
+            // D11/F15: disabling the L1 aggregator while the retention sweep
+            // (AERO__SERVER__LOGIN_FAILURE_RETENTION_DAYS, default 180d) runs
+            // permanently loses that window's v2 failure signal — warn ONCE at
+            // boot so the operator can reopen it within the retention window.
+            let retention_days = std::env::var("AERO__SERVER__LOGIN_FAILURE_RETENTION_DAYS")
+                .ok()
+                .and_then(|value| value.parse::<i64>().ok())
+                .unwrap_or(180);
+            if retention_days > 0 {
+                tracing::warn!(
+                    "AERO__SERVER__LOGIN_FAILURE_L1_AGGREGATE_SECS=0 disables the L1 \
+                     auth.login.failure aggregation: closed buckets are never aggregated and \
+                     the retention sweep ({}d) will permanently delete that window's v2 signal \
+                     — reopen the timer within the retention window to self-heal",
+                    retention_days
+                );
+            }
+        }
+    }
+
     // Webhook dispatcher
     {
         let s = state.clone();

@@ -201,6 +201,24 @@ async fn auth_login(
     record_session(&s, out.participant.id, out.session_id, &out.refresh_token, &headers)
         .await
         .map_err(AeroError::from)?;
+    // B5-1: login-success governance pair (auth.login / admin.auth.login).
+    // D5 PIN — this call site must NEVER move into `AuthService::login`: the
+    // 2FA gate runs here in the handler, so a 2FA-failed attempt must never be
+    // recorded as a successful login. Fail-open: `record_pair_standalone`
+    // swallows everything (Option<AuditId> — Database-class failures land in
+    // the DLQ, connection-level failures warn); the login result is never
+    // flipped (R7). Account-level event: nil default workspace.
+    let participant_id_text = out.participant.id.to_string();
+    let _ = aero_storage::audit_governance::AuditGovernanceOutboxRepo::new(s.pg.clone())
+        .record_pair_standalone(
+            DEFAULT_WORKSPACE_ID,
+            Some(out.participant.id),
+            aero_storage::audit_governance::tokens::AUTH_LOGIN,
+            Some(&participant_id_text),
+            serde_json::json!({}),
+            aero_storage::audit_governance::tokens::OUTBOUND_AUTH_LOGIN,
+        )
+        .await;
     // ROADMAP5 方向五: record the login in the IP/device history + flag a new-IP
     // login (best-effort; never fails login). The audit event is scoped to the
     // default workspace (login is workspace-agnostic — a participant can belong to

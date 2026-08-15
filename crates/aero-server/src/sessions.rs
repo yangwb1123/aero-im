@@ -91,49 +91,37 @@ async fn revoke_session(
     Path(id_str): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let id = parse_session(&id_str)?;
-    let revoked = repo(&s)
-        .revoke_and_blacklist(id, auth.participant_id)
+    // B5-1: revoke + governance pair (session.revoked /
+    // admin.auth.session.revoke — target = session id, detail
+    // `{"session_id":…}` — the existing inventory shape) in ONE transaction;
+    // the pool-level post-hoc `audit_session_revoked` append is gone (same
+    // action string → the audit trajectory is continuous). Pair is SAVEPOINT
+    // fail-open: an audit failure never blocks the revoke (R7).
+    let mut tx = s.pg.begin().await.map_err(AeroError::from)?;
+    let revoked = SessionRepo::revoke_and_blacklist_in_tx(&mut tx, id, auth.participant_id)
         .await
         .map_err(AeroError::from)?;
     if !revoked {
+        tx.rollback().await.map_err(AeroError::from)?;
         return Err(AeroError::NotFound(format!("session {id}")).into());
     }
+    let _ = aero_storage::audit_governance::AuditGovernanceOutboxRepo::append_pair_in_tx_fail_open(
+        &mut tx,
+        aero_common::WorkspaceId::from_uuid(uuid::Uuid::nil()),
+        Some(auth.participant_id),
+        aero_storage::audit_governance::tokens::SESSION_REVOKED,
+        Some(&id.to_string()),
+        serde_json::json!({ "session_id": id.to_string() }),
+        aero_storage::audit_governance::tokens::OUTBOUND_AUTH_SESSION_REVOKE,
+    )
+    .await
+    .map_err(AeroError::from)?; // Ok(None) = fail-open skip (DLQ row in-tx)
+    tx.commit().await.map_err(AeroError::from)?;
     s.hub.disconnect_session(auth.participant_id, id);
     crate::session_control::publish_revoke_session(&s, auth.participant_id, id).await;
-    // Best-effort privileged-operation audit (ROADMAP 方向四). A session revocation
-    // is account-scoped with no workspace context, so it is attributed to the
-    // all-zero default workspace (uuid nil), with the session id as target. The
-    // append already happened; a logging failure only warns, never fails the
-    // already-done revocation.
-    audit_session_revoked(&s, auth.participant_id, id).await;
     Ok(Json(
         serde_json::json!({ "revoked": true, "session_id": id }),
     ))
-}
-
-/// Record a `session.revoked` audit event for an explicit session-inventory
-/// revoke. Attributed to the all-zero default workspace (uuid nil) since the
-/// action has no tenant context; the session id is the target. Best-effort: an
-/// append failure is warn-logged and swallowed (the session is already revoked).
-async fn audit_session_revoked(
-    s: &AppState,
-    actor: aero_common::ParticipantId,
-    session: SessionId,
-) {
-    let workspace = aero_common::WorkspaceId::from_uuid(uuid::Uuid::nil());
-    if let Err(e) = s
-        .audit
-        .append(
-            workspace,
-            Some(actor),
-            "session.revoked",
-            Some(&session.to_string()),
-            serde_json::json!({ "session_id": session.to_string() }),
-        )
-        .await
-    {
-        tracing::warn!(error = ?e, "session.revoked audit append failed");
-    }
 }
 
 /// Request body for "sign out everywhere else" — the caller's current refresh

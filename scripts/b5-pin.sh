@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # B5 acceptance-gate pin material for scripts/test-integration.sh (G6 总装门):
 #
-#   * B5_CONTRACT_TEST_LIST — the 40/40 named contract-test slots (AC1 of
+#   * B5_CONTRACT_TEST_LIST — the 41/41 named contract-test slots (AC1 of
 #     docs/requirements/2026-08-07-aero-cli-b5-acceptance-gate-harness.req.md).
-#     18 in-repo-executable names + 21 out-of-repo slots tagged [PROPOSED]
+#     20 in-repo-executable names + 21 out-of-repo slots tagged [PROPOSED]
 #     (docs/proposals/audit-contract-batch-aero-im.md :13 — the v2 contract
 #     test names live outside this repo; when the contract text lands, replace
 #     the placeholders verbatim — one-touch — and the guard automatically
@@ -11,7 +11,7 @@
 #   * b5_check — the verdict-line protocol (`B5-CHECK <name>: PASS|SKIP
 #     (<reason>)`): echoed to stdout AND appended to $B5_LOG (the pin guard's
 #     evidence file).
-#   * assert_b5_contract_pin — the guard: exactly 39 slots, no duplicates, no
+#   * assert_b5_contract_pin — the guard: exactly 41 slots, no duplicates, no
 #     malformed entries, ≥1 executed slot (no vacuous green), and (fresh mode)
 #     every executed slot backed by a `B5-CHECK <name>: PASS|SKIP` verdict
 #     line in the B5 log (SKIP-with-reason counts as handled — 0239 / sibling
@@ -20,7 +20,7 @@
 # Sourced by scripts/test-integration.sh and exercised standalone by
 # scripts/test-b5-pin-guard.sh (pure bash — no database, no services).
 
-# 40 slots: 19 executed + 21 [PROPOSED]. The executed slots' verdict sources:
+# 41 slots: 20 executed + 21 [PROPOSED]. The executed slots' verdict sources:
 #   cargo-test filters (run_migration_regression / run_migrated_integration —
 #   empty-filter guarded, ≥1 test must actually run), 0239-gated B5-1 entries,
 #   the A3 / T-11 / moderation-priority drill sections, the notification
@@ -38,6 +38,7 @@ B5_CONTRACT_TEST_LIST=(
     audit_governance::
     moderation_finalize_outbox_parity
     moderation_finalize_drill
+    auth_outbox_parity
     a3-relay-drill
     t11-fail-closed
     moderation-priority-drill
@@ -81,15 +82,15 @@ b5_check() {
     echo "$line" >>"${B5_LOG:-/dev/null}"
 }
 
-# The 39/39 pin guard (AC1). Argument: the B5 log file holding the verdict
+# The 41/41 pin guard (AC1). Argument: the B5 log file holding the verdict
 # lines. Unconditional (no DB); in SKIP_DB_CREATE dev-hygiene mode the
 # verdict-evidence half degrades (fresh-DB segments did not run) while the
 # count/format/dupe/vacuous checks stay enforced.
 assert_b5_contract_pin() {
     local log_file="$1"
     local count=${#B5_CONTRACT_TEST_LIST[@]}
-    if [ "$count" -ne 40 ]; then
-        echo "✗ B5 contract pin: 40/${count} (expected exactly 40 named slots)" >&2
+    if [ "$count" -ne 41 ]; then
+        echo "✗ B5 contract pin: 41/${count} (expected exactly 41 named slots)" >&2
         return 1
     fi
     local -A seen=()
@@ -131,7 +132,7 @@ assert_b5_contract_pin() {
     else
         echo "B5 pin: verdict evidence degraded (SKIP_DB_CREATE); count/format/dupe/vacuous checks still enforced"
     fi
-    echo "B5 contract pin: 40/40 (${executed} executed, ${proposed} [PROPOSED]): PASS"
+    echo "B5 contract pin: 41/41 (${executed} executed, ${proposed} [PROPOSED]): PASS"
 }
 
 # F4 stub-reachability pin (merged B5-2 design §6 step 7): the test stub

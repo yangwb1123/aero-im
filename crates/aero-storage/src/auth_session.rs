@@ -20,7 +20,7 @@
 
 use aero_common::{ParticipantId, SessionId};
 use serde::Serialize;
-use sqlx::PgPool;
+use sqlx::{PgPool, Postgres, Transaction};
 
 mod admin_revoke;
 pub use admin_revoke::AdminSessionRevokeError;
@@ -501,6 +501,23 @@ impl SessionRepo {
         id: SessionId,
         participant: ParticipantId,
     ) -> Result<bool, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let revoked = Self::revoke_and_blacklist_in_tx(&mut tx, id, participant).await?;
+        tx.commit().await?;
+        Ok(revoked)
+    }
+
+    /// Transaction-scoped [`revoke_and_blacklist`](Self::revoke_and_blacklist)
+    /// (B5-1 route path: the B5-1 route appends the `session.revoked` governance
+    /// pair on top of this before committing).
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`].
+    pub async fn revoke_and_blacklist_in_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        id: SessionId,
+        participant: ParticipantId,
+    ) -> Result<bool, sqlx::Error> {
         let row: Option<(String,)> = sqlx::query_as(
             r"WITH revoked AS (
                    UPDATE auth_sessions
@@ -518,7 +535,7 @@ impl SessionRepo {
         )
         .bind(id.to_uuid())
         .bind(participant.to_uuid())
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut **tx)
         .await?;
         Ok(row.is_some())
     }
@@ -561,6 +578,46 @@ impl SessionRepo {
         participant: ParticipantId,
     ) -> Result<bool, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
+        let revoked = Self::revoke_by_hash_and_blacklist_in_tx(&mut tx, token_hash, participant)
+            .await?;
+        tx.commit().await?;
+        Ok(revoked)
+    }
+
+    /// Transaction-scoped revoke-by-hash (B5-1 logout route path): the UPDATE
+    /// only — no blacklist, no begin/commit. The route appends the
+    /// `session.revoked` governance pair on top of this before committing.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`].
+    pub async fn revoke_by_hash_in_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        token_hash: &str,
+        participant: ParticipantId,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            r"UPDATE auth_sessions
+                 SET revoked_at = now()
+               WHERE token_hash = $1 AND participant_id = $2 AND revoked_at IS NULL",
+        )
+        .bind(token_hash)
+        .bind(participant.to_uuid())
+        .execute(&mut **tx)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Transaction-scoped blacklist + revoke (B5-1 logout route path: the route
+    /// keeps the blacklist in the SAME tx as the pair). The blacklist insert is
+    /// idempotent, so a repeated logout remains successful.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`].
+    pub async fn revoke_by_hash_and_blacklist_in_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        token_hash: &str,
+        participant: ParticipantId,
+    ) -> Result<bool, sqlx::Error> {
         sqlx::query(
             r"INSERT INTO revoked_tokens (token_hash, participant_id)
                VALUES ($1, $2)
@@ -568,7 +625,7 @@ impl SessionRepo {
         )
         .bind(token_hash)
         .bind(participant.to_uuid())
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
         let revoked = sqlx::query(
             r"UPDATE auth_sessions
@@ -577,11 +634,10 @@ impl SessionRepo {
         )
         .bind(token_hash)
         .bind(participant.to_uuid())
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?
         .rows_affected()
             > 0;
-        tx.commit().await?;
         Ok(revoked)
     }
 

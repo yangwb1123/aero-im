@@ -9,7 +9,27 @@
 use aero_common::{Participant, ParticipantId, ParticipantKind, SessionId, WorkspaceId};
 use sqlx::PgPool;
 
+use crate::audit_governance::AuditGovernanceOutboxRepo;
 use crate::AuditRepo;
+
+/// Governance pair spec for a registration (B5-1 auth slice). When `Some`,
+/// [`RegistrationRepo::create`] REPLACES the legacy audit-only append with the
+/// fail-open pair writer (exactly 1 audit row + 1 outbox row, same tx — never
+/// double-audited). `detail` is `{}` (D-N1: PII reduction — the email leaves
+/// the audit trail on the pair path; no in-repo consumers of the register
+/// audit detail exist).
+#[derive(Debug, Clone)]
+pub struct NewRegistrationAudit {
+    /// Local token: `auth.register`.
+    pub action: &'static str,
+    /// New participant id (the audit target).
+    pub target: String,
+    /// Envelope `payload` (must be a JSON object — the pair writer's contract
+    /// pre-check rejects non-objects).
+    pub detail: serde_json::Value,
+    /// Outbound token: `admin.auth.register`.
+    pub outbound_action: &'static str,
+}
 
 #[derive(Debug, Clone)]
 pub struct NewRegistration {
@@ -21,6 +41,10 @@ pub struct NewRegistration {
     pub session_id: SessionId,
     pub refresh_token_hash: String,
     pub user_agent: Option<String>,
+    /// Governance pair spec — `None` (SSO/OIDC JIT etc.) keeps the legacy
+    /// audit-only `auth.register` append (D-N4); `Some` (first-party
+    /// `register_enrolled`) writes the 1:1 pair.
+    pub auth_audit: Option<NewRegistrationAudit>,
 }
 
 #[derive(Clone)]
@@ -109,23 +133,39 @@ impl RegistrationRepo {
         .await?;
 
         // Security-event audit (auth slice direction): the account-creation
-        // event rides the SAME transaction — same-fate. A failed audit insert
-        // aborts registration exactly like any other failed statement, leaving
-        // zero rows of either kind; a committed registration always has its
-        // audit row (actor/target = the new participant; the FK resolves
-        // against the participant inserted above in this tx).
-        AuditRepo::append_in_tx(
-            &mut tx,
-            new.workspace_id,
-            Some(new.participant_id),
-            "auth.register",
-            Some(&new.participant_id.to_string()),
-            serde_json::json!({
-                "email": new.email.trim(),
-                "user_agent": new.user_agent,
-            }),
-        )
-        .await?;
+        // event rides the SAME transaction — same-fate. When `auth_audit` is
+        // `Some`, the governance PAIR writer replaces the legacy append:
+        // exactly 1 audit row + 1 outbox row (SAVEPOINT fail-open — `Ok(None)`
+        // continues silently, `Err` propagates). When `None` (SSO/OIDC JIT,
+        // db_tests), the legacy audit-only append stays (D-N4).
+        match new.auth_audit {
+            Some(audit) => {
+                let _ = AuditGovernanceOutboxRepo::append_pair_in_tx_fail_open(
+                    &mut tx,
+                    new.workspace_id,
+                    Some(new.participant_id),
+                    audit.action,
+                    Some(&audit.target),
+                    audit.detail,
+                    audit.outbound_action,
+                )
+                .await?; // Ok(None) = fail-open skip (DLQ row in-tx)
+            }
+            None => {
+                AuditRepo::append_in_tx(
+                    &mut tx,
+                    new.workspace_id,
+                    Some(new.participant_id),
+                    "auth.register",
+                    Some(&new.participant_id.to_string()),
+                    serde_json::json!({
+                        "email": new.email.trim(),
+                        "user_agent": new.user_agent,
+                    }),
+                )
+                .await?;
+            }
+        }
 
         tx.commit().await?;
         Ok(Participant {
@@ -183,6 +223,7 @@ mod db_tests {
                 session_id: session,
                 refresh_token_hash: format!("refresh-{session}"),
                 user_agent: Some("registration-test".into()),
+                auth_audit: None,
             })
             .await;
         assert!(
@@ -246,6 +287,7 @@ mod db_tests {
             session_id: session,
             refresh_token_hash: format!("refresh-{session}"),
             user_agent: Some("registration-test".into()),
+            auth_audit: None,
         })
         .await
         .expect("registration commits");
@@ -367,6 +409,7 @@ mod db_tests {
                 session_id: session,
                 refresh_token_hash: format!("refresh-{session}"),
                 user_agent: None,
+                auth_audit: None,
             })
             .await
             .unwrap();

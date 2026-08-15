@@ -32,6 +32,31 @@
 //! Every submodule opens `use super::*;`; helpers shared across domains live
 //! in `db_tests.rs` so the submodule test bodies stay byte-identical to the
 //! pre-split file.
+//!
+//! ## H3 landed (auth slice)
+//!
+//! [`outbox`] = the v2 enqueue-side repo (`AuditGovernanceOutboxRepo`:
+//! envelope mirror, SAVEPOINT fail-open pair, standalone pair, L1
+//! aggregation, error classifier); [`failed_pairs`] = the 0244 DLQ
+//! compensation repo; [`tokens`] = the §2.7 allowlist (storage is the single
+//! Rust source; `aero-auth::audit_tokens` mirrors textually with its pin
+//! test). IMMEDIATE-constraint pin (D4): 0239/0236 CHECK/RAISE are all
+//! IMMEDIATE — a future DEFERRABLE change defers errors to COMMIT and breaks
+//! the SAVEPOINT fail-open branch (whole-tx fail-closed, violates R7); see
+//! also migration 0244's DDL comment.
+
+pub mod failed_pairs;
+pub mod outbox;
+pub mod tokens;
+
+pub use failed_pairs::FailedPairRepo;
+pub use outbox::{AuditGovernanceOutboxRepo, governance_envelope, is_fail_open_error};
+pub use tokens::{
+    AUTH_LOGIN, AUTH_PAT_ISSUE, AUTH_PAT_REVOKE, AUTH_REFRESH, AUTH_REGISTER, AUTH_SOURCE_SYSTEM,
+    AUTH_TOTP_ENROLL, L1_AUTH_LOGIN_FAILURE_ACTION, OUTBOUND_AUTH_LOGIN, OUTBOUND_AUTH_LOGIN_FAILURE,
+    OUTBOUND_AUTH_PAT_ISSUE, OUTBOUND_AUTH_PAT_REVOKE, OUTBOUND_AUTH_REGISTER, OUTBOUND_AUTH_REFRESH,
+    OUTBOUND_AUTH_SESSION_REVOKE, OUTBOUND_AUTH_TOTP_ENROLL, SESSION_REVOKED, SESSION_REVOKED_ADMIN,
+};
 
 #[cfg(test)]
 mod db_tests;

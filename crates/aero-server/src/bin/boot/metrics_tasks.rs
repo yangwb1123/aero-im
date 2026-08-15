@@ -165,6 +165,34 @@ pub(crate) fn spawn_all(
         });
     }
 
+    // Audit-governance failed-pairs DLQ depth gauge (B5-1 auth slice, D10):
+    // non-zero means a fail-open audit pair is awaiting ops replay.
+    {
+        let repo = aero_storage::audit_governance::FailedPairRepo::new(state.pg.clone());
+        let cancel = ai_shutdown.clone();
+        tracker.spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    () = cancel.cancelled() => break,
+                    _ = tick.tick() => {}
+                }
+                match repo.count().await {
+                    Ok(n) => {
+                        // Gauge counts are far below 2^53; the narrowing is exact in practice.
+                        #[allow(clippy::cast_precision_loss)]
+                        common_metrics::set_gauge(
+                            common_metrics::names::AUDIT_GOVERNANCE_FAILED_PAIRS,
+                            n as f64,
+                        );
+                    }
+                    Err(e) => tracing::warn!(error = %e, "failed-pairs DLQ count query failed"),
+                }
+            }
+        });
+    }
+
     // NATS consumer backlog gauges
     {
         let js = jetstream.clone();

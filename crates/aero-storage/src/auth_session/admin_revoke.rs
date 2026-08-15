@@ -109,19 +109,24 @@ impl SessionRepo {
         .await?;
         let revoked = u64::try_from(row.0).unwrap_or(0);
         let target_text = target.to_string();
-        crate::AuditRepo::append_in_tx(
+        // B5-1 auth slice: the admin force-revoke governance PAIR rides this
+        // existing transaction (route zero-change). `session.revoked.admin` is
+        // the NEW admin-side local token (D6); the pair is fail-open — a
+        // Database-class audit failure rolls back to the SAVEPOINT, enqueues
+        // the DLQ row, and the revoke still commits (R7). Workspace = the
+        // revoker's/target's workspace (the existing audit's workspace).
+        crate::audit_governance::AuditGovernanceOutboxRepo::append_pair_in_tx_fail_open(
             &mut tx,
             workspace,
             Some(caller),
-            "session.revoked",
+            crate::audit_governance::tokens::SESSION_REVOKED_ADMIN,
             Some(&target_text),
             serde_json::json!({
-                "revoked": revoked,
-                "scope": "participant_global",
-                "target_role": target_role,
+                "admin_revoked": true,
             }),
+            crate::audit_governance::tokens::OUTBOUND_AUTH_SESSION_REVOKE,
         )
-        .await?;
+        .await?; // Ok(None) = fail-open skip (DLQ row in-tx); Err = connection-level
         tx.commit().await?;
         Ok(revoked)
     }

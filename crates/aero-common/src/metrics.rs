@@ -135,6 +135,23 @@ pub mod names {
     /// `stage` and `outcome` vocabularies.
     pub const WEBHOOK_DELIVERY_OUTCOMES_TOTAL: &str = "aero_webhook_delivery_outcomes_total";
 
+    // --- Audit governance (B5-1 auth slice, D10) ---
+    /// Counter: fail-open audit-pair write failures in the auth slice, labeled by
+    /// the bounded `category` set ({contract, binding, database}). SQLSTATE is the
+    /// classification key (P0001 → binding; 23514/23503/23505 → contract;
+    /// 40P01/40001/55P03/other → database; the Rust contract pre-check also
+    /// counts contract). Emitted from the shared pair-write path in aero-storage
+    /// (its first metric — deliberate exception, connector design §2.8). Naming
+    /// note (D-N3): the literal LACKS the `aero_` namespace prefix this module's
+    /// doc prescribes — kept verbatim per the governing design (both B5-1
+    /// designs agree); flagged for the connector design review, do not silently
+    /// "fix".
+    pub const AUDIT_AUTH_WRITE_FAILURES_TOTAL: &str = "audit_auth_write_failures_total";
+    /// Gauge: rows in `audit_governance_failed_pairs` (the DLQ for fail-open
+    /// audit pairs). Non-zero means a lost pair awaiting ops replay — alert at
+    /// threshold > 0. Sampled every 30 s in `bin/boot/metrics_tasks.rs`.
+    pub const AUDIT_GOVERNANCE_FAILED_PAIRS: &str = "aero_audit_governance_failed_pairs";
+
     // --- Live media ingest ---
     /// Gauge: active WHIP ingest sessions (WebRTC streams currently being ingested).
     /// Updated every 15 s alongside the DB pool gauges.
@@ -848,6 +865,16 @@ pub fn register_known_metrics(r: &Registry) {
         names::WEBHOOK_DELIVERY_OUTCOMES_TOTAL,
         MetricKind::Counter,
         "Outgoing webhook processing outcomes by stage and bounded outcome.",
+    );
+    r.register_help(
+        names::AUDIT_AUTH_WRITE_FAILURES_TOTAL,
+        MetricKind::Counter,
+        "Fail-open audit-pair write failures by category (contract|binding|database).",
+    );
+    r.register_help(
+        names::AUDIT_GOVERNANCE_FAILED_PAIRS,
+        MetricKind::Gauge,
+        "Depth of audit_governance_failed_pairs (DLQ for fail-open audit pairs).",
     );
     r.register_help(
         names::HTTP_REQUESTS_TOTAL,

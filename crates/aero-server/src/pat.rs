@@ -20,7 +20,11 @@
 
 use std::str::FromStr;
 
-use aero_common::{Error as AeroError, PatId, Result as AeroResult};
+use aero_common::{Error as AeroError, PatId, Result as AeroResult, WorkspaceId};
+use aero_storage::audit_governance::outbox::AuditGovernanceOutboxRepo;
+use aero_storage::audit_governance::tokens::{
+    AUTH_PAT_ISSUE, AUTH_PAT_REVOKE, OUTBOUND_AUTH_PAT_ISSUE, OUTBOUND_AUTH_PAT_REVOKE,
+};
 use aero_storage::pat::{generate_pat, hash_pat};
 use aero_storage::PatRepo;
 use axum::{
@@ -126,18 +130,36 @@ async fn mint_pat(
     let scopes = normalize_scopes(req.scopes)?;
     let expires_at = resolve_expiry(req.expires_in_secs, time::OffsetDateTime::now_utc())?;
 
-    // Generate the plaintext once; persist only its hash.
+    // Generate the plaintext once; persist only its hash. B5-1: the mint and
+    // its governance pair (auth.pat.issue / admin.auth.pat.issue — target =
+    // pat id, detail `{"scopes":[…]}`, no free-text name, §2.5) commit in ONE
+    // transaction; the pair is SAVEPOINT fail-open, so an audit failure never
+    // blocks the mint (R7).
     let token = generate_pat();
-    let id = pat_repo(&s)
-        .create(
-            auth.participant_id,
-            &hash_pat(&token),
-            name,
-            &scopes,
-            expires_at,
-        )
-        .await
-        .map_err(AeroError::from)?;
+    let pool = s.participants.pool().clone();
+    let mut tx = pool.begin().await.map_err(AeroError::from)?;
+    let id = PatRepo::create_in_tx(
+        &mut tx,
+        auth.participant_id,
+        &hash_pat(&token),
+        name,
+        &scopes,
+        expires_at,
+    )
+    .await
+    .map_err(AeroError::from)?;
+    let _ = AuditGovernanceOutboxRepo::append_pair_in_tx_fail_open(
+        &mut tx,
+        WorkspaceId::nil(),
+        Some(auth.participant_id),
+        AUTH_PAT_ISSUE,
+        Some(&id.to_string()),
+        serde_json::json!({ "scopes": scopes }),
+        OUTBOUND_AUTH_PAT_ISSUE,
+    )
+    .await
+    .map_err(AeroError::from)?; // Ok(None) = fail-open skip (DLQ row in-tx)
+    tx.commit().await.map_err(AeroError::from)?;
 
     Ok((
         StatusCode::CREATED,
@@ -168,10 +190,28 @@ async fn revoke_pat(
     Path(id): Path<String>,
 ) -> ApiResult<StatusCode> {
     let pat_id = PatId::from_str(&id).map_err(|e| AeroError::Invalid(format!("pat id: {e}")))?;
-    let revoked = pat_repo(&s)
-        .revoke(pat_id, auth.participant_id)
+    // B5-1: revoke + governance pair (auth.pat.revoke / admin.auth.pat.revoke)
+    // in ONE transaction. Idempotency unchanged: a no-op revoke (non-owned /
+    // already revoked) audits nothing and returns 404 as today.
+    let pool = s.participants.pool().clone();
+    let mut tx = pool.begin().await.map_err(AeroError::from)?;
+    let revoked = PatRepo::revoke_in_tx(&mut tx, pat_id, auth.participant_id)
         .await
         .map_err(AeroError::from)?;
+    if revoked {
+        let _ = AuditGovernanceOutboxRepo::append_pair_in_tx_fail_open(
+            &mut tx,
+            WorkspaceId::nil(),
+            Some(auth.participant_id),
+            AUTH_PAT_REVOKE,
+            Some(&pat_id.to_string()),
+            serde_json::json!({}),
+            OUTBOUND_AUTH_PAT_REVOKE,
+        )
+        .await
+        .map_err(AeroError::from)?; // Ok(None) = fail-open skip (DLQ row in-tx)
+    }
+    tx.commit().await.map_err(AeroError::from)?;
     if revoked {
         Ok(StatusCode::NO_CONTENT)
     } else {

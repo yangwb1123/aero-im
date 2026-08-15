@@ -205,6 +205,19 @@ async fn governance_rows_for(p: &PgPool, ws: WorkspaceId) -> i64 {
 // Full-table counts/selects below assume a pristine table, so each test
 // resets it at start — same isolation assumption the drills document.
 async fn reset_governance_table(p: &PgPool) {
+    // The B5-1 auth slice added full-table DLQ / login-failure counters; the
+    // module's isolation assumption ("full-table counts assume a pristine
+    // table, so each test resets it at start") extends to the new tables.
+    // `audit_events` is deliberately NOT cleared — tests scope by
+    // workspace/actor/target and rows accumulate across a run.
+    sqlx::query("DELETE FROM audit_governance_failed_pairs")
+        .execute(p)
+        .await
+        .expect("reset failed-pairs DLQ");
+    sqlx::query("DELETE FROM login_failures")
+        .execute(p)
+        .await
+        .expect("reset login failures");
     sqlx::query("DELETE FROM audit_governance_outbox")
         .execute(p)
         .await
@@ -349,3 +362,6 @@ mod l1;
 mod lanes;
 mod parity;
 mod producer;
+mod auth;
+mod failed_pairs;
+mod l1_auth;

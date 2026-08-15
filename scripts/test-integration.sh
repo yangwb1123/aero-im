@@ -33,6 +33,7 @@ SCIM_NIL_WORKSPACE_INTEGRATION_DB="aero_scim_nil_workspace_$$"
 AUDIT_CONNECTOR_INTEGRATION_DB="aero_audit_connector_$$"
 AUDIT_GOVERNANCE_INTEGRATION_DB="aero_audit_governance_$$"
 MODERATION_FINALIZE_PARITY_INTEGRATION_DB="aero_moderation_finalize_parity_$$"
+AUTH_OUTBOX_PARITY_INTEGRATION_DB="aero_auth_outbox_parity_$$"
 MODERATION_FINALIZE_DRILL_DB="aero_moderation_finalize_drill_$$"
 T11_DRILL_DB="aero_t11_drill_$$"
 PRIORITY_DRILL_DB="aero_priority_drill_$$"
@@ -62,6 +63,7 @@ assert_disposable_db_name "SCIM nil-workspace integration database" "$SCIM_NIL_W
 assert_disposable_db_name "audit connector integration database" "$AUDIT_CONNECTOR_INTEGRATION_DB"
 assert_disposable_db_name "audit governance integration database" "$AUDIT_GOVERNANCE_INTEGRATION_DB"
 assert_disposable_db_name "moderation finalize parity integration database" "$MODERATION_FINALIZE_PARITY_INTEGRATION_DB"
+assert_disposable_db_name "auth outbox parity integration database" "$AUTH_OUTBOX_PARITY_INTEGRATION_DB"
 assert_disposable_db_name "moderation finalize drill database" "$MODERATION_FINALIZE_DRILL_DB"
 assert_disposable_db_name "T-11 fail-closed drill database" "$T11_DRILL_DB"
 assert_disposable_db_name "moderation priority drill database" "$PRIORITY_DRILL_DB"
@@ -335,11 +337,19 @@ if [ -z "$SKIP_DB_CREATE" ]; then
             "moderation_finalize_drill" \
             "ai-worker moderation finalize drill db_tests" \
             "aero-ai"
+        # B5-1 auth slice: the named §2.7 parity entry (auth_outbox_parity_1to1
+        # — the empty-filter guard makes the name load-bearing; a vacuous green
+        # is a FAIL).
+        run_migrated_integration \
+            "$AUTH_OUTBOX_PARITY_INTEGRATION_DB" \
+            "auth_outbox_parity" \
+            "auth outbox parity 1:1"
     else
         echo "▶ Skipping B5-1 governance entries: migrations/0239_audit_governance_outbox.sql (B5-1 storage slice) has not landed"
         b5_check "audit_governance::" "SKIP (0239 not landed)"
         b5_check "moderation_finalize_outbox_parity" "SKIP (0239 not landed)"
         b5_check "moderation_finalize_drill" "SKIP (0239 not landed)"
+        b5_check "auth_outbox_parity" "SKIP (0239 not landed)"
     fi
     # A3 relay drill (B5-2): throwaway DB → migrate → seed N governance rows →
     # run the connector relay against a stub audit sink → assert
@@ -611,14 +621,13 @@ if [ -z "$SKIP_DB_CREATE" ]; then
     # 0242 file (a second slice landing a renumbered copy reds here).
     if [ -f "migrations/0242_audit_governance_l1_aggregate.sql" ]; then
         MIGRATION_COUNT="$(ls migrations/*.sql | wc -l)"
-        # Static arbiter counts ACTUAL files: 244 = 243 landed + migration
-        # 0246 (message-recall lane, B5-1 outbox enqueue coverage). 0243/0244
-        # are designed-only (auth slice: login_failures_created_at_idx +
-        # audit_governance_failed_pairs DLQ) and do not exist yet. HANDOFF:
-        # when the auth slice lands its two files, THAT commit flips this
-        # literal to 246 (same-commit rule applies symmetrically).
-        if [ "$MIGRATION_COUNT" -ne 244 ]; then
-            echo "✗ 0242 static arbiter: expected exactly 244 migrations, found ${MIGRATION_COUNT}" >&2
+        # Static arbiter counts ACTUAL files: 246 = 243 landed + migration
+        # 0246 (message-recall lane, B5-1 outbox enqueue coverage) + 0243
+        # (login_failures_created_at_idx) + 0244 (audit_governance_failed_pairs
+        # DLQ) — the auth slice landed its two files (F-4: same-commit rule
+        # applies symmetrically — THIS commit flipped the literal from 244).
+        if [ "$MIGRATION_COUNT" -ne 246 ]; then
+            echo "✗ 0242 static arbiter: expected exactly 246 migrations, found ${MIGRATION_COUNT}" >&2
             exit 1
         fi
         L1_DEFINITIONS="$(rg -l "aero_enqueue_l1_aggregate_audit" migrations/ 2>/dev/null || true)"

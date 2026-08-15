@@ -116,9 +116,26 @@ async fn enroll_2fa(
         .ok_or_else(|| AeroError::NotFound("participant".into()))?;
 
     let secret = aero_auth::totp::generate_secret();
-    repo.upsert_secret(auth.participant_id, &secret)
+    // B5-1: enroll + governance pair (auth.totp.enroll /
+    // admin.auth.totp.enroll — target = participant, detail
+    // `{"stage":"enroll"}`) in ONE transaction; an upsert ALWAYS writes, so
+    // the pair is unconditional. SAVEPOINT fail-open (R7).
+    let mut tx = s.pg.begin().await.map_err(AeroError::from)?;
+    TotpRepo::upsert_secret_in_tx(&mut tx, auth.participant_id, &secret)
         .await
         .map_err(map_totp_write_error)?;
+    let _ = aero_storage::audit_governance::AuditGovernanceOutboxRepo::append_pair_in_tx_fail_open(
+        &mut tx,
+        aero_common::WorkspaceId::nil(),
+        Some(auth.participant_id),
+        aero_storage::audit_governance::tokens::AUTH_TOTP_ENROLL,
+        Some(&auth.participant_id.to_string()),
+        serde_json::json!({ "stage": "enroll" }),
+        aero_storage::audit_governance::tokens::OUTBOUND_AUTH_TOTP_ENROLL,
+    )
+    .await
+    .map_err(AeroError::from)?; // Ok(None) = fail-open skip (DLQ row in-tx)
+    tx.commit().await.map_err(AeroError::from)?;
 
     let label = encode_label(&participant.display_name);
     let otpauth_uri = format!(
@@ -150,10 +167,28 @@ async fn verify_2fa(
         return Err(AeroError::Invalid("invalid code".into()).into());
     }
     // Idempotent: `activate` is a no-op if it was already activated, so a repeated
-    // verify still reports success.
-    repo.activate(auth.participant_id)
+    // verify still reports success. B5-1: activation + governance pair
+    // (auth.totp.enroll / admin.auth.totp.enroll — detail
+    // `{"stage":"activate"}`) in ONE transaction; the pair is emitted ONLY
+    // when a row actually flipped (a no-op activation audits nothing).
+    let mut tx = s.pg.begin().await.map_err(AeroError::from)?;
+    let activated = TotpRepo::activate_in_tx(&mut tx, auth.participant_id)
         .await
         .map_err(AeroError::from)?;
+    if activated {
+        let _ = aero_storage::audit_governance::AuditGovernanceOutboxRepo::append_pair_in_tx_fail_open(
+            &mut tx,
+            aero_common::WorkspaceId::nil(),
+            Some(auth.participant_id),
+            aero_storage::audit_governance::tokens::AUTH_TOTP_ENROLL,
+            Some(&auth.participant_id.to_string()),
+            serde_json::json!({ "stage": "activate" }),
+            aero_storage::audit_governance::tokens::OUTBOUND_AUTH_TOTP_ENROLL,
+        )
+        .await
+        .map_err(AeroError::from)?; // Ok(None) = fail-open skip (DLQ row in-tx)
+    }
+    tx.commit().await.map_err(AeroError::from)?;
     Ok(Json(serde_json::json!({ "activated": true })))
 }
 

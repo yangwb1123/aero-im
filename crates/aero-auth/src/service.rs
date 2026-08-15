@@ -10,10 +10,14 @@ use std::time::Duration;
 use aero_common::{Error, Participant, ParticipantId, Result, SessionId, WorkspaceId};
 use aero_storage::participant::NewHuman;
 use aero_storage::revoked_token::hash_token;
-use aero_storage::{AuditRepo, NewRegistration, ParticipantRepo, RegistrationRepo, SessionRepo};
+use aero_storage::audit_governance::outbox::AuditGovernanceOutboxRepo;
+use aero_storage::audit_governance::tokens::{OUTBOUND_AUTH_REGISTER, OUTBOUND_AUTH_REFRESH};
+use aero_storage::{
+    AuditRepo, NewRegistration, NewRegistrationAudit, ParticipantRepo, RegistrationRepo, SessionRepo,
+};
 use serde::{Deserialize, Serialize};
 
-use crate::audit_tokens::{AUTH_LOGIN_FAILED, AUTH_LOGIN_LOCKED};
+use crate::audit_tokens::{AUTH_LOGIN_FAILED, AUTH_LOGIN_LOCKED, AUTH_REGISTER, AUTH_REFRESH};
 use crate::bot::SharedBotVerifier;
 use crate::jwt::{Claims, JwtCodec, TokenKind};
 use crate::password;
@@ -240,6 +244,16 @@ impl AuthService {
                 session_id: tokens.session_id,
                 refresh_token_hash,
                 user_agent: user_agent.map(ToOwned::to_owned),
+                // B5-1: first-party registration writes the 1:1 governance
+                // pair (auth.register / admin.auth.register) riding the
+                // registration tx (SAVEPOINT fail-open). SSO/OIDC JIT keeps
+                // `None` (audit-only, D-N4).
+                auth_audit: Some(NewRegistrationAudit {
+                    action: AUTH_REGISTER,
+                    target: participant_id.to_string(),
+                    detail: serde_json::json!({}), // D-N1: PII-reduced — email leaves the audit trail on the pair path
+                    outbound_action: OUTBOUND_AUTH_REGISTER,
+                }),
             })
             .await
             .map_err(map_create_error)?;
@@ -417,6 +431,22 @@ impl AuthService {
         let access_token = self
             .jwt
             .issue_for_session(pid, TokenKind::Access, session_id)?;
+        // B5-1: refresh-success governance pair (auth.refresh /
+        // admin.auth.refresh), standalone transaction, fail-open — never flips
+        // the refresh result (Option<AuditId> swallow-all, D12). Account-level
+        // event: nil default workspace (aero-auth has no DEFAULT_WORKSPACE_ID
+        // const — the session.rs:221 spelling).
+        let session_id_text = session_id.to_string();
+        AuditGovernanceOutboxRepo::new(self.repo.pool().clone())
+            .record_pair_standalone(
+                WorkspaceId::from_uuid(uuid::Uuid::nil()),
+                Some(pid),
+                AUTH_REFRESH,
+                Some(&session_id_text),
+                serde_json::json!({}),
+                OUTBOUND_AUTH_REFRESH,
+            )
+            .await;
         Ok(AuthTokens {
             access_token,
             refresh_token: refresh_token.to_string(),

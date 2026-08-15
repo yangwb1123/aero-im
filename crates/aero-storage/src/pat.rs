@@ -102,10 +102,13 @@ impl PatRepo {
     /// generated plaintext and returns the plaintext exactly once). `expires_at`
     /// of `None` means the token never expires. Returns the new token's id.
     ///
-    /// Security-event audit: the mint commits with an `auth.pat.create` row in
+    /// Security-event audit: the mint commits with an `auth.pat.issue` row in
     /// the SAME transaction (same-fate — a failed audit insert rolls the token
     /// back; a committed token always has its audit row). Account-level event:
-    /// workspace = the nil default tenant.
+    /// workspace = the nil default tenant. The B5-1 route orchestrates the
+    /// governance PAIR on top of [`create_in_tx`](Self::create_in_tx); this
+    /// pool method keeps the legacy audit-only append so the existing `db_tests`
+    /// pass verbatim.
     pub async fn create(
         &self,
         participant: ParticipantId,
@@ -114,8 +117,42 @@ impl PatRepo {
         scopes: &[String],
         expires_at: Option<time::OffsetDateTime>,
     ) -> Result<PatId, sqlx::Error> {
-        let id = PatId::new();
         let mut tx = self.pool.begin().await?;
+        let id = Self::create_in_tx(&mut tx, participant, token_hash, name, scopes, expires_at)
+            .await?;
+        crate::AuditRepo::append_in_tx(
+            &mut tx,
+            aero_common::WorkspaceId::nil(),
+            Some(participant),
+            crate::audit_governance::tokens::AUTH_PAT_ISSUE,
+            Some(&id.to_string()),
+            serde_json::json!({
+                "name": name,
+                "scopes": scopes,
+                "expires_at": expires_at,
+            }),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(id)
+    }
+
+    /// Transaction-scoped mint (B5-1 route path): the INSERT only — no audit,
+    /// no begin/commit. The route appends the governance pair via
+    /// [`AuditGovernanceOutboxRepo::append_pair_in_tx_fail_open`] before
+    /// committing.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`].
+    pub async fn create_in_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        participant: ParticipantId,
+        token_hash: &str,
+        name: Option<&str>,
+        scopes: &[String],
+        expires_at: Option<time::OffsetDateTime>,
+    ) -> Result<PatId, sqlx::Error> {
+        let id = PatId::new();
         sqlx::query(
             r"INSERT INTO pat_tokens (id, participant_id, token_hash, name, scopes, expires_at, created_at)
                VALUES ($1, $2, $3, $4, $5, $6, now())",
@@ -126,22 +163,8 @@ impl PatRepo {
         .bind(name)
         .bind(scopes)
         .bind(expires_at)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
-        crate::AuditRepo::append_in_tx(
-            &mut tx,
-            aero_common::WorkspaceId::nil(),
-            Some(participant),
-            "auth.pat.create",
-            Some(&id.to_string()),
-            serde_json::json!({
-                "name": name,
-                "scopes": scopes,
-                "expires_at": expires_at,
-            }),
-        )
-        .await?;
-        tx.commit().await?;
         Ok(id)
     }
 
@@ -211,23 +234,18 @@ impl PatRepo {
     /// Security-event audit: a successful (rows-affected) revoke commits an
     /// `auth.pat.revoke` row in the SAME transaction (same-fate); a no-op
     /// revoke (non-owned / already revoked) commits nothing and audits nothing.
+    /// The B5-1 route orchestrates the governance PAIR on top of
+    /// [`revoke_in_tx`](Self::revoke_in_tx); this pool method keeps the legacy
+    /// audit-only append so the existing `db_tests` pass verbatim.
     pub async fn revoke(&self, id: PatId, participant: ParticipantId) -> Result<bool, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
-        let result = sqlx::query(
-            r"UPDATE pat_tokens SET revoked_at = now()
-               WHERE id = $1 AND participant_id = $2 AND revoked_at IS NULL",
-        )
-        .bind(id.to_uuid())
-        .bind(participant.to_uuid())
-        .execute(&mut *tx)
-        .await?;
-        let revoked = result.rows_affected() > 0;
+        let revoked = Self::revoke_in_tx(&mut tx, id, participant).await?;
         if revoked {
             crate::AuditRepo::append_in_tx(
                 &mut tx,
                 aero_common::WorkspaceId::nil(),
                 Some(participant),
-                "auth.pat.revoke",
+                crate::audit_governance::tokens::AUTH_PAT_REVOKE,
                 Some(&id.to_string()),
                 serde_json::json!({ "id": id.to_string() }),
             )
@@ -235,6 +253,29 @@ impl PatRepo {
         }
         tx.commit().await?;
         Ok(revoked)
+    }
+
+    /// Transaction-scoped revoke (B5-1 route path): the UPDATE only — no audit,
+    /// no begin/commit. Idempotency unchanged (`revoked_at IS NULL` predicate,
+    /// rows-affected semantics): a no-op revoke audits nothing (the route
+    /// appends the pair only when this returns `true`).
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`].
+    pub async fn revoke_in_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        id: PatId,
+        participant: ParticipantId,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            r"UPDATE pat_tokens SET revoked_at = now()
+               WHERE id = $1 AND participant_id = $2 AND revoked_at IS NULL",
+        )
+        .bind(id.to_uuid())
+        .bind(participant.to_uuid())
+        .execute(&mut **tx)
+        .await?;
+        Ok(result.rows_affected() > 0)
     }
 }
 
@@ -378,7 +419,7 @@ mod db_tests {
         );
 
         // Security-event audit (AC1b): the mint committed exactly one
-        // `auth.pat.create` row (nil workspace, actor = owner, target = the
+        // `auth.pat.issue` row (nil workspace, actor = owner, target = the
         // token id, detail per R1); the owner revoke committed exactly one
         // `auth.pat.revoke` row; the non-owner attempt and the second (no-op)
         // revoke added ZERO rows — counts scoped by actor_id (the sibling
@@ -387,12 +428,12 @@ mod db_tests {
             sqlx::query_as(
                 "SELECT workspace_id::text, actor_id::text, target, detail->>'expires_at', detail
                    FROM audit_events
-                  WHERE action = 'auth.pat.create' AND actor_id = $1",
+                  WHERE action = 'auth.pat.issue' AND actor_id = $1",
             )
             .bind(owner.to_uuid())
             .fetch_one(&p)
             .await
-            .expect("exactly one auth.pat.create row");
+            .expect("exactly one auth.pat.issue row");
         assert_eq!(create.0, "00000000-0000-0000-0000-000000000000", "nil workspace");
         assert_eq!(create.1, owner.to_uuid().to_string(), "actor = owner");
         assert_eq!(create.2, id.to_string(), "target = the PAT id");
@@ -400,7 +441,7 @@ mod db_tests {
         assert_eq!(create.4["scopes"], serde_json::json!(["read", "write"]));
         assert!(create.3.is_none(), "expires_at null when absent");
         let create_total: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM audit_events WHERE action = 'auth.pat.create' AND actor_id = $1",
+            "SELECT COUNT(*) FROM audit_events WHERE action = 'auth.pat.issue' AND actor_id = $1",
         )
         .bind(owner.to_uuid())
         .fetch_one(&p)
@@ -408,7 +449,7 @@ mod db_tests {
         .unwrap();
         assert_eq!(create_total, 1, "one create row per mint");
         let create_other: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM audit_events WHERE action = 'auth.pat.create' AND actor_id = $1",
+            "SELECT COUNT(*) FROM audit_events WHERE action = 'auth.pat.issue' AND actor_id = $1",
         )
         .bind(other.to_uuid())
         .fetch_one(&p)

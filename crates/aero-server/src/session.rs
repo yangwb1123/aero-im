@@ -197,44 +197,38 @@ async fn logout(State(s): State<AppState>, Json(req): Json<RefreshReq>) -> ApiRe
         return Err(AeroError::Unauthorized("refresh session binding mismatch".into()).into());
     }
     let session_id = claimed_session.or(active_session);
-    sessions
-        .revoke_by_hash_and_blacklist(&hash, participant)
+    // B5-1: blacklist + revoke + governance pair (session.revoked /
+    // admin.auth.session.revoke) in ONE transaction. D-N2: the audit detail
+    // SHAPE CHANGES from `{"token_hash_prefix":…}` to `{"session_id":…}`
+    // (trajectory token unchanged — D6; no in-repo consumers of
+    // `token_hash_prefix` exist). The pair is emitted only when a row actually
+    // flipped and the session id is resolvable (no-op logout audits nothing);
+    // SAVEPOINT fail-open (R7) — an audit failure never fails the logout.
+    let mut tx = s.pg.begin().await.map_err(AeroError::from)?;
+    let revoked = SessionRepo::revoke_by_hash_and_blacklist_in_tx(&mut tx, &hash, participant)
         .await
         .map_err(AeroError::from)?;
+    if revoked {
+        if let Some(sid) = session_id {
+            let _ = aero_storage::audit_governance::AuditGovernanceOutboxRepo::append_pair_in_tx_fail_open(
+                &mut tx,
+                aero_common::WorkspaceId::from_uuid(uuid::Uuid::nil()),
+                Some(participant),
+                aero_storage::audit_governance::tokens::SESSION_REVOKED,
+                Some(&sid.to_string()),
+                serde_json::json!({ "session_id": sid.to_string() }),
+                aero_storage::audit_governance::tokens::OUTBOUND_AUTH_SESSION_REVOKE,
+            )
+            .await
+            .map_err(AeroError::from)?; // Ok(None) = fail-open skip (DLQ row in-tx)
+        }
+    }
+    tx.commit().await.map_err(AeroError::from)?;
     if let Some(session_id) = session_id {
         s.hub.disconnect_session(participant, session_id);
         crate::session_control::publish_revoke_session(&s, participant, session_id).await;
     }
-    // Best-effort privileged-operation audit (ROADMAP 方向四). Logout carries no
-    // workspace context, so the event is attributed to the all-zero default
-    // workspace (uuid nil). The full token hash is never recorded — only a short
-    // prefix. A logging failure only warns, never fails the already-done logout.
-    audit_session_revoked(&s, participant, &hash).await;
     Ok(StatusCode::NO_CONTENT)
-}
-
-/// Record a `session.revoked` audit event for a logout. Attributed to the
-/// all-zero default workspace (uuid nil) since logout has no tenant context, and
-/// carries only a short prefix of the refresh-token hash (never the full hash).
-/// Best-effort: an append failure is warn-logged and swallowed.
-async fn audit_session_revoked(s: &AppState, actor: aero_common::ParticipantId, token_hash: &str) {
-    let workspace = aero_common::WorkspaceId::from_uuid(uuid::Uuid::nil());
-    // A short, non-reversible prefix is enough to correlate without exposing the
-    // hash itself.
-    let prefix: String = token_hash.chars().take(12).collect();
-    if let Err(e) = s
-        .audit
-        .append(
-            workspace,
-            Some(actor),
-            "session.revoked",
-            None,
-            serde_json::json!({ "token_hash_prefix": prefix }),
-        )
-        .await
-    {
-        tracing::warn!(error = ?e, "session.revoked audit append failed");
-    }
 }
 
 #[cfg(test)]
