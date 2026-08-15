@@ -19,6 +19,10 @@ pub struct FailedPairRepo {
 }
 
 /// (workspace, actor, action, target, detail, `outbound_action`) of one
+/// F-4 replay cap: a row is DEAD after this many failed replay attempts
+/// (a persistent bug cannot keep doubling the table; ops triages dead rows).
+pub const MAX_REPLAY_ATTEMPTS: i64 = 5;
+
 /// unreplayed DLQ row (factored out of [`replay`](Self::replay)'s query row).
 type ReplayCandidate = (
     uuid::Uuid,
@@ -142,7 +146,7 @@ impl FailedPairRepo {
         let row: Option<ReplayCandidate> = sqlx::query_as(
                 r"SELECT workspace_id, actor_id, action, target, detail, outbound_action
                    FROM audit_governance_failed_pairs
-                  WHERE id = $1 AND replayed_at IS NULL",
+                  WHERE id = $1 AND status = 'pending' AND replayed_at IS NULL",
             )
             .bind(id)
             .fetch_optional(&self.pool)
@@ -162,16 +166,33 @@ impl FailedPairRepo {
         )
         .await?;
         if let Some(audit_id) = pair {
-            sqlx::query("UPDATE audit_governance_failed_pairs SET replayed_at = now() WHERE id = $1")
-                .bind(id)
-                .execute(&mut *tx)
-                .await?;
+            sqlx::query(
+                "UPDATE audit_governance_failed_pairs
+                    SET replayed_at = now(),
+                        replay_attempts = replay_attempts + 1
+                  WHERE id = $1",
+            )
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
             tx.commit().await?;
             Ok(Some(audit_id))
         } else {
             // Re-failed (Database class): the new DLQ row committed with this
-            // tx; the original row stays for the next ops loop. Roll back the
-            // empty tx (the new DLQ row is inside it — keep it).
+            // tx; the original row stays for the next ops loop — but bounded:
+            // MAX_ATTEMPTS reached marks it DEAD so `replay_all` cannot keep
+            // doubling the table under a persistent bug (F-4). The new DLQ
+            // row is inside this tx — commit keeps it.
+            sqlx::query(
+                "UPDATE audit_governance_failed_pairs
+                    SET replay_attempts = replay_attempts + 1,
+                        status = CASE WHEN replay_attempts + 1 >= $2 THEN 'dead' ELSE status END
+                  WHERE id = $1",
+            )
+            .bind(id)
+            .bind(MAX_REPLAY_ATTEMPTS)
+            .execute(&mut *tx)
+            .await?;
             tx.commit().await?;
             Ok(None)
         }
@@ -185,7 +206,7 @@ impl FailedPairRepo {
     pub async fn replay_all(&self, limit: i64) -> Result<usize, sqlx::Error> {
         let ids: Vec<i64> = sqlx::query_scalar(
             r"SELECT id FROM audit_governance_failed_pairs
-               WHERE replayed_at IS NULL
+               WHERE status = 'pending' AND replayed_at IS NULL
                ORDER BY id
                LIMIT $1",
         )

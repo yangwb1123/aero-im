@@ -307,25 +307,30 @@ pub(crate) fn spawn_all(
     // L1 auth.login.failure aggregation (B5-1 auth slice): closed-bucket scan
     // over login_failures → one governance outbox row per bucket (class
     // 'message', priority 10, deterministic v5 event_id, envelope top-level
-    // "aggregated": true). Env `AERO__SERVER__LOGIN_FAILURE_L1_AGGREGATE_SECS`
-    // (default 30, 0 disables; env-only like LOGIN_FAILURE_RETENTION_DAYS — no
-    // config.toml key). The timer NEVER deletes base rows (forensic retention;
-    // the retention sweep owns deletion — D11: disabling this while retention
-    // runs permanently loses that window's v2 signal; reopening within the
-    // retention window self-heals via the pull-scan backfill).
+    // "aggregated": true). **C2 (design-gate blocker)**: the WINDOW is the
+    // leaf `aero_common::L1_WINDOW_SECONDS` (60) — a single call site, so
+    // prod bucket keys equal the test keys; the env knob
+    // `AERO__SERVER__LOGIN_FAILURE_L1_AGGREGATE_SECS` is DISABLE-ONLY (0 =
+    // off; any other value enables with the leaf window, never a size
+    // override — an ops change cannot re-key buckets and double-count at
+    // the sink). The timer NEVER deletes base rows (forensic retention; the
+    // retention sweep owns deletion — D11).
     {
-        let l1_aggregate_secs = std::env::var("AERO__SERVER__LOGIN_FAILURE_L1_AGGREGATE_SECS")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(30);
-        if l1_aggregate_secs != 0 {
-            let repo = aero_storage::audit_governance::AuditGovernanceOutboxRepo::new(
+        let l1_aggregate_enabled = std::env::var(
+            "AERO__SERVER__LOGIN_FAILURE_L1_AGGREGATE_SECS",
+        )
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+            != Some(0);
+        if l1_aggregate_enabled {
+            let mut repo = aero_storage::audit_governance::AuditGovernanceOutboxRepo::new(
                 state.pg.clone(),
             );
             let cancel = ai_shutdown.clone();
+            let l1_window = aero_common::L1_WINDOW_SECONDS;
             tracker.spawn(async move {
                 let mut tick = tokio::time::interval(std::time::Duration::from_secs(
-                    l1_aggregate_secs,
+                    u64::try_from(l1_window).unwrap_or(60),
                 ));
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
@@ -334,7 +339,7 @@ pub(crate) fn spawn_all(
                         _ = tick.tick() => {}
                     }
                     match repo
-                        .aggregate_login_failure_buckets(i64::try_from(l1_aggregate_secs).unwrap_or(30))
+                        .aggregate_login_failure_buckets(l1_window)
                         .await
                     {
                         Ok(inserted) if inserted > 0 => {

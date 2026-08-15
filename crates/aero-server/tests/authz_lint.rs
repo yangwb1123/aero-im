@@ -744,3 +744,96 @@ fn lint_classifies_synthetic_handlers_correctly() {
         assert_eq!(guarded, expect_guarded, "misclassified synthetic handler");
     }
 }
+
+/// B5-1 auth audit-boundary pins (design-gate QA F-1/F-2, run 386d075c).
+///
+/// The auth in-tx audit pair producer (auth.register/login/refresh/pat/totp/
+/// session → `AuditGovernanceOutboxRepo::append_pair_in_tx_fail_open` /
+/// `record_pair_standalone`) must stay wired exactly where the landing design
+/// pinned it. These source pins make the boundary executable:
+///
+///   1. `_in_tx` references — the PAT/TOTP/session write paths the server
+///      routes use must go through the storage `_in_tx` variants (the
+///      in-tx pair writers). A future route that drops back to a pool-level
+///      write loses the same-transaction audit pair → red here.
+///   2. `audit_session_revoked` removal — the old post-hoc append token must
+///      not resurface as a production emitter (it was merged into
+///      `session.revoked` per D6).
+///   3. D5 placement — the `auth.login` governance pair must be emitted from
+///      the LOGIN HANDLER (post-2FA gate), never from inside
+///      `AuthService::login` (a 2FA-failed attempt must never count as a
+///      successful login).
+///   4. SSO placement — `complete_oidc_login` must carry the same pair
+///      (F-3: previously zero audit on the SSO path).
+#[test]
+fn b5_1_auth_audit_boundaries_are_pinned() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let src = root.join("src");
+
+    // 1. `_in_tx` variants must be the referenced write paths (PAT/TOTP/session).
+    let pat = fs::read_to_string(src.join("pat.rs")).unwrap();
+    let totp = fs::read_to_string(src.join("twofa.rs")).unwrap();
+    let sessions = fs::read_to_string(src.join("sessions.rs")).unwrap();
+    for (label, content, symbol) in [
+        ("pat.rs", &pat, "PatRepo::create_in_tx("),
+        ("pat.rs", &pat, "PatRepo::revoke_in_tx("),
+        ("twofa.rs", &totp, "TotpRepo::upsert_secret_in_tx("),
+        ("twofa.rs", &totp, "TotpRepo::activate_in_tx("),
+        ("sessions.rs", &sessions, "SessionRepo::revoke_and_blacklist_in_tx("),
+    ] {
+        assert!(
+            content.contains(symbol),
+            "B5-1 auth boundary: {label} lost the in-tx pair writer reference {symbol}"
+        );
+    }
+
+    // 2. `audit_session_revoked` must not be a production token or emitter.
+    let audit_tokens = fs::read_to_string(root.join("../aero-auth/src/audit_tokens.rs")).unwrap();
+    assert!(
+        !audit_tokens.contains("audit_session_revoked"),
+        "B5-1: the removed audit_session_revoked token resurfaced in aero-auth/audit_tokens.rs"
+    );
+    for file in [&pat, &totp, &sessions] {
+        assert!(
+            !file.contains("AuditRepo::append_in_tx") || !file.contains("audit_session_revoked"),
+            "B5-1: a production emitter resurrected the audit_session_revoked append"
+        );
+    }
+
+    // 3. D5: the login-success pair lives in the LOGIN HANDLER (post-2FA),
+    //    not inside AuthService::login (auth.rs route file).
+    let handlers = src.join("routes/handlers/auth.rs");
+    let handlers_src = fs::read_to_string(&handlers).unwrap();
+    let d5_at = handlers_src
+        .find("record_pair_standalone(")
+        .unwrap_or_else(|| panic!("handlers/auth.rs lost the D5 login pair call"));
+    let d5_token_at = handlers_src[d5_at..]
+        .find("AUTH_LOGIN")
+        .unwrap_or_else(|| panic!("handlers/auth.rs D5 pair must use the AUTH_LOGIN token"));
+    assert!(
+        d5_token_at < 400,
+        "handlers/auth.rs D5 pair call drifted out of the login handler region"
+    );
+    assert!(
+        handlers_src.contains("finalize_login("),
+        "handlers/auth.rs must still call finalize_login before the pair"
+    );
+
+    // 4. SSO: complete_oidc_login carries the same pair (F-3).
+    let sso = fs::read_to_string(src.join("sso.rs")).unwrap();
+    let sso_pair_at = sso
+        .find("record_pair_standalone(")
+        .unwrap_or_else(|| panic!("sso.rs lost the auth.login pair (F-3)"));
+    let sso_token_at = sso[sso_pair_at..]
+        .find("AUTH_LOGIN")
+        .unwrap_or_else(|| panic!("sso.rs pair must use the AUTH_LOGIN token"));
+    assert!(
+        sso_token_at < 200,
+        "sso.rs complete_oidc_login pair call drifted out of the function"
+    );
+    assert!(
+        sso[sso_pair_at..].contains("complete_oidc_login")
+            || sso[..sso_pair_at].contains("complete_oidc_login"),
+        "sso.rs pair must live in complete_oidc_login"
+    );
+}

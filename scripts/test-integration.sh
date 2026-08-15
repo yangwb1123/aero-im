@@ -628,13 +628,12 @@ if [ -z "$SKIP_DB_CREATE" ]; then
     # 0242 file (a second slice landing a renumbered copy reds here).
     if [ -f "migrations/0242_audit_governance_l1_aggregate.sql" ]; then
         MIGRATION_COUNT="$(ls migrations/*.sql | wc -l)"
-        # Static arbiter counts ACTUAL files: 246 = 243 landed + migration
-        # 0246 (message-recall lane, B5-1 outbox enqueue coverage) + 0243
-        # (login_failures_created_at_idx) + 0244 (audit_governance_failed_pairs
-        # DLQ) — the auth slice landed its two files (F-4: same-commit rule
-        # applies symmetrically — THIS commit flipped the literal from 244).
-        if [ "$MIGRATION_COUNT" -ne 246 ]; then
-            echo "✗ 0242 static arbiter: expected exactly 246 migrations, found ${MIGRATION_COUNT}" >&2
+        # Static arbiter counts ACTUAL files: 247 = 243 landed + 0246
+        # (message-recall lane) + 0243 (login_failures_created_at_idx) + 0244
+        # (audit_governance_failed_pairs DLQ) + 0247 (failed-pairs replay caps,
+        # F-4).
+        if [ "$MIGRATION_COUNT" -ne 247 ]; then
+            echo "✗ 0242 static arbiter: expected exactly 247 migrations, found ${MIGRATION_COUNT}" >&2
             exit 1
         fi
         L1_DEFINITIONS="$(rg -l "aero_enqueue_l1_aggregate_audit" migrations/ 2>/dev/null || true)"

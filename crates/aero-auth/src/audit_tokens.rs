@@ -51,11 +51,14 @@ pub const AUTH_PAT_ISSUE: &str = "auth.pat.issue";
 /// still-active owned row was revoked).
 pub const AUTH_PAT_REVOKE: &str = "auth.pat.revoke";
 /// TOTP enrollment activated (`TotpRepo::activate`, in-tx) / removed
-/// (`TotpRepo::disable`, in-tx). REPLACES `auth.totp.enabled` /
-/// `auth.totp.disabled` (DP-1). §2.7 pair token on the enroll/activate
-/// route paths; the disable route stays pool-level (audit-only — outside
-/// the §2.7 pair table).
+/// (`TotpRepo::disable`, in-tx). REPLACES `auth.totp.enabled` (DP-1). §2.7
+/// pair token on the enroll/activate route paths.
 pub const AUTH_TOTP_ENROLL: &str = "auth.totp.enroll";
+/// TOTP removed (`TotpRepo::disable`, in-tx). RESTORED from the DP-1 merge
+/// (design-gate F-2): 2FA *removal* must never be recorded as an
+/// *enrollment* (production AC-3 false-positive class). Audit-only (outside
+/// the §2.7 pair table).
+pub const AUTH_TOTP_DISABLED: &str = "auth.totp.disabled";
 /// Backup recovery-code batch regenerated (`RecoveryCodeRepo::generate`,
 /// in-tx, unconditional — every call replaces the batch).
 pub const AUTH_TOTP_RECOVERY_CODES_REGENERATED: &str = "auth.totp.recovery_codes_regenerated";
@@ -98,6 +101,7 @@ mod tests {
         assert_eq!(AUTH_PAT_ISSUE, "auth.pat.issue");
         assert_eq!(AUTH_PAT_REVOKE, "auth.pat.revoke");
         assert_eq!(AUTH_TOTP_ENROLL, "auth.totp.enroll");
+        assert_eq!(AUTH_TOTP_DISABLED, "auth.totp.disabled");
         assert_eq!(
             AUTH_TOTP_RECOVERY_CODES_REGENERATED,
             "auth.totp.recovery_codes_regenerated"

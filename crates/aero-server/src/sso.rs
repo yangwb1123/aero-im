@@ -764,6 +764,26 @@ async fn complete_oidc_login(
         .record_with_id(participant_id, tokens.session_id, &hash, user_agent)
         .await
         .map_err(AeroError::from)?;
+    // F-3 (design-gate blocker): SSO login must carry the same governance
+    // `auth.login` pair as the password path (D5 pattern of
+    // handlers/auth.rs:204). Previously `complete_oidc_login` issued tokens
+    // + recorded the session with ZERO audit — a production auth.login
+    // coverage gap. Fail-open: `record_pair_standalone` swallows everything
+    // (Database-class → DLQ, connection-level → warn); the login result is
+    // never flipped. Account-level event: nil default workspace.
+    let participant_id_text = participant_id.to_string();
+    let _ = aero_storage::audit_governance::AuditGovernanceOutboxRepo::new(
+        s.participants.pool().clone(),
+    )
+    .record_pair_standalone(
+        DEFAULT_WORKSPACE_ID,
+        Some(participant_id),
+        aero_storage::audit_governance::tokens::AUTH_LOGIN,
+        Some(&participant_id_text),
+        serde_json::json!({}),
+        aero_storage::audit_governance::tokens::OUTBOUND_AUTH_LOGIN,
+    )
+    .await;
     Ok(OidcSession {
         access_token: tokens.access_token,
         refresh_token: tokens.refresh_token,

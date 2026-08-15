@@ -44,11 +44,13 @@ pub const AUTH_PAT_ISSUE: &str = "auth.pat.issue";
 pub const AUTH_PAT_REVOKE: &str = "auth.pat.revoke";
 /// TOTP enrolled/activated (route-orchestrated `TotpRepo` `_in_tx` variants +
 /// pair, detail `{"stage":"enroll"|"activate"}`; pair only when a row flipped).
-/// REPLACES `auth.totp.enabled`/`auth.totp.disabled` (DP-1). The pool-level
-/// `TotpRepo::disable` legacy audit also writes this token (audit-only — the
-/// disable route is outside the §2.7 pair table; a production no-miss-write
-/// monitor must scope to paired rows, same as D-N4's JIT scoping).
+/// REPLACES `auth.totp.enabled` (DP-1).
 pub const AUTH_TOTP_ENROLL: &str = "auth.totp.enroll";
+/// TOTP removed (`TotpRepo::disable`, in-tx). RESTORED from the DP-1 merge
+/// (design-gate F-2): 2FA removal must never be recorded as enrollment.
+/// Audit-only (outside the §2.7 pair table; a production no-miss-write
+/// monitor must scope to paired rows, same as D-N4's JIT scoping).
+pub const AUTH_TOTP_DISABLED: &str = "auth.totp.disabled";
 /// Session revoked by its owner (inventory `DELETE /api/auth/sessions/:sid`
 /// and logout). Kept for trajectory continuity (D6) — existing consumers of
 /// the `session.revoked` audit trail are unaffected.
@@ -72,7 +74,13 @@ pub const OUTBOUND_AUTH_LOGIN_FAILURE: &str = "admin.auth.login.failure";
 /// Envelope `source_system` for auth explicit writes (the 0239 moderation
 /// trigger uses `binding.source_system`; auth rows are written explicitly,
 /// never by trigger-token extension — D1).
-pub const AUTH_SOURCE_SYSTEM: &str = "aero-auth";
+///
+/// **C1 (design-gate blocker)**: this MUST equal the leaf
+/// [`aero_common::model::audit::AUDIT_SOURCE_SYSTEM`] — the connector's
+/// `validate_delivery_payload` (client.rs:518) dead-letters any row whose
+/// `source_system != AERO_AUDIT_SOURCE_SYSTEM` (default `aero-im.source`);
+/// a local `"aero-auth"` spelling killed the entire auth lane at the relay.
+pub const AUTH_SOURCE_SYSTEM: &str = aero_common::model::audit::AUDIT_SOURCE_SYSTEM;
 /// Local action token carried by the L1 aggregation envelope's `payload`
 /// (there is no `audit_events` row for it — D7).
 pub const L1_AUTH_LOGIN_FAILURE_ACTION: &str = "auth.login.failure";

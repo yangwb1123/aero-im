@@ -68,7 +68,7 @@ async fn login_failure_l1_aggregation_n_to_one() {
     seed_failures(&p, ts(bucket_b), 2).await;
     seed_failures(&p, ts(open_bucket), 1).await; // open — never aggregated
 
-    let repo = AuditGovernanceOutboxRepo::new(p.clone());
+    let mut repo = AuditGovernanceOutboxRepo::new(p.clone());
     let inserted = repo
         .aggregate_login_failure_buckets(WINDOW)
         .await

@@ -200,17 +200,17 @@ impl TotpRepo {
             .execute(&mut *tx)
             .await?;
         // Security-event audit: a successful removal commits an
-        // `auth.totp.enroll` row in the SAME transaction (same-fate, after the
-        // DELETE and before commit — lock ordering untouched); a no-op audits
-        // nothing. Account-level event: nil default tenant. DP-1: the token
-        // REPLACED `auth.totp.disabled` — the disable route stays outside the
-        // §2.7 pair table (audit-only; no-miss-write monitors scope to pairs).
+        // `auth.totp.disabled` row in the SAME transaction (same-fate, after
+        // the DELETE and before commit — lock ordering untouched); a no-op
+        // audits nothing. Account-level event: nil default tenant. F-2
+        // (design gate): 2FA removal must NEVER be recorded as an
+        // enrollment — `auth.totp.enroll` is the activate/enroll token only.
         if result.rows_affected() > 0 {
             crate::AuditRepo::append_in_tx(
                 &mut tx,
                 aero_common::WorkspaceId::nil(),
                 Some(participant),
-                crate::audit_governance::tokens::AUTH_TOTP_ENROLL,
+                crate::audit_governance::tokens::AUTH_TOTP_DISABLED,
                 Some(&participant.to_string()),
                 serde_json::json!({}),
             )

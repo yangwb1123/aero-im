@@ -73,12 +73,19 @@ const SQLSTATE_CONNECTION: &str = "08006";
 #[must_use]
 pub struct AuditGovernanceOutboxRepo {
     pool: PgPool,
+    /// F-A watermark: max processed `login_failures.created_at` from the
+    /// last aggregation tick (process-local; resets to UNIX_EPOCH on restart
+    /// → a closed-window rescan, deduped by `ON CONFLICT DO NOTHING`).
+    l1_watermark: time::OffsetDateTime,
 }
 
 impl AuditGovernanceOutboxRepo {
     /// Build a repo over the given pool.
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            l1_watermark: time::OffsetDateTime::UNIX_EPOCH,
+        }
     }
 
     /// Transaction-scoped outbox row insert (mirrors
@@ -312,6 +319,7 @@ impl AuditGovernanceOutboxRepo {
         let mut tx = match self.pool.begin().await {
             Ok(tx) => tx,
             Err(e) => {
+                Self::count_failure(CATEGORY_DATABASE);
                 tracing::warn!(
                     workspace_id = %workspace,
                     action,
@@ -336,6 +344,7 @@ impl AuditGovernanceOutboxRepo {
         {
             Ok(Some(audit_id)) => {
                 if let Err(e) = tx.commit().await {
+                    Self::count_failure(CATEGORY_DATABASE);
                     tracing::warn!(
                         workspace_id = %workspace,
                         action,
@@ -354,6 +363,7 @@ impl AuditGovernanceOutboxRepo {
                 // Committing an empty tx (contract pre-check / F-6 case) is
                 // harmless.
                 if let Err(e) = tx.commit().await {
+                    Self::count_failure(CATEGORY_DATABASE);
                     tracing::warn!(
                         workspace_id = %workspace,
                         action,
@@ -366,6 +376,7 @@ impl AuditGovernanceOutboxRepo {
             }
             Err(e) => {
                 let _ = tx.rollback().await;
+                Self::count_failure(CATEGORY_DATABASE);
                 tracing::warn!(
                     workspace_id = %workspace,
                     action,
@@ -388,6 +399,7 @@ impl AuditGovernanceOutboxRepo {
                 )
                 .await
                 {
+                    Self::count_failure(CATEGORY_DATABASE);
                     tracing::warn!(
                         workspace_id = %workspace,
                         action,
@@ -415,22 +427,45 @@ impl AuditGovernanceOutboxRepo {
     /// # Errors
     /// Propagates connection-level [`sqlx::Error`] only.
     pub async fn aggregate_login_failure_buckets(
-        &self,
+        &mut self,
         window_secs: i64,
     ) -> Result<usize, sqlx::Error> {
         let window_secs = window_secs.max(1);
+        // F-A (design-gate blocker): the scan must be SARGABLE on
+        // `created_at` so the 0243 `login_failures_created_at_idx` index is
+        // usable — the previous `floor(extract(epoch FROM created_at)/$1)`
+        // predicate forced a full Seq Scan of the whole retention window
+        // every tick. The closed-bucket predicate is now
+        // `created_at < <last full bucket start>` (equivalent boundary,
+        // index-friendly), plus a per-run watermark (`> $2`, the max
+        // processed `created_at`) so each tick scans only rows landed since
+        // the last tick. On restart the watermark resets → a rescan of the
+        // closed window; `ON CONFLICT (event_id) DO NOTHING` dedupes (safe).
         let buckets: Vec<(i64, i64)> = sqlx::query_as(
             r"SELECT floor(extract(epoch FROM created_at) / $1)::bigint * $1 AS bucket_start,
                     COUNT(*)::bigint AS n
                FROM login_failures
-              WHERE (floor(extract(epoch FROM created_at) / $1)::bigint + 1) * $1
-                    <= extract(epoch FROM clock_timestamp()) - $1
+              WHERE created_at < to_timestamp(
+                        floor(extract(epoch FROM clock_timestamp()) / $1)::bigint * $1)
+                AND created_at > $2
               GROUP BY bucket_start
               ORDER BY bucket_start",
         )
         .bind(window_secs)
+        .bind(self.l1_watermark)
         .fetch_all(&self.pool)
         .await?;
+        // Advance the watermark to the max `created_at` seen (cheap: MAX on
+        // the 0243-indexed column). Best-effort: a failure only costs a
+        // rescan next tick (deduped) — it never drops rows.
+        if let Some(max_ts) = sqlx::query_scalar::<_, Option<time::OffsetDateTime>>(
+            "SELECT MAX(created_at) FROM login_failures",
+        )
+        .fetch_one(&self.pool)
+        .await?
+        {
+            self.l1_watermark = max_ts;
+        }
 
         let nil_workspace = WorkspaceId::nil();
         let mut inserted = 0usize;
