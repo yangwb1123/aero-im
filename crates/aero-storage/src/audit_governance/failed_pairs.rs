@@ -146,7 +146,8 @@ impl FailedPairRepo {
         let row: Option<ReplayCandidate> = sqlx::query_as(
                 r"SELECT workspace_id, actor_id, action, target, detail, outbound_action
                    FROM audit_governance_failed_pairs
-                  WHERE id = $1 AND status = 'pending' AND replayed_at IS NULL",
+                  WHERE id = $1 AND status = 'pending' AND replayed_at IS NULL
+                  FOR UPDATE SKIP LOCKED",
             )
             .bind(id)
             .fetch_optional(&self.pool)
@@ -155,7 +156,10 @@ impl FailedPairRepo {
             return Ok(None);
         };
         let mut tx = self.pool.begin().await?;
-        let pair = crate::audit_governance::outbox::AuditGovernanceOutboxRepo::append_pair_in_tx_fail_open(
+        // No-DLQ variant (async-reviewer fix): a Database-class re-failure
+        // returns Ok(None) WITHOUT enqueueing a fresh clone — the original
+        // row's attempts increment below and the population cannot double.
+        let pair = crate::audit_governance::outbox::AuditGovernanceOutboxRepo::append_pair_in_tx_fail_open_no_dlq(
             &mut tx,
             WorkspaceId::from_uuid(workspace),
             actor.map(ParticipantId::from_uuid),
@@ -178,11 +182,9 @@ impl FailedPairRepo {
             tx.commit().await?;
             Ok(Some(audit_id))
         } else {
-            // Re-failed (Database class): the new DLQ row committed with this
-            // tx; the original row stays for the next ops loop — but bounded:
-            // MAX_ATTEMPTS reached marks it DEAD so `replay_all` cannot keep
-            // doubling the table under a persistent bug (F-4). The new DLQ
-            // row is inside this tx — commit keeps it.
+            // Re-failed (Database class, no clone — no_dlq writer): increment
+            // the ORIGINAL row's attempts; MAX_ATTEMPTS reached marks it DEAD
+            // so `replay_all` cannot keep hammering a persistent bug (F-4).
             sqlx::query(
                 "UPDATE audit_governance_failed_pairs
                     SET replay_attempts = replay_attempts + 1,
@@ -208,7 +210,8 @@ impl FailedPairRepo {
             r"SELECT id FROM audit_governance_failed_pairs
                WHERE status = 'pending' AND replayed_at IS NULL
                ORDER BY id
-               LIMIT $1",
+               LIMIT $1
+               FOR UPDATE SKIP LOCKED",
         )
         .bind(limit)
         .fetch_all(&self.pool)

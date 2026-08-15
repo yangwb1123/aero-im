@@ -156,6 +156,35 @@ impl AuditGovernanceOutboxRepo {
             detail,
             outbound_action,
             "in_tx",
+            false,
+        )
+        .await
+    }
+
+    /// Replay-only variant: on a Database-class re-failure it returns
+    /// `Ok(None)` WITHOUT enqueueing a fresh DLQ clone — the ORIGINAL DLQ
+    /// row's replay_attempts increments and caps at dead (F-4/async-reviewer
+    /// fix: `replay_all` must not double the population under a persistent
+    /// bug). The producer path keeps the DLQ clone (at-least-once, D9).
+    pub async fn append_pair_in_tx_fail_open_no_dlq(
+        tx: &mut Transaction<'_, Postgres>,
+        workspace: WorkspaceId,
+        actor: Option<ParticipantId>,
+        action: &str,
+        target: Option<&str>,
+        detail: serde_json::Value,
+        outbound_action: &str,
+    ) -> Result<Option<AuditId>, sqlx::Error> {
+        Self::append_pair_in_tx_fail_open_inner(
+            tx,
+            workspace,
+            actor,
+            action,
+            target,
+            detail,
+            outbound_action,
+            "replay",
+            true,
         )
         .await
     }
@@ -173,6 +202,7 @@ impl AuditGovernanceOutboxRepo {
         detail: serde_json::Value,
         outbound_action: &str,
         path: &str,
+        suppress_dlq: bool,
     ) -> Result<Option<AuditId>, sqlx::Error> {
         // F-2 contract pre-check: non-object detail → Ok(None), no DB touch.
         if !detail.is_object() {
@@ -218,8 +248,13 @@ impl AuditGovernanceOutboxRepo {
                 let (category, level) = Self::classify(&sqlstate);
                 // D9: same-tx DLQ enqueue (nested savepoint — a failed DLQ
                 // insert, e.g. 42P01 with a missing 0244, can never abort the
-                // domain tx: F-6 last-resort guard).
-                let dlq_id = match FailedPairRepo::enqueue_in_tx(
+                // domain tx: F-6 last-resort guard). Suppressed on the replay
+                // path (`suppress_dlq`) — a re-failed replay increments the
+                // ORIGINAL row's attempts instead of cloning the population.
+                let dlq_id = if suppress_dlq {
+                    None
+                } else {
+                match FailedPairRepo::enqueue_in_tx(
                     tx,
                     workspace,
                     actor,
@@ -245,6 +280,7 @@ impl AuditGovernanceOutboxRepo {
                         );
                         None
                     }
+                }
                 };
                 Self::log_and_count(category, level, workspace, action, path, &sqlstate, dlq_id);
                 Ok(None)
@@ -339,6 +375,7 @@ impl AuditGovernanceOutboxRepo {
             detail.clone(),
             outbound_action,
             "standalone",
+            false,
         )
         .await
         {
@@ -433,39 +470,40 @@ impl AuditGovernanceOutboxRepo {
         let window_secs = window_secs.max(1);
         // F-A (design-gate blocker): the scan must be SARGABLE on
         // `created_at` so the 0243 `login_failures_created_at_idx` index is
-        // usable — the previous `floor(extract(epoch FROM created_at)/$1)`
-        // predicate forced a full Seq Scan of the whole retention window
-        // every tick. The closed-bucket predicate is now
-        // `created_at < <last full bucket start>` (equivalent boundary,
-        // index-friendly), plus a per-run watermark (`> $2`, the max
-        // processed `created_at`) so each tick scans only rows landed since
-        // the last tick. On restart the watermark resets → a rescan of the
-        // closed window; `ON CONFLICT (event_id) DO NOTHING` dedupes (safe).
+        // usable. The closed-bucket boundary is fetched once (server clock),
+        // `created_at < boundary` is the index-friendly closed-bucket
+        // predicate (equivalent to the legacy `bucket_end <= now - W` — the
+        // extra-window margin is preserved: boundary = current_bucket_start -
+        // W), and `> watermark` limits each tick to newly-closed rows.
+        //
+        // **Async-reviewer fixes (design gate, run 386d075c)**: the watermark
+        // advances to the BOUNDARY (all rows below it were scanned + upserted
+        // in this call), never to a global MAX — a MAX over open-bucket rows
+        // skipped by the scan would permanently lose every bucket's first
+        // `(boot mod W)` seconds (ON CONFLICT DO NOTHING freezes the
+        // undercount). The advance happens AFTER the insert loop, so a
+        // mid-loop failure leaves the watermark behind the scanned rows and
+        // the next tick rescans them (deduped — never lost).
+        let boundary: i64 = sqlx::query_scalar(
+            r"SELECT floor(extract(epoch FROM clock_timestamp()) / $1)::bigint * $1 - $1",
+        )
+        .bind(window_secs)
+        .fetch_one(&self.pool)
+        .await?;
         let buckets: Vec<(i64, i64)> = sqlx::query_as(
             r"SELECT floor(extract(epoch FROM created_at) / $1)::bigint * $1 AS bucket_start,
                     COUNT(*)::bigint AS n
                FROM login_failures
-              WHERE created_at < to_timestamp(
-                        floor(extract(epoch FROM clock_timestamp()) / $1)::bigint * $1 - $1)
-                AND created_at > $2
+              WHERE created_at < to_timestamp($2)
+                AND created_at > $3
               GROUP BY bucket_start
               ORDER BY bucket_start",
         )
         .bind(window_secs)
+        .bind(boundary)
         .bind(self.l1_watermark)
         .fetch_all(&self.pool)
         .await?;
-        // Advance the watermark to the max `created_at` seen (cheap: MAX on
-        // the 0243-indexed column). Best-effort: a failure only costs a
-        // rescan next tick (deduped) — it never drops rows.
-        if let Some(max_ts) = sqlx::query_scalar::<_, Option<time::OffsetDateTime>>(
-            "SELECT MAX(created_at) FROM login_failures",
-        )
-        .fetch_one(&self.pool)
-        .await?
-        {
-            self.l1_watermark = max_ts;
-        }
 
         let nil_workspace = WorkspaceId::nil();
         let mut inserted = 0usize;
@@ -507,6 +545,11 @@ impl AuditGovernanceOutboxRepo {
                 inserted += 1;
             }
         }
+        // Watermark advance AFTER the insert loop (async-reviewer fix): only
+        // on success does the boundary become the new watermark — a mid-loop
+        // failure (`?` above) leaves it behind so nothing is lost.
+        self.l1_watermark = time::OffsetDateTime::from_unix_timestamp(boundary)
+            .unwrap_or(self.l1_watermark);
         Ok(inserted)
     }
 
