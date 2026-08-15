@@ -74,7 +74,7 @@ const SQLSTATE_CONNECTION: &str = "08006";
 pub struct AuditGovernanceOutboxRepo {
     pool: PgPool,
     /// F-A watermark: max processed `login_failures.created_at` from the
-    /// last aggregation tick (process-local; resets to UNIX_EPOCH on restart
+    /// last aggregation tick (process-local; resets to `UNIX_EPOCH` on restart
     /// → a closed-window rescan, deduped by `ON CONFLICT DO NOTHING`).
     l1_watermark: time::OffsetDateTime,
 }
@@ -163,7 +163,7 @@ impl AuditGovernanceOutboxRepo {
 
     /// Replay-only variant: on a Database-class re-failure it returns
     /// `Ok(None)` WITHOUT enqueueing a fresh DLQ clone — the ORIGINAL DLQ
-    /// row's replay_attempts increments and caps at dead (F-4/async-reviewer
+    /// row's `replay_attempts` increments and caps at dead (F-4/async-reviewer
     /// fix: `replay_all` must not double the population under a persistent
     /// bug). The producer path keeps the DLQ clone (at-least-once, D9).
     pub async fn append_pair_in_tx_fail_open_no_dlq(

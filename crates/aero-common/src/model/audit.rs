@@ -504,7 +504,7 @@ mod tests {
     }
 
     /// L1 vocabulary canonical-value pins (0242 trigger allowlist + envelope
-    /// — the SQL literals are cross-pinned by the aero-storage db_tests; a
+    /// — the `SQL literals` are cross-pinned by the aero-storage `db_tests`; a
     /// flip here is a one-line edit and the cross-pins follow automatically).
     #[test]
     fn l1_vocabulary_consts_are_pinned() {

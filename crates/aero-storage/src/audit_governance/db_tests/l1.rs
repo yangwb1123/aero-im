@@ -395,6 +395,7 @@ async fn l1_window_aggregates_concurrent_merge_serializes() {
 #[tokio::test]
 #[ignore = "requires live Postgres"]
 async fn admin_rows_never_merged_into_l1_window() {
+    const N: i64 = 3;
     let p = pool();
     if !l1_aggregate_migrated(&p).await {
         return;
@@ -407,7 +408,6 @@ async fn admin_rows_never_merged_into_l1_window() {
         .expect("capture fixed ts");
 
     // N message.create rows, same window → 1 window row, count = N.
-    const N: i64 = 3;
     let mut tx = p.begin().await.expect("begin create-window tx");
     for _ in 0..N {
         insert_audit_row(&mut tx, ws, actor, LOCAL_ACTION_MESSAGE_CREATE, fixed_ts).await;

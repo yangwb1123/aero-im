@@ -101,8 +101,10 @@ CLAIM_ALLOWLIST=(
     'crates/aero-storage/src/aero_vault_blob_store.rs:62:"scope"'
     'crates/aero-storage/src/aero_vault_blob_store.rs:291:"scope"'
     # admin_revoke.rs — audit-event payload field name ("session.revoked"
-    # audit JSON schema), NOT a vault form param.
-    'crates/aero-storage/src/auth_session/admin_revoke.rs:120:"scope"'
+    # audit JSON schema), NOT a vault form param. Removed with the B5-1 auth
+    # slice: the legacy append's `"scope": "participant_global"` payload
+    # field was replaced by the governance pair writer (detail
+    # `{"admin_revoked": true}`) — no `scope` literal remains in the file.
     # blob.rs / blob_gc.rs — expect("scope") panic-message strings inside
     # #[tokio::test] fns, NOT production vault params.
     'crates/aero-storage/src/blob.rs:876:"scope"'
@@ -118,8 +120,16 @@ CLAIM_ALLOWLIST=(
     # pat.rs — PAT token-response JSON field name "scopes" (plural; different
     # wire contract than the RFC 9068 singular "scope" claim — substring-guard
     # false positive on the token-response plural field).
-    'crates/aero-storage/src/pat.rs:139:"scopes"'
-    'crates/aero-storage/src/pat.rs:400:"scopes"'
+    'crates/aero-storage/src/pat.rs:131:"scopes"'
+    'crates/aero-storage/src/pat.rs:441:"scopes"'
+    # aero-server/pat.rs — the B5-1 PAT-pair detail carries the same
+    # token-response plural "scopes" field (`json!({ "scopes": scopes })`).
+    'crates/aero-server/src/pat.rs:157:"scopes"'
+    # db_tests/auth.rs — B5-1 auth-slice parity fixtures reuse the same
+    # token-response plural "scopes" field (never the RFC 9068 singular claim).
+    'crates/aero-storage/src/audit_governance/db_tests/auth.rs:248:"scopes"'
+    'crates/aero-storage/src/audit_governance/db_tests/auth.rs:263:"scopes"'
+    'crates/aero-storage/src/audit_governance/db_tests/auth.rs:569:"scopes"'
     # live.rs — chat-line label "sub" in #[tokio::test] (pure vocabulary
     # false positive: a subscriber/non-subscriber chat line, not a claim).
     'crates/aero-storage/src/live.rs:584:"sub"'

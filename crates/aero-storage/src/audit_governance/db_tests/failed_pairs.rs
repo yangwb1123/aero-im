@@ -106,29 +106,29 @@ const REBUILD_TARGET: &str = "replay-rebuild-target";
 #[tokio::test]
 #[ignore = "requires live Postgres"]
 async fn failed_pair_replay_all_replays_unreplayed_rows() {
-    let p = pool();
-    reset_governance_table(&p).await;
-    let a = seed_dlq_row(&p, AUTH_LOGIN, "replay-all-target").await;
-    let b = seed_dlq_row(&p, AUTH_LOGIN, "replay-all-target").await;
+    let pool = pool();
+    reset_governance_table(&pool).await;
+    let first = seed_dlq_row(&pool, AUTH_LOGIN, "replay-all-target").await;
+    let second = seed_dlq_row(&pool, AUTH_LOGIN, "replay-all-target").await;
 
-    let repo = FailedPairRepo::new(p.clone());
+    let repo = FailedPairRepo::new(pool.clone());
     assert_eq!(repo.count().await.expect("count"), 2, "DLQ depth = 2");
     let replayed = repo.replay_all(10).await.expect("replay_all");
     assert_eq!(replayed, 2, "both rows replayed");
     let unreplayed: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM audit_governance_failed_pairs WHERE replayed_at IS NULL",
     )
-    .fetch_one(&p)
+    .fetch_one(&pool)
     .await
     .unwrap();
     assert_eq!(unreplayed, 0, "ops loop drains the unreplayed set");
     assert_eq!(repo.count().await.expect("count"), 2, "replayed rows remain (depth includes them)");
     // The ops-loop limit is honored (one row per bounded call; a drained
     // call replays nothing).
-    let c = seed_dlq_row(&p, AUTH_LOGIN, "replay-all-target").await;
-    let d = seed_dlq_row(&p, AUTH_LOGIN, "replay-all-target").await;
+    let third = seed_dlq_row(&pool, AUTH_LOGIN, "replay-all-target").await;
+    let fourth = seed_dlq_row(&pool, AUTH_LOGIN, "replay-all-target").await;
     assert_eq!(repo.replay_all(1).await.expect("limited replay"), 1);
     assert_eq!(repo.replay_all(1).await.expect("second limited replay"), 1);
     assert_eq!(repo.replay_all(1).await.expect("drained replay"), 0);
-    let _ = (a, b, c, d);
+    let _ = (first, second, third, fourth);
 }
