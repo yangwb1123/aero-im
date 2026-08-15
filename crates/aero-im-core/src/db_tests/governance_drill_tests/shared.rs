@@ -24,10 +24,10 @@ use aero_common::{
 
 use super::*;
 
-/// The 0239 16-key envelope (`aero_enqueue_governance_audit` jsonb_build_object
+/// The 0239 16-key envelope (`aero_enqueue_governance_audit` `jsonb_build_object`
 /// list, byte-identical in 0242/0245/0246). Single definition — every
 /// lane drill asserts the same list.
-pub const ENVELOPE_KEYS: [&str; 16] = [
+pub(crate) const ENVELOPE_KEYS: [&str; 16] = [
     "event_id",
     "source_system",
     "event_type",
@@ -50,7 +50,7 @@ pub const ENVELOPE_KEYS: [&str; 16] = [
 /// `create_room_in_workspace` enqueued in the same tx (same priority 10,
 /// earlier `created_at` ⇒ sorts ahead in `claim_due`'s total order). No-op
 /// when 0245 absent. Run after ALL facade writes, before any assertion.
-pub async fn scrub_room_lane_rows(pool: &PgPool) {
+pub(crate) async fn scrub_room_lane_rows(pool: &PgPool) {
     sqlx::query("DELETE FROM audit_governance_outbox WHERE class = 'room'")
         .execute(pool)
         .await
@@ -65,7 +65,7 @@ pub async fn scrub_room_lane_rows(pool: &PgPool) {
 /// `::bigint` matches the trigger's preimage; the class and bucket bind the
 /// leaf consts so a preimage drift reds loudly at the `event_id == key`
 /// pins. Inline SQL required — aero-storage's test helper is unreachable.
-pub async fn window_row_for(
+pub(crate) async fn window_row_for(
     pool: &PgPool,
     ws: WorkspaceId,
     created_at: time::OffsetDateTime,
@@ -91,7 +91,7 @@ pub async fn window_row_for(
 
 /// T-11 claim predicate (pg.rs `claim_due` WHERE verbatim): whether the row
 /// is due/claimable — `true` = not lost, `false` = terminal.
-pub async fn claim_predicate_holds(pool: &PgPool, event_id: Uuid) -> bool {
+pub(crate) async fn claim_predicate_holds(pool: &PgPool, event_id: Uuid) -> bool {
     sqlx::query_scalar(
         "SELECT EXISTS(
             SELECT 1 FROM audit_governance_outbox
@@ -110,7 +110,7 @@ pub async fn claim_predicate_holds(pool: &PgPool, event_id: Uuid) -> bool {
 /// `force_lease_expiry`; after a requeue the row is status 0, so only
 /// `available_at` gates `claim_due`). Deterministic — no sleep, the
 /// backdate overrides any backoff drift.
-pub async fn force_re_due(pool: &PgPool, event_id: AuditId) {
+pub(crate) async fn force_re_due(pool: &PgPool, event_id: AuditId) {
     sqlx::query(
         "UPDATE audit_governance_outbox
             SET available_at = clock_timestamp() - interval '1 second',
@@ -130,7 +130,7 @@ pub async fn force_re_due(pool: &PgPool, event_id: AuditId) {
 /// (`message.create`/`message.edit`/`room.create`/`room.archived`/
 /// `message.recalled`/`message.moderated` — recall audit rows carry
 /// `workspace_id`, E9).
-pub async fn cleanup_facade_rows(
+pub(crate) async fn cleanup_facade_rows(
     pool: &PgPool,
     ws: WorkspaceId,
     message_ids: &[MessageId],
@@ -178,7 +178,7 @@ pub async fn cleanup_facade_rows(
 
 /// Mutable-column state of one governance outbox row (settle/requeue/dead
 /// assertions).
-pub struct RowState {
+pub(crate) struct RowState {
     pub status: i32,
     pub attempts: i64,
     pub delivered_at: Option<time::OffsetDateTime>,
@@ -187,7 +187,7 @@ pub struct RowState {
     pub lease_expires_at: Option<time::OffsetDateTime>,
 }
 
-pub async fn outbox_row(pool: &PgPool, event_id: AuditId) -> RowState {
+pub(crate) async fn outbox_row(pool: &PgPool, event_id: AuditId) -> RowState {
     let (status, attempts, delivered_at, last_error, claim_token, lease_expires_at) =
         sqlx::query_as::<
             _,

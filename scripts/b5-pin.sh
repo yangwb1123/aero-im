@@ -11,7 +11,7 @@
 #   * b5_check — the verdict-line protocol (`B5-CHECK <name>: PASS|SKIP
 #     (<reason>)`): echoed to stdout AND appended to $B5_LOG (the pin guard's
 #     evidence file).
-#   * assert_b5_contract_pin — the guard: exactly 41 slots, no duplicates, no
+#   * assert_b5_contract_pin — the guard: exactly 46 slots, no duplicates, no
 #     malformed entries, ≥1 executed slot (no vacuous green), and (fresh mode)
 #     every executed slot backed by a `B5-CHECK <name>: PASS|SKIP` verdict
 #     line in the B5 log (SKIP-with-reason counts as handled — 0239 / sibling

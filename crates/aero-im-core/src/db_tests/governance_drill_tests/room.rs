@@ -21,7 +21,7 @@
 //!     enforcement OFF is the correct fixture state (0245 has no binding
 //!     lookup, no runtime gate).
 //!   * Recall lane (0246): `message.recalled` rows DO enter the outbox —
-//!     1:1 (event_id = audit id), class 'message', priority 10 — produced
+//!     1:1 (`event_id` = audit id), class 'message', priority 10 — produced
 //!     ONLY by the 0246 trigger. `governance_lane_for("message.recalled")`
 //!     stays `None` (the arbitration; pinned at unit level by the aero-ai
 //!     suite `unknown_local_token_passes_through_unmapped` /
@@ -64,14 +64,13 @@ use super::*;
 /// One room-create fixture (shared by all six drills): self-isolate → start-
 /// of-test singleton re-assert (enforcement OFF — 0245 is gate-free; do NOT
 /// seed a binding) → workspace/room. Returns the room + the audit id (1:1
-/// with the outbox event_id) + the outbox row.
+/// with the outbox `event_id`) + the outbox row.
 struct RoomFixture {
     ws: WorkspaceId,
     owner: ParticipantId,
     room: aero_common::RoomId,
-    /// The `room.create` audit row id == the 0245 outbox event_id.
+    /// The `room.create` audit row id == the 0245 outbox `event_id`.
     audit_id: AuditId,
-    payload: serde_json::Value,
 }
 
 async fn room_create_fixture(pool: &PgPool, svc: &crate::service::ImService, prefix: &str) -> RoomFixture {
@@ -113,24 +112,16 @@ async fn room_create_fixture(pool: &PgPool, svc: &crate::service::ImService, pre
         detail.get("name").is_none(),
         "unvalidated name must not enter the audit payload (G-SEC2)"
     );
-    let payload: serde_json::Value = sqlx::query_scalar(
-        "SELECT payload FROM audit_governance_outbox WHERE event_id = $1",
-    )
-    .bind(audit_id)
-    .fetch_one(pool)
-    .await
-    .expect("room.create outbox payload");
     RoomFixture {
         ws,
         owner,
         room,
         audit_id: AuditId::from_uuid(audit_id),
-        payload,
     }
 }
 
 /// Assert the 0245 1:1 outbox row shape (shared by R1/R2 and the R5 legs):
-/// class 'room', priority 10, status 0, attempts 0, last_error NULL, the
+/// class 'room', priority 10, status 0, attempts 0, `last_error` NULL, the
 /// 16-key envelope, `action` == the leaf token VERBATIM, `idempotency_key`
 /// == `event_id`, `source_system` == `AUDIT_SOURCE_SYSTEM`.
 async fn assert_room_outbox_shape(
@@ -192,22 +183,19 @@ async fn assert_room_outbox_shape(
         aggregate_id.to_uuid().to_string(),
         "aggregate_id == workspace id"
     );
-    match actor_id {
-        Some(actor) => {
-            assert_eq!(
-                payload["actor"]["id"],
-                actor.to_string(),
-                "actor.id == the human creator"
-            );
-            assert_eq!(
-                payload["actor"]["type"], "participant",
-                "actor.type == participant (never system for a room op)"
-            );
-        }
-        None => {
-            assert_eq!(payload["actor"]["id"], "system", "nil actor → system id");
-            assert_eq!(payload["actor"]["type"], "system");
-        }
+    if let Some(actor) = actor_id {
+        assert_eq!(
+            payload["actor"]["id"],
+            actor.to_string(),
+            "actor.id == the human creator"
+        );
+        assert_eq!(
+            payload["actor"]["type"], "participant",
+            "actor.type == participant (never system for a room op)"
+        );
+    } else {
+        assert_eq!(payload["actor"]["id"], "system", "nil actor → system id");
+        assert_eq!(payload["actor"]["type"], "system");
     }
     assert_eq!(
         payload["targets"][0]["id"],
