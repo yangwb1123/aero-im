@@ -355,3 +355,36 @@ pub struct NewRegistrationAudit {
 4. Auth rows at priority 10 share the claim lane with message backlog — ordering `priority DESC` (moderation 100 first); no lane filtering (0240 index).
 5. `audit_governance::` filter already matches existing tests — the **named** `auth_outbox_parity` + `auth_allowlist_no_miss_write` entries (empty-filter guarded) prevent vacuous green.
 6. L1 disable × retention sweep loses that window's v2 signal (accepted, D11) — boot warns; reopen within retention self-heals.
+
+---
+
+## 9. design-resolved — design_gate blockers (VERDICT: FAIL, 2026-08-14; run 386d075c)
+
+The design gate verified the landed implementation (committed with the review
+stage as 5ac8a90: migrations 0243/0244, `AuditGovernanceOutboxRepo` H3 pair
+writer, failed-pairs DLQ, DP-1 token renames, L1 aggregation) against the
+design and found 8 BLOCKING findings, all verified in-tree. Resolutions
+(carry explicit reviewer fix prescriptions):
+
+| # | Finding (severity) | Verified anchor | Resolution (fix prescription) |
+|---|---|---|---|
+| **C1** (protocol, BLOCKING) | `source_system="aero-auth"` dead-letters the whole auth lane | `client.rs:518-519` `validate_delivery_payload` bails on `source_system != config.source_system`; `config.rs:121` reads `AERO_AUDIT_SOURCE_SYSTEM` (default `aero-im.source`, :300); 0242 header pins `aero-im.source` | **One-const change**: auth emitter `AUTH_SOURCE_SYSTEM = AUDIT_SOURCE_SYSTEM` (the leaf `aero_common::AUDIT_SOURCE_SYSTEM`); the auth pair + L1 rows then survive the connector guard. Parity tests must assert against the leaf const, not the local string |
+| **F-A** (perf, BLOCKING) | L1 scan non-sargable: `WHERE (floor(extract(epoch FROM created_at)/$1)::bigint + 1) * $1 <= extract(epoch FROM clock_timestamp()) - $1` — full Seq Scan of the 180-day window every tick; 0243 index unusable; no watermark | `outbox.rs:~417` | Rewrite to sargable form on `created_at` (e.g. `created_at <= now() - make_interval(secs => $1)`), leveraging the 0243 `login_failures_created_at_idx`; carry a per-run watermark (max processed `created_at`) so each tick scans only new rows |
+| **C2** (protocol, BLOCKING) | L1 window = tick env `AERO__SERVER__LOGIN_FAILURE_L1_AGGREGATE_SECS` (default 30) ≠ `L1_WINDOW_SECONDS` (60) → prod keys ≠ test keys; ops env change re-keys buckets → sink double-counts | `background.rs:317/:361` | Single call site: the aggregation uses the leaf `L1_WINDOW_SECONDS` constant; drop the env knob (or keep it only as a disable switch, 0 = off), never as a window-size override |
+| **F-2** (security, BLOCKING) | TOTP disable emits `auth.totp.enroll` — 2FA *removal* recorded as *enrollment* (audit-only; production AC-3 false-positive class) | `totp.rs:206-214` | Restore the distinct `auth.totp.disabled` token for the disable path (DP-1 rename half kept for the enable path only: `auth.totp.enabled` → `auth.totp.enroll`) |
+| **F-3** (security, BLOCKING) | `complete_oidc_login` (`sso.rs:714-770`) issues tokens + records session with zero audit — no `auth.login`, no pair, no pin | `sso.rs:714-770` | Emit the `auth.login` pair at `complete_oidc_login` in the same tx as token issuance (D5 placement pattern of `handlers/auth.rs:204`); add the SSO pin to authz_lint |
+| **F-4** (security, BLOCKING) | `failed_pairs.rs` has no `replay_attempts` cap, no dead state, no retention; `replay_all` doubles the table per run under a persistent bug | `failed_pairs.rs` | Add `replay_attempts` (bounded, MAX_ATTEMPTS=5 → `dead` state), retention sweep for dead rows, and a `replay_all` guard (cap per run) |
+| **F-1** (security, BLOCKING) | `record_pair_standalone` connection-level branches (begin :317-325, commit :333-341, connection :371-376) warn-only, no `count_failure` — the only attacker-inducible class is uncounted | `outbox.rs:317-376` | Count every connection-level failure with `count_failure` (the `audit_auth_write_failures_total` metric) so the alert control plane sees the attacker-inducible class |
+| **QA F-1/F-2** (HIGH) | `authz_lint.rs` has zero B5-1 rules (no `_in_tx` reference checks, no `audit_session_revoked`-gone check, no D5/SSO placement pins); no HTTP-level smoke | `crates/aero-server/tests/authz_lint.rs` | Add B5-1 authz_lint rules: `_in_tx` references required on PAT/TOTP/session writes, `audit_session_revoked` removal pin, D5 login-handler placement oracle, SSO `complete_oidc_login` pair placement; add the HTTP-level smoke leg |
+
+**Re-verification path**: implement stage lands the 8 fixes in this order:
+C1 (one-const) → C2 (single window site) → F-A (sargable + watermark) →
+F-2 (totp.disabled) → F-3 (SSO pair) → F-4 (replay caps) → F-1 (counting) →
+QA (authz_lint rules + smoke) → full gates (`cargo check`, `test-integration.sh`,
+b5-pin 41/41, clippy no-new-warnings).
+
+**Non-blocking residuals** (recorded, not in this batch's acceptance): F-B
+(outbox-terminal/DLQ sweep), F-C (clock-domain freeze + `ON CONFLICT DO
+NOTHING` merge arm), F-E (0243 header claim), F-F, C3 (`Z` vs `+00:00`),
+C4 (two L1 envelope shapes), C8 (payload unprojected), security F-5/F-6
+(provisioning carve-out pin; `credential_rotation.rs:69/:167` audit-only).
