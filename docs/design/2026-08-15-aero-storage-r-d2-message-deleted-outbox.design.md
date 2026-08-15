@@ -231,3 +231,58 @@ ls migrations/*.sql | wc -l                                # stays 246
 ## 9. Out of scope (unchanged from spec)
 
 Retention/GDPR sweep deletes (`WorkspaceRepo::sweep_expired_messages` — produces no `message.deleted` token; needs a separate in-tx audit append first), L1 window extension (rejected §1), repo/connector/reconciler internals, new migrations, new b5-pin slots, web/UI, `message.recalled`/`message.moderated`/`create`/`edit`/`room.*` (already mapped).
+
+---
+
+## 10. design-resolved — design_gate blockers (VERDICT: FAIL, 2026-08-15; run ecc80034)
+
+Gate verified the design predates all four reviews with no revision. Resolutions
+(anchors verified in-tree):
+
+1. **SRE HIGH — monitoring surface absent (launch blocker)**: runbook refs
+   `aero_audit_outbox_transient_requeue/_dead/token_rejections/delivery_outcomes`
+   but the connector crate has zero metrics calls. **Resolution**: add a
+   minimal dependency-free counter registry `crates/aero-audit-connector/src/metrics.rs`
+   (static atomics + Prometheus text render), emit at the four delivery
+   branches (relay.rs requeue/dead, client.rs token-rejection, delivery
+   outcome), and register the collector in the server's observability gauge
+   sampler (30s). Acceptance: a unit test emits + reads back each counter;
+   the runbook's metric names then exist.
+2. **SRE HIGH / Compliance F-1 / DB M1 — no governance-outbox retention**:
+   `boot/retention.rs` sweeps `event_outbox`/audit partitions, never
+   `audit_governance_outbox`; R-D2 user deletes persist 120-char digests
+   forever. **Resolution**: add `AERO__SERVER__GOVERNANCE_OUTBOX_RETENTION_DAYS`
+   (default 365, 0=off) + a `sweep_governance_outbox` leg (DELETE rows older
+   than TTL and status in (2,3) dead/terminal; never live status-0/1 rows);
+   db_test pins the sweep. GDPR-consistent with the 365d audit partition DROP.
+3. **QA F-1 / Compliance F-4 — rollback half unpinned**: writer's SELECT
+   targets a provably-existing row, INSERT passes all CHECKs, no FK → no
+   fail-closed injection. **Resolution**: `delete_lane_writer_failure_aborts_delete_fail_closed`
+   drives `append_message_delete_in_tx` with a **broken-FK workspace**
+   (nonexistent workspace_id → FK Err) and asserts zero outbox rows + the
+   delete tx rolled back — the same injection shape as
+   `audit_failure_rolls_back_delete_and_outbox_append` (events.rs:614-647).
+4. **DB M2 — AC-3 occurred_at byte-spelling**: Rust Rfc3339 renders `Z` +
+   fraction-trimmed; PG `jsonb_build_object('occurred_at', NEW.created_at)`
+   renders `+00:00` + microseconds (outbox.rs:579-582 vs 0239:113 — a real
+   wire inconsistency, not just a test bug). **Resolution**: add
+   `aero_common::audit_wire_occurred_at(ts) -> String` (the PG spelling:
+   `+00:00`, 6-digit microsecond fraction) used by the Rust
+   `governance_envelope`; AC-3 byte-asserts both sides against the one
+   canonical spelling. The auth direction's C3 residual shares this helper.
+5. **QA F-2 / Compliance F-5 / SRE — version-skew silent drop**: old binary
+   writes the audit row, no outbox row; 0241 reconciler is
+   `message.moderated`-only. **Resolution**: extend the 0241 reconciler scan
+   to the `message.deleted` token (same whole-pair contract, DELETED
+   idempotent) so the skew window self-heals; add AC-2a negative control
+   (`delete_lane_version_skew_backfills_on_reconcile`: seed an orphaned
+   `message.deleted` audit row → reconcile → outbox row appears, exactly one).
+
+**Implementation order**: metrics registry + emits → retention sweep leg →
+writer-failure test → occurred_at helper (shared) → reconciler extension +
+negative control → full gates (cargo check/test-integration/b5-pin
+unchanged 42/42/clippy).
+
+**Non-blocking residuals** (recorded): QA F3/F4 (concurrent-delete race,
+recalled-then-deleted composition — Low), truth-check baseline exit 6 /
+file-size exit 1 at HEAD (Info, pre-existing).
