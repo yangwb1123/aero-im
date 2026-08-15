@@ -12,8 +12,8 @@ use aero_audit_connector::{
 };
 use uuid::Uuid;
 
+use super::shared::*;
 use super::*;
-
 // ---------------------------------------------------------------------------
 // R5/R6 — permanent terminals on write-path rows (AC3a/AC3b).
 // ---------------------------------------------------------------------------

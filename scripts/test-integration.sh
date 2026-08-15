@@ -43,6 +43,10 @@ L1_PARITY_DB="aero_l1_parity_$$"
 ROOM_LANE_DB="aero_room_lane_$$"
 MESSAGE_LANE_DB="aero_message_lane_$$"
 FACADE_L1_WINDOW_DB="aero_facade_l1_window_$$"
+ROOM_FACADE_DRILL_DB="aero_room_facade_drill_$$"
+RECALL_FACADE_DRILL_DB="aero_recall_facade_drill_$$"
+POSTURE_DRILL_DB="aero_posture_drill_$$"
+R4_SINK_LEG_DB="aero_r4_sink_leg_$$"
 
 assert_disposable_db_name() {
     local variable_name="$1"
@@ -74,6 +78,10 @@ assert_disposable_db_name "L1 parity drill database" "$L1_PARITY_DB"
 assert_disposable_db_name "room lane parity database" "$ROOM_LANE_DB"
 assert_disposable_db_name "message lane parity database" "$MESSAGE_LANE_DB"
 assert_disposable_db_name "facade L1 window drill database" "$FACADE_L1_WINDOW_DB"
+assert_disposable_db_name "room facade drill database" "$ROOM_FACADE_DRILL_DB"
+assert_disposable_db_name "recall facade drill database" "$RECALL_FACADE_DRILL_DB"
+assert_disposable_db_name "connector posture drill database" "$POSTURE_DRILL_DB"
+assert_disposable_db_name "R4 sink leg drill database" "$R4_SINK_LEG_DB"
 
 # Parse host and user from BASE_URL for psql
 PSQL_ARGS="${BASE_URL#postgres://}"
@@ -713,6 +721,50 @@ if [ -z "$SKIP_DB_CREATE" ]; then
             "facade-l1-window-drill"
     else
         b5_check "facade-l1-window-drill" "SKIP (0242 not landed)"
+    fi
+    # Room/recall-facade drills + R4 sink leg + connector-posture drill
+    # (close-room direction, design §D9/DR-3): four named slots, each on its
+    # own throwaway DB via run_migrated_integration (empty-filter guarded).
+    # Gates: room lane 0245, recall lane 0246, connector posture + R4 sink
+    # leg 0239. Absent migration → explicit SKIP, never silent green.
+    if [ -f "migrations/0239_audit_governance_outbox.sql" ]; then
+        if [ -f "migrations/0245_room_audit_governance.sql" ]; then
+            run_migrated_integration \
+                "$ROOM_FACADE_DRILL_DB" \
+                "drill_room_" \
+                "room lane facade drill db_tests" \
+                "aero-im-core" \
+                "room-lane-facade-drill"
+        else
+            b5_check "room-lane-facade-drill" "SKIP (0245 not landed)"
+        fi
+        if [ -f "migrations/0246_message_recall_audit_governance.sql" ]; then
+            run_migrated_integration \
+                "$RECALL_FACADE_DRILL_DB" \
+                "drill_recall_" \
+                "recall lane facade drill db_tests" \
+                "aero-im-core" \
+                "recall-lane-facade-drill"
+        else
+            b5_check "recall-lane-facade-drill" "SKIP (0246 not landed)"
+        fi
+        run_migrated_integration \
+            "$POSTURE_DRILL_DB" \
+            "drill_posture_" \
+            "connector posture drill db_tests" \
+            "aero-im-core" \
+            "connector-posture-drill"
+        run_migrated_integration \
+            "$R4_SINK_LEG_DB" \
+            "drill_payload_contract_" \
+            "r4 sink leg drill db_tests" \
+            "aero-im-core" \
+            "drill-payload-contract-slot"
+    else
+        b5_check "room-lane-facade-drill" "SKIP (0239 not landed)"
+        b5_check "recall-lane-facade-drill" "SKIP (0239 not landed)"
+        b5_check "connector-posture-drill" "SKIP (0239 not landed)"
+        b5_check "drill-payload-contract-slot" "SKIP (0239 not landed)"
     fi
     # Notification fan-out suite (AT-1…AT-7): owns a fresh throwaway DB with
     # its own migration + required Redis presence leg; the shared main-DB run

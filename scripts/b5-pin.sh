@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # B5 acceptance-gate pin material for scripts/test-integration.sh (G6 总装门):
 #
-#   * B5_CONTRACT_TEST_LIST — the 42/42 named contract-test slots (AC1 of
+#   * B5_CONTRACT_TEST_LIST — the 46/46 named contract-test slots (AC1 of
 #     docs/requirements/2026-08-07-aero-cli-b5-acceptance-gate-harness.req.md).
 #     21 in-repo-executable names + 21 out-of-repo slots tagged [PROPOSED]
 #     (docs/proposals/audit-contract-batch-aero-im.md :13 — the v2 contract
@@ -20,7 +20,7 @@
 # Sourced by scripts/test-integration.sh and exercised standalone by
 # scripts/test-b5-pin-guard.sh (pure bash — no database, no services).
 
-# 42 slots: 21 executed + 21 [PROPOSED]. The executed slots' verdict sources:
+# 46 slots: 25 executed + 21 [PROPOSED]. The executed slots' verdict sources:
 #   cargo-test filters (run_migration_regression / run_migrated_integration —
 #   empty-filter guarded, ≥1 test must actually run), 0239-gated B5-1 entries,
 #   the A3 / T-11 / moderation-priority drill sections, the notification
@@ -71,6 +71,10 @@ B5_CONTRACT_TEST_LIST=(
     room_lane_outbox_parity
     message_lane_outbox_parity
     facade-l1-window-drill
+    room-lane-facade-drill
+    recall-lane-facade-drill
+    connector-posture-drill
+    drill-payload-contract-slot
 )
 
 # Verdict-line protocol: `B5-CHECK <name>: PASS|SKIP (<reason>)`. Each
@@ -90,8 +94,8 @@ b5_check() {
 assert_b5_contract_pin() {
     local log_file="$1"
     local count=${#B5_CONTRACT_TEST_LIST[@]}
-    if [ "$count" -ne 42 ]; then
-        echo "✗ B5 contract pin: 42/${count} (expected exactly 42 named slots)" >&2
+    if [ "$count" -ne 46 ]; then
+        echo "✗ B5 contract pin: 46/${count} (expected exactly 46 named slots)" >&2
         return 1
     fi
     local -A seen=()
@@ -133,7 +137,7 @@ assert_b5_contract_pin() {
     else
         echo "B5 pin: verdict evidence degraded (SKIP_DB_CREATE); count/format/dupe/vacuous checks still enforced"
     fi
-    echo "B5 contract pin: 42/42 (${executed} executed, ${proposed} [PROPOSED]): PASS"
+    echo "B5 contract pin: 46/46 (${executed} executed, ${proposed} [PROPOSED]): PASS"
 }
 
 # F4 stub-reachability pin (merged B5-2 design §6 step 7): the test stub

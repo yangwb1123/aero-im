@@ -31,138 +31,16 @@ use aero_audit_connector::stub::{DuplicateBehavior, SinkBehavior, StubSink};
 use aero_common::{
     AGGREGATED_MESSAGE_ACTION, AUDIT_DATA_CLASSIFICATION, AUDIT_EVENT_TYPE, AUDIT_OUTCOME_SUCCESS,
     AUDIT_RETENTION_CLASS, AUDIT_SCHEMA_ID, AUDIT_SCHEMA_VERSION, AUDIT_SOURCE_SYSTEM,
-    GOVERNANCE_CLASS_MESSAGE, L1_WINDOW_SECONDS, LOCAL_ACTION_MESSAGE_CREATE,
-    LOCAL_ACTION_MESSAGE_EDIT, LOCAL_ACTION_MODERATED, LOCAL_ACTION_ROOM_CREATE,
+    GOVERNANCE_CLASS_MESSAGE, LOCAL_ACTION_MESSAGE_CREATE, LOCAL_ACTION_MESSAGE_EDIT,
 };
 use uuid::Uuid;
 
+use super::shared::*;
 use super::*;
 
-// ----- Scoped helpers (the parent `scrub_seam_rows` deletes ALL non-admin rows — these drills need the message-class window row). -----
-
-/// D3 scrub: DELETE the 0245 class-'room' outbox rows the fixture's
-/// `create_room_in_workspace` enqueued in the same tx (same priority 10,
-/// earlier `created_at` ⇒ sorts ahead in `claim_due`'s total order). No-op
-/// when 0245 absent. Run after ALL facade writes, before any assertion.
-async fn scrub_room_lane_rows(pool: &PgPool) {
-    sqlx::query("DELETE FROM audit_governance_outbox WHERE class = 'room'")
-        .execute(pool)
-        .await
-        .expect("scrub room-lane outbox rows");
-}
-
-/// Recompute the 0242 window PK from a server-stamped audit `created_at`.
-/// Two-step copy of the drift-pinned shape (`aero-storage
-/// producer/mod.rs::window_key_for`): epoch =
-/// `floor(extract(epoch FROM $1::timestamptz) / 60)::bigint`, then
-/// `md5(ws::text || '|' || class || '|' || epoch)::uuid`. The explicit
-/// `::bigint` matches the trigger's preimage; the class and bucket bind the
-/// leaf consts so a preimage drift reds loudly at the `event_id == key`
-/// pins. Inline SQL required — aero-storage's test helper is unreachable.
-async fn window_row_for(
-    pool: &PgPool,
-    ws: WorkspaceId,
-    created_at: time::OffsetDateTime,
-) -> Uuid {
-    let window_epoch: i64 =
-        sqlx::query_scalar("SELECT floor(extract(epoch FROM $1::timestamptz) / $2)::bigint")
-            .bind(created_at)
-            .bind(L1_WINDOW_SECONDS)
-            .fetch_one(pool)
-            .await
-            .expect("window epoch floor");
-    sqlx::query_scalar("SELECT md5($1)::uuid")
-        .bind(format!(
-            "{}|{}|{}",
-            ws.to_uuid(),
-            GOVERNANCE_CLASS_MESSAGE,
-            window_epoch
-        ))
-        .fetch_one(pool)
-        .await
-        .expect("recompute 0242 window key")
-}
-
-/// T-11 claim predicate (pg.rs `claim_due` WHERE verbatim): whether the row
-/// is due/claimable — `true` = not lost, `false` = terminal.
-async fn claim_predicate_holds(pool: &PgPool, event_id: Uuid) -> bool {
-    sqlx::query_scalar(
-        "SELECT EXISTS(
-            SELECT 1 FROM audit_governance_outbox
-             WHERE event_id = $1
-               AND status IN (0, 1)
-               AND available_at <= clock_timestamp()
-               AND (lease_expires_at IS NULL OR lease_expires_at <= clock_timestamp()))",
-    )
-    .bind(event_id)
-    .fetch_one(pool)
-    .await
-    .expect("claim-predicate probe")
-}
-
-/// FR-7: re-park a requeued row into the due set (mirrors
-/// `force_lease_expiry`; after a requeue the row is status 0, so only
-/// `available_at` gates `claim_due`). Deterministic — no sleep, the
-/// backdate overrides any backoff drift.
-async fn force_re_due(pool: &PgPool, event_id: AuditId) {
-    sqlx::query(
-        "UPDATE audit_governance_outbox
-            SET available_at = clock_timestamp() - interval '1 second',
-                lease_expires_at = NULL
-          WHERE event_id = $1",
-    )
-    .bind(event_id.to_uuid())
-    .execute(pool)
-    .await
-    .expect("force re-due");
-}
-
-/// End-of-drill cleanup: outbox rows (window ∪ moderation ids), audit rows
-/// by (workspace, `LOCAL_ACTION_*` allowlist — bound, never literals),
-/// `event_outbox` rows by message ids, singleton restore.
-async fn cleanup_facade_rows(
-    pool: &PgPool,
-    ws: WorkspaceId,
-    message_ids: &[MessageId],
-    window_ids: &[AuditId],
-    moderation_ids: &[AuditId],
-) {
-    let outbox_ids: Vec<Uuid> = window_ids
-        .iter()
-        .chain(moderation_ids)
-        .map(AuditId::to_uuid)
-        .collect();
-    if !outbox_ids.is_empty() {
-        sqlx::query("DELETE FROM audit_governance_outbox WHERE event_id = ANY($1)")
-            .bind(&outbox_ids)
-            .execute(pool)
-            .await
-            .expect("clean facade outbox rows");
-    }
-    sqlx::query(
-        "DELETE FROM audit_events
-          WHERE workspace_id = $1 AND action = ANY($2)",
-    )
-    .bind(ws.to_uuid())
-    .bind(vec![
-        LOCAL_ACTION_MESSAGE_CREATE,
-        LOCAL_ACTION_MESSAGE_EDIT,
-        LOCAL_ACTION_ROOM_CREATE,
-        LOCAL_ACTION_MODERATED,
-    ])
-    .execute(pool)
-    .await
-    .expect("clean facade audit rows");
-    let msg_ids: Vec<Uuid> = message_ids.iter().map(MessageId::to_uuid).collect();
-    if !msg_ids.is_empty() {
-        sqlx::query("DELETE FROM event_outbox WHERE message_id = ANY($1)")
-            .bind(&msg_ids)
-            .execute(pool)
-            .await
-            .expect("clean facade event-outbox rows");
-    }
-    restore_enforcement_disabled(pool).await;
-}
+// ----- Shared helpers live in `shared.rs` (D2 hoist): `scrub_room_lane_rows`,
+// `window_row_for`, `claim_predicate_holds`, `force_re_due`, `cleanup_facade_rows`,
+// `outbox_row`/`RowState`, `ENVELOPE_KEYS`. Imported via `super::shared::*`.
 
 // ----- Shared window fixture (FR-1/FR-3/FR-4/FR-6/FR-7; FR-2 does its own setup — its moderation lane needs seed BEFORE writes). -----
 

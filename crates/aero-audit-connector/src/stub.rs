@@ -163,6 +163,11 @@ pub struct StubSink {
     /// (drill observation API — the header is parsed in zero historical
     /// tests; a regression swapping the header spelling must fail loudly).
     seen_keys: Arc<Mutex<Vec<String>>>,
+    /// Every `POST /events` body, in order (drill observation API — the
+    /// payload the relay forwards verbatim from the claim; the R4 sink-echo
+    /// pin asserts the delivered payload's `action` at the sink, closing the
+    /// producer→sink end-to-end gap the claim-level pin cannot see).
+    seen_payloads: Arc<Mutex<Vec<Value>>>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -186,6 +191,7 @@ impl StubSink {
         let token_requests = Arc::new(AtomicUsize::new(0));
         let unauthorized_fired = Arc::new(AtomicBool::new(false));
         let seen_keys = Arc::new(Mutex::new(Vec::new()));
+        let seen_payloads = Arc::new(Mutex::new(Vec::new()));
         // First 202 receipt per seen key (the duplicate modes replay it). The
         // serve task's clone keeps this alive; the struct itself never reads
         // it (observation is via `seen_idempotency_keys`).
@@ -197,6 +203,7 @@ impl StubSink {
             token_requests.clone(),
             unauthorized_fired.clone(),
             seen_keys.clone(),
+            seen_payloads.clone(),
             first_receipts.clone(),
         ));
         Ok(Self {
@@ -206,6 +213,7 @@ impl StubSink {
             token_requests,
             unauthorized_fired,
             seen_keys,
+            seen_payloads,
             task,
         })
     }
@@ -257,6 +265,15 @@ impl StubSink {
         self.seen_keys.lock().await.clone()
     }
 
+    /// Every `POST /events` body, in order (drill observation API — D7).
+    /// `set_behavior` deliberately does NOT reset this: a mid-test behavior
+    /// swap must preserve the observed payload sequence across the swap
+    /// (same contract as `seen_idempotency_keys`). Memory bounded by drill
+    /// POST volume (dozens).
+    pub async fn seen_payloads(&self) -> Vec<Value> {
+        self.seen_payloads.lock().await.clone()
+    }
+
     pub async fn set_behavior(&self, behavior: SinkBehavior) {
         *self.behavior.lock().await = behavior;
         self.unauthorized_fired.store(false, Ordering::SeqCst);
@@ -276,6 +293,7 @@ async fn serve(
     token_requests: Arc<AtomicUsize>,
     unauthorized_fired: Arc<AtomicBool>,
     seen_keys: Arc<Mutex<Vec<String>>>,
+    seen_payloads: Arc<Mutex<Vec<Value>>>,
     first_receipts: Arc<Mutex<std::collections::HashMap<String, Vec<u8>>>>,
 ) {
     loop {
@@ -287,6 +305,7 @@ async fn serve(
         let token_requests = token_requests.clone();
         let unauthorized_fired = unauthorized_fired.clone();
         let seen_keys = seen_keys.clone();
+        let seen_payloads = seen_payloads.clone();
         let first_receipts = first_receipts.clone();
         tokio::spawn(async move {
             let _ = handle_connection(
@@ -296,6 +315,7 @@ async fn serve(
                 &token_requests,
                 &unauthorized_fired,
                 &seen_keys,
+                &seen_payloads,
                 &first_receipts,
             )
             .await;
@@ -310,6 +330,7 @@ async fn handle_connection(
     token_requests: &AtomicUsize,
     unauthorized_fired: &AtomicBool,
     seen_keys: &Mutex<Vec<String>>,
+    seen_payloads: &Mutex<Vec<Value>>,
     first_receipts: &Mutex<std::collections::HashMap<String, Vec<u8>>>,
 ) -> std::io::Result<()> {
     let request = read_request(stream).await?;
@@ -391,6 +412,13 @@ async fn handle_connection(
         let key = request.idempotency_key.clone();
         if let Some(key) = &key {
             seen_keys.lock().await.push(key.clone());
+        }
+        // Drill observation API (D7): record every POST body, in order —
+        // BEFORE the behavior-dependent response branch, so terminal/error
+        // legs also observe the forwarded payload (the sink-echo pin asserts
+        // the delivered `action` even when the sink rejects the delivery).
+        if let Ok(payload) = serde_json::from_slice::<Value>(&request.body) {
+            seen_payloads.lock().await.push(payload);
         }
         let behavior = behavior.lock().await;
         if behavior.delay_ms > 0 {

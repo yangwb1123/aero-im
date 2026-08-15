@@ -6,6 +6,7 @@ use aero_common::{Error, RoomKind};
 use serde_json::Value;
 use uuid::Uuid;
 
+use super::shared::*;
 use super::*;
 
 // ---------------------------------------------------------------------------
