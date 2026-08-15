@@ -140,7 +140,7 @@ async fn failed_pair_replay_all_replays_unreplayed_rows() {
 /// concurrent claim SKIPs or blocks and re-checks `replayed_at` after the
 /// winner commits. Pre-fix (autocommit claim + unguarded UPDATE), two runs
 /// could both rebuild the same row: 1 DLQ row → 2 audit pairs + 2 outbox
-/// rows (distinct event_ids — the sink double-delivers the compensation),
+/// rows (distinct `event_ids` — the sink double-delivers the compensation),
 /// and both incremented `replay_attempts` (premature `dead` at ~half the
 /// intended cap).
 ///

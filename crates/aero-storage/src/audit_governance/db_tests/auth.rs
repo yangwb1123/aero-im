@@ -812,6 +812,88 @@ async fn auth_pair_enforcement_on_without_nil_binding_fails_open_drops_pair() {
     restore_enforcement_disabled(&p).await;
 }
 
+/// Security F-5.1 (design-gate residual, now pinned): the production
+/// no-miss-write monitor's `detail.provisioning IS NULL` scope is
+/// LOAD-BEARING. SSO/OIDC JIT registrations write an `auth.register` audit
+/// row WITHOUT an outbox pair by design (`NewRegistration { auth_audit: None }`
+/// — D-N4; the JIT producer is `aero-storage/src/sso.rs`
+/// `resolve_or_provision_human_in_tx`, detail `{"provisioning": "sso_jit",
+/// issuer, subject, display_name, email}`). If the monitor ran the unscoped
+/// verbatim §2.7 query, every JIT account creation would trip it; the
+/// `? 'provisioning'` exemption is what keeps it green — and the exemption is
+/// the only thing protecting a future `None` producer that forgets the marker.
+/// This test seeds the JIT row (raw INSERT through the pass-through triggers:
+/// 0239 skips non-`message.moderated` actions, so NO v2 outbox row exists —
+/// the exact production state) and asserts the scope split:
+///   * unscoped query → ≥ 1 orphan (the JIT row IS an orphan to it);
+///   * scoped query (`NOT (a.detail ? 'provisioning')`) → 0 — proving the
+///     exemption is what keeps the monitor green, and that dropping the
+///     marker (or a new exempt producer without one) trips the monitor.
+#[tokio::test]
+#[ignore = "requires live Postgres"]
+async fn auth_allowlist_jit_provisioning_carveout_is_load_bearing() {
+    let p = pool();
+    reset_governance_table(&p).await;
+    let (ws, actor) = fixture(&p).await;
+    enable_enforcement_with_binding(&p, ws).await;
+
+    // JIT-shaped `auth.register` row (sso.rs detail shape verbatim: sso_jit +
+    // IdP provenance + email). Workspace-scoped so repeated suite runs on one
+    // DB never leak across tests.
+    sqlx::query(
+        "INSERT INTO audit_events (id, workspace_id, actor_id, action, detail, created_at)\n\
+             VALUES ($1, $2, $3, 'auth.register',\n\
+                     '{\"provisioning\":\"sso_jit\",\"issuer\":\"issuer-1\",\"subject\":\"sub-1\",\"email\":\"jit@example.test\",\"display_name\":\"JIT User\"}'::jsonb,\n\
+                     now())",
+    )
+    .bind(Uuid::new_v4())
+    .bind(ws.to_uuid())
+    .bind(actor.to_uuid())
+    .execute(&p)
+    .await
+    .expect("insert JIT-shaped auth.register row");
+
+    // The verbatim §2.7 allowlist (same literal set as auth_allowlist_no_miss_write).
+    let allowlist =
+        "('message.moderated','auth.register','auth.login','auth.refresh','auth.pat.issue',\
+         'auth.pat.revoke','auth.totp.enroll','session.revoked','session.revoked.admin')";
+    let unscoped: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM audit_events a
+            WHERE a.workspace_id = $1
+              AND a.action IN {allowlist}
+              AND NOT EXISTS (SELECT 1 FROM audit_governance_outbox o
+                               WHERE o.event_id = a.id)"
+    ))
+    .bind(ws.to_uuid())
+    .fetch_one(&p)
+    .await
+    .expect("unscoped no-miss-write count");
+    assert_eq!(
+        unscoped, 1,
+        "the JIT row IS an orphan to the UNscoped monitor — the carve-out scope \
+         is what keeps production green"
+    );
+    let scoped: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM audit_events a
+            WHERE a.workspace_id = $1
+              AND a.action IN {allowlist}
+              AND NOT (a.detail ? 'provisioning')
+              AND NOT EXISTS (SELECT 1 FROM audit_governance_outbox o
+                               WHERE o.event_id = a.id)"
+    ))
+    .bind(ws.to_uuid())
+    .fetch_one(&p)
+    .await
+    .expect("scoped no-miss-write count");
+    assert_eq!(
+        scoped, 0,
+        "the detail.provisioning scope exempts JIT rows — zero allowlist-token \
+         orphans in the production-scoped monitor"
+    );
+
+    restore_enforcement_disabled(&p).await;
+}
+
 /// The `audit_auth_write_failures_total{category="binding"}` counter value
 /// from the process-global Prometheus registry (rendered text — the only
 /// introspection surface for the storage-emitted counter).

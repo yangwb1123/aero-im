@@ -476,7 +476,7 @@ async fn l1_auth_watermark_not_advanced_on_mid_loop_failure() {
 }
 
 /// Q3 (distributed-engineer blocker, F-C skew bound): a DELIBERATELY
-/// SKEWED / out-of-band row — created_at inserted into a bucket whose outbox
+/// SKEWED / out-of-band row — `created_at` inserted into a bucket whose outbox
 /// row ALREADY exists (backfill/restore/manual) — must NOT change the frozen
 /// count. `login_failures.created_at` is DB-stamped (`DEFAULT now()`) and
 /// `LoginFailureRepo::record` never binds it, so producer and aggregator
@@ -580,7 +580,7 @@ async fn l1_auth_backfilled_row_into_aggregated_bucket_keeps_count_frozen() {
 /// advanced the watermark to):
 ///   tick 1: nothing seeded yet → 0 rows; wm := b2 (read back from the DB
 ///           clock immediately after — the boundary tick 1 used)
-///   seed:   1 row at created_at == b2 EXACTLY (the now-current watermark)
+///   seed:   1 row at `created_at == b2` EXACTLY (the now-current watermark)
 ///   tick 2: the bucket [b2, b2+w) closed → the row at exactly b2 is scanned
 ///           only with `>= watermark` (strict `>` excludes it forever → the
 ///           leak). Red on the pre-fix `>` predicate, green on `>=`.

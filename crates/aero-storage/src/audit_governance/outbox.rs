@@ -501,8 +501,9 @@ impl AuditGovernanceOutboxRepo {
     ///    rescan but `ON CONFLICT DO NOTHING` cannot merge into an existing
     ///    row — the frozen undercount stands), or
     /// 2. an **out-of-band insert** (backfill/restore/manual) into a bucket
-    ///    whose outbox row already exists: the row is scanned (created_at
-    ///    ≥ watermark) but `ON CONFLICT DO NOTHING` freezes the count — there
+    ///    whose outbox row already exists: the row is scanned
+    ///    (`created_at ≥ watermark`) but `ON CONFLICT DO NOTHING` freezes the
+    ///    count — there
     ///    is no merge arm for the auth pull-scan (the 0242 trigger's
     ///    `DO UPDATE … WHERE status = 0` merge is message-lane only).
     ///
