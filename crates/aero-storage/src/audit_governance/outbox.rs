@@ -446,7 +446,7 @@ impl AuditGovernanceOutboxRepo {
                     COUNT(*)::bigint AS n
                FROM login_failures
               WHERE created_at < to_timestamp(
-                        floor(extract(epoch FROM clock_timestamp()) / $1)::bigint * $1)
+                        floor(extract(epoch FROM clock_timestamp()) / $1)::bigint * $1 - $1)
                 AND created_at > $2
               GROUP BY bucket_start
               ORDER BY bucket_start",
