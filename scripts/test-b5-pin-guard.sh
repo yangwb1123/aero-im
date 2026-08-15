@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Regression tests for the B5 41/41 contract pin guard (scripts/b5-pin.sh).
+# Regression tests for the B5 42/42 contract pin guard (scripts/b5-pin.sh).
 # Pure bash — no database, no services. Exercises the guard's positive case
 # and every negative case the B5 acceptance requires:
 #   count ≠ 40 → FAIL; duplicates → FAIL; malformed slot → FAIL;
@@ -36,7 +36,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# Fabricate full verdict evidence for the 19 executed slots (all PASS).
+# Fabricate full verdict evidence for the 21 executed slots (all PASS).
 positive_log() {
     : >"$B5_LOG"
     for entry in "${ORIG_LIST[@]}"; do
@@ -61,19 +61,19 @@ restore_list() {
 # --- list shape ---
 temp_log
 positive_log
-run_guard "list-is-exactly-41-slots" "B5 contract pin: 41/41 (20 executed, 21 \[PROPOSED\]): PASS"
+run_guard "list-is-exactly-42-slots" "B5 contract pin: 42/42 (21 executed, 21 \[PROPOSED\]): PASS"
 b5_check "t11-fail-closed" "PASS"
 check "b5-check-appends-to-log" "B5-CHECK t11-fail-closed: PASS" "$(cat "$B5_LOG")"
 
-# --- count ≠ 41 (36 slots) ---
-# (A 36-slice of the 41-list prints `41/36` — the count check fires first.)
+# --- count ≠ 42 (36 slots) ---
+# (A 36-slice of the 42-list prints `42/36` — the count check fires first.)
 temp_log
 positive_log
 restore_list
 B5_CONTRACT_TEST_LIST=("${ORIG_LIST[@]:0:36}")
-run_guard "count-36-fails" "B5 contract pin: 41/36"
+run_guard "count-36-fails" "B5 contract pin: 42/36"
 
-# --- duplicate slot (still 40 entries) ---
+# --- duplicate slot (still 42 entries) ---
 temp_log
 positive_log
 restore_list
@@ -94,7 +94,7 @@ temp_log
 positive_log
 restore_list
 B5_CONTRACT_TEST_LIST=()
-for i in $(seq -w 1 41); do
+for i in $(seq -w 1 42); do
     B5_CONTRACT_TEST_LIST+=("contract-test-${i}[PROPOSED]")
 done
 run_guard "vacuous-list-fails" "vacuous list"
@@ -111,7 +111,7 @@ temp_log
 restore_list
 out="$(SKIP_DB_CREATE=1 assert_b5_contract_pin "$B5_LOG" 2>&1)" || true
 check "skip-db-create-degrades-with-note" "verdict evidence degraded" "$out"
-check "skip-db-create-still-pins" "B5 contract pin: 41/41 (20 executed, 21 \[PROPOSED\]): PASS" "$out"
+check "skip-db-create-still-pins" "B5 contract pin: 42/42 (21 executed, 21 \[PROPOSED\]): PASS" "$out"
 
 if [ "$failures" -ne 0 ]; then
     echo "✗ b5 pin guard: ${failures} regression case(s) failed" >&2

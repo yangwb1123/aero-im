@@ -42,6 +42,7 @@ L1_AGGREGATE_DB="aero_l1_aggregate_$$"
 L1_PARITY_DB="aero_l1_parity_$$"
 ROOM_LANE_DB="aero_room_lane_$$"
 MESSAGE_LANE_DB="aero_message_lane_$$"
+FACADE_L1_WINDOW_DB="aero_facade_l1_window_$$"
 
 assert_disposable_db_name() {
     local variable_name="$1"
@@ -72,6 +73,7 @@ assert_disposable_db_name "L1 window aggregate database" "$L1_AGGREGATE_DB"
 assert_disposable_db_name "L1 parity drill database" "$L1_PARITY_DB"
 assert_disposable_db_name "room lane parity database" "$ROOM_LANE_DB"
 assert_disposable_db_name "message lane parity database" "$MESSAGE_LANE_DB"
+assert_disposable_db_name "facade L1 window drill database" "$FACADE_L1_WINDOW_DB"
 
 # Parse host and user from BASE_URL for psql
 PSQL_ARGS="${BASE_URL#postgres://}"
@@ -159,7 +161,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# B5 acceptance gate (G6 总装门): load the 39/39 contract-pin material
+# B5 acceptance gate (G6 总装门): load the contract-pin material
 # (scripts/b5-pin.sh) and self-test the guard first — pure bash, instant — so
 # a pin-guard regression fails the harness before the expensive DB work.
 # shellcheck disable=SC1091
@@ -190,6 +192,11 @@ run_migrated_integration() {
     local test_name="$2"
     local label="$3"
     local crate_name="${4:-aero-storage}"
+    # Optional 5th arg: the B5 slot name for the verdict line (defaults to
+    # the test filter). Needed when the slot name and the cargo filter
+    # differ (e.g. slot facade-l1-window-drill runs the drill_facade_ filter) —
+    # the pin guard greps B5_LOG for the SLOT name.
+    local slot_name="${5:-$test_name}"
     local integration_url="${BASE_URL}/${database_name}"
     local test_output=""
 
@@ -223,7 +230,7 @@ run_migrated_integration() {
     fi
     drop_created_database "$database_name"
     echo "✓ ${label} passed and database dropped"
-    b5_check "${2}" "PASS"
+    b5_check "${slot_name}" "PASS"
 }
 
 echo "=== Aero IM Integration Tests ==="
@@ -263,7 +270,7 @@ if [ -z "$SKIP_DB_CREATE" ]; then
     # B5-4 provisioning seam (leg B, always-run, v1): throwaway DB → migrate
     # → fresh state must be `consistent` (relay off + zero undelivered) →
     # seed one v1 audit row → fail-closed with the no-grant reason (A1).
-    # Reuses the pinned audit-provision-check slot (39/39 unchanged); the
+    # Reuses the pinned audit-provision-check slot (count-driven); the
     # verdict greps make a stale/no-op command fail red instead of passing.
     B5_HELP_OUT="$(cargo run -p aero-cli -- help 2>&1 || true)"
     if grep -q "audit-provision-check" <<<"$B5_HELP_OUT"; then
@@ -691,6 +698,23 @@ if [ -z "$SKIP_DB_CREATE" ]; then
         b5_check "room_lane_outbox_parity" "SKIP (0245 not landed)"
         b5_check "message_lane_outbox_parity" "SKIP (0245 not landed)"
     fi
+    # Facade-level L1 window drill (B5-1, FR-1…FR-4, FR-6, FR-7): ImService
+    # send/edit → in-tx audit → 0242 window → claim_due → real AuditRelay →
+    # StubSink, on its own throwaway DB. Gated on 0239 (table) AND 0242
+    # (trigger): absent → explicit SKIP, never silent green. The empty-filter
+    # guard inside run_migrated_integration fails the slot if drill_facade_
+    # matches zero tests (no vacuous green).
+    if [ -f "migrations/0239_audit_governance_outbox.sql" ] \
+        && [ -f "migrations/0242_audit_governance_l1_aggregate.sql" ]; then
+        run_migrated_integration \
+            "$FACADE_L1_WINDOW_DB" \
+            "drill_facade_" \
+            "facade L1 window drill db_tests" \
+            "aero-im-core" \
+            "facade-l1-window-drill"
+    else
+        b5_check "facade-l1-window-drill" "SKIP (0242 not landed)"
+    fi
     # Notification fan-out suite (AT-1…AT-7): owns a fresh throwaway DB with
     # its own migration + required Redis presence leg; the shared main-DB run
     # below must --skip db_tests:: (its relay loops claim global state). This
@@ -781,7 +805,7 @@ else
     exit "$TEST_EXIT"
 fi
 
-# ---- B5 acceptance gate closure (relay coverage + 39/39 pin) ----
+# ---- B5 acceptance gate closure (relay coverage + contract pin) ----
 # Relay-mock probe leg (sibling B5-2): DB-free black-box probe suite over the
 # connector state machine (mock sink instead of a global-state relay loop);
 # gated on the probe bin being landed — explicit SKIP verdict otherwise.
@@ -819,7 +843,7 @@ if [ -z "$SKIP_DB_CREATE" ] && [ "$relay_legs" -eq 0 ]; then
 fi
 echo "B5 relay coverage: ${relay_legs} leg(s) executed (fan-out + A3 + relay-mock)"
 
-# 39/39 contract pin (AC1): exactly 39 named slots, no dupes, no malformed
+# Contract pin (AC1): exactly 42 named slots, no dupes, no malformed
 # entries, ≥1 executed slot, and every executed slot backed by a
 # `B5-CHECK <name>: PASS|SKIP` verdict line (fresh mode).
 if ! assert_b5_contract_pin "$B5_LOG"; then

@@ -16,6 +16,13 @@
 //!   R12   crash window → 422 at attempt 2 → dead (budget counts claims)
 //!   R13   crash window → 403 → immediate dead
 //!   R14   duplicate conflict signals (409 / conflict:true) → dead, documented
+//!   FR-1  facade send → 0242 window → claim → relay → stub echo → settle
+//!   FR-2  moderation (priority 100) preempts the window row in the same batch
+//!   FR-3  relay absent → window row stays status 0 (T-11), never dead
+//!   FR-4  facade edit merges into the SAME window row (count 1→2)
+//!   FR-6  window-lane crash → lease expiry → reclaim → same key → settle
+//!   FR-7  window shape → 422 → requeue attempt 1 → dead attempt 2
+//!   (FR-1…FR-7 live in `facade.rs`; slot `facade-l1-window-drill`)
 //!
 //! Load-bearing invariants (drill-spec §2.3/§8 — do not weaken):
 //!   * START-OF-TEST singleton re-assert is the invariant — there is NO Drop
@@ -783,4 +790,5 @@ async fn drill_payload_contract_16_key_envelope_via_moderate_delete() {
 }
 
 mod crash;
+mod facade;
 mod terminal;
