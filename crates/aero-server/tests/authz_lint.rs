@@ -814,9 +814,18 @@ fn b5_1_auth_audit_boundaries_are_pinned() {
         d5_token_at < 400,
         "handlers/auth.rs D5 pair call drifted out of the login handler region"
     );
+    // QA F-1 oracle strengthening (code-architecture-reviewer): the pair must
+    // come AFTER the success-path 2FA gate (`finalize_login(&email, true)`),
+    // not merely somewhere in the handler file — a 2FA-failed attempt must
+    // never be recorded as a successful login. The failure-path
+    // `finalize_login(&email, false)` sits earlier in the file; requiring the
+    // pair AFTER the success-path call pins the D5 placement exactly.
+    let success_gate_at = handlers_src
+        .find("finalize_login(&email, true)")
+        .unwrap_or_else(|| panic!("handlers/auth.rs lost the success-path finalize_login(&email, true) 2FA gate"));
     assert!(
-        handlers_src.contains("finalize_login("),
-        "handlers/auth.rs must still call finalize_login before the pair"
+        success_gate_at < d5_at,
+        "D5: the login pair must be emitted AFTER the 2FA gate passes (finalize_login(&email, true)) — a 2FA-failed attempt must never produce auth.login"
     );
 
     // 4. SSO: complete_oidc_login carries the same pair (F-3).

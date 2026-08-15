@@ -53,6 +53,15 @@ pub(crate) fn spawn(
         .ok()
         .and_then(|s| s.parse::<i64>().ok())
         .unwrap_or(180);
+    // B5-1 auth slice (F-4 third leg): terminal audit-governance DLQ rows
+    // (`status='dead'` or replayed) older than N days are hard-deleted;
+    // never-replayed `pending` rows stay (the gauge's alert surface).
+    let governance_failed_pairs_retention_days = std::env::var(
+        "AERO__SERVER__GOVERNANCE_FAILED_PAIRS_RETENTION_DAYS",
+    )
+    .ok()
+    .and_then(|s| s.parse::<i64>().ok())
+    .unwrap_or(30);
     let viewer_raw_retention_days = std::env::var("AERO__SERVER__VIEWER_RAW_RETENTION_DAYS")
         .ok()
         .and_then(|s| s.parse::<i32>().ok())
@@ -178,6 +187,11 @@ pub(crate) fn spawn(
                     sweep_search_clicks(&lifecycle_pool, search_click_retention_days, now).await;
                     sweep_login_events(&lifecycle_pool, login_event_retention_days, now).await;
                     sweep_login_failures(&lifecycle_pool, login_failure_retention_days, now).await;
+                    sweep_governance_failed_pairs(
+                        &lifecycle_pool,
+                        governance_failed_pairs_retention_days,
+                        now,
+                    ).await;
                     sweep_notification_bundles(&lifecycle_pool, bundle_retention_days, now).await;
                     sweep_message_send_keys(
                         &lifecycle_pool,
@@ -425,6 +439,21 @@ async fn sweep_login_failures(pool: &sqlx::PgPool, days: i64, now: time::OffsetD
         Ok(0) => {}
         Ok(n) => info!(swept = n, "old login failures purged"),
         Err(e) => warn!(error = ?e, "login-failure retention sweep failed"),
+    }
+}
+
+async fn sweep_governance_failed_pairs(pool: &sqlx::PgPool, days: i64, now: time::OffsetDateTime) {
+    if days == 0 {
+        return;
+    }
+    let cutoff = now - time::Duration::days(days);
+    match aero_storage::audit_governance::FailedPairRepo::new(pool.clone())
+        .sweep_terminal_before(cutoff)
+        .await
+    {
+        Ok(0) => {}
+        Ok(n) => info!(swept = n, "terminal failed-pair DLQ rows purged"),
+        Err(e) => warn!(error = ?e, "governance-failed-pairs retention sweep failed"),
     }
 }
 

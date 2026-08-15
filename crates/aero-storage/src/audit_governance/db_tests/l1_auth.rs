@@ -367,14 +367,19 @@ async fn l1_auth_watermark_not_advanced_on_mid_loop_failure() {
     seed_failures(&p, ts(bucket_b + W / 2), 2).await;
 
     // Forcing fixture: a unique trigger raising for exactly bucket B's v5
-    // event_id (unique names so repeated runs / parallel suites never
-    // collide; dropped at the end).
+    // event_id. **Fixture hygiene (code-architecture-reviewer)**: the names
+    // are unique PER RUN (v5 key + a per-run random suffix) — deterministic
+    // names derived from the bucket key collided across parallel runs on one
+    // DB and left residue that poisoned reruns within the same bucket window
+    // ("already exists"). A crashed run's residue can never collide with a
+    // later run; the DROP IF EXISTS hygiene below stays best-effort.
     let v5_b = l1_key(bucket_b);
     // Hyphen-stripped uuid so the name is a valid unquoted SQL identifier
     // (a hyphenated name would parse as subtraction).
     let fn_suffix = v5_b.to_string().replace('-', "");
-    let fn_name = format!("raise_for_l1_bucket_{fn_suffix}");
-    let tg_name = format!("tg_l1_fail_{fn_suffix}");
+    let run_suffix = uuid::Uuid::new_v4().to_string().replace('-', "");
+    let fn_name = format!("raise_for_l1_bucket_{fn_suffix}_{run_suffix}");
+    let tg_name = format!("tg_l1_fail_{fn_suffix}_{run_suffix}");
     sqlx::query(&format!(
         "CREATE FUNCTION {fn_name}() RETURNS trigger AS $$
            BEGIN
@@ -468,4 +473,180 @@ async fn l1_auth_watermark_not_advanced_on_mid_loop_failure() {
         .execute(&p)
         .await
         .expect("cleanup function");
+}
+
+/// Q3 (distributed-engineer blocker, F-C skew bound): a DELIBERATELY
+/// SKEWED / out-of-band row — created_at inserted into a bucket whose outbox
+/// row ALREADY exists (backfill/restore/manual) — must NOT change the frozen
+/// count. `login_failures.created_at` is DB-stamped (`DEFAULT now()`) and
+/// `LoginFailureRepo::record` never binds it, so producer and aggregator
+/// share one clock domain; the documented freeze residual is exactly this
+/// out-of-band insert. The freeze is exercised under RESTART semantics: a
+/// FRESH repo (watermark resets to `UNIX_EPOCH`) rescans the whole closed
+/// window, re-sees the backfilled row, and `ON CONFLICT DO NOTHING` cannot
+/// merge it into the existing row (there is no merge arm for the auth
+/// pull-scan — the 0242 trigger's `DO UPDATE … WHERE status = 0` merge is
+/// message-lane only). A future-dated row lands in an OPEN bucket and is not
+/// aggregated until its bucket closes (the rollover test pins that eventual
+/// counting).
+#[tokio::test]
+#[ignore = "requires live Postgres"]
+async fn l1_auth_backfilled_row_into_aggregated_bucket_keeps_count_frozen() {
+    const W: i64 = 60;
+    let p = pool();
+    reset_governance_table(&p).await;
+    let now_epoch = time::OffsetDateTime::now_utc().unix_timestamp();
+    // Two closed buckets (≥2-window margin per QA F-3 — never open at run
+    // time) + one open bucket. Bucket floors computed off `now` so boundary
+    // drift can never move a seeded row across a bucket edge.
+    let bucket_a = (now_epoch - 150).div_euclid(W) * W; // rows at +30s inside
+    let bucket_b = (now_epoch - 210).div_euclid(W) * W;
+    let open_bucket = (now_epoch - 30).div_euclid(W) * W;
+    let ts = |bucket: i64| {
+        time::OffsetDateTime::from_unix_timestamp(bucket + 30).expect("bucket ts")
+    };
+    seed_failures(&p, ts(bucket_a), 3).await;
+    seed_failures(&p, ts(bucket_b), 2).await;
+    seed_failures(&p, ts(open_bucket), 1).await; // open — never aggregated
+
+    let mut repo = AuditGovernanceOutboxRepo::new(p.clone());
+    let inserted = repo
+        .aggregate_login_failure_buckets(W)
+        .await
+        .expect("aggregate closed buckets");
+    assert_eq!(inserted, 2, "exactly one row per CLOSED bucket (3 and 2 → 2 rows)");
+
+    // **Deliberately skewed backfill**: insert ONE more row into bucket A —
+    // a bucket whose outbox row ALREADY exists (out-of-band restore/backfill).
+    seed_failures(&p, ts(bucket_a), 1).await;
+
+    // RESTART rescan: a FRESH repo (watermark = UNIX_EPOCH — the boot
+    // restart / new-instance shape) re-scans the entire closed window. The
+    // backfilled row IS scanned (created_at ≥ UNIX_EPOCH and < boundary) and
+    // collides with bucket A's existing outbox row — `ON CONFLICT DO NOTHING`
+    // keeps the count FROZEN at 3 (no merge arm). The open bucket stays out.
+    let mut fresh = AuditGovernanceOutboxRepo::new(p.clone());
+    let inserted = fresh
+        .aggregate_login_failure_buckets(W)
+        .await
+        .expect("fresh-repo rescan after backfill");
+    assert_eq!(inserted, 0, "rescan inserts nothing — the backfilled row cannot merge");
+    let rows: Vec<(String, i64, i64)> = sqlx::query_as(
+        "SELECT event_id::text,
+                (payload->'payload'->>'count')::bigint,
+                (payload->'payload'->>'window_start_epoch')::bigint
+           FROM audit_governance_outbox
+          ORDER BY payload->'payload'->>'window_start_epoch'",
+    )
+    .fetch_all(&p)
+    .await
+    .expect("read aggregation rows");
+    assert_eq!(rows.len(), 2, "still exactly 2 aggregation rows");
+    for (event_id, count, window_start) in &rows {
+        let (expected_start, expected_count) =
+            if *window_start == bucket_a { (bucket_a, 3) } else { (bucket_b, 2) };
+        assert_eq!(
+            window_start, &expected_start,
+            "window_start_epoch = the bucket floor"
+        );
+        assert_eq!(
+            count, &expected_count,
+            "count FROZEN — the backfilled row is never merged into bucket A"
+        );
+        assert_eq!(
+            event_id,
+            &l1_key(expected_start).to_string(),
+            "deterministic v5 event_id (recomputed, never inline)"
+        );
+    }
+
+    // Hygiene: remove the seeded base rows (shared-DB discipline).
+    sqlx::query("DELETE FROM login_failures WHERE ip = '203.0.113.1'")
+        .execute(&p)
+        .await
+        .expect("cleanup seeded failures");
+    let _ = open_bucket; // referenced by the seed placement above
+}
+
+/// Q1 residual (distributed-engineer): a row whose `created_at` is EXACTLY
+/// a bucket boundary (a whole-second multiple of W) must be counted when its
+/// bucket closes — the pre-fix strict `created_at > watermark` excluded it
+/// from the scan that closed its bucket AND from every later scan (permanent
+/// leak). The fix is `>= watermark`: the boundary-exact row is picked up by
+/// the first scan whose boundary passes its bucket end. The initial watermark
+/// is `UNIX_EPOCH`, so `>=` is safe from the first tick.
+///
+/// Timeline (w = 3s buckets, row seeded at exactly the boundary that tick 1
+/// advanced the watermark to):
+///   tick 1: nothing seeded yet → 0 rows; wm := b2 (read back from the DB
+///           clock immediately after — the boundary tick 1 used)
+///   seed:   1 row at created_at == b2 EXACTLY (the now-current watermark)
+///   tick 2: the bucket [b2, b2+w) closed → the row at exactly b2 is scanned
+///           only with `>= watermark` (strict `>` excludes it forever → the
+///           leak). Red on the pre-fix `>` predicate, green on `>=`.
+#[tokio::test]
+#[ignore = "requires live Postgres"]
+async fn l1_auth_boundary_exact_row_is_counted_once() {
+    const W: i64 = 3;
+    let p = pool();
+    reset_governance_table(&p).await;
+
+    let mut repo = AuditGovernanceOutboxRepo::new(p.clone());
+    let inserted = repo
+        .aggregate_login_failure_buckets(W)
+        .await
+        .expect("tick 1 aggregation");
+    assert_eq!(inserted, 0, "tick 1: no rows seeded yet");
+
+    // Read back the boundary tick 1 advanced the watermark to (no edge
+    // crosses in the milliseconds between the aggregation's boundary fetch
+    // and this read — the wait_for_boundary gate below guarantees the
+    // seeded bucket is closed before tick 2).
+    let b2: i64 = sqlx::query_scalar(
+        "SELECT floor(extract(epoch FROM clock_timestamp()) / $1)::bigint * $1 - $1",
+    )
+    .bind(W)
+    .fetch_one(&p)
+    .await
+    .expect("boundary read");
+    // Seed a row at EXACTLY b2 — the boundary value the watermark now holds.
+    seed_failures(
+        &p,
+        time::OffsetDateTime::from_unix_timestamp(b2).expect("boundary ts"),
+        1,
+    )
+    .await;
+
+    // Close [b2, b2+w): the row at exactly b2 must be counted NOW (only the
+    // `>= watermark` predicate includes it — strict `>` leaks it forever).
+    wait_for_boundary(&p, W, b2 + W).await;
+    let inserted = repo
+        .aggregate_login_failure_buckets(W)
+        .await
+        .expect("tick 2 aggregation");
+    assert_eq!(
+        inserted, 1,
+        "tick 2: the boundary-exact row is counted when its bucket closes (>= watermark)"
+    );
+    let row: (String, i64) = sqlx::query_as(
+        "SELECT event_id::text, (payload->'payload'->>'count')::bigint
+           FROM audit_governance_outbox",
+    )
+    .fetch_one(&p)
+    .await
+    .expect("read boundary row");
+    assert_eq!(row.0, l1_key(b2).to_string(), "deterministic v5 key for bucket b2");
+    assert_eq!(row.1, 1, "count 1 for the boundary-exact row");
+    // Rerun idempotent; base row retained.
+    assert_eq!(
+        repo.aggregate_login_failure_buckets(W).await.expect("rerun"),
+        0,
+        "rerun inserts nothing"
+    );
+
+    // Hygiene.
+    sqlx::query("DELETE FROM login_failures WHERE ip = '203.0.113.1'")
+        .execute(&p)
+        .await
+        .expect("cleanup seeded failures");
 }

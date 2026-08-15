@@ -260,33 +260,55 @@ impl AuditGovernanceOutboxRepo {
                 let dlq_id = if suppress_dlq {
                     None
                 } else {
-                match FailedPairRepo::enqueue_in_tx(
-                    tx,
-                    workspace,
-                    actor,
-                    action,
-                    target,
-                    detail,
-                    outbound_action,
-                    &sqlstate,
-                    Some(db_err.message()),
-                )
-                .await
-                {
-                    Ok(id) => Some(id),
-                    Err(dlq_err) => {
-                        // F-6: pair lost-but-logged; domain commits anyway.
-                        tracing::error!(
-                            workspace_id = %workspace,
-                            action,
-                            path,
-                            error_sqlstate = %sqlstate,
-                            dlq_error = %dlq_err,
-                            "audit pair failed open AND its DLQ enqueue failed (pair lost-but-logged)"
-                        );
-                        None
+                    // F-6 (code-architecture-reviewer blocker): the DLQ
+                    // enqueue runs under its OWN NESTED SAVEPOINT — a failed
+                    // DLQ INSERT (e.g. 42P01 with a missing 0244 in a bad
+                    // deploy, or any Database-class error) would otherwise
+                    // ABORT the whole caller's tx: PG marks the tx aborted and
+                    // the subsequent `tx.commit()` fails with "current
+                    // transaction is aborted", silently rolling back the
+                    // domain op — fail-CLOSED, violating R7. The nested
+                    // savepoint restores the tx to a usable state: the domain
+                    // commits, the pair is lost-but-logged.
+                    sqlx::query("SAVEPOINT aero_audit_dlq")
+                        .execute(&mut **tx)
+                        .await?;
+                    match FailedPairRepo::enqueue_in_tx(
+                        tx,
+                        workspace,
+                        actor,
+                        action,
+                        target,
+                        detail,
+                        outbound_action,
+                        &sqlstate,
+                        Some(db_err.message()),
+                    )
+                    .await
+                    {
+                        Ok(id) => {
+                            sqlx::query("RELEASE SAVEPOINT aero_audit_dlq")
+                                .execute(&mut **tx)
+                                .await?;
+                            Some(id)
+                        }
+                        Err(dlq_err) => {
+                            // Restore the tx to usable state; the pair is
+                            // lost-but-logged (R7 fail-open preserved).
+                            sqlx::query("ROLLBACK TO SAVEPOINT aero_audit_dlq")
+                                .execute(&mut **tx)
+                                .await?;
+                            tracing::error!(
+                                workspace_id = %workspace,
+                                action,
+                                path,
+                                error_sqlstate = %sqlstate,
+                                dlq_error = %dlq_err,
+                                "audit pair failed open AND its DLQ enqueue failed (pair lost-but-logged)"
+                            );
+                            None
+                        }
                     }
-                }
                 };
                 Self::log_and_count(category, level, workspace, action, path, &sqlstate, dlq_id);
                 Ok(None)
@@ -465,6 +487,31 @@ impl AuditGovernanceOutboxRepo {
     /// pollution). Never deletes base rows (forensic retention; the retention
     /// timer owns deletion).
     ///
+    /// # F-C clock-domain skew bound (documented residual)
+    ///
+    /// For the L1 auth path the app-vs-DB skew is **structurally absent**:
+    /// `login_failures.created_at` is DB-stamped (`DEFAULT now()`, microsecond
+    /// precision — migration 0140), and `LoginFailureRepo::record` never binds
+    /// it. Producer and aggregator share one clock domain (the DB server
+    /// clock), so a row written in bucket B is always scanned by the first
+    /// tick whose boundary passes B's end. The freeze residual applies ONLY to:
+    /// 1. a DB **clock retreat** ≥ the one-window margin (the boundary
+    ///    expression `floor(now/W)*W − W` retreats with the clock; the
+    ///    watermark assignment is unconditional, so a retreat triggers a
+    ///    rescan but `ON CONFLICT DO NOTHING` cannot merge into an existing
+    ///    row — the frozen undercount stands), or
+    /// 2. an **out-of-band insert** (backfill/restore/manual) into a bucket
+    ///    whose outbox row already exists: the row is scanned (created_at
+    ///    ≥ watermark) but `ON CONFLICT DO NOTHING` freezes the count — there
+    ///    is no merge arm for the auth pull-scan (the 0242 trigger's
+    ///    `DO UPDATE … WHERE status = 0` merge is message-lane only).
+    ///
+    /// The closure margin is **one window** beyond bucket-end
+    /// (`current_bucket_start − W`), less conservative than the architect's
+    /// recommended `bucket_end ≤ now − 2W` — acceptable for DB-stamped rows
+    /// (a row is scanned only after its bucket end is ≥ one full window in
+    /// the past), and it is the documented tolerance.
+    ///
     /// Returns the number of NEWLY inserted outbox rows.
     ///
     /// # Errors
@@ -480,7 +527,7 @@ impl AuditGovernanceOutboxRepo {
         // `created_at < boundary` is the index-friendly closed-bucket
         // predicate (equivalent to the legacy `bucket_end <= now - W` — the
         // extra-window margin is preserved: boundary = current_bucket_start -
-        // W), and `> watermark` limits each tick to newly-closed rows.
+        // W), and `>= watermark` limits each tick to newly-closed rows.
         //
         // **Async-reviewer fixes (design gate, run 386d075c)**: the watermark
         // advances to the BOUNDARY (all rows below it were scanned + upserted
@@ -490,6 +537,14 @@ impl AuditGovernanceOutboxRepo {
         // undercount). The advance happens AFTER the insert loop, so a
         // mid-loop failure leaves the watermark behind the scanned rows and
         // the next tick rescans them (deduped — never lost).
+        //
+        // **Q1 residual (distributed-engineer)**: the watermark predicate is
+        // `>=` (not `>`) so a row whose `created_at` is EXACTLY a boundary
+        // (a whole-second multiple of W) is picked up by the first scan whose
+        // boundary passes its bucket end — with strict `>` it was excluded by
+        // the scan that closed its bucket AND by every later scan (permanent
+        // leak). The initial watermark is `UNIX_EPOCH`, so `>=` is safe from
+        // the first tick (no row predates 1970).
         let boundary: i64 = sqlx::query_scalar(
             r"SELECT floor(extract(epoch FROM clock_timestamp()) / $1)::bigint * $1 - $1",
         )
@@ -501,7 +556,7 @@ impl AuditGovernanceOutboxRepo {
                     COUNT(*)::bigint AS n
                FROM login_failures
               WHERE created_at < to_timestamp($2)
-                AND created_at > $3
+                AND created_at >= $3
               GROUP BY bucket_start
               ORDER BY bucket_start",
         )

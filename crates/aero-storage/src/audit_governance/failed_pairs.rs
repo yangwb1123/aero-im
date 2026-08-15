@@ -130,19 +130,58 @@ impl FailedPairRepo {
         Ok(count)
     }
 
+    /// Data-lifecycle retention sweep (design §9 F-4, third leg): hard-delete
+    /// TERMINAL DLQ rows older than `cutoff` — `status = 'dead'` (replay
+    /// attempts exhausted; the compensation is unreachable) or
+    /// `replayed_at IS NOT NULL` (compensation already delivered; the row is
+    /// only a delivery receipt). Never-replayed `pending` rows are the alert
+    /// surface (`aero_audit_governance_failed_pairs` gauge) and are NEVER
+    /// swept. Returns the number of rows deleted.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`].
+    pub async fn sweep_terminal_before(
+        &self,
+        cutoff: time::OffsetDateTime,
+    ) -> Result<u64, sqlx::Error> {
+        let res = sqlx::query(
+            r"DELETE FROM audit_governance_failed_pairs
+               WHERE (status = 'dead' OR replayed_at IS NOT NULL)
+                 AND created_at < $1",
+        )
+        .bind(cutoff)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
     /// Replay one DLQ row: rebuild the pair with the stored original input in
     /// a fresh transaction (NEW `AuditId` — the original pair never committed,
-    /// so there is no `idempotency` `conflict`). On success stamp `replayed_at`.
-    /// A re-failed replay re-enqueues a new DLQ row (at-least-once,
-    /// acceptable) and leaves the original row for the next ops loop.
+    /// so there is no `idempotency` `conflict`). On success stamp `replayed_at`
+    /// and increment `replay_attempts` once.
+    ///
+    /// **Q2 claim fence (async-reviewer)**: the claim SELECT runs INSIDE the
+    /// replay tx, so the `FOR UPDATE` row lock spans the pair rebuild + status
+    /// update — a concurrent replay of the same row SKIPs (`SKIP LOCKED`) or
+    /// blocks and re-checks `replayed_at` after the winner commits → `Ok(None)`.
+    /// The terminal UPDATE additionally re-checks the claim predicate and
+    /// asserts `rows_affected() == 1` (belt-and-braces: a zero-row UPDATE
+    /// rolls back our pair write — no duplicate pair can ever commit).
+    ///
+    /// A re-failed replay does NOT clone the row — it increments the ORIGINAL
+    /// row's `replay_attempts` (async-reviewer no-clone fix); at
+    /// [`MAX_REPLAY_ATTEMPTS`] the row is marked `dead` so `replay_all` cannot
+    /// keep hammering a persistent bug (F-4).
     ///
     /// Returns `Some(audit_id)` when the pair was rebuilt, `None` when the
-    /// row does not exist or was already replayed.
+    /// row does not exist, was already replayed, or is locked by a concurrent
+    /// replay (which will finish it).
     ///
     /// # Errors
     /// Propagates connection-level [`sqlx::Error`] only (Database-class
     /// failures fail open inside the pair writer and return `Ok(None)`).
     pub async fn replay(&self, id: i64) -> Result<Option<AuditId>, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
         let row: Option<ReplayCandidate> = sqlx::query_as(
                 r"SELECT workspace_id, actor_id, action, target, detail, outbound_action
                    FROM audit_governance_failed_pairs
@@ -150,12 +189,15 @@ impl FailedPairRepo {
                   FOR UPDATE SKIP LOCKED",
             )
             .bind(id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *tx)
             .await?;
         let Some((workspace, actor, action, target, detail, outbound_action)) = row else {
+            // Not claimable (absent, already replayed, or locked by a
+            // concurrent replay that will finish it) — commit the empty tx
+            // (harmless) and report None.
+            tx.commit().await?;
             return Ok(None);
         };
-        let mut tx = self.pool.begin().await?;
         // No-DLQ variant (async-reviewer fix): a Database-class re-failure
         // returns Ok(None) WITHOUT enqueueing a fresh clone — the original
         // row's attempts increment below and the population cannot double.
@@ -170,31 +212,44 @@ impl FailedPairRepo {
         )
         .await?;
         if let Some(audit_id) = pair {
-            sqlx::query(
+            let updated = sqlx::query(
                 "UPDATE audit_governance_failed_pairs
                     SET replayed_at = now(),
                         replay_attempts = replay_attempts + 1
-                  WHERE id = $1",
+                  WHERE id = $1 AND status = 'pending' AND replayed_at IS NULL",
             )
             .bind(id)
             .execute(&mut *tx)
             .await?;
+            if updated.rows_affected() != 1 {
+                // Belt-and-braces (Q2): the row was replayed/claimed by a
+                // concurrent run between our claim and this UPDATE — drop our
+                // pair (rollback) and report None; the winner's rebuild stands.
+                tx.rollback().await?;
+                return Ok(None);
+            }
             tx.commit().await?;
             Ok(Some(audit_id))
         } else {
             // Re-failed (Database class, no clone — no_dlq writer): increment
             // the ORIGINAL row's attempts; MAX_ATTEMPTS reached marks it DEAD
             // so `replay_all` cannot keep hammering a persistent bug (F-4).
-            sqlx::query(
+            // Guarded like the success arm (Q2): a zero-row UPDATE means a
+            // concurrent run already claimed it — drop our tx and report None.
+            let updated = sqlx::query(
                 "UPDATE audit_governance_failed_pairs
                     SET replay_attempts = replay_attempts + 1,
                         status = CASE WHEN replay_attempts + 1 >= $2 THEN 'dead' ELSE status END
-                  WHERE id = $1",
+                  WHERE id = $1 AND status = 'pending' AND replayed_at IS NULL",
             )
             .bind(id)
             .bind(MAX_REPLAY_ATTEMPTS)
             .execute(&mut *tx)
             .await?;
+            if updated.rows_affected() != 1 {
+                tx.rollback().await?;
+                return Ok(None);
+            }
             tx.commit().await?;
             Ok(None)
         }
@@ -203,6 +258,11 @@ impl FailedPairRepo {
     /// Ops loop: replay up to `limit` unreplayed rows. Returns the number of
     /// successfully replayed pairs.
     ///
+    /// The batch SELECT is only a candidate-id pre-filter (plain SELECT — no
+    /// `FOR UPDATE`: the per-row claim inside [`Self::replay`] is the Q2
+    /// fence; an autocommit lock here would release at statement end anyway).
+    /// A row locked by a concurrent run is simply retried by the next loop.
+    ///
     /// # Errors
     /// Propagates connection-level [`sqlx::Error`] only.
     pub async fn replay_all(&self, limit: i64) -> Result<usize, sqlx::Error> {
@@ -210,8 +270,7 @@ impl FailedPairRepo {
             r"SELECT id FROM audit_governance_failed_pairs
                WHERE status = 'pending' AND replayed_at IS NULL
                ORDER BY id
-               LIMIT $1
-               FOR UPDATE SKIP LOCKED",
+               LIMIT $1",
         )
         .bind(limit)
         .fetch_all(&self.pool)
