@@ -491,6 +491,133 @@ mod tests {
         .await;
     }
 
+    /// M2 posture pin (protocol review finding M2): token-endpoint failures
+    /// are ALL transient by the current production classification
+    /// (`request_token` bails on any non-200 → `access_token()?` →
+    /// `DeliveryError::Transient`). RFC 6749 §5.2 error responses (401
+    /// `invalid_client` / 400 `invalid_grant` / 5xx) are NOT distinguished at
+    /// the connector — there is no terminal, no distinct alert, and the stub
+    /// `/token` historically always answered 200 (zero coverage). This test
+    /// pins the CURRENT contract as the regression net: any token-endpoint
+    /// failure requeues with the capped backoff (never dead), `posts() == 0`
+    /// (no POST without a validated token), `last_error` carries a
+    /// per-status fragment, and the row recovers when the identity provider
+    /// returns.
+    ///
+    /// A positive terminal class (401/400 → dead) is a DEFERRED production
+    /// classification change (Change-Manifest-gated; would red this test by
+    /// design). Three phases, one stub, fake clock as the single domain:
+    /// 5xx → 401 → recovery, mirroring the facade drill
+    /// `drill_posture_token_endpoint_failures_requeue_never_dead`.
+    #[tokio::test]
+    async fn token_endpoint_failure_requeues_without_any_post() {
+        let stub = StubSink::start().await.expect("start stub");
+        let fake = Arc::new(FakeOutbox::new());
+        let t0 = OffsetDateTime::now_utc();
+        fake.set_now(Some(t0)).await;
+        let id = Uuid::new_v4();
+        fake.insert(AuditId::from_uuid(id), claim_payload(id), t0)
+            .await;
+
+        // Phase 1: 5xx token endpoint (IdP outage) → transient requeue.
+        stub.set_behavior(SinkBehavior {
+            token_status: Some(500),
+            ..SinkBehavior::default()
+        })
+        .await;
+        let config = test_config(&stub);
+        let client = AuditClient::new(config.clone()).expect("build audit client");
+        let relay = AuditRelay::new(fake.clone(), client, config);
+        let claims = fake.claim_due(LEASE, 10).await.expect("claim");
+        assert_eq!(claims.len(), 1);
+        let token_a = claims[0].claim_token;
+        relay
+            .deliver_claim(claims.into_iter().next().expect("one claim"))
+            .await;
+        let row = fake.row(AuditId::from_uuid(id)).await.expect("row");
+        assert_eq!(
+            row.status,
+            FakeStatus::Ready,
+            "token failure must requeue, never dead (M2 all-transient)"
+        );
+        assert_eq!(row.attempts, 1);
+        assert_eq!(
+            row.available_at,
+            t0 + Duration::seconds(1),
+            "requeue re-parks with backoff(1) = 1s on the repo clock"
+        );
+        assert_eq!(row.claim_token, None, "requeue drops the fencing token");
+        assert_eq!(row.lease_expires_at, None);
+        assert!(
+            row.last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("audit token endpoint returned HTTP 500")),
+            "last_error must carry the per-status fragment (got {:?})",
+            row.last_error
+        );
+        assert_eq!(stub.posts(), 0, "no POST without a validated token");
+        assert_eq!(stub.token_requests(), 1, "the token path was actually hit");
+
+        // Phase 2: 401 invalid_client (revoked/rotated secret) — the
+        // operator-critical case — same transient shape, distinct fragment.
+        stub.set_behavior(SinkBehavior {
+            token_status: Some(401),
+            ..SinkBehavior::default()
+        })
+        .await;
+        fake.set_now(Some(t0 + Duration::seconds(1))).await;
+        let reclaimed = fake.claim_due(LEASE, 10).await.expect("reclaim");
+        assert_eq!(reclaimed.len(), 1, "requeued row must be claimable again");
+        assert_eq!(reclaimed[0].attempts, 2);
+        assert_ne!(
+            reclaimed[0].claim_token, token_a,
+            "requeue must rotate a fresh token"
+        );
+        relay
+            .deliver_claim(reclaimed.into_iter().next().expect("one claim"))
+            .await;
+        let row = fake.row(AuditId::from_uuid(id)).await.expect("row");
+        assert_eq!(
+            row.status,
+            FakeStatus::Ready,
+            "401 must also requeue, never dead — there is no token terminal today"
+        );
+        assert_eq!(row.attempts, 2);
+        assert_eq!(
+            row.available_at,
+            t0 + Duration::seconds(3),
+            "backoff(2) = 2s on the repo clock"
+        );
+        assert!(
+            row.last_error
+                .as_deref()
+                .is_some_and(|error| error.contains("audit token endpoint returned HTTP 401")),
+            "401 must be distinguishable from 5xx via the last_error fragment (got {:?})",
+            row.last_error
+        );
+        assert_eq!(stub.posts(), 0, "still no POST across the failure phases");
+
+        // Phase 3: the IdP returns → the row recovers and settles (the
+        // all-transient requeue is a retry ladder, not a dead end).
+        stub.set_behavior(SinkBehavior::default()).await;
+        fake.set_now(Some(t0 + Duration::seconds(3))).await;
+        let recovered = fake.claim_due(LEASE, 10).await.expect("recovery claim");
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].attempts, 3);
+        relay
+            .deliver_claim(recovered.into_iter().next().expect("one claim"))
+            .await;
+        let row = fake.row(AuditId::from_uuid(id)).await.expect("row");
+        assert_eq!(
+            row.status,
+            FakeStatus::Delivered,
+            "the row must settle once the token endpoint returns"
+        );
+        assert_eq!(row.attempts, 3);
+        assert_eq!(stub.posts(), 1, "exactly one delivery POST, after recovery");
+        stub.shutdown();
+    }
+
     #[test]
     fn backoff_is_bounded_and_exponential() {
         let expected = [1, 2, 4, 8, 16, 32, 64, 128, 256];

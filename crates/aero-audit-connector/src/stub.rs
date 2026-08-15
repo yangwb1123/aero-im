@@ -88,6 +88,14 @@ pub struct SinkBehavior {
     pub token_claims_after_first: Option<Value>,
     /// HTTP status for `POST /events` (202 for the happy path).
     pub events_status: u16,
+    /// HTTP status for `POST /token` (`None` = 200, the happy path).
+    /// Exercises RFC 6749 §5.2 token-endpoint error responses (401
+    /// `invalid_client` / 400 `invalid_grant` / 5xx): the connector bails on
+    /// ANY non-200 and classifies it Transient — the M2 all-transient
+    /// posture pin. The error body mirrors §5.2 semantics for
+    /// forward-compatibility with a future terminal-class refinement that
+    /// parses the `error` field (the connector ignores the body today).
+    pub token_status: Option<u16>,
     /// Echo the request's `event_id` into the durable receipt (`false` = the
     /// receipt `event_id` is corrupted → `ReceiptMismatch`).
     pub receipt_valid: bool,
@@ -130,6 +138,7 @@ impl Default for SinkBehavior {
             }),
             token_claims_after_first: None,
             events_status: 202,
+            token_status: None,
             receipt_valid: true,
             receipt_event_id_override: None,
             unauthorized_once: false,
@@ -307,6 +316,21 @@ async fn handle_connection(
     if request.path == "/token" {
         let behavior = behavior.lock().await;
         let request_index = token_requests.fetch_add(1, Ordering::SeqCst);
+        if let Some(status) = behavior.token_status {
+            // M2 knob: answer the token request with a §5.2-shaped error.
+            // The counter increment above already proves the token path was
+            // hit (non-vacuous — the drill's `posts() == 0` is not because
+            // the relay skipped the row).
+            let error = match status {
+                400 => "invalid_grant",
+                401 | 403 => "invalid_client",
+                _ => "server_error",
+            };
+            let body = format!(
+                "{{\"error\":\"{error}\",\"error_description\":\"token endpoint drill (M2)\"}}"
+            );
+            return respond(stream, status, body.as_bytes()).await;
+        }
         let claims = if request_index == 0 {
             &behavior.token_claims
         } else {
