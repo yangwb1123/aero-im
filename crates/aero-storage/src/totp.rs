@@ -552,11 +552,12 @@ mod db_tests {
         );
 
         // Security-event audit (AC1c): the first activate committed exactly one
-        // `auth.totp.enroll` row and the disable exactly one (nil workspace,
-        // actor = target = owner); activate-without-enrollment, the second
-        // activate, the second disable, and the re-enroll (`upsert_secret` —
-        // deliberately untouched) added ZERO rows. Counts scoped by actor_id
-        // (sibling tests). DP-1: replaced `auth.totp.enabled`/`.disabled`.
+        // `auth.totp.enroll` row and the disable exactly one `auth.totp.disabled`
+        // row (nil workspace, actor = target = owner); activate-without-enrollment,
+        // the second activate, the second disable, and the re-enroll
+        // (`upsert_secret` — deliberately untouched) added ZERO rows. Counts
+        // scoped by actor_id (sibling tests). F-2 (design gate): removal is
+        // NEVER recorded as enrollment — the tokens are distinct.
         let enabled: (String, String, String) = sqlx::query_as(
             "SELECT workspace_id::text, actor_id::text, target
                FROM audit_events
@@ -572,12 +573,12 @@ mod db_tests {
         let disabled: (String, String, String) = sqlx::query_as(
             "SELECT workspace_id::text, actor_id::text, target
                FROM audit_events
-              WHERE action = 'auth.totp.enroll' AND actor_id = $1",
+              WHERE action = 'auth.totp.disabled' AND actor_id = $1",
         )
         .bind(owner.to_uuid())
         .fetch_one(&p)
         .await
-        .expect("exactly one auth.totp.enroll row (disable)");
+        .expect("exactly one auth.totp.disabled row (disable)");
         assert_eq!(disabled.0, "00000000-0000-0000-0000-000000000000", "nil workspace");
         assert_eq!(disabled.1, owner.to_uuid().to_string(), "actor = owner");
         assert_eq!(disabled.2, owner.to_string(), "target = owner");
@@ -589,7 +590,7 @@ mod db_tests {
         .await
         .unwrap();
         let disabled_total: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM audit_events WHERE action = 'auth.totp.enroll' AND actor_id = $1",
+            "SELECT COUNT(*) FROM audit_events WHERE action = 'auth.totp.disabled' AND actor_id = $1",
         )
         .bind(owner.to_uuid())
         .fetch_one(&p)
@@ -597,8 +598,8 @@ mod db_tests {
         .unwrap();
         assert_eq!(
             (enabled_total, disabled_total),
-            (2, 2),
-            "no-op activate/disable/re-enroll add no audit rows (2 = activate + disable)"
+            (1, 1),
+            "no-op activate/disable/re-enroll add no audit rows (1 enroll + 1 disabled)"
         );
 
         // Cleanup (FK NO ACTION, 0007): audit rows reference the participant.
