@@ -238,9 +238,15 @@ impl AuditGovernanceOutboxRepo {
                     .await?;
                 Ok(Some(audit_id))
             }
-            Err(sqlx::Error::Database(db_err)) => {
+            Err(e) if is_fail_open_error(&e) => {
                 // Whole pair rolled back — zero rows escape (at-least-once
-                // discipline, AGENTS.md §4.2). The tx remains usable.
+                // discipline, AGENTS.md §4.2). The tx remains usable. The
+                // shared classifier ([`is_fail_open_error`]) is the G1-pinned
+                // branch boundary — Database-class → fail-open, everything
+                // else → propagate below.
+                let db_err = e
+                    .as_database_error()
+                    .expect("is_fail_open_error checked the Database class");
                 sqlx::query("ROLLBACK TO SAVEPOINT aero_audit_pair")
                     .execute(&mut **tx)
                     .await?;
@@ -704,7 +710,10 @@ pub fn governance_envelope(
 /// Shared fail-open classifier (D4/D9): `sqlx::Error::Database(_)` → fail-open
 /// (SAVEPOINT rollback + DLQ + classified log/count); everything else
 /// (IO / `Protocol` / `PoolTimedOut` / connection-level) → propagate (in-tx) /
-/// warn + `None` (standalone). Both write paths share it.
+/// warn + `None` (standalone). Both write paths share it — it is the match
+/// guard on the pair writer's failure branch (the single shared branch
+/// boundary), so a future error class can never silently fall into the
+/// wrong side.
 ///
 /// G1 unit test pins the propagation branch; `PgDatabaseError` is
 /// `pub(crate)` in sqlx-postgres, so `Database(_)` cannot be constructed in
