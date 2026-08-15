@@ -506,9 +506,19 @@ async fn count_null_errors(pool: &PgPool, ids: &[AuditId]) -> i64 {
 /// 40 backlog rows (priority 10, earlier `available_at`, inverted
 /// `created_at`) + 10 moderation rows via the REAL `svc.moderate_delete`
 /// write path (priority 100, later `available_at`); `claim_due(30s, 10)`
-/// with limit 10 < 50 must return SET-EQUAL {all 10 admin} — priority
-/// preempts FIFO regardless of enqueue order. Set-parity only (D3: the
-/// `UPDATE … RETURNING` emits heap order, never CTE order).
+/// with limit 10 < 50 must return SET-EQUAL {9 admin} ∪ {1 earliest
+/// backlog} — the B5-3 D-CAP split at `K = min_service_floor(10) = 1`:
+/// arm A = top `limit − K` = 9 of the total order (every admin row sorts
+/// ahead of every backlog row, so arm A drops exactly the last-sorted
+/// admin row), arm B = the single earliest-due backlog row. Priority
+/// still preempts FIFO within arm A regardless of enqueue order. The
+/// second claim (limit 50) drains the remaining 40 due rows: the 39
+/// backlog plus the one admin row arm A dropped in round 1 (never
+/// leased, so it tops round 2's total order and is conserved).
+/// Set-parity only (D3: the `UPDATE … RETURNING` emits heap order,
+/// never CTE order). Mirror of `pg.rs::mixed_priority_claim_orders_`
+/// `moderation_first_then_fifo` ({all 10 admin} ∪ {15 earliest backlog}
+/// at limit 25).
 #[tokio::test]
 #[ignore = "requires live Postgres (DATABASE_URL)"]
 async fn drill_priority_claim_preempts_fifo_on_write_path_rows() {
@@ -553,30 +563,81 @@ async fn drill_priority_claim_preempts_fifo_on_write_path_rows() {
     );
     let claimed_ids: HashSet<AuditId> = claimed.iter().map(|c| c.event_id).collect();
     let admin_set: HashSet<AuditId> = rows.event_ids.iter().copied().collect();
+    // B5-3 D-CAP: arm A = top `limit − K` = 9 of the total order
+    // `(priority DESC, available_at, created_at, event_id)` — all admin
+    // rows sort ahead of every backlog row, so arm A drops exactly the
+    // last-sorted admin row; arm B = `K = min_service_floor(10) = 1`
+    // earliest-due backlog row (`backlog[0]`: seeded `available_at` is
+    // strictly increasing). The dropped admin row is re-derived from the
+    // DB so the expectation tracks the write-path trigger's stamps.
+    let dropped_admin: AuditId = {
+        let admin_ids: Vec<Uuid> = rows.event_ids.iter().map(AuditId::to_uuid).collect();
+        let dropped: Uuid = sqlx::query_scalar(
+            r"SELECT event_id FROM audit_governance_outbox
+                WHERE event_id = ANY($1)
+                ORDER BY priority DESC, available_at DESC, created_at DESC,
+                         event_id DESC
+                LIMIT 1",
+        )
+        .bind(&admin_ids)
+        .fetch_one(&pool)
+        .await
+        .expect("last-sorted admin row (arm A's tail)");
+        AuditId::from_uuid(dropped)
+    };
+    let mut expected: HashSet<AuditId> = admin_set.clone();
+    expected.remove(&dropped_admin);
+    expected.insert(AuditId::from_uuid(backlog[0]));
     assert_eq!(
-        claimed_ids, admin_set,
-        "priority DESC preempts FIFO on REAL write-path rows (set-parity, D3)"
+        claimed_ids, expected,
+        "D-CAP split at limit 10: {{9 admin}} ∪ {{1 earliest backlog}} \
+         (priority preempts FIFO within arm A, set-parity, D3)"
     );
-    for claim in &claimed {
+    let admin_claims: Vec<_> = claimed.iter().filter(|c| c.priority == 100).collect();
+    let backlog_claims: Vec<_> = claimed.iter().filter(|c| c.priority == 10).collect();
+    assert_eq!(admin_claims.len(), 9, "arm A: exactly 9 admin claims");
+    assert_eq!(backlog_claims.len(), 1, "arm B: exactly 1 backlog claim");
+    for claim in &admin_claims {
         assert_eq!(claim.attempts, 1, "first claim records attempts == 1");
-        assert_eq!(claim.priority, 100, "moderation lane priority");
         assert_eq!(claim.class, "admin", "moderation lane class");
     }
+    assert_eq!(
+        backlog_claims[0].event_id,
+        AuditId::from_uuid(backlog[0]),
+        "arm B serves the earliest-due backlog row"
+    );
+    assert_eq!(backlog_claims[0].attempts, 1, "first claim increments attempts");
+    assert_eq!(backlog_claims[0].class, "message", "backlog lane class");
 
-    // Second claim (limit 50) drains exactly the 40 backlog — the moderation
-    // rows are leased (status 1, live lease), the backlog is all that is due.
+    // Second claim (limit 50): the 9 admin rows and backlog[0] are leased
+    // (status 1, live lease). The remaining due set is 39 backlog + the one
+    // admin row arm A dropped in round 1 (never leased). K = 2 at limit 50,
+    // but arm A (limit 48) already holds every due row, so arm B adds
+    // nothing — the claim drains all 40 and no row is lost across rounds.
     let rest = repo
         .claim_due(time::Duration::seconds(30), 50)
         .await
         .expect("claim the backlog");
     let rest_set: HashSet<AuditId> = rest.iter().map(|c| c.event_id).collect();
-    let backlog_set: HashSet<AuditId> = backlog.iter().map(|id| AuditId::from_uuid(*id)).collect();
+    let mut expected_rest: HashSet<AuditId> = backlog
+        .iter()
+        .map(|id| AuditId::from_uuid(*id))
+        .collect();
+    expected_rest.remove(&AuditId::from_uuid(backlog[0]));
+    expected_rest.insert(dropped_admin);
     assert_eq!(
         rest.len(),
         40,
-        "the remaining due set is exactly the backlog"
+        "round 2 drains the 39 backlog + the arm-A-dropped admin row"
     );
-    assert_eq!(rest_set, backlog_set, "backlog claimed set-parity");
+    assert_eq!(rest_set, expected_rest, "backlog claimed set-parity (conservation)");
+    for claim in &rest {
+        assert_eq!(claim.attempts, 1, "round-2 claims are all first claims");
+    }
+    assert!(
+        rest.iter().any(|c| c.event_id == dropped_admin),
+        "the arm-A-dropped admin row is conserved into round 2's claim"
+    );
 
     // Cleanup: backlog rows are synthetic (no audit_events row) — delete by
     // outbox id; the write-path rows via the shared helper.
