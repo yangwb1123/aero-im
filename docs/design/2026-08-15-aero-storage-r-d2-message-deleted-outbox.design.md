@@ -257,11 +257,17 @@ Gate verified the design predates all four reviews with no revision. Resolutions
    db_test pins the sweep. GDPR-consistent with the 365d audit partition DROP.
 3. **QA F-1 / Compliance F-4 — rollback half unpinned**: writer's SELECT
    targets a provably-existing row, INSERT passes all CHECKs, no FK → no
-   fail-closed injection. **Resolution**: `delete_lane_writer_failure_aborts_delete_fail_closed`
-   drives `append_message_delete_in_tx` with a **broken-FK workspace**
-   (nonexistent workspace_id → FK Err) and asserts zero outbox rows + the
-   delete tx rolled back — the same injection shape as
-   `audit_failure_rolls_back_delete_and_outbox_append` (events.rs:614-647).
+   fail-closed injection. **REVISED (gate round 2 — the broken-FK workspace
+   shape is vacuous: `audit_governance_outbox` 0239 has NO FK, so a bad
+   workspace fails at the audit append = F1, already pinned)**:
+   `delete_lane_writer_failure_aborts_delete_fail_closed` injects at the
+   WRITER by **dropping `audit_governance_outbox` mid-test** (throwaway DB
+   only — the DROP is scoped to the drill's DB and recreated on re-migrate):
+   the writer's outbox INSERT then raises 42P01 → `Err` propagates → the
+   delete transaction rolls back → assert message visible, zero audit rows,
+   zero outbox rows, zero event_outbox rows. This pins the writer's
+   fail-closed propagation, not the audit append (F1's coverage stays
+   events.rs:614-647).
 4. **DB M2 — AC-3 occurred_at byte-spelling**: Rust Rfc3339 renders `Z` +
    fraction-trimmed; PG `jsonb_build_object('occurred_at', NEW.created_at)`
    renders `+00:00` + microseconds (outbox.rs:579-582 vs 0239:113 — a real
@@ -272,11 +278,18 @@ Gate verified the design predates all four reviews with no revision. Resolutions
    canonical spelling. The auth direction's C3 residual shares this helper.
 5. **QA F-2 / Compliance F-5 / SRE — version-skew silent drop**: old binary
    writes the audit row, no outbox row; 0241 reconciler is
-   `message.moderated`-only. **Resolution**: extend the 0241 reconciler scan
-   to the `message.deleted` token (same whole-pair contract, DELETED
-   idempotent) so the skew window self-heals; add AC-2a negative control
-   (`delete_lane_version_skew_backfills_on_reconcile`: seed an orphaned
-   `message.deleted` audit row → reconcile → outbox row appears, exactly one).
+   `message.moderated`-only. **REVISED (gate round 2 — extending the 0241
+   migration contradicts its immutable contract, §3.1/§3.3/§9, and 0241's
+   never-fabricate header)**: the skew backfill is a **Rust parallel scan**
+   in `AuditGovernanceOutboxRepo::reconcile_message_deleted(pool, batch)`
+   (no migration edit): select orphaned `message.deleted` audit rows
+   (`action = LOCAL_ACTION_MESSAGE_DELETED` with no outbox twin) within the
+   retention window, enqueue each via the same 16-key envelope
+   (`ON CONFLICT (event_id) DO NOTHING` — idempotent), bounded batch; the
+   boot timer calls it alongside the existing 0241 (Rust-side twin, same
+   contract). AC-2a negative control: seed an orphaned `message.deleted`
+   audit row → `reconcile_message_deleted` → outbox row appears, exactly
+   one; re-run is a no-op.
 
 **Implementation order**: metrics registry + emits → retention sweep leg →
 writer-failure test → occurred_at helper (shared) → reconciler extension +
@@ -286,3 +299,17 @@ unchanged 42/42/clippy).
 **Non-blocking residuals** (recorded): QA F3/F4 (concurrent-delete race,
 recalled-then-deleted composition — Low), truth-check baseline exit 6 /
 file-size exit 1 at HEAD (Info, pre-existing).
+
+### §10.6 gate round 2 — acceptance mapping completed (§6 gap)
+
+Each §10 resolution gains an executable AC row (the §6 table is extended):
+
+| §10 resolution | Executable AC (name + core assertion) |
+|---|---|
+| Metrics registry + 4 emits + sampler leg | `delete_lane_metrics_registry_emits_and_reads_back`: unit test emits each counter (transient_requeue/dead/token_rejections/delivery_outcomes) and reads the Prometheus text render back (values match); the runbook's metric names exist |
+| Retention sweep | `delete_lane_governance_outbox_retention_sweep`: seed terminal (status 2/3) rows older than TTL + live (0/1) rows → sweep deletes only terminal+old; live rows survive; 0=off no-op |
+| Writer-failure injection (DROP TABLE, §10.3-revised) | `delete_lane_writer_failure_aborts_delete_fail_closed`: DROP audit_governance_outbox → writer Err → delete rolled back, zero audit/outbox/event_outbox rows, message visible |
+| occurred_at helper (§10.4) | `delete_lane_wire_occurred_at_canonical_spelling`: `audit_wire_occurred_at(ts)` == the PG `jsonb_build_object('occurred_at', created_at)` byte spelling (`+00:00`, microseconds) — AC-3 asserts both sides via the helper |
+| Reconciler Rust scan (§10.5-revised) | `delete_lane_version_skew_backfills_on_reconcile`: orphaned `message.deleted` audit row → `reconcile_message_deleted` → exactly 1 outbox row; re-run no-op |
+
+**DoD command (§8)**: `cargo check --workspace` · `cargo test -p aero-storage --lib --locked audit_governance:: -- --ignored --test-threads=1` (≥44 + new tests green) · `cargo clippy --workspace --all-targets` (no new warnings) · `bash scripts/test-integration.sh` (all B5 slots PASS; migration count 247 — the b5 batch landed 0247, the design's "stays 246" line is superseded).
