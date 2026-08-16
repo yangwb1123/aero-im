@@ -49,7 +49,10 @@ const Q2_SQL: &str =
 const Q3_SQL: &str = "SELECT status, count(*) FROM {table} GROUP BY status ORDER BY status";
 
 /// Q4 — oldest pending row age in seconds (empty result = no pending rows).
-const Q4_SQL: &str = "SELECT extract(epoch FROM (clock_timestamp() - min(available_at)))::bigint FROM {table} WHERE status = 0";
+/// `pub` (B5-4): the aero-server sampler's `oldest_pending_secs` query is a
+/// text mirror of this — the parity is load-bearing (CLI/sampler oracle
+/// agreement) and pinned by the server-side unit test.
+pub const Q4_SQL: &str = "SELECT extract(epoch FROM (clock_timestamp() - min(available_at)))::bigint FROM {table} WHERE status = 0";
 
 /// Q5 — dead-row detail (only run when dead > 0), bounded to 5 rows.
 const Q5_SQL: &str = "SELECT event_id::text, left(coalesce(last_error, ''), 120) FROM {table} WHERE status = 3 ORDER BY available_at LIMIT 5";

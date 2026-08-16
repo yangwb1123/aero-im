@@ -9,6 +9,15 @@ web_dir = "./web"
 # RTMP binds independently from the HTTP gateway. When this host is wildcard,
 # stream-create responses advertise AERO_INGEST_HOST or the AERO_PUBLIC_BASE_URL host.
 rtmp_listen = "0.0.0.0:1935"
+# ---- B5-4 audit-outbox sampler (env-only, not figment) ----
+# AERO__SERVER__AUDIT_OUTBOX_FULL_SAMPLE_SECS: Tier-2 full-sample cadence.
+#   0 = disabled (one boot info); valid positive = interval; absent = 300;
+#   garbage/negative/overflow = fail-closed DISABLED + one boot error (a typo
+#   cannot quintuple the most expensive sampler). Tier-1 (30s) is unconditional.
+# AERO_METRICS_TOKEN: bearer token for /metrics (default unauthenticated — set
+#   one in production).
+# AERO_AUDIT_PROVISION_FRESHNESS_SECS: settle-face heartbeat freshness window
+#   (default 300, bounds [60, 86400]) — see .env.example audit relay block.
 
 [database]
 url = "postgres://aero:aero_dev_pw@localhost:5432/aero"

@@ -298,7 +298,7 @@ mod tests {
         assert!(settled, "recorder Err must not fail the settle value");
     }
 
-    /// R4.5 — non-settle faces (requeue / mark_dead / claim_due / reconcile /
+    /// R4.5 — non-settle faces (requeue / `mark_dead` / `claim_due` / reconcile /
     /// both probes) are pure delegation: the recorder is never touched.
     #[tokio::test]
     async fn non_settle_faces_are_pure_delegation() {

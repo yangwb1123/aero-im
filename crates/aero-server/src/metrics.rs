@@ -345,13 +345,35 @@ pub async fn sample_audit_outbox(
     repo.verdict_probe().await
 }
 
-/// B5-4 Tier-2 (slow) full sample: the exact Q3 status-bucket mirror
-/// (CLI/sampler oracle parity) + the oldest-pending `Q4_SQL` mirror + the
-/// oldest-claimed (status 1) stall mirror + the table-size gauge input.
-/// `oldest_pending_secs`/`oldest_claimed_secs` are `None` when their status
-/// has no rows (series absent — CLI "n/a" semantics). Pure reads; any query
-/// failure fails the whole sample (the caller retains old values; Tier-1 is
-/// unaffected — the two tiers fail independently, FM10).
+/// Recency window for the sampler's Q3 status-bucket scan (P-2): the gauge's
+/// purpose is the LIVE backlog + recent terminal state, not 1-year
+/// archaeology — bounded per-instance cost even as the retention-bounded
+/// table grows. This is a DELIBERATE sampler/CLI divergence: the connector
+/// trait's `status_buckets()` and the aero-eng `audit-provision-check` CLI
+/// stay the exact unbounded `Q3_SQL` mirror (oracle parity); only the
+/// periodic sampler windows its scan. `{status="dead"}` therefore counts
+/// dead rows created in the last 7 days; the unbounded Tier-1
+/// `aero_audit_outbox_dead_rows` flag (O(1) EXISTS via the
+/// `audit_governance_status3_idx` partial index) remains the "any dead row
+/// exists (ever)" alert signal.
+const AUDIT_OUTBOX_Q3_RECENCY: &str = "interval '7 days'";
+
+/// Exact text mirror of `aero_eng::audit_provision::Q4_SQL` (with `{table}`
+/// resolved): the sampler's oldest-pending age must agree with the
+/// `audit-provision-check` CLI's — parity pinned by the unit test below.
+const AUDIT_OUTBOX_OLDEST_PENDING_Q4_MIRROR: &str =
+    "SELECT extract(epoch FROM (clock_timestamp() - min(available_at)))::bigint \
+     FROM audit_governance_outbox WHERE status = 0";
+
+/// B5-4 Tier-2 (slow) full sample: the Q3 status-bucket aggregation
+/// (RECENCY-BOUNDED — see [`AUDIT_OUTBOX_Q3_RECENCY`]; the connector trait's
+/// `status_buckets()` stays the exact unbounded mirror for CLI parity) + the
+/// oldest-pending `Q4_SQL` mirror + the oldest-claimed (status 1) stall
+/// mirror + the table-size gauge input. `oldest_pending_secs`/
+/// `oldest_claimed_secs` are `None` when their status has no rows (series
+/// absent — CLI "n/a" semantics). Pure reads; any query failure fails the
+/// whole sample (the caller retains old values; Tier-1 is unaffected — the
+/// two tiers fail independently, FM10).
 pub async fn sample_audit_outbox_full(
     pool: &sqlx::PgPool,
 ) -> Result<
@@ -363,16 +385,33 @@ pub async fn sample_audit_outbox_full(
     ),
     aero_audit_connector::outbox::Error,
 > {
-    let repo = aero_audit_connector::pg::PgOutboxRepo::new(pool.clone());
-    let buckets = repo.status_buckets().await?;
+    // Q3 mirror, recency-bounded (P-2): `created_at >= now() - 7 days` over
+    // all four statuses — the 30s-hot Tier-1 stays untouched (cost ∝ due
+    // set); this Tier-2 scan is the one that must not grow with history.
+    // Missing table → `Err` (never a fabricated zero snapshot).
+    let rows = sqlx::query_as::<_, (i32, i64)>(&format!(
+        "SELECT status, count(*)::bigint FROM audit_governance_outbox
+          WHERE created_at >= clock_timestamp() - {AUDIT_OUTBOX_Q3_RECENCY}
+          GROUP BY status ORDER BY status"
+    ))
+    .fetch_all(pool)
+    .await?;
+    let mut buckets = aero_audit_connector::outbox::StatusBuckets::default();
+    for (status, count) in rows {
+        match status {
+            0 => buckets.enqueued = count,
+            1 => buckets.claimed = count,
+            2 => buckets.delivered = count,
+            3 => buckets.dead = count,
+            _ => {}
+        }
+    }
     // Exact Q4 mirror: `min(available_at)`, status = 0 → NULL over an empty
     // set → `None` (the aero-eng CLI's "n/a" semantics, kept for parity).
-    let oldest_pending: Option<i64> = sqlx::query_scalar(
-        "SELECT extract(epoch FROM (clock_timestamp() - min(available_at)))::bigint
-           FROM audit_governance_outbox WHERE status = 0",
-    )
-    .fetch_one(pool)
-    .await?;
+    let oldest_pending: Option<i64> =
+        sqlx::query_scalar(AUDIT_OUTBOX_OLDEST_PENDING_Q4_MIRROR)
+            .fetch_one(pool)
+            .await?;
     // FM-Q stall visibility: the same expression over status = 1 — the rows
     // settle-rejection strands (lease reclaim, never requeue).
     let oldest_claimed: Option<i64> = sqlx::query_scalar(
@@ -943,6 +982,23 @@ mod tests {
     // B5-4 audit-outbox sampler (gauge-name pins + env parse table).
     // -----------------------------------------------------------------------
 
+    /// F-10 — CLI/sampler oracle parity: the sampler's oldest-pending query
+    /// is a TEXT mirror of the aero-eng CLI's `Q4_SQL` (table resolved). If
+    /// either side drifts (e.g. a recency filter sneaks in, or the CLI
+    /// changes its age expression), this reds — the two surfaces must keep
+    /// answering the same question.
+    #[test]
+    fn oldest_pending_q4_mirror_parity_with_the_cli() {
+        assert_eq!(
+            AUDIT_OUTBOX_OLDEST_PENDING_Q4_MIRROR,
+            aero_eng::audit_provision::Q4_SQL.replace(
+                "{table}",
+                "audit_governance_outbox",
+            ),
+            "sampler oldest-pending must stay a verbatim Q4_SQL mirror"
+        );
+    }
+
     #[test]
     fn audit_outbox_gauge_names_are_pinned() {
         assert_eq!(AUDIT_OUTBOX_STATUS, "aero_audit_outbox_status");
@@ -1096,6 +1152,40 @@ mod tests {
         .expect("row statuses");
         statuses.sort_unstable();
         assert_eq!(statuses, vec![0, 2], "probes must never mutate state");
+
+        // P-2 recency-window pin: an OLD dead row (30 days, outside the 7-day
+        // sampler window) is visible to Tier-1's unbounded O(1) EXISTS flag
+        // (the alert signal) but EXCLUDED from the Tier-2 windowed buckets —
+        // the sampler's GROUP BY stays bounded by history growth.
+        let old_dead_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            r"INSERT INTO audit_governance_outbox
+                    (event_id, payload, status, attempts,
+                     created_at)
+              VALUES ($1, $2, 3, 0,
+                      clock_timestamp() - make_interval(days => 30))",
+        )
+        .bind(old_dead_id)
+        .bind(serde_json::json!({
+            "event_id": old_dead_id.to_string(),
+            "source_system": "aero-im.source",
+            "action": "admin.content.flag",
+        }))
+        .execute(&pool)
+        .await
+        .expect("seed old dead row");
+        let probe = sample_audit_outbox(&pool)
+            .await
+            .expect("Tier-1 probe");
+        assert!(
+            probe.has_dead,
+            "Tier-1's unbounded EXISTS flag must see the old dead row"
+        );
+        let (buckets, _, _, _) = sample_audit_outbox_full(&pool).await.expect("Tier-2 full sample");
+        assert_eq!(
+            buckets.dead, 0,
+            "Tier-2's recency-bounded buckets exclude rows older than the 7-day window"
+        );
         sqlx::query("TRUNCATE audit_governance_outbox")
             .execute(&pool)
             .await

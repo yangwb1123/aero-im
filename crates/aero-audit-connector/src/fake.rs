@@ -556,7 +556,7 @@ mod tests {
     }
 
     /// R1.5 — sampling surfaces flip in step with the state machine: seed
-    /// one row per status → `{1,1,true}` / `{1,1,1,1}`; claim/settle/mark_dead
+    /// one row per status → `{1,1,true}` / `{1,1,1,1}`; `claim/settle/mark_dead`
     /// the enqueued row → both probes flip in step; an all-delivered subset →
     /// `{0,0,false}` / `{0,0,N,0}` (PG parity, no DB).
     #[tokio::test]

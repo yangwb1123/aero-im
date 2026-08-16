@@ -80,13 +80,24 @@ CLAIM_ALLOWLIST=(
     'crates/aero-auth/src/oidc.rs:367:"sub"'   # id_token set_required_spec_claims — same
     # audit connector client.rs — RFC 6749 §4.4 token-request form param in
     # request_token (wire contract, not claims validation).
-    'crates/aero-audit-connector/src/client.rs:453:"scope"'
+    'crates/aero-audit-connector/src/client.rs:491:"scope"'
     # relay.rs — #[tokio::test] fixture JSON (claim-drift test data).
-    'crates/aero-audit-connector/src/relay.rs:489:"iss"'
-    'crates/aero-audit-connector/src/relay.rs:490:"aud"'
-    'crates/aero-audit-connector/src/relay.rs:491:"scope"'
-    'crates/aero-audit-connector/src/relay.rs:492:"sub"'
-    'crates/aero-audit-connector/src/relay.rs:493:"client_id"'
+    'crates/aero-audit-connector/src/relay.rs:495:"iss"'
+    'crates/aero-audit-connector/src/relay.rs:496:"aud"'
+    'crates/aero-audit-connector/src/relay.rs:497:"scope"'
+    'crates/aero-audit-connector/src/relay.rs:498:"sub"'
+    'crates/aero-audit-connector/src/relay.rs:499:"client_id"'
+    # im-core governance_drill_tests/heartbeat.rs — S4 drill fixture: the
+    # scope-missing client-credentials token (B5-4 ScopeRejected path). The
+    # fixture must carry the literal claim names because it exercises the
+    # wire contract the leaf's check_* fns validate (the drill asserts the
+    # typed-gate-before-check_scope order with a valid sub/client_id + a
+    # non-granting scope).
+    'crates/aero-im-core/src/db_tests/governance_drill_tests/heartbeat.rs:323:"iss"'
+    'crates/aero-im-core/src/db_tests/governance_drill_tests/heartbeat.rs:324:"aud"'
+    'crates/aero-im-core/src/db_tests/governance_drill_tests/heartbeat.rs:325:"scope"'
+    'crates/aero-im-core/src/db_tests/governance_drill_tests/heartbeat.rs:326:"sub"'
+    'crates/aero-im-core/src/db_tests/governance_drill_tests/heartbeat.rs:327:"client_id"'
     # audit connector metrics.rs — R-D2 §10.1 runbook counter label
     # vocabularies + rejection-reason classifier (bounded label strings for
     # aero_audit_token_rejections_total / _delivery_outcomes_total; NOT
@@ -176,7 +187,18 @@ CLAIM_AUDIT_FILE="crates/aero-common/src/model/audit.rs"
 # mechanism.
 AUDIT_FLAG_ALLOWLIST=(
     'crates/aero-audit-connector/src/bin/aero-audit-priority-drill.rs:94'
-    'crates/aero-audit-connector/src/bin/aero-audit-priority-drill.rs:654'
+    'crates/aero-audit-connector/src/bin/aero-audit-priority-drill.rs:655'
+    # aero-server metrics.rs — B5-4 sampler PG-gated test fixtures: the
+    # seeded `audit_governance_outbox` rows must carry the moderation
+    # outbound vocabulary literal to exercise the Q3/Q4 mirror SQL with
+    # realistic payloads (the sampler asserts buckets/ages, not the action
+    # strings themselves).
+    # metrics.rs — audit-outbox sampler db_tests fixtures ("action":
+    # MODERATION_OUTBOUND_ACTION literal in seeded governance envelopes —
+    # test-only, mirrors the relay.rs fixture-allowlist precedent).
+    'crates/aero-server/src/metrics.rs:1099'
+    'crates/aero-server/src/metrics.rs:1114'
+    'crates/aero-server/src/metrics.rs:1172'
 )
 
 # L1 allowlist-token guard (rule 3e) — F2 closure for migration 0242's

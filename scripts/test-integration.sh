@@ -833,9 +833,18 @@ SQL
         # L3: DROP TABLE → sampler_up 0, errors ≥1, enqueued retains last value.
                 run_psql -h "$PSQL_HOST" -p "$PSQL_PORT" -U "$PSQL_USER" -d "$AUDIT_OUTBOX_SAMPLER_DB" \
             -c "DROP TABLE audit_governance_outbox;" >/dev/null
-        sleep 35
-        METRICS3="$(curl -sf -H "Authorization: Bearer smoke-token"             "http://localhost:${AERO_SAMPLER_PORT:-3030}/metrics" 2>/dev/null || true)"
-        if ! echo "$METRICS3" | grep -q 'aero_audit_outbox_sampler_up 0'             || ! echo "$METRICS3" | grep -Eq 'aero_audit_outbox_sample_errors_total [1-9][0-9]*'; then
+        # Poll (≤90s) — the Tier-1 tick is 30s and MissedTickBehavior::Skip
+        # makes a fixed sleep race-prone on loaded hosts.
+        l3_ok=0
+        for _ in $(seq 1 18); do
+            sleep 5
+            METRICS3="$(curl -sf -H "Authorization: Bearer smoke-token"             "http://localhost:${AERO_SAMPLER_PORT:-3030}/metrics" 2>/dev/null || true)"
+            if echo "$METRICS3" | grep -q 'aero_audit_outbox_sampler_up 0'             && echo "$METRICS3" | grep -Eq 'aero_audit_outbox_sample_errors_total [1-9][0-9]*'; then
+                l3_ok=1
+                break
+            fi
+        done
+        if [ "$l3_ok" -ne 1 ]; then
             echo "✗ audit-outbox-sampler L3: fail-closed sampler state not observed" >&2
             echo "$METRICS3" | grep -E "sampler_up|sample_errors|enqueued" >&2
             sampler_ok=0

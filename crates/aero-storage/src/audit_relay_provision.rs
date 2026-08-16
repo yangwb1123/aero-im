@@ -3,7 +3,7 @@
 //! A singleton durable liveness row backing the settle-face freshness gate:
 //! the audit relay only acknowledges deliveries (fenced settle → status 2)
 //! while this row exists and is fresh. **Empty table = fail-closed
-//! NotVerified** — settles stay rejected until a heartbeat lands.
+//! `NotVerified`** — settles stay rejected until a heartbeat lands.
 //!
 //! Single clock domain: the write (`record_heartbeat`), the freshness check
 //! (`provision_check`), and the server samplers' ages all read the DB clock
@@ -21,7 +21,7 @@ use time::OffsetDateTime;
 pub enum ProvisionCheck {
     /// Row exists and `verified_at + freshness >= clock_timestamp()`
     /// (age == freshness still counts as fresh; age == freshness + 1 is
-    /// stale — boundary pinned by the db_tests).
+    /// stale — boundary pinned by the `db_tests`).
     Verified(OffsetDateTime),
     /// Row exists but stale: `age > freshness`.
     Stale(OffsetDateTime),
@@ -101,7 +101,7 @@ mod tests {
             .expect("well-formed DATABASE_URL")
     }
 
-    /// Freshness window used by the boundary db_tests.
+    /// Freshness window used by the boundary `db_tests`.
     const FRESHNESS: time::Duration = time::Duration::seconds(300);
 
     /// Self-isolating start: the singleton row is global (shared throwaway
@@ -170,7 +170,7 @@ mod tests {
 
     /// R3.3 — three-state `provision_check` + the freshness boundary:
     /// age == freshness → Verified; age == freshness + 1 → Stale; no row →
-    /// NotVerified (fail-closed).
+    /// `NotVerified` (fail-closed).
     #[tokio::test]
     #[ignore = "requires live Postgres (DATABASE_URL)"]
     async fn provision_check_pins_three_states_and_the_freshness_boundary() {

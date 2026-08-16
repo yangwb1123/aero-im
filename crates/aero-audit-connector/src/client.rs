@@ -83,7 +83,7 @@ pub enum DeliveryError {
     Forbidden,
     /// Client-credentials token missing the configured audit scope: dead
     /// immediately (Forbidden-class, T-11) — a provisioning fault, not a
-    /// retryable IdP drift (B5-4 auto-feedback).
+    /// retryable `IdP` drift (`B5-4` auto-feedback).
     #[error("audit:event:write scope missing from the client credentials token (T-11)")]
     ScopeRejected,
 }
@@ -116,7 +116,7 @@ impl ClaimRejection {
 }
 
 /// Structured classification of a claim rejection. `ScopeMissing` is the
-/// only Forbidden-class rejection; everything else stays Transient (IdP
+/// only Forbidden-class rejection; everything else stays `Transient` (`IdP`
 /// config drift self-heals on token refresh).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClaimRejectionKind {

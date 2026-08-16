@@ -302,12 +302,12 @@ async fn wrong_token_decorator_settle(pool: &PgPool, event_id: AuditId, token: U
 
 /// S4 — scope-provisioning auto-feedback: a client-credentials token whose
 /// grant lacks `audit:event:write` is rejected pre-POST and deads IMMEDIATELY
-/// (Forbidden-class T-11) with the exact ScopeRejected `last_error`, zero
+/// (Forbidden-class T-11) with the exact `ScopeRejected` `last_error`, zero
 /// retries, `delivered_at` None, and the heartbeat untouched (no settle ever
 /// fired). The fixture carries a valid typed-gate shape (`sub`/`client_id`)
 /// + a non-granting scope — the typed gate runs BEFORE `check_scope`, so a
 /// bare scope claim would fail as Other (Transient) and never reach the
-/// ScopeMissing classification (QA F-1).
+/// `ScopeMissing` classification (QA F-1).
 #[tokio::test]
 #[ignore = "requires live Postgres (DATABASE_URL)"]
 async fn drill_scope_missing_client_credentials_deads_immediately() {
