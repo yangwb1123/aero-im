@@ -417,45 +417,6 @@ async fn force_lease_expiry(pool: &PgPool, event_id: AuditId) {
     .expect("force lease expiry");
 }
 
-struct RowState {
-    status: i32,
-    attempts: i64,
-    delivered_at: Option<time::OffsetDateTime>,
-    last_error: Option<String>,
-    claim_token: Option<Uuid>,
-    lease_expires_at: Option<time::OffsetDateTime>,
-}
-
-async fn outbox_row(pool: &PgPool, event_id: AuditId) -> RowState {
-    let (status, attempts, delivered_at, last_error, claim_token, lease_expires_at) =
-        sqlx::query_as::<
-            _,
-            (
-                i32,
-                i64,
-                Option<time::OffsetDateTime>,
-                Option<String>,
-                Option<Uuid>,
-                Option<time::OffsetDateTime>,
-            ),
-        >(
-            "SELECT status, attempts, delivered_at, last_error, claim_token, lease_expires_at
-               FROM audit_governance_outbox WHERE event_id = $1",
-        )
-        .bind(event_id.to_uuid())
-        .fetch_one(pool)
-        .await
-        .expect("governance row");
-    RowState {
-        status,
-        attempts,
-        delivered_at,
-        last_error,
-        claim_token,
-        lease_expires_at,
-    }
-}
-
 async fn count_status(pool: &PgPool, ids: &[AuditId], status: i32) -> i64 {
     let ids: Vec<Uuid> = ids.iter().map(AuditId::to_uuid).collect();
     sqlx::query_scalar(
@@ -668,6 +629,34 @@ async fn drill_priority_claim_preempts_fifo_on_write_path_rows() {
 // R4 — payload contract: the 16-key envelope via the real write path (AC2).
 // ---------------------------------------------------------------------------
 
+/// Moderation outbound-token arbitration — END-TO-END producer→sink pin
+/// (R4 + design D6/DR-1). The single-token lock is the leaf const
+/// `MODERATION_OUTBOUND_ACTION` (`aero_common::model::audit`); the
+/// contract proposal's alternative outbound token is rejected in-repo
+/// (the leaf's doc note records that arbitration). The lock is pinned per
+/// producer at claim level by three suites, and — the gap this drill
+/// closes — through the REAL relay to the sink for
+/// `ImService::moderate_delete`:
+///   * `AiWorker::handle_moderate` → `drill_moderation_finalize_commits_`
+///     `atomically` (aero-ai, payload action pin) — existing, no new work;
+///   * `ImService::moderate_delete` → THIS drill (claim-level) + the sink
+///     leg below (`seen_payloads()[0]["action"]`) — the gap being closed;
+///   * `message_reports::review_authorized` → storage test
+///     (`message_reports.rs`, actor = reviewer differential) — existing;
+///     run-on-demand only (`#[ignore]`-gated, no named CI slot).
+/// No producer carries a bare spelling of the outbound token literal
+/// (truth-check AC4 §3d mirror — the literal is legal only in the leaf or
+/// an allowlisted pin site); the sink-echo assert binds the leaf const
+/// only.
+///
+/// Sequencing (DR-1): the relay is the SOLE claimer. The envelope asserts
+/// read the row's payload directly from the DB (payload is immutable — no
+/// `UPDATE … SET payload` exists anywhere in pg.rs; reconcile only INSERTs),
+/// so a manual `claim_due` would hold a live lease that blocks the relay's
+/// own claim (`pg.rs` lease filter) — it is deliberately NOT called. The
+/// dual-format pin recomputes `AuditId::from_uuid(event_id).to_string()`
+/// without a claim object.
+///
 /// On a claimed moderation row produced by `svc.moderate_delete`: action ==
 /// the leaf `MODERATION_OUTBOUND_ACTION`, `idempotency_key` == `event_id` ==
 /// `audit_events.id::text` (join), `source_system` == the binding row value
@@ -678,44 +667,25 @@ async fn drill_priority_claim_preempts_fifo_on_write_path_rows() {
 #[tokio::test]
 #[ignore = "requires live Postgres (DATABASE_URL)"]
 async fn drill_payload_contract_16_key_envelope_via_moderate_delete() {
-    // All 16 envelope keys present — exactly the `jsonb_build_object` list
-    // in `aero_enqueue_governance_audit` (0239).
-    const ENVELOPE_KEYS: [&str; 16] = [
-        "event_id",
-        "source_system",
-        "event_type",
-        "schema_id",
-        "schema_version",
-        "occurred_at",
-        "actor",
-        "targets",
-        "aggregate_type",
-        "aggregate_id",
-        "action",
-        "outcome",
-        "payload",
-        "data_classification",
-        "retention_class",
-        "idempotency_key",
-    ];
     let pool = pool();
     let svc = service(pool.clone());
     let rows = write_path_rows(&pool, &svc, "drill-r4", 1).await;
     let event_id = rows.event_ids[0];
     let message_id = rows.message_ids[0];
 
-    let repo = PgOutboxRepo::new(pool.clone());
-    let claims = repo
-        .claim_due(time::Duration::seconds(30), 1)
-        .await
-        .expect("claim one row");
-    assert_eq!(claims.len(), 1);
-    let claim = &claims[0];
-    assert_eq!(claim.event_id, event_id);
-    let payload = &claim.payload;
+    // Claim-level envelope asserts read the row payload directly (DR-1: no
+    // manual claim — the relay below is the sole claimer). Identical JSON to
+    // `claim.payload` (payload is immutable by construction).
+    let payload: serde_json::Value = sqlx::query_scalar(
+        "SELECT payload FROM audit_governance_outbox WHERE event_id = $1",
+    )
+    .bind(event_id.to_uuid())
+    .fetch_one(&pool)
+    .await
+    .expect("moderation row payload");
 
     let obj = payload.as_object().expect("payload is an object");
-    for key in ENVELOPE_KEYS {
+    for key in shared::ENVELOPE_KEYS {
         assert!(obj.contains_key(key), "missing envelope key {key}");
     }
     assert_eq!(obj.len(), 16, "exactly the 16-key envelope");
@@ -726,7 +696,7 @@ async fn drill_payload_contract_16_key_envelope_via_moderate_delete() {
         serde_json::from_value(payload.clone()).expect("payload parses into the leaf twin");
     assert_eq!(
         serde_json::to_value(&typed).unwrap(),
-        *payload,
+        payload,
         "re-serialized twin equals the stored JSONB (semantic parity)"
     );
 
@@ -780,15 +750,48 @@ async fn drill_payload_contract_16_key_envelope_via_moderate_delete() {
         "payload source pin"
     );
 
-    // Dual-format pin (D-W2): the connector's Idempotency-Key header is the
-    // base32 `AuditId` Display, the payload's event_id is uuid::text — the
-    // receipt validator equates them value-level; a regression respelling
-    // either side breaks here.
-    assert_ne!(claim.event_id.to_string(), audit_id_text);
+    // Dual-format pin (D-W2, recomputed without a claim object — DR-1): the
+    // connector's Idempotency-Key header is the base32 `AuditId` Display, the
+    // payload's event_id is uuid::text — the receipt validator equates them
+    // value-level; a regression respelling either side breaks here.
+    assert_ne!(AuditId::from_uuid(event_id.to_uuid()).to_string(), audit_id_text);
+
+    // ---- Sink leg (R4 acceptance / D6): deliver the row through the REAL
+    // relay to the stub sink and assert the delivered payload's action at the
+    // SINK ECHO — the end-to-end producer→sink arbitration pin that no drill
+    // exercised before. The relay is the sole claimer (DR-1: no manual claim
+    // above), so `dispatch_batch` claims the status-0 row, delivers, and
+    // settles it. Relay config source = the SEEDED BINDING's `source_system`
+    // (0239 stamps the binding value — unlike room/recall rows which stamp
+    // `AUDIT_SOURCE_SYSTEM`).
+    let stub = StubSink::start().await.expect("start stub");
+    let (relay, _repo, _config) = relay_for(&pool, &stub, &rows.source).await;
+    assert_eq!(
+        relay.dispatch_batch().await.expect("dispatch"),
+        1,
+        "claims exactly the moderation row"
+    );
+    assert_eq!(stub.posts(), 1, "exactly one POST");
+    assert_eq!(stub.seen_idempotency_keys().await.len(), 1, "one header");
+    let delivered = &stub.seen_payloads().await[0];
+    assert_eq!(
+        delivered["action"], MODERATION_OUTBOUND_ACTION,
+        "sink echo: delivered payload action == the leaf const (single-token lock)"
+    );
+    let row = shared::outbox_row(&pool, event_id).await;
+    assert_eq!(row.status, 2, "the stub's 202 + receipt echo settles the row");
+    assert!(row.delivered_at.is_some(), "delivered_at stamped");
+    assert_eq!(row.attempts, 1, "exactly one claim (relay is the sole claimer)");
+    assert!(row.claim_token.is_none(), "fencing token cleared on settle");
+    assert!(row.lease_expires_at.is_none(), "lease cleared on settle");
+    assert!(row.last_error.is_none(), "no error recorded on settle");
 
     cleanup_drill_rows(&pool, &rows).await;
 }
 
 mod crash;
 mod facade;
+mod shared;
+mod room;
+mod posture;
 mod terminal;
