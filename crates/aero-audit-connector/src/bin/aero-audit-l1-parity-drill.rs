@@ -540,8 +540,7 @@ async fn run() -> anyhow::Result<()> {
         delete_rows.iter().map(|(e, ..)| e.clone()).collect();
     if expected_ids != actual_ids {
         anyhow::bail!(
-            "delete row event_id not 1:1 with the audit id: expected {:?} actual {:?}",
-            expected_ids, actual_ids
+            "delete row event_id not 1:1 with the audit id: expected {expected_ids:?} actual {actual_ids:?}"
         );
     }
     // Per-row field pins. The set-parity proved event_id == audit id 1:1;
@@ -551,7 +550,7 @@ async fn run() -> anyhow::Result<()> {
         .iter()
         .map(|(msg_id, audit_id)| (audit_id.to_string(), msg_id.clone()))
         .collect();
-    for (event_id, status, class, priority, payload) in delete_rows.iter() {
+    for (event_id, status, class, priority, payload) in &delete_rows {
         let msg_id = by_event.get(event_id).expect("set-parity guarantees the entry");
         if *status != 0 || class != GOVERNANCE_CLASS_MESSAGE || *priority != 10 {
             anyhow::bail!(
