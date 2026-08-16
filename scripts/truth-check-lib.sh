@@ -80,13 +80,24 @@ CLAIM_ALLOWLIST=(
     'crates/aero-auth/src/oidc.rs:367:"sub"'   # id_token set_required_spec_claims — same
     # audit connector client.rs — RFC 6749 §4.4 token-request form param in
     # request_token (wire contract, not claims validation).
-    'crates/aero-audit-connector/src/client.rs:448:"scope"'
+    'crates/aero-audit-connector/src/client.rs:453:"scope"'
     # relay.rs — #[tokio::test] fixture JSON (claim-drift test data).
-    'crates/aero-audit-connector/src/relay.rs:479:"iss"'
-    'crates/aero-audit-connector/src/relay.rs:480:"aud"'
-    'crates/aero-audit-connector/src/relay.rs:481:"scope"'
-    'crates/aero-audit-connector/src/relay.rs:482:"sub"'
-    'crates/aero-audit-connector/src/relay.rs:483:"client_id"'
+    'crates/aero-audit-connector/src/relay.rs:489:"iss"'
+    'crates/aero-audit-connector/src/relay.rs:490:"aud"'
+    'crates/aero-audit-connector/src/relay.rs:491:"scope"'
+    'crates/aero-audit-connector/src/relay.rs:492:"sub"'
+    'crates/aero-audit-connector/src/relay.rs:493:"client_id"'
+    # audit connector metrics.rs — R-D2 §10.1 runbook counter label
+    # vocabularies + rejection-reason classifier (bounded label strings for
+    # aero_audit_token_rejections_total / _delivery_outcomes_total; NOT
+    # claim-validation logic — the leaf's check_* fns stay the single
+    # authority, usage-rule 3 pinned to oidc.rs/client.rs only).
+    'crates/aero-audit-connector/src/metrics.rs:31:"scope"'   # TOKEN_REJECT_REASONS label vocabulary
+    'crates/aero-audit-connector/src/metrics.rs:82:"scope"'  # classify_token_rejection scope-match arm
+    'crates/aero-audit-connector/src/metrics.rs:83:"scope"'  # classify_token_rejection scope label
+    'crates/aero-audit-connector/src/metrics.rs:84:"iss"'    # classify_token_rejection claims-match arm
+    'crates/aero-audit-connector/src/metrics.rs:84:"aud"'    # same
+    'crates/aero-audit-connector/src/metrics.rs:84:"sub"'    # same
     # extractor.rs — #[cfg(test)] Claims test-struct fixture field values.
     'crates/aero-auth/src/extractor.rs:173:"jti"'
     'crates/aero-auth/src/extractor.rs:191:"jti"'

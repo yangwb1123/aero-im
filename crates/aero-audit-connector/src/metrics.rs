@@ -10,7 +10,7 @@
 //!
 //! Label vocabularies are fixed (bounded — never free-form labels):
 //!   * `aero_audit_token_rejections_total{reason}` — reason ∈ {scope,
-//!     claims, unknown_key, malformed, unsupported_alg, other};
+//!     claims, `unknown_key`, malformed, `unsupported_alg`, other};
 //!   * `aero_audit_delivery_outcomes_total{outcome}` — outcome ∈
 //!     {delivered, transient, permanent, forbidden, unprovisioned}.
 
@@ -75,8 +75,8 @@ pub fn inc_token_rejection(reason: &str) {
 }
 
 /// Map a client-side rejection reason string onto the runbook's bounded
-/// `reason` vocabulary ({scope, claims, unknown_key, malformed,
-/// unsupported_alg, other}). The fallback is `other` — never a new label.
+/// `reason` vocabulary ({scope, claims, `unknown_key`, malformed,
+/// `unsupported_alg`, other}). The fallback is `other` — never a new label.
 #[must_use]
 pub fn classify_token_rejection(reason: &str) -> &'static str {
     if reason.contains("scope") {

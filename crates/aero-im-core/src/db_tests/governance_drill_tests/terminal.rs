@@ -246,7 +246,7 @@ async fn drill_relay_absent_rows_stay_status_zero() {
 /// status 2. Status-2 set-parity `{event_id}` == the seeded delete set.
 /// The relay config pins `source_system = AUDIT_SOURCE_SYSTEM` (the R-D2
 /// writer stamps the leaf const — unlike moderation rows which stamp the
-/// binding value; both must equal the relay's config or PayloadGuard deads).
+/// binding value; both must equal the relay's config or `PayloadGuard` deads).
 #[tokio::test]
 #[ignore = "requires live Postgres (DATABASE_URL)"]
 async fn drill_message_deleted_lane_delivers_through_real_relay() {
@@ -346,10 +346,10 @@ async fn drill_message_deleted_lane_delivers_through_real_relay() {
 
 /// AC-2b negative controls: direct-seeded corrupted rows dead at ≤1 retry
 /// with the permanent class recorded in `last_error`. (1) `payload.event_id`
-/// ≠ PK → the stub echoes the payload's event_id → `ReceiptMismatch` → dead
+/// ≠ PK → the stub echoes the payload's `event_id` → `ReceiptMismatch` → dead
 /// at attempt 2; (2) `payload.source_system` mismatch → `PayloadGuard`
 /// (pre-POST) → dead at attempt 2. No POST is ever attempted for the
-/// PayloadGuard row.
+/// `PayloadGuard` row.
 #[tokio::test]
 #[ignore = "requires live Postgres (DATABASE_URL)"]
 async fn drill_delete_lane_permanent_negatives_dead() {
@@ -472,7 +472,20 @@ async fn drill_delete_lane_permanent_negatives_dead() {
     assert_eq!(pg.status, 3, "payload-guard dead at attempt 2");
     assert_eq!(pg.attempts, 2);
     assert!(pg.delivered_at.is_none(), "never delivered");
-    assert_eq!(stub.posts(), 2, "the payload-guard row never produced a POST");
+    // Conforming row posts once (settles); the receipt-mismatch row posts once
+    // per attempt (2 — the `drill_422` "exactly two real POSTs" convention);
+    // the payload-guard row NEVER posts (PayloadGuard bails pre-POST on both
+    // attempts). The negative control is therefore total 3 with the
+    // payload-guard payload absent from the sink's observation log.
+    assert_eq!(stub.posts(), 3, "conforming 1 + receipt-mismatch 2 attempts; the payload-guard row produced 0 POSTs");
+    let seen = stub.seen_payloads().await;
+    assert!(
+        !seen.iter().any(|p| p
+            .get("source_system")
+            .and_then(serde_json::Value::as_str)
+            == Some("source-wrong")),
+        "the payload-guard payload never reached the sink"
+    );
 
     // Cleanup: synthetic rows have no audit twins — delete by outbox id.
     sqlx::query(

@@ -64,7 +64,7 @@ const L1_PRIORITY: i16 = 10;
 /// the Rust writer (never the 0242 window — the 1:1 requirement is
 /// load-bearing, 0246 header). The priority is local (aero-storage must not
 /// depend on aero-ai; `GOVERNANCE_PRIORITY_BACKLOG = 10` drift-guarded by the
-/// db_tests pins — `AUTH_PAIR_PRIORITY` precedent).
+/// `db_tests` pins — `AUTH_PAIR_PRIORITY` precedent).
 const MESSAGE_DELETE_CLASS: &str = GOVERNANCE_CLASS_MESSAGE;
 const MESSAGE_DELETE_PRIORITY: i16 = 10;
 /// Reconciler batch upper bound (mirror of the connector's `MAX_CLAIM`=500
@@ -147,7 +147,7 @@ impl AuditGovernanceOutboxRepo {
     /// 1:1 `message.deleted` outbox row, written in the delete tx (R-D2
     /// writer — the 0245/0246 declared carve-out: `message.deleted` is NOT
     /// trigger-owned). The audit row MUST already exist in-tx (the caller
-    /// appended it first); `occurred_at` is re-selected from it (write_pair
+    /// appended it first); `occurred_at` is re-selected from it (`write_pair`
     /// precedent — single clock domain, never a Rust formatter).
     ///
     /// Fail-closed: propagates [`sqlx::Error`] — a lost outbox row aborts the
@@ -696,7 +696,7 @@ impl AuditGovernanceOutboxRepo {
     /// 16-key envelope as [`Self::append_message_delete_in_tx`]
     /// (`ON CONFLICT (event_id) DO NOTHING` — idempotent, concurrent-instance
     /// safe). Never fabricates a `message.moderated` claim and never touches
-    /// trigger-owned tokens (exact-token scan). The scan is SARGable on the
+    /// trigger-owned tokens (exact-token scan). The scan is `SARGable` on the
     /// partition key (`action`, `created_at >= cutoff` prunes partitions),
     /// bounded by `batch`.
     ///

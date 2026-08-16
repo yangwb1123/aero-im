@@ -772,14 +772,14 @@ async fn room_lane_unconditional_enqueue() {
 /// (`soft_delete_outboxed_authorized` — the exact `ImService::delete_message`
 /// path): N deletes → exactly N 1:1 class-'message' priority-10 rows written
 /// in the delete txs by the Rust writer, ALL 16 envelope keys field-by-field
-/// vs the 0239 spelling (occurred_at byte-asserted against BOTH the PG
+/// vs the 0239 spelling (`occurred_at` byte-asserted against BOTH the PG
 /// `to_jsonb(created_at)` text and the shared `audit_wire_occurred_at`
 /// helper — §10.4 canonical spelling; actor = the deleter; non-empty
 /// targets; payload = the `{room_id, digest}` detail; action verbatim
 /// `LOCAL_ACTION_MESSAGE_DELETED`; `idempotency_key == event_id`; no L1
 /// marker keys), each payload parses into `AuditClaimPayload`
 /// (`deny_unknown_fields`) and re-serializes Value-equal. Rollback half → 0
-/// new rows; replay half (same-id audit re-INSERT with a VARYING created_at
+/// new rows; replay half (same-id audit re-INSERT with a VARYING `created_at`
 /// — the composite PK `(id, created_at)` admits it — never fires the writer,
 /// which lives only in the delete path) → still exactly N rows.
 #[tokio::test]

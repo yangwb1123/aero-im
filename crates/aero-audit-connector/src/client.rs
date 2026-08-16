@@ -408,7 +408,7 @@ impl AuditClient {
     /// Signature-plane rejection: invalidate the poisoned token cache (D7 —
     /// the retry must rotate a fresh token, or the ≤1-retry budget is fake)
     /// and classify permanent. `reason` feeds the bounded rejection counter
-    /// (runbook vocabulary: {malformed, unsupported_alg, unknown_key, other}).
+    /// (runbook vocabulary: {malformed, `unsupported_alg`, `unknown_key`, other}).
     async fn signature_rejected(&self, token: &str, reason: &str) -> DeliveryError {
         crate::metrics::inc_token_rejection(reason);
         self.invalidate_token(token).await;
