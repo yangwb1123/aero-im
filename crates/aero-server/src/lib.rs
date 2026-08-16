@@ -22,6 +22,7 @@ mod consumer_event_receipt;
 /// Magic-byte content sniffing for uploaded blobs (reject disguised executables/markup).
 pub mod content_sniff;
 mod deferred_blocks;
+pub mod audit_relay_heartbeat;
 pub mod drafts;
 pub mod emoji;
 pub mod error;

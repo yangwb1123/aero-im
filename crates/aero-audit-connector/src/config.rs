@@ -48,6 +48,12 @@ pub struct RelayConfig {
     /// `None` ⇒ signature verification is off (exp/nbf claim checks stay
     /// unconditional). Same URL policy as the service endpoints.
     pub jwks_uri: Option<Url>,
+    /// Settle-face freshness window (`AERO_AUDIT_PROVISION_FRESHNESS_SECS`,
+    /// default 300, bounds [60, 86400]): a durable heartbeat older than this
+    /// rejects the acknowledgement fail-closed. Same `AERO_AUDIT_*` family,
+    /// so setting it without `AERO_AUDIT_TOKEN_ENDPOINT` trips the existing
+    /// stray-scan boot error (fail-loud, no new code).
+    pub provision_freshness: Duration,
 }
 
 impl RelayConfig {
@@ -89,6 +95,8 @@ impl RelayConfig {
         let batch_size = integer_env("AERO_AUDIT_BATCH_SIZE", 100, 1, 500)?;
         let concurrency =
             usize::try_from(integer_env("AERO_AUDIT_CONCURRENCY", 4, 1, 32)?).expect("bounded");
+        let provision_freshness =
+            duration_secs("AERO_AUDIT_PROVISION_FRESHNESS_SECS", 300, 60, 86_400)?;
 
         let jwks_uri = if let Some(raw) = optional_env("AERO_AUDIT_JWKS_URL") {
             if optional_env("AERO_AUDIT_JWKS_URI").is_some() {
@@ -126,6 +134,7 @@ impl RelayConfig {
             batch_size,
             concurrency,
             jwks_uri,
+            provision_freshness,
         }))
     }
 }
@@ -318,6 +327,7 @@ mod tests {
         "AERO_AUDIT_EXPECTED_SUB",
         "AERO_AUDIT_SOURCE_SYSTEM",
         "AERO_AUDIT_ALLOW_INSECURE_LOOPBACK",
+        "AERO_AUDIT_PROVISION_FRESHNESS_SECS",
     ];
 
     /// Run `f` with a controlled `AERO_AUDIT_*` env (required vars + `extra`),
@@ -399,5 +409,44 @@ mod tests {
         .expect_err("both JWKS env names must fail loudly");
         assert!(error.to_string().contains("AERO_AUDIT_JWKS_URL"));
         assert!(error.to_string().contains("AERO_AUDIT_JWKS_URI"));
+    }
+
+    /// R4.3 — `AERO_AUDIT_PROVISION_FRESHNESS_SECS`: default 300, legal
+    /// values parse, out-of-bounds (below 60 / above 86400 / garbage) bail
+    /// fail-loud like the rest of the `AERO_AUDIT_*` family.
+    #[test]
+    fn provision_freshness_defaults_and_bounds() {
+        let _guard = ENV_LOCK.lock().expect("env test lock");
+        let default = with_audit_env(&[], RelayConfig::from_env)
+            .expect("complete audit env must parse")
+            .expect("connector enabled");
+        assert_eq!(
+            default.provision_freshness,
+            std::time::Duration::from_secs(300),
+            "unset AERO_AUDIT_PROVISION_FRESHNESS_SECS defaults to 300s"
+        );
+
+        let legal = with_audit_env(
+            &[("AERO_AUDIT_PROVISION_FRESHNESS_SECS", "600")],
+            RelayConfig::from_env,
+        )
+        .expect("legal freshness must parse")
+        .expect("connector enabled");
+        assert_eq!(
+            legal.provision_freshness,
+            std::time::Duration::from_secs(600)
+        );
+
+        for bad in ["59", "86401", "not-a-number"] {
+            let error = with_audit_env(
+                &[("AERO_AUDIT_PROVISION_FRESHNESS_SECS", bad)],
+                RelayConfig::from_env,
+            )
+            .expect_err("out-of-bounds freshness must bail fail-loud");
+            assert!(
+                error.to_string().contains("AERO_AUDIT_PROVISION_FRESHNESS_SECS"),
+                "error must name the offending env var (got: {error})"
+            );
+        }
     }
 }

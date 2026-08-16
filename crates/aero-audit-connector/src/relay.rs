@@ -214,21 +214,26 @@ impl AuditRelay {
                     ),
                 }
             }
-            // Deliberately NOT `is_dead_at`: HTTP 403 is fail-closed immediate
-            // death (T-11) regardless of the retry budget — it is an identity/
-            // provisioning fault, not a payload-class fault that earns one retry.
-            Err(DeliveryError::Forbidden) => {
+            // Deliberately NOT `is_dead_at`: HTTP 403 and scope-missing are
+            // fail-closed immediate death (T-11) regardless of the retry
+            // budget — identity/provisioning faults, not payload-class faults
+            // that earn one retry. The 403-loop causal chain (gate unhealthy
+            // ⇒ IdP rejects ⇒ 403-class ⇒ dead, heartbeat never refreshes)
+            // is preserved; `ScopeRejected` shares the terminal with its own
+            // exact `last_error` (B5-4 auto-feedback).
+            Err(error @ (DeliveryError::Forbidden | DeliveryError::ScopeRejected)) => {
                 crate::metrics::inc_delivery_outcome("forbidden");
                 crate::metrics::inc_dead();
-                let dead = self
-                    .repo
-                    .mark_dead(
-                        event_id,
-                        token,
-                        attempts,
-                        "audit sink rejected the service identity (HTTP 403)",
-                    )
-                    .await;
+                let reason = match error {
+                    DeliveryError::Forbidden => {
+                        "audit sink rejected the service identity (HTTP 403)"
+                    }
+                    DeliveryError::ScopeRejected => {
+                        "audit:event:write scope missing from the client credentials token (T-11)"
+                    }
+                    _ => unreachable!("covered by the or-pattern"),
+                };
+                let dead = self.repo.mark_dead(event_id, token, attempts, reason).await;
                 if !matches!(dead, Ok(true)) {
                     warn!(%event_id, ?dead, "audit 403 terminal transition lost its fence; lease expiry will reclaim");
                 }
@@ -341,6 +346,7 @@ mod tests {
             batch_size: 100,
             concurrency: 4,
             jwks_uri: None,
+            provision_freshness: std::time::Duration::from_secs(300),
         }
     }
 

@@ -160,13 +160,25 @@ pub fn check_audience(claims: &Value, cfg: &ClientCredentialsTokenConfig) -> boo
 /// single-required-scope config this is equivalent to its historical
 /// any-match; for aero-auth the typed [`ClientCredentialsClaims::granted_scopes`]
 /// union (array `scopes` ∪ string `scope`) is the corresponding face.
+///
+/// B5-4 P1: the Value path ALSO unions the `scopes` array claim (the
+/// Snaplink minting face aero-auth's `granted_scopes` reads) — a legitimate
+/// token granting via the array shape must not be misclassified as
+/// scope-missing (which would dead it at attempts 1). Scope-missing is
+/// classified only when NO recognized shape grants the requested scope.
 #[must_use]
 pub fn check_scope(claims: &Value, cfg: &ClientCredentialsTokenConfig) -> bool {
-    let granted: Vec<&str> = match claims.get(CLAIM_SCOPE) {
-        Some(Value::String(value)) => value.split_whitespace().collect(),
-        Some(Value::Array(values)) => values.iter().filter_map(Value::as_str).collect(),
-        _ => return false,
-    };
+    let mut granted: Vec<&str> = Vec::new();
+    if let Some(scope) = claims.get(CLAIM_SCOPE) {
+        match scope {
+            Value::String(value) => granted.extend(value.split_whitespace()),
+            Value::Array(values) => granted.extend(values.iter().filter_map(Value::as_str)),
+            _ => {}
+        }
+    }
+    if let Some(Value::Array(values)) = claims.get(CLAIM_SCOPES) {
+        granted.extend(values.iter().filter_map(Value::as_str));
+    }
     cfg.required_scopes
         .iter()
         .all(|required| granted.iter().any(|word| word == required))
@@ -289,7 +301,10 @@ mod tests {
     }
 
     /// The Value-path scope check keeps the dual-shape tolerance — the
-    /// property the connector gate must not regress (delta ④).
+    /// property the connector gate must not regress (delta ④) — and unions
+    /// the `scopes` array claim (B5-4 P1: a legitimate Snaplink token minting
+    /// via the array shape must not be misclassified scope-missing, which
+    /// would dead it at attempts 1).
     #[test]
     fn check_scope_accepts_string_and_array_forms() {
         assert!(check_scope(
@@ -300,10 +315,22 @@ mod tests {
             &json!({"scope": ["audit:event:write", "metering:read"]}),
             &cfg()
         ));
+        assert!(check_scope(
+            &json!({"scopes": ["aero.notify.publish", "audit:event:write"]}),
+            &cfg()
+        ), "the scopes array claim is a sanctioned granting shape (B5-4 P1)");
+        assert!(check_scope(
+            &json!({"scope": "metering:read", "scopes": ["audit:event:write"]}),
+            &cfg()
+        ), "the union face accepts either shape granting the scope");
         assert!(!check_scope(
             &json!({"scope": "billing:entitlement:read"}),
             &cfg()
         ));
+        assert!(!check_scope(
+            &json!({"scope": "metering:read", "scopes": ["billing:entitlement:read"]}),
+            &cfg()
+        ), "no recognized shape grants → scope missing (ScopeRejected classification)");
         assert!(!check_scope(&json!({}), &cfg()));
         assert!(!check_scope(&json!({"scope": 42}), &cfg()));
     }

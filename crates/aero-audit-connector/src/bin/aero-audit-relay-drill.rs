@@ -119,6 +119,7 @@ async fn run() -> anyhow::Result<()> {
         batch_size: 100,
         concurrency: 4,
         jwks_uri: None,
+        provision_freshness: std::time::Duration::from_secs(300),
     };
 
     // Seed N conforming rows (status 0, due now): rows/3 1:1-shaped + rows/3

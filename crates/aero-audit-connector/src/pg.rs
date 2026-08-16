@@ -23,7 +23,7 @@ use uuid::Uuid;
 
 use aero_common::{AuditId, OutboxStatus};
 
-use crate::outbox::{Claim, Error, OutboxRepo};
+use crate::outbox::{Claim, Error, OutboxRepo, StatusBuckets, VerdictProbe};
 use crate::relay::{audit_backoff, clamped_lease, min_service_floor, truncate_error, MAX_CLAIM};
 
 /// Governance outbox status enum — B5-1 0239 DDL normative values, derived
@@ -289,6 +289,57 @@ impl OutboxRepo for PgOutboxRepo {
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() == 1)
+    }
+
+    async fn verdict_probe(&self) -> Result<VerdictProbe, Error> {
+        // QP1: status IN (0,1) counts, served by the due partial indexes
+        // (`audit_governance_due_idx` / `audit_governance_due_prio_idx` —
+        // both `WHERE status IN (0,1)`) — cost ∝ due set, not table size.
+        let rows = sqlx::query_as::<_, (i32, i64)>(
+            "SELECT status, count(*)::bigint FROM audit_governance_outbox
+              WHERE status IN (0, 1) GROUP BY status ORDER BY status",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut probe = VerdictProbe::default();
+        for (status, count) in rows {
+            match status {
+                STATUS_ENQUEUED => probe.enqueued = count,
+                STATUS_CLAIMED => probe.claimed = count,
+                _ => {}
+            }
+        }
+        // QP2: EXISTS — the healthy-state "no dead rows" case is an O(1)
+        // index lookup via the 0248 `audit_governance_status3_idx` partial
+        // index (`WHERE status = 3`); a seq scan would cost the whole table.
+        probe.has_dead = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM audit_governance_outbox WHERE status = 3)",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(probe)
+    }
+
+    async fn status_buckets(&self) -> Result<StatusBuckets, Error> {
+        // Exact text mirror of `aero_eng::audit_provision::Q3_SQL`
+        // (`GROUP BY status ORDER BY status`) for CLI/sampler oracle parity.
+        let rows = sqlx::query_as::<_, (i32, i64)>(
+            "SELECT status, count(*)::bigint FROM audit_governance_outbox
+              GROUP BY status ORDER BY status",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut buckets = StatusBuckets::default();
+        for (status, count) in rows {
+            match status {
+                STATUS_ENQUEUED => buckets.enqueued = count,
+                STATUS_CLAIMED => buckets.claimed = count,
+                STATUS_DELIVERED => buckets.delivered = count,
+                STATUS_DEAD => buckets.dead = count,
+                _ => {}
+            }
+        }
+        Ok(buckets)
     }
 }
 
@@ -790,5 +841,97 @@ mod tests {
         let claimed = repo.claim_due(Duration::seconds(30), 0).await.expect("zero-limit claim");
         assert_eq!(claimed.len(), 1, "limit 0 clamps to batch 1 (K = 0)");
         assert_eq!(claimed[0].event_id, AuditId::from_uuid(event_id));
+    }
+
+    /// R1.4 — read-only sampling data plane (B5-4): `verdict_probe` +
+    /// `status_buckets` over a seeded {0×2, 1×1, 2×1, 3×1} set →
+    /// `{2, 1, true}` / `{2, 1, 1, 1}`; an all-delivered set → `{0, 0,
+    /// false}` / `{0, 0, N, 0}`. **Read-only pin**: a full-row snapshot of
+    /// every mutable column is byte-identical before and after both probes —
+    /// the sampler must never mutate state (FM8).
+    #[tokio::test]
+    #[ignore = "requires live Postgres (DATABASE_URL)"]
+    async fn sampling_data_plane_reads_never_mutate() {
+        let url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must point at a throwaway Postgres");
+        let pool = pool(&url);
+        ensure_outbox_table(&pool).await;
+        sqlx::query("TRUNCATE audit_governance_outbox").execute(&pool).await.expect("reset");
+        let repo = PgOutboxRepo::new(pool.clone());
+
+        // {0×2, 1×1, 2×1, 3×1} — one row in every status bucket.
+        for (n, status) in [(2, 0), (1, 1), (1, 2), (1, 3)] {
+            for _ in 0..n {
+                sqlx::query(
+                    r"INSERT INTO audit_governance_outbox
+                            (event_id, payload, status, attempts, priority,
+                             available_at, created_at)
+                      VALUES ($1, $2, $3, 0, 10,
+                              clock_timestamp() - make_interval(secs => 200),
+                              clock_timestamp() - make_interval(secs => 200))",
+                )
+                .bind(Uuid::new_v4())
+                .bind(json!({"event_id": Uuid::new_v4().to_string(), "source_system": "aero-im.source"}))
+                .bind(status)
+                .execute(&pool)
+                .await
+                .expect("seed probe row");
+            }
+        }
+
+        let before = row_snapshot(&pool).await;
+        let probe = repo.verdict_probe().await.expect("verdict probe");
+        assert_eq!(
+            probe,
+            VerdictProbe { enqueued: 2, claimed: 1, has_dead: true },
+            "Tier-1 probe over statuses {{0×2, 1×1, 2×1, 3×1}}"
+        );
+        let buckets = repo.status_buckets().await.expect("status buckets");
+        assert_eq!(
+            buckets,
+            StatusBuckets { enqueued: 2, claimed: 1, delivered: 1, dead: 1 },
+            "Tier-2 buckets mirror Q3_SQL exactly"
+        );
+        let after = row_snapshot(&pool).await;
+        assert_eq!(
+            before, after,
+            "both probes are pure reads: no mutable column may change (FM8)"
+        );
+
+        // All-delivered subset → zero pending/claimed/dead.
+        sqlx::query("TRUNCATE audit_governance_outbox").execute(&pool).await.expect("reset");
+        for _ in 0..3 {
+            sqlx::query(
+                r"INSERT INTO audit_governance_outbox
+                        (event_id, payload, status, attempts)
+                  VALUES ($1, $2, 2, 0)",
+            )
+            .bind(Uuid::new_v4())
+            .bind(json!({"event_id": Uuid::new_v4().to_string(), "source_system": "aero-im.source"}))
+            .execute(&pool)
+            .await
+            .expect("seed delivered row");
+        }
+        assert_eq!(
+            repo.verdict_probe().await.expect("verdict probe"),
+            VerdictProbe { enqueued: 0, claimed: 0, has_dead: false },
+            "no pending/claimed/dead rows → zero probe"
+        );
+        assert_eq!(
+            repo.status_buckets().await.expect("status buckets"),
+            StatusBuckets { enqueued: 0, claimed: 0, delivered: 3, dead: 0 },
+            "delivered rows land only in the delivered bucket"
+        );
+    }
+
+    /// Full-row mutable-column snapshot (read-only pin oracle).
+    async fn row_snapshot(pool: &PgPool) -> Vec<(Uuid, i32, i64, Option<Uuid>, Option<OffsetDateTime>, Option<String>)> {
+        sqlx::query_as::<_, (Uuid, i32, i64, Option<Uuid>, Option<OffsetDateTime>, Option<String>)>(
+            "SELECT event_id, status, attempts, claim_token, lease_expires_at, last_error
+               FROM audit_governance_outbox ORDER BY event_id",
+        )
+        .fetch_all(pool)
+        .await
+        .expect("snapshot the governance outbox")
     }
 }

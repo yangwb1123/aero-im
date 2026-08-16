@@ -25,6 +25,29 @@ use uuid::Uuid;
 
 use aero_common::AuditId;
 
+/// Tier-1 (30s) read-only outbox verdict probe (B5-4 R1). `enqueued`/
+/// `claimed` are exact status-0/status-1 counts (QP1, partial-index-served);
+/// `has_dead` is the EXISTS(status = 3) signal (QP2, O(1) via the
+/// `audit_governance_status3_idx` partial index). Pure read — never a
+/// fabricated zero snapshot: a missing table fails the whole probe (`Err`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct VerdictProbe {
+    pub enqueued: i64,
+    pub claimed: i64,
+    pub has_dead: bool,
+}
+
+/// Tier-2 (slow) full status-bucket aggregation (B5-4 R1), mirroring
+/// `aero-eng` `Q3_SQL` (`GROUP BY status ORDER BY status`) exactly for CLI
+/// oracle parity. Pure read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StatusBuckets {
+    pub enqueued: i64,
+    pub claimed: i64,
+    pub delivered: i64,
+    pub dead: i64,
+}
+
 /// One leased outbox row.
 ///
 /// `event_id` is `AuditId` — the compile-time 1:1 with `audit_events.id`
@@ -114,6 +137,15 @@ pub trait OutboxRepo: Send + Sync {
         attempts: i64,
         error: &str,
     ) -> Result<bool, Error>;
+
+    /// Tier-1 (30s) read-only verdict probe: exact enqueued (status 0) /
+    /// claimed (status 1) counts plus whether any dead (status 3) row exists.
+    /// Never fabricates a zero snapshot — a missing table is `Err`.
+    async fn verdict_probe(&self) -> Result<VerdictProbe, Error>;
+
+    /// Tier-2 (slow) read-only full aggregation over the four status buckets
+    /// (exact `Q3_SQL` mirror). Never fabricates a zero snapshot.
+    async fn status_buckets(&self) -> Result<StatusBuckets, Error>;
 }
 
 /// Outbox store failure. Fence violations are *not* errors — they return

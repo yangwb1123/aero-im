@@ -21,7 +21,7 @@ use uuid::Uuid;
 
 use aero_common::AuditId;
 
-use crate::outbox::{Claim, Error, OutboxRepo};
+use crate::outbox::{Claim, Error, OutboxRepo, StatusBuckets, VerdictProbe};
 use crate::relay::{audit_backoff, clamped_lease, min_service_floor, truncate_error, MAX_CLAIM};
 
 /// Terminal/retry status of a fake row, mirroring the B5-1 0239 status enum
@@ -341,6 +341,34 @@ impl OutboxRepo for FakeOutbox {
         row.last_error = Some(truncate_error(error));
         Ok(true)
     }
+
+    async fn verdict_probe(&self) -> Result<VerdictProbe, Error> {
+        let state = self.state.lock().expect("fake outbox poisoned");
+        let mut probe = VerdictProbe::default();
+        for row in state.rows.values() {
+            match row.status {
+                FakeStatus::Ready => probe.enqueued += 1,
+                FakeStatus::Claimed => probe.claimed += 1,
+                FakeStatus::Dead => probe.has_dead = true,
+                FakeStatus::Delivered => {}
+            }
+        }
+        Ok(probe)
+    }
+
+    async fn status_buckets(&self) -> Result<StatusBuckets, Error> {
+        let state = self.state.lock().expect("fake outbox poisoned");
+        let mut buckets = StatusBuckets::default();
+        for row in state.rows.values() {
+            match row.status {
+                FakeStatus::Ready => buckets.enqueued += 1,
+                FakeStatus::Claimed => buckets.claimed += 1,
+                FakeStatus::Delivered => buckets.delivered += 1,
+                FakeStatus::Dead => buckets.dead += 1,
+            }
+        }
+        Ok(buckets)
+    }
 }
 
 #[cfg(test)]
@@ -524,6 +552,61 @@ mod tests {
             round2.iter().find(|c| c.priority == 10).map(|c| c.event_id),
             Some(low),
             "the requeued low-lane row re-enters the claim once due"
+        );
+    }
+
+    /// R1.5 — sampling surfaces flip in step with the state machine: seed
+    /// one row per status → `{1,1,true}` / `{1,1,1,1}`; claim/settle/mark_dead
+    /// the enqueued row → both probes flip in step; an all-delivered subset →
+    /// `{0,0,false}` / `{0,0,N,0}` (PG parity, no DB).
+    #[tokio::test]
+    async fn sampling_surfaces_flip_in_step_with_the_state_machine() {
+        let fake = FakeOutbox::new();
+        let t0 = t0();
+        fake.set_now(Some(t0)).await;
+        let ids: Vec<AuditId> = (0..4).map(|_| AuditId::from_uuid(Uuid::new_v4())).collect();
+        for (idx, id) in ids.iter().enumerate() {
+            fake.insert(*id, json!({"n": idx}), t0 - Duration::seconds(200)).await;
+        }
+        assert_eq!(
+            fake.verdict_probe().await.expect("probe"),
+            VerdictProbe { enqueued: 4, claimed: 0, has_dead: false },
+            "all ready rows are enqueued"
+        );
+        assert_eq!(
+            fake.status_buckets().await.expect("buckets"),
+            StatusBuckets { enqueued: 4, claimed: 0, delivered: 0, dead: 0 }
+        );
+
+        // Drive one row through claim → settle, one to dead, leaving two ready.
+        let claimed = fake.claim_due(Duration::seconds(30), 4).await.expect("claim");
+        assert_eq!(claimed.len(), 4);
+        let token_for = |id: AuditId| {
+            claimed
+                .iter()
+                .find(|claim| claim.event_id == id)
+                .expect("claimed row")
+                .claim_token
+        };
+        assert!(fake
+            .settle(ids[0], token_for(ids[0]))
+            .await
+            .expect("settle"));
+        assert!(fake
+            .mark_dead(ids[1], token_for(ids[1]), 1, "drill dead")
+            .await
+            .expect("mark dead"));
+        // ids[2]/ids[3] stay claimed (leases live; no requeue) — the probe
+        // surface mirrors PG: claimed counts leased-but-unacked rows.
+        assert_eq!(
+            fake.verdict_probe().await.expect("probe"),
+            VerdictProbe { enqueued: 0, claimed: 2, has_dead: true },
+            "claim/settle/dead flip the Tier-1 probe in step"
+        );
+        assert_eq!(
+            fake.status_buckets().await.expect("buckets"),
+            StatusBuckets { enqueued: 0, claimed: 2, delivered: 1, dead: 1 },
+            "Tier-2 buckets flip in step"
         );
     }
 }

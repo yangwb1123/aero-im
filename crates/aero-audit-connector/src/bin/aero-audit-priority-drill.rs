@@ -242,6 +242,7 @@ async fn run() -> anyhow::Result<()> {
         batch_size: BATCH_SIZE,
         concurrency: 1,
         jwks_uri: None,
+        provision_freshness: std::time::Duration::from_secs(300),
     };
 
     // Seed backlog FIRST (earlier available_at), the auth-token backlog row

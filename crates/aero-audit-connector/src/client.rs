@@ -81,12 +81,50 @@ pub enum DeliveryError {
     /// HTTP 403: dead immediately (T-11 fail-closed).
     #[error("audit sink rejected the service identity (HTTP 403)")]
     Forbidden,
+    /// Client-credentials token missing the configured audit scope: dead
+    /// immediately (Forbidden-class, T-11) — a provisioning fault, not a
+    /// retryable IdP drift (B5-4 auto-feedback).
+    #[error("audit:event:write scope missing from the client credentials token (T-11)")]
+    ScopeRejected,
 }
 
 /// Why a token's JWT claims failed validation (fail-closed: no POST).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaimRejection {
     pub reason: String,
+    pub kind: ClaimRejectionKind,
+}
+
+impl ClaimRejection {
+    /// Every non-scope rejection (iss/aud/sub/time-window/typed-gate/shape).
+    fn other(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            kind: ClaimRejectionKind::Other,
+        }
+    }
+
+    /// The single scope-missing site (`check_scope` failure) — the B5-4
+    /// auto-feedback surface: a provisioning fault surfaces as a
+    /// Forbidden-class immediate dead, never a hidden transient re-park.
+    fn scope_missing(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            kind: ClaimRejectionKind::ScopeMissing,
+        }
+    }
+}
+
+/// Structured classification of a claim rejection. `ScopeMissing` is the
+/// only Forbidden-class rejection; everything else stays Transient (IdP
+/// config drift self-heals on token refresh).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClaimRejectionKind {
+    /// The token grants no recognized scope shape containing the configured
+    /// audit scope — the client-credentials grant is missing the scope.
+    ScopeMissing,
+    /// Any other claim failure.
+    Other,
 }
 
 struct CachedToken {
@@ -182,8 +220,7 @@ impl AuditClient {
             // (JWKS unavailable) are Transient — requeue, never dead.
             self.verify_token_signature(&token).await?;
             if let Err(rejection) = self.validate_token_claims(&token) {
-                // Fail-closed: discard the unusable token and re-park the row
-                // (transient — the fault is IdP config drift, fixed by B5-4).
+                // Fail-closed: discard the unusable token and re-park the row.
                 crate::metrics::inc_token_rejection(
                     crate::metrics::classify_token_rejection(&rejection.reason),
                 );
@@ -192,10 +229,19 @@ impl AuditClient {
                     reason = %rejection.reason,
                     "audit token failed claim validation; no delivery attempted"
                 );
-                return Err(DeliveryError::Transient(anyhow!(
-                    "audit token claim validation failed: {}",
-                    rejection.reason
-                )));
+                return if rejection.kind == ClaimRejectionKind::ScopeMissing {
+                    // B5-4 auto-feedback: a token whose grant lacks the audit
+                    // scope is a provisioning fault — fail-closed immediate
+                    // dead (Forbidden-class, T-11), never an invisible
+                    // retry loop. The heartbeat never refreshes (no settle).
+                    Err(DeliveryError::ScopeRejected)
+                } else {
+                    // IdP config drift: transient — self-heals on token refresh.
+                    Err(DeliveryError::Transient(anyhow!(
+                        "audit token claim validation failed: {}",
+                        rejection.reason
+                    )))
+                };
             }
             let response = self
                 .http
@@ -286,11 +332,9 @@ impl AuditClient {
             || token.len() > MAX_ACCESS_TOKEN_BYTES
             || token.chars().any(char::is_control)
         {
-            return Err(ClaimRejection {
-                reason: "token has an invalid shape".into(),
-            });
+            return Err(ClaimRejection::other("token has an invalid shape"));
         }
-        let claims = decode_jwt_claims(token).map_err(|error| ClaimRejection { reason: error })?;
+        let claims = decode_jwt_claims(token).map_err(ClaimRejection::other)?;
         // Typed gate (leaf `ClientCredentialsGateClaims`, fail-closed deltas
         // ①–③): `sub`/`client_id` must be present strings; `iat`/`jti`, when
         // present, must be u64 / String — a fractional NumericDate `iat`
@@ -299,62 +343,56 @@ impl AuditClient {
         // dual-shape Value tolerance (string | array) so array-form `scope`
         // tokens keep delivering (delta ④ pin).
         if serde_json::from_value::<ClientCredentialsGateClaims>(claims.clone()).is_err() {
-            return Err(ClaimRejection {
-                reason: "token claims missing required fields (sub/client_id)".into(),
-            });
+            return Err(ClaimRejection::other(
+                "token claims missing required fields (sub/client_id)",
+            ));
         }
         let iss_present = claims.get(CLAIM_ISS).and_then(Value::as_str).is_some();
         if !check_issuer(&claims, &self.cc_cfg) {
-            return Err(ClaimRejection {
-                reason: if iss_present {
-                    "token iss does not match the configured issuer".into()
-                } else {
-                    "token has no iss claim".into()
-                },
-            });
+            return Err(ClaimRejection::other(if iss_present {
+                "token iss does not match the configured issuer"
+            } else {
+                "token has no iss claim"
+            }));
         }
         if !check_audience(&claims, &self.cc_cfg) {
-            return Err(ClaimRejection {
-                reason: "token aud does not contain the configured audience".into(),
-            });
+            return Err(ClaimRejection::other(
+                "token aud does not contain the configured audience",
+            ));
         }
         if !check_scope(&claims, &self.cc_cfg) {
-            return Err(ClaimRejection {
-                reason: "token scope does not contain the configured audit scope".into(),
-            });
+            // The single ScopeMissing site: no recognized scope shape grants
+            // the configured audit scope — the B5-4 auto-feedback surface.
+            return Err(ClaimRejection::scope_missing(
+                "token scope does not contain the configured audit scope",
+            ));
         }
         let sub_present = claims.get(CLAIM_SUB).and_then(Value::as_str).is_some();
         if !check_subject(&claims, &self.config.expected_sub) {
-            return Err(ClaimRejection {
-                reason: if sub_present {
-                    "token sub does not match the configured identity".into()
-                } else {
-                    "token has no sub claim".into()
-                },
-            });
+            return Err(ClaimRejection::other(if sub_present {
+                "token sub does not match the configured identity"
+            } else {
+                "token has no sub claim"
+            }));
         }
         // RFC 7519 NumericDate time window (validated-when-present, D1): the
         // leeway absorbs boundary clock skew; a non-numeric present value is
         // malformed and fails closed.
         let now_secs = now.unix_timestamp();
         if let Some(exp) = claims.get("exp") {
-            let exp = exp.as_f64().ok_or_else(|| ClaimRejection {
-                reason: "token exp is not a number".into(),
+            let exp = exp.as_f64().ok_or_else(|| {
+                ClaimRejection::other("token exp is not a number")
             })?;
             if exp <= (now_secs + TIME_CLAIM_LEEWAY_SECS) as f64 {
-                return Err(ClaimRejection {
-                    reason: "token has expired".into(),
-                });
+                return Err(ClaimRejection::other("token has expired"));
             }
         }
         if let Some(nbf) = claims.get("nbf") {
-            let nbf = nbf.as_f64().ok_or_else(|| ClaimRejection {
-                reason: "token nbf is not a number".into(),
+            let nbf = nbf.as_f64().ok_or_else(|| {
+                ClaimRejection::other("token nbf is not a number")
             })?;
             if nbf > (now_secs + TIME_CLAIM_LEEWAY_SECS) as f64 {
-                return Err(ClaimRejection {
-                    reason: "token is not yet valid".into(),
-                });
+                return Err(ClaimRejection::other("token is not yet valid"));
             }
         }
         Ok(())

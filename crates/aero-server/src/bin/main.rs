@@ -15,6 +15,7 @@
 mod boot;
 
 use aero_ai::AiWorker;
+use aero_audit_connector::heartbeat::HeartbeatRecorder as _;
 use aero_common::config::AppConfig;
 use aero_common::metrics as common_metrics;
 use aero_common::telemetry;
@@ -242,22 +243,76 @@ async fn main() -> anyhow::Result<()> {
         runtime.spawn(&tracker, ai_shutdown.clone());
     }
 
-    // ---------- Audit connector relay (B5-2) ----------
+    // ---------- Audit connector relay (B5-2 + B5-4) ----------
     // Presence-gated on AERO_AUDIT_TOKEN_ENDPOINT; any AERO_AUDIT_* variable
     // set while incomplete is a boot error (fail-loud). The relay claims only
     // the B5-1 governance outbox through the OutboxRepo seam and never touches
     // the v1 snaplink_delivery_outbox table; booting before the 0239 table
     // lands degrades to logged claim errors, not a crash.
+    //
+    // B5-4: the repo is wrapped in the heartbeat freshness decorator (settles
+    // are fail-closed while the durable provisioning row is absent/stale),
+    // with a one-shot bootstrap arm at spawn + a fixed 60s tick keeping the
+    // row fresh — liveness is traffic-independent (a quiet period can never
+    // stale the gate; worst case ~60s stale vs the 300s default freshness,
+    // and a missed tick self-heals on the next tick).
     match aero_audit_connector::config::RelayConfig::from_env() {
         Ok(Some(relay_cfg)) => {
-            let repo: Arc<dyn aero_audit_connector::outbox::OutboxRepo> = Arc::new(
-                aero_audit_connector::pg::PgOutboxRepo::new(persistence.pg.clone()),
+            let pool = persistence.pg.clone();
+            let inner: Arc<dyn aero_audit_connector::outbox::OutboxRepo> = Arc::new(
+                aero_audit_connector::pg::PgOutboxRepo::new(pool.clone()),
             );
+            let recorder = Arc::new(
+                aero_server::audit_relay_heartbeat::PgHeartbeatRecorder::new(
+                    aero_storage::audit_relay_provision::AuditRelayProvisionRepo::new(pool),
+                    relay_cfg.provision_freshness,
+                ),
+            );
+            let repo: Arc<dyn aero_audit_connector::outbox::OutboxRepo> = Arc::new(
+                aero_audit_connector::heartbeat::HeartbeatOutboxRepo::new(inner, recorder.clone()),
+            );
+            // Bootstrap arm (one-shot): arm the settle fence before the first
+            // event. Failure → warn and continue (fail-closed default: settles
+            // stay rejected until a heartbeat row exists). Bounded false-green
+            // ≤ provision_freshness.
+            if let Err(error) = recorder.record_heartbeat().await {
+                tracing::warn!(
+                    ?error,
+                    "audit relay bootstrap heartbeat failed; settles fail-closed until the row exists"
+                );
+            }
             let client = aero_audit_connector::client::AuditClient::new(relay_cfg.clone())
                 .context("initialize audit connector client")?;
             let relay = aero_audit_connector::relay::AuditRelay::new(repo, client, relay_cfg);
             tracker.spawn(relay.spawn(ai_shutdown.clone()));
-            info!("audit connector relay enabled");
+            // Tick-driven heartbeat (C-1): fixed 60s, independent of settle
+            // traffic and of the Tier-2 sampler's 300s cadence. With strict
+            // `age < freshness` (default 300s) the age can never reach the
+            // boundary (worst case ~60s stale), so the quiet-period permanent
+            // stall is structurally impossible; FM-B (no row, e.g. DB down at
+            // boot) self-heals ≤ next tick — this tick is the second creator
+            // path.
+            {
+                let heartbeat = recorder.clone();
+                let cancel = ai_shutdown.clone();
+                tracker.spawn(async move {
+                    let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    loop {
+                        tokio::select! {
+                            () = cancel.cancelled() => break,
+                            _ = tick.tick() => {}
+                        }
+                        if let Err(error) = heartbeat.record_heartbeat().await {
+                            tracing::warn!(
+                                ?error,
+                                "audit relay heartbeat tick failed; retrying next tick (FM-B)"
+                            );
+                        }
+                    }
+                });
+            }
+            info!("audit connector relay enabled (heartbeat-gated settles)");
         }
         Ok(None) => {}
         Err(error) => {

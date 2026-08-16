@@ -37,6 +37,7 @@ use std::time::Instant;
 
 use aero_common::metrics::{self, names};
 use aero_common::WorkspaceId;
+use aero_audit_connector::outbox::OutboxRepo as _;
 use axum::{
     extract::{MatchedPath, Request, State},
     http::{header, HeaderMap, StatusCode},
@@ -101,6 +102,57 @@ pub const PG_INDEX_SCANS_TOTAL: &str = "aero_pg_index_scans_total";
 pub const PG_IDLE_IN_TRANSACTION_COUNT: &str = "aero_pg_idle_in_transaction_count";
 /// Gauge: age in seconds of the oldest idle-in-transaction session.
 pub const PG_IDLE_IN_TRANSACTION_MAX_SECONDS: &str = "aero_pg_idle_in_transaction_max_seconds";
+
+// ---------------------------------------------------------------------------
+// B5-4 audit-outbox sampler gauges (fail-closed operational loop).
+// ---------------------------------------------------------------------------
+//
+// The B5-4 loop's observability face: the relay is presence-gated with no
+// runtime health signal, so a misconfigured/absent relay silently strands
+// `audit_governance_outbox` rows in status 0/1. These series make the stall
+// visible and fail closed (sampler_up 0 + errors_total + retained values,
+// never a fabricated zero snapshot).
+//
+// Multi-instance aggregation contract (HELP text): consumers must use `max()`
+// across instances — fail-safe stale-high (a dead instance's old values are
+// retained, so `max()` keeps the worst case visible); `sum()`/`avg()` are
+// wrong. The error counter is a per-instance COUNTER and aggregates with
+// `sum()`.
+
+/// Gauge (server-local name): `audit_governance_outbox` status-bucket counts,
+/// labeled `status` ∈ {enqueued, claimed, delivered, dead}. Tier-1 (30s)
+/// writes {enqueued, claimed} (exact counts); Tier-2 (slow) writes all four
+/// labels (exact counts). `{status="dead"}` is written ONLY by Tier-2 — the
+/// Tier-1 dead signal lives on the separate [`AUDIT_OUTBOX_DEAD_ROWS`] series
+/// so no label set mixes a 0/1 boolean with an exact count (single value
+/// domain per series, `max()` aggregation stays exact).
+pub const AUDIT_OUTBOX_STATUS: &str = "aero_audit_outbox_status";
+/// Gauge (server-local name): age in seconds of the oldest status-0 (pending)
+/// outbox row — exact `Q4_SQL` mirror (`min(available_at)`, status = 0) for
+/// CLI/sampler oracle parity. Series absent when no pending row (CLI "n/a"
+/// semantics).
+pub const AUDIT_OUTBOX_OLDEST_PENDING_SECS: &str = "aero_audit_outbox_oldest_pending_secs";
+/// Gauge (server-local name): age in seconds of the oldest status-1 (claimed)
+/// row — the FM-Q stall-claim visibility mirror (the same expression over
+/// status = 1). Settle-rejected rows live in status 1 (lease reclaim, never
+/// requeue), so a quiet-period stall is visible HERE, not in the pending
+/// series. Series absent when no claimed row.
+pub const AUDIT_OUTBOX_OLDEST_CLAIMED_SECS: &str = "aero_audit_outbox_oldest_claimed_secs";
+/// Gauge (server-local name): 1 = the last Tier-1 sample succeeded; 0 = it
+/// failed (prior values retained — never a fabricated zero snapshot).
+pub const AUDIT_OUTBOX_SAMPLER_UP: &str = "aero_audit_outbox_sampler_up";
+/// Gauge (server-local name): count of dead (status 3) rows. OWN series — the
+/// Tier-1 dead signal is a 0/1 flag (FM4 ≤ 1 tick visibility); the exact
+/// count also lands on `{status="dead"}` via Tier-2. Keeping the bool off the
+/// labeled status series preserves its `max()` aggregation contract.
+pub const AUDIT_OUTBOX_DEAD_ROWS: &str = "aero_audit_outbox_dead_rows";
+/// Counter (server-local name, per-instance): failed audit-outbox samples
+/// (Tier-1 + Tier-2). Aggregates with `sum()` (a counter, never `max()`).
+pub const AUDIT_OUTBOX_SAMPLE_ERRORS_TOTAL: &str = "aero_audit_outbox_sample_errors_total";
+/// Gauge (server-local name): on-disk size in bytes of `audit_governance_outbox`
+/// (the P-2 growth-surfacing companion to the bounded Q3 scan: growth is
+/// visible before it approaches `statement_timeout`).
+pub const AUDIT_OUTBOX_TABLE_SIZE_BYTES: &str = "aero_audit_outbox_table_size_bytes";
 
 /// The default set of indexes the size gauge samples — the hot, bloat-prone
 /// `messages` indexes touched by migration 0136 (partial GIN/HNSW slimming) plus
@@ -281,6 +333,98 @@ pub async fn sample_pg_health(pool: &sqlx::PgPool) -> PgHealthSample {
         Err(error) => tracing::warn!(%error, "PostgreSQL idle-transaction sample failed"),
     }
     sample
+}
+
+/// B5-4 Tier-1 (30s) read-only probe of the audit governance outbox. Any
+/// query failure fails the WHOLE sample (never a partial/all-zero assembly):
+/// the caller retains prior gauge values and flips `sampler_up` to 0 (F2).
+pub async fn sample_audit_outbox(
+    pool: &sqlx::PgPool,
+) -> Result<aero_audit_connector::outbox::VerdictProbe, aero_audit_connector::outbox::Error> {
+    let repo = aero_audit_connector::pg::PgOutboxRepo::new(pool.clone());
+    repo.verdict_probe().await
+}
+
+/// B5-4 Tier-2 (slow) full sample: the exact Q3 status-bucket mirror
+/// (CLI/sampler oracle parity) + the oldest-pending `Q4_SQL` mirror + the
+/// oldest-claimed (status 1) stall mirror + the table-size gauge input.
+/// `oldest_pending_secs`/`oldest_claimed_secs` are `None` when their status
+/// has no rows (series absent — CLI "n/a" semantics). Pure reads; any query
+/// failure fails the whole sample (the caller retains old values; Tier-1 is
+/// unaffected — the two tiers fail independently, FM10).
+pub async fn sample_audit_outbox_full(
+    pool: &sqlx::PgPool,
+) -> Result<
+    (
+        aero_audit_connector::outbox::StatusBuckets,
+        Option<i64>,
+        Option<i64>,
+        i64,
+    ),
+    aero_audit_connector::outbox::Error,
+> {
+    let repo = aero_audit_connector::pg::PgOutboxRepo::new(pool.clone());
+    let buckets = repo.status_buckets().await?;
+    // Exact Q4 mirror: `min(available_at)`, status = 0 → NULL over an empty
+    // set → `None` (the aero-eng CLI's "n/a" semantics, kept for parity).
+    let oldest_pending: Option<i64> = sqlx::query_scalar(
+        "SELECT extract(epoch FROM (clock_timestamp() - min(available_at)))::bigint
+           FROM audit_governance_outbox WHERE status = 0",
+    )
+    .fetch_one(pool)
+    .await?;
+    // FM-Q stall visibility: the same expression over status = 1 — the rows
+    // settle-rejection strands (lease reclaim, never requeue).
+    let oldest_claimed: Option<i64> = sqlx::query_scalar(
+        "SELECT extract(epoch FROM (clock_timestamp() - min(available_at)))::bigint
+           FROM audit_governance_outbox WHERE status = 1",
+    )
+    .fetch_one(pool)
+    .await?;
+    // P-2 growth companion: O(1) `pg_total_relation_size` so table growth is
+    // visible before the full GROUP BY approaches `statement_timeout`.
+    let table_bytes: Option<i64> =
+        sqlx::query_scalar("SELECT pg_total_relation_size('audit_governance_outbox')")
+            .fetch_one(pool)
+            .await?;
+    Ok((buckets, oldest_pending, oldest_claimed, table_bytes.unwrap_or(0)))
+}
+
+/// Parse `AERO__SERVER__AUDIT_OUTBOX_FULL_SAMPLE_SECS` (H-3 three-state
+/// table):
+/// * absent / empty → `Some(300)` (default);
+/// * `0` → `None` (disabled — one boot `info!`);
+/// * a valid positive integer → `Some(secs)`;
+/// * garbage / negative / overflow → **fail-closed disable**: `None` + one
+///   boot `error!` (a typo must not quintuple the most expensive sampler).
+///
+/// Read via `std::env::var` directly (mirroring the `AERO_INDEX_SIZE_SAMPLE_SECS`
+/// pattern): it must NOT live in the `AERO_AUDIT_*` namespace (the connector's
+/// stray-scan boot error fires for any such var without `AERO_AUDIT_TOKEN_ENDPOINT`,
+/// breaking the relay-absent harness boot) and must NOT go through figment's
+/// `AppConfig` (aero-common is the no-touch list; figment ignores unknown keys
+/// anyway).
+#[must_use]
+pub fn parse_audit_full_sample_secs() -> Option<u64> {
+    let Some(raw) = std::env::var("AERO__SERVER__AUDIT_OUTBOX_FULL_SAMPLE_SECS").ok() else {
+        return Some(300);
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Some(300);
+    }
+    match trimmed.parse::<u64>() {
+        Ok(0) => None,
+        Ok(secs) => Some(secs),
+        Err(_) => {
+            tracing::error!(
+                %trimmed,
+                "AERO__SERVER__AUDIT_OUTBOX_FULL_SAMPLE_SECS is not a positive integer; \
+                 the audit outbox Tier-2 full sampler is DISABLED (fail-closed)"
+            );
+            None
+        }
+    }
 }
 
 /// `/metrics` exposure policy, read from the environment.
@@ -793,5 +937,168 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(metrics::render_prometheus().contains(names::HTTP_REQUESTS_TOTAL));
+    }
+
+    // -----------------------------------------------------------------------
+    // B5-4 audit-outbox sampler (gauge-name pins + env parse table).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn audit_outbox_gauge_names_are_pinned() {
+        assert_eq!(AUDIT_OUTBOX_STATUS, "aero_audit_outbox_status");
+        assert_eq!(
+            AUDIT_OUTBOX_OLDEST_PENDING_SECS,
+            "aero_audit_outbox_oldest_pending_secs"
+        );
+        assert_eq!(
+            AUDIT_OUTBOX_OLDEST_CLAIMED_SECS,
+            "aero_audit_outbox_oldest_claimed_secs"
+        );
+        assert_eq!(AUDIT_OUTBOX_SAMPLER_UP, "aero_audit_outbox_sampler_up");
+        assert_eq!(AUDIT_OUTBOX_DEAD_ROWS, "aero_audit_outbox_dead_rows");
+        assert_eq!(
+            AUDIT_OUTBOX_SAMPLE_ERRORS_TOTAL,
+            "aero_audit_outbox_sample_errors_total"
+        );
+        assert_eq!(
+            AUDIT_OUTBOX_TABLE_SIZE_BYTES,
+            "aero_audit_outbox_table_size_bytes"
+        );
+    }
+
+    /// H-3 env parse table (no PG): absent → default 300; "0" → disable
+    /// (None); valid positive → Some; garbage / negative / overflow →
+    /// fail-closed disable (None). Env is snapshotted/restored around each
+    /// case.
+    #[test]
+    fn parse_audit_full_sample_secs_pins_the_three_state_table() {
+        const KEY: &str = "AERO__SERVER__AUDIT_OUTBOX_FULL_SAMPLE_SECS";
+        let saved = std::env::var(KEY).ok();
+        let run = |value: Option<&str>| {
+            match value {
+                Some(v) => std::env::set_var(KEY, v),
+                None => std::env::remove_var(KEY),
+            }
+            let parsed = parse_audit_full_sample_secs();
+            match value {
+                Some(v) => std::env::set_var(KEY, v),
+                None => std::env::remove_var(KEY),
+            }
+            parsed
+        };
+        // Absent → default 300.
+        assert_eq!(run(None), Some(300));
+        // Empty string → default 300 (figment-style tolerance).
+        assert_eq!(run(Some("")), Some(300));
+        // 0 → disabled.
+        assert_eq!(run(Some("0")), None);
+        // Valid positive → interval.
+        assert_eq!(run(Some("60")), Some(60));
+        assert_eq!(run(Some("300")), Some(300));
+        // Garbage / negative / overflow → fail-closed disable (never a
+        // default that quintuples the most expensive sampler).
+        assert_eq!(run(Some("not-a-number")), None);
+        assert_eq!(run(Some("-5")), None);
+        assert_eq!(run(Some("99999999999999999999999999")), None);
+        // Restore.
+        match saved {
+            Some(v) => std::env::set_var(KEY, v),
+            None => std::env::remove_var(KEY),
+        }
+    }
+
+    /// R2.4 — PG-gated full sampler: seed {1 status=0 backdated 600s, 1
+    /// status=2} → `sample_audit_outbox` = {1, 0, false}; full = buckets
+    /// {1, 0, 1, 0} + `oldest_pending ≥ 600` (FM11 probe determinism) +
+    /// `oldest_claimed None` + a positive table-size byte count. Read-only:
+    /// both probes must not mutate any row.
+    #[tokio::test]
+    #[ignore = "requires live Postgres (DATABASE_URL)"]
+    async fn audit_outbox_full_sampler_pins_backdated_pending() {
+        use aero_audit_connector::outbox::{StatusBuckets, VerdictProbe};
+
+        let url = std::env::var("DATABASE_URL")
+            .expect("DATABASE_URL must point at a throwaway Postgres");
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect_lazy(&url)
+            .expect("well-formed DATABASE_URL");
+        sqlx::query("TRUNCATE audit_governance_outbox")
+            .execute(&pool)
+            .await
+            .expect("reset the governance outbox");
+        let pending_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            r"INSERT INTO audit_governance_outbox
+                    (event_id, payload, status, attempts, priority,
+                     available_at, created_at)
+              VALUES ($1, $2, 0, 0, 10,
+                      clock_timestamp() - make_interval(secs => 600),
+                      clock_timestamp() - make_interval(secs => 600))",
+        )
+        .bind(pending_id)
+        .bind(serde_json::json!({
+            "event_id": pending_id.to_string(),
+            "source_system": "aero-im.source",
+            "action": "admin.content.flag",
+        }))
+        .execute(&pool)
+        .await
+        .expect("seed backdated pending row");
+        let delivered_id = uuid::Uuid::new_v4();
+        sqlx::query(
+            r"INSERT INTO audit_governance_outbox
+                    (event_id, payload, status, attempts)
+              VALUES ($1, $2, 2, 0)",
+        )
+        .bind(delivered_id)
+        .bind(serde_json::json!({
+            "event_id": delivered_id.to_string(),
+            "source_system": "aero-im.source",
+            "action": "admin.content.flag",
+        }))
+        .execute(&pool)
+        .await
+        .expect("seed delivered row");
+
+        let probe = sample_audit_outbox(&pool)
+            .await
+            .expect("Tier-1 probe must not fabricate a zero");
+        assert_eq!(
+            probe,
+            VerdictProbe { enqueued: 1, claimed: 0, has_dead: false },
+            "Tier-1 probe sees the pending row only"
+        );
+        let (buckets, oldest_pending, oldest_claimed, table_bytes) =
+            sample_audit_outbox_full(&pool).await.expect("Tier-2 full sample");
+        assert_eq!(
+            buckets,
+            StatusBuckets { enqueued: 1, claimed: 0, delivered: 1, dead: 0 },
+            "Tier-2 buckets mirror the seeded distribution"
+        );
+        let pending = oldest_pending.expect("a status-0 row exists");
+        assert!(
+            pending >= 600,
+            "backdated pending row must report age >= 600s (got {pending})"
+        );
+        assert_eq!(
+            oldest_claimed, None,
+            "no status-1 row → the oldest-claimed series is absent"
+        );
+        assert!(table_bytes > 0, "table-size gauge carries a real size");
+
+        // Read-only pin: the rows are untouched by both probes.
+        let mut statuses: Vec<i32> = sqlx::query_scalar(
+            "SELECT status FROM audit_governance_outbox ORDER BY event_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .expect("row statuses");
+        statuses.sort_unstable();
+        assert_eq!(statuses, vec![0, 2], "probes must never mutate state");
+        sqlx::query("TRUNCATE audit_governance_outbox")
+            .execute(&pool)
+            .await
+            .expect("reset the governance outbox");
     }
 }

@@ -217,6 +217,196 @@ pub(crate) fn spawn_all(
         });
     }
 
+    // B5-4 audit-outbox sampler — Tier-1 (30s) verdict probe: enqueued /
+    // claimed counts (exact) + the dead-rows 0/1 signal + sampler_up. Any
+    // query error → no bucket writes (old values retained), sampler_up 0,
+    // errors+1, one warn (FM1/FM2 fail-closed posture — never a fabricated
+    // zero snapshot). Never emits `verdict:`-prefixed lines (acceptance #1).
+    {
+        let pool = state.pg.clone();
+        let cancel = ai_shutdown.clone();
+        common_metrics::global().register_help(
+            aero_server::metrics::AUDIT_OUTBOX_STATUS,
+            common_metrics::MetricKind::Gauge,
+            "Audit governance outbox (0239) status-bucket counts (label status \
+             \u{2208} enqueued|claimed|delivered|dead). Multi-instance aggregation: \
+             max() (fail-safe stale-high); sum()/avg() are wrong.",
+        );
+        common_metrics::global().register_help(
+            aero_server::metrics::AUDIT_OUTBOX_DEAD_ROWS,
+            common_metrics::MetricKind::Gauge,
+            "Audit governance outbox dead (status 3) row flag/count. Own series: \
+             the Tier-1 dead signal is a 0/1 flag; the exact count also lands on \
+             {status=\"dead\"} via the Tier-2 sampler. Aggregation: max().",
+        );
+        common_metrics::global().register_help(
+            aero_server::metrics::AUDIT_OUTBOX_OLDEST_PENDING_SECS,
+            common_metrics::MetricKind::Gauge,
+            "Age in seconds of the oldest status-0 (pending) audit outbox row \
+             (min(available_at)); absent when no pending row. Aggregation: max().",
+        );
+        common_metrics::global().register_help(
+            aero_server::metrics::AUDIT_OUTBOX_OLDEST_CLAIMED_SECS,
+            common_metrics::MetricKind::Gauge,
+            "Age in seconds of the oldest status-1 (claimed) audit outbox row — \
+             FM-Q stall visibility; absent when no claimed row. Aggregation: max().",
+        );
+        common_metrics::global().register_help(
+            aero_server::metrics::AUDIT_OUTBOX_SAMPLER_UP,
+            common_metrics::MetricKind::Gauge,
+            "1 = last Tier-1 audit outbox sample succeeded; 0 = failed (prior \
+             values retained). Aggregation: min() across instances (any \
+             instance failing is a signal).",
+        );
+        common_metrics::global().register_help(
+            aero_server::metrics::AUDIT_OUTBOX_SAMPLE_ERRORS_TOTAL,
+            common_metrics::MetricKind::Counter,
+            "Per-instance count of failed audit outbox samples (Tier-1 + \
+             Tier-2). Aggregation: sum() (a counter — max() is wrong).",
+        );
+        common_metrics::global().register_help(
+            aero_server::metrics::AUDIT_OUTBOX_TABLE_SIZE_BYTES,
+            common_metrics::MetricKind::Gauge,
+            "On-disk size in bytes of audit_governance_outbox (growth surfaces \
+             before the Tier-2 full scan approaches statement_timeout). Aggregation: max().",
+        );
+        tracker.spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    () = cancel.cancelled() => break,
+                    _ = tick.tick() => {}
+                }
+                match aero_server::metrics::sample_audit_outbox(&pool).await {
+                    Ok(probe) => {
+                        // Gauge counts are far below 2^53; the narrowing is exact in practice.
+                        #[allow(clippy::cast_precision_loss)]
+                        {
+                            common_metrics::set_gauge_labeled(
+                                aero_server::metrics::AUDIT_OUTBOX_STATUS,
+                                probe.enqueued as f64,
+                                &[("status", "enqueued")],
+                            );
+                            common_metrics::set_gauge_labeled(
+                                aero_server::metrics::AUDIT_OUTBOX_STATUS,
+                                probe.claimed as f64,
+                                &[("status", "claimed")],
+                            );
+                        }
+                        common_metrics::set_gauge(
+                            aero_server::metrics::AUDIT_OUTBOX_DEAD_ROWS,
+                            if probe.has_dead { 1.0 } else { 0.0 },
+                        );
+                        common_metrics::set_gauge(aero_server::metrics::AUDIT_OUTBOX_SAMPLER_UP, 1.0);
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "audit outbox Tier-1 sample failed; prior gauge values retained (FM2)"
+                        );
+                        common_metrics::set_gauge(aero_server::metrics::AUDIT_OUTBOX_SAMPLER_UP, 0.0);
+                        common_metrics::inc_counter(aero_server::metrics::AUDIT_OUTBOX_SAMPLE_ERRORS_TOTAL, 1);
+                    }
+                }
+            }
+        });
+    }
+
+    // B5-4 audit-outbox sampler — Tier-2 (slow) full sample. Interval from
+    // `AERO__SERVER__AUDIT_OUTBOX_FULL_SAMPLE_SECS` (H-3): 0 = disable (one
+    // boot info); valid positive = interval; garbage/negative/overflow =
+    // fail-closed disable + one boot error (a typo cannot quintuple the most
+    // expensive sampler). Err → warn + old values retained; Tier-1 unaffected
+    // (FM10). Log posture: steady-state healthy ticks log nothing.
+    {
+        let interval_secs = aero_server::metrics::parse_audit_full_sample_secs();
+        match interval_secs {
+            Some(secs) => {
+                tracing::info!(
+                    interval_secs = secs,
+                    "audit outbox Tier-2 full sampler enabled"
+                );
+                let pool = state.pg.clone();
+                let cancel = ai_shutdown.clone();
+                tracker.spawn(async move {
+                    let mut tick = tokio::time::interval(std::time::Duration::from_secs(secs));
+                    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    loop {
+                        tokio::select! {
+                            () = cancel.cancelled() => break,
+                            _ = tick.tick() => {}
+                        }
+                        match aero_server::metrics::sample_audit_outbox_full(&pool).await {
+                            Ok((buckets, oldest_pending, oldest_claimed, table_bytes)) => {
+                                // Gauge counts are far below 2^53; the narrowing is exact in practice.
+                                #[allow(clippy::cast_precision_loss)]
+                                {
+                                    common_metrics::set_gauge_labeled(
+                                        aero_server::metrics::AUDIT_OUTBOX_STATUS,
+                                        buckets.enqueued as f64,
+                                        &[("status", "enqueued")],
+                                    );
+                                    common_metrics::set_gauge_labeled(
+                                        aero_server::metrics::AUDIT_OUTBOX_STATUS,
+                                        buckets.claimed as f64,
+                                        &[("status", "claimed")],
+                                    );
+                                    common_metrics::set_gauge_labeled(
+                                        aero_server::metrics::AUDIT_OUTBOX_STATUS,
+                                        buckets.delivered as f64,
+                                        &[("status", "delivered")],
+                                    );
+                                    common_metrics::set_gauge_labeled(
+                                        aero_server::metrics::AUDIT_OUTBOX_STATUS,
+                                        buckets.dead as f64,
+                                        &[("status", "dead")],
+                                    );
+                                }
+                                if let Some(secs) = oldest_pending {
+                                    // Gauge counts are far below 2^53; the narrowing is exact in practice.
+                                    #[allow(clippy::cast_precision_loss)]
+                                    common_metrics::set_gauge(
+                                        aero_server::metrics::AUDIT_OUTBOX_OLDEST_PENDING_SECS,
+                                        secs as f64,
+                                    );
+                                }
+                                if let Some(secs) = oldest_claimed {
+                                    #[allow(clippy::cast_precision_loss)]
+                                    common_metrics::set_gauge(
+                                        aero_server::metrics::AUDIT_OUTBOX_OLDEST_CLAIMED_SECS,
+                                        secs as f64,
+                                    );
+                                }
+                                #[allow(clippy::cast_precision_loss)]
+                                common_metrics::set_gauge(
+                                    aero_server::metrics::AUDIT_OUTBOX_TABLE_SIZE_BYTES,
+                                    table_bytes as f64,
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    "audit outbox Tier-2 full sample failed; prior values retained (FM10)"
+                                );
+                                common_metrics::inc_counter(
+                                    aero_server::metrics::AUDIT_OUTBOX_SAMPLE_ERRORS_TOTAL,
+                                    1,
+                                );
+                            }
+                        }
+                    }
+                });
+            }
+            None => {
+                tracing::info!(
+                    "audit outbox Tier-2 full sampler disabled \
+                     (AERO__SERVER__AUDIT_OUTBOX_FULL_SAMPLE_SECS unset/0/invalid)"
+                );
+            }
+        }
+    }
+
     // NATS consumer backlog gauges
     {
         let js = jetstream.clone();

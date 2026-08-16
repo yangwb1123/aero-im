@@ -9,6 +9,7 @@ pub mod ai_job;
 pub mod ai_usage;
 pub mod audit;
 pub mod audit_governance;
+pub mod audit_relay_provision;
 pub mod blob;
 pub mod blob_store;
 pub mod block_interaction;
@@ -149,6 +150,7 @@ pub use ai_usage::{
     UsageFinalizeOutcome, UsageOutcome, UsageReservation, UsageReserveOutcome, UsageRow,
 };
 pub use audit::{events_to_csv, AuditEvent, AuditRepo, AUDIT_CSV_HEADER};
+pub use audit_relay_provision::{AuditRelayProvisionRepo, ProvisionCheck};
 pub use blob::{BlobRepo, BlobStorageScope, NewBlob};
 pub use blob_store::{BlobStore, BlobStoreError, LocalFsBlobStore};
 pub use block_interaction::{BlockInteraction, BlockInteractionRepo};

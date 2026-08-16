@@ -38,6 +38,7 @@ fn config(stub: &StubSink) -> RelayConfig {
         batch_size: 100,
         concurrency: 4,
         jwks_uri: None,
+        provision_freshness: std::time::Duration::from_secs(300),
     }
 }
 

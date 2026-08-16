@@ -166,6 +166,7 @@ async fn run() -> anyhow::Result<()> {
         batch_size: 100,
         concurrency: 4,
         jwks_uri: None,
+        provision_freshness: std::time::Duration::from_secs(300),
     };
 
     // Seed N enqueued rows (status 0, due now, 1:1 event_id with the audit
