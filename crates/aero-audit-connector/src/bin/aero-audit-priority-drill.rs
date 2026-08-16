@@ -671,9 +671,16 @@ mod tests {
     /// `outbound_vocabulary_is_the_contract_pair`, so no new literal site).
     #[test]
     fn delivered_sibling_spelling_is_rejected() {
-        assert!(!delivered_moderation_action_is_pinned(Some(
-            MODERATION_OUTBOUND_ACTIONS[1]
-        )));
+        // The sibling is "the OTHER contract member" — derived from the pair,
+        // never hardcoded, so a coordinated flip (index 0 becomes the
+        // sibling) keeps this green (A1.3 executable, scripts/coordinated-flip-drill.sh).
+        let sibling = MODERATION_OUTBOUND_ACTIONS
+            .iter()
+            .copied()
+            .find(|candidate| *candidate != MODERATION_OUTBOUND_ACTION)
+            .expect("the pair has exactly two distinct members");
+        assert_ne!(sibling, MODERATION_OUTBOUND_ACTION);
+        assert!(!delivered_moderation_action_is_pinned(Some(sibling)));
     }
 
     /// A missing/NULL delivered action is rejected — never a no-op pass.

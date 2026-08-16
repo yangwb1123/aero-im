@@ -152,6 +152,16 @@ impl AuditClass {
 /// and the drill's exact-equality bail red a partial flip).
 pub const MODERATION_OUTBOUND_ACTION: &str = "admin.content.flag";
 
+/// The two contract-legal outbound spellings, in canonical order: index 0 =
+/// the pinned [`MODERATION_OUTBOUND_ACTION`], index 1 = the sibling. A
+/// coordinated flip swaps the members (index 0 becomes the sibling) — the
+/// single vocabulary both the priority drill's pair and the
+/// `claim_validation` drift twin derive their "the other spelling" from, so
+/// A1.3 (scripts/coordinated-flip-drill.sh) stays executable without a
+/// third hardcoded copy.
+pub const MODERATION_OUTBOUND_VOCABULARY: [&str; 2] =
+    ["admin.content.flag", "admin.moderation.action"];
+
 /// Local audit token produced by every moderation finalize producer
 /// (`AiWorker::handle_moderate`, `ImService::moderate_delete`, report
 /// review). Call sites spell the token through this name, never a bare

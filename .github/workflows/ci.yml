@@ -49,6 +49,11 @@ jobs:
       # it explicit prevents `--lib` from silently dropping the authorization
       # lint from CI.
       - run: cargo test -p aero-server --test authz_lint --locked
+      # B5-1 dual-moderation pin (design gate F1): the claim_validation
+      # integration tests (tests/ target) and the drill's unit pins (bin
+      # target) are hermetic — `--lib` never runs them, so they must be
+      # explicit or the moderation-token pin never executes in CI.
+      - run: cargo test -p aero-audit-connector --tests --bins --locked
 
   integration:
     name: Integration tests (PostgreSQL)
