@@ -381,7 +381,7 @@ if [ -z "$SKIP_DB_CREATE" ]; then
             cargo run --bin aero-cli -- migrate 2>&1 | tail -1
         echo "▶ Running audit connector relay drill (A3)..."
         DATABASE_URL="$AUDIT_DRILL_URL" \
-            cargo run --quiet -p aero-audit-connector --bin aero-audit-relay-drill
+            cargo run --quiet --locked -p aero-audit-connector --bin aero-audit-relay-drill
         drop_created_database "$AUDIT_CONNECTOR_INTEGRATION_DB"
         echo "✓ Audit connector drill passed (status 2 == N, event_id parity)"
         b5_check "a3-relay-drill" "PASS"
@@ -407,7 +407,7 @@ if [ -z "$SKIP_DB_CREATE" ]; then
             cargo run --bin aero-cli -- migrate 2>&1 | tail -1
         echo "▶ Running T-11 fail-closed drill (relay absent ⇒ rows stay pending)..."
         DATABASE_URL="$T11_DRILL_URL" \
-            cargo run --quiet -p aero-audit-connector --bin aero-audit-t11-drill
+            cargo run --quiet --locked -p aero-audit-connector --bin aero-audit-t11-drill
         # B5-4 provisioning seam (T-11 leg 2): when the sibling's
         # audit-provision-check command has landed, the same relay-absent DB
         # must refuse any audit:event:write grant (fail-closed) — non-zero
@@ -542,7 +542,7 @@ if [ -z "$SKIP_DB_CREATE" ]; then
         set +e
         AERO_PRIORITY_DRILL_ALLOW_TRUNCATE=0 \
             DATABASE_URL="$PRIORITY_DRILL_URL" \
-            cargo run --quiet -p aero-audit-connector --bin aero-audit-priority-drill \
+            cargo run --quiet --locked -p aero-audit-connector --bin aero-audit-priority-drill \
             >"$NEGATIVE_DRILL_LOG" 2>&1
         NEG_RC=$?
         set -e
@@ -674,7 +674,7 @@ if [ -z "$SKIP_DB_CREATE" ]; then
             cargo run --bin aero-cli -- migrate 2>&1 | tail -1
         echo "▶ Running L1 parity drill (self-seeded through the 0242 trigger)..."
         DATABASE_URL="$L1_PARITY_URL" \
-            cargo run --quiet -p aero-audit-connector --bin aero-audit-l1-parity-drill
+            cargo run --quiet --locked -p aero-audit-connector --bin aero-audit-l1-parity-drill
         drop_created_database "$L1_PARITY_DB"
         echo "✓ L1 parity drill passed (SUM(count) == COUNT(mapped audit), spill leg balanced)"
         b5_check "l1-aggregation-drill" "PASS"

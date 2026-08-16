@@ -54,6 +54,11 @@ jobs:
       # target) are hermetic — `--lib` never runs them, so they must be
       # explicit or the moderation-token pin never executes in CI.
       - run: cargo test -p aero-audit-connector --tests --bins --locked
+      # B5-1 registry guard (SRE F-2, the F-1 twin): test-b5-pin-guard.sh is
+      # hermetic (pure bash, no DB) and exercises the 47-slot pin guard this
+      # change mutated — it must execute in CI, not only inside
+      # test-integration.sh.
+      - run: bash scripts/test-b5-pin-guard.sh
 
   integration:
     name: Integration tests (PostgreSQL)
