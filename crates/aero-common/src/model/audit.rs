@@ -227,6 +227,20 @@ pub const LOCAL_ACTION_ROOM_ARCHIVED: &str = "room.archived";
 /// load-bearing).
 pub const LOCAL_ACTION_MESSAGE_RECALLED: &str = "message.recalled";
 
+// ---- Message-delete vocabulary (R-D2 Rust writer) ----
+// `message.deleted` is NOT trigger-owned (0245/0246 headers declare the
+// carve-out): the governance outbox row is produced by the Rust writer
+// (`AuditGovernanceOutboxRepo::append_message_delete_in_tx`) from the
+// soft-delete choke point — never by an AFTER-INSERT allowlist.
+
+/// R-D2: user-delete token. NOT trigger-owned (0245/0246 carve-out); the
+/// governance outbox row is produced by the Rust writer
+/// (`AuditGovernanceOutboxRepo::append_message_delete_in_tx`) from the
+/// soft-delete choke point — never by an AFTER-INSERT allowlist. Stays
+/// UNMAPPED in `governance_lane_for` (aero-ai) — the writer is a direct
+/// outbox write, not a lane mapping.
+pub const LOCAL_ACTION_MESSAGE_DELETED: &str = "message.deleted";
+
 // ---- Class derived aliases ----
 // Keep the `aero_ai::governance::GOVERNANCE_CLASS_*` chain and the 0239 DDL
 // comment pins textually stable while the definition lives here (the leaf is
@@ -264,6 +278,34 @@ pub const AUDIT_SCHEMA_ID: &str = "aero.im.security";
 pub const AUDIT_SCHEMA_VERSION: u32 = 1;
 pub const AUDIT_AGGREGATE_TYPE: &str = "workspace";
 pub const AUDIT_OUTCOME_SUCCESS: &str = "success";
+
+/// Canonical `occurred_at` wire spelling shared by every Rust producer of
+/// the 0239 envelope (R-D2 §10.4): PG renders `timestamptz → jsonb` as
+/// ISO-8601-with-offset with `+00:00` (never `Z`) and a trailing-zero-\
+/// trimmed subsecond fraction that is omitted when zero (e.g.
+/// `2026-08-15T12:34:56.123456+00:00`, `…56.5+00:00`, `…56+00:00`) — the
+/// `time` crate's `Rfc3339` well-known format instead emits `Z`, which
+/// drifts the wire contract vs trigger-produced rows. The 0239 trigger's
+/// `jsonb_build_object('occurred_at', NEW.created_at)` and this helper are
+/// the single canonical spelling; AC-3 byte-asserts both sides against it.
+#[must_use]
+pub fn audit_wire_occurred_at(ts: time::OffsetDateTime) -> String {
+    // `[subsecond digits:1+]` reproduces PG's trailing-zero trim exactly
+    // (`.000010` → `.00001`); a zero subsecond renders no fraction at all
+    // (PG: `…56+00:00`, never `…56.0+00:00`) — hence the two format items.
+    static WITH_FRACTION: &[time::format_description::BorrowedFormatItem<'static>] =
+        time::macros::format_description!(
+            "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:1+]+00:00"
+        );
+    static WITHOUT_FRACTION: &[time::format_description::BorrowedFormatItem<'static>] =
+        time::macros::format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]+00:00");
+    let utc = ts.to_offset(time::UtcOffset::UTC);
+    if utc.nanosecond() == 0 {
+        utc.format(WITHOUT_FRACTION).expect("offset datetime formats")
+    } else {
+        utc.format(WITH_FRACTION).expect("offset datetime formats")
+    }
+}
 pub const AUDIT_DATA_CLASSIFICATION: &str = "confidential";
 pub const AUDIT_RETENTION_CLASS: &str = "security";
 pub const AUDIT_ACTOR_TYPE_SYSTEM: &str = "system";
@@ -563,8 +605,36 @@ mod tests {
             "the recall token is disjoint from the moderation token"
         );
         assert_ne!(
-            LOCAL_ACTION_MESSAGE_RECALLED, "message.deleted",
-            "the recall token is disjoint from the R-D2-excluded message.deleted token"
+            LOCAL_ACTION_MESSAGE_RECALLED, LOCAL_ACTION_MESSAGE_DELETED,
+            "the recall token is disjoint from the R-D2 message.deleted token"
+        );
+        assert_eq!(
+            LOCAL_ACTION_MESSAGE_DELETED, "message.deleted",
+            "R-D2 delete token value pin (leaf single definition)"
+        );
+        assert_ne!(
+            LOCAL_ACTION_MESSAGE_DELETED, LOCAL_ACTION_MESSAGE_CREATE,
+            "the delete token is disjoint from the L1 allowlist tokens"
+        );
+        assert_ne!(
+            LOCAL_ACTION_MESSAGE_DELETED, LOCAL_ACTION_MESSAGE_EDIT,
+            "the delete token is disjoint from the L1 allowlist tokens"
+        );
+        assert_ne!(
+            LOCAL_ACTION_MESSAGE_DELETED, LOCAL_ACTION_MODERATED,
+            "the delete token is disjoint from the moderation token (exact-token gate)"
+        );
+        assert_ne!(
+            LOCAL_ACTION_MESSAGE_DELETED, LOCAL_ACTION_ROOM_CREATE,
+            "the delete token is disjoint from the room tokens"
+        );
+        assert_ne!(
+            LOCAL_ACTION_MESSAGE_DELETED, LOCAL_ACTION_ROOM_ARCHIVED,
+            "the delete token is disjoint from the room tokens"
+        );
+        assert_ne!(
+            LOCAL_ACTION_MESSAGE_DELETED, LOCAL_ACTION_MESSAGE_RECALLED,
+            "the delete token is disjoint from the recall token"
         );
         assert_ne!(
             LOCAL_ACTION_MESSAGE_RECALLED, LOCAL_ACTION_MESSAGE_CREATE,
@@ -587,7 +657,7 @@ mod tests {
             AuditActor::system(),
             vec![],
             "0195b7d3-5a11-7000-8000-000000000002".to_owned(),
-            "message.deleted".to_owned(),
+            LOCAL_ACTION_MESSAGE_DELETED.to_owned(),
             serde_json::json!({ "reason": "spam" }),
         )
     }
@@ -691,5 +761,55 @@ mod tests {
         assert_eq!(target.kind, "resource");
         assert_eq!(AuditActor::system().kind, AUDIT_ACTOR_TYPE_SYSTEM);
         assert_eq!(AuditActor::system().id, "system");
+    }
+
+    /// R-D2 §10.4: the canonical `occurred_at` wire spelling — the PG
+    /// `timestamptz → jsonb` text form (`+00:00` offset, trailing-zero-\
+    /// trimmed fraction, omitted when zero). A `Z` suffix, a padded
+    /// fraction, or a dangling `.0` reds here — the drift
+    /// `audit_wire_occurred_at` exists to kill (the `time` crate's Rfc3339
+    /// emits `Z`). Values pinned against live PG output verified at design
+    /// time (docker `aero-postgres`): `.5` → `.5`, `.120000` → `.12`,
+    /// `.000010` → `.00001`, zero → no fraction.
+    #[test]
+    fn audit_wire_occurred_at_canonical_spelling() {
+        let parse = |s: &str| {
+            time::OffsetDateTime::parse(
+                s,
+                &time::format_description::well_known::Rfc3339,
+            )
+            .expect("fixed ts")
+        };
+        assert_eq!(
+            audit_wire_occurred_at(parse("2026-08-15T12:34:56Z")),
+            "2026-08-15T12:34:56+00:00",
+            "zero subsecond → no fraction (PG never emits .0)"
+        );
+        assert_eq!(
+            audit_wire_occurred_at(parse("2026-08-15T12:34:56.5Z")),
+            "2026-08-15T12:34:56.5+00:00",
+            "single digit, never padded"
+        );
+        assert_eq!(
+            audit_wire_occurred_at(parse("2026-08-15T12:34:56.123456Z")),
+            "2026-08-15T12:34:56.123456+00:00",
+            "full microseconds"
+        );
+        assert_eq!(
+            audit_wire_occurred_at(parse("2026-08-15T12:34:56.120000Z")),
+            "2026-08-15T12:34:56.12+00:00",
+            "trailing zeros trimmed (PG trim, never padded)"
+        );
+        assert_eq!(
+            audit_wire_occurred_at(parse("2026-08-15T12:34:56.000010Z")),
+            "2026-08-15T12:34:56.00001+00:00",
+            "internal zeros preserved, only trailing trimmed"
+        );
+        // A non-UTC input is normalized to +00:00 (PG renders UTC).
+        assert_eq!(
+            audit_wire_occurred_at(parse("2026-08-15T12:34:56.5+02:00")),
+            "2026-08-15T10:34:56.5+00:00",
+            "offset normalized to UTC"
+        );
     }
 }

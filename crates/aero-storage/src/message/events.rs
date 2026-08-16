@@ -2,6 +2,7 @@
 
 use aero_common::{
     Block, Error, Message, MessageEditId, MessageId, ParticipantId, RoomEvent, RoomId, WorkspaceId,
+    LOCAL_ACTION_MESSAGE_DELETED,
 };
 use sqlx::{Postgres, Transaction};
 
@@ -334,15 +335,33 @@ impl MessageRepo {
         Self::enqueue_unreferenced_blobs_in_tx(tx, &blob_ids).await?;
 
         if let (Some(workspace), Some(action)) = (workspace, audit_action) {
-            crate::audit::AuditRepo::append_in_tx(
+            let audit_id = crate::audit::AuditRepo::append_in_tx(
                 tx,
                 workspace,
                 audit_actor,
                 action,
                 Some(&id.to_string()),
-                detail,
+                detail.clone(),
             )
             .await?;
+            // Exact-token gate (trigger discipline: never a prefix). The
+            // writer is fail-closed (a lost outbox row aborts the delete,
+            // mirroring AFTER-trigger abort semantics) and fires only for
+            // `message.deleted` — `message.moderated` deletes keep the 0239
+            // admin/100 trigger path untouched, `message.recalled` the 0246
+            // trigger (R-D2 0245/0246 carve-out). The audit append precedes
+            // the writer so an audit failure still aborts first (F1).
+            if action == LOCAL_ACTION_MESSAGE_DELETED {
+                crate::audit_governance::outbox::AuditGovernanceOutboxRepo::append_message_delete_in_tx(
+                    tx,
+                    audit_id,
+                    workspace,
+                    audit_actor,
+                    Some(&id.to_string()),
+                    detail,
+                )
+                .await?;
+            }
         }
 
         let room_id = existing.room_id;
@@ -619,7 +638,7 @@ mod db_tests {
                 message_id,
                 Some(WorkspaceId::new()),
                 Some(participant.id),
-                Some("message.deleted"),
+                Some(LOCAL_ACTION_MESSAGE_DELETED),
                 serde_json::json!({}),
                 participant.id,
                 None,

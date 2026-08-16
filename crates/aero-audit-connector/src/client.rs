@@ -184,6 +184,9 @@ impl AuditClient {
             if let Err(rejection) = self.validate_token_claims(&token) {
                 // Fail-closed: discard the unusable token and re-park the row
                 // (transient — the fault is IdP config drift, fixed by B5-4).
+                crate::metrics::inc_token_rejection(
+                    crate::metrics::classify_token_rejection(&rejection.reason),
+                );
                 self.invalidate_token(&token).await;
                 warn!(
                     reason = %rejection.reason,
@@ -370,10 +373,10 @@ impl AuditClient {
             return Ok(());
         };
         let Ok(header) = jsonwebtoken::decode_header(token) else {
-            return Err(self.signature_rejected(token).await);
+            return Err(self.signature_rejected(token, "malformed").await);
         };
         if header.alg != Algorithm::RS256 {
-            return Err(self.signature_rejected(token).await);
+            return Err(self.signature_rejected(token, "unsupported_alg").await);
         }
         let key = match keys
             .decoding_key_fallible(header.kid.as_deref(), Algorithm::RS256)
@@ -382,7 +385,7 @@ impl AuditClient {
             Ok(Some(key)) => key,
             // Genuine unknown-kid (even after the key source refreshed): the
             // permanent plane — requeue once then dead.
-            Ok(None) => return Err(self.signature_rejected(token).await),
+            Ok(None) => return Err(self.signature_rejected(token, "unknown_key").await),
             // The key-source mechanism is unavailable (fetch/refresh
             // failure): the transient plane — requeue forever, never dead.
             Err(error) => {
@@ -398,14 +401,16 @@ impl AuditClient {
         validation.required_spec_claims.clear();
         match jsonwebtoken::decode::<Value>(token, &key, &validation) {
             Ok(_) => Ok(()),
-            Err(_) => Err(self.signature_rejected(token).await),
+            Err(_) => Err(self.signature_rejected(token, "other").await),
         }
     }
 
     /// Signature-plane rejection: invalidate the poisoned token cache (D7 —
     /// the retry must rotate a fresh token, or the ≤1-retry budget is fake)
-    /// and classify permanent.
-    async fn signature_rejected(&self, token: &str) -> DeliveryError {
+    /// and classify permanent. `reason` feeds the bounded rejection counter
+    /// (runbook vocabulary: {malformed, unsupported_alg, unknown_key, other}).
+    async fn signature_rejected(&self, token: &str, reason: &str) -> DeliveryError {
+        crate::metrics::inc_token_rejection(reason);
         self.invalidate_token(token).await;
         DeliveryError::Permanent(PermanentKind::SignatureRejected)
     }

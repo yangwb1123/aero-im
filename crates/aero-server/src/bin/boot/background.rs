@@ -254,6 +254,40 @@ pub(crate) fn spawn_all(
         });
     }
 
+    // R-D2 §10.5: version-skew backfill for the message-delete lane — the
+    // Rust twin of the 0241 reconciler (which is `message.moderated`-only
+    // and immutable). During a rolling deploy an old binary commits the
+    // `message.deleted` audit row but no outbox row; this timer backfills
+    // orphaned rows within the audit-retention window, idempotent
+    // (`ON CONFLICT DO NOTHING`), bounded batch. Runs unconditionally (rows
+    // sit status 0 harmlessly when no relay is configured; pre-0239 DBs
+    // degrade to a logged error, never a crash).
+    {
+        let repo = aero_storage::audit_governance::AuditGovernanceOutboxRepo::new(state.pg.clone());
+        let audit_retention_days = std::env::var("AERO__SERVER__AUDIT_RETENTION_DAYS")
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(365);
+        let cancel = ai_shutdown.clone();
+        tracker.spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => break,
+                    _ = tick.tick() => {}
+                }
+                let cutoff = time::OffsetDateTime::now_utc() - time::Duration::days(audit_retention_days);
+                match repo.reconcile_message_deleted(cutoff, 500).await {
+                    Ok(0) => {}
+                    Ok(n) => tracing::debug!(backfilled = n, "message.deleted governance rows reconciled"),
+                    Err(e) => tracing::warn!(error = %e, "message.deleted governance reconcile failed"),
+                }
+            }
+        });
+    }
+
     // Embedding backfill
     {
         let msgs = MessageRepo::new(state.pg.clone());

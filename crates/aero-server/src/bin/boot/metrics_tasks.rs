@@ -193,6 +193,30 @@ pub(crate) fn spawn_all(
         });
     }
 
+    // Audit-relay delivery counters (R-D2 §10.1 — the runbook's metric names
+    // become real): the connector's in-process counter registry
+    // (`aero_audit_connector::metrics`) is re-exposed here every 30 s so
+    // `/metrics` serves the four runbook names with their fixed label
+    // vocabularies. Pure-read loop: never mutates relay state.
+    {
+        let cancel = ai_shutdown.clone();
+        tracker.spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    () = cancel.cancelled() => break,
+                    _ = tick.tick() => {}
+                }
+                for (name, labels, value) in aero_audit_connector::metrics::sample() {
+                    // Gauge counts are far below 2^53; the narrowing is exact in practice.
+                    #[allow(clippy::cast_precision_loss)]
+                    common_metrics::set_gauge_labeled(name, value as f64, &labels);
+                }
+            }
+        });
+    }
+
     // NATS consumer backlog gauges
     {
         let js = jetstream.clone();

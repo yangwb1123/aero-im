@@ -45,9 +45,12 @@ async fn moderation_finalize_runtime_disabled_commits_1_plus_0() {
     );
 }
 
-/// A2 half 9 (pass-through no-raise): a non-moderation action keeps
-/// flowing through the shared trigger untouched — zero governance rows,
-/// and the v1 row is still produced (0236 trigger, action verbatim).
+/// A2 half 9 (pass-through no-raise) + R-D2 writer: a non-moderation action
+/// keeps flowing through the shared 0239 trigger untouched — zero ADMIN
+/// governance rows (the trigger's token-keyed mapping never fires), and the
+/// Rust R-D2 writer now yields exactly one MESSAGE-class row for the
+/// `message.deleted` delete (the 0245/0246 declared carve-out). The v1 row is
+/// still produced (0236 trigger, action verbatim).
 #[tokio::test]
 #[ignore = "requires live Postgres"]
 async fn non_moderation_action_passes_through_unmapped() {
@@ -73,11 +76,36 @@ async fn non_moderation_action_passes_through_unmapped() {
     .fetch_one(&p)
     .await
     .expect("audit row exists");
-    assert_eq!(action, "message.deleted", "local token flows verbatim");
+    assert_eq!(action, LOCAL_ACTION_MESSAGE_DELETED, "local token flows verbatim");
+    // 0239 trigger pass-through: zero ADMIN rows (the trigger maps only
+    // `message.moderated`); the R-D2 Rust writer produced exactly one
+    // MESSAGE-class row in the same tx.
+    let admin_rows: i64 = sqlx::query_as::<_, (i64,)>(
+        "SELECT COUNT(*) FROM audit_governance_outbox
+          WHERE payload->>'aggregate_id' = $1 AND class = 'admin'",
+    )
+    .bind(ws.to_uuid().to_string())
+    .fetch_one(&p)
+    .await
+    .unwrap()
+    .0;
     assert_eq!(
-        count_governance_rows(&p).await,
-        0,
-        "unmapped token produces zero governance rows (pass-through no-raise)"
+        admin_rows, 0,
+        "unmapped token produces zero ADMIN governance rows (trigger pass-through no-raise)"
+    );
+    let message_rows: i64 = sqlx::query_as::<_, (i64,)>(
+        "SELECT COUNT(*) FROM audit_governance_outbox
+          WHERE payload->>'aggregate_id' = $1 AND class = 'message'
+            AND payload->>'action' = 'message.deleted'",
+    )
+    .bind(ws.to_uuid().to_string())
+    .fetch_one(&p)
+    .await
+    .unwrap()
+    .0;
+    assert_eq!(
+        message_rows, 1,
+        "the R-D2 writer yields exactly one message-class delete row"
     );
     // v1 row for THIS audit row (scoped by idempotency_key = audit id —
     // the table is shared across tests within one entry run).

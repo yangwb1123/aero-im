@@ -50,7 +50,7 @@
 
 use aero_common::{
     AGGREGATED_MESSAGE_ACTION, AUDIT_SOURCE_SYSTEM, GOVERNANCE_CLASS_MESSAGE,
-    LOCAL_ACTION_MESSAGE_CREATE, LOCAL_ACTION_MESSAGE_EDIT,
+    LOCAL_ACTION_MESSAGE_CREATE, LOCAL_ACTION_MESSAGE_DELETED, LOCAL_ACTION_MESSAGE_EDIT,
 };
 use anyhow::Context;
 use sqlx::PgPool;
@@ -398,6 +398,261 @@ async fn run() -> anyhow::Result<()> {
     println!(
         "leg-2 parity: SUM(count) = {sum2} == COUNT(mapped) = {count2} == {rows} \
          (rows produced through the real send path)"
+    );
+
+    // --- Leg 3 (R-D2): the message-delete lane through the REAL delete seam ---
+    // N deletes via `soft_delete_outboxed_system` (the system delete seam —
+    // the user path `soft_delete_outboxed_authorized` is the same choke
+    // point) → exactly N 1:1 class-'message' priority-10 rows (own
+    // `idempotency_key`, `source_system = AUDIT_SOURCE_SYSTEM`, no L1 marker
+    // keys), while the window parity for the SAME workspace holds unchanged
+    // (1:1 rows are invisible to the SUM side by the aggregated/spill marker
+    // filter). Plus the §10.5 negative control: an orphaned
+    // `message.deleted` audit row (version skew) changes nothing until
+    // `reconcile_message_deleted` runs, which fabricates exactly one row;
+    // a re-run is a no-op.
+    let ws3 = Uuid::new_v4();
+    let actor3 = Uuid::new_v4();
+    let room3 = Uuid::new_v4();
+    sqlx::query("INSERT INTO participants (id, kind, display_name) VALUES ($1, 'human', $2)")
+        .bind(actor3)
+        .bind(format!("l1-parity-delete-{ws3}"))
+        .execute(&pool)
+        .await
+        .context("insert leg-3 participant")?;
+    let mut ws3_tx = pool
+        .begin()
+        .await
+        .context("begin leg-3 workspace fixture tx")?;
+    sqlx::query(
+        "INSERT INTO workspaces (id, name, slug, created_by, created_at)
+         VALUES ($1, $2, $3, $4, now())",
+    )
+    .bind(ws3)
+    .bind("L1 Parity Delete Path WS")
+    .bind(format!("l1-parity-delete-{ws3}"))
+    .bind(actor3)
+    .execute(&mut *ws3_tx)
+    .await
+    .context("insert leg-3 workspace")?;
+    sqlx::query(
+        "INSERT INTO workspace_members (workspace_id, participant_id, role, joined_at)
+         VALUES ($1, $2, 'owner', now())",
+    )
+    .bind(ws3)
+    .bind(actor3)
+    .execute(&mut *ws3_tx)
+    .await
+    .context("insert leg-3 workspace owner edge")?;
+    ws3_tx
+        .commit()
+        .await
+        .context("commit leg-3 workspace fixture")?;
+    sqlx::query(
+        "INSERT INTO rooms (id, kind, name, created_by, created_at, workspace_id)
+         VALUES ($1, 'group', $2, $3, now(), $4)",
+    )
+    .bind(room3)
+    .bind(format!("l1-parity-delete-room-{ws3}"))
+    .bind(actor3)
+    .bind(ws3)
+    .execute(&pool)
+    .await
+    .context("insert leg-3 room")?;
+    sqlx::query(
+        "INSERT INTO room_members (room_id, participant_id, role, joined_at)
+         VALUES ($1, $2, 'owner', now())",
+    )
+    .bind(room3)
+    .bind(actor3)
+    .execute(&pool)
+    .await
+    .context("insert leg-3 room owner edge")?;
+
+    let repo = aero_storage::message::MessageRepo::new(pool.clone());
+    // (message_id DISPLAY string — the envelope targets[0].id format —, audit_id)
+    let mut delete_ids: Vec<(String, Uuid)> = Vec::new();
+    for _ in 0..rows {
+        let msg = repo
+            .insert_outboxed(
+                aero_storage::message::NewMessage {
+                    room_id: aero_common::RoomId::from_uuid(room3),
+                    sender_id: aero_common::ParticipantId::from_uuid(actor3),
+                    blocks: vec![aero_common::Block::text("l1-parity-delete-drill")],
+                    reply_to: None,
+                    metadata: serde_json::Value::Null,
+                    expires_at: None,
+                },
+                None,
+                Vec::new(),
+                None,
+            )
+            .await
+            .context("service-path send (leg-3 delete target)")?
+            .message()
+            .clone();
+        repo.soft_delete_outboxed_system(
+            msg.id,
+            Some(aero_common::WorkspaceId::from_uuid(ws3)),
+            Some(aero_common::ParticipantId::from_uuid(actor3)),
+            Some(LOCAL_ACTION_MESSAGE_DELETED),
+            serde_json::json!({ "room_id": room3, "digest": "l1-parity-delete-drill" }),
+            aero_common::ParticipantId::from_uuid(actor3),
+            None,
+        )
+        .await
+        .context("delete commits")?
+        .context("message deleted")?;
+        let audit_id: Uuid = sqlx::query_scalar(
+            "SELECT id FROM audit_events
+              WHERE workspace_id = $1 AND action = 'message.deleted' AND target = $2::text",
+        )
+        .bind(ws3)
+        .bind(msg.id.to_string())
+        .fetch_one(&pool)
+        .await
+        .context("delete audit row id")?;
+        delete_ids.push((msg.id.to_string(), audit_id));
+    }
+
+    // Exactly N 1:1 delete rows, all fields pinned.
+    let delete_rows: Vec<(String, i32, String, i16, serde_json::Value)> = sqlx::query_as(
+        "SELECT event_id::text, status, class, priority, payload
+               FROM audit_governance_outbox
+              WHERE payload->>'aggregate_id' = $1::text AND payload->>'action' = 'message.deleted'",
+    )
+    .bind(ws3)
+    .fetch_all(&pool)
+    .await
+    .context("read delete rows")?;
+    if delete_rows.len() != delete_ids.len() {
+        anyhow::bail!(
+            "delete leg: expected exactly {} 1:1 rows, got {}",
+            delete_ids.len(),
+            delete_rows.len()
+        );
+    }
+    // Set-parity (D3 — never Vec position): heap order of the SELECT is not
+    // the delete order. Match each audit id to its row by event_id.
+    let expected_ids: std::collections::HashSet<String> =
+        delete_ids.iter().map(|(_, id)| id.to_string()).collect();
+    let actual_ids: std::collections::HashSet<String> =
+        delete_rows.iter().map(|(e, ..)| e.clone()).collect();
+    if expected_ids != actual_ids {
+        anyhow::bail!(
+            "delete row event_id not 1:1 with the audit id: expected {:?} actual {:?}",
+            expected_ids, actual_ids
+        );
+    }
+    // Per-row field pins. The set-parity proved event_id == audit id 1:1;
+    // the per-row checks look up the message id BY EVENT_ID (never Vec
+    // position — heap order ≠ delete order).
+    let by_event: std::collections::HashMap<String, String> = delete_ids
+        .iter()
+        .map(|(msg_id, audit_id)| (audit_id.to_string(), msg_id.clone()))
+        .collect();
+    for (event_id, status, class, priority, payload) in delete_rows.iter() {
+        let msg_id = by_event.get(event_id).expect("set-parity guarantees the entry");
+        if *status != 0 || class != GOVERNANCE_CLASS_MESSAGE || *priority != 10 {
+            anyhow::bail!(
+                "delete row {event_id}: status {status} / class {class} / priority {priority} drifted"
+            );
+        }
+        if payload["source_system"] != AUDIT_SOURCE_SYSTEM {
+            anyhow::bail!("delete row {event_id}: source_system drifted");
+        }
+        if payload["idempotency_key"] != payload["event_id"] {
+            anyhow::bail!("delete row {event_id}: idempotency_key != event_id");
+        }
+        if payload["action"] != LOCAL_ACTION_MESSAGE_DELETED {
+            anyhow::bail!("delete row {event_id}: action drifted");
+        }
+        if payload["targets"][0]["id"].as_str() != Some(msg_id.as_str()) {
+            anyhow::bail!("delete row {event_id}: target drifted");
+        }
+        for marker in ["aggregated", "spill", "count", "window_start", "window_end"] {
+            if payload.get(marker).is_some() {
+                anyhow::bail!("delete row {event_id} carries an L1 marker key {marker}");
+            }
+        }
+    }
+    println!(
+        "leg 3: {rows} deletes through the real delete seam → {rows} 1:1 message-class rows (ws3 = {ws3})"
+    );
+
+    // The window parity for ws3 holds UNCHANGED: the delete rows are 1:1
+    // (marker-less → invisible to the SUM side) and the delete audit rows are
+    // outside the COUNT-side allowlist.
+    let cutoff3 = retention_cutoff_epoch(&pool, retention_days).await?;
+    let (sum3, count3) = parity(&pool, &ws3, cutoff3).await?;
+    if sum3 != count3 || sum3 != rows {
+        anyhow::bail!(
+            "delete leg: window parity must hold unchanged — SUM = {sum3}, COUNT = {count3}, expected {rows}"
+        );
+    }
+    println!(
+        "leg-3 parity (unchanged by deletes): SUM(count) = {sum3} == COUNT(mapped) = {count3} == {rows}"
+    );
+
+    // §10.5 negative control: an orphaned message.deleted audit row (no
+    // outbox twin — version-skew) changes nothing until the Rust reconciler
+    // runs; then exactly one row appears, and a re-run is a no-op.
+    // Hygiene: the reconcile scan is GLOBAL — delete this drill's OWN
+    // orphans from any prior run (a re-run TRUNCATEs the outbox, which
+    // re-orphans the prior seed; fresh harness DBs are unaffected).
+    sqlx::query(
+        r"DELETE FROM audit_events a
+           WHERE a.action = 'message.deleted'
+             AND NOT EXISTS (
+                   SELECT 1 FROM audit_governance_outbox o
+                    WHERE o.event_id = a.id)",
+    )
+    .execute(&pool)
+    .await
+    .context("clean prior orphaned delete audit rows")?;
+    let orphan_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO audit_events (id, workspace_id, actor_id, action, target, detail, created_at)
+         VALUES ($1, $2, $3, $4, $5, $6, now())",
+    )
+    .bind(orphan_id)
+    .bind(ws3)
+    .bind(actor3)
+    .bind(LOCAL_ACTION_MESSAGE_DELETED)
+    .bind(format!("orphan-{orphan_id}"))
+    .bind(serde_json::json!({ "room_id": room3 }))
+    .execute(&pool)
+    .await
+    .context("seed the orphaned delete audit row")?;
+    let orphan_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM audit_governance_outbox WHERE event_id = $1",
+    )
+    .bind(orphan_id)
+    .fetch_one(&pool)
+    .await
+    .context("orphan row count")?;
+    if orphan_count != 0 {
+        anyhow::bail!("orphaned delete audit row must have no outbox twin (no silent fabrication)");
+    }
+    let reconciler = aero_storage::audit_governance::AuditGovernanceOutboxRepo::new(pool.clone());
+    let backfilled = reconciler
+        .reconcile_message_deleted(time::OffsetDateTime::now_utc() - time::Duration::days(retention_days), 50)
+        .await
+        .context("reconcile_message_deleted")?;
+    if backfilled != 1 {
+        anyhow::bail!(
+            "reconcile must backfill exactly the one orphan (got {backfilled})"
+        );
+    }
+    let again = reconciler
+        .reconcile_message_deleted(time::OffsetDateTime::now_utc() - time::Duration::days(retention_days), 50)
+        .await
+        .context("reconcile re-run")?;
+    if again != 0 {
+        anyhow::bail!("reconcile re-run must be a no-op (got {again})");
+    }
+    println!(
+        "leg-3 orphan negative control: no silent fabrication; reconcile backfilled exactly 1, re-run no-op"
     );
     println!("drill: l1-aggregation-parity: PASS");
     Ok(())

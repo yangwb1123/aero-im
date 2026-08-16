@@ -199,22 +199,27 @@ impl AuditRelay {
         let token = claim.claim_token;
         let attempts = claim.attempts;
         match self.client.deliver(&claim).await {
-            Ok(()) => match self.repo.settle(event_id, token).await {
-                Ok(true) => {}
-                Ok(false) => warn!(
-                    %event_id,
-                    "audit delivery lost its lease before acknowledgement; idempotent retry will recover"
-                ),
-                Err(error) => warn!(
-                    %event_id,
-                    ?error,
-                    "audit delivery succeeded but acknowledgement failed; idempotent retry will recover"
-                ),
-            },
+            Ok(()) => {
+                crate::metrics::inc_delivery_outcome("delivered");
+                match self.repo.settle(event_id, token).await {
+                    Ok(true) => {}
+                    Ok(false) => warn!(
+                        %event_id,
+                        "audit delivery lost its lease before acknowledgement; idempotent retry will recover"
+                    ),
+                    Err(error) => warn!(
+                        %event_id,
+                        ?error,
+                        "audit delivery succeeded but acknowledgement failed; idempotent retry will recover"
+                    ),
+                }
+            }
             // Deliberately NOT `is_dead_at`: HTTP 403 is fail-closed immediate
             // death (T-11) regardless of the retry budget — it is an identity/
             // provisioning fault, not a payload-class fault that earns one retry.
             Err(DeliveryError::Forbidden) => {
+                crate::metrics::inc_delivery_outcome("forbidden");
+                crate::metrics::inc_dead();
                 let dead = self
                     .repo
                     .mark_dead(
@@ -229,13 +234,16 @@ impl AuditRelay {
                 }
             }
             Err(DeliveryError::Permanent(kind)) => {
+                crate::metrics::inc_delivery_outcome("permanent");
                 let error = format!("audit delivery classified permanent: {kind:?}");
                 // Single decision point on the pure predicate (webhook_delivery.rs
                 // `mark_failed_with_backoff` shape): attempt 1 requeues with
                 // backoff, attempt ≥ 2 reaches the dead terminal.
                 let parked = if is_dead_at(attempts) {
+                    crate::metrics::inc_dead();
                     self.repo.mark_dead(event_id, token, attempts, &error).await
                 } else {
+                    crate::metrics::inc_transient_requeue();
                     self.repo.requeue(event_id, token, attempts, &error).await
                 };
                 if !matches!(parked, Ok(true)) {
@@ -243,6 +251,8 @@ impl AuditRelay {
                 }
             }
             Err(DeliveryError::Transient(error)) => {
+                crate::metrics::inc_delivery_outcome("transient");
+                crate::metrics::inc_transient_requeue();
                 let parked = self
                     .repo
                     .requeue(event_id, token, attempts, &error.to_string())

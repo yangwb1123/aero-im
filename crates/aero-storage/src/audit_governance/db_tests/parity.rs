@@ -276,7 +276,7 @@ async fn rust_produced_payload_matches_0239_envelope() {
         &mut tx,
         ws_b,
         Some(actor_b),
-        "message.deleted",
+        LOCAL_ACTION_MESSAGE_DELETED,
         Some(id_b.to_string().as_str()),
         detail.clone(),
     )
@@ -298,7 +298,7 @@ async fn rust_produced_payload_matches_0239_envelope() {
         AuditActor::participant(actor_b.to_uuid().to_string()),
         vec![AuditTarget::resource(id_b.to_string())],
         ws_b.to_uuid().to_string(),
-        "message.deleted".to_owned(),
+        LOCAL_ACTION_MESSAGE_DELETED.to_owned(),
         detail.clone(),
     );
     // class 'message' + priority 10 are outbox COLUMNS (comment-pinned
@@ -355,7 +355,7 @@ async fn rust_produced_payload_matches_0239_envelope() {
     );
     assert_eq!(back.aggregate_type, "workspace");
     assert_eq!(back.aggregate_id, ws_b.to_uuid().to_string());
-    assert_eq!(back.action, "message.deleted");
+    assert_eq!(back.action, LOCAL_ACTION_MESSAGE_DELETED);
     assert_eq!(back.outcome, "success");
     assert_eq!(back.payload, detail);
     assert_eq!(back.data_classification, "confidential");

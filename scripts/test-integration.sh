@@ -660,7 +660,7 @@ if [ -z "$SKIP_DB_CREATE" ]; then
             echo "  found: $L1_DEFINITIONS" >&2
             exit 1
         fi
-        echo "✓ 0242 static arbiter: 244 migrations, single aero_enqueue_l1_aggregate_audit definition"
+        echo "✓ 0242 static arbiter: 247 migrations, single aero_enqueue_l1_aggregate_audit definition"
         run_migrated_integration \
             "$L1_AGGREGATE_DB" \
             "l1_window_aggregates_" \

@@ -468,7 +468,7 @@ async fn admin_rows_never_merged_into_l1_window() {
     let mut tx = p.begin().await.expect("begin non-allowlist tx");
     for action in [
         "message.moderated",
-        "message.deleted",
+        LOCAL_ACTION_MESSAGE_DELETED,
         LOCAL_ACTION_ROOM_CREATE,
         "auth.login",
     ] {

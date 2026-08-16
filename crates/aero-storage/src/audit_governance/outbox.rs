@@ -40,8 +40,9 @@ use aero_common::{
     AuditActor, AuditId, AuditTarget, ParticipantId, WorkspaceId, AUDIT_ACTOR_TYPE_PARTICIPANT,
     AUDIT_ACTOR_TYPE_SYSTEM, AUDIT_AGGREGATE_TYPE, AUDIT_DATA_CLASSIFICATION, AUDIT_EVENT_TYPE,
     AUDIT_OUTCOME_SUCCESS, AUDIT_RETENTION_CLASS, AUDIT_SCHEMA_ID, AUDIT_SCHEMA_VERSION,
-    AUDIT_TARGET_TYPE_RESOURCE, GOVERNANCE_CLASS_ADMIN, GOVERNANCE_CLASS_MESSAGE,
-    L1_WINDOW_SECONDS,
+    AUDIT_SOURCE_SYSTEM, AUDIT_TARGET_TYPE_RESOURCE, GOVERNANCE_CLASS_ADMIN,
+    GOVERNANCE_CLASS_MESSAGE, L1_WINDOW_SECONDS, LOCAL_ACTION_MESSAGE_DELETED,
+    audit_wire_occurred_at,
 };
 use sqlx::{PgPool, Postgres, Transaction};
 use time::OffsetDateTime;
@@ -58,6 +59,28 @@ const AUTH_PAIR_PRIORITY: i16 = 10;
 /// L1 aggregation rows are class 'message', priority 10 (D2 outcome A).
 const L1_CLASS: &str = GOVERNANCE_CLASS_MESSAGE;
 const L1_PRIORITY: i16 = 10;
+
+/// R-D2 message-delete lane: 1:1 class-'message' priority-10 rows written by
+/// the Rust writer (never the 0242 window — the 1:1 requirement is
+/// load-bearing, 0246 header). The priority is local (aero-storage must not
+/// depend on aero-ai; `GOVERNANCE_PRIORITY_BACKLOG = 10` drift-guarded by the
+/// db_tests pins — `AUTH_PAIR_PRIORITY` precedent).
+const MESSAGE_DELETE_CLASS: &str = GOVERNANCE_CLASS_MESSAGE;
+const MESSAGE_DELETE_PRIORITY: i16 = 10;
+/// Reconciler batch upper bound (mirror of the connector's `MAX_CLAIM`=500
+/// claim-batch cap — the scan must never outsize a claim batch).
+const RECONCILE_BATCH_MAX: i64 = 500;
+
+/// One orphaned `message.deleted` audit row awaiting the Rust-side backfill
+/// (version-skew window: the old binary wrote the audit row, no outbox twin).
+type DeleteLaneOrphan = (
+    uuid::Uuid,
+    uuid::Uuid,
+    Option<uuid::Uuid>,
+    Option<String>,
+    serde_json::Value,
+    OffsetDateTime,
+);
 
 /// Counter categories (bounded label vocabulary, §2.8).
 const CATEGORY_CONTRACT: &str = "contract";
@@ -119,6 +142,55 @@ impl AuditGovernanceOutboxRepo {
         .execute(&mut **tx)
         .await?;
         Ok(())
+    }
+
+    /// 1:1 `message.deleted` outbox row, written in the delete tx (R-D2
+    /// writer — the 0245/0246 declared carve-out: `message.deleted` is NOT
+    /// trigger-owned). The audit row MUST already exist in-tx (the caller
+    /// appended it first); `occurred_at` is re-selected from it (write_pair
+    /// precedent — single clock domain, never a Rust formatter).
+    ///
+    /// Fail-closed: propagates [`sqlx::Error`] — a lost outbox row aborts the
+    /// delete (mirrors the 0239/0242/0245/0246 AFTER-trigger abort semantics;
+    /// the deliberate opposite of the auth `append_pair_in_tx_fail_open`).
+    /// Gate-free (0242 D2): no runtime gate, no binding lookup.
+    ///
+    /// # Errors
+    /// Propagates any [`sqlx::Error`] (the caller's tx aborts with it).
+    pub async fn append_message_delete_in_tx(
+        tx: &mut Transaction<'_, Postgres>,
+        audit_id: AuditId,
+        workspace: WorkspaceId,
+        actor: Option<ParticipantId>,
+        target: Option<&str>,
+        detail: serde_json::Value,
+    ) -> Result<(), sqlx::Error> {
+        // Server-stamped created_at re-selected (write_pair precedent,
+        // outbox.rs write_pair) — single clock domain, never a Rust formatter.
+        let occurred_at: OffsetDateTime =
+            sqlx::query_scalar("SELECT created_at FROM audit_events WHERE id = $1")
+                .bind(audit_id.to_uuid())
+                .fetch_one(&mut **tx)
+                .await?;
+        let payload = governance_envelope(
+            audit_id,
+            workspace,
+            actor,
+            target,
+            detail,
+            LOCAL_ACTION_MESSAGE_DELETED, // outbound action = local token verbatim
+            AUDIT_OUTCOME_SUCCESS,
+            occurred_at,
+            AUDIT_SOURCE_SYSTEM, // "aero-im.source" — passes connector PayloadGuard
+        );
+        Self::append_in_tx(
+            tx,
+            audit_id,
+            MESSAGE_DELETE_CLASS,
+            MESSAGE_DELETE_PRIORITY,
+            payload,
+        )
+        .await
     }
 
     /// R1 + R7 single implementation point: SAVEPOINT-wrapped 1:1 audit pair.
@@ -615,6 +687,103 @@ impl AuditGovernanceOutboxRepo {
         Ok(inserted)
     }
 
+    /// R-D2 §10.5: version-skew backfill — the Rust parallel-scan twin of
+    /// the 0241 reconciler (which is `message.moderated`-only and immutable;
+    /// no migration edit). During a rolling deploy an old binary commits the
+    /// `message.deleted` audit row but no outbox row; this scan backfills
+    /// orphaned rows (`action = message.deleted` with no outbox twin) within
+    /// the audit-retention window (`cutoff`), enqueueing each via the SAME
+    /// 16-key envelope as [`Self::append_message_delete_in_tx`]
+    /// (`ON CONFLICT (event_id) DO NOTHING` — idempotent, concurrent-instance
+    /// safe). Never fabricates a `message.moderated` claim and never touches
+    /// trigger-owned tokens (exact-token scan). The scan is SARGable on the
+    /// partition key (`action`, `created_at >= cutoff` prunes partitions),
+    /// bounded by `batch`.
+    ///
+    /// Returns the number of NEWLY inserted outbox rows.
+    ///
+    /// # Errors
+    /// Propagates connection-level [`sqlx::Error`] only.
+    pub async fn reconcile_message_deleted(
+        &self,
+        cutoff: OffsetDateTime,
+        batch: i64,
+    ) -> Result<i64, sqlx::Error> {
+        let batch = batch.clamp(1, RECONCILE_BATCH_MAX);
+        // AuditId/WorkspaceId/ParticipantId are newtypes — decode the raw
+        // uuid columns and wrap (no sqlx Decode impl for the newtypes).
+        let orphans: Vec<DeleteLaneOrphan> = sqlx::query_as(
+            r"SELECT a.id, a.workspace_id, a.actor_id, a.target, a.detail, a.created_at
+                 FROM audit_events a
+                WHERE a.action = $1
+                  AND a.created_at >= $2
+                  AND NOT EXISTS (
+                        SELECT 1 FROM audit_governance_outbox o
+                         WHERE o.event_id = a.id)
+                ORDER BY a.created_at
+                LIMIT $3",
+        )
+        .bind(LOCAL_ACTION_MESSAGE_DELETED)
+        .bind(cutoff)
+        .bind(batch)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut inserted = 0i64;
+        for (audit_id, workspace, actor, target, detail, created_at) in orphans {
+            let payload = governance_envelope(
+                AuditId::from_uuid(audit_id),
+                WorkspaceId::from_uuid(workspace),
+                actor.map(ParticipantId::from_uuid),
+                target.as_deref(),
+                detail,
+                LOCAL_ACTION_MESSAGE_DELETED,
+                AUDIT_OUTCOME_SUCCESS,
+                created_at,
+                AUDIT_SOURCE_SYSTEM,
+            );
+            let row: Option<uuid::Uuid> = sqlx::query_scalar(
+                r"INSERT INTO audit_governance_outbox (event_id, status, class, priority, payload)
+                   VALUES ($1, 0, $2, $3, $4)
+                   ON CONFLICT (event_id) DO NOTHING
+                   RETURNING event_id",
+            )
+            .bind(audit_id)
+            .bind(MESSAGE_DELETE_CLASS)
+            .bind(MESSAGE_DELETE_PRIORITY)
+            .bind(payload)
+            .fetch_optional(&self.pool)
+            .await?;
+            if row.is_some() {
+                inserted += 1;
+            }
+        }
+        Ok(inserted)
+    }
+
+    /// R-D2 §10.2: retention sweep for the governance outbox — DELETE only
+    /// TERMINAL rows (`status IN (2, 3)`: delivered / dead; the sink holds
+    /// the ledger once delivered) older than `cutoff`. Live rows (status
+    /// 0/1) are NEVER touched while the relay runs (0246 header: "never
+    /// delete while the relay runs" — a live row is still due for claim).
+    /// Returns the number of deleted rows.
+    ///
+    /// # Errors
+    /// Propagates connection-level [`sqlx::Error`] only.
+    pub async fn sweep_terminal_before(
+        &self,
+        cutoff: OffsetDateTime,
+    ) -> Result<u64, sqlx::Error> {
+        let deleted = sqlx::query(
+            r"DELETE FROM audit_governance_outbox
+               WHERE status IN (2, 3)
+                 AND created_at < $1",
+        )
+        .bind(cutoff)
+        .execute(&self.pool)
+        .await?;
+        Ok(deleted.rows_affected())
+    }
+
     /// SQLSTATE classification (§2.8): P0001 → binding (ERROR); contract-bug
     /// classes 23514/23503/23505/other → contract (ERROR) / database (ERROR);
     /// transient 40P01/40001/55P03 → database (warn).
@@ -716,9 +885,11 @@ pub fn governance_envelope(
     occurred_at: OffsetDateTime,
     source_system: &str,
 ) -> serde_json::Value {
-    let occurred_at = occurred_at
-        .format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_else(|_| occurred_at.to_string());
+    // Canonical PG timestamptz→jsonb spelling (§10.4): `+00:00` offset,
+    // trailing-zero-trimmed fraction, omitted when zero — byte-identical to
+    // the 0239 trigger's `jsonb_build_object('occurred_at', NEW.created_at)`
+    // (the `Rfc3339` well-known format would emit `Z` and drift the wire).
+    let occurred_at = audit_wire_occurred_at(occurred_at);
     let actor = match actor {
         Some(actor) => AuditActor {
             // actor_id::text spelling (UUID-hyphenated — the trigger's

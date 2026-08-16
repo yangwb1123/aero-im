@@ -100,14 +100,18 @@ async fn moderation_finalize_outbox_parity_integration_notification_carved_out()
     );
 }
 
-/// `message.deleted` is audited in-tx but R-D2-unmapped: the audit row is
-/// present, and ZERO outbox rows are produced for it.
+/// `message.deleted` is audited in-tx and R-D2 writer-owned: the audit row is
+/// present AND exactly ONE 1:1 class-'message' outbox row is produced by the
+/// Rust writer (AC-1) — the 0245/0246 declared carve-out ("NOT trigger-owned;
+/// the sibling Rust outbox write … remains the planned path") now fulfilled
+/// by `AuditGovernanceOutboxRepo::append_message_delete_in_tx` from the
+/// soft-delete choke point.
 #[tokio::test]
 #[ignore = "requires live Postgres"]
-async fn moderation_finalize_outbox_parity_message_deleted_unmapped() {
+async fn moderation_finalize_outbox_parity_message_deleted_lane() {
     let p = pool();
     reset_governance_table(&p).await;
-    let (ws, actor, room) = room_fixture(&p, "producer-deleted-unmapped").await;
+    let (ws, actor, room) = room_fixture(&p, "producer-deleted-lane").await;
     let repo = crate::message::MessageRepo::new(p.clone());
     let seeded = repo
         .insert_outboxed(new_message(room, actor), None, Vec::new(), None)
@@ -115,41 +119,155 @@ async fn moderation_finalize_outbox_parity_message_deleted_unmapped() {
         .expect("seed message")
         .message()
         .clone();
-    // Seed send already produced 1 window row.
+    // Seed send already produced 1 window row (0242, message.create).
     let before = governance_rows_for(&p, ws).await;
     assert_eq!(before, 1, "seed send produced one window row");
 
-    repo.soft_delete_outboxed_system(
-        seeded.id,
+    // --- Commit half: delete through the EXACT `ImService::delete_message`
+    // seam (`soft_delete_outboxed_authorized` — sender-only, room access
+    // re-fenced at commit time). The actor IS the sender and the room
+    // creator (owner member edge from room_fixture). ---
+    repo.soft_delete_outboxed_authorized(seeded.id, actor, None)
+        .await
+        .expect("authorized delete commits")
+        .expect("message deleted");
+
+    let deleted_rows = audit_rows_for(&p, ws, LOCAL_ACTION_MESSAGE_DELETED).await;
+    assert_eq!(deleted_rows.len(), 1, "message.deleted is audited in-tx");
+    let after = governance_rows_for(&p, ws).await;
+    assert_eq!(
+        after,
+        before + 1,
+        "exactly one 1:1 outbox row added by the Rust writer (R-D2)"
+    );
+
+    // The delete row: 1:1 with the audit id, class 'message', priority 10,
+    // 16-key envelope field-by-field (payload = the {room_id, digest} detail).
+    let (audit_id, target): (uuid::Uuid, String) = deleted_rows[0].clone();
+    assert_eq!(target, seeded.id.to_string(), "target = message id");
+    let row: (i32, String, i16, serde_json::Value) = sqlx::query_as(
+        "SELECT status, class, priority, payload
+               FROM audit_governance_outbox WHERE event_id = $1",
+    )
+    .bind(audit_id)
+    .fetch_one(&p)
+    .await
+    .expect("delete outbox row");
+    assert_eq!(row.0, 0, "status 0 = enqueued (0239 normative)");
+    assert_eq!(
+        row.1, GOVERNANCE_CLASS_MESSAGE,
+        "class 'message' (GOVERNANCE_CLASS_MESSAGE leaf const)"
+    );
+    assert_eq!(
+        row.2, 10,
+        "priority 10 = GOVERNANCE_PRIORITY_BACKLOG (comment-pinned; aero-storage cannot import aero-ai)"
+    );
+    let envelope = row.3;
+    assert_eq!(
+        envelope["event_id"],
+        audit_id.to_string(),
+        "payload event_id mirrors"
+    );
+    assert_eq!(
+        envelope["source_system"], AUDIT_SOURCE_SYSTEM,
+        "source_system = AUDIT_SOURCE_SYSTEM (connector payload-guard value)"
+    );
+    assert_eq!(
+        envelope["action"], LOCAL_ACTION_MESSAGE_DELETED,
+        "action = local token VERBATIM (no fabricated contract token)"
+    );
+    assert_eq!(
+        envelope["targets"],
+        serde_json::json!([{ "id": seeded.id.to_string(), "type": "resource" }]),
+        "targets = [{{id: message id, type: 'resource'}}] — non-empty"
+    );
+    assert_eq!(
+        envelope["payload"],
+        serde_json::json!({
+            "room_id": room, // RoomId own serialization (same as the producer)
+            "digest": seeded.searchable_text().chars().take(120).collect::<String>(),
+        }),
+        "payload = the {{room_id, digest}} detail object (authorization.rs shape)"
+    );
+    assert_eq!(
+        envelope["aggregate_id"],
+        ws.to_uuid().to_string(),
+        "aggregate_id == workspace id"
+    );
+    assert_eq!(
+        envelope["idempotency_key"],
+        audit_id.to_string(),
+        "idempotency_key = event_id (sink dedup)"
+    );
+    for marker in ["count", "aggregated", "spill", "window_start", "window_end"] {
+        assert!(
+            envelope.get(marker).is_none(),
+            "no L1 marker key {marker} on 1:1 delete rows"
+        );
+    }
+    // Fail-closed parse into the typed twin + Value equality (drift alarm).
+    let parsed: AuditClaimPayload = serde_json::from_value(envelope.clone())
+        .expect("typed twin parses the R-D2 payload (deny_unknown_fields)");
+    assert_eq!(
+        serde_json::to_value(&parsed).unwrap(),
+        envelope,
+        "re-serialized twin must equal the stored JSONB (semantic parity)"
+    );
+    assert_eq!(
+        parsed.action, LOCAL_ACTION_MESSAGE_DELETED,
+        "typed action == the leaf const verbatim"
+    );
+
+    // --- Replay half: the same delete is a no-op (deleted_at guard) → the
+    // writer never re-fires; still exactly 1 row. ---
+    let replay = repo
+        .soft_delete_outboxed_authorized(seeded.id, actor, None)
+        .await
+        .expect("replay delete returns Ok");
+    assert!(replay.is_none(), "replay of an already-deleted message is Ok(None)");
+    assert_eq!(
+        governance_rows_for(&p, ws).await,
+        after,
+        "replay appends no second row (at-most-one)"
+    );
+
+    // --- Rollback half: aborted tx → zero new rows (no partial state). ---
+    // A FRESH message (the commit-half one is already deleted — the
+    // `deleted_at` guard would make the rollback half vacuous).
+    let rollback_msg = repo
+        .insert_outboxed(new_message(room, actor), None, Vec::new(), None)
+        .await
+        .expect("seed rollback message")
+        .message()
+        .clone();
+    let mut tx = p.begin().await.expect("begin rollback tx");
+    let existing = crate::message::MessageRepo::lock_message_in_tx(&mut tx, rollback_msg.id)
+        .await
+        .expect("lock the message")
+        .expect("message row exists");
+    crate::message::MessageRepo::soft_delete_locked_outboxed_in_tx(
+        &mut tx,
+        existing,
         Some(ws),
         Some(actor),
-        Some("message.deleted"),
+        Some(LOCAL_ACTION_MESSAGE_DELETED),
         serde_json::json!({ "room_id": room }),
         actor,
         None,
     )
     .await
-    .expect("delete commits")
-    .expect("message deleted");
-
-    let deleted_rows = audit_rows_for(&p, ws, "message.deleted").await;
-    assert_eq!(deleted_rows.len(), 1, "message.deleted is audited in-tx");
-    let after = governance_rows_for(&p, ws).await;
+    .expect("in-tx delete succeeds")
+    .expect("deleted");
+    tx.rollback().await.expect("rollback delete tx");
     assert_eq!(
-        after, 1,
-        "no outbox row for message.deleted (R-D2 unmapped)"
+        governance_rows_for(&p, ws).await,
+        after,
+        "rollback aborts the outbox row with the delete (writer is in-tx)"
     );
-    let deleted_outbox: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*)::bigint FROM audit_governance_outbox
-          WHERE payload->>'aggregate_id' = $1 AND payload->>'action' = 'message.deleted'",
-    )
-    .bind(ws.to_uuid().to_string())
-    .fetch_one(&p)
-    .await
-    .expect("deleted outbox count");
     assert_eq!(
-        deleted_outbox, 0,
-        "no 1:1 row carries the message.deleted action"
+        audit_rows_for(&p, ws, LOCAL_ACTION_MESSAGE_DELETED).await.len(),
+        1,
+        "rollback aborted the audit row too"
     );
 }
 

@@ -3,7 +3,7 @@
 //!
 //! Extracted from `message.rs` as part of REFACTOR_PLAN.md Step 2.
 
-use aero_common::{Block, Message, MessageId, ParticipantId, WorkspaceId};
+use aero_common::{Block, Message, MessageId, ParticipantId, WorkspaceId, LOCAL_ACTION_MESSAGE_DELETED};
 use pgvector::Vector;
 use sqlx::{Postgres, Transaction};
 
@@ -371,11 +371,24 @@ impl MessageRepo {
         let mut tx = self.pool.begin().await?;
         let deleted = Self::soft_delete_in_tx(&mut tx, id).await?;
         if deleted {
-            crate::audit::AuditRepo::append_in_tx(
+            let audit_id = crate::audit::AuditRepo::append_in_tx(
                 &mut tx,
                 workspace,
                 actor,
-                "message.deleted",
+                LOCAL_ACTION_MESSAGE_DELETED,
+                Some(&id.to_string()),
+                detail.clone(),
+            )
+            .await?;
+            // R-D2 seam parity: the same fail-closed Rust writer the
+            // production choke point uses (the action is hard-coded here, so
+            // the gate is unconditional). No production caller exists today
+            // (only audit.rs tests + audit_governance db_tests).
+            crate::audit_governance::outbox::AuditGovernanceOutboxRepo::append_message_delete_in_tx(
+                &mut tx,
+                audit_id,
+                workspace,
+                actor,
                 Some(&id.to_string()),
                 detail,
             )

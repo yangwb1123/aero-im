@@ -139,7 +139,10 @@ async fn governance_reconcile_backfills_disabled_window() {
 
     // A NON-moderation audit row commits in the same window — the
     // reconciler must not fabricate a MODERATION_OUTBOUND_ACTION claim
-    // for it (token-keyed R-D2; it stays locally audited + v1-laned only).
+    // for it (token-keyed R-D2). The R-D2 writer is GATE-FREE (0242 D2
+    // precedent): this `message.deleted` delete writes its own MESSAGE-class
+    // outbox row even while enforcement is disabled — the admin lane stays
+    // empty until the reconcile backfill below.
     let id2 = message_in_workspace(&p, ws, actor).await;
     crate::message::MessageRepo::new(p.clone())
         .soft_delete_audited(id2, ws, Some(actor), serde_json::json!({ "digest": "x" }))
@@ -164,10 +167,33 @@ async fn governance_reconcile_backfills_disabled_window() {
     );
     assert_eq!(
         governance_rows_for(&p, ws).await,
-        1,
-        "exactly one governance row for THIS workspace; the unmapped action is never \
-             fabricated into the admin lane (token-keyed)"
+        2,
+        "exactly two governance rows for THIS workspace: the R-D2 writer's \
+             message-class delete row (gate-free) + the backfilled admin row; \
+             the delete row is never fabricated into the admin lane (token-keyed)"
     );
+    // The writer's delete row is class 'message', action verbatim — the
+    // admin backfill is the ONLY admin-class row.
+    let delete_class: i64 = sqlx::query_as::<_, (i64,)>(
+        "SELECT COUNT(*) FROM audit_governance_outbox
+          WHERE payload->>'aggregate_id' = $1 AND payload->>'action' = 'message.deleted'",
+    )
+    .bind(ws.to_uuid().to_string())
+    .fetch_one(&p)
+    .await
+    .unwrap()
+    .0;
+    assert_eq!(delete_class, 1, "the delete row is message-class");
+    let admin_class: i64 = sqlx::query_as::<_, (i64,)>(
+        "SELECT COUNT(*) FROM audit_governance_outbox
+          WHERE payload->>'aggregate_id' = $1 AND class = 'admin'",
+    )
+    .bind(ws.to_uuid().to_string())
+    .fetch_one(&p)
+    .await
+    .unwrap()
+    .0;
+    assert_eq!(admin_class, 1, "exactly one admin row (the backfill)");
     let again: i32 = sqlx::query_scalar("SELECT aero_reconcile_governance_audit(10)")
         .fetch_one(&p)
         .await
@@ -191,7 +217,7 @@ async fn governance_reconcile_backfills_disabled_window() {
     let gov: (String, i32, String, i16, serde_json::Value) = sqlx::query_as(
         "SELECT event_id::text, status, class, priority, payload
                FROM audit_governance_outbox
-              WHERE payload->>'aggregate_id' = $1",
+              WHERE payload->>'aggregate_id' = $1 AND class = 'admin'",
     )
     .bind(ws.to_uuid().to_string())
     .fetch_one(&p)
@@ -214,8 +240,10 @@ async fn governance_reconcile_backfills_disabled_window() {
     );
 
     // Parity over the mapped subset (enabled window): exactly one outbox
-    // row per message.moderated audit row — dead rows still count (parity
-    // is row existence, never delivery status).
+    // row per message.moderated audit row — scoped to class 'admin' (the
+    // R-D2 delete row is message-class and never counts toward the
+    // moderation parity). Dead rows still count (parity is row existence,
+    // never delivery status).
     let audit_count: i64 = sqlx::query_as::<_, (i64,)>(
         "SELECT COUNT(*) FROM audit_events
               WHERE workspace_id = $1 AND action = 'message.moderated'",
@@ -225,10 +253,17 @@ async fn governance_reconcile_backfills_disabled_window() {
     .await
     .unwrap()
     .0;
+    let admin_parity: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM audit_governance_outbox
+          WHERE payload->>'aggregate_id' = $1 AND class = 'admin'",
+    )
+    .bind(ws.to_uuid().to_string())
+    .fetch_one(&p)
+    .await
+    .expect("admin-class parity count");
     assert_eq!(
-        governance_rows_for(&p, ws).await,
-        audit_count,
-        "P2 parity after reconcile (over the workspace's mapped subset)"
+        admin_parity, audit_count,
+        "P2 parity after reconcile (over the workspace's mapped admin subset)"
     );
 
     // Dead is terminal: a dead row exists in the outbox, so NOT EXISTS

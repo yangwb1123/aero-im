@@ -2,8 +2,8 @@
 
 use aero_common::{
     recall_window_expired, Block, Error, Message, MessageEditId, MessageId, ParticipantId,
-    RoomEvent, RoomId, WorkspaceId, LOCAL_ACTION_MESSAGE_EDIT, LOCAL_ACTION_MESSAGE_RECALLED,
-    RECALLED_MESSAGE_PLACEHOLDER,
+    RoomEvent, RoomId, WorkspaceId, LOCAL_ACTION_MESSAGE_DELETED, LOCAL_ACTION_MESSAGE_EDIT,
+    LOCAL_ACTION_MESSAGE_RECALLED, RECALLED_MESSAGE_PLACEHOLDER,
 };
 use sqlx::{Postgres, Transaction};
 
@@ -511,7 +511,7 @@ impl MessageRepo {
             existing,
             Some(access.workspace),
             Some(actor),
-            Some("message.deleted"),
+            Some(LOCAL_ACTION_MESSAGE_DELETED),
             detail,
             actor,
             traceparent,

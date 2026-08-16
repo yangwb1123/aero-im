@@ -62,6 +62,18 @@ pub(crate) fn spawn(
     .ok()
     .and_then(|s| s.parse::<i64>().ok())
     .unwrap_or(30);
+    // R-D2 §10.2: governance-outbox retention — TERMINAL rows only
+    // (status 2/3 delivered/dead; the sink holds the ledger once delivered),
+    // aligned with the 365d audit-partition DROP so the outbox copy of
+    // content digests is bounded (GDPR Art. 5(1)(e) exposure). Live rows
+    // (status 0/1) are NEVER swept while the relay runs (0246 header).
+    // 0 disables.
+    let governance_outbox_retention_days = std::env::var(
+        "AERO__SERVER__GOVERNANCE_OUTBOX_RETENTION_DAYS",
+    )
+    .ok()
+    .and_then(|s| s.parse::<i64>().ok())
+    .unwrap_or(365);
     let viewer_raw_retention_days = std::env::var("AERO__SERVER__VIEWER_RAW_RETENTION_DAYS")
         .ok()
         .and_then(|s| s.parse::<i32>().ok())
@@ -190,6 +202,11 @@ pub(crate) fn spawn(
                     sweep_governance_failed_pairs(
                         &lifecycle_pool,
                         governance_failed_pairs_retention_days,
+                        now,
+                    ).await;
+                    sweep_governance_outbox(
+                        &lifecycle_pool,
+                        governance_outbox_retention_days,
                         now,
                     ).await;
                     sweep_notification_bundles(&lifecycle_pool, bundle_retention_days, now).await;
@@ -454,6 +471,26 @@ async fn sweep_governance_failed_pairs(pool: &sqlx::PgPool, days: i64, now: time
         Ok(0) => {}
         Ok(n) => info!(swept = n, "terminal failed-pair DLQ rows purged"),
         Err(e) => warn!(error = ?e, "governance-failed-pairs retention sweep failed"),
+    }
+}
+
+/// R-D2 §10.2: governance-outbox retention — DELETE only terminal rows
+/// (status 2/3) older than the TTL; live rows (status 0/1) are never swept
+/// while the relay runs (0246 header). Aligned with the 365d audit-partition
+/// DROP so content digests in the outbox copy stay bounded (GDPR). `days == 0`
+/// disables.
+async fn sweep_governance_outbox(pool: &sqlx::PgPool, days: i64, now: time::OffsetDateTime) {
+    if days == 0 {
+        return;
+    }
+    let cutoff = now - time::Duration::days(days);
+    match aero_storage::audit_governance::AuditGovernanceOutboxRepo::new(pool.clone())
+        .sweep_terminal_before(cutoff)
+        .await
+    {
+        Ok(0) => {}
+        Ok(n) => info!(swept = n, "terminal governance-outbox rows purged"),
+        Err(e) => warn!(error = ?e, "governance-outbox retention sweep failed"),
     }
 }
 

@@ -185,7 +185,7 @@ AUDIT_FLAG_ALLOWLIST=(
 # in ~49 sites across 11 files (connector config/JWT claims/drill configs/
 # binding fixtures); its 0242-SQL pin is the AC2 db_test field assertion
 # (`payload->>'source_system' == AUDIT_SOURCE_SYSTEM`), not a literal scan.
-L1_TOKEN_LITERALS_CS=( '"message.create"' '"message.edit"' '"message.batch"' '"message.recalled"' )
+L1_TOKEN_LITERALS_CS=( '"message.create"' '"message.edit"' '"message.batch"' '"message.recalled"' '"message.deleted"' )
 L1_TOKEN_ALLOWLIST=()
 
 # Room allowlist-token guard (rule 3f) — N3 closure for migration 0245's

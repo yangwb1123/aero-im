@@ -474,7 +474,7 @@ mod tests {
 #[cfg(test)]
 mod db_tests {
     use super::*;
-    use aero_common::{ParticipantId, WorkspaceId};
+    use aero_common::{ParticipantId, WorkspaceId, LOCAL_ACTION_MESSAGE_DELETED};
 
     fn pool() -> PgPool {
         let url = std::env::var("DATABASE_URL")
@@ -734,7 +734,7 @@ mod db_tests {
         let audit_rows: Vec<_> = trail
             .iter()
             .filter(|e| {
-                e.action == "message.deleted" && e.target.as_deref() == Some(&id.to_string())
+                e.action == LOCAL_ACTION_MESSAGE_DELETED && e.target.as_deref() == Some(&id.to_string())
             })
             .collect();
         assert_eq!(
@@ -758,7 +758,7 @@ mod db_tests {
         let repeats = trail
             .iter()
             .filter(|e| {
-                e.action == "message.deleted" && e.target.as_deref() == Some(&id.to_string())
+                e.action == LOCAL_ACTION_MESSAGE_DELETED && e.target.as_deref() == Some(&id.to_string())
             })
             .count();
         assert_eq!(repeats, 1, "the no-op repeat appended no second audit row");

@@ -21,6 +21,7 @@
 pub mod client;
 pub mod config;
 pub mod fake;
+pub mod metrics;
 pub mod outbox;
 pub mod pg;
 pub mod relay;

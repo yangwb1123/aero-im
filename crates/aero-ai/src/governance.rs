@@ -41,8 +41,9 @@ pub const GOVERNANCE_PRIORITY_BACKLOG: i16 = 10;
 pub use aero_common::model::audit::{
     AGGREGATED_MESSAGE_ACTION, AUDIT_SOURCE_SYSTEM, GOVERNANCE_CLASS_ADMIN,
     GOVERNANCE_CLASS_MESSAGE, GOVERNANCE_CLASS_ROOM, L1_WINDOW_SECONDS,
-    LOCAL_ACTION_MESSAGE_CREATE, LOCAL_ACTION_MESSAGE_EDIT, LOCAL_ACTION_MESSAGE_RECALLED,
-    LOCAL_ACTION_MODERATED, LOCAL_ACTION_ROOM_ARCHIVED, LOCAL_ACTION_ROOM_CREATE,
+    LOCAL_ACTION_MESSAGE_CREATE, LOCAL_ACTION_MESSAGE_DELETED, LOCAL_ACTION_MESSAGE_EDIT,
+    LOCAL_ACTION_MESSAGE_RECALLED, LOCAL_ACTION_MODERATED, LOCAL_ACTION_ROOM_ARCHIVED,
+    LOCAL_ACTION_ROOM_CREATE,
     MODERATION_OUTBOUND_ACTION,
 };
 
@@ -164,7 +165,7 @@ mod tests {
             LOCAL_ACTION_MESSAGE_CREATE,
             LOCAL_ACTION_MESSAGE_EDIT,
             LOCAL_ACTION_MESSAGE_RECALLED,
-            "message.deleted",
+            LOCAL_ACTION_MESSAGE_DELETED,
             "call.join",
             "",
         ] {
@@ -186,8 +187,8 @@ mod tests {
     /// raise (second abort path), fails this test.
     #[test]
     fn user_delete_token_stays_out_of_admin_lane() {
-        assert_eq!(governance_lane_for("message.deleted"), None);
-        assert!(!is_admin_class("message.deleted"));
+        assert_eq!(governance_lane_for(LOCAL_ACTION_MESSAGE_DELETED), None);
+        assert!(!is_admin_class(LOCAL_ACTION_MESSAGE_DELETED));
     }
 
     /// R1 token-keyed, not caller-keyed: the mapping is a pure function of the
@@ -203,7 +204,7 @@ mod tests {
         // No other in-repo local action token is admin-class (the L1
         // allowlist tokens included — they stay unmapped, see the L1 design).
         for token in [
-            "message.deleted",
+            LOCAL_ACTION_MESSAGE_DELETED,
             LOCAL_ACTION_MESSAGE_CREATE,
             LOCAL_ACTION_MESSAGE_RECALLED,
             LOCAL_ACTION_ROOM_CREATE,

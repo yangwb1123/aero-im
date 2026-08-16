@@ -524,9 +524,10 @@ async fn message_lane_outbox_parity() {
     }
     insert_audit_row(&mut tx, ws, actor, LOCAL_ACTION_MESSAGE_EDIT, fixed_ts).await;
     // Plus unmapped noise that must NOT balance anything: room rows are
-    // 1:1 (their own lane) and message.deleted stays unmapped (R-D2).
+    // 1:1 (their own lane) and message.deleted stays trigger-unmapped (R-D2; Rust-writer-owned
+    // via the delete seam — a raw audit INSERT never fires the writer).
     insert_audit_row(&mut tx, ws, actor, LOCAL_ACTION_ROOM_CREATE, fixed_ts).await;
-    insert_audit_row(&mut tx, ws, actor, "message.deleted", fixed_ts).await;
+    insert_audit_row(&mut tx, ws, actor, LOCAL_ACTION_MESSAGE_DELETED, fixed_ts).await;
     tx.commit().await.expect("commit message parity tx");
 
     // SUM side (drill mirror): window + spill rows, class 'message'.
@@ -564,8 +565,9 @@ async fn message_lane_outbox_parity() {
     );
     assert_eq!(sum, 6, "sanity: 5 create + 1 edit balance exactly");
     // The room row is NOT counted on either side (its own 1:1 lane), and
-    // message.deleted stays unmapped (R-D2) — both invisible to the
-    // message-lane parity by construction.
+    // message.deleted stays trigger-unmapped (R-D2; Rust-writer-owned via the
+    // delete seam — a raw audit INSERT never fires the writer) — both invisible
+    // to the message-lane parity by construction.
     let room_rows: i64 = sqlx::query_as::<_, (i64,)>(
         "SELECT COUNT(*) FROM audit_governance_outbox
               WHERE class = 'room' AND payload->>'aggregate_id' = $1",
@@ -695,7 +697,8 @@ async fn room_lane_never_merged_into_l1_window() {
 /// still produce their outbox rows (contrast: the 0239 moderation lane
 /// Gate 1 pass-through produces nothing while disabled). Non-allowlisted
 /// tokens — `room.creat` (prefix typo), `auth.login`, `message.deleted`
-/// (R-D2) — produce ZERO rows. NO v1 assertion here (F-A split: with
+/// (R-D2; Rust-writer-owned via the delete seam — a raw audit INSERT never
+/// fires the writer) — produce ZERO rows. NO v1 assertion here (F-A split: with
 /// enforcement disabled the 0236 v1 trigger returns NEW before producing
 /// a v1 row).
 #[tokio::test]
@@ -727,7 +730,7 @@ async fn room_lane_unconditional_enqueue() {
     // Non-allowlisted tokens must pass through unmapped.
     insert_audit_row(&mut tx, ws, actor, "room.creat", fixed_ts).await;
     insert_audit_row(&mut tx, ws, actor, "auth.login", fixed_ts).await;
-    insert_audit_row(&mut tx, ws, actor, "message.deleted", fixed_ts).await;
+    insert_audit_row(&mut tx, ws, actor, LOCAL_ACTION_MESSAGE_DELETED, fixed_ts).await;
     tx.commit().await.expect("commit unconditional tx");
 
     let rows: Vec<(String, i16)> = sqlx::query_as(
@@ -763,4 +766,294 @@ async fn room_lane_unconditional_enqueue() {
             v1_for_room_create, 0,
             "no v1 row while enforcement disabled (the dual-path assertion lives in room_lane_outbox_parity)"
         );
+}
+
+/// R-D2 AC-3 — message-delete lane outbox parity via the REAL producer seam
+/// (`soft_delete_outboxed_authorized` — the exact `ImService::delete_message`
+/// path): N deletes → exactly N 1:1 class-'message' priority-10 rows written
+/// in the delete txs by the Rust writer, ALL 16 envelope keys field-by-field
+/// vs the 0239 spelling (occurred_at byte-asserted against BOTH the PG
+/// `to_jsonb(created_at)` text and the shared `audit_wire_occurred_at`
+/// helper — §10.4 canonical spelling; actor = the deleter; non-empty
+/// targets; payload = the `{room_id, digest}` detail; action verbatim
+/// `LOCAL_ACTION_MESSAGE_DELETED`; `idempotency_key == event_id`; no L1
+/// marker keys), each payload parses into `AuditClaimPayload`
+/// (`deny_unknown_fields`) and re-serializes Value-equal. Rollback half → 0
+/// new rows; replay half (same-id audit re-INSERT with a VARYING created_at
+/// — the composite PK `(id, created_at)` admits it — never fires the writer,
+/// which lives only in the delete path) → still exactly N rows.
+#[tokio::test]
+#[ignore = "requires live Postgres"]
+async fn delete_lane_outbox_parity() {
+    let p = pool();
+    reset_governance_table(&p).await;
+    // Bare fixture (no authorized room-create — that path would self-produce
+    // a room.create audit row + 0245 outbox row): workspace + owner actor +
+    // one channel room (creator = owner member edge).
+    let (ws, actor) = fixture(&p).await;
+    let room = crate::room::RoomRepo::new(p.clone())
+        .create_in_workspace(
+            ws,
+            aero_common::RoomKind::Channel,
+            Some(format!("delete-lane-parity-{}", uuid::Uuid::new_v4())),
+            actor,
+        )
+        .await
+        .expect("create channel room")
+        .id;
+    let repo = crate::message::MessageRepo::new(p.clone());
+
+    // --- Commit half: N messages + N authorized deletes (each delete commits
+    // its audit row + writer outbox row atomically). Bare `insert` (no audit
+    // append — no window-row pollution). ---
+    let mut message_ids = Vec::new();
+    for i in 0..3 {
+        let msg = repo
+            .insert(crate::message::NewMessage {
+                room_id: room,
+                sender_id: actor,
+                blocks: vec![aero_common::Block::text(format!("delete-lane-{i}"))],
+                reply_to: None,
+                metadata: serde_json::json!({}),
+                expires_at: None,
+            })
+            .await
+            .expect("seed message");
+        repo.soft_delete_outboxed_authorized(msg.id, actor, None)
+            .await
+            .expect("authorized delete commits")
+            .expect("message deleted");
+        message_ids.push(msg);
+    }
+
+    let audit_rows: Vec<(uuid::Uuid, String)> = sqlx::query_as(
+        "SELECT id, target FROM audit_events
+          WHERE workspace_id = $1 AND action = $2
+          ORDER BY created_at, id",
+    )
+    .bind(ws.to_uuid())
+    .bind(LOCAL_ACTION_MESSAGE_DELETED)
+    .fetch_all(&p)
+    .await
+    .expect("query delete audit rows");
+    assert_eq!(
+        audit_rows.len(),
+        3,
+        "N deletes → N message.deleted audit rows"
+    );
+    let delete_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM audit_governance_outbox
+          WHERE payload->>'aggregate_id' = $1 AND payload->>'action' = 'message.deleted'",
+    )
+    .bind(ws.to_uuid().to_string())
+    .fetch_one(&p)
+    .await
+    .expect("delete outbox count");
+    assert_eq!(
+        delete_rows, 3,
+        "N deletes → exactly N 1:1 message-class outbox rows (no aggregation, no duplicates)"
+    );
+
+    // Field-by-field envelope pins (G2 closure — recomputed from leaf consts
+    // and the PG jsonb spelling, never inline literals).
+    for ((audit_id, target), msg) in audit_rows.iter().zip(&message_ids) {
+        assert_eq!(*target, msg.id.to_string(), "target = message id");
+        let row: (i32, String, i16, serde_json::Value) = sqlx::query_as(
+            "SELECT status, class, priority, payload
+                   FROM audit_governance_outbox WHERE event_id = $1",
+        )
+        .bind(*audit_id)
+        .fetch_one(&p)
+        .await
+        .expect("delete outbox row");
+        assert_eq!(row.0, 0, "status 0 = enqueued (0239 normative)");
+        assert_eq!(
+            row.1, GOVERNANCE_CLASS_MESSAGE,
+            "class 'message' (GOVERNANCE_CLASS_MESSAGE leaf const)"
+        );
+        assert_eq!(
+            row.2, 10,
+            "priority 10 = GOVERNANCE_PRIORITY_BACKLOG (comment-pinned; aero-storage cannot import aero-ai)"
+        );
+        let envelope = row.3;
+        // occurred_at byte-parity: the envelope spelling must equal BOTH the
+        // PG `to_jsonb(created_at)` text (the trigger's ground truth) and the
+        // shared helper (single canonical spelling, §10.4).
+        let created_at: time::OffsetDateTime =
+            sqlx::query_scalar("SELECT created_at FROM audit_events WHERE id = $1")
+                .bind(*audit_id)
+                .fetch_one(&p)
+                .await
+                .expect("audit row created_at");
+        let pg_spelling: String =
+            sqlx::query_scalar("SELECT (to_jsonb($1::timestamptz))::text")
+                .bind(created_at)
+                .fetch_one(&p)
+                .await
+                .expect("PG jsonb spelling");
+        let pg_spelling = pg_spelling.trim_matches('"').to_owned();
+        let helper_spelling = aero_common::audit_wire_occurred_at(created_at);
+        assert_eq!(pg_spelling, helper_spelling, "helper == PG spelling");
+        assert_eq!(
+            envelope["occurred_at"].as_str().expect("occurred_at string"),
+            pg_spelling,
+            "R-D2 envelope occurred_at == the canonical PG spelling (byte-identical)"
+        );
+        assert_eq!(
+            envelope["event_id"],
+            audit_id.to_string(),
+            "payload event_id mirrors"
+        );
+        assert_eq!(
+            envelope["source_system"], AUDIT_SOURCE_SYSTEM,
+            "payload source_system = AUDIT_SOURCE_SYSTEM (connector payload-guard value)"
+        );
+        assert_eq!(envelope["event_type"], AUDIT_EVENT_TYPE);
+        assert_eq!(envelope["schema_id"], AUDIT_SCHEMA_ID);
+        assert_eq!(envelope["schema_version"], AUDIT_SCHEMA_VERSION);
+        assert_eq!(
+            envelope["actor"]["id"],
+            actor.to_uuid().to_string(),
+            "actor.id = the DELETER's participant id"
+        );
+        assert_eq!(
+            envelope["actor"]["type"], AUDIT_ACTOR_TYPE_PARTICIPANT,
+            "actor.type = 'participant' (deleter is a human actor)"
+        );
+        assert_eq!(
+                envelope["targets"],
+                serde_json::json!([{ "id": msg.id.to_string(), "type": "resource" }]),
+                "targets = [{{id: <message id>, type: 'resource'}}] — non-empty (delete target is the message)"
+            );
+        assert_eq!(envelope["aggregate_type"], AUDIT_AGGREGATE_TYPE);
+        assert_eq!(envelope["aggregate_id"], ws.to_uuid().to_string());
+        assert_eq!(
+            envelope["action"], LOCAL_ACTION_MESSAGE_DELETED,
+            "action = local token VERBATIM (no fabricated contract token)"
+        );
+        assert_eq!(envelope["outcome"], AUDIT_OUTCOME_SUCCESS);
+        assert_eq!(
+                envelope["payload"],
+                serde_json::json!({
+                    // RoomId serializes in its OWN Display format (the same
+                    // serde the producer uses) — never to_uuid().to_string()
+                    // (uuid::text differs, e.g. hyphens).
+                    "room_id": room,
+                    "digest": msg.searchable_text().chars().take(120).collect::<String>(),
+                }),
+                "payload = the {{room_id, digest}} detail object (authorization.rs shape)"
+            );
+        assert_eq!(envelope["data_classification"], AUDIT_DATA_CLASSIFICATION);
+        assert_eq!(envelope["retention_class"], AUDIT_RETENTION_CLASS);
+        assert_eq!(
+            envelope["idempotency_key"],
+            audit_id.to_string(),
+            "idempotency_key = event_id (sink dedup)"
+        );
+        for marker in ["count", "aggregated", "spill", "window_start", "window_end"] {
+            assert!(
+                envelope.get(marker).is_none(),
+                "no L1 marker key {marker} on 1:1 delete rows"
+            );
+        }
+        // Fail-closed typed parse + Value-level re-serialize equality.
+        let parsed: AuditClaimPayload = serde_json::from_value(envelope.clone())
+            .expect("typed twin parses the R-D2 payload (deny_unknown_fields = drift alarm)");
+        assert_eq!(
+            serde_json::to_value(&parsed).unwrap(),
+            envelope,
+            "re-serialized twin must equal the stored JSONB (semantic parity)"
+        );
+        assert_eq!(
+            parsed.action, LOCAL_ACTION_MESSAGE_DELETED,
+            "typed action == the leaf const verbatim"
+        );
+    }
+
+    // --- Replay half: re-delete is Ok(None) (deleted_at guard — the writer
+    // never re-fires); a raw same-id audit re-INSERT (varying created_at) is
+    // admitted by the composite PK but never fires the writer (it lives only
+    // in the delete path) → still exactly N rows (at-most-one). ---
+    let replay = repo
+        .soft_delete_outboxed_authorized(message_ids[0].id, actor, None)
+        .await
+        .expect("replay delete returns Ok");
+    assert!(replay.is_none(), "replay of an already-deleted message is Ok(None)");
+    let mut tx = p.begin().await.expect("begin replay tx");
+    sqlx::query(
+        "INSERT INTO audit_events (id, workspace_id, actor_id, action, target, detail, created_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+    )
+    .bind(audit_rows[0].0)
+    .bind(ws.to_uuid())
+    .bind(actor.to_uuid())
+    .bind(LOCAL_ACTION_MESSAGE_DELETED)
+    .bind(message_ids[0].id.to_string())
+    .bind(sqlx::types::Json(serde_json::json!({ "room_id": room })))
+    .bind(
+        sqlx::query_scalar::<_, time::OffsetDateTime>("SELECT now()")
+            .fetch_one(&p)
+            .await
+            .expect("replay ts"),
+    )
+    .execute(&mut *tx)
+    .await
+    .expect("replayed audit row (same id, varied created_at) is admitted by the composite PK");
+    tx.commit().await.expect("commit replay tx");
+    let after_replay: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM audit_governance_outbox
+          WHERE payload->>'aggregate_id' = $1 AND payload->>'action' = 'message.deleted'",
+    )
+    .bind(ws.to_uuid().to_string())
+    .fetch_one(&p)
+    .await
+    .expect("count after replay");
+    assert_eq!(
+        after_replay, 3,
+        "replay produces no second row (at-most-one — writer fires only on the delete path)"
+    );
+
+    // --- Rollback half: aborted tx → zero new rows (no partial state). ---
+    let rollback_msg = repo
+        .insert(crate::message::NewMessage {
+            room_id: room,
+            sender_id: actor,
+            blocks: vec![aero_common::Block::text("delete-lane-rollback")],
+            reply_to: None,
+            metadata: serde_json::json!({}),
+            expires_at: None,
+        })
+        .await
+        .expect("seed rollback message");
+    let mut tx = p.begin().await.expect("begin rollback tx");
+    let existing = crate::message::MessageRepo::lock_message_in_tx(&mut tx, rollback_msg.id)
+        .await
+        .expect("lock the message")
+        .expect("message row exists");
+    crate::message::MessageRepo::soft_delete_locked_outboxed_in_tx(
+        &mut tx,
+        existing,
+        Some(ws),
+        Some(actor),
+        Some(LOCAL_ACTION_MESSAGE_DELETED),
+        serde_json::json!({ "room_id": room }),
+        actor,
+        None,
+    )
+    .await
+    .expect("in-tx delete succeeds")
+    .expect("deleted");
+    tx.rollback().await.expect("rollback delete tx");
+    let after_rollback: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM audit_governance_outbox
+          WHERE payload->>'aggregate_id' = $1 AND payload->>'action' = 'message.deleted'",
+    )
+    .bind(ws.to_uuid().to_string())
+    .fetch_one(&p)
+    .await
+    .expect("count after rollback");
+    assert_eq!(
+        after_rollback, 3,
+        "rollback aborts the writer's outbox row with the delete (in-tx atomicity)"
+    );
 }
