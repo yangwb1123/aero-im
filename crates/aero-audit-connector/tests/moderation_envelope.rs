@@ -1,7 +1,7 @@
 //! Moderation-envelope wire pins (A2.1) — split out of `claim_validation.rs`
 //! to keep that file under the 800-line WARN budget (Security F4, design gate
 //! 5a44687a). The config/claim fixture helpers are duplicated verbatim (the
-//! lint — claim_validation's "the 11 tests here exercise JWT validation" — is
+//! lint — `claim_validation`'s "the 11 tests here exercise JWT validation" — is
 //! file-scoped; a shared tests/ helper module would be a bigger refactor than
 //! the split's purpose).
 
