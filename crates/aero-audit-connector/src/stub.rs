@@ -286,6 +286,7 @@ impl StubSink {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // D7 seen_payloads observation API (test stub; 8 params)
 async fn serve(
     listener: TcpListener,
     behavior: Arc<Mutex<SinkBehavior>>,
@@ -323,6 +324,7 @@ async fn serve(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // D7 seen_payloads observation API (test stub; 8 params)
 async fn handle_connection(
     stream: &mut TcpStream,
     behavior: &Mutex<SinkBehavior>,
