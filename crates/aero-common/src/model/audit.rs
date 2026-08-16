@@ -504,9 +504,15 @@ mod tests {
 
     /// Vocabulary canonical-value pins (the leaf is the single definition
     /// point — the migration from governance.rs:197's literal assert).
+    /// The outbound moderation spelling is pinned to the VOCABULARY's index
+    /// 0 (not a bare literal): a coordinated flip (A1.3, scripts/coordinated-
+    /// flip-drill.sh) swaps the vocabulary members and the const follows —
+    /// this pin stays green and still catches an uncoordinated drift
+    /// (const ≠ index 0).
     #[test]
     fn vocabulary_consts_are_pinned() {
-        assert_eq!(MODERATION_OUTBOUND_ACTION, "admin.content.flag");
+        assert_eq!(MODERATION_OUTBOUND_ACTION, MODERATION_OUTBOUND_VOCABULARY[0]);
+        assert_ne!(MODERATION_OUTBOUND_VOCABULARY[0], MODERATION_OUTBOUND_VOCABULARY[1]);
         assert_eq!(LOCAL_ACTION_MODERATED, "message.moderated");
         assert_eq!(GOVERNANCE_CLASS_ADMIN, AuditClass::Admin.as_str());
         assert_eq!(GOVERNANCE_CLASS_MESSAGE, AuditClass::Message.as_str());
