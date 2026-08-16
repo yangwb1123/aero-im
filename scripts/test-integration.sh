@@ -789,6 +789,12 @@ if [ -z "$SKIP_DB_CREATE" ]; then
         echo "▶ Migrating database for audit-outbox sampler smoke..."
         DATABASE_URL="$SAMPLER_URL"             AERO__DATABASE__URL="$SAMPLER_URL"             cargo run --bin aero-cli -- migrate 2>&1 | tail -1
         # Seed: one enqueued row backdated 600s + one delivered row.
+        # NOTE: the commercial runtime is deliberately NOT enabled here —
+        # `SnaplinkCommercialRuntime::from_env` (runtime.rs) fail-closes the
+        # boot when the DB switch is on without the AERO_SNAPLINK_* config
+        # family, and the sampler leg must boot WITHOUT the relay/Snaplink
+        # config (the FM11 probe). Rows are seeded directly (the sampler is
+        # read-only — the 0239 trigger is not needed).
                 run_psql -h "$PSQL_HOST" -p "$PSQL_PORT" -U "$PSQL_USER" -d "$AUDIT_OUTBOX_SAMPLER_DB" \
             -v ON_ERROR_STOP=1 >/dev/null <<'SQL' 
 INSERT INTO audit_governance_outbox (event_id, status, attempts, priority, payload, available_at, created_at)
@@ -808,7 +814,7 @@ SQL
         for _ in $(seq 1 24); do
             sleep 5
             METRICS="$(curl -sf -H "Authorization: Bearer smoke-token"                 "http://localhost:${AERO_SAMPLER_PORT:-3030}/metrics" 2>/dev/null || true)"
-            if echo "$METRICS" | grep -q 'aero_audit_outbox_status{status="enqueued"} 1'                 && echo "$METRICS" | grep -q 'aero_audit_outbox_status{status="claimed"} 0'                 && echo "$METRICS" | grep -q 'aero_audit_outbox_status{status="delivered"} 1'                 && echo "$METRICS" | grep -q 'aero_audit_outbox_dead_rows 0'                 && echo "$METRICS" | grep -q 'aero_audit_outbox_sampler_up 1'; then
+            if echo "$METRICS" | grep -q 'aero_audit_outbox_status{status="enqueued"} 1'                 && echo "$METRICS" | grep -q 'aero_audit_outbox_status{status="claimed"} 0'                 && echo "$METRICS" | grep -q 'aero_audit_outbox_status{status="delivered"} 1'                 && echo "$METRICS" | grep -q 'aero_audit_outbox_status{status="dead"} 0'                 && echo "$METRICS" | grep -q 'aero_audit_outbox_dead_rows 0'                 && echo "$METRICS" | grep -q 'aero_audit_outbox_sampler_up 1'; then
                 found=1
                 break
             fi
@@ -816,6 +822,13 @@ SQL
         if [ "$found" -ne 1 ]; then
             echo "✗ audit-outbox-sampler L1: sampler gauges not observed" >&2
             tail -20 "$SAMPLER_LOG" >&2
+            sampler_ok=0
+        fi
+        # L1 (AC1-C): the backdated status-0 row must surface as
+        # oldest_pending_secs ≥ 600 (the seeded age — Q4 mirror parity).
+        OLDEST1="$(echo "$METRICS" | grep -o 'aero_audit_outbox_oldest_pending_secs [0-9]*' | grep -o '[0-9]*$' || true)"
+        if [ -z "${OLDEST1:-}" ] || [ "$OLDEST1" -lt 600 ]; then
+            echo "✗ audit-outbox-sampler L1: oldest_pending_secs missing or < 600 (${OLDEST1:-absent})" >&2
             sampler_ok=0
         fi
         if grep -q "verdict:" "$SAMPLER_LOG"; then
@@ -847,6 +860,12 @@ SQL
         if [ "$l3_ok" -ne 1 ]; then
             echo "✗ audit-outbox-sampler L3: fail-closed sampler state not observed" >&2
             echo "$METRICS3" | grep -E "sampler_up|sample_errors|enqueued" >&2
+            sampler_ok=0
+        fi
+        # L3 (F2): the enqueued gauge retains its last value — never a
+        # fabricated zero snapshot on a query failure.
+        if ! echo "$METRICS3" | grep -q 'aero_audit_outbox_status{status="enqueued"} 1'; then
+            echo "✗ audit-outbox-sampler L3: enqueued gauge did not retain its last value (fabricated zero snapshot)" >&2
             sampler_ok=0
         fi
         kill "$SERVER_PID" 2>/dev/null || true
