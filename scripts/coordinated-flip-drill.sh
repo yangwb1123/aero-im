@@ -55,9 +55,9 @@ check_sync() {
 }
 
 apply_flip() {
-    local wd
+    local wd=""
     wd="$(mktemp -d "${TMPDIR:-/tmp}/aero-flip.XXXXXX")"
-    trap 'rm -rf "$wd"' EXIT
+    trap 'test -n "${wd:-}" && rm -rf "$wd"' EXIT
     git -C "$ROOT" worktree add --detach "$wd" HEAD >/dev/null
     cd "$wd"
     # 1. leaf const + vocabulary pair (index 0 = pinned; swap members)
