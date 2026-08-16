@@ -47,6 +47,7 @@ ROOM_FACADE_DRILL_DB="aero_room_facade_drill_$$"
 RECALL_FACADE_DRILL_DB="aero_recall_facade_drill_$$"
 POSTURE_DRILL_DB="aero_posture_drill_$$"
 R4_SINK_LEG_DB="aero_r4_sink_leg_$$"
+AUDIT_OUTBOX_SAMPLER_DB="aero_audit_sampler_$$"
 
 assert_disposable_db_name() {
     local variable_name="$1"
@@ -82,6 +83,7 @@ assert_disposable_db_name "room facade drill database" "$ROOM_FACADE_DRILL_DB"
 assert_disposable_db_name "recall facade drill database" "$RECALL_FACADE_DRILL_DB"
 assert_disposable_db_name "connector posture drill database" "$POSTURE_DRILL_DB"
 assert_disposable_db_name "R4 sink leg drill database" "$R4_SINK_LEG_DB"
+assert_disposable_db_name "audit outbox sampler database" "$AUDIT_OUTBOX_SAMPLER_DB"
 
 # Parse host and user from BASE_URL for psql
 PSQL_ARGS="${BASE_URL#postgres://}"
@@ -645,12 +647,12 @@ if [ -z "$SKIP_DB_CREATE" ]; then
     # 0242 file (a second slice landing a renumbered copy reds here).
     if [ -f "migrations/0242_audit_governance_l1_aggregate.sql" ]; then
         MIGRATION_COUNT="$(ls migrations/*.sql | wc -l)"
-        # Static arbiter counts ACTUAL files: 247 = 243 landed + 0246
+        # Static arbiter counts ACTUAL files: 248 = 243 landed + 0246
         # (message-recall lane) + 0243 (login_failures_created_at_idx) + 0244
         # (audit_governance_failed_pairs DLQ) + 0247 (failed-pairs replay caps,
         # F-4).
-        if [ "$MIGRATION_COUNT" -ne 247 ]; then
-            echo "✗ 0242 static arbiter: expected exactly 247 migrations, found ${MIGRATION_COUNT}" >&2
+        if [ "$MIGRATION_COUNT" -ne 248 ]; then
+            echo "✗ 0242 static arbiter: expected exactly 248 migrations, found ${MIGRATION_COUNT}" >&2
             exit 1
         fi
         L1_DEFINITIONS="$(rg -l "aero_enqueue_l1_aggregate_audit" migrations/ 2>/dev/null || true)"
@@ -660,7 +662,7 @@ if [ -z "$SKIP_DB_CREATE" ]; then
             echo "  found: $L1_DEFINITIONS" >&2
             exit 1
         fi
-        echo "✓ 0242 static arbiter: 247 migrations, single aero_enqueue_l1_aggregate_audit definition"
+        echo "✓ 0242 static arbiter: 248 migrations, single aero_enqueue_l1_aggregate_audit definition"
         run_migrated_integration \
             "$L1_AGGREGATE_DB" \
             "l1_window_aggregates_" \
@@ -774,6 +776,83 @@ if [ -z "$SKIP_DB_CREATE" ]; then
         b5_check "recall-lane-facade-drill" "SKIP (0239 not landed)"
         b5_check "connector-posture-drill" "SKIP (0239 not landed)"
         b5_check "drill-payload-contract-slot" "SKIP (0239 not landed)"
+    fi
+    # B5-4 audit-outbox sampler smoke (design D5 A1): boot the real server
+    # against a throwaway DB with backdated governance rows, poll /metrics
+    # for the sampler gauges, exercise a slow tick + a DROP TABLE failure
+    # leg, assert zero verdict-pollution lines. Gated on 0239 (the outbox
+    # table) — absent → explicit SKIP, never silent green.
+    if [ -f "migrations/0239_audit_governance_outbox.sql" ]         && [ -f "migrations/0248_audit_relay_provisioning.sql" ]; then
+        echo "▶ Creating fresh database for audit-outbox sampler smoke: ${AUDIT_OUTBOX_SAMPLER_DB}"
+        create_throwaway_database "$AUDIT_OUTBOX_SAMPLER_DB"
+        SAMPLER_URL="${BASE_URL}/${AUDIT_OUTBOX_SAMPLER_DB}"
+        echo "▶ Migrating database for audit-outbox sampler smoke..."
+        DATABASE_URL="$SAMPLER_URL"             AERO__DATABASE__URL="$SAMPLER_URL"             cargo run --bin aero-cli -- migrate 2>&1 | tail -1
+        # Seed: one enqueued row backdated 600s + one delivered row.
+                run_psql -h "$PSQL_HOST" -p "$PSQL_PORT" -U "$PSQL_USER" -d "$AUDIT_OUTBOX_SAMPLER_DB" \
+            -v ON_ERROR_STOP=1 >/dev/null <<'SQL' 
+INSERT INTO audit_governance_outbox (event_id, status, attempts, priority, payload, available_at, created_at)
+VALUES (gen_random_uuid(), 0, 0, 10, '{"event_id":"seed-1","source_system":"aero-im.source","action":"message.moderated"}'::jsonb,
+        clock_timestamp() - interval '600 seconds', clock_timestamp() - interval '600 seconds');
+INSERT INTO audit_governance_outbox (event_id, status, attempts, priority, payload, delivered_at, created_at)
+VALUES (gen_random_uuid(), 2, 1, 10, '{"event_id":"seed-2","source_system":"aero-im.source","action":"message.moderated"}'::jsonb,
+        clock_timestamp(), clock_timestamp() - interval '600 seconds');
+SQL
+        SAMPLER_LOG="$(mktemp "${TMPDIR:-/tmp}/aero-sampler.XXXXXX.log")"
+        # Boot the real server (dev config.toml present; AERO__ envs win).
+        DATABASE_URL="$SAMPLER_URL"             AERO__DATABASE__URL="$SAMPLER_URL"             AERO__REDIS__URL="${REDIS_URL:-redis://localhost:6379}"             AERO__NATS__URL="${AERO__NATS__URL:-nats://localhost:4222}"             AERO_METRICS_TOKEN=smoke-token             AERO__SERVER__AUDIT_OUTBOX_FULL_SAMPLE_SECS=60             AERO__SERVER__BLOB_DIR=/tmp/aero-sampler-blobs             AERO__SERVER__HLS_DIR=/tmp/aero-sampler-hls             nohup cargo run --quiet --bin aero-server >"$SAMPLER_LOG" 2>&1 &
+        SERVER_PID=$!
+        sampler_ok=1
+        # L1: poll /metrics (≤120s) for the sampler gauges.
+        found=0
+        for _ in $(seq 1 24); do
+            sleep 5
+            METRICS="$(curl -sf -H "Authorization: Bearer smoke-token"                 "http://localhost:${AERO_SAMPLER_PORT:-3030}/metrics" 2>/dev/null || true)"
+            if echo "$METRICS" | grep -q 'aero_audit_outbox_status{status="enqueued"} 1'                 && echo "$METRICS" | grep -q 'aero_audit_outbox_status{status="claimed"} 0'                 && echo "$METRICS" | grep -q 'aero_audit_outbox_status{status="delivered"} 1'                 && echo "$METRICS" | grep -q 'aero_audit_outbox_dead_rows 0'                 && echo "$METRICS" | grep -q 'aero_audit_outbox_sampler_up 1'; then
+                found=1
+                break
+            fi
+        done
+        if [ "$found" -ne 1 ]; then
+            echo "✗ audit-outbox-sampler L1: sampler gauges not observed" >&2
+            tail -20 "$SAMPLER_LOG" >&2
+            sampler_ok=0
+        fi
+        if grep -q "verdict:" "$SAMPLER_LOG"; then
+            echo "✗ audit-outbox-sampler L1: verdict-pollution line in server log" >&2
+            sampler_ok=0
+        fi
+        # L2: one slow tick (65s) — oldest strictly increases, delivered unchanged.
+        sleep 65
+        METRICS2="$(curl -sf -H "Authorization: Bearer smoke-token"             "http://localhost:${AERO_SAMPLER_PORT:-3030}/metrics" 2>/dev/null || true)"
+        OLDEST2="$(echo "$METRICS2" | grep -o 'aero_audit_outbox_oldest_pending_secs [0-9]*' | grep -o '[0-9]*$' || echo 0)"
+        if [ -n "$OLDEST2" ] && [ "$OLDEST2" -lt 600 ]; then
+            echo "✗ audit-outbox-sampler L2: oldest_pending_secs did not increase (${OLDEST2})" >&2
+            sampler_ok=0
+        fi
+        # L3: DROP TABLE → sampler_up 0, errors ≥1, enqueued retains last value.
+                run_psql -h "$PSQL_HOST" -p "$PSQL_PORT" -U "$PSQL_USER" -d "$AUDIT_OUTBOX_SAMPLER_DB" \
+            -c "DROP TABLE audit_governance_outbox;" >/dev/null
+        sleep 35
+        METRICS3="$(curl -sf -H "Authorization: Bearer smoke-token"             "http://localhost:${AERO_SAMPLER_PORT:-3030}/metrics" 2>/dev/null || true)"
+        if ! echo "$METRICS3" | grep -q 'aero_audit_outbox_sampler_up 0'             || ! echo "$METRICS3" | grep -Eq 'aero_audit_outbox_sample_errors_total [1-9][0-9]*'; then
+            echo "✗ audit-outbox-sampler L3: fail-closed sampler state not observed" >&2
+            echo "$METRICS3" | grep -E "sampler_up|sample_errors|enqueued" >&2
+            sampler_ok=0
+        fi
+        kill "$SERVER_PID" 2>/dev/null || true
+        wait "$SERVER_PID" 2>/dev/null || true
+        rm -f "$SAMPLER_LOG"
+        drop_created_database "$AUDIT_OUTBOX_SAMPLER_DB"
+        if [ "$sampler_ok" -eq 1 ]; then
+            echo "✓ audit-outbox-sampler smoke passed"
+            b5_check "audit-outbox-sampler" "PASS"
+        else
+            echo "✗ audit-outbox-sampler smoke FAILED" >&2
+            exit 1
+        fi
+    else
+        b5_check "audit-outbox-sampler" "SKIP (0239/0248 not landed)"
     fi
     # Notification fan-out suite (AT-1…AT-7): owns a fresh throwaway DB with
     # its own migration + required Redis presence leg; the shared main-DB run
