@@ -142,11 +142,14 @@ impl AuditClass {
 // ---- Action-token vocabulary (the only legal literal site in Rust) ----
 
 /// Single outbound contract token: the 0239 trigger/0241 reconciler hardcode
-/// this in SQL (their INSERT literals are pinned against this constant by the
-/// aero-storage `db_tests` — leaf ↔ DDL cross-pin). The contract proposal
-/// listed both `admin.content.flag` and `admin.moderation.action`; locked
-/// here as ONE constant — a flip is a one-line edit and the cross-pins
-/// follow automatically.
+/// this in SQL (their INSERT literals are pinned against this constant by
+/// the aero-storage `db_tests` — leaf ↔ DDL cross-pin — and by truth-check
+/// rule 3g's static SQL-literal guard). The contract proposal listed both
+/// `admin.content.flag` and `admin.moderation.action`; locked here as ONE
+/// constant. A flip is a COORDINATED edit: this leaf + the 0239/0241 SQL
+/// literals + the priority drill's contract-vocabulary pair (index 0) + the
+/// test-integration drill fixture, all in one commit (truth-check rule 3g
+/// and the drill's exact-equality bail red a partial flip).
 pub const MODERATION_OUTBOUND_ACTION: &str = "admin.content.flag";
 
 /// Local audit token produced by every moderation finalize producer

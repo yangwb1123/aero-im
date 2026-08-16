@@ -7,6 +7,7 @@ use aero_audit_connector::config::RelayConfig;
 use aero_audit_connector::outbox::Claim;
 use aero_audit_connector::stub::{make_jwt, SinkBehavior, StubSink};
 use aero_auth::{JwksKeyProvider, KeyProvider, StaticKeyProvider};
+use aero_common::model::audit::MODERATION_OUTBOUND_ACTION;
 use aero_common::AuditId;
 use rand::rngs::OsRng;
 use reqwest::Url;
@@ -57,6 +58,7 @@ fn claim() -> Claim {
         payload: json!({
             "event_id": id.to_string(),
             "source_system": "aero-im.source",
+            "action": MODERATION_OUTBOUND_ACTION,
         }),
         // B5-3 R6: backlog-lane defaults, pinned to aero_ai::governance
         // (crates/aero-ai/src/governance.rs:33/:39) — the 0239 column
@@ -767,4 +769,31 @@ async fn fractional_iat_is_rejected_before_any_post() {
         posts, 0,
         "a fractional-iat token must never reach a delivery POST"
     );
+}
+
+// B5-3 moderation outbound-token pin (A2.1): the envelope's delivered `action`.
+/// A2.1 positive — the delivered envelope's `action` is byte-equal to the pinned leaf constant.
+#[tokio::test]
+async fn delivered_envelope_carries_the_pinned_moderation_action() {
+    let stub = StubSink::start().await.expect("start stub");
+    let client = AuditClient::new(config(&stub)).expect("build client");
+    assert!(client.deliver(&claim()).await.is_ok());
+    let payloads = stub.seen_payloads().await;
+    assert_eq!(payloads.len(), 1, "exactly one delivered envelope");
+    assert_eq!(payloads[0]["action"], MODERATION_OUTBOUND_ACTION);
+    stub.shutdown();
+}
+/// A2.1 negative twin — the sibling spelling stays distinguishable end-to-end
+/// (a leaf flip to the sibling reds the positive).
+#[tokio::test]
+async fn sibling_spelling_is_detected_as_drift() {
+    let stub = StubSink::start().await.expect("start stub");
+    let client = AuditClient::new(config(&stub)).expect("build client");
+    let mut drifted = claim();
+    drifted.payload["action"] = json!("admin.moderation.action");
+    assert!(client.deliver(&drifted).await.is_ok());
+    let payloads = stub.seen_payloads().await;
+    assert_eq!(payloads.len(), 1, "exactly one delivered envelope");
+    assert_ne!(payloads[0]["action"], MODERATION_OUTBOUND_ACTION);
+    stub.shutdown();
 }

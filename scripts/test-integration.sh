@@ -611,9 +611,15 @@ if [ -z "$SKIP_DB_CREATE" ]; then
             }
             cat "$PRIORITY_DRILL_LOG"   # drill 的 PASS 行保持可见
             b5_check "moderation-priority-drill" "PASS"
+            # The outbound-token pin rides the same drill: the seed-time
+            # EXACT-equality bail + the `moderation-action-vocabulary` read-
+            # back are the executable half of the coordinated-flip contract
+            # (truth-check rule 3g covers the SQL literals statically).
+            b5_check "moderation-outbound-token-exact" "PASS"
         elif [ "$PRIORITY_DRILL_RC" -eq 2 ]; then
             cat "$PRIORITY_DRILL_LOG"
             b5_check "moderation-priority-drill" "SKIP (priority/class not landed)"
+            b5_check "moderation-outbound-token-exact" "SKIP (priority/class not landed)"
         else
             echo "✗ moderation-priority drill FAILED (exit $PRIORITY_DRILL_RC)" >&2
             cat "$PRIORITY_DRILL_LOG" >&2
@@ -621,9 +627,12 @@ if [ -z "$SKIP_DB_CREATE" ]; then
         fi
         rm -f "$PRIORITY_DRILL_LOG"
         drop_created_database "$PRIORITY_DRILL_DB"
-        b5_check "moderation-priority-drill" "PASS"
+        # (Pre-existing duplicate PASS removed: the RC==0 branch above already
+        # emitted PASS, and an unconditional PASS here contradicted the RC==2
+        # SKIP path — SKIP-with-reason must be the terminal verdict.)
     else
         b5_check "moderation-priority-drill" "SKIP (0239 not landed)"
+        b5_check "moderation-outbound-token-exact" "SKIP (0239 not landed)"
     fi
     # L1 window aggregation (B5-1 core, migration 0242): AC2 db_tests
     # (l1_window_aggregates_5_rows_to_1_outbox + concurrent merge) on their

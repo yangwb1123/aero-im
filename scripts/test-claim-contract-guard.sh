@@ -38,11 +38,17 @@ check() { # check <name> <expected-grep-pattern> <actual-output>
 }
 
 # fresh copy of the real crates tree (rs files only, structure preserved)
+# + the moderation SQL pin subjects (migrations 0239/0241 + the
+# test-integration.sh drill fixture): rule 3g scans those three files, so
+# fixtures must carry them or the clean-fixture case would false-red.
 make_fixture() {
     local dest="$1"
-    mkdir -p "$dest"
+    mkdir -p "$dest/migrations" "$dest/scripts"
     (cd "$ROOT" && find crates -name '*.rs' -print0 | tar --null -T - -cf -) \
         | (cd "$dest" && tar -xf -)
+    cp "$ROOT/migrations/0239_audit_governance_outbox.sql" \
+       "$ROOT/migrations/0241_governance_reconcile.sql" "$dest/migrations/"
+    cp "$ROOT/scripts/test-integration.sh" "$dest/scripts/"
 }
 
 scan() { # scan <root> — run the guard, capture stdout, keep violations visible
@@ -142,6 +148,23 @@ sed -i '405s/client_id/scope/' "$TMP/n9/crates/aero-server/src/sso.rs"
 out="$(scan "$TMP/n9")"
 check "n9-wrong-literal-at-pinned-line-fails" 'CLAIM LITERAL: crates/aero-server/src/sso.rs:405:"scope"' "$out"
 check "n9-old-pin-goes-stale" "STALE ALLOWLIST ENTRY: crates/aero-server/src/sso.rs:405" "$out"
+
+# n10: moderation SQL guard (3g): a drifted emission literal in the 0239
+#     migration is a violation even though the leaf still matches (comment
+#     lines are stripped before matching, so a comment mention cannot
+#     satisfy the guard).
+make_fixture "$TMP/n10sql"
+sed -i "s/'action', 'admin.content.flag'/'action', 'admin.moderation.action'/" \
+    "$TMP/n10sql/migrations/0239_audit_governance_outbox.sql"
+out="$(scan "$TMP/n10sql")"
+check "n10-sql-literal-drift-fails" "MODERATION SQL GUARD: migrations/0239_audit_governance_outbox.sql" "$out"
+
+# n11: moderation sibling guard (3h): the sibling spelling outside the
+#     leaf/allowlist is a violation (mirror of n7).
+make_fixture "$TMP/n11sib"
+printf 'let _s = "admin.moderation.action";\n' >> "$TMP/n11sib/crates/aero-auth/src/jwt.rs"
+out="$(scan "$TMP/n11sib")"
+check "n11-sibling-outside-audit-rs-fails" 'AUDIT SIBLING LITERAL:.*jwt\.rs' "$out"
 
 # ── ⑧ exit-code fold (F5): wired truth-check exits orphan + guard ──────────
 mkdir -p "$TMP/wired"

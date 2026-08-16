@@ -17,7 +17,12 @@
 //! backlog) and 1 moderation row (`class = 'admin'`,
 //! priority = [`MODERATION_PRIORITY`] = 100, `GOVERNANCE_PRIORITY_MODERATION`
 //! = the 0239 trigger stamp, outbound action
-//! [`MODERATION_OUTBOUND_ACTION`] (the leaf-single-sourced contract token),
+//! [`MODERATION_OUTBOUND_ACTION`] (the leaf-single-sourced contract token —
+//! pinned EXACTLY: the seed-time bail requires the leaf to equal the pair's
+//! index 0 and the delivered-row read-back requires byte equality, so a
+//! partial flip to the sibling spelling reds before any destructive work;
+//! a coordinated flip updates leaf + 0239/0241 SQL literals + this pair
+//! together, in one commit),
 //! enqueued LAST / later `available_at`), so any ordering evidence can only
 //! come from priority, never FIFO. Drains with `batch_size = 100` (the first batch
 //! cannot hold all 502 rows) / `concurrency = 1` (serial settle) against a
@@ -83,9 +88,9 @@ const MODERATION_PRIORITY: i64 = 100;
 const MODERATION_ACTION: &str = MODERATION_OUTBOUND_ACTION;
 
 /// Contract item 3 outbound vocabulary (proposal:10, implementation-
-/// gate.md:65; the leaf locks ONE constant — either spelling is contract-
-/// legal). Hardcoded, NOT derived from the leaf: a leaf flip must not
-/// auto-follow and silently kill the pin.
+/// gate.md:65) — DOCUMENTATION ONLY, never an acceptance set: the leaf
+/// locks ONE emission constant, and index 0 is the locked spelling the
+/// drill accepts; a coordinated flip updates BOTH entries in one commit.
 const MODERATION_OUTBOUND_ACTIONS: [&str; 2] = ["admin.content.flag", "admin.moderation.action"];
 
 const BACKLOG_ROWS: i64 = 500;
@@ -118,6 +123,15 @@ fn truncate_gate_allows(n: i64, allow_truncate: Option<&str>) -> bool {
     n == 0 || allow_truncate == Some("1")
 }
 
+/// The delivered envelope's `action` must be EXACTLY the locked leaf
+/// constant (R1.2 exact-equality read-back) — pure, so the drill's runtime
+/// check and its unit tests share one equality. The contract pair's sibling
+/// spelling and a missing/NULL action both fail here.
+#[must_use]
+fn delivered_moderation_action_is_pinned(action: Option<&str>) -> bool {
+    action == Some(MODERATION_OUTBOUND_ACTION)
+}
+
 fn main() -> anyhow::Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -127,13 +141,14 @@ fn main() -> anyhow::Result<()> {
 }
 
 async fn run() -> anyhow::Result<()> {
-    // D8′ vocabulary pin (design: priority-drill-destructive-gate): bail red
-    // BEFORE any destructive work if the leaf drifted outside the contract
-    // pair — the pin must not auto-follow a leaf flip.
-    if !MODERATION_OUTBOUND_ACTIONS.contains(&MODERATION_ACTION) {
+    // D8′ vocabulary pin: bail red BEFORE any destructive work if the
+    // leaf drifted off the locked emission spelling — EXACT equality on
+    // the pair's index 0 (`contains` would be tautological: the alias).
+    if MODERATION_ACTION != MODERATION_OUTBOUND_ACTIONS[0] {
         anyhow::bail!(
-            "leaf MODERATION_OUTBOUND_ACTION {MODERATION_ACTION} is outside the contract \
-             vocabulary {MODERATION_OUTBOUND_ACTIONS:?}"
+            "leaf MODERATION_OUTBOUND_ACTION {MODERATION_ACTION} drifted from the locked \
+             emission spelling {} — the pair is documentation only",
+            MODERATION_OUTBOUND_ACTIONS[0]
         );
     }
     let url = std::env::var("DATABASE_URL").context("DATABASE_URL is required")?;
@@ -339,11 +354,11 @@ async fn run() -> anyhow::Result<()> {
     println!("drill: moderation-in-first-batch: PASS");
 
     // D8′ vocabulary read-back: the delivered moderation row's payload
-    // `action` must be inside the contract pair. This is a seeded-row re-
-    // read (the relay forwards claim.payload verbatim and never writes the
-    // payload back), not wire-level delivery evidence — its value is the
-    // greppable acceptance line + defense-in-depth against future payload
-    // rewriting. NULL/missing action → red FAIL, never a no-op pass.
+    // `action` must be EXACTLY the locked emission spelling (R1.2), not
+    // merely inside the contract pair. A seeded-row re-read (the relay
+    // forwards claim.payload verbatim, never writes it back) — greppable
+    // acceptance line + defense-in-depth; the wire-level envelope is pinned
+    // by the claim_validation suite. NULL/missing action → red FAIL.
     let delivered_action: Option<String> = sqlx::query_scalar(
         "SELECT payload->>'action' FROM audit_governance_outbox WHERE event_id = $1",
     )
@@ -351,12 +366,12 @@ async fn run() -> anyhow::Result<()> {
     .fetch_one(&pool)
     .await
     .context("read the delivered moderation row action")?;
-    match delivered_action.as_deref() {
-        Some(action) if MODERATION_OUTBOUND_ACTIONS.contains(&action) => {}
-        other => anyhow::bail!(
-            "delivered moderation row action {other:?} not in contract vocabulary \
-             {MODERATION_OUTBOUND_ACTIONS:?}"
-        ),
+    if !delivered_moderation_action_is_pinned(delivered_action.as_deref()) {
+        anyhow::bail!(
+            "delivered moderation row action {delivered_action:?} must be exactly \
+             MODERATION_OUTBOUND_ACTION ({MODERATION_OUTBOUND_ACTION}) — the locked \
+             emission spelling, never the pair's documentation sibling"
+        );
     }
     println!("drill: moderation-action-vocabulary: PASS");
 
@@ -640,11 +655,31 @@ mod tests {
         );
     }
 
-    /// The leaf's single locked constant must be inside the pair — either
-    /// contract spelling is legal (a flip between the two stays green).
+    /// The leaf's single locked constant must be EXACTLY the pair's index 0
+    /// — the locked emission spelling the drill accepts and truth-check 3g
+    /// pins against the 0239/0241 SQL literals. A leaf flip to the sibling
+    /// breaks this pin (A1.1 red) even though the pair documents both
+    /// spellings — the pair is documentation, never an acceptance set.
     #[test]
-    fn leaf_action_is_inside_the_contract_vocabulary() {
-        assert!(MODERATION_OUTBOUND_ACTIONS.contains(&MODERATION_ACTION));
+    fn emitted_spelling_is_the_pair_lock() {
+        assert_eq!(MODERATION_OUTBOUND_ACTIONS[0], MODERATION_OUTBOUND_ACTION);
+    }
+
+    /// The sibling spelling of the delivered envelope must be rejected by
+    /// the read-back helper — the same equality the drill runs at runtime
+    /// (the sibling is the pair's index 1, itself pinned verbatim by
+    /// `outbound_vocabulary_is_the_contract_pair`, so no new literal site).
+    #[test]
+    fn delivered_sibling_spelling_is_rejected() {
+        assert!(!delivered_moderation_action_is_pinned(Some(
+            MODERATION_OUTBOUND_ACTIONS[1]
+        )));
+    }
+
+    /// A missing/NULL delivered action is rejected — never a no-op pass.
+    #[test]
+    fn delivered_missing_action_is_rejected() {
+        assert!(!delivered_moderation_action_is_pinned(None));
     }
 
     /// B5-3 D-CAP: the pinned starvation floor must equal the production

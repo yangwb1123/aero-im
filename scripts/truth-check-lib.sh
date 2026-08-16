@@ -38,6 +38,16 @@
 #      a fact) or at an allowlisted pin site (AUDIT_FLAG_ALLOWLIST — the
 #      drill bin's contract-vocabulary pin, a deliberate second site with
 #      its own regression surface).
+#   5. MODERATION-SQL mirror (3g) — the emitted SQL literals
+#      ('action', '<leaf>') in migrations 0239/0241 (and the drill fixture in
+#      scripts/test-integration.sh) must match the leaf constant byte-for-byte
+#      on NON-comment lines: rule 3d scans Rust only, so the SQL emission
+#      sites are the load-bearing pin for the *emitted* token. A leaf flip
+#      without the coordinated SQL flip reds here.
+#   6. AUDIT-SIBLING mirror (3h) — the contract pair's sibling spelling
+#      "admin.moderation.action" gets the same single-source scan as 3d
+#      (same skip rules + same AUDIT_FLAG_ALLOWLIST — both pin sites contain
+#      the sibling; a future production `.rs` sibling drift reds).
 #
 # Skip rules (checked before the allowlist):
 #   * whole-file exemptions: the leaf file itself (its constants/tests are
@@ -140,18 +150,22 @@ CLAIM_LEAF_FILE="crates/aero-common/src/model/client_credentials.rs"
 CLAIM_STUB_FILE="crates/aero-audit-connector/src/stub.rs"
 CLAIM_AUDIT_FILE="crates/aero-common/src/model/audit.rs"
 
-# AUDIT-FLAG allowlist (rule 3d) — deliberate, contract-mandated second
-# sites for the `"admin.content.flag"` literal. Key format: <path>:<line>
-# (the literal itself is fixed for this rule). The drill bin's vocabulary
-# pin is the destructive-gate direction's product (R3): the pair is
-# hardcoded, NOT derived from the leaf, so a leaf flip cannot auto-follow
-# and silently kill the pin — the seed-time membership check (drill :77
-# const) and the bin unit test (:379) are the pin's own regression surface.
-# Stale entries (file:line no longer containing the literal) warn → re-pin,
-# exactly like the CLAIM_ALLOWLIST mechanism.
+# AUDIT-FLAG allowlist (rules 3d + 3h) — deliberate, contract-mandated
+# second sites for the moderation outbound vocabulary literals
+# ("admin.content.flag" and its documented sibling
+# "admin.moderation.action"). Key format: <path>:<line> (both literals are
+# fixed for these rules; the leaf is the single definition point). The
+# drill bin's contract-vocabulary pair is the destructive-gate direction's
+# product (R3): the pair is hardcoded, NOT derived from the leaf, so a leaf
+# flip cannot auto-follow and silently kill the pin — the seed-time
+# EXACT-equality bail on the pair's index 0, the
+# `emitted_spelling_is_the_pair_lock` unit test, and rule 3g (SQL literals)
+# are the pin's own regression surface. Stale entries (file:line no longer
+# containing the literals) warn → re-pin, exactly like the CLAIM_ALLOWLIST
+# mechanism.
 AUDIT_FLAG_ALLOWLIST=(
-    'crates/aero-audit-connector/src/bin/aero-audit-priority-drill.rs:89'
-    'crates/aero-audit-connector/src/bin/aero-audit-priority-drill.rs:639'
+    'crates/aero-audit-connector/src/bin/aero-audit-priority-drill.rs:94'
+    'crates/aero-audit-connector/src/bin/aero-audit-priority-drill.rs:654'
 )
 
 # L1 allowlist-token guard (rule 3e) — F2 closure for migration 0242's
@@ -255,7 +269,7 @@ is_comment_line() {
 claim_guard_scan() {
     local root="$1"
     local literal_violations=0 type_violations=0 usage_violations=0 flag_violations=0
-    local l1_violations=0 room_violations=0
+    local l1_violations=0 room_violations=0 sql_violations=0 sibling_violations=0
     local hits hit path rest line lit lit_lc key h n
     local -a cs_args ci_args
     for l in "${CLAIM_LITERALS_CS[@]}"; do cs_args+=(-e "$l"); done
@@ -393,6 +407,51 @@ claim_guard_scan() {
         room_violations=$((room_violations + 1))
     done <<< "$hits"
 
+    # ── 3g. moderation outbound SQL-literal guard (emitted-token pin) ────
+    # The 0239 trigger / 0241 reconciler hardcode the outbound moderation
+    # token in SQL (and test-integration.sh seeds a drill fixture with it);
+    # rule 3d scans Rust only, so the emitted token's SQL spellings are
+    # statically unpoliced. Extract the leaf value once and require the
+    # exact `'action', '<leaf>'` pair in each file on a NON-comment line
+    # (a comment mentioning the literal must not satisfy the guard). A leaf
+    # flip without the coordinated SQL flip reds here.
+    leaf_moderation_action=$(sed -n 's/^pub const MODERATION_OUTBOUND_ACTION: &str = "\([^"]*\)";/\1/p' "$root/$CLAIM_AUDIT_FILE")
+    leaf_moderation_lines=$(printf '%s\n' "$leaf_moderation_action" | grep -c . || true)
+    if [ "$leaf_moderation_lines" -ne 1 ]; then
+        echo "  ❌ MODERATION SQL GUARD: leaf MODERATION_OUTBOUND_ACTION extraction yielded $leaf_moderation_lines line(s) (must be exactly 1)"
+        sql_violations=$((sql_violations + 1))
+    else
+        for sql_file in migrations/0239_audit_governance_outbox.sql migrations/0241_governance_reconcile.sql scripts/test-integration.sh; do
+            if ! grep -v '^[[:space:]]*--' "$root/$sql_file" 2>/dev/null | grep -qF "'action', '$leaf_moderation_action'"; then
+                echo "  ❌ MODERATION SQL GUARD: $sql_file lacks the exact emitted literal 'action', '$leaf_moderation_action' (leaf MODERATION_OUTBOUND_ACTION) on a non-comment line"
+                sql_violations=$((sql_violations + 1))
+            fi
+        done
+    fi
+
+    # ── 3h. moderation sibling-literal scan (symmetric to 3d) ─────────────
+    # The contract pair's sibling spelling gets its first scan: any
+    # production `.rs` site spelling "admin.moderation.action" outside the
+    # leaf/allowlist is a violation (same skip rules as 3d's documented set
+    # — leaf + tests components + comment lines — plus the same AUDIT_FLAG
+    # allowlist: both drill pin sites contain the sibling). A future sibling
+    # drift in production code reds here; the claim_validation negative-twin
+    # fixture lives in a tests/ dir and is skipped by design.
+    hits=$(cd "$root" && rg -n -F '"admin.moderation.action"' crates --glob '*.rs' 2>/dev/null || true)
+    while IFS= read -r h; do
+        [ -z "$h" ] && continue
+        path="${h%%:*}"
+        rest="${h#*:}"
+        line="${rest%%:*}"
+        [ "$path" = "$CLAIM_AUDIT_FILE" ] && continue
+        skip_tests_component "$path" && continue
+        is_comment_line "$root" "$path" "$line" && continue
+        if [ -z "${AUDIT_FLAG_ALLOWED["$path:$line"]:-}" ]; then
+            echo "  ❌ AUDIT SIBLING LITERAL: $h (sibling spelling only legal in $CLAIM_AUDIT_FILE or an allowlisted pin site)"
+            sibling_violations=$((sibling_violations + 1))
+        fi
+    done <<< "$hits"
+
     # ── stale allowlist entries (drift → re-pin) ──────────────────────────
     for entry in "${CLAIM_ALLOWLIST[@]}"; do
         path="${entry%%:*}"
@@ -411,7 +470,7 @@ claim_guard_scan() {
         fi
     done
 
-    CLAIM_GUARD_VIOLATIONS=$((literal_violations + type_violations + usage_violations + flag_violations + l1_violations + room_violations))
-    echo "  claim guard: ${CLAIM_GUARD_VIOLATIONS} violation(s) (literal=${literal_violations} type=${type_violations} usage=${usage_violations} flag=${flag_violations} l1=${l1_violations} room=${room_violations})"
+    CLAIM_GUARD_VIOLATIONS=$((literal_violations + type_violations + usage_violations + flag_violations + l1_violations + room_violations + sql_violations + sibling_violations))
+    echo "  claim guard: ${CLAIM_GUARD_VIOLATIONS} violation(s) (literal=${literal_violations} type=${type_violations} usage=${usage_violations} flag=${flag_violations} l1=${l1_violations} room=${room_violations} sql=${sql_violations} sibling=${sibling_violations})"
     return 0
 }
