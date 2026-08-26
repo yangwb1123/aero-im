@@ -2,7 +2,12 @@
 
 - **Module**: `crates/aero-im-core`
 - **Source direction**: `docs/auto/analyses/crates-aero-im-core-cfe64e80.json` (direction 1)
-- **Date**: 2026-08-06 · **Status**: spec (unimplemented)
+- **Date**: 2026-08-06 · **Status**: source implementation complete; DB-gated acceptance remains
+- **Current source (2026-08-19)**: `db_tests/notifications_tests.rs` and
+  `db_tests/relay_tests.rs` cover the targeting/suppression, idempotent
+  bundle/outbox, relay failure fencing, and stale side-effect cases described
+  here. The suite stays `#[ignore]` because it requires a throwaway migrated
+  Postgres (and Redis for the presence narrowing branch).
 - **Scope**: `#[ignore]`-gated Postgres integration tests only. Zero production-code changes. Tests cover `ImService::dispatch_notifications` (all 10 suppression/targeting layers listed in the acceptance) and the two relay loops `dispatch_event_outbox_batch` / `dispatch_message_side_effect_batch`, driven through real repositories against a real Postgres.
 
 ---

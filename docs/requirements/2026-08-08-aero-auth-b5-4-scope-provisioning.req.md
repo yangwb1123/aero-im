@@ -5,6 +5,7 @@
 - **Source analysis**: `docs/auto/analyses/crates-aero-auth-0b9b4b9f.json`（direction #2）
 - **Campaign**: `aero-im-b5-outbox-relay`（`docs/campaigns/campaign-aero-im-b5.yaml:39-42`："(4) scope provisioning (grant audit:event:write only after relay works; fail-closed without relay)"）；gate anchor `docs/campaigns/implementation-gate.md:64`（aero-im 行 T-11 "无 relay 配给被拒"）
 - **Status**: Requirements（下述证据全部经源码 grep 核对，2026-08-08）
+- **Current implementation status (2026-08-19)**: 已落地并通过无数据库回归测试。`aero-auth::relay_scope` 提供 Q0 + settle-heartbeat 组合 provisioner；`AuthService::assert_audit_scope_provisioned` 未注入/谓词失败时 fail-closed；`AuditRelay` 在 claim 前复评同一 gate。生产 boot 将同一 `Arc` 注入认证服务与 relay，connector 另有“未配给零 claim”回归 pin。
 - **Verification date**: 2026-08-08。行号为核对时锚点，会漂移——**文件/符号**才是稳定 grep 锚点（AGENTS.md §0）
 
 ## 1. Evidence verification（direction 引用逐条核对）

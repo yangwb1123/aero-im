@@ -18,6 +18,8 @@ pub mod oidc;
 pub mod password;
 pub mod password_policy;
 pub mod pat;
+pub mod relay_gate;
+pub mod relay_scope;
 pub mod service;
 pub mod totp;
 
@@ -35,4 +37,9 @@ pub use oidc::{
 };
 pub use password_policy::PasswordPolicy;
 pub use pat::{PatVerifier, SharedPatVerifier};
+pub use relay_gate::{PgRelayProvisionGate, RelayProvisionGate, SharedRelayProvisionGate};
+pub use relay_scope::{
+    ComposedProvisioner, PgRelayScopeProvisioner, RelayScopeProvisioner,
+    SharedRelayScopeProvisioner,
+};
 pub use service::{AuthService, AuthTokens, LoginRequest, RegisterRequest, RegisterResponse};

@@ -885,17 +885,18 @@ async fn delete_lane_outbox_parity() {
                 .fetch_one(&p)
                 .await
                 .expect("audit row created_at");
-        let pg_spelling: String =
-            sqlx::query_scalar("SELECT (to_jsonb($1::timestamptz))::text")
-                .bind(created_at)
-                .fetch_one(&p)
-                .await
-                .expect("PG jsonb spelling");
+        let pg_spelling: String = sqlx::query_scalar("SELECT (to_jsonb($1::timestamptz))::text")
+            .bind(created_at)
+            .fetch_one(&p)
+            .await
+            .expect("PG jsonb spelling");
         let pg_spelling = pg_spelling.trim_matches('"').to_owned();
         let helper_spelling = aero_common::audit_wire_occurred_at(created_at);
         assert_eq!(pg_spelling, helper_spelling, "helper == PG spelling");
         assert_eq!(
-            envelope["occurred_at"].as_str().expect("occurred_at string"),
+            envelope["occurred_at"]
+                .as_str()
+                .expect("occurred_at string"),
             pg_spelling,
             "R-D2 envelope occurred_at == the canonical PG spelling (byte-identical)"
         );
@@ -933,16 +934,16 @@ async fn delete_lane_outbox_parity() {
         );
         assert_eq!(envelope["outcome"], AUDIT_OUTCOME_SUCCESS);
         assert_eq!(
-                envelope["payload"],
-                serde_json::json!({
-                    // RoomId serializes in its OWN Display format (the same
-                    // serde the producer uses) — never to_uuid().to_string()
-                    // (uuid::text differs, e.g. hyphens).
-                    "room_id": room,
-                    "digest": msg.searchable_text().chars().take(120).collect::<String>(),
-                }),
-                "payload = the {{room_id, digest}} detail object (authorization.rs shape)"
-            );
+            envelope["payload"],
+            serde_json::json!({
+                // RoomId serializes in its OWN Display format (the same
+                // serde the producer uses) — never to_uuid().to_string()
+                // (uuid::text differs, e.g. hyphens).
+                "room_id": room,
+                "digest": msg.searchable_text().chars().take(120).collect::<String>(),
+            }),
+            "payload = the {{room_id, digest}} detail object (authorization.rs shape)"
+        );
         assert_eq!(envelope["data_classification"], AUDIT_DATA_CLASSIFICATION);
         assert_eq!(envelope["retention_class"], AUDIT_RETENTION_CLASS);
         assert_eq!(
@@ -978,7 +979,10 @@ async fn delete_lane_outbox_parity() {
         .soft_delete_outboxed_authorized(message_ids[0].id, actor, None)
         .await
         .expect("replay delete returns Ok");
-    assert!(replay.is_none(), "replay of an already-deleted message is Ok(None)");
+    assert!(
+        replay.is_none(),
+        "replay of an already-deleted message is Ok(None)"
+    );
     let mut tx = p.begin().await.expect("begin replay tx");
     sqlx::query(
         "INSERT INTO audit_events (id, workspace_id, actor_id, action, target, detail, created_at)

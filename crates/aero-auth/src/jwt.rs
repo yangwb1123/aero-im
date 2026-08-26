@@ -301,6 +301,11 @@ mod tests {
         assert_eq!(claims.kind, TokenKind::Access);
         assert_eq!(claims.participant_id().unwrap(), pid);
         assert!(claims.exp > claims.iat);
+        let wire = serde_json::to_value(&claims).expect("serialize claims");
+        assert!(
+            wire.get("scope").is_none(),
+            "participant JWTs carry no audit scope"
+        );
     }
 
     #[test]

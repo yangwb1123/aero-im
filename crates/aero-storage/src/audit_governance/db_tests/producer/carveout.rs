@@ -4,7 +4,6 @@
 
 use super::*;
 
-
 // --- G-SEC1 boundary pins: audited-but-unmapped is INTENTIONAL ---
 
 /// `integration.notification.published` is already audited in-tx (M2) and its
@@ -224,7 +223,10 @@ async fn moderation_finalize_outbox_parity_message_deleted_lane() {
         .soft_delete_outboxed_authorized(seeded.id, actor, None)
         .await
         .expect("replay delete returns Ok");
-    assert!(replay.is_none(), "replay of an already-deleted message is Ok(None)");
+    assert!(
+        replay.is_none(),
+        "replay of an already-deleted message is Ok(None)"
+    );
     assert_eq!(
         governance_rows_for(&p, ws).await,
         after,
@@ -265,7 +267,9 @@ async fn moderation_finalize_outbox_parity_message_deleted_lane() {
         "rollback aborts the outbox row with the delete (writer is in-tx)"
     );
     assert_eq!(
-        audit_rows_for(&p, ws, LOCAL_ACTION_MESSAGE_DELETED).await.len(),
+        audit_rows_for(&p, ws, LOCAL_ACTION_MESSAGE_DELETED)
+            .await
+            .len(),
         1,
         "rollback aborted the audit row too"
     );
@@ -354,12 +358,11 @@ async fn moderation_finalize_outbox_parity_dm_find_or_create_carved_out() {
         .await
         .expect("dm re-find");
     assert_eq!(again.id, room.id, "re-find returns the same DM room");
-    let rooms_after: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM rooms WHERE workspace_id = $1")
-            .bind(ws.to_uuid())
-            .fetch_one(&p)
-            .await
-            .expect("rooms count after re-find");
+    let rooms_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rooms WHERE workspace_id = $1")
+        .bind(ws.to_uuid())
+        .fetch_one(&p)
+        .await
+        .expect("rooms count after re-find");
     let audit_after: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM audit_events WHERE workspace_id = $1")
             .bind(ws.to_uuid())
@@ -421,12 +424,11 @@ async fn moderation_finalize_outbox_parity_group_dm_find_or_create_carved_out() 
         .await
         .expect("group dm re-find");
     assert_eq!(again.id, room.id, "re-find returns the same group-DM room");
-    let rooms_after: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM rooms WHERE workspace_id = $1")
-            .bind(ws.to_uuid())
-            .fetch_one(&p)
-            .await
-            .expect("rooms count after re-find");
+    let rooms_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM rooms WHERE workspace_id = $1")
+        .bind(ws.to_uuid())
+        .fetch_one(&p)
+        .await
+        .expect("rooms count after re-find");
     let audit_after: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM audit_events WHERE workspace_id = $1")
             .bind(ws.to_uuid())
@@ -516,9 +518,7 @@ async fn moderation_finalize_outbox_parity_integration_notification_carved_out_r
             room_id: room,
             recipient: None,
             blocks: vec![Block::text("carveout rollback notification")],
-            traceparent: Some(
-                "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".into(),
-            ),
+            traceparent: Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".into()),
             lease_token: None,
         })
         .await

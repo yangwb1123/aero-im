@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use aero_audit_connector::{
     client::AuditClient,
+    fake::StaticScopeProvisioner,
     heartbeat::{HeartbeatOutboxRepo, HeartbeatRecorder},
     outbox::OutboxRepo,
     pg::PgOutboxRepo,
@@ -102,7 +103,8 @@ fn heartbeat_relay_for(
         Arc::new(HeartbeatOutboxRepo::new(repo.clone(), recorder.clone()));
     let config = drill_config(stub, source_system);
     let client = AuditClient::new(config.clone()).expect("build audit client");
-    let relay = AuditRelay::new(decorated, client, config);
+    let relay = AuditRelay::new(decorated, client, config)
+        .with_scope_provisioner(Arc::new(StaticScopeProvisioner::new(true)));
     (relay, repo, recorder)
 }
 
@@ -154,7 +156,11 @@ async fn drill_stale_heartbeat_rejects_settle_row_reclaimed() {
         "still rejected — status never 2 across both rounds"
     );
     assert!(row.delivered_at.is_none());
-    assert_eq!(stub.posts(), 2, "exactly two real POSTs (replays dedup at the sink)");
+    assert_eq!(
+        stub.posts(),
+        2,
+        "exactly two real POSTs (replays dedup at the sink)"
+    );
 
     // Operator refresh (the runbook's `UPDATE verified_at = clock_timestamp()`)
     // → round 3 settles exactly once. The lease minted by round 2's reclaim
@@ -297,7 +303,10 @@ async fn wrong_token_decorator_settle(pool: &PgPool, event_id: AuditId, token: U
     });
     let decorated: Arc<dyn OutboxRepo> =
         Arc::new(HeartbeatOutboxRepo::new(repo.clone(), recorder.clone()));
-    decorated.settle(event_id, token).await.expect("decorator settle")
+    decorated
+        .settle(event_id, token)
+        .await
+        .expect("decorator settle")
 }
 
 /// S4 — scope-provisioning auto-feedback: a client-credentials token whose

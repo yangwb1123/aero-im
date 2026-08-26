@@ -55,8 +55,18 @@ pub mod config;
 pub mod context;
 pub mod outcome;
 pub mod registry;
+pub mod relay_runtime;
 pub mod run;
 pub mod term;
+
+/// Run the canonical engineering `gate` command implementation.
+///
+/// The full `aero-cli` binary uses this seam for its database-capable command
+/// registry, while the lightweight `aero-eng` binary registers the same
+/// implementation through [`CommandRegistry::collect`].
+pub async fn run_gate(ctx: &ExecutionContext, args: &[String]) -> Outcome {
+    commands::gate::run(ctx, args).await
+}
 
 // ---------------------------------------------------------------------------
 // Convenience re-exports

@@ -183,14 +183,14 @@ impl FailedPairRepo {
     pub async fn replay(&self, id: i64) -> Result<Option<AuditId>, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
         let row: Option<ReplayCandidate> = sqlx::query_as(
-                r"SELECT workspace_id, actor_id, action, target, detail, outbound_action
+            r"SELECT workspace_id, actor_id, action, target, detail, outbound_action
                    FROM audit_governance_failed_pairs
                   WHERE id = $1 AND status = 'pending' AND replayed_at IS NULL
                   FOR UPDATE SKIP LOCKED",
-            )
-            .bind(id)
-            .fetch_optional(&mut *tx)
-            .await?;
+        )
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
         let Some((workspace, actor, action, target, detail, outbound_action)) = row else {
             // Not claimable (absent, already replayed, or locked by a
             // concurrent replay that will finish it) — commit the empty tx

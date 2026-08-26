@@ -60,6 +60,7 @@ use std::time::Duration;
 
 use aero_audit_connector::client::AuditClient;
 use aero_audit_connector::config::RelayConfig;
+use aero_audit_connector::fake::StaticScopeProvisioner;
 use aero_audit_connector::outbox::OutboxRepo;
 use aero_audit_connector::pg::PgOutboxRepo;
 use aero_audit_connector::relay::AuditRelay;
@@ -210,7 +211,8 @@ async fn run() -> anyhow::Result<()> {
 
     let repo: Arc<dyn OutboxRepo> = Arc::new(PgOutboxRepo::new(pool.clone()));
     let client = AuditClient::new(config.clone()).context("build audit client")?;
-    let relay = AuditRelay::new(repo, client, config);
+    let relay = AuditRelay::new(repo, client, config)
+        .with_scope_provisioner(Arc::new(StaticScopeProvisioner::new(true)));
 
     for round in 1..=ROUNDS {
         let claimed = relay
@@ -337,9 +339,7 @@ async fn seed_l1_shapes(pool: &PgPool) -> anyhow::Result<(Uuid, Uuid)> {
             .await
             .context("window epoch")?;
     let window_key: Uuid = sqlx::query_scalar("SELECT md5($1)::uuid")
-        .bind(format!(
-            "{ws}|{GOVERNANCE_CLASS_MESSAGE}|{window_epoch}"
-        ))
+        .bind(format!("{ws}|{GOVERNANCE_CLASS_MESSAGE}|{window_epoch}"))
         .fetch_one(pool)
         .await
         .context("window key")?;
@@ -352,8 +352,10 @@ async fn seed_l1_shapes(pool: &PgPool) -> anyhow::Result<(Uuid, Uuid)> {
         .await
         .context("spill key")?;
     let started = time::OffsetDateTime::now_utc();
-    let rfc3339 =
-        |ts: time::OffsetDateTime| -> String { ts.format(&time::format_description::well_known::Rfc3339).expect("rfc3339") };
+    let rfc3339 = |ts: time::OffsetDateTime| -> String {
+        ts.format(&time::format_description::well_known::Rfc3339)
+            .expect("rfc3339")
+    };
     let window_start = rfc3339(started);
     let window_end = rfc3339(started + time::Duration::seconds(L1_WINDOW_SECONDS));
     let event_at = rfc3339(started);
@@ -384,10 +386,7 @@ async fn seed_l1_shapes(pool: &PgPool) -> anyhow::Result<(Uuid, Uuid)> {
         }
         payload
     };
-    for (key, count, spill) in [
-        (window_key, 1, false),
-        (spill_key, 1, true),
-    ] {
+    for (key, count, spill) in [(window_key, 1, false), (spill_key, 1, true)] {
         sqlx::query(
             r"INSERT INTO audit_governance_outbox
                     (event_id, payload, available_at, attempts, status, class, priority)

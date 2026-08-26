@@ -25,6 +25,8 @@
 //! mis-tokened as `message.deleted` must NOT silently enter the admin lane
 //! (R-D2) — see `user_delete_token_stays_out_of_admin_lane`.
 
+use aero_storage::AiJob;
+
 /// Governance claim ordering is `priority DESC` (B5-3: highest = first) — the
 /// INVERSE of `ai_job`'s ASC lower-first model. Do not "align" these. Moderation
 /// is the top lane.
@@ -43,9 +45,14 @@ pub use aero_common::model::audit::{
     GOVERNANCE_CLASS_MESSAGE, GOVERNANCE_CLASS_ROOM, L1_WINDOW_SECONDS,
     LOCAL_ACTION_MESSAGE_CREATE, LOCAL_ACTION_MESSAGE_DELETED, LOCAL_ACTION_MESSAGE_EDIT,
     LOCAL_ACTION_MESSAGE_RECALLED, LOCAL_ACTION_MODERATED, LOCAL_ACTION_ROOM_ARCHIVED,
-    LOCAL_ACTION_ROOM_CREATE,
-    MODERATION_OUTBOUND_ACTION,
+    LOCAL_ACTION_ROOM_CREATE, MODERATION_OUTBOUND_ACTION,
 };
+
+/// Authoritative vocabulary of local audit tokens that enter the admin lane.
+/// Adding a new `admin.*` token requires both a vocabulary entry and a mapping
+/// arm in [`governance_lane_for`]; the plain map-or-reject test prevents a
+/// forgotten arm from silently passing through as an ordinary audit row.
+pub const ADMIN_LANE_TOKENS: &[&str] = &[LOCAL_ACTION_MODERATED];
 
 /// Governance tuple stamped onto a `snaplink_delivery_outbox` (v2) row by the
 /// 0239 enqueue redirect, and the drill fixture's expected start state.
@@ -60,6 +67,23 @@ pub struct GovernanceLane {
     pub outbound_action: &'static str,
     /// Status 0 is the enqueue-time normative state (0239); a property of the
     /// outbox row lifecycle, pinned here as the drill fixture's start state.
+    pub status: i16,
+}
+
+/// The complete moderation-finalize contract shared by the audit event and
+/// the governance outbox row. This is the pure mirror of the tuple committed
+/// by `AiWorker::handle_moderate` and asserted by the storage parity drill.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModerationFinalizeContract {
+    /// Local audit event action (`audit_events.action`).
+    pub audit_action: &'static str,
+    /// Governance outbox class.
+    pub class: &'static str,
+    /// Governance outbox priority (higher is claimed first).
+    pub priority: i16,
+    /// External governance action in the outbox payload.
+    pub outbound_action: &'static str,
+    /// Enqueue-time outbox status.
     pub status: i16,
 }
 
@@ -112,6 +136,31 @@ pub fn governance_lane_for(local_action: &str) -> Option<GovernanceLane> {
     }
 }
 
+/// Return the exact five-field contract implied by the moderation worker's
+/// finalize path.
+///
+/// A contract exists only for a blocking verdict with a target message. The
+/// workspace fail-closed decision remains in the caller's
+/// `moderation_delete_workspace` guard; this function is intentionally pure,
+/// total, and independent of tenant resolution or database state.
+#[must_use]
+pub fn finalize_contract_for(
+    job: &AiJob,
+    verdict: Option<&str>,
+) -> Option<ModerationFinalizeContract> {
+    if verdict.is_none() || job.target_id.is_none() {
+        return None;
+    }
+    let lane = governance_lane_for(LOCAL_ACTION_MODERATED)?;
+    Some(ModerationFinalizeContract {
+        audit_action: LOCAL_ACTION_MODERATED,
+        class: lane.class,
+        priority: lane.priority,
+        outbound_action: lane.outbound_action,
+        status: lane.status,
+    })
+}
+
 /// R5 classification for the L1 aggregation bypass (landed: migration 0242
 /// `aero_enqueue_l1_aggregate_audit` + trigger `audit_events_l1_aggregate` —
 /// the SQL-side allowlist is `LOCAL_ACTION_MESSAGE_CREATE`/`LOCAL_ACTION_MESSAGE_EDIT`):
@@ -128,6 +177,27 @@ pub fn is_admin_class(local_action: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aero_storage::{AiJobKind, AiJobStatus};
+    use time::OffsetDateTime;
+    use ulid::Ulid;
+    use uuid::Uuid;
+
+    fn moderation_job(target_id: Option<Uuid>) -> AiJob {
+        AiJob {
+            id: Ulid::new(),
+            kind: AiJobKind::Moderate,
+            target_id,
+            workspace_id: None,
+            status: AiJobStatus::Queued,
+            attempts: 0,
+            payload: serde_json::Value::Null,
+            result: None,
+            error: None,
+            scheduled_at: OffsetDateTime::now_utc(),
+            started_at: None,
+            finished_at: None,
+        }
+    }
 
     /// R4 lane precedence under the DESC claim model. `ai_job::priority_for`
     /// is ASC lower-first; the governance outbox (B5-3) claims `priority DESC`
@@ -268,5 +338,84 @@ mod tests {
                 "{token} is room-class, never admin-class"
             );
         }
+    }
+
+    /// Plain mirror of the storage `moderation_finalize_outbox_parity` drill:
+    /// keep both the leaf constants and the DDL-facing literal tuple pinned.
+    #[test]
+    fn finalize_contract_mirrors_drill_fixture() {
+        let job = moderation_job(Some(Uuid::new_v4()));
+        let contract = finalize_contract_for(&job, Some("spam")).expect("blocking target");
+        let actual = (
+            contract.audit_action,
+            contract.class,
+            contract.priority,
+            contract.outbound_action,
+            contract.status,
+        );
+        assert_eq!(
+            actual,
+            (
+                "message.moderated",
+                "admin",
+                100_i16,
+                "admin.content.flag",
+                0_i16
+            )
+        );
+        assert_eq!(
+            actual,
+            (
+                LOCAL_ACTION_MODERATED,
+                GOVERNANCE_CLASS_ADMIN,
+                GOVERNANCE_PRIORITY_MODERATION,
+                MODERATION_OUTBOUND_ACTION,
+                0_i16
+            )
+        );
+    }
+
+    #[test]
+    fn finalize_contract_safe_verdict_yields_no_contract() {
+        let job = moderation_job(Some(Uuid::new_v4()));
+        assert_eq!(finalize_contract_for(&job, None), None);
+    }
+
+    #[test]
+    fn finalize_contract_no_target_yields_no_contract() {
+        let job = moderation_job(None);
+        assert_eq!(finalize_contract_for(&job, Some("spam")), None);
+        // Workspace resolution is the separate R-D1 caller gate, not part of
+        // this pure tuple mirror.
+        let no_workspace = moderation_job(Some(Uuid::new_v4()));
+        assert!(finalize_contract_for(&no_workspace, Some("spam")).is_some());
+    }
+
+    #[test]
+    fn admin_lane_vocabulary_fully_mapped_or_fail_closed() {
+        assert!(
+            !ADMIN_LANE_TOKENS.is_empty(),
+            "admin lane vocabulary must contain at least one authoritative token"
+        );
+        assert!(
+            ADMIN_LANE_TOKENS.contains(&LOCAL_ACTION_MODERATED),
+            "authoritative moderation leaf token must enter the admin vocabulary"
+        );
+        for token in ADMIN_LANE_TOKENS {
+            let lane = governance_lane_for(token).expect("admin token must be mapped");
+            assert_eq!(lane.class, GOVERNANCE_CLASS_ADMIN);
+            assert_eq!(lane.priority, GOVERNANCE_PRIORITY_MODERATION);
+            assert_eq!(lane.status, 0);
+            let contract =
+                finalize_contract_for(&moderation_job(Some(Uuid::new_v4())), Some("blocked"))
+                    .expect("mapped admin token has a finalize contract");
+            assert_eq!(contract.audit_action, *token);
+            assert_eq!(contract.class, lane.class);
+            assert_eq!(contract.priority, lane.priority);
+            assert_eq!(contract.outbound_action, lane.outbound_action);
+            assert_eq!(contract.status, lane.status);
+        }
+        assert!(!ADMIN_LANE_TOKENS.contains(&LOCAL_ACTION_MESSAGE_DELETED));
+        assert!(!ADMIN_LANE_TOKENS.contains(&"message.deleted"));
     }
 }

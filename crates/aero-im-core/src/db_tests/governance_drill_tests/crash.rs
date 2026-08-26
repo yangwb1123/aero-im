@@ -492,12 +492,11 @@ async fn drill_panic_leaves_enforcement_on_backstopped_by_start_reassert() {
     assert!(fired.is_err(), "the simulated panic fired");
 
     // The panic really left the switch ON — the failure mode is real.
-    let enabled: bool = sqlx::query_scalar(
-        "SELECT enabled FROM snaplink_commercial_runtime WHERE singleton",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("read singleton");
+    let enabled: bool =
+        sqlx::query_scalar("SELECT enabled FROM snaplink_commercial_runtime WHERE singleton")
+            .fetch_one(&pool)
+            .await
+            .expect("read singleton");
     assert!(enabled, "panic left enforcement ON (the F1 hazard is real)");
 
     // The leaked-ON state IS the P0001 cascade: an unbound message INSERT
@@ -527,12 +526,11 @@ async fn drill_panic_leaves_enforcement_on_backstopped_by_start_reassert() {
     // exact statement above) heals the singleton; the same INSERT then
     // commits. The cascade is closed BY the backstop, not by luck.
     restore_enforcement_disabled(&pool).await;
-    let enabled: bool = sqlx::query_scalar(
-        "SELECT enabled FROM snaplink_commercial_runtime WHERE singleton",
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("read singleton");
+    let enabled: bool =
+        sqlx::query_scalar("SELECT enabled FROM snaplink_commercial_runtime WHERE singleton")
+            .fetch_one(&pool)
+            .await
+            .expect("read singleton");
     assert!(!enabled, "backstop restored the fresh-DB default");
     sqlx::query(
         "INSERT INTO messages (id, room_id, sender_id, blocks)
@@ -546,4 +544,3 @@ async fn drill_panic_leaves_enforcement_on_backstopped_by_start_reassert() {
     .await
     .expect("the same INSERT commits after the backstop");
 }
-

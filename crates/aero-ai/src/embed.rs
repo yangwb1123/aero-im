@@ -19,6 +19,7 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use crate::error::{AiError, Result};
+use crate::retry::{is_retryable, retry_with_backoff, AttemptError};
 
 /// The fixed embedding dimension used across the system.
 ///
@@ -66,8 +67,10 @@ pub trait Embedder: Send + Sync {
 #[derive(Clone)]
 pub struct VoyageEmbedder {
     api_key: String,
+    base_url: String,
     model: String,
     http: reqwest::Client,
+    retry_base: Duration,
 }
 
 impl VoyageEmbedder {
@@ -78,9 +81,26 @@ impl VoyageEmbedder {
             .unwrap_or_else(|_| reqwest::Client::new());
         Self {
             api_key: api_key.into(),
+            base_url: VOYAGE_URL.to_owned(),
             model: model.into(),
             http,
+            retry_base: Duration::from_secs(1),
         }
+    }
+
+    /// Override the embeddings endpoint (proxies and deterministic mock servers
+    /// use this seam; production defaults to the Voyage URL).
+    #[must_use]
+    pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
+        self.base_url = base_url.into();
+        self
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_retry_base(mut self, retry_base: Duration) -> Self {
+        self.retry_base = retry_base;
+        self
     }
 
     #[must_use]
@@ -112,38 +132,58 @@ impl VoyageEmbedder {
             input: vec![text],
             input_type: Some(input_type),
         };
-        let resp = self
-            .http
-            .post(VOYAGE_URL)
-            .bearer_auth(&self.api_key)
-            .header("content-type", "application/json")
-            .json(&body)
-            .send()
-            .await?;
+        let url = self.base_url.trim_end_matches('/').to_owned();
+        retry_with_backoff(3, self.retry_base, || async {
+            let resp = self
+                .http
+                .post(&url)
+                .bearer_auth(&self.api_key)
+                .header("content-type", "application/json")
+                .json(&body)
+                .send()
+                .await
+                .map_err(|error| AttemptError {
+                    retryable: true,
+                    error: AiError::Http(error.to_string()),
+                })?;
 
-        let status = resp.status();
-        let raw = resp.text().await?;
-        if !status.is_success() {
-            return Err(AiError::Embedding(format!(
-                "voyage {}: {}",
-                status.as_u16(),
-                raw.chars().take(512).collect::<String>()
-            )));
-        }
-        let parsed: VoyageResponse = serde_json::from_str(&raw)?;
-        let first = parsed
-            .data
-            .into_iter()
-            .next()
-            .ok_or_else(|| AiError::Embedding("voyage returned no embeddings".into()))?;
-        if first.embedding.len() != EMBED_DIM {
-            return Err(AiError::Embedding(format!(
-                "voyage returned dim {}, expected {}",
-                first.embedding.len(),
-                EMBED_DIM
-            )));
-        }
-        Ok(first.embedding)
+            let status = resp.status();
+            let raw = resp.text().await.map_err(|error| AttemptError {
+                retryable: true,
+                error: AiError::Http(error.to_string()),
+            })?;
+            if !status.is_success() {
+                return Err(AttemptError {
+                    retryable: is_retryable(status),
+                    error: AiError::Embedding(format!(
+                        "voyage {}: {}",
+                        status.as_u16(),
+                        raw.chars().take(512).collect::<String>()
+                    )),
+                });
+            }
+            let parsed: VoyageResponse =
+                serde_json::from_str(&raw).map_err(|error| AttemptError {
+                    retryable: false,
+                    error: AiError::Json(error.to_string()),
+                })?;
+            let first = parsed.data.into_iter().next().ok_or_else(|| AttemptError {
+                retryable: false,
+                error: AiError::Embedding("voyage returned no embeddings".into()),
+            })?;
+            if first.embedding.len() != EMBED_DIM {
+                return Err(AttemptError {
+                    retryable: false,
+                    error: AiError::Embedding(format!(
+                        "voyage returned dim {}, expected {}",
+                        first.embedding.len(),
+                        EMBED_DIM
+                    )),
+                });
+            }
+            Ok(first.embedding)
+        })
+        .await
     }
 }
 
@@ -282,6 +322,59 @@ pub fn default_embedder() -> Arc<dyn Embedder + Send + Sync> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    async fn voyage_stub(
+        statuses: Vec<u16>,
+    ) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 4_096];
+                loop {
+                    let Ok(read) = socket.read(&mut buffer).await else {
+                        break;
+                    };
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let call = observed.fetch_add(1, Ordering::Relaxed);
+                let status = statuses.get(call).copied().unwrap_or(500);
+                let (status_text, body) = if status == 200 {
+                    (
+                        "OK",
+                        serde_json::json!({
+                            "data": [{"embedding": vec![0.0; EMBED_DIM], "index": 0}]
+                        })
+                        .to_string(),
+                    )
+                } else {
+                    ("Error", "{\"error\":\"try again\"}".to_owned())
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} {status_text}\r\ncontent-type: application/json\r\n\
+                     content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        (format!("http://{address}"), calls, task)
+    }
 
     #[tokio::test]
     async fn hash_embedder_query_role_matches_document() {
@@ -355,6 +448,42 @@ mod tests {
     async fn hash_embedder_model_id_stable() {
         let e = HashEmbedder::new();
         assert_eq!(e.model_id(), "hash-1024");
+    }
+
+    #[tokio::test]
+    async fn voyage_retries_429_then_succeeds() {
+        let (url, calls, server) = voyage_stub(vec![429, 200]).await;
+        let embedder = VoyageEmbedder::new("test-key", "voyage-test")
+            .with_base_url(url)
+            .with_retry_base(Duration::from_millis(1));
+        let values = embedder.embed_one("hello").await.unwrap();
+        assert_eq!(values.len(), EMBED_DIM);
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn voyage_retries_three_5xx_attempts_and_preserves_error_prefix() {
+        let (url, calls, server) = voyage_stub(vec![500, 500, 500]).await;
+        let embedder = VoyageEmbedder::new("test-key", "voyage-test")
+            .with_base_url(url)
+            .with_retry_base(Duration::from_millis(1));
+        let error = embedder.embed_query("hello").await.unwrap_err();
+        assert!(error.to_string().contains("voyage 500:"));
+        assert_eq!(calls.load(Ordering::Relaxed), 3);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn voyage_fails_fast_on_non_retryable_4xx() {
+        let (url, calls, server) = voyage_stub(vec![400, 200]).await;
+        let embedder = VoyageEmbedder::new("test-key", "voyage-test")
+            .with_base_url(url)
+            .with_retry_base(Duration::from_millis(1));
+        let error = embedder.embed_one("hello").await.unwrap_err();
+        assert!(error.to_string().contains("voyage 400:"));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        server.abort();
     }
 
     #[test]

@@ -256,6 +256,140 @@ async fn rust_produced_payload_matches_0239_envelope() {
         "a renamed key must fail the fail-closed parse (drift alarm)"
     );
 
+    // ---- Half A-L1: the 0242 trigger's aggregate row gets its own strict
+    // typed twin. Keep this leg probe-gated so the 0239 harness remains useful
+    // against a database that predates the additive L1 migration.
+    if l1_aggregate_migrated(&p).await {
+        let fixed_ts: time::OffsetDateTime = sqlx::query_scalar("SELECT clock_timestamp()")
+            .fetch_one(&p)
+            .await
+            .expect("capture aggregate fixture timestamp");
+        let aggregate_rows = 5_i64;
+        let mut tx = p.begin().await.expect("begin aggregate parity tx");
+        for _ in 0..aggregate_rows {
+            insert_audit_row(
+                &mut tx,
+                ws_a,
+                actor_a,
+                LOCAL_ACTION_MESSAGE_CREATE,
+                fixed_ts,
+            )
+            .await;
+        }
+        tx.commit().await.expect("commit aggregate parity tx");
+
+        let (aggregate_id, aggregate_text, aggregate_stored): (Uuid, String, serde_json::Value) =
+            sqlx::query_as(
+                "SELECT event_id, payload::text, payload
+               FROM audit_governance_outbox
+              WHERE payload->>'aggregate_id' = $1
+                AND payload->>'action' = $2",
+            )
+            .bind(ws_a.to_uuid().to_string())
+            .bind(AGGREGATED_MESSAGE_ACTION)
+            .fetch_one(&p)
+            .await
+            .expect("trigger aggregate row");
+        let aggregate: AuditAggregatePayload = serde_json::from_str(&aggregate_text)
+            .expect("typed twin parses aggregate wire text (fail-closed)");
+        let aggregate_from_value: AuditAggregatePayload =
+            serde_json::from_value(aggregate_stored.clone())
+                .expect("typed twin parses aggregate JSON value (fail-closed)");
+        assert_eq!(aggregate, aggregate_from_value);
+        assert_eq!(
+            serde_json::to_value(&aggregate).unwrap(),
+            aggregate_stored,
+            "aggregate twin must round-trip to the trigger JSONB value"
+        );
+        assert_eq!(aggregate.event_id, aggregate_id.to_string());
+        assert_eq!(aggregate.source_system, AUDIT_SOURCE_SYSTEM);
+        assert_eq!(aggregate.event_type, AUDIT_EVENT_TYPE);
+        assert_eq!(aggregate.schema_id, AUDIT_SCHEMA_ID);
+        assert_eq!(aggregate.schema_version, AUDIT_SCHEMA_VERSION);
+        assert_eq!(aggregate.occurred_at, aggregate.window_start);
+        assert_eq!(aggregate.aggregate_type, AUDIT_AGGREGATE_TYPE);
+        assert_eq!(aggregate.aggregate_id, ws_a.to_uuid().to_string());
+        assert_eq!(aggregate.action, AGGREGATED_MESSAGE_ACTION);
+        assert_eq!(aggregate.outcome, AUDIT_OUTCOME_SUCCESS);
+        assert_eq!(aggregate.data_classification, AUDIT_DATA_CLASSIFICATION);
+        assert_eq!(aggregate.retention_class, AUDIT_RETENTION_CLASS);
+        assert_eq!(aggregate.idempotency_key, aggregate.event_id);
+        assert_eq!(aggregate.count, aggregate_rows);
+        assert!(aggregate.aggregated);
+        assert_eq!(aggregate.spill, None, "window rows omit spill");
+
+        let window_epoch: i64 =
+            sqlx::query_scalar("SELECT floor(extract(epoch FROM $1::timestamptz) / $2)::bigint")
+                .bind(fixed_ts)
+                .bind(L1_WINDOW_SECONDS)
+                .fetch_one(&p)
+                .await
+                .expect("aggregate window epoch");
+        let start_epoch: i64 =
+            sqlx::query_scalar("SELECT floor(extract(epoch FROM $1::timestamptz))::bigint")
+                .bind(&aggregate.window_start)
+                .fetch_one(&p)
+                .await
+                .expect("aggregate window start epoch");
+        let end_epoch: i64 =
+            sqlx::query_scalar("SELECT floor(extract(epoch FROM $1::timestamptz))::bigint")
+                .bind(&aggregate.window_end)
+                .fetch_one(&p)
+                .await
+                .expect("aggregate window end epoch");
+        assert_eq!(
+            start_epoch,
+            window_epoch * L1_WINDOW_SECONDS,
+            "window_start follows the leaf window size"
+        );
+        assert_eq!(
+            end_epoch,
+            start_epoch + L1_WINDOW_SECONDS,
+            "window_end follows the leaf window size"
+        );
+        assert_eq!(
+            aggregate.first_event_at, aggregate.last_event_at,
+            "fixed created_at keeps first/last event timestamps equal"
+        );
+        let first_matches_fixed: bool =
+            sqlx::query_scalar("SELECT $1::timestamptz = $2::timestamptz")
+                .bind(&aggregate.first_event_at)
+                .bind(fixed_ts)
+                .fetch_one(&p)
+                .await
+                .expect("compare aggregate first event timestamp");
+        assert!(first_matches_fixed);
+        for key in [
+            "actor",
+            "targets",
+            "payload",
+            "tenant_id",
+            "window_id",
+            "first_event_id",
+            "last_event_id",
+        ] {
+            assert!(
+                aggregate_stored.get(key).is_none(),
+                "aggregate envelope must not carry forbidden key {key}"
+            );
+        }
+
+        let mut missing_count = aggregate_stored;
+        missing_count
+            .as_object_mut()
+            .expect("aggregate object")
+            .remove("count");
+        assert!(
+            serde_json::from_value::<AuditAggregatePayload>(missing_count).is_err(),
+            "a missing aggregate count must fail closed"
+        );
+    }
+
+    // Half A may leave both its moderation row and, on current schemas, its
+    // L1 aggregate row.  Capture that exact baseline instead of assuming the
+    // pre-L1 single-row shape; the rollback halves below must not add to it.
+    let rows_after_half_a = count_governance_rows(&p).await;
+
     // ---- Half B: Rust-produced `message.deleted` row, field-by-field
     // vs the 0239 envelope, same tx as the audit append. ----
     let (ws_b, actor_b) = fixture(&p).await;
@@ -368,8 +502,8 @@ async fn rust_produced_payload_matches_0239_envelope() {
     tx.rollback().await.expect("rollback half-B tx");
     assert_eq!(
         count_governance_rows(&p).await,
-        1,
-        "half-B row rolled back with the audit append; only half-A's row remains"
+        rows_after_half_a,
+        "half-B row rolled back with the audit append; half-A baseline remains"
     );
 
     // ---- Half C: the AUTH token shape (`auth.register` — the real
@@ -478,8 +612,8 @@ async fn rust_produced_payload_matches_0239_envelope() {
     tx.rollback().await.expect("rollback half-C tx");
     assert_eq!(
         count_governance_rows(&p).await,
-        1,
-        "half-C row rolled back with the audit append; only half-A's row remains"
+        rows_after_half_a,
+        "half-C row rolled back with the audit append; half-A baseline remains"
     );
     // Restore the fresh-DB default (see `restore_enforcement_disabled`).
     restore_enforcement_disabled(&p).await;

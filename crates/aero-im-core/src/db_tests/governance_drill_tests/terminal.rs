@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use aero_audit_connector::{
     client::AuditClient,
+    fake::StaticScopeProvisioner,
     pg::PgOutboxRepo,
     relay::AuditRelay,
     stub::{SinkBehavior, StubSink},
@@ -137,7 +138,8 @@ async fn drill_closed_endpoint_t11_pending_with_attempts_growth() {
     stub.shutdown(); // closed endpoint: the listener is dropped (bind + drop)
     let repo = Arc::new(PgOutboxRepo::new(pool.clone()));
     let client = AuditClient::new(config.clone()).expect("build audit client");
-    let relay = AuditRelay::new(repo.clone(), client, config);
+    let relay = AuditRelay::new(repo.clone(), client, config)
+        .with_scope_provisioner(Arc::new(StaticScopeProvisioner::new(true)));
 
     assert_eq!(
         relay.dispatch_batch().await.expect("round 1"),
@@ -273,7 +275,9 @@ async fn drill_message_deleted_lane_delivers_through_real_relay() {
             )
             .await
             .expect("send message");
-        svc.delete_message(owner, msg.id).await.expect("delete message");
+        svc.delete_message(owner, msg.id)
+            .await
+            .expect("delete message");
         let audit_id: Uuid = sqlx::query_scalar(
             "SELECT id FROM audit_events
               WHERE workspace_id = $1 AND target = $2::text AND action = 'message.deleted'",
@@ -302,8 +306,7 @@ async fn drill_message_deleted_lane_delivers_through_real_relay() {
     );
 
     let stub = StubSink::start().await.expect("start stub");
-    let (relay, _repo, _config) =
-        relay_for(&pool, &stub, aero_common::AUDIT_SOURCE_SYSTEM).await;
+    let (relay, _repo, _config) = relay_for(&pool, &stub, aero_common::AUDIT_SOURCE_SYSTEM).await;
     let claimed = relay.dispatch_batch().await.expect("dispatch");
     assert_eq!(claimed, 3, "all three delete rows claimed in one round");
     assert_eq!(stub.posts(), 3, "three real POSTs");
@@ -359,7 +362,12 @@ async fn drill_delete_lane_permanent_negatives_dead() {
     restore_enforcement_disabled(&pool).await;
     let (ws, owner) = workspace_fixture(&pool, "drill-del-neg").await;
     let room = svc
-        .create_room_in_workspace(owner, ws, RoomKind::Channel, Some("drill-del-neg-room".into()))
+        .create_room_in_workspace(
+            owner,
+            ws,
+            RoomKind::Channel,
+            Some("drill-del-neg-room".into()),
+        )
         .await
         .expect("create room")
         .id;
@@ -369,7 +377,9 @@ async fn drill_delete_lane_permanent_negatives_dead() {
         .send_message(owner, room, vec![Block::text("drill-del-neg")], None, None)
         .await
         .expect("send message");
-    svc.delete_message(owner, msg.id).await.expect("delete message");
+    svc.delete_message(owner, msg.id)
+        .await
+        .expect("delete message");
     sqlx::query(
         "DELETE FROM audit_governance_outbox WHERE COALESCE(payload->>'action','') <> 'message.deleted'",
     )
@@ -410,8 +420,7 @@ async fn drill_delete_lane_permanent_negatives_dead() {
     .expect("seed payload-guard row");
 
     let stub = StubSink::start().await.expect("start stub");
-    let (relay, _repo, _config) =
-        relay_for(&pool, &stub, aero_common::AUDIT_SOURCE_SYSTEM).await;
+    let (relay, _repo, _config) = relay_for(&pool, &stub, aero_common::AUDIT_SOURCE_SYSTEM).await;
 
     // Round 1: the conforming delete row settles; both negatives requeue
     // (permanent attempt-1 — the ≤1-retry budget is not yet spent).
@@ -421,16 +430,19 @@ async fn drill_delete_lane_permanent_negatives_dead() {
         "round 1 claims the delete row + both negatives"
     );
     assert_eq!(stub.posts(), 2, "one POST for the conforming row + one for the receipt-mismatch row; the payload-guard row never POSTs");
-    let conforming = outbox_row(&pool, AuditId::from_uuid(
-        sqlx::query_scalar(
-            "SELECT id FROM audit_events
+    let conforming = outbox_row(
+        &pool,
+        AuditId::from_uuid(
+            sqlx::query_scalar(
+                "SELECT id FROM audit_events
               WHERE action = 'message.deleted' AND target = $1::text",
-        )
+            )
             .bind(msg.id.to_string())
             .fetch_one(&pool)
             .await
             .expect("delete audit id"),
-    ))
+        ),
+    )
     .await;
     assert_eq!(conforming.status, 2, "conforming row settles");
 
@@ -477,24 +489,25 @@ async fn drill_delete_lane_permanent_negatives_dead() {
     // the payload-guard row NEVER posts (PayloadGuard bails pre-POST on both
     // attempts). The negative control is therefore total 3 with the
     // payload-guard payload absent from the sink's observation log.
-    assert_eq!(stub.posts(), 3, "conforming 1 + receipt-mismatch 2 attempts; the payload-guard row produced 0 POSTs");
+    assert_eq!(
+        stub.posts(),
+        3,
+        "conforming 1 + receipt-mismatch 2 attempts; the payload-guard row produced 0 POSTs"
+    );
     let seen = stub.seen_payloads().await;
     assert!(
-        !seen.iter().any(|p| p
-            .get("source_system")
-            .and_then(serde_json::Value::as_str)
-            == Some("source-wrong")),
+        !seen.iter().any(
+            |p| p.get("source_system").and_then(serde_json::Value::as_str) == Some("source-wrong")
+        ),
         "the payload-guard payload never reached the sink"
     );
 
     // Cleanup: synthetic rows have no audit twins — delete by outbox id.
-    sqlx::query(
-        "DELETE FROM audit_governance_outbox WHERE event_id = ANY($1)",
-    )
-    .bind(vec![receipt_mismatch_id, payload_guard_id])
-    .execute(&pool)
-    .await
-    .expect("clean synthetic rows");
+    sqlx::query("DELETE FROM audit_governance_outbox WHERE event_id = ANY($1)")
+        .bind(vec![receipt_mismatch_id, payload_guard_id])
+        .execute(&pool)
+        .await
+        .expect("clean synthetic rows");
     let rows = DrillRows {
         ws,
         source: aero_common::AUDIT_SOURCE_SYSTEM.into(),
@@ -503,10 +516,10 @@ async fn drill_delete_lane_permanent_negatives_dead() {
                 "SELECT id FROM audit_events
                   WHERE action = 'message.deleted' AND target = $1::text",
             )
-                .bind(msg.id.to_string())
-                .fetch_one(&pool)
-                .await
-                .expect("delete audit id"),
+            .bind(msg.id.to_string())
+            .fetch_one(&pool)
+            .await
+            .expect("delete audit id"),
         )],
         message_ids: vec![msg.id],
     };

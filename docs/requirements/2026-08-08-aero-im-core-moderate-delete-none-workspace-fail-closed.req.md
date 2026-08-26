@@ -17,14 +17,14 @@
 | E1 | `crates/aero-im-core/src/service/messages.rs:632` — `workspace.map(\|_\| "message.moderated")`，None 分支 = 无审计 | ❌ **STALE（HEAD 已修复）**。`moderate_delete` :611-659；`workspace.map` 已不存在——:625-633 为硬守卫 `let workspace = workspace.ok_or_else(|| Error::Invalid("moderate_delete requires a workspace; refusing un-audited delete (R-D1)"))?`；:642-652 以 `Some(workspace)` + `Some("message.moderated")` 调 `soft_delete_outboxed_system`。`git log -S "moderate_delete requires a workspace"` → 引入于 `d8c732a`（HEAD 历史内）。参数类型仍为 `Option<WorkspaceId>`（守卫在运行时而非类型层，与 AiWorker 同构） |
 | E2 | `crates/aero-ai/src/worker/mod.rs:383-388` — R-D1：无 workspace 拒绝删除（fail-closed 对照） | ✅ **Verified（行号微漂）**。`handle_moderate` :389 `let workspace = moderation_delete_workspace(job)?;`；helper :183-190：`job.workspace_id.map(...).ok_or_else(AiError::Invalid("moderation job {} has no workspace_id; refusing un-audited delete (R-D1)"))`——Err 传播 → retry → bounded DLQ。worker 单测 `moderation_delete_workspace_refuses_none_fail_closed`（worker/tests.rs:131-148）钉 None 拒绝 + Some 成功 |
 | E3 | `crates/aero-server/src/moderation_bot.rs` — 以 job workspace 调 moderate_delete（happy path 掩盖 None 分支） | ✅ **Verified（实际是双重守卫）**。bot 在调用前**自己先挡一层**：`let Some(workspace) = workspace else { record_skip(SkipReason::WorkspaceUnresolvable, job.message_id); return; };`（:477-483，模块 doc :155 注明 R-D1 parity），再 `:483 .moderate_delete(job.message_id, Some(workspace), &reason, &digest)`——`SkipReason::WorkspaceUnresolvable` 变体 :155-158 文档明言 "must NOT be deleted un-audited"。调用面 = caller 守卫 + 服务层守卫双保险 |
-| E4 | `crates/aero-storage/src/message_reports.rs` — `review_authorized`：第三 moderation 生产者，actor=Some(reviewer) | ✅ **Verified（类型层已 fail-closed + 断言缺口）**。`review_authorized` :240 签名 `workspace: WorkspaceId`（**非 Option——类型层杜绝 None**）；remove 分支 :300-308 `MessageRepo::soft_delete_locked_outboxed_in_tx(..., Some(workspace), Some(reviewer), Some("message.moderated"), ...)`（actor=reviewer、同 tx 审计 + 0239 触发 outbox）。db 测试 `remove_review_commits_decision_delete_audit_and_outbox_once` :589-661：断言 1 条 audit 行（actor=reviewer）+ 1 条 deleted-event outbox——**但零 `audit_governance_outbox` 行形状断言**（无 status/class/priority/action）——**全仓唯一残余缺口（§4 R3）** |
+| E4 | `crates/aero-storage/src/message_reports.rs` — `review_authorized`：第三 moderation 生产者，actor=Some(reviewer) | ✅ **Verified（类型层 fail-closed + 完整 parity 断言）**。`review_authorized` :240 签名 `workspace: WorkspaceId`（**非 Option——类型层杜绝 None**）；remove 分支 :300-308 `MessageRepo::soft_delete_locked_outboxed_in_tx(..., Some(workspace), Some(reviewer), Some("message.moderated"), ...)`（actor=reviewer、同 tx 审计 + 0239 触发 outbox）。db 测试 `remove_review_commits_decision_delete_audit_and_outbox_once` 现在同时断言 1 条 audit 行、1 条 deleted-event outbox，以及治理 outbox 的 status/class/priority/action/event_id 一致性。 |
 | E5 | `crates/aero-common/src/model/audit.rs` — `MODERATION_OUTBOUND_ACTION` 叶子 token | ✅ **Verified**。:150 `pub const MODERATION_OUTBOUND_ACTION: &str = "admin.content.flag";`；:437 const 断言 `assert_eq!(MODERATION_OUTBOUND_ACTION, "admin.content.flag")`。0239 触发器（migrations/0239_audit_governance_outbox.sql:16,98,123）同值硬编码 |
 
 ### 1.1 对 direction 陈述的勘误/钉化（evidence-backed）
 
 - **勘误① 生产缺陷已在 HEAD 关闭**：E1 的 `workspace.map` 分支被 `d8c732a` 的 R-D1 守卫取代（:625-633）。**本 direction 不需要任何生产代码改动**——`moderate_delete(None)` 现在返回 `Err(Invalid)`、消息保持可见、零 audit/零 governance/零 Deleted 广播（与 AiWorker `moderation_delete_workspace` 完全对称）。三生产者的 fail-closed 姿态现在是**同构的**：AiWorker = 运行时 Err（worker/mod.rs:183-190,389）；moderation_bot = caller 守卫 + 服务层守卫（moderation_bot.rs:477-483）；review_authorized = 类型层非 Option（message_reports.rs:240）。
 - **勘误② 验收第一项已满足且更强**：direction 验收给「拒绝（Err，镜像 R-D1）**或**写 system-scoped audit 行」二选一——实现选了拒绝分支，且 R9 drill（`crates/aero-im-core/src/db_tests/governance_drill_tests/crash.rs:22-149`）断言**完整负包络**：`Err(Invalid)`、`deleted_at IS NULL`、blocks 原样、audit_events=0、audit_governance_outbox=0、event_outbox deleted 帧=0；控制半（`Some(ws)` + enforcement ON）断言 1 audit + 1 governance 行（status 0 / class 'admin' / priority 100）。R9 在 `--test-threads=1` 的 workspace 级 ignored 套件中执行（test-integration.sh:615-622 只 skip notifications/relay 两个 im-core 模块，governance_drill_tests 不 skip）。
-- **勘误③ 验收第二项三腿现状不均**：AiWorker 腿 = `moderation_finalize_outbox_parity`（audit_governance.rs:247，经 :180-198 `moderate_finalize` seam——模块 doc 明言 "The exact production seam `AiWorker::handle_moderate` calls"，断言 1 audit + 1 governance 行全形状含 payload action）；moderation_bot 腿 = R9 控制半 + R3 `drill_priority_claim_preempts_fifo_on_write_path_rows`（priority 100/class admin）+ R4 `drill_payload_contract_16_key_envelope_via_moderate_delete`（payload action = `MODERATION_OUTBOUND_ACTION`）；**review_authorized 腿 = 缺 governance 行断言（E4）**。
+- **勘误③ 验收第二项三腿现状已对齐**：AiWorker 腿 = `moderation_finalize_outbox_parity`（audit_governance.rs，经 `moderate_finalize` seam——模块 doc 明言 "The exact production seam `AiWorker::handle_moderate` calls"，断言 1 audit + 1 governance 行全形状含 payload action）；moderation_bot 腿 = R9 控制半 + 优先级/载荷契约钻取；`review_authorized` 腿 = `remove_review_commits_decision_delete_audit_and_outbox_once` 新增治理 outbox 完整形状与 event_id 1:1 断言。三腿均保持同一 status=0 / class=admin / priority=100 / action 契约。
 - **行号漂移登记**：messages.rs:632（→:625-633 守卫区，符号 `moderate_delete` 稳定）；worker/mod.rs:383-388（→:389 调用点 + :183-190 helper）。**符号锚点全部命中**。
 
 ## 2. Verified current state（缺口盘点）
@@ -40,13 +40,13 @@
   a) None-workspace DB-gated 测试        → 已有且强于验收下限（R9，crash.rs:22-115，workspace 级 ignored 腿）
   b) 三生产者 parity                     → AiWorker 腿 ✅（moderation_finalize_outbox_parity，storage seam）
                                           moderation_bot 腿 ✅（R9 控制半 + R3/R4，真实 svc.moderate_delete）
-                                          review_authorized 腿 ❌ 治理 outbox 行形状零断言（E4）——唯一缺口
+                                          review_authorized 腿 ✅ 治理 outbox 行形状与 event_id 1:1 断言已补齐
   c) 钻取门                              → moderation-priority-drill（moderation-in-first-batch :276 /
                                           parity-501 :350）+ t11-fail-closed 均为 b5-pin.sh 37 槽执行槽
                                           （:40-41），test-integration.sh 命名条目驱动
 ```
 
-**Gap this direction closes**（all verified）：仅验收第二项的 review_authorized 腿（E4）——给第三生产者的 remove 路径补治理 outbox 行形状断言（status 0 / class 'admin' / priority 100 / payload.action = `MODERATION_OUTBOUND_ACTION` / event_id 1:1 with audit_events.id），并视实现形态合并为「每生产者恰一行」的统一 parity 断言集（§4 R3）。effort 3 的量级 = 既有 ignored 测试补 ~15 行断言（或新增一个同名测试），零生产代码、零迁移。
+**Gap this direction closed**（all verified）：验收第二项的 `review_authorized` 腿已补齐治理 outbox 行形状断言（status 0 / class 'admin' / priority 100 / payload.action = `MODERATION_OUTBOUND_ACTION` / event_id 1:1 with audit_events.id），与另外两条生产者腿形成统一 parity 断言集（§4 R3）。无生产代码、无迁移改动。
 
 ## 3. Scope
 
@@ -103,7 +103,7 @@ moderation 优先级钻取与 T-11 fail-closed 钻取不因本 direction 的任�
 |---|---|---|---|
 | A1.1/A1.2 | `moderate_delete` R-D1 守卫（符号 + 错误串） | crates/aero-im-core/src/service/messages.rs:625-633 | ✅ 已落地（d8c732a），回归钉 |
 | A2.1/A2.2 | `drill_moderate_delete_none_workspace_refuses_like_rd1`（R9 负包络 + 控制半） | crates/aero-im-core/src/db_tests/governance_drill_tests/crash.rs:22-149 | ✅ 已落地，workspace 级 ignored 腿执行 |
-| A3.1 | review_authorized remove 路径补 governance 行形状断言（恰 1 行 + 四元组 + event_id 1:1） | crates/aero-storage/src/message_reports.rs db_tests（:589 测试或同模块新增） | ❌ **本 direction 唯一实现增量** |
+| A3.1 | review_authorized remove 路径治理行形状断言（恰 1 行 + 四元组 + event_id 1:1） | crates/aero-storage/src/message_reports.rs db_tests | ✅ 已落地并通过 DB-gated parity 验证 |
 | A3.2 | AiWorker 腿 `moderation_finalize_outbox_parity`（:247）· bot 腿 R4（:578）既有断言不动 | crates/aero-storage/src/audit_governance.rs · crates/aero-im-core/src/db_tests/governance_drill_tests.rs | ✅ 已落地，作为 parity 参照腿 |
 | A3.3 | 三腿均 `--ignored` DB-gated + 计数断言（非 vacuous） | harness `--ignored --test-threads=1` 腿 + `audit_governance::` 命名槽 | ✅ 既有机制；A3.1 补丁落同机制 |
 | A4.1 | `drill: moderation-in-first-batch: PASS` / `drill: parity-501: PASS` | crates/aero-audit-connector/src/bin/aero-audit-priority-drill.rs:276/:350 | ✅ 回归门 |

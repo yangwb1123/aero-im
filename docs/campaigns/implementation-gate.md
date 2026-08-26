@@ -1,5 +1,11 @@
 实施分派完成。完整批次清单已写入 **`docs/snaplink-platform/v2/implementation-batches.md`**（13KB），以下为全量内容（可人工核对）。
 
+> **当前 B5 pin（2026-08-26）**：`scripts/b5-pin.sh` 的 live
+> `B5_CONTRACT_TEST_LIST` 是 48 个 slot：27 个非 `[PROPOSED]` 可执行
+> slot + 21 个 `[PROPOSED]` 仓外占位。这里的“27 executed”是 manifest
+> 分类，不是本次运行已执行测试数；历史 acceptance 文档的数字不作当前
+> 执行证据。
+
 **批次模型**：COMPOSE-2026-017 为基线 → B1（sink P0）→ B2（aero-id）/ B3（aero-vault）→ B4（IdP）→ B5（aero-im）→ B6（console）。**两处归属校正**（按已验证代码）：① "dev-token 关闭"（S1）在 sink 仓库（`cmd/audit-api/main.go`）；② "discovery 真值化"（F-3）在 IdP **部署仓**（`interfaces/sso/server_discovery.go`/`server_discovery_config.go`）。**信任路径联合门禁**：B1-1 + B4-1 + B1-7 合并为"真实流量"P0 门禁（T-1.1/T-1.2/T-8a）。**gate 重审修正**（原位修订）：B4 全部钉到部署仓（SDK 树 `yangwb1123/snaplink`，HEAD `b3c839bb`；legacy 树 `github.com/opensso/sso` @ `ac5d367` 未部署、不引用）；"补 kid" 已存在并移除；F5 计数修正为 49 个 `_ =` 站点；新增 sink B1-8（tenant 一致性 422）与 gRPC 拓扑覆盖（B1-6）。
 
 ---
@@ -60,7 +66,7 @@
 
 | # | 仓库 | 文件或模块 | 改动 | 验收断言 | 依赖批次 |
 |---|---|---|---|---|---|
-| 1 | aero-im | `crates/aero-storage/src/audit.rs` + outbox migration | Outbox + in-tx：DDL（status 0/1/2/3 normative）；`message.*`/`room.*`/`admin.*` 同事务写入；‡ 类走 L1 | 30 个忽略测试 CI 全绿（37/37）；P2 parity | B1 |
+| 1 | aero-im | `crates/aero-storage/src/audit.rs` + outbox migration | Outbox + in-tx：DDL（status 0/1/2/3 normative）；`message.*`/`room.*`/`admin.*` 同事务写入；‡ 类走 L1 | B5 pin 48/48（27 个可执行 slot + 21 个 [PROPOSED]；不等同于本次已执行测试数）；P2 parity | B1 |
 | 2 | aero-im | 新 connector crate（aero-id 模式） | Rust relay：§1.2 语义（lease/backoff/422→dead）；cc + claim 契约；scope `audit:event:write` | 首个 `room.create` 到 sink；422 → 终态；T-11（无 relay 配给被拒） | B1, B4-2 |
 | 3 | aero-im | outbox schema（flag/partition） | Moderation 优先级：`admin.content.flag`/`admin.moderation.action` 先于积压 | 注入积压 drill：moderation 先达 sink | B5-1..2 |
 | 4 | aero-im | snaplink scope registry（B4-2 配给侧） | Scope 配给：relay 完成后授予 `audit:event:write` | 矩阵配给端到端 403-free；无 relay 时 fail-closed 拒绝 | B4-2, B5-2 |
@@ -75,7 +81,7 @@
 | G3（B2） | B2-1..6 | T-5、T-10.1/10.2、T-4 联合、首个事件 e2e |
 | G4（B3） | B3-1..6 | T-3、T-4、D1 drill、首个事件 e2e |
 | G5（B4） | B4-2..5 | T-2、T-8(b–e)、T-9、L0 持久化、P2 parity |
-| G6（B5） | B5-1..4 | 37/37、T-11、moderation 优先级 |
+| G6（B5） | B5-1..4 | 48/48（27 个可执行 slot + 21 个 [PROPOSED]）、T-11、moderation 优先级 |
 | G7（B6） | B6-1..2 | T-12 联合、console 服务端记录 |
 | G8（生产 cutover） | 全部批次 + 迁移骨架 P1–P3 | 各仓 CI 全绿、首个事件验证、DLQ/alert 上线（H2/H6） |
 

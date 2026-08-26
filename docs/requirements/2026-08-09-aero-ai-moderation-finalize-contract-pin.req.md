@@ -33,14 +33,13 @@
   worker 隐含：  handle_moderate :396-408 → soft_delete_outboxed_system(..., Some(LOCAL_ACTION_MODERATED), ...)
   storage 派生： 0239 触发器（token-keyed，仅 'message.moderated' 入队）→ audit_governance_outbox 行
   DB-gated 断言： moderation_finalize_outbox_parity（audit_governance.rs，#[ignore]）half 2+3 全形状
-  plain 断言：   governance.rs 6 测试 —— 钉 token-keyed / R-D2 / DESC 优先 / outbound 单 token，
-                 但**无任何函数返回完整 5 元组**（audit_action 缺失）
+  plain 断言：   governance.rs 现有契约测试 + `finalize_contract_for` 四个 plain 测试 —— 钉 token-keyed / R-D2 / DESC 优先 / outbound 单 token 与完整 5 元组
 
 漂移检测面现状：
   token 漂移        → 叶子 vocabulary_consts_are_pinned（aero-common，plain）+ 0239 SQL 注释 pin（textual）
   映射漂移          → governance.rs 6 测试（plain）——但只到 4 元组
-  完整 5 元组漂移    → ❌ 无 plain 守卫；只在 DB-gated drill 迟到失败（direction 问题陈述精确）
-  admin.* 新 token  → ❌ 无词汇表级守卫（"加 token 忘 mapping 臂" 静默 None pass-through 不可见）
+  完整 5 元组漂移    → ✅ `finalize_contract_mirrors_drill_fixture` plain 守卫
+  admin.* 新 token  → ✅ `ADMIN_LANE_TOKENS` + map-or-reject plain 守卫（R-D2 负 pin）
 ```
 
 **Gap this direction closes**（all verified）：① 一个纯 fn 返回 `handle_moderate` 最终提交的完整 5 元组；② 镜像 drill fixture 的 plain `cargo test` 测试（无 DATABASE_URL），任何 token/常量/DDL 字面量漂移在 CI 早段失败；③ admin.* 词汇表级 map-or-reject 守卫（R-D2 负 pin 保持）。
@@ -134,9 +133,9 @@ pub const ADMIN_LANE_TOKENS: &[&str] = &[LOCAL_ACTION_MODERATED];
 
 | Direction acceptance（原文） | Testable artifact | Location | Status |
 |---|---|---|---|
-| "New pure fn (e.g. governance::finalize_contract_for(job, verdict)) returning the exact (audit_action, class, priority, outbound_action, status) tuple handle_moderate implies" | R1：`finalize_contract_for(job: &AiJob, verdict: Option<&str>) -> Option<ModerationFinalizeContract>`（5 字段类型，组合 `governance_lane_for`） | crates/aero-ai/src/governance.rs + lib.rs re-export 链 :37-39 | ❌ **本 direction 实现增量** |
-| "unit tests mirroring the storage drill fixture run in plain `cargo test` (no DATABASE_URL) and fail on any token/DDL divergence (T-11 group)" | R2：4 个 plain 单测（`finalize_contract_mirrors_drill_fixture` / `_safe_verdict_yields_no_contract` / `_no_target_yields_no_contract` / 漂移矩阵 A2.3 逐条可执行） | crates/aero-ai/src/governance.rs `#[cfg(test)]`；执行 = `cargo test -p aero-ai` | ❌ 实现增量 |
-| "extending the match with a new admin.* token (admin.moderation.action) either maps to the admin lane or is explicitly rejected fail-closed, with the R-D2 negative re-asserted" | R3：`ADMIN_LANE_TOKENS` 词汇表 + `admin_lane_vocabulary_fully_mapped_or_fail_closed`（map-or-reject）+ R-D2 词汇表层重断言；翻转场景 = 叶子 pin + A2.1 字面量臂 fail-closed | crates/aero-ai/src/governance.rs（常量 + 测试） | ❌ 实现增量 |
+| "New pure fn (e.g. governance::finalize_contract_for(job, verdict)) returning the exact (audit_action, class, priority, outbound_action, status) tuple handle_moderate implies" | R1：`finalize_contract_for(job: &AiJob, verdict: Option<&str>) -> Option<ModerationFinalizeContract>`（5 字段类型，组合 `governance_lane_for`） | crates/aero-ai/src/governance.rs + lib.rs re-export 链 | ✅ 已实现并通过单测 |
+| "unit tests mirroring the storage drill fixture run in plain `cargo test` (no DATABASE_URL) and fail on any token/DDL divergence (T-11 group)" | R2：4 个 plain 单测（`finalize_contract_mirrors_drill_fixture` / `_safe_verdict_yields_no_contract` / `_no_target_yields_no_contract` / 漂移矩阵 A2.3 逐条可执行） | crates/aero-ai/src/governance.rs `#[cfg(test)]`；执行 = `cargo test -p aero-ai` | ✅ 已实现并通过 plain cargo test |
+| "extending the match with a new admin.* token (admin.moderation.action) either maps to the admin lane or is explicitly rejected fail-closed, with the R-D2 negative re-asserted" | R3：`ADMIN_LANE_TOKENS` 词汇表 + `admin_lane_vocabulary_fully_mapped_or_fail_closed`（map-or-reject）+ R-D2 词汇表层重断言；翻转场景 = 叶子 pin + A2.1 字面量臂 fail-closed | crates/aero-ai/src/governance.rs（常量 + 测试） | ✅ 已实现并通过正/负词汇表测试 |
 | "existing governance + worker tests stay green" | R4：governance 6 测试 + worker 全单测（含 R-D1）零改动绿；drill `moderation_finalize_outbox_parity` 零改动 PASS | 既有文件，回归门 | ✅ 既有（回归验证） |
 
 ## 6. Harness gates & coordination

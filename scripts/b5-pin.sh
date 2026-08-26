@@ -79,6 +79,18 @@ B5_CONTRACT_TEST_LIST=(
     drill-payload-contract-slot
 )
 
+# B5 gauge pin — audit governance outbox health gauges (requirements:
+# 2026-08-09-aero-ai-governance-outbox-health-gauges.req.md R1).  These are
+# Prometheus series names, not additional contract-test slots: keep the
+# 48/48 contract list above unchanged while pinning the five public metrics.
+B5_GAUGE_PIN=(
+    aero_audit_outbox_pending
+    aero_audit_outbox_claimed
+    aero_audit_outbox_delivered
+    aero_audit_outbox_dead
+    aero_audit_outbox_oldest_pending_secs
+)
+
 # Verdict-line protocol: `B5-CHECK <name>: PASS|SKIP (<reason>)`. Each
 # executed segment records its verdict here; the pin guard greps $B5_LOG for
 # the evidence (a missing verdict line for an executed slot = FAIL).
@@ -140,6 +152,31 @@ assert_b5_contract_pin() {
         echo "B5 pin: verdict evidence degraded (SKIP_DB_CREATE); count/format/dupe/vacuous checks still enforced"
     fi
     echo "B5 contract pin: 48/48 (${executed} executed, ${proposed} [PROPOSED]): PASS"
+}
+
+# Gauge-name pin guard (R6): exactly five lowercase Prometheus names, with no
+# duplicates.  Source drift is checked by the integration harness after this
+# shape guard; keeping the pure guard here makes it independently testable.
+assert_b5_gauge_pin() {
+    local count=${#B5_GAUGE_PIN[@]}
+    if [ "$count" -ne 5 ]; then
+        echo "✗ B5 gauge pin: ${count}/5 (expected exactly 5 names)" >&2
+        return 1
+    fi
+    local -A seen=()
+    local entry
+    for entry in "${B5_GAUGE_PIN[@]}"; do
+        if [[ ! "$entry" =~ ^[a-z0-9_]+$ ]]; then
+            echo "✗ B5 gauge pin: malformed name '${entry}'" >&2
+            return 1
+        fi
+        if [ -n "${seen[$entry]:-}" ]; then
+            echo "✗ B5 gauge pin: duplicate name '${entry}'" >&2
+            return 1
+        fi
+        seen[$entry]=1
+    done
+    echo "B5 gauge pin: 5/5: PASS"
 }
 
 # F4 stub-reachability pin (merged B5-2 design §6 step 7): the test stub

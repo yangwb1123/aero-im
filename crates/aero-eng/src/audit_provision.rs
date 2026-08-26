@@ -13,6 +13,8 @@
 //! Design: `docs/design/2026-08-07-aero-cli-b5-4-audit-provision-check-psql.design.md`.
 
 use crate::outcome::Outcome;
+use crate::relay_runtime::{claimed_age_line, parse_claimed_age, MAX_LEASE_SECONDS, Q7_SQL};
+pub use crate::relay_runtime::{parse_db_url, ConnParams};
 use aero_common::model::audit::OutboxStatus;
 use std::fmt::Write as _;
 use std::io::Write;
@@ -24,7 +26,7 @@ const QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// The B5-1 0239 table-name candidates, in probe order: the T-11 drill /
 /// harness-pinned name first, then the aero-bus B5-1 design name. The single
 /// point to extend if B5-1 lands a third name.
-const G0239_CANDIDATES: [&str; 2] = ["audit_governance_outbox", "audit_outbox"];
+pub const G0239_CANDIDATES: [&str; 2] = ["audit_governance_outbox", "audit_outbox"];
 
 // -- SQL contract (each query runs as its own psql -At -v ON_ERROR_STOP=1) --
 
@@ -46,7 +48,7 @@ const Q2_SQL: &str =
 /// Q3 — 0239 four status buckets (0=pending, 1=claimed, 2=delivered,
 /// 3=dead). `{table}` is only ever one of the fixed [`G0239_CANDIDATES`]
 /// literals (resolved by [`parse_probe_line`]); never user input.
-const Q3_SQL: &str = "SELECT status, count(*) FROM {table} GROUP BY status ORDER BY status";
+pub const Q3_SQL: &str = "SELECT status, count(*) FROM {table} GROUP BY status ORDER BY status";
 
 /// Q4 — oldest pending row age in seconds (empty result = no pending rows).
 /// `pub` (B5-4): the aero-server sampler's `oldest_pending_secs` query is a
@@ -100,6 +102,8 @@ pub struct G0239Counts {
     pub dead: i64,
     /// Oldest pending row age in seconds (None = no pending rows).
     pub oldest_pending_secs: Option<i64>,
+    /// Oldest claimed-row age in seconds (None = no claimed rows). Q7.
+    pub oldest_claimed_secs: Option<i64>,
     /// Dead-row detail (`event_id`, `last_error`), ≤ 5 rows.
     pub dead_rows: Vec<(String, String)>,
 }
@@ -154,6 +158,15 @@ pub fn verdict(s: &AuditSnapshot) -> Verdict {
         }
         return Verdict::Consistent;
     }
+    if let Some(g) = &s.g0239 {
+        if let Some(secs) = g.oldest_claimed_secs {
+            if secs > MAX_LEASE_SECONDS {
+                return Verdict::FailClosed(format!(
+                    "stuck lease: oldest claimed row is {secs}s old (> {MAX_LEASE_SECONDS}s); relay died after claiming"
+                ));
+            }
+        }
+    }
     Verdict::Healthy
 }
 
@@ -190,6 +203,7 @@ pub fn format_report(s: &AuditSnapshot, v: &Verdict) -> String {
                     let _ = writeln!(out, "audit-provision-check: oldest-pending-age: n/a");
                 }
             }
+            let _ = writeln!(out, "{}", claimed_age_line(g.oldest_claimed_secs));
             for (event_id, last_error) in &g.dead_rows {
                 let _ = writeln!(out, "audit-provision-check: dead: {event_id} {last_error}");
             }
@@ -375,64 +389,6 @@ pub fn parse_dead_rows(out: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Connection parameters parsed from a `postgres://user:pass@host:port/db`
-/// URL (harness-compatible parsing; password travels via `PGPASSWORD`, never
-/// argv).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ConnParams {
-    pub user: String,
-    pub password: String,
-    pub host: String,
-    pub port: String,
-    pub db: String,
-}
-
-/// Parse a postgres connection URL. Host defaults to localhost, port to
-/// 5432; query strings are stripped; user and database are required.
-pub fn parse_db_url(url: &str) -> Result<ConnParams, String> {
-    let rest = url
-        .strip_prefix("postgres://")
-        .or_else(|| url.strip_prefix("postgresql://"))
-        .ok_or_else(|| "database URL must start with postgres://".to_string())?;
-    let rest = rest.split('?').next().unwrap_or(rest);
-    let (auth, host_and_db) = match rest.rfind('@') {
-        Some(i) => (&rest[..i], &rest[i + 1..]),
-        None => ("", rest),
-    };
-    let (user, password) = match auth.split_once(':') {
-        Some((u, p)) => (u.to_string(), p.to_string()),
-        None => (auth.to_string(), String::new()),
-    };
-    let (host_port, db) = match host_and_db.split_once('/') {
-        Some((h, d)) => (h, d.to_string()),
-        None => (host_and_db, String::new()),
-    };
-    let (host, port) = match host_port.rsplit_once(':') {
-        Some((h, p)) if !h.is_empty() && !p.is_empty() => (h.to_string(), p.to_string()),
-        _ => (
-            if host_port.is_empty() {
-                "localhost".to_string()
-            } else {
-                host_port.to_string()
-            },
-            "5432".to_string(),
-        ),
-    };
-    if user.is_empty() {
-        return Err("database URL must include a user".to_string());
-    }
-    if db.is_empty() {
-        return Err("database URL must include a database name".to_string());
-    }
-    Ok(ConnParams {
-        user,
-        password,
-        host,
-        port,
-        db,
-    })
-}
-
 /// How the check launches psql (mirrors the harness's `PSQL_MODE`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PsqlMode {
@@ -591,9 +547,10 @@ pub async fn run(db_url: &str) -> Outcome {
     };
     let g0239 = match parse_probe_line(&q2) {
         Some(table) => {
-            // Q3 — four status buckets; Q4 — oldest pending age; Q5 — dead
-            // detail (only when dead > 0). `{table}` is a fixed candidate
-            // literal resolved above; no user input reaches the SQL.
+            // Q3 — four status buckets; Q4 — oldest pending age; Q7 — oldest
+            // claimed age; Q5 — dead detail (only when dead > 0). `{table}`
+            // is a fixed candidate literal resolved above; no user input
+            // reaches the SQL.
             let q3 = match runner.query(&Q3_SQL.replace("{table}", table)).await {
                 Ok(o) => o,
                 Err(e) => return outcome_error(e),
@@ -613,6 +570,14 @@ pub async fn run(db_url: &str) -> Outcome {
                     }
                 }
             };
+            let q7 = match runner.query(&Q7_SQL.replace("{table}", table)).await {
+                Ok(o) => o,
+                Err(e) => return outcome_error(e),
+            };
+            let oldest_claimed_secs = match parse_claimed_age(&q7) {
+                Ok(secs) => secs,
+                Err(e) => return outcome_error(e),
+            };
             let dead_rows = if buckets[3] > 0 {
                 match runner.query(&Q5_SQL.replace("{table}", table)).await {
                     Ok(o) => parse_dead_rows(&o),
@@ -628,6 +593,7 @@ pub async fn run(db_url: &str) -> Outcome {
                 delivered: buckets[2],
                 dead: buckets[3],
                 oldest_pending_secs,
+                oldest_claimed_secs,
                 dead_rows,
             })
         }

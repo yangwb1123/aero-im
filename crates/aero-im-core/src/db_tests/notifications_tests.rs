@@ -10,8 +10,9 @@
 
 use aero_common::{Block, NotificationKind, ParticipantId, WorkspaceId};
 use aero_storage::{
-    BlockRepo, NotificationPrefsRepo, NotificationRepo, ParticipantRepo, ThreadMuteRepo,
-    ThreadNotificationPrefsRepo, ThreadSubscriptionRepo, WorkspaceMuteRepo,
+    BlockRepo, KeywordAlertRepo, NotificationPrefsRepo, NotificationRepo, ParticipantRepo,
+    ThreadMuteRepo, ThreadNotificationPrefsRepo, ThreadSubscriptionRepo, UserGroupRepo,
+    WorkspaceMuteRepo,
 };
 use fred::prelude::ClientLike;
 
@@ -20,6 +21,71 @@ use super::{
     new_participant, notification_service, pending_notify_outbox, pool, side_effect_job_state,
 };
 use crate::service::orig::{notify_delivery_id, NotifyBatchKind};
+
+async fn notification_rows(
+    pool: &sqlx::PgPool,
+    message_id: aero_common::MessageId,
+) -> Vec<(ParticipantId, NotificationKind, Option<ParticipantId>)> {
+    sqlx::query_as::<_, (uuid::Uuid, String, Option<uuid::Uuid>)>(
+        "SELECT participant_id, kind, actor_id
+           FROM notifications
+          WHERE message_id = $1
+          ORDER BY participant_id",
+    )
+    .bind(message_id.to_uuid())
+    .fetch_all(pool)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|(participant, kind, actor)| {
+        (
+            ParticipantId::from_uuid(participant),
+            NotificationKind::from_str_lenient(&kind),
+            actor.map(ParticipantId::from_uuid),
+        )
+    })
+    .collect()
+}
+
+/// Build the nil-workspace fixture used by the user-group acceptance tests. The
+/// extra participant is enrolled in the workspace but deliberately not added to
+/// the room, proving that group membership alone cannot widen room visibility.
+async fn group_mention_fixture(
+    prefix: &str,
+) -> (
+    sqlx::PgPool,
+    crate::service::ImService,
+    Vec<aero_common::Participant>,
+    aero_common::RoomId,
+    String,
+) {
+    let pool = super::pool();
+    let (svc, _bus) = super::notification_service(pool.clone(), false);
+    let (members, room) = super::group_room(&pool, &svc, prefix, 4).await;
+    let eve = super::new_participant(
+        &aero_storage::ParticipantRepo::new(pool.clone()),
+        &format!("{prefix}-eve"),
+    )
+    .await;
+    let groups = UserGroupRepo::new(pool.clone());
+    let workspace = WorkspaceId::from_uuid(uuid::Uuid::nil());
+    // The notification suite intentionally shares one throwaway database
+    // across tests. The nil workspace is the room fixture's tenant, so the
+    // handle must be unique per fixture or AT-1b..AT-1e collide on the
+    // user_groups_workspace_id_handle_key constraint after AT-1a.
+    let handle = format!("team-{}", uuid::Uuid::new_v4().simple());
+    let group = groups
+        .create_authorized(workspace, &handle, "Team", members[0].id)
+        .await
+        .unwrap();
+    for participant in [members[1].id, members[2].id, eve.id] {
+        groups
+            .add_member_authorized(workspace, group.id, participant, members[0].id)
+            .await
+            .unwrap();
+    }
+    (pool, svc, [members, vec![eve]].concat(), room, handle)
+}
 
 /// Build a `PresenceStore` against `REDIS_URL`, or `None` when the variable is
 /// UNSET (manual ad-hoc runs only). A set-but-unreachable Redis PANICS — a green
@@ -172,7 +238,7 @@ async fn at2_redelivery_with_same_delivery_id_dedups() {
     // The re-arm → dispatch → assert section runs under BATCH_SERIAL: the
     // re-armed job is globally claimable and AT-6b/AT-7's global batch could
     // otherwise claim it mid-test (design §5.6).
-    let _serial = super::BATCH_SERIAL.lock().unwrap();
+    let _serial = super::batch_serial();
     assert_eq!(
         super::rearm_side_effect_job(&pool, job_id).await,
         1,
@@ -757,4 +823,318 @@ async fn at5g_thread_level_suppresses_per_recipient() {
     assert_eq!(count_notifications(&pool, loud.id, Some(alice.id)).await, 1);
     assert_eq!(count_notifications(&pool, loud.id, Some(carol.id)).await, 1);
     assert_eq!(count_notifications(&pool, loud.id, Some(dave.id)).await, 0);
+}
+
+/// AT-1a: a user-group handle expands only to the intersection of group members
+/// and room members, excluding the sender.
+#[tokio::test]
+#[ignore = "requires running Postgres with migrations applied"]
+async fn at1a_user_group_mention_intersects_room_members() {
+    let (pool, svc, members, room, handle) = group_mention_fixture("at1a-group").await;
+    let (alice, bob, carol, dave, eve) = (
+        &members[0],
+        &members[1],
+        &members[2],
+        &members[3],
+        &members[4],
+    );
+    let message = svc
+        .send_message(
+            alice.id,
+            room,
+            vec![Block::text(format!("hello @{handle}"))],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let rows = notification_rows(&pool, message.id).await;
+    assert_eq!(rows.len(), 2);
+    assert!(rows.contains(&(bob.id, NotificationKind::Mention, Some(alice.id))));
+    assert!(rows.contains(&(carol.id, NotificationKind::Mention, Some(alice.id))));
+    assert!(!rows.iter().any(|(p, _, _)| *p == alice.id));
+    assert!(!rows.iter().any(|(p, _, _)| *p == dave.id));
+    assert!(!rows.iter().any(|(p, _, _)| *p == eve.id));
+}
+
+/// AT-1b: reply-author notifications retain the stronger `Reply` kind when the
+/// same recipient is also reached through a group handle; direct + group mention
+/// paths remain idempotently deduplicated.
+#[tokio::test]
+#[ignore = "requires running Postgres with migrations applied"]
+async fn at1b_user_group_does_not_downgrade_reply_or_duplicate_mentions() {
+    let (pool, svc, members, room, handle) = group_mention_fixture("at1b-group").await;
+    let (alice, bob, carol) = (&members[0], &members[1], &members[2]);
+    let root_message = svc
+        .send_message(bob.id, room, vec![Block::text("root")], None, None)
+        .await
+        .unwrap();
+    let reply = svc
+        .send_message(
+            alice.id,
+            room,
+            vec![Block::text(format!("@{handle}"))],
+            Some(root_message.id),
+            None,
+        )
+        .await
+        .unwrap();
+    let rows = notification_rows(&pool, reply.id).await;
+    assert_eq!(rows.len(), 2);
+    assert!(rows.contains(&(bob.id, NotificationKind::Reply, Some(alice.id))));
+    assert!(rows.contains(&(carol.id, NotificationKind::Mention, Some(alice.id))));
+
+    let direct_and_group = svc
+        .send_message(
+            alice.id,
+            room,
+            vec![
+                Block::Mention {
+                    participant: bob.id,
+                },
+                Block::text(format!("@{handle}")),
+            ],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let rows = notification_rows(&pool, direct_and_group.id).await;
+    assert_eq!(rows.len(), 2);
+    assert_eq!(
+        rows.iter().filter(|(p, _, _)| *p == bob.id).count(),
+        1,
+        "direct and group paths deduplicate the same recipient"
+    );
+    assert!(rows.contains(&(bob.id, NotificationKind::Mention, Some(alice.id))));
+    assert!(rows.contains(&(carol.id, NotificationKind::Mention, Some(alice.id))));
+}
+
+/// AT-1c: the existing block filter applies equally to a group-expanded target.
+#[tokio::test]
+#[ignore = "requires running Postgres with migrations applied"]
+async fn at1c_user_group_respects_block_filter() {
+    let (pool, svc, members, room, handle) = group_mention_fixture("at1c-group").await;
+    let (alice, bob, carol) = (&members[0], &members[1], &members[2]);
+    BlockRepo::new(pool.clone())
+        .block(bob.id, alice.id)
+        .await
+        .unwrap();
+    let message = svc
+        .send_message(
+            alice.id,
+            room,
+            vec![Block::text(format!("@{handle}"))],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let rows = notification_rows(&pool, message.id).await;
+    assert_eq!(rows.len(), 1);
+    assert!(rows.contains(&(carol.id, NotificationKind::Mention, Some(alice.id))));
+    assert!(!rows.iter().any(|(p, _, _)| *p == bob.id));
+}
+
+/// AT-1d: a full-day DND window suppresses a group-expanded recipient without
+/// affecting the other group member.
+#[tokio::test]
+#[ignore = "requires running Postgres with migrations applied"]
+async fn at1d_user_group_respects_dnd_filter() {
+    let (pool, svc, members, room, handle) = group_mention_fixture("at1d-group").await;
+    let (alice, bob, carol) = (&members[0], &members[1], &members[2]);
+    NotificationPrefsRepo::new(pool.clone())
+        .set_dnd(bob.id, Some(0), Some(1440))
+        .await
+        .unwrap();
+    let message = svc
+        .send_message(
+            alice.id,
+            room,
+            vec![Block::text(format!("@{handle}"))],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let rows = notification_rows(&pool, message.id).await;
+    assert_eq!(rows.len(), 1);
+    assert!(rows.contains(&(carol.id, NotificationKind::Mention, Some(alice.id))));
+    assert!(!rows.iter().any(|(p, _, _)| *p == bob.id));
+}
+
+/// AT-1e: a room mute suppresses a group-expanded recipient while preserving the
+/// notification for the unmuted member.
+#[tokio::test]
+#[ignore = "requires running Postgres with migrations applied"]
+async fn at1e_user_group_respects_channel_mute() {
+    let (pool, svc, members, room, handle) = group_mention_fixture("at1e-group").await;
+    let (alice, bob, carol) = (&members[0], &members[1], &members[2]);
+    super::insert_channel_mute(&pool, bob.id, room).await;
+    let message = svc
+        .send_message(
+            alice.id,
+            room,
+            vec![Block::text(format!("@{handle}"))],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let rows = notification_rows(&pool, message.id).await;
+    assert_eq!(rows.len(), 1);
+    assert!(rows.contains(&(carol.id, NotificationKind::Mention, Some(alice.id))));
+    assert!(!rows.iter().any(|(p, _, _)| *p == bob.id));
+}
+
+/// AT-2: keyword alerts add exactly the authorized, room-member subscriber;
+/// sender, non-room members, and non-matching keywords are excluded.
+#[tokio::test]
+#[ignore = "requires running Postgres with migrations applied"]
+async fn at2_keyword_alert_fanout_is_room_scoped_and_case_insensitive() {
+    let pool = super::pool();
+    let (svc, _bus) = super::notification_service(pool.clone(), false);
+    let (members, room) = super::group_room(&pool, &svc, "at2-keyword", 4).await;
+    let (alice, bob, carol, dave) = (&members[0], &members[1], &members[2], &members[3]);
+    let eve = super::new_participant(
+        &aero_storage::ParticipantRepo::new(pool.clone()),
+        "at2-keyword-eve",
+    )
+    .await;
+    let workspace = WorkspaceId::from_uuid(uuid::Uuid::nil());
+    let alerts = KeywordAlertRepo::new(pool.clone());
+    alerts
+        .add_authorized(bob.id, workspace, "invoice")
+        .await
+        .unwrap();
+    alerts
+        .add_authorized(alice.id, workspace, "invoice")
+        .await
+        .unwrap();
+    alerts
+        .add_authorized(eve.id, workspace, "invoice")
+        .await
+        .unwrap();
+    alerts
+        .add_authorized(carol.id, workspace, "payroll")
+        .await
+        .unwrap();
+
+    let matched = svc
+        .send_message(
+            alice.id,
+            room,
+            vec![Block::text("send the INVOICE now")],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    let rows = notification_rows(&pool, matched.id).await;
+    assert_eq!(rows.len(), 1);
+    assert!(rows.contains(&(bob.id, NotificationKind::Mention, Some(alice.id))));
+    assert!(!rows.iter().any(|(p, _, _)| *p == alice.id));
+    assert!(!rows.iter().any(|(p, _, _)| *p == eve.id));
+    assert!(!rows.iter().any(|(p, _, _)| *p == carol.id));
+    assert!(!rows.iter().any(|(p, _, _)| *p == dave.id));
+
+    let unmatched = svc
+        .send_message(
+            alice.id,
+            room,
+            vec![Block::text("nothing relevant here")],
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(notification_rows(&pool, unmatched.id).await.is_empty());
+}
+
+/// AT-4: the service-level flush timer consumes an expired reply bundle,
+/// materializes one deterministic Reply notification and Notify outbox row, and
+/// remains idempotent on a second invocation.
+#[tokio::test]
+#[ignore = "requires running Postgres with migrations applied"]
+async fn at4_notification_bundle_flush_materializes_durable_event() {
+    let pool = super::pool();
+    let (svc, _bus) = super::notification_service(pool.clone(), true);
+    let (members, room) = super::group_room(&pool, &svc, "at4-flush", 2).await;
+    let (alice, bob) = (&members[0], &members[1]);
+    let root_message = svc
+        .send_message(alice.id, room, vec![Block::text("root")], None, None)
+        .await
+        .unwrap();
+    let reply = svc
+        .send_message(
+            bob.id,
+            room,
+            vec![Block::text("reply")],
+            Some(root_message.id),
+            None,
+        )
+        .await
+        .unwrap();
+    let job_id: uuid::Uuid = sqlx::query_scalar(
+        "SELECT id FROM message_side_effect_jobs
+          WHERE message_id = $1 AND kind = 'notifications'",
+    )
+    .bind(reply.id.to_uuid())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let (completed_at, _, last_error) = side_effect_job_state(&pool, job_id).await;
+    assert!(completed_at.is_some());
+    assert!(
+        last_error.is_none(),
+        "bundle source completed: {last_error:?}"
+    );
+    assert_eq!(count_notifications(&pool, reply.id, None).await, 0);
+    assert_eq!(count_notify_outbox(&pool, reply.id).await, 0);
+    assert_eq!(count_bundles(&pool, reply.id).await, 1);
+
+    let bundle_ids = super::bundle_delivery_ids(&pool, reply.id).await;
+    assert_eq!(bundle_ids.len(), 1);
+    let expected =
+        super::expected_bundle_delivery_id(alice.id, room, Some(root_message.id), &bundle_ids);
+    super::backdate_bundle(&pool, reply.id).await;
+    svc.flush_notification_bundles().await;
+
+    assert_eq!(count_bundles(&pool, reply.id).await, 0);
+    assert_eq!(count_notifications(&pool, reply.id, None).await, 1);
+    assert_eq!(count_notify_outbox(&pool, reply.id).await, 1);
+    let (kind, delivery_id): (String, uuid::Uuid) =
+        sqlx::query_as("SELECT kind, delivery_id FROM notifications WHERE message_id = $1")
+            .bind(reply.id.to_uuid())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(kind, NotificationKind::Reply.as_str());
+    assert_eq!(delivery_id, expected);
+    let (event_id, payload) = super::pending_notify_outbox(&pool, reply.id)
+        .await
+        .expect("flush creates one pending Notify outbox row");
+    assert_eq!(event_id, expected);
+    let aero_common::RoomEvent::NotifyBatch {
+        message_id,
+        delivery_id: payload_delivery_id,
+        recipients,
+        ..
+    } = serde_json::from_value(payload).unwrap()
+    else {
+        panic!("flush outbox payload is NotifyBatch");
+    };
+    assert_eq!(message_id, reply.id);
+    assert_eq!(payload_delivery_id, expected);
+    assert_eq!(recipients.len(), 1);
+    assert_eq!(recipients[0].participant, alice.id);
+    assert_eq!(recipients[0].kind, NotificationKind::Reply);
+
+    svc.flush_notification_bundles().await;
+    assert_eq!(count_bundles(&pool, reply.id).await, 0);
+    assert_eq!(count_notifications(&pool, reply.id, None).await, 1);
+    assert_eq!(count_notify_outbox(&pool, reply.id).await, 1);
+    let (completed_at, _, last_error) = side_effect_job_state(&pool, job_id).await;
+    assert!(completed_at.is_some());
+    assert!(last_error.is_none());
 }

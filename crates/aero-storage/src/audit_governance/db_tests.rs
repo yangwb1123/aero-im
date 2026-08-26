@@ -1,11 +1,12 @@
 use aero_common::{
-    AuditActor, AuditClaimPayload, AuditId, AuditTarget, MessageId, ParticipantId, RoomId,
-    WorkspaceId, AGGREGATED_MESSAGE_ACTION, AUDIT_ACTOR_TYPE_PARTICIPANT, AUDIT_AGGREGATE_TYPE,
-    AUDIT_DATA_CLASSIFICATION, AUDIT_EVENT_TYPE, AUDIT_OUTCOME_SUCCESS, AUDIT_RETENTION_CLASS,
-    AUDIT_SCHEMA_ID, AUDIT_SCHEMA_VERSION, AUDIT_SOURCE_SYSTEM, GOVERNANCE_CLASS_MESSAGE,
-    GOVERNANCE_CLASS_ROOM, L1_WINDOW_SECONDS, LOCAL_ACTION_MESSAGE_CREATE,
-    LOCAL_ACTION_MESSAGE_DELETED, LOCAL_ACTION_MESSAGE_EDIT, LOCAL_ACTION_MESSAGE_RECALLED,
-    LOCAL_ACTION_ROOM_ARCHIVED, LOCAL_ACTION_ROOM_CREATE, MODERATION_OUTBOUND_ACTION,
+    AuditActor, AuditAggregatePayload, AuditClaimPayload, AuditId, AuditTarget, MessageId,
+    ParticipantId, RoomId, WorkspaceId, AGGREGATED_MESSAGE_ACTION, AUDIT_ACTOR_TYPE_PARTICIPANT,
+    AUDIT_AGGREGATE_TYPE, AUDIT_DATA_CLASSIFICATION, AUDIT_EVENT_TYPE, AUDIT_OUTCOME_SUCCESS,
+    AUDIT_RETENTION_CLASS, AUDIT_SCHEMA_ID, AUDIT_SCHEMA_VERSION, AUDIT_SOURCE_SYSTEM,
+    GOVERNANCE_CLASS_MESSAGE, GOVERNANCE_CLASS_ROOM, L1_WINDOW_SECONDS,
+    LOCAL_ACTION_MESSAGE_CREATE, LOCAL_ACTION_MESSAGE_DELETED, LOCAL_ACTION_MESSAGE_EDIT,
+    LOCAL_ACTION_MESSAGE_RECALLED, LOCAL_ACTION_ROOM_ARCHIVED, LOCAL_ACTION_ROOM_CREATE,
+    MODERATION_OUTBOUND_ACTION,
 };
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -205,6 +206,13 @@ async fn governance_rows_for(p: &PgPool, ws: WorkspaceId) -> i64 {
 // Full-table counts/selects below assume a pristine table, so each test
 // resets it at start — same isolation assumption the drills document.
 async fn reset_governance_table(p: &PgPool) {
+    // The commercial runtime switch is a database-global singleton.  If a
+    // preceding test panicked after enabling it, the next test must restore
+    // the fresh-DB fail-open default before it inserts fixture rows; otherwise
+    // the 0236 audit trigger can reject an unrelated fixture for lacking an
+    // entitlement projection.  Keeping this reset self-contained makes the
+    // ignored suite order-independent even after a failed test run.
+    restore_enforcement_disabled(p).await;
     // The B5-1 auth slice added full-table DLQ / login-failure counters; the
     // module's isolation assumption ("full-table counts assume a pristine
     // table, so each test resets it at start") extends to the new tables.
@@ -355,14 +363,14 @@ async fn recall_trigger_migrated(p: &PgPool) -> bool {
     true
 }
 
+mod auth;
 mod ddl;
 mod dedup;
+mod failed_pairs;
 mod gates;
-mod rd2;
 mod l1;
+mod l1_auth;
 mod lanes;
 mod parity;
 mod producer;
-mod auth;
-mod failed_pairs;
-mod l1_auth;
+mod rd2;

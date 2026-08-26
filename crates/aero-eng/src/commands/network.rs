@@ -4,6 +4,43 @@ use crate::outcome::Outcome;
 use crate::register_command;
 use crate::term;
 
+/// Resolve the optional relay-probe mock URL to a TCP authority and verify it
+/// before spawning the DB-free probe.  The CLI crate intentionally has no URL
+/// dependency, so this keeps the small `http[s]://host[:port][/path]` parser
+/// local and uses the scheme's default port when one is omitted.
+async fn check_relay_mock_url(raw: &str) -> Result<(), String> {
+    let trimmed = raw.trim();
+    let (scheme, authority) = if let Some(value) = trimmed.strip_prefix("http://") {
+        ("http", value)
+    } else if let Some(value) = trimmed.strip_prefix("https://") {
+        ("https", value)
+    } else {
+        return Err("URL must start with http:// or https://".to_owned());
+    };
+    let authority = authority.split('/').next().unwrap_or_default();
+    if authority.is_empty() || authority.contains('@') {
+        return Err("URL must contain a host without credentials".to_owned());
+    }
+    let default_port = if scheme == "https" { 443 } else { 80 };
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((host, port)) if !host.is_empty() && !port.is_empty() => {
+            let port = port
+                .parse::<u16>()
+                .map_err(|_| "URL port is invalid".to_owned())?;
+            (host, port)
+        }
+        _ => (authority, default_port),
+    };
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        tokio::net::TcpStream::connect((host, port)),
+    )
+    .await
+    .map_err(|_| format!("TCP connect to {host}:{port} timed out"))?
+    .map(|_| ())
+    .map_err(|error| format!("TCP connect to {host}:{port} failed: {error}"))
+}
+
 register_command!(
     Network_,
     "network",
@@ -107,6 +144,11 @@ register_command!(
                 // probe bin is B5-2's file-gate; this arm is pre-wired so the
                 // harness `relay-mock-probe` leg goes green the moment the
                 // file lands.
+                if let Some(url) = args.get(3) {
+                    if let Err(error) = check_relay_mock_url(url).await {
+                        return Outcome::error(format!("relay mock unreachable: {error}"));
+                    }
+                }
                 let mut cmd = if let Ok(bin) = std::env::var("AERO_RELAY_PROBE_BIN") {
                     tokio::process::Command::new(bin)
                 } else {

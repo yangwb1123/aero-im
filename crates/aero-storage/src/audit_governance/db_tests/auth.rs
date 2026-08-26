@@ -4,17 +4,17 @@
 use super::*;
 use crate::audit_governance::outbox::AuditGovernanceOutboxRepo;
 use crate::audit_governance::tokens::{
-    AUTH_LOGIN, AUTH_PAT_ISSUE, AUTH_PAT_REVOKE, AUTH_REGISTER, AUTH_REFRESH, AUTH_SOURCE_SYSTEM,
+    AUTH_LOGIN, AUTH_PAT_ISSUE, AUTH_PAT_REVOKE, AUTH_REFRESH, AUTH_REGISTER, AUTH_SOURCE_SYSTEM,
     AUTH_TOTP_ENROLL, OUTBOUND_AUTH_LOGIN, OUTBOUND_AUTH_PAT_ISSUE, OUTBOUND_AUTH_PAT_REVOKE,
-    OUTBOUND_AUTH_REGISTER, OUTBOUND_AUTH_REFRESH, OUTBOUND_AUTH_SESSION_REVOKE,
+    OUTBOUND_AUTH_REFRESH, OUTBOUND_AUTH_REGISTER, OUTBOUND_AUTH_SESSION_REVOKE,
     OUTBOUND_AUTH_TOTP_ENROLL, SESSION_REVOKED, SESSION_REVOKED_ADMIN,
 };
 use crate::PatRepo;
 use crate::TotpRepo;
 use aero_common::{
-    AUDIT_ACTOR_TYPE_PARTICIPANT, AUDIT_AGGREGATE_TYPE, AUDIT_DATA_CLASSIFICATION,
+    SessionId, AUDIT_ACTOR_TYPE_PARTICIPANT, AUDIT_AGGREGATE_TYPE, AUDIT_DATA_CLASSIFICATION,
     AUDIT_EVENT_TYPE, AUDIT_OUTCOME_SUCCESS, AUDIT_RETENTION_CLASS, AUDIT_SCHEMA_ID,
-    AUDIT_SCHEMA_VERSION, AUDIT_TARGET_TYPE_RESOURCE, GOVERNANCE_CLASS_ADMIN, SessionId,
+    AUDIT_SCHEMA_VERSION, AUDIT_TARGET_TYPE_RESOURCE, GOVERNANCE_CLASS_ADMIN,
 };
 use serde_json::json;
 
@@ -41,7 +41,11 @@ async fn assert_pair_envelope(
     .fetch_one(p)
     .await
     .expect("outbox row for the pair");
-    assert_eq!(row.0, audit_id.to_string(), "event_id 1:1 with audit_events.id");
+    assert_eq!(
+        row.0,
+        audit_id.to_string(),
+        "event_id 1:1 with audit_events.id"
+    );
     assert_eq!(row.1, 0, "status 0 = enqueued (0239 normative)");
     assert_eq!(
         row.2, GOVERNANCE_CLASS_ADMIN,
@@ -60,18 +64,15 @@ async fn assert_pair_envelope(
     let occurred = envelope["occurred_at"]
         .as_str()
         .expect("occurred_at string");
-    let parsed = time::OffsetDateTime::parse(
-        occurred,
-        &time::format_description::well_known::Rfc3339,
-    )
-    .expect("occurred_at is RFC3339");
-    let audit_created: time::OffsetDateTime = sqlx::query_scalar(
-        "SELECT created_at FROM audit_events WHERE id = $1",
-    )
-    .bind(audit_id)
-    .fetch_one(p)
-    .await
-    .expect("audit created_at");
+    let parsed =
+        time::OffsetDateTime::parse(occurred, &time::format_description::well_known::Rfc3339)
+            .expect("occurred_at is RFC3339");
+    let audit_created: time::OffsetDateTime =
+        sqlx::query_scalar("SELECT created_at FROM audit_events WHERE id = $1")
+            .bind(audit_id)
+            .fetch_one(p)
+            .await
+            .expect("audit created_at");
     assert!(
         (parsed - audit_created).abs() < time::Duration::microseconds(2),
         "occurred_at mirrors the server-stamped audit created_at"
@@ -144,14 +145,13 @@ async fn register_pair(p: &PgPool, ws: WorkspaceId) -> (uuid::Uuid, ParticipantI
         })
         .await
         .expect("registration commits");
-    let audit_id = sqlx::query_scalar(
-        "SELECT id FROM audit_events WHERE actor_id = $1 AND action = $2",
-    )
-    .bind(participant.to_uuid())
-    .bind(AUTH_REGISTER)
-    .fetch_one(p)
-    .await
-    .expect("auth.register audit row");
+    let audit_id =
+        sqlx::query_scalar("SELECT id FROM audit_events WHERE actor_id = $1 AND action = $2")
+            .bind(participant.to_uuid())
+            .bind(AUTH_REGISTER)
+            .fetch_one(p)
+            .await
+            .expect("auth.register audit row");
     (audit_id, participant)
 }
 
@@ -489,7 +489,10 @@ async fn auth_outbox_parity_1to1() {
             .fetch_one(&p)
             .await
             .unwrap();
-    assert_eq!(deduped, 1, "same-id replay INSERT is deduped (ON CONFLICT DO NOTHING)");
+    assert_eq!(
+        deduped, 1,
+        "same-id replay INSERT is deduped (ON CONFLICT DO NOTHING)"
+    );
 }
 
 /// AC-3: under enforcement ON + binding, exercising every §2.7 producer leaves
@@ -709,7 +712,10 @@ async fn auth_pair_enforcement_on_with_nil_binding_commits_pair_and_v1() {
     .await
     .expect("count v1 rows")
     .0;
-    assert_eq!(v1, 1, "v1 audit delivery row coexists (0236 trigger untouched)");
+    assert_eq!(
+        v1, 1,
+        "v1 audit delivery row coexists (0236 trigger untouched)"
+    );
     let v1_action: String = sqlx::query_scalar(
         "SELECT payload->>'action' FROM snaplink_delivery_outbox
               WHERE destination = 'audit' AND idempotency_key = $1",
@@ -742,13 +748,11 @@ async fn auth_pair_enforcement_on_without_nil_binding_fails_open_drops_pair() {
     // (auth_pair_enforcement_on_with_nil_binding_*) leave the nil binding
     // row behind (restore only disables the switch) — delete it first so the
     // precondition is order-independent.
-    sqlx::query(
-        "DELETE FROM snaplink_commercial_bindings WHERE workspace_id = $1",
-    )
-    .bind(WorkspaceId::nil().to_uuid())
-    .execute(&p)
-    .await
-    .expect("clear nil-workspace bindings");
+    sqlx::query("DELETE FROM snaplink_commercial_bindings WHERE workspace_id = $1")
+        .bind(WorkspaceId::nil().to_uuid())
+        .execute(&p)
+        .await
+        .expect("clear nil-workspace bindings");
     sqlx::query(
         "UPDATE snaplink_commercial_runtime SET enabled = TRUE, updated_at = clock_timestamp()
           WHERE singleton",
@@ -777,27 +781,24 @@ async fn auth_pair_enforcement_on_without_nil_binding_fails_open_drops_pair() {
         .await;
     assert!(pair.is_none(), "P0001 → fail-open: Ok(None)");
 
-    let audit_rows: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM audit_events WHERE action = $1 AND actor_id = $2",
-    )
-    .bind(AUTH_LOGIN)
-    .bind(actor.to_uuid())
-    .fetch_one(&p)
-    .await
-    .expect("count audit rows");
-    assert_eq!(audit_rows, 0, "whole pair absent — zero audit rows (R7)");
-    let outbox_rows: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM audit_governance_outbox")
+    let audit_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM audit_events WHERE action = $1 AND actor_id = $2")
+            .bind(AUTH_LOGIN)
+            .bind(actor.to_uuid())
             .fetch_one(&p)
             .await
-            .expect("count outbox rows");
+            .expect("count audit rows");
+    assert_eq!(audit_rows, 0, "whole pair absent — zero audit rows (R7)");
+    let outbox_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM audit_governance_outbox")
+        .fetch_one(&p)
+        .await
+        .expect("count outbox rows");
     assert_eq!(outbox_rows, 0, "whole pair absent — zero outbox rows (R7)");
-    let dlq: Vec<(i64, String, String)> = sqlx::query_as(
-        "SELECT id, action, error_sqlstate FROM audit_governance_failed_pairs",
-    )
-    .fetch_all(&p)
-    .await
-    .expect("dlq rows");
+    let dlq: Vec<(i64, String, String)> =
+        sqlx::query_as("SELECT id, action, error_sqlstate FROM audit_governance_failed_pairs")
+            .fetch_all(&p)
+            .await
+            .expect("dlq rows");
     assert_eq!(dlq.len(), 1, "exactly one DLQ row (replayable, not lost)");
     assert_eq!(dlq[0].1, AUTH_LOGIN, "DLQ carries the original action");
     assert_eq!(dlq[0].2, "P0001", "error_sqlstate = the 0236 binding RAISE");

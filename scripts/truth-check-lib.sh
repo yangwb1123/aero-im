@@ -82,33 +82,37 @@ CLAIM_ALLOWLIST=(
     # request_token (wire contract, not claims validation).
     'crates/aero-audit-connector/src/client.rs:491:"scope"'
     # relay.rs — #[tokio::test] fixture JSON (claim-drift test data).
-    'crates/aero-audit-connector/src/relay.rs:495:"iss"'
-    'crates/aero-audit-connector/src/relay.rs:496:"aud"'
-    'crates/aero-audit-connector/src/relay.rs:497:"scope"'
-    'crates/aero-audit-connector/src/relay.rs:498:"sub"'
-    'crates/aero-audit-connector/src/relay.rs:499:"client_id"'
+    'crates/aero-audit-connector/src/relay.rs:536:"iss"'
+    'crates/aero-audit-connector/src/relay.rs:537:"aud"'
+    'crates/aero-audit-connector/src/relay.rs:538:"scope"'
+    'crates/aero-audit-connector/src/relay.rs:539:"sub"'
+    'crates/aero-audit-connector/src/relay.rs:540:"client_id"'
     # im-core governance_drill_tests/heartbeat.rs — S4 drill fixture: the
     # scope-missing client-credentials token (B5-4 ScopeRejected path). The
     # fixture must carry the literal claim names because it exercises the
     # wire contract the leaf's check_* fns validate (the drill asserts the
     # typed-gate-before-check_scope order with a valid sub/client_id + a
     # non-granting scope).
-    'crates/aero-im-core/src/db_tests/governance_drill_tests/heartbeat.rs:323:"iss"'
-    'crates/aero-im-core/src/db_tests/governance_drill_tests/heartbeat.rs:324:"aud"'
-    'crates/aero-im-core/src/db_tests/governance_drill_tests/heartbeat.rs:325:"scope"'
-    'crates/aero-im-core/src/db_tests/governance_drill_tests/heartbeat.rs:326:"sub"'
-    'crates/aero-im-core/src/db_tests/governance_drill_tests/heartbeat.rs:327:"client_id"'
+    'crates/aero-im-core/src/db_tests/governance_drill_tests/heartbeat.rs:332:"iss"'
+    'crates/aero-im-core/src/db_tests/governance_drill_tests/heartbeat.rs:333:"aud"'
+    'crates/aero-im-core/src/db_tests/governance_drill_tests/heartbeat.rs:334:"scope"'
+    'crates/aero-im-core/src/db_tests/governance_drill_tests/heartbeat.rs:335:"sub"'
+    'crates/aero-im-core/src/db_tests/governance_drill_tests/heartbeat.rs:336:"client_id"'
+    # jwt.rs — participant JWT shape assertion deliberately names the
+    # forbidden audit scope key; it is a negative wire-contract pin, not a
+    # second claim implementation.
+    'crates/aero-auth/src/jwt.rs:306:"scope"'
     # audit connector metrics.rs — R-D2 §10.1 runbook counter label
     # vocabularies + rejection-reason classifier (bounded label strings for
     # aero_audit_token_rejections_total / _delivery_outcomes_total; NOT
     # claim-validation logic — the leaf's check_* fns stay the single
     # authority, usage-rule 3 pinned to oidc.rs/client.rs only).
     'crates/aero-audit-connector/src/metrics.rs:31:"scope"'   # TOKEN_REJECT_REASONS label vocabulary
-    'crates/aero-audit-connector/src/metrics.rs:82:"scope"'  # classify_token_rejection scope-match arm
-    'crates/aero-audit-connector/src/metrics.rs:83:"scope"'  # classify_token_rejection scope label
-    'crates/aero-audit-connector/src/metrics.rs:84:"iss"'    # classify_token_rejection claims-match arm
-    'crates/aero-audit-connector/src/metrics.rs:84:"aud"'    # same
-    'crates/aero-audit-connector/src/metrics.rs:84:"sub"'    # same
+    'crates/aero-audit-connector/src/metrics.rs:93:"scope"'  # classify_token_rejection scope-match arm
+    'crates/aero-audit-connector/src/metrics.rs:94:"scope"'  # classify_token_rejection scope label
+    'crates/aero-audit-connector/src/metrics.rs:95:"iss"'    # classify_token_rejection claims-match arm
+    'crates/aero-audit-connector/src/metrics.rs:96:"aud"'    # same
+    'crates/aero-audit-connector/src/metrics.rs:97:"sub"'    # same
     # extractor.rs — #[cfg(test)] Claims test-struct fixture field values.
     'crates/aero-auth/src/extractor.rs:173:"jti"'
     'crates/aero-auth/src/extractor.rs:191:"jti"'
@@ -119,10 +123,13 @@ CLAIM_ALLOWLIST=(
     'crates/aero-server/src/sso.rs:405:"client_id"' # authorization-code request append_pair
     'crates/aero-server/src/sso.rs:407:"scope"'     # authorization-code request append_pair
     'crates/aero-server/src/sso.rs:545:"iss"'       # IdP response form-param parse
-    # integrations.rs — #[test] fixture JSON (CreateInstallationReq payloads).
-    'crates/aero-server/src/integrations.rs:806:"client_id"'
-    'crates/aero-server/src/integrations.rs:816:"client_id"'
-    'crates/aero-server/src/integrations.rs:847:"client_id"'
+    # integrations.rs — account-summary audit detail plus #[test] fixture
+    # JSON (CreateInstallationReq payloads). The production field is an
+    # audit-detail schema key, not client-credential claim validation.
+    'crates/aero-server/src/integrations.rs:393:"client_id"'
+    'crates/aero-server/src/integrations/tests.rs:62:"client_id"'
+    'crates/aero-server/src/integrations/tests.rs:72:"client_id"'
+    'crates/aero-server/src/integrations/tests.rs:103:"client_id"'
     # snaplink_commercial/http.rs — RFC 6749 §4.4 token-request form param
     # (v1 Snaplink client). "冻结面" is policy; the contract reason is the
     # §4.4 wire param.
@@ -153,7 +160,7 @@ CLAIM_ALLOWLIST=(
     # wire contract than the RFC 9068 singular "scope" claim — substring-guard
     # false positive on the token-response plural field).
     'crates/aero-storage/src/pat.rs:131:"scopes"'
-    'crates/aero-storage/src/pat.rs:441:"scopes"'
+    'crates/aero-storage/src/pat.rs:443:"scopes"'
     # aero-server/pat.rs — the B5-1 PAT-pair detail carries the same
     # token-response plural "scopes" field (`json!({ "scopes": scopes })`).
     'crates/aero-server/src/pat.rs:157:"scopes"'
@@ -161,7 +168,7 @@ CLAIM_ALLOWLIST=(
     # token-response plural "scopes" field (never the RFC 9068 singular claim).
     'crates/aero-storage/src/audit_governance/db_tests/auth.rs:248:"scopes"'
     'crates/aero-storage/src/audit_governance/db_tests/auth.rs:263:"scopes"'
-    'crates/aero-storage/src/audit_governance/db_tests/auth.rs:569:"scopes"'
+    'crates/aero-storage/src/audit_governance/db_tests/auth.rs:572:"scopes"'
     # live.rs — chat-line label "sub" in #[tokio::test] (pure vocabulary
     # false positive: a subscriber/non-subscriber chat line, not a claim).
     'crates/aero-storage/src/live.rs:584:"sub"'
@@ -186,8 +193,8 @@ CLAIM_AUDIT_FILE="crates/aero-common/src/model/audit.rs"
 # containing the literals) warn → re-pin, exactly like the CLAIM_ALLOWLIST
 # mechanism.
 AUDIT_FLAG_ALLOWLIST=(
-    'crates/aero-audit-connector/src/bin/aero-audit-priority-drill.rs:94'
-    'crates/aero-audit-connector/src/bin/aero-audit-priority-drill.rs:655'
+    'crates/aero-audit-connector/src/bin/aero-audit-priority-drill.rs:95'
+    'crates/aero-audit-connector/src/bin/aero-audit-priority-drill.rs:658'
     # aero-server metrics.rs — B5-4 sampler PG-gated test fixtures: the
     # seeded `audit_governance_outbox` rows must carry the moderation
     # outbound vocabulary literal to exercise the Q3/Q4 mirror SQL with
@@ -196,9 +203,12 @@ AUDIT_FLAG_ALLOWLIST=(
     # metrics.rs — audit-outbox sampler db_tests fixtures ("action":
     # MODERATION_OUTBOUND_ACTION literal in seeded governance envelopes —
     # test-only, mirrors the relay.rs fixture-allowlist precedent).
-    'crates/aero-server/src/metrics.rs:1099'
-    'crates/aero-server/src/metrics.rs:1114'
-    'crates/aero-server/src/metrics.rs:1172'
+    'crates/aero-server/src/metrics/tests.rs:407'
+    'crates/aero-server/src/metrics/tests.rs:422'
+    'crates/aero-server/src/metrics/tests.rs:489'
+    # aero-ai governance plain fixture: the literal tuple is deliberately
+    # independent of the leaf constants so a token/DDL drift fails early.
+    'crates/aero-ai/src/governance.rs:362'
 )
 
 # L1 allowlist-token guard (rule 3e) — F2 closure for migration 0242's
@@ -455,7 +465,10 @@ claim_guard_scan() {
         sql_violations=$((sql_violations + 1))
     else
         for sql_file in migrations/0239_audit_governance_outbox.sql migrations/0241_governance_reconcile.sql scripts/test-integration.sh; do
-            if ! grep -v '^[[:space:]]*--' "$root/$sql_file" 2>/dev/null | grep -qF "'action', '$leaf_moderation_action'"; then
+            # Do not use grep -q in the consumer: this file is sourced under
+            # `pipefail`, and an early quit can turn the producer's SIGPIPE
+            # into a false negative when the fixture is large.
+            if ! grep -v '^[[:space:]]*--' "$root/$sql_file" 2>/dev/null | grep -F "'action', '$leaf_moderation_action'" >/dev/null; then
                 echo "  ❌ MODERATION SQL GUARD: $sql_file lacks the exact emitted literal 'action', '$leaf_moderation_action' (leaf MODERATION_OUTBOUND_ACTION) on a non-comment line"
                 sql_violations=$((sql_violations + 1))
             fi

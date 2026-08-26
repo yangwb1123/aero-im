@@ -109,6 +109,10 @@ async fn main() -> anyhow::Result<()> {
         presence: repos.presence.clone(),
         redis_client: persistence.cache.client().clone(),
     })?;
+    // The same composed Q0+heartbeat capability is injected into AuthService
+    // and the relay below; keeping one Arc prevents boot-time split-brain
+    // between the claim and future machine-token acceptance paths.
+    let relay_scope_provisioner = services.relay_scope_provisioner.clone();
 
     // ---------- AI worker ----------
     let ai_shutdown = CancellationToken::new();
@@ -259,9 +263,8 @@ async fn main() -> anyhow::Result<()> {
     match aero_audit_connector::config::RelayConfig::from_env() {
         Ok(Some(relay_cfg)) => {
             let pool = persistence.pg.clone();
-            let inner: Arc<dyn aero_audit_connector::outbox::OutboxRepo> = Arc::new(
-                aero_audit_connector::pg::PgOutboxRepo::new(pool.clone()),
-            );
+            let inner: Arc<dyn aero_audit_connector::outbox::OutboxRepo> =
+                Arc::new(aero_audit_connector::pg::PgOutboxRepo::new(pool.clone()));
             let recorder = Arc::new(
                 aero_server::audit_relay_heartbeat::PgHeartbeatRecorder::new(
                     aero_storage::audit_relay_provision::AuditRelayProvisionRepo::new(pool),
@@ -283,7 +286,12 @@ async fn main() -> anyhow::Result<()> {
             }
             let client = aero_audit_connector::client::AuditClient::new(relay_cfg.clone())
                 .context("initialize audit connector client")?;
-            let relay = aero_audit_connector::relay::AuditRelay::new(repo, client, relay_cfg);
+            let relay = aero_audit_connector::relay::AuditRelay::new_with_scope_provisioner(
+                repo,
+                client,
+                relay_cfg,
+                relay_scope_provisioner.clone(),
+            );
             tracker.spawn(relay.spawn(ai_shutdown.clone()));
             // Tick-driven heartbeat (C-1): fixed 60s, independent of settle
             // traffic and of the Tier-2 sampler's 300s cadence. With strict

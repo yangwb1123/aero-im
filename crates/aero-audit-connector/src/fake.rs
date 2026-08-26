@@ -19,6 +19,7 @@ use std::sync::Mutex;
 use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
+use aero_auth::relay_scope::RelayScopeProvisioner;
 use aero_common::AuditId;
 
 use crate::outbox::{Claim, Error, OutboxRepo, StatusBuckets, VerdictProbe};
@@ -88,6 +89,28 @@ struct FakeState {
 #[derive(Debug, Default)]
 pub struct FakeOutbox {
     state: Mutex<FakeState>,
+}
+
+/// Small deterministic scope provisioner for connector tests and local drills.
+/// Production boot uses the database-backed implementation from
+/// `aero_storage::SnaplinkCommercialRepo` instead.
+#[derive(Debug, Clone, Copy)]
+pub struct StaticScopeProvisioner {
+    provisioned: bool,
+}
+
+impl StaticScopeProvisioner {
+    #[must_use]
+    pub const fn new(provisioned: bool) -> Self {
+        Self { provisioned }
+    }
+}
+
+#[async_trait::async_trait]
+impl RelayScopeProvisioner for StaticScopeProvisioner {
+    async fn audit_event_write_provisioned(&self) -> bool {
+        self.provisioned
+    }
 }
 
 impl Clone for FakeOutbox {
@@ -237,9 +260,7 @@ impl OutboxRepo for FakeOutbox {
         if let Some(min_priority) = due.iter().map(|(_, _, _, priority)| *priority).min() {
             let arm_b_ids: Vec<AuditId> = due
                 .iter()
-                .filter(|(id, _, _, priority)| {
-                    *priority == min_priority && !selected.contains(id)
-                })
+                .filter(|(id, _, _, priority)| *priority == min_priority && !selected.contains(id))
                 .take(floor_take)
                 .map(|(id, ..)| *id)
                 .collect();
@@ -418,7 +439,10 @@ mod tests {
             backlog.push(id);
         }
 
-        let claimed = fake.claim_due(Duration::seconds(30), 10).await.expect("claim");
+        let claimed = fake
+            .claim_due(Duration::seconds(30), 10)
+            .await
+            .expect("claim");
         assert_eq!(claimed.len(), 10);
         let admin_claims: Vec<_> = claimed.iter().filter(|c| c.priority == 100).collect();
         let backlog_claims: Vec<_> = claimed.iter().filter(|c| c.priority == 10).collect();
@@ -436,7 +460,11 @@ mod tests {
         for id in admin.into_iter().chain(backlog) {
             if !ids.contains(&id) {
                 let row = fake.row(id).await.expect("remaining row");
-                assert_eq!(row.status, FakeStatus::Ready, "unclaimed rows stay untouched");
+                assert_eq!(
+                    row.status,
+                    FakeStatus::Ready,
+                    "unclaimed rows stay untouched"
+                );
                 assert_eq!(row.attempts, 0);
             }
         }
@@ -478,7 +506,10 @@ mod tests {
             backlog.push(id);
         }
 
-        let claimed = fake.claim_due(Duration::seconds(30), 10).await.expect("claim");
+        let claimed = fake
+            .claim_due(Duration::seconds(30), 10)
+            .await
+            .expect("claim");
         let mut expected: HashSet<AuditId> = admin.into_iter().collect();
         expected.extend(backlog.into_iter().take(7));
         let claimed_ids: HashSet<AuditId> = claimed.iter().map(|c| c.event_id).collect();
@@ -497,7 +528,10 @@ mod tests {
         fake.set_now(Some(t0)).await;
         let id = AuditId::from_uuid(Uuid::new_v4());
         fake.insert(id, json!({"n": 1}), t0).await;
-        let claimed = fake.claim_due(Duration::seconds(30), 0).await.expect("claim");
+        let claimed = fake
+            .claim_due(Duration::seconds(30), 0)
+            .await
+            .expect("claim");
         assert_eq!(claimed.len(), 1, "limit 0 clamps to batch 1 (PG parity)");
         assert_eq!(claimed[0].event_id, id);
         assert_eq!(claimed[0].attempts, 1);
@@ -525,12 +559,21 @@ mod tests {
             .await;
         }
         let low = AuditId::from_uuid(Uuid::new_v4());
-        fake.insert_lane(low, json!({"n": "low"}), t0 + Duration::seconds(1), 10, "message".into())
-            .await;
+        fake.insert_lane(
+            low,
+            json!({"n": "low"}),
+            t0 + Duration::seconds(1),
+            10,
+            "message".into(),
+        )
+        .await;
 
         // Round 1: the low row is not due yet — arm B backfills admin from
         // the MIN lane, so the batch is still full (9 arm A + 1 arm B).
-        let round1 = fake.claim_due(Duration::seconds(30), 10).await.expect("round 1");
+        let round1 = fake
+            .claim_due(Duration::seconds(30), 10)
+            .await
+            .expect("round 1");
         assert_eq!(round1.len(), 10);
         assert!(
             round1.iter().all(|c| c.priority == 100),
@@ -540,7 +583,10 @@ mod tests {
         // Clock advance: the requeued low row is due; under the still-pending
         // admin flood it must be claimed via arm B (1 slot), not starved.
         fake.set_now(Some(t0 + Duration::seconds(1))).await;
-        let round2 = fake.claim_due(Duration::seconds(30), 10).await.expect("round 2");
+        let round2 = fake
+            .claim_due(Duration::seconds(30), 10)
+            .await
+            .expect("round 2");
         assert_eq!(round2.len(), 10);
         assert_eq!(
             round2.iter().filter(|c| c.priority == 100).count(),
@@ -566,20 +612,33 @@ mod tests {
         fake.set_now(Some(t0)).await;
         let ids: Vec<AuditId> = (0..4).map(|_| AuditId::from_uuid(Uuid::new_v4())).collect();
         for (idx, id) in ids.iter().enumerate() {
-            fake.insert(*id, json!({"n": idx}), t0 - Duration::seconds(200)).await;
+            fake.insert(*id, json!({"n": idx}), t0 - Duration::seconds(200))
+                .await;
         }
         assert_eq!(
             fake.verdict_probe().await.expect("probe"),
-            VerdictProbe { enqueued: 4, claimed: 0, has_dead: false },
+            VerdictProbe {
+                enqueued: 4,
+                claimed: 0,
+                has_dead: false
+            },
             "all ready rows are enqueued"
         );
         assert_eq!(
             fake.status_buckets().await.expect("buckets"),
-            StatusBuckets { enqueued: 4, claimed: 0, delivered: 0, dead: 0 }
+            StatusBuckets {
+                enqueued: 4,
+                claimed: 0,
+                delivered: 0,
+                dead: 0
+            }
         );
 
         // Drive one row through claim → settle, one to dead, leaving two ready.
-        let claimed = fake.claim_due(Duration::seconds(30), 4).await.expect("claim");
+        let claimed = fake
+            .claim_due(Duration::seconds(30), 4)
+            .await
+            .expect("claim");
         assert_eq!(claimed.len(), 4);
         let token_for = |id: AuditId| {
             claimed
@@ -600,12 +659,21 @@ mod tests {
         // surface mirrors PG: claimed counts leased-but-unacked rows.
         assert_eq!(
             fake.verdict_probe().await.expect("probe"),
-            VerdictProbe { enqueued: 0, claimed: 2, has_dead: true },
+            VerdictProbe {
+                enqueued: 0,
+                claimed: 2,
+                has_dead: true
+            },
             "claim/settle/dead flip the Tier-1 probe in step"
         );
         assert_eq!(
             fake.status_buckets().await.expect("buckets"),
-            StatusBuckets { enqueued: 0, claimed: 2, delivered: 1, dead: 1 },
+            StatusBuckets {
+                enqueued: 0,
+                claimed: 2,
+                delivered: 1,
+                dead: 1
+            },
             "Tier-2 buckets flip in step"
         );
     }

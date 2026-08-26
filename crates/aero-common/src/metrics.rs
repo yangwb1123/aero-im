@@ -117,6 +117,18 @@ pub mod names {
     /// Gauge: AI jobs in `dead` status (exhausted retries). Non-zero means
     /// moderation / summarisation is silently failing; alert at threshold > 0.
     pub const AI_DEAD_LETTER_QUEUE_SIZE: &str = "aero_ai_dlq_size";
+
+    // --- Audit governance outbox (B5-1 relay feedback loop) ---
+    /// Gauge: audit-governance outbox rows in status 0 (pending/enqueued).
+    pub const AUDIT_OUTBOX_PENDING: &str = "aero_audit_outbox_pending";
+    /// Gauge: audit-governance outbox rows in status 1 (claimed, lease held).
+    pub const AUDIT_OUTBOX_CLAIMED: &str = "aero_audit_outbox_claimed";
+    /// Gauge: audit-governance outbox rows in status 2 (delivered).
+    pub const AUDIT_OUTBOX_DELIVERED: &str = "aero_audit_outbox_delivered";
+    /// Gauge: audit-governance outbox rows in status 3 (dead, terminal).
+    pub const AUDIT_OUTBOX_DEAD: &str = "aero_audit_outbox_dead";
+    /// Gauge: age in seconds of the oldest status-0 pending row.
+    pub const AUDIT_OUTBOX_OLDEST_PENDING_SECS: &str = "aero_audit_outbox_oldest_pending_secs";
     /// Counter: outgoing-webhook deliveries skipped because the endpoint's circuit
     /// breaker was open (the endpoint has been failing). A sustained non-zero rate
     /// means a chronically-down receiver — the breaker is shielding us from

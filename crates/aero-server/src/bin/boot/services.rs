@@ -14,6 +14,7 @@ use tracing::info;
 /// Wired-up top-level services.
 pub(crate) struct Services {
     pub(crate) auth: AuthService,
+    pub(crate) relay_scope_provisioner: Option<aero_auth::SharedRelayScopeProvisioner>,
     pub(crate) im: Arc<ImService>,
     pub(crate) live: LiveService,
     pub(crate) ai_service: Arc<AiService>,
@@ -62,6 +63,27 @@ pub(crate) fn build(deps: ServicesDeps<'_>) -> anyhow::Result<Services> {
         // participant. Mirrors the PAT verifier; a deleted bot's token is rejected
         // by the `participants.deleted_at` guard in `BotRepo::verify_token`.
         .with_bot_verifier(Arc::new(aero_storage::BotRepo::new(deps.pg.clone())));
+    // B5-4 scope capability: only an explicitly configured audit relay gets a
+    // provisioner.  The provisioner re-reads the canonical Q0 database
+    // predicate at the claim/accept boundary and collapses DB failures to
+    // false, so a disabled or unhealthy relay never advertises the scope.
+    let relay_scope_provisioner =
+        if let Some(relay_config) = aero_audit_connector::config::RelayConfig::from_env()? {
+            let q0 = aero_auth::PgRelayScopeProvisioner::new(deps.pg.clone());
+            let heartbeat = Arc::new(aero_auth::PgRelayProvisionGate::new(
+                deps.pg.clone(),
+                time::Duration::seconds(
+                    i64::try_from(relay_config.provision_freshness.as_secs()).unwrap_or(86_400),
+                ),
+            ));
+            let provisioner: aero_auth::SharedRelayScopeProvisioner =
+                Arc::new(aero_auth::ComposedProvisioner::new(q0, heartbeat));
+            auth = auth.with_relay_scope_provisioner(provisioner.clone());
+            info!("audit:event:write scope provisioner enabled");
+            Some(provisioner)
+        } else {
+            None
+        };
     // Cross-node aggregation when AERO_LOGIN_LOCKOUT_REDIS is set (shared INCR/SETEX
     // over the same Redis the cache uses); otherwise the in-process default.
     if let Some(throttle) =
@@ -189,6 +211,7 @@ pub(crate) fn build(deps: ServicesDeps<'_>) -> anyhow::Result<Services> {
 
     Ok(Services {
         auth,
+        relay_scope_provisioner,
         im,
         live,
         ai_service,

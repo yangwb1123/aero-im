@@ -1,9 +1,10 @@
-# Design — aero-ai B5-3：映射表 token 单源 + 37/37 具名 parity 清单落地（verify-and-hold + 三处收口）
+# Design — aero-ai B5-3：映射表 token 单源 + current 48/48 parity 清单（verify-and-hold + 三处收口）
 
 - **Requirements**: `docs/requirements/2026-08-08-aero-ai-b5-3-token-parity-harness.req.md`（R1–R5 / P0）
-- **Upstream designs**: `docs/design/2026-08-08-aero-common-b5-contract-vocabulary-leaf-types.design.md`（叶子单源 + AC4 守卫形态 §6 + F3 两处 harness 加固）；`docs/design/2026-08-07-aero-cli-b5-acceptance-gate-harness.design.md`（37/37 pin 骨架）；`docs/design/2026-08-08-aero-cli-b5-3-moderation-priority-drill.design.md`（`--priority` CLI 面）
+- **Upstream designs**: `docs/design/2026-08-08-aero-common-b5-contract-vocabulary-leaf-types.design.md`（叶子单源 + AC4 守卫形态 §6 + F3 两处 harness 加固）；`docs/design/2026-08-07-aero-cli-b5-acceptance-gate-harness.design.md`（历史 37/37 pin 骨架）；`docs/design/2026-08-08-aero-cli-b5-3-moderation-priority-drill.design.md`（`--priority` CLI 面）
 - **Landing owner**: `scripts/truth-check.sh` + `scripts/test-integration.sh`（**Rust 零改动**）；R1/R2/R3/R5 = verify-and-hold
 - **Verification date**: 2026-08-08（全部锚点源码实读/实跑；行号会漂移，符号为准）
+- **Current B5 pin (2026-08-26)**: live `B5_CONTRACT_TEST_LIST` 为 48 个 slot（27 个非 `[PROPOSED]` 可执行 slot + 21 个 `[PROPOSED]` 仓外占位）。“executed”是 manifest 分类，不是本设计声称已经运行的测试数；下文原始 37/37 仅作历史 provenance。
 
 ## 0. Evidence disposition（untrusted → verified）
 
@@ -16,8 +17,8 @@ requirements 文档的引用证据全部复核。除两处**已更正**（G2/G3�
 | E3 | 0239:98,123 / 0241:110 SQL 字面量 | ✅ | 0239 :98 注释 + :123 `'action', 'admin.content.flag', -- MODERATION_OUTBOUND_ACTION (A2 half 5 field assertion)`；0241 :110 同值 INSERT |
 | E4 | governance.rs re-export 链 + 6 测试 | ✅ | `crates/aero-ai/src/governance.rs` `pub use aero_common::model::audit::{…MODERATION_OUTBOUND_ACTION}`；`rg -c '#\[test\]'` = 6 |
 | E5 | empty-filter guard + 0239-gated 块 | ✅ | `scripts/test-integration.sh` :196-202（`grep -Eq 'test result: ok\. [1-9][0-9]* passed'`，零匹配 exit 1）；:300-321 0239-gated 段（`audit_governance::` :309、`moderation_finalize_outbox_parity` :313，缺 0239 显式 SKIP） |
-| E6 | implementation-gate.md :63/:78 | ✅ | :63 aero-im 行 1「30 个忽略测试 CI 全绿（37/37）；P2 parity」；:78 G6「37/37、T-11、moderation 优先级」 |
-| E7 | 37 槽 = 15 executed + 22 [PROPOSED] | ✅ | `scripts/b5-pin.sh`：awk 精确计数 37 = 15 + 22（`contract-test-01..22[PROPOSED]`） |
+| E6 | implementation-gate.md :63/:78 | ✅ | 当前 gate 使用 48/48 pin（27 个可执行 slot + 21 个 `[PROPOSED]`）；旧 37/37 为历史 gate 文本。 |
+| E7 | 当前 48 槽 = 27 个可执行 slot + 21 个 [PROPOSED] | ✅ | `scripts/b5-pin.sh`：当前 manifest 精确计数 48 = 27 + 21；27 是可执行 slot 分类，不是本次运行计数。 |
 | E8 | guard 自测全反例 | ✅ | `scripts/test-b5-pin-guard.sh`：count-36-fails / duplicate-slot-fails / malformed-slot-fails / vacuous-list-fails / SKIP_DB_CREATE 降级；`bash -n` OK；harness :148-149 在 DB 工作前先跑 |
 | E9 | priority drill 三断言 + exit-2 能力门 | ✅ | `crates/aero-audit-connector/src/bin/aero-audit-priority-drill.rs`：`drill: moderation-in-first-batch: PASS` :243、`drain-501` :278、`parity-501` :296；:31-32 明确「0239 落地但 DESC 缺失 = FAIL 非 SKIP」；TRUNCATE-at-start 自隔离 |
 | E10 | `aero-cli audit-provision-check --priority` | ✅ | `crates/aero-cli/src/main.rs` :489-501：`Some("--priority") => aero_eng::audit_provision::run_priority(&url)`（:497），未知 flag → usage error；`run_priority` :640；`priority_landed` :103、判定行 :192 |
@@ -37,7 +38,7 @@ requirements 文档的引用证据全部复核。除两处**已更正**（G2/G3�
 
 ## 1. Design decisions
 
-- **D1 — 本切片 = verify-and-hold + 三处收口**：R1（叶子单源）/ R2（37/37 pin）/ R3（priority drill）/ R5（T-11 + state_machine）**已全部落地**（§0 账本），验收走既有测试面，**零 Rust 改动**。本 design 的代码改动恰好三处，全部在 shell 侧：**W1**（R4 落地，req 的 F1 缺口——truth-check.sh TOKEN 类别）、**W2**（G1——`run_migration_regression` 空过滤守卫）、**W3**（G2——删重复 PASS）。W2/W3 是 vocabulary-leaf 设计 F3 明确要求「纳入本 design step 7 前」的加固，收进同一基线。
+- **D1 — 本切片 = verify-and-hold + 三处收口**：R1（叶子单源）/ R2（当前 48/48 pin）/ R3（priority drill）/ R5（T-11 + state_machine）**已全部落地**（§0 账本），验收走既有测试面，**零 Rust 改动**。本 design 的代码改动恰好三处，全部在 shell 侧：**W1**（R4 落地，req 的 F1 缺口——truth-check.sh TOKEN 类别）、**W2**（G1——`run_migration_regression` 空过滤守卫）、**W3**（G2——删重复 PASS）。W2/W3 是 vocabulary-leaf 设计 F3 明确要求「纳入本 design step 7 前」的加固，收进同一基线。
 - **D2 — W1 形态 = vocabulary-leaf §6 原样**（AC4 守卫正确形态，防 `set -euo pipefail` 双向失效）：
   ```bash
   # 3. TOKEN 单源（AC4 回归守卫）：admin.content.flag 只允许出现在叶子 audit.rs
@@ -70,7 +71,7 @@ requirements 文档的引用证据全部复核。除两处**已更正**（G2/G3�
 
 ### 2.3 不变量（本切片验收后必须保持的对外契约）
 
-- `B5_CONTRACT_TEST_LIST` = 恰好 37 槽（15 executed + 22 [PROPOSED]），`assert_b5_contract_pin` 的 count/dupe/malformed/vacuous/判词证据检查全绿。
+- `B5_CONTRACT_TEST_LIST` = 恰好 48 槽（27 个可执行 slot + 21 [PROPOSED]），`assert_b5_contract_pin` 的 count/dupe/malformed/vacuous/判词证据检查全绿；这不是 27 个已执行测试的声明。
 - `B5-CHECK <name>: PASS|SKIP (<reason>)` 判词协议不变；每个 executed 槽每个运行路径恰好一条判词。
 - `audit-provision-check` 三态退出码（0/2/other）与 `priority: landed|absent` 判定行不变。
 - drill 能力门语义不变：0239 表/列缺 → exit 2 SKIP；**0239 落地但 DESC 缺失 → FAIL 红**。
@@ -79,7 +80,7 @@ requirements 文档的引用证据全部复核。除两处**已更正**（G2/G3�
 
 - **翻转协议（未来偶发事件）**：`admin.content.flag` 翻转 = 叶子 1 行（:150）+ 0239:123 + 0241:110 两处 SQL 联动编辑；db_tests（`audit_governance.rs` :320/:884 断言 `gov.4["action"] == MODERATION_OUTBOUND_ACTION`，导入叶子常量）是 DDL 侧回归网——单侧翻转必红。TOKEN 守卫**不**覆盖 SQL/docs 字面量（SQL 无法 import Rust），此为设计边界非盲区。
 - **DESC 排序语义是 load-bearing**：`governance.rs` 头注释明确「与 `ai_job` 的 ASC lower-first 是**反向模型**，别"对齐"」——`GOVERNANCE_PRIORITY_MODERATION(100) > GOVERNANCE_PRIORITY_BACKLOG(10)` 下 moderation 先被 claim。任何「修复方向」都会反转车道并被 drill 红 + state_machine `priority_first_claim_preempts_fifo_…` 测试 + 0240 index 三面夹击。
-- **37 槽构成固定**：15 executed + 22 [PROPOSED] 占位（仓外契约名，proposal :13/:15）；**不得**把占位替换为臆造名——契约文本落地时按 `b5-pin.sh` 头注释一键替换，guard 自动开始要求判词证据。
+- **48 槽构成固定**：27 个可执行 slot + 21 个 [PROPOSED] 占位（仓外契约名，proposal :13/:15）；**不得**把占位替换为臆造名——契约文本落地时按 `b5-pin.sh` 头注释一键替换，guard 自动开始要求判词证据。
 - **`set -euo pipefail` 双向失效**：truth-check.sh 是 `set -euo pipefail`——naive 一行 `rg … | grep -v …` 在零命中时 rg exit 1 误红、命中时管道 exit 0 漏报。D2 形态（`|| true` + 单一计数 + 单一 exit 点）是**唯一正确形态**，不得简化。
 - **迁移编译期嵌入**：任何 throwaway 库流程 = `cargo build`（或等价 `cargo run --bin aero-cli -- migrate` 先编译）→ migrate。harness 已遵循；本切片零新增迁移。
 - **零新依赖 / 零新迁移 / connector `src/` 零改动**：drill bins 已存在，本切片只动两个 shell 脚本。
@@ -119,7 +120,7 @@ requirements 文档的引用证据全部复核。除两处**已更正**（G2/G3�
 | 验收 | 可执行检查 | 基线（2026-08-08 实跑/实测） |
 |---|---|---|
 | (a) 裁决记录 + 翻转 = 1 叶子 + 2 SQL 联动，跨 pin 跟随 → **R1 + R4** | `rg -n 'MODERATION_OUTBOUND_ACTION' crates/aero-common/src/model/audit.rs`（:150 const + :268-269 pin + :147-149 裁决注释）；`rg 'admin.content.flag' crates/ --glob '*.rs'` = 4 处全在叶子（排除叶子 = 0）；`cargo test -p aero-common --lib`；`cargo test -p aero-ai --lib`（governance 6 测试）；throwaway 迁移库 `cargo test -p aero-storage --lib audit_governance:: -- --ignored --test-threads=1`（:320/:884 跨 pin 绿）；**W1 负例**：临时在非叶子 crate 写字面量 → truth-check 红，删除恢复绿 | 4/4 命中叶子；两 lib 测试绿；db_tests 待迁移库实跑 |
-| (b) 37/37 具名 + 命名过滤器 + 零匹配即红 → **R2** | `bash scripts/test-b5-pin-guard.sh` 全反例绿（count-36 / duplicate / malformed / vacuous / SKIP_DB_CREATE）；`SKIP_DB_CREATE=1 bash scripts/test-integration.sh` → `B5 contract pin: 37/37 (15 executed, 22 [PROPOSED]): PASS`，改 36/38 槽 → FAIL；**W2 负例**：临时把某迁移槽过滤器改成不存在的名字 → harness 红（empty-filter guard），还原绿；`audit_governance::` / `moderation_finalize_outbox_parity` 各匹配 ≥1 现存测试（`audit_governance.rs` :248 同名 db_test） | 37 = 15 + 22（awk 实测）；guard 自测反例全在 |
+| (b) 48/48 具名 + 命名过滤器 + 零匹配即红 → **R2** | `bash scripts/test-b5-pin-guard.sh` 全反例绿（count / duplicate / malformed / vacuous / SKIP_DB_CREATE）；`SKIP_DB_CREATE=1 bash scripts/test-integration.sh` → `B5 contract pin: 48/48 (27 executed, 21 [PROPOSED]): PASS`；**W2 负例**：临时把某迁移槽过滤器改成不存在的名字 → harness 红（empty-filter guard），还原绿；`audit_governance::` / `moderation_finalize_outbox_parity` 各匹配 ≥1 现存测试 | 48 = 27 个可执行 slot + 21 [PROPOSED]（manifest 分类；不声称 27 个已运行）；guard 自测反例全在 |
 | (c) priority drill：flag 行先于 prio-10 积压（0240 DESC）→ **R3** | harness moderation-priority-drill 段全绿：exit 0 + `priority: landed` 判定行 + `B5-CHECK moderation-priority-drill: PASS`（:471）；drill 三 PASS 行可见：`moderation-in-first-batch`（轮 1 `COUNT(status=2)==100` 且 moderation 行 ∈ 集——成员资格 = DESC 契约，非 `delivered_at == MIN`）、`drain-501`、`parity-501`；能力门：0239 表/`priority`/`class` 列缺 → exit 2 SKIP（:474）；**DESC 缺失 → FAIL 红**（不 SKIP）；**W3 验收**：SKIP 路径日志无矛盾 PASS 行 | drill bin :243/:278/:296 三断言；0240 index == pg.rs:117 ORDER BY（已核证） |
 | (d) T-11 drill + state_machine 回归 → **R5** | harness t11-fail-closed 段全绿（:436 PASS；relay 缺席 → 行保持 pending、`SUM(attempts)` 增长、零终态、transport-errors=N、配给 seam 拒发 grant）；`cargo test -p aero-audit-connector --test state_machine` **7 测试全绿**（具名：`stale_token_cannot_ack_after_reclaim`、`backoff_is_bounded_and_exponential`、`permanent_error_dead_after_exactly_two_attempts`、`forbidden_dead_on_first_attempt`、`happy_path_settles_and_removes_from_claimable`、`skew_gt_lease_cannot_livelock_claim_fence_settle`、`priority_first_claim_preempts_fifo_and_limit1_keeps_top_lane`）；relay 覆盖 legs ≥1（`grep -q "^B5-CHECK …: PASS$" "$B5_LOG"` 计数模式 :581-582） | 7 tests（`--list` 实测；**req R5.2 的「8」已更正为 7**） |
 | W1/W2/W3 自身 | 见 (a)/(b)/(c) 各负例 + `bash -n` 两脚本 | — |
@@ -128,7 +129,7 @@ requirements 文档的引用证据全部复核。除两处**已更正**（G2/G3�
 
 - **不做契约翻转**：裁决已锁定 `admin.content.flag`；本切片只保证「翻转 = 叶子 1 行 + 0239:123/0241:110 两处 SQL 联动」的编辑协议与回归网（R1/R4），不执行翻转。
 - **不实现 B5-3 排序本身**：`pg.rs:117` DESC claim 已落地（F3 事实），drill 是断言方；anti-starvation K-floor cap 是 sibling（claim-lane-carriage D7）已接受的 latent 边界，本切片不实现。
-- **不改 37 槽构成**：15 executed + 22 [PROPOSED] 保持；仓外契约名不臆造（F4 事实）。
+- **不改 48 槽构成**：27 个可执行 slot + 21 [PROPOSED] 保持；仓外契约名不臆造（F4 事实）。
 - **不实现 B5-4 auth 配给门 / B5-2 relay 本体 / L1 聚合**：sibling 切片职责；`audit-provision-check` 判词接线是既有 seam，本切片不动其语义。
 - **不动 0239/0240/0241 DDL**：SQL 字面量是 DB 侧单源，仅经 db_tests 交叉互钉。
 - **零新增迁移、零新增第三方依赖、connector `src/` 零改动、Rust 零改动**：本切片只改 `scripts/truth-check.sh` 与 `scripts/test-integration.sh`。

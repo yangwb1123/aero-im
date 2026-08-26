@@ -52,7 +52,8 @@ async fn delete_lane_governance_outbox_retention_sweep() {
     let mut statuses: Vec<i32> = remaining.iter().map(|r| r.0).collect();
     statuses.sort_unstable();
     assert_eq!(
-        statuses, vec![0, 1],
+        statuses,
+        vec![0, 1],
         "live rows survive; terminal rows deleted"
     );
 }
@@ -118,7 +119,10 @@ async fn delete_lane_writer_failure_aborts_delete_fail_closed() {
         .await
         .expect("get message")
         .expect("message retained");
-    assert!(current.deleted_at.is_none(), "delete rolled back (fail-closed)");
+    assert!(
+        current.deleted_at.is_none(),
+        "delete rolled back (fail-closed)"
+    );
     let audit_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM audit_events WHERE workspace_id = $1")
             .bind(ws.to_uuid())
@@ -133,16 +137,17 @@ async fn delete_lane_writer_failure_aborts_delete_fail_closed() {
             .fetch_one(&p)
             .await
             .expect("event outbox count");
-    assert_eq!(outbox_count, 0, "no RoomEvent::Deleted escaped the rollback");
+    assert_eq!(
+        outbox_count, 0,
+        "no RoomEvent::Deleted escaped the rollback"
+    );
 
     // Restore: rename the table back (the 0239 trigger + indexes ride the
     // table — the shared harness DB is whole for every later test).
-    sqlx::query(
-        "ALTER TABLE audit_governance_outbox_injected RENAME TO audit_governance_outbox",
-    )
-    .execute(&p)
-    .await
-    .expect("restore the outbox table (rename back)");
+    sqlx::query("ALTER TABLE audit_governance_outbox_injected RENAME TO audit_governance_outbox")
+        .execute(&p)
+        .await
+        .expect("restore the outbox table (rename back)");
     // Sanity: the restored table accepts a normal insert (CHECKs intact).
     sqlx::query(
         "INSERT INTO audit_governance_outbox (event_id, payload)
@@ -308,7 +313,10 @@ async fn delete_lane_version_skew_backfills_on_reconcile() {
         .reconcile_message_deleted(cutoff, 50)
         .await
         .expect("reconcile after moderation orphan");
-    assert_eq!(inserted2, 0, "message.moderated stays out of the delete scan");
+    assert_eq!(
+        inserted2, 0,
+        "message.moderated stays out of the delete scan"
+    );
     let mod_row: i64 = sqlx::query_scalar(
         "SELECT COUNT(*)::bigint FROM audit_governance_outbox WHERE event_id = $1",
     )

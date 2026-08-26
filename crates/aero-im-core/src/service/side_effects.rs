@@ -62,13 +62,9 @@ impl ImService {
                 true
             }
             Err(error) => {
+                let error_text = format!("{error:#}");
                 match repo
-                    .mark_failed(
-                        job.id,
-                        job.attempts,
-                        OffsetDateTime::now_utc(),
-                        &error.to_string(),
-                    )
+                    .mark_failed(job.id, job.attempts, OffsetDateTime::now_utc(), &error_text)
                     .await
                 {
                     Err(mark_error) => warn!(

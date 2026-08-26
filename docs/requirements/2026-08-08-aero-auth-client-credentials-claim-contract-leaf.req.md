@@ -7,6 +7,7 @@
 - **并行方向（本 spec 不实施，见 §7）**: `docs/requirements/2026-08-08-aero-auth-b5-2-relay-claims-unification.req.md` + `docs/design/2026-08-08-aero-auth-b5-2-relay-claims-unification.design.md`（删除 connector 手写验证器、整体委托 aero-auth 验证器——另一种架构，status = Proposed）
 - **Status**: Requirements（全部引用经源码 grep + 实跑测试复核）
 - **Verification date**: 2026-08-08。行号是复核时锚点，可能漂移——**文件/符号**才是稳定 grep 锚点（AGENTS.md §0）
+- **Current B5 pin (2026-08-26)**: live `B5_CONTRACT_TEST_LIST` 为 48 个 slot（27 个非 `[PROPOSED]` 可执行 slot + 21 个 `[PROPOSED]` 仓外占位）；“executed”是 manifest 分类，不是本文件声称已经运行的测试数。原始 37/37 基线仅为历史快照。
 
 ## 1. Evidence verification（direction 引用逐条核对）
 
@@ -15,7 +16,7 @@
 | E1 | `crates/aero-auth/src/oidc.rs:367-455` — `ClientCredentialsTokenConfig` + `validate_client_credentials_token`（iss/aud/scope/sub + at+jwt type） | ✅ 符号命中（范围末端漂移 ~30 行）：`ClientCredentialsTokenConfig { issuer, audience, required_scopes: Vec<String> }` :378-383；`ClientCredentialsClaims { sub, client_id, iat: u64, jti: String, scopes, scope }` :386-394；`granted_scopes()` BTreeSet 并集 :397-406；`validate_client_credentials_token` :420-487：at+jwt typ 白名单 :428-434 → alg 白名单 RS256/EdDSA :434-441 → `Validation::set_issuer/set_audience`（精确 iss/aud）:447-450 → `required_spec_claims` 含 iss/aud/exp/nbf/iat/jti/sub/client_id :452-455 → `valid_identity_component` + `sub == client_id` :461-469 → future-iat 拒 :471-475 → jti 约束 :477-481 → `required_scopes ⊆ granted_scopes` :482-487。`LEEWAY_SECS = 60` :307。**实跑**：`cargo test -p aero-auth --lib` = **85 passed / 0 failed** |
 | E2 | `crates/aero-audit-connector/src/client.rs:1-60` — 自有 claim 校验；"'JWKS verification is [PROPOSED]' comment" | ⚠️ **半成立**：模块注释 :1-12 确认 "claim validation (iss/aud/scope/sub) before every POST"；手写验证器 `validate_token_claims` :238 / `validate_token_claims_at` :248-336（shape → base64url 解 payload → iss/aud/scope/sub + exp/nbf validated-when-present，leeway 60s）；POST 前 fail-closed 拒绝臂 :166-176（`invalidate_token` + `DeliveryError::Transient` + "no delivery attempted"）；`ClaimRejection` :79-82；`decode_jwt_claims` :570。**但 "[PROPOSED]" 注释不存在**（前一批次已落地签名面 `verify_token_signature` :346-402，JWKS-on 强制 + Permanent(SignatureRejected) 分类；残留 JWKS-off 跳过臂 :347-349）——核心事实「两份独立实现并存」仍成立（见 §3 对照表） |
 | E3 | `crates/aero-audit-connector/tests/claim_validation.rs` — parameterized claim assertions（重复契约的测试 pin） | ✅ 符号命中：24 个测试函数，每测试钉一个 claim 维度且 `assert_eq!(posts, 0)`（wrong_issuer :117 / missing_audience :130 / missing_audit_scope :143 / wrong_subject :156 / opaque :169 / valid :178 + B5-2 exp/nbf :364-444 + JWKS 面 :465-690）。**措辞勘误**：非字面 parameterized（无 proptest 表），是逐维度独立测试函数；夹具 `config()` :21-40 直构 `RelayConfig { expected_iss, expected_aud, expected_scope, expected_sub, jwks_uri: None, … }`——connector 侧无 scope-array 用例（正向全为标量 `scope`）。**实跑**：24 passed / 0 failed |
-| E4 | `crates/aero-common/src/model/audit.rs` — 既有 leaf 单源模式 + "truth-check AC4 hard-fail on literal drift" | ✅ leaf 模式成立：`MODERATION_OUTBOUND_ACTION = "admin.content.flag"` :150（"Action-token vocabulary" 区）+ 值 pin `vocabulary_consts_are_pinned` :264-273 + aero-storage `audit_governance.rs` db_tests 交叉 pin（:320/:884，leaf ↔ DDL）。⚠️ **"truth-check AC4 hard-fail" 未实现**：`scripts/truth-check.sh`（212 行，本次全读）只有孤儿模块 + 零调用 builder 两项检查，**无任何字面量扫描**——audit.rs :5-6 的 doc 注释超前于实现（AC4 guard 是文档声称、非现存机制）；本 spec 的 R3 将其落实。另：`audit.rs` 在 git status 中为 **untracked**（leaf 模式本身属前一批次未提交改动） |
+| E4 | `crates/aero-common/src/model/audit.rs` — 既有 leaf 单源模式 + truth-check AC4 literal guard | ✅ leaf 模式成立：`MODERATION_OUTBOUND_ACTION = "admin.content.flag"` + 值 pin + aero-storage db_tests 交叉 pin（leaf ↔ DDL）。`scripts/truth-check-lib.sh` 的 audit-flag/sibling/SQL guards 已接入 `scripts/truth-check.sh`，当前扫描 0 violations；旧的“未实现”判断已过期。 |
 | E5 | `crates/aero-audit-connector/src/lib.rs` — 刻意隔离："does not import AiUsageRepo nor touch the v1 table" | ✅ 逐字命中 lib.rs :18-19："The connector deliberately does not import `AiUsageRepo` nor touch the `snaplink_delivery_outbox` (v1) table"。补充：connector `Cargo.toml` **已依赖 `aero-common.workspace = true` + `aero-auth.workspace = true`**（`use aero_common::AuditId`、`use aero_auth::{JwksKeyProvider, KeyProvider}`）——leaf 在 aero-common 消费**零新依赖边**，隔离面（不 import aero-auth 的验证器、不 import aero-storage）保持不变 |
 
 **补充核对（direction 未列、spec 必须处理的现场事实）**：
@@ -77,7 +78,7 @@ d) leaf 模式范本（audit.rs，本次复核）+ 缺口
    + doc 注释声称的 "truth-check.sh 字面量 hard-fail" —— 脚本内**不存在**（R3 新建）
    aero-common 导出面：model/mod.rs `pub use audit::*`（未提交）；lib.rs 显式 `pub use model::{...}` 清单（未提交）
 
-e) 基线（本次实跑）：aero-auth 85/85；connector 46 passed/3 ignored；b5-pin.sh 37/37（15 executed + 22 [PROPOSED]）
+e) 基线（本次实跑）：aero-auth 85/85；connector 46 passed/3 ignored；b5-pin.sh 当前 48/48（27 个可执行 slot + 21 个 [PROPOSED]；manifest 分类，不是本次执行计数）
 ```
 
 ## 4. Scope

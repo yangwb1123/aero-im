@@ -7,8 +7,8 @@
 //! first:
 //!
 //! * `Ok(true)` → delegate to the inner fenced settle; on `Ok(true)` record a
-//!   heartbeat (Err → warn only; the acknowledgement stands). Bounded
-//!   false-green ≤ one freshness window (the check-to-settle gap is
+//!   heartbeat (Err or timeout → warn only; the acknowledgement stands).
+//!   Bounded false-green ≤ one freshness window (the check-to-settle gap is
 //!   milliseconds against a ≥60s window).
 //! * `Ok(false)` (stale or absent) → **`Ok(false)` without delegating**: the
 //!   row stays status 1 claimed with `attempts` untouched; lease expiry
@@ -24,7 +24,7 @@
 //! period cannot stale the gate — the decorator's record-on-fenced-settle is
 //! the second refresh path, not the only one.
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use tracing::warn;
@@ -48,17 +48,38 @@ pub trait HeartbeatRecorder: Send + Sync {
     async fn heartbeat_fresh(&self) -> Result<bool, sqlx::Error>;
 }
 
+/// Maximum time a fenced settle may spend refreshing the durable heartbeat.
+///
+/// The refresh is best-effort after the acknowledgement has already committed:
+/// a slow or unavailable database must not hold the relay's whole concurrent
+/// delivery batch open. A timeout leaves the next freshness check to fail
+/// closed once the existing heartbeat ages out.
+const HEARTBEAT_RECORD_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// [`OutboxRepo`] decorator gating the acknowledgement face on heartbeat
 /// freshness. The 3rd `OutboxRepo` implementer.
 pub struct HeartbeatOutboxRepo<R> {
     inner: Arc<dyn OutboxRepo>,
     recorder: Arc<R>,
+    record_timeout: Duration,
 }
 
 impl<R: HeartbeatRecorder + 'static> HeartbeatOutboxRepo<R> {
     #[must_use]
     pub fn new(inner: Arc<dyn OutboxRepo>, recorder: Arc<R>) -> Self {
-        Self { inner, recorder }
+        Self::with_record_timeout(inner, recorder, HEARTBEAT_RECORD_TIMEOUT)
+    }
+
+    fn with_record_timeout(
+        inner: Arc<dyn OutboxRepo>,
+        recorder: Arc<R>,
+        record_timeout: Duration,
+    ) -> Self {
+        Self {
+            inner,
+            recorder,
+            record_timeout,
+        }
     }
 }
 
@@ -80,12 +101,27 @@ impl<R: HeartbeatRecorder + 'static> OutboxRepo for HeartbeatOutboxRepo<R> {
                     // Record-on-fenced-settle: only an acknowledgement that
                     // actually fired refreshes liveness. Err → warn only; the
                     // delivery stands (the tick path keeps the row fresh).
-                    if let Err(error) = self.recorder.record_heartbeat().await {
-                        warn!(
-                            %event_id,
-                            ?error,
-                            "audit relay heartbeat record failed after a fenced settle; the delivery is acknowledged"
-                        );
+                    match tokio::time::timeout(
+                        self.record_timeout,
+                        self.recorder.record_heartbeat(),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => {
+                            warn!(
+                                %event_id,
+                                ?error,
+                                "audit relay heartbeat record failed after a fenced settle; the delivery is acknowledged"
+                            );
+                        }
+                        Err(_) => {
+                            warn!(
+                                %event_id,
+                                timeout_ms = self.record_timeout.as_millis(),
+                                "audit relay heartbeat record timed out after a fenced settle; the delivery is acknowledged"
+                            );
+                        }
                     }
                 }
                 Ok(settled)
@@ -118,7 +154,9 @@ impl<R: HeartbeatRecorder + 'static> OutboxRepo for HeartbeatOutboxRepo<R> {
         attempts: i64,
         error: &str,
     ) -> Result<bool, Error> {
-        self.inner.requeue(event_id, claim_token, attempts, error).await
+        self.inner
+            .requeue(event_id, claim_token, attempts, error)
+            .await
     }
 
     async fn mark_dead(
@@ -128,7 +166,9 @@ impl<R: HeartbeatRecorder + 'static> OutboxRepo for HeartbeatOutboxRepo<R> {
         attempts: i64,
         error: &str,
     ) -> Result<bool, Error> {
-        self.inner.mark_dead(event_id, claim_token, attempts, error).await
+        self.inner
+            .mark_dead(event_id, claim_token, attempts, error)
+            .await
     }
 
     async fn verdict_probe(&self) -> Result<VerdictProbe, Error> {
@@ -144,6 +184,7 @@ impl<R: HeartbeatRecorder + 'static> OutboxRepo for HeartbeatOutboxRepo<R> {
 mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::time::Duration as StdDuration;
 
     use serde_json::json;
     use time::Duration;
@@ -178,6 +219,24 @@ mod tests {
         }
     }
 
+    /// Recorder whose write never resolves. The settle must still return once
+    /// the decorator's bounded refresh timeout expires.
+    struct HangingRecorder {
+        records: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl HeartbeatRecorder for HangingRecorder {
+        async fn record_heartbeat(&self) -> Result<(), sqlx::Error> {
+            self.records.fetch_add(1, Ordering::SeqCst);
+            std::future::pending::<Result<(), sqlx::Error>>().await
+        }
+
+        async fn heartbeat_fresh(&self) -> Result<bool, sqlx::Error> {
+            Ok(true)
+        }
+    }
+
     #[async_trait]
     impl HeartbeatRecorder for CountingRecorder {
         async fn record_heartbeat(&self) -> Result<(), sqlx::Error> {
@@ -205,9 +264,16 @@ mod tests {
         let t0 = t0();
         fake.set_now(Some(t0)).await;
         let id = AuditId::from_uuid(Uuid::new_v4());
-        fake.insert(id, json!({"event_id": id.to_uuid().to_string(), "source_system": "aero-im.source"}), t0)
-            .await;
-        let claims = fake.claim_due(Duration::seconds(30), 1).await.expect("claim");
+        fake.insert(
+            id,
+            json!({"event_id": id.to_uuid().to_string(), "source_system": "aero-im.source"}),
+            t0,
+        )
+        .await;
+        let claims = fake
+            .claim_due(Duration::seconds(30), 1)
+            .await
+            .expect("claim");
         assert_eq!(claims.len(), 1);
         (id, claims[0].claim_token)
     }
@@ -227,9 +293,17 @@ mod tests {
             .await
             .expect("decorator settle never errors on a stale gate");
         assert!(!settled, "stale heartbeat must reject the settle");
-        assert_eq!(stale.records.load(Ordering::SeqCst), 0, "no record without a fenced settle");
+        assert_eq!(
+            stale.records.load(Ordering::SeqCst),
+            0,
+            "no record without a fenced settle"
+        );
         let row = fake.row(id).await.expect("row");
-        assert_eq!(row.status, FakeStatus::Claimed, "row stays claimed (lease reclaims it)");
+        assert_eq!(
+            row.status,
+            FakeStatus::Claimed,
+            "row stays claimed (lease reclaims it)"
+        );
         assert_eq!(row.attempts, 1, "attempts untouched by the rejection");
     }
 
@@ -242,12 +316,13 @@ mod tests {
 
         let fresh = Arc::new(CountingRecorder::fresh(true));
         let decorated = Arc::new(HeartbeatOutboxRepo::new(fake.clone(), fresh.clone()));
-        let settled = decorated
-            .settle(id, token)
-            .await
-            .expect("decorator settle");
+        let settled = decorated.settle(id, token).await.expect("decorator settle");
         assert!(settled, "fresh heartbeat must allow the fenced settle");
-        assert_eq!(fresh.records.load(Ordering::SeqCst), 1, "record-on-fenced-settle");
+        assert_eq!(
+            fresh.records.load(Ordering::SeqCst),
+            1,
+            "record-on-fenced-settle"
+        );
         assert_eq!(
             fake.row(id).await.expect("row").status,
             FakeStatus::Delivered
@@ -256,15 +331,41 @@ mod tests {
         // A direct second settle on the settled row → false (fence: status
         // IN (0,1) fails) and the recorder does NOT gain another record.
         let before = fresh.records.load(Ordering::SeqCst);
-        let second = decorated
-            .settle(id, token)
-            .await
-            .expect("decorator settle");
+        let second = decorated.settle(id, token).await.expect("decorator settle");
         assert!(!second, "never double-settled");
         assert_eq!(
             fresh.records.load(Ordering::SeqCst),
             before,
             "no record for a fenced-false settle"
+        );
+    }
+
+    /// A fenced settle must not hang the relay batch when the best-effort
+    /// heartbeat write never resolves. The acknowledgement remains committed
+    /// and the row is still delivered.
+    #[tokio::test]
+    async fn hanging_heartbeat_record_is_bounded_after_settle() {
+        let fake = Arc::new(FakeOutbox::new());
+        let (id, token) = seed_claimed(&fake).await;
+
+        let recorder = Arc::new(HangingRecorder {
+            records: AtomicUsize::new(0),
+        });
+        let decorated = Arc::new(HeartbeatOutboxRepo::with_record_timeout(
+            fake.clone(),
+            recorder.clone(),
+            StdDuration::from_millis(10),
+        ));
+
+        let settled = tokio::time::timeout(StdDuration::from_secs(1), decorated.settle(id, token))
+            .await
+            .expect("heartbeat timeout must release settle")
+            .expect("decorator settle");
+        assert!(settled, "the fenced acknowledgement must stand");
+        assert_eq!(recorder.records.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fake.row(id).await.expect("row").status,
+            FakeStatus::Delivered
         );
     }
 
@@ -278,12 +379,13 @@ mod tests {
         let fresh = Arc::new(CountingRecorder::fresh(true));
         let decorated = Arc::new(HeartbeatOutboxRepo::new(fake.clone(), fresh.clone()));
         let wrong = Uuid::new_v4();
-        let settled = decorated
-            .settle(id, wrong)
-            .await
-            .expect("decorator settle");
+        let settled = decorated.settle(id, wrong).await.expect("decorator settle");
         assert!(!settled, "wrong token must fence the settle");
-        assert_eq!(fresh.records.load(Ordering::SeqCst), 0, "fenced-false never records");
+        assert_eq!(
+            fresh.records.load(Ordering::SeqCst),
+            0,
+            "fenced-false never records"
+        );
         assert_eq!(fake.row(id).await.expect("row").status, FakeStatus::Claimed);
 
         // Recorder failure after a fenced Ok(true) → warn only; the settle
@@ -291,10 +393,7 @@ mod tests {
         let failing = Arc::new(CountingRecorder::fresh(true));
         failing.record_err.store(true, Ordering::SeqCst);
         let decorated = Arc::new(HeartbeatOutboxRepo::new(fake.clone(), failing.clone()));
-        let settled = decorated
-            .settle(id, token)
-            .await
-            .expect("decorator settle");
+        let settled = decorated.settle(id, token).await.expect("decorator settle");
         assert!(settled, "recorder Err must not fail the settle value");
     }
 

@@ -2,7 +2,6 @@
 
 use super::*;
 
-
 /// One send tx commits exactly 1 `message.create` audit row AND 1 L1 window
 /// outbox row (count 1) per (workspace, 60s window), plus the `event_outbox`
 /// row — the S1 + 0242 allowlist pin.

@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use aero_audit_connector::client::AuditClient;
 use aero_audit_connector::config::RelayConfig;
-use aero_audit_connector::fake::{FakeOutbox, FakeStatus};
+use aero_audit_connector::fake::{FakeOutbox, FakeStatus, StaticScopeProvisioner};
 use aero_audit_connector::outbox::OutboxRepo;
 use aero_audit_connector::relay::{audit_backoff, is_dead_at, AuditRelay, PERMANENT_DEAD_AT};
 use aero_audit_connector::stub::{SinkBehavior, StubSink};
@@ -75,6 +75,33 @@ fn relay_with_keys(
     let config = test_config(stub);
     let client = AuditClient::with_key_provider(config.clone(), keys).expect("build audit client");
     AuditRelay::new(fake, client, config)
+        .with_scope_provisioner(Arc::new(StaticScopeProvisioner::new(true)))
+}
+
+/// B5-4 `AC1a` — an unconfigured relay is fail-closed at the claim boundary:
+/// it performs no claim and leaves the durable row in status 0 with no token.
+#[tokio::test]
+async fn relay_disabled_rows_never_claimed() {
+    let fake = Arc::new(FakeOutbox::new());
+    let now = OffsetDateTime::now_utc();
+    fake.set_now(Some(now)).await;
+    let id = AuditId::from_uuid(Uuid::new_v4());
+    fake.insert(id, claim_payload(id.to_uuid()), now).await;
+
+    let stub = StubSink::start().await.expect("start stub");
+    let config = test_config(&stub);
+    let client = AuditClient::new(config.clone()).expect("build audit client");
+    // No scope provisioner is intentionally installed: this is the T-11
+    // disabled/unconfigured path, not a transport failure.
+    let relay = AuditRelay::new(fake.clone(), client, config);
+
+    assert_eq!(relay.dispatch_batch().await.expect("disabled dispatch"), 0);
+    let row = fake.row(id).await.expect("row snapshot");
+    assert_eq!(row.status, FakeStatus::Ready);
+    assert_eq!(row.status.code(), 0);
+    assert!(row.claim_token.is_none());
+    assert_eq!(stub.posts(), 0, "a disabled relay must never POST");
+    stub.shutdown();
 }
 
 /// A1-1 — lease expiry makes a row reclaimable with a rotated token; the

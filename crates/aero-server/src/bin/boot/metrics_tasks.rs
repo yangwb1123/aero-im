@@ -217,7 +217,8 @@ pub(crate) fn spawn_all(
         });
     }
 
-    // B5-4 audit-outbox sampler — Tier-1 (30s) verdict probe: enqueued /
+    // B5-4 audit-outbox sampler — the sole runtime owner of the audit-outbox
+    // status/oldest-age series. Tier-1 (30s) verdict probe: enqueued /
     // claimed counts (exact) + the dead-rows 0/1 signal + sampler_up. Any
     // query error → no bucket writes (old values retained), sampler_up 0,
     // errors+1, one warn (FM1/FM2 fail-closed posture — never a fabricated
@@ -298,15 +299,24 @@ pub(crate) fn spawn_all(
                             aero_server::metrics::AUDIT_OUTBOX_DEAD_ROWS,
                             if probe.has_dead { 1.0 } else { 0.0 },
                         );
-                        common_metrics::set_gauge(aero_server::metrics::AUDIT_OUTBOX_SAMPLER_UP, 1.0);
+                        common_metrics::set_gauge(
+                            aero_server::metrics::AUDIT_OUTBOX_SAMPLER_UP,
+                            1.0,
+                        );
                     }
                     Err(e) => {
                         tracing::warn!(
                             error = %e,
                             "audit outbox Tier-1 sample failed; prior gauge values retained (FM2)"
                         );
-                        common_metrics::set_gauge(aero_server::metrics::AUDIT_OUTBOX_SAMPLER_UP, 0.0);
-                        common_metrics::inc_counter(aero_server::metrics::AUDIT_OUTBOX_SAMPLE_ERRORS_TOTAL, 1);
+                        common_metrics::set_gauge(
+                            aero_server::metrics::AUDIT_OUTBOX_SAMPLER_UP,
+                            0.0,
+                        );
+                        common_metrics::inc_counter(
+                            aero_server::metrics::AUDIT_OUTBOX_SAMPLE_ERRORS_TOTAL,
+                            1,
+                        );
                     }
                 }
             }

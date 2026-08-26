@@ -5,7 +5,9 @@
 - **Source analysis**: `docs/auto/analyses/crates-aero-cli-e99ec77a.json`（direction #1 of 3；#2 deps-audit 已在工作树落地，见 §2；#3 B5-3/B5-4 面不在本方向）
 - **上游设计（已存在，本方向直接消费）**: `docs/design/2026-08-07-aero-cli-b5-2-relay-probe.design.md`（§2.1 场景矩阵 + §6 AC 映射）；sibling `docs/requirements/2026-08-07-aero-cli-b5-2-relay-probe.req.md`（原全切片 spec，R1-R6；本方向是其收窄重定界：**只交付 probe bin**，其余 seam 已预埋/已落地）
 - **Campaign**: `aero-im-b5-outbox-relay`；contract anchor `docs/proposals/audit-contract-batch-aero-im.md`（B5-2 行 :9、[PROPOSED] :13）
-- **Status**: Requirements（下述证据全部经源码实读/实跑核对，核对日期 2026-08-08）
+- **Status**: Implemented（历史证据核对日期 2026-08-08；当前实现与 harness 已于 2026-08-20 复核）
+- **当前状态更新（2026-08-20）**：本 direction 已闭合。`crates/aero-audit-connector/src/bin/aero-audit-relay-probe.rs` 现已落地；直接运行输出 9 个具名 `probe: <name>: PASS` 行，integration harness 的 `relay-mock-probe` 为 `PASS`。下方 V3 与 §2 中“缺失/exit 1/SKIP”的段落保留为 2026-08-08 的历史核对证据，不再代表当前工作树状态。
+- **Current B5 pin (2026-08-26)**：live `B5_CONTRACT_TEST_LIST` 为 48 个 slot（27 个非 `[PROPOSED]` 可执行 slot + 21 个 `[PROPOSED]` 仓外占位）；“executed”是 manifest 分类，不是本文件声称已经运行的测试数。
 - **行号纪律**：行号是核对时锚点、会漂移（AGENTS.md §0）——**文件/符号才是稳定 grep 锚点**
 
 ## 1. Evidence verification（direction 引用逐条核对）
@@ -13,8 +15,8 @@
 | # | Cited evidence | Verification result |
 |---|---|---|
 | V1 | `crates/aero-cli/src/main.rs` `Network_` 的 `relay-probe` 臂 pre-wired：直 spawn `aero-audit-relay-probe` bin、exit-code 透传 | ✅ **实读**。`"relay-probe"` 臂 :428-480：`AERO_RELAY_PROBE_BIN` env 覆盖（缺省 `cargo run --quiet -p aero-audit-connector --bin aero-audit-relay-probe`）；`stdout/stderr` inherit；`timeout(120s)` + `child.kill()`；码映射 `0→ok` / `1→error` / `2→warning(2)` / **契约外（panic 101、信号）→ error**。help 文本 :348 已含 `relay-probe [mock-url]`。`main.rs` :32-43 `Err(r) → std::process::exit(r.exit_code())`（warning 码穿透）；`aero-eng/src/outcome.rs:47` `Outcome::warning(exit_code, msg)` 存在；`aero-eng/src/run.rs` `run_cmd` 非零拍平为 1（:15-41）——**直 spawn 保 distinct 码的必要性成立** |
-| V2 | `scripts/test-integration.sh:556-573` harness 命名 leg `relay-mock-probe`，file-gate + grep 恰 9 行 `probe: <name>: PASS` | ✅ **实读**（leg 现于 :558-580，行号微漂，符号稳定）：`:560` file-gate `[ -f crates/aero-audit-connector/src/bin/aero-audit-relay-probe.rs ]`；`:565` `grep -c '^probe: .*: PASS$'` 恒等 9；PASS/FAIL/SKIP 三 verdict（`:566/:570/:576/:580`，SKIP 文案 = "B5-2 relay probe not landed"）；`:590` relay_legs 计数含 `B5-CHECK relay-mock-probe: PASS`。**leg 名已入 `scripts/b5-pin.sh:43` 的 37/37 pin 槽位**（G6 总装门）——bin 落地即从 SKIP 转 PASS，无需改 harness |
-| V3 | `crates/aero-audit-connector/src/bin/` 缺 `aero-audit-relay-probe.rs`，仅三 drill | ✅ **实读**：`src/bin/` = `aero-audit-priority-drill.rs` / `aero-audit-relay-drill.rs` / `aero-audit-t11-drill.rs`，**无 probe bin**。**实跑取证**：`cargo run --quiet -p aero-cli -- network relay-probe` → exit **1**，stderr `relay probe exited abnormally: exit status: 101`（cargo 找不到 bin target，列出的 available targets 恰为三 drill）。⚠️ 与 direction 问题陈述的 'cannot launch relay probe' 文案不同（该文案只在 `cmd.spawn()` 本身失败时触发，如 `AERO_RELAY_PROBE_BIN` 指向不存在路径）——**死 seam 结论一致（exit 1），文案以实跑为准** |
+| V2 | `scripts/test-integration.sh:556-573` harness 命名 leg `relay-mock-probe`，file-gate + grep 恰 9 行 `probe: <name>: PASS` | ✅ **实读**（leg 现于 :558-580，行号微漂，符号稳定）：`:560` file-gate `[ -f crates/aero-audit-connector/src/bin/aero-audit-relay-probe.rs ]`；`:565` `grep -c '^probe: .*: PASS$'` 恒等 9；PASS/FAIL/SKIP 三 verdict（`:566/:570/:576/:580`，SKIP 文案 = "B5-2 relay probe not landed"）；`:590` relay_legs 计数含 `B5-CHECK relay-mock-probe: PASS`。**leg 名已入 `scripts/b5-pin.sh` 的当前 48/48 pin 槽位**（27 个可执行 slot + 21 个 [PROPOSED]，G6 总装门）——bin 落地即从 SKIP 转 PASS，无需改 harness |
+| V3 | `crates/aero-audit-connector/src/bin/` 缺 `aero-audit-relay-probe.rs`，仅三 drill | ⚠️ **历史证据（已被当前实现 supersede）**：2026-08-08 实读时确实只有三个 drill，`network relay-probe` 因 bin 缺席退出 1。当前文件已存在；直接 probe 与 integration `relay-mock-probe` 均 PASS，故该历史 exit-1 结果不再描述当前状态。 |
 | V4 | connector 全 pub API 可驱动（FakeOutbox/StubSink/AuditRelay/AuditClient），零 src/ 改动 | ✅ **实读全部签名**：`fake.rs` `FakeOutbox::{new, set_now:111, insert, insert_lane, make_due_now:164, row:175}`；`FakeRowSnapshot` 全字段 pub（status/available_at/attempts/claim_token/lease_expires_at/last_error/priority/class）；`FakeStatus::code()` 0-3（Ready/Claimed/Delivered/Dead，镜像 0239）；`stub.rs` `StubSink::{start:133(127.0.0.1:0), token_url:158, events_url:163, posts:186, set_behavior:190, shutdown:197}` + `SinkBehavior` 全字段（含 `events_status`/`receipt_valid`/`delay_ms`）；`relay.rs` `AuditRelay::{new:101, dispatch_batch:164, deliver_claim:160}`、`audit_backoff:56`、`MAX_BACKOFF_SECONDS=300:33`、`PERMANENT_DEAD_AT=2:42`、`is_dead_at:48`；`client.rs` `AuditClient::{new:134, deliver:169}`；`config.rs` `RelayConfig` 全 pub 字段 + `check_lease_invariant:143`；`outbox.rs` `OutboxRepo` trait 全 pub（claim_due/settle/requeue/mark_dead/reconcile）。**`cargo check -p aero-audit-connector --all-targets` 实跑 ✅ 干净**（12.7s）——bin 有可直接构建的基线 |
 | V5 | 状态机语义（403→dead attempt1；422/409/receipt→dead ≤1；transient→退避永不 dead；lease > 2×timeout+2s；stale token fencing） | ✅ **实读**：`client.rs:169-240` 分类——403→`Forbidden`；422→`Permanent(Unprocessable)`；409→`Permanent(Conflict)`；回执无效→`Permanent(ReceiptMismatch)`；payload guard→`Permanent(PayloadGuard)`；5xx/其他 4xx/传输错→`Transient`。`relay.rs:206-260` `deliver_claim`：Ok→settle；**Forbidden→无条件 mark_dead（T-11 fail-closed，注释明言不经 retry budget）**；Permanent→`is_dead_at(attempts)`（attempts≥2）mark_dead / 否则 requeue（**attempt1 requeue、attempt2 dead = dead ≤1 retry**）；Transient→恒 requeue。`config.rs:143` `check_lease_invariant`：`delivery_lease <= request_timeout*2 + 2s` → bail——**(5s,12s) Err（12≤12）、(5s,13s) Ok（13>12）** 精确成立。`audit_backoff(1..=11) = [1,2,4,8,16,32,64,128,256,300,300]`（`2^(n-1)` cap 300，attempts 9/10/11 → 256/300/300）✅ |
 | V6 | in-crate 测试锚点 `tests/state_machine.rs` | ✅ **实读**（⚠️ 路径修正：在 **`crates/aero-audit-connector/tests/state_machine.rs`**，非 aero-cli/tests——aero-cli 无 tests/ 目录）：现有 **8** 个测试（原 spec 记 6，后增 `priority_first_claim_preempts_fifo_and_limit1_keeps_top_lane`、`signature_rejected_dead_after_exactly_two_attempts`），含全部 6 个引用锚点：`stale_token_cannot_ack_after_reclaim` / `backoff_is_bounded_and_exponential` / `permanent_error_dead_after_exactly_two_attempts`（422/409/receipt 参数化）/ `forbidden_dead_on_first_attempt` / `happy_path_settles_and_removes_from_claimable` / `skew_gt_lease_cannot_livelock_claim_fence_settle`。`:36-82` 的 `claim_payload`/`test_config`/`relay` helper 即现成装配模板 |
@@ -43,18 +45,17 @@
 ## 2. Verified current state
 
 ```
-已预埋/已落地（工作树，未提交——git status 实证）：
-a) Network_ relay-probe 臂  main.rs:428-480 —— 完整（spawn/超时/码映射/help），只差 bin 文件
-b) harness leg               test-integration.sh:558-580 —— file-gate + 9 行 PASS grep + verdict；
-                             b5-pin.sh:43 槽位已含 relay-mock-probe（37/37 pin）
+已预埋/已落地（工作树，未提交——git status 实证；以下 a/b 的“只差 bin”是历史快照）：
+a) Network_ relay-probe 臂  main.rs:428-480 —— 完整（spawn/超时/码映射/help）
+b) harness leg               test-integration.sh:558-580 —— file-gate + 9 行 PASS grep + verdict；当前实际分支为 PASS
+                             b5-pin.sh 槽位已含 relay-mock-probe（当前 48/48 pin：27 个可执行 slot + 21 个 [PROPOSED]）
 c) 探测对象                  connector 状态机全实现 + 8+11 in-crate 测试 + cargo check 干净（V4/V5/V6）
 d) deps 审计（AC4 后半）     checks.rs:257-258 + :801-812 回归 + dependency-check.sh:63-64 —— 已落地
 e) sibling B5-4              main.rs AuditProvisionCheck_ 已注册；harness legs presence-gated
 
-唯一缺失（本 direction 全部交付物）：
-   crates/aero-audit-connector/src/bin/aero-audit-relay-probe.rs —— 不存在
-   └─ 落地的直接效果：network relay-probe 从 exit 1（101 码）→ exit 0；
-      harness leg 从 SKIP → PASS（9 行具名 grep 恒等成立）
+当前交付物状态：
+   crates/aero-audit-connector/src/bin/aero-audit-relay-probe.rs —— 已存在并通过 9 场景黑盒探测
+   └─ 当前效果：network relay-probe exit 0；harness leg 为 PASS（9 行具名 grep 恒等成立）
 ```
 
 ## 3. Scope
@@ -149,7 +150,7 @@ bash scripts/test-integration.sh 2>&1 | grep -E '^B5-CHECK relay-mock-probe:'
 # 必须输出:  B5-CHECK relay-mock-probe: PASS
 # 不得输出:  B5-CHECK relay-mock-probe: SKIP (B5-2 relay probe not landed)
 ```
-- leg 本身 DB-free（test-integration.sh:558-580）；file-gate 命中后跑 `cargo run --quiet -p aero-cli -- network relay-probe` 并 grep 9 行 PASS（AC1+AC2 的组合面）；`B5-CHECK relay-mock-probe: PASS` 计入 relay_legs（:590）且满足 b5-pin 37/37 槽位（b5-pin.sh:43）。
+- leg 本身 DB-free（test-integration.sh:558-580）；file-gate 命中后跑 `cargo run --quiet -p aero-cli -- network relay-probe` 并 grep 9 行 PASS（AC1+AC2 的组合面）；`B5-CHECK relay-mock-probe: PASS` 计入 relay_legs（:590）且满足 b5-pin 当前 48/48 槽位（27 个可执行 slot + 21 个 [PROPOSED]）。
 
 ### AC4 — suite wall-clock <15s (only transient_timeout sleeps, 10x margin)
 

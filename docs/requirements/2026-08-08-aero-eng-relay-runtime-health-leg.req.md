@@ -3,9 +3,11 @@
 - **Module (analysis root)**: `crates/aero-eng` — `audit_provision.rs`（B5-4 psql-backed fail-closed 供给门 + B5-3 `--priority` drill 面）+ aero-cli `AuditProvisionCheck_` 臂接线
 - **Direction**: "Add relay runtime-health leg to the gate: oldest-claimed age (stuck leases) + unified --relay mock-sink probe for B5-2 state machine (422→dead, claim validation, client_credentials/scope)"（value 7 / risk_reduction 7 / effort 6 / confidence 7）
 - **Source analysis**: `docs/auto/analyses/crates-aero-eng-36facc3d.json`（direction #3）
-- **Campaign**: `aero-im-b5-outbox-relay`；gate anchor `docs/campaigns/implementation-gate.md`（G6 "37/37、T-11、moderation 优先级"）
+- **Campaign**: `aero-im-b5-outbox-relay`；gate anchor `docs/campaigns/implementation-gate.md`（G6 当前为 "48/48（27 个可执行 slot + 21 个 [PROPOSED]）、T-11、moderation 优先级"）
 - **Sibling specs（同批次，命令面协调）**: `2026-08-07-aero-cli-b5-4-audit-provision-check.req.md`（命令本体 = 本 direction 的扩展宿主）、`2026-08-08-aero-eng-b5-1-operation-class-coverage-leg.req.md`（同模块 Q6 腿，先于本 direction 落地；其 R8 兄弟模块拆分纪律为本 direction 复用）、`2026-08-08-aero-cli-b5-2-relay-probe-bin-landing.req.md`（**probe bin 的交付 direction**——本 direction 只消费、不交付）、`2026-08-07-aero-cli-b5-2-relay-probe.design.md` + `2026-08-08-aero-cli-b5-2-relay-probe-bin-landing.design.md`（probe 契约源）
-- **Status**: Requirements（下述证据全部经源码实读核对，核对日期 2026-08-08；**direction 两处事实性更正**——① `aero-audit-relay-probe` bin **不存在**，是已设计未落地的 file-gate（`src/bin/` 仅 3 个 drill），`--relay` 的 PASS 行契约必须锚定其设计文档的 9 个具名场景；② `test-integration.sh` **leg C 已存在**（dead-row 腿，跑在 T-11 throwaway 库上），新 stuck-lease 腿是**追加腿**（leg E），复用同一 `audit-provision-check` B5-CHECK slot，绝不动 leg C 语义。§1.1 逐条更正，acceptance 原句在 §5 保留并 re-ground）
+- **Status**: Implemented（历史证据核对日期 2026-08-08；Q7、`--relay`、probe 与 harness 已于 2026-08-20 复核）
+- **当前状态更新（2026-08-20）**：Q7 claimed-age/stuck-lease、`audit-provision-check --relay`、9 场景 probe 及 integration legs E/F/F′ 均已落地并通过。下方 E6、§1.1、§2 与协调段落中关于“probe 缺失 / SKIP”的文字是历史核对记录；当前 file-gate 分支实际执行为 PASS。
+- **Current B5 pin (2026-08-26)**：live `B5_CONTRACT_TEST_LIST` 为 48 个 slot（27 个非 `[PROPOSED]` 可执行 slot + 21 个 `[PROPOSED]` 仓外占位）；“executed”是 manifest 分类，不是本文件声称已经运行的测试数。
 - **行号纪律**: 行号是核对时锚点、会漂移——**文件/符号**才是稳定 grep 锚点（AGENTS.md §0）
 
 ## 1. Evidence verification（direction 引用逐条核对）
@@ -17,8 +19,8 @@
 | E3 | `crates/aero-cli/src/main.rs:427-470`（'relay-probe' 臂；直接 spawn；exit-code passthrough；AERO_RELAY_PROBE_BIN） | ✅ 全中（`Network_` 子命令 `"relay-probe"` 臂）：`AERO_RELAY_PROBE_BIN` env 覆盖（缺省 `cargo run --quiet -p aero-audit-connector --bin aero-audit-relay-probe`）；可选 `[mock-url]` 透传；`stdout/stderr` inherit；`timeout(120s)` + `child.kill()`；码映射 `0→ok / 1→error / 2→warning(2) / 其他→error`。**该臂不改**（acceptance AC5：legacy 无 contract break）——`--relay` 模式在 aero-eng 内**复用其 spawn 契约**（同 env、同 bin、同超时），但改 captured-output + PASS 行断言（R5） |
 | E4 | `crates/aero-audit-connector/tests/state_machine.rs` + `tests/claim_validation.rs`（iss/aud/scope/sub validation before POST——'scope audit:event:write' claim 契约） | ✅ 全中：`state_machine.rs` = **8** 个 async 测试（lease 过期重领+token 轮换、settle 移出 claimable、backoff 序列、422/409 permanent→attempt1 requeue/attempt2 dead、403→attempt1 即 dead、stale-token 三 fence 全 false、skew≥lease 不活锁、signature-rejected dead）；`claim_validation.rs` = 27 个测试条目（wrong_issuer / missing_audience / missing_audit_scope / wrong_subject / token_without_client_id 等全部 **POST 前拒绝**）。claim 契约值：`expected_scope = "audit:event:write"`（= `client.rs::SCOPE_AUDIT`）、`expected_aud = "audit-governance"`、`expected_iss`/`expected_sub` 同值锁步。**probe 场景名/断言即这些测试的黑盒镜像**（E6） |
 | E5 | `crates/aero-audit-connector/src/client.rs`（DeliveryError classes: 422/409/403 permanent vs transient） | ✅ 全中：`pub enum DeliveryError { Transient(anyhow::Error), Permanent(PermanentKind), Forbidden }`；`PermanentKind::{Unprocessable(422), Conflict(409), ReceiptMismatch, PayloadGuard, SignatureRejected}`；`Forbidden` = HTTP 403 立即 dead（relay.rs `deliver_claim` Forbidden 臂不经 `is_dead_at`）；422/409 走 Permanent 臂（attempt1 requeue / attempt≥2 `mark_dead`）。**probe 的 422→dead 语义源头** |
-| E6 | ⚠️ 「DB-free mock-sink probe（aero-audit-relay-probe, covering 422→dead / 403 immediate-dead / claim validation / lease）**exists**」 | ❌→⚠️ **事实更正：probe bin 不存在**。`crates/aero-audit-connector/src/bin/` 仅有 3 个 drill（`aero-audit-priority-drill.rs` / `aero-audit-relay-drill.rs` / `aero-audit-t11-drill.rs`），**无 `aero-audit-relay-probe.rs`**。实况：CLI 臂 + harness leg 是**预埋 file-gate**——`scripts/test-integration.sh` `if [ -f "crates/aero-audit-connector/src/bin/aero-audit-relay-probe.rs" ]` 且 grep `^probe: .*: PASS$` **计数 == 9**，缺席 → `SKIP (B5-2 relay probe not landed)`；`scripts/b5-pin.sh` 37-slot 已含 `relay-mock-probe`（执行槽 14）。probe 的**设计契约已钉死**（`docs/design/2026-08-08-aero-cli-b5-2-relay-probe-bin-landing.design.md`）：9 个具名场景 = `happy_path, forbidden_403, permanent_422, permanent_409, receipt_mismatch, transient_500, transient_timeout, lease_invariant, fencing_stale_token`，每场景一行 `probe: <name>: PASS`（PASS 行**不得带尾随 detail**——harness `^probe: .*: PASS$` 锚定行尾），退出码 0=全 PASS / 1=任一 FAIL / 2=usage（bin 内不可达）。**本 direction 只消费不交付**：`--relay` 的 PASS 行要求锚定这 9 个名字（R6），probe bin 本身归 sibling direction（`2026-08-08-aero-cli-b5-2-relay-probe-bin-landing.req.md`）；harness 新腿对 probe 缺席保持 file-gate SKIP（R8，phase-1 窗口绿） |
-| E7 | ⚠️ 「Extends … scripts/test-integration.sh leg C」 | ✅→⚠️ **事实更正：leg C 已存在** = dead-row 腿（"audit-provision-check leg C (one dead row ⇒ fail-closed, never delivered)"），跑在 T-11 throwaway 库上（relay enabled + binding 的 leg-D 态之后、`drop_created_database` 之前），grep `dead=1` / `delivered=0` / `audit-provision-check: dead:` / `verdict: fail-closed`，复用 `b5_check "audit-provision-check" "PASS"`。`b5_check` **append** 到 B5_LOG；`assert_b5_contract_pin` 对每个 executed slot 只要求 `grep -Eq "^B5-CHECK ${entry}: (PASS|SKIP)( |$)"` ≥1 行——**同 slot 多行合法**。新 stuck-lease 腿 = **追加腿 leg E**（同 slot 复用，37/37 不变，`b5-pin.sh` 零改动） |
+| E6 | ⚠️ 「DB-free mock-sink probe（aero-audit-relay-probe, covering 422→dead / 403 immediate-dead / claim validation / lease）**exists**」 | ⚠️ **历史缺失记录已 superseded**：2026-08-08 的 file-gate 确实因 probe 未落地而 SKIP；当前 `aero-audit-relay-probe.rs` 已存在，直接运行与 `relay-mock-probe` harness 均为 PASS。9 个场景名、PASS 行格式与退出码契约保持不变；本 direction 仍只消费该 sibling bin，不重复实现。 |
+| E7 | ⚠️ 「Extends … scripts/test-integration.sh leg C」 | ✅→⚠️ **事实更正：leg C 已存在** = dead-row 腿（"audit-provision-check leg C (one dead row ⇒ fail-closed, never delivered)"），跑在 T-11 throwaway 库上（relay enabled + binding 的 leg-D 态之后、`drop_created_database` 之前），grep `dead=1` / `delivered=0` / `audit-provision-check: dead:` / `verdict: fail-closed`，复用 `b5_check "audit-provision-check" "PASS"`。`b5_check` **append** 到 B5_LOG；`assert_b5_contract_pin` 对每个 executed slot 只要求 `grep -Eq "^B5-CHECK ${entry}: (PASS|SKIP)( |$)"` ≥1 行——**同 slot 多行合法**。新 stuck-lease 腿 = **追加腿 leg E**（同 slot 复用，48/48 不变，`b5-pin.sh` 零改动） |
 | E8 | （补充核对）0239 DDL claim-state CHECK + `claim_due` 重领过滤 | ✅ `migrations/0239_audit_governance_outbox.sql`：`status INTEGER NOT NULL DEFAULT 0 CHECK (status IN (0,1,2,3))`；`claim_token UUID`、`lease_expires_at TIMESTAMPTZ` + CHECK `(claim_token IS NULL AND lease_expires_at IS NULL) OR (claim_token IS NOT NULL AND lease_expires_at IS NOT NULL)`——**种子 status=1 行必须同时设 claim_token + lease_expires_at**（leg E 种子约束）。`pg.rs claim_due` 过滤：`status IN (0,1) AND available_at <= clock_timestamp() AND (lease_expires_at IS NULL OR lease_expires_at <= clock_timestamp())`——**lease 过期的 claimed 行可被活 relay 下个 tick 重领**；故「claimed 行 age 超 MAX_LEASE_SECONDS」⇒ 无活 relay 在重领 ⇒ relay 实质上已死（stuck-lease 语义链成立）。`available_at` 在 claim 时不改写（claim 只铸 lease_expires_at + claim_token + attempts+=1）——Q7 以 available_at 计龄是保守代理：claim_time ≥ available_at ∧ lease ≤ 86400 ⇒ age(from available_at) > 86400 在 prompt-claiming 下必已 lease 过期 |
 | E9 | （补充核对）aero-eng 依赖/尺寸/测试面约束 | ✅ `crates/aero-eng/src/checks.rs` `ALLOWED_DEPS`：`("aero-eng", &["aero-common", "serde", "tokio"])`——**aero-eng 不得依赖 aero-audit-connector**（加依赖须改 checks.rs + dependency-check.sh，出范围）；MAX_LEASE_SECONDS 用本地 clone 字面量。`audit_provision.rs` 现 **790 行**（800 WARN / 1200 HARD，`scripts/file-size-check.sh`：WARN 不 exit 非零，但 sibling B5-1 §6 已立「不得新增 WARN」纪律）——`run_relay` + 校验器 ≈ 130 行**必须落兄弟模块**（R10）。`tests/audit_provision.rs`（487 行）用 `use aero_eng::audit_provision::*;` **glob import**——`pub use` 再导出对测试透明。`cli_smoke.rs`/`cli_integration.rs` 均不引用 audit-provision-check/relay（只测 help/unknown-command/doctor/gate-list 等泛化面）——main.rs 增 `--relay` 臂不影响 cli_smoke |
 
@@ -26,7 +28,7 @@
 
 | 项 | direction 声称 | 实况（2026-08-08 实读） | 影响 |
 |---|---|---|---|
-| probe bin 存在性 | 「DB-free mock-sink probe（aero-audit-relay-probe …）exists」 | **不存在**——CLI 臂 + harness leg 是 file-gate，probe 是设计已钉、未落地的 sibling 交付物（E6） | `--relay` 的 PASS 行要求锚定设计文档 9 个具名场景（R6）；harness 新腿 file-gate SKIP（R8）；spawn 失败（bin 缺席）→ fail-closed error（R5） |
+| probe bin 存在性 | 「DB-free mock-sink probe（aero-audit-relay-probe …）exists」 | **历史记录（已 supersede）**：当时不存在；当前 bin 已落地，直接 probe 与 relay-mock leg 均 PASS | `--relay` 仍锚定设计文档 9 个具名场景；file-gate 保留为防御性检查，当前分支执行 PASS |
 | leg C | 「Extends … leg C」 | leg C **已存在**（dead-row 腿）；新腿是追加 leg E，同 slot 复用（E7） | 新增腿不改动既有 leg C 语义与 grep |
 | 种子 status=1 | 「seed a claimed row with clock_timestamp()-based available_at」 | 0239 CHECK 强制 claim_token 与 lease_expires_at 同存（E8） | leg E 种子 SQL 必须三列齐设（R8.3） |
 | MAX_LEASE_SECONDS 引用 | evidence 指向 connector relay.rs | aero-eng 依赖审计禁止 import（E9） | 本地 `const MAX_LEASE_SECONDS: i64 = 86_400` clone + 交叉引用注释（R4） |
@@ -39,9 +41,9 @@
   Q0-Q5 psql 查询面（relay 开关/bindings、v1 桶、0239 四 status 桶、oldest-pending-age、dead 明细）
   verdict() 三态矩阵（dead-first → relay-off+undelivered → consistent/healthy）
   --priority 面（B5-3）+ run_priority 的 direct-spawn/码映射/120s 超时先例
-  network relay-probe CLI 臂（E3，预埋 file-gate，probe bin 缺席时 exit 1）
+  network relay-probe CLI 臂（E3，预埋 file-gate；当前 probe bin 存在时 exit 0）
   harness leg B1/B2（AUDIT_PROVISION_DB）、leg D/C（T-11 库，relay-on healthy → dead fail-closed）
-  relay-mock-probe harness leg（file-gate + 9 行 PASS grep，E6）+ b5-pin.sh 37-slot
+  relay-mock-probe harness leg（file-gate + 9 行 PASS grep，当前 PASS）+ b5-pin.sh 当前 48-slot（27 个可执行 slot + 21 个 [PROPOSED]）
   connector 状态机全实现（relay.rs/client.rs/pg.rs）+ 35 个 in-crate/集成测试（E4/E5）
 
 缺口（本 direction 关闭，全部 verified）：
@@ -49,7 +51,7 @@
      无 CLI 信号，静默老化向 lease 过期（86400s），「grant only after relay works」(B5-4) 未真验证
   b) B5-2 状态机 probe 与供给 verdict 零关系：probe 走独立 network relay-probe 面，
      audit-provision-check 的 Healthy 不要求任何 probe 证据
-  c) probe bin 未落地时 --relay 无从 spawn（file-gate 语义需在命令面显式化）
+  c) probe 缺席时 --relay 仍须 fail-closed（防御性语义）；当前 probe 已落地并通过
 ```
 
 ## 3. Scope
@@ -64,11 +66,11 @@
 - 新兄弟模块 `crates/aero-eng/src/relay_runtime.rs` + `ConnParams`/`parse_db_url` 搬迁（尺寸纪律，R10）
 
 **Out of scope**：
-- **`aero-audit-relay-probe` bin 本体**——sibling direction 交付物（`2026-08-08-aero-cli-b5-2-relay-probe-bin-landing.req.md`）；本 direction 只按 E6 契约消费（9 具名场景、`probe: <name>: PASS` 行格式、退出码 0/1/2）
+- **`aero-audit-relay-probe` bin 本体的重复实现**——它已由 sibling direction 落地；本 direction 只按 E6 契约消费（9 具名场景、`probe: <name>: PASS` 行格式、退出码 0/1/2）。缺席时的 fail-closed 分支仍保留。
 - connector `src/` 任何改动、connector `Cargo.toml`、0239/0240/0241 迁移——零改动
 - `verdict()` 既有三支优先级（dead-first → relay-off+undelivered）**逐字节保留**——stuck-lease 是纯追加支（R3）
 - legacy `network relay-probe` 臂——零改动（AC5 no contract break）
-- `--priority` 面、`Gate_`/`scripts/relay-mock.sh`、b5-pin.sh 37-slot 清单、新 B5-CHECK slot——零改动（E7）
+- `--priority` 面、`Gate_`/`scripts/relay-mock.sh`、b5-pin.sh 当前 48-slot 清单、新 B5-CHECK slot——零改动（E7）
 - aero-eng 依赖图（ALLOWED_DEPS）——零改动（R4 clone 字面量替代 import，E9）
 
 ## 4. Requirements
@@ -200,7 +202,7 @@ pub fn validate_probe_output(exit_ok: bool, stdout: &str) -> Result<(), String>
 
 ### R8 — harness 追加腿（`scripts/test-integration.sh`，T-11 块内，零新 slot）
 
-全部在既有 T-11 throwaway 库块内（leg D 之后、leg C 之前追加；leg C 语义与 grep 逐字节不动），`b5_check "audit-provision-check" "PASS"` 同 slot 复用（E7：append 多行 + pin 只要求 ≥1 行，37/37 不变）：
+全部在既有 T-11 throwaway 库块内（leg D 之后、leg C 之前追加；leg C 语义与 grep 逐字节不动），`b5_check "audit-provision-check" "PASS"` 同 slot 复用（E7：append 多行 + pin 只要求 ≥1 行，48/48 不变）：
 
 1. **leg F′（--relay 负向，stub bin，无 file-gate）**——leg-D 态（relay on + binding + T-11 遗留 pending 行 = Healthy）：
    `AERO_RELAY_PROBE_BIN=/bin/true cargo run -p aero-cli -- audit-provision-check --relay` ⇒ **exit 非零** + stdout 含 `relay-probe: FAIL`（/bin/true exit 0 但零 PASS 行 → 校验器 Err——证明不信任 exit code 单点，AC2 的 stub-bin 注入面）。
@@ -241,8 +243,8 @@ pub fn validate_probe_output(exit_ok: bool, stdout: &str) -> Result<(), String>
 
 ## 6. Coordination & hard rules（AGENTS §4）
 
-- **probe bin 边界**：`aero-audit-relay-probe.rs` 是 sibling direction（aero-cli-b5-2-relay-probe-bin-landing）的交付物——本 direction 只消费其设计契约（E6 9 场景名 + `probe: <name>: PASS` 行格式 + 退出码 0/1/2）；`--relay` 在 probe 缺席时 fail-closed（spawn error），harness 腿 F 以 file-gate 显式 SKIP——两 direction 并行不互相阻塞。
-- **零新 slot / 零 b5-pin 改动**：leg E/F/F′ 全部复用 `audit-provision-check` B5-CHECK slot（`b5_check` append + pin ≥1 行，E7）；37/37 保持。
+- **probe bin 边界**：`aero-audit-relay-probe.rs` 已由 sibling direction 落地——本 direction 只消费其设计契约（E6 9 场景名 + `probe: <name>: PASS` 行格式 + 退出码 0/1/2）；`--relay` 在 probe 缺席时仍 fail-closed（spawn error），harness 腿 F 的 file-gate 是防御性检查，当前分支为 PASS。
+- **零新 slot / 零 b5-pin 改动**：leg E/F/F′ 全部复用 `audit-provision-check` B5-CHECK slot（`b5_check` append + pin ≥1 行，E7）；48/48 保持。
 - **零新依赖**：`MAX_LEASE_SECONDS` clone 字面量 + 锁步测试（R4）；ALLOWED_DEPS / checks.rs / dependency-check.sh 零改动。
 - **fail-closed 顺序**：dead → relay-off+undelivered → stuck-lease → probe；任一 fail 即短路，probe 绝不先于 DB-fail 状态 spawn（R5）。
 - **种子 CHECK 纪律**：status=1 种子行必须 claim_token + lease_expires_at 齐设（E8 CHECK）；`available_at` 用 `clock_timestamp()` 系（单时钟域，E8）。

@@ -16,6 +16,7 @@ use futures::stream::{Stream, StreamExt as _};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{AiError, Result};
+use crate::retry::{is_retryable, retry_with_backoff, AttemptError};
 
 const ENV_API_KEY: &str = "ANTHROPIC_API_KEY";
 const ENV_MODEL: &str = "ANTHROPIC_MODEL";
@@ -208,12 +209,8 @@ impl AnthropicClient {
 
         let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
 
-        // Retry loop: retryable HTTP statuses get exponential backoff.
-        let max_attempts = 3;
-        let mut attempt = 0;
-        let resp = loop {
-            attempt += 1;
-            let r = self
+        let resp = retry_with_backoff(3, Duration::from_secs(1), || async {
+            let resp = self
                 .http
                 .post(&url)
                 .header("x-api-key", &self.api_key)
@@ -221,30 +218,28 @@ impl AnthropicClient {
                 .header("content-type", "application/json")
                 .json(&body)
                 .send()
-                .await;
-
-            match r {
-                Ok(resp) => {
-                    let status = resp.status();
-                    if status.is_success() || attempt >= max_attempts || !is_retryable(status) {
-                        break resp; // deliver to caller (success or final error)
-                    }
-                    // Retryable: wait with backoff then loop.
-                    let delay = Duration::from_secs(1 << (attempt - 1)); // 1s, 2s, 4s
-                    tracing::debug!(status = %status, attempt, delay = ?delay, "anthropic retry");
-                    tokio::time::sleep(delay).await;
-                }
-                Err(e) => {
-                    if attempt >= max_attempts {
-                        return Err(AiError::Http(e.to_string()));
-                    }
-                    // Transport error: retry after backoff.
-                    let delay = Duration::from_secs(1 << (attempt - 1));
-                    tracing::debug!(error = %e, attempt, delay = ?delay, "anthropic transport retry");
-                    tokio::time::sleep(delay).await;
-                }
+                .await
+                .map_err(|error| AttemptError {
+                    retryable: true,
+                    error: AiError::Http(error.to_string()),
+                })?;
+            let status = resp.status();
+            if status.is_success() || !is_retryable(status) {
+                return Ok(resp);
             }
-        };
+            let raw = resp.text().await.map_err(|error| AttemptError {
+                retryable: true,
+                error: AiError::Http(error.to_string()),
+            })?;
+            Err(AttemptError {
+                retryable: true,
+                error: AiError::Anthropic {
+                    status: status.as_u16(),
+                    message: truncate(&raw, 1024),
+                },
+            })
+        })
+        .await?;
 
         let status = resp.status();
         let raw = resp.text().await?;
@@ -725,15 +720,6 @@ fn extract_text_delta(block: &str) -> Option<String> {
         return None;
     }
     Some(delta.get("text")?.as_str()?.to_string())
-}
-
-/// Whether an HTTP status code is eligible for retry with backoff.
-/// 429 (rate limit) and 5xx (server error) are retryable — the same request
-/// may succeed on a later attempt. Other 4xx codes are client errors and
-/// should fail immediately.
-#[must_use]
-fn is_retryable(status: reqwest::StatusCode) -> bool {
-    status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
 }
 
 /// Truncate a string to `max` chars on a char boundary. Never panics.

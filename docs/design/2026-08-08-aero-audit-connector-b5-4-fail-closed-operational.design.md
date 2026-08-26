@@ -5,6 +5,8 @@
 > Seam 契约锚点（已落地）：`docs/design/2026-08-07-aero-cli-b5-4-audit-provision-check-psql.design.md`（CLI psql 检查，`aero_eng::audit_provision`）+ `docs/requirements/2026-08-07-aero-cli-b5-4-audit-provision-check.req.md`。
 > Sibling（勿撞）：`docs/requirements/2026-08-08-aero-ai-b5-4-relay-boot-provisioning-gate.req.md`（**requirements 态未落地**——`decide_relay_boot` 全仓零命中，见 §0.6；本设计与其互补：boot 门 = 启动拒绝，本设计 = 运行期自动 flip + 可观测）。
 > Status: **proposed design — REV 2**（2026-08-08）。REV 2 采纳三轮评审（sql_perf_reviewer / observability_reviewer / audit_integrity_security_reviewer）的修正，**重钉 AC1–AC4 oracle** 覆盖 F1/F2/F3、三值 indicator、边沿 ERROR、两档 SQL 探针——采纳表见 §0.3，oracle 重钉见 §6。§0 证据核对基于当前工作树，行号为核对时锚点、可能漂移——**文件/符号**才是稳定 grep 锚点。
+>
+> **Current B5 pin (2026-08-26)**：live `B5_CONTRACT_TEST_LIST` 为 48 个 slot（27 个非 `[PROPOSED]` 可执行 slot + 21 个 `[PROPOSED]` 仓外占位）。历史 REV2 草案中的 37→38 计划不代表当前清单；“executed”是 manifest 分类，不是本设计声称已经运行的测试数。
 
 ## 0. Evidence verification verdict（5 条证据逐条复验）
 
@@ -32,7 +34,7 @@
 | tokio 首 tick 语义 | `Cargo.lock` tokio **1.52.3**：`interval()` = `interval_at(now, …)`——**首 tick 立即触发**；heartbeat 块（metrics_tasks.rs :242/:348/:411）pre-loop `tick().await` 丢弃首 tick，sampler 块（AI DLQ :142、NATS :174、pg-health :116）**不丢弃**——新块照 sampler 模式（observability (c)） |
 | `AERO__SERVER__*` env 先例 | `retention.rs:144` `std::env::var("AERO__SERVER__RETENTION_SWEEP_SECS")`（figment 双下划线，0 禁）——慢节奏 env 同款 |
 | `/metrics` bearer 门控 | `metrics.rs:291-323`：`AERO_METRICS_TOKEN` 非空即要求 bearer——冒烟 curl 需带 token |
-| `b5-pin.sh` 槽位守卫 | `scripts/b5-pin.sh:29-59` `B5_CONTRACT_TEST_LIST` 恰 **37** 槽（15 executed + 22 proposed）；`assert_b5_contract_pin` :84-90 `[ "$count" -ne 37 ]` 硬钉——**新增槽位须同步 bump 37→38**（§2.10） |
+| `b5-pin.sh` 槽位守卫 | `scripts/b5-pin.sh` 当前 `B5_CONTRACT_TEST_LIST` 恰 **48** 槽（27 个可执行 slot + 21 个 [PROPOSED]）；`assert_b5_contract_pin` 以 48 为硬钉。历史 REV2 计划中的 37→38 已被后续清单演进取代。 |
 | harness CLI 侧 F3 钉已存在 | `test-integration.sh` leg B2（约 :270-296）：switch off + 1 条 v1 undelivered audit 行 → CLI exit≠0 + `verdict: fail-closed` + `no audit:event:write grant issued`——**CLI 侧 v1 臂分歧已钉**，sampler 侧钉在 §2.7 C2（F3 采纳） |
 
 ### 0.2 direction 前提钉化（复验结论）
@@ -457,7 +459,7 @@ aero-eng.workspace = true
 
 **新 b5_check 槽 `audit-outbox-sampler`**（B5-4 运行期采样冒烟的专属契约槽——CLI 槽 `audit-provision-check` 是 psql 检查面，运行期 sampler 面需要自己的 verdict 证据行）：
 
-- `scripts/b5-pin.sh`：`B5_CONTRACT_TEST_LIST` 在 `audit-provision-check` 后插入 `audit-outbox-sampler`；`assert_b5_contract_pin` 的 `-ne 37` → **`-ne 38`**、错误文案 37→38、文件头注释 37/37→38/38。**这是有意的、最小的 harness 变更**（REV 1 的「零改动 harness」因新增运行期契约而修订，§3 同步）。
+- `scripts/b5-pin.sh`：`B5_CONTRACT_TEST_LIST` 在 `audit-provision-check` 后插入 `audit-outbox-sampler`；`assert_b5_contract_pin` 的历史 `-ne 37` → `-ne 38` 计划已被当前 48-slot manifest 取代；当前 runtime sampler 复用既有 slot，不再按本历史草案新增计数。
 - `scripts/test-integration.sh`：新增 `AUDIT_SAMPLER_DB="aero_audit_sampler_$$"` + `assert_disposable_db_name` 条目；新段落在 T-11 段之后（0239 文件 gate，缺席 → `b5_check "audit-outbox-sampler" "SKIP (0239 not landed)"`）：
 
 ```
@@ -584,7 +586,7 @@ aero-eng.workspace = true
 | `pg.rs` `mod tests` 既有 db_tests | **零改动** + 新增 1 个 `#[ignore]` | `ensure_outbox_table`/TRUNCATE 自隔离先例沿用；`--test-threads` 约定不变 |
 | 新测试构造 `VerdictProbe`/`StatusBuckets`/`AuditOutboxSample`/`AuditOutboxFullSample` | derive(`Default`, `PartialEq`) 齐备 | `::default()` 与 `assert_eq!` 编译通过（D6：类型自带 derive，不再依赖 `fresh` 等值比较） |
 | **`fresh` 引用** | **全仓删除**（REV 1 仅 §2.5 草图有；无测试文件引用过） | 落地时 `rg fresh crates/aero-audit-connector crates/aero-server` 零命中；`sample_audit_outbox` 返回 `Result`（F2/D6） |
-| `scripts/b5-pin.sh` / `test-integration.sh` 既有槽与 leg | 新增 1 槽 + 1 段 + 计数 37→38（§2.10）；既有 37 槽零改动 | 38-slot guard 与 `b5_check` 协议不变；`t11-fail-closed`/`moderation-priority-drill`/`audit-provision-check` 断言逐字保留 |
+| `scripts/b5-pin.sh` / `test-integration.sh` 既有槽与 leg | 历史草案曾计划新增 1 槽（37→38，§2.10）；当前 manifest 已演进为 48 槽（27 个可执行 + 21 个 [PROPOSED]），runtime sampler 不再改变该计数 | 当前 48-slot guard 与 `b5_check` 协议不变；`t11-fail-closed`/`moderation-priority-drill`/`audit-provision-check` 断言逐字保留 |
 | `crates/aero-server/src/metrics.rs` 既有 `mod tests` | 增量（3 个新单测）；既有断言零改动 | 纯函数单测不触 PG |
 
 ## 7. Sequencing

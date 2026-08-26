@@ -836,7 +836,8 @@ mod db_tests {
             "review-seam actor type is participant, never system"
         );
         assert_eq!(
-            gov2.4["actor"]["id"], fixture.reviewer.to_uuid().to_string(),
+            gov2.4["actor"]["id"],
+            fixture.reviewer.to_uuid().to_string(),
             "payload actor id = the reviewer (UUID spelling, 0239 actor_id::text)"
         );
 

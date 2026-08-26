@@ -2,8 +2,14 @@
 
 - **Module**: `crates/aero-ai`
 - **Source direction**: `docs/auto/analyses/crates-aero-ai-f8cd3622.json` (direction 1)
-- **Date**: 2026-08-06 · **Status**: spec (unimplemented)
-- **Scope**: byte-preserving incremental UTF-8 handling in `SseParser` (`crates/aero-ai/src/anthropic.rs`) so a multi-byte character split across network chunks is never dropped, plus regression tests. No changes to accounting, retry policy, other provider paths, or the wire format.
+- **Date**: 2026-08-06 · **Status**: implemented in source and regression-tested
+- **Scope**: byte-preserving incremental UTF-8 handling in `SseParser` (`crates/aero-ai/src/anthropic.rs`) so a multi-byte character split across network chunks is never dropped, plus CJK/emoji/property regression tests. Accounting, retry policy, other provider paths, and wire format remain unchanged by this fix.
+
+> Current-source note (2026-08-19): `SseParser` retains incomplete UTF-8 tails,
+> warns on genuine mid-stream corruption, and the external `anthropic/tests.rs`
+> module covers two-/three-chunk CJK, four-push emoji, every split offset, empty
+> pushes, and corruption handling. The old all-or-nothing `from_utf8` behavior
+> described below is historical evidence for the direction.
 
 ---
 
@@ -36,7 +42,7 @@ The truncation scenario and its user-visible frequency are reasoned from code in
 
 ---
 
-## 2. Problem statement (as verified)
+## 2. Problem statement (historical gap; now closed by incremental decoding)
 
 - `SseParser::push_bytes` (`anthropic.rs:618-621`) treats a chunk as all-or-nothing: any chunk that is not wholly valid UTF-8 is silently discarded. reqwest's `bytes_stream()` (`anthropic.rs:380`) yields at arbitrary byte boundaries, so a 3-byte CJK character split across two chunks produces two individually-invalid chunks, and **every SSE event contained in either chunk is lost without any error, log, or accounting signal**.
 - The affected path is the flagship interactive RAG stream: `/api/rooms/:id/ask/stream` (`server/src/routes/ai.rs`) → `answer_question_stream_with_usage_context` (`service_impl.rs:543`) → `complete_stream_accounted` (`accounting.rs:544`) → `complete_stream` (`anthropic.rs:339`). The system prompt mandates Chinese output (`tools.rs:60`), so multi-byte characters are guaranteed in replies.

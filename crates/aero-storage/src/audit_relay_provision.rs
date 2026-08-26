@@ -119,8 +119,8 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires live Postgres (DATABASE_URL)"]
     async fn record_heartbeat_is_idempotent_and_advances_verified_at() {
-        let url = std::env::var("DATABASE_URL")
-            .expect("DATABASE_URL must point at a throwaway Postgres");
+        let url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must point at a throwaway Postgres");
         let pool = pool(&url);
         self_isolate(&pool).await;
         let repo = AuditRelayProvisionRepo::new(pool.clone());
@@ -135,7 +135,9 @@ mod tests {
             .expect("row exists after the first heartbeat");
         assert!(
             matches!(
-                repo.provision_check(FRESHNESS).await.expect("provision check"),
+                repo.provision_check(FRESHNESS)
+                    .await
+                    .expect("provision check"),
                 ProvisionCheck::Verified(_)
             ),
             "a just-recorded heartbeat must be Verified"
@@ -174,15 +176,17 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires live Postgres (DATABASE_URL)"]
     async fn provision_check_pins_three_states_and_the_freshness_boundary() {
-        let url = std::env::var("DATABASE_URL")
-            .expect("DATABASE_URL must point at a throwaway Postgres");
+        let url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must point at a throwaway Postgres");
         let pool = pool(&url);
         self_isolate(&pool).await;
         let repo = AuditRelayProvisionRepo::new(pool.clone());
 
         // No row → NotVerified (the fail-closed default).
         assert_eq!(
-            repo.provision_check(FRESHNESS).await.expect("provision check"),
+            repo.provision_check(FRESHNESS)
+                .await
+                .expect("provision check"),
             ProvisionCheck::NotVerified,
             "empty table must be fail-closed NotVerified"
         );
@@ -265,7 +269,9 @@ mod tests {
         repo.record_heartbeat().await.expect("fresh heartbeat");
         assert!(
             matches!(
-                repo.provision_check(FRESHNESS).await.expect("provision check"),
+                repo.provision_check(FRESHNESS)
+                    .await
+                    .expect("provision check"),
                 ProvisionCheck::Verified(_)
             ),
             "a fresh heartbeat must be Verified"

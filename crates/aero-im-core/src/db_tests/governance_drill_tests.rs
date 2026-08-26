@@ -58,8 +58,8 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use aero_audit_connector::{
-    client::AuditClient, config::RelayConfig, outbox::OutboxRepo, pg::PgOutboxRepo,
-    relay::AuditRelay, stub::StubSink,
+    client::AuditClient, config::RelayConfig, fake::StaticScopeProvisioner, outbox::OutboxRepo,
+    pg::PgOutboxRepo, relay::AuditRelay, stub::StubSink,
 };
 use aero_common::{
     AuditClaimPayload, AuditId, Block, MessageId, ParticipantId, RoomKind, WorkspaceId,
@@ -362,7 +362,8 @@ async fn relay_for(
     let config = drill_config(stub, source_system);
     let client = AuditClient::new(config.clone()).expect("build audit client");
     (
-        AuditRelay::new(repo.clone(), client, config.clone()),
+        AuditRelay::new(repo.clone(), client, config.clone())
+            .with_scope_provisioner(Arc::new(StaticScopeProvisioner::new(true))),
         repo,
         config,
     )
@@ -575,7 +576,10 @@ async fn drill_priority_claim_preempts_fifo_on_write_path_rows() {
         AuditId::from_uuid(backlog[0]),
         "arm B serves the earliest-due backlog row"
     );
-    assert_eq!(backlog_claims[0].attempts, 1, "first claim increments attempts");
+    assert_eq!(
+        backlog_claims[0].attempts, 1,
+        "first claim increments attempts"
+    );
     assert_eq!(backlog_claims[0].class, "message", "backlog lane class");
 
     // Second claim (limit 50): the 9 admin rows and backlog[0] are leased
@@ -588,10 +592,8 @@ async fn drill_priority_claim_preempts_fifo_on_write_path_rows() {
         .await
         .expect("claim the backlog");
     let rest_set: HashSet<AuditId> = rest.iter().map(|c| c.event_id).collect();
-    let mut expected_rest: HashSet<AuditId> = backlog
-        .iter()
-        .map(|id| AuditId::from_uuid(*id))
-        .collect();
+    let mut expected_rest: HashSet<AuditId> =
+        backlog.iter().map(|id| AuditId::from_uuid(*id)).collect();
     expected_rest.remove(&AuditId::from_uuid(backlog[0]));
     expected_rest.insert(dropped_admin);
     assert_eq!(
@@ -599,7 +601,10 @@ async fn drill_priority_claim_preempts_fifo_on_write_path_rows() {
         40,
         "round 2 drains the 39 backlog + the arm-A-dropped admin row"
     );
-    assert_eq!(rest_set, expected_rest, "backlog claimed set-parity (conservation)");
+    assert_eq!(
+        rest_set, expected_rest,
+        "backlog claimed set-parity (conservation)"
+    );
     for claim in &rest {
         assert_eq!(claim.attempts, 1, "round-2 claims are all first claims");
     }
@@ -677,13 +682,12 @@ async fn drill_payload_contract_16_key_envelope_via_moderate_delete() {
     // Claim-level envelope asserts read the row payload directly (DR-1: no
     // manual claim — the relay below is the sole claimer). Identical JSON to
     // `claim.payload` (payload is immutable by construction).
-    let payload: serde_json::Value = sqlx::query_scalar(
-        "SELECT payload FROM audit_governance_outbox WHERE event_id = $1",
-    )
-    .bind(event_id.to_uuid())
-    .fetch_one(&pool)
-    .await
-    .expect("moderation row payload");
+    let payload: serde_json::Value =
+        sqlx::query_scalar("SELECT payload FROM audit_governance_outbox WHERE event_id = $1")
+            .bind(event_id.to_uuid())
+            .fetch_one(&pool)
+            .await
+            .expect("moderation row payload");
 
     let obj = payload.as_object().expect("payload is an object");
     for key in shared::ENVELOPE_KEYS {
@@ -755,7 +759,10 @@ async fn drill_payload_contract_16_key_envelope_via_moderate_delete() {
     // connector's Idempotency-Key header is the base32 `AuditId` Display, the
     // payload's event_id is uuid::text — the receipt validator equates them
     // value-level; a regression respelling either side breaks here.
-    assert_ne!(AuditId::from_uuid(event_id.to_uuid()).to_string(), audit_id_text);
+    assert_ne!(
+        AuditId::from_uuid(event_id.to_uuid()).to_string(),
+        audit_id_text
+    );
 
     // ---- Sink leg (R4 acceptance / D6): deliver the row through the REAL
     // relay to the stub sink and assert the delivered payload's action at the
@@ -780,9 +787,15 @@ async fn drill_payload_contract_16_key_envelope_via_moderate_delete() {
         "sink echo: delivered payload action == the leaf const (single-token lock)"
     );
     let row = shared::outbox_row(&pool, event_id).await;
-    assert_eq!(row.status, 2, "the stub's 202 + receipt echo settles the row");
+    assert_eq!(
+        row.status, 2,
+        "the stub's 202 + receipt echo settles the row"
+    );
     assert!(row.delivered_at.is_some(), "delivered_at stamped");
-    assert_eq!(row.attempts, 1, "exactly one claim (relay is the sole claimer)");
+    assert_eq!(
+        row.attempts, 1,
+        "exactly one claim (relay is the sole claimer)"
+    );
     assert!(row.claim_token.is_none(), "fencing token cleared on settle");
     assert!(row.lease_expires_at.is_none(), "lease cleared on settle");
     assert!(row.last_error.is_none(), "no error recorded on settle");
@@ -792,8 +805,8 @@ async fn drill_payload_contract_16_key_envelope_via_moderate_delete() {
 
 mod crash;
 mod facade;
-mod shared;
-mod room;
-mod posture;
-mod terminal;
 mod heartbeat;
+mod posture;
+mod room;
+mod shared;
+mod terminal;

@@ -66,10 +66,14 @@ impl ImService {
             }
             Err(error) => {
                 let now = OffsetDateTime::now_utc();
-                match repo
-                    .mark_failed(id, attempts, now, &error.to_string())
-                    .await
-                {
+                // Keep the causal chain in the durable retry record. `Error`
+                // often carries a useful transport cause beneath a stable
+                // context (for example `nats: injected failure`); storing only
+                // `Display` on the outer context makes retry diagnostics and
+                // acceptance assertions indistinguishable from an unknown
+                // failure.
+                let error_text = format!("{error:#}");
+                match repo.mark_failed(id, attempts, now, &error_text).await {
                     Err(mark_error) => warn!(
                         error = ?mark_error,
                         publish_error = %error,

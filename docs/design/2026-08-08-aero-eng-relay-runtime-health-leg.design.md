@@ -4,7 +4,9 @@
 - **Requirements**: `docs/requirements/2026-08-08-aero-eng-relay-runtime-health-leg.req.md`（253 行，R1-R10）
 - **宿主命令**: `audit-provision-check`（`crates/aero-cli/src/main.rs:488-510` 命令臂）
 - **Sibling 设计**: `docs/design/2026-08-08-aero-eng-b5-1-operation-class-coverage-leg.design.md`（同模块 Q6 腿，尺寸纪律/报告行纪律先例）、`docs/design/2026-08-07-aero-cli-b5-4-audit-provision-check-psql.design.md`（命令本体）、`docs/design/2026-08-08-aero-cli-b5-2-relay-probe-bin-landing.design.md`（**probe bin 契约源：9 场景名 + `probe: <name>: PASS` 行格式 + 退出码 0/1/2**）、`docs/design/2026-08-07-aero-cli-b5-acceptance-gate-harness.design.md`（leg 纪律）
-- **Status**: Design（证据全部经源码实读复核，见 §1；实现预算 §6 精确到行）
+- **Status**: Implemented（设计证据全部经源码实读复核，见 §1；Q7/`--relay`/harness 已于 2026-08-20 通过完整 integration 验收）
+- **当前状态更新（2026-08-20）**：本设计中的 `relay_runtime.rs`、Q7、`audit-provision-check --relay` 以及 T-11 F′/F/E 腿均已落地。§1 的 E6“probe 缺失”是实现前历史快照；当前 sibling probe 已存在并输出 9/9 PASS。
+- **Current B5 pin (2026-08-26)**：live `B5_CONTRACT_TEST_LIST` 为 48 个 slot（27 个非 `[PROPOSED]` 可执行 slot + 21 个 `[PROPOSED]` 仓外占位）；“executed”是 manifest 分类，不是本设计声称已经运行的测试数。
 
 ## §1 证据核验（untrusted claims → 源码逐条对照）
 
@@ -15,13 +17,13 @@
 | E3 | `aero-cli/src/main.rs` relay-probe 臂：直接 spawn、`AERO_RELAY_PROBE_BIN`、0/1/2 映射、120s | ✅ 全中（:428-481）：env 覆盖缺省 `cargo run --quiet -p aero-audit-connector --bin aero-audit-relay-probe`；可选 `[mock-url]` 透传 :448-450；`Stdio::inherit` :451-452；`timeout(120s)` + `child.kill()` :454-480；映射 `0→ok / 1→error / 2→warning(2) / 其他→error`。**该臂零改动**（AC5） |
 | E4 | `state_machine.rs` 8 测试 + `claim_validation.rs` 27 条目（iss/aud/scope/sub POST 前拒绝） | ✅ 全中：`state_machine.rs` 恰 **8** 个 `#[tokio::test]`（:83 stale_token_cannot_ack_after_reclaim / :136 backoff_is_bounded_and_exponential / :169 permanent_error_dead_after_exactly_two_attempts / :255 forbidden_dead_on_first_attempt / :286 happy_path_settles_and_removes_from_claimable / :321 skew_gt_lease_cannot_livelock_claim_fence_settle / :360 priority_first_claim_preempts_fifo_and_limit1_keeps_top_lane / :470 signature_rejected_dead_after_exactly_two_attempts）；`claim_validation.rs` = 26 async + 1 sync（`jwt_claims_decode_roundtrip` :364）= **27** 条目，wrong_issuer/missing_audience/missing_audit_scope/wrong_subject 等全部 **POST 前拒绝**（:139-186）；契约值 `expected_scope = "audit:event:write"`（= `client.rs:47 SCOPE_AUDIT`）、`expected_aud = "audit-governance"` :29 |
 | E5 | `client.rs` DeliveryError：422/409 permanent、403 immediate-dead | ✅ 全中：`PermanentKind::{Unprocessable, Conflict, ReceiptMismatch, PayloadGuard, SignatureRejected}` :53-65、`Forbidden` :80；HTTP 映射 :220 FORBIDDEN→Forbidden、:222 422→Unprocessable、:225 409→Conflict |
-| E6 | `aero-audit-relay-probe` bin **不存在**（src/bin/ 仅 3 drill）；harness relay-mock-probe leg 是 file-gate（`grep -c '^probe: .*: PASS$' == 9`）；37-slot 含 relay-mock-probe | ✅ 全中：`src/bin/` = priority/relay/t11 三 drill 无 probe；`test-integration.sh:649-666` file-gate `if [ -f "crates/aero-audit-connector/src/bin/aero-audit-relay-probe.rs" ]` + 计数==9 断言 + else `SKIP (B5-2 relay probe not landed)`；`b5-pin.sh:43` 37-slot 含 `relay-mock-probe`；sibling 设计文档 :104-112 钉死 9 场景名 = happy_path / forbidden_403 / permanent_422 / permanent_409 / receipt_mismatch / transient_500 / transient_timeout / lease_invariant / fencing_stale_token，`probe!` 宏输出 `probe: <name>: PASS` |
+| E6 | **历史核对**：`aero-audit-relay-probe` bin 当时**不存在**（src/bin/ 仅 3 drill）；harness relay-mock-probe leg 是 file-gate（`grep -c '^probe: .*: PASS$' == 9`）；当前 48-slot（27 个可执行 slot + 21 个 [PROPOSED]）含 relay-mock-probe | ✅ 历史事实已被当前实现 supersede：`aero-audit-relay-probe.rs` 已落地，9 场景与 PASS 行均通过；file-gate 仍作为防御性检查保留，当前 48-slot 不变（27 个可执行 + 21 个 [PROPOSED]）。 |
 | E7 | leg C 已存在（dead-row 腿，T-11 库）；`b5_check` append；pin 只要求 ≥1 行 | ✅ 全中：`test-integration.sh:421-448` leg C（`UPDATE … SET status = 3 WHERE event_id = (SELECT … WHERE status = 0 LIMIT 1)` + grep `dead=1`/`delivered=0`/`audit-provision-check: dead:`/`verdict: fail-closed` + `b5_check "audit-provision-check" "PASS"`）；`b5-pin.sh:73-79` `b5_check` = echo + append 到 B5_LOG；`assert_b5_contract_pin` :100-106 `grep -Eq "^B5-CHECK ${entry}: (PASS|SKIP)( |$)"`（≥1 行即可，**同 slot 多行合法**）。leg D 在 :379-417（relay enabled + binding ⇒ healthy + `oldest-pending-age:` grep），插入点 = leg D 结束与 leg C 之间 |
 | E8 | 0239 CHECK 强制 claim_token+lease_expires_at 同存；`claim_due` 重领过期 lease 行 | ✅ 全中：`migrations/0239_audit_governance_outbox.sql` `CONSTRAINT audit_governance_claim_state CHECK ((claim_token IS NULL AND lease_expires_at IS NULL) OR (claim_token IS NOT NULL AND lease_expires_at IS NOT NULL))`（:44-47，注释 "mirror v1 0235"）；`pg.rs:99-116` claim_due 过滤 `status IN (0,1) AND available_at <= clock_timestamp() AND (lease_expires_at IS NULL OR lease_expires_at <= clock_timestamp())`；claim 不改写 available_at（只铸 lease_expires_at + claim_token + attempts+=1 :125-131）——「claimed 行 age > 86400 ⇒ lease 必已过期 ⇒ 活 relay 已重领」语义链成立（**prompt-claiming 前提**，见 §4 FM-10） |
 | E9 | aero-eng 依赖/尺寸/测试面约束 | ✅ 全中：`checks.rs:256` ALLOWED_DEPS `("aero-eng", &["aero-common", "serde", "tokio"])`（检查只审计 `aero-*` workspace 内部依赖 :294-296，实际强制项 = aero-common——加 `aero-audit-connector` 即红，需改 checks.rs + dependency-check.sh = 出范围）；`audit_provision.rs` = **790 行**（file-size-check.sh MAX_LINES=800 比较符 `-gt`，**801 即 WARN**，余量 10 行）；`tests/audit_provision.rs` = **487 行**、:5 `use aero_eng::audit_provision::*;` glob import；`ConnParams` :375 pub、`parse_db_url` :385 pub（~56 行自包含）；`PsqlRunner` :437 **私有**、`query` :466 **私有**（新模块不能自建 runner，`run_relay` 必须调 `audit_provision::run`）；`lib.rs` 已 `pub use outcome::{Outcome, Severity}` :45 + `pub mod audit_provision` :50；`cli_smoke.rs`/`cli_integration.rs` 零 audit-provision-check/relay 引用（grep 无命中）→ main.rs 增量不触 cli_smoke |
 | E10 | （补充）`run_priority` 先跑 `run()` 短路先例 + `run()` 报告/退出契约 | ✅ `run_priority` :665-672：base error 直接返回（`if base.is_error() { return base; }`）——`run_relay` 阶段 1 同构；`run()` :552 起，Q0-Q5 全走 `runner.query`（`-At` 单行输出 :466-485，trimmed；零行 = 空串），结尾 `print!("{report}")` + FailClosed→`Outcome::error` / Consistent|Healthy→`Outcome::ok` :646-656；`verdict()` 文案 `verdict: fail-closed — {reason}`（:209 harness grep 前缀） |
 
-**结论**：requirements 全部证据成立，两处事实更正（E6 probe bin 不存在、E7 leg C 已存在）与全部约束（E8 CHECK、E9 尺寸/依赖/可见性）复验通过。本设计补充实现级发现：**E9-PsrqlRunner 私有**（`run_relay` 的 base 阶段只能调 `audit_provision::run`，不能自建 runner）、**E10-短路先例**（run_priority 同构）、**§4 FM-10 假阳性窗口**（available_at 计龄代理在「积压 > 24h 后 relay 才启用」场景的瞬时误报，须显式文档化）。
+**结论**：requirements 全部证据成立；历史核对中的两处事实更正（E6 probe 缺失、E7 leg C 已存在）均已由当前实现复验，全部约束（E8 CHECK、E9 尺寸/依赖/可见性）通过。本设计补充实现级发现：**E9-PsrqlRunner 私有**（`run_relay` 的 base 阶段只能调 `audit_provision::run`，不能自建 runner）、**E10-短路先例**（run_priority 同构）、**§4 FM-10 假阳性窗口**（available_at 计龄代理在「积压 > 24h 后 relay 才启用」场景的瞬时误报，须显式文档化）。
 
 ## §2 API 变更
 
@@ -255,13 +257,13 @@ Some(_) => Outcome::error("usage: audit-provision-check [--priority|--relay]"),
 | `--priority` 面 | 零改动，且**自动继承 Q7** | `run_priority` 先跑 `run()`（E10）——Q7 行 + stuck-lease 支随 base 报告进入 priority 面 |
 | `verdict()` 既有两支 | dead-first → relay-off+undelivered **逐字节保留** | §2.2-5 纯追加支，位于两检查之后；单测 ②③ 钉优先级（R9） |
 | 既有 harness leg B/C/D | 语义与 grep 零改动 | 新腿插在 leg D 后、leg C 前；leg C 的 `WHERE status = 0 LIMIT 1` 不触 E 的 status=1 行；leg E 行保持 status=1 → C 的 `dead=1`/`delivered=0` 断言不受影响（E 行 claimed ≠ dead ≠ delivered） |
-| 37/37 pin / slot 清单 | 零新 slot、b5-pin.sh 零改动 | `b5_check` append（E7）+ pin 只要求 `^B5-CHECK ${entry}: (PASS|SKIP)( \|$)` ≥1 行——leg E/F/F′ 全复用 `audit-provision-check` slot |
+| 48/48 pin / slot 清单 | 零新 slot、b5-pin.sh 零改动 | `b5_check` append（E7）+ pin 只要求 `^B5-CHECK ${entry}: (PASS|SKIP)( \|$)` ≥1 行——leg E/F/F′ 全复用 `audit-provision-check` slot |
 | 依赖图 | 零新依赖 | `MAX_LEASE_SECONDS` clone 字面量 + 锁步测试（§5/§7）；checks.rs / dependency-check.sh 零改动 |
 | 迁移 | 零 SQL 迁移 | 0239 CHECK 已含 claim-state 对约束（E8）；Q7 只读 |
 | 报告行兼容 | 新 `oldest-claimed-age:` 与既有 `oldest-pending-age:` 并存 | 完整前缀 grep 纪律（§8）；测试断言均 `.contains` 子串（:222/:232 等）——新行不含 `oldest-pending-age` 子串（claimed ≠ pending），`report_not_migrated_has_no_age_or_dead_lines`（:227）在 `g0239: None` 时无新行（claimed_age_line 只在 Some(g) 分支调用） |
 | cli_smoke / cli_integration | 零改动 | 二者不引用本命令（E9） |
 | 尺寸 | `audit_provision.rs` 不得新增 WARN（801 即 WARN，`-gt`） | 790 − 56（搬迁）+ ~35（增量）≈ 769 ≤ 800；`relay_runtime.rs` ≤ 250；tests ≤ 800（487 + ~140） |
-| probe 缺席窗口（phase-1） | `--relay` fail-closed（spawn error），harness leg F file-gate SKIP | 与 relay-mock-probe leg 同款 file-gate 先例（E6）；leg E/F′ 无 file-gate，phase-1 即绿 |
+| 历史 probe 缺席窗口（phase-1） | `--relay` fail-closed（spawn error），harness leg F file-gate SKIP | 当前 probe 已落地并走 PASS；file-gate 作为防御性守卫保留；leg E/F′ 无 file-gate，缺 bin 仍 fail-closed |
 
 ## §4 失败模式（FM）
 
@@ -324,7 +326,7 @@ VALUES (gen_random_uuid(), 1, 'message', 10,
 ## §8 协调与硬规则（AGENTS §4）
 
 - **probe bin 边界**：`aero-audit-relay-probe.rs` 归 sibling direction（aero-cli-b5-2-relay-probe-bin-landing）——本设计只消费其钉死契约（9 场景名、`probe: <name>: PASS` 行格式、退出码 0/1/2）；`--relay` 在 probe 缺席时 fail-closed（FM-3），leg F file-gate 显式 SKIP，并行不互阻塞。
-- **零新 slot / 零 b5-pin 改动**：leg E/F/F′ 全复用 `audit-provision-check` slot（b5_check append + pin ≥1 行，E7）；37/37 保持。
+- **零新 slot / 零 b5-pin 改动**：leg E/F/F′ 全复用 `audit-provision-check` slot（b5_check append + pin ≥1 行，E7）；48/48 保持。
 - **零新依赖 / 零迁移**：`MAX_LEASE_SECONDS` clone + 锁步测试；checks.rs / dependency-check.sh / migrations 零改动。
 - **fail-closed 顺序**：dead → relay-off+undelivered → stuck-lease → probe；任一 fail 即短路，probe 绝不先于 DB-fail 状态 spawn（FM-9）。
 - **种子 CHECK 纪律**：status=1 种子必须 claim_token + lease_expires_at 齐设（E8）；`available_at`/`lease_expires_at` 用 `clock_timestamp()` 系（单时钟域）。

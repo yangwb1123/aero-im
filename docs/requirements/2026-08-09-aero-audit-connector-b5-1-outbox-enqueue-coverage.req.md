@@ -4,10 +4,17 @@
 > `migrations/0239`/`0242`/`0245` + `crates/aero-ai/src/governance.rs` +
 > `crates/aero-common/src/model/audit.rs` + `crates/aero-storage/src/audit_governance.rs`).
 > Source analysis: `docs/auto/analyses/crates-aero-audit-connector-src-7edb5949.json` (direction 2).
-> Status: requirements specification, pre-implementation.
+> Status: source implementation complete (R1/R2); live acceptance remains
+> environment-gated.
 > **Read §0 first**: the analysis snapshot predates migrations 0242 and 0245;
 > most of this direction has since landed. The residual delta is small and
 > precisely bounded (§1, §4).
+
+> **Current source status (2026-08-19):** the T-11 drill now seeds the
+> message, aggregate, admin, and room shapes with a bounded total; the exact
+> `message.recalled` trigger and parity lane are present. Static/unit gates pass;
+> the live acceptance commands below still require a fresh migrated PostgreSQL
+> database.
 
 ## 0. Repo-state delta (analysis is stale — read this first)
 
@@ -34,10 +41,10 @@ The storage-side parity suite (`audit_governance.rs`) gained
 
 What the direction still requires, verified against the tree:
 
-- **AC4 is NOT landed**: `aero-audit-t11-drill` seeds N 1:1 rows (column
+- **At the time of this snapshot AC4 was NOT landed**: `aero-audit-t11-drill` seeds N 1:1 rows (column
   defaults ⇒ class `'message'`) + one window + one spill shape — **no
   admin-class row, no room-class row** (§4 R1).
-- **One in-scope token is unmapped**: `message.recalled` (migration 0238
+- **At the time of this snapshot one in-scope token was unmapped**: `message.recalled` (migration 0238
   recall producer `crates/aero-storage/src/message/authorization.rs:368`,
   in-tx via `AuditRepo::append_in_tx`) is a non-moderation `message.*` action
   the analysis never listed; it passes through all three triggers and stays
@@ -218,10 +225,10 @@ precedent), following the 0245 room-lane template verbatim:
 > `aero-cli migrate` → run → `DROP DATABASE`, AGENTS.md §4.1/§4.3; the
 > migration is compile-time embedded, so build before migrate). Supplied
 > acceptance items are preserved; each is restated in executable form against
-> the current tree, with the residual items marked **[OPEN]**.
+> the current tree, with live-environment checks marked **[LIVE VERIFY]**.
 
 **AC1 — Enqueue coverage: room.* and admin.* (and non-moderation message.*) actions produce outbox rows with correct class/priority.**
-Per-class parity coverage is in place: admin — `rust_produced_payload_matches_0239_envelope` half A (real 0239 row, `class='admin'`, priority 100); message 1:1 — same test half B (`class='message'`, priority 10) and, after R2, the `message.recalled` arm; message L1 — `l1_window_aggregates_5_rows_to_1_outbox` (:1249) + `message_lane_outbox_parity` (:1938); room — `room_lane_outbox_parity` (:1750) + `room_lane_unconditional_enqueue` (:2134). The `audit_governance::` harness filter (`test-integration.sh:321-331`) runs the whole module on a migrated throwaway DB and passes (empty-filter guard = no vacuous green). **[OPEN for message.recalled: R2's `recall_lane_outbox_parity`]**
+Per-class parity coverage is in place: admin — `rust_produced_payload_matches_0239_envelope` half A (real 0239 row, `class='admin'`, priority 100); message 1:1 — same test half B (`class='message'`, priority 10) and the `message.recalled` arm; message L1 — `l1_window_aggregates_5_rows_to_1_outbox` + `message_lane_outbox_parity`; room — `room_lane_outbox_parity` + `room_lane_unconditional_enqueue`. **[LIVE VERIFY]** Re-run the `audit_governance::` harness filter on a migrated throwaway DB; the empty-filter guard prevents a vacuous green.
 
 **AC2 — Fail-open preserved: unmapped tokens still pass through.**
 `cargo test -p aero-ai --lib` green: `unknown_local_token_passes_through_unmapped` (after R2, includes `LOCAL_ACTION_MESSAGE_RECALLED` → `None`), `user_delete_token_stays_out_of_admin_lane` (R-D2), `room_lane_maps_to_room_class`. `DATABASE_URL=<migrated throwaway> cargo test -p aero-storage --lib --locked audit_governance:: -- --ignored --test-threads=1` green, including `non_moderation_action_passes_through_unmapped`: `message.deleted` produces exactly zero governance rows and one v1 `snaplink_delivery_outbox` row. No trigger body (0239/0242/0245/0246) ever raises for an unmapped token.
@@ -229,16 +236,16 @@ Per-class parity coverage is in place: admin — `rust_produced_payload_matches_
 **AC3 — Claim ordering: admin (100) precedes room/message backlog (10) regardless of enqueue order.**
 `DATABASE_URL=<migrated throwaway> cargo test -p aero-audit-connector --lib mixed_priority_claim_orders_moderation_first_then_fifo -- --ignored` green (seeded set = {10 admin, later `available_at`} ∪ {40 backlog, earlier `available_at`}; claimed 25 = {10 admin} ∪ {15 earliest backlog}). `DATABASE_URL=<migrated throwaway> cargo run -p aero-audit-connector --bin aero-audit-priority-drill` exits 0 with `moderation-in-first-batch`, `drain-501`, `parity-501` PASS; harness slot `moderation-priority-drill` (`test-integration.sh:462-547`) PASS.
 
-**AC4 — T-11: drill seeds one row per class — relay absent ⇒ all stay status 0, SUM(attempts) grows, no false dead.** **[OPEN: R1]**
-After R1, `DATABASE_URL=<migrated throwaway> cargo run -p aero-audit-connector --bin aero-audit-t11-drill` exits 0 and prints `drill: t11-pending: PASS`, with: seeded total = N + 4 (1:1 + window + spill + admin + room); round r ∈ {1,2}: `COUNT(status=0) == total`, `COUNT(status IN (1,2,3)) == 0`, `SUM(attempts) == total × r`, `COUNT(last_error LIKE '%audit connector HTTP transport failed%') == total`; per-shape evidence for the admin and room keys: `status=0`, `attempts == r`, `class`/`priority` columns equal the seeded values (admin/100, room/10), transport `last_error`. Harness slot `t11-fail-closed` (`test-integration.sh:366-453`) PASS with no harness edits.
+**AC4 — T-11: drill seeds one row per class — relay absent ⇒ all stay status 0, SUM(attempts) grows, no false dead.**
+Current source: `DATABASE_URL=<migrated throwaway> cargo run -p aero-audit-connector --bin aero-audit-t11-drill` seeds total = N + 5 (1:1 + window + spill + admin + room + auth-shaped row), enforces N ≤ 95, and asserts `COUNT(status=0) == total`, no terminal rows, growing attempts, and transport `last_error`. **[LIVE VERIFY]** Run the drill on a fresh migrated database; the harness slot is unchanged.
 
 **AC5 — Reconcile parity: 0241 disabled-window backfill keeps COUNT(outbox) == COUNT(audit) for the mapped subset after a disabled window.**
 `DATABASE_URL=<migrated throwaway> cargo test -p aero-storage --lib --locked governance_reconcile_backfills_disabled_window -- --ignored` green: with enforcement disabled and no binding, a `message.moderated` audit row commits with zero outbox rows; after re-enable, `aero_reconcile_governance_audit` backfills exactly one outbox row (COUNT parity for the mapped subset = `message.moderated`, the only gated token). Unchanged by R1/R2 — 0242/0245/0246 have no runtime gate, so no disabled window and no reconciler extension (0245 header decision).
 
-**AC6 — [R2] `message.recalled` rows land in the message lane.**
+**AC6 — `message.recalled` rows land in the message lane.**
 `DATABASE_URL=<migrated throwaway> cargo test -p aero-storage --lib --locked audit_governance:: -- --ignored --test-threads=1` green, including `recall_lane_outbox_parity`: N in-tx `message.recalled` audit inserts (via `AuditRepo::append_in_tx`, the `authorization.rs:368` producer seam) → exactly N outbox rows with `class='message'`, `priority=10`, 16-key envelope, `action='message.recalled'` verbatim, `source_system='aero-im.source'`, no L1 marker keys; each payload parses into `AuditClaimPayload` Value-equal. `cargo test -p aero-ai --lib` still green with `LOCAL_ACTION_MESSAGE_RECALLED` in the pass-through list (`governance_lane_for` → `None`; `is_admin_class` → false).
 
-**AC7 — [R2] Mapping is exact-token and trigger-owned.**
+**AC7 — Mapping is exact-token and trigger-owned.**
 `rg -n "aero_enqueue_message_recall_audit" migrations/` matches exactly
 `migrations/0246_message_recall_audit_governance.sql` (static single-definition
 arbiter, 0242/0245 precedent); the 0246 body's allowlist is the exact token
@@ -283,9 +290,9 @@ clean · `cargo test --workspace --lib` green · `cargo clippy --workspace
   `validate_delivery_payload` deads them after ≤1 retry — breaking
   `terminal == 0` in T-11 and the parity fixtures.
 - **b5-pin slot list is pinned**: the acceptance mentions the
-  `moderation_finalize_outbox_parity` slot (37/37 at analysis time; the list
-  has since grown). R1/R2 must not add, remove, or rename slots — new tests
-  ride existing module filters.
+  `moderation_finalize_outbox_parity` slot (current 48/48; 37/37 is the
+  historical analysis-time baseline). R1/R2 must not add, remove, or rename
+  slots — new tests ride existing module filters.
 - **Trigger-name ordering**: `audit_events_message_recall_enqueue` sorts
   between `audit_events_l1_aggregate` and `audit_events_room_enqueue`; token
   sets are pairwise disjoint so firing order is inert (0245 header) — do not

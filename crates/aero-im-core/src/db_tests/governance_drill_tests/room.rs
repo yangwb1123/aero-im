@@ -73,7 +73,11 @@ struct RoomFixture {
     audit_id: AuditId,
 }
 
-async fn room_create_fixture(pool: &PgPool, svc: &crate::service::ImService, prefix: &str) -> RoomFixture {
+async fn room_create_fixture(
+    pool: &PgPool,
+    svc: &crate::service::ImService,
+    prefix: &str,
+) -> RoomFixture {
     self_isolate(pool).await;
     // Start-of-test singleton re-assert (module invariant — no Drop guard;
     // a panicked earlier drill may have left the global ON). Enforcement OFF
@@ -87,20 +91,16 @@ async fn room_create_fixture(pool: &PgPool, svc: &crate::service::ImService, pre
         .id;
     // Exactly 1 room.create audit row (a dropped `append_in_tx` yields zero
     // rows — loud red, never vacuous).
-    let (audit_id, actor, target, detail): (
-        Uuid,
-        Option<Uuid>,
-        String,
-        serde_json::Value,
-    ) = sqlx::query_as(
-        "SELECT id, actor_id, target, detail FROM audit_events
+    let (audit_id, actor, target, detail): (Uuid, Option<Uuid>, String, serde_json::Value) =
+        sqlx::query_as(
+            "SELECT id, actor_id, target, detail FROM audit_events
           WHERE workspace_id = $1 AND action = $2",
-    )
-    .bind(ws.to_uuid())
-    .bind(LOCAL_ACTION_ROOM_CREATE)
-    .fetch_one(pool)
-    .await
-    .expect("exactly one room.create audit row");
+        )
+        .bind(ws.to_uuid())
+        .bind(LOCAL_ACTION_ROOM_CREATE)
+        .fetch_one(pool)
+        .await
+        .expect("exactly one room.create audit row");
     assert_eq!(actor, Some(owner.to_uuid()), "audit actor = creator");
     assert_eq!(target, room.to_string(), "audit target = room id");
     assert_eq!(
@@ -146,13 +146,12 @@ async fn assert_room_outbox_shape(
     assert_eq!(status, 0, "status 0 = enqueued (0245 normative)");
     assert_eq!(attempts, 0, "attempts 0");
     assert!(last_error.is_none(), "last_error NULL");
-    let payload: serde_json::Value = sqlx::query_scalar(
-        "SELECT payload FROM audit_governance_outbox WHERE event_id = $1",
-    )
-    .bind(audit_id.to_uuid())
-    .fetch_one(pool)
-    .await
-    .expect("outbox payload");
+    let payload: serde_json::Value =
+        sqlx::query_scalar("SELECT payload FROM audit_governance_outbox WHERE event_id = $1")
+            .bind(audit_id.to_uuid())
+            .fetch_one(pool)
+            .await
+            .expect("outbox payload");
     let obj = payload.as_object().expect("payload is an object");
     for key in ENVELOPE_KEYS {
         assert!(obj.contains_key(key), "missing envelope key {key}");
@@ -198,8 +197,7 @@ async fn assert_room_outbox_shape(
         assert_eq!(payload["actor"]["type"], "system");
     }
     assert_eq!(
-        payload["targets"][0]["id"],
-        target,
+        payload["targets"][0]["id"], target,
         "targets[0].id == target"
     );
     assert_eq!(payload["targets"][0]["type"], "resource");
@@ -248,7 +246,10 @@ async fn drill_room_create_claims_delivers_settles() {
         "Idempotency-Key header = AuditId base32"
     );
     let row = outbox_row(&pool, f.audit_id).await;
-    assert_eq!(row.status, 2, "the stub's 202 + receipt echo settles the row");
+    assert_eq!(
+        row.status, 2,
+        "the stub's 202 + receipt echo settles the row"
+    );
     assert!(row.delivered_at.is_some(), "delivered_at stamped");
     assert_eq!(row.attempts, 1, "exactly one claim (no double-claim)");
     assert!(row.claim_token.is_none(), "fencing token cleared on settle");
@@ -299,20 +300,16 @@ async fn drill_room_archive_claims_delivers_settles() {
         .expect("archive channel commits");
 
     // Exactly 1 room.archived audit row (actor == owner, detail.archived).
-    let (audit_id, actor, target, detail): (
-        Uuid,
-        Option<Uuid>,
-        String,
-        serde_json::Value,
-    ) = sqlx::query_as(
-        "SELECT id, actor_id, target, detail FROM audit_events
+    let (audit_id, actor, target, detail): (Uuid, Option<Uuid>, String, serde_json::Value) =
+        sqlx::query_as(
+            "SELECT id, actor_id, target, detail FROM audit_events
           WHERE workspace_id = $1 AND action = $2",
-    )
-    .bind(f.ws.to_uuid())
-    .bind(LOCAL_ACTION_ROOM_ARCHIVED)
-    .fetch_one(&pool)
-    .await
-    .expect("exactly one room.archived audit row");
+        )
+        .bind(f.ws.to_uuid())
+        .bind(LOCAL_ACTION_ROOM_ARCHIVED)
+        .fetch_one(&pool)
+        .await
+        .expect("exactly one room.archived audit row");
     assert_eq!(actor, Some(f.owner.to_uuid()), "audit actor = the archiver");
     assert_eq!(target, f.room.to_string(), "audit target = room id");
     assert_eq!(
@@ -418,7 +415,11 @@ async fn drill_recall_claims_delivers_settles() {
     .fetch_one(&pool)
     .await
     .expect("exactly one message.recalled audit row");
-    assert_eq!(actor, Some(f.owner.to_uuid()), "actor == the recaller (never system)");
+    assert_eq!(
+        actor,
+        Some(f.owner.to_uuid()),
+        "actor == the recaller (never system)"
+    );
     assert_eq!(target, msg.id.to_string(), "audit target = message id");
     assert_eq!(
         detail.get("room_id").and_then(serde_json::Value::as_str),
@@ -426,7 +427,10 @@ async fn drill_recall_claims_delivers_settles() {
         "detail.room_id == room id"
     );
     let expected_digest: String = msg.searchable_text().chars().take(120).collect();
-    assert!(!expected_digest.is_empty(), "fixture message has searchable text");
+    assert!(
+        !expected_digest.is_empty(),
+        "fixture message has searchable text"
+    );
     let digest = detail
         .get("digest")
         .and_then(serde_json::Value::as_str)
@@ -456,13 +460,12 @@ async fn drill_recall_claims_delivers_settles() {
     assert_eq!(status, 0, "status 0 = enqueued (0246 normative)");
     assert_eq!(attempts, 0, "attempts 0");
     assert!(last_error.is_none(), "last_error NULL");
-    let payload: serde_json::Value = sqlx::query_scalar(
-        "SELECT payload FROM audit_governance_outbox WHERE event_id = $1",
-    )
-    .bind(audit_id.to_uuid())
-    .fetch_one(&pool)
-    .await
-    .expect("recall outbox payload");
+    let payload: serde_json::Value =
+        sqlx::query_scalar("SELECT payload FROM audit_governance_outbox WHERE event_id = $1")
+            .bind(audit_id.to_uuid())
+            .fetch_one(&pool)
+            .await
+            .expect("recall outbox payload");
     let obj = payload.as_object().expect("payload is an object");
     for key in ENVELOPE_KEYS {
         assert!(obj.contains_key(key), "missing envelope key {key}");
@@ -477,7 +480,15 @@ async fn drill_recall_claims_delivers_settles() {
         payload,
         "re-serialized twin equals the stored JSONB (semantic parity)"
     );
-    for absent in ["aggregated", "spill", "count", "window_start", "window_end", "first_event_at", "last_event_at"] {
+    for absent in [
+        "aggregated",
+        "spill",
+        "count",
+        "window_start",
+        "window_end",
+        "first_event_at",
+        "last_event_at",
+    ] {
         assert!(
             !obj.contains_key(absent),
             "1:1 recall payload must not carry L1 marker '{absent}'"
@@ -526,7 +537,10 @@ async fn drill_recall_claims_delivers_settles() {
     .fetch_one(&pool)
     .await
     .expect("aggregated row count");
-    assert_eq!(aggregated, 0, "no 0242 window row for the ws after the recall");
+    assert_eq!(
+        aggregated, 0,
+        "no 0242 window row for the ws after the recall"
+    );
     let window_key = window_row_for(&pool, f.ws, created_at).await;
     assert_ne!(
         audit_id.to_uuid(),

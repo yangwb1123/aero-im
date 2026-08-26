@@ -40,6 +40,7 @@ use std::time::Duration;
 
 use aero_audit_connector::client::AuditClient;
 use aero_audit_connector::config::RelayConfig;
+use aero_audit_connector::fake::StaticScopeProvisioner;
 use aero_audit_connector::outbox::OutboxRepo;
 use aero_audit_connector::pg::PgOutboxRepo;
 use aero_audit_connector::relay::AuditRelay;
@@ -129,9 +130,7 @@ async fn run() -> anyhow::Result<()> {
     // the payload guard runs before any POST).
     let third = rows / 3;
     if third == 0 {
-        anyhow::bail!(
-            "AERO_AUDIT_DRILL_ROWS must be >= 3 for the mixed-shape leg (got {rows})"
-        );
+        anyhow::bail!("AERO_AUDIT_DRILL_ROWS must be >= 3 for the mixed-shape leg (got {rows})");
     }
     let one_one_n = third;
     let window_n = third;
@@ -155,15 +154,17 @@ async fn run() -> anyhow::Result<()> {
 
     for _ in 0..one_one_n {
         let event_id = Uuid::new_v4();
-        seed_conforming(&pool, event_id, json!({ "event_id": event_id.to_string(), "source_system": AUDIT_SOURCE_SYSTEM }))
-            .await?;
+        seed_conforming(
+            &pool,
+            event_id,
+            json!({ "event_id": event_id.to_string(), "source_system": AUDIT_SOURCE_SYSTEM }),
+        )
+        .await?;
         seeded.push(event_id);
     }
     for _ in 0..window_n {
         let key: Uuid = sqlx::query_scalar("SELECT md5($1)::uuid")
-            .bind(format!(
-                "{ws}|{GOVERNANCE_CLASS_MESSAGE}|{window_epoch}"
-            ))
+            .bind(format!("{ws}|{GOVERNANCE_CLASS_MESSAGE}|{window_epoch}"))
             .fetch_one(&pool)
             .await
             .context("window key")?;
@@ -218,7 +219,8 @@ async fn run() -> anyhow::Result<()> {
 
     let repo: Arc<dyn OutboxRepo> = Arc::new(PgOutboxRepo::new(pool.clone()));
     let client = AuditClient::new(config.clone()).context("build audit client")?;
-    let relay = AuditRelay::new(repo, client, config);
+    let relay = AuditRelay::new(repo, client, config)
+        .with_scope_provisioner(Arc::new(StaticScopeProvisioner::new(true)));
     for round in 1..=MAX_ROUNDS {
         let claimed = relay
             .dispatch_batch()
@@ -252,12 +254,11 @@ async fn run() -> anyhow::Result<()> {
     .fetch_one(&pool)
     .await
     .context("count stuck rows")?;
-    let dead: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*)::bigint FROM audit_governance_outbox WHERE status = 3",
-    )
-    .fetch_one(&pool)
-    .await
-    .context("count dead rows")?;
+    let dead: i64 =
+        sqlx::query_scalar("SELECT COUNT(*)::bigint FROM audit_governance_outbox WHERE status = 3")
+            .fetch_one(&pool)
+            .await
+            .context("count dead rows")?;
 
     if delivered != rows {
         anyhow::bail!("delivered {delivered} != seeded conforming {rows} (stuck rows: {stuck})");

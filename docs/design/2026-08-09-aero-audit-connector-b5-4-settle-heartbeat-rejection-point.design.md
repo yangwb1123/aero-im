@@ -5,6 +5,8 @@
 > Design pins（继承）：`docs/design/2026-08-07-aero-auth-b5-4-relay-provisioning-gate.design.md`（心跳语义 = 成功 fenced settle，§2.4 装饰器落家，D1/D2/D3）+ `docs/requirements/2026-08-07-aero-auth-b5-4-relay-provisioning-gate.req.md`（R1–R8、AC1）。
 > Sibling（勿撞）：`docs/requirements/2026-08-08-aero-ai-b5-4-relay-boot-provisioning-gate.req.md`（boot 门，requirements 态未落地）、`docs/design/2026-08-08-aero-audit-connector-b5-4-fail-closed-operational.design.md`（运行期 gauge 采样面，已落地）。
 > Status: **proposed design**（2026-08-09）。全部行号 = 核对时锚点、会漂移——**文件/符号**才是稳定 grep 锚点（AGENTS.md §0）。
+>
+> **Current B5 pin (2026-08-26)**：live `B5_CONTRACT_TEST_LIST` 为 48 个 slot（27 个非 `[PROPOSED]` 可执行 slot + 21 个 `[PROPOSED]` 仓外占位）；“executed”是 manifest 分类，不是本设计声称已经运行的测试数。本文历史 39/39 计划不代表当前 pin。
 
 ## §0 Evidence verification（全部逐条复验，2 处对 req spec 的修正 + 2 处补全）
 
@@ -16,7 +18,7 @@
 | E4 | `extractor.rs` JWT→PAT→bot 链无机器身份；三 seam 全仓零命中 | ✅ **精确**。`AuthUser{participant_id, session_id, exp}` :34-40；链 :116-130（`assert_access_claims_active` → `verify_pat` :127 → `verify_bot_token` :130）。`--glob '!docs/**'` 全仓 `record_heartbeat`/`RelayProvisionGate`/`assert_audit_scope_provisioned`/`audit_relay_provision` = **0 命中** |
 | E5 | `Error::Forbidden` → HTTP 403 | ✅ `aero-common/src/error.rs` :19（variant）/ :70（403）/ :85（reason） |
 | E6 | 迁移 0240 已被占，心跳迁移顺延 0246 | ✅ `ls migrations` 尾：0239/0240（`audit_governance_due_prio_idx.sql`）/0241/0242/0245——**下一个空号 = 0246** |
-| E7 | b5-pin.sh 39/39（18 executed + 21 PROPOSED），`audit-provision-check` 槽在 executed 名单 | ✅ `scripts/b5-pin.sh` :4/:14/:23/:45/:87-91/:133——`assert_b5_contract_pin` 强校验**恰好 39**；`audit-provision-check` :45。本设计**不增槽不删槽** |
+| E7 | current b5-pin.sh 48/48（27 executable + 21 PROPOSED），`audit-provision-check` 槽在 executable 名单 | ✅ `scripts/b5-pin.sh` 的 `assert_b5_contract_pin` 强校验**恰好 48**；本设计**不增槽不删槽**。原 39/39 是历史中间态。 |
 | E8 | RelayConfig 字面量 6 处 | ✅ **补全（9 处文本 / 6 个 helper 站点 / 6 文件）**：`bin/aero-audit-t11-drill.rs:127`、`bin/aero-audit-relay-drill.rs:104`、`bin/aero-audit-priority-drill.rs:175`、`relay.rs:297-298`（test_config）、`tests/state_machine.rs:43-44`、`tests/claim_validation.rs:21-22`——加字段后**编译强制同步全部 9 处**（req spec 记 6 处 = 按文件计，文本出现 9 次） |
 | E9 | harness leg B :257-310、leg D :398-431（healthy 断言无心跳行） | ✅ **精确**。leg B 实际 :255-313：B1 :272-290（空库 → consistent）、B2 :290-308（1 undelivered → fail-closed）、drop :309-310、`b5_check "audit-provision-check"` :311/:313。leg D :398-431：T-11 DB 上 enable relay + INSERT binding → 断言 `verdict: healthy` + 0239 分布 + oldest-pending-age——**无心跳 seed，新臂落地后必红，须同 commit 适配**。leg C（dead 行 → fail-closed）在 leg D 后，不动 |
 | E10 | 已落地 check = psql 变体（aero-eng），harness 经 `cargo run -p aero-cli -- audit-provision-check` 调用 | ✅ `crates/aero-eng/src/commands/audit.rs` :7-23 注册（`DATABASE_URL`/`AERO__DATABASE__URL` → `audit_provision::run` / `--priority` → `run_priority`）；harness 全走此命令。`run()` 内 snapshot 字面量 :641 + `format_report` + `PsqlRunner`（`psql -At -c` 子进程，无参数绑定通道——**新 SQL 只能是固定字面量，无用户输入插值**，Q2/Q3 同款模式） |
@@ -26,7 +28,7 @@
 | E14 | **补全（req spec 未列）**：`AuditSnapshot` 字面量站点 = **8 处** | `src/audit_provision.rs:641`（run()）+ `tests/audit_provision.rs` 7 处（`snapshot()` helper :8 + 直接字面量 :70/:88/:115/:196/:238/:290）——加 `heartbeat_age_secs`/`heartbeat_fresh` 字段后编译强制同步 8 处；`snapshot()` helper 是测试面的单一收口，改 helper 签名 + 6 处直接字面量补字段即可 |
 | E15 | **补全**：boot 接线文件路径 | `crates/aero-server/src/bin/boot/services.rs`（req spec 写 `boot/services.rs`；实际在 `src/bin/boot/` 下）——`AuthService` 装配在 :55-60 区域（`let mut auth = n(deps.participants.clone(), jwt_codec)` + `with_pat_verifier`/`with_bot_verifier`/`with_login_throttle` 链） |
 
-**结论**：req spec 的全部核心主张（假绿、零心跳、零拒绝点、迁移序号冲突、39/39 钉、6 文件 RelayConfig 同步、零新依赖）**全部成立**。本设计对 req spec 做 **2 处修正**（① AC4 矩阵测试落 `tests/audit_provision.rs` 而非 src `#[cfg(test)]`——800 行 WARN；② 其余为补全清单：RelayConfig 9 处文本、AuditSnapshot 8 处字面量、boot 路径），**不改变任何验收语义**。
+**结论**：req spec 的全部核心主张（假绿、零心跳、零拒绝点、迁移序号冲突、当前 48/48 钉、6 文件 RelayConfig 同步、零新依赖）**全部成立**。本设计对 req spec 做 **2 处修正**（① AC4 矩阵测试落 `tests/audit_provision.rs` 而非 src `#[cfg(test)]`——800 行 WARN；② 其余为补全清单：RelayConfig 9 处文本、AuditSnapshot 8 处字面量、boot 路径），**不改变任何验收语义**。
 
 ## §1 API changes（逐 crate，全部 additive，零新依赖）
 
@@ -189,7 +191,7 @@ pub heartbeat_fresh: bool,             // run() 内按 age_secs <= freshness 预
 // audit-provision-check: heartbeat: absent|fresh (age=Ns)|stale (age=Ns)
 ```
 
-### 1.6 `scripts/test-integration.sh`（leg B3 + leg D 适配；39/39 钉不变）
+### 1.6 `scripts/test-integration.sh`（leg B3 + leg D 适配；48/48 钉不变）
 
 leg B 内、`drop_created_database` 前插 **leg B3**（复用 `audit-provision-check` 槽，`b5_check` 仍 PASS）：
 1. **B3a（无心跳行）**：DELETE B2 的 undelivered 行 → `UPDATE snaplink_commercial_runtime SET enabled = TRUE` → INSERT binding（leg D 同款）→ 跑 check → **非零** ∧ grep `verdict: fail-closed` ∧ grep `no audit:event:write grant issued`
@@ -208,7 +210,7 @@ leg B 内、`drop_created_database` 前插 **leg B3**（复用 `audit-provision-
    | 新 check + 旧 DB（表缺） | Q6A 探测 → absent → 仅 relay on 时 fail-closed（方向正确）；relay off 时 consistent 语义不变——leg B1 与任何 pre-0246 库不误伤 |
    | 新 check + 新 DB | 五臂全活 |
 4. **presence-gated 不变量**：`AERO_AUDIT_PROVISION_FRESHNESS_SECS` 属 `AERO_AUDIT_*` 家族——无 `AERO_AUDIT_TOKEN_ENDPOINT` 时设置 = 既有 stray 扫描 boot Err（fail-loud，非静默忽略）。
-5. **no-touch 文件（diff 守卫）**：`migrations/0236_*`–`0245`、`relay.rs`、`outbox.rs`、`fake.rs`、`stub.rs`、`snaplink_commercial/*`、`routes/health.rs`（readyz 永不因 gate 翻转）、`extractor.rs`（无机器身份路径）、`B5_CONTRACT_TEST_LIST` 槽数（39/39 不变）。
+5. **no-touch 文件（diff 守卫）**：`migrations/0236_*`–`0245`、`relay.rs`、`outbox.rs`、`fake.rs`、`stub.rs`、`snaplink_commercial/*`、`routes/health.rs`（readyz 永不因 gate 翻转）、`extractor.rs`（无机器身份路径）、`B5_CONTRACT_TEST_LIST` 槽数（48/48 不变；27 个可执行 slot + 21 个 [PROPOSED]）。
 6. **投递面永不 consult gate**：0236/0239 触发器、relay 状态机、B5-3 排序均不读心跳表——安静期门关只影响配给验收，不阻塞投递（自愈：事件到达并成功 settle 后刷新）。
 7. **时钟域**：心跳写入（`clock_timestamp()`）、新鲜度判定（DB 时钟）、check 年龄（DB 时钟）三处同一 DB 时钟域；无应用时钟插值（`pg.rs` 单时钟域不变量保持）。
 8. **freshness 双字面量镜像**（connector config + aero-eng env 直读，默认 300 / 界 [60,86400]）：aero-eng 零 connector 依赖使镜像成为唯一 seam；两处注释互相引用（"mirror of RelayConfig::from_env" / "mirror of aero-eng check"）；leg B3b 用 2×300=600s seed 隐式钉住默认值。
@@ -236,14 +238,14 @@ leg B 内、`drop_created_database` 前插 **leg B3**（复用 `audit-provision-
 4. **aero-auth**：`relay_gate.rs`（trait + `SharedRelayProvisionGate` + `PgRelayProvisionGate` + `AuthService` 字段/builder/no-op hook + `assert_audit_scope_provisioned`）+ lib.rs re-export + AC3 三态单测。
 5. **aero-server**：`audit_relay_heartbeat.rs`（`PgHeartbeatRecorder`）+ main.rs 包装（`HeartbeatOutboxRepo`）+ `boot/services.rs` gate 注入；确认 health.rs/extractor.rs 零改动。
 6. **aero-eng**：Q6A/Q6B + `AuditSnapshot` 两字段（8 处字面量同步）+ verdict 第 4 臂 + report 行 + freshness env 解析；**AC4 矩阵测试落 `tests/audit_provision.rs`**（既有 28 测试文件扩展，非 src `#[cfg(test)]`——800 行 WARN）。
-7. **harness（同 commit）**：leg B3（B3a/B3b/B3c）+ leg D seed 适配；验 `bash scripts/test-b5-pin-guard.sh` → `bash scripts/test-integration.sh` → 期望 `B5-CHECK audit-provision-check: PASS` + `B5 contract pin: 39/39 ... PASS`。
+7. **harness（同 commit）**：leg B3（B3a/B3b/B3c）+ leg D seed 适配；验 `bash scripts/test-b5-pin-guard.sh` → `bash scripts/test-integration.sh` → 期望 `B5-CHECK audit-provision-check: PASS` + `B5 contract pin: 48/48 ... PASS`。
 8. **门禁**：`cargo check --workspace` · `cargo test --workspace --lib`（PG 门控 `-- --ignored` 需 `DATABASE_URL`+已迁移）· `cargo clippy --workspace --all-targets`（无新警告）· `scripts/{truth-check,file-size-check,web-check}.sh`（0 违规）· no-touch diff 守卫。
 
 ## §5 Testable acceptance mapping（AC1–AC4 → 具体测试）
 
 | Acceptance | 测试面 | 断言 | 位置 |
 |---|---|---|---|
-| **AC1**（T-11 mapping：enabled + 零 dead + relay 实际已死 → fail-closed） | harness leg B3 三子步 + leg D 适配 | B3a/B3b：非零 exit ∧ grep `verdict: fail-closed` ∧ grep `no audit:event:write grant issued`；B3c：exit 0 ∧ grep `verdict: healthy`；leg D：seed 后 healthy 断言原样保持；leg B1/B2 grep 与退出码一字不变；39/39 钉不变 | `scripts/test-integration.sh` |
+| **AC1**（T-11 mapping：enabled + 零 dead + relay 实际已死 → fail-closed） | harness leg B3 三子步 + leg D 适配 | B3a/B3b：非零 exit ∧ grep `verdict: fail-closed` ∧ grep `no audit:event:write grant issued`；B3c：exit 0 ∧ grep `verdict: healthy`；leg D：seed 后 healthy 断言原样保持；leg B1/B2 grep 与退出码一字不变；48/48 钉不变 | `scripts/test-integration.sh` |
 | **AC2.1**（仅 fenced settle 盖心跳） | heartbeat.rs 单测（假 inner repo 可编程 settle + 计数 recorder） | `Ok(true)` → +1 且返回值原样；`Ok(false)`/`Err` → 0；requeue/mark_dead/claim_due/reconcile → 0；recorder 自身 Err → settle 仍 `Ok(true)` | `crates/aero-audit-connector/src/heartbeat.rs` tests |
 | **AC2.2**（403-loop 闭环） | state_machine.rs 新测试（`HeartbeatOutboxRepo` + `FakeOutbox` + `StubSink events_status:403`） | 403 批 → 全 Dead ∧ 计数 0；回 202 + 新行 → Delivered ∧ 计数 1；既有 `forbidden_dead_on_first_attempt` 零改动保持绿 | `crates/aero-audit-connector/tests/state_machine.rs` |
 | **AC3**（单一拒绝点三态） | relay_gate.rs 单测（无 DB，fake gate）+ 仓储 PG `#[ignore]` db_tests | (a) 未注入 → `Err(Forbidden)` ∧ 消息含 `"audit:event:write is not provisioned"` ∧ `status_code()==403`；(b) 恒 false gate → 同；(c) 恒 true → `Ok(())`；extractor.rs 零改动（git diff 守卫）；仓储三态 + UPSERT 幂等 + freshness 边界 | `crates/aero-auth/src/relay_gate.rs` tests + `crates/aero-storage/src/audit_relay_provision.rs` db_tests |

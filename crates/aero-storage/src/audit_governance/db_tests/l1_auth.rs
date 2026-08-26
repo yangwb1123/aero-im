@@ -61,9 +61,8 @@ async fn login_failure_l1_aggregation_n_to_one() {
     let bucket_a = (now_epoch - 150).div_euclid(WINDOW) * WINDOW; // rows at +30s inside
     let bucket_b = (now_epoch - 210).div_euclid(WINDOW) * WINDOW;
     let open_bucket = (now_epoch - 30).div_euclid(WINDOW) * WINDOW;
-    let ts = |bucket: i64| {
-        time::OffsetDateTime::from_unix_timestamp(bucket + 30).expect("bucket ts")
-    };
+    let ts =
+        |bucket: i64| time::OffsetDateTime::from_unix_timestamp(bucket + 30).expect("bucket ts");
     seed_failures(&p, ts(bucket_a), 3).await;
     seed_failures(&p, ts(bucket_b), 2).await;
     seed_failures(&p, ts(open_bucket), 1).await; // open — never aggregated
@@ -73,7 +72,10 @@ async fn login_failure_l1_aggregation_n_to_one() {
         .aggregate_login_failure_buckets(WINDOW)
         .await
         .expect("aggregate closed buckets");
-    assert_eq!(inserted, 2, "exactly one row per CLOSED bucket (3 and 2 → 2 rows)");
+    assert_eq!(
+        inserted, 2,
+        "exactly one row per CLOSED bucket (3 and 2 → 2 rows)"
+    );
 
     let rows: Vec<(String, i32, String, i16, serde_json::Value)> = sqlx::query_as(
         "SELECT event_id::text, status, class, priority, payload
@@ -95,7 +97,10 @@ async fn login_failure_l1_aggregation_n_to_one() {
             "payload->>'aggregated' = 'true' at the ENVELOPE TOP LEVEL (0242-shared parity-exemption key — never inside detail)"
         );
         assert_eq!(payload["action"], OUTBOUND_AUTH_LOGIN_FAILURE);
-        assert_eq!(payload["source_system"], crate::audit_governance::tokens::AUTH_SOURCE_SYSTEM);
+        assert_eq!(
+            payload["source_system"],
+            crate::audit_governance::tokens::AUTH_SOURCE_SYSTEM
+        );
         let window_start: i64 = payload["payload"]["window_start_epoch"]
             .as_i64()
             .expect("window_start_epoch");
@@ -155,7 +160,10 @@ async fn login_failure_l1_aggregation_n_to_one() {
         .fetch_one(&p)
         .await
         .unwrap();
-    assert_eq!(base, 6, "aggregation never deletes login_failures base rows");
+    assert_eq!(
+        base, 6,
+        "aggregation never deletes login_failures base rows"
+    );
 
     // Hygiene: remove the seeded base rows (shared-DB discipline — later
     // runs must not re-aggregate this test's buckets).
@@ -286,10 +294,17 @@ async fn l1_auth_multi_tick_rollover_never_loses_rows() {
     .fetch_all(&p)
     .await
     .expect("read rollover rows");
-    assert_eq!(rows.len(), 2, "exactly one row per closed bucket (2 + 3 → 2 rows)");
+    assert_eq!(
+        rows.len(),
+        2,
+        "exactly one row per closed bucket (2 + 3 → 2 rows)"
+    );
     for (idx, (event_id, count, window_start)) in rows.iter().enumerate() {
         let (expected_start, expected_count) = if idx == 0 { (b1, 2) } else { (b1 + W, 3) };
-        assert_eq!(window_start, &expected_start, "window_start_epoch = bucket floor");
+        assert_eq!(
+            window_start, &expected_start,
+            "window_start_epoch = bucket floor"
+        );
         assert_eq!(count, &expected_count, "count = the closed bucket's N");
         assert_eq!(
             event_id,
@@ -308,15 +323,23 @@ async fn l1_auth_multi_tick_rollover_never_loses_rows() {
             .fetch_one(&p)
             .await
             .unwrap();
-    assert_eq!(audit_rows, 0, "aggregation rows never create audit_events rows (D7)");
+    assert_eq!(
+        audit_rows, 0,
+        "aggregation rows never create audit_events rows (D7)"
+    );
     // Base rows retained (forensic retention) + rerun idempotent.
     let base: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM login_failures")
         .fetch_one(&p)
         .await
         .unwrap();
-    assert_eq!(base, 5, "all 5 seeded rows retained (the timer never deletes)");
     assert_eq!(
-        repo.aggregate_login_failure_buckets(W).await.expect("rerun"),
+        base, 5,
+        "all 5 seeded rows retained (the timer never deletes)"
+    );
+    assert_eq!(
+        repo.aggregate_login_failure_buckets(W)
+            .await
+            .expect("rerun"),
         0,
         "rerun inserts nothing (idempotent)"
     );
@@ -420,10 +443,12 @@ async fn l1_auth_watermark_not_advanced_on_mid_loop_failure() {
     // Drop the forcing trigger; the same repo re-aggregates immediately.
     // The watermark never advanced (it moves only AFTER a successful insert
     // loop), so the rescan covers both buckets again — A dedupes, B lands.
-    sqlx::query(&format!("DROP TRIGGER IF EXISTS {tg_name} ON audit_governance_outbox"))
-        .execute(&p)
-        .await
-        .expect("drop forcing trigger");
+    sqlx::query(&format!(
+        "DROP TRIGGER IF EXISTS {tg_name} ON audit_governance_outbox"
+    ))
+    .execute(&p)
+    .await
+    .expect("drop forcing trigger");
     sqlx::query(&format!("DROP FUNCTION IF EXISTS {fn_name}()"))
         .execute(&p)
         .await
@@ -449,8 +474,11 @@ async fn l1_auth_watermark_not_advanced_on_mid_loop_failure() {
     .expect("read recovery rows");
     assert_eq!(rows.len(), 2, "both buckets recovered exactly once");
     for (idx, (event_id, count, window_start)) in rows.iter().enumerate() {
-        let (expected_start, expected_count) =
-            if idx == 0 { (bucket_a, 2) } else { (bucket_b, 2) };
+        let (expected_start, expected_count) = if idx == 0 {
+            (bucket_a, 2)
+        } else {
+            (bucket_b, 2)
+        };
         assert_eq!(window_start, &expected_start);
         assert_eq!(count, &expected_count, "counts are the closed buckets' N");
         assert_eq!(
@@ -465,10 +493,12 @@ async fn l1_auth_watermark_not_advanced_on_mid_loop_failure() {
         .execute(&p)
         .await
         .expect("cleanup seeded failures");
-    sqlx::query(&format!("DROP TRIGGER IF EXISTS {tg_name} ON audit_governance_outbox"))
-        .execute(&p)
-        .await
-        .expect("cleanup trigger");
+    sqlx::query(&format!(
+        "DROP TRIGGER IF EXISTS {tg_name} ON audit_governance_outbox"
+    ))
+    .execute(&p)
+    .await
+    .expect("cleanup trigger");
     sqlx::query(&format!("DROP FUNCTION IF EXISTS {fn_name}()"))
         .execute(&p)
         .await
@@ -502,9 +532,8 @@ async fn l1_auth_backfilled_row_into_aggregated_bucket_keeps_count_frozen() {
     let bucket_a = (now_epoch - 150).div_euclid(W) * W; // rows at +30s inside
     let bucket_b = (now_epoch - 210).div_euclid(W) * W;
     let open_bucket = (now_epoch - 30).div_euclid(W) * W;
-    let ts = |bucket: i64| {
-        time::OffsetDateTime::from_unix_timestamp(bucket + 30).expect("bucket ts")
-    };
+    let ts =
+        |bucket: i64| time::OffsetDateTime::from_unix_timestamp(bucket + 30).expect("bucket ts");
     seed_failures(&p, ts(bucket_a), 3).await;
     seed_failures(&p, ts(bucket_b), 2).await;
     seed_failures(&p, ts(open_bucket), 1).await; // open — never aggregated
@@ -514,7 +543,10 @@ async fn l1_auth_backfilled_row_into_aggregated_bucket_keeps_count_frozen() {
         .aggregate_login_failure_buckets(W)
         .await
         .expect("aggregate closed buckets");
-    assert_eq!(inserted, 2, "exactly one row per CLOSED bucket (3 and 2 → 2 rows)");
+    assert_eq!(
+        inserted, 2,
+        "exactly one row per CLOSED bucket (3 and 2 → 2 rows)"
+    );
 
     // **Deliberately skewed backfill**: insert ONE more row into bucket A —
     // a bucket whose outbox row ALREADY exists (out-of-band restore/backfill).
@@ -530,7 +562,10 @@ async fn l1_auth_backfilled_row_into_aggregated_bucket_keeps_count_frozen() {
         .aggregate_login_failure_buckets(W)
         .await
         .expect("fresh-repo rescan after backfill");
-    assert_eq!(inserted, 0, "rescan inserts nothing — the backfilled row cannot merge");
+    assert_eq!(
+        inserted, 0,
+        "rescan inserts nothing — the backfilled row cannot merge"
+    );
     let rows: Vec<(String, i64, i64)> = sqlx::query_as(
         "SELECT event_id::text,
                 (payload->'payload'->>'count')::bigint,
@@ -543,8 +578,11 @@ async fn l1_auth_backfilled_row_into_aggregated_bucket_keeps_count_frozen() {
     .expect("read aggregation rows");
     assert_eq!(rows.len(), 2, "still exactly 2 aggregation rows");
     for (event_id, count, window_start) in &rows {
-        let (expected_start, expected_count) =
-            if *window_start == bucket_a { (bucket_a, 3) } else { (bucket_b, 2) };
+        let (expected_start, expected_count) = if *window_start == bucket_a {
+            (bucket_a, 3)
+        } else {
+            (bucket_b, 2)
+        };
         assert_eq!(
             window_start, &expected_start,
             "window_start_epoch = the bucket floor"
@@ -635,11 +673,17 @@ async fn l1_auth_boundary_exact_row_is_counted_once() {
     .fetch_one(&p)
     .await
     .expect("read boundary row");
-    assert_eq!(row.0, l1_key(b2).to_string(), "deterministic v5 key for bucket b2");
+    assert_eq!(
+        row.0,
+        l1_key(b2).to_string(),
+        "deterministic v5 key for bucket b2"
+    );
     assert_eq!(row.1, 1, "count 1 for the boundary-exact row");
     // Rerun idempotent; base row retained.
     assert_eq!(
-        repo.aggregate_login_failure_buckets(W).await.expect("rerun"),
+        repo.aggregate_login_failure_buckets(W)
+            .await
+            .expect("rerun"),
         0,
         "rerun inserts nothing"
     );

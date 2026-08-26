@@ -3,6 +3,10 @@
 //! Kept out of the lib file to stay under the 800-line file-size WARN line.
 
 use aero_eng::audit_provision::*;
+use aero_eng::relay_runtime::{
+    claimed_age_line, parse_claimed_age, validate_probe_output, MAX_LEASE_SECONDS,
+    RELAY_PROBE_SCENARIOS,
+};
 
 fn snapshot(v1: V1OutboxCounts, g0239: Option<G0239Counts>) -> AuditSnapshot {
     AuditSnapshot {
@@ -100,6 +104,7 @@ fn verdict_relay_on_with_backlog_is_healthy() {
             delivered: 0,
             dead: 0,
             oldest_pending_secs: Some(0),
+            oldest_claimed_secs: None,
             dead_rows: Vec::new(),
         }),
         priority_landed: true,
@@ -123,6 +128,7 @@ fn verdict_dead_is_fail_closed_even_with_relay_on() {
             delivered: 0,
             dead: 1,
             oldest_pending_secs: Some(42),
+            oldest_claimed_secs: None,
             dead_rows: vec![(
                 "00000000-0000-0000-0000-000000000001".to_string(),
                 "403 provisioning refusal".to_string(),
@@ -156,6 +162,7 @@ fn verdict_dead_priority_over_relay_disabled() {
             delivered: 0,
             dead: 2,
             oldest_pending_secs: None,
+            oldest_claimed_secs: None,
             dead_rows: Vec::new(),
         }),
     );
@@ -179,6 +186,7 @@ fn verdict_0239_undelivered_counts_with_relay_off() {
             delivered: 0,
             dead: 0,
             oldest_pending_secs: Some(0),
+            oldest_claimed_secs: None,
             dead_rows: Vec::new(),
         }),
     );
@@ -208,6 +216,7 @@ fn report_contains_greppable_lines_with_four_buckets_and_age() {
             delivered: 10,
             dead: 0,
             oldest_pending_secs: Some(0),
+            oldest_claimed_secs: None,
             dead_rows: Vec::new(),
         }),
         priority_landed: true,
@@ -246,6 +255,7 @@ fn report_lists_dead_rows_separately_from_delivered() {
             delivered: 0,
             dead: 1,
             oldest_pending_secs: Some(12),
+            oldest_claimed_secs: None,
             dead_rows: vec![(
                 "11111111-1111-1111-1111-111111111111".to_string(),
                 "403 provisioning refusal (drill)".to_string(),
@@ -261,6 +271,82 @@ fn report_lists_dead_rows_separately_from_delivered() {
             "audit-provision-check: dead: 11111111-1111-1111-1111-111111111111 403 provisioning refusal (drill)"
         ));
     assert!(report.contains("verdict: fail-closed"));
+}
+
+#[test]
+fn q7_claimed_age_parser_and_report_line() {
+    assert_eq!(parse_claimed_age("42"), Ok(Some(42)));
+    assert_eq!(parse_claimed_age(" 42\n"), Ok(Some(42)));
+    assert_eq!(parse_claimed_age(""), Ok(None));
+    assert!(parse_claimed_age("abc").is_err());
+    assert_eq!(
+        claimed_age_line(Some(42)),
+        "audit-provision-check: oldest-claimed-age: 42s"
+    );
+    assert_eq!(
+        claimed_age_line(None),
+        "audit-provision-check: oldest-claimed-age: n/a"
+    );
+}
+
+fn q7_snapshot(age: Option<i64>) -> AuditSnapshot {
+    AuditSnapshot {
+        relay_enabled: true,
+        enabled_bindings: 1,
+        v1: empty_v1(),
+        g0239: Some(G0239Counts {
+            table: Some("audit_governance_outbox"),
+            pending: 0,
+            claimed: 0,
+            delivered: 0,
+            dead: 0,
+            oldest_pending_secs: None,
+            oldest_claimed_secs: age,
+            dead_rows: Vec::new(),
+        }),
+        priority_landed: true,
+        class_landed: true,
+    }
+}
+
+#[test]
+fn q7_stuck_lease_is_fail_closed_with_priority_and_boundary() {
+    let stuck = verdict(&q7_snapshot(Some(90_000)));
+    let Verdict::FailClosed(reason) = stuck else {
+        panic!("expected stuck-lease failure");
+    };
+    assert!(reason.contains("stuck lease"));
+    assert_eq!(MAX_LEASE_SECONDS, 86_400);
+    assert_eq!(
+        verdict(&q7_snapshot(Some(MAX_LEASE_SECONDS))),
+        Verdict::Healthy
+    );
+    assert_eq!(verdict(&q7_snapshot(None)), Verdict::Healthy);
+
+    let mut dead = q7_snapshot(Some(90_000));
+    dead.g0239.as_mut().unwrap().dead = 1;
+    assert!(matches!(verdict(&dead), Verdict::FailClosed(reason) if reason.contains("dead")));
+
+    let mut relay_off = q7_snapshot(Some(90_000));
+    relay_off.relay_enabled = false;
+    relay_off.g0239.as_mut().unwrap().claimed = 1;
+    assert!(
+        matches!(verdict(&relay_off), Verdict::FailClosed(reason) if reason.contains("no audit:event:write grant issued"))
+    );
+}
+
+#[test]
+fn relay_probe_output_requires_all_named_pass_lines() {
+    let output = RELAY_PROBE_SCENARIOS
+        .iter()
+        .map(|name| format!("probe: {name}: PASS"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(validate_probe_output(true, &output).is_ok());
+    assert!(validate_probe_output(false, &output).is_err());
+    assert!(validate_probe_output(true, &output.replace("lease_invariant", "missing")).is_err());
+    assert!(validate_probe_output(true, &format!("{output}\nprobe: extra: FAIL boom")).is_err());
+    assert!(validate_probe_output(true, "").is_err());
 }
 
 // -- parsers --
@@ -302,6 +388,7 @@ fn report_priority_and_class_verdict_lines() {
             delivered: 0,
             dead: 0,
             oldest_pending_secs: None,
+            oldest_claimed_secs: None,
             dead_rows: Vec::new(),
         }),
         priority_landed: true,

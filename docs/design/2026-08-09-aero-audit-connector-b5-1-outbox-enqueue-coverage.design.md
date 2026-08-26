@@ -1,23 +1,28 @@
 # Design — B5-1 outbox enqueue coverage completion (R1 + R2 + R3)
 
 > Source: `docs/requirements/2026-08-09-aero-audit-connector-b5-1-outbox-enqueue-coverage.req.md`.
-> Status: design, pre-implementation. All citations below were re-verified against
-> the tree on 2026-08-09 (§1); every residual delta in the spec was confirmed real.
+> Status: source implementation complete; this design retains the historical
+> residual analysis. Live acceptance remains environment-gated.
+
+> **Current source status (2026-08-19):** the T-11 five-shape seed/bound,
+> exact-token `message.recalled` lane, and associated parity tests are present.
+> The remaining commands below require a fresh migrated PostgreSQL database.
 
 ## 0. Executive summary
 
 The direction's problem statement ("v2 producer only enqueues the moderation
 token", "`governance_lane_for` returns Some only for `message.moderated`") is
 **stale**: migrations 0242 (L1 message lane) and 0245 (room lane) landed, and
-`governance_lane_for` now has three arms. The residual delta is exactly two
-items plus a verify-only third:
+`governance_lane_for` now has three arms. The historical residual delta was
+exactly two items plus a verify-only third; both implementation items are now
+present in the current tree:
 
-- **R1**: `aero-audit-t11-drill` must seed one admin-class and one room-class
+- **R1**: `aero-audit-t11-drill` now seeds one admin-class and one room-class
   row (AC4).
 - **R2**: `message.recalled` (the only in-scope unmapped non-moderation
-  `message.*` token) maps 1:1 onto the existing message lane via a **new**
-  migration **0246** (trigger-only ownership, exact-token allowlist) + leaf
-  const + parity db_test.
+  `message.*` token) now maps 1:1 onto the existing message lane via migration
+  **0246** (trigger-only ownership, exact-token allowlist) + leaf const + parity
+  db_test.
 - **R3**: fail-open, claim ordering, and reconcile parity are already pinned —
   verify only, zero code change.
 
@@ -32,18 +37,16 @@ items plus a verify-only third:
 | E5 | Parity fixture `rust_produced_payload_matches_0239_envelope` :455; `mixed_priority_claim_orders_moderation_first_then_fifo` pg.rs:546 | ✅ Both exact. Claim CTE at pg.rs:109-117 (`ORDER BY candidate.priority DESC, candidate.available_at, candidate.created_at, candidate.event_id FOR UPDATE SKIP LOCKED`, `status IN (0,1)`) — spec's ":78-96" is actually `reconcile`; the DESC-claim substance is confirmed. |
 | E6 | 0241 reconcile + `governance_reconcile_backfills_disabled_window` :981 | ✅ 0241 is token-keyed `message.moderated`-only; test at :981. |
 | E7 | Harness `audit_governance::` slot test-integration.sh:321-331 | ✅ Confirmed (0239-file-gated, `run_migrated_integration`, empty-filter guard = no vacuous green). Sibling slots at :366-453 (t11-fail-closed), :462-547 (moderation-priority-drill), :596-634 (L1 arbiter + drills), :644-665 (room/message-lane parity). `scripts/b5-pin.sh` lists `audit_governance::` :38, `t11-fail-closed` :41, `moderation-priority-drill` :42, `room_lane_outbox_parity` :69, `message_lane_outbox_parity` :70. |
-| E8 | T-11 drill seeds N 1:1 (default class) + window + spill; **no admin/room seed** | ⚠️ **Shape facts confirmed, but the drill is RED in this tree** — R1 fixes it, not merely extends it. `aero-audit-t11-drill.rs`: `total = rows + 2` (:167), 1:1 seed INSERT omits class/priority → defaults `'message'`/10 (:154), evidence loop covers only `[window_key, spill_key]` (:230), exit-2 `to_regclass` probe (:88), TRUNCATE-at-start (:104), closed loopback token endpoint. **Pre-existing bug**: the per-key evidence loop reads `row.2["last_error"]` from the **payload** (:243/:254), but the relay writes `last_error` only to the **column** — pg.rs requeue `last_error = $5` (:202) / mark_dead `last_error = $4` (:231); `deliver(&Claim)` never mutates `claim.payload` (relay.rs `deliver_claim` :179). Live run: `round 1: aggregated row … last_error=Null` → exit 1 → the `t11-fail-closed` harness slot (test-integration.sh:366-453) is red. **Second defect**: `AERO_AUDIT_DRILL_ROWS` (:78) is unbounded env input — `dispatch_batch` claims exactly once per batch with the drill's fixed `batch_size: 100` (:142) and the drill asserts `claimed == total` ⇒ after R1 `total = rows + 4 ≤ 100` ⇒ **`rows ≤ 96`** (rows=97 empirically fails `round 1: claimed 100 rows, expected 101`). |
+| E8 | T-11 drill seeds per-class shapes | ✅ Current source seeds 1:1, window, spill, admin, room, and auth-shaped rows; reads transport failure from the `last_error` column and enforces `AERO_AUDIT_DRILL_ROWS ≤ 95` because the fixed claim batch is 100. |
 | E9 | `aero-audit-priority-drill` | ✅ Exists (500 backlog/10 + 1 admin/100, batch 100, moderation-in-first-batch). |
-| E10 | Migration numbering; `MIGRATION_COUNT` arbiter = 243 | ✅ 0239/0240/0241/0242/0245 landed; 0243/0244 absent (auth-slice designed-only); `ls migrations/*.sql | wc -l` = **243**; arbiter at test-integration.sh:597-605 pins 243; next free = **0246**. |
+| E10 | Migration numbering; `MIGRATION_COUNT` arbiter | ✅ 0239/0240/0241/0242/0245/0246 are present; 0243/0244 remain designed-only; the current migration count and arbiter agree at 244. |
 | F2 | `message.recalled` producer at `authorization.rs:368`; only unmapped in-scope token | ✅ Exact line confirmed: `AuditRepo::append_in_tx(tx, workspace, Some(actor), "message.recalled", Some(&id.to_string()), json!({...}))`, in the same tx as the 0238 recall + `EventOutboxRepo::insert_room_event_in_tx`. Recall db_test (`recall_tests.rs:231-243`) pins the v1 audit row only. Passes 0239/0242/0245 fail-open → v1-only today. |
 | F3/F4/F5 | Per-class seeding absent; trigger-only ownership (0245 header); lane authority split | ✅ All confirmed (0245 header declares trigger-owned set; `message.deleted` R-D2 excluded; `unknown_local_token_passes_through_unmapped` doc pins the no-message-arm rule). |
 | — | Truth-check literal families | ✅ `scripts/truth-check-lib.sh` :157 `L1_TOKEN_LITERALS_CS=('"message.create"' '"message.edit"' '"message.batch"')`, :171 `ROOM_TOKEN_LITERALS_CS=('"room.create"' '"room.archived"')`, :335 enforcement loop. |
 
-**Conclusion: the evidence is accurate; no blocking misclaim — with one
-pre-existing RED the design must fix, not extend.** Two line-number drifts
-(E4 ±1, E6 CTE label) are non-substantive; E8's "all confirmed" is stale on
-the payload-vs-column `last_error` bug (§3.4.3 fixes it) and the undocumented
-`rows ≤ 96` bound (§3.4.2). The design below implements only R1 + R2 and
+**Conclusion of the historical review:** the evidence identified the R1/R2
+gaps. Those source changes are now present; the remaining acceptance rows are
+verification commands only. The design below is retained as provenance and
 preserves R3.
 
 ## 2. API changes
@@ -266,15 +269,15 @@ never deleted while the relay runs.
      a guard-failing row would dead and break `terminal == 0`);
    - **room**: `class = 'room'`, `priority = 10` (`GOVERNANCE_PRIORITY_BACKLOG`),
      same conforming envelope shape.
-2. `let total = rows + 4;` (constant shift; all invariants are already written
-   in terms of `total`). **Clamp `rows ≤ 96`**: `dispatch_batch` calls
+2. `let total = rows + 5;` (constant shift; all invariants are already written
+   in terms of `total`). **Clamp `rows ≤ 95`**: `dispatch_batch` calls
    `claim_due` exactly once per batch with the drill's fixed
    `batch_size: 100` (relay.rs `dispatch_batch` → pg.rs `claim_due`
-   `LIMIT $1`), and the drill asserts `claimed == total` ⇒ `total = rows + 4
-   ≤ 100`. `AERO_AUDIT_DRILL_ROWS` is unbounded env input today; the revised
+   `LIMIT $1`), and the drill asserts `claimed == total` ⇒ `total = rows + 5
+   ≤ 100`. `AERO_AUDIT_DRILL_ROWS` is bounded in the current source; the
    drill must **document the bound in its `//!` header** and **fail loud at
-   startup** (`anyhow::bail!` after the existing `> 0` filter at :78, e.g.
-   "AERO_AUDIT_DRILL_ROWS must be ≤ 96 (total = rows + 4 ≤ claim batch 100)") —
+   startup** (`anyhow::bail!` after the existing `> 0` filter, e.g.
+   "AERO_AUDIT_DRILL_ROWS must be ≤ 95 (total = rows + 5 ≤ claim batch 100)") —
    instead of the confusing mid-run `round 1: claimed 100 rows, expected
    101` (empirically reproduced at rows=97). Default 3 is unaffected; the
    harness slot runs the default.
@@ -381,7 +384,12 @@ never deleted while the relay runs.
 
 > Commands assume a throwaway migrated PG (`DATABASE_URL=<throwaway>`), per
 > AGENTS.md §4.3. Supplied acceptance items preserved; residual items marked
-> **[OPEN]** before implementation.
+> **[LIVE VERIFY]** for a fresh migrated PostgreSQL database; source changes are
+> already present in the current tree.
+
+> The table below is a historical acceptance transcript. Any legacy `[OPEN]`
+> marker means “live database command not rerun in the current environment,”
+> not a missing source implementation.
 
 | AC | Executable check | Status |
 |---|---|---|
@@ -407,7 +415,7 @@ never deleted while the relay runs.
 | `crates/aero-storage/src/message/authorization.rs` | R2: :368 spells token through the const |
 | `crates/aero-storage/src/audit_governance.rs` | R2: `recall_lane_outbox_parity` + `recall_trigger_migrated` probe |
 | `crates/aero-ai/src/governance.rs` | R2: re-export + pass-through test token list; no mapping arm |
-| `crates/aero-audit-connector/src/bin/aero-audit-t11-drill.rs` | R1: admin/room seed rows; `total = rows + 4` with **`rows ≤ 96` startup clamp + docstring bound**; evidence loop gains 2 keys + **class/priority/last_error (column)** columns |
+| `crates/aero-audit-connector/src/bin/aero-audit-t11-drill.rs` | R1: admin/room seed rows; current total = `rows + 5` with **`rows ≤ 95` startup clamp + docstring bound**; evidence loop gains class/priority/last-error column checks |
 | `scripts/truth-check-lib.sh` | R2: literal family gains `'"message.recalled"'` |
 | `scripts/test-integration.sh` | R2: `MIGRATION_COUNT` 243 → 244 (same commit) |
 | `scripts/b5-pin.sh` | **No change** |

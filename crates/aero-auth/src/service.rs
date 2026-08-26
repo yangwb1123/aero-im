@@ -8,20 +8,22 @@
 use std::time::Duration;
 
 use aero_common::{Error, Participant, ParticipantId, Result, SessionId, WorkspaceId};
+use aero_storage::audit_governance::outbox::AuditGovernanceOutboxRepo;
+use aero_storage::audit_governance::tokens::{OUTBOUND_AUTH_REFRESH, OUTBOUND_AUTH_REGISTER};
 use aero_storage::participant::NewHuman;
 use aero_storage::revoked_token::hash_token;
-use aero_storage::audit_governance::outbox::AuditGovernanceOutboxRepo;
-use aero_storage::audit_governance::tokens::{OUTBOUND_AUTH_REGISTER, OUTBOUND_AUTH_REFRESH};
 use aero_storage::{
-    AuditRepo, NewRegistration, NewRegistrationAudit, ParticipantRepo, RegistrationRepo, SessionRepo,
+    AuditRepo, NewRegistration, NewRegistrationAudit, ParticipantRepo, RegistrationRepo,
+    SessionRepo,
 };
 use serde::{Deserialize, Serialize};
 
-use crate::audit_tokens::{AUTH_LOGIN_FAILED, AUTH_LOGIN_LOCKED, AUTH_REGISTER, AUTH_REFRESH};
+use crate::audit_tokens::{AUTH_LOGIN_FAILED, AUTH_LOGIN_LOCKED, AUTH_REFRESH, AUTH_REGISTER};
 use crate::bot::SharedBotVerifier;
 use crate::jwt::{Claims, JwtCodec, TokenKind};
 use crate::password;
 use crate::pat::SharedPatVerifier;
+use crate::relay_scope::SharedRelayScopeProvisioner;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RegisterRequest {
@@ -76,6 +78,9 @@ pub struct AuthService {
     /// auth is disabled and the extractor's behaviour is identical to before — only
     /// JWTs and (when wired) PATs are accepted.
     bot_verifier: Option<SharedBotVerifier>,
+    /// Optional audit-scope provisioning capability. `None` is deliberately
+    /// fail-closed: no relay means no `audit:event:write` grant.
+    relay_scope_provisioner: Option<SharedRelayScopeProvisioner>,
     /// Optional per-account login lockout (ROADMAP5 方向五). `None` (default) =
     /// disabled; when present, [`Self::login`] rejects locked accounts and records
     /// each auth failure / success. Shared (`Arc`) so the in-process failure state
@@ -95,6 +100,7 @@ impl AuthService {
             jwt,
             pat_verifier: None,
             bot_verifier: None,
+            relay_scope_provisioner: None,
             login_throttle: None,
         }
     }
@@ -158,6 +164,46 @@ impl AuthService {
         self.bot_verifier = Some(verifier);
         self
     }
+
+    /// Enable the audit-scope capability after the boot layer has installed a
+    /// live provisioning predicate.  The predicate is intentionally separate
+    /// from participant JWT claims and from PAT/bot identity verification.
+    #[must_use]
+    pub fn with_relay_scope_provisioner(
+        mut self,
+        provisioner: SharedRelayScopeProvisioner,
+    ) -> Self {
+        self.relay_scope_provisioner = Some(provisioner);
+        self
+    }
+
+    /// Assert that the service is allowed to advertise or accept the
+    /// `audit:event:write` capability.
+    ///
+    /// This is a single fail-closed rejection point for future machine-token
+    /// and internal audit endpoints.  It returns `403 Forbidden`, not `401`:
+    /// the caller may be authenticated while the capability is unavailable.
+    pub async fn assert_audit_scope_provisioned(&self) -> Result<()> {
+        let Some(provisioner) = &self.relay_scope_provisioner else {
+            return Err(Error::Forbidden(
+                "audit:event:write is not provisioned: relay-scope provisioner is not installed (T-11)"
+                    .into(),
+            ));
+        };
+        if provisioner.audit_event_write_provisioned().await {
+            Ok(())
+        } else {
+            Err(Error::Forbidden(
+                "audit:event:write is not provisioned: relay provisioning predicate not satisfied (T-11)"
+                    .into(),
+            ))
+        }
+    }
+
+    /// Lifecycle hook for boot/task owners.  Provisioning is read at the
+    /// claim/accept boundary, so this hook is intentionally a no-op and does
+    /// not maintain an in-process cache.
+    pub async fn refresh_relay_provision(&self) {}
 
     /// Convenience constructor that builds the JWT codec inline from PEM strings.
     pub fn from_pem(
@@ -677,10 +723,21 @@ fn map_create_error(err: sqlx::Error) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use rand::rngs::OsRng;
     use rsa::pkcs1::EncodeRsaPublicKey;
     use rsa::pkcs8::EncodePrivateKey;
     use rsa::RsaPrivateKey;
+    use std::sync::Arc;
+
+    struct StaticScopeProvisioner(bool);
+
+    #[async_trait]
+    impl crate::relay_scope::RelayScopeProvisioner for StaticScopeProvisioner {
+        async fn audit_event_write_provisioned(&self) -> bool {
+            self.0
+        }
+    }
 
     fn token_service() -> AuthService {
         let mut rng = OsRng;
@@ -703,6 +760,54 @@ mod tests {
             .connect_lazy("postgres://aero:aero_dev_pw@localhost:5432/aero")
             .unwrap();
         AuthService::new(ParticipantRepo::new(pool), jwt)
+    }
+
+    #[tokio::test]
+    async fn audit_scope_provisioning_is_fail_closed_and_composable() {
+        let bare = token_service();
+        let error = bare
+            .assert_audit_scope_provisioned()
+            .await
+            .expect_err("missing provisioner must reject the capability");
+        assert!(matches!(error, Error::Forbidden(message) if message.contains("not provisioned")));
+
+        let allowed =
+            token_service().with_relay_scope_provisioner(Arc::new(StaticScopeProvisioner(true)));
+        assert!(allowed.assert_audit_scope_provisioned().await.is_ok());
+
+        let denied =
+            token_service().with_relay_scope_provisioner(Arc::new(StaticScopeProvisioner(false)));
+        let error = denied
+            .assert_audit_scope_provisioned()
+            .await
+            .expect_err("false predicate must reject the capability");
+        assert!(matches!(error, Error::Forbidden(message) if message.contains("predicate")));
+
+        // The capability option composes with the existing PAT/bot options;
+        // installing it does not alter their independent lookup gates.
+        let composed = token_service()
+            .with_pat_verifier(Arc::new(StubPatVerifier))
+            .with_bot_verifier(Arc::new(StubBotVerifier))
+            .with_relay_scope_provisioner(Arc::new(StaticScopeProvisioner(true)));
+        assert!(composed.assert_audit_scope_provisioned().await.is_ok());
+    }
+
+    struct StubPatVerifier;
+
+    #[async_trait]
+    impl crate::pat::PatVerifier for StubPatVerifier {
+        async fn verify(&self, _token_hash: &str) -> Option<ParticipantId> {
+            None
+        }
+    }
+
+    struct StubBotVerifier;
+
+    #[async_trait]
+    impl crate::bot::BotTokenVerifier for StubBotVerifier {
+        async fn verify(&self, _token: &str) -> Option<ParticipantId> {
+            None
+        }
     }
 
     #[test]

@@ -53,6 +53,7 @@ pub mod reaction;
 pub mod receipt;
 pub mod region_blob_store;
 pub mod registration;
+pub mod relay_scope;
 pub mod room;
 pub mod s3_blob_store;
 pub mod saved_search;
@@ -179,6 +180,7 @@ pub use identity_migration::{
     IDENTITY_MIGRATED_AUDIT_ACTION, IDENTITY_MIGRATED_REASON,
 };
 pub use region_blob_store::{PersistedRegionBlobStore, RegionRouter, DEFAULT_STORAGE_REGION};
+pub use relay_scope::RelayScopeRepo;
 pub use s3_blob_store::{blob_store_from_env, blob_store_from_env_checked, S3BlobStore, S3Config};
 // `generate_token`/`hash_token` are NOT re-exported at the crate root (the webhook
 // module exports same-named helpers); invitation consumers use the

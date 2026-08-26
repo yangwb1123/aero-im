@@ -2,7 +2,6 @@
 
 use super::*;
 
-
 /// room.create yields 1 audit row + 1:1 class 'room' outbox row (0245 pin):
 /// `event_id` == `audit_events.id`, `idempotency_key` == `event_id`, no L1
 /// aggregated/spill/count/window keys. Detail carries `room_id` + kind (the

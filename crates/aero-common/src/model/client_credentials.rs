@@ -315,22 +315,31 @@ mod tests {
             &json!({"scope": ["audit:event:write", "metering:read"]}),
             &cfg()
         ));
-        assert!(check_scope(
-            &json!({"scopes": ["aero.notify.publish", "audit:event:write"]}),
-            &cfg()
-        ), "the scopes array claim is a sanctioned granting shape (B5-4 P1)");
-        assert!(check_scope(
-            &json!({"scope": "metering:read", "scopes": ["audit:event:write"]}),
-            &cfg()
-        ), "the union face accepts either shape granting the scope");
+        assert!(
+            check_scope(
+                &json!({"scopes": ["aero.notify.publish", "audit:event:write"]}),
+                &cfg()
+            ),
+            "the scopes array claim is a sanctioned granting shape (B5-4 P1)"
+        );
+        assert!(
+            check_scope(
+                &json!({"scope": "metering:read", "scopes": ["audit:event:write"]}),
+                &cfg()
+            ),
+            "the union face accepts either shape granting the scope"
+        );
         assert!(!check_scope(
             &json!({"scope": "billing:entitlement:read"}),
             &cfg()
         ));
-        assert!(!check_scope(
-            &json!({"scope": "metering:read", "scopes": ["billing:entitlement:read"]}),
-            &cfg()
-        ), "no recognized shape grants → scope missing (ScopeRejected classification)");
+        assert!(
+            !check_scope(
+                &json!({"scope": "metering:read", "scopes": ["billing:entitlement:read"]}),
+                &cfg()
+            ),
+            "no recognized shape grants → scope missing (ScopeRejected classification)"
+        );
         assert!(!check_scope(&json!({}), &cfg()));
         assert!(!check_scope(&json!({"scope": 42}), &cfg()));
     }

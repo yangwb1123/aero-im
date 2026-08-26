@@ -58,6 +58,7 @@ use std::time::Duration;
 
 use aero_audit_connector::client::AuditClient;
 use aero_audit_connector::config::RelayConfig;
+use aero_audit_connector::fake::StaticScopeProvisioner;
 use aero_audit_connector::outbox::OutboxRepo;
 use aero_audit_connector::pg::PgOutboxRepo;
 use aero_audit_connector::relay::AuditRelay;
@@ -316,7 +317,8 @@ async fn run() -> anyhow::Result<()> {
 
     let repo: Arc<dyn OutboxRepo> = Arc::new(PgOutboxRepo::new(pool.clone()));
     let client = AuditClient::new(config.clone()).context("build audit client")?;
-    let relay = AuditRelay::new(repo, client, config);
+    let relay = AuditRelay::new(repo, client, config)
+        .with_scope_provisioner(Arc::new(StaticScopeProvisioner::new(true)));
 
     // Round 1: batch_size 100 < 501 rows, so the first claimed set cannot
     // contain everything — its composition must come from priority, not FIFO.
@@ -464,7 +466,9 @@ async fn phase2_starvation(pool: &PgPool, relay: &AuditRelay) -> anyhow::Result<
         .context("count outbox rows in the phase-2 gate")?;
     if !truncate_gate_allows(
         n,
-        std::env::var("AERO_PRIORITY_DRILL_ALLOW_TRUNCATE").ok().as_deref(),
+        std::env::var("AERO_PRIORITY_DRILL_ALLOW_TRUNCATE")
+            .ok()
+            .as_deref(),
     ) {
         tx.rollback().await?;
         eprintln!(
@@ -610,12 +614,11 @@ async fn phase2_starvation(pool: &PgPool, relay: &AuditRelay) -> anyhow::Result<
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
 
-    let delivered: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*)::bigint FROM audit_governance_outbox WHERE status = 2",
-    )
-    .fetch_one(pool)
-    .await
-    .context("count delivered starvation rows")?;
+    let delivered: i64 =
+        sqlx::query_scalar("SELECT COUNT(*)::bigint FROM audit_governance_outbox WHERE status = 2")
+            .fetch_one(pool)
+            .await
+            .context("count delivered starvation rows")?;
     if delivered != STARVATION_ADMIN_ROWS + STARVATION_BACKLOG_ROWS {
         anyhow::bail!(
             "starvation drain delivered {delivered}, expected {}",

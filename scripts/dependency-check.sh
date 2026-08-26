@@ -35,9 +35,13 @@ check_deps() {
 
     # Parse dependency keys only. Grepping the entire TOML also sees vendor
     # paths such as `vendor/aero-str0m-msrv`, which are not workspace crates.
-    DEPS=$(sed -nE \
+    DEPS=$(awk '
+        /^[[:space:]]*\[(dependencies|build-dependencies)\][[:space:]]*$/ { in_deps=1; next }
+        /^[[:space:]]*\[/ { in_deps=0 }
+        in_deps { print }
+    ' "$path" | sed -nE \
         's/^[[:space:]]*(aero-[a-z0-9-]+)[[:space:]]*(\.|=).*$/\1/p' \
-        "$path" | grep -vE "^($exclude)$" | sort -u || true)
+        | grep -vE "^($exclude)$" | sort -u || true)
     if [ -n "$DEPS" ]; then
         echo "    ❌ $crate 依赖了: $(echo "$DEPS" | tr '\n' ' ')"
         return 1
@@ -61,7 +65,7 @@ check_deps "aero-im-core" "aero-common,aero-bus,aero-storage,aero-auth,aero-sign
 check_deps "aero-im-call" "aero-common,aero-storage,aero-signaling,aero-live-webrtc" || violations=$((violations + 1))
 check_deps "aero-ai" "aero-common,aero-storage,aero-bus" || violations=$((violations + 1))
 check_deps "aero-cli" "aero-eng" || violations=$((violations + 1))
-check_deps "aero-audit-connector" "aero-common,aero-auth" || violations=$((violations + 1))
+check_deps "aero-audit-connector" "aero-common,aero-auth,aero-storage" || violations=$((violations + 1))
 
 # 检查是否有 crate 依赖了 aero-server（禁止反向依赖）
 echo "  检查反向依赖（任何 crate → aero-server）?"
@@ -69,7 +73,11 @@ FOUND_ILLEGAL=false
 for crate in crates/*/; do
     name=$(basename "$crate")
     [ "$name" = "aero-server" ] && continue
-    if grep -q 'aero-server' "$crate/Cargo.toml" 2>/dev/null; then
+    if awk '
+        /^[[:space:]]*\[(dependencies|build-dependencies)\][[:space:]]*$/ { in_deps=1; next }
+        /^[[:space:]]*\[/ { in_deps=0 }
+        in_deps { print }
+    ' "$crate/Cargo.toml" | sed -nE 's/^[[:space:]]*(aero-[a-z0-9-]+)[[:space:]]*(\.|=).*$/\1/p' | grep -qx 'aero-server'; then
         echo "    ❌ $name 依赖了 aero-server"
         violations=$((violations + 1))
         FOUND_ILLEGAL=true

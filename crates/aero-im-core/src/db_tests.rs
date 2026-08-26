@@ -16,10 +16,10 @@ use aero_common::{
     Block, CallKind, CallMode, MessageId, ParticipantId, RoomId, RoomKind, WorkspaceRole,
 };
 use aero_storage::{
-    db::PgPool, AiJobRepo, BlockRepo, CallRepo, DmRepo, GroupDmRepo, MessageRepo,
+    db::PgPool, AiJobRepo, BlockRepo, CallRepo, DmRepo, GroupDmRepo, KeywordAlertRepo, MessageRepo,
     NotificationBundleRepo, NotificationPrefsRepo, NotificationRepo, ParticipantRepo, ReactionRepo,
     ReceiptRepo, RoomRepo, ThreadMuteRepo, ThreadNotificationPrefsRepo, ThreadSubscriptionRepo,
-    WorkspaceMuteRepo, WorkspaceRepo,
+    UserGroupRepo, WorkspaceMuteRepo, WorkspaceRepo,
 };
 
 use crate::service::ImService;
@@ -80,6 +80,15 @@ fn service(pool: PgPool) -> ImService {
 /// the runbook additionally runs the suite with `--test-threads=1`.
 static BATCH_SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Recover the serialization guard after a test assertion panics while it is
+/// held. A poisoned process-global mutex must not turn one failed acceptance
+/// case into a cascade of unrelated `PoisonError` failures.
+pub(super) fn batch_serial() -> std::sync::MutexGuard<'static, ()> {
+    BATCH_SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Fresh participants + a group room whose creator is `members[0]` and who adds
 /// every other member. Returns (members, room).
 async fn group_room(
@@ -127,6 +136,8 @@ fn notification_service(pool: PgPool, bundles: bool) -> (ImService, Arc<MockBus>
     .with_notification_prefs(NotificationPrefsRepo::new(pool.clone()))
     .with_block_repo(BlockRepo::new(pool.clone()))
     .with_workspace_mutes(WorkspaceMuteRepo::new(pool.clone()))
+    .with_user_groups(UserGroupRepo::new(pool.clone()))
+    .with_keyword_alerts(KeywordAlertRepo::new(pool.clone()))
     .with_thread_subs(ThreadSubscriptionRepo::new(pool.clone()))
     .with_thread_mutes(ThreadMuteRepo::new(pool.clone()))
     .with_thread_notification_prefs(ThreadNotificationPrefsRepo::new(pool.clone()));
@@ -300,6 +311,105 @@ async fn pending_notify_outbox(
     .fetch_optional(pool)
     .await
     .unwrap()
+}
+
+/// Re-arm one claimed Notify row for a deterministic retry attempt. The relay's
+/// failure path clears `claimed_at`; only `available_at` needs moving back into
+/// the due window for the next claim.
+async fn backdate_outbox_row(pool: &PgPool, id: uuid::Uuid) {
+    sqlx::query(
+        "UPDATE event_outbox
+            SET available_at = now() - interval '1 minute'
+          WHERE id = $1",
+    )
+    .bind(id)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// Make a notification bundle eligible for the periodic flush without changing
+/// the process-global deadline environment variable.
+async fn backdate_bundle(pool: &PgPool, message_id: MessageId) {
+    sqlx::query(
+        "UPDATE notification_bundles
+            SET created_at = now() - interval '1 minute'
+          WHERE message_id = $1",
+    )
+    .bind(message_id.to_uuid())
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// Claim/retry state for one event-outbox row. `claimed_at` is asserted by the
+/// failure tests with a separate query because this compact helper mirrors the
+/// durable state fields used by the acceptance contract.
+async fn outbox_row_state(
+    pool: &PgPool,
+    id: uuid::Uuid,
+) -> (
+    i32,
+    Option<String>,
+    Option<time::OffsetDateTime>,
+    Option<time::OffsetDateTime>,
+) {
+    sqlx::query_as::<
+        _,
+        (
+            i32,
+            Option<String>,
+            Option<time::OffsetDateTime>,
+            Option<time::OffsetDateTime>,
+        ),
+    >(
+        "SELECT attempts, last_error, available_at, published_at
+           FROM event_outbox
+          WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// IDs of the pending bundle rows that a flush will consume. Read before
+/// flushing; the rows are deleted atomically with the materialized notification.
+async fn bundle_delivery_ids(pool: &PgPool, message_id: MessageId) -> Vec<uuid::Uuid> {
+    sqlx::query_scalar(
+        "SELECT id FROM notification_bundles
+          WHERE message_id = $1
+          ORDER BY id",
+    )
+    .bind(message_id.to_uuid())
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
+/// Reproduce `NotificationBundleRepo::bundle_delivery_id` in the integration
+/// test. Keeping the frozen `UUIDv5` namespace here makes a namespace drift fail
+/// loudly instead of silently changing the durable outbox id.
+fn expected_bundle_delivery_id(
+    participant: ParticipantId,
+    room: RoomId,
+    thread_root: Option<MessageId>,
+    bundle_ids: &[uuid::Uuid],
+) -> uuid::Uuid {
+    let namespace = uuid::Uuid::parse_str("37301db9-9690-4ad7-8324-12d5cdd730a0").unwrap();
+    let mut ids = bundle_ids.to_vec();
+    ids.sort_unstable();
+    let mut name = format!(
+        "{}:{}:{}:",
+        participant.to_uuid(),
+        room.to_uuid(),
+        thread_root.map_or_else(uuid::Uuid::default, |root| root.to_uuid())
+    );
+    for id in ids {
+        name.push_str(&id.to_string());
+        name.push(':');
+    }
+    uuid::Uuid::new_v5(&namespace, name.as_bytes())
 }
 
 /// (`completed_at`, `attempts`, `last_error`) for one side-effect job row.

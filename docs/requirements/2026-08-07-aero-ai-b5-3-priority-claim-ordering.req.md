@@ -3,7 +3,19 @@
 > Module: `crates/aero-ai` (fixture authority: `governance.rs`) with the physical
 > change in `crates/aero-audit-connector` (`pg.rs` claim query).
 > Source analysis: `docs/auto/analyses/crates-aero-ai-f8cd3622.json` (direction 2).
-> Status: requirements specification, pre-implementation.
+> Status: source implementation complete; live Postgres/drill acceptance remains
+> environment-gated.
+
+> Current-source note (2026-08-19): `PgOutboxRepo::claim_due` orders by
+> `priority DESC` with the FIFO tie-break and applies the landed D-CAP floor;
+> migration `0240_audit_governance_due_prio_idx.sql` matches that order. The
+> mixed-priority PG test and priority drill are present; only a throwaway
+> Postgres run is unavailable in this workspace.
+>
+> **Current B5 pin (2026-08-26):** `scripts/b5-pin.sh` pins 48 slots:
+> 27 non-`[PROPOSED]` executable slots and 21 `[PROPOSED]` out-of-repo
+> placeholders. “Executed” here is the manifest classification, not a claim
+> that all 27 slots ran in this review.
 
 ## 0. Amendment — 2026-08-08 (deployment/rollout review)
 
@@ -69,7 +81,7 @@ is the honest signal for this change.
 | E5 | governance.rs:95-108 — `moderation_lane_preempts_backlog_under_desc_claim` | ✅ Confirmed. Asserts `lane.priority > GOVERNANCE_PRIORITY_BACKLOG` and pins DESC semantics. |
 | E6 | governance.rs:201-218 — `admin_class_rows_never_aggregated` | ✅ Confirmed. `is_admin_class("message.moderated") == true`; message/room classes are the aggregatable population. |
 | E7 | 0239 DDL (analysis listed its absence as a gap) | ✅ **Landed since the analysis**: `migrations/0239_audit_governance_outbox.sql` exists with `priority SMALLINT NOT NULL DEFAULT 10` (≡ `GOVERNANCE_PRIORITY_BACKLOG`), `class TEXT NOT NULL DEFAULT 'message'`, trigger stamping `class='admin'`, `priority=100` for `message.moderated`. Line 44: "B5-3 extends ORDER BY with priority; the index change is B5-3's, not this slice's." |
-| E8 | Drill integration slot | ✅ Confirmed: `scripts/test-integration.sh:450-462` runs the drill (gated only on the 0239 file existing — it does), and `scripts/b5-pin.sh` lists `moderation-priority-drill` as one of the 37 contract slots (15 executed + 22 [PROPOSED]). The slot currently FAILs red until this change lands. |
+| E8 | Drill integration slot | ✅ Confirmed: `scripts/test-integration.sh:450-462` runs the drill (gated only on the 0239 file existing — it does), and `scripts/b5-pin.sh` lists `moderation-priority-drill` as one of the 48 contract slots (27 executable + 21 [PROPOSED]). The current slot is executable; its live verdict remains environment-gated. |
 | E9 | `pg.rs` test fixture minimal table | ⚠️ **Additional finding (must be handled)**: `ensure_outbox_table` (pg.rs:242-263) creates a minimal table **without** `priority`/`class` columns. After R1, the existing `#[ignore]` PG test `concurrent_double_claim_across_two_sessions_is_impossible` would hit `column "candidate.priority" does not exist` on non-0239 databases. The fixture must gain the `priority` column. |
 | E10 | `outbox.rs` trait doc ordering contract | ⚠️ **Additional finding**: `OutboxRepo::claim_due` doc (outbox.rs:29-31) pins ordering "`(available_at, created_at, event_id)`" — stale once R1 lands; must be updated for the PG impl (priority DESC, then FIFO). |
 
@@ -176,10 +188,9 @@ same-priority rows return in `(available_at, created_at, event_id)` order.
 tests, FakeOutbox), `tests/claim_validation.rs` (11 tests), `src/relay.rs`
 (6 unit tests), `src/config.rs` (2 unit tests), plus the ignored PG test
 under `DATABASE_URL` (its fixture gained the column via R2; its seeds are
-unchanged and still claim 25/25 disjoint with `attempts == 1`). The 37-slot
-B5 pin guard (`scripts/b5-pin.sh`, `scripts/test-b5-pin-guard.sh`) still
-passes — `moderation-priority-drill` moves from FAIL to PASS; no slot is
-removed or renamed. The ordering change is additive: filters, fencing,
+unchanged and still claim 25/25 disjoint with `attempts == 1`). The 48-slot B5 pin guard (`scripts/b5-pin.sh`, `scripts/test-b5-pin-guard.sh`)
+still passes — `moderation-priority-drill` remains pinned; no slot is removed
+or renamed. The ordering change is additive: filters, fencing,
 backoff, dead semantics, and the fake-based suites are untouched.
 
 **AC4 — Lane direction invariant holds.**

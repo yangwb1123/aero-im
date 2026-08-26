@@ -438,54 +438,7 @@ c!(Smoke_, "smoke", "List/run smoke tests", |ctx, args| {
     }
 });
 c!(Gate_, "gate", "Run gates (shell + native)", |ctx, args| {
-    async fn bash(p: String, t: u64) -> Outcome {
-        aero_eng::run::run_cmd("bash", &[&p], std::time::Duration::from_secs(t)).await
-    }
-    let sub = args.get(2).map_or("list", std::string::String::as_str);
-    let sd = ctx.root.join("scripts");
-    let file = |n: &str| -> String { sd.join(n).to_string_lossy().to_string() };
-    match sub {
-        "list" => Outcome::ok("filesize truth web deps complexity filesize-native deps-native workspace-members todos metadata readme all"),
-        "filesize" => bash(file("file-size-check.sh"),60).await, "truth" => bash(file("truth-check.sh"),60).await,
-        "web" => bash(file("web-check.sh"),60).await, "deps" => bash(file("dependency-check.sh"),60).await,
-        "complexity" => bash(file("complexity-check.sh"),60).await,
-        "all" => {
-            let (filesize, truth, web, deps, complexity) = tokio::join!(
-                bash(file("file-size-check.sh"), 120),
-                bash(file("truth-check.sh"), 120),
-                bash(file("web-check.sh"), 120),
-                bash(file("dependency-check.sh"), 120),
-                bash(file("complexity-check.sh"), 120),
-            );
-            let native_filesize =
-                aero_eng::checks::check_filesize(&ctx.root, &ctx.eng_config);
-            let native_deps = aero_eng::checks::check_deps(&ctx.root);
-            let workspace = aero_eng::checks::check_workspace_members(&ctx.root);
-            let todos = aero_eng::checks::check_todos(&ctx.root);
-            let metadata = aero_eng::checks::check_crate_metadata(&ctx.root);
-            let readme = aero_eng::checks::check_readme(&ctx.root);
-            Outcome::merge(&[
-                filesize,
-                truth,
-                web,
-                deps,
-                complexity,
-                native_filesize,
-                native_deps,
-                workspace,
-                todos,
-                metadata,
-                readme,
-            ])
-        }
-        "filesize-native" => { let o = aero_eng::checks::check_filesize(&ctx.root, &ctx.eng_config); if let Some(d) = o.detail() { println!("{}", serde_json::to_string_pretty(&d).unwrap_or_default()); } o }
-        "deps-native" => { let o = aero_eng::checks::check_deps(&ctx.root); if let Some(d) = o.detail() { println!("{}", serde_json::to_string_pretty(&d).unwrap_or_default()); } o }
-        "workspace-members" => { let o = aero_eng::checks::check_workspace_members(&ctx.root); if let Some(d) = o.detail() { println!("{}", serde_json::to_string_pretty(&d).unwrap_or_default()); } o }
-        "todos" => { let o = aero_eng::checks::check_todos(&ctx.root); if let Some(d) = o.detail() { println!("{}", serde_json::to_string_pretty(&d).unwrap_or_default()); } o }
-        "metadata" => { let o = aero_eng::checks::check_crate_metadata(&ctx.root); println!("{}", o.message()); o }
-        "readme" => { let o = aero_eng::checks::check_readme(&ctx.root); println!("{}", o.message()); o }
-        _ => Outcome::error("unknown")
-    }
+    aero_eng::run_gate(ctx, args).await
 });
 c!(Skill_, "skill", "List/view/run skills", |ctx, args| {
     let sub = args.get(2).map_or("list", std::string::String::as_str);

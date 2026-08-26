@@ -9,7 +9,7 @@ use std::{
 use aero_storage::{AiJobRepo, MessageRepo, RoomRepo};
 
 use super::*;
-use crate::embed::{Embedder, HashEmbedder, EMBED_DIM};
+use crate::embed::{Embedder, HashEmbedder, VoyageEmbedder, EMBED_DIM};
 use crate::transcribe::{StubTranscriber, Transcriber};
 use crate::usage::{
     UsageEvent, UsagePersistOutcome, UsageReservation, UsageReserveOutcome, UsageSink,
@@ -300,6 +300,58 @@ async fn anthropic_stub(
     (Arc::new(client), task)
 }
 
+async fn voyage_retry_stub(
+    statuses: Vec<u16>,
+) -> (String, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed = calls.clone();
+    let task = tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4_096];
+            loop {
+                let Ok(read) = socket.read(&mut buffer).await else {
+                    break;
+                };
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let call = observed.fetch_add(1, Ordering::Relaxed);
+            let status = statuses.get(call).copied().unwrap_or(500);
+            let (status_text, body) = if status == 200 {
+                (
+                    "OK",
+                    serde_json::json!({
+                        "data": [{"embedding": vec![0.0; EMBED_DIM], "index": 0}]
+                    })
+                    .to_string(),
+                )
+            } else {
+                ("Error", "{\"error\":\"try again\"}".to_owned())
+            };
+            let response = format!(
+                "HTTP/1.1 {status} {status_text}\r\ncontent-type: application/json\r\n\
+                 content-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        }
+    });
+    (format!("http://{address}"), calls, task)
+}
+
 #[tokio::test]
 async fn local_fallbacks_do_not_require_or_emit_usage() {
     let svc = service(Arc::new(HashEmbedder::new()), Arc::new(StubTranscriber));
@@ -343,6 +395,46 @@ async fn ordinary_provider_failure_cancels_its_reservation() {
     assert_eq!(sink.events.lock().unwrap().len(), 1);
     assert_eq!(sink.finalized.load(Ordering::Relaxed), 0);
     assert_eq!(sink.cancelled.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn voyage_retry_success_is_one_accounted_operation() {
+    let (url, calls, server) = voyage_retry_stub(vec![429, 200]).await;
+    let embedder = VoyageEmbedder::new("test-key", "voyage-test")
+        .with_base_url(url)
+        .with_retry_base(std::time::Duration::from_millis(1));
+    let sink = Arc::new(CaptureSink::default());
+    let svc = service(Arc::new(embedder), Arc::new(StubTranscriber)).with_usage_sink(sink.clone());
+
+    let values = svc
+        .embed_query_with_context("hello", UsageContext::new(None), "voyage_query")
+        .await
+        .expect("retry should recover the provider call");
+    assert_eq!(values.len(), EMBED_DIM);
+    assert_eq!(calls.load(Ordering::Relaxed), 2);
+    assert_eq!(sink.finalized.load(Ordering::Relaxed), 1);
+    assert_eq!(sink.cancelled.load(Ordering::Relaxed), 0);
+    server.abort();
+}
+
+#[tokio::test]
+async fn voyage_retry_failure_cancels_once_after_last_attempt() {
+    let (url, calls, server) = voyage_retry_stub(vec![500, 500, 500]).await;
+    let embedder = VoyageEmbedder::new("test-key", "voyage-test")
+        .with_base_url(url)
+        .with_retry_base(std::time::Duration::from_millis(1));
+    let sink = Arc::new(CaptureSink::default());
+    let svc = service(Arc::new(embedder), Arc::new(StubTranscriber)).with_usage_sink(sink.clone());
+
+    let error = svc
+        .embed_query_with_context("hello", UsageContext::new(None), "voyage_query")
+        .await
+        .expect_err("persistent provider failure should surface");
+    assert!(error.to_string().contains("voyage 500:"));
+    assert_eq!(calls.load(Ordering::Relaxed), 3);
+    assert_eq!(sink.finalized.load(Ordering::Relaxed), 0);
+    assert_eq!(sink.cancelled.load(Ordering::Relaxed), 1);
+    server.abort();
 }
 
 #[tokio::test]

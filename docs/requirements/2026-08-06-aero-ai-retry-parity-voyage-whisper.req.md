@@ -2,8 +2,14 @@
 
 - **Module**: `crates/aero-ai`
 - **Source direction**: `docs/auto/analyses/crates-aero-ai-f8cd3622.json` (direction 2)
-- **Date**: 2026-08-06 · **Status**: spec (unimplemented)
-- **Scope**: retry with exponential backoff on the two interactive HTTP provider calls that currently fail hard on transient 429/5xx/transport errors. No other provider paths, no accounting changes, no timeout changes.
+- **Date**: 2026-08-06 · **Status**: implemented in source and provider-tested
+- **Scope**: retry with exponential backoff on Voyage and Whisper interactive HTTP calls for transient 429/5xx/transport errors. Shared policy, provider test seams, and error-prefix/accounting invariants are implemented; no timeout or accounting-wrapper changes.
+
+> Current-source note (2026-08-19): `crates/aero-ai/src/retry.rs` is the shared
+> 3-attempt 1s/2s/4s policy used by Anthropic, Voyage, and Whisper. Voyage and
+> Whisper expose base-URL seams for deterministic mock servers; their unit tests
+> cover 429→200, persistent 5xx, and fail-fast 4xx. The no-retry findings below
+> are historical evidence for the direction.
 
 ---
 
@@ -12,18 +18,18 @@
 | Direction claim | Verified finding |
 |---|---|
 | `AnthropicClient::complete_with_usage_model` retries 429/5xx/transport with backoff 1s/2s/4s, 3 attempts | ✅ `crates/aero-ai/src/anthropic.rs:191-249` — loop with `max_attempts = 3`, `Duration::from_secs(1 << (attempt - 1))` sleeps at 233 (HTTP status) and 242 (transport); `is_retryable` at 672 = `429 ‖ is_server_error()` |
-| `VoyageEmbedder::embed_with` — single `.send().await?`, no retry | ✅ `crates/aero-ai/src/embed.rs:121` — exactly one POST; transport error propagates via `?`; non-2xx → `AiError::Embedding("voyage {status}: …")`. No retry anywhere in the method |
-| `WhisperTranscriber` — single send, no retry | ✅ `crates/aero-ai/src/transcribe.rs:77` — exactly one POST; non-2xx → `AiError::Internal("whisper {status}: …")` |
+| `VoyageEmbedder::embed_with` — historical single `.send().await?`, no retry | ✅ historical finding; current `embed_with` uses `retry_with_backoff(3, 1s)` and preserves the `voyage <numeric-status>:` error prefix |
+| `WhisperTranscriber` — historical single send, no retry | ✅ historical finding; current `transcribe` uses the shared retry helper and preserves the `whisper <numeric-status>:` error prefix |
 | Interactive RAG callers treat the embedding leg as fatal | ✅ `crates/aero-ai/src/service/service_impl.rs:250` (`retrieve_room_with_context`) and `:277` (`retrieve_workspace_with_context`) — `embed_query_with_context(..).await?` is fatal, while the FTS leg right below it degrades with a `tracing::warn!`; `:1110` (`find_expert_with_usage_context`) is the same fatal pattern |
 | Queue-backed Embed jobs are mitigated by retry-on-claim | ✅ `crates/aero-ai/src/worker/mod.rs:314` — `embed_text_with_context` in `handle_embed`; job rows are re-claimed on failure (`MAX_ATTEMPTS=5`, §2 of AGENTS.md). Interactive `/ask`, `/ask/context` (routes/ai.rs), hybrid search (routes/search.rs), `find_expert` (find_expert.rs:117) have no such safety net |
 | `settle_provider_error` interacts with retries | ✅ `crates/aero-ai/src/service/accounting.rs` — `settle_provider_error`: `AiError::Embedding` with a `voyage {status}:` prefix and `AiError::Internal` with `whisper {status}:` are `definitive_no_charge` (reservation **cancelled**); `AiError::Http` (transport) is **ambiguous** (reservation retained, conservative charge) |
 | Reservation/finalize protocol: reserve → provider call → finalize/cancel | ✅ `accounting.rs` `embed_text_with_context` / `embed_query_with_context` / `transcribe_with_context` — each reserves, calls `self.embedder.embed_*` / `self.transcriber.transcribe`, then finalizes (or settles error) exactly once per logical operation |
 
-**Discrepancy found (testability gap, not a fact error)**: the direction says "unit test with a local mock HTTP server", but `VoyageEmbedder` has **no base-URL override** (URL is the const `VOYAGE_URL`, `embed.rs:23`) and `WhisperTranscriber` has **no public constructor other than `from_env()`** (`transcribe.rs:34`, env-dependent — racy under parallel tests). The acceptance tests are therefore not writable without two minimal test seams (§4, REQ-4), mirroring the existing `AnthropicClient::new` + `with_base_url` pattern (`anthropic.rs:56-72`). The existing mock-server pattern to reuse is `anthropic_stub` in `crates/aero-ai/src/service/accounting/tests.rs:263` (tokio `TcpListener` on `127.0.0.1:0` + `AtomicUsize` request counter); the accounting counter seam is `CaptureSink` (`accounting/tests.rs:81`, `finalized`/`cancelled` atomics).
+**Discrepancy resolved**: the direction's mock-server tests required two seams. Current `VoyageEmbedder` and `WhisperTranscriber` provide explicit constructors/base-URL overrides (plus test-only millisecond retry bases), and provider tests use local `TcpListener` counters without mutating process-wide env vars.
 
 ---
 
-## 2. Problem statement (as verified)
+## 2. Problem statement (historical gap; now closed by the shared retry implementation)
 
 - Voyage query embeddings (`embed_query` → `embed_with("query")`) and Whisper transcription are the **only two paid HTTP legs without retry** in `aero-ai`. One transient 429/5xx/connection reset fails the whole user-facing operation:
   - `/api/rooms/:id/ask` and `/ask/context` (`routes/ai.rs` → `retrieve_room_with_context`/`retrieve_workspace_with_context`),

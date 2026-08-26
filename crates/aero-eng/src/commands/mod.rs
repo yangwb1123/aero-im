@@ -12,7 +12,7 @@ mod check;
 mod completion;
 mod dashboard;
 mod doctor;
-mod gate;
+pub(crate) mod gate;
 mod network;
 mod skill;
 

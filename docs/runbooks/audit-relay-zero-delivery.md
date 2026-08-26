@@ -9,6 +9,11 @@
 > （iss/aud/sub/scope/typed-gate/时间窗），**不是** RFC 9068 strict validator——「主流 IdP 默认
 > client-credentials token 形状全部 fail-closed」是历史叙事（aero-auth 消费侧的事），relay 侧
 > 的 fail-closed 行为以本文件 §1 哨兵串为准。
+>
+> **当前 B5 pin（2026-08-26）**：live `B5_CONTRACT_TEST_LIST` 为 48 个
+> slot，即 27 个非 `[PROPOSED]` 可执行 slot 与 21 个 `[PROPOSED]` 仓外占位。
+> “27 executed”是 manifest 分类，不是本 runbook 声称已经运行的测试数；历史
+> acceptance 记录中的 37/39/40/41/47 只保留其历史语境。
 
 ## 0. B5-4 运行时环（先读这段）
 

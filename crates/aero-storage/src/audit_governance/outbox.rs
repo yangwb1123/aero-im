@@ -37,19 +37,21 @@
 //! shared with 0242 rows — NEVER inside `detail`).
 
 use aero_common::{
-    AuditActor, AuditId, AuditTarget, ParticipantId, WorkspaceId, AUDIT_ACTOR_TYPE_PARTICIPANT,
-    AUDIT_ACTOR_TYPE_SYSTEM, AUDIT_AGGREGATE_TYPE, AUDIT_DATA_CLASSIFICATION, AUDIT_EVENT_TYPE,
-    AUDIT_OUTCOME_SUCCESS, AUDIT_RETENTION_CLASS, AUDIT_SCHEMA_ID, AUDIT_SCHEMA_VERSION,
-    AUDIT_SOURCE_SYSTEM, AUDIT_TARGET_TYPE_RESOURCE, GOVERNANCE_CLASS_ADMIN,
-    GOVERNANCE_CLASS_MESSAGE, L1_WINDOW_SECONDS, LOCAL_ACTION_MESSAGE_DELETED,
-    audit_wire_occurred_at,
+    audit_wire_occurred_at, AuditActor, AuditId, AuditTarget, ParticipantId, WorkspaceId,
+    AUDIT_ACTOR_TYPE_PARTICIPANT, AUDIT_ACTOR_TYPE_SYSTEM, AUDIT_AGGREGATE_TYPE,
+    AUDIT_DATA_CLASSIFICATION, AUDIT_EVENT_TYPE, AUDIT_OUTCOME_SUCCESS, AUDIT_RETENTION_CLASS,
+    AUDIT_SCHEMA_ID, AUDIT_SCHEMA_VERSION, AUDIT_SOURCE_SYSTEM, AUDIT_TARGET_TYPE_RESOURCE,
+    GOVERNANCE_CLASS_ADMIN, GOVERNANCE_CLASS_MESSAGE, L1_WINDOW_SECONDS,
+    LOCAL_ACTION_MESSAGE_DELETED,
 };
 use sqlx::{PgPool, Postgres, Transaction};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
 use super::failed_pairs::FailedPairRepo;
-use super::tokens::{AUTH_SOURCE_SYSTEM, L1_AUTH_LOGIN_FAILURE_ACTION, OUTBOUND_AUTH_LOGIN_FAILURE};
+use super::tokens::{
+    AUTH_SOURCE_SYSTEM, L1_AUTH_LOGIN_FAILURE_ACTION, OUTBOUND_AUTH_LOGIN_FAILURE,
+};
 use crate::audit::AuditRepo;
 
 /// Governance class for auth 1:1 pairs (class 'admin', priority 10 — the
@@ -410,8 +412,8 @@ impl AuditGovernanceOutboxRepo {
         detail: serde_json::Value,
         outbound_action: &str,
     ) -> Result<AuditId, sqlx::Error> {
-        let audit_id = AuditRepo::append_in_tx(tx, workspace, actor, action, target, detail.clone())
-            .await?;
+        let audit_id =
+            AuditRepo::append_in_tx(tx, workspace, actor, action, target, detail.clone()).await?;
         // Server-stamped created_at re-selected so the envelope mirrors the
         // trigger's jsonb_build_object('occurred_at', NEW.created_at) exactly
         // (single clock domain).
@@ -682,8 +684,8 @@ impl AuditGovernanceOutboxRepo {
         // Watermark advance AFTER the insert loop (async-reviewer fix): only
         // on success does the boundary become the new watermark — a mid-loop
         // failure (`?` above) leaves it behind so nothing is lost.
-        self.l1_watermark = time::OffsetDateTime::from_unix_timestamp(boundary)
-            .unwrap_or(self.l1_watermark);
+        self.l1_watermark =
+            time::OffsetDateTime::from_unix_timestamp(boundary).unwrap_or(self.l1_watermark);
         Ok(inserted)
     }
 
@@ -769,10 +771,7 @@ impl AuditGovernanceOutboxRepo {
     ///
     /// # Errors
     /// Propagates connection-level [`sqlx::Error`] only.
-    pub async fn sweep_terminal_before(
-        &self,
-        cutoff: OffsetDateTime,
-    ) -> Result<u64, sqlx::Error> {
+    pub async fn sweep_terminal_before(&self, cutoff: OffsetDateTime) -> Result<u64, sqlx::Error> {
         let deleted = sqlx::query(
             r"DELETE FROM audit_governance_outbox
                WHERE status IN (2, 3)

@@ -3,7 +3,13 @@
 > Module: `crates/aero-ai` (fixture authority: `governance.rs`) with the physical
 > change in `crates/aero-audit-connector` (`pg.rs` claim query).
 > Requirements: `docs/requirements/2026-08-07-aero-ai-b5-3-priority-claim-ordering.req.md`
-> (R1-R5 / AC1-AC4). Status: design, pre-implementation.
+> (R1-R5 / AC1-AC4). Status: source implementation complete; live
+> Postgres acceptance remains environment-gated.
+>
+> **Current B5 pin (2026-08-26):** `scripts/b5-pin.sh` pins 48 slots:
+> 27 non-`[PROPOSED]` executable slots and 21 `[PROPOSED]` out-of-repo
+> placeholders. “Executed” is manifest classification, not a claim that all
+> 27 slots ran in this review; older 37/37 wording is historical provenance.
 >
 > **P1 fold-in amendment (2026-08-08, landed with the 0239 batch):** the
 > slice is **implemented in the working tree** as part of the 0239 verified
@@ -44,7 +50,7 @@ repo on 2026-08-07; **every claim verified**. One empirical proof was executed
 | 3 | Drill seeds backlog first (earlier `available_at`), moderation last; round-1 `delivered_at == MIN(delivered_at)`; strict-first on full drain; `concurrency=1` | ✅ Confirmed. Seed at drill:140-182 (500 backlog then 1 moderation, both `clock_timestamp()`), round-1 asserts at 190-230 (`BATCH_SIZE=100 < 501` so composition must come from priority), drain asserts at 260-300 (parity + `moderation_at < MIN(backlog delivered_at)`). `RelayConfig.concurrency: 1` ⇒ settle order == claim order. |
 | 4 | `governance.rs` — `GOVERNANCE_PRIORITY_MODERATION=100 > BACKLOG=10`, DESC pin, "do not align with ai_job" warning, both named unit tests | ✅ Confirmed. Constants at governance.rs:26/31; module doc 11-25 carries the DESC-vs-ASC warning ("Do not 'fix' the direction to match `ai_job`"); tests `moderation_lane_preempts_backlog_under_desc_claim` and `unknown_local_token_passes_through_unmapped` (plus 4 more) all present. |
 | 5 | 0239 migration landed — `priority SMALLINT NOT NULL DEFAULT 10`, admin stamp 100, line 44 defers index change to B5-3 | ✅ Confirmed. `migrations/0239_audit_governance_outbox.sql:26` (`priority SMALLINT NOT NULL DEFAULT 10`), trigger INSERT stamps `class='admin', priority=100` for `message.moderated`; line 44: "B5-3 extends ORDER BY with priority; the index change is B5-3's, not this slice's." |
-| 6 | Drill wired into `test-integration.sh:450-462` + 37-slot `b5-pin.sh`; slot currently fails red | ✅ Confirmed. `scripts/test-integration.sh:447-461` runs the drill on a throwaway DB (gated only on the 0239 file existing — it does) and emits `B5-CHECK moderation-priority-drill: PASS`. `scripts/b5-pin.sh` lists `moderation-priority-drill` among 37 slots (15 executed + 22 [PROPOSED]; count/format/dupe/vacuous guard at `assert_b5_contract_pin`). **Empirically proven red**: fresh throwaway DB migrated through 0239, ran `aero-audit-priority-drill` → exit 1, `Error: round 1: the moderation row was NOT claimed+delivered first — claim order must be priority DESC, not FIFO/enqueue order (B5-3 not landed?)`. |
+| 6 | Drill wired into `test-integration.sh:450-462` + current 48-slot `b5-pin.sh`; historical pre-landing result was red | ✅ Confirmed. `scripts/test-integration.sh:447-461` runs the drill on a throwaway DB (gated only on the 0239 file existing — it does) and emits `B5-CHECK moderation-priority-drill: PASS`. `scripts/b5-pin.sh` lists `moderation-priority-drill` among the current 48 slots (27 executable + 21 [PROPOSED]; count/format/dupe/vacuous guard at `assert_b5_contract_pin`). The cited exit-1 result is retained as historical pre-landing evidence, not a current verdict. |
 | F1 | `pg.rs` test fixture lacks `priority` (pg.rs:242-263) | ✅ Confirmed. `ensure_outbox_table` (pg.rs:244-266) creates a minimal table with no `priority`/`class` columns. After R1's `ORDER BY candidate.priority DESC`, the existing `#[ignore]` test `concurrent_double_claim_across_two_sessions_is_impossible` would fail with `column "candidate.priority" does not exist` on non-0239 throwaway DBs. |
 | F2 | Trait doc pins the old ordering (outbox.rs:29-31) | ✅ Confirmed. `OutboxRepo::claim_due` doc (outbox.rs:29-31): "ordered `(available_at, created_at, event_id)`". `FakeOutbox` has **no** `priority` field (grep: zero hits in fake.rs); its sort is `(available_at, created_at, id)` FIFO — fake-based suites (state_machine 6, claim_validation 11, relay 6, config 2 — counts verified) are untouched by an additive SQL-only change. |
 
@@ -179,7 +185,7 @@ module, `#[ignore = "requires live Postgres (DATABASE_URL)"]` per AGENTS.md
 3. **Fake-based suites untouched** (signature unchanged, fake has no priority):
    `tests/state_machine.rs` (6), `tests/claim_validation.rs` (11),
    `src/relay.rs` (6), `src/config.rs` (2) — verified counts.
-4. **37-slot B5 pin unchanged in shape.** No slot added/removed/renamed; the
+4. **48-slot B5 pin unchanged in shape.** No slot added/removed/renamed; the
    `moderation-priority-drill` slot's verdict flips FAIL→PASS. The pin guard
    (`assert_b5_contract_pin`) still demands a `B5-CHECK` verdict line for
    every executed slot.
@@ -275,7 +281,7 @@ Steps (AGENTS.md §4.2 order — build before migrate):
 5. **Pin slot flips green**: `scripts/test-integration.sh` (or the
    `moderation-priority-drill` segment alone) emits `B5-CHECK
    moderation-priority-drill: PASS`; `scripts/test-b5-pin-guard.sh` still
-   passes 37/37.
+   passes the current 48/48 pin (27 executable + 21 [PROPOSED]).
 
 ### 5.2 Dual-partial-index rolling deploy
 
@@ -356,7 +362,7 @@ downtime; rollback is binary-only until P4.
 |---|---|---|
 | AC1 | Priority drill passes (oracle) | `DATABASE_URL=<throwaway, migrated through 0239+0240> cargo run -p aero-audit-connector --bin aero-audit-priority-drill` exits 0 with `drill: moderation-in-first-batch: PASS`, `drain-501: PASS`, `parity-501: PASS`. The oracle is **batch membership** — the moderation row ∈ the round-1 delivered set of 100, the contract of an ORDER BY+LIMIT claim (delivery *firstness* is an executor artifact, D3). Pre-state proven red (exit 1, `moderation row was NOT claimed+delivered within the first batch`). In `test-integration.sh`, `B5-CHECK moderation-priority-drill: PASS`. |
 | AC2 | Mixed-priority PG test: admin rows first, FIFO within lane | `DATABASE_URL=<throwaway> cargo test -p aero-audit-connector --lib -- --ignored mixed_priority_claim_orders_moderation_first_then_fifo` passes **with and without** 0239/0240 migration (R2 fixture covers the non-0239 shape). Set-based: claim `limit 25 < 50`; the claimed set = {10 admin} ∪ {15 earliest-`available_at` backlog} — plan-independent (D3). Seed inversion + inverted `created_at` make FIFO and column-swap regressions impossible explanations. |
-| AC3 | No regression on connector suites + pin | `cargo test -p aero-audit-connector` green: state_machine (6), claim_validation (11), relay (6), config (2), plus `concurrent_double_claim_across_two_sessions_is_impossible` (25/25 disjoint, attempts==1, 50 distinct tokens) under DATABASE_URL. `scripts/test-b5-pin-guard.sh` passes 37/37 (no slot removed/renamed; `moderation-priority-drill` verdict now PASS). |
+| AC3 | No regression on connector suites + pin | `cargo test -p aero-audit-connector` green: state_machine (6), claim_validation (11), relay (6), config (2), plus `concurrent_double_claim_across_two_sessions_is_impossible` (25/25 disjoint, attempts==1, 50 distinct tokens) under DATABASE_URL. `scripts/test-b5-pin-guard.sh` passes the current 48/48 pin (27 executable + 21 [PROPOSED]; no slot removed/renamed; `moderation-priority-drill` verdict now PASS). |
 | AC4 | Lane direction invariant holds | `cargo test -p aero-ai --lib` keeps `moderation_lane_preempts_backlog_under_desc_claim` green (100 > 10 under DESC) and `admin_class_rows_never_aggregated` green. Source check: `claim_due` ORDER BY contains `priority DESC`, no ASC priority term, no `priority_for`-style alignment; governance.rs "do not align with `ai_job`" warning intact. |
 | AC5 | Index gate (0240) | On the same throwaway DB: `pg_indexes` shows both `audit_governance_due_prio_idx` (new shape, partial over status 0/1) and `audit_governance_due_idx` (legacy); aero-storage's schema-shape test (`audit_governance.rs`) stays green; `make migrate-smoke` replays 0240 on a fresh DB. Plan-shape (EXPLAIN) verification is the §5.3 runbook check, not a drill assert (F5). |
 

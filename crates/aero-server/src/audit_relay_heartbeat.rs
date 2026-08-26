@@ -84,8 +84,8 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires live Postgres (DATABASE_URL)"]
     async fn bootstrap_record_heartbeat_arms_the_fence() {
-        let url = std::env::var("DATABASE_URL")
-            .expect("DATABASE_URL must point at a throwaway Postgres");
+        let url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must point at a throwaway Postgres");
         let pool = pool(&url);
         reset(&pool).await;
         let recorder = PgHeartbeatRecorder::new(
@@ -115,8 +115,8 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires live Postgres (DATABASE_URL)"]
     async fn missing_table_heartbeat_stays_fail_closed() {
-        let url = std::env::var("DATABASE_URL")
-            .expect("DATABASE_URL must point at a throwaway Postgres");
+        let url =
+            std::env::var("DATABASE_URL").expect("DATABASE_URL must point at a throwaway Postgres");
         let pool = pool(&url);
         sqlx::query("DROP TABLE IF EXISTS audit_relay_provisioning")
             .execute(&pool)

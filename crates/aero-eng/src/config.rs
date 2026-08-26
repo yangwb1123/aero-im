@@ -45,6 +45,8 @@ pub struct FilesizeConfig {
     pub routes_hard: usize,
     /// JavaScript/TypeScript: warn above this line count.
     pub js_warn: usize,
+    /// JavaScript/TypeScript: hard-fail above this line count.
+    pub js_hard: usize,
 }
 
 impl Default for FilesizeConfig {
@@ -53,7 +55,8 @@ impl Default for FilesizeConfig {
             rust_warn: 800,
             rust_hard: 1200,
             routes_hard: 3000,
-            js_warn: 1000,
+            js_warn: 600,
+            js_hard: 1000,
         }
     }
 }
@@ -102,6 +105,8 @@ mod tests {
         let cfg = EngineeringConfig::default();
         assert_eq!(cfg.filesize.rust_warn, 800);
         assert_eq!(cfg.filesize.rust_hard, 1200);
+        assert_eq!(cfg.filesize.js_warn, 600);
+        assert_eq!(cfg.filesize.js_hard, 1000);
         assert_eq!(cfg.complexity.warn, 12);
         assert!(cfg.check.clippy);
     }
@@ -125,6 +130,8 @@ mod tests {
 [filesize]
 rust_warn = 500
 rust_hard = 1000
+js_warn = 300
+js_hard = 900
 [complexity]
 warn = 10
 hard = 25
@@ -147,6 +154,7 @@ rust_warn = 300
         assert_eq!(cfg.filesize.rust_warn, 300);
         // Defaults for unspecified fields
         assert_eq!(cfg.filesize.rust_hard, 1200);
+        assert_eq!(cfg.filesize.js_hard, 1000);
         assert_eq!(cfg.complexity.warn, 12);
         assert!(cfg.check.clippy);
     }

@@ -23,6 +23,8 @@ use time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+use aero_auth::relay_scope::SharedRelayScopeProvisioner;
+
 use crate::client::{AuditClient, DeliveryError};
 use crate::config::RelayConfig;
 use crate::outbox::{Claim, Error, OutboxRepo};
@@ -103,6 +105,7 @@ pub struct AuditRelay {
     repo: Arc<dyn OutboxRepo>,
     client: AuditClient,
     config: RelayConfig,
+    scope_provisioner: Option<SharedRelayScopeProvisioner>,
 }
 
 impl std::fmt::Debug for AuditRelay {
@@ -117,11 +120,37 @@ impl std::fmt::Debug for AuditRelay {
 impl AuditRelay {
     #[must_use]
     pub fn new(repo: Arc<dyn OutboxRepo>, client: AuditClient, config: RelayConfig) -> Self {
+        Self::new_with_scope_provisioner(repo, client, config, None)
+    }
+
+    /// Construct a relay with the fail-closed scope capability.  Production
+    /// boot must install a provisioner; leaving it absent intentionally keeps
+    /// every row queued and performs no claim.
+    #[must_use]
+    pub fn new_with_scope_provisioner(
+        repo: Arc<dyn OutboxRepo>,
+        client: AuditClient,
+        config: RelayConfig,
+        scope_provisioner: Option<SharedRelayScopeProvisioner>,
+    ) -> Self {
         Self {
             repo,
             client,
             config,
+            scope_provisioner,
         }
+    }
+
+    /// Add the scope provisioner to an already-built relay.  This is useful
+    /// for boot assembly where the repo/client and capability are constructed
+    /// by different dependency layers.
+    #[must_use]
+    pub fn with_scope_provisioner(
+        mut self,
+        scope_provisioner: SharedRelayScopeProvisioner,
+    ) -> Self {
+        self.scope_provisioner = Some(scope_provisioner);
+        self
     }
 
     /// Spawn the poll loop on the shared cancellation token. The loop logs and
@@ -180,6 +209,10 @@ impl AuditRelay {
     /// A reconcile error aborts the batch (warn + next tick retries), the
     /// same degrade class as a claim error on a pre-0239 DB (F11).
     pub async fn dispatch_batch(&self) -> Result<usize, Error> {
+        if !self.audit_scope_provisioned().await {
+            warn!("audit scope is not provisioned; relay leaves queued rows unclaimed (T-11)");
+            return Ok(0);
+        }
         let lease = Duration::seconds(
             i64::try_from(self.config.delivery_lease.as_secs()).unwrap_or(MAX_LEASE_SECONDS),
         );
@@ -192,6 +225,13 @@ impl AuditRelay {
             })
             .await;
         Ok(count)
+    }
+
+    async fn audit_scope_provisioned(&self) -> bool {
+        match &self.scope_provisioner {
+            Some(provisioner) => provisioner.audit_event_write_provisioned().await,
+            None => false,
+        }
     }
 
     async fn deliver_claim(&self, claim: Claim) {
@@ -287,7 +327,7 @@ mod tests {
     use super::{audit_backoff, AuditRelay};
     use crate::client::AuditClient;
     use crate::config::RelayConfig;
-    use crate::fake::{FakeOutbox, FakeStatus};
+    use crate::fake::{FakeOutbox, FakeStatus, StaticScopeProvisioner};
     use crate::outbox::OutboxRepo;
     use crate::stub::{SinkBehavior, StubSink};
     use reqwest::Url;
@@ -401,7 +441,8 @@ mod tests {
         config.request_timeout = request_timeout;
         let client =
             AuditClient::with_key_provider(config.clone(), keys).expect("build audit client");
-        let relay = AuditRelay::new(fake.clone(), client, config);
+        let relay = AuditRelay::new(fake.clone(), client, config)
+            .with_scope_provisioner(Arc::new(StaticScopeProvisioner::new(true)));
 
         let claims = fake.claim_due(LEASE, 10).await.expect("claim");
         assert_eq!(claims.len(), 1);
@@ -543,7 +584,8 @@ mod tests {
         .await;
         let config = test_config(&stub);
         let client = AuditClient::new(config.clone()).expect("build audit client");
-        let relay = AuditRelay::new(fake.clone(), client, config);
+        let relay = AuditRelay::new(fake.clone(), client, config)
+            .with_scope_provisioner(Arc::new(StaticScopeProvisioner::new(true)));
         let claims = fake.claim_due(LEASE, 10).await.expect("claim");
         assert_eq!(claims.len(), 1);
         let token_a = claims[0].claim_token;
@@ -765,7 +807,8 @@ mod tests {
             Some(Arc::new(JwksKeyProvider::new(stub.jwks_url()))),
         )
         .expect("build audit client");
-        let relay = AuditRelay::new(fake.clone(), client, config);
+        let relay = AuditRelay::new(fake.clone(), client, config)
+            .with_scope_provisioner(Arc::new(StaticScopeProvisioner::new(true)));
 
         // Attempt 1: the IdP signs with key-b while the endpoint still serves
         // {A} — unknown kid after a refresh → permanent signature rejection

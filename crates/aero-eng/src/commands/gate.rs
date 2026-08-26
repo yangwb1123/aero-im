@@ -3,7 +3,7 @@
 use crate::outcome::Outcome;
 use crate::register_command;
 
-register_command!(Gate_, "gate", "Run engineering gates", |ctx, args| {
+pub(crate) async fn run(ctx: &crate::ExecutionContext, args: &[String]) -> Outcome {
     async fn b(p: String, t: u64) -> Outcome {
         crate::run::run_cmd("bash", &[&p], std::time::Duration::from_secs(t)).await
     }
@@ -12,20 +12,26 @@ register_command!(Gate_, "gate", "Run engineering gates", |ctx, args| {
     let f = |n: &str| -> String { sd.join(n).to_string_lossy().to_string() };
     match sub {
         "list" => Outcome::ok(
-            "filesize truth web deps complexity filesize-native deps-native workspace-members todos metadata readme b5 all",
+            "filesize truth web deps complexity format format-tests migrations migration-tests filesize-native deps-native workspace-members todos metadata readme b5 all",
         ),
         "filesize" => b(f("file-size-check.sh"), 60).await,
         "truth" => b(f("truth-check.sh"), 60).await,
         "web" => b(f("web-check.sh"), 60).await,
         "deps" => b(f("dependency-check.sh"), 60).await,
         "complexity" => b(f("complexity-check.sh"), 60).await,
+        "format" => b(f("fmt-check.sh"), 60).await,
+        "format-tests" => b(f("test-fmt-check.sh"), 60).await,
+        "migrations" => b(f("migration-immutability-check.sh"), 60).await,
+        "migration-tests" => b(f("test-migration-immutability-check.sh"), 60).await,
         "all" => {
-            let (filesize, truth, web, deps, complexity) = tokio::join!(
+            let (filesize, truth, web, deps, complexity, format, migrations) = tokio::join!(
                 b(f("file-size-check.sh"), 120),
                 b(f("truth-check.sh"), 120),
                 b(f("web-check.sh"), 120),
                 b(f("dependency-check.sh"), 120),
                 b(f("complexity-check.sh"), 120),
+                b(f("fmt-check.sh"), 120),
+                b(f("migration-immutability-check.sh"), 120),
             );
             let native_filesize =
                 crate::checks::check_filesize(&ctx.root, &ctx.eng_config);
@@ -40,6 +46,8 @@ register_command!(Gate_, "gate", "Run engineering gates", |ctx, args| {
                 web,
                 deps,
                 complexity,
+                format,
+                migrations,
                 native_filesize,
                 native_deps,
                 workspace,
@@ -89,4 +97,8 @@ register_command!(Gate_, "gate", "Run engineering gates", |ctx, args| {
         }
         _ => Outcome::error("unknown"),
     }
+}
+
+register_command!(Gate_, "gate", "Run engineering gates", |ctx, args| {
+    run(ctx, args).await
 });

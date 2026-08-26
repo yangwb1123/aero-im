@@ -76,7 +76,10 @@ async fn non_moderation_action_passes_through_unmapped() {
     .fetch_one(&p)
     .await
     .expect("audit row exists");
-    assert_eq!(action, LOCAL_ACTION_MESSAGE_DELETED, "local token flows verbatim");
+    assert_eq!(
+        action, LOCAL_ACTION_MESSAGE_DELETED,
+        "local token flows verbatim"
+    );
     // 0239 trigger pass-through: zero ADMIN rows (the trigger maps only
     // `message.moderated`); the R-D2 Rust writer produced exactly one
     // MESSAGE-class row in the same tx.

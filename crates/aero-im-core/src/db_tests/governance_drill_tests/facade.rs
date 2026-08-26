@@ -88,22 +88,41 @@ async fn facade_window_fixture(
         .expect("send message");
     scrub_room_lane_rows(pool).await;
     // Audit seam: exactly 1 message.create row (a dropped `append_in_tx`
-    // yields zero rows — loud red, never vacuous).
-    let (created_at, target, actor): (time::OffsetDateTime, String, Option<Uuid>) =
-        sqlx::query_as(
-            "SELECT created_at, target, actor_id FROM audit_events
+    // yields zero rows — loud red, never vacuous). Count first: `fetch_one`
+    // alone would accept a duplicate audit append.
+    let create_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM audit_events
               WHERE workspace_id = $1 AND action = $2",
-        )
-        .bind(ws.to_uuid())
-        .bind(LOCAL_ACTION_MESSAGE_CREATE)
-        .fetch_one(pool)
-        .await
-        .expect("exactly one message.create audit row");
+    )
+    .bind(ws.to_uuid())
+    .bind(LOCAL_ACTION_MESSAGE_CREATE)
+    .fetch_one(pool)
+    .await
+    .expect("message.create audit count");
+    assert_eq!(create_count, 1, "exactly one message.create audit row");
+    let (created_at, target, actor): (time::OffsetDateTime, String, Option<Uuid>) = sqlx::query_as(
+        "SELECT created_at, target, actor_id FROM audit_events
+              WHERE workspace_id = $1 AND action = $2",
+    )
+    .bind(ws.to_uuid())
+    .bind(LOCAL_ACTION_MESSAGE_CREATE)
+    .fetch_one(pool)
+    .await
+    .expect("exactly one message.create audit row");
     assert_eq!(target, msg.id.to_string(), "audit target = message id");
     assert_eq!(actor, Some(owner.to_uuid()), "audit actor = sender");
     // Window key pin: recompute the 0242 md5 preimage from the
     // server-stamped created_at (strongest key-derivation pin).
     let key = window_row_for(pool, ws, created_at).await;
+    let window_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM audit_governance_outbox
+          WHERE payload->>'aggregate_id' = $1 AND class = 'message'",
+    )
+    .bind(ws.to_uuid().to_string())
+    .fetch_one(pool)
+    .await
+    .expect("message window count");
+    assert_eq!(window_count, 1, "exactly one message-class window row");
     let (event_id, class, priority, status, attempts, last_error): (
         Uuid,
         String,
@@ -120,7 +139,10 @@ async fn facade_window_fixture(
     .fetch_one(pool)
     .await
     .expect("exactly one window row (0242 aggregated)");
-    assert_eq!(event_id, key, "outbox event_id == recomputed 0242 window key");
+    assert_eq!(
+        event_id, key,
+        "outbox event_id == recomputed 0242 window key"
+    );
     assert_eq!(class, GOVERNANCE_CLASS_MESSAGE, "class 'message'");
     assert_eq!(priority, 10, "priority 10 (GOVERNANCE_PRIORITY_BACKLOG)");
     assert_eq!(status, 0, "status 0 = enqueued (0242 normative)");
@@ -153,13 +175,12 @@ async fn drill_facade_send_window_claims_delivers_settles() {
     // Full Value-level payload pins (D1: 19-key AGGREGATED shape — a typed
     // `AuditClaimPayload` parse is FORBIDDEN here; `deny_unknown_fields`
     // would reject it by design).
-    let payload: serde_json::Value = sqlx::query_scalar(
-        "SELECT payload FROM audit_governance_outbox WHERE event_id = $1",
-    )
-    .bind(w.key)
-    .fetch_one(&pool)
-    .await
-    .expect("window payload");
+    let payload: serde_json::Value =
+        sqlx::query_scalar("SELECT payload FROM audit_governance_outbox WHERE event_id = $1")
+            .bind(w.key)
+            .fetch_one(&pool)
+            .await
+            .expect("window payload");
     let obj = payload.as_object().expect("payload is an object");
     for absent in ["actor", "targets", "payload", "spill"] {
         assert!(
@@ -219,7 +240,10 @@ async fn drill_facade_send_window_claims_delivers_settles() {
     .fetch_one(&pool)
     .await
     .expect("window span probe");
-    assert!(span_ok, "window_start/end span the 60s grid; occurred_at == window_start; first/last == created_at");
+    assert!(
+        span_ok,
+        "window_start/end span the 60s grid; occurred_at == window_start; first/last == created_at"
+    );
 
     // Relay leg — D2 pin: the window row carries `source_system =
     // AUDIT_SOURCE_SYSTEM`, so the relay config MUST use the compile-time
@@ -232,6 +256,27 @@ async fn drill_facade_send_window_claims_delivers_settles() {
         "claims exactly the window row"
     );
     assert_eq!(stub.posts(), 1, "exactly one POST");
+    let delivered_payloads = stub.seen_payloads().await;
+    assert_eq!(
+        delivered_payloads.len(),
+        1,
+        "the sink observed exactly one delivered payload"
+    );
+    let delivered = &delivered_payloads[0];
+    assert_eq!(
+        delivered["action"], AGGREGATED_MESSAGE_ACTION,
+        "sink payload action = message.batch"
+    );
+    assert_eq!(
+        delivered["event_id"],
+        w.key.to_string(),
+        "sink payload event_id = window event_id"
+    );
+    assert_eq!(
+        delivered["idempotency_key"],
+        w.key.to_string(),
+        "sink payload idempotency_key = window event_id"
+    );
     // Dual-format pin: header = base32 `AuditId` Display, payload
     // `event_id` = `uuid::text` — unequal by design.
     let key_b32 = AuditId::from_uuid(w.key).to_string();
@@ -272,6 +317,9 @@ async fn drill_facade_moderation_preempts_window_in_same_batch() {
     let pool = pool();
     let svc = service(pool.clone());
     self_isolate(&pool).await;
+    // A prior ignored test may have panicked after enabling the singleton;
+    // reassert the default before creating any fixture state.
+    restore_enforcement_disabled(&pool).await;
     let (ws, owner) = workspace_fixture(&pool, "drill-facade-preempt").await;
     // Enforcement ON + binding + entitlement BEFORE the writes (mandatory:
     // Gate 2 RAISEs without a binding; 0235 metering RAISEs on the INSERT).
@@ -368,6 +416,10 @@ async fn drill_facade_window_relay_absent_stays_status_zero() {
     let svc = service(pool.clone());
     let w = facade_window_fixture(&pool, &svc, "drill-facade-relay-absent").await;
 
+    // Construct only the sink, never a relay/client. This makes the
+    // no-POST assertion observable rather than a consequence of having no
+    // endpoint object at all.
+    let stub = StubSink::start().await.expect("start stub");
     let row = outbox_row(&pool, w.key_audit_id).await;
     assert_eq!(row.status, 0, "stays enqueued without a relay");
     assert_eq!(row.attempts, 0, "zero claims");
@@ -379,6 +431,9 @@ async fn drill_facade_window_relay_absent_stays_status_zero() {
         claim_predicate_holds(&pool, w.key).await,
         "relay-absent row stays due/claimable"
     );
+    assert_eq!(stub.posts(), 0, "no relay means no sink POST");
+    assert_eq!(stub.token_requests(), 0, "no relay means no token request");
+    stub.shutdown();
 
     cleanup_facade_rows(&pool, w.ws, &[w.msg_id], &[w.key_audit_id], &[]).await;
 }
@@ -398,12 +453,7 @@ async fn drill_facade_edit_merges_into_same_window() {
     // Version-fallback path (messages.rs) — ms-spacing keeps both events in
     // one 60s window (E3 precedent; a boundary hit reds loudly).
     let edited = svc
-        .edit_message(
-            w.owner,
-            w.msg_id,
-            vec![Block::text("edited content")],
-            None,
-        )
+        .edit_message(w.owner, w.msg_id, vec![Block::text("edited content")], None)
         .await
         .expect("edit commits (version-fallback path)");
     assert_eq!(edited.id, w.msg_id, "edit returns the same message");
@@ -419,6 +469,16 @@ async fn drill_facade_edit_merges_into_same_window() {
     .await
     .expect("message.create audit count");
     assert_eq!(create_count, 1, "exactly one message.create audit row");
+    let edit_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)::bigint FROM audit_events
+          WHERE workspace_id = $1 AND action = $2",
+    )
+    .bind(w.ws.to_uuid())
+    .bind(LOCAL_ACTION_MESSAGE_EDIT)
+    .fetch_one(&pool)
+    .await
+    .expect("message.edit audit count");
+    assert_eq!(edit_count, 1, "exactly one message.edit audit row");
     let (edit_target, edit_actor, edit_created): (String, Option<Uuid>, time::OffsetDateTime) =
         sqlx::query_as(
             "SELECT target, actor_id, created_at FROM audit_events
@@ -429,7 +489,11 @@ async fn drill_facade_edit_merges_into_same_window() {
         .fetch_one(&pool)
         .await
         .expect("exactly one message.edit audit row");
-    assert_eq!(edit_target, w.msg_id.to_string(), "edit target = message id");
+    assert_eq!(
+        edit_target,
+        w.msg_id.to_string(),
+        "edit target = message id"
+    );
     assert_eq!(edit_actor, Some(w.owner.to_uuid()), "edit actor = editor");
 
     // Window row: exactly 1, merged count == 2, first/last stamps advanced.
@@ -445,25 +509,19 @@ async fn drill_facade_edit_merges_into_same_window() {
         window_count, 1,
         "exactly one window row — the edit merges into it, never a second row"
     );
-    let (count, status, priority, class, first_ok, last_ok): (
-        i64,
-        i32,
-        i16,
-        String,
-        bool,
-        bool,
-    ) = sqlx::query_as(
-        "SELECT (payload->>'count')::bigint, status, priority, class,
+    let (count, status, priority, class, first_ok, last_ok): (i64, i32, i16, String, bool, bool) =
+        sqlx::query_as(
+            "SELECT (payload->>'count')::bigint, status, priority, class,
                 (payload->>'first_event_at')::timestamptz = $2,
                 (payload->>'last_event_at')::timestamptz = $3
            FROM audit_governance_outbox WHERE event_id = $1",
-    )
-    .bind(w.key)
-    .bind(w.created_at)
-    .bind(edit_created)
-    .fetch_one(&pool)
-    .await
-    .expect("merged window row");
+        )
+        .bind(w.key)
+        .bind(w.created_at)
+        .bind(edit_created)
+        .fetch_one(&pool)
+        .await
+        .expect("merged window row");
     assert_eq!(
         (count, status, priority, class.as_str()),
         (2, 0, 10, "message"),
@@ -521,13 +579,12 @@ async fn drill_facade_window_crash_reclaim_settles() {
 
     // Settle-side fencing probe (no state change): the crashed epoch's
     // persisted token is dead — the fenced re-read fails.
-    let (persisted_token,): (Uuid,) = sqlx::query_as(
-        "SELECT claim_token FROM audit_governance_outbox WHERE event_id = $1",
-    )
-    .bind(w.key)
-    .fetch_one(&pool)
-    .await
-    .expect("crashed claim token");
+    let (persisted_token,): (Uuid,) =
+        sqlx::query_as("SELECT claim_token FROM audit_governance_outbox WHERE event_id = $1")
+            .bind(w.key)
+            .fetch_one(&pool)
+            .await
+            .expect("crashed claim token");
     assert!(
         !repo
             .settle(w.key_audit_id, persisted_token)
@@ -612,7 +669,10 @@ async fn drill_facade_window_permanent_rejection_deads_after_one_retry() {
     assert_eq!(row.status, 0, "attempt 1 requeues — never dead (≤1 retry)");
     assert_eq!(row.attempts, 1);
     assert!(row.delivered_at.is_none(), "never delivered");
-    assert!(row.claim_token.is_none(), "requeue clears the fencing token");
+    assert!(
+        row.claim_token.is_none(),
+        "requeue clears the fencing token"
+    );
     assert!(row.lease_expires_at.is_none(), "requeue clears the lease");
     assert!(
         row.last_error

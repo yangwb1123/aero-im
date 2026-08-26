@@ -156,3 +156,38 @@ async fn execute_help_and_subcommand_help_exit_ok() {
         .await;
     assert!(r.is_ok(), "gate list should dispatch ok");
 }
+
+#[tokio::test]
+async fn canonical_gate_list_is_shared_and_advertises_migration_guards() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let ctx = aero_eng::ExecutionContext::new(root);
+    let args = vec!["aero-cli".into(), "gate".into(), "list".into()];
+    let outcome = aero_eng::run_gate(&ctx, &args).await;
+
+    assert!(!outcome.is_error(), "gate list must succeed");
+    assert!(
+        outcome.message().contains("migrations"),
+        "gate list must advertise the repository migration guard"
+    );
+    assert!(
+        outcome.message().contains("migration-tests"),
+        "gate list must advertise the guard's hermetic regression suite"
+    );
+    assert!(
+        outcome.message().contains("format"),
+        "gate list must advertise the incremental rustfmt guard"
+    );
+    assert!(
+        outcome.message().contains("format-tests"),
+        "gate list must advertise the rustfmt guard regression suite"
+    );
+    assert!(
+        outcome.message().contains("b5"),
+        "the canonical list must retain the B5 integration gate"
+    );
+}

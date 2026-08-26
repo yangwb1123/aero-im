@@ -15,6 +15,7 @@
 
 pub mod agent;
 pub mod anthropic;
+pub mod audit_outbox_health;
 pub mod budget;
 pub mod doc_extract;
 pub mod embed;
@@ -22,6 +23,7 @@ pub mod error;
 pub mod governance;
 pub mod metrics;
 pub mod rerank;
+pub(crate) mod retry;
 pub mod service;
 pub mod tier;
 pub mod transcribe;
@@ -33,11 +35,15 @@ mod db_tests;
 
 pub use agent::{run_agent_loop, AgentOutcome, AgentTool, ToolChat};
 pub use anthropic::{AgentTurn, AnthropicClient, ChatMsg, ToolDef, ToolUse, Usage};
+pub use audit_outbox_health::{
+    dead_alarm, sample_outbox_health, set_audit_outbox_gauges, AuditOutboxCounts, Q3_SQL, Q4_SQL,
+};
 pub use budget::{CostBudget, KeyedCostBudget};
 pub use embed::{default_embedder, Embedder, HashEmbedder, VoyageEmbedder, EMBED_DIM};
 pub use error::{AiError, Result};
 pub use governance::{
-    governance_lane_for, is_admin_class, GovernanceLane, GOVERNANCE_CLASS_ADMIN,
+    finalize_contract_for, governance_lane_for, is_admin_class, GovernanceLane,
+    ModerationFinalizeContract, ADMIN_LANE_TOKENS, GOVERNANCE_CLASS_ADMIN,
     GOVERNANCE_PRIORITY_MODERATION, MODERATION_OUTBOUND_ACTION,
 };
 pub use metrics::CostModel;

@@ -27,9 +27,10 @@
 use aero_audit_connector::{
     client::AuditClient,
     config::RelayConfig,
+    fake::StaticScopeProvisioner,
     pg::PgOutboxRepo,
     relay::AuditRelay,
-    stub::{SinkBehavior, StubSink, trusted_key},
+    stub::{trusted_key, SinkBehavior, StubSink},
 };
 use aero_common::{AuditId, RoomKind, AUDIT_SOURCE_SYSTEM, LOCAL_ACTION_ROOM_CREATE};
 use std::sync::Arc;
@@ -47,12 +48,15 @@ fn relay_for_jwks(
     source_system: &str,
 ) -> (AuditRelay, Arc<PgOutboxRepo>, RelayConfig) {
     let mut config = drill_config(stub, source_system);
-    config.jwks_uri = Some(
-        Url::parse(&stub.jwks_url()).expect("stub JWKS URL"),
-    );
+    config.jwks_uri = Some(Url::parse(&stub.jwks_url()).expect("stub JWKS URL"));
     let repo = Arc::new(PgOutboxRepo::new(pool.clone()));
     let client = AuditClient::new(config.clone()).expect("build audit client with JWKS provider");
-    (AuditRelay::new(repo.clone(), client, config.clone()), repo, config)
+    (
+        AuditRelay::new(repo.clone(), client, config.clone())
+            .with_scope_provisioner(Arc::new(StaticScopeProvisioner::new(true))),
+        repo,
+        config,
+    )
 }
 
 /// One room-create row (D11/D12 fixture): self-isolate → singleton re-assert
@@ -69,14 +73,13 @@ async fn posture_room_row(
     svc.create_room_in_workspace(owner, ws, RoomKind::Channel, Some(format!("{prefix}-room")))
         .await
         .expect("create room in workspace");
-    let (audit_id,): (Uuid,) = sqlx::query_as(
-        "SELECT id FROM audit_events WHERE workspace_id = $1 AND action = $2",
-    )
-    .bind(ws.to_uuid())
-    .bind(LOCAL_ACTION_ROOM_CREATE)
-    .fetch_one(pool)
-    .await
-    .expect("exactly one room.create audit row");
+    let (audit_id,): (Uuid,) =
+        sqlx::query_as("SELECT id FROM audit_events WHERE workspace_id = $1 AND action = $2")
+            .bind(ws.to_uuid())
+            .bind(LOCAL_ACTION_ROOM_CREATE)
+            .fetch_one(pool)
+            .await
+            .expect("exactly one room.create audit row");
     (ws, AuditId::from_uuid(audit_id))
 }
 

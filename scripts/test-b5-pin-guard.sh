@@ -12,6 +12,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck disable=SC1091
 source "$ROOT/scripts/b5-pin.sh"
 ORIG_LIST=("${B5_CONTRACT_TEST_LIST[@]}")
+ORIG_GAUGES=("${B5_GAUGE_PIN[@]}")
 
 failures=0
 TMP_LOGS=()
@@ -56,6 +57,17 @@ run_guard() {
 
 restore_list() {
     B5_CONTRACT_TEST_LIST=("${ORIG_LIST[@]}")
+}
+
+restore_gauges() {
+    B5_GAUGE_PIN=("${ORIG_GAUGES[@]}")
+}
+
+run_gauge_guard() {
+    local name="$1" pattern="$2"
+    local out
+    out="$(assert_b5_gauge_pin 2>&1)" || true
+    check "$name" "$pattern" "$out"
 }
 
 # --- list shape ---
@@ -112,6 +124,26 @@ restore_list
 out="$(SKIP_DB_CREATE=1 assert_b5_contract_pin "$B5_LOG" 2>&1)" || true
 check "skip-db-create-degrades-with-note" "verdict evidence degraded" "$out"
 check "skip-db-create-still-pins" "B5 contract pin: 48/48 (27 executed, 21 \[PROPOSED\]): PASS" "$out"
+
+# --- gauge-name pin ---
+restore_gauges
+run_gauge_guard "gauge-list-is-exactly-five" "B5 gauge pin: 5/5: PASS"
+
+restore_gauges
+B5_GAUGE_PIN=("${ORIG_GAUGES[@]:0:4}")
+run_gauge_guard "gauge-count-four-fails" "B5 gauge pin: 4/5"
+
+restore_gauges
+B5_GAUGE_PIN=("${ORIG_GAUGES[@]}")
+B5_GAUGE_PIN[4]="${B5_GAUGE_PIN[0]}"
+run_gauge_guard "gauge-duplicate-fails" "duplicate name"
+
+restore_gauges
+B5_GAUGE_PIN=("${ORIG_GAUGES[@]}")
+B5_GAUGE_PIN[4]="aero audit outbox dead"
+run_gauge_guard "gauge-malformed-fails" "malformed name"
+
+restore_gauges
 
 if [ "$failures" -ne 0 ]; then
     echo "✗ b5 pin guard: ${failures} regression case(s) failed" >&2
