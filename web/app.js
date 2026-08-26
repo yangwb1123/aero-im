@@ -33,7 +33,7 @@ import { initMessageActivity } from './message_activity.js';
 import { clearPendingDelivery, findPendingMatch, initReliableDelivery, pendingTempId, sendOptimistically } from './delivery.js';
 import { refreshWsAccessToken } from './ws_auth.js';
 import { draftComposerCleared, draftRoomSwitched, initDrafts, resetDrafts } from './drafts.js';
-let wsHooksInstalled = false;
+import { createSessionController } from './session_controller.js';
 // ---------- view switching ----------
 function showAuth() { els.viewAuth.hidden = false; els.viewChat.hidden = true; }
 function showChat() { els.viewAuth.hidden = true; els.viewChat.hidden = false; }
@@ -45,80 +45,6 @@ for (const t of els.tabs) {
   });
 }
 document.addEventListener('visibilitychange', () => { if (!document.hidden && state.currentRoomId) clearUnread(state.currentRoomId); });
-function enterChat() {
-  showChat();
-  const me = state.me;
-  els.meName.textContent = me.display_name || '—';
-  els.meEmail.textContent = me.email || me.id || '';
-  els.meAvatar.textContent = initialOf(me.display_name || me.email);
-  els.meAvatar.setAttribute('style', avatarStyleFromId(me.id));
-  hookWs();
-  ws.connect(auth.getToken(), me.id, {
-    refreshAccessToken: () => refreshWsAccessToken(api, auth, state),
-  });
-  syncRoomSidebar(forceReauth, () => { refreshRoomList(); updateTitleBadge(); });
-  api.rtcConfig().then((c) => { state.rtcConfig = c; }).catch(() => {});
-  // Load the gift catalog once so stream cards can render the gift bar; re-render if a room is open.
-  api.liveGifts().then((r) => {
-    state.giftCatalog = r?.gifts || [];
-    if (state.currentRoomId) rerenderCurrentRoom();
-  }).catch(() => {});
-  // Ask for notification permission once (silent if denied).
-  if ('Notification' in window && Notification.permission === 'default') {
-    Notification.requestPermission().catch(() => {});
-  }
-  // Seed the bell badge from the persisted unread-notification count.
-  refreshNotifBadge();
-}
-
-// ---------- ws ----------
-function hookWs() {
-  if (wsHooksInstalled) return;
-  wsHooksInstalled = true;
-  ws.on('auth_expired', forceReauth);
-  ws.on('status', (s) => {
-    els.wsDot.classList.remove('ws-up', 'ws-down', 'ws-wait');
-    if (s === 'up') els.wsDot.classList.add('ws-up');
-    else if (s === 'wait' || s === 'connecting') els.wsDot.classList.add('ws-wait');
-    else els.wsDot.classList.add('ws-down');
-    els.wsDot.title = `WS: ${s}`;
-  });
-  ws.on('open', () => {
-    if (!state.currentRoomId) return;
-    ws.joinRoom(state.currentRoomId);
-    // Re-watch live streams that survived the disconnect (ROADMAP 方向一): the
-    // server drops a participant's stream subscriptions when the socket closes,
-    // so without this danmaku/gifts/viewer-count die silently after any blip.
-    for (const sid of state.watchedStreams) ws.watchStream(sid);
-    // Replay edits/deletes that happened while we were disconnected.
-    replayChanges(state.currentRoomId);
-  });
-  ws.on('msg:message', (f) => handleIncomingMessage(f.message, f.client_message_id));
-  ws.on('msg:edited', (f) => handleEdited(f.message));
-  ws.on('msg:recalled', (f) => handleRecalled(f.message));
-  ws.on('msg:deleted', (f) => handleDeleted(f));
-  ws.on('msg:reaction', (f) => handleReaction(f));
-  ws.on('msg:read', (f) => handleReadReceipt(f));
-  ws.on('msg:typing', (f) => handleTyping(f));
-  ws.on('msg:notify', (f) => handleNotify(f));
-  ws.on('msg:pin', (f) => handlePin(f));
-  ws.on('msg:presence', (f) => handlePresence(f));
-  ws.on('msg:membership', (f) => handleMembership(f));
-  ws.on('msg:call', (f) => handleCall(f.event));
-  ws.on('msg:stream_event', (f) => handleStreamEvent(f.event));
-  ws.on('msg:backfill', (f) => handleBackfillTruncated(f));
-  ws.on('msg:resync', () => handleResync());
-  ws.on('msg:error', (f) => toast(f.code === 'rate_limited' ? '操作太频繁,请稍后重试' : `服务端:${f.msg || f.code || 'error'}`, 'error'));
-  ws.on('msg:pong', () => {});
-  initMessageActivity();
-  initReliableDelivery({
-    ws,
-    getPendingMap: () => state.pendingByTempId,
-    onCanonical: handleIncomingMessage,
-    onRestore: restorePendingDelivery,
-    onPendingChanged: rerenderCurrentRoom,
-  });
-}
 
 const CATCHUP_PAGE_SIZE = 100;
 
@@ -965,6 +891,44 @@ initLive();
 initSmartReplies({ optimisticAdd });
 initMedia({ optimisticAdd, clearReply, forceReauth });
 initDrafts({ state, els, forceReauth, clearReply, renderReplyChip });
+const { enterChat } = createSessionController({
+  api,
+  auth,
+  state,
+  ws,
+  els,
+  showChat,
+  forceReauth,
+  refreshRoomList,
+  updateTitleBadge,
+  rerenderCurrentRoom,
+  replayChanges,
+  handleIncomingMessage,
+  handleEdited,
+  handleRecalled,
+  handleDeleted,
+  handleReaction,
+  handleReadReceipt,
+  handleTyping,
+  handleNotify,
+  handlePin,
+  handlePresence,
+  handleMembership,
+  handleCall,
+  handleStreamEvent,
+  handleBackfillTruncated,
+  handleResync,
+  restorePendingDelivery,
+  refreshWsAccessToken,
+  syncRoomSidebar,
+  initMessageActivity,
+  initReliableDelivery,
+  getPendingMap: () => state.pendingByTempId,
+  refreshNotifBadge,
+  toast,
+  initialOf,
+  avatarStyleFromId,
+});
 // Modal-backed forms + auth/logout wiring (`enterChat`/`showAuth`/callbacks hoisted).
 initModalForms({ forceReauth, refreshRoomList, switchRoom });
 initAuthUi({ enterChat, showAuth, onLogout: resetDrafts });
