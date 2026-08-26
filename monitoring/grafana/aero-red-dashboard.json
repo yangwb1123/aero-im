@@ -11,7 +11,7 @@
         "name": "datasource",
         "type": "datasource",
         "query": "prometheus",
-        "current": {}
+        "current": { "selected": true, "text": "Prometheus", "value": "aero-prometheus" }
       }
     ]
   },
@@ -80,6 +80,39 @@
       "fieldConfig": { "defaults": { "unit": "percentunit" }, "overrides": [] },
       "targets": [
         { "expr": "aero_db_pool_in_use / clamp_min(aero_db_pool_size, 1)", "legendFormat": "in use" }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Audit outbox age (s)",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 16 },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [
+        { "expr": "max(aero_audit_outbox_oldest_pending_secs)", "legendFormat": "pending" },
+        { "expr": "max(aero_audit_outbox_oldest_claimed_secs)", "legendFormat": "claimed" }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Audit failure queues",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 16 },
+      "targets": [
+        { "expr": "max(aero_audit_outbox_dead_rows)", "legendFormat": "dead outbox" },
+        { "expr": "max(aero_audit_governance_failed_pairs)", "legendFormat": "failed pairs" }
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Firing alerts",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 16 },
+      "targets": [
+        { "expr": "sum by (alertname, severity) (ALERTS{alertstate=\"firing\"})", "legendFormat": "{{alertname}} ({{severity}})" }
       ]
     }
   ]

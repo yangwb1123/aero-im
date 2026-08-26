@@ -1,8 +1,81 @@
 name: aero-im
 
 services:
+  # The default profile starts only the local dependency stack.  Enable the
+  # optional app profile for a complete Docker deployment:
+  #   docker compose --profile app up -d --build
+  # The one-shot migrate service completes before the gateway is started.
+  migrate:
+    profiles: ["app"]
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: migrate
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      AERO__DATABASE__URL: postgres://aero:aero_dev_pw@postgres:5432/aero
+      AERO__DATABASE__MAX_CONNECTIONS: "16"
+      AERO__REDIS__URL: redis://redis:6379
+      AERO__NATS__URL: nats://nats:4222
+    command: ["/usr/local/bin/aero-cli", "migrate"]
+    networks: [aero-dev]
+
+  app:
+    profiles: ["app"]
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      target: runtime
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+    environment:
+      AERO__SERVER__HOST: 0.0.0.0
+      AERO__SERVER__PORT: "8080"
+      AERO__SERVER__WEB_DIR: /app/web
+      AERO__SERVER__RTMP_LISTEN: 0.0.0.0:1935
+      AERO__LIVE__SRT_LISTEN: 0.0.0.0:1936
+      AERO__SERVER__BLOB_DIR: /var/lib/aero/blobs
+      AERO__SERVER__HLS_DIR: /var/lib/aero/hls
+      AERO__DATABASE__URL: postgres://aero:aero_dev_pw@postgres:5432/aero
+      AERO__DATABASE__MAX_CONNECTIONS: "16"
+      AERO__REDIS__URL: redis://redis:6379
+      AERO__NATS__URL: nats://nats:4222
+      AERO__TELEMETRY__OTLP_ENDPOINT: http://jaeger:4317
+      AERO_PUBLIC_BASE_URL: ${AERO_PUBLIC_BASE_URL:-http://localhost:8080}
+      AERO__AUTH__JWT_PRIVATE_KEY_FILE: /run/secrets/aero_jwt_private_key
+      AERO__AUTH__JWT_PUBLIC_KEY_FILE: /run/secrets/aero_jwt_public_key
+      AERO__AUTH__ISSUER: ${AERO__AUTH__ISSUER:-aero-im}
+      AERO_METRICS_TOKEN_FILE: /run/secrets/aero_metrics_token
+    ports:
+      - "${AERO_APP_BIND_HOST:-127.0.0.1}:8080:8080"
+      - "${AERO_RTMP_BIND_HOST:-127.0.0.1}:1935:1935"
+      - "${AERO_SRT_BIND_HOST:-127.0.0.1}:1936:1936/udp"
+    volumes:
+      - ./data/server-blobs:/var/lib/aero/blobs
+      - ./data/server-hls:/var/lib/aero/hls
+    secrets:
+      - aero_jwt_private_key
+      - aero_jwt_public_key
+      - aero_metrics_token
+    networks: [aero-dev]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health/live"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 15s
+
   postgres:
-    image: pgvector/pgvector:pg17
+    image: "${AERO_POSTGRES_IMAGE:-pgvector/pgvector:pg17@sha256:feb68f4f15446397d8cac7f4fe48fe4586de83160d1fc48b46283312d1a33966}"
     container_name: aero-postgres
     restart: unless-stopped
     environment:
@@ -24,7 +97,7 @@ services:
       start_period: 10s
 
   redis:
-    image: redis:7-alpine
+    image: "${AERO_REDIS_IMAGE:-redis:7-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99}"
     container_name: aero-redis
     restart: unless-stopped
     command: ["redis-server", "--appendonly", "yes", "--dir", "/data"]
@@ -45,7 +118,7 @@ services:
     # while this service's HTTP health probe intentionally uses both. Keep the
     # Alpine variant so Docker can execute the probe instead of permanently
     # misreporting a healthy NATS process as unhealthy.
-    image: nats:2.10-alpine
+    image: "${AERO_NATS_IMAGE:-nats:2.10-alpine@sha256:b83efabe3e7def1e0a4a31ec6e078999bb17c80363f881df35edc70fcb6bb927}"
     container_name: aero-nats
     restart: unless-stopped
     command: ["-js", "-sd", "/data", "-m", "8222"]
@@ -64,11 +137,11 @@ services:
       start_period: 10s
 
   jaeger:
-    image: jaegertracing/all-in-one:latest
+    # Jaeger v1 reached EOL at the end of 2025. v2 keeps the all-in-one
+    # development topology while accepting OTLP on the same ports.
+    image: "${AERO_JAEGER_IMAGE:-cr.jaegertracing.io/jaegertracing/jaeger:2.20.0@sha256:46a886260e04002d8f45e213fc39063fa11a50446048fdaa64786fc0840cb9f8}"
     container_name: aero-jaeger
     restart: unless-stopped
-    environment:
-      COLLECTOR_OTLP_ENABLED: "true"
     ports:
       - "${AERO_DEPENDENCY_BIND_HOST:-127.0.0.1}:4317:4317"   # OTLP gRPC
       - "${AERO_DEPENDENCY_BIND_HOST:-127.0.0.1}:4318:4318"   # OTLP HTTP
@@ -76,13 +149,94 @@ services:
     networks:
       - aero-dev
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:16686/ || exit 1"]
+      test: ["CMD-SHELL", "/usr/bin/wget -qO- http://localhost:16686/ || exit 1"]
       interval: 10s
       timeout: 3s
       retries: 5
 
+  prometheus:
+    profiles: ["observability"]
+    image: "${AERO_PROMETHEUS_IMAGE:-quay.io/prometheus/prometheus:v3.13.1@sha256:3c42b892cf723fa54d2f262c37a0e1f80aa8c8ddb1da7b9b0df9455a35a7f893}"
+    container_name: aero-prometheus
+    restart: unless-stopped
+    depends_on:
+      app:
+        condition: service_healthy
+      alertmanager:
+        condition: service_started
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=${AERO_PROMETHEUS_RETENTION:-15d}
+      - --web.enable-lifecycle
+    ports:
+      - "${AERO_DEPENDENCY_BIND_HOST:-127.0.0.1}:9090:9090"
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/prometheus/recording_rules.yml:/etc/prometheus/recording_rules.yml:ro
+      - ./monitoring/prometheus/alert_rules.yml:/etc/prometheus/alert_rules.yml:ro
+      - prometheus-data:/prometheus
+    secrets:
+      - aero_metrics_token
+    networks: [aero-dev]
+    healthcheck:
+      test: ["CMD", "/bin/wget", "--spider", "-q", "http://localhost:9090/-/healthy"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  alertmanager:
+    profiles: ["observability"]
+    image: "${AERO_ALERTMANAGER_IMAGE:-quay.io/prometheus/alertmanager:v0.33.1@sha256:9e082985f56f4c8c9f724e18f2288c6708f472e56a5286b8863d080434ea065d}"
+    container_name: aero-alertmanager
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+    ports:
+      - "${AERO_DEPENDENCY_BIND_HOST:-127.0.0.1}:9093:9093"
+    volumes:
+      - ./monitoring/alertmanager.example.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager-data:/alertmanager
+    networks: [aero-dev]
+    healthcheck:
+      test: ["CMD", "/bin/wget", "--spider", "-q", "http://localhost:9093/-/healthy"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  grafana:
+    profiles: ["observability"]
+    image: "${AERO_GRAFANA_IMAGE:-grafana/grafana:13.2.0@sha256:3fd54ae1214669f8355f065ec9f6445d5279a3d77095ab048ca045685272429b}"
+    container_name: aero-grafana
+    restart: unless-stopped
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    environment:
+      GF_SECURITY_ADMIN_USER: ${AERO_GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${AERO_GRAFANA_ADMIN_PASSWORD:-aero_grafana_dev_pw}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_PLUGINS_PREINSTALL_DISABLED: "true"
+    ports:
+      - "${AERO_DEPENDENCY_BIND_HOST:-127.0.0.1}:3000:3000"
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/aero-red-dashboard.json:/var/lib/grafana/dashboards/aero-red-dashboard.json:ro
+      - grafana-data:/var/lib/grafana
+    networks: [aero-dev]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:3000/api/health || exit 1"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 20s
+
   minio:
-    image: minio/minio:latest
+    image: "${AERO_MINIO_IMAGE:-minio/minio:RELEASE.2025-09-07T16-13-09Z@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e}"
     container_name: aero-minio
     restart: unless-stopped
     command: ["server", "/data", "--console-address", ":9001"]
@@ -106,3 +260,16 @@ networks:
   aero-dev:
     name: aero-dev
     driver: bridge
+
+volumes:
+  prometheus-data:
+  alertmanager-data:
+  grafana-data:
+
+secrets:
+  aero_jwt_private_key:
+    file: ${AERO_JWT_PRIVATE_KEY_FILE:-./secrets/jwt_private.pem}
+  aero_jwt_public_key:
+    file: ${AERO_JWT_PUBLIC_KEY_FILE:-./secrets/jwt_public.pem}
+  aero_metrics_token:
+    file: ${AERO_METRICS_TOKEN_FILE:-./secrets/metrics_token}

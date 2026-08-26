@@ -88,6 +88,48 @@ groups:
           summary: "NATS publish errors"
           description: "Event fan-out is failing to publish; room/stream events may be lost."
 
+      - alert: AeroAuditOutboxSamplerDown
+        # sampler_up is per instance; one failed sampler is enough to surface.
+        expr: min(aero_audit_outbox_sampler_up) == 0
+        for: 2m
+        labels: { severity: page }
+        annotations:
+          summary: "Audit outbox sampler is failing"
+          description: "At least one gateway cannot verify audit outbox health; prior gauge values are intentionally retained."
+
+      - alert: AeroAuditOutboxDeadRows
+        # Outbox bucket gauges have a documented max() cross-instance contract.
+        expr: max(aero_audit_outbox_dead_rows) > 0
+        for: 2m
+        labels: { severity: page }
+        annotations:
+          summary: "Audit governance outbox contains dead rows"
+          description: "A governance delivery exhausted its retry path and requires operator review."
+
+      - alert: AeroAuditOutboxPendingStalled
+        expr: max(aero_audit_outbox_oldest_pending_secs) > 300
+        for: 10m
+        labels: { severity: page }
+        annotations:
+          summary: "Audit governance outbox has stalled pending rows"
+          description: "The oldest pending governance delivery has been available for more than five minutes."
+
+      - alert: AeroAuditOutboxClaimStalled
+        expr: max(aero_audit_outbox_oldest_claimed_secs) > 300
+        for: 10m
+        labels: { severity: page }
+        annotations:
+          summary: "Audit governance outbox has a stale claim"
+          description: "A claimed governance delivery has not settled or been reclaimed for more than five minutes."
+
+      - alert: AeroAuditGovernanceFailedPairs
+        expr: max(aero_audit_governance_failed_pairs) > 0
+        for: 5m
+        labels: { severity: page }
+        annotations:
+          summary: "Audit governance producer pairs await replay"
+          description: "An authorization/audit pair failed open into the replay queue and requires operator action."
+
       - alert: AeroDbPoolSaturated
         expr: aero_db_pool_in_use / clamp_min(aero_db_pool_size, 1) > 0.9
         for: 5m

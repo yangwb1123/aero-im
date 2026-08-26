@@ -16,9 +16,19 @@ PUB="${SECRETS_DIR}/jwt_public.pem"
 mkdir -p "${SECRETS_DIR}"
 chmod 700 "${SECRETS_DIR}"
 
-if [[ -f "${PRIV}" || -f "${PUB}" ]]; then
-    echo "Refusing to overwrite existing keys in ${SECRETS_DIR}/."
-    echo "Delete them manually if you really want to regenerate."
+if [[ -f "${PRIV}" && -f "${PUB}" ]]; then
+    if [[ ! -s "${PRIV}" || ! -s "${PUB}" ]]; then
+        echo "Existing JWT key file is empty in ${SECRETS_DIR}/" >&2
+        exit 1
+    fi
+    chmod 600 "${PRIV}"
+    chmod 644 "${PUB}"
+    echo "JWT keys already present in ${SECRETS_DIR}/ (not overwritten)."
+    exit 0
+fi
+if [[ -e "${PRIV}" || -e "${PUB}" ]]; then
+    echo "Incomplete JWT keypair in ${SECRETS_DIR}/; refusing to overwrite either file." >&2
+    echo "Move the surviving file aside or restore its matching key." >&2
     exit 1
 fi
 

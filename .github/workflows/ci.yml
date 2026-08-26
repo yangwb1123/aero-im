@@ -8,6 +8,18 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  migration-guard:
+    name: Immutable migration history
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Reject historical migration changes
+        run: bash scripts/migration-immutability-check.sh
+        env:
+          AERO_MIGRATION_BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before }}
+
   build:
     name: Build
     runs-on: ubuntu-latest
@@ -59,13 +71,17 @@ jobs:
       # change mutated — it must execute in CI, not only inside
       # test-integration.sh.
       - run: bash scripts/test-b5-pin-guard.sh
+      - name: Migration guard regression suite
+        run: bash scripts/test-migration-immutability-check.sh
+      - name: Incremental rustfmt guard regression suite
+        run: bash scripts/test-fmt-check.sh
 
   integration:
     name: Integration tests (PostgreSQL)
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: pgvector/pgvector:pg17
+        image: pgvector/pgvector:pg17@sha256:feb68f4f15446397d8cac7f4fe48fe4586de83160d1fc48b46283312d1a33966
         env:
           POSTGRES_PASSWORD: aero
           POSTGRES_USER: aero
@@ -78,7 +94,7 @@ jobs:
         ports:
           - 5432:5432
       redis:
-        image: redis:7-alpine
+        image: redis:7-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
         options: >-
           --health-cmd "redis-cli ping"
           --health-interval 10s
@@ -92,7 +108,8 @@ jobs:
       - run: cargo build -p aero-server --bin aero-cli --locked
       - name: Start NATS JetStream
         run: |
-          docker run --detach --name aero-nats --publish 4222:4222 nats:2.10-alpine -js
+          docker run --detach --name aero-nats --publish 4222:4222 \
+            nats:2.10-alpine@sha256:b83efabe3e7def1e0a4a31ec6e078999bb17c80363f881df35edc70fcb6bb927 -js
           for _ in $(seq 1 30); do
             if (echo > /dev/tcp/127.0.0.1/4222) 2>/dev/null; then
               exit 0
@@ -179,6 +196,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions-rust-lang/setup-rust-toolchain@v1
       - uses: actions/setup-node@v4
         with: { node-version: '20' }
@@ -186,10 +205,21 @@ jobs:
         working-directory: web
       - run: cargo build -p aero-server --bin aero-cli --locked
       - run: ./target/debug/aero-cli gate all
+        env:
+          AERO_FORMAT_BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before }}
+          AERO_MIGRATION_BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before }}
       - run: npm test
         working-directory: web
       - run: npm run lint
         working-directory: web
+
+  docker-smoke:
+    name: Fresh Docker deployment
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - run: bash scripts/docker-deploy-smoke.sh
 
   security:
     name: cargo deny

@@ -142,6 +142,46 @@ AI-Native 即时通讯 + 直播平台,Rust 实现。
 
 ## 快速开始
 
+### Docker 完整部署（推荐验证路径）
+
+```bash
+# 生成 JWT 密钥；app profile 将 secrets/ 中被 Git 忽略的 PEM 作为 Docker secrets 挂载
+make jwt-keys
+
+# 构建镜像、启动 PostgreSQL/Redis/NATS/Jaeger/MinIO，执行迁移，再启动 gateway
+make up-app
+open http://localhost:8080
+
+# 可选：同时启动 Prometheus、Alertmanager 和已 provisioning 的 Grafana
+make up-observability
+open http://localhost:3000
+```
+
+`docker compose up -d` 仍只启动依赖服务；需要完整应用栈时使用 `make up-app`（或
+`docker compose --profile app up -d --build`）。宿主机绑定默认仅监听 `127.0.0.1`，可用
+`.env` 中的 `AERO_APP_BIND_HOST` / `AERO_RTMP_BIND_HOST` 覆盖。`make down` 会停止当前
+Compose 项目，但不会删除 `data/` 持久化卷。依赖镜像以版本与 digest 固定；升级时显式覆盖
+对应 `AERO_*_IMAGE` 并在评审后更新仓库默认值。`make up-observability` 使用独立 Compose
+profile，通过文件型 bearer token 抓取 `/metrics`，加载 SLO/运维告警，并自动 provision
+Grafana 数据源与 Aero RED 看板。默认 Grafana 凭据只用于回环绑定的本地环境，生产必须覆盖。
+`make docker-smoke` 会在隔离网络和全新 PostgreSQL 中重放镜像构建、完整迁移、原子备份、
+一次性恢复和数据指纹比对，再验证 secret 文件注入、Prometheus scrape/规则、Grafana
+provisioning、健康检查及 relay probe，完成后自动清理临时容器。
+
+运行中的 Compose PostgreSQL 可用下列命令生成 custom-format 归档，并在新建的一次性数据库
+中验证可恢复性；校验流程不会覆盖或删除源数据库，也不会接管已存在的目标数据库：
+
+```bash
+make postgres-backup
+make postgres-restore-verify DUMP=data/backups/postgres/aero-YYYYmmddTHHMMSSZ.dump
+```
+
+生产保留、加密、异地复制、对象存储一致性和切换步骤见
+[`docs/runbooks/postgres-backup-restore.md`](docs/runbooks/postgres-backup-restore.md)。
+监控配置、告警语义和 staging 验收见 [`monitoring/README.md`](monitoring/README.md)。
+
+### 本机 Rust 部署
+
 ```bash
 # 1. 起开发环境(Postgres / Redis / NATS / Jaeger / MinIO)
 make up
@@ -339,6 +379,8 @@ cargo check --workspace          # 干净
 cargo test --workspace --lib     # hermetic 单测；忽略的 DB 集成测试需 DATABASE_URL + 已迁移的新库
 cargo build --bin aero-server    # 二进制成功
 cargo clippy --workspace --all-targets
+scripts/fmt-check.sh
+scripts/migration-immutability-check.sh
 scripts/truth-check.sh
 scripts/file-size-check.sh
 scripts/web-check.sh

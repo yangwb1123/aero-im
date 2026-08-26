@@ -43,7 +43,11 @@
   OTLP、AI provider 与 GIPHY 网络往返；校准账单/质量，并人工确认 GIPHY
   attribution 在目标浏览器和 CSP 下可见。本机 MinIO/Mailpit/mock
   OIDC/Jaeger/ClamAV/OTel 的通过记录不能替代供应商验收。
-- [ ] 在 staging 验证 Prometheus 告警、仪表盘、备份恢复和容量/SLO。
+- [ ] 在 staging 验证 Prometheus 告警、仪表盘、备份恢复和容量/SLO。仓库内
+  `make docker-smoke` 已在隔离 PostgreSQL 自动完成 custom-format 备份、一次性恢复及
+  业务标记/迁移账本指纹比对，并验证 bearer-gated Prometheus scrape、SLO/运维规则加载、
+  Alertmanager 健康和 Grafana provisioning；这只能证明本地流程，不能替代 staging 告警
+  送达、真实流量阈值、数据规模、加密存储、保留策略、RPO/RTO 与故障切换演练。
 
 这些项目需要真实对端、网络、凭据或人工观察；hermetic CI 不能替代，也不能在
 未执行时写成“已完成”。

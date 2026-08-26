@@ -1,0 +1,15 @@
+.git
+.github
+.claude
+.pi-batch
+target
+data
+logs
+secrets
+.env
+.env.*
+config.toml
+docs
+skills
+**/*.rs.bk
+*.log

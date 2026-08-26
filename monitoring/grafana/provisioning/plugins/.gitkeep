@@ -1,0 +1,1 @@
+# Keep the provisioning directory present so Grafana does not report it missing.
