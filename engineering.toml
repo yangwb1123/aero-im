@@ -1,6 +1,7 @@
 # Aero IM — engineering thresholds and check configuration.
-# Read by `aero-cli check` commands. All values are defaults;
-# override per-deployment as needed.
+# The native filesize checks read [filesize] from this file. Shell gates keep
+# their script-defined defaults; [complexity] and [check] are parsed but do
+# not currently change gate behavior.
 
 [filesize]
 # Rust source: warn above this line count, hard-fail above hard_limit
@@ -8,16 +9,17 @@ rust_warn = 800
 rust_hard = 1200
 # routes.rs has its own higher exemption
 routes_hard = 3000
-# JavaScript (web/): warn above this
-js_warn = 1000
+# JavaScript (web/): matches scripts/file-size-check.sh (WARN >600, HARD >1000)
+js_warn = 600
+js_hard = 1000
 
 [complexity]
-# Cyclomatic complexity per function; warn above warn, hard-fail above hard
+# Currently unused by the gate; it uses the script's fixed >50-line heuristic
+# and is warning-only, not cyclomatic complexity.
 warn = 12
 hard = 20
 
 [check]
-# Whether to run cargo clippy as part of `aero-cli check`
+# Currently unused; `check` always runs all three cargo commands.
 clippy = true
-# Whether to run the full cargo test suite
 full_test = true

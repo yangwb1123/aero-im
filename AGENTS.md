@@ -88,7 +88,7 @@ flowchart LR
 | **blob_gc_drain**（GDPR/附件清理） | 固定 60s，持共享 cancel token | drain ≤50：普通清理先查 live reference，有引用则 `cancel`；GDPR/失效 reservation 等 `force_delete` 不可取消；随后 `blob_store.delete`，**仅 Ok 才 `ack`**（delete-then-ack，失败留行重试）。消息附件加锁校验与普通 enqueue 的 `FOR UPDATE` 共同封住 attach/enqueue/delete 竞态 |
 | **integration receipt sweep** | `AERO__SERVER__INTEGRATION_RECEIPT_SWEEP_SECS`（0 禁），持共享 cancel token | 有界清扫过期 machine request / notification / blob 幂等 receipt；live processing lease 不删。最后一个 blob receipt 到期只入普通 blob GC，消息仍引用则取消删除；安装 blob ledger 仅随 blob 真删除扣账 |
 | **embedding_backfill**（RAG） | 固定 300s | 扫 ≤200 无 embedding 消息 → `enqueue_unique(Embed)` dedup → AiWorker 填；受下游 AI 预算约束 |
-| **observability_gauge_samplers** | 三独立 timer（DB 池+WHIP 15s / AI DLQ 30s / NATS backlog 30s），无 env、**不持 cancel token** | 纯观察设 Prometheus gauge，永不改状态；query Err 留旧值 |
+| **observability_gauge_samplers** | 九个采样 timer（DB 池+WHIP 15s / index-size 60s（`AERO_INDEX_SIZE_SAMPLE_SECS`，0/非法回默认）/ PG stats 60s（`AERO_PG_STATS_SAMPLE_SECS`，0 禁）/ AI DLQ 30s / failed-pairs DLQ 30s / audit-relay counter snapshot 30s / audit outbox Tier-1 30s / Tier-2 默认 300s（`AERO__SERVER__AUDIT_OUTBOX_FULL_SAMPLE_SECS`，0/非法禁用）/ NATS backlog 30s），均持共享 cancel token + `MissedTickBehavior::Skip` | 只读设 Prometheus gauge，永不改状态；查询失败不伪造零值并保留旧值（Tier-1 另设 `sampler_up=0`、递增 errors） |
 
 ### 核心扇出循环（boot 起一个/进程）
 

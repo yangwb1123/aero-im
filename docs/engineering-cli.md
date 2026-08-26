@@ -28,15 +28,26 @@ cargo build -p aero-server --bin aero-cli
 
 | 命令 | 说明 | 执行内容 |
 |---|---|---|
-| `aero-cli check` | 并行门禁 | `cargo check` + `test` + `clippy` 同时运行 |
+| `aero-cli check` | 并行基础检查 + 原生门禁 | `cargo check` + `cargo test --workspace --lib` + `cargo clippy` 并行；随后原生 filesize/deps/workspace/todos/metadata 检查 |
 | `aero-cli test` | 运行测试 | `cargo test --workspace --lib` |
-| `aero-cli gate list` | 列出门禁 | — |
-| `aero-cli gate filesize` | 文件尺寸 | `scripts/file-size-check.sh` |
+| `aero-cli gate list` | 列出门禁 | 列出下方所有 gate 名称 |
+| `aero-cli gate filesize` | 文件尺寸 | `scripts/file-size-check.sh`（固定脚本阈值） |
 | `aero-cli gate truth` | 死代码检测 | `scripts/truth-check.sh` |
 | `aero-cli gate web` | 前端完整性 | `scripts/web-check.sh` |
 | `aero-cli gate deps` | 依赖方向 | `scripts/dependency-check.sh` |
-| `aero-cli gate deps-native` | 依赖方向（原生 Rust） | 解析 Cargo.toml，校验 ALLOWED_DEPS |
-| `aero-cli gate filesize-native` | 文件尺寸（原生 Rust） | 递归扫描，使用 engineering.toml 阈值 |
+| `aero-cli gate complexity` | 长函数近似检查 | `scripts/complexity-check.sh`（固定 >50 行，告警式、非实际圈复杂度） |
+| `aero-cli gate format` | 增量 rustfmt；基线整洁/新增文件不得引入格式债 | `scripts/fmt-check.sh`（历史格式债仅告警） |
+| `aero-cli gate format-tests` | 增量 rustfmt 门禁正反例回归 | `scripts/test-fmt-check.sh`（无数据库、无网络） |
+| `aero-cli gate migrations` | 历史迁移不可变与新增序号检查 | `scripts/migration-immutability-check.sh` |
+| `aero-cli gate migration-tests` | 迁移守卫正反例回归 | `scripts/test-migration-immutability-check.sh`（无数据库、无网络） |
+| `aero-cli gate filesize-native` | 文件尺寸（原生 Rust） | 递归扫描，使用 engineering.toml 的 filesize 阈值 |
+| `aero-cli gate deps-native` | 依赖方向（原生 Rust） | 解析 Cargo.toml 的生产/构建依赖，校验 ALLOWED_DEPS（dev-dependencies 仅供测试，不计入生产方向图） |
+| `aero-cli gate workspace-members` | workspace 成员完整性 | 校验 Cargo.toml 声明的 crate 目录均存在 |
+| `aero-cli gate todos` | TODO/FIXME/HACK 提醒 | 扫描 crate Rust 注释，告警式、非失败门 |
+| `aero-cli gate metadata` | crate 元数据完整性 | 校验每个 workspace crate 使用 workspace 的 version/edition/license |
+| `aero-cli gate readme` | crate 文档完整性 | 每个 workspace crate 必须有首个非空行以 crate 名开头的 README H1；缺失或标题不匹配直接失败，不检查占位正文 |
+| `aero-cli gate b5` | B5 集成门 | `scripts/test-integration.sh`（需集成环境） |
+| `aero-cli gate all` | 标准门禁汇总 | 并行运行 7 个 shell gate（filesize/truth/web/deps/complexity/format/migrations），随后运行 6 个原生 gate（filesize/deps/workspace/todos/metadata/readme）；不包含 format-tests、migration-tests 或 b5 |
 
 ### 测试调度
 
@@ -77,18 +88,39 @@ aero-cli completion fish     # Fish 补全
 
 ## 配置
 
+### 阈值语义
+
+文件尺寸比较使用严格的 `>`：正好达到阈值不触发该级别；例如 Rust
+801 行开始告警、1201 行开始硬失败，JS 601 行开始告警、1001 行开始硬失败。
+Rust 在 1200 行时仍是告警，`routes.rs` 只有超过 3000 行才硬失败。告警不会
+让 shell gate 或命令退出码变为失败，硬失败退出码为 1。
+
 ### `engineering.toml`
+
+`aero-cli`/`aero-eng` 启动时会读取此文件。`[filesize]` 由
+`gate filesize-native`、`check` 和 `gate all` 的原生 filesize 检查使用；
+`gate filesize` 使用 `scripts/file-size-check.sh` 内的固定默认值，因此自定义
+配置不会改变 shell gate。当前 `[complexity]` 和 `[check]` 只会被解析，尚未
+改变 gate 行为：`gate complexity` 仍是固定的 >50 行近似告警，`check` 始终运行
+cargo check、`cargo test --workspace --lib` 和 clippy。
 
 ```toml
 [filesize]
-rust_warn = 800      # Rust 文件超过此行数报警
-rust_hard = 1200     # Rust 文件超过此行数禁止
-routes_hard = 3000   # routes.rs 独立阈值
-js_warn = 1000       # JS 文件报警线
+rust_warn = 800      # 严格按 > 比较；超过此行数告警
+rust_hard = 1200     # 严格按 > 比较；超过此行数硬失败
+routes_hard = 3000   # routes.rs 独立硬阈值
+js_warn = 600        # JS 严格按 > 比较的告警线
+js_hard = 1000       # JS 严格按 > 比较的硬失败线
 
+# Parsed for compatibility; gate complexity currently uses scripts/ constants.
+[complexity]
+warn = 12
+hard = 20
+
+# Parsed for compatibility; check currently always runs all three cargo commands.
 [check]
-clippy = true        # check 命令是否运行 clippy
-full_test = true     # check 命令是否运行完整测试
+clippy = true
+full_test = true
 ```
 
 ### 环境变量
@@ -106,10 +138,10 @@ make install-hooks        # 安装 git pre-commit hook
 
 # 日常开发
 make dev                  # 启动环境
-make check                # 运行工程门禁
-make gate                 # 运行全部门禁
+make check                # cargo check --workspace --all-targets
+make gate                 # 通过 aero-cli 运行 gate all
 make doctor               # 环境诊断
 
 # CI 管线
-make ci                   # check + gate all
+make ci                   # aero-cli check + gate all
 ```

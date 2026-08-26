@@ -1,5 +1,6 @@
-# Example Prometheus config for scraping Aero IM and loading the SLO rules.
-# Copy alongside recording_rules.yml + alert_rules.yml and point Prometheus at it.
+# Example Prometheus config for an external deployment. Replace the
+# `aero-server` target with the gateway's externally resolvable host. Compose
+# uses the checked-in prometheus.yml, which points at the `app` service.
 #
 # NOTE: `/metrics` is bearer-gated (set `AERO_METRICS_TOKEN` on the server, see
 # crates/aero-server/src/metrics.rs); supply the same token to the scrape job.
