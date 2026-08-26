@@ -1,0 +1,573 @@
+name: aero-platform
+
+x-nginx-edge: &nginx-edge
+  image: nginx:1.29-alpine
+  restart: unless-stopped
+  networks: [platform]
+
+services:
+  snaplink-init:
+    image: alpine:3.22
+    user: root
+    environment:
+      SNAPLINK_ADMIN_PASSWORD: ${SNAPLINK_ADMIN_PASSWORD:-admin-local-only}
+    volumes:
+      - snaplink-data:/var/lib/snaplink
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        apk add --no-cache apache2-utils >/dev/null
+        umask 077
+        htpasswd -bnBC 12 '' "$${SNAPLINK_ADMIN_PASSWORD}" | tr -d ':\n' > /var/lib/snaplink/admin.bcrypt
+        chown -R 65532:65532 /var/lib/snaplink
+    restart: "no"
+
+  snaplink:
+    build:
+      context: ../../../workspace/demo/snaplink
+      dockerfile: Dockerfile
+      target: sso-server
+    command: ["--config=/etc/sso/config.yaml", "--grpc-insecure"]
+    depends_on:
+      snaplink-init:
+        condition: service_completed_successfully
+    ports:
+      - "${PLATFORM_BIND_HOST:-127.0.0.1}:28080:8080"
+    volumes:
+      - ./config/snaplink.yaml:/etc/sso/config.yaml:ro
+      - snaplink-data:/var/lib/snaplink
+    networks: [platform]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "/healthcheck"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 10s
+
+  snaplink-config-sync:
+    image: python:3.13-alpine
+    depends_on:
+      snaplink:
+        condition: service_healthy
+    environment:
+      SNAPLINK_BASE_URL: http://snaplink:8080
+      SNAPLINK_ADMIN_USERNAME: admin
+      SNAPLINK_ADMIN_PASSWORD: ${SNAPLINK_ADMIN_PASSWORD:-admin-local-only}
+      SNAPLINK_MANAGED_CLIENT_ID: aero-account-console
+      SNAPLINK_MANAGED_CLIENT_NAME: Aero Account Console
+      SNAPLINK_MANAGED_CLIENT_REDIRECT_URIS: http://localhost:28010/
+      SNAPLINK_MANAGED_CLIENT_LOGIN_PAGE_URI: ""
+      SNAPLINK_MANAGED_CLIENT_SCOPES: openid profile account:read account:write operation:read source:sync audit:read
+      SNAPLINK_MANAGED_CLIENT_AUTHENTICATORS: password
+      SNAPLINK_MANAGED_CLIENT_TOKEN_STRATEGY: jwt
+    volumes:
+      - ./scripts/sync-snaplink-config.py:/sync-snaplink-config.py:ro
+    command: ["python", "/sync-snaplink-config.py"]
+    networks: [platform]
+    restart: "no"
+
+  audit-governance-postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: audit_governance
+      POSTGRES_USER: audit
+      POSTGRES_PASSWORD: ${AUDIT_POSTGRES_PASSWORD:-local-audit-db-password}
+    volumes:
+      - audit-postgres-data:/var/lib/postgresql/data
+    networks: [platform]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U audit -d audit_governance"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  audit-governance-edge:
+    <<: *nginx-edge
+    ports:
+      - "${PLATFORM_BIND_HOST:-127.0.0.1}:28089:8089"
+    volumes:
+      - ./nginx/audit-governance.conf:/etc/nginx/conf.d/default.conf:ro
+
+  audit-governance-init:
+    image: alpine:3.22
+    user: root
+    volumes:
+      - audit-archive-data:/var/lib/audit/archive
+    entrypoint: ["/bin/sh", "-ec"]
+    command: ["chown -R 100:101 /var/lib/audit/archive && chmod 0750 /var/lib/audit/archive"]
+    restart: "no"
+
+  audit-governance-migrate:
+    image: postgres:17-alpine
+    depends_on:
+      audit-governance-postgres:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: ${AUDIT_POSTGRES_PASSWORD:-local-audit-db-password}
+    volumes:
+      - ../../../workspace/demo/snaplink-audit-governance/migrations:/migrations:ro
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        for migration in /migrations/*.sql; do
+          psql -v ON_ERROR_STOP=1 \
+            -h audit-governance-postgres \
+            -U audit \
+            -d audit_governance \
+            -f "$${migration}"
+        done
+    networks: [platform]
+    restart: "no"
+
+  audit-governance:
+    build:
+      context: ../../../workspace/demo/snaplink-audit-governance
+      dockerfile: Dockerfile
+    network_mode: service:audit-governance-edge
+    depends_on:
+      audit-governance-postgres:
+        condition: service_healthy
+      snaplink:
+        condition: service_healthy
+      audit-governance-edge:
+        condition: service_started
+      audit-governance-init:
+        condition: service_completed_successfully
+      audit-governance-migrate:
+        condition: service_completed_successfully
+    environment:
+      AUDIT_LISTEN: :8089
+      AUDIT_POSTGRES_DSN: postgres://audit:${AUDIT_POSTGRES_PASSWORD:-local-audit-db-password}@audit-governance-postgres:5432/audit_governance?sslmode=disable
+      AUDIT_ARCHIVE_DIR: /var/lib/audit/archive
+      AUDIT_JWKS_URL: http://127.0.0.1:18080/.well-known/jwks.json
+      AUDIT_ALLOW_INSECURE_JWKS_LOOPBACK: "true"
+      AUDIT_JWT_ISSUER: http://localhost:28080
+      AUDIT_JWT_AUDIENCE: audit-governance
+      AUDIT_ALLOW_DEV_AUTH: "false"
+      AUDIT_ALLOW_PG_EMPTY_LEDGER: "true"
+      AUDIT_BOOTSTRAP_TENANT: platform-local
+      AUDIT_SIGNING_SECRET: ${AUDIT_SIGNING_SECRET:-uV3x9Pq7Nw2Ks6Bc8Fd4Jh1Rm5Ty0ZaE}
+      AUDIT_ENCRYPTION_KEY: ${AUDIT_ENCRYPTION_KEY:-Gm8Qv2Lp5Xc9Rs3Wd7Hj1Bk6Nt4Fy0Za}
+    volumes:
+      - audit-archive-data:/var/lib/audit/archive
+    restart: unless-stopped
+
+  audit-bootstrap:
+    image: python:3.13-alpine
+    depends_on:
+      snaplink:
+        condition: service_healthy
+      snaplink-config-sync:
+        condition: service_completed_successfully
+      audit-governance:
+        condition: service_started
+    environment:
+      AUDIT_BASE_URL: http://audit-governance-edge:8089
+      SNAPLINK_TOKEN_URL: http://snaplink:8080/token
+      BOOTSTRAP_CLIENT_ID: platform-audit-bootstrap
+      BOOTSTRAP_CLIENT_SECRET: local-platform-audit-bootstrap-secret-0001
+      AERO_VAULT_AUDIT_HMAC_KEY: ${AERO_VAULT_AUDIT_HMAC_KEY:-Wf9Kp3Nq7Vc2Rm6Ty1Bh8Dz4Ls5Xj0Ea}
+    volumes:
+      - ./scripts/bootstrap-audit.py:/bootstrap-audit.py:ro
+    command: ["python", "/bootstrap-audit.py"]
+    networks: [platform]
+    restart: "no"
+
+  optional-api-disabled:
+    image: nginx:1.29-alpine
+    volumes:
+      - ./nginx/optional-api-disabled.conf:/etc/nginx/conf.d/default.conf:ro
+    networks: [platform]
+    restart: unless-stopped
+
+  snaplink-console:
+    build:
+      context: ../../../workspace/demo/snaplink-console
+      dockerfile: Dockerfile
+      args:
+        SNAPLINK_ADMIN_OAUTH_RESOURCES: audit-governance
+    depends_on:
+      snaplink:
+        condition: service_healthy
+      audit-bootstrap:
+        condition: service_completed_successfully
+      optional-api-disabled:
+        condition: service_started
+    environment:
+      SNAPLINK_UPSTREAM: http://snaplink:8080
+      SNAPLINK_BILLING_UPSTREAM: http://optional-api-disabled:8088
+      SNAPLINK_STRIPE_ADAPTER_UPSTREAM: http://optional-api-disabled:8088
+      AUDIT_GOVERNANCE_UPSTREAM: http://audit-governance-edge:8089
+    ports:
+      - "${PLATFORM_BIND_HOST:-127.0.0.1}:28000:80"
+    networks: [platform]
+    restart: unless-stopped
+
+  aero-vault-postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: aero_vault
+      POSTGRES_USER: aero
+      POSTGRES_PASSWORD: ${AERO_VAULT_POSTGRES_PASSWORD:-local-aero-vault-db-password}
+    volumes:
+      - aero-vault-postgres-data:/var/lib/postgresql/data
+    networks: [platform]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aero -d aero_vault"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  aero-vault-minio:
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${AERO_VAULT_MINIO_USER:-aerovault}
+      MINIO_ROOT_PASSWORD: ${AERO_VAULT_MINIO_PASSWORD:-local-aero-vault-minio-password}
+    ports:
+      - "${PLATFORM_BIND_HOST:-127.0.0.1}:29000:9000"
+      - "${PLATFORM_BIND_HOST:-127.0.0.1}:29001:9001"
+    volumes:
+      - aero-vault-minio-data:/data
+    networks: [platform]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:9000/minio/health/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  aero-vault-minio-init:
+    image: minio/mc:RELEASE.2025-08-13T08-35-41Z
+    depends_on:
+      aero-vault-minio:
+        condition: service_healthy
+    environment:
+      MINIO_ROOT_USER: ${AERO_VAULT_MINIO_USER:-aerovault}
+      MINIO_ROOT_PASSWORD: ${AERO_VAULT_MINIO_PASSWORD:-local-aero-vault-minio-password}
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        mc alias set local http://aero-vault-minio:9000 "$${MINIO_ROOT_USER}" "$${MINIO_ROOT_PASSWORD}"
+        mc mb --ignore-existing local/aero-vault
+    networks: [platform]
+    restart: "no"
+
+  aero-vault-edge:
+    <<: *nginx-edge
+    ports:
+      - "${PLATFORM_BIND_HOST:-127.0.0.1}:28081:8080"
+    volumes:
+      - ./nginx/aero-vault.conf:/etc/nginx/conf.d/default.conf:ro
+
+  aero-vault:
+    build:
+      context: ../../../aero-vault
+      dockerfile: Dockerfile
+    network_mode: service:aero-vault-edge
+    depends_on:
+      aero-vault-postgres:
+        condition: service_healthy
+      aero-vault-minio-init:
+        condition: service_completed_successfully
+      audit-bootstrap:
+        condition: service_completed_successfully
+      aero-vault-edge:
+        condition: service_started
+    environment:
+      APP_ADDR: :8080
+      DB_DRIVER: postgres
+      DB_DSN: postgres://aero:${AERO_VAULT_POSTGRES_PASSWORD:-local-aero-vault-db-password}@aero-vault-postgres:5432/aero_vault?sslmode=disable
+      STORAGE_BACKEND: s3
+      STORAGE_S3_ENDPOINT: http://aero-vault-minio:9000
+      STORAGE_S3_REGION: us-east-1
+      STORAGE_S3_BUCKET: aero-vault
+      STORAGE_S3_ACCESS_KEY: ${AERO_VAULT_MINIO_USER:-aerovault}
+      STORAGE_S3_SECRET_KEY: ${AERO_VAULT_MINIO_PASSWORD:-local-aero-vault-minio-password}
+      STORAGE_S3_FORCE_PATH_STYLE: "true"
+      AUTH_JWT_ISSUER: http://localhost:28080
+      AUTH_JWKS_ENDPOINT: http://127.0.0.1:18080/.well-known/jwks.json
+      AUTH_JWKS_AUDIENCE: aero-vault
+      AUTH_JWKS_TENANT_CLAIM: tenant_id
+      AERO_VAULT_ACCOUNT_SOURCE_REGION: local
+      AUDIT_GOVERNANCE_ENABLED: "true"
+      AUDIT_GOVERNANCE_BASE_URL: http://127.0.0.1:18089
+      AUDIT_GOVERNANCE_TOKEN_URL: http://127.0.0.1:18080/token
+      AUDIT_GOVERNANCE_BINDINGS_FILE: /run/aero-vault/audit-bindings.json
+      AUDIT_GOVERNANCE_HMAC_KEY: ${AERO_VAULT_AUDIT_HMAC_KEY:-Wf9Kp3Nq7Vc2Rm6Ty1Bh8Dz4Ls5Xj0Ea}
+      AUDIT_GOVERNANCE_CLIENT_SECRET_PLATFORM_LOCAL: local-aero-vault-audit-secret-000000001
+    volumes:
+      - ./config/aero-vault-audit-bindings.json:/run/aero-vault/audit-bindings.json:ro
+    restart: unless-stopped
+
+  aero-id-postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: aero_id
+      POSTGRES_USER: aero
+      POSTGRES_PASSWORD: ${AERO_ID_POSTGRES_PASSWORD:-local-aero-id-db-password}
+    volumes:
+      - aero-id-postgres-data:/var/lib/postgresql/data
+    networks: [platform]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aero -d aero_id"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  aero-id-redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - aero-id-redis-data:/data
+    networks: [platform]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  aero-id-migrate:
+    build:
+      context: ../../../aero-id
+      dockerfile: deployments/Dockerfile
+    entrypoint: ["/app/migrate"]
+    command: ["-config", "/app/configs/platform.yaml", "-migrations", "/app/migrations", "up"]
+    depends_on:
+      aero-id-postgres:
+        condition: service_healthy
+    environment:
+      AERO_ID_DATABASE_PASSWORD: ${AERO_ID_POSTGRES_PASSWORD:-local-aero-id-db-password}
+      AERO_ID_AUDIT_CLIENT_SECRET_PLATFORM_LOCAL: local-aero-id-audit-secret-000000000001
+    volumes:
+      - ./config/aero-id.yaml:/app/configs/platform.yaml:ro
+    networks: [platform]
+    restart: "no"
+
+  aero-id-edge:
+    <<: *nginx-edge
+    ports:
+      - "${PLATFORM_BIND_HOST:-127.0.0.1}:28083:8080"
+      - "${PLATFORM_BIND_HOST:-127.0.0.1}:29090:9090"
+    volumes:
+      - ./nginx/aero-id.conf:/etc/nginx/conf.d/default.conf:ro
+
+  aero-id:
+    build:
+      context: ../../../aero-id
+      dockerfile: deployments/Dockerfile
+    network_mode: service:aero-id-edge
+    depends_on:
+      aero-id-migrate:
+        condition: service_completed_successfully
+      aero-id-redis:
+        condition: service_healthy
+      audit-bootstrap:
+        condition: service_completed_successfully
+      aero-id-edge:
+        condition: service_started
+    environment:
+      AERO_ID_DATABASE_PASSWORD: ${AERO_ID_POSTGRES_PASSWORD:-local-aero-id-db-password}
+      AERO_ID_AUDIT_CLIENT_SECRET_PLATFORM_LOCAL: local-aero-id-audit-secret-000000000001
+    volumes:
+      - ./config/aero-id.yaml:/app/configs/platform.yaml:ro
+      - aero-id-files:/var/lib/aero-id/files
+    entrypoint: ["/app/aero-id", "-config", "/app/configs/platform.yaml"]
+    restart: unless-stopped
+
+  aero-im-postgres:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_DB: aero
+      POSTGRES_USER: aero
+      POSTGRES_PASSWORD: ${AERO_IM_POSTGRES_PASSWORD:-local-aero-im-db-password}
+    volumes:
+      - aero-im-postgres-data:/var/lib/postgresql/data
+    networks: [platform]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U aero -d aero"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  aero-im-redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - aero-im-redis-data:/data
+    networks: [platform]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  aero-im-nats:
+    image: nats:2.10-alpine
+    command: ["-js", "-sd", "/data", "-m", "8222"]
+    volumes:
+      - aero-im-nats-data:/data
+    networks: [platform]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8222/healthz >/dev/null"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  aero-im-keygen:
+    image: alpine:3.22
+    user: root
+    volumes:
+      - aero-im-keys:/keys
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        apk add --no-cache openssl >/dev/null
+        if [ ! -s /keys/private.pem ]; then
+          umask 077
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out /keys/private.pem
+          openssl pkey -in /keys/private.pem -pubout -out /keys/public.pem
+        fi
+        chmod 0600 /keys/private.pem
+        chmod 0644 /keys/public.pem
+    restart: "no"
+
+  aero-im-migrate:
+    build:
+      context: ../..
+      dockerfile: docker/Dockerfile
+      target: migrate
+    depends_on:
+      aero-im-postgres:
+        condition: service_healthy
+      aero-im-keygen:
+        condition: service_completed_successfully
+    environment:
+      AERO__DATABASE__URL: postgres://aero:${AERO_IM_POSTGRES_PASSWORD:-local-aero-im-db-password}@aero-im-postgres:5432/aero
+      AERO__REDIS__URL: redis://aero-im-redis:6379
+      AERO__NATS__URL: nats://aero-im-nats:4222
+      AERO__AUTH__JWT_PRIVATE_KEY_FILE: /run/aero-keys/private.pem
+      AERO__AUTH__JWT_PUBLIC_KEY_FILE: /run/aero-keys/public.pem
+    volumes:
+      - aero-im-keys:/run/aero-keys:ro
+    networks: [platform]
+    restart: "no"
+
+  aero-im-edge:
+    <<: *nginx-edge
+    ports:
+      - "${PLATFORM_BIND_HOST:-127.0.0.1}:28082:8080"
+      - "${PLATFORM_BIND_HOST:-127.0.0.1}:21935:1935"
+    volumes:
+      - ./nginx/aero-im.conf:/etc/nginx/conf.d/default.conf:ro
+
+  aero-im:
+    build:
+      context: ../..
+      dockerfile: docker/Dockerfile
+      target: runtime
+    network_mode: service:aero-im-edge
+    depends_on:
+      aero-im-migrate:
+        condition: service_completed_successfully
+      aero-im-redis:
+        condition: service_healthy
+      aero-im-nats:
+        condition: service_healthy
+      aero-vault:
+        condition: service_started
+      audit-bootstrap:
+        condition: service_completed_successfully
+      aero-im-edge:
+        condition: service_started
+    environment:
+      AERO__SERVER__HOST: 0.0.0.0
+      AERO__SERVER__PORT: "8080"
+      AERO__SERVER__WEB_DIR: /app/web
+      AERO__SERVER__RTMP_LISTEN: 0.0.0.0:1935
+      AERO__SERVER__BLOB_DIR: /var/lib/aero/blobs
+      AERO__SERVER__HLS_DIR: /var/lib/aero/hls
+      AERO__DATABASE__URL: postgres://aero:${AERO_IM_POSTGRES_PASSWORD:-local-aero-im-db-password}@aero-im-postgres:5432/aero
+      AERO__REDIS__URL: redis://aero-im-redis:6379
+      AERO__NATS__URL: nats://aero-im-nats:4222
+      AERO__AUTH__JWT_PRIVATE_KEY_FILE: /run/aero-keys/private.pem
+      AERO__AUTH__JWT_PUBLIC_KEY_FILE: /run/aero-keys/public.pem
+      AERO__AUTH__ISSUER: aero-im
+      AERO_PUBLIC_BASE_URL: http://localhost:28082
+      AERO_BLOB_BACKEND: vault
+      AERO_VAULT_URL: http://127.0.0.1:18081
+      AERO_VAULT_TENANT: platform-local
+      AERO_VAULT_PREFIX: im-attachments
+      AERO_VAULT_OAUTH_TOKEN_ENDPOINT: http://127.0.0.1:18080/token
+      AERO_VAULT_OAUTH_CLIENT_ID: aero-im-vault
+      AERO_VAULT_OAUTH_CLIENT_SECRET: local-aero-im-vault-secret-000000000001
+      AERO_VAULT_OAUTH_SCOPE: read write
+      AERO_VAULT_OAUTH_RESOURCE: aero-vault
+      AERO__OIDC__ISSUER: http://localhost:28080
+      AERO__OIDC__AUDIENCE: aero-im
+      AERO__OIDC__JWKS_URI: http://127.0.0.1:18080/.well-known/jwks.json
+      AERO__OIDC__AUTHORIZATION_ENDPOINT: https://localhost:18443/authorize
+      AERO__OIDC__TOKEN_ENDPOINT: https://localhost:18443/token
+      AERO__OIDC__CLIENT_ID: aero-im
+      AERO__OIDC__CLIENT_SECRET: local-aero-im-browser-secret-change-before-production
+      AERO__OIDC__REDIRECT_URI: https://localhost:28482/callback
+      AERO__OIDC__LOGIN_PAGE: local
+      AERO__INTEGRATIONS__ISSUER: http://localhost:28080
+      AERO__INTEGRATIONS__AUDIENCE: aero-im-integration
+      AERO__INTEGRATIONS__JWKS_URI: http://127.0.0.1:18080/.well-known/jwks.json
+      AERO__SCIM__IDENTITY_ISSUER: http://localhost:28080
+    volumes:
+      - aero-im-keys:/run/aero-keys:ro
+      - aero-im-blobs:/var/lib/aero/blobs
+      - aero-im-hls:/var/lib/aero/hls
+    restart: unless-stopped
+
+  aero-platform-console:
+    build:
+      context: ../../../iris-ui
+      dockerfile: apps/aero-platform-console/Dockerfile
+    depends_on:
+      aero-id:
+        condition: service_started
+      snaplink-console:
+        condition: service_started
+    ports:
+      - "${PLATFORM_BIND_HOST:-127.0.0.1}:28010:80"
+    volumes:
+      - ./config/runtime-config.js:/usr/share/nginx/html/runtime-config.js:ro
+    networks: [platform]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/healthz >/dev/null"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+      start_period: 3s
+
+networks:
+  platform:
+    name: aero-platform
+
+volumes:
+  snaplink-data:
+  audit-postgres-data:
+  audit-archive-data:
+  aero-vault-postgres-data:
+  aero-vault-minio-data:
+  aero-id-postgres-data:
+  aero-id-redis-data:
+  aero-id-files:
+  aero-im-postgres-data:
+  aero-im-redis-data:
+  aero-im-nats-data:
+  aero-im-keys:
+  aero-im-blobs:
+  aero-im-hls:

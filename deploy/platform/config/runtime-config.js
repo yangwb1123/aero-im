@@ -1,0 +1,21 @@
+window.__AERO_PLATFORM_CONFIG__ = {
+  snaplinkIssuer: 'http://localhost:28080',
+  snaplinkHostedLoginUrl: 'http://localhost:28000/login/',
+  snaplinkClientId: 'aero-account-console',
+  snaplinkResource: 'aero-id',
+  snaplinkScopes: [
+    'openid',
+    'profile',
+    'account:read',
+    'account:write',
+    'operation:read',
+    'source:sync',
+    'audit:read',
+  ],
+  redirectUri: 'http://localhost:28010/',
+  aeroIdApiBase: 'http://localhost:28010/api/aero-id/v1',
+  auditConsoleUrl: 'http://localhost:28000/admin/',
+  snaplinkConsoleUrl: 'http://localhost:28000/admin/',
+  aeroImConsoleUrl: 'http://localhost:28082',
+  aeroVaultConsoleUrl: 'http://localhost:28081',
+}

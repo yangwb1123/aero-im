@@ -1,0 +1,11 @@
+{
+  "revision": 1,
+  "bindings": [
+    {
+      "tenant_id": "platform-local",
+      "client_id": "aero-vault-audit",
+      "client_secret_env": "AUDIT_GOVERNANCE_CLIENT_SECRET_PLATFORM_LOCAL",
+      "state": "active"
+    }
+  ]
+}
