@@ -278,11 +278,17 @@ pub(crate) fn spawn_all(
                     () = cancel.cancelled() => break,
                     _ = tick.tick() => {}
                 }
-                let cutoff = time::OffsetDateTime::now_utc() - time::Duration::days(audit_retention_days);
+                let cutoff =
+                    time::OffsetDateTime::now_utc() - time::Duration::days(audit_retention_days);
                 match repo.reconcile_message_deleted(cutoff, 500).await {
                     Ok(0) => {}
-                    Ok(n) => tracing::debug!(backfilled = n, "message.deleted governance rows reconciled"),
-                    Err(e) => tracing::warn!(error = %e, "message.deleted governance reconcile failed"),
+                    Ok(n) => tracing::debug!(
+                        backfilled = n,
+                        "message.deleted governance rows reconciled"
+                    ),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "message.deleted governance reconcile failed")
+                    }
                 }
             }
         });
@@ -350,16 +356,13 @@ pub(crate) fn spawn_all(
     // the sink). The timer NEVER deletes base rows (forensic retention; the
     // retention sweep owns deletion — D11).
     {
-        let l1_aggregate_enabled = std::env::var(
-            "AERO__SERVER__LOGIN_FAILURE_L1_AGGREGATE_SECS",
-        )
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
+        let l1_aggregate_enabled = std::env::var("AERO__SERVER__LOGIN_FAILURE_L1_AGGREGATE_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
             != Some(0);
         if l1_aggregate_enabled {
-            let mut repo = aero_storage::audit_governance::AuditGovernanceOutboxRepo::new(
-                state.pg.clone(),
-            );
+            let mut repo =
+                aero_storage::audit_governance::AuditGovernanceOutboxRepo::new(state.pg.clone());
             let cancel = ai_shutdown.clone();
             let l1_window = aero_common::L1_WINDOW_SECONDS;
             tracker.spawn(async move {
@@ -372,10 +375,7 @@ pub(crate) fn spawn_all(
                         () = cancel.cancelled() => break,
                         _ = tick.tick() => {}
                     }
-                    match repo
-                        .aggregate_login_failure_buckets(l1_window)
-                        .await
-                    {
+                    match repo.aggregate_login_failure_buckets(l1_window).await {
                         Ok(inserted) if inserted > 0 => {
                             tracing::info!(inserted, "L1 login-failure buckets aggregated");
                         }

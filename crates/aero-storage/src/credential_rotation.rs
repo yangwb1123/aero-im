@@ -389,8 +389,15 @@ mod tests {
         .fetch_one(&pool)
         .await
         .expect("exactly one auth.password.reset row");
-        assert_eq!(reset.0, "00000000-0000-0000-0000-000000000000", "nil workspace");
-        assert_eq!(reset.1, participant.to_uuid().to_string(), "actor = participant");
+        assert_eq!(
+            reset.0, "00000000-0000-0000-0000-000000000000",
+            "nil workspace"
+        );
+        assert_eq!(
+            reset.1,
+            participant.to_uuid().to_string(),
+            "actor = participant"
+        );
         assert_eq!(reset.2, participant.to_string(), "target = participant");
         let changed: (String, String, String) = sqlx::query_as(
             "SELECT workspace_id::text, actor_id::text, target
@@ -401,8 +408,15 @@ mod tests {
         .fetch_one(&pool)
         .await
         .expect("exactly one auth.password.changed row");
-        assert_eq!(changed.0, "00000000-0000-0000-0000-000000000000", "nil workspace");
-        assert_eq!(changed.1, participant.to_uuid().to_string(), "actor = participant");
+        assert_eq!(
+            changed.0, "00000000-0000-0000-0000-000000000000",
+            "nil workspace"
+        );
+        assert_eq!(
+            changed.1,
+            participant.to_uuid().to_string(),
+            "actor = participant"
+        );
         assert_eq!(changed.2, participant.to_string(), "target = participant");
         let reset_total: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM audit_events WHERE action = 'auth.password.reset' AND actor_id = $1",
@@ -462,13 +476,12 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(reset, 0);
-        let stored: (String,) = sqlx::query_as(
-            "SELECT password_hash FROM credentials WHERE participant_id = $1",
-        )
-        .bind(participant.to_uuid())
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let stored: (String,) =
+            sqlx::query_as("SELECT password_hash FROM credentials WHERE participant_id = $1")
+                .bind(participant.to_uuid())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(stored.0, "hash-old", "credential unchanged");
 
         // Cleanup (FK NO ACTION, 0007).

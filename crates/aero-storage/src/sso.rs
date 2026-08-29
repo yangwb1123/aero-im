@@ -821,8 +821,16 @@ mod db_tests {
             default_workspace().to_uuid().to_string(),
             "workspace = the IdP workspace (nil UUID)"
         );
-        assert_eq!(row.1, participant.to_uuid().to_string(), "actor = the new participant");
-        assert_eq!(row.2, participant.to_string(), "target = the new participant");
+        assert_eq!(
+            row.1,
+            participant.to_uuid().to_string(),
+            "actor = the new participant"
+        );
+        assert_eq!(
+            row.2,
+            participant.to_string(),
+            "target = the new participant"
+        );
         assert_eq!(row.3, "sso_jit");
         assert_eq!(row.4, issuer);
         assert_eq!(row.5, subject);
@@ -848,7 +856,10 @@ mod db_tests {
         .fetch_one(&p)
         .await
         .unwrap();
-        assert_eq!(total, 1, "repeat login of an existing identity audits nothing");
+        assert_eq!(
+            total, 1,
+            "repeat login of an existing identity audits nothing"
+        );
 
         // Cleanup (FK NO ACTION, 0007): audit rows reference the participant.
         sqlx::query("DELETE FROM audit_events WHERE actor_id = $1")

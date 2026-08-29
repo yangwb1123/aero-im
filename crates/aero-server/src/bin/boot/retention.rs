@@ -56,24 +56,22 @@ pub(crate) fn spawn(
     // B5-1 auth slice (F-4 third leg): terminal audit-governance DLQ rows
     // (`status='dead'` or replayed) older than N days are hard-deleted;
     // never-replayed `pending` rows stay (the gauge's alert surface).
-    let governance_failed_pairs_retention_days = std::env::var(
-        "AERO__SERVER__GOVERNANCE_FAILED_PAIRS_RETENTION_DAYS",
-    )
-    .ok()
-    .and_then(|s| s.parse::<i64>().ok())
-    .unwrap_or(30);
+    let governance_failed_pairs_retention_days =
+        std::env::var("AERO__SERVER__GOVERNANCE_FAILED_PAIRS_RETENTION_DAYS")
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(30);
     // R-D2 §10.2: governance-outbox retention — TERMINAL rows only
     // (status 2/3 delivered/dead; the sink holds the ledger once delivered),
     // aligned with the 365d audit-partition DROP so the outbox copy of
     // content digests is bounded (GDPR Art. 5(1)(e) exposure). Live rows
     // (status 0/1) are NEVER swept while the relay runs (0246 header).
     // 0 disables.
-    let governance_outbox_retention_days = std::env::var(
-        "AERO__SERVER__GOVERNANCE_OUTBOX_RETENTION_DAYS",
-    )
-    .ok()
-    .and_then(|s| s.parse::<i64>().ok())
-    .unwrap_or(365);
+    let governance_outbox_retention_days =
+        std::env::var("AERO__SERVER__GOVERNANCE_OUTBOX_RETENTION_DAYS")
+            .ok()
+            .and_then(|s| s.parse::<i64>().ok())
+            .unwrap_or(365);
     let viewer_raw_retention_days = std::env::var("AERO__SERVER__VIEWER_RAW_RETENTION_DAYS")
         .ok()
         .and_then(|s| s.parse::<i32>().ok())

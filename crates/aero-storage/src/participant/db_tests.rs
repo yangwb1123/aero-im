@@ -831,12 +831,14 @@ async fn update_email_audits_email_change() {
         .await
         .expect("insert participant");
     let old_email = format!("old-{id}@example.test");
-    sqlx::query("INSERT INTO credentials (participant_id, email, password_hash) VALUES ($1, $2, 'h')")
-        .bind(id.to_uuid())
-        .bind(&old_email)
-        .execute(&p)
-        .await
-        .expect("insert credentials");
+    sqlx::query(
+        "INSERT INTO credentials (participant_id, email, password_hash) VALUES ($1, $2, 'h')",
+    )
+    .bind(id.to_uuid())
+    .bind(&old_email)
+    .execute(&p)
+    .await
+    .expect("insert credentials");
 
     // Positive: the change commits with exactly one audit row.
     let new_email = format!("new-{id}@example.test");
@@ -850,20 +852,27 @@ async fn update_email_audits_email_change() {
     .fetch_one(&p)
     .await
     .expect("exactly one auth.email.changed row");
-    assert_eq!(row.0, "00000000-0000-0000-0000-000000000000", "nil workspace");
+    assert_eq!(
+        row.0, "00000000-0000-0000-0000-000000000000",
+        "nil workspace"
+    );
     assert_eq!(row.1, id.to_uuid().to_string(), "actor = participant");
     assert_eq!(row.2, id.to_string(), "target = participant");
-    let stored: String = sqlx::query_scalar("SELECT email FROM credentials WHERE participant_id = $1")
-        .bind(id.to_uuid())
-        .fetch_one(&p)
-        .await
-        .unwrap();
+    let stored: String =
+        sqlx::query_scalar("SELECT email FROM credentials WHERE participant_id = $1")
+            .bind(id.to_uuid())
+            .fetch_one(&p)
+            .await
+            .unwrap();
     assert_eq!(stored, new_email, "credentials.email == new value");
 
     // Negative: unknown participant → false, zero rows affected, zero audit.
     let ghost = ParticipantId::new();
     assert!(
-        !repo.update_email(ghost, "ghost@example.test").await.expect("no-op"),
+        !repo
+            .update_email(ghost, "ghost@example.test")
+            .await
+            .expect("no-op"),
         "unknown participant is a no-op"
     );
     let total: i64 = sqlx::query_scalar(

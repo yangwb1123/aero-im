@@ -578,8 +578,8 @@ impl SessionRepo {
         participant: ParticipantId,
     ) -> Result<bool, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
-        let revoked = Self::revoke_by_hash_and_blacklist_in_tx(&mut tx, token_hash, participant)
-            .await?;
+        let revoked =
+            Self::revoke_by_hash_and_blacklist_in_tx(&mut tx, token_hash, participant).await?;
         tx.commit().await?;
         Ok(revoked)
     }

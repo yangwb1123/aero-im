@@ -567,7 +567,10 @@ mod db_tests {
         .fetch_one(&p)
         .await
         .expect("exactly one auth.totp.enroll row");
-        assert_eq!(enabled.0, "00000000-0000-0000-0000-000000000000", "nil workspace");
+        assert_eq!(
+            enabled.0, "00000000-0000-0000-0000-000000000000",
+            "nil workspace"
+        );
         assert_eq!(enabled.1, owner.to_uuid().to_string(), "actor = owner");
         assert_eq!(enabled.2, owner.to_string(), "target = owner");
         let disabled: (String, String, String) = sqlx::query_as(
@@ -579,7 +582,10 @@ mod db_tests {
         .fetch_one(&p)
         .await
         .expect("exactly one auth.totp.disabled row (disable)");
-        assert_eq!(disabled.0, "00000000-0000-0000-0000-000000000000", "nil workspace");
+        assert_eq!(
+            disabled.0, "00000000-0000-0000-0000-000000000000",
+            "nil workspace"
+        );
         assert_eq!(disabled.1, owner.to_uuid().to_string(), "actor = owner");
         assert_eq!(disabled.2, owner.to_string(), "target = owner");
         let enabled_total: i64 = sqlx::query_scalar(
@@ -766,7 +772,10 @@ mod db_tests {
         .fetch_one(&p)
         .await
         .expect("exactly one recovery-codes row per generate");
-        assert_eq!(row.0, "00000000-0000-0000-0000-000000000000", "nil workspace");
+        assert_eq!(
+            row.0, "00000000-0000-0000-0000-000000000000",
+            "nil workspace"
+        );
         assert_eq!(row.1, owner.to_uuid().to_string(), "actor = owner");
         assert_eq!(row.2, owner.to_string(), "target = owner");
         let total: i64 = sqlx::query_scalar(
@@ -777,7 +786,10 @@ mod db_tests {
         .fetch_one(&p)
         .await
         .unwrap();
-        assert_eq!(total, 2, "a second generate (batch rotation) emits a second row");
+        assert_eq!(
+            total, 2,
+            "a second generate (batch rotation) emits a second row"
+        );
 
         // Cleanup (FK NO ACTION, 0007).
         sqlx::query("DELETE FROM audit_events WHERE actor_id = $1")

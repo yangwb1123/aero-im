@@ -63,10 +63,18 @@ fn service(pool: PgPool, throttle: Option<LoginThrottle>) -> AuthService {
         .to_pkcs8_pem(rsa::pkcs8::LineEnding::LF)
         .unwrap()
         .to_string();
-    let public_pem = private.to_public_key().to_pkcs1_pem(rsa::pkcs8::LineEnding::LF).unwrap();
-    let jwt =
-        JwtCodec::from_pem(&private_pem, &public_pem, "aero-im", Duration::from_secs(60), Duration::from_secs(600))
-            .expect("jwt codec");
+    let public_pem = private
+        .to_public_key()
+        .to_pkcs1_pem(rsa::pkcs8::LineEnding::LF)
+        .unwrap();
+    let jwt = JwtCodec::from_pem(
+        &private_pem,
+        &public_pem,
+        "aero-im",
+        Duration::from_secs(60),
+        Duration::from_secs(600),
+    )
+    .expect("jwt codec");
     let mut svc = AuthService::new(ParticipantRepo::new(pool), jwt);
     if let Some(throttle) = throttle {
         svc = svc.with_login_throttle(Arc::new(throttle));
@@ -171,7 +179,10 @@ async fn failed_login_and_lockout_audit_rows() {
         password: "wrong-password".into(),
     };
     let err = svc.login(wrong.clone()).await.expect_err("wrong password");
-    assert!(matches!(err, Error::Unauthorized(_)), "outcome unchanged by the audit");
+    assert!(
+        matches!(err, Error::Unauthorized(_)),
+        "outcome unchanged by the audit"
+    );
     assert_eq!(
         failed_rows(&p, &email, Some("invalid_credentials")).await,
         1,
@@ -187,7 +198,10 @@ async fn failed_login_and_lockout_audit_rows() {
     // attempt is rejected on the lockout path → locked row, no extra failed
     // row (the locked path returns before the failed emission).
     let err = svc.login(wrong).await.expect_err("locked account");
-    assert!(matches!(err, Error::Unauthorized(_)), "outcome unchanged by the audit");
+    assert!(
+        matches!(err, Error::Unauthorized(_)),
+        "outcome unchanged by the audit"
+    );
     assert_eq!(
         locked_rows(&p, &email).await,
         1,
@@ -219,7 +233,10 @@ async fn failed_login_audits_without_throttle() {
         })
         .await
         .expect_err("wrong password");
-    assert!(matches!(err, Error::Unauthorized(_)), "outcome unchanged by the audit");
+    assert!(
+        matches!(err, Error::Unauthorized(_)),
+        "outcome unchanged by the audit"
+    );
     assert_eq!(
         failed_rows(&p, &email, Some("invalid_credentials")).await,
         1,
@@ -270,7 +287,11 @@ async fn failed_2fa_audits_and_success_is_silent() {
         0,
         "a 2FA failure never also emits invalid_credentials"
     );
-    assert_eq!(failed_rows(&p, &email, None).await, 1, "per-attempt total == 1");
+    assert_eq!(
+        failed_rows(&p, &email, None).await,
+        1,
+        "per-attempt total == 1"
+    );
 
     cleanup(&p, pid).await;
 }

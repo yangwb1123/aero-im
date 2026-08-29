@@ -3,7 +3,9 @@
 //!
 //! Extracted from `message.rs` as part of REFACTOR_PLAN.md Step 2.
 
-use aero_common::{Block, Message, MessageId, ParticipantId, WorkspaceId, LOCAL_ACTION_MESSAGE_DELETED};
+use aero_common::{
+    Block, Message, MessageId, ParticipantId, WorkspaceId, LOCAL_ACTION_MESSAGE_DELETED,
+};
 use pgvector::Vector;
 use sqlx::{Postgres, Transaction};
 

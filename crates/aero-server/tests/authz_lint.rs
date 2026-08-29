@@ -779,7 +779,11 @@ fn b5_1_auth_audit_boundaries_are_pinned() {
         ("pat.rs", &pat, "PatRepo::revoke_in_tx("),
         ("twofa.rs", &totp, "TotpRepo::upsert_secret_in_tx("),
         ("twofa.rs", &totp, "TotpRepo::activate_in_tx("),
-        ("sessions.rs", &sessions, "SessionRepo::revoke_and_blacklist_in_tx("),
+        (
+            "sessions.rs",
+            &sessions,
+            "SessionRepo::revoke_and_blacklist_in_tx(",
+        ),
     ] {
         assert!(
             content.contains(symbol),
@@ -822,7 +826,9 @@ fn b5_1_auth_audit_boundaries_are_pinned() {
     // pair AFTER the success-path call pins the D5 placement exactly.
     let success_gate_at = handlers_src
         .find("finalize_login(&email, true)")
-        .unwrap_or_else(|| panic!("handlers/auth.rs lost the success-path finalize_login(&email, true) 2FA gate"));
+        .unwrap_or_else(|| {
+            panic!("handlers/auth.rs lost the success-path finalize_login(&email, true) 2FA gate")
+        });
     assert!(
         success_gate_at < d5_at,
         "D5: the login pair must be emitted AFTER the 2FA gate passes (finalize_login(&email, true)) — a 2FA-failed attempt must never produce auth.login"

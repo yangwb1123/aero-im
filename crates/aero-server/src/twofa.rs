@@ -176,17 +176,18 @@ async fn verify_2fa(
         .await
         .map_err(AeroError::from)?;
     if activated {
-        let _ = aero_storage::audit_governance::AuditGovernanceOutboxRepo::append_pair_in_tx_fail_open(
-            &mut tx,
-            aero_common::WorkspaceId::nil(),
-            Some(auth.participant_id),
-            aero_storage::audit_governance::tokens::AUTH_TOTP_ENROLL,
-            Some(&auth.participant_id.to_string()),
-            serde_json::json!({ "stage": "activate" }),
-            aero_storage::audit_governance::tokens::OUTBOUND_AUTH_TOTP_ENROLL,
-        )
-        .await
-        .map_err(AeroError::from)?; // Ok(None) = fail-open skip (DLQ row in-tx)
+        let _ =
+            aero_storage::audit_governance::AuditGovernanceOutboxRepo::append_pair_in_tx_fail_open(
+                &mut tx,
+                aero_common::WorkspaceId::nil(),
+                Some(auth.participant_id),
+                aero_storage::audit_governance::tokens::AUTH_TOTP_ENROLL,
+                Some(&auth.participant_id.to_string()),
+                serde_json::json!({ "stage": "activate" }),
+                aero_storage::audit_governance::tokens::OUTBOUND_AUTH_TOTP_ENROLL,
+            )
+            .await
+            .map_err(AeroError::from)?; // Ok(None) = fail-open skip (DLQ row in-tx)
     }
     tx.commit().await.map_err(AeroError::from)?;
     Ok(Json(serde_json::json!({ "activated": true })))

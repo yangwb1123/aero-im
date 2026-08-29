@@ -313,9 +313,17 @@ mod db_tests {
             participant.to_uuid().to_string(),
             "actor = the new participant"
         );
-        assert_eq!(row.2, participant.to_string(), "target = the new participant");
+        assert_eq!(
+            row.2,
+            participant.to_string(),
+            "target = the new participant"
+        );
         assert_eq!(row.3, email, "detail.email = the registration email");
-        assert_eq!(row.4.as_deref(), Some("registration-test"), "detail.user_agent");
+        assert_eq!(
+            row.4.as_deref(),
+            Some("registration-test"),
+            "detail.user_agent"
+        );
         assert_eq!(row.5, "auth.register");
         let total: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM audit_events WHERE action = 'auth.register' AND actor_id = $1",

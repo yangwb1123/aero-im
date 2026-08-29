@@ -57,7 +57,7 @@ pub(super) async fn upload_blob(
     multipart: Multipart,
 ) -> IntegrationApiResult<Response> {
     let installation_id = parse_installation(&installation_raw)?;
-    let principal = authenticate_machine(&headers).await?;
+    let principal = authenticate_machine(&headers, REQUIRED_PUBLISH_SCOPE).await?;
     let idempotency_key = required_idempotency_key(&headers)?;
     let target = upload_target(&headers)?;
     let repo = IntegrationRepo::new(state.pg.clone());

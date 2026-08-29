@@ -118,8 +118,8 @@ impl PatRepo {
         expires_at: Option<time::OffsetDateTime>,
     ) -> Result<PatId, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
-        let id = Self::create_in_tx(&mut tx, participant, token_hash, name, scopes, expires_at)
-            .await?;
+        let id =
+            Self::create_in_tx(&mut tx, participant, token_hash, name, scopes, expires_at).await?;
         crate::AuditRepo::append_in_tx(
             &mut tx,
             aero_common::WorkspaceId::nil(),
@@ -424,17 +424,19 @@ mod db_tests {
         // `auth.pat.revoke` row; the non-owner attempt and the second (no-op)
         // revoke added ZERO rows — counts scoped by actor_id (the sibling
         // `pat_expired_token_does_not_verify` test mints its own tokens).
-        let create: (String, String, String, Option<String>, serde_json::Value) =
-            sqlx::query_as(
-                "SELECT workspace_id::text, actor_id::text, target, detail->>'expires_at', detail
+        let create: (String, String, String, Option<String>, serde_json::Value) = sqlx::query_as(
+            "SELECT workspace_id::text, actor_id::text, target, detail->>'expires_at', detail
                    FROM audit_events
                   WHERE action = 'auth.pat.issue' AND actor_id = $1",
-            )
-            .bind(owner.to_uuid())
-            .fetch_one(&p)
-            .await
-            .expect("exactly one auth.pat.issue row");
-        assert_eq!(create.0, "00000000-0000-0000-0000-000000000000", "nil workspace");
+        )
+        .bind(owner.to_uuid())
+        .fetch_one(&p)
+        .await
+        .expect("exactly one auth.pat.issue row");
+        assert_eq!(
+            create.0, "00000000-0000-0000-0000-000000000000",
+            "nil workspace"
+        );
         assert_eq!(create.1, owner.to_uuid().to_string(), "actor = owner");
         assert_eq!(create.2, id.to_string(), "target = the PAT id");
         assert_eq!(create.4["name"], "ci");
@@ -466,7 +468,10 @@ mod db_tests {
         .fetch_one(&p)
         .await
         .expect("exactly one auth.pat.revoke row");
-        assert_eq!(revoke.0, "00000000-0000-0000-0000-000000000000", "nil workspace");
+        assert_eq!(
+            revoke.0, "00000000-0000-0000-0000-000000000000",
+            "nil workspace"
+        );
         assert_eq!(revoke.1, owner.to_uuid().to_string(), "actor = owner");
         assert_eq!(revoke.2, id.to_string(), "detail.id = the revoked token id");
         let revoke_total: i64 = sqlx::query_scalar(
