@@ -287,7 +287,7 @@ pub(crate) fn spawn_all(
                         "message.deleted governance rows reconciled"
                     ),
                     Err(e) => {
-                        tracing::warn!(error = %e, "message.deleted governance reconcile failed")
+                        tracing::warn!(error = %e, "message.deleted governance reconcile failed");
                     }
                 }
             }
