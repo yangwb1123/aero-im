@@ -202,7 +202,7 @@ struct IntegrationAuthConfig {
 }
 
 impl IntegrationAuthConfig {
-    fn from_env() -> Result<Self, AeroError> {
+    fn from_env(required_scope: &str) -> Result<Self, AeroError> {
         let issuer =
             env_value("AERO__INTEGRATIONS__ISSUER").or_else(|| env_value("AERO__OIDC__ISSUER"));
         let audience = env_value("AERO__INTEGRATIONS__AUDIENCE");
@@ -220,7 +220,7 @@ impl IntegrationAuthConfig {
             token: ClientCredentialsTokenConfig {
                 issuer,
                 audience,
-                required_scopes: vec![REQUIRED_PUBLISH_SCOPE.into()],
+                required_scopes: vec![required_scope.into()],
             },
             jwks_uri,
         })
@@ -233,9 +233,12 @@ struct MachinePrincipal {
     client_id: String,
 }
 
-async fn authenticate_machine(headers: &HeaderMap) -> Result<MachinePrincipal, AeroError> {
+async fn authenticate_machine(
+    headers: &HeaderMap,
+    required_scope: &str,
+) -> Result<MachinePrincipal, AeroError> {
     let token = bearer_token(headers)?;
-    let config = IntegrationAuthConfig::from_env()?;
+    let config = IntegrationAuthConfig::from_env(required_scope)?;
     let provider = INTEGRATION_JWKS.get_or_init(|| JwksKeyProvider::new(config.jwks_uri.clone()));
     let claims = validate_client_credentials_token(token, &config.token, provider)
         .await
@@ -334,7 +337,7 @@ async fn create_installation(
 ) -> ApiResult<(StatusCode, Json<serde_json::Value>)> {
     let workspace = parse_workspace(&workspace_raw)?;
     assert_admin(&state, workspace, auth.participant_id).await?;
-    let config = IntegrationAuthConfig::from_env()?;
+    let config = IntegrationAuthConfig::from_env(REQUIRED_PUBLISH_SCOPE)?;
     let user_identity_issuer =
         select_user_identity_issuer(req.user_identity_issuer, env_value("AERO__OIDC__ISSUER"))?;
     let name = req.name.trim();
@@ -413,7 +416,11 @@ async fn update_installation(
         return Err(AeroError::Invalid("name must contain 1 to 128 bytes".into()).into());
     }
     let issuer = if req.rotate_to_current_issuer {
-        Some(IntegrationAuthConfig::from_env()?.token.issuer)
+        Some(
+            IntegrationAuthConfig::from_env(REQUIRED_PUBLISH_SCOPE)?
+                .token
+                .issuer,
+        )
     } else {
         None
     };
@@ -518,7 +525,7 @@ async fn publish_notification(
     Json(req): Json<PublishNotificationReq>,
 ) -> IntegrationApiResult<Response> {
     let installation_id = parse_installation(&installation_raw)?;
-    let principal = authenticate_machine(&headers).await?;
+    let principal = authenticate_machine(&headers, REQUIRED_PUBLISH_SCOPE).await?;
     let idempotency_key = required_idempotency_key(&headers)?;
     let target = req.target.into_storage();
     let request_hash = notification_request_hash(&target, &req.blocks)?;
