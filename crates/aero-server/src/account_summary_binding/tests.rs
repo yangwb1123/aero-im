@@ -47,6 +47,25 @@ fn config() -> TargetAssertionConfig {
     }
 }
 
+#[test]
+fn dedicated_target_jwks_requires_https_even_for_loopback() {
+    for uri in [
+        "http://localhost:18080/keys",
+        "http://127.0.0.1:18080/keys",
+        "http://[::1]:18080/keys",
+    ] {
+        assert!(
+            validate_jwks_uri(uri).is_ok(),
+            "generic OIDC rejected {uri}"
+        );
+        assert!(
+            validate_dedicated_jwks_uri(uri).is_err(),
+            "dedicated JWKS accepted cleartext loopback {uri}"
+        );
+    }
+    assert!(validate_dedicated_jwks_uri("https://keys.example.test/jwks").is_ok());
+}
+
 fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

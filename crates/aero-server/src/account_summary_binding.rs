@@ -102,9 +102,7 @@ impl AccountSummaryTargetVerifier {
         let jwks_uri = target_assertion_jwks_uri_from_env().ok_or_else(|| {
             AeroError::Invalid("account summary target assertion is incomplete".into())
         })?;
-        validate_jwks_uri(&jwks_uri).map_err(|_| {
-            AeroError::Invalid("account summary target assertion JWKS URI is not allowed".into())
-        })?;
+        validate_dedicated_jwks_uri(&jwks_uri)?;
         if dedicated_jwks_reuses_general_uri(&jwks_uri)
             || dedicated_assertion_reuses_general_issuer(&config.issuer)
         {
@@ -293,6 +291,23 @@ pub(crate) fn canonical_request_bytes(
         encoded.extend_from_slice(field.as_bytes());
     }
     Ok(encoded)
+}
+
+/// The dedicated production key boundary has no generic OIDC loopback
+/// exception: cleartext JWKS retrieval is never acceptable here.
+fn validate_dedicated_jwks_uri(uri: &str) -> Result<(), AeroError> {
+    validate_jwks_uri(uri).map_err(|_| {
+        AeroError::Invalid("account summary target assertion JWKS URI is not allowed".into())
+    })?;
+    let is_https = url::Url::parse(uri)
+        .map(|parsed| parsed.scheme() == "https")
+        .unwrap_or(false);
+    if !is_https {
+        return Err(AeroError::Invalid(
+            "account summary target assertion JWKS URI is not allowed".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn target_assertion_config_from_env() -> Result<Option<TargetAssertionConfig>, AeroError> {

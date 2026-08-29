@@ -58,7 +58,8 @@ log_level = "info,aero=debug"
 # not this general config file. When enabled, set
 # AERO__ACCOUNT_SOURCE__REGION and the dedicated
 # AERO__ACCOUNT_SUMMARY__TARGET_ASSERTION_* values from .env.example. The
-# JWKS URI must be an external Aero ID target-assertion JWKS, never Snaplink's.
+# JWKS URI must be an external, HTTPS-only Aero ID target-assertion JWKS
+# (including loopback-looking hosts), never Snaplink's; redirects are rejected.
 
 # Optional S3-compatible residency backends. `default` is reserved for the
 # primary AERO_BLOB_BACKEND/LocalFs store and must not be declared here.
