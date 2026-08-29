@@ -444,7 +444,9 @@ mod tests {
             )
             .expect_err("out-of-bounds freshness must bail fail-loud");
             assert!(
-                error.to_string().contains("AERO_AUDIT_PROVISION_FRESHNESS_SECS"),
+                error
+                    .to_string()
+                    .contains("AERO_AUDIT_PROVISION_FRESHNESS_SECS"),
                 "error must name the offending env var (got: {error})"
             );
         }

@@ -221,9 +221,9 @@ impl AuditClient {
             self.verify_token_signature(&token).await?;
             if let Err(rejection) = self.validate_token_claims(&token) {
                 // Fail-closed: discard the unusable token and re-park the row.
-                crate::metrics::inc_token_rejection(
-                    crate::metrics::classify_token_rejection(&rejection.reason),
-                );
+                crate::metrics::inc_token_rejection(crate::metrics::classify_token_rejection(
+                    &rejection.reason,
+                ));
                 self.invalidate_token(&token).await;
                 warn!(
                     reason = %rejection.reason,
@@ -380,17 +380,17 @@ impl AuditClient {
         // malformed and fails closed.
         let now_secs = now.unix_timestamp();
         if let Some(exp) = claims.get("exp") {
-            let exp = exp.as_f64().ok_or_else(|| {
-                ClaimRejection::other("token exp is not a number")
-            })?;
+            let exp = exp
+                .as_f64()
+                .ok_or_else(|| ClaimRejection::other("token exp is not a number"))?;
             if exp <= (now_secs + TIME_CLAIM_LEEWAY_SECS) as f64 {
                 return Err(ClaimRejection::other("token has expired"));
             }
         }
         if let Some(nbf) = claims.get("nbf") {
-            let nbf = nbf.as_f64().ok_or_else(|| {
-                ClaimRejection::other("token nbf is not a number")
-            })?;
+            let nbf = nbf
+                .as_f64()
+                .ok_or_else(|| ClaimRejection::other("token nbf is not a number"))?;
             if nbf > (now_secs + TIME_CLAIM_LEEWAY_SECS) as f64 {
                 return Err(ClaimRejection::other("token is not yet valid"));
             }

@@ -551,7 +551,9 @@ async fn run() -> anyhow::Result<()> {
         .map(|(msg_id, audit_id)| (audit_id.to_string(), msg_id.clone()))
         .collect();
     for (event_id, status, class, priority, payload) in &delete_rows {
-        let msg_id = by_event.get(event_id).expect("set-parity guarantees the entry");
+        let msg_id = by_event
+            .get(event_id)
+            .expect("set-parity guarantees the entry");
         if *status != 0 || class != GOVERNANCE_CLASS_MESSAGE || *priority != 10 {
             anyhow::bail!(
                 "delete row {event_id}: status {status} / class {class} / priority {priority} drifted"
@@ -635,16 +637,20 @@ async fn run() -> anyhow::Result<()> {
     }
     let reconciler = aero_storage::audit_governance::AuditGovernanceOutboxRepo::new(pool.clone());
     let backfilled = reconciler
-        .reconcile_message_deleted(time::OffsetDateTime::now_utc() - time::Duration::days(retention_days), 50)
+        .reconcile_message_deleted(
+            time::OffsetDateTime::now_utc() - time::Duration::days(retention_days),
+            50,
+        )
         .await
         .context("reconcile_message_deleted")?;
     if backfilled != 1 {
-        anyhow::bail!(
-            "reconcile must backfill exactly the one orphan (got {backfilled})"
-        );
+        anyhow::bail!("reconcile must backfill exactly the one orphan (got {backfilled})");
     }
     let again = reconciler
-        .reconcile_message_deleted(time::OffsetDateTime::now_utc() - time::Duration::days(retention_days), 50)
+        .reconcile_message_deleted(
+            time::OffsetDateTime::now_utc() - time::Duration::days(retention_days),
+            50,
+        )
         .await
         .context("reconcile re-run")?;
     if again != 0 {

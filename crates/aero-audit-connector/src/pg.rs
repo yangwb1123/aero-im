@@ -177,8 +177,8 @@ impl OutboxRepo for PgOutboxRepo {
                      outbox.priority, outbox.class",
         )
         .bind(limit - floor) // $1: arm A = top (limit − K); K ≤ limit − 1 so this is ≥ 1
-        .bind(floor)         // $2: arm B = K (0 is valid: LIMIT 0 → empty arm B)
-        .bind(lease_secs)    // $3: lease minted on the DB clock
+        .bind(floor) // $2: arm B = K (0 is valid: LIMIT 0 → empty arm B)
+        .bind(lease_secs) // $3: lease minted on the DB clock
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(Into::into).collect())
@@ -759,29 +759,58 @@ mod tests {
             std::env::var("DATABASE_URL").expect("DATABASE_URL must point at a throwaway Postgres");
         let pool = pool(&url);
         ensure_outbox_table(&pool).await;
-        sqlx::query("TRUNCATE audit_governance_outbox").execute(&pool).await.expect("reset");
+        sqlx::query("TRUNCATE audit_governance_outbox")
+            .execute(&pool)
+            .await
+            .expect("reset");
         let mut backlog = Vec::new();
-        for i in 0..40 { backlog.push(seed(&pool, 10, i).await); }
+        for i in 0..40 {
+            backlog.push(seed(&pool, 10, i).await);
+        }
         let mut admin = Vec::new();
-        for j in 0..190 { admin.push(seed(&pool, 100, j).await); }
+        for j in 0..190 {
+            admin.push(seed(&pool, 100, j).await);
+        }
         let repo = PgOutboxRepo::new(pool.clone());
-        let round1 = repo.claim_due(Duration::seconds(30), 100).await.expect("round 1");
-        let round2 = repo.claim_due(Duration::seconds(30), 100).await.expect("round 2");
+        let round1 = repo
+            .claim_due(Duration::seconds(30), 100)
+            .await
+            .expect("round 1");
+        let round2 = repo
+            .claim_due(Duration::seconds(30), 100)
+            .await
+            .expect("round 2");
         let split = |claims: &[Claim]| {
             (
                 claims.iter().filter(|c| c.priority == 100).count(),
                 claims.iter().filter(|c| c.priority == 10).count(),
             )
         };
-        assert_eq!(split(&round1), (95, 5), "round 1 must split 95 admin / 5 backlog");
-        assert_eq!(split(&round2), (95, 5), "round 2 must split 95 admin / 5 backlog");
+        assert_eq!(
+            split(&round1),
+            (95, 5),
+            "round 1 must split 95 admin / 5 backlog"
+        );
+        assert_eq!(
+            split(&round2),
+            (95, 5),
+            "round 2 must split 95 admin / 5 backlog"
+        );
         let set1: HashSet<AuditId> = round1.iter().map(|c| c.event_id).collect();
         let set2: HashSet<AuditId> = round2.iter().map(|c| c.event_id).collect();
-        assert!(set1.is_disjoint(&set2), "round 2 disjoint from round 1 (no arm overlap)");
+        assert!(
+            set1.is_disjoint(&set2),
+            "round 2 disjoint from round 1 (no arm overlap)"
+        );
         let admin_ids: HashSet<AuditId> = admin.iter().map(|id| AuditId::from_uuid(*id)).collect();
-        let backlog_ids: HashSet<AuditId> = backlog.iter().map(|id| AuditId::from_uuid(*id)).collect();
+        let backlog_ids: HashSet<AuditId> =
+            backlog.iter().map(|id| AuditId::from_uuid(*id)).collect();
         let union: HashSet<AuditId> = set1.union(&set2).copied().collect();
-        assert_eq!(union.intersection(&admin_ids).count(), 190, "all 190 admin claimed");
+        assert_eq!(
+            union.intersection(&admin_ids).count(),
+            190,
+            "all 190 admin claimed"
+        );
         assert_eq!(
             union.intersection(&backlog_ids).count(),
             10,
@@ -800,16 +829,26 @@ mod tests {
         let pool_a = pool(&url);
         let pool_b = pool(&url);
         ensure_outbox_table(&pool_a).await;
-        sqlx::query("TRUNCATE audit_governance_outbox").execute(&pool_a).await.expect("reset");
-        for _ in 0..60 { seed(&pool_a, 100, 0).await; }
+        sqlx::query("TRUNCATE audit_governance_outbox")
+            .execute(&pool_a)
+            .await
+            .expect("reset");
+        for _ in 0..60 {
+            seed(&pool_a, 100, 0).await;
+        }
         let mut backlog = Vec::new();
-        for i in 0..2 { backlog.push(seed(&pool_a, 10, i).await); }
+        for i in 0..2 {
+            backlog.push(seed(&pool_a, 10, i).await);
+        }
         let session_a = PgOutboxRepo::new(pool_a.clone());
         let session_b = PgOutboxRepo::new(pool_b.clone());
         let barrier = Arc::new(Barrier::new(2));
         let claim = |session: PgOutboxRepo, barrier: Arc<Barrier>| async move {
             barrier.wait().await;
-            session.claim_due(Duration::seconds(30), LIMIT).await.expect("concurrent claim")
+            session
+                .claim_due(Duration::seconds(30), LIMIT)
+                .await
+                .expect("concurrent claim")
         };
         let claimed_a = tokio::spawn(claim(session_a.clone(), Arc::clone(&barrier)));
         let claimed_b = tokio::spawn(claim(session_b.clone(), Arc::clone(&barrier)));
@@ -821,9 +860,17 @@ mod tests {
         let ids_b: HashSet<AuditId> = claimed_b.iter().map(|c| c.event_id).collect();
         assert!(ids_a.is_disjoint(&ids_b), "zero double-claims");
         let union: HashSet<AuditId> = ids_a.union(&ids_b).copied().collect();
-        let backlog_ids: HashSet<AuditId> = backlog.iter().map(|id| AuditId::from_uuid(*id)).collect();
-        assert_eq!(union.intersection(&backlog_ids).count(), 2, "both low rows claimed once");
-        assert!(claimed_a.iter().chain(&claimed_b).all(|c| c.attempts == 1), "attempts == 1");
+        let backlog_ids: HashSet<AuditId> =
+            backlog.iter().map(|id| AuditId::from_uuid(*id)).collect();
+        assert_eq!(
+            union.intersection(&backlog_ids).count(),
+            2,
+            "both low rows claimed once"
+        );
+        assert!(
+            claimed_a.iter().chain(&claimed_b).all(|c| c.attempts == 1),
+            "attempts == 1"
+        );
     }
 
     /// QA F4 — clamp parity: `claim_due(0)` clamps to batch 1 (K = 0, arm
@@ -835,10 +882,16 @@ mod tests {
             std::env::var("DATABASE_URL").expect("DATABASE_URL must point at a throwaway Postgres");
         let pool = pool(&url);
         ensure_outbox_table(&pool).await;
-        sqlx::query("TRUNCATE audit_governance_outbox").execute(&pool).await.expect("reset");
+        sqlx::query("TRUNCATE audit_governance_outbox")
+            .execute(&pool)
+            .await
+            .expect("reset");
         let event_id = seed(&pool, 10, 0).await;
         let repo = PgOutboxRepo::new(pool.clone());
-        let claimed = repo.claim_due(Duration::seconds(30), 0).await.expect("zero-limit claim");
+        let claimed = repo
+            .claim_due(Duration::seconds(30), 0)
+            .await
+            .expect("zero-limit claim");
         assert_eq!(claimed.len(), 1, "limit 0 clamps to batch 1 (K = 0)");
         assert_eq!(claimed[0].event_id, AuditId::from_uuid(event_id));
     }
@@ -856,7 +909,10 @@ mod tests {
             std::env::var("DATABASE_URL").expect("DATABASE_URL must point at a throwaway Postgres");
         let pool = pool(&url);
         ensure_outbox_table(&pool).await;
-        sqlx::query("TRUNCATE audit_governance_outbox").execute(&pool).await.expect("reset");
+        sqlx::query("TRUNCATE audit_governance_outbox")
+            .execute(&pool)
+            .await
+            .expect("reset");
         let repo = PgOutboxRepo::new(pool.clone());
 
         // {0×2, 1×1, 2×1, 3×1} — one row in every status bucket.
@@ -883,13 +939,22 @@ mod tests {
         let probe = repo.verdict_probe().await.expect("verdict probe");
         assert_eq!(
             probe,
-            VerdictProbe { enqueued: 2, claimed: 1, has_dead: true },
+            VerdictProbe {
+                enqueued: 2,
+                claimed: 1,
+                has_dead: true
+            },
             "Tier-1 probe over statuses {{0×2, 1×1, 2×1, 3×1}}"
         );
         let buckets = repo.status_buckets().await.expect("status buckets");
         assert_eq!(
             buckets,
-            StatusBuckets { enqueued: 2, claimed: 1, delivered: 1, dead: 1 },
+            StatusBuckets {
+                enqueued: 2,
+                claimed: 1,
+                delivered: 1,
+                dead: 1
+            },
             "Tier-2 buckets mirror Q3_SQL exactly"
         );
         let after = row_snapshot(&pool).await;
@@ -899,7 +964,10 @@ mod tests {
         );
 
         // All-delivered subset → zero pending/claimed/dead.
-        sqlx::query("TRUNCATE audit_governance_outbox").execute(&pool).await.expect("reset");
+        sqlx::query("TRUNCATE audit_governance_outbox")
+            .execute(&pool)
+            .await
+            .expect("reset");
         for _ in 0..3 {
             sqlx::query(
                 r"INSERT INTO audit_governance_outbox
@@ -907,27 +975,66 @@ mod tests {
                   VALUES ($1, $2, 2, 0)",
             )
             .bind(Uuid::new_v4())
-            .bind(json!({"event_id": Uuid::new_v4().to_string(), "source_system": "aero-im.source"}))
+            .bind(
+                json!({"event_id": Uuid::new_v4().to_string(), "source_system": "aero-im.source"}),
+            )
             .execute(&pool)
             .await
             .expect("seed delivered row");
         }
         assert_eq!(
             repo.verdict_probe().await.expect("verdict probe"),
-            VerdictProbe { enqueued: 0, claimed: 0, has_dead: false },
+            VerdictProbe {
+                enqueued: 0,
+                claimed: 0,
+                has_dead: false
+            },
             "no pending/claimed/dead rows → zero probe"
         );
         assert_eq!(
             repo.status_buckets().await.expect("status buckets"),
-            StatusBuckets { enqueued: 0, claimed: 0, delivered: 3, dead: 0 },
+            StatusBuckets {
+                enqueued: 0,
+                claimed: 0,
+                delivered: 3,
+                dead: 0
+            },
             "delivered rows land only in the delivered bucket"
         );
     }
 
     /// Full-row mutable-column snapshot (read-only pin oracle).
-    async fn row_snapshot(pool: &PgPool) -> Vec<(Uuid, i32, i64, Option<Uuid>, Option<OffsetDateTime>, Option<String>)> {
-        sqlx::query_as::<_, (Uuid, i32, i64, Option<Uuid>, Option<OffsetDateTime>, Option<String>)>(
-            "SELECT event_id, status, attempts, claim_token, lease_expires_at, last_error
+    async fn row_snapshot(
+        pool: &PgPool,
+    ) -> Vec<(
+        Uuid,
+        i32,
+        i64,
+        OffsetDateTime,
+        Option<Uuid>,
+        Option<OffsetDateTime>,
+        Option<OffsetDateTime>,
+        Option<String>,
+        i16,
+        String,
+    )> {
+        sqlx::query_as::<
+            _,
+            (
+                Uuid,
+                i32,
+                i64,
+                OffsetDateTime,
+                Option<Uuid>,
+                Option<OffsetDateTime>,
+                Option<OffsetDateTime>,
+                Option<String>,
+                i16,
+                String,
+            ),
+        >(
+            "SELECT event_id, status, attempts, available_at, claim_token,
+                    lease_expires_at, delivered_at, last_error, priority, class
                FROM audit_governance_outbox ORDER BY event_id",
         )
         .fetch_all(pool)

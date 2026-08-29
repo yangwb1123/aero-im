@@ -27,11 +27,22 @@ pub const TOKEN_REJECTIONS_TOTAL: &str = "aero_audit_token_rejections_total";
 pub const DELIVERY_OUTCOMES_TOTAL: &str = "aero_audit_delivery_outcomes_total";
 
 /// Token-rejection label vocabulary (runbook §3).
-pub const TOKEN_REJECT_REASONS: [&str; 6] =
-    ["scope", "claims", "unknown_key", "malformed", "unsupported_alg", "other"];
+pub const TOKEN_REJECT_REASONS: [&str; 6] = [
+    "scope",
+    "claims",
+    "unknown_key",
+    "malformed",
+    "unsupported_alg",
+    "other",
+];
 /// Delivery-outcome label vocabulary (runbook §3).
-pub const DELIVERY_OUTCOMES: [&str; 5] =
-    ["delivered", "transient", "permanent", "forbidden", "unprovisioned"];
+pub const DELIVERY_OUTCOMES: [&str; 5] = [
+    "delivered",
+    "transient",
+    "permanent",
+    "forbidden",
+    "unprovisioned",
+];
 
 static TRANSIENT_REQUEUE: AtomicU64 = AtomicU64::new(0);
 static DEAD: AtomicU64 = AtomicU64::new(0);
@@ -81,11 +92,17 @@ pub fn inc_token_rejection(reason: &str) {
 pub fn classify_token_rejection(reason: &str) -> &'static str {
     if reason.contains("scope") {
         "scope"
-    } else if reason.contains("iss") || reason.contains("aud") || reason.contains("sub")
+    } else if reason.contains("iss")
+        || reason.contains("aud")
+        || reason.contains("sub")
         || reason.contains("missing required fields")
+        || reason.contains("expired")
+        || reason.contains("not yet valid")
+        || reason.contains("exp is not a number")
+        || reason.contains("nbf is not a number")
     {
         "claims"
-    } else if reason.contains("shape") {
+    } else if reason.contains("shape") || reason.contains("JWT") {
         "malformed"
     } else if reason.contains("alg") {
         "unsupported_alg"
@@ -114,7 +131,11 @@ pub type SampledCounter = (&'static str, Vec<(&'static str, &'static str)>, u64)
 #[must_use]
 pub fn sample() -> Vec<SampledCounter> {
     let mut out = Vec::new();
-    out.push((OUTBOX_TRANSIENT_REQUEUE, Vec::new(), TRANSIENT_REQUEUE.load(Ordering::Relaxed)));
+    out.push((
+        OUTBOX_TRANSIENT_REQUEUE,
+        Vec::new(),
+        TRANSIENT_REQUEUE.load(Ordering::Relaxed),
+    ));
     out.push((OUTBOX_DEAD, Vec::new(), DEAD.load(Ordering::Relaxed)));
     for (idx, reason) in TOKEN_REJECT_REASONS.iter().enumerate() {
         out.push((
@@ -149,7 +170,7 @@ pub fn render() -> String {
                 .map(|(k, v)| format!("{k}=\"{v}\""))
                 .collect::<Vec<_>>()
                 .join(",");
-            let _ = write!(text, "{{{joined}}}" );
+            let _ = write!(text, "{{{joined}}}");
         }
         text.push(' ');
         text.push_str(&value.to_string());
@@ -170,8 +191,14 @@ mod tests {
     fn delete_lane_metrics_registry_emits_and_reads_back() {
         let before_requeue = TRANSIENT_REQUEUE.load(Ordering::Relaxed);
         let before_dead = DEAD.load(Ordering::Relaxed);
-        let before_rej: Vec<u64> = TOKEN_REJECTIONS.iter().map(|c| c.load(Ordering::Relaxed)).collect();
-        let before_out: Vec<u64> = DELIVERY_OUTCOMES_CNT.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+        let before_rej: Vec<u64> = TOKEN_REJECTIONS
+            .iter()
+            .map(|c| c.load(Ordering::Relaxed))
+            .collect();
+        let before_out: Vec<u64> = DELIVERY_OUTCOMES_CNT
+            .iter()
+            .map(|c| c.load(Ordering::Relaxed))
+            .collect();
 
         inc_transient_requeue();
         inc_dead();
@@ -201,10 +228,16 @@ mod tests {
         assert!(text.contains("aero_audit_delivery_outcomes_total"));
         // Label vocabulary lines present.
         for reason in TOKEN_REJECT_REASONS {
-            assert!(text.contains(&format!("reason=\"{reason}\"")), "reason label {reason}");
+            assert!(
+                text.contains(&format!("reason=\"{reason}\"")),
+                "reason label {reason}"
+            );
         }
         for outcome in DELIVERY_OUTCOMES {
-            assert!(text.contains(&format!("outcome=\"{outcome}\"")), "outcome label {outcome}");
+            assert!(
+                text.contains(&format!("outcome=\"{outcome}\"")),
+                "outcome label {outcome}"
+            );
         }
         // Deltas: each emit landed at least once. The counters are GLOBAL
         // statics shared with the relay/client tests (which emit the same
@@ -214,7 +247,10 @@ mod tests {
             TRANSIENT_REQUEUE.load(Ordering::Relaxed) > before_requeue,
             "transient-requeue incremented"
         );
-        assert!(DEAD.load(Ordering::Relaxed) > before_dead, "dead incremented");
+        assert!(
+            DEAD.load(Ordering::Relaxed) > before_dead,
+            "dead incremented"
+        );
         for (idx, reason) in TOKEN_REJECT_REASONS.iter().enumerate() {
             assert!(
                 TOKEN_REJECTIONS[idx].load(Ordering::Relaxed) > before_rej[idx],
@@ -225,6 +261,26 @@ mod tests {
             assert!(
                 DELIVERY_OUTCOMES_CNT[idx].load(Ordering::Relaxed) > before_out[idx],
                 "outcome {outcome} incremented"
+            );
+        }
+    }
+
+    /// Claim-plane validation failures and malformed JWT decoding failures
+    /// map to their documented bounded metric labels.
+    #[test]
+    fn claim_rejection_classification_covers_claim_and_malformed_shapes() {
+        for (reason, expected) in [
+            ("token has expired", "claims"),
+            ("token is not yet valid", "claims"),
+            ("token exp is not a number", "claims"),
+            ("token nbf is not a number", "claims"),
+            ("token has no JWT header segment", "malformed"),
+            ("JWT payload is not valid JSON", "malformed"),
+        ] {
+            assert_eq!(
+                classify_token_rejection(reason),
+                expected,
+                "reason: {reason}"
             );
         }
     }
