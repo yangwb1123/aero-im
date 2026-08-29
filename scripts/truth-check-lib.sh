@@ -126,7 +126,7 @@ CLAIM_ALLOWLIST=(
     # integrations.rs — account-summary audit detail plus #[test] fixture
     # JSON (CreateInstallationReq payloads). The production field is an
     # audit-detail schema key, not client-credential claim validation.
-    'crates/aero-server/src/integrations.rs:393:"client_id"'
+    'crates/aero-server/src/integrations.rs:461:"client_id"'
     'crates/aero-server/src/integrations/tests.rs:62:"client_id"'
     'crates/aero-server/src/integrations/tests.rs:72:"client_id"'
     'crates/aero-server/src/integrations/tests.rs:103:"client_id"'

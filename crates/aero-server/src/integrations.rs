@@ -5,6 +5,7 @@
 //! `client_credentials`; a machine token is never converted into a participant.
 
 use std::{
+    collections::{BTreeMap, BTreeSet},
     str::FromStr,
     sync::{Arc, OnceLock},
     time::Duration,
@@ -14,7 +15,9 @@ use aero_auth::{
     validate_client_credentials_token, validate_jwks_uri, AuthUser, ClientCredentialsTokenConfig,
     JwksKeyProvider,
 };
-use aero_common::{Block, Error as AeroError, FileKind, ParticipantId, RoomId, WorkspaceId};
+use aero_common::{
+    Block, Error as AeroError, FileKind, Notification, ParticipantId, RoomId, WorkspaceId,
+};
 use aero_im_core::{
     moderation_text, validate_blocks, KeywordModerator, ModerationVerdict, Moderator, PiiDetector,
 };
@@ -24,11 +27,12 @@ use aero_storage::{
         IntegrationBlobOutcome, IntegrationBlobProbe, IntegrationBlobQuotaReservation,
         IntegrationNotificationClaim,
     },
-    AutoModRuleRepo, IntegrationReplayProbe, IntegrationRepo, IntegrationTarget, NewBlob,
-    NewIntegrationInstallation, NewIntegrationNotification, UpdateIntegrationInstallation,
+    AuditRepo, AutoModRuleRepo, IntegrationReplayProbe, IntegrationRepo, IntegrationTarget,
+    NewBlob, NewIntegrationInstallation, NewIntegrationNotification, ParticipantRepo, SsoRepo,
+    UpdateIntegrationInstallation, WorkspaceRepo,
 };
 use axum::{
-    extract::{DefaultBodyLimit, Multipart, Path, State},
+    extract::{DefaultBodyLimit, Multipart, Path, RawQuery, State},
     http::{header, HeaderMap, HeaderValue, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -49,6 +53,20 @@ use crate::{
 };
 
 const REQUIRED_PUBLISH_SCOPE: &str = "aero.notify.publish";
+const REQUIRED_ACCOUNT_SUMMARY_SCOPE: &str = "aero.account.summary.read";
+const ACCOUNT_SUMMARY_PATH: &str = "/internal/account-summary";
+const ACCOUNT_ID_HEADER: &str = "x-aero-account-id";
+const CANONICAL_UID_HEADER: &str = "x-aero-canonical-uid";
+const MAX_ACCOUNT_SUMMARY_QUERY_BYTES: usize = 8 * 1024;
+const MAX_ACCOUNT_SUMMARY_ACCOUNT_ID_BYTES: usize = 512;
+const MAX_ACCOUNT_SUMMARY_REGION_BYTES: usize = 128;
+const MAX_ACCOUNT_SUMMARY_DATASETS: usize = 4;
+const ACCOUNT_SUMMARY_BINDING_UNAVAILABLE: &str = "account summary target binding is unavailable";
+const ACCOUNT_NOTIFICATION_LIMIT: i64 = 50;
+
+fn account_notification_limit_usize() -> usize {
+    usize::try_from(ACCOUNT_NOTIFICATION_LIMIT).expect("notification limit fits usize")
+}
 const MAX_MACHINE_TOKEN_BYTES: usize = 48 * 1024;
 const MAX_NOTIFICATION_BODY_BYTES: usize = 512 * 1024;
 const MAX_INTEGRATION_UPLOAD_BODY_BYTES: usize = 33 * 1024 * 1024;
@@ -176,6 +194,7 @@ fn request_pending_response() -> Response {
 
 pub fn routes() -> Router<AppState> {
     Router::new()
+        .route(ACCOUNT_SUMMARY_PATH, get(account_summary))
         .route(
             "/api/workspaces/:workspace_id/integrations",
             get(list_installations).post(create_installation),
@@ -250,6 +269,420 @@ async fn authenticate_machine(
         issuer: config.token.issuer,
         client_id: claims.client_id,
     })
+}
+
+#[derive(Debug)]
+struct AccountSummaryRequest {
+    /// Opaque Aero ID account identifier. This is deliberately not parsed as
+    /// or converted to an Aero `ParticipantId`.
+    account_id: String,
+    region: Option<String>,
+    datasets: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AuthorizedAccountSummaryTarget {
+    account_id: String,
+    canonical_uid: String,
+    tenant_id: String,
+    region: String,
+    datasets: BTreeSet<String>,
+}
+
+#[derive(Serialize)]
+struct AccountSummaryResponse {
+    source_region: String,
+    version: i64,
+    generated_at: String,
+    complete: bool,
+    datasets: BTreeMap<String, serde_json::Value>,
+    sources: Vec<serde_json::Value>,
+    memberships: Vec<serde_json::Value>,
+}
+
+/// Owner-facing target-authorization seam for the account-summary projection.
+///
+/// The checked-in implementation is deliberately non-accepting: neither the
+/// broad machine token nor the legacy identity headers proves that an account
+/// belongs to the caller. An approved signed assertion or durable exact
+/// mapping must replace this body before the projection can be enabled.
+fn authorize_account_summary_target(
+    _principal: &MachinePrincipal,
+    _request: &AccountSummaryRequest,
+    _headers: &HeaderMap,
+) -> Result<AuthorizedAccountSummaryTarget, AeroError> {
+    Err(AeroError::Upstream(
+        ACCOUNT_SUMMARY_BINDING_UNAVAILABLE.into(),
+    ))
+}
+
+fn validate_bound_account_summary_target(
+    request: &AccountSummaryRequest,
+    target: &AuthorizedAccountSummaryTarget,
+    source_region: &str,
+) -> Result<(), AeroError> {
+    let expected_datasets = if request.datasets.is_empty() {
+        all_account_summary_dataset_names()
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    } else {
+        request.datasets.clone()
+    };
+    let query_region_matches = request
+        .region
+        .as_deref()
+        .map_or(true, |region| region == target.region);
+    if target.account_id != request.account_id
+        || target.datasets != expected_datasets
+        || target.region != source_region
+        || !query_region_matches
+        || !valid_account_summary_identifier(
+            &target.canonical_uid,
+            MAX_ACCOUNT_SUMMARY_ACCOUNT_ID_BYTES,
+        )
+        || !valid_account_summary_identifier(
+            &target.tenant_id,
+            MAX_ACCOUNT_SUMMARY_ACCOUNT_ID_BYTES,
+        )
+    {
+        return Err(AeroError::Forbidden(
+            "account summary target binding mismatch".into(),
+        ));
+    }
+    Ok(())
+}
+
+async fn account_summary(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+) -> IntegrationApiResult<Json<AccountSummaryResponse>> {
+    let principal = authenticate_machine(&headers, REQUIRED_ACCOUNT_SUMMARY_SCOPE).await?;
+    let request = parse_account_summary_query(raw_query.as_deref())?;
+    // This gate is intentionally before every identity and projection lookup.
+    // Equal unsigned headers cannot authorize a target; they are only optional
+    // consistency inputs to the owner-approved binding seam.
+    let target = authorize_account_summary_target(&principal, &request, &headers)?;
+    let source_region = env_value("AERO__ACCOUNT_SOURCE__REGION").unwrap_or_else(|| "local".into());
+    validate_bound_account_summary_target(&request, &target, &source_region)?;
+    validate_account_summary_legacy_headers(&headers, &target)?;
+    let canonical_uid = target.canonical_uid.as_str();
+    let human_issuer = env_value("AERO__OIDC__ISSUER").ok_or_else(|| {
+        AeroError::Invalid("Snaplink human identity issuer is not configured".into())
+    })?;
+
+    let participant_id = SsoRepo::new(state.pg.clone())
+        .find_participant(&human_issuer, canonical_uid)
+        .await?;
+    let now = time::OffsetDateTime::now_utc();
+    let generated_at = now
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_default();
+    let version = i64::try_from(now.unix_timestamp_nanos() / 1_000_000).unwrap_or(i64::MAX);
+    let requested = requested_account_datasets(&target.datasets);
+    let mut datasets = BTreeMap::new();
+    let mut sources = Vec::new();
+    let mut memberships = Vec::new();
+
+    if let Some(participant_id) = participant_id {
+        let participant = ParticipantRepo::new(state.pg.clone())
+            .get(participant_id)
+            .await?
+            .ok_or_else(|| AeroError::NotFound("participant".into()))?;
+        let workspaces = WorkspaceRepo::new(state.pg.clone())
+            .list_for_participant(participant_id)
+            .await?;
+        if requested.contains("aero-im.profile") {
+            datasets.insert(
+                "aero-im.profile".into(),
+                serde_json::json!({
+                    "display_name": participant.display_name,
+                    "avatar_url": participant.avatar_url,
+                    "status": "active",
+                }),
+            );
+        }
+        if requested.contains("aero-im.workspaces") {
+            datasets.insert(
+                "aero-im.workspaces".into(),
+                serde_json::json!({
+                    "items": workspaces.iter().map(|workspace| serde_json::json!({
+                        "id": workspace.id, "name": workspace.name, "slug": workspace.slug,
+                    })).collect::<Vec<_>>()
+                }),
+            );
+        }
+        if requested.contains("aero-im.activity_summary") {
+            datasets.insert(
+                "aero-im.activity_summary".into(),
+                serde_json::json!({"workspace_count": workspaces.len()}),
+            );
+        }
+        if requested.contains("aero-im.notifications") {
+            let notifications = state
+                .notifications
+                .list(
+                    participant_id,
+                    None,
+                    false,
+                    Some(ACCOUNT_NOTIFICATION_LIMIT + 1),
+                )
+                .await?;
+            let unread_count = state.notifications.unread_count(participant_id).await?;
+            datasets.insert(
+                "aero-im.notifications".into(),
+                notification_dataset(notifications, unread_count, "active"),
+            );
+        }
+        sources.push(serde_json::json!({
+            "source_account_id": participant_id,
+            "scope_type": "account",
+            "scope_id": target.account_id,
+            "status": "active",
+            "data": {},
+        }));
+        memberships.extend(workspaces.iter().map(|workspace| {
+            serde_json::json!({
+                "scope_type": "workspace",
+                "scope_id": workspace.id,
+                "source_member_id": participant_id,
+                "role": "member",
+                "status": "active",
+                "data": {},
+            })
+        }));
+        AuditRepo::new(state.pg.clone())
+            .append(
+                WorkspaceId::nil(),
+                None,
+                "integration.account_summary.read",
+                Some(&participant_id.to_string()),
+                serde_json::json!({"client_id": principal.client_id, "datasets": requested}),
+            )
+            .await?;
+    } else {
+        for dataset in requested {
+            let value = if dataset == "aero-im.notifications" {
+                notification_dataset(Vec::new(), 0, "not_found")
+            } else {
+                serde_json::json!({"status": "not_found"})
+            };
+            datasets.insert(dataset.to_owned(), value);
+        }
+    }
+
+    Ok(Json(AccountSummaryResponse {
+        source_region,
+        version,
+        generated_at,
+        complete: true,
+        datasets,
+        sources,
+        memberships,
+    }))
+}
+
+fn valid_account_summary_query_encoding(raw: &str) -> bool {
+    let bytes = raw.as_bytes();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len()
+                || !bytes[index + 1].is_ascii_hexdigit()
+                || !bytes[index + 2].is_ascii_hexdigit()
+            {
+                return false;
+            }
+            index += 3;
+        } else {
+            index += 1;
+        }
+    }
+    true
+}
+
+fn valid_account_summary_identifier(value: &str, max_bytes: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= max_bytes
+        && value == value.trim()
+        && !value.contains('\u{FFFD}')
+        && value
+            .chars()
+            .all(|character| !character.is_control() && !character.is_whitespace())
+}
+
+fn parse_account_summary_query(raw: Option<&str>) -> Result<AccountSummaryRequest, AeroError> {
+    let raw = raw.unwrap_or_default();
+    if raw.len() > MAX_ACCOUNT_SUMMARY_QUERY_BYTES {
+        return Err(AeroError::Invalid(
+            "account summary query is too large".into(),
+        ));
+    }
+    if !valid_account_summary_query_encoding(raw) {
+        return Err(AeroError::Invalid(
+            "account summary query is malformed".into(),
+        ));
+    }
+    let mut account_id = None;
+    let mut region = None;
+    let mut datasets = BTreeSet::new();
+    for (name, value) in form_urlencoded::parse(raw.as_bytes()) {
+        match name.as_ref() {
+            "account_id" => {
+                if account_id.is_some() {
+                    return Err(AeroError::Invalid(
+                        "account_id must appear exactly once".into(),
+                    ));
+                }
+                let value = value.into_owned();
+                if !valid_account_summary_identifier(&value, MAX_ACCOUNT_SUMMARY_ACCOUNT_ID_BYTES) {
+                    return Err(AeroError::Invalid("account_id is invalid".into()));
+                }
+                account_id = Some(value);
+            }
+            "region" => {
+                if region.is_some() {
+                    return Err(AeroError::Invalid("region must appear at most once".into()));
+                }
+                let value = value.into_owned();
+                if !valid_account_summary_identifier(&value, MAX_ACCOUNT_SUMMARY_REGION_BYTES) {
+                    return Err(AeroError::Invalid("region is invalid".into()));
+                }
+                region = Some(value);
+            }
+            "dataset" => {
+                let value = value.into_owned();
+                if !matches!(
+                    value.as_str(),
+                    "aero-im.profile"
+                        | "aero-im.workspaces"
+                        | "aero-im.activity_summary"
+                        | "aero-im.notifications"
+                ) {
+                    return Err(AeroError::Invalid(
+                        "unsupported account summary dataset".into(),
+                    ));
+                }
+                if !datasets.insert(value) {
+                    return Err(AeroError::Invalid("dataset must appear only once".into()));
+                }
+            }
+            _ => {
+                return Err(AeroError::Invalid(
+                    "unknown account summary query parameter".into(),
+                ));
+            }
+        }
+    }
+    if datasets.len() > MAX_ACCOUNT_SUMMARY_DATASETS {
+        return Err(AeroError::Invalid(
+            "too many account summary datasets".into(),
+        ));
+    }
+    Ok(AccountSummaryRequest {
+        account_id: account_id
+            .ok_or_else(|| AeroError::Invalid("account_id is required".into()))?,
+        region,
+        datasets,
+    })
+}
+
+fn all_account_summary_dataset_names() -> [&'static str; 4] {
+    [
+        "aero-im.profile",
+        "aero-im.workspaces",
+        "aero-im.activity_summary",
+        "aero-im.notifications",
+    ]
+}
+
+fn requested_account_datasets(values: &BTreeSet<String>) -> BTreeSet<&str> {
+    if values.is_empty() {
+        return BTreeSet::from(all_account_summary_dataset_names());
+    }
+    values.iter().map(String::as_str).collect()
+}
+
+fn notification_dataset(
+    mut notifications: Vec<Notification>,
+    unread_count: u64,
+    source_account_status: &str,
+) -> serde_json::Value {
+    let limit = account_notification_limit_usize();
+    let truncated = notifications.len() > limit;
+    notifications.truncate(limit);
+    let items = notifications
+        .iter()
+        .map(|notification| {
+            serde_json::json!({
+                "notification_id": notification.id,
+                "room_id": notification.room_id,
+                "message_id": notification.message_id,
+                "kind": notification.kind,
+                "actor_id": notification.actor_id,
+                "created_at": notification.created_at,
+                "read_at": notification.read_at,
+                "aggregate_count": notification.aggregate_count,
+                "importance_score": notification.importance_score,
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "items": items,
+        "unread_count": unread_count,
+        "truncated": truncated,
+        "source_account_status": source_account_status,
+    })
+}
+
+fn required_account_header<'a>(headers: &'a HeaderMap, name: &str) -> Result<&'a str, AeroError> {
+    let mut values = headers.get_all(name).iter();
+    let value = values
+        .next()
+        .ok_or_else(|| AeroError::Invalid(format!("{name} is required")))?;
+    if values.next().is_some() {
+        return Err(AeroError::Invalid(format!(
+            "exactly one {name} header is required"
+        )));
+    }
+    let value = value
+        .to_str()
+        .map_err(|_| AeroError::Invalid(format!("{name} must be valid ASCII")))?;
+    if !valid_account_summary_identifier(value, MAX_ACCOUNT_SUMMARY_ACCOUNT_ID_BYTES) {
+        return Err(AeroError::Invalid(format!("{name} is invalid")));
+    }
+    Ok(value)
+}
+
+/// Validates legacy headers only as optional consistency data. It never
+/// returns an authorized identity and must not be used as the target gate.
+fn validate_account_summary_legacy_headers(
+    headers: &HeaderMap,
+    target: &AuthorizedAccountSummaryTarget,
+) -> Result<(), AeroError> {
+    if headers.get_all(ACCOUNT_ID_HEADER).iter().next().is_some() {
+        let header_account_id = required_account_header(headers, ACCOUNT_ID_HEADER)?;
+        if header_account_id != target.account_id {
+            return Err(AeroError::Invalid(
+                "account summary target binding header mismatch".into(),
+            ));
+        }
+    }
+    if headers
+        .get_all(CANONICAL_UID_HEADER)
+        .iter()
+        .next()
+        .is_some()
+    {
+        let header_canonical_uid = required_account_header(headers, CANONICAL_UID_HEADER)?;
+        if header_canonical_uid != target.canonical_uid {
+            return Err(AeroError::Invalid(
+                "account summary target binding header mismatch".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn bearer_token(headers: &HeaderMap) -> Result<&str, AeroError> {
@@ -748,213 +1181,4 @@ async fn cleanup_failed_request(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn bearer_and_idempotency_headers_are_strict() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            header::AUTHORIZATION,
-            HeaderValue::from_static("bearer token"),
-        );
-        assert_eq!(bearer_token(&headers).unwrap(), "token");
-        headers.append(
-            header::AUTHORIZATION,
-            HeaderValue::from_static("Basic attacker"),
-        );
-        assert!(bearer_token(&headers).is_err());
-        headers.remove(header::AUTHORIZATION);
-        headers.insert(
-            header::AUTHORIZATION,
-            HeaderValue::from_static("bearer token"),
-        );
-        headers.insert("idempotency-key", HeaderValue::from_static("not-a-uuid"));
-        assert!(required_idempotency_key(&headers).is_err());
-        let key = Uuid::new_v4();
-        headers.insert(
-            "idempotency-key",
-            HeaderValue::from_str(&key.to_string()).unwrap(),
-        );
-        assert_eq!(required_idempotency_key(&headers).unwrap(), key);
-        headers.append(
-            "idempotency-key",
-            HeaderValue::from_str(&Uuid::new_v4().to_string()).unwrap(),
-        );
-        assert!(required_idempotency_key(&headers).is_err());
-    }
-
-    #[test]
-    fn request_hash_binds_target_and_blocks() {
-        let room = IntegrationTarget::Room(RoomId::new());
-        let base = notification_request_hash(&room, &[Block::text("hello")]).unwrap();
-        assert_eq!(
-            base,
-            notification_request_hash(&room, &[Block::text("hello")]).unwrap()
-        );
-        assert_ne!(
-            base,
-            notification_request_hash(&room, &[Block::text("changed")]).unwrap()
-        );
-        assert_ne!(
-            base,
-            notification_request_hash(
-                &IntegrationTarget::SnaplinkUser("user-1".into()),
-                &[Block::text("hello")],
-            )
-            .unwrap()
-        );
-    }
-
-    #[test]
-    fn installation_user_dm_policy_is_opt_in() {
-        let request: CreateInstallationReq = serde_json::from_value(serde_json::json!({
-            "bot_id": ParticipantId::new(),
-            "client_id": "erp-client",
-            "name": "ERP",
-            "room_ids": [],
-        }))
-        .unwrap();
-        assert!(!request.allow_user_dm);
-        assert!(request.user_identity_issuer.is_none());
-
-        let enabled: CreateInstallationReq = serde_json::from_value(serde_json::json!({
-            "bot_id": ParticipantId::new(),
-            "client_id": "erp-client",
-            "name": "ERP",
-            "user_identity_issuer": "https://human-sso.example",
-            "allow_user_dm": true,
-        }))
-        .unwrap();
-        assert!(enabled.allow_user_dm);
-        assert_eq!(
-            enabled.user_identity_issuer.as_deref(),
-            Some("https://human-sso.example")
-        );
-
-        let update: UpdateInstallationReq = serde_json::from_value(serde_json::json!({
-            "rotate_to_current_issuer": true,
-            "user_identity_issuer": "https://rotated-human-sso.example"
-        }))
-        .unwrap();
-        assert!(update.rotate_to_current_issuer);
-        assert_eq!(
-            update.user_identity_issuer.as_deref(),
-            Some("https://rotated-human-sso.example")
-        );
-        assert!(
-            serde_json::from_value::<UpdateInstallationReq>(serde_json::json!({
-                "issuer": "https://attacker-controlled.example"
-            }))
-            .is_err()
-        );
-        assert!(
-            serde_json::from_value::<CreateInstallationReq>(serde_json::json!({
-                "bot_id": ParticipantId::new(),
-                "client_id": "erp-client",
-                "name": "ERP",
-                "issuer": "https://attacker-controlled.example"
-            }))
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn human_identity_issuer_comes_only_from_trusted_admin_or_oidc_config() {
-        assert_eq!(
-            select_user_identity_issuer(None, Some("https://configured-human-sso.example".into()))
-                .unwrap(),
-            "https://configured-human-sso.example"
-        );
-        assert_eq!(
-            select_user_identity_issuer(
-                Some("https://admin-selected-human-sso.example".into()),
-                Some("https://configured-human-sso.example".into())
-            )
-            .unwrap(),
-            "https://admin-selected-human-sso.example"
-        );
-        assert!(select_user_identity_issuer(None, None).is_err());
-        assert!(select_user_identity_issuer(Some(" bad".into()), None).is_err());
-        assert!(select_user_identity_issuer(Some("https://bad\nissuer".into()), None).is_err());
-    }
-
-    #[test]
-    fn pending_claim_reprobes_are_bounded_and_back_off() {
-        let mut backoff = ClaimBackoff::new();
-        let mut delays = Vec::new();
-        while let Some(delay) = backoff.next_delay() {
-            delays.push(delay);
-        }
-        assert_eq!(delays.len(), usize::from(CLAIM_REPROBE_LIMIT));
-        assert_eq!(delays[0], CLAIM_REPROBE_INITIAL);
-        assert_eq!(delays.last().copied(), Some(CLAIM_REPROBE_MAX));
-        assert!(delays.windows(2).all(|pair| pair[0] <= pair[1]));
-        assert!(backoff.next_delay().is_none());
-
-        let response = request_pending_response();
-        assert_eq!(response.status(), StatusCode::CONFLICT);
-        assert_eq!(response.headers().get("retry-after").unwrap(), "1");
-    }
-
-    #[test]
-    fn integration_rate_limit_response_has_retry_after_without_changing_other_errors() {
-        let response = IntegrationApiError::from(AeroError::RateLimited).into_response();
-        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(
-            response.headers().get(header::RETRY_AFTER).unwrap(),
-            INTEGRATION_RATE_RETRY_AFTER_SECS
-        );
-
-        let response =
-            IntegrationApiError::from(AeroError::Invalid("bad request".into())).into_response();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert!(response.headers().get(header::RETRY_AFTER).is_none());
-    }
-
-    #[test]
-    fn integration_upload_concurrency_is_bounded() {
-        assert_eq!(
-            integration_upload_concurrency_from_value(None),
-            DEFAULT_INTEGRATION_UPLOAD_CONCURRENCY
-        );
-        assert_eq!(integration_upload_concurrency_from_value(Some("0")), 1);
-        assert_eq!(integration_upload_concurrency_from_value(Some("7")), 7);
-        assert_eq!(
-            integration_upload_concurrency_from_value(Some("999999")),
-            MAX_INTEGRATION_UPLOAD_CONCURRENCY
-        );
-        assert_eq!(
-            integration_upload_concurrency_from_value(Some("invalid")),
-            DEFAULT_INTEGRATION_UPLOAD_CONCURRENCY
-        );
-    }
-
-    #[tokio::test]
-    async fn integration_upload_gate_limits_concurrency_and_releases_permits() {
-        let gate = IntegrationUploadGate::new(1);
-        let first = gate.acquire().await.unwrap();
-        assert_eq!(gate.available_permits(), 0);
-
-        let waiting_gate = gate.clone();
-        let mut waiting = tokio::spawn(async move { waiting_gate.acquire().await.unwrap() });
-        assert!(
-            tokio::time::timeout(Duration::from_millis(25), &mut waiting)
-                .await
-                .is_err()
-        );
-
-        drop(first);
-        let second = tokio::time::timeout(Duration::from_secs(1), waiting)
-            .await
-            .expect("waiting upload must acquire a released permit")
-            .unwrap();
-        assert_eq!(gate.available_permits(), 0);
-        drop(second);
-        assert_eq!(gate.available_permits(), 1);
-
-        let final_permit = gate.acquire().await.unwrap();
-        drop(final_permit);
-        assert_eq!(gate.available_permits(), 1);
-    }
-}
+mod tests;
