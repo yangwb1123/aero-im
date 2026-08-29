@@ -110,6 +110,28 @@ async fn accepts_valid_dedicated_eddsa_target_assertion() {
 }
 
 #[tokio::test]
+async fn rejects_not_before_after_expiry_even_with_clock_skew() {
+    let cfg = config();
+    let now = now();
+    let mut value = claims(&cfg, now);
+    value.iat = now.saturating_sub(10);
+    value.nbf = now + 25;
+    value.exp = now + 15;
+    let token = sign(
+        &value,
+        Algorithm::EdDSA,
+        Some(ACCOUNT_TARGET_ASSERTION_TYPE),
+        Some("assertion-key"),
+    );
+    assert_eq!(
+        validate_target_assertion_at(&token, &cfg, &keys(), now)
+            .await
+            .unwrap_err(),
+        TargetAssertionError::Invalid
+    );
+}
+
+#[tokio::test]
 async fn rejects_wrong_header_algorithm_type_and_kid() {
     let cfg = config();
     let now = now();

@@ -194,6 +194,7 @@ pub async fn validate_target_assertion_at(
         || claims.iat > now.saturating_add(cfg.clock_skew_secs)
         || claims.nbf > now.saturating_add(cfg.clock_skew_secs)
         || claims.nbf < claims.iat
+        || claims.nbf > claims.exp
         || claims.exp <= claims.iat
         || claims.exp - claims.iat > cfg.max_lifetime_secs
     {
