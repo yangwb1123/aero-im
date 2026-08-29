@@ -190,6 +190,11 @@ fn account_summary_query_is_bounded_strict_and_opaque() {
     assert_eq!(query.region.as_deref(), Some("local"));
     assert_eq!(query.datasets.len(), 2);
     assert!(query.datasets.contains("aero-im.profile"));
+    assert!(parse_account_summary_query(Some(&format!("account_id={account_id}"))).is_err());
+    assert!(parse_account_summary_query(Some(&format!(
+        "account_id={account_id}&region=local&dataset=aero-im.workspaces&dataset=aero-im.profile"
+    )))
+    .is_err());
     assert!(parse_account_summary_query(Some("account_id=")).is_err());
     assert!(parse_account_summary_query(Some("account_id= account")).is_err());
     assert!(parse_account_summary_query(Some(&format!(
@@ -213,6 +218,9 @@ fn account_summary_query_is_bounded_strict_and_opaque() {
             .is_err()
     );
     assert!(parse_account_summary_query(Some("account_id=%ZZ")).is_err());
+    assert!(parse_account_summary_query(Some("account_id=a&region=local&")).is_err());
+    assert!(parse_account_summary_query(Some("account_id=a&&region=local")).is_err());
+    assert!(parse_account_summary_query(Some("account_id=a&reconcile=true&region=local")).is_err());
     assert!(
         parse_account_summary_query(Some(&"x".repeat(MAX_ACCOUNT_SUMMARY_QUERY_BYTES + 1)))
             .is_err()
@@ -227,9 +235,11 @@ fn account_summary_legacy_headers_are_consistency_only() {
         tenant_id: "tenant-A".into(),
         region: "local".into(),
         datasets: BTreeSet::from(["aero-im.profile".into()]),
+        jti: "test-jti".into(),
+        exp: 1,
     };
     let mut headers = HeaderMap::new();
-    assert!(validate_account_summary_legacy_headers(&headers, &target).is_ok());
+    assert!(validate_account_summary_legacy_headers(&headers, &target).is_err());
 
     headers.insert(
         ACCOUNT_ID_HEADER,
@@ -245,6 +255,8 @@ fn account_summary_legacy_headers_are_consistency_only() {
         CANONICAL_UID_HEADER,
         HeaderValue::from_static("canonical-user-1"),
     );
+    headers.insert(TENANT_ID_HEADER, HeaderValue::from_static("tenant-A"));
+    headers.insert(REGION_HEADER, HeaderValue::from_static("local"));
     assert!(validate_account_summary_legacy_headers(&headers, &target).is_ok());
 
     headers.append(
@@ -268,8 +280,8 @@ fn account_summary_legacy_headers_are_consistency_only() {
     assert!(validate_account_summary_legacy_headers(&headers, &target).is_err());
 }
 
-#[test]
-fn account_summary_binding_gate_rejects_equal_headers_without_authorization() {
+#[tokio::test]
+async fn account_summary_binding_gate_rejects_equal_headers_without_authorization() {
     let principal = MachinePrincipal {
         issuer: "https://issuer.example".into(),
         client_id: "aero-id".into(),
@@ -289,7 +301,9 @@ fn account_summary_binding_gate_rejects_equal_headers_without_authorization() {
         HeaderValue::from_static("canonical-user-B"),
     );
 
-    let error = authorize_account_summary_target(&principal, &request, &headers).unwrap_err();
+    let error = authorize_account_summary_target(None, &principal, &request, "local", &headers)
+        .await
+        .unwrap_err();
     assert!(
         matches!(error, AeroError::Upstream(ref message) if message == ACCOUNT_SUMMARY_BINDING_UNAVAILABLE)
     );
@@ -310,6 +324,8 @@ fn account_summary_bound_target_requires_exact_target_fields() {
         tenant_id: "tenant-A".into(),
         region: "local".into(),
         datasets: request.datasets.clone(),
+        jti: "test-jti".into(),
+        exp: 1,
     };
     assert!(validate_bound_account_summary_target(&request, &target, "local").is_ok());
 

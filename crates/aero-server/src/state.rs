@@ -372,6 +372,11 @@ pub struct AiSentiment {
 #[derive(Clone)]
 pub struct AppState {
     pub auth: AuthService,
+    /// Dedicated Aero ID account-summary target binding. `None` is the safe
+    /// default: the internal projection route remains unavailable until its
+    /// issuer, audience, JWKS, and replay contract are configured.
+    pub account_summary_binding:
+        Option<Arc<crate::account_summary_binding::AccountSummaryTargetVerifier>>,
     pub im: Arc<ImService>,
     /// Optional Snaplink commercial projector and durable usage/audit relay.
     /// Readiness consults its local entitlement projection, never live central

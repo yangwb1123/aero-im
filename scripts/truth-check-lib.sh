@@ -78,6 +78,11 @@ CLAIM_ALLOWLIST=(
     'crates/aero-auth/src/oidc.rs:367:"iss"'   # id_token set_required_spec_claims — RFC 7519/OIDC Core id_token contract (different wire contract)
     'crates/aero-auth/src/oidc.rs:367:"aud"'   # id_token set_required_spec_claims — same
     'crates/aero-auth/src/oidc.rs:367:"sub"'   # id_token set_required_spec_claims — same
+    # target_assertion.rs — EdDSA account-summary target-assertion JWS uses
+    # registered `iss`/`aud` required-claim spellings under a separate wire
+    # contract, not the unified RFC 9068 client-credentials contract.
+    'crates/aero-auth/src/target_assertion.rs:161:"iss"'
+    'crates/aero-auth/src/target_assertion.rs:161:"aud"'
     # audit connector client.rs — RFC 6749 §4.4 token-request form param in
     # request_token (wire contract, not claims validation).
     'crates/aero-audit-connector/src/client.rs:491:"scope"'
@@ -126,7 +131,7 @@ CLAIM_ALLOWLIST=(
     # integrations.rs — account-summary audit detail plus #[test] fixture
     # JSON (CreateInstallationReq payloads). The production field is an
     # audit-detail schema key, not client-credential claim validation.
-    'crates/aero-server/src/integrations.rs:461:"client_id"'
+    'crates/aero-server/src/integrations.rs:503:"client_id"'
     'crates/aero-server/src/integrations/tests.rs:62:"client_id"'
     'crates/aero-server/src/integrations/tests.rs:72:"client_id"'
     'crates/aero-server/src/integrations/tests.rs:103:"client_id"'

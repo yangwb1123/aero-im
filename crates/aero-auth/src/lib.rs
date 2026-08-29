@@ -21,6 +21,7 @@ pub mod pat;
 pub mod relay_gate;
 pub mod relay_scope;
 pub mod service;
+pub mod target_assertion;
 pub mod totp;
 
 #[cfg(test)]
@@ -43,3 +44,8 @@ pub use relay_scope::{
     SharedRelayScopeProvisioner,
 };
 pub use service::{AuthService, AuthTokens, LoginRequest, RegisterRequest, RegisterResponse};
+pub use target_assertion::{
+    validate_target_assertion, validate_target_assertion_at, TargetAssertionClaims,
+    TargetAssertionConfig, TargetAssertionError, ACCOUNT_TARGET_ASSERTION_METHOD,
+    ACCOUNT_TARGET_ASSERTION_PATH, ACCOUNT_TARGET_ASSERTION_TYPE,
+};

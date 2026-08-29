@@ -9,6 +9,7 @@ pub mod bot_dispatch;
 pub mod call_bridge_subscribe;
 pub mod call_bridge_supervisor;
 // ROADMAP 方向五: per-peer SFU media session (the str0m loop driving on_rtp).
+pub mod account_summary_binding;
 pub mod ai_adapter;
 pub mod audit_relay_heartbeat;
 /// ClamAV (`clamd`) INSTREAM anti-virus scanning for uploaded blobs.

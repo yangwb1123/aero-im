@@ -101,6 +101,7 @@ bergshamra = { version = "0.5.1", optional = true }
 
 [dev-dependencies]
 pretty_assertions.workspace = true
+jsonwebtoken.workspace = true
 # Adversarial SAML signature tests mint a throwaway RSA keypair + self-signed
 # X.509 cert (rcgen, fed an `rsa`-generated key) and sign a SAML Response with
 # bergshamra, then assert legitimate/tampered/XSW/wrong-cert/unsigned verdicts.

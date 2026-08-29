@@ -75,8 +75,21 @@ pub(crate) fn build(d: StateDeps) -> AppState {
     let pg_for_blocks = d.pg.clone();
     let pg_for_cursors = d.pg.clone();
     let redis_for_ws_rate = d.redis_client.clone();
+    let account_summary_binding = if let Ok(binding) =
+        aero_server::account_summary_binding::AccountSummaryTargetVerifier::from_env(
+            d.redis_client.clone(),
+        ) {
+        binding.map(Arc::new)
+    } else {
+        // Invalid or partial assertion configuration must not make the
+        // route usable. Keep the verifier absent and avoid logging any
+        // configured issuer, endpoint, or secret material.
+        tracing::warn!("account summary target binding is unavailable");
+        None
+    };
     AppState {
         auth: d.auth,
+        account_summary_binding,
         im: d.im,
         snaplink_commercial: d.snaplink_commercial,
         pg: d.pg,

@@ -54,6 +54,12 @@ refresh_ttl_secs = 604800        # 7 days
 otlp_endpoint = "http://localhost:4317"
 log_level = "info,aero=debug"
 
+# Account-summary target binding is configured through environment variables,
+# not this general config file. When enabled, set
+# AERO__ACCOUNT_SOURCE__REGION and the dedicated
+# AERO__ACCOUNT_SUMMARY__TARGET_ASSERTION_* values from .env.example. The
+# JWKS URI must be an external Aero ID target-assertion JWKS, never Snaplink's.
+
 # Optional S3-compatible residency backends. `default` is reserved for the
 # primary AERO_BLOB_BACKEND/LocalFs store and must not be declared here.
 # Workspace Owner/Admin can select only these keys (or `default`) for future

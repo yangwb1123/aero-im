@@ -48,15 +48,19 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::{
+    account_summary_binding::{
+        AccountSummaryTargetVerifier, ACCOUNT_SUMMARY_PATH, ACCOUNT_SUMMARY_SCOPE,
+    },
     error::{ApiError, ApiResult},
     state::AppState,
 };
 
 const REQUIRED_PUBLISH_SCOPE: &str = "aero.notify.publish";
-const REQUIRED_ACCOUNT_SUMMARY_SCOPE: &str = "aero.account.summary.read";
-const ACCOUNT_SUMMARY_PATH: &str = "/internal/account-summary";
+const REQUIRED_ACCOUNT_SUMMARY_SCOPE: &str = ACCOUNT_SUMMARY_SCOPE;
 const ACCOUNT_ID_HEADER: &str = "x-aero-account-id";
 const CANONICAL_UID_HEADER: &str = "x-aero-canonical-uid";
+const TENANT_ID_HEADER: &str = "x-aero-tenant-id";
+const REGION_HEADER: &str = "x-aero-region";
 const MAX_ACCOUNT_SUMMARY_QUERY_BYTES: usize = 8 * 1024;
 const MAX_ACCOUNT_SUMMARY_ACCOUNT_ID_BYTES: usize = 512;
 const MAX_ACCOUNT_SUMMARY_REGION_BYTES: usize = 128;
@@ -287,6 +291,8 @@ struct AuthorizedAccountSummaryTarget {
     tenant_id: String,
     region: String,
     datasets: BTreeSet<String>,
+    jti: String,
+    exp: u64,
 }
 
 #[derive(Serialize)]
@@ -300,20 +306,50 @@ struct AccountSummaryResponse {
     memberships: Vec<serde_json::Value>,
 }
 
-/// Owner-facing target-authorization seam for the account-summary projection.
-///
-/// The checked-in implementation is deliberately non-accepting: neither the
-/// broad machine token nor the legacy identity headers proves that an account
-/// belongs to the caller. An approved signed assertion or durable exact
-/// mapping must replace this body before the projection can be enabled.
-fn authorize_account_summary_target(
-    _principal: &MachinePrincipal,
-    _request: &AccountSummaryRequest,
-    _headers: &HeaderMap,
+/// Verify the owner-approved assertion before any source identity or
+/// projection lookup. Unsigned headers are checked only as exact consistency
+/// fields after the signed target has been verified.
+async fn authorize_account_summary_target(
+    binding: Option<&AccountSummaryTargetVerifier>,
+    principal: &MachinePrincipal,
+    request: &AccountSummaryRequest,
+    source_region: &str,
+    headers: &HeaderMap,
 ) -> Result<AuthorizedAccountSummaryTarget, AeroError> {
-    Err(AeroError::Upstream(
-        ACCOUNT_SUMMARY_BINDING_UNAVAILABLE.into(),
-    ))
+    let binding =
+        binding.ok_or_else(|| AeroError::Upstream(ACCOUNT_SUMMARY_BINDING_UNAVAILABLE.into()))?;
+    let expected_datasets = if request.datasets.is_empty() {
+        all_account_summary_dataset_names()
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    } else {
+        request.datasets.clone()
+    };
+    let verified = binding
+        .verify_request(
+            &principal.client_id,
+            &request.account_id,
+            request.region.as_deref(),
+            &expected_datasets,
+            headers,
+        )
+        .await?;
+    let target = AuthorizedAccountSummaryTarget {
+        account_id: verified.account_id.clone(),
+        canonical_uid: verified.canonical_uid.clone(),
+        tenant_id: verified.tenant_id.clone(),
+        region: verified.region.clone(),
+        datasets: verified.datasets.clone(),
+        jti: verified.jti.clone(),
+        exp: verified.exp,
+    };
+    validate_bound_account_summary_target(request, &target, source_region)?;
+    validate_account_summary_legacy_headers(headers, &target)?;
+    // Replay consumption is the last gate. No source identity, participant,
+    // workspace, notification, projection, or audit lookup may precede it.
+    binding.consume_replay(&verified).await?;
+    Ok(target)
 }
 
 fn validate_bound_account_summary_target(
@@ -332,7 +368,7 @@ fn validate_bound_account_summary_target(
     let query_region_matches = request
         .region
         .as_deref()
-        .map_or(true, |region| region == target.region);
+        .is_some_and(|region| region == target.region);
     if target.account_id != request.account_id
         || target.datasets != expected_datasets
         || target.region != source_region
@@ -361,12 +397,18 @@ async fn account_summary(
     let principal = authenticate_machine(&headers, REQUIRED_ACCOUNT_SUMMARY_SCOPE).await?;
     let request = parse_account_summary_query(raw_query.as_deref())?;
     // This gate is intentionally before every identity and projection lookup.
-    // Equal unsigned headers cannot authorize a target; they are only optional
-    // consistency inputs to the owner-approved binding seam.
-    let target = authorize_account_summary_target(&principal, &request, &headers)?;
-    let source_region = env_value("AERO__ACCOUNT_SOURCE__REGION").unwrap_or_else(|| "local".into());
-    validate_bound_account_summary_target(&request, &target, &source_region)?;
-    validate_account_summary_legacy_headers(&headers, &target)?;
+    // Equal unsigned headers cannot authorize a target; they are only required
+    // consistency inputs after the owner-approved assertion is verified.
+    let source_region = env_value("AERO__ACCOUNT_SOURCE__REGION")
+        .ok_or_else(|| AeroError::Upstream(ACCOUNT_SUMMARY_BINDING_UNAVAILABLE.into()))?;
+    let target = authorize_account_summary_target(
+        state.account_summary_binding.as_deref(),
+        &principal,
+        &request,
+        &source_region,
+        &headers,
+    )
+    .await?;
     let canonical_uid = target.canonical_uid.as_str();
     let human_issuer = env_value("AERO__OIDC__ISSUER").ok_or_else(|| {
         AeroError::Invalid("Snaplink human identity issuer is not configured".into())
@@ -519,13 +561,19 @@ fn parse_account_summary_query(raw: Option<&str>) -> Result<AccountSummaryReques
             "account summary query is too large".into(),
         ));
     }
-    if !valid_account_summary_query_encoding(raw) {
+    if !valid_account_summary_query_encoding(raw)
+        || raw.is_empty()
+        || raw.starts_with('&')
+        || raw.ends_with('&')
+        || raw.contains("&&")
+    {
         return Err(AeroError::Invalid(
             "account summary query is malformed".into(),
         ));
     }
     let mut account_id = None;
     let mut region = None;
+    let mut last_dataset: Option<String> = None;
     let mut datasets = BTreeSet::new();
     for (name, value) in form_urlencoded::parse(raw.as_bytes()) {
         match name.as_ref() {
@@ -564,6 +612,15 @@ fn parse_account_summary_query(raw: Option<&str>) -> Result<AccountSummaryReques
                         "unsupported account summary dataset".into(),
                     ));
                 }
+                if last_dataset
+                    .as_deref()
+                    .is_some_and(|last| last.as_bytes() >= value.as_bytes())
+                {
+                    return Err(AeroError::Invalid(
+                        "dataset parameters must be in canonical order".into(),
+                    ));
+                }
+                last_dataset = Some(value.clone());
                 if !datasets.insert(value) {
                     return Err(AeroError::Invalid("dataset must appear only once".into()));
                 }
@@ -583,7 +640,7 @@ fn parse_account_summary_query(raw: Option<&str>) -> Result<AccountSummaryReques
     Ok(AccountSummaryRequest {
         account_id: account_id
             .ok_or_else(|| AeroError::Invalid("account_id is required".into()))?,
-        region,
+        region: Some(region.ok_or_else(|| AeroError::Invalid("region is required".into()))?),
         datasets,
     })
 }
@@ -636,7 +693,11 @@ fn notification_dataset(
     })
 }
 
-fn required_account_header<'a>(headers: &'a HeaderMap, name: &str) -> Result<&'a str, AeroError> {
+fn required_account_header<'a>(
+    headers: &'a HeaderMap,
+    name: &str,
+    max_bytes: usize,
+) -> Result<&'a str, AeroError> {
     let mut values = headers.get_all(name).iter();
     let value = values
         .next()
@@ -649,39 +710,48 @@ fn required_account_header<'a>(headers: &'a HeaderMap, name: &str) -> Result<&'a
     let value = value
         .to_str()
         .map_err(|_| AeroError::Invalid(format!("{name} must be valid ASCII")))?;
-    if !valid_account_summary_identifier(value, MAX_ACCOUNT_SUMMARY_ACCOUNT_ID_BYTES) {
+    if !valid_account_summary_identifier(value, max_bytes) {
         return Err(AeroError::Invalid(format!("{name} is invalid")));
     }
     Ok(value)
 }
 
-/// Validates legacy headers only as optional consistency data. It never
-/// returns an authorized identity and must not be used as the target gate.
+/// Requires the signed target's identity headers as exact wire consistency
+/// fields. They are never accepted as authorization without the assertion.
 fn validate_account_summary_legacy_headers(
     headers: &HeaderMap,
     target: &AuthorizedAccountSummaryTarget,
 ) -> Result<(), AeroError> {
-    if headers.get_all(ACCOUNT_ID_HEADER).iter().next().is_some() {
-        let header_account_id = required_account_header(headers, ACCOUNT_ID_HEADER)?;
-        if header_account_id != target.account_id {
+    for (name, expected, max_bytes) in [
+        (
+            ACCOUNT_ID_HEADER,
+            target.account_id.as_str(),
+            MAX_ACCOUNT_SUMMARY_ACCOUNT_ID_BYTES,
+        ),
+        (
+            CANONICAL_UID_HEADER,
+            target.canonical_uid.as_str(),
+            MAX_ACCOUNT_SUMMARY_ACCOUNT_ID_BYTES,
+        ),
+        (
+            TENANT_ID_HEADER,
+            target.tenant_id.as_str(),
+            MAX_ACCOUNT_SUMMARY_ACCOUNT_ID_BYTES,
+        ),
+        (
+            REGION_HEADER,
+            target.region.as_str(),
+            MAX_ACCOUNT_SUMMARY_REGION_BYTES,
+        ),
+    ] {
+        if required_account_header(headers, name, max_bytes)? != expected {
             return Err(AeroError::Invalid(
                 "account summary target binding header mismatch".into(),
             ));
         }
     }
-    if headers
-        .get_all(CANONICAL_UID_HEADER)
-        .iter()
-        .next()
-        .is_some()
-    {
-        let header_canonical_uid = required_account_header(headers, CANONICAL_UID_HEADER)?;
-        if header_canonical_uid != target.canonical_uid {
-            return Err(AeroError::Invalid(
-                "account summary target binding header mismatch".into(),
-            ));
-        }
-    }
+    // X-Aero-Actor-UID is deliberately not authorization material: the target
+    // assertion has no actor claim, so this diagnostic value is ignored.
     Ok(())
 }
 

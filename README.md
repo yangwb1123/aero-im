@@ -240,6 +240,7 @@ open http://localhost:3030
 | `AERO_VAULT_*` | `AERO_BLOB_BACKEND=vault` 时将附件字节写入 Aero Vault；支持 Snaplink client_credentials 短期机器令牌、稳定 BlobId 幂等上传、Range 下载与 GC 硬删除，配置不完整时启动失败 |
 | `AERO_DEPENDENCY_BIND_HOST` | Docker Compose 中 PostgreSQL/Redis/NATS/Jaeger/MinIO 的宿主机绑定地址，安全默认 `127.0.0.1`；仅在防火墙与认证私网齐备时覆盖 |
 | `AERO__INTEGRATIONS__ISSUER` / `AERO__INTEGRATIONS__AUDIENCE` / `AERO__INTEGRATIONS__JWKS_URI` | 外部 ERP/worker 的 Snaplink RFC 9068 access-token 信任边界；issuer/JWKS 可回落 OIDC 配置，API audience 必须显式配置，token 须含 `aero.notify.publish` scope |
+| `AERO__ACCOUNT_SOURCE__REGION` / `AERO__ACCOUNT_SUMMARY__TARGET_ASSERTION_ISSUER` / `_AUDIENCE` / `_SUBJECT` / `_JWKS_URI` | Aero ID account-summary 目标绑定；必须同时配置专用 EdDSA assertion 与集群 Redis replay，audience=`aero-im-account-summary`、subject=`aero-id-sync`；JWKS 是外部专用发布契约，禁止复用 Snaplink 的 OIDC/integration JWKS，缺失/不可达时路由 fail-closed |
 | `AERO_SNAPLINK_COMMERCIAL_*` | 可选的 Snaplink Billing Entitlement 投影、月度消息/通知计量和 Audit Governance durable relay；按工作区 client_credentials/source binding，细节见 `docs/snaplink-commercial.md` |
 | `AERO_AUDIT_SIGNING_KEY` | 可选 HMAC-SHA256 审计 CSV 签名；响应通过 `x-audit-signature` 暴露防篡改校验值 |
 | `AERO_AGENTIC_ANSWERS` | 置位后 AI 问答走「能动」工具循环(模型自驱动房间检索 search→refine→answer);默认关闭(单次检索更省) |
