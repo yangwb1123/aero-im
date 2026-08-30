@@ -128,13 +128,14 @@ CLAIM_ALLOWLIST=(
     'crates/aero-server/src/sso.rs:405:"client_id"' # authorization-code request append_pair
     'crates/aero-server/src/sso.rs:407:"scope"'     # authorization-code request append_pair
     'crates/aero-server/src/sso.rs:545:"iss"'       # IdP response form-param parse
-    # integrations.rs — account-summary audit detail plus #[test] fixture
-    # JSON (CreateInstallationReq payloads). The production field is an
-    # audit-detail schema key, not client-credential claim validation.
-    'crates/aero-server/src/integrations.rs:503:"client_id"'
-    'crates/aero-server/src/integrations/tests.rs:62:"client_id"'
-    'crates/aero-server/src/integrations/tests.rs:72:"client_id"'
-    'crates/aero-server/src/integrations/tests.rs:103:"client_id"'
+    # integrations/account_summary.rs — account-summary audit detail plus
+    # #[test] fixture JSON (CreateInstallationReq payloads). The production
+    # field is an audit-detail schema key, not client-credential claim
+    # validation.
+    'crates/aero-server/src/integrations/account_summary.rs:263:"client_id"'
+    'crates/aero-server/src/integrations/tests.rs:73:"client_id"'
+    'crates/aero-server/src/integrations/tests.rs:83:"client_id"'
+    'crates/aero-server/src/integrations/tests.rs:114:"client_id"'
     # snaplink_commercial/http.rs — RFC 6749 §4.4 token-request form param
     # (v1 Snaplink client). "冻结面" is policy; the contract reason is the
     # §4.4 wire param.
