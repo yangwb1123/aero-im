@@ -1,7 +1,5 @@
 use std::collections::BTreeSet;
 
-use super::*;
-use aero_common::Notification;
 use super::account_summary::{
     account_notification_limit_usize, authorize_account_summary_target, notification_dataset,
     parse_account_summary_query, requested_account_datasets,
@@ -10,6 +8,8 @@ use super::account_summary::{
     ACCOUNT_SUMMARY_BINDING_UNAVAILABLE, CANONICAL_UID_HEADER, MAX_ACCOUNT_SUMMARY_QUERY_BYTES,
     REGION_HEADER, REQUIRED_ACCOUNT_SUMMARY_SCOPE, TENANT_ID_HEADER,
 };
+use super::*;
+use aero_common::Notification;
 
 #[test]
 fn bearer_and_idempotency_headers_are_strict() {
@@ -355,6 +355,47 @@ fn account_summary_bound_target_requires_exact_target_fields() {
         mutate(&mut mutated);
         assert!(validate_bound_account_summary_target(&request, &mutated, "local").is_err());
     }
+}
+
+#[test]
+fn account_summary_audience_override_leaves_generic_integrations_unchanged() {
+    let keys = [
+        "AERO__INTEGRATIONS__ISSUER",
+        "AERO__INTEGRATIONS__AUDIENCE",
+        "AERO__INTEGRATIONS__JWKS_URI",
+    ];
+    let previous = keys
+        .iter()
+        .map(|key| (*key, std::env::var_os(key)))
+        .collect::<Vec<_>>();
+    for (key, value) in [
+        ("AERO__INTEGRATIONS__ISSUER", "https://sso.example"),
+        ("AERO__INTEGRATIONS__AUDIENCE", "aero-im-integration"),
+        ("AERO__INTEGRATIONS__JWKS_URI", "https://sso.example/jwks"),
+    ] {
+        std::env::set_var(key, value);
+    }
+    let generic = IntegrationAuthConfig::from_env("generic.scope").unwrap();
+    let account_summary = IntegrationAuthConfig::from_env_with_audience(
+        REQUIRED_ACCOUNT_SUMMARY_SCOPE,
+        Some(super::ACCOUNT_SUMMARY_ACCESS_AUDIENCE),
+    )
+    .unwrap();
+    for (key, value) in previous {
+        if let Some(value) = value {
+            std::env::set_var(key, value);
+        } else {
+            std::env::remove_var(key);
+        }
+    }
+
+    assert_eq!(generic.token.audience, "aero-im-integration");
+    assert_eq!(
+        account_summary.token.audience,
+        super::ACCOUNT_SUMMARY_ACCESS_AUDIENCE
+    );
+    assert_eq!(generic.jwks_uri, account_summary.jwks_uri);
+    assert_eq!(generic.token.issuer, account_summary.token.issuer);
 }
 
 #[tokio::test]

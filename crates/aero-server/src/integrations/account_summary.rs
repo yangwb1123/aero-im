@@ -16,7 +16,7 @@ use axum::{
 };
 use serde::Serialize;
 
-use super::{authenticate_machine, env_value, IntegrationApiResult, MachinePrincipal, AppState};
+use super::{env_value, IntegrationApiResult, MachinePrincipal, AppState};
 use crate::account_summary_binding::{AccountSummaryTargetVerifier, ACCOUNT_SUMMARY_SCOPE};
 
 pub(super) const REQUIRED_ACCOUNT_SUMMARY_SCOPE: &str = ACCOUNT_SUMMARY_SCOPE;
@@ -154,7 +154,7 @@ pub(super) async fn account_summary(
     headers: HeaderMap,
     RawQuery(raw_query): RawQuery,
 ) -> IntegrationApiResult<Json<AccountSummaryResponse>> {
-    let principal = authenticate_machine(&headers, REQUIRED_ACCOUNT_SUMMARY_SCOPE).await?;
+    let principal = super::authenticate_account_summary_machine(&headers).await?;
     let request = parse_account_summary_query(raw_query.as_deref())?;
     // This gate is intentionally before every identity and projection lookup.
     // Equal unsigned headers cannot authorize a target; they are only required

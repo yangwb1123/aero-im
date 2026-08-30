@@ -48,6 +48,7 @@ use crate::{
 };
 
 const REQUIRED_PUBLISH_SCOPE: &str = "aero.notify.publish";
+const ACCOUNT_SUMMARY_ACCESS_AUDIENCE: &str = "aero-im";
 const MAX_MACHINE_TOKEN_BYTES: usize = 48 * 1024;
 const MAX_NOTIFICATION_BODY_BYTES: usize = 512 * 1024;
 const MAX_INTEGRATION_UPLOAD_BODY_BYTES: usize = 33 * 1024 * 1024;
@@ -205,9 +206,18 @@ struct IntegrationAuthConfig {
 
 impl IntegrationAuthConfig {
     fn from_env(required_scope: &str) -> Result<Self, AeroError> {
+        Self::from_env_with_audience(required_scope, None)
+    }
+
+    fn from_env_with_audience(
+        required_scope: &str,
+        audience_override: Option<&str>,
+    ) -> Result<Self, AeroError> {
         let issuer =
             env_value("AERO__INTEGRATIONS__ISSUER").or_else(|| env_value("AERO__OIDC__ISSUER"));
-        let audience = env_value("AERO__INTEGRATIONS__AUDIENCE");
+        let audience = audience_override
+            .map(str::to_owned)
+            .or_else(|| env_value("AERO__INTEGRATIONS__AUDIENCE"));
         let jwks_uri =
             env_value("AERO__INTEGRATIONS__JWKS_URI").or_else(|| env_value("AERO__OIDC__JWKS_URI"));
         let (Some(issuer), Some(audience), Some(jwks_uri)) = (issuer, audience, jwks_uri) else {
@@ -239,8 +249,30 @@ async fn authenticate_machine(
     headers: &HeaderMap,
     required_scope: &str,
 ) -> Result<MachinePrincipal, AeroError> {
+    authenticate_machine_with_audience(headers, required_scope, None).await
+}
+
+async fn authenticate_account_summary_machine(
+    headers: &HeaderMap,
+) -> Result<MachinePrincipal, AeroError> {
+    // Snaplink maps the RFC 8707 resource indicator into the access-token
+    // audience. This override is only for account-summary; publish/upload
+    // retain the generic integration audience contract.
+    authenticate_machine_with_audience(
+        headers,
+        account_summary::REQUIRED_ACCOUNT_SUMMARY_SCOPE,
+        Some(ACCOUNT_SUMMARY_ACCESS_AUDIENCE),
+    )
+    .await
+}
+
+async fn authenticate_machine_with_audience(
+    headers: &HeaderMap,
+    required_scope: &str,
+    audience_override: Option<&str>,
+) -> Result<MachinePrincipal, AeroError> {
     let token = bearer_token(headers)?;
-    let config = IntegrationAuthConfig::from_env(required_scope)?;
+    let config = IntegrationAuthConfig::from_env_with_audience(required_scope, audience_override)?;
     let provider = INTEGRATION_JWKS.get_or_init(|| JwksKeyProvider::new(config.jwks_uri.clone()));
     let claims = validate_client_credentials_token(token, &config.token, provider)
         .await
