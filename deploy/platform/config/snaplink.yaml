@@ -179,7 +179,7 @@ clients:
     redirect_uris: []
     allowed_scopes: [aero.account.summary.read]
     allowed_authenticators: []
-    allowed_resources: [aero-im-integration]
+    allowed_resources: [aero-im]
     token_strategy: jwt
     tenant_id: platform-local
     active: true

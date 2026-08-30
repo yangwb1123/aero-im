@@ -100,7 +100,7 @@ class PlatformContractTests(unittest.TestCase):
         contracts = {
             "aero-account-console": "allowed_resources: [aero-id]",
             "aero-id-snaplink-source": "allowed_resources: [snaplink-account-source]",
-            "aero-id-im-source": "allowed_resources: [aero-im-integration]",
+            "aero-id-im-source": "allowed_resources: [aero-im]",
             "aero-id-vault-source": "allowed_resources: [aero-vault]",
             "aero-im-vault": "allowed_scopes: [read, write]",
             "aero-id-audit": "allowed_scopes: [audit:event:write]",
@@ -118,6 +118,22 @@ class PlatformContractTests(unittest.TestCase):
         self.assertIn("require_pkce: true", public_client)
         self.assertIn("allowed_pkce_methods: [S256]", public_client)
         self.assertNotIn("client_secret:", public_client)
+
+    def test_local_aero_im_account_summary_is_resource_aligned_but_fail_closed(self) -> None:
+        id_config = (PLATFORM_DIR / "config" / "aero-id.yaml").read_text()
+        aero_im_source = id_config.split("  aero_im:\n", 1)[1].split(
+            "  aero_vault:\n", 1
+        )[0]
+        self.assertIn("oauth_resource: aero-im", aero_im_source)
+        self.assertNotIn("target_assertion_", aero_im_source)
+
+        im_environment = self.compose["services"]["aero-im"]["environment"]
+        self.assertEqual(
+            im_environment["AERO__INTEGRATIONS__AUDIENCE"], "aero-im-integration"
+        )
+        self.assertFalse(
+            any(key.startswith("AERO__ACCOUNT_SUMMARY__TARGET_ASSERTION_") for key in im_environment)
+        )
 
     def test_console_optional_commerce_routes_fail_explicitly(self) -> None:
         console = self.compose["services"]["snaplink-console"]

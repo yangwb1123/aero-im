@@ -69,6 +69,11 @@ connector 固定探测 `/healthz`，平台 loopback edge 分别把它映射到 S
 和 Aero IM `/health/ready`；Aero IM 的结果包含 PostgreSQL、Redis、NATS 与 Vault blob
 依赖，不能用始终 200 的静态响应代替。
 
+本地夹具的 Aero IM account-summary OAuth resource 已对齐为 `aero-im`；通用集成
+受众仍是独立的 `aero-im-integration`。本地未配置专用 target-assertion issuer、
+audience、subject 或 JWKS，因此 `/internal/account-summary` 有意保持 fail-closed
+（502）。启用必须由外部 HTTPS 专用 JWKS 与协调后的 Secret/config rollout 完成。
+
 `audit-bootstrap` 是 create-only 的一次性控制器：它注册 `platform-local`
 tenant、Aero ID/IM/Vault source 和对应 schema；重复启动时 HTTP 409 被当作幂等成功。
 Vault 与 Aero ID 审计 relay 默认启用并采用 fail-closed 绑定。

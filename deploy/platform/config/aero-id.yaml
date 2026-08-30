@@ -28,7 +28,7 @@ sources:
     oauth_client_id: aero-id-im-source
     oauth_client_secret: local-aero-id-im-source-secret-00000001
     oauth_scope: aero.account.summary.read
-    oauth_resource: aero-im-integration
+    oauth_resource: aero-im
     timeout: 3s
     max_body_bytes: 1048576
     max_concurrency: 16
