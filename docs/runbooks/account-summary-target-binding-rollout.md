@@ -1,6 +1,6 @@
 # Runbook — Aero ID ↔ Aero IM account-summary target binding rollout
 
-> Contract: `docs/designs/2026-08-29-aero-im-account-summary-target-binding-rollout.md`
+> Contract: `docs/design/2026-08-29-aero-im-account-summary-target-binding-rollout.md`
 > (IM side) and `aero-id/docs/contracts/source-account-summary.md` §"Aero IM
 > target binding" (signer side). Deployment: `aero-id/deployments/k8s/README.md`.
 > Status before owner rollout: **fail-closed on both sides** — no configuration,
