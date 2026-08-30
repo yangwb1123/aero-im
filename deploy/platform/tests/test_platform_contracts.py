@@ -219,7 +219,8 @@ class PlatformContractTests(unittest.TestCase):
             / "crates"
             / "aero-server"
             / "src"
-            / "integrations.rs"
+            / "integrations"
+            / "account_summary.rs"
         ).read_text()
         aero_id_context = Path(self.compose["services"]["aero-id"]["build"]["context"])
         registry = (aero_id_context / "internal" / "domain" / "aggregation.go").read_text()
