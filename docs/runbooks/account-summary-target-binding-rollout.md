@@ -28,6 +28,25 @@
    Deploy both sides in the same window: the IM verifier rejects the
    general-integration JWKS/issuer, and a one-sided enable is not a rollout.
 
+## Machine access-token resource/audience split
+
+After commit `3fdd37c`, the account-summary machine bearer is validated with
+JWT audience `aero-im` (`ACCOUNT_SUMMARY_ACCESS_AUDIENCE`). The authoritative
+Aero ID source requests RFC 8707 `resource=aero-im`; Snaplink maps that
+resource indicator to the JWT `aud` claim. This is only the account-summary
+access-token audience and is not the final account authorization decision.
+
+Generic publish/upload integration endpoints intentionally continue to use the
+configured `AERO__INTEGRATIONS__AUDIENCE` value (normally
+`aero-im-integration`) and their own integration scope (`aero.notify.publish` in
+the current server wiring). Do **not** globally change
+`AERO__INTEGRATIONS__AUDIENCE` to `aero-im` to enable account-summary; that
+would change the generic integration contract and can invalidate their tokens.
+
+The target assertion remains a separate EdDSA trust domain with its dedicated
+JWKS and is still required for final account authorization, after the machine
+access-token check succeeds.
+
 ## Observable signals (existing, no new instrumentation)
 
 | Signal | Meaning |
