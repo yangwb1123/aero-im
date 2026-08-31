@@ -136,6 +136,7 @@ def main() -> int:
         },
     )
 
+    tenant_query = urllib.parse.urlencode({"tenant_id": TENANT})
     sources = [
         (source_sha("aero-id", TENANT), "Aero ID", ["aero-id-audit"]),
         ("aero-im.source", "Aero IM", ["aero-im-audit"]),
@@ -149,7 +150,7 @@ def main() -> int:
         create(
             audit_base,
             token,
-            "/api/v1/sources",
+            f"/api/v1/sources?{tenant_query}",
             {
                 "id": source_id,
                 "tenant_id": TENANT,
@@ -179,7 +180,7 @@ def main() -> int:
         create(
             audit_base,
             token,
-            "/api/v1/schemas",
+            f"/api/v1/schemas?{tenant_query}",
             {
                 "tenant_id": TENANT,
                 "schema_id": schema_id,
