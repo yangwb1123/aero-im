@@ -135,6 +135,34 @@ class PlatformContractTests(unittest.TestCase):
             any(key.startswith("AERO__ACCOUNT_SUMMARY__TARGET_ASSERTION_") for key in im_environment)
         )
 
+    def test_aero_id_control_plane_defaults_are_local_and_overridable(self) -> None:
+        defaults = {
+            "AERO_ID_SIGNING_KEY": "local-aero-id-signing-key-000000000001",
+            "AERO_ID_CALLBACK_MASTER_KEY": "local-aero-id-callback-master-key-000000000001",
+            "AERO_ID_EVENT_INGEST_SIGNING_KEY": "local-aero-id-event-ingest-key-000000000001",
+            "AERO_ID_AUDIT_LEDGER_SIGNING_KEY": "local-aero-id-ledger-signing-key-00000001",
+            "AERO_ID_EXPORT_ENCRYPTION_KEY": "local-aero-id-export-key-000000000001",
+        }
+        compose_text = COMPOSE_FILE.read_text()
+        for key, default in defaults.items():
+            self.assertIn(f"{key}: ${{{key}:-{default}}}", compose_text)
+            self.assertTrue(default.startswith("local-aero-id-"))
+
+        environment = os.environ.copy()
+        overrides = {key: f"test-override-{key.lower()}" for key in defaults}
+        environment.update(overrides)
+        completed = subprocess.run(
+            ["docker", "compose", "-f", str(COMPOSE_FILE), "config", "--format", "json"],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+        configured = json.loads(completed.stdout)["services"]
+        for service in ("aero-id-migrate", "aero-id"):
+            for key, value in overrides.items():
+                self.assertEqual(configured[service]["environment"][key], value)
+
     def test_console_optional_commerce_routes_fail_explicitly(self) -> None:
         console = self.compose["services"]["snaplink-console"]
         self.assertEqual(

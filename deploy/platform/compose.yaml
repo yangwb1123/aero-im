@@ -343,11 +343,13 @@ services:
         condition: service_healthy
     environment:
       AERO_ID_DATABASE_PASSWORD: ${AERO_ID_POSTGRES_PASSWORD:-local-aero-id-db-password}
-      AERO_ID_SIGNING_KEY: local-aero-id-signing-key-000000000001
-      AERO_ID_CALLBACK_MASTER_KEY: local-aero-id-callback-master-key-000000000001
-      AERO_ID_EVENT_INGEST_SIGNING_KEY: local-aero-id-event-ingest-key-000000000001
-      AERO_ID_AUDIT_LEDGER_SIGNING_KEY: local-aero-id-ledger-signing-key-00000001
-      AERO_ID_EXPORT_ENCRYPTION_KEY: local-aero-id-export-key-000000000001
+      # Local-platform defaults; override via deploy/platform/.env before
+      # binding beyond loopback. Production uses an external secret manager.
+      AERO_ID_SIGNING_KEY: ${AERO_ID_SIGNING_KEY:-local-aero-id-signing-key-000000000001}
+      AERO_ID_CALLBACK_MASTER_KEY: ${AERO_ID_CALLBACK_MASTER_KEY:-local-aero-id-callback-master-key-000000000001}
+      AERO_ID_EVENT_INGEST_SIGNING_KEY: ${AERO_ID_EVENT_INGEST_SIGNING_KEY:-local-aero-id-event-ingest-key-000000000001}
+      AERO_ID_AUDIT_LEDGER_SIGNING_KEY: ${AERO_ID_AUDIT_LEDGER_SIGNING_KEY:-local-aero-id-ledger-signing-key-00000001}
+      AERO_ID_EXPORT_ENCRYPTION_KEY: ${AERO_ID_EXPORT_ENCRYPTION_KEY:-local-aero-id-export-key-000000000001}
       AERO_ID_AUDIT_CLIENT_SECRET_PLATFORM_LOCAL: local-aero-id-audit-secret-000000000001
     volumes:
       - ./config/aero-id.yaml:/app/configs/platform.yaml:ro
@@ -378,11 +380,11 @@ services:
         condition: service_started
     environment:
       AERO_ID_DATABASE_PASSWORD: ${AERO_ID_POSTGRES_PASSWORD:-local-aero-id-db-password}
-      AERO_ID_SIGNING_KEY: local-aero-id-signing-key-000000000001
-      AERO_ID_CALLBACK_MASTER_KEY: local-aero-id-callback-master-key-000000000001
-      AERO_ID_EVENT_INGEST_SIGNING_KEY: local-aero-id-event-ingest-key-000000000001
-      AERO_ID_AUDIT_LEDGER_SIGNING_KEY: local-aero-id-ledger-signing-key-00000001
-      AERO_ID_EXPORT_ENCRYPTION_KEY: local-aero-id-export-key-000000000001
+      AERO_ID_SIGNING_KEY: ${AERO_ID_SIGNING_KEY:-local-aero-id-signing-key-000000000001}
+      AERO_ID_CALLBACK_MASTER_KEY: ${AERO_ID_CALLBACK_MASTER_KEY:-local-aero-id-callback-master-key-000000000001}
+      AERO_ID_EVENT_INGEST_SIGNING_KEY: ${AERO_ID_EVENT_INGEST_SIGNING_KEY:-local-aero-id-event-ingest-key-000000000001}
+      AERO_ID_AUDIT_LEDGER_SIGNING_KEY: ${AERO_ID_AUDIT_LEDGER_SIGNING_KEY:-local-aero-id-ledger-signing-key-00000001}
+      AERO_ID_EXPORT_ENCRYPTION_KEY: ${AERO_ID_EXPORT_ENCRYPTION_KEY:-local-aero-id-export-key-000000000001}
       AERO_ID_AUDIT_CLIENT_SECRET_PLATFORM_LOCAL: local-aero-id-audit-secret-000000000001
     volumes:
       - ./config/aero-id.yaml:/app/configs/platform.yaml:ro
