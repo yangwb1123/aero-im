@@ -169,7 +169,7 @@ fn cfg() -> OidcConfig {
 fn client_credentials_cfg() -> ClientCredentialsTokenConfig {
     ClientCredentialsTokenConfig {
         issuer: "https://sso.example.com".into(),
-        audience: "aero-im-integrations".into(),
+        audience: "aero-im-integration".into(),
         required_scopes: vec!["aero.notify.publish".into()],
     }
 }

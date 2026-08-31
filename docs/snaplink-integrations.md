@@ -56,7 +56,7 @@ INSTALLATION_ID='<INSTALLATION_UUID>'
 
 ```bash
 AERO__INTEGRATIONS__ISSUER=https://sso.ywbsd.site
-AERO__INTEGRATIONS__AUDIENCE=aero-im-integrations
+AERO__INTEGRATIONS__AUDIENCE=aero-im-integration
 AERO__INTEGRATIONS__JWKS_URI=https://sso.ywbsd.site/.well-known/jwks.json
 # 每实例同时持有的完整 multipart/扫描/Vault 写入任务；范围 1..=32，默认 4
 AERO__INTEGRATIONS__UPLOAD_MAX_CONCURRENCY=4
@@ -237,7 +237,7 @@ show-error
 header = "Content-Type: application/x-www-form-urlencoded"
 data-urlencode = "grant_type=client_credentials"
 data-urlencode = "scope=aero.notify.publish"
-data-urlencode = "resource=aero-im-integrations"
+data-urlencode = "resource=aero-im-integration"
 ```
 
 运行时只把配置文件路径放入命令行，并把短期 token 响应和后续 Authorization 配置
