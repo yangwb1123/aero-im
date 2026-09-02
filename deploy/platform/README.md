@@ -74,6 +74,15 @@ connector 固定探测 `/healthz`，平台 loopback edge 分别把它映射到 S
 audience、subject 或 JWKS，因此 `/internal/account-summary` 有意保持 fail-closed
 （502）。启用必须由外部 HTTPS 专用 JWKS 与协调后的 Secret/config rollout 完成。
 
+`deploy/platform/config/aero-id.yaml` 故意把三个 source 的 `oauth_client_secret`
+留空；本地仅由 `deploy/platform/compose.yaml` 向 `aero-id` 与 `aero-id-migrate`
+注入 `AERO_ID_SOURCES_SNAPLINK_OAUTH_CLIENT_SECRET`、
+`AERO_ID_SOURCES_AERO_IM_OAUTH_CLIENT_SECRET`、
+`AERO_ID_SOURCES_AERO_VAULT_OAUTH_CLIENT_SECRET`（带显式 local-only 默认值，且可被
+`deploy/platform/.env` 覆盖）。因此把该挂载配置脱离本 Compose 环境单独运行时，
+必须自行提供这三个环境变量；生产 Kubernetes 仍应继续通过 Secret 注入，绝不能把
+这些 client secret 回填进 ConfigMap 或配置 YAML。
+
 `audit-bootstrap` 是 create-only 的一次性控制器：它注册 `platform-local`
 tenant、Aero ID/IM/Vault source 和对应 schema；重复启动时 HTTP 409 被当作幂等成功。
 Vault 与 Aero ID 审计 relay 默认启用并采用 fail-closed 绑定。
