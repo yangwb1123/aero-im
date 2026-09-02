@@ -12,7 +12,7 @@ sources:
     region: local
     oauth_token_url: http://127.0.0.1:18080/token
     oauth_client_id: aero-id-snaplink-source
-    oauth_client_secret: local-aero-id-snaplink-source-secret-0001
+    oauth_client_secret: ""
     oauth_scope: account:summary:read
     oauth_resource: snaplink-account-source
     timeout: 3s
@@ -26,7 +26,7 @@ sources:
     region: local
     oauth_token_url: http://127.0.0.1:18080/token
     oauth_client_id: aero-id-im-source
-    oauth_client_secret: local-aero-id-im-source-secret-00000001
+    oauth_client_secret: ""
     oauth_scope: aero.account.summary.read
     oauth_resource: aero-im
     timeout: 3s
@@ -40,7 +40,7 @@ sources:
     region: local
     oauth_token_url: http://127.0.0.1:18080/token
     oauth_client_id: aero-id-vault-source
-    oauth_client_secret: local-aero-id-vault-source-secret-00001
+    oauth_client_secret: ""
     oauth_scope: read
     oauth_resource: aero-vault
     timeout: 3s

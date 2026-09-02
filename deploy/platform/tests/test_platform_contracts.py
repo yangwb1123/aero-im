@@ -142,10 +142,47 @@ class PlatformContractTests(unittest.TestCase):
             "AERO_ID_EVENT_INGEST_SIGNING_KEY": "local-aero-id-event-ingest-key-000000000001",
             "AERO_ID_AUDIT_LEDGER_SIGNING_KEY": "local-aero-id-ledger-signing-key-00000001",
             "AERO_ID_EXPORT_ENCRYPTION_KEY": "local-aero-id-export-key-000000000001",
+            "AERO_ID_AUDIT_CLIENT_SECRET_PLATFORM_LOCAL": "local-aero-id-audit-secret-000000000001",
         }
         compose_text = COMPOSE_FILE.read_text()
+        env_example = (PLATFORM_DIR / ".env.example").read_text()
         for key, default in defaults.items():
             self.assertIn(f"{key}: ${{{key}:-{default}}}", compose_text)
+            self.assertIn(f"{key}=", env_example)
+            self.assertTrue(default.startswith("local-aero-id-"))
+
+        environment = os.environ.copy()
+        overrides = {key: f"test-override-{key.lower()}" for key in defaults}
+        environment.update(overrides)
+        completed = subprocess.run(
+            ["docker", "compose", "-f", str(COMPOSE_FILE), "config", "--format", "json"],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+        configured = json.loads(completed.stdout)["services"]
+        for service in ("aero-id-migrate", "aero-id"):
+            for key, value in overrides.items():
+                self.assertEqual(configured[service]["environment"][key], value)
+
+    def test_aero_id_source_oauth_secrets_are_env_backed_and_overridable(self) -> None:
+        id_config = (PLATFORM_DIR / "config" / "aero-id.yaml").read_text()
+        self.assertEqual(id_config.count('oauth_client_secret: ""'), 3)
+        self.assertNotIn("local-aero-id-snaplink-source-secret-0001", id_config)
+        self.assertNotIn("local-aero-id-im-source-secret-00000001", id_config)
+        self.assertNotIn("local-aero-id-vault-source-secret-00001", id_config)
+
+        defaults = {
+            "AERO_ID_SOURCES_SNAPLINK_OAUTH_CLIENT_SECRET": "local-aero-id-snaplink-source-secret-0001",
+            "AERO_ID_SOURCES_AERO_IM_OAUTH_CLIENT_SECRET": "local-aero-id-im-source-secret-00000001",
+            "AERO_ID_SOURCES_AERO_VAULT_OAUTH_CLIENT_SECRET": "local-aero-id-vault-source-secret-00001",
+        }
+        compose_text = COMPOSE_FILE.read_text()
+        env_example = (PLATFORM_DIR / ".env.example").read_text()
+        for key, default in defaults.items():
+            self.assertIn(f"{key}: ${{{key}:-{default}}}", compose_text)
+            self.assertIn(f"{key}=", env_example)
             self.assertTrue(default.startswith("local-aero-id-"))
 
         environment = os.environ.copy()

@@ -350,7 +350,10 @@ services:
       AERO_ID_EVENT_INGEST_SIGNING_KEY: ${AERO_ID_EVENT_INGEST_SIGNING_KEY:-local-aero-id-event-ingest-key-000000000001}
       AERO_ID_AUDIT_LEDGER_SIGNING_KEY: ${AERO_ID_AUDIT_LEDGER_SIGNING_KEY:-local-aero-id-ledger-signing-key-00000001}
       AERO_ID_EXPORT_ENCRYPTION_KEY: ${AERO_ID_EXPORT_ENCRYPTION_KEY:-local-aero-id-export-key-000000000001}
-      AERO_ID_AUDIT_CLIENT_SECRET_PLATFORM_LOCAL: local-aero-id-audit-secret-000000000001
+      AERO_ID_AUDIT_CLIENT_SECRET_PLATFORM_LOCAL: ${AERO_ID_AUDIT_CLIENT_SECRET_PLATFORM_LOCAL:-local-aero-id-audit-secret-000000000001}
+      AERO_ID_SOURCES_SNAPLINK_OAUTH_CLIENT_SECRET: ${AERO_ID_SOURCES_SNAPLINK_OAUTH_CLIENT_SECRET:-local-aero-id-snaplink-source-secret-0001}
+      AERO_ID_SOURCES_AERO_IM_OAUTH_CLIENT_SECRET: ${AERO_ID_SOURCES_AERO_IM_OAUTH_CLIENT_SECRET:-local-aero-id-im-source-secret-00000001}
+      AERO_ID_SOURCES_AERO_VAULT_OAUTH_CLIENT_SECRET: ${AERO_ID_SOURCES_AERO_VAULT_OAUTH_CLIENT_SECRET:-local-aero-id-vault-source-secret-00001}
     volumes:
       - ./config/aero-id.yaml:/app/configs/platform.yaml:ro
     networks: [platform]
@@ -385,7 +388,10 @@ services:
       AERO_ID_EVENT_INGEST_SIGNING_KEY: ${AERO_ID_EVENT_INGEST_SIGNING_KEY:-local-aero-id-event-ingest-key-000000000001}
       AERO_ID_AUDIT_LEDGER_SIGNING_KEY: ${AERO_ID_AUDIT_LEDGER_SIGNING_KEY:-local-aero-id-ledger-signing-key-00000001}
       AERO_ID_EXPORT_ENCRYPTION_KEY: ${AERO_ID_EXPORT_ENCRYPTION_KEY:-local-aero-id-export-key-000000000001}
-      AERO_ID_AUDIT_CLIENT_SECRET_PLATFORM_LOCAL: local-aero-id-audit-secret-000000000001
+      AERO_ID_AUDIT_CLIENT_SECRET_PLATFORM_LOCAL: ${AERO_ID_AUDIT_CLIENT_SECRET_PLATFORM_LOCAL:-local-aero-id-audit-secret-000000000001}
+      AERO_ID_SOURCES_SNAPLINK_OAUTH_CLIENT_SECRET: ${AERO_ID_SOURCES_SNAPLINK_OAUTH_CLIENT_SECRET:-local-aero-id-snaplink-source-secret-0001}
+      AERO_ID_SOURCES_AERO_IM_OAUTH_CLIENT_SECRET: ${AERO_ID_SOURCES_AERO_IM_OAUTH_CLIENT_SECRET:-local-aero-id-im-source-secret-00000001}
+      AERO_ID_SOURCES_AERO_VAULT_OAUTH_CLIENT_SECRET: ${AERO_ID_SOURCES_AERO_VAULT_OAUTH_CLIENT_SECRET:-local-aero-id-vault-source-secret-00001}
     volumes:
       - ./config/aero-id.yaml:/app/configs/platform.yaml:ro
       - aero-id-files:/var/lib/aero-id/files
