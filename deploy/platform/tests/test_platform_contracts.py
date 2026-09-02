@@ -166,6 +166,20 @@ class PlatformContractTests(unittest.TestCase):
             for key, value in overrides.items():
                 self.assertEqual(configured[service]["environment"][key], value)
 
+    def test_aero_id_local_secret_fields_are_blank(self) -> None:
+        id_config = (PLATFORM_DIR / "config" / "aero-id.yaml").read_text()
+        database = id_config.split("database:\n", 1)[1].split("\nsso:\n", 1)[0]
+        audit_ledger = id_config.split("audit_ledger:\n", 1)[1].split(
+            "\n\naudit_governance:\n", 1
+        )[0]
+
+        self.assertIn('  password: ""', database)
+        self.assertIn('  signing_key: ""', audit_ledger)
+        self.assertIn('\nsigning_key: ""\n', id_config)
+        self.assertNotIn("local-aero-id-db-password", id_config)
+        self.assertNotIn("local-aero-id-ledger-signing-key-00000001", id_config)
+        self.assertNotIn("local-aero-id-signing-key-000000000001", id_config)
+
     def test_aero_id_source_oauth_secrets_are_env_backed_and_overridable(self) -> None:
         id_config = (PLATFORM_DIR / "config" / "aero-id.yaml").read_text()
         self.assertEqual(id_config.count('oauth_client_secret: ""'), 3)

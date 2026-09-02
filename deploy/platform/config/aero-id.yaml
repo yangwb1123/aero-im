@@ -74,7 +74,7 @@ database:
   host: aero-id-postgres
   port: 5432
   user: aero
-  password: local-aero-id-db-password
+  password: ""
   dbname: aero_id
   sslmode: disable
   max_open_conns: 30
@@ -103,7 +103,7 @@ sso:
   user_batch_size: 128
 
 audit_ledger:
-  signing_key: local-aero-id-ledger-signing-key-00000001
+  signing_key: ""
 
 audit_governance:
   enabled: true
@@ -148,5 +148,5 @@ storage:
     root: /var/lib/aero-id/files
     public_base_url: http://localhost:28083
 
-signing_key: local-aero-id-signing-key-000000000001
+signing_key: ""
 log: { level: info, encoding: console, sample_ratio: 0 }
