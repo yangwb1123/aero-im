@@ -1,4 +1,4 @@
-app: { name: aero-id, env: local-platform, version: 0.1.0 }
+app: { name: aero-id, env: local, version: 0.1.0 }
 account:
   issuer: http://localhost:28080
   region: local
@@ -8,7 +8,13 @@ account:
 sources:
   snaplink:
     endpoint: http://127.0.0.1:18080
+    allow_insecure_loopback: true
     summary_path: /internal/account-summary
+    capabilities:
+      summary: true
+      erase: false
+      operation_status: false
+      erase_contract_version: ""
     region: local
     oauth_token_url: http://127.0.0.1:18080/token
     oauth_client_id: aero-id-snaplink-source
@@ -22,9 +28,10 @@ sources:
     retry_backoff: 50ms
   aero_im:
     endpoint: http://127.0.0.1:18082
+    allow_insecure_loopback: true
     summary_path: /internal/account-summary
     region: local
-    oauth_token_url: http://127.0.0.1:18080/token
+    oauth_token_url: http://127.0.0.1:18082/token
     oauth_client_id: aero-id-im-source
     oauth_client_secret: ""
     oauth_scope: aero.account.summary.read
@@ -36,9 +43,14 @@ sources:
     retry_backoff: 50ms
   aero_vault:
     endpoint: http://127.0.0.1:18081
+    allow_insecure_loopback: true
     summary_path: /v1/internal/account-summary
+    capabilities:
+      erase: false
+      operation_status: false
+    oauth_tenant_id: platform-local
     region: local
-    oauth_token_url: http://127.0.0.1:18080/token
+    oauth_token_url: http://127.0.0.1:18081/token
     oauth_client_id: aero-id-vault-source
     oauth_client_secret: ""
     oauth_scope: read
