@@ -83,6 +83,16 @@ audience、subject 或 JWKS，因此 `/internal/account-summary` 有意保持 fa
 必须自行提供这三个环境变量；生产 Kubernetes 仍应继续通过 Secret 注入，绝不能把
 这些 client secret 回填进 ConfigMap 或配置 YAML。
 
+Snaplink 的 stock loader 对 `clients` 列表提供已验证的 `SSO_CLIENTS` YAML-list
+环境覆盖（`config/sources/source_env.go`）；它不提供按列表索引的
+`SSO_CLIENTS__...` 覆盖，且本地 stock server 未注册 `secret://` resolver。因此
+挂载的 `config/snaplink.yaml` 只保留空的 `secret` 字段，Compose 向 `snaplink`
+注入完整客户端列表，并把每个机密客户端的值从 `deploy/platform/.env`（local-only
+默认值）代入；相关消费者复用同一个变量。不要把 `SSO_CLIENTS` 改成只含部分客户的
+列表，否则会替换而不是合并整个 `clients` slice。生产应将这些变量改为 Secret
+注入，绝不能把 client secret 回填到挂载 YAML；`aero-account-console` 仍是无密钥、
+PKCE 保护的 public client。
+
 `audit-bootstrap` 是 create-only 的一次性控制器：它注册 `platform-local`
 tenant、Aero ID/IM/Vault source 和对应 schema；重复启动时 HTTP 409 被当作幂等成功。
 Vault 与 Aero ID 审计 relay 默认启用并采用 fail-closed 绑定。

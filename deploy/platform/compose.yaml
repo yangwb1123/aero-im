@@ -33,6 +33,25 @@ services:
         condition: service_completed_successfully
     ports:
       - "${PLATFORM_BIND_HOST:-127.0.0.1}:28080:8080"
+    environment:
+      # Snaplink's stock loader supports SSO_CLIENTS as a YAML-list env
+      # override (config/sources/source_env.go). Keep the mounted seed
+      # metadata non-secret and inject the complete client seed here so the
+      # list cannot be partially replaced by a per-index, unsupported key.
+      SSO_CLIENTS: >-
+        [
+          {"id":"sso-admin-console","secret":"${SNAPLINK_CLIENT_SECRET_SSO_ADMIN_CONSOLE:-local-console-secret-change-before-production}","name":"Snaplink Admin Console","redirect_uris":[],"allowed_scopes":["openid","profile","admin:read","admin:write"],"allowed_authenticators":["password"],"allowed_resources":["audit-governance"],"token_strategy":"jwt","tenant_id":"platform-local","active":true},
+          {"id":"aero-account-console","secret":"","name":"Aero Account Console","token_endpoint_auth_method":"none","redirect_uris":["http://localhost:28010/"],"post_logout_redirect_uris":["http://localhost:28010/"],"allowed_scopes":["openid","profile","account:read","account:write","operation:read","source:sync","audit:read"],"allowed_authenticators":["password"],"allowed_resources":["aero-id"],"token_strategy":"jwt","tenant_id":"platform-local","require_pkce":true,"allowed_pkce_methods":["S256"],"skip_consent":true,"active":true},
+          {"id":"aero-im","secret":"${SNAPLINK_CLIENT_SECRET_AERO_IM:-local-aero-im-browser-secret-change-before-production}","name":"Aero IM","redirect_uris":["https://localhost:28482/callback"],"allowed_scopes":["openid","profile","email"],"allowed_authenticators":["password"],"allowed_resources":["aero-im"],"token_strategy":"jwt","tenant_id":"platform-local","active":true},
+          {"id":"aero-id-snaplink-source","secret":"${AERO_ID_SOURCES_SNAPLINK_OAUTH_CLIENT_SECRET:-local-aero-id-snaplink-source-secret-0001}","name":"Aero ID Snaplink source","redirect_uris":[],"allowed_scopes":["account:summary:read"],"allowed_authenticators":[],"allowed_resources":["snaplink-account-source"],"token_strategy":"jwt","tenant_id":"platform-local","active":true},
+          {"id":"aero-id-im-source","secret":"${AERO_ID_SOURCES_AERO_IM_OAUTH_CLIENT_SECRET:-local-aero-id-im-source-secret-00000001}","name":"Aero ID IM source","redirect_uris":[],"allowed_scopes":["aero.account.summary.read"],"allowed_authenticators":[],"allowed_resources":["aero-im"],"token_strategy":"jwt","tenant_id":"platform-local","active":true},
+          {"id":"aero-id-vault-source","secret":"${AERO_ID_SOURCES_AERO_VAULT_OAUTH_CLIENT_SECRET:-local-aero-id-vault-source-secret-00001}","name":"Aero ID Vault source","redirect_uris":[],"allowed_scopes":["read"],"allowed_authenticators":[],"allowed_resources":["aero-vault"],"token_strategy":"jwt","tenant_id":"platform-local","active":true},
+          {"id":"aero-im-vault","secret":"${SNAPLINK_CLIENT_SECRET_AERO_IM_VAULT:-local-aero-im-vault-secret-000000000001}","name":"Aero IM Vault client","redirect_uris":[],"allowed_scopes":["read","write"],"allowed_authenticators":[],"allowed_resources":["aero-vault"],"token_strategy":"jwt","tenant_id":"platform-local","active":true},
+          {"id":"aero-id-audit","secret":"${AERO_ID_AUDIT_CLIENT_SECRET_PLATFORM_LOCAL:-local-aero-id-audit-secret-000000000001}","name":"Aero ID audit relay","redirect_uris":[],"allowed_scopes":["audit:event:write"],"allowed_authenticators":[],"allowed_resources":["audit-governance"],"token_strategy":"jwt","tenant_id":"platform-local","active":true},
+          {"id":"aero-vault-audit","secret":"${SNAPLINK_CLIENT_SECRET_AERO_VAULT_AUDIT:-local-aero-vault-audit-secret-000000001}","name":"Aero Vault audit relay","redirect_uris":[],"allowed_scopes":["audit:event:write"],"allowed_authenticators":[],"allowed_resources":["audit-governance"],"token_strategy":"jwt","tenant_id":"platform-local","active":true},
+          {"id":"aero-im-audit","secret":"${SNAPLINK_CLIENT_SECRET_AERO_IM_AUDIT:-local-aero-im-audit-secret-000000000001}","name":"Aero IM audit relay","redirect_uris":[],"allowed_scopes":["audit:event:write"],"allowed_authenticators":[],"allowed_resources":["audit-governance"],"token_strategy":"jwt","tenant_id":"platform-local","active":true},
+          {"id":"platform-audit-bootstrap","secret":"${SNAPLINK_CLIENT_SECRET_PLATFORM_AUDIT_BOOTSTRAP:-local-platform-audit-bootstrap-secret-0001}","name":"Platform audit provisioner","redirect_uris":[],"allowed_scopes":["audit:platform:cross_tenant","audit:policy:read","audit:policy:write"],"allowed_authenticators":[],"allowed_resources":["audit-governance"],"token_strategy":"jwt","tenant_id":"platform-local","active":true}
+        ]
     volumes:
       - ./config/snaplink.yaml:/etc/sso/config.yaml:ro
       - snaplink-data:/var/lib/snaplink
@@ -167,7 +186,7 @@ services:
       AUDIT_BASE_URL: http://audit-governance-edge:8089
       SNAPLINK_TOKEN_URL: http://snaplink:8080/token
       BOOTSTRAP_CLIENT_ID: platform-audit-bootstrap
-      BOOTSTRAP_CLIENT_SECRET: local-platform-audit-bootstrap-secret-0001
+      BOOTSTRAP_CLIENT_SECRET: ${SNAPLINK_CLIENT_SECRET_PLATFORM_AUDIT_BOOTSTRAP:-local-platform-audit-bootstrap-secret-0001}
       AERO_VAULT_AUDIT_HMAC_KEY: ${AERO_VAULT_AUDIT_HMAC_KEY:-Wf9Kp3Nq7Vc2Rm6Ty1Bh8Dz4Ls5Xj0Ea}
     volumes:
       - ./scripts/bootstrap-audit.py:/bootstrap-audit.py:ro
@@ -298,7 +317,7 @@ services:
       AUDIT_GOVERNANCE_TOKEN_URL: http://127.0.0.1:18080/token
       AUDIT_GOVERNANCE_BINDINGS_FILE: /run/aero-vault/audit-bindings.json
       AUDIT_GOVERNANCE_HMAC_KEY: ${AERO_VAULT_AUDIT_HMAC_KEY:-Wf9Kp3Nq7Vc2Rm6Ty1Bh8Dz4Ls5Xj0Ea}
-      AUDIT_GOVERNANCE_CLIENT_SECRET_PLATFORM_LOCAL: local-aero-vault-audit-secret-000000001
+      AUDIT_GOVERNANCE_CLIENT_SECRET_PLATFORM_LOCAL: ${SNAPLINK_CLIENT_SECRET_AERO_VAULT_AUDIT:-local-aero-vault-audit-secret-000000001}
     volumes:
       - ./config/aero-vault-audit-bindings.json:/run/aero-vault/audit-bindings.json:ro
     restart: unless-stopped
@@ -526,7 +545,7 @@ services:
       AERO_VAULT_PREFIX: im-attachments
       AERO_VAULT_OAUTH_TOKEN_ENDPOINT: http://127.0.0.1:18080/token
       AERO_VAULT_OAUTH_CLIENT_ID: aero-im-vault
-      AERO_VAULT_OAUTH_CLIENT_SECRET: local-aero-im-vault-secret-000000000001
+      AERO_VAULT_OAUTH_CLIENT_SECRET: ${SNAPLINK_CLIENT_SECRET_AERO_IM_VAULT:-local-aero-im-vault-secret-000000000001}
       AERO_VAULT_OAUTH_SCOPE: read write
       AERO_VAULT_OAUTH_RESOURCE: aero-vault
       AERO__OIDC__ISSUER: http://localhost:28080
@@ -535,7 +554,7 @@ services:
       AERO__OIDC__AUTHORIZATION_ENDPOINT: https://localhost:18443/authorize
       AERO__OIDC__TOKEN_ENDPOINT: https://localhost:18443/token
       AERO__OIDC__CLIENT_ID: aero-im
-      AERO__OIDC__CLIENT_SECRET: local-aero-im-browser-secret-change-before-production
+      AERO__OIDC__CLIENT_SECRET: ${SNAPLINK_CLIENT_SECRET_AERO_IM:-local-aero-im-browser-secret-change-before-production}
       AERO__OIDC__REDIRECT_URI: https://localhost:28482/callback
       AERO__OIDC__LOGIN_PAGE: local
       AERO__INTEGRATIONS__ISSUER: http://localhost:28080

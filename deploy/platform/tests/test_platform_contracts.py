@@ -119,6 +119,139 @@ class PlatformContractTests(unittest.TestCase):
         self.assertIn("allowed_pkce_methods: [S256]", public_client)
         self.assertNotIn("client_secret:", public_client)
 
+    def test_snaplink_confidential_secrets_are_env_backed(self) -> None:
+        config = (PLATFORM_DIR / "config" / "snaplink.yaml").read_text()
+        self.assertEqual(config.count('secret: ""'), 11)
+        for static_secret in (
+            "local-console-secret-change-before-production",
+            "local-aero-im-browser-secret-change-before-production",
+            "local-aero-id-snaplink-source-secret-0001",
+            "local-aero-id-im-source-secret-00000001",
+            "local-aero-id-vault-source-secret-00001",
+            "local-aero-im-vault-secret-000000000001",
+            "local-aero-id-audit-secret-000000000001",
+            "local-aero-vault-audit-secret-000000001",
+            "local-aero-im-audit-secret-000000000001",
+            "local-platform-audit-bootstrap-secret-0001",
+        ):
+            self.assertNotIn(static_secret, config)
+
+        defaults = {
+            "sso-admin-console": (
+                "SNAPLINK_CLIENT_SECRET_SSO_ADMIN_CONSOLE",
+                "local-console-secret-change-before-production",
+                ["audit-governance"],
+                ["openid", "profile", "admin:read", "admin:write"],
+            ),
+            "aero-im": (
+                "SNAPLINK_CLIENT_SECRET_AERO_IM",
+                "local-aero-im-browser-secret-change-before-production",
+                ["aero-im"],
+                ["openid", "profile", "email"],
+            ),
+            "aero-id-snaplink-source": (
+                "AERO_ID_SOURCES_SNAPLINK_OAUTH_CLIENT_SECRET",
+                "local-aero-id-snaplink-source-secret-0001",
+                ["snaplink-account-source"],
+                ["account:summary:read"],
+            ),
+            "aero-id-im-source": (
+                "AERO_ID_SOURCES_AERO_IM_OAUTH_CLIENT_SECRET",
+                "local-aero-id-im-source-secret-00000001",
+                ["aero-im"],
+                ["aero.account.summary.read"],
+            ),
+            "aero-id-vault-source": (
+                "AERO_ID_SOURCES_AERO_VAULT_OAUTH_CLIENT_SECRET",
+                "local-aero-id-vault-source-secret-00001",
+                ["aero-vault"],
+                ["read"],
+            ),
+            "aero-im-vault": (
+                "SNAPLINK_CLIENT_SECRET_AERO_IM_VAULT",
+                "local-aero-im-vault-secret-000000000001",
+                ["aero-vault"],
+                ["read", "write"],
+            ),
+            "aero-id-audit": (
+                "AERO_ID_AUDIT_CLIENT_SECRET_PLATFORM_LOCAL",
+                "local-aero-id-audit-secret-000000000001",
+                ["audit-governance"],
+                ["audit:event:write"],
+            ),
+            "aero-vault-audit": (
+                "SNAPLINK_CLIENT_SECRET_AERO_VAULT_AUDIT",
+                "local-aero-vault-audit-secret-000000001",
+                ["audit-governance"],
+                ["audit:event:write"],
+            ),
+            "aero-im-audit": (
+                "SNAPLINK_CLIENT_SECRET_AERO_IM_AUDIT",
+                "local-aero-im-audit-secret-000000000001",
+                ["audit-governance"],
+                ["audit:event:write"],
+            ),
+            "platform-audit-bootstrap": (
+                "SNAPLINK_CLIENT_SECRET_PLATFORM_AUDIT_BOOTSTRAP",
+                "local-platform-audit-bootstrap-secret-0001",
+                ["audit-governance"],
+                [
+                    "audit:platform:cross_tenant",
+                    "audit:policy:read",
+                    "audit:policy:write",
+                ],
+            ),
+        }
+        snaplink_environment = self.compose["services"]["snaplink"]["environment"]
+        clients = json.loads(snaplink_environment["SSO_CLIENTS"])
+        by_id = {client["id"]: client for client in clients}
+        self.assertEqual(set(by_id), set(defaults) | {"aero-account-console"})
+        for client_id, (env_name, default, resources, scopes) in defaults.items():
+            self.assertEqual(by_id[client_id]["secret"], default)
+            self.assertEqual(by_id[client_id]["allowed_resources"], resources)
+            self.assertEqual(by_id[client_id]["allowed_scopes"], scopes)
+            self.assertIn(f"{env_name}=", (PLATFORM_DIR / ".env.example").read_text())
+        self.assertEqual(by_id["aero-account-console"]["secret"], "")
+
+        environment = os.environ.copy()
+        overrides = {
+            env_name: f"test-override-{env_name.lower()}"
+            for env_name, _, _, _ in defaults.values()
+        }
+        environment.update(overrides)
+        completed = subprocess.run(
+            ["docker", "compose", "-f", str(COMPOSE_FILE), "config", "--format", "json"],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+        overridden = json.loads(completed.stdout)["services"]["snaplink"]["environment"]
+        overridden_clients = {client["id"]: client for client in json.loads(overridden["SSO_CLIENTS"])}
+        for client_id, (env_name, _, _, _) in defaults.items():
+            self.assertEqual(overridden_clients[client_id]["secret"], overrides[env_name])
+
+        consumer_bindings = (
+            ("audit-bootstrap", "BOOTSTRAP_CLIENT_SECRET", "platform-audit-bootstrap"),
+            ("aero-vault", "AUDIT_GOVERNANCE_CLIENT_SECRET_PLATFORM_LOCAL", "aero-vault-audit"),
+            ("aero-im", "AERO_VAULT_OAUTH_CLIENT_SECRET", "aero-im-vault"),
+            ("aero-im", "AERO__OIDC__CLIENT_SECRET", "aero-im"),
+            ("aero-id", "AERO_ID_AUDIT_CLIENT_SECRET_PLATFORM_LOCAL", "aero-id-audit"),
+            ("aero-id-migrate", "AERO_ID_AUDIT_CLIENT_SECRET_PLATFORM_LOCAL", "aero-id-audit"),
+            ("aero-id", "AERO_ID_SOURCES_SNAPLINK_OAUTH_CLIENT_SECRET", "aero-id-snaplink-source"),
+            ("aero-id-migrate", "AERO_ID_SOURCES_SNAPLINK_OAUTH_CLIENT_SECRET", "aero-id-snaplink-source"),
+            ("aero-id", "AERO_ID_SOURCES_AERO_IM_OAUTH_CLIENT_SECRET", "aero-id-im-source"),
+            ("aero-id-migrate", "AERO_ID_SOURCES_AERO_IM_OAUTH_CLIENT_SECRET", "aero-id-im-source"),
+            ("aero-id", "AERO_ID_SOURCES_AERO_VAULT_OAUTH_CLIENT_SECRET", "aero-id-vault-source"),
+            ("aero-id-migrate", "AERO_ID_SOURCES_AERO_VAULT_OAUTH_CLIENT_SECRET", "aero-id-vault-source"),
+        )
+        for service, environment_name, client_id in consumer_bindings:
+            self.assertEqual(
+                self.compose["services"][service]["environment"][environment_name],
+                by_id[client_id]["secret"],
+            )
+            self.assertIn(f"{environment_name}:", COMPOSE_FILE.read_text())
+
     def test_local_aero_im_account_summary_is_resource_aligned_but_fail_closed(self) -> None:
         id_config = (PLATFORM_DIR / "config" / "aero-id.yaml").read_text()
         aero_im_source = id_config.split("  aero_im:\n", 1)[1].split(

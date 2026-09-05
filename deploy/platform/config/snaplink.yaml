@@ -124,7 +124,7 @@ tenant:
 
 clients:
   - id: sso-admin-console
-    secret: local-console-secret-change-before-production
+    secret: ""
     name: Snaplink Admin Console
     redirect_uris: []
     allowed_scopes: [openid, profile, admin:read, admin:write]
@@ -151,7 +151,7 @@ clients:
     active: true
 
   - id: aero-im
-    secret: local-aero-im-browser-secret-change-before-production
+    secret: ""
     name: Aero IM
     redirect_uris:
       - https://localhost:28482/callback
@@ -163,7 +163,7 @@ clients:
     active: true
 
   - id: aero-id-snaplink-source
-    secret: local-aero-id-snaplink-source-secret-0001
+    secret: ""
     name: Aero ID Snaplink source
     redirect_uris: []
     allowed_scopes: [account:summary:read]
@@ -174,7 +174,7 @@ clients:
     active: true
 
   - id: aero-id-im-source
-    secret: local-aero-id-im-source-secret-00000001
+    secret: ""
     name: Aero ID IM source
     redirect_uris: []
     allowed_scopes: [aero.account.summary.read]
@@ -185,7 +185,7 @@ clients:
     active: true
 
   - id: aero-id-vault-source
-    secret: local-aero-id-vault-source-secret-00001
+    secret: ""
     name: Aero ID Vault source
     redirect_uris: []
     allowed_scopes: [read]
@@ -196,7 +196,7 @@ clients:
     active: true
 
   - id: aero-im-vault
-    secret: local-aero-im-vault-secret-000000000001
+    secret: ""
     name: Aero IM Vault client
     redirect_uris: []
     allowed_scopes: [read, write]
@@ -207,7 +207,7 @@ clients:
     active: true
 
   - id: aero-id-audit
-    secret: local-aero-id-audit-secret-000000000001
+    secret: ""
     name: Aero ID audit relay
     redirect_uris: []
     allowed_scopes: [audit:event:write]
@@ -218,7 +218,7 @@ clients:
     active: true
 
   - id: aero-vault-audit
-    secret: local-aero-vault-audit-secret-000000001
+    secret: ""
     name: Aero Vault audit relay
     redirect_uris: []
     allowed_scopes: [audit:event:write]
@@ -229,7 +229,7 @@ clients:
     active: true
 
   - id: aero-im-audit
-    secret: local-aero-im-audit-secret-000000000001
+    secret: ""
     name: Aero IM audit relay
     redirect_uris: []
     allowed_scopes: [audit:event:write]
@@ -240,7 +240,7 @@ clients:
     active: true
 
   - id: platform-audit-bootstrap
-    secret: local-platform-audit-bootstrap-secret-0001
+    secret: ""
     name: Platform audit provisioner
     redirect_uris: []
     allowed_scopes: [audit:platform:cross_tenant, audit:policy:read, audit:policy:write]
