@@ -324,17 +324,53 @@ fn parse_https_url(label: &str, value: &str) -> Result<Url, AeroError> {
         return Err(AeroError::Invalid(format!("oidc {label} is too large")));
     }
     let url = Url::parse(value).map_err(|_| AeroError::Invalid(format!("invalid oidc {label}")))?;
-    if url.scheme() != "https"
+    let https = url.scheme() == "https";
+    let local_http =
+        url.scheme() == "http" && insecure_loopback_oidc_enabled() && is_loopback_host(&url);
+    if (!https && !local_http)
         || url.host_str().is_none()
         || !url.username().is_empty()
         || url.password().is_some()
         || url.fragment().is_some()
     {
         return Err(AeroError::Invalid(format!(
-            "oidc {label} must be an HTTPS URL without credentials or fragment"
+            "oidc {label} must use HTTPS (or explicit local loopback HTTP) without credentials or fragment"
         )));
     }
     Ok(url)
+}
+
+fn insecure_loopback_oidc_enabled() -> bool {
+    std::env::var("AERO__OIDC__ALLOW_INSECURE_LOOPBACK")
+        .ok()
+        .is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes"
+            )
+        })
+}
+
+fn is_loopback_host(url: &Url) -> bool {
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
+fn insecure_loopback_redirect() -> bool {
+    if !insecure_loopback_oidc_enabled() {
+        return false;
+    }
+    std::env::var("AERO__OIDC__REDIRECT_URI")
+        .ok()
+        .and_then(|value| Url::parse(value.trim()).ok())
+        .is_some_and(|url| url.scheme() == "http" && is_loopback_host(&url))
 }
 
 fn require_flow_config() -> Result<FlowConfig, AeroError> {
@@ -419,9 +455,14 @@ fn authorization_url(
 }
 
 fn flow_cookie(name: &str, value: &str) -> String {
+    let secure = if insecure_loopback_redirect() {
+        ""
+    } else {
+        "; Secure"
+    };
     format!(
         "{name}={value}; Path={CALLBACK_PATH}; Max-Age={FLOW_COOKIE_MAX_AGE_SECS}; \
-         HttpOnly; Secure; SameSite=Lax"
+         HttpOnly; SameSite=Lax{secure}"
     )
 }
 
@@ -455,9 +496,14 @@ fn append_flow_cookies(headers: &mut HeaderMap, flow: &BrowserFlowState) -> Resu
 }
 
 fn append_clear_cookie(headers: &mut HeaderMap, name: &str) {
+    let secure = if insecure_loopback_redirect() {
+        ""
+    } else {
+        "; Secure"
+    };
     let cookie = format!(
         "{name}=; Path={CALLBACK_PATH}; Max-Age=0; \
-         Expires=Thu, 01 Jan 1970 00:00:00 GMT; HttpOnly; Secure; SameSite=Lax"
+         Expires=Thu, 01 Jan 1970 00:00:00 GMT; HttpOnly; SameSite=Lax{secure}"
     );
     if let Ok(value) = HeaderValue::from_str(&cookie) {
         headers.append(header::SET_COOKIE, value);

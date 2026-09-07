@@ -16,7 +16,7 @@ use axum::{
 };
 use serde::Serialize;
 
-use super::{env_value, IntegrationApiResult, MachinePrincipal, AppState};
+use super::{env_value, AppState, IntegrationApiResult, MachinePrincipal};
 use crate::account_summary_binding::{AccountSummaryTargetVerifier, ACCOUNT_SUMMARY_SCOPE};
 
 pub(super) const REQUIRED_ACCOUNT_SUMMARY_SCOPE: &str = ACCOUNT_SUMMARY_SCOPE;
@@ -28,7 +28,8 @@ pub(super) const MAX_ACCOUNT_SUMMARY_QUERY_BYTES: usize = 8 * 1024;
 pub(super) const MAX_ACCOUNT_SUMMARY_ACCOUNT_ID_BYTES: usize = 512;
 pub(super) const MAX_ACCOUNT_SUMMARY_REGION_BYTES: usize = 128;
 pub(super) const MAX_ACCOUNT_SUMMARY_DATASETS: usize = 4;
-pub(super) const ACCOUNT_SUMMARY_BINDING_UNAVAILABLE: &str = "account summary target binding is unavailable";
+pub(super) const ACCOUNT_SUMMARY_BINDING_UNAVAILABLE: &str =
+    "account summary target binding is unavailable";
 pub(super) const ACCOUNT_NOTIFICATION_LIMIT: i64 = 50;
 
 pub(super) fn account_notification_limit_usize() -> usize {
@@ -156,9 +157,8 @@ pub(super) async fn account_summary(
 ) -> IntegrationApiResult<Json<AccountSummaryResponse>> {
     let principal = super::authenticate_account_summary_machine(&headers).await?;
     let request = parse_account_summary_query(raw_query.as_deref())?;
-    // This gate is intentionally before every identity and projection lookup.
-    // Equal unsigned headers cannot authorize a target; they are only required
-    // consistency inputs after the owner-approved assertion is verified.
+    // The signed target/replay gate precedes every identity/projection lookup.
+    // Unsigned headers are consistency-only and cannot authorize a target.
     let source_region = env_value("AERO__ACCOUNT_SOURCE__REGION")
         .ok_or_else(|| AeroError::Upstream(ACCOUNT_SUMMARY_BINDING_UNAVAILABLE.into()))?;
     let target = authorize_account_summary_target(
@@ -173,7 +173,6 @@ pub(super) async fn account_summary(
     let human_issuer = env_value("AERO__OIDC__ISSUER").ok_or_else(|| {
         AeroError::Invalid("Snaplink human identity issuer is not configured".into())
     })?;
-
     let participant_id = SsoRepo::new(state.pg.clone())
         .find_participant(&human_issuer, canonical_uid)
         .await?;
@@ -238,7 +237,7 @@ pub(super) async fn account_summary(
             );
         }
         sources.push(serde_json::json!({
-            "source_account_id": participant_id,
+            "source_account_id": target.account_id,
             "scope_type": "account",
             "scope_id": target.account_id,
             "status": "active",
@@ -314,7 +313,9 @@ fn valid_account_summary_identifier(value: &str, max_bytes: usize) -> bool {
             .all(|character| !character.is_control() && !character.is_whitespace())
 }
 
-pub(super) fn parse_account_summary_query(raw: Option<&str>) -> Result<AccountSummaryRequest, AeroError> {
+pub(super) fn parse_account_summary_query(
+    raw: Option<&str>,
+) -> Result<AccountSummaryRequest, AeroError> {
     let raw = raw.unwrap_or_default();
     if raw.len() > MAX_ACCOUNT_SUMMARY_QUERY_BYTES {
         return Err(AeroError::Invalid(

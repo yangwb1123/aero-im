@@ -43,6 +43,21 @@ permissions:
         - code: sso-admin
           name: Snaplink Administrator
           permissions: [admin:*]
+    - client_id: audit-governance-web
+      roles:
+        - code: tenant-admin
+          name: Audit Tenant Administrator
+          permissions:
+            - audit:event:read
+            - audit:operation:read
+            - audit:export:create
+            - audit:integrity:verify
+            - audit:legal_hold:manage
+            - audit:policy:read
+            - audit:policy:write
+        - code: platform-admin
+          name: Audit Platform Administrator
+          permissions: [audit:platform:cross_tenant]
     - client_id: aero-id
       roles:
         - code: aero-platform-admin
@@ -58,6 +73,7 @@ permissions:
             - audit.read
   user_roles:
     - { user_id: admin, client_id: sso-admin-console, roles: [sso-admin] }
+    - { user_id: admin, client_id: audit-governance-web, roles: [tenant-admin, platform-admin] }
     - { user_id: admin, client_id: aero-id, roles: [aero-platform-admin] }
 
 admin:
@@ -86,6 +102,11 @@ security:
       - http://localhost:28000
       - http://localhost:28010
       - http://localhost:28082
+      - http://localhost:4444
+      - http://localhost:5178
+      - http://localhost:5181
+      - http://localhost:5183
+      - http://localhost:5184
     allowed_methods: [GET, POST, PUT, PATCH, DELETE, OPTIONS]
     allowed_headers: [Authorization, Content-Type, X-Request-ID]
     exposed_headers: [X-Request-ID, Retry-After]
@@ -111,6 +132,12 @@ oauth:
       - read
       - write
       - audit:platform:cross_tenant
+      - audit:event:read
+      - audit:event:write
+      - audit:operation:read
+      - audit:export:create
+      - audit:integrity:verify
+      - audit:legal_hold:manage
       - audit:policy:read
       - audit:policy:write
       - account:read
@@ -138,11 +165,47 @@ clients:
     secret: ""
     name: Aero Account Console
     token_endpoint_auth_method: none
-    redirect_uris: [http://localhost:28010/]
-    post_logout_redirect_uris: [http://localhost:28010/]
+    redirect_uris: [http://localhost:28010/, http://localhost:5183/, http://localhost:5184/]
+    post_logout_redirect_uris: [http://localhost:28010/, http://localhost:5183/, http://localhost:5184/]
     allowed_scopes: [openid, profile, account:read, account:write, operation:read, source:sync, audit:read]
     allowed_authenticators: [password]
     allowed_resources: [aero-id]
+    token_strategy: jwt
+    tenant_id: platform-local
+    require_pkce: true
+    allowed_pkce_methods: [S256]
+    skip_consent: true
+    active: true
+
+  - id: audit-governance-web
+    secret: ""
+    name: Audit Governance Web
+    token_endpoint_auth_method: none
+    redirect_uris:
+      - http://localhost:5178/auth/callback
+    post_logout_redirect_uris:
+      - http://localhost:5178/
+    allowed_scopes: [openid, profile, audit:event:read, audit:event:write, audit:operation:read, audit:export:create, audit:integrity:verify, audit:legal_hold:manage, audit:policy:read, audit:policy:write, audit:platform:cross_tenant]
+    allowed_authenticators: [password]
+    allowed_resources: [audit-governance]
+    token_strategy: jwt
+    tenant_id: platform-local
+    require_pkce: true
+    allowed_pkce_methods: [S256]
+    skip_consent: true
+    active: true
+
+  - id: aero-vault
+    secret: ""
+    name: Aero Vault Web
+    token_endpoint_auth_method: none
+    redirect_uris:
+      - http://localhost:28081/auth/oidc/callback
+    post_logout_redirect_uris:
+      - http://localhost:28081/ui/
+    allowed_scopes: [openid, profile, email, read, write]
+    allowed_authenticators: [password]
+    allowed_resources: [aero-vault]
     token_strategy: jwt
     tenant_id: platform-local
     require_pkce: true
@@ -154,12 +217,14 @@ clients:
     secret: ""
     name: Aero IM
     redirect_uris:
-      - https://localhost:28482/callback
+      - http://localhost:28082/callback
     allowed_scopes: [openid, profile, email]
     allowed_authenticators: [password]
     allowed_resources: [aero-im]
     token_strategy: jwt
     tenant_id: platform-local
+    require_pkce: true
+    allowed_pkce_methods: [S256]
     active: true
 
   - id: aero-id-snaplink-source

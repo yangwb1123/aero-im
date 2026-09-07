@@ -62,7 +62,7 @@ pub enum PermanentKind {
     ReceiptMismatch,
     /// Local payload guard violation (tenant selection / source mismatch).
     PayloadGuard,
-    /// Signature-plane rejection: alg outside the RS256 allowlist, bad
+    /// Signature-plane rejection: alg outside the RS256/EdDSA allowlist, bad
     /// signature, or an unknown kid after the key source refreshed. Requeued
     /// once then dead (≤1 retry), like every permanent class.
     SignatureRejected,
@@ -400,8 +400,8 @@ impl AuditClient {
 
     /// Signature plane (D6: runs before the claims plane on every token that
     /// will be used for a POST). JWKS-off → `Ok(())` unconditionally.
-    /// JWKS-on: alg must be RS256, the key source must resolve the header's
-    /// `kid`, and the signature must verify under an explicit `Validation`
+    /// JWKS-on: alg must be RS256 or EdDSA, the key source must resolve the
+    /// header's `kid`, and the signature must verify under an explicit `Validation`
     /// whose time/audience/spec-claim checks are all disabled — those belong
     /// to the claims plane (F1: jsonwebtoken 9.3.1 defaults `validate_aud`/
     /// `validate_exp`/`required_spec_claims` ON and would otherwise dead
@@ -413,11 +413,12 @@ impl AuditClient {
         let Ok(header) = jsonwebtoken::decode_header(token) else {
             return Err(self.signature_rejected(token, "malformed").await);
         };
-        if header.alg != Algorithm::RS256 {
-            return Err(self.signature_rejected(token, "unsupported_alg").await);
-        }
+        let algorithm = match header.alg {
+            Algorithm::RS256 | Algorithm::EdDSA => header.alg,
+            _ => return Err(self.signature_rejected(token, "unsupported_alg").await),
+        };
         let key = match keys
-            .decoding_key_fallible(header.kid.as_deref(), Algorithm::RS256)
+            .decoding_key_fallible(header.kid.as_deref(), algorithm)
             .await
         {
             Ok(Some(key)) => key,
@@ -432,7 +433,7 @@ impl AuditClient {
                 )));
             }
         };
-        let mut validation = Validation::new(Algorithm::RS256);
+        let mut validation = Validation::new(algorithm);
         validation.validate_aud = false;
         validation.validate_exp = false;
         validation.validate_nbf = false;
