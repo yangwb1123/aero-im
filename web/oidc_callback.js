@@ -22,13 +22,13 @@
     localStorage.setItem('aero_pid', session.participant_id);
     payloadNode.remove();
     window.location.replace('/');
-  } catch (_error) {
+  } catch {
     payloadNode?.remove();
     try {
       localStorage.removeItem('aero_token');
       localStorage.removeItem('aero_refresh');
       localStorage.removeItem('aero_pid');
-    } catch (_storageError) {
+    } catch {
       // Storage may itself be unavailable; the callback still fails closed.
     }
     document.body.textContent = 'Snaplink SSO 登录完成失败，请返回后重试。';

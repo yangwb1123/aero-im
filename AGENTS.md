@@ -50,7 +50,7 @@ flowchart LR
 | 直播 | `aero-live-webrtc` | str0m SFU：选择性转发 + seq/ts 重映射 + Simulcast + RTCP(PLI/FIR) + 跨节点 `CallBridge` |
 | 直播 | `aero-live-srt` | 手写 SRT HSv5 + AES-CTR + Key Wrap(RFC 3394) + even/odd SEK 周期轮换 + ACK/NAK + `MpegTsSegmenter` |
 | 组合 | `aero-server` | Axum gateway：HTTP + WS + WHIP/WHEP + HLS + RTMP `:1935` + bots/workers/timers + `Hub`；boot 装配在 `bin/boot/` |
-| 组合 | `web/` | 零依赖 ES2020 SPA（hls.js / RTCPeerConnection / SpeechRecognition CDN） |
+| 组合 | `web/` | SolidJS/Vite SPA（本地 `~/iris-ui`，产物 `web/dist`） |
 
 **技术栈**：Rust 2021 / MSRV 1.80 · tokio · axum 0.7 · sqlx 0.8 · fred 9(Redis 7) · async-nats 0.36(JetStream) · str0m 0.19（纯 Rust DTLS-SRTP，仅 `aero-live-whip`/`-webrtc` 各自 `Cargo.toml` 声明，**不在 root**）· Postgres 17 + pgvector + pg_trgm。
 

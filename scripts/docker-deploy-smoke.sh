@@ -105,6 +105,11 @@ require_command sha256sum
 cd "$REPO_ROOT"
 docker info >/dev/null
 
+if [[ ! -f "$REPO_ROOT/web/dist/index.html" ]]; then
+    echo "docker-smoke: missing web/dist/index.html; run 'cd web && pnpm run build:iris && pnpm run build' first" >&2
+    exit 1
+fi
+
 if [[ "${AERO_DOCKER_SKIP_BUILD:-0}" != "1" ]]; then
     BUILT_IMAGES=1
     echo "docker-smoke: building runtime image"

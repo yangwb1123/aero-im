@@ -5,7 +5,7 @@
 [server]
 host = "0.0.0.0"
 port = 8080
-web_dir = "./web"
+web_dir = "./web/dist"
 # RTMP binds independently from the HTTP gateway. When this host is wildcard,
 # stream-create responses advertise AERO_INGEST_HOST or the AERO_PUBLIC_BASE_URL host.
 rtmp_listen = "0.0.0.0:1935"

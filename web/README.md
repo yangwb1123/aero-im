@@ -1,123 +1,89 @@
-# Aero IM — Web Debug Client
+# Aero IM — SolidJS Web Frontend
 
-A single-page, zero-dependency, native JavaScript client for talking to the
-Aero IM Rust backend during integration work.
+Aero IM 的 Web 前端已直接切换为 SolidJS + Vite，并使用本地
+`~/iris-ui` 的 `@iris-ui-kit/solid` 组件适配器。
 
-It speaks the HTTP `/api/*` surface for auth, rooms, and message history and
-the `/ws` WebSocket for the realtime stream.
+## 构建
 
-## File layout
+```bash
+cd /home/u1/aero-im/web
+pnpm install --frozen-lockfile
 
-| File         | Purpose                                                        |
-|--------------|----------------------------------------------------------------|
-| `index.html` | Markup. Three-pane chat shell + auth card + modals + toast.    |
-| `style.css`  | Dark theme, brand gradient `#6366f1 → #a855f7`, 8 px radius.   |
-| `api.js`     | `fetch`-based HTTP wrapper. Carries `Authorization: Bearer`.   |
-| `vendor/snaplink_sso_client.ts` | Snaplink's generated TypeScript SDK, synchronized from the Snaplink repository. |
-| `vendor/snaplink_sso_client.js` | Browser build of that generated SDK; never hand-reimplement its operations in the SPA. |
-| `snaplink_auth.js` | Login-page wiring around the official SDK (`login`/`postMFAComplete`). |
-| `ws.js`      | WebSocket client with exponential-backoff reconnect + ping.    |
-| `render.js`  | Safe DOM rendering — escaping, avatars, blocks, toasts.        |
-| `app.js`     | Wiring. State, event handlers, optimistic sends, history.      |
+# ~/iris-ui 源码或其组件发生变化时执行
+pnpm run build:iris
 
-The runtime is plain ES2020+ modules. The SPA has no runtime dependency; the
-Snaplink SDK source is generated TypeScript and is compiled once with the
-checked-in `build:snaplink-sdk` command.
+pnpm run build
+```
 
-## Running locally
+产物位于 `web/dist/`。`pnpm run build` 会先执行 TypeScript 类型检查，再执行
+Vite 生产构建。
 
-Serve the directory with any static server. For convenience:
+开发模式：
 
 ```bash
 cd web
-python3 -m http.server 8080 --bind 127.0.0.1
+pnpm run dev
 ```
 
-Now open `http://127.0.0.1:8080/`.
+开发服务器地址为 `http://127.0.0.1:5177`，并将 `/api`、`/ws`、`/hls` 代理到
+本地 Rust gateway 的 `3030` 端口。
 
-### Talking to the backend
+让 Rust gateway 托管构建产物：
 
-The client calls the API on **the same origin** it was served from. There are
-two normal setups:
-
-1. **Backend serves the static files** — drop `web/` behind the Rust app and
-   expose it at `/`. `/api/*` and `/ws` already resolve correctly.
-2. **Reverse-proxy in front** — run nginx (or `vite`, `caddy`, …) and proxy
-   `/api/*` and `/ws` to the Rust process, while serving `web/` as static.
-
-A minimal nginx snippet (assuming the backend listens on `:8000`):
-
-```nginx
-server {
-  listen 8080;
-  root /path/to/aero-im/web;
-  location /api/ { proxy_pass http://127.0.0.1:8000; }
-  location /ws   {
-    proxy_pass http://127.0.0.1:8000;
-    proxy_http_version 1.1;
-    proxy_set_header Upgrade $http_upgrade;
-    proxy_set_header Connection "upgrade";
-  }
-}
+```bash
+AERO__SERVER__WEB_DIR=./web/dist cargo run --bin aero-server
 ```
 
-If you really need cross-origin access without a proxy, set
-`API_BASE` / `WS_BASE` overrides via `localStorage` (see "Quick tweaks" below)
-or run the backend with permissive CORS — the client deliberately uses
-relative URLs so it stays portable.
+## 目录
 
-## Usage
+- `index.html` — Vite/SolidJS 页面入口。
+- `src/main.tsx` — Solid 根挂载。
+- `src/App.tsx` — Iris Provider、会话恢复、登录注册和认证门。
+- `src/ChatShell.tsx` — 房间、消息历史、Presence 和 WebSocket 实时消息。
+- `src/api.ts` — 类型化 REST API 和本地会话存储。
+- `src/style.css` — 使用 Iris CSS tokens 的页面布局样式。
+- `vite.config.ts` — Vite、`vite-plugin-solid`、开发代理和 `dist` 配置。
 
-1. The auth screen follows `GET /api/auth/config`: `both` shows both options,
-   `snaplink` shows the Snaplink hosted page, and `local` keeps Aero's page but
-   validates credentials through the Snaplink SDK. When Snaplink is configured,
-   the Aero-owned form in `both` mode also uses that SDK; registration is then
-   managed by Snaplink and its local registration tab is hidden.
-2. **Register** on the auth screen (email + display name + password ≥ 6) only
-   when the legacy local Aero flow is enabled without Snaplink.
-3. After a successful register/login, the access token, refresh token, and
-   participant id are persisted in `localStorage` under
-   `aero_token`, `aero_refresh`, `aero_pid`.
-4. **Create a room** via the "+ 新建" button — pick `group` / `channel`
-   / `direct`, optionally name it.
-5. **Add members** with the room header button. Paste a participant ID
-   (you can register a second user in another browser to grab theirs).
-6. **Send messages** — Enter to send, Shift+Enter for newline.
+旧版原生 JS 文件暂时保留为迁移参考，但不再被 `index.html` 加载；新的
+SolidJS 应用是唯一的前端入口。
 
-WebSocket frames go through `/ws?token=…`. Browsers can't attach custom
-headers to WS, so the JWT rides on the query string — matching the backend
-contract.
+## Iris UI 本地依赖
 
-## Key behaviours
+`web/package.json` 通过 pnpm `link:` 依赖相邻目录中的 Iris UI：
 
-- **Optimistic send.** Your own message renders immediately as a faded
-  bubble. When the server echoes it back over WS, the placeholder is
-  replaced by the canonical message (matched by sender + text + ≤ 15 s).
-- **Exponential backoff.** Reconnect attempts wait `1s, 2s, 4s, 8s, 16s, 30s`
-  and cap at 30 s. The dot in the header turns green / amber / red.
-- **History on scroll-to-top.** Scrolling within ~40 px of the top fires a
-  `?before=<oldest-id>&limit=100` fetch and prepends results while
-  preserving the visible scroll anchor.
-- **Auth recovery.** A 401 on any API call clears local session and bounces
-  back to the login screen.
-- **XSS safety.** Every user-controlled string is inserted via `textContent`
-  or `escapeHtml`; the only `innerHTML` writes are static skeletons with
-  zero interpolation.
+```text
+../../iris-ui/packages/solid
+../../iris-ui/packages/core
+../../iris-ui/packages/theme
+../../iris-ui/packages/tokens
+```
 
-## Quick tweaks
+因此当前工作区布局需要满足：
 
-| What                      | How                                           |
-|---------------------------|-----------------------------------------------|
-| Force re-login            | DevTools → `localStorage.clear()` and reload  |
-| See WS frames             | DevTools → Network → WS                        |
-| Brand colors              | `style.css` — `--brand-1`, `--brand-2`         |
-| Backoff schedule          | `ws.js` — `BACKOFF_MS`                         |
-| Default history page size | `api.js` / `app.js` — both default to 100      |
+```text
+/home/u1/iris-ui
+/home/u1/aero-im
+```
 
-## Caveats
+`pnpm run build:iris` 实际执行 `~/iris-ui` 工作区中 Solid 适配器及其依赖的构建。
 
-- This is a **debug client**: no read-receipts, no editing/deleting, no
-  attachments, no notifications.
-- Pending messages are not persisted; refreshing the page drops them.
-- Presence is whatever the server pushes — no client-side heartbeat
-  beyond a 25 s `{"type":"ping"}` to keep the socket warm.
+## 后端通信
+
+前端使用同源相对路径：
+
+- REST：`/api/*`
+- WebSocket：`/ws?token=...`
+- HLS：`/hls/*`
+
+生产环境建议由 Rust gateway 或反向代理同时提供静态文件、REST 和 WebSocket，
+避免跨源认证和 WebSocket 配置问题。
+
+## 校验
+
+```bash
+cd web
+pnpm run typecheck
+pnpm test
+pnpm lint
+bash ../scripts/web-check.sh
+```

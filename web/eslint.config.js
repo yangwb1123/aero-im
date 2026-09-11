@@ -1,14 +1,14 @@
-// eslint.config.js — ESLint flat config（「npm 可用时」的完整前端门）
+// eslint.config.js — ESLint flat config（pnpm 可用时的完整前端门）
 //
-// ⚠️ 本配置需要 `npm install`（拉取 eslint + eslint-plugin-import）。
+// ⚠️ 本配置需要 `pnpm install`（拉取 eslint + eslint-plugin-import）。
 //    沙箱/CI 可能无网，因此它**不是主门**、不应阻断流水线。
-//    主门是 scripts/web-check.sh（仅依赖 node，零 npm 依赖），
+//    主门是 scripts/web-check.sh（仅依赖 node，不需要安装依赖），
 //    专抓「语法错误」「import 指向不存在的文件」这两类破损。
 //    本配置是它的超集：额外覆盖 no-undef（调用未定义函数/变量）、
 //    import/no-unresolved（更严格的 import 解析）、max-lines（文件尺寸警告）。
 //
 // 用法（需联网环境）：
-//    cd web && npm install && npm run lint
+//    cd web && pnpm install --frozen-lockfile && pnpm run lint
 
 import js from '@eslint/js';
 import importPlugin from 'eslint-plugin-import';

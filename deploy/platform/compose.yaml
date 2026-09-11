@@ -536,7 +536,7 @@ services:
     environment:
       AERO__SERVER__HOST: 0.0.0.0
       AERO__SERVER__PORT: "8080"
-      AERO__SERVER__WEB_DIR: /app/web
+      AERO__SERVER__WEB_DIR: /app/web/dist
       AERO__SERVER__RTMP_LISTEN: 0.0.0.0:1935
       AERO__SERVER__BLOB_DIR: /var/lib/aero/blobs
       AERO__SERVER__HLS_DIR: /var/lib/aero/hls

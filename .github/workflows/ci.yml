@@ -124,7 +124,7 @@ jobs:
           [server]
           host = "0.0.0.0"
           port = 8080
-          web_dir = "./web"
+          web_dir = "./web/dist"
           [database]
           url = "postgres://aero:aero@localhost:5432/aero"
           max_connections = 4
@@ -198,19 +198,35 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - uses: actions/checkout@v4
+        with:
+          repository: yangwb1123/iris-ui-kit
+          path: iris-ui
       - uses: actions-rust-lang/setup-rust-toolchain@v1
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.34.5
       - uses: actions/setup-node@v4
-        with: { node-version: '20' }
-      - run: npm ci
+        with:
+          node-version: '20'
+          cache: pnpm
+      - run: ln -s "$GITHUB_WORKSPACE/iris-ui" "$GITHUB_WORKSPACE/../iris-ui"
+      - run: pnpm install --frozen-lockfile
+        working-directory: ../iris-ui
+      - run: pnpm install --frozen-lockfile
+        working-directory: web
+      - run: pnpm run build:iris
+        working-directory: web
+      - run: pnpm run build
         working-directory: web
       - run: cargo build -p aero-server --bin aero-cli --locked
       - run: ./target/debug/aero-cli gate all
         env:
           AERO_FORMAT_BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before }}
           AERO_MIGRATION_BASE_REF: ${{ github.event.pull_request.base.sha || github.event.before }}
-      - run: npm test
+      - run: pnpm test
         working-directory: web
-      - run: npm run lint
+      - run: pnpm lint
         working-directory: web
 
   docker-smoke:
@@ -219,6 +235,26 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: yangwb1123/iris-ui-kit
+          path: iris-ui
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.34.5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: pnpm
+      - run: ln -s "$GITHUB_WORKSPACE/iris-ui" "$GITHUB_WORKSPACE/../iris-ui"
+      - run: pnpm install --frozen-lockfile
+        working-directory: ../iris-ui
+      - run: pnpm install --frozen-lockfile
+        working-directory: web
+      - run: pnpm run build:iris
+        working-directory: web
+      - run: pnpm run build
+        working-directory: web
       - run: bash scripts/docker-deploy-smoke.sh
 
   security:

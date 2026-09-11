@@ -11,8 +11,8 @@ When Snaplink regenerates its SDK, replace the TypeScript file from the
 Snaplink repository and run:
 
 ```bash
-npm install
-npm run build:snaplink-sdk
+pnpm install --frozen-lockfile
+pnpm run build:snaplink-sdk
 ```
 
 The SPA imports only the generated JavaScript build. `snaplink_auth.js` adds

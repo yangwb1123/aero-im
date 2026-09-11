@@ -1,17 +1,16 @@
 #!/usr/bin/env bash
-# web-check.sh — 前端零工具链校验门
+# web-check.sh — 前端静态兼容性校验门
 #
-# 背景：本仓库 web/ 是原生 ES-module SPA（无构建工具、无 node_modules），
-# Rust 侧有 file-size/complexity/dependency/truth-check 多道 harness 门，
-# 但前端长期裸奔——一次模块化重构曾把 app.js 拆坏（调用未定义函数、
-# import 不存在的 ../state.js），没有任何门拦得住。本脚本补这一缺口：
-# 沙箱可跑、无需 npm install，专抓「语法错误」和「import 指向不存在的文件」。
+# web/ 使用 SolidJS/Vite；本门保持沙箱可跑、无需 npm install，负责保留的
+# 原生 JS 辅助模块的语法/相对 import，以及 SolidJS 入口 HTML 的本地引用；
+# SolidJS 的 TSX 类型与生产构建由
+# `cd web && pnpm run build` 负责。
 #
 # 检测项（逐个 web/**/*.js）：
 #   1. 语法     —— node --check <file>
 #   2. import 解析 —— 每个 import ... from '相对路径'（./x.js / ../x.js）
-#                    校验目标文件确实存在于磁盘（抓 ../state.js 那一类）
-#   3. (轻量) index.html 里 <script type="module" src="..."> 的本地引用也校验存在
+#                    校验目标文件确实存在于磁盘
+#   3. index.html 的 <script type="module" src="..."> 本地引用存在
 #
 # 退出码 = violation 数（0 = 通过）。被 Makefile `check-web` 与 CI `web-check` 调用。
 set -euo pipefail
@@ -25,7 +24,7 @@ violations=0
 checked_files=0
 checked_imports=0
 
-echo "=== Web Check（前端零工具链校验门）==="
+echo "=== Web Check（前端静态校验门）==="
 
 # --- node 优雅缺失处理 ---
 if ! command -v node >/dev/null 2>&1; then
@@ -91,13 +90,14 @@ while IFS= read -r f; do
       | grep -oE "['\"](\.\.?/)[^'\"]+['\"]" \
       | sed -E "s/^['\"]//; s/['\"]\$//"
   )
-done < <(find "$WEB_DIR" -name '*.js' -type f -not -path '*/node_modules/*' | sort)
+done < <(find "$WEB_DIR" -name '*.js' -type f \
+  -not -path '*/node_modules/*' -not -path '*/dist/*' | sort)
 
 # =====================================================================
-# 3) (轻量) index.html 的 <script type="module" src="本地文件">
+# 3) (轻量) frontend entry HTML's module scripts
 # =====================================================================
-HTML="$WEB_DIR/index.html"
-if [ -f "$HTML" ]; then
+for HTML in "$WEB_DIR/index.html"; do
+  [ -f "$HTML" ] || continue
   while IFS= read -r src; do
     [ -z "$src" ] && continue
     # 跳过绝对 URL（http(s):// 或 //cdn...）
@@ -106,7 +106,8 @@ if [ -f "$HTML" ]; then
     esac
     target="$(resolve_relative "$HTML" "$src")"
     if [ ! -f "$target" ]; then
-      echo "  ❌ UNRESOLVED SCRIPT: web/index.html → $src  (期望文件不存在: $target)"
+      rel_html="${HTML#"$ROOT_DIR"/}"
+      echo "  ❌ UNRESOLVED SCRIPT: $rel_html → $src  (期望文件不存在: $target)"
       violations=$((violations + 1))
     fi
   done < <(
@@ -114,7 +115,7 @@ if [ -f "$HTML" ]; then
       | grep -oE "src=['\"][^'\"]+['\"]" \
       | sed -E "s/^src=['\"]//; s/['\"]\$//"
   )
-fi
+done
 
 rm -f /tmp/web-check-syntax.$$
 

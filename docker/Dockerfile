@@ -56,7 +56,7 @@ COPY --from=builder /workspace/config.example.toml /app/config.toml
 
 ENV AERO__SERVER__HOST=0.0.0.0 \
     AERO__SERVER__PORT=8080 \
-    AERO__SERVER__WEB_DIR=/app/web \
+    AERO__SERVER__WEB_DIR=/app/web/dist \
     AERO__SERVER__BLOB_DIR=/var/lib/aero/blobs \
     AERO__SERVER__HLS_DIR=/var/lib/aero/hls \
     AERO_RELAY_PROBE_BIN=/usr/local/bin/aero-audit-relay-probe \

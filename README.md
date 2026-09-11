@@ -85,7 +85,7 @@ AI-Native 即时通讯 + 直播平台,Rust 实现。
 ## 架构
 
 ```
-┌─ 客户端(Web ES2020 SPA)── HTTP REST + WebSocket + WebRTC ─────┐
+┌─ 客户端(Web SolidJS SPA)── HTTP REST + WebSocket + WebRTC ───────┐
 │                                                                │
 └──┬─────────────────────────────────────────────────────────────┘
    │
@@ -138,13 +138,16 @@ AI-Native 即时通讯 + 直播平台,Rust 实现。
 - **aero-push** — FCM/APNs 服务端推送网关 + token-provider seam
 - **aero-server** — Axum gateway + ai_adapter + agent_bot + hub
 - **aero-eng / aero-cli** — 工程命令框架与 `aero-eng` CLI
-- **web/** — 依赖零的 ES2020 SPA
+- **web/** — SolidJS/Vite SPA（使用本地 `~/iris-ui` Solid 适配器）
 
 ## 快速开始
 
 ### Docker 完整部署（推荐验证路径）
 
 ```bash
+# 构建 SolidJS 静态产物（Dockerfile 将 web/dist 打入镜像）
+cd web && pnpm install --frozen-lockfile && pnpm run build:iris && pnpm run build && cd ..
+
 # 生成 JWT 密钥；app profile 将 secrets/ 中被 Git 忽略的 PEM 作为 Docker secrets 挂载
 make jwt-keys
 
@@ -189,15 +192,41 @@ make up
 # 2. 生成 JWT 密钥(PKCS#1 PEM)+ 配置
 make jwt-keys env
 
-# 3. 先编译再跑全部迁移（迁移在编译期嵌入 aero-cli）
+# 3. 构建 SolidJS 前端（产物写入 web/dist）
+cd web
+pnpm install --frozen-lockfile
+pnpm run build:iris
+pnpm run build
+cd ..
+
+# 4. 先编译再跑全部迁移（迁移在编译期嵌入 aero-cli）
 cargo build --bin aero-cli
 cargo run --bin aero-cli -- migrate
 
-# 4. 启动服务（端口以 config/env 为准；示例 env=8080，仓库本地 config/smoke=3030）
+# 5. 启动服务（端口以 config/env 为准；示例 env=8080，仓库本地 config/smoke=3030）
 cargo run --bin aero-server
 
-# 5. 浏览器
+# 6. 浏览器
 open http://localhost:3030
+```
+
+### SolidJS / Iris UI 前端
+
+Web 前端已直接切换为 SolidJS，入口是 `web/index.html` 和 `web/src/`，使用本地
+`~/iris-ui` 的 `@iris-ui-kit/solid`。运行：
+
+```bash
+cd web
+pnpm install --frozen-lockfile
+pnpm run build:iris   # Iris 源码有变化时执行
+pnpm run build        # 输出 web/dist/
+pnpm run dev          # http://127.0.0.1:5177，代理 API/WS 到 :3030
+```
+
+如果希望由 Rust gateway 托管构建产物：
+
+```bash
+AERO__SERVER__WEB_DIR=./web/dist cargo run --bin aero-server
 ```
 
 ### 可选环境变量

@@ -69,6 +69,27 @@ ps: ## list running docker services
 	docker compose ps
 
 ##@ Build / Test
+.PHONY: web-install
+web-install: ## install the local Iris UI and Aero SolidJS frontend dependencies with pnpm
+	cd ../iris-ui && pnpm install --frozen-lockfile
+	cd web && pnpm install --frozen-lockfile
+
+.PHONY: web-build-iris
+web-build-iris: ## build the local ~/iris-ui Solid adapter and its dependencies
+	cd web && pnpm run build:iris
+
+.PHONY: web-build
+web-build: web-build-iris ## build Iris UI, then typecheck and build the SolidJS frontend into web/dist
+	cd web && pnpm run build
+
+.PHONY: web-dev
+web-dev: ## run the SolidJS frontend dev server (Vite proxy targets :3030)
+	cd web && pnpm run dev
+
+.PHONY: web-preview
+web-preview: ## preview the built SolidJS frontend
+	cd web && pnpm run preview
+
 .PHONY: check
 check: ## cargo check the whole workspace
 	cargo check --workspace --all-targets
