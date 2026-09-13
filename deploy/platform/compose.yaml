@@ -220,6 +220,7 @@ services:
       SNAPLINK_UPSTREAM: http://snaplink:8080
       SNAPLINK_BILLING_UPSTREAM: http://optional-api-disabled:8088
       SNAPLINK_STRIPE_ADAPTER_UPSTREAM: http://optional-api-disabled:8088
+      AGENT_HUB_UPSTREAM: http://optional-api-disabled:8088
       AUDIT_GOVERNANCE_UPSTREAM: http://audit-governance-edge:8089
     ports:
       - "${PLATFORM_BIND_HOST:-127.0.0.1}:28000:80"
