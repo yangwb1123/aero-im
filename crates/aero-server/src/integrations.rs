@@ -4,15 +4,17 @@
 //! The publish/upload surfaces accept only RFC 9068 Snaplink access tokens from
 //! `client_credentials`; a machine token is never converted into a participant.
 
-use std::{str::FromStr, sync::{Arc, OnceLock}, time::Duration};
+use std::{
+    str::FromStr,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 
 use aero_auth::{
     validate_client_credentials_token, validate_jwks_uri, AuthUser, ClientCredentialsTokenConfig,
     JwksKeyProvider,
 };
-use aero_common::{
-    Block, Error as AeroError, FileKind, ParticipantId, RoomId, WorkspaceId,
-};
+use aero_common::{Block, Error as AeroError, FileKind, ParticipantId, RoomId, WorkspaceId};
 use aero_im_core::{
     moderation_text, validate_blocks, KeywordModerator, ModerationVerdict, Moderator, PiiDetector,
 };

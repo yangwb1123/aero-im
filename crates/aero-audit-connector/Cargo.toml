@@ -48,4 +48,6 @@ uuid.workspace = true
 base64 = "0.22"
 
 [dev-dependencies]
+ed25519-dalek = "2.1"
+sha2 = "0.10"
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "net", "io-util", "sync", "time"] }
