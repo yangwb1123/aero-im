@@ -87,8 +87,9 @@ test('Solid session APIs use access-token auth and send refresh only in the conf
   try {
     const { api } = await loadSolidApi();
     await api.listSessions();
-    await api.revokeOtherSessions('current-refresh-secret');
+    const revokeResult = await api.revokeOtherSessions('current-refresh-secret');
 
+    assert.deepEqual(revokeResult, { revoked_count: 2 });
     assert.deepEqual(requests.map(({ url, init }) => [init.method, url]), [
       ['GET', '/api/auth/sessions'],
       ['POST', '/api/auth/sessions/revoke-others'],
@@ -101,7 +102,7 @@ test('Solid session APIs use access-token auth and send refresh only in the conf
     });
     assert.ok(requests.every(({ url, init }) => (
       !url.includes('current-refresh-secret')
-      && init.headers.Authorization !== 'Bearer current-refresh-secret'
+      && !String(init.headers.Authorization ?? '').includes('current-refresh-secret')
     )));
   } finally {
     globalThis.fetch = previousFetch;

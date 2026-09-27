@@ -368,6 +368,18 @@ describe('ChatShell collaborative Canvas integration', () => {
     const socket = FakeWebSocket.instances[0]
     socket.open()
     await waitFor(() => roomACalls === 1, 'deferred first room history')
+    socket.message({
+      type: 'welcome',
+      participant: participant.id,
+      capabilities: ['delivery_cursor_v2'],
+    })
+    socket.message({
+      type: 'delivery_ready',
+      rooms: [
+        { room_id: 'room-a', delivery_ordinal: 0 },
+        { room_id: 'room-b', delivery_ordinal: 0 },
+      ],
+    })
 
     socket.message({
       type: 'message',
@@ -426,6 +438,7 @@ describe('ChatShell collaborative Canvas integration', () => {
       .mockRejectedValueOnce(new Error('offline'))
       .mockResolvedValueOnce([])
       .mockResolvedValueOnce({ sessions: [] })
+      .mockResolvedValueOnce([null])
     mounted = mountChat()
     mounted.container.querySelector<HTMLButtonElement>('.session-trigger')!.click()
     await waitFor(() => mockApi.listSessions.mock.calls.length === 1, 'initial session load')
@@ -442,6 +455,34 @@ describe('ChatShell collaborative Canvas integration', () => {
     await waitFor(() => mockApi.listSessions.mock.calls.length === 3, 'invalid session response')
     await waitFor(() => document.body.querySelector('.session-error') !== null, 'invalid response error')
     expect(document.body.textContent).not.toContain('当前没有活跃登录会话')
+
+    document.body.querySelector<HTMLButtonElement>('.session-close')!.click()
+    mounted.container.querySelector<HTMLButtonElement>('.session-trigger')!.click()
+    await waitFor(() => mockApi.listSessions.mock.calls.length === 4, 'invalid session entry')
+    await waitFor(() => document.body.querySelector('.session-error') !== null, 'invalid session entry error')
+    expect(document.body.textContent).not.toContain('当前没有活跃登录会话')
+  })
+
+  it('ignores stale session-list responses after closing and reopening the panel', async () => {
+    let resolveOldSessions!: (rows: ReturnType<typeof authSession>[]) => void
+    let resolveFreshSessions!: (rows: ReturnType<typeof authSession>[]) => void
+    mockApi.listSessions
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveOldSessions = resolve }))
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveFreshSessions = resolve }))
+    mounted = mountChat()
+    mounted.container.querySelector<HTMLButtonElement>('.session-trigger')!.click()
+    await waitFor(() => mockApi.listSessions.mock.calls.length === 1, 'first session list')
+
+    document.body.querySelector<HTMLButtonElement>('.session-close')!.click()
+    mounted.container.querySelector<HTMLButtonElement>('.session-trigger')!.click()
+    await waitFor(() => mockApi.listSessions.mock.calls.length === 2, 'reopened session list')
+    resolveFreshSessions([authSession('fresh-session', 'Fresh device')])
+    await waitFor(() => document.body.textContent?.includes('Fresh device') === true, 'fresh session response')
+
+    resolveOldSessions([authSession('stale-session', 'Stale device')])
+    await flushPromises()
+    expect(document.body.textContent).toContain('Fresh device')
+    expect(document.body.textContent).not.toContain('Stale device')
   })
 
   it('requires a refresh token and at least two loaded sessions to enable revoking others', async () => {
@@ -482,6 +523,7 @@ describe('ChatShell collaborative Canvas integration', () => {
     revokeButton.click()
     expect(window.confirm).toHaveBeenCalledTimes(1)
     expect(mockApi.revokeOtherSessions).not.toHaveBeenCalled()
+    expect(mockApi.listSessions).toHaveBeenCalledTimes(1)
 
     window.confirm = vi.fn(() => true)
     revokeButton.click()
@@ -491,6 +533,27 @@ describe('ChatShell collaborative Canvas integration', () => {
     await waitFor(() => document.body.querySelectorAll('.session-row').length === 1, 'refreshed active session')
     expect(document.body.textContent).not.toContain(refreshToken)
     expect(document.body.innerHTML).not.toContain(refreshToken)
+    expect(onLogout).not.toHaveBeenCalled()
+    expect(mockSession.clear).not.toHaveBeenCalled()
+  })
+
+  it('does not revoke when the refresh token disappears during confirmation', async () => {
+    mockSession.refresh = 'refresh-available-before-confirmation'
+    mockApi.listSessions.mockResolvedValue([authSession('current'), authSession('other')])
+    const onLogout = vi.fn(async () => {})
+    mounted = mountChat(onLogout)
+    window.confirm = vi.fn(() => {
+      mockSession.refresh = null
+      return true
+    })
+    mounted.container.querySelector<HTMLButtonElement>('.session-trigger')!.click()
+    await waitFor(() => document.body.querySelectorAll('.session-row').length === 2, 'loaded sessions')
+    const revokeButton = [...document.body.querySelectorAll<HTMLButtonElement>('button')]
+      .find((button) => button.textContent?.includes('退出其他设备'))!
+    revokeButton.click()
+
+    await waitFor(() => document.body.textContent?.includes('无法读取当前登录凭据') === true, 'missing refresh token error')
+    expect(mockApi.revokeOtherSessions).not.toHaveBeenCalled()
     expect(onLogout).not.toHaveBeenCalled()
     expect(mockSession.clear).not.toHaveBeenCalled()
   })

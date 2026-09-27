@@ -605,22 +605,35 @@ test('a reloaded account restores only its own cursor and keeps legacy since fal
       }),
     });
     unauthorizedSocket.emit('message', {
+      data: JSON.stringify({
+        type: 'message',
+        seq: 12,
+        delivery_ordinal: 12,
+        message: { id: 'pre-barrier-unauthorized-message', room_id: 'room-a' },
+      }),
+    });
+    unauthorizedSocket.emit('message', {
       data: JSON.stringify({ type: 'delivery_ready', rooms: [] }),
     });
     assert.deepEqual(unauthorizedSocket.frames, [], 'saved cursors outside the barrier are not restored');
     assert.equal(storage.values.get('aero_delivery_cursors_v1:participant-a') !== undefined, true,
       'the participant has a persisted cursor for the unauthorized room');
+    let unauthorizedLedger = JSON.parse(
+      storage.values.get('aero_delivery_cursors_v1:participant-a'),
+    );
+    assert.equal(unauthorizedLedger.rooms['room-a'].delivery_ordinal, 11,
+      'an empty barrier cannot commit the buffered pre-barrier cursor');
     unauthorizedSocket.emit('message', {
       data: JSON.stringify({
         type: 'message',
-        seq: 12,
-        delivery_ordinal: 12,
-        message: { id: 'unauthorized-room-message', room_id: 'room-a' },
+        seq: 13,
+        delivery_ordinal: 13,
+        message: { id: 'later-unauthorized-room-message', room_id: 'room-a' },
       }),
     });
     unauthorized._flushDeliveryAcks();
     assert.deepEqual(unauthorizedSocket.frames, [], 'an empty barrier cannot restore or ACK that room');
-    const unauthorizedLedger = JSON.parse(
+    unauthorizedLedger = JSON.parse(
       storage.values.get('aero_delivery_cursors_v1:participant-a'),
     );
     assert.equal(unauthorizedLedger.rooms['room-a'].delivery_ordinal, 11,
