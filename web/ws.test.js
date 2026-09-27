@@ -608,6 +608,23 @@ test('a reloaded account restores only its own cursor and keeps legacy since fal
       data: JSON.stringify({ type: 'delivery_ready', rooms: [] }),
     });
     assert.deepEqual(unauthorizedSocket.frames, [], 'saved cursors outside the barrier are not restored');
+    assert.equal(storage.values.get('aero_delivery_cursors_v1:participant-a') !== undefined, true,
+      'the participant has a persisted cursor for the unauthorized room');
+    unauthorizedSocket.emit('message', {
+      data: JSON.stringify({
+        type: 'message',
+        seq: 12,
+        delivery_ordinal: 12,
+        message: { id: 'unauthorized-room-message', room_id: 'room-a' },
+      }),
+    });
+    unauthorized._flushDeliveryAcks();
+    assert.deepEqual(unauthorizedSocket.frames, [], 'an empty barrier cannot restore or ACK that room');
+    const unauthorizedLedger = JSON.parse(
+      storage.values.get('aero_delivery_cursors_v1:participant-a'),
+    );
+    assert.equal(unauthorizedLedger.rooms['room-a'].delivery_ordinal, 11,
+      'a later message in the unauthorized room cannot advance the persisted cursor');
 
     const malformed = new WsClient({ cursorStorage: storage });
     malformed.connect('token-a', 'participant-a');
@@ -707,6 +724,59 @@ test('a throwing message handler neither advances nor ACKs and forces replay', (
       code: 1011,
       reason: 'message application failed',
     }]);
+    client.close();
+  } finally {
+    console.error = previousConsoleError;
+    if (previousWebSocket === undefined) delete globalThis.WebSocket;
+    else globalThis.WebSocket = previousWebSocket;
+    if (previousLocation === undefined) delete globalThis.location;
+    else globalThis.location = previousLocation;
+  }
+});
+
+test('a failed frame without a room identity still fences the socket before ACK shape checks', () => {
+  const previousWebSocket = globalThis.WebSocket;
+  const previousLocation = globalThis.location;
+  const previousConsoleError = console.error;
+  const sockets = [];
+  class FakeSocket {
+    static OPEN = 1;
+    constructor() {
+      this.readyState = FakeSocket.OPEN;
+      this.handlers = new Map();
+      this.frames = [];
+      this.closes = [];
+      sockets.push(this);
+    }
+    addEventListener(event, fn) { this.handlers.set(event, fn); }
+    emit(event, payload = {}) { return this.handlers.get(event)?.(payload); }
+    send(raw) { this.frames.push(JSON.parse(raw)); }
+    close(code, reason) { this.closes.push({ code, reason }); }
+  }
+  globalThis.WebSocket = FakeSocket;
+  globalThis.location = { protocol: 'https:', host: 'example.test' };
+  console.error = () => {};
+  try {
+    const storage = new MemoryStorage();
+    const client = new WsClient({ cursorStorage: storage });
+    client.on('msg:message', () => { throw new Error('apply failed without room'); });
+    client.connect('token-a', 'participant-a');
+    const socket = sockets[0];
+    socket.emit('message', {
+      data: JSON.stringify({
+        type: 'message',
+        seq: 19,
+        delivery_ordinal: 8,
+        message: { id: 'message-without-room' },
+      }),
+    });
+    client._flushDeliveryAcks();
+
+    assert.deepEqual(socket.frames, []);
+    assert.deepEqual(socket.closes, [{ code: 1011, reason: 'message application failed' }]);
+    assert.equal(client._seqGate.scopes.has('g'), false, 'the failed seq is forgotten');
+    assert.equal(client._lastSeen, null, 'failed content cannot advance the legacy cursor');
+    assert.equal(storage.values.size, 0, 'missing room metadata cannot create a delivery cursor');
     client.close();
   } finally {
     console.error = previousConsoleError;

@@ -13,6 +13,12 @@ import {
   IrisBadge,
   IrisButton,
   IrisCard,
+  IrisDialog,
+  IrisDialogClose,
+  IrisDialogContent,
+  IrisDialogDescription,
+  IrisDialogTitle,
+  IrisDialogTrigger,
   IrisIcon,
   IrisInput,
   IrisSpinner,
@@ -21,6 +27,7 @@ import {
   api,
   messageText,
   sessionStorage,
+  type AuthSession,
   type Message,
   type Participant,
   type Room,
@@ -65,6 +72,20 @@ function messageTime(value?: string): string {
     : date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
 }
 
+function isAuthSession(value: unknown): value is AuthSession {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const session = value as Record<string, unknown>
+  return typeof session.id === 'string'
+    && typeof session.participant_id === 'string'
+    && typeof session.token_prefix === 'string'
+    && (session.user_agent === undefined || session.user_agent === null
+      || typeof session.user_agent === 'string')
+    && typeof session.created_at === 'string'
+    && typeof session.last_seen_at === 'string'
+    && (session.revoked_at === undefined || session.revoked_at === null
+      || typeof session.revoked_at === 'string')
+}
+
 export function ChatShell(props: ChatShellProps): JSX.Element {
   const [rooms, setRooms] = createSignal<Room[]>([])
   const [currentRoomId, setCurrentRoomId] = createSignal('')
@@ -81,9 +102,16 @@ export function ChatShell(props: ChatShellProps): JSX.Element {
   const [error, setError] = createSignal('')
   const [showNewRoom, setShowNewRoom] = createSignal(false)
   const [canvasDraftDirty, setCanvasDraftDirty] = createSignal(false)
+  const [sessionPanelOpen, setSessionPanelOpen] = createSignal(false)
+  const [sessionRows, setSessionRows] = createSignal<AuthSession[] | null>(null)
+  const [sessionLoadState, setSessionLoadState] = createSignal<'idle' | 'loading' | 'loaded' | 'error'>('idle')
+  const [sessionLoadError, setSessionLoadError] = createSignal('')
+  const [sessionRevokeError, setSessionRevokeError] = createSignal('')
+  const [revokingOthers, setRevokingOthers] = createSignal(false)
   const wsClient = new WsClient()
   const unsubscribe: Array<() => void> = []
   let messageLoadGeneration = 0
+  let sessionLoadGeneration = 0
   let sendResetTimer: number | undefined
   let disposed = false
 
@@ -108,6 +136,68 @@ export function ChatShell(props: ChatShellProps): JSX.Element {
       if (!disposed) setError(reason instanceof Error ? reason.message : '房间加载失败')
     } finally {
       if (!disposed) setLoadingRooms(false)
+    }
+  }
+
+  const loadSessions = async (): Promise<void> => {
+    if (disposed || !sessionPanelOpen()) return
+    const generation = ++sessionLoadGeneration
+    setSessionRows(null)
+    setSessionLoadError('')
+    setSessionRevokeError('')
+    setSessionLoadState('loading')
+    try {
+      const result: unknown = await api.listSessions()
+      if (disposed || !sessionPanelOpen() || generation !== sessionLoadGeneration) return
+      if (!Array.isArray(result) || !result.every(isAuthSession)) {
+        throw new Error('invalid session response')
+      }
+      setSessionRows(result)
+      setSessionLoadState('loaded')
+    } catch {
+      if (disposed || !sessionPanelOpen() || generation !== sessionLoadGeneration) return
+      setSessionRows(null)
+      setSessionLoadError('登录会话加载失败，请检查网络后重试。')
+      setSessionLoadState('error')
+    }
+  }
+
+  const setSessionPanelVisibility = (open: boolean): void => {
+    setSessionPanelOpen(open)
+    if (open) {
+      void loadSessions()
+      return
+    }
+    sessionLoadGeneration += 1
+    setSessionRows(null)
+    setSessionLoadError('')
+    setSessionRevokeError('')
+    setSessionLoadState('idle')
+  }
+
+  const canRevokeOthers = (): boolean => sessionLoadState() === 'loaded'
+    && (sessionRows()?.length ?? 0) >= 2
+    && Boolean(sessionStorage.refresh)
+    && !revokingOthers()
+    && sessionLoadState() !== 'loading'
+
+  const revokeOtherSessions = async (): Promise<void> => {
+    if (!canRevokeOthers() || !sessionPanelOpen()) return
+    if (!window.confirm('确定退出除当前设备外的所有登录会话吗？当前设备将保持登录。')) return
+    const refreshToken = sessionStorage.refresh
+    if (!refreshToken) {
+      setSessionRevokeError('无法读取当前登录凭据，请重新打开会话面板后重试。')
+      return
+    }
+    setSessionRevokeError('')
+    setRevokingOthers(true)
+    try {
+      await api.revokeOtherSessions(refreshToken)
+      if (!disposed && sessionPanelOpen()) await loadSessions()
+    } catch {
+      if (!disposed) setSessionRevokeError('退出其他设备失败，请稍后重试。')
+    } finally {
+      if (!disposed) setRevokingOthers(false)
     }
   }
 
@@ -256,6 +346,7 @@ export function ChatShell(props: ChatShellProps): JSX.Element {
   onCleanup(() => {
     disposed = true
     messageLoadGeneration += 1
+    sessionLoadGeneration += 1
     if (sendResetTimer !== undefined) window.clearTimeout(sendResetTimer)
     for (const off of unsubscribe) off()
     wsClient.close()
@@ -284,6 +375,51 @@ export function ChatShell(props: ChatShellProps): JSX.Element {
             {socketStatus() === 'online' ? '实时在线' : socketStatus() === 'connecting' ? '连接中' : '重连中'}
           </IrisBadge>
           <IrisAvatar name={props.participant.display_name ?? props.participant.email ?? 'A'} size={30} />
+          <IrisDialog open={sessionPanelOpen()} onOpenChange={setSessionPanelVisibility}>
+            <IrisDialogTrigger class="session-trigger">登录会话</IrisDialogTrigger>
+            <IrisDialogContent class="session-dialog">
+              <IrisDialogTitle>登录会话</IrisDialogTitle>
+              <IrisDialogDescription>查看当前账户的活跃登录设备。退出其他设备不会结束当前会话。</IrisDialogDescription>
+              <Show when={sessionRevokeError()}>
+                <div class="session-error" role="alert">{sessionRevokeError()}</div>
+              </Show>
+              <Show when={sessionLoadState() === 'loading'}>
+                <div class="session-state" role="status"><IrisSpinner size="sm" />正在加载登录会话…</div>
+              </Show>
+              <Show when={sessionLoadState() === 'error'}>
+                <div class="session-error" role="alert">
+                  <span>{sessionLoadError()}</span>
+                  <IrisButton class="session-retry" variant="outline" size="sm" onClick={() => void loadSessions()}>
+                    重试
+                  </IrisButton>
+                </div>
+              </Show>
+              <Show when={sessionLoadState() === 'loaded'}>
+                <Show when={(sessionRows()?.length ?? 0) > 0} fallback={<p class="session-state">当前没有活跃登录会话。</p>}>
+                  <ul class="session-list">
+                    <For each={sessionRows() ?? []}>
+                      {(session) => (
+                        <li class="session-row">
+                          <strong>{session.user_agent?.trim() || '未记录设备信息'}</strong>
+                          <span>最近活动：<time datetime={session.last_seen_at}>{session.last_seen_at}</time></span>
+                        </li>
+                      )}
+                    </For>
+                  </ul>
+                </Show>
+              </Show>
+              <div class="session-actions">
+                <IrisButton
+                  variant="outline"
+                  disabled={!canRevokeOthers() || sessionLoadState() === 'loading' || revokingOthers()}
+                  onClick={() => void revokeOtherSessions()}
+                >
+                  {revokingOthers() ? '正在退出其他设备…' : '退出其他设备'}
+                </IrisButton>
+                <IrisDialogClose class="session-close">关闭</IrisDialogClose>
+              </div>
+            </IrisDialogContent>
+          </IrisDialog>
           <IrisButton variant="ghost" size="sm" onClick={() => void props.onLogout()}>
             退出
           </IrisButton>

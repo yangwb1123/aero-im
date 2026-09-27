@@ -5,6 +5,8 @@ import { ChatShell } from '../src/ChatShell'
 
 const mockApi = vi.hoisted(() => ({
   listRooms: vi.fn(),
+  listSessions: vi.fn(),
+  revokeOtherSessions: vi.fn(),
   createRoom: vi.fn(),
   listMessages: vi.fn(),
   listCanvases: vi.fn(),
@@ -15,6 +17,8 @@ const mockApi = vi.hoisted(() => ({
   refresh: vi.fn(),
 }))
 
+const mockSession = vi.hoisted(() => ({ refresh: null as string | null, clear: vi.fn() }))
+
 vi.mock('../src/api', () => ({
   api: mockApi,
   messageText: (message: { blocks?: Array<{ type?: string; content?: string }> }) => (
@@ -22,10 +26,10 @@ vi.mock('../src/api', () => ({
   ),
   sessionStorage: {
     get token() { return 'test-access-token' },
-    get refresh() { return null },
+    get refresh() { return mockSession.refresh },
     get participantId() { return 'participant-1' },
     set() {},
-    clear() {},
+    clear: mockSession.clear,
   },
 }))
 
@@ -92,6 +96,22 @@ function canvas(id: string, title: string, content: string) {
   }
 }
 
+function authSession(
+  id: string,
+  userAgent: string | null = 'Firefox on Linux',
+  lastSeen = '2026-05-01T12:34:56Z',
+) {
+  return {
+    id,
+    participant_id: participant.id,
+    token_prefix: `prefix-${id}`,
+    user_agent: userAgent,
+    created_at: '2026-04-01T12:00:00Z',
+    last_seen_at: lastSeen,
+    revoked_at: null,
+  }
+}
+
 function message(id: string, roomId: string, text: string) {
   return {
     id,
@@ -127,10 +147,10 @@ function submit(selector: string, root = document): void {
   form.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }))
 }
 
-function mountChat(): { container: HTMLElement; unmount: () => void } {
+function mountChat(onLogout: () => Promise<void> = async () => {}): { container: HTMLElement; unmount: () => void } {
   const container = document.createElement('div')
   document.body.appendChild(container)
-  const dispose = render(() => <ChatShell participant={participant} onLogout={async () => {}} />, container)
+  const dispose = render(() => <ChatShell participant={participant} onLogout={onLogout} />, container)
   return {
     container,
     unmount: () => {
@@ -152,6 +172,10 @@ describe('ChatShell collaborative Canvas integration', () => {
     FakeWebSocket.instances = []
     globalThis.WebSocket = FakeWebSocket as unknown as typeof WebSocket
     mockApi.listRooms.mockResolvedValue([roomA])
+    mockApi.listSessions.mockResolvedValue([])
+    mockApi.revokeOtherSessions.mockResolvedValue({ revoked_count: 1 })
+    mockSession.refresh = null
+    mockSession.clear.mockClear()
     mockApi.listMessages.mockResolvedValue([])
     mockApi.listCanvases.mockResolvedValue([canvas('canvas-1', 'Planning', 'Initial text')])
     mockApi.createCanvas.mockResolvedValue(canvas('canvas-2', 'New board', 'New text'))
@@ -327,6 +351,7 @@ describe('ChatShell collaborative Canvas integration', () => {
   it('merges live room events with deferred history and ignores stale room responses', async () => {
     mockApi.listRooms.mockResolvedValue([roomA, roomB])
     let resolveOldHistory!: (rows: ReturnType<typeof message>[]) => void
+    let resolveCurrentHistory!: (rows: ReturnType<typeof message>[]) => void
     let roomACalls = 0
     mockApi.listMessages.mockImplementation((roomId: string) => {
       if (roomId === 'room-a') {
@@ -334,7 +359,7 @@ describe('ChatShell collaborative Canvas integration', () => {
         if (roomACalls === 1) {
           return new Promise((resolve) => { resolveOldHistory = resolve })
         }
-        return Promise.resolve([])
+        return new Promise((resolve) => { resolveCurrentHistory = resolve })
       }
       return Promise.resolve([message('history-b', 'room-b', 'Room B history')])
     })
@@ -358,9 +383,149 @@ describe('ChatShell collaborative Canvas integration', () => {
     expect(mounted.container.textContent).not.toContain('Late room A history')
 
     mounted.container.querySelectorAll<HTMLButtonElement>('.room-item')[0].click()
-    await waitFor(() => mounted!.container.textContent?.includes('Live room A message') === true, 'merged live state after room switch')
+    await waitFor(() => roomACalls === 2, 'current room A history')
+    socket.message({
+      type: 'message',
+      seq: 34,
+      delivery_ordinal: 2,
+      message: message('live-a-2', 'room-a', 'Second live room A message'),
+    })
+    resolveCurrentHistory([message('history-a', 'room-a', 'Room A history')])
+    await waitFor(() => mounted!.container.textContent?.includes('Room A history') === true, 'Room A history merge')
+    expect(mounted.container.textContent).toContain('Live room A message')
+    expect(mounted.container.textContent).toContain('Second live room A message')
     expect(mounted.container.textContent).not.toContain('Late room A history')
     expect(FakeWebSocket.instances).toHaveLength(1)
+  })
+
+  it('loads login sessions and shows device/activity details without enabling one-session revocation', async () => {
+    mockSession.refresh = 'stored-refresh-secret'
+    let resolveSessions!: (rows: ReturnType<typeof authSession>[]) => void
+    mockApi.listSessions.mockImplementationOnce(() => new Promise((resolve) => {
+      resolveSessions = resolve
+    }))
+    mounted = mountChat()
+    mounted.container.querySelector<HTMLButtonElement>('.session-trigger')!.click()
+    await waitFor(() => mockApi.listSessions.mock.calls.length === 1, 'session list request')
+
+    const dialog = document.body.querySelector<HTMLElement>('.session-dialog')!
+    expect(dialog.textContent).toContain('正在加载登录会话')
+    const revokeButton = [...dialog.querySelectorAll<HTMLButtonElement>('button')]
+      .find((button) => button.textContent?.includes('退出其他设备'))
+    expect(revokeButton?.disabled).toBe(true)
+
+    resolveSessions([authSession('session-current', null, '2026-05-02T08:09:10Z')])
+    await waitFor(() => dialog.textContent?.includes('未记录设备信息') === true, 'session details')
+    expect(dialog.textContent).toContain('最近活动：2026-05-02T08:09:10Z')
+    expect(revokeButton?.disabled).toBe(true)
+    expect(dialog.textContent).not.toContain('prefix-session-current')
+  })
+
+  it('distinguishes session load errors from empty results, retries, and rejects invalid responses', async () => {
+    mockApi.listSessions
+      .mockRejectedValueOnce(new Error('offline'))
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce({ sessions: [] })
+    mounted = mountChat()
+    mounted.container.querySelector<HTMLButtonElement>('.session-trigger')!.click()
+    await waitFor(() => mockApi.listSessions.mock.calls.length === 1, 'initial session load')
+    await waitFor(() => document.body.querySelector('.session-error') !== null, 'session load error')
+    expect(document.body.textContent).not.toContain('当前没有活跃登录会话')
+
+    document.body.querySelector<HTMLButtonElement>('.session-retry')!.click()
+    await waitFor(() => mockApi.listSessions.mock.calls.length === 2, 'session load retry')
+    await waitFor(() => document.body.textContent?.includes('当前没有活跃登录会话') === true, 'valid empty sessions')
+    expect(document.body.querySelector('.session-error')).toBeNull()
+
+    document.body.querySelector<HTMLButtonElement>('.session-close')!.click()
+    mounted.container.querySelector<HTMLButtonElement>('.session-trigger')!.click()
+    await waitFor(() => mockApi.listSessions.mock.calls.length === 3, 'invalid session response')
+    await waitFor(() => document.body.querySelector('.session-error') !== null, 'invalid response error')
+    expect(document.body.textContent).not.toContain('当前没有活跃登录会话')
+  })
+
+  it('requires a refresh token and at least two loaded sessions to enable revoking others', async () => {
+    mockApi.listSessions
+      .mockResolvedValueOnce([authSession('one'), authSession('two')])
+      .mockResolvedValueOnce([authSession('only-one')])
+    mounted = mountChat()
+    mounted.container.querySelector<HTMLButtonElement>('.session-trigger')!.click()
+    await waitFor(() => document.body.querySelectorAll('.session-row').length === 2, 'two sessions')
+    let revokeButton = [...document.body.querySelectorAll<HTMLButtonElement>('button')]
+      .find((button) => button.textContent?.includes('退出其他设备'))!
+    expect(revokeButton.disabled).toBe(true)
+
+    document.body.querySelector<HTMLButtonElement>('.session-close')!.click()
+    mockSession.refresh = 'available-refresh-secret'
+    mounted.container.querySelector<HTMLButtonElement>('.session-trigger')!.click()
+    await waitFor(() => mockApi.listSessions.mock.calls.length === 2, 'one-session reload')
+    await waitFor(() => document.body.querySelectorAll('.session-row').length === 1, 'single session')
+    revokeButton = [...document.body.querySelectorAll<HTMLButtonElement>('button')]
+      .find((button) => button.textContent?.includes('退出其他设备'))!
+    expect(revokeButton.disabled).toBe(true)
+    expect(mockApi.revokeOtherSessions).not.toHaveBeenCalled()
+  })
+
+  it('waits for confirmation, sends the refresh token only to the API, and reloads sessions', async () => {
+    const refreshToken = 'current-refresh-secret-not-for-display'
+    mockSession.refresh = refreshToken
+    mockApi.listSessions
+      .mockResolvedValueOnce([authSession('current'), authSession('other')])
+      .mockResolvedValueOnce([authSession('current')])
+    const onLogout = vi.fn(async () => {})
+    mounted = mountChat(onLogout)
+    window.confirm = vi.fn(() => false)
+    mounted.container.querySelector<HTMLButtonElement>('.session-trigger')!.click()
+    await waitFor(() => document.body.querySelectorAll('.session-row').length === 2, 'loaded sessions')
+    const revokeButton = [...document.body.querySelectorAll<HTMLButtonElement>('button')]
+      .find((button) => button.textContent?.includes('退出其他设备'))!
+    revokeButton.click()
+    expect(window.confirm).toHaveBeenCalledTimes(1)
+    expect(mockApi.revokeOtherSessions).not.toHaveBeenCalled()
+
+    window.confirm = vi.fn(() => true)
+    revokeButton.click()
+    await waitFor(() => mockApi.revokeOtherSessions.mock.calls.length === 1, 'session revocation')
+    expect(mockApi.revokeOtherSessions).toHaveBeenCalledWith(refreshToken)
+    await waitFor(() => mockApi.listSessions.mock.calls.length === 2, 'session list refresh')
+    await waitFor(() => document.body.querySelectorAll('.session-row').length === 1, 'refreshed active session')
+    expect(document.body.textContent).not.toContain(refreshToken)
+    expect(document.body.innerHTML).not.toContain(refreshToken)
+    expect(onLogout).not.toHaveBeenCalled()
+    expect(mockSession.clear).not.toHaveBeenCalled()
+  })
+
+  it('prevents duplicate revocations and allows retry after a failed request without logging out', async () => {
+    mockSession.refresh = 'current-refresh-for-retry'
+    mockApi.listSessions.mockResolvedValue([authSession('current'), authSession('other')])
+    let rejectRevocation!: (reason: Error) => void
+    mockApi.revokeOtherSessions
+      .mockImplementationOnce(() => new Promise((_resolve, reject) => { rejectRevocation = reject }))
+      .mockResolvedValueOnce({ revoked_count: 1 })
+    const onLogout = vi.fn(async () => {})
+    mounted = mountChat(onLogout)
+    window.confirm = vi.fn(() => true)
+    mounted.container.querySelector<HTMLButtonElement>('.session-trigger')!.click()
+    await waitFor(() => document.body.querySelectorAll('.session-row').length === 2, 'loaded sessions')
+    let revokeButton = [...document.body.querySelectorAll<HTMLButtonElement>('button')]
+      .find((button) => button.textContent?.includes('退出其他设备'))!
+    revokeButton.click()
+    await waitFor(() => mockApi.revokeOtherSessions.mock.calls.length === 1, 'first revocation')
+    expect(revokeButton.disabled).toBe(true)
+    revokeButton.click()
+    expect(mockApi.revokeOtherSessions).toHaveBeenCalledTimes(1)
+
+    rejectRevocation(new Error('request failed'))
+    await waitFor(() => document.body.textContent?.includes('退出其他设备失败') === true, 'revocation error')
+    revokeButton = [...document.body.querySelectorAll<HTMLButtonElement>('button')]
+      .find((button) => button.textContent?.includes('退出其他设备'))!
+    expect(revokeButton.disabled).toBe(false)
+    revokeButton.click()
+    await waitFor(() => mockApi.revokeOtherSessions.mock.calls.length === 2, 'revocation retry')
+    await waitFor(() => mockApi.listSessions.mock.calls.length === 2, 'post-revocation reload')
+    expect(mockApi.revokeOtherSessions).toHaveBeenNthCalledWith(2, 'current-refresh-for-retry')
+    expect(onLogout).not.toHaveBeenCalled()
+    expect(mockSession.clear).not.toHaveBeenCalled()
   })
 
   it('ignores a Canvas list response from a previous close/reopen cycle', async () => {

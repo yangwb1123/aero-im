@@ -11,6 +11,20 @@ export interface SessionResponse {
   participant: Participant
 }
 
+export interface AuthSession {
+  id: string
+  participant_id: string
+  token_prefix: string
+  user_agent?: string | null
+  created_at: string
+  last_seen_at: string
+  revoked_at?: string | null
+}
+
+export interface RevokeOtherSessionsResponse {
+  revoked_count: number
+}
+
 export interface Room {
   id: string
   name?: string | null
@@ -171,6 +185,16 @@ export const api = {
     return request('POST', '/api/auth/logout', {
       body: { refresh_token: refresh ?? '' },
       authenticated: false,
+    })
+  },
+
+  listSessions(): Promise<AuthSession[]> {
+    return request<AuthSession[]>('GET', '/api/auth/sessions')
+  },
+
+  revokeOtherSessions(currentRefreshToken: string): Promise<RevokeOtherSessionsResponse> {
+    return request<RevokeOtherSessionsResponse>('POST', '/api/auth/sessions/revoke-others', {
+      body: { current_refresh_token: currentRefreshToken },
     })
   },
 

@@ -11,10 +11,10 @@ async function loadSolidApi() {
   return import(url);
 }
 
-function response(body = {}) {
+function response(body = {}, { ok = true, status = 200 } = {}) {
   return {
-    ok: true,
-    status: 200,
+    ok,
+    status,
     headers: { get: () => 'application/json' },
     json: async () => body,
   };
@@ -60,6 +60,70 @@ test('Solid Canvas API adapter encodes room-scoped requests and bodies', async (
     });
     assert.equal(requests[4].init.headers.Authorization, 'Bearer solid-access-token');
     assert.ok(requests.every(({ url }) => url.includes('/rooms/')));
+  } finally {
+    globalThis.fetch = previousFetch;
+    if (previousWindow === undefined) delete globalThis.window;
+    else Object.defineProperty(globalThis, 'window', previousWindow);
+  }
+});
+
+test('Solid session APIs use access-token auth and send refresh only in the confirmed-request body', async () => {
+  const previousWindow = Object.getOwnPropertyDescriptor(globalThis, 'window');
+  const previousFetch = globalThis.fetch;
+  const storage = new Map([
+    ['aero_token', 'solid-access-token'],
+    ['aero_refresh', 'current-refresh-secret'],
+  ]);
+  const requests = [];
+  Object.defineProperty(globalThis, 'window', {
+    configurable: true,
+    value: { localStorage: { getItem: (key) => storage.get(key) ?? null } },
+  });
+  globalThis.fetch = async (url, init) => {
+    requests.push({ url: String(url), init });
+    return response(requests.length === 1 ? [] : { revoked_count: 2 });
+  };
+
+  try {
+    const { api } = await loadSolidApi();
+    await api.listSessions();
+    await api.revokeOtherSessions('current-refresh-secret');
+
+    assert.deepEqual(requests.map(({ url, init }) => [init.method, url]), [
+      ['GET', '/api/auth/sessions'],
+      ['POST', '/api/auth/sessions/revoke-others'],
+    ]);
+    assert.equal(requests[0].init.body, undefined, 'GET must not send a body');
+    assert.equal(requests[0].init.headers.Authorization, 'Bearer solid-access-token');
+    assert.equal(requests[1].init.headers.Authorization, 'Bearer solid-access-token');
+    assert.deepEqual(JSON.parse(requests[1].init.body), {
+      current_refresh_token: 'current-refresh-secret',
+    });
+    assert.ok(requests.every(({ url, init }) => (
+      !url.includes('current-refresh-secret')
+      && init.headers.Authorization !== 'Bearer current-refresh-secret'
+    )));
+  } finally {
+    globalThis.fetch = previousFetch;
+    if (previousWindow === undefined) delete globalThis.window;
+    else Object.defineProperty(globalThis, 'window', previousWindow);
+  }
+});
+
+test('Solid session API preserves ApiError details for an unauthorized response', async () => {
+  const previousWindow = Object.getOwnPropertyDescriptor(globalThis, 'window');
+  const previousFetch = globalThis.fetch;
+  Object.defineProperty(globalThis, 'window', {
+    configurable: true,
+    value: { localStorage: { getItem: () => 'solid-access-token' } },
+  });
+  globalThis.fetch = async () => response({ msg: 'not authorized' }, { ok: false, status: 401 });
+
+  try {
+    const { ApiError, api } = await loadSolidApi();
+    await assert.rejects(api.listSessions(), (error) => (
+      error instanceof ApiError && error.status === 401 && error.message === 'not authorized'
+    ));
   } finally {
     globalThis.fetch = previousFetch;
     if (previousWindow === undefined) delete globalThis.window;

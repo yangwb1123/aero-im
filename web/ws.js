@@ -398,13 +398,15 @@ export class WsClient {
 
   _fenceFailedApplication(msg) {
     const roomId = msg?.room_id || msg?.message?.room_id || msg?.event?.room_id;
-    if (typeof roomId !== 'string' || !roomId) return;
-    this._deliveryFailedRooms.add(roomId);
-    this._preReadyDeliveryAcks.delete(roomId);
-    this._pendingDeliveryAcks.delete(roomId);
-    this._pausedDeliveryAcks.delete(roomId);
-    // Reconnect from the unchanged durable cursor so this exact frame is
-    // replayed after the application recovers.
+    if (typeof roomId === 'string' && roomId) {
+      this._deliveryFailedRooms.add(roomId);
+      this._preReadyDeliveryAcks.delete(roomId);
+      this._pendingDeliveryAcks.delete(roomId);
+      this._pausedDeliveryAcks.delete(roomId);
+    }
+    // Fence before ACK validation can return for an invalid seq or missing
+    // room. If the frame has no room identity, closing is still required so
+    // the failed application is retried instead of silently consumed.
     try { this.ws?.close(1011, 'message application failed'); } catch { /* close event retries */ }
   }
 

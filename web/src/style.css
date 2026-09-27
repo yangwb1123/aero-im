@@ -743,3 +743,73 @@ textarea {
     padding: 16px 0 0;
   }
 }
+
+.session-trigger,
+.session-close {
+  min-height: 36px;
+  border: 1px solid var(--iris-border);
+  border-radius: var(--iris-radius-md, 8px);
+  padding: 7px 11px;
+  background: transparent;
+  color: var(--iris-foreground);
+  cursor: pointer;
+}
+
+.session-trigger:hover,
+.session-close:hover {
+  border-color: var(--iris-primary);
+}
+
+.session-dialog {
+  width: min(520px, 100%);
+}
+
+.session-state {
+  display: flex;
+  min-height: 64px;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  margin: 0;
+  color: var(--iris-muted);
+}
+
+.session-list {
+  display: grid;
+  gap: 10px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.session-row {
+  display: grid;
+  gap: 6px;
+  border: 1px solid var(--iris-border);
+  border-radius: var(--iris-radius-md, 8px);
+  padding: 12px;
+  overflow-wrap: anywhere;
+}
+
+.session-row span {
+  color: var(--iris-muted);
+  font-size: 13px;
+}
+
+.session-error,
+.session-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.session-error {
+  margin: 8px 0;
+  color: var(--iris-danger);
+}
+
+.session-actions {
+  justify-content: flex-end;
+  margin-top: 18px;
+}
