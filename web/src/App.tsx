@@ -56,7 +56,8 @@ function AuthScreen(props: { onSuccess: (session: SessionResponse) => void }): J
 
   return (
     <main class="auth-page">
-      <IrisCard class="auth-card" padding="lg">
+      <div class="auth-card">
+        <IrisCard padding="lg">
         <div class="brand-lockup">
           <div class="brand-mark">A</div>
           <div>
@@ -89,7 +90,7 @@ function AuthScreen(props: { onSuccess: (session: SessionResponse) => void }): J
               value={email()}
               required
               autocomplete="email"
-              onInput={(event) => setEmail(event.currentTarget.value)}
+              onInput={(event: InputEvent & { currentTarget: HTMLInputElement }) => setEmail(event.currentTarget.value)}
             />
           </IrisFormField>
 
@@ -100,7 +101,7 @@ function AuthScreen(props: { onSuccess: (session: SessionResponse) => void }): J
                 required
                 maxlength={64}
                 autocomplete="nickname"
-                onInput={(event) => setDisplayName(event.currentTarget.value)}
+                onInput={(event: InputEvent & { currentTarget: HTMLInputElement }) => setDisplayName(event.currentTarget.value)}
               />
             </IrisFormField>
           </Show>
@@ -112,7 +113,7 @@ function AuthScreen(props: { onSuccess: (session: SessionResponse) => void }): J
               required
               minlength={6}
               autocomplete={mode() === 'login' ? 'current-password' : 'new-password'}
-              onInput={(event) => setPassword(event.currentTarget.value)}
+              onInput={(event: InputEvent & { currentTarget: HTMLInputElement }) => setPassword(event.currentTarget.value)}
             />
           </IrisFormField>
 
@@ -122,7 +123,7 @@ function AuthScreen(props: { onSuccess: (session: SessionResponse) => void }): J
                 value={secondFactor()}
                 autocomplete="one-time-code"
                 placeholder="可选"
-                onInput={(event) => setSecondFactor(event.currentTarget.value)}
+                onInput={(event: InputEvent & { currentTarget: HTMLInputElement }) => setSecondFactor(event.currentTarget.value)}
               />
             </IrisFormField>
           </Show>
@@ -137,7 +138,8 @@ function AuthScreen(props: { onSuccess: (session: SessionResponse) => void }): J
             </Show>
           </IrisButton>
         </form>
-      </IrisCard>
+        </IrisCard>
+      </div>
     </main>
   )
 }

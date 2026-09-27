@@ -469,6 +469,13 @@ test('cursor mode acknowledges seq-less backfill after the ready barrier', () =>
         }),
       });
     }
+    socket.emit('message', {
+      data: JSON.stringify({
+        type: 'message',
+        delivery_ordinal: 8,
+        message: { id: 'unlisted-message', room_id: 'room-b' },
+      }),
+    });
     assert.deepEqual(socket.frames, [], 'backfill cannot ACK before its barrier');
     socket.emit('message', {
       data: JSON.stringify({
@@ -484,6 +491,8 @@ test('cursor mode acknowledges seq-less backfill after the ready barrier', () =>
       delivery_ordinal: 5,
       seq: 0,
     }]);
+    assert.equal(storage.values.get('aero_delivery_cursors_v1:participant-a')
+      ?.includes('room-b'), false, 'pre-ready messages outside the barrier are not persisted');
     client.close();
   } finally {
     if (previousWebSocket === undefined) delete globalThis.WebSocket;
@@ -525,7 +534,10 @@ test('a reloaded account restores only its own cursor and keeps legacy since fal
       }),
     });
     sockets[0].emit('message', {
-      data: JSON.stringify({ type: 'delivery_ready', rooms: [] }),
+      data: JSON.stringify({
+        type: 'delivery_ready',
+        rooms: [{ room_id: 'room-a', delivery_ordinal: 10 }],
+      }),
     });
     sockets[0].emit('message', {
       data: JSON.stringify({
@@ -548,7 +560,10 @@ test('a reloaded account restores only its own cursor and keeps legacy since fal
       }),
     });
     ownSocket.emit('message', {
-      data: JSON.stringify({ type: 'delivery_ready', rooms: [] }),
+      data: JSON.stringify({
+        type: 'delivery_ready',
+        rooms: [{ room_id: 'room-a', delivery_ordinal: 11 }],
+      }),
     });
     assert.deepEqual(ownSocket.frames, [{
       type: 'delivery_ack',
@@ -579,8 +594,38 @@ test('a reloaded account restores only its own cursor and keeps legacy since fal
     other._open();
     assert.match(sockets[3].url, /[?&]cursors=1(?:&|$)/);
     assert.match(sockets[3].url, /[?&]since=message-global(?:&|$)/);
+
+    const unauthorized = new WsClient({ cursorStorage: storage });
+    unauthorized.connect('token-a', 'participant-a');
+    const unauthorizedSocket = sockets[4];
+    unauthorizedSocket.emit('message', {
+      data: JSON.stringify({
+        type: 'welcome', participant: 'participant-a',
+        capabilities: ['delivery_cursor_v2'],
+      }),
+    });
+    unauthorizedSocket.emit('message', {
+      data: JSON.stringify({ type: 'delivery_ready', rooms: [] }),
+    });
+    assert.deepEqual(unauthorizedSocket.frames, [], 'saved cursors outside the barrier are not restored');
+
+    const malformed = new WsClient({ cursorStorage: storage });
+    malformed.connect('token-a', 'participant-a');
+    const malformedSocket = sockets[5];
+    malformedSocket.emit('message', {
+      data: JSON.stringify({
+        type: 'welcome', participant: 'participant-a',
+        capabilities: ['delivery_cursor_v2'],
+      }),
+    });
+    malformedSocket.emit('message', {
+      data: JSON.stringify({ type: 'delivery_ready', rooms: {} }),
+    });
+    assert.deepEqual(malformedSocket.frames, [], 'a malformed barrier fails closed');
     reloaded.close();
     other.close();
+    unauthorized.close();
+    malformed.close();
   } finally {
     if (previousWebSocket === undefined) delete globalThis.WebSocket;
     else globalThis.WebSocket = previousWebSocket;
@@ -625,19 +670,37 @@ test('a throwing message handler neither advances nor ACKs and forces replay', (
       }),
     });
     socket.emit('message', {
-      data: JSON.stringify({ type: 'delivery_ready', rooms: [] }),
+      data: JSON.stringify({
+        type: 'delivery_ready',
+        rooms: [{ room_id: 'room-a', delivery_ordinal: 0 }],
+      }),
+    });
+    client._pendingDeliveryAcks.set('room-a', {
+      room_id: 'room-a', message_id: 'stale', delivery_ordinal: 1, seq: 1,
+    });
+    client._preReadyDeliveryAcks.set('room-a', {
+      room_id: 'room-a', message_id: 'stale', delivery_ordinal: 1, seq: 1,
+    });
+    client._pausedDeliveryAcks.set('room-a', {
+      room_id: 'room-a', message_id: 'stale', delivery_ordinal: 1, seq: 1,
     });
     socket.emit('message', {
       data: JSON.stringify({
         type: 'message',
-        seq: 1,
+        seq: 0,
         delivery_ordinal: 1,
-        message: { id: 'message-1', room_id: 'room-a' },
+        room_id: 'room-a',
+        message: { id: 'message-1' },
       }),
     });
     client._flushDeliveryAcks();
 
     assert.deepEqual(socket.frames, []);
+    assert.equal(client._deliveryFailedRooms.has('room-a'), true);
+    assert.equal(client._pendingDeliveryAcks.has('room-a'), false);
+    assert.equal(client._preReadyDeliveryAcks.has('room-a'), false);
+    assert.equal(client._pausedDeliveryAcks.has('room-a'), false);
+    assert.equal(client._seqGate.scopes.has('r:room-a'), false);
     assert.equal(storage.values.size, 0);
     assert.equal(client._lastSeen, null, 'legacy fallback must not skip rejected content');
     assert.deepEqual(socket.closes, [{
@@ -687,7 +750,10 @@ test('application catch-up pauses durable ACKs and commits only on success', () 
       }),
     });
     socket.emit('message', {
-      data: JSON.stringify({ type: 'delivery_ready', rooms: [] }),
+      data: JSON.stringify({
+        type: 'delivery_ready',
+        rooms: [{ room_id: 'room-a', delivery_ordinal: 0 }],
+      }),
     });
 
     const complete = client.pauseDeliveryAcks();
@@ -783,7 +849,10 @@ test('stale account-A socket callbacks cannot contaminate account B', () => {
       }),
     });
     current.emit('message', {
-      data: JSON.stringify({ type: 'delivery_ready', rooms: [] }),
+      data: JSON.stringify({
+        type: 'delivery_ready',
+        rooms: [{ room_id: 'room-b', delivery_ordinal: 0 }],
+      }),
     });
 
     old.emit('message', {

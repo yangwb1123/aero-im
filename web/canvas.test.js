@@ -44,6 +44,30 @@ test('normalization prefers durable op_seq and duplicate WS echo is idempotent',
   assert.deepEqual(reducer.blocks, [{ type: 'text', content: 'after' }]);
 });
 
+test('a missing live op_seq queues without using the room bus seq as the document cursor', () => {
+  const reducer = new CanvasReducer({ id: 'canvas-1', blocks: [] });
+  const liveFrame = {
+    type: 'canvas_op',
+    room_id: 'room-1',
+    canvas_id: 'canvas-1',
+    op_id: 'op-1',
+    seq: 9876,
+    op: { type: 'set_text', text: 'durable' },
+  };
+  assert.equal(normalizeCanvasOp(liveFrame), null);
+  assert.deepEqual(reducer.ingest(liveFrame), { status: 'queued', applied: [], gap: true });
+  assert.equal(reducer.cursor, 0);
+  assert.equal(reducer.snapshot().pending_unsequenced, 1);
+
+  const restored = reducer.ingest(row(1, { type: 'set_text', text: 'durable' }, 'op-1'));
+  assert.equal(restored.status, 'applied');
+  assert.equal(reducer.cursor, 1);
+  assert.equal(reducer.snapshot().pending_unsequenced, 0);
+  assert.equal(reducer.ingest(liveFrame).status, 'duplicate');
+  assert.equal(reducer.snapshot().pending_unsequenced, 0);
+  assert.deepEqual(reducer.blocks, [{ type: 'text', content: 'durable' }]);
+});
+
 test('out-of-order operations queue at a gap and drain strictly by op_seq', () => {
   const reducer = new CanvasReducer({ id: 'canvas-1', version: 0, blocks: [] });
 
@@ -67,6 +91,16 @@ test('out-of-order operations queue at a gap and drain strictly by op_seq', () =
   assert.equal(filled.gap, false);
   assert.equal(reducer.cursor, 3);
   assert.deepEqual(reducer.blocks.map((block) => block.content), ['first', 'second', 'third']);
+});
+
+test('unsupported operations still advance the durable cursor and remain visible', () => {
+  const reducer = new CanvasReducer({ id: 'canvas-1', blocks: [] });
+  assert.equal(reducer.ingest(row(1, { type: 'future_operation', value: 1 })).status, 'applied');
+  assert.equal(reducer.cursor, 1);
+  assert.equal(reducer.snapshot().unknown_ops, 1);
+  assert.equal(reducer.ingest(row(2, { type: 'set_text', text: 'continued' })).status, 'applied');
+  assert.equal(reducer.cursor, 2);
+  assert.equal(reducer.blocks[0].content, 'continued');
 });
 
 test('supported block operations replay deterministically without duplicate notes', () => {

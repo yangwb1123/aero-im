@@ -20,10 +20,15 @@ import {
 import {
   api,
   messageText,
+  sessionStorage,
   type Message,
   type Participant,
   type Room,
 } from './api'
+import { CanvasPanel } from './CanvasPanel'
+import { mergeRoomMessages } from './room_state'
+import { WsClient } from '../ws.js'
+import { refreshWsAccessToken } from '../ws_auth.js'
 
 interface ChatShellProps {
   participant: Participant
@@ -60,18 +65,11 @@ function messageTime(value?: string): string {
     : date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
 }
 
-function appendUnique(list: Message[], next: Message): Message[] {
-  const index = list.findIndex((item) => item.id === next.id)
-  if (index < 0) return [...list, next]
-  const copy = list.slice()
-  copy[index] = next
-  return copy
-}
-
 export function ChatShell(props: ChatShellProps): JSX.Element {
   const [rooms, setRooms] = createSignal<Room[]>([])
   const [currentRoomId, setCurrentRoomId] = createSignal('')
-  const [messages, setMessages] = createSignal<Message[]>([])
+  const [messagesByRoom, setMessagesByRoom] = createSignal<Record<string, Message[]>>({})
+  const messages = (): Message[] => messagesByRoom()[currentRoomId()] ?? []
   const [online, setOnline] = createSignal<string[]>([])
   const [draft, setDraft] = createSignal('')
   const [newRoomName, setNewRoomName] = createSignal('')
@@ -82,23 +80,18 @@ export function ChatShell(props: ChatShellProps): JSX.Element {
   const [socketStatus, setSocketStatus] = createSignal<SocketStatus>('connecting')
   const [error, setError] = createSignal('')
   const [showNewRoom, setShowNewRoom] = createSignal(false)
-  let socket: WebSocket | undefined
-  let reconnectTimer: number | undefined
-  let reconnectAttempt = 0
-  let stopped = false
+  const wsClient = new WsClient()
+  const unsubscribe: Array<() => void> = []
+  let messageLoadGeneration = 0
 
   const selectedRoom = (): Room | undefined =>
     rooms().find((room) => room.id === currentRoomId())
 
-  const sendFrame = (frame: Record<string, unknown>): boolean => {
-    if (!socket || socket.readyState !== WebSocket.OPEN) return false
-    socket.send(JSON.stringify(frame))
-    return true
-  }
+  const sendFrame = (frame: Record<string, unknown>): boolean => wsClient.send(frame)
 
   const joinCurrentRoom = (): void => {
     const roomId = currentRoomId()
-    if (roomId) sendFrame({ type: 'join_room', room_id: roomId })
+    if (roomId) wsClient.joinRoom(roomId)
   }
 
   const loadRooms = async (): Promise<void> => {
@@ -115,36 +108,54 @@ export function ChatShell(props: ChatShellProps): JSX.Element {
   }
 
   const loadMessages = async (roomId: string): Promise<void> => {
+    const generation = ++messageLoadGeneration
     setLoadingMessages(true)
     setError('')
+    wsClient.joinRoom(roomId)
     try {
       const result = await api.listMessages(roomId)
-      const normalized = Array.isArray(result) ? result.slice() : []
-      normalized.sort((a, b) => (a.created_at ?? '').localeCompare(b.created_at ?? ''))
-      setMessages(normalized)
+      if (generation !== messageLoadGeneration || roomId !== currentRoomId()) return
+      const history = Array.isArray(result) ? result.slice() : []
+      history.sort((a, b) => (a.created_at ?? '').localeCompare(b.created_at ?? ''))
+      setMessagesByRoom((current) => ({
+        ...current,
+        [roomId]: mergeRoomMessages(history, current[roomId] ?? []),
+      }))
       setOnline([])
-      sendFrame({ type: 'join_room', room_id: roomId })
     } catch (reason) {
+      if (generation !== messageLoadGeneration || roomId !== currentRoomId()) return
       setError(reason instanceof Error ? reason.message : '消息加载失败')
-      setMessages([])
     } finally {
-      setLoadingMessages(false)
+      if (generation === messageLoadGeneration && roomId === currentRoomId()) {
+        setLoadingMessages(false)
+      }
     }
   }
 
   const handleFrame = (frame: ServerFrame): void => {
-    if (frame.type === 'message' && frame.message?.room_id === currentRoomId()) {
-      setMessages((current) => appendUnique(current, frame.message!))
+    if (frame.type === 'message' && frame.message?.room_id) {
+      const roomId = frame.message.room_id
+      setMessagesByRoom((current) => ({
+        ...current,
+        [roomId]: mergeRoomMessages(current[roomId] ?? [], [frame.message!]),
+      }))
       return
     }
-    if (frame.type === 'edited' && frame.event?.room_id === currentRoomId()) {
-      setMessages((current) => appendUnique(current, frame.event!))
+    if (frame.type === 'edited' && frame.event?.room_id) {
+      const roomId = frame.event.room_id
+      setMessagesByRoom((current) => ({
+        ...current,
+        [roomId]: mergeRoomMessages(current[roomId] ?? [], [frame.event!]),
+      }))
       return
     }
-    if (frame.type === 'deleted' && frame.room_id === currentRoomId() && frame.id) {
-      setMessages((current) => current.map((message) => message.id === frame.id
-        ? { ...message, deleted_at: new Date().toISOString(), blocks: [] }
-        : message))
+    if (frame.type === 'deleted' && frame.room_id && frame.id) {
+      setMessagesByRoom((current) => ({
+        ...current,
+        [frame.room_id!]: (current[frame.room_id!] ?? []).map((message) => message.id === frame.id
+          ? { ...message, deleted_at: new Date().toISOString(), blocks: [] }
+          : message),
+      }))
       return
     }
     if (frame.type === 'presence' && frame.room_id === currentRoomId()) {
@@ -153,43 +164,26 @@ export function ChatShell(props: ChatShellProps): JSX.Element {
   }
 
   const connect = (): void => {
-    if (stopped || !sessionStorageToken()) return
-    setSocketStatus('connecting')
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-    const url = `${protocol}//${window.location.host}/ws?token=${encodeURIComponent(sessionStorageToken()!)}&cursors=1`
-    try {
-      socket = new WebSocket(url)
-    } catch {
-      scheduleReconnect()
-      return
+    const token = sessionStorage.token
+    if (!token) return
+    const auth = {
+      getRefresh: () => sessionStorage.refresh,
+      setSession: (access: string, refresh: string, participantId: string) => {
+        sessionStorage.set({
+          access_token: access,
+          refresh_token: refresh,
+          participant: { id: participantId },
+        })
+      },
     }
-    socket.addEventListener('open', () => {
-      reconnectAttempt = 0
-      setSocketStatus('online')
-      joinCurrentRoom()
+    setSocketStatus('connecting')
+    wsClient.connect(token, props.participant.id, {
+      refreshAccessToken: () => refreshWsAccessToken(
+        api,
+        auth,
+        { me: props.participant },
+      ),
     })
-    socket.addEventListener('message', (event) => {
-      try {
-        handleFrame(JSON.parse(event.data) as ServerFrame)
-      } catch {
-        setError('收到无法识别的实时消息')
-      }
-    })
-    socket.addEventListener('close', () => {
-      if (socket?.readyState !== WebSocket.OPEN) scheduleReconnect()
-    })
-    socket.addEventListener('error', () => setSocketStatus('offline'))
-  }
-
-  const scheduleReconnect = (): void => {
-    if (stopped || reconnectTimer !== undefined) return
-    setSocketStatus('offline')
-    const delay = Math.min(30_000, 1_000 * 2 ** reconnectAttempt)
-    reconnectAttempt = Math.min(reconnectAttempt + 1, 5)
-    reconnectTimer = window.setTimeout(() => {
-      reconnectTimer = undefined
-      connect()
-    }, delay)
   }
 
   const selectRoom = (roomId: string): void => {
@@ -230,19 +224,34 @@ export function ChatShell(props: ChatShellProps): JSX.Element {
   }
 
   onMount(() => {
+    unsubscribe.push(
+      wsClient.on('status', (status) => {
+        if (status === 'up') setSocketStatus('online')
+        else if (status === 'connecting' || status === 'wait') setSocketStatus('connecting')
+        else setSocketStatus('offline')
+      }),
+      wsClient.on('open', joinCurrentRoom),
+      wsClient.on('message', (frame) => handleFrame(frame as ServerFrame)),
+      wsClient.on('auth_expired', () => {
+        setSocketStatus('offline')
+        setError('登录已过期，请重新登录。')
+      }),
+    )
     void loadRooms()
     connect()
   })
 
   onCleanup(() => {
-    stopped = true
-    if (reconnectTimer !== undefined) window.clearTimeout(reconnectTimer)
-    socket?.close(1000, 'page closed')
+    for (const off of unsubscribe) off()
+    wsClient.close()
   })
 
   createEffect(() => {
     const roomId = currentRoomId()
-    if (roomId) void loadMessages(roomId)
+    if (roomId) {
+      setOnline([])
+      void loadMessages(roomId)
+    }
   })
 
   return (
@@ -284,7 +293,7 @@ export function ChatShell(props: ChatShellProps): JSX.Element {
                 value={newRoomName()}
                 maxlength={128}
                 placeholder="房间名称"
-                onInput={(event) => setNewRoomName(event.currentTarget.value)}
+                onInput={(event: InputEvent & { currentTarget: HTMLInputElement }) => setNewRoomName(event.currentTarget.value)}
               />
               <select value={newRoomKind()} onChange={(event) => setNewRoomKind(event.currentTarget.value as 'group' | 'channel')}>
                 <option value="group">群组</option>
@@ -334,6 +343,12 @@ export function ChatShell(props: ChatShellProps): JSX.Element {
                 <Show when={error()}>
                   <IrisAlert tone="danger" class="inline-alert">{error()}</IrisAlert>
                 </Show>
+
+                <CanvasPanel
+                  roomId={() => currentRoomId()}
+                  ws={wsClient}
+                  participantId={props.participant.id}
+                />
 
                 <section class="message-scroll" aria-live="polite">
                   <Show when={!loadingMessages()} fallback={<div class="empty-state"><IrisSpinner /></div>}>
@@ -402,8 +417,4 @@ export function ChatShell(props: ChatShellProps): JSX.Element {
       </div>
     </div>
   )
-}
-
-function sessionStorageToken(): string | null {
-  return window.localStorage.getItem('aero_token')
 }

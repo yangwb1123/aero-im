@@ -20,10 +20,11 @@ function opId(raw, canvasId, seq) {
 }
 
 // Durable REST rows carry `seq`; live WS frames carry both room-bus `seq` and
-// durable `op_seq`. Prefer op_seq whenever it exists.
+// durable `op_seq`. A room-scoped frame must never fall back to its bus seq.
 export function normalizeCanvasOp(raw) {
   if (!isRecord(raw) || !isRecord(raw.op)) return null;
-  const seq = Number(raw.op_seq ?? raw.seq);
+  const seqValue = raw.room_id != null ? raw.op_seq : (raw.op_seq ?? raw.seq);
+  const seq = Number(seqValue);
   const canvasId = String(raw.canvas_id ?? '');
   if (!canvasId || !Number.isSafeInteger(seq) || seq < 1) return null;
   return {
@@ -137,6 +138,7 @@ export class CanvasReducer {
     // second time (which is destructive for non-idempotent operations).
     this.cursor = this.snapshotOpSeq;
     this.pending = new Map();
+    this.pendingUnsequenced = new Map();
     this.appliedIds = new Map();
     this.unknownOps = 0;
     return this.snapshot();
@@ -151,14 +153,43 @@ export class CanvasReducer {
       snapshot_op_seq: this.snapshotOpSeq,
       op_seq: this.cursor,
       pending: [...this.pending.keys()].sort((a, b) => a - b),
+      pending_unsequenced: this.pendingUnsequenced.size,
       unknown_ops: this.unknownOps,
     };
   }
 
   ingest(raw) {
     const normalized = normalizeCanvasOp(raw);
-    if (!normalized || (this.canvasId && normalized.canvas_id !== this.canvasId)) {
-      return { status: 'invalid', applied: [], gap: this.pending.size > 0 };
+    if (!normalized) {
+      const canvasId = isRecord(raw) ? String(raw.canvas_id ?? '') : '';
+      const missingLiveSeq = isRecord(raw) && raw.room_id != null
+        && raw.op_seq == null && isRecord(raw.op) && canvasId
+        && (!this.canvasId || canvasId === this.canvasId);
+      if (missingLiveSeq) {
+        const rawId = raw.op_id ?? raw.id;
+        const key = rawId == null || rawId === '' ? JSON.stringify(raw) : String(rawId);
+        if (rawId != null && [...this.appliedIds.values()].includes(String(rawId))) {
+          return {
+            status: 'duplicate',
+            applied: [],
+            gap: this.pending.size > 0 || this.pendingUnsequenced.size > 0,
+          };
+        }
+        this.pendingUnsequenced.set(key, jsonClone(raw));
+        return { status: 'queued', applied: [], gap: true };
+      }
+      return {
+        status: 'invalid',
+        applied: [],
+        gap: this.pending.size > 0 || this.pendingUnsequenced.size > 0,
+      };
+    }
+    if (this.canvasId && normalized.canvas_id !== this.canvasId) {
+      return {
+        status: 'invalid',
+        applied: [],
+        gap: this.pending.size > 0 || this.pendingUnsequenced.size > 0,
+      };
     }
 
     const knownId = this.appliedIds.get(normalized.seq);
@@ -166,7 +197,7 @@ export class CanvasReducer {
       return {
         status: knownId && knownId !== normalized.id ? 'conflict' : 'duplicate',
         applied: [],
-        gap: this.pending.size > 0,
+        gap: this.pending.size > 0 || this.pendingUnsequenced.size > 0,
       };
     }
 
@@ -193,7 +224,11 @@ export class CanvasReducer {
       this.applyOne(next);
       applied.push(next);
     }
-    return { status: 'applied', applied, gap: this.pending.size > 0 };
+    return {
+      status: 'applied',
+      applied,
+      gap: this.pending.size > 0 || this.pendingUnsequenced.size > 0,
+    };
   }
 
   ingestMany(rows) {
@@ -205,7 +240,7 @@ export class CanvasReducer {
     return {
       results,
       conflict: results.some((result) => result.status === 'conflict'),
-      gap: this.pending.size > 0,
+      gap: this.pending.size > 0 || this.pendingUnsequenced.size > 0,
       applied: results.flatMap((result) => result.applied),
     };
   }
@@ -214,6 +249,7 @@ export class CanvasReducer {
     this.blocks = reduceCanvasBlocks(this.blocks, row.op);
     this.cursor = row.seq;
     this.appliedIds.set(row.seq, row.id);
+    this.pendingUnsequenced.delete(row.id);
     if (!isSupportedCanvasOp(row.op)) this.unknownOps += 1;
   }
 }

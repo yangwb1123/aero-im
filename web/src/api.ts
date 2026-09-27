@@ -43,6 +43,31 @@ export interface PresenceFrame {
   online?: string[]
 }
 
+export interface Canvas {
+  id: string
+  room_id?: string
+  title: string
+  blocks: unknown[]
+  version: number
+  snapshot_op_seq: number
+}
+
+export interface CanvasOperation {
+  id: string
+  canvas_id: string
+  client_op_id?: string
+  seq: number
+  author_id: string
+  op: Record<string, unknown>
+  created_at?: string
+}
+
+export interface CanvasOperationPage {
+  canvas_id: string
+  since: number
+  ops: CanvasOperation[]
+}
+
 export class ApiError extends Error {
   readonly status: number
   readonly body: unknown
@@ -149,6 +174,13 @@ export const api = {
     })
   },
 
+  refresh(refreshToken: string): Promise<SessionResponse> {
+    return request<SessionResponse>('POST', '/api/auth/refresh', {
+      body: { refresh_token: refreshToken },
+      authenticated: false,
+    })
+  },
+
   listRooms(): Promise<Room[]> {
     return request<Room[]>('GET', '/api/rooms')
   },
@@ -163,6 +195,51 @@ export const api = {
     return request<Message[]>(
       'GET',
       `/api/rooms/${encodeURIComponent(roomId)}/messages?limit=100`,
+    )
+  },
+
+  listCanvases(roomId: string): Promise<Canvas[]> {
+    return request<Canvas[]>('GET', `/api/rooms/${encodeURIComponent(roomId)}/canvases`)
+  },
+
+  createCanvas(
+    roomId: string,
+    input: { title: string; blocks: unknown[] },
+  ): Promise<Canvas> {
+    return request<Canvas>('POST', `/api/rooms/${encodeURIComponent(roomId)}/canvases`, {
+      body: { title: input.title, blocks: input.blocks },
+    })
+  },
+
+  getCanvas(roomId: string, canvasId: string): Promise<Canvas> {
+    return request<Canvas>(
+      'GET',
+      `/api/rooms/${encodeURIComponent(roomId)}/canvases/${encodeURIComponent(canvasId)}`,
+    )
+  },
+
+  listCanvasOps(
+    roomId: string,
+    canvasId: string,
+    { since = 0, limit = 500 }: { since?: number; limit?: number } = {},
+  ): Promise<CanvasOperationPage> {
+    const query = new URLSearchParams({ since: String(since), limit: String(limit) })
+    return request<CanvasOperationPage>(
+      'GET',
+      `/api/rooms/${encodeURIComponent(roomId)}/canvases/${encodeURIComponent(canvasId)}/ops?${query}`,
+    )
+  },
+
+  appendCanvasOp(
+    roomId: string,
+    canvasId: string,
+    op: Record<string, unknown>,
+    clientOpId: string,
+  ): Promise<CanvasOperation> {
+    return request<CanvasOperation>(
+      'POST',
+      `/api/rooms/${encodeURIComponent(roomId)}/canvases/${encodeURIComponent(canvasId)}/ops`,
+      { body: { client_op_id: clientOpId, op } },
     )
   },
 }

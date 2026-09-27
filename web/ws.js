@@ -90,6 +90,22 @@ function seqScope(msg) {
   return rid ? `r:${rid}` : 'g';
 }
 
+// The delivery barrier is also the server-authorized room set for restoring
+// client cursors. Any malformed shape fails closed rather than widening scope.
+function deliveryBarrierRooms(rooms) {
+  if (!Array.isArray(rooms)) return null;
+  const authorized = new Set();
+  for (const room of rooms) {
+    if (!room || typeof room !== 'object' || Array.isArray(room)
+      || typeof room.room_id !== 'string' || !room.room_id
+      || !Number.isSafeInteger(room.delivery_ordinal) || room.delivery_ordinal < 0) {
+      return null;
+    }
+    authorized.add(room.room_id);
+  }
+  return authorized;
+}
+
 export class WsClient {
   constructor({ cursorStorage } = {}) {
     this.ws = null;
@@ -112,6 +128,7 @@ export class WsClient {
     this._socketGeneration = 0;
     this._deliveryCursorSupported = false;
     this._deliveryReady = false;
+    this._deliveryAuthorizedRooms = new Set();
     this._deliveryLedger = new DeliveryCursorLedger(cursorStorage);
     this._pendingDeliveryAcks = new Map();
     this._preReadyDeliveryAcks = new Map();
@@ -164,6 +181,7 @@ export class WsClient {
     this.capabilities.clear();
     this._deliveryCursorSupported = false;
     this._deliveryReady = false;
+    this._deliveryAuthorizedRooms.clear();
     this._pendingDeliveryAcks.clear();
     this._preReadyDeliveryAcks.clear();
     this._deliveryFailedRooms.clear();
@@ -249,6 +267,7 @@ export class WsClient {
       this.capabilities.clear();
       this._deliveryCursorSupported = false;
       this._deliveryReady = false;
+      this._deliveryAuthorizedRooms.clear();
       this._preReadyDeliveryAcks.clear();
       this._deliveryFailedRooms.clear();
       this._deliveryPauseDepth = 0;
@@ -272,6 +291,7 @@ export class WsClient {
           this._preReadyDeliveryAcks.clear();
           this._pausedDeliveryAcks.clear();
           this._deliveryFailedRooms.clear();
+          this._deliveryAuthorizedRooms.clear();
           this._deliveryPauseDepth = 0;
           this._lastSeen = null;
           this._seqGate.reset();
@@ -283,8 +303,10 @@ export class WsClient {
         this._deliveryCursorSupported = this.capabilities.has('delivery_cursor_v2');
       }
       if (msg?.type === 'delivery_ready' && this._deliveryCursorSupported) {
+        this._deliveryAuthorizedRooms = deliveryBarrierRooms(msg.rooms) || new Set();
         this._deliveryReady = true;
         for (const cursor of this._preReadyDeliveryAcks.values()) {
+          if (!this._deliveryAuthorizedRooms.has(cursor.room_id)) continue;
           this._commitDeliveryCursor(
             cursor.room_id,
             cursor.message_id,
@@ -307,6 +329,7 @@ export class WsClient {
       // A handler failure is not delivery: undo seq de-duplication and do not
       // move even the legacy `?since=` fallback past the rejected frame.
       if (!applied && msg?.seq != null) this._seqGate.forget(seqScope(msg), msg.seq);
+      if (!applied) this._fenceFailedApplication(msg);
       if (applied) {
         // Only ordinary room-message frames advance the legacy `?since=`
         // backfill cursor. Mutations (edited/deleted/recalled) converge via
@@ -362,7 +385,8 @@ export class WsClient {
 
   _restoreDeliveryAcks() {
     for (const cursor of this._deliveryLedger.entries()) {
-      if (this._deliveryFailedRooms.has(cursor.room_id)) continue;
+      if (!this._deliveryAuthorizedRooms.has(cursor.room_id)
+        || this._deliveryFailedRooms.has(cursor.room_id)) continue;
       const current = this._pendingDeliveryAcks.get(cursor.room_id);
       if (!current || cursor.delivery_ordinal > current.delivery_ordinal
         || (cursor.delivery_ordinal === current.delivery_ordinal
@@ -372,9 +396,22 @@ export class WsClient {
     }
   }
 
+  _fenceFailedApplication(msg) {
+    const roomId = msg?.room_id || msg?.message?.room_id || msg?.event?.room_id;
+    if (typeof roomId !== 'string' || !roomId) return;
+    this._deliveryFailedRooms.add(roomId);
+    this._preReadyDeliveryAcks.delete(roomId);
+    this._pendingDeliveryAcks.delete(roomId);
+    this._pausedDeliveryAcks.delete(roomId);
+    // Reconnect from the unchanged durable cursor so this exact frame is
+    // replayed after the application recovers.
+    try { this.ws?.close(1011, 'message application failed'); } catch { /* close event retries */ }
+  }
+
   _queueDeliveryAck(msg, applied) {
+    if (!applied) return;
     if (msg?.type !== 'message') return;
-    const roomId = msg.message?.room_id;
+    const roomId = msg.room_id || msg.message?.room_id;
     const messageId = msg.message?.id;
     const deliveryOrdinal = msg.delivery_ordinal;
     // Backfill messages are database rows and therefore have no NATS seq. ACK
@@ -385,17 +422,8 @@ export class WsClient {
     const seq = msg.seq == null ? 0 : msg.seq;
     if (typeof roomId !== 'string' || typeof messageId !== 'string'
       || !Number.isSafeInteger(deliveryOrdinal) || deliveryOrdinal <= 0) return;
-    if (!applied) {
-      this._deliveryFailedRooms.add(roomId);
-      this._preReadyDeliveryAcks.delete(roomId);
-      this._pendingDeliveryAcks.delete(roomId);
-      this._pausedDeliveryAcks.delete(roomId);
-      // Reconnect from the unchanged durable cursor so this exact frame is
-      // replayed after the application recovers.
-      try { this.ws?.close(1011, 'message application failed'); } catch { /* close event retries */ }
-      return;
-    }
     if (this._deliveryFailedRooms.has(roomId)) return;
+    if (this._deliveryReady && !this._deliveryAuthorizedRooms.has(roomId)) return;
     if (!this._deliveryReady) {
       const current = this._preReadyDeliveryAcks.get(roomId);
       if (!current || deliveryOrdinal > current.delivery_ordinal
@@ -414,7 +442,8 @@ export class WsClient {
   }
 
   _commitDeliveryCursor(roomId, messageId, deliveryOrdinal, seq) {
-    if (this._deliveryFailedRooms.has(roomId)) return;
+    if (this._deliveryFailedRooms.has(roomId)
+      || (this._deliveryReady && !this._deliveryAuthorizedRooms.has(roomId))) return;
     if (this._deliveryPauseDepth > 0) {
       const current = this._pausedDeliveryAcks.get(roomId);
       if (!current || deliveryOrdinal > current.delivery_ordinal
@@ -445,6 +474,11 @@ export class WsClient {
     if (!this._deliveryCursorSupported || !this._deliveryReady
       || this._deliveryPauseDepth > 0) return;
     for (const [roomId, cursor] of this._pendingDeliveryAcks) {
+      if (!this._deliveryAuthorizedRooms.has(roomId)
+        || this._deliveryFailedRooms.has(roomId)) {
+        this._pendingDeliveryAcks.delete(roomId);
+        continue;
+      }
       if (this.deliveryAck(
         roomId, cursor.message_id, cursor.delivery_ordinal, cursor.seq,
       )) {
