@@ -302,7 +302,21 @@ export class WsClient {
         );
         this._deliveryCursorSupported = this.capabilities.has('delivery_cursor_v2');
       }
-      if (msg?.type === 'delivery_ready' && this._deliveryCursorSupported) {
+      // Seq dedup (ROADMAP v3 方向一): drop a frame whose per-room/per-stream
+      // seq was already applied (at-least-once redelivery). Frames without a
+      // seq pass through unchanged.
+      if (msg && msg.seq != null && !this._seqGate.accept(seqScope(msg), msg.seq)) return;
+      const genericApplied = this._emit('message', msg);
+      const typedApplied = !msg || typeof msg.type !== 'string'
+        ? true : this._emit(`msg:${msg.type}`, msg);
+      const applied = genericApplied && typedApplied;
+      // A handler failure is not delivery: undo seq de-duplication and do not
+      // move even the legacy `?since=` fallback past the rejected frame.
+      if (!applied && msg?.seq != null) this._seqGate.forget(seqScope(msg), msg.seq);
+      if (!applied) this._fenceFailedApplication(msg);
+      if (applied && msg?.type === 'delivery_ready' && this._deliveryCursorSupported) {
+        // The barrier authorizes cursor restoration only after every application
+        // handler accepts it. A failed handler must not persist or ACK any cursor.
         this._deliveryAuthorizedRooms = deliveryBarrierRooms(msg.rooms) || new Set();
         this._deliveryReady = true;
         for (const cursor of this._preReadyDeliveryAcks.values()) {
@@ -318,18 +332,6 @@ export class WsClient {
         this._restoreDeliveryAcks();
         this._flushDeliveryAcks();
       }
-      // Seq dedup (ROADMAP v3 方向一): drop a frame whose per-room/per-stream
-      // seq was already applied (at-least-once redelivery). Frames without a
-      // seq pass through unchanged.
-      if (msg && msg.seq != null && !this._seqGate.accept(seqScope(msg), msg.seq)) return;
-      const genericApplied = this._emit('message', msg);
-      const typedApplied = !msg || typeof msg.type !== 'string'
-        ? true : this._emit(`msg:${msg.type}`, msg);
-      const applied = genericApplied && typedApplied;
-      // A handler failure is not delivery: undo seq de-duplication and do not
-      // move even the legacy `?since=` fallback past the rejected frame.
-      if (!applied && msg?.seq != null) this._seqGate.forget(seqScope(msg), msg.seq);
-      if (!applied) this._fenceFailedApplication(msg);
       if (applied) {
         // Only ordinary room-message frames advance the legacy `?since=`
         // backfill cursor. Mutations (edited/deleted/recalled) converge via

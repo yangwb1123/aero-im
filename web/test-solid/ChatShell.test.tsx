@@ -719,6 +719,46 @@ describe('ChatShell collaborative Canvas integration', () => {
     expect(mounted.container.textContent).toContain('New board')
   })
 
+  it('does not reconcile an uncertain create from a Canvas list request already in flight', async () => {
+    let resolveInitialList!: (rows: ReturnType<typeof canvas>[]) => void
+    let resolveFreshList!: (rows: ReturnType<typeof canvas>[]) => void
+    const recovered = canvas('canvas-2', 'New board', 'New text')
+    mockApi.listCanvases
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveInitialList = resolve }))
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveFreshList = resolve }))
+    mockApi.getCanvas.mockImplementation(async (_roomId: string, canvasId: string) => (
+      canvasId === 'canvas-2' ? recovered : canvas('canvas-1', 'Planning', 'Initial text')
+    ))
+    mockApi.createCanvas.mockRejectedValueOnce(Object.assign(new Error('response lost'), { status: 0 }))
+    mounted = mountChat()
+    await waitFor(() => mounted!.container.querySelector('.room-item') !== null, 'room list')
+    mounted.container.querySelector<HTMLButtonElement>('.canvas-toggle')!.click()
+    await waitFor(() => mockApi.listCanvases.mock.calls.length === 1, 'deferred initial Canvas list')
+
+    input('[aria-label="新 Canvas 标题"]', 'New board', mounted.container)
+    submit('.canvas-create-form', mounted.container)
+    await waitFor(() => mounted!.container.querySelector('.canvas-error')?.textContent?.includes('结果暂时无法确认'), 'uncertain create error')
+    const createButton = mounted.container.querySelector<HTMLButtonElement>('.canvas-create-form button')!
+    expect(createButton.disabled).toBe(true)
+    resolveInitialList([canvas('canvas-1', 'Planning', 'Initial text')])
+    await flushPromises()
+    expect(createButton.disabled).toBe(true)
+    expect(mounted.container.querySelector('.canvas-error')?.textContent).toContain('结果暂时无法确认')
+    submit('.canvas-create-form', mounted.container)
+    expect(mockApi.createCanvas).toHaveBeenCalledTimes(1)
+
+    mounted.container.querySelector<HTMLButtonElement>('.canvas-error button')!.click()
+    await waitFor(() => mockApi.listCanvases.mock.calls.length === 2, 'explicit fresh-list retry')
+    resolveFreshList([canvas('canvas-1', 'Planning', 'Initial text'), recovered])
+    await waitFor(() => (
+      mounted!.container.querySelector<HTMLTextAreaElement>('[aria-label="Canvas 正文"]')?.value
+      === 'New text'
+    ), 'reconciliation from fresh list')
+    expect(mockApi.createCanvas).toHaveBeenCalledTimes(1)
+    expect(createButton.disabled).toBe(false)
+    expect(mounted.container.textContent).toContain('New board')
+  })
+
   it('keeps a new room usable while a create request for the previous room is pending', async () => {
     mockApi.listRooms.mockResolvedValue([roomA, roomB])
     mockApi.listCanvases.mockImplementation((roomId: string) => Promise.resolve(

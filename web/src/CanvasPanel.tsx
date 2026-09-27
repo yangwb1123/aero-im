@@ -27,6 +27,7 @@ type RecoveryAction = 'none' | 'list' | 'canvas' | 'sync'
 interface UncertainCreate {
   title: string
   knownIds: string[]
+  listGenerationAtFailure: number
 }
 
 function createOutcomeMayBeUnknown(reason: unknown): boolean {
@@ -216,19 +217,23 @@ export function CanvasPanel(props: CanvasPanelProps): JSX.Element {
       const rows = await api.listCanvases(roomId)
       if (!isCurrentList()) return
       const list = Array.isArray(rows) ? rows : []
+      const uncertain = uncertainCreates()[roomId]
+      // A list request already in flight when the create became uncertain cannot
+      // prove whether the server committed that create. Ignore it entirely; only
+      // an explicit refresh started afterward may reconcile the result.
+      if (uncertain && listToken <= uncertain.listGenerationAtFailure) return
       setCanvases(list)
       setAccessDenied(false)
       setListStatus('ready')
-      const uncertain = uncertainCreates()[roomId]
       const reconciled = uncertain && list.find((row) =>
         row.title.trim() === uncertain.title && !uncertain.knownIds.includes(row.id))
-      if (uncertain) {
+      if (uncertain && reconciled) {
         setUncertainCreates((current) => {
           const next = { ...current }
           delete next[roomId]
           return next
         })
-        if (reconciled) setCreateTitle('')
+        setCreateTitle('')
       }
       const listPreferredId = reconciled?.id ?? preferredId
       const preferred = listPreferredId && list.some((row) => row.id === listPreferredId)
@@ -236,6 +241,10 @@ export function CanvasPanel(props: CanvasPanelProps): JSX.Element {
         : list[0]?.id
       if (preferred) await selectCanvas(preferred, roomToken)
       else clearCanvas()
+      if (uncertain && !reconciled) {
+        setError('创建结果仍无法确认，刷新列表后继续确认；请勿重复提交。')
+        setRecoveryAction('list')
+      }
     } catch (reason) {
       if (!isCurrentList()) return
       setListStatus('error')
@@ -301,8 +310,9 @@ export function CanvasPanel(props: CanvasPanelProps): JSX.Element {
       if (createOutcomeMayBeUnknown(reason)) {
         setUncertainCreates((current) => ({
           ...current,
-          [roomId]: { title, knownIds },
+          [roomId]: { title, knownIds, listGenerationAtFailure: listGeneration },
         }))
+        if (listStatus() === 'loading') setListStatus('error')
       }
       if (!isCurrentRoom(roomId, roomToken)) return
       setError(errorText(reason, 'Canvas 创建失败'))

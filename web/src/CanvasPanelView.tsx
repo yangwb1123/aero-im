@@ -121,7 +121,9 @@ export function CanvasPanelView(props: CanvasPanelViewProps): JSX.Element {
                 <p class="canvas-state">正在加载 Canvas 列表…</p>
               </Show>
               <Show when={props.listStatus() === 'error'}>
-                <p class="canvas-state">Canvas 列表加载失败。</p>
+                <p class="canvas-state">
+                  {props.creationUncertain() ? '创建结果未确认，请刷新列表。' : 'Canvas 列表加载失败。'}
+                </p>
               </Show>
               <Show when={props.listStatus() === 'ready' && props.canvases().length === 0}>
                 <p class="canvas-state">
