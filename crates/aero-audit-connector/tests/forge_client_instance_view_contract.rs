@@ -7,6 +7,11 @@ use serde::{Deserialize, Deserializer};
 use serde_json::{Map, Value};
 use std::fmt;
 
+const MAX_CLIENT_INSTANCE_SESSION_IDS: usize = 128;
+const MAX_CLIENT_INSTANCE_IDENTIFIER_BYTES: usize = 128;
+const MAX_CLIENT_INSTANCE_OWNER_PART_BYTES: usize = 512;
+const MAX_JSON_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
+
 const SESSION_FIXTURE: &[u8] =
     include_bytes!("testdata/forge-client-instance-session-view-v1.json");
 const RESOURCE_FIXTURE: &[u8] =
@@ -205,25 +210,57 @@ fn decode<T: DeserializeOwned>(raw: &[u8]) -> Result<T, String> {
 }
 
 fn instance_rows_valid(owner: &Owner, rows: &[Instance]) -> bool {
-    rows.len() == 5
-        && rows
-            .iter()
-            .map(|row| row.client_kind.as_str())
-            .eq(["app", "cli", "mobile", "tui", "web"])
+    valid_owner(owner)
+        && rows.len() == 5
         && rows
             .windows(2)
             .all(|pair| pair[0].instance_id < pair[1].instance_id)
         && rows.iter().all(|row| {
-            !row.instance_id.is_empty()
-                && !row.client_kind.is_empty()
+            valid_identifier(&row.instance_id)
+                && valid_client_kind(&row.client_kind)
+                && row.session_ids.len() <= MAX_CLIENT_INSTANCE_SESSION_IDS
                 && row.observed_at_ms > 0
-                && !row.status.is_empty()
+                && row.observed_at_ms <= MAX_JSON_SAFE_INTEGER
+                && valid_client_instance_status(&row.status)
                 && row.session_ids.windows(2).all(|pair| pair[0] < pair[1])
-                && row.session_ids.iter().all(|id| !id.is_empty())
-                && !owner.issuer.is_empty()
-                && !owner.subject.is_empty()
-                && !owner.tenant_id.is_empty()
+                && row.session_ids.iter().all(|id| valid_identifier(id))
         })
+}
+
+fn valid_owner(owner: &Owner) -> bool {
+    valid_owner_part(&owner.issuer)
+        && valid_owner_part(&owner.subject)
+        && valid_owner_part(&owner.tenant_id)
+}
+
+fn valid_owner_part(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_CLIENT_INSTANCE_OWNER_PART_BYTES
+        && value.trim() == value
+        && !value.chars().any(char::is_control)
+}
+
+fn valid_identifier(value: &str) -> bool {
+    if value.is_empty() || value.len() > MAX_CLIENT_INSTANCE_IDENTIFIER_BYTES {
+        return false;
+    }
+    let mut characters = value.chars();
+    let Some(first) = characters.next() else {
+        return false;
+    };
+    first.is_ascii_alphanumeric()
+        && characters.all(|character| {
+            character.is_ascii_alphanumeric()
+                || matches!(character, '.' | '_' | ':' | '+' | '/' | '-')
+        })
+}
+
+fn valid_client_kind(value: &str) -> bool {
+    matches!(value, "cli" | "tui" | "web" | "app" | "mobile")
+}
+
+fn valid_client_instance_status(value: &str) -> bool {
+    matches!(value, "active" | "idle" | "offline" | "unknown")
 }
 
 fn session_is_display_only(value: &SessionView) -> bool {
@@ -250,12 +287,13 @@ fn resource_is_display_only(value: &ResourceView) -> bool {
         })
         && value.devices.iter().all(|device| {
             device.owner == value.owner_declaration
-                && !device.device_id.is_empty()
-                && !device.runner_instance_id.is_empty()
+                && valid_identifier(&device.device_id)
+                && valid_identifier(&device.runner_instance_id)
                 && device.revision > 0
                 && device.generation > 0
                 && device.heartbeat_sequence > 0
                 && device.observed_at_ms > 0
+                && device.observed_at_ms <= MAX_JSON_SAFE_INTEGER
                 && !device.approval_state.is_empty()
                 && !device.cordon_state.is_empty()
                 && !device.reservation_state.is_empty()
@@ -300,4 +338,115 @@ fn client_instance_views_reject_unknown_duplicate_authority_and_foreign_owner() 
     foreign["devices"][0]["owner"]["subject"] = Value::String("other-user".into());
     let value: ResourceView = decode(&serde_json::to_vec(&foreign).unwrap()).unwrap();
     assert!(!resource_is_display_only(&value));
+}
+
+#[test]
+fn client_instance_views_reject_unsupported_or_unbounded_rows() {
+    let cases = [
+        (
+            "unsupported client kind",
+            "client_kind",
+            Value::String("runner".into()),
+        ),
+        (
+            "unsupported status",
+            "status",
+            Value::String("draining".into()),
+        ),
+        (
+            "unsafe observation time",
+            "observed_at_ms",
+            Value::from(MAX_JSON_SAFE_INTEGER + 1),
+        ),
+        (
+            "invalid identifier",
+            "instance_id",
+            Value::String("client app".into()),
+        ),
+    ];
+    for (name, field, replacement) in cases {
+        let mut root: Map<String, Value> = serde_json::from_slice(SESSION_FIXTURE).unwrap();
+        root["instances"][0][field] = replacement;
+        let value: SessionView = decode(&serde_json::to_vec(&root).unwrap()).unwrap();
+        assert!(
+            !session_is_display_only(&value),
+            "{name} unexpectedly accepted"
+        );
+    }
+
+    let mut owner: Map<String, Value> = serde_json::from_slice(SESSION_FIXTURE).unwrap();
+    owner["owner_declaration"]["issuer"] = Value::String(" https://id.example".into());
+    let value: SessionView = decode(&serde_json::to_vec(&owner).unwrap()).unwrap();
+    assert!(!session_is_display_only(&value));
+
+    let mut resource: Map<String, Value> = serde_json::from_slice(RESOURCE_FIXTURE).unwrap();
+    resource["devices"][0]["device_id"] = Value::String("device id".into());
+    let value: ResourceView = decode(&serde_json::to_vec(&resource).unwrap()).unwrap();
+    assert!(!resource_is_display_only(&value));
+}
+
+const CONVERGENCE_FIXTURE: &[u8] =
+    include_bytes!("testdata/forge-client-instance-session-resource-convergence-v1.json");
+
+#[test]
+fn canonical_client_instance_session_resource_convergence_is_display_only() {
+    let root: Map<String, Value> = decode(CONVERGENCE_FIXTURE).expect("convergence fixture");
+    let expected = [
+        "schema_version",
+        "evaluation_mode",
+        "session_view",
+        "resource_view",
+        "converged",
+        "read_only",
+        "authority",
+    ];
+    assert_eq!(root.len(), expected.len());
+    assert!(expected.iter().all(|key| root.contains_key(*key)));
+    assert_eq!(
+        root["schema_version"],
+        Value::String("forge.client-instance-session-resource-convergence/v1".into())
+    );
+    assert_eq!(
+        root["evaluation_mode"],
+        Value::String("owner_bound_client_instance_session_resource_convergence_only".into())
+    );
+    assert_eq!(root["converged"], Value::Bool(true));
+    assert_eq!(root["read_only"], Value::Bool(true));
+
+    let session: SessionView =
+        decode(&serde_json::to_vec(&root["session_view"]).unwrap()).expect("session view");
+    let resource: ResourceView =
+        decode(&serde_json::to_vec(&root["resource_view"]).unwrap()).expect("resource view");
+    assert!(session_is_display_only(&session));
+    assert!(resource_is_display_only(&resource));
+    assert_eq!(session.owner_declaration, resource.owner_declaration);
+    assert_eq!(
+        root["session_view"]["instances"],
+        root["resource_view"]["instances"]
+    );
+    let authority: Authority =
+        decode(&serde_json::to_vec(&root["authority"]).unwrap()).expect("authority");
+    assert_eq!(authority, Authority::default());
+}
+
+#[test]
+fn client_instance_session_resource_convergence_has_bounded_keys_and_rejects_duplicates() {
+    let mut root: Map<String, Value> = serde_json::from_slice(CONVERGENCE_FIXTURE).unwrap();
+    root.insert("unexpected".into(), Value::Bool(true));
+    assert!(![
+        "schema_version",
+        "evaluation_mode",
+        "session_view",
+        "resource_view",
+        "converged",
+        "read_only",
+        "authority",
+    ]
+    .iter()
+    .all(|key| root.contains_key(*key) && root.len() == 7));
+    let duplicate = format!(
+        r#"{},"schema_version":"forge.client-instance-session-resource-convergence/v1"}}"#,
+        String::from_utf8_lossy(CONVERGENCE_FIXTURE).trim_end_matches('}')
+    );
+    assert!(decode::<Map<String, Value>>(duplicate.as_bytes()).is_err());
 }
