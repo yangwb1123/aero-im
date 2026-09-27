@@ -80,9 +80,12 @@ export function ChatShell(props: ChatShellProps): JSX.Element {
   const [socketStatus, setSocketStatus] = createSignal<SocketStatus>('connecting')
   const [error, setError] = createSignal('')
   const [showNewRoom, setShowNewRoom] = createSignal(false)
+  const [canvasDraftDirty, setCanvasDraftDirty] = createSignal(false)
   const wsClient = new WsClient()
   const unsubscribe: Array<() => void> = []
   let messageLoadGeneration = 0
+  let sendResetTimer: number | undefined
+  let disposed = false
 
   const selectedRoom = (): Room | undefined =>
     rooms().find((room) => room.id === currentRoomId())
@@ -98,12 +101,13 @@ export function ChatShell(props: ChatShellProps): JSX.Element {
     setLoadingRooms(true)
     try {
       const result = await api.listRooms()
+      if (disposed) return
       setRooms(Array.isArray(result) ? result : [])
       if (!currentRoomId() && result[0]?.id) setCurrentRoomId(result[0].id)
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : '房间加载失败')
+      if (!disposed) setError(reason instanceof Error ? reason.message : '房间加载失败')
     } finally {
-      setLoadingRooms(false)
+      if (!disposed) setLoadingRooms(false)
     }
   }
 
@@ -188,6 +192,7 @@ export function ChatShell(props: ChatShellProps): JSX.Element {
 
   const selectRoom = (roomId: string): void => {
     if (roomId === currentRoomId()) return
+    if (canvasDraftDirty() && !window.confirm('切换房间会离开未保存的 Canvas 草稿，是否继续？')) return
     setCurrentRoomId(roomId)
   }
 
@@ -195,12 +200,15 @@ export function ChatShell(props: ChatShellProps): JSX.Element {
     event.preventDefault()
     try {
       const room = await api.createRoom(newRoomKind(), newRoomName())
+      if (disposed) return
+      const shouldSelect = !canvasDraftDirty()
+        || window.confirm('新房间已创建。切换过去会离开未保存的 Canvas 草稿，是否继续？')
       setRooms((current) => [...current, room])
       setNewRoomName('')
       setShowNewRoom(false)
-      setCurrentRoomId(room.id)
+      if (shouldSelect) setCurrentRoomId(room.id)
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : '创建房间失败')
+      if (!disposed) setError(reason instanceof Error ? reason.message : '创建房间失败')
     }
   }
 
@@ -220,7 +228,11 @@ export function ChatShell(props: ChatShellProps): JSX.Element {
     }
     setSending(true)
     setDraft('')
-    window.setTimeout(() => setSending(false), 250)
+    if (sendResetTimer !== undefined) window.clearTimeout(sendResetTimer)
+    sendResetTimer = window.setTimeout(() => {
+      sendResetTimer = undefined
+      if (!disposed) setSending(false)
+    }, 250)
   }
 
   onMount(() => {
@@ -242,6 +254,9 @@ export function ChatShell(props: ChatShellProps): JSX.Element {
   })
 
   onCleanup(() => {
+    disposed = true
+    messageLoadGeneration += 1
+    if (sendResetTimer !== undefined) window.clearTimeout(sendResetTimer)
     for (const off of unsubscribe) off()
     wsClient.close()
   })
@@ -348,6 +363,7 @@ export function ChatShell(props: ChatShellProps): JSX.Element {
                   roomId={() => currentRoomId()}
                   ws={wsClient}
                   participantId={props.participant.id}
+                  onDraftStateChange={setCanvasDraftDirty}
                 />
 
                 <section class="message-scroll" aria-live="polite">

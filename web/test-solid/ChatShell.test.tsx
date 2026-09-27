@@ -29,6 +29,12 @@ vi.mock('../src/api', () => ({
   },
 }))
 
+interface FakeSocketEvent {
+  data?: string
+  code?: number
+  reason?: string
+}
+
 class FakeWebSocket {
   static OPEN = 1
   static instances: FakeWebSocket[] = []
@@ -36,19 +42,19 @@ class FakeWebSocket {
   readonly url: string
   readonly sent: Array<Record<string, unknown>> = []
   readonly closed: Array<{ code: number; reason: string }> = []
-  private listeners = new Map<string, Set<(event: any) => void>>()
+  private listeners = new Map<string, Set<(event: FakeSocketEvent) => void>>()
 
   constructor(url: string) {
     this.url = url
     FakeWebSocket.instances.push(this)
   }
 
-  addEventListener(event: string, callback: (event: any) => void): void {
+  addEventListener(event: string, callback: (event: FakeSocketEvent) => void): void {
     if (!this.listeners.has(event)) this.listeners.set(event, new Set())
     this.listeners.get(event)!.add(callback)
   }
 
-  emit(event: string, data: unknown = {}): void {
+  emit(event: string, data: FakeSocketEvent = {}): void {
     for (const callback of this.listeners.get(event) ?? []) callback(data)
   }
 
@@ -136,11 +142,13 @@ function mountChat(): { container: HTMLElement; unmount: () => void } {
 
 describe('ChatShell collaborative Canvas integration', () => {
   let previousWebSocket: typeof WebSocket | undefined
+  let previousConfirm: typeof window.confirm
   let mounted: { container: HTMLElement; unmount: () => void } | undefined
 
   beforeEach(() => {
     vi.clearAllMocks()
     previousWebSocket = globalThis.WebSocket
+    previousConfirm = window.confirm
     FakeWebSocket.instances = []
     globalThis.WebSocket = FakeWebSocket as unknown as typeof WebSocket
     mockApi.listRooms.mockResolvedValue([roomA])
@@ -176,6 +184,7 @@ describe('ChatShell collaborative Canvas integration', () => {
     vi.useRealTimers()
     if (previousWebSocket) globalThis.WebSocket = previousWebSocket
     else Reflect.deleteProperty(globalThis, 'WebSocket')
+    window.confirm = previousConfirm
   })
 
   it('opens, creates and selects room canvases, applies live/reconnected ops, and retains failed edits', async () => {
@@ -292,16 +301,27 @@ describe('ChatShell collaborative Canvas integration', () => {
     submit('.canvas-edit-form', mounted.container)
     await waitFor(() => mounted!.container.querySelector('.canvas-error')?.textContent?.includes('保存失败'), 'visible failed-save error')
     expect(text.value).toBe('Unsent user input')
-    expect(mounted.container.querySelector('.canvas-save-status')?.textContent).toBe('保存失败')
+    expect(mounted.container.querySelector('.canvas-save-status')?.textContent).toContain('保存失败')
     expect(mounted.container.querySelector('.canvas-save-status')?.textContent).not.toContain('已保存')
     const retryIds = mockApi.appendCanvasOp.mock.calls.slice(appendStart).map((call) => call[3])
     expect(retryIds).toHaveLength(2)
     expect(retryIds[0]).toBe(retryIds[1])
 
+    const reconnectingSocket = FakeWebSocket.instances[1]
+    reconnectingSocket.readyState = 3
+    reconnectingSocket.emit('close', { code: 1006 })
+    await vi.advanceTimersByTimeAsync(1000)
+    await waitFor(() => FakeWebSocket.instances.length === 3, 'second reconnect')
+    FakeWebSocket.instances[2].open()
+    await waitFor(() => mockApi.listCanvasOps.mock.calls.some((call) => call[2]?.since === 2), 'post-failure catch-up')
+    expect(mounted.container.querySelector('.canvas-save-status')?.textContent).toContain('保存失败')
+    expect(mounted.container.querySelector('.canvas-save-status')?.textContent).not.toContain('已同步')
+    expect(mounted.container.querySelector('.canvas-error')?.textContent).toContain('保存失败')
+
     submit('.canvas-edit-form', mounted.container)
-    await waitFor(() => mounted!.container.querySelector('.canvas-save-status')?.textContent === '已保存', 'manual retry success')
+    await waitFor(() => mounted!.container.querySelector('.canvas-save-status')?.textContent?.includes('已保存') === true, 'manual retry success')
     expect(mockApi.appendCanvasOp.mock.calls[appendStart + 2][3]).toBe(retryIds[0])
-    expect(FakeWebSocket.instances).toHaveLength(2)
+    expect(FakeWebSocket.instances).toHaveLength(3)
   })
 
   it('merges live room events with deferred history and ignores stale room responses', async () => {
@@ -341,5 +361,325 @@ describe('ChatShell collaborative Canvas integration', () => {
     await waitFor(() => mounted!.container.textContent?.includes('Live room A message') === true, 'merged live state after room switch')
     expect(mounted.container.textContent).not.toContain('Late room A history')
     expect(FakeWebSocket.instances).toHaveLength(1)
+  })
+
+  it('ignores a Canvas list response from a previous close/reopen cycle', async () => {
+    let resolveOldList!: (rows: ReturnType<typeof canvas>[]) => void
+    let resolveFreshList!: (rows: ReturnType<typeof canvas>[]) => void
+    mockApi.listCanvases
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveOldList = resolve }))
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveFreshList = resolve }))
+    mockApi.getCanvas.mockImplementation(async (_roomId: string, canvasId: string) => (
+      canvasId === 'canvas-fresh'
+        ? canvas('canvas-fresh', 'Fresh canvas', 'Fresh content')
+        : canvas('canvas-stale', 'Stale canvas', 'Stale content')
+    ))
+    mounted = mountChat()
+    await waitFor(() => mounted!.container.querySelector('.room-item') !== null, 'room list')
+    mounted.container.querySelector<HTMLButtonElement>('.canvas-toggle')!.click()
+    await waitFor(() => mockApi.listCanvases.mock.calls.length === 1, 'first Canvas list')
+
+    mounted.container.querySelector<HTMLButtonElement>('.canvas-toggle')!.click()
+    mounted.container.querySelector<HTMLButtonElement>('.canvas-toggle')!.click()
+    await waitFor(() => mockApi.listCanvases.mock.calls.length === 2, 'reopened Canvas list')
+    resolveFreshList([canvas('canvas-fresh', 'Fresh canvas', 'Fresh content')])
+    await waitFor(() => (
+      mounted!.container.querySelector<HTMLTextAreaElement>('[aria-label="Canvas 正文"]')?.value
+      === 'Fresh content'
+    ), 'fresh Canvas selection')
+
+    resolveOldList([canvas('canvas-stale', 'Stale canvas', 'Stale content')])
+    await flushPromises()
+    expect(mounted.container.textContent).toContain('Fresh canvas')
+    expect(mounted.container.textContent).not.toContain('Stale canvas')
+    expect(mounted.container.querySelector<HTMLTextAreaElement>('[aria-label="Canvas 正文"]')?.value)
+      .toBe('Fresh content')
+  })
+
+  it('keeps Canvas list errors visible and provides an explicit retry', async () => {
+    mockApi.listCanvases
+      .mockRejectedValueOnce(new Error('temporarily offline'))
+      .mockResolvedValueOnce([])
+    mounted = mountChat()
+    await waitFor(() => mounted!.container.querySelector('.room-item') !== null, 'room list')
+    mounted.container.querySelector<HTMLButtonElement>('.canvas-toggle')!.click()
+    await waitFor(() => (
+      mounted!.container.querySelector('.canvas-error')?.textContent?.includes('temporarily offline')
+    ), 'visible Canvas list failure')
+    const retry = [...mounted.container.querySelectorAll<HTMLButtonElement>('.canvas-error button')]
+      .find((button) => button.textContent?.includes('刷新 Canvas 列表'))
+    expect(retry).toBeDefined()
+    expect(mounted.container.textContent).not.toContain('此房间还没有 Canvas')
+
+    retry!.click()
+    await waitFor(() => mockApi.listCanvases.mock.calls.length === 2, 'explicit list retry')
+    await waitFor(() => mounted!.container.textContent?.includes('创建第一个协作空间') === true, 'recovered empty state')
+    expect(mounted.container.querySelector('.canvas-error')).toBeNull()
+  })
+
+  it('asks before discarding a Canvas draft on panel or room navigation', async () => {
+    mockApi.listRooms.mockResolvedValue([roomA, roomB])
+    mockApi.listCanvases.mockImplementation((roomId: string) => Promise.resolve(
+      roomId === 'room-a' ? [canvas('canvas-1', 'Planning', 'Initial text')] : [],
+    ))
+    window.confirm = vi.fn(() => false)
+    mounted = mountChat()
+    await waitFor(() => mounted!.container.querySelectorAll('.room-item').length === 2, 'both rooms')
+    mounted.container.querySelector<HTMLButtonElement>('.canvas-toggle')!.click()
+    await waitFor(() => (
+      mounted!.container.querySelector<HTMLTextAreaElement>('[aria-label="Canvas 正文"]')?.value
+      === 'Initial text'
+    ), 'selected Canvas')
+    input('[aria-label="Canvas 正文"]', 'Unsaved draft', mounted.container)
+
+    mounted.container.querySelectorAll<HTMLButtonElement>('.room-item')[1].click()
+    expect(mounted.container.querySelector('h1')?.textContent).toContain('Room A')
+    expect(mounted.container.querySelector<HTMLTextAreaElement>('[aria-label="Canvas 正文"]')?.value)
+      .toBe('Unsaved draft')
+    mounted.container.querySelector<HTMLButtonElement>('.canvas-toggle')!.click()
+    expect(mounted.container.querySelector('.canvas-panel')).not.toBeNull()
+
+    window.confirm = vi.fn(() => true)
+    mounted.container.querySelectorAll<HTMLButtonElement>('.room-item')[1].click()
+    await waitFor(() => mounted!.container.querySelector('h1')?.textContent?.includes('Room B') === true, 'confirmed room navigation')
+    await waitFor(() => mounted!.container.textContent?.includes('此房间还没有 Canvas') === true, 'new room Canvas state')
+    expect(mounted.container.textContent).not.toContain('Unsaved draft')
+    expect(mounted.container.querySelector('[aria-label="Canvas 正文"]')).toBeNull()
+  })
+
+  it('confirms shared note removal before appending the delete operation', async () => {
+    mockApi.getCanvas.mockResolvedValue({
+      ...canvas('canvas-1', 'Planning', 'Initial text'),
+      blocks: [
+        { type: 'text', content: 'Initial text' },
+        { type: 'note', note_id: 'note-1', content: 'Shared note' },
+      ],
+    })
+    mounted = mountChat()
+    await waitFor(() => mounted!.container.querySelector('.room-item') !== null, 'room list')
+    mounted.container.querySelector<HTMLButtonElement>('.canvas-toggle')!.click()
+    await waitFor(() => mounted!.container.querySelector('[aria-label="便笺 note-1"]') !== null, 'shared note')
+
+    const deleteButton = [...mounted.container.querySelectorAll<HTMLButtonElement>('.canvas-note-actions button')]
+      .find((button) => button.textContent?.trim() === '删除便笺')
+    expect(deleteButton).toBeDefined()
+    deleteButton!.click()
+    expect(mounted.container.textContent).toContain('从共享 Canvas 移除此便笺')
+    expect(mockApi.appendCanvasOp).not.toHaveBeenCalled()
+
+    mounted.container.querySelector<HTMLButtonElement>('.canvas-delete-confirm button:not([data-danger])')!.click()
+    expect(mockApi.appendCanvasOp).not.toHaveBeenCalled()
+    const removeButton = [...mounted.container.querySelectorAll<HTMLButtonElement>('.canvas-note-actions button')]
+      .find((button) => button.textContent?.trim() === '删除便笺')
+    removeButton!.click()
+    mounted.container.querySelector<HTMLButtonElement>('[data-danger="true"]')!.click()
+    await waitFor(() => mockApi.appendCanvasOp.mock.calls.length === 1, 'confirmed delete operation')
+    expect(mockApi.appendCanvasOp.mock.calls[0][2]).toEqual({
+      type: 'delete_note',
+      note_id: 'note-1',
+    })
+    await waitFor(() => mounted!.container.textContent?.includes('暂无便笺') === true, 'note removal')
+  })
+
+  it('preserves only user-entered drafts when a save is forbidden', async () => {
+    mounted = mountChat()
+    await waitFor(() => mounted!.container.querySelector('.room-item') !== null, 'room list')
+    mounted.container.querySelector<HTMLButtonElement>('.canvas-toggle')!.click()
+    await waitFor(() => mounted!.container.querySelector('[aria-label="Canvas 正文"]') !== null, 'Canvas editor')
+    input('[aria-label="Canvas 正文"]', 'User-authored draft', mounted.container)
+    mockApi.appendCanvasOp.mockRejectedValueOnce(Object.assign(new Error('forbidden'), { status: 403 }))
+
+    submit('.canvas-edit-form', mounted.container)
+    await waitFor(() => mounted!.container.querySelector('.canvas-preserved-drafts') !== null, 'preserved draft panel')
+
+    expect(mockApi.appendCanvasOp).toHaveBeenCalledTimes(1)
+    expect(mounted.container.querySelector('[aria-label="Canvas 正文"]')).toBeNull()
+    expect(mounted.container.querySelector<HTMLTextAreaElement>('[aria-label="保留草稿：正文"]')?.value)
+      .toBe('User-authored draft')
+    expect(mounted.container.textContent).not.toContain('Initial text')
+    expect(mounted.container.querySelector<HTMLInputElement>('[aria-label="新 Canvas 标题"]')?.disabled)
+      .toBe(true)
+  })
+
+  it('does not let a pre-create Canvas list response replace the created Canvas', async () => {
+    let resolveOldList!: (rows: ReturnType<typeof canvas>[]) => void
+    mockApi.listCanvases.mockImplementationOnce(() => new Promise((resolve) => { resolveOldList = resolve }))
+    mockApi.getCanvas.mockImplementation(async (_roomId: string, canvasId: string) => (
+      canvasId === 'canvas-2'
+        ? canvas('canvas-2', 'New board', 'New text')
+        : canvas('canvas-1', 'Planning', 'Initial text')
+    ))
+    mounted = mountChat()
+    await waitFor(() => mounted!.container.querySelector('.room-item') !== null, 'room list')
+    mounted.container.querySelector<HTMLButtonElement>('.canvas-toggle')!.click()
+    await waitFor(() => mockApi.listCanvases.mock.calls.length === 1, 'deferred Canvas list')
+
+    input('[aria-label="新 Canvas 标题"]', 'New board', mounted.container)
+    submit('.canvas-create-form', mounted.container)
+    await waitFor(() => mounted!.container.querySelector<HTMLTextAreaElement>('[aria-label="Canvas 正文"]')?.value === 'New text', 'created Canvas selection')
+    resolveOldList([canvas('canvas-stale', 'Stale list item', 'Stale text')])
+    await flushPromises()
+
+    expect(mounted.container.textContent).toContain('New board')
+    expect(mounted.container.textContent).not.toContain('Stale list item')
+    expect(mounted.container.querySelector<HTMLTextAreaElement>('[aria-label="Canvas 正文"]')?.value)
+      .toBe('New text')
+  })
+
+  it('reconciles an uncertain create by refreshing the room list before allowing another POST', async () => {
+    const recovered = canvas('canvas-2', 'New board', 'New text')
+    mockApi.listCanvases
+      .mockResolvedValueOnce([canvas('canvas-1', 'Planning', 'Initial text')])
+      .mockResolvedValueOnce([canvas('canvas-1', 'Planning', 'Initial text'), recovered])
+    mockApi.getCanvas.mockImplementation(async (_roomId: string, canvasId: string) => (
+      canvasId === 'canvas-2' ? recovered : canvas('canvas-1', 'Planning', 'Initial text')
+    ))
+    mockApi.createCanvas.mockRejectedValueOnce(Object.assign(new Error('response lost'), { status: 0 }))
+    mounted = mountChat()
+    await waitFor(() => mounted!.container.querySelector('.room-item') !== null, 'room list')
+    mounted.container.querySelector<HTMLButtonElement>('.canvas-toggle')!.click()
+    await waitFor(() => mounted!.container.querySelector('[aria-label="Canvas 正文"]') !== null, 'initial Canvas')
+
+    input('[aria-label="新 Canvas 标题"]', 'New board', mounted.container)
+    submit('.canvas-create-form', mounted.container)
+    await waitFor(() => mounted!.container.querySelector('.canvas-error')?.textContent?.includes('结果暂时无法确认'), 'uncertain create error')
+    expect(mounted.container.querySelector<HTMLButtonElement>('.canvas-create-form button')?.disabled).toBe(true)
+    submit('.canvas-create-form', mounted.container)
+    expect(mockApi.createCanvas).toHaveBeenCalledTimes(1)
+
+    mounted.container.querySelector<HTMLButtonElement>('.canvas-error button')!.click()
+    await waitFor(() => mounted!.container.querySelector<HTMLTextAreaElement>('[aria-label="Canvas 正文"]')?.value === 'New text', 'recovered created Canvas')
+    expect(mockApi.listCanvases).toHaveBeenCalledTimes(2)
+    expect(mockApi.createCanvas).toHaveBeenCalledTimes(1)
+    expect(mounted.container.textContent).toContain('New board')
+  })
+
+  it('keeps a new room usable while a create request for the previous room is pending', async () => {
+    mockApi.listRooms.mockResolvedValue([roomA, roomB])
+    mockApi.listCanvases.mockImplementation((roomId: string) => Promise.resolve(
+      roomId === 'room-a' ? [canvas('canvas-1', 'Planning', 'Initial text')] : [],
+    ))
+    let resolveRoomACreate!: (value: ReturnType<typeof canvas>) => void
+    mockApi.createCanvas
+      .mockImplementationOnce(() => new Promise((resolve) => { resolveRoomACreate = resolve }))
+      .mockResolvedValueOnce(canvas('canvas-b', 'Board B', 'Room B Canvas'))
+    mockApi.getCanvas.mockImplementation(async (_roomId: string, canvasId: string) => (
+      canvasId === 'canvas-b' ? canvas('canvas-b', 'Board B', 'Room B Canvas')
+        : canvas('canvas-1', 'Planning', 'Initial text')
+    ))
+    mounted = mountChat()
+    await waitFor(() => mounted!.container.querySelectorAll('.room-item').length === 2, 'both rooms')
+    mounted.container.querySelector<HTMLButtonElement>('.canvas-toggle')!.click()
+    await waitFor(() => mounted!.container.querySelector('[aria-label="Canvas 正文"]') !== null, 'room A Canvas')
+
+    input('[aria-label="新 Canvas 标题"]', 'Board A', mounted.container)
+    submit('.canvas-create-form', mounted.container)
+    await waitFor(() => mockApi.createCanvas.mock.calls.length === 1, 'pending room A create')
+    mounted.container.querySelectorAll<HTMLButtonElement>('.room-item')[1].click()
+    await waitFor(() => mounted!.container.querySelector('h1')?.textContent?.includes('Room B') === true, 'room B')
+    await waitFor(() => mounted!.container.textContent?.includes('创建第一个协作空间') === true, 'room B empty Canvas state')
+    expect(mounted.container.querySelector<HTMLButtonElement>('.canvas-create-form button')?.disabled).toBe(false)
+
+    input('[aria-label="新 Canvas 标题"]', 'Board B', mounted.container)
+    submit('.canvas-create-form', mounted.container)
+    await waitFor(() => mounted!.container.querySelector<HTMLTextAreaElement>('[aria-label="Canvas 正文"]')?.value === 'Room B Canvas', 'room B create')
+    resolveRoomACreate(canvas('canvas-a', 'Board A', 'Room A Canvas'))
+    await flushPromises()
+    expect(mockApi.createCanvas).toHaveBeenCalledTimes(2)
+    expect(mounted.container.querySelector<HTMLTextAreaElement>('[aria-label="Canvas 正文"]')?.value)
+      .toBe('Room B Canvas')
+    expect(mounted.container.textContent).not.toContain('Room A Canvas')
+  })
+
+  it('treats clearing an existing note as an unsaved edit requiring confirmation', async () => {
+    mockApi.listRooms.mockResolvedValue([roomA, roomB])
+    mockApi.getCanvas.mockResolvedValue({
+      ...canvas('canvas-1', 'Planning', 'Initial text'),
+      blocks: [
+        { type: 'text', content: 'Initial text' },
+        { type: 'note', note_id: 'note-1', content: 'Shared note' },
+      ],
+    })
+    window.confirm = vi.fn(() => false)
+    mounted = mountChat()
+    await waitFor(() => mounted!.container.querySelectorAll('.room-item').length === 2, 'both rooms')
+    mounted.container.querySelector<HTMLButtonElement>('.canvas-toggle')!.click()
+    await waitFor(() => mounted!.container.querySelector('[aria-label="便笺 note-1"]') !== null, 'shared note')
+
+    input('[aria-label="便笺 note-1"]', '', mounted.container)
+    mounted.container.querySelectorAll<HTMLButtonElement>('.room-item')[1].click()
+    expect(window.confirm).toHaveBeenCalled()
+    expect(mounted.container.querySelector('h1')?.textContent).toContain('Room A')
+    expect(mounted.container.querySelector<HTMLTextAreaElement>('[aria-label="便笺 note-1"]')?.value)
+      .toBe('')
+  })
+
+  it('retries a failed same-Canvas snapshot and operation-log load', async () => {
+    mockApi.listCanvasOps
+      .mockRejectedValueOnce(new Error('ops unavailable'))
+      .mockResolvedValueOnce({ canvas_id: 'canvas-1', since: 0, ops: [] })
+    mounted = mountChat()
+    await waitFor(() => mounted!.container.querySelector('.room-item') !== null, 'room list')
+    mounted.container.querySelector<HTMLButtonElement>('.canvas-toggle')!.click()
+    await waitFor(() => mounted!.container.querySelector('.canvas-error')?.textContent?.includes('ops unavailable'), 'operation-log failure')
+    expect(mockApi.getCanvas).toHaveBeenCalledTimes(1)
+
+    const retry = [...mounted.container.querySelectorAll<HTMLButtonElement>('.canvas-error button')]
+      .find((button) => button.textContent?.includes('重新加载此 Canvas'))
+    expect(retry).toBeDefined()
+    retry!.click()
+    await waitFor(() => mockApi.getCanvas.mock.calls.length === 2, 'forced Canvas reload')
+    await waitFor(() => mounted!.container.querySelector('.canvas-error') === null, 'recovered Canvas')
+    expect(mockApi.listCanvasOps).toHaveBeenCalledTimes(2)
+    expect(mounted.container.querySelector<HTMLTextAreaElement>('[aria-label="Canvas 正文"]')?.value)
+      .toBe('Initial text')
+  })
+
+  it('does not let an old in-flight save block or mutate the newly selected Canvas', async () => {
+    mockApi.listCanvases.mockResolvedValue([
+      canvas('canvas-1', 'Planning', 'Initial text'),
+      canvas('canvas-2', 'Research', 'Second Canvas'),
+    ])
+    mockApi.getCanvas.mockImplementation(async (_roomId: string, canvasId: string) => (
+      canvasId === 'canvas-2'
+        ? canvas('canvas-2', 'Research', 'Second Canvas')
+        : canvas('canvas-1', 'Planning', 'Initial text')
+    ))
+    let resolveFirstSave!: (operation: Record<string, unknown>) => void
+    mockApi.appendCanvasOp.mockImplementationOnce(() => new Promise((resolve) => {
+      resolveFirstSave = resolve
+    }))
+    window.confirm = vi.fn(() => true)
+    mounted = mountChat()
+    await waitFor(() => mounted!.container.querySelector('.room-item') !== null, 'room list')
+    mounted.container.querySelector<HTMLButtonElement>('.canvas-toggle')!.click()
+    await waitFor(() => mounted!.container.querySelector<HTMLTextAreaElement>('[aria-label="Canvas 正文"]')?.value === 'Initial text', 'first Canvas')
+
+    input('[aria-label="Canvas 正文"]', 'Pending old-room save', mounted.container)
+    submit('.canvas-edit-form', mounted.container)
+    await waitFor(() => mockApi.appendCanvasOp.mock.calls.length === 1, 'pending first Canvas save')
+    const second = [...mounted.container.querySelectorAll<HTMLButtonElement>('.canvas-list-item')]
+      .find((button) => button.textContent?.includes('Research'))
+    expect(second).toBeDefined()
+    second!.click()
+    await waitFor(() => mounted!.container.querySelector<HTMLTextAreaElement>('[aria-label="Canvas 正文"]')?.value === 'Second Canvas', 'second Canvas')
+    expect(mounted.container.querySelector<HTMLButtonElement>('.canvas-edit-form button')?.disabled)
+      .toBe(false)
+
+    input('[aria-label="Canvas 正文"]', 'Second Canvas saved', mounted.container)
+    submit('.canvas-edit-form', mounted.container)
+    await waitFor(() => mockApi.appendCanvasOp.mock.calls.length === 2, 'second Canvas save')
+    await waitFor(() => mounted!.container.querySelector('.canvas-save-status')?.textContent?.includes('已保存') === true, 'second save completion')
+    resolveFirstSave({
+      id: 'old-op',
+      canvas_id: 'canvas-1',
+      seq: 1,
+      author_id: participant.id,
+      op: { type: 'set_text', text: 'Pending old-room save' },
+    })
+    await flushPromises()
+    expect(mounted.container.querySelector<HTMLTextAreaElement>('[aria-label="Canvas 正文"]')?.value)
+      .toBe('Second Canvas saved')
+    expect(mounted.container.querySelector('.canvas-save-status')?.textContent).toContain('已保存')
   })
 })

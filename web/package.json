@@ -13,7 +13,7 @@
     "typecheck": "tsc --noEmit",
     "lint": "pnpm typecheck && pnpm lint:legacy",
     "test:legacy": "node --test api.test.js canvas.test.js solid_api.test.js compliance_admin.test.js delivery.test.js delivery_cursor.test.js drafts.test.js drafts_restore.test.js ws.test.js security_admin.test.js governance_utils.test.js rtc_config.test.js sfu_calls.test.js realtime_events.test.js render_giphy.test.js render_recall.test.js solid_entry.test.js snaplink_sdk.test.js",
-    "test": "pnpm test:legacy",
+    "test": "pnpm test:legacy && pnpm test:solid",
     "test:solid": "vitest run --config vite.config.ts --environment jsdom test-solid/",
     "lint:legacy": "eslint --config eslint.config.js --ignore-pattern 'vendor/**' --ignore-pattern 'dist/**' .",
     "build:snaplink-sdk": "esbuild vendor/snaplink_sso_client.ts --bundle --format=esm --platform=browser --target=es2020 --outfile=vendor/snaplink_sso_client.js"

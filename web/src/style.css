@@ -283,7 +283,7 @@ textarea {
   justify-content: space-between;
   align-items: flex-start;
   gap: 16px;
-  padding: 22px 28px 18px;
+  padding: 22px 24px 18px;
   border-bottom: 1px solid var(--iris-border);
 }
 
@@ -303,7 +303,7 @@ textarea {
 }
 
 .inline-alert {
-  margin: 12px 28px 0;
+  margin: 12px 24px 0;
 }
 
 .message-scroll {
@@ -313,7 +313,7 @@ textarea {
   flex-direction: column;
   gap: 15px;
   overflow: auto;
-  padding: 24px 28px;
+  padding: 24px;
 }
 
 .message-row {
@@ -364,7 +364,7 @@ textarea {
 .composer {
   align-items: flex-end;
   gap: 10px;
-  padding: 16px 28px 22px;
+  padding: 16px 24px 22px;
   border-top: 1px solid var(--iris-border);
 }
 
@@ -444,7 +444,7 @@ textarea {
   .conversation-header,
   .message-scroll,
   .composer {
-    padding-inline: 14px;
+    padding-inline: 16px;
   }
 
   .message-row {
@@ -453,7 +453,7 @@ textarea {
 }
 
 .canvas-workspace {
-  padding: 12px 28px 0;
+  padding: 12px 24px 0;
 }
 
 .canvas-toggle,
@@ -462,12 +462,23 @@ textarea {
 .canvas-note-actions button,
 .canvas-note-create button,
 .canvas-structured-form button {
+  min-height: 40px;
   border: 1px solid var(--iris-border);
   border-radius: var(--iris-radius-md, 8px);
-  padding: 8px 12px;
+  padding: 8px 16px;
   background: var(--iris-surface);
   color: var(--iris-foreground);
   cursor: pointer;
+}
+
+.canvas-toggle:disabled,
+.canvas-create-form button:disabled,
+.canvas-edit-form button:disabled,
+.canvas-note-actions button:disabled,
+.canvas-note-create button:disabled,
+.canvas-structured-form button:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
 }
 
 .canvas-toggle:hover,
@@ -513,19 +524,33 @@ textarea {
 }
 
 .canvas-error {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
   margin: 12px 0;
-  border: 1px solid color-mix(in srgb, #ef4444 50%, var(--iris-border));
+  border: 1px solid color-mix(in srgb, var(--iris-danger) 50%, var(--iris-border));
   border-radius: 8px;
-  padding: 9px 12px;
-  color: #fecaca;
-  background: color-mix(in srgb, #ef4444 13%, var(--iris-surface));
+  padding: 8px 12px;
+  color: var(--iris-danger);
+  background: var(--iris-danger-subtle);
+}
+
+.canvas-error button {
+  min-height: 40px;
+  border: 1px solid var(--iris-danger);
+  border-radius: 8px;
+  padding: 8px 12px;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
 }
 
 .canvas-create-form,
 .canvas-note-create {
   display: flex;
   gap: 8px;
-  margin: 14px 0;
+  margin: 16px 0;
 }
 
 .canvas-create-form input,
@@ -536,13 +561,14 @@ textarea {
   min-width: 0;
   border: 1px solid var(--iris-border);
   border-radius: 8px;
-  padding: 9px 11px;
+  padding: 8px 12px;
   background: var(--iris-background);
   color: var(--iris-foreground);
 }
 
 .canvas-create-form input,
 .canvas-note-create input {
+  min-height: 40px;
   flex: 1;
 }
 
@@ -551,21 +577,22 @@ textarea {
   grid-template-columns: minmax(150px, 220px) minmax(0, 1fr);
   gap: 16px;
   border-top: 1px solid var(--iris-border);
-  padding-top: 14px;
+  padding-top: 16px;
 }
 
 .canvas-list {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 8px;
 }
 
 .canvas-list-item {
   display: grid;
   gap: 4px;
+  min-height: 40px;
   border: 1px solid transparent;
   border-radius: 8px;
-  padding: 10px;
+  padding: 8px 12px;
   background: transparent;
   color: var(--iris-foreground);
   text-align: left;
@@ -596,7 +623,7 @@ textarea {
 .canvas-structured-form {
   display: grid;
   gap: 8px;
-  margin: 14px 0;
+  margin: 16px 0;
 }
 
 .canvas-edit-form textarea,
@@ -608,36 +635,102 @@ textarea {
 
 .canvas-notes,
 .canvas-structured {
-  margin-top: 18px;
+  margin-top: 16px;
   border-top: 1px solid var(--iris-border);
-  padding-top: 10px;
+  padding-top: 8px;
 }
 
 .canvas-note {
   display: grid;
   gap: 8px;
-  margin: 10px 0;
+  margin: 8px 0;
 }
 
 .canvas-note-actions {
   justify-content: flex-start;
 }
 
+.canvas-delete-confirm {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.canvas-delete-confirm span {
+  color: var(--iris-warning);
+}
+
+.canvas-delete-confirm button[data-danger='true'] {
+  border-color: var(--iris-danger);
+  color: var(--iris-danger);
+  background: var(--iris-danger-subtle);
+}
+
 .canvas-structured pre {
   overflow: auto;
   border-radius: 8px;
-  padding: 10px;
+  padding: 8px;
   background: var(--iris-background);
   font-size: 12px;
 }
 
 .canvas-state {
-  padding: 10px 4px;
+  padding: 8px 4px;
+}
+
+.canvas-save-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.canvas-save-status[data-state='success'] {
+  color: var(--iris-success);
+}
+
+.canvas-save-status[data-state='pending'],
+.canvas-save-status[data-state='warning'] {
+  color: var(--iris-warning);
+}
+
+.canvas-save-status[data-state='error'] {
+  color: var(--iris-danger);
+}
+
+.canvas-preserved-drafts {
+  display: grid;
+  gap: 8px;
+  margin: 12px 0;
+  border: 1px solid var(--iris-warning);
+  border-radius: 8px;
+  padding: 12px;
+  background: var(--iris-warning-subtle);
+}
+
+.canvas-preserved-drafts h3,
+.canvas-preserved-drafts p {
+  margin: 0;
+}
+
+.canvas-preserved-drafts label {
+  display: grid;
+  gap: 4px;
+}
+
+.canvas-preserved-drafts textarea {
+  width: 100%;
+  border: 1px solid var(--iris-border);
+  border-radius: 8px;
+  padding: 8px 12px;
+  background: var(--iris-background);
+  color: var(--iris-foreground);
+  resize: vertical;
 }
 
 @media (max-width: 620px) {
   .canvas-workspace {
-    padding-inline: 14px;
+    padding-inline: 16px;
   }
 
   .canvas-columns {
@@ -647,6 +740,6 @@ textarea {
   .canvas-editor {
     border-top: 1px solid var(--iris-border);
     border-left: 0;
-    padding: 14px 0 0;
+    padding: 16px 0 0;
   }
 }
