@@ -10,6 +10,14 @@ export class WsClient {
   ): void
   on(event: string, callback: (...args: any[]) => unknown): () => void
   send(frame: Record<string, unknown>): boolean
+  sendMessage(roomId: string, blocks: unknown[], replyTo?: string | null, clientMessageId?: string | null): boolean
+  sendMarkdown(
+    roomId: string,
+    markdown: string,
+    replyTo?: string | null,
+    expiresAfterSecs?: number | null,
+    clientMessageId?: string | null,
+  ): boolean
   joinRoom(roomId: string): boolean
   close(): void
   supports(capability: string): boolean

@@ -9,7 +9,7 @@ export function errorText(reason: unknown, action: string): string {
   const error = reason as Partial<ApiError> | null
   if (action.includes('创建')
     && (error?.status === 0 || (typeof error?.status === 'number' && error.status >= 500))) {
-    return `${action}，结果暂时无法确认。请先刷新列表检查是否已创建，再决定是否重试。`
+    return `${action}，结果暂时无法确认。可安全重试；系统会复用原创建标识，避免重复创建。`
   }
   if (error?.status === 0) return `${action}遇到网络问题。检查连接后可安全重试。`
   if (error?.status === 401) return '登录已过期，请重新登录后继续。'

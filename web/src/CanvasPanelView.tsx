@@ -32,6 +32,7 @@ interface CanvasPanelViewProps {
   saving: Accessor<boolean>
   onToggle: () => void
   onRetryList: () => void
+  onRetryCreate: () => void
   onRetryCanvas: () => void
   onRetrySync: () => void
   onCreate: (event: SubmitEvent) => void
@@ -71,11 +72,24 @@ export function CanvasPanelView(props: CanvasPanelViewProps): JSX.Element {
             <span class="canvas-room-label">当前房间 · {props.currentRoomId().slice(0, 12)}</span>
           </header>
 
-          <Show when={props.error()}>
+          <Show when={props.error() || props.creationUncertain()}>
             <div class="canvas-error" role="alert">
-              <span aria-hidden="true">⚠</span> {props.error()}
+              <span aria-hidden="true">⚠</span>{' '}
+              <Show when={props.error()} fallback="创建结果仍未确认；请使用安全重试创建，避免重复提交。">
+                {props.error()}
+              </Show>
               <Show when={props.recoveryAction() === 'list'}>
                 <button type="button" onClick={props.onRetryList}>刷新 Canvas 列表</button>
+              </Show>
+              <Show when={props.creationUncertain()}>
+                <button
+                  type="button"
+                  data-testid="canvas-safe-create-retry"
+                  disabled={props.creating() || props.accessDenied()}
+                  onClick={props.onRetryCreate}
+                >
+                  安全重试创建
+                </button>
               </Show>
               <Show when={props.recoveryAction() === 'canvas' && props.activeId()}>
                 <button type="button" onClick={props.onRetryCanvas}>重新加载此 Canvas</button>
@@ -111,7 +125,7 @@ export function CanvasPanelView(props: CanvasPanelViewProps): JSX.Element {
               onInput={(event) => props.onCreateTitleInput(event.currentTarget.value)}
             />
             <button type="submit" disabled={props.creating() || props.accessDenied() || props.creationUncertain()}>
-              {props.creating() ? '创建中…' : props.creationUncertain() ? '先刷新列表确认创建结果' : '创建 Canvas'}
+              {props.creating() ? '创建中…' : props.creationUncertain() ? '创建结果待确认' : '创建 Canvas'}
             </button>
           </form>
 
@@ -122,7 +136,7 @@ export function CanvasPanelView(props: CanvasPanelViewProps): JSX.Element {
               </Show>
               <Show when={props.listStatus() === 'error'}>
                 <p class="canvas-state">
-                  {props.creationUncertain() ? '创建结果未确认，请刷新列表。' : 'Canvas 列表加载失败。'}
+                  {props.creationUncertain() ? '创建结果未确认；可安全重试。' : 'Canvas 列表加载失败。'}
                 </p>
               </Show>
               <Show when={props.listStatus() === 'ready' && props.canvases().length === 0}>

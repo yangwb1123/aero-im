@@ -85,7 +85,7 @@ CLAIM_ALLOWLIST=(
     'crates/aero-auth/src/target_assertion.rs:161:"aud"'
     # audit connector client.rs — RFC 6749 §4.4 token-request form param in
     # request_token (wire contract, not claims validation).
-    'crates/aero-audit-connector/src/client.rs:491:"scope"'
+    'crates/aero-audit-connector/src/client.rs:492:"scope"'
     # relay.rs — #[tokio::test] fixture JSON (claim-drift test data).
     'crates/aero-audit-connector/src/relay.rs:536:"iss"'
     'crates/aero-audit-connector/src/relay.rs:537:"aud"'
@@ -123,16 +123,16 @@ CLAIM_ALLOWLIST=(
     'crates/aero-auth/src/extractor.rs:191:"jti"'
     # sso.rs — OIDC authorization-code (RFC 6749 §4.1) form params + IdP
     # response `iss` parse (OIDC Core §3.1.3.7) — a different OIDC flow.
-    'crates/aero-server/src/sso.rs:385:"client_id"' # RESERVED auth-code param list
-    'crates/aero-server/src/sso.rs:387:"scope"'     # RESERVED auth-code param list
-    'crates/aero-server/src/sso.rs:405:"client_id"' # authorization-code request append_pair
-    'crates/aero-server/src/sso.rs:407:"scope"'     # authorization-code request append_pair
-    'crates/aero-server/src/sso.rs:545:"iss"'       # IdP response form-param parse
+    'crates/aero-server/src/sso.rs:421:"client_id"' # RESERVED auth-code param list
+    'crates/aero-server/src/sso.rs:423:"scope"'     # RESERVED auth-code param list
+    'crates/aero-server/src/sso.rs:441:"client_id"' # authorization-code request append_pair
+    'crates/aero-server/src/sso.rs:443:"scope"'     # authorization-code request append_pair
+    'crates/aero-server/src/sso.rs:591:"iss"'       # IdP response form-param parse
     # integrations/account_summary.rs — account-summary audit detail plus
     # #[test] fixture JSON (CreateInstallationReq payloads). The production
     # field is an audit-detail schema key, not client-credential claim
     # validation.
-    'crates/aero-server/src/integrations/account_summary.rs:263:"client_id"'
+    'crates/aero-server/src/integrations/account_summary.rs:262:"client_id"'
     'crates/aero-server/src/integrations/tests.rs:73:"client_id"'
     'crates/aero-server/src/integrations/tests.rs:83:"client_id"'
     'crates/aero-server/src/integrations/tests.rs:114:"client_id"'

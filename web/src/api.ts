@@ -39,6 +39,18 @@ export interface MessageBlock {
   [key: string]: unknown
 }
 
+export interface ReactionSummary {
+  emoji: string
+  count: number
+  participants: string[]
+}
+
+export interface ReactionToggleResult {
+  message_id: string
+  emoji: string
+  op: 'add' | 'remove'
+}
+
 export interface Message {
   id: string
   room_id: string
@@ -48,7 +60,13 @@ export interface Message {
   edited_at?: string | null
   deleted_at?: string | null
   recalled_at?: string | null
+  recalled_by?: string | null
+  reply_to?: string | null
+  version?: number
   delivery_ordinal?: number
+  client_message_id?: string
+  delivery_status?: 'sending' | 'waiting' | 'retrying' | 'failed'
+  failure_message?: string | null
 }
 
 export interface PresenceFrame {
@@ -222,16 +240,52 @@ export const api = {
     )
   },
 
+  getMessage(messageId: string): Promise<Message> {
+    return request<Message>('GET', `/api/messages/${encodeURIComponent(messageId)}`)
+  },
+
+  recallMessage(messageId: string): Promise<Message> {
+    return request<Message>('POST', `/api/messages/${encodeURIComponent(messageId)}/recall`)
+  },
+
+  deleteMessage(messageId: string): Promise<void> {
+    return request<void>('DELETE', `/api/messages/${encodeURIComponent(messageId)}`)
+  },
+
+  editMessage(messageId: string, blocks: MessageBlock[], expectedVersion?: number): Promise<Message> {
+    const body: Record<string, unknown> = { blocks }
+    if (expectedVersion !== undefined) body.expected_version = expectedVersion
+    return request<Message>('PATCH', `/api/messages/${encodeURIComponent(messageId)}`, { body })
+  },
+
+  toggleReaction(messageId: string, emoji: string): Promise<ReactionToggleResult> {
+    return request<ReactionToggleResult>(
+      'POST',
+      `/api/messages/${encodeURIComponent(messageId)}/reactions`,
+      { body: { emoji } },
+    )
+  },
+
+  reactionsBatch(messageIds: string[]): Promise<Record<string, ReactionSummary[]>> {
+    return request<Record<string, ReactionSummary[]>>('POST', '/api/messages/reactions', {
+      body: { message_ids: messageIds },
+    })
+  },
+
   listCanvases(roomId: string): Promise<Canvas[]> {
     return request<Canvas[]>('GET', `/api/rooms/${encodeURIComponent(roomId)}/canvases`)
   },
 
   createCanvas(
     roomId: string,
-    input: { title: string; blocks: unknown[] },
+    input: { title: string; blocks: unknown[]; clientCreateId: string },
   ): Promise<Canvas> {
     return request<Canvas>('POST', `/api/rooms/${encodeURIComponent(roomId)}/canvases`, {
-      body: { title: input.title, blocks: input.blocks },
+      body: {
+        title: input.title,
+        blocks: input.blocks,
+        client_create_id: input.clientCreateId,
+      },
     })
   },
 

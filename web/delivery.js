@@ -13,10 +13,30 @@ const MAX_PERSISTED_AGE_MS = 24 * 60 * 60 * 1000;
 
 let runtime = null;
 const restoredParticipants = new Set();
-let pagehideInstalled = false;
+let pagehideTarget = null;
+
+function currentParticipantId() {
+  try { return auth.getPid(); } catch { return null; }
+}
+
+function currentConnectionMarker() {
+  return runtime ? `${runtime.instanceId}:${runtime.ws.connectionId}` : 0;
+}
 
 export function pendingTempId(clientMessageId) {
   return `_pending_${clientMessageId}`;
+}
+
+export function retryPendingMessage(clientMessageId) {
+  const pending = currentPending(clientMessageId);
+  if (!pending || pending.delivery_status !== 'failed') return false;
+  pending.attempts = 0;
+  pending.failure_message = null;
+  pending.retryable = true;
+  pending.delivery_status = 'waiting';
+  pendingChanged();
+  retryPending(pending);
+  return true;
 }
 
 export function clearPendingDelivery(pending) {
@@ -38,52 +58,124 @@ export function initReliableDelivery({
   onRestore = () => null,
   onPendingChanged = () => {},
   onFailure = (msg) => toast(msg, 'error'),
+  onNotice = (msg, kind = 'info') => toast(msg, kind),
 }) {
   if (runtime?.ws === ws) {
-    runtime = {
-      ws, getPendingMap, onCanonical, onRestore, onPendingChanged, onFailure,
-    };
-    return;
+    const participantId = currentParticipantId();
+    if (runtime.participantId !== participantId) {
+      restoredParticipants.delete(runtime.participantId);
+      runtime.persistedClientMessageIds.clear();
+      runtime.legacyLoaded = false;
+    }
+    Object.assign(runtime, {
+      getPendingMap, onCanonical, onRestore, onPendingChanged, onFailure, onNotice,
+      participantId,
+      persistenceDiscarded: false,
+    });
+    return runtime.dispose;
   }
-  runtime = {
-    ws, getPendingMap, onCanonical, onRestore, onPendingChanged, onFailure,
+  runtime?.dispose?.();
+  const current = {
+    ws, getPendingMap, onCanonical, onRestore, onPendingChanged, onFailure, onNotice,
+    participantId: currentParticipantId(),
+    instanceId: crypto.randomUUID(),
+    persistedClientMessageIds: new Set(),
+    legacyLoaded: false,
+    persistenceDiscarded: false,
+    disposers: [],
+    dispose: null,
   };
-  ws.on('msg:message_ack', handleAck);
-  ws.on('msg:message_nack', handleNack);
-  ws.on('msg:welcome', handleWelcome);
-  ws.on('close', handleClose);
-  ws.on('status', handleConnectionStatus);
-  if (!pagehideInstalled && typeof window !== 'undefined' && window.addEventListener) {
-    pagehideInstalled = true;
-    window.addEventListener('pagehide', persistPending);
+  runtime = current;
+  for (const [event, handler] of [
+    ['msg:message_ack', handleAck],
+    ['msg:message_nack', handleNack],
+    ['msg:welcome', handleWelcome],
+    ['close', handleClose],
+    ['status', handleConnectionStatus],
+  ]) {
+    const dispose = ws.on(event, handler);
+    if (typeof dispose === 'function') current.disposers.push(dispose);
   }
+  if (typeof window !== 'undefined' && window.addEventListener) {
+    pagehideTarget = window;
+    pagehideTarget.addEventListener('pagehide', persistPending);
+  }
+  current.dispose = () => {
+    if (runtime !== current) return;
+    for (const pending of current.getPendingMap().values()) {
+      if (pending?._ackTimer) clearTimeout(pending._ackTimer);
+      if (pending) pending._ackTimer = null;
+      if (pending && pending.delivery_status !== 'failed') pending.delivery_status = 'waiting';
+    }
+    persistPending();
+    for (const dispose of current.disposers) dispose();
+    pagehideTarget?.removeEventListener?.('pagehide', persistPending);
+    pagehideTarget = null;
+    restoredParticipants.delete(current.participantId);
+    runtime = null;
+  };
+  return current.dispose;
 }
 
 export function sendOptimistically(sendFrame, addPending, outbound = null) {
   const clientMessageId = crypto.randomUUID();
-  const accepted = sendFrame(clientMessageId);
-  if (!accepted && (!outbound || !runtime)) {
-    toast('连接中断，消息未发送，请重试', 'error');
-    return false;
-  }
+  const canQueue = Boolean(outbound && runtime);
   const delivery = {
     client_message_id: clientMessageId,
     outbound: cloneOutbound(outbound),
-    attempts: accepted ? 1 : 0,
-    last_connection_id: accepted ? runtime?.ws?.connectionId || 0 : 0,
-    delivery_status: accepted ? 'sending' : 'waiting',
+    attempts: 0,
+    last_connection_id: 0,
+    delivery_status: 'waiting',
     retryable: true,
   };
-  // WebSocket message events cannot interleave with this JavaScript task, so the
-  // pending entry exists before the canonical server echo can be processed.
-  const pending = addPending(delivery);
-  if (pending) {
+  // Persist the logical send before touching the socket when storage is available.
+  // A crash after transport acceptance can then only cause an idempotent retry.
+  let pending = null;
+  if (canQueue) {
+    pending = addPending(delivery);
+    if (!pending) return false;
     persistPending();
-    if (accepted) {
+  }
+
+  let accepted = false;
+  try {
+    accepted = Boolean(sendFrame(clientMessageId));
+  } catch {
+    // An ambiguous transport exception must be retried with the same id.
+  }
+  if (!accepted && (!outbound || !runtime)) {
+    (runtime?.onNotice || toast)('连接中断，消息未发送，请重试', 'error');
+    return false;
+  }
+
+  if (!pending) {
+    pending = addPending({
+      ...delivery,
+      attempts: accepted ? 1 : 0,
+      last_connection_id: accepted ? currentConnectionMarker() : 0,
+      delivery_status: accepted ? 'sending' : 'waiting',
+    });
+  }
+  if (!pending) return accepted;
+
+  if (accepted) {
+    pending.attempts = 1;
+    pending.last_connection_id = currentConnectionMarker();
+    pending.delivery_status = 'sending';
+    pending.failure_message = null;
+    if (runtime) {
+      pendingChanged();
       armRetry(pending, ACK_TIMEOUT_MS);
     } else {
-      runtime.onPendingChanged();
-      toast('当前离线，消息已加入待发送队列', 'info');
+      persistPending();
+    }
+  } else {
+    pending.attempts = 0;
+    pending.last_connection_id = 0;
+    pending.delivery_status = 'waiting';
+    if (runtime) {
+      pendingChanged();
+      runtime.onNotice('当前离线，消息已加入待发送队列', 'info');
     }
   }
   return true;
@@ -91,21 +183,30 @@ export function sendOptimistically(sendFrame, addPending, outbound = null) {
 
 /// Remove the current participant's persistent outbox on an explicit logout.
 /// Network disconnects never call this: they must preserve and retry the queue.
-export function discardPersistedDeliveries(participantId = auth.getPid()) {
+export function discardPersistedDeliveries(participantId = currentParticipantId()) {
+  if (!participantId) return;
+  if (runtime?.participantId === participantId) {
+    runtime.persistenceDiscarded = true;
+    runtime.persistedClientMessageIds.clear();
+  }
+  restoredParticipants.delete(participantId);
   const storage = browserStorage();
-  if (!participantId || !storage) return;
+  if (!storage) return;
   try {
     storage.removeItem(storageKey(participantId));
+    for (const key of storageKeysWithPrefix(storage, storageEntryPrefix(participantId))) {
+      storage.removeItem(key);
+    }
   } catch {
     // Private browsing / disabled storage: the in-memory queue still works.
   }
-  restoredParticipants.delete(participantId);
 }
 
 export function findPendingMatch(serverMsg, pendingMap, myPid) {
   if (serverMsg.sender_id !== myPid) return null;
   const serverBlocks = JSON.stringify(serverMsg.blocks || []);
   const serverTime = Date.parse(serverMsg.created_at || '') || Date.now();
+  let match = null;
   for (const [tempId, pending] of pendingMap) {
     if (
       pending.sender_id !== myPid ||
@@ -114,9 +215,13 @@ export function findPendingMatch(serverMsg, pendingMap, myPid) {
       JSON.stringify(pending.blocks || []) !== serverBlocks
     ) continue;
     const pendingTime = Date.parse(pending.created_at || '') || Date.now();
-    if (Math.abs(serverTime - pendingTime) <= 15000) return tempId;
+    if (Math.abs(serverTime - pendingTime) > 15000) continue;
+    // Without a server correlation id, matching identical sends is ambiguous.
+    // Leave all candidates pending rather than falsely settling the wrong one.
+    if (match !== null) return null;
+    match = tempId;
   }
-  return null;
+  return match;
 }
 
 function cloneOutbound(outbound) {
@@ -125,6 +230,27 @@ function cloneOutbound(outbound) {
 
 function storageKey(participantId) {
   return `${STORAGE_PREFIX}${participantId}`;
+}
+
+function storageEntryPrefix(participantId) {
+  return `${storageKey(participantId)}:item:`;
+}
+
+function storageEntryKey(participantId, clientMessageId) {
+  return `${storageEntryPrefix(participantId)}${clientMessageId}`;
+}
+
+function storageKeysWithPrefix(storage, prefix) {
+  const keys = [];
+  try {
+    for (let index = 0; index < storage.length; index += 1) {
+      const key = storage.key(index);
+      if (key?.startsWith(prefix)) keys.push(key);
+    }
+  } catch {
+    // Unsupported Storage implementations simply cannot enumerate outbox keys.
+  }
+  return keys;
 }
 
 function browserStorage() {
@@ -139,80 +265,145 @@ function browserStorage() {
 function serializablePending(pending) {
   const {
     _ackTimer: ignoredTimer,
+    persistence_warning: ignoredWarning,
     ...serializable
   } = pending;
   void ignoredTimer;
+  void ignoredWarning;
   return serializable;
 }
 
 function persistPending() {
   const storage = browserStorage();
-  if (!runtime || !storage) return;
-  const participantId = auth.getPid();
+  if (!runtime || !storage || runtime.persistenceDiscarded) return;
+  const participantId = runtime.participantId;
   if (!participantId) return;
   const items = Array.from(runtime.getPendingMap().values())
     .filter((pending) => (
       pending?.sender_id === participantId
       && pending.client_message_id
       && pending.outbound
-      && pending.delivery_status !== 'failed'
     ))
     .sort((left, right) => Date.parse(left.created_at || '') - Date.parse(right.created_at || ''))
     .slice(-MAX_PERSISTED)
     .map(serializablePending);
-  try {
-    if (!items.length) {
-      storage.removeItem(storageKey(participantId));
-      return;
+  const retainedIds = new Set();
+  for (const item of items) {
+    const clientMessageId = item.client_message_id;
+    retainedIds.add(clientMessageId);
+    try {
+      storage.setItem(storageEntryKey(participantId, clientMessageId), JSON.stringify({
+        version: 1,
+        saved_at: new Date().toISOString(),
+        item,
+      }));
+      runtime.persistedClientMessageIds.add(clientMessageId);
+    } catch {
+      // Storage is an enhancement. The bounded in-memory queue remains active.
     }
-    storage.setItem(storageKey(participantId), JSON.stringify({
-      version: 1,
-      saved_at: new Date().toISOString(),
-      items,
-    }));
-  } catch {
-    // Storage is an enhancement. The bounded in-memory queue remains active.
+  }
+  for (const clientMessageId of runtime.persistedClientMessageIds) {
+    if (retainedIds.has(clientMessageId)) continue;
+    try {
+      storage.removeItem(storageEntryKey(participantId, clientMessageId));
+      runtime.persistedClientMessageIds.delete(clientMessageId);
+    } catch {
+      // Keep the id tracked so a later persistence pass can retry cleanup.
+    }
+  }
+  if (runtime.legacyLoaded) {
+    try { storage.removeItem(storageKey(participantId)); } catch { /* best effort */ }
   }
 }
 
 function restorePersisted() {
   const storage = browserStorage();
   if (!runtime || !storage) return;
-  const participantId = auth.getPid();
+  const participantId = runtime.participantId;
   if (!participantId || restoredParticipants.has(participantId)) return;
   restoredParticipants.add(participantId);
-  let parsed;
-  try {
-    parsed = JSON.parse(storage.getItem(storageKey(participantId)) || 'null');
-  } catch {
-    discardPersistedDeliveries(participantId);
-    return;
+  const candidates = new Map();
+  for (const storedKey of storageKeysWithPrefix(storage, storageEntryPrefix(participantId))) {
+    let record;
+    try {
+      record = JSON.parse(storage.getItem(storedKey) || 'null');
+    } catch {
+      try { storage.removeItem(storedKey); } catch { /* best effort */ }
+      continue;
+    }
+    const item = record?.version === 1 ? record.item : null;
+    const id = item?.client_message_id;
+    if (!item || typeof id !== 'string' || storedKey !== storageEntryKey(participantId, id)) {
+      try { storage.removeItem(storedKey); } catch { /* best effort */ }
+      continue;
+    }
+    candidates.set(id, { item, storedKey, legacy: false });
   }
-  if (parsed?.version !== 1 || !Array.isArray(parsed.items)) return;
+
+  const legacyKey = storageKey(participantId);
+  let legacyRecord;
+  try {
+    legacyRecord = JSON.parse(storage.getItem(legacyKey) || 'null');
+  } catch {
+    try { storage.removeItem(legacyKey); } catch { /* best effort */ }
+  }
+  runtime.legacyLoaded = true;
+  if (legacyRecord?.version === 1 && Array.isArray(legacyRecord.items)) {
+    for (const item of legacyRecord.items.slice(-MAX_PERSISTED)) {
+      if (typeof item?.client_message_id !== 'string' || candidates.has(item.client_message_id)) continue;
+      candidates.set(item.client_message_id, { item, storedKey: legacyKey, legacy: true });
+    }
+  } else if (legacyRecord != null) {
+    try { storage.removeItem(legacyKey); } catch { /* best effort */ }
+  }
+
   const now = Date.now();
   let restored = 0;
-  for (const item of parsed.items.slice(-MAX_PERSISTED)) {
+  const ordered = [...candidates.values()]
+    .sort((left, right) => Date.parse(left.item.created_at || '') - Date.parse(right.item.created_at || ''))
+    .slice(-MAX_PERSISTED);
+  for (const candidate of ordered) {
+    const { item, storedKey, legacy } = candidate;
     const created = Date.parse(item?.created_at || '');
+    const attempts = Number(item?.attempts ?? 0);
+    const failed = item?.delivery_status === 'failed' || attempts >= MAX_SEND_ATTEMPTS;
     if (
-      !item
-      || item.sender_id !== participantId
-      || typeof item.client_message_id !== 'string'
+      item.sender_id !== participantId
       || !item.outbound
       || !Number.isFinite(created)
       || now - created > MAX_PERSISTED_AGE_MS
-      || Number(item.attempts || 0) >= MAX_SEND_ATTEMPTS
-    ) continue;
+      || !Number.isFinite(attempts)
+      || attempts < 0
+    ) {
+      if (!legacy) {
+        try { storage.removeItem(storedKey); } catch { /* best effort */ }
+      }
+      continue;
+    }
     const key = pendingTempId(item.client_message_id);
-    if (runtime.getPendingMap().has(key)) continue;
+    if (runtime.getPendingMap().has(key)) {
+      if (!legacy) runtime.persistedClientMessageIds.add(item.client_message_id);
+      continue;
+    }
     const restoredItem = runtime.onRestore({
       ...item,
       id: key,
-      delivery_status: 'waiting',
-      failure_message: null,
-      retryable: true,
+      attempts: Math.min(Math.floor(attempts), MAX_SEND_ATTEMPTS),
+      delivery_status: failed ? 'failed' : 'waiting',
+      failure_message: failed
+        ? (typeof item.failure_message === 'string'
+          ? item.failure_message.slice(0, 500)
+          : '发送未获确认，请检查连接后重新发送')
+        : null,
+      retryable: failed ? false : true,
       _ackTimer: null,
     });
-    if (restoredItem) restored += 1;
+    if (restoredItem) {
+      restored += 1;
+      if (!legacy) runtime.persistedClientMessageIds.add(item.client_message_id);
+    } else if (!legacy) {
+      try { storage.removeItem(storedKey); } catch { /* best effort */ }
+    }
   }
   if (restored) runtime.onPendingChanged();
   persistPending();
@@ -266,13 +457,25 @@ function retryPending(pending) {
     failPending(pending, '发送未获确认，请检查连接后重新发送');
     return;
   }
-  if (!runtime.ws.supports(MESSAGE_ACK_CAPABILITY) || !sendOutbound(pending)) {
+  if (!runtime.ws.supports(MESSAGE_ACK_CAPABILITY)) {
+    if (sendOutbound(pending)) {
+      pending.attempts += 1;
+      pending.last_connection_id = currentConnectionMarker();
+      pending.delivery_status = 'sending';
+      pending.failure_message = null;
+    } else {
+      pending.delivery_status = 'waiting';
+    }
+    pendingChanged();
+    return;
+  }
+  if (!sendOutbound(pending)) {
     pending.delivery_status = 'waiting';
     pendingChanged();
     return;
   }
   pending.attempts += 1;
-  pending.last_connection_id = runtime.ws.connectionId;
+  pending.last_connection_id = currentConnectionMarker();
   pending.delivery_status = 'sending';
   pending.failure_message = null;
   pendingChanged();
@@ -304,23 +507,15 @@ function handleNack(frame) {
 function handleWelcome() {
   restorePersisted();
   const supportsAck = runtime.ws.supports(MESSAGE_ACK_CAPABILITY);
-  let changed = false;
+  const connection = currentConnectionMarker();
   for (const pending of runtime.getPendingMap().values()) {
     if (!pending.client_message_id || pending.delivery_status === 'failed') continue;
-    if (!supportsAck) {
-      if (sendOutbound(pending)) {
-        pending.attempts += 1;
-        pending.last_connection_id = runtime.ws.connectionId;
-        pending.delivery_status = 'sending';
-      }
-    } else if (pending.last_connection_id !== runtime.ws.connectionId) {
+    if (pending.last_connection_id !== connection) {
       retryPending(pending);
-    } else {
+    } else if (supportsAck && !pending._ackTimer) {
       armRetry(pending, ACK_TIMEOUT_MS);
     }
-    changed = true;
   }
-  if (changed) pendingChanged();
 }
 
 function handleClose() {
@@ -345,7 +540,30 @@ function failPending(pending, message) {
 
 function pendingChanged() {
   persistPending();
+  refreshPersistenceWarnings();
   runtime?.onPendingChanged();
+}
+
+function refreshPersistenceWarnings() {
+  if (!runtime) return;
+  const storage = browserStorage();
+  const participantId = runtime.participantId;
+  const storageAvailable = Boolean(storage && participantId) && !runtime.persistenceDiscarded;
+  for (const pending of runtime.getPendingMap().values()) {
+    if (!pending?.client_message_id || !pending.outbound) continue;
+    let durable = false;
+    if (storageAvailable && pending.sender_id === participantId) {
+      try {
+        const record = JSON.parse(storage.getItem(storageEntryKey(participantId, pending.client_message_id)) || 'null');
+        durable = record?.version === 1
+          && record.item?.client_message_id === pending.client_message_id
+          && Boolean(record.item.outbound);
+      } catch {
+        durable = false;
+      }
+    }
+    pending.persistence_warning = !durable;
+  }
 }
 
 function handleConnectionStatus(status) {

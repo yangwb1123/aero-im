@@ -79,6 +79,15 @@ fn parse_canvas(s: &str) -> Result<CanvasId, AeroError> {
 }
 
 /// Validate a (trimmed) title: non-empty and within [`MAX_TITLE_LEN`].
+fn clean_client_create_id(id: Option<uuid::Uuid>) -> Result<Option<uuid::Uuid>, AeroError> {
+    if id.is_some_and(|id| id.get_version_num() != 7) {
+        return Err(AeroError::Invalid(
+            "client_create_id must be a UUIDv7".into(),
+        ));
+    }
+    Ok(id)
+}
+
 fn clean_title(raw: &str) -> Result<&str, AeroError> {
     let title = raw.trim();
     if title.is_empty() {
@@ -121,11 +130,17 @@ struct CreateCanvasReq {
     /// Optional document body (a JSON array of blocks); absent ⇒ empty.
     #[serde(default)]
     blocks: Option<serde_json::Value>,
+    /// Stable client-generated `UUIDv7` identity for retry-safe creation.
+    /// Optional for backwards compatibility with older API clients.
+    #[serde(default)]
+    client_create_id: Option<uuid::Uuid>,
 }
 
 /// `POST /api/rooms/:id/canvases` — create a canvas in the room. Room-access
 /// gated; the author is the caller. A blank/over-long title is `400`, and a
-/// non-array `blocks` is `400`. Returns the created canvas.
+/// non-array `blocks` is `400`. `UUIDv7` `client_create_id`, when supplied, makes
+/// retries idempotent; it remains optional for older clients. Returns the
+/// created canvas.
 async fn create_canvas(
     State(s): State<AppState>,
     auth: AuthUser,
@@ -135,10 +150,24 @@ async fn create_canvas(
     let room = parse_room(&room_str)?;
     let title = clean_title(&req.title)?;
     let blocks = clean_blocks(req.blocks)?;
+    let client_create_id = clean_client_create_id(req.client_create_id)?;
 
-    let row = repo(&s)
-        .create_canvas_authorized(room, auth.participant_id, title, &blocks)
-        .await?;
+    let canvases = repo(&s);
+    let row = if let Some(client_create_id) = client_create_id {
+        canvases
+            .create_canvas_with_client_id_authorized(
+                room,
+                auth.participant_id,
+                client_create_id,
+                title,
+                &blocks,
+            )
+            .await?
+    } else {
+        canvases
+            .create_canvas_authorized(room, auth.participant_id, title, &blocks)
+            .await?
+    };
     Ok(Json(serde_json::to_value(row).map_err(AeroError::from)?))
 }
 
@@ -371,6 +400,36 @@ mod tests {
             "text": "x".repeat(MAX_OP_BYTES)
         }))
         .is_err());
+    }
+
+    #[test]
+    fn create_request_accepts_an_optional_uuid_retry_key() {
+        let client_create_id = uuid::Uuid::now_v7();
+        let with_id: CreateCanvasReq = serde_json::from_value(serde_json::json!({
+            "title": "Launch",
+            "client_create_id": client_create_id,
+        }))
+        .unwrap();
+        assert_eq!(with_id.client_create_id, Some(client_create_id));
+        assert!(with_id.blocks.is_none());
+
+        let legacy: CreateCanvasReq = serde_json::from_value(serde_json::json!({
+            "title": "Launch",
+        }))
+        .unwrap();
+        assert!(legacy.client_create_id.is_none());
+        assert!(
+            serde_json::from_value::<CreateCanvasReq>(serde_json::json!({
+                "title": "Launch",
+                "client_create_id": "not-a-uuid",
+            }))
+            .is_err()
+        );
+        assert_eq!(
+            clean_client_create_id(Some(client_create_id)).unwrap(),
+            Some(client_create_id)
+        );
+        assert!(clean_client_create_id(Some(uuid::Uuid::new_v4())).is_err());
     }
 
     #[test]

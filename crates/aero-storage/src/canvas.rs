@@ -16,6 +16,8 @@ use aero_common::{CanvasId, Error, ParticipantId, RoomId};
 use serde::Serialize;
 use sqlx::{PgPool, Postgres, Transaction};
 
+mod client_create;
+
 const MAX_TITLE_CHARS: usize = 512;
 const MAX_BLOCKS_BYTES: usize = 1024 * 1024;
 
@@ -149,6 +151,26 @@ impl CanvasRepo {
             .await?;
         tx.commit().await?;
         Ok(row_to_model(row))
+    }
+
+    /// Create a canvas with a client-generated retry identity. Replaying the
+    /// same identity in the same room by the same author returns the original
+    /// row instead of inserting a duplicate. The client UUID maps directly to
+    /// the canvas primary key, so no separate idempotency table is needed.
+    ///
+    /// # Errors
+    /// Returns [`Error::Conflict`] if the identity is already bound to a
+    /// different room or author; authorization and payload errors match
+    /// [`Self::create_canvas_authorized`].
+    pub async fn create_canvas_with_client_id_authorized(
+        &self,
+        room: RoomId,
+        author: ParticipantId,
+        client_create_id: uuid::Uuid,
+        title: &str,
+        blocks: &serde_json::Value,
+    ) -> Result<Canvas, Error> {
+        client_create::create(self, room, author, client_create_id, title, blocks).await
     }
 
     /// Fetch one canvas through its path room while the actor's effective live
@@ -607,6 +629,8 @@ mod db_tests {
             .await
             .unwrap();
     }
+
+    mod idempotency_tests;
 
     #[tokio::test]
     #[ignore = "requires live Postgres"]

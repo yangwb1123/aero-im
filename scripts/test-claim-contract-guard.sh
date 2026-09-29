@@ -137,17 +137,17 @@ check "n7-flag-outside-audit-rs-fails" 'AUDIT FLAG LITERAL:.*jwt\.rs' "$out"
 # n8: allowlist entry whose file:line lost its literal → stale warning (the
 #     allowlist can never silently mask a moved literal).
 make_fixture "$TMP/n8"
-sed -i '385s/.*/        "response_type",/' "$TMP/n8/crates/aero-server/src/sso.rs"
+sed -i '421s/.*/        "response_type",/' "$TMP/n8/crates/aero-server/src/sso.rs"
 out="$(scan "$TMP/n8")"
-check "n8-stale-allowlist-warns" "STALE ALLOWLIST ENTRY: crates/aero-server/src/sso.rs:385" "$out"
+check "n8-stale-allowlist-warns" "STALE ALLOWLIST ENTRY: crates/aero-server/src/sso.rs:421" "$out"
 
 # n9: allowlist is per-line-per-literal — the SAME line with a different
 #     literal is a violation, and the old pin goes stale.
 make_fixture "$TMP/n9"
-sed -i '405s/client_id/scope/' "$TMP/n9/crates/aero-server/src/sso.rs"
+sed -i '441s/client_id/scope/' "$TMP/n9/crates/aero-server/src/sso.rs"
 out="$(scan "$TMP/n9")"
-check "n9-wrong-literal-at-pinned-line-fails" 'CLAIM LITERAL: crates/aero-server/src/sso.rs:405:"scope"' "$out"
-check "n9-old-pin-goes-stale" "STALE ALLOWLIST ENTRY: crates/aero-server/src/sso.rs:405" "$out"
+check "n9-wrong-literal-at-pinned-line-fails" 'CLAIM LITERAL: crates/aero-server/src/sso.rs:441:"scope"' "$out"
+check "n9-old-pin-goes-stale" "STALE ALLOWLIST ENTRY: crates/aero-server/src/sso.rs:441" "$out"
 
 # n10: moderation SQL guard (3g): a drifted emission literal in the 0239
 #     migration is a violation even though the leaf still matches (comment

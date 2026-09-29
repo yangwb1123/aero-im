@@ -9,6 +9,11 @@ import type { CanvasReducerSnapshot } from '../canvas_model.js'
 import type { WsClient } from '../ws.js'
 import type { ApiError, Canvas } from './api'
 import { api } from './api'
+import {
+  clearCanvasCreateIntent,
+  loadCanvasCreateIntent,
+  saveCanvasCreateIntent,
+} from './canvas_create_intents.js'
 import { createCanvasEditor } from './canvas_editor'
 import type { CanvasEditContext, RetainedCanvasDraft } from './canvas_editor'
 import { CanvasPanelView } from './CanvasPanelView'
@@ -26,8 +31,31 @@ type RecoveryAction = 'none' | 'list' | 'canvas' | 'sync'
 
 interface UncertainCreate {
   title: string
-  knownIds: string[]
+  clientCreateId: string
   listGenerationAtFailure: number
+}
+
+function newClientCreateId(): string {
+  // UUIDv7 keeps the timestamp in the high bits. The server maps those bits
+  // directly to CanvasId's ULID value, preserving the Canvas sort invariant.
+  const bytes = globalThis.crypto.getRandomValues(new Uint8Array(16))
+  let timestamp = Date.now()
+  for (let index = 5; index >= 0; index -= 1) {
+    bytes[index] = timestamp % 256
+    timestamp = Math.floor(timestamp / 256)
+  }
+  bytes[6] = (bytes[6] & 0x0f) | 0x70
+  bytes[8] = (bytes[8] & 0x3f) | 0x80
+  const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`
+}
+
+function canvasCreateIntentStorage(): Storage | null {
+  try {
+    return window.sessionStorage
+  } catch {
+    return null
+  }
 }
 
 function createOutcomeMayBeUnknown(reason: unknown): boolean {
@@ -219,30 +247,22 @@ export function CanvasPanel(props: CanvasPanelProps): JSX.Element {
       const list = Array.isArray(rows) ? rows : []
       const uncertain = uncertainCreates()[roomId]
       // A list request already in flight when the create became uncertain cannot
-      // prove whether the server committed that create. Ignore it entirely; only
-      // an explicit refresh started afterward may reconcile the result.
+      // prove whether the server committed that create. Ignore it entirely.
       if (uncertain && listToken <= uncertain.listGenerationAtFailure) return
       setCanvases(list)
       setAccessDenied(false)
       setListStatus('ready')
-      const reconciled = uncertain && list.find((row) =>
-        row.title.trim() === uncertain.title && !uncertain.knownIds.includes(row.id))
-      if (uncertain && reconciled) {
-        setUncertainCreates((current) => {
-          const next = { ...current }
-          delete next[roomId]
-          return next
-        })
-        setCreateTitle('')
-      }
-      const listPreferredId = reconciled?.id ?? preferredId
-      const preferred = listPreferredId && list.some((row) => row.id === listPreferredId)
-        ? listPreferredId
-        : list[0]?.id
+      // Titles are not identities: a same-titled Canvas may belong to another
+      // creation. While uncertain, only keep an explicitly selected existing
+      // Canvas; never auto-select a possible match or clear the uncertainty.
+      const preferred = preferredId && list.some((row) => row.id === preferredId)
+        ? preferredId
+        : uncertain ? undefined : list[0]?.id
       if (preferred) await selectCanvas(preferred, roomToken)
-      else clearCanvas()
-      if (uncertain && !reconciled) {
-        setError('创建结果仍无法确认，刷新列表后继续确认；请勿重复提交。')
+      else if (!uncertain) clearCanvas()
+      if (!isCurrentList()) return
+      if (uncertain) {
+        setError('创建结果仍无法确认；列表中的同名 Canvas 不能证明是本次创建。请安全重试以复用原请求 ID。')
         setRecoveryAction('list')
       }
     } catch (reason) {
@@ -275,19 +295,27 @@ export function CanvasPanel(props: CanvasPanelProps): JSX.Element {
     void loadList(roomId, roomToken)
   }
 
-  const createCanvas = async (event: SubmitEvent): Promise<void> => {
-    event.preventDefault()
-    const roomId = currentRoomId()
-    const roomToken = roomGeneration
-    const title = createTitle().trim()
+  const performCreate = async (
+    roomId: string,
+    roomToken: number,
+    title: string,
+    clientCreateId: string,
+  ): Promise<void> => {
     if (!roomId || accessDenied() || creatingRooms()[roomId]
-      || inFlightCreateRooms.has(roomId) || uncertainCreates()[roomId]) return
-    if (!title) {
-      setError('请输入 Canvas 标题。')
-      setRecoveryAction('none')
+      || inFlightCreateRooms.has(roomId)) return
+    // Persist before sending: a reload between the server commit and response
+    // must retry with the same operation identity.
+    const intentSaved = saveCanvasCreateIntent(canvasCreateIntentStorage(), props.participantId, roomId, {
+      title,
+      clientCreateId,
+    })
+    if (!intentSaved) {
+      if (isCurrentRoom(roomId, roomToken)) {
+        setError('浏览器会话存储不可用，创建请求尚未发送。启用会话存储后再安全重试。')
+        setRecoveryAction('none')
+      }
       return
     }
-    const knownIds = canvases().map((item) => item.id)
     inFlightCreateRooms.add(roomId)
     setCreatingRooms((current) => ({ ...current, [roomId]: true }))
     setError('')
@@ -295,7 +323,20 @@ export function CanvasPanel(props: CanvasPanelProps): JSX.Element {
     try {
       const created = await api.createCanvas(roomId, {
         title,
+        clientCreateId,
         blocks: [{ type: 'text', content: '' }],
+      })
+      clearCanvasCreateIntent(
+        canvasCreateIntentStorage(),
+        props.participantId,
+        roomId,
+        clientCreateId,
+      )
+      setUncertainCreates((current) => {
+        if (current[roomId]?.clientCreateId !== clientCreateId) return current
+        const next = { ...current }
+        delete next[roomId]
+        return next
       })
       if (!isCurrentRoom(roomId, roomToken)) return
       // Invalidate any list started before the create completed so it cannot
@@ -308,11 +349,28 @@ export function CanvasPanel(props: CanvasPanelProps): JSX.Element {
       await selectCanvas(created.id, roomToken)
     } catch (reason) {
       if (createOutcomeMayBeUnknown(reason)) {
-        setUncertainCreates((current) => ({
-          ...current,
-          [roomId]: { title, knownIds, listGenerationAtFailure: listGeneration },
-        }))
-        if (listStatus() === 'loading') setListStatus('error')
+        saveCanvasCreateIntent(canvasCreateIntentStorage(), props.participantId, roomId, {
+          title,
+          clientCreateId,
+        })
+        setUncertainCreates((current) => {
+          const existing = current[roomId]
+          if (existing && existing.clientCreateId !== clientCreateId) return current
+          return {
+            ...current,
+            [roomId]: { title, clientCreateId, listGenerationAtFailure: listGeneration },
+          }
+        })
+        if (isCurrentRoom(roomId, roomToken) && listStatus() === 'loading') {
+          setListStatus('error')
+        }
+      } else if (uncertainCreates()[roomId]?.clientCreateId !== clientCreateId) {
+        clearCanvasCreateIntent(
+          canvasCreateIntentStorage(),
+          props.participantId,
+          roomId,
+          clientCreateId,
+        )
       }
       if (!isCurrentRoom(roomId, roomToken)) return
       setError(errorText(reason, 'Canvas 创建失败'))
@@ -328,6 +386,37 @@ export function CanvasPanel(props: CanvasPanelProps): JSX.Element {
         })
       }
     }
+  }
+
+  const createCanvas = async (event: SubmitEvent): Promise<void> => {
+    event.preventDefault()
+    const roomId = currentRoomId()
+    const roomToken = roomGeneration
+    const title = createTitle().trim()
+    if (!roomId || accessDenied() || creatingRooms()[roomId]
+      || inFlightCreateRooms.has(roomId) || uncertainCreates()[roomId]) return
+    if (!title) {
+      setError('请输入 Canvas 标题。')
+      setRecoveryAction('none')
+      return
+    }
+    let clientCreateId: string
+    try {
+      clientCreateId = newClientCreateId()
+    } catch {
+      setError('无法生成安全的 Canvas 创建标识，请检查浏览器加密支持后重试。')
+      setRecoveryAction('none')
+      return
+    }
+    await performCreate(roomId, roomToken, title, clientCreateId)
+  }
+
+  const retryUncertainCreate = async (): Promise<void> => {
+    const roomId = currentRoomId()
+    const pending = uncertainCreates()[roomId]
+    if (!roomId || !pending || accessDenied() || creatingRooms()[roomId]
+      || inFlightCreateRooms.has(roomId)) return
+    await performCreate(roomId, roomGeneration, pending.title, pending.clientCreateId)
   }
 
   const catchUp = async (verifySnapshot = true): Promise<void> => {
@@ -399,6 +488,21 @@ export function CanvasPanel(props: CanvasPanelProps): JSX.Element {
     setError('')
     setRecoveryAction('none')
     clearCanvas()
+    if (roomId) {
+      const pendingCreate = loadCanvasCreateIntent(
+        canvasCreateIntentStorage(),
+        props.participantId,
+        roomId,
+      )
+      if (pendingCreate) {
+        setUncertainCreates((current) => current[roomId]
+          ? current
+          : {
+            ...current,
+            [roomId]: { ...pendingCreate, listGenerationAtFailure: -1 },
+          })
+      }
+    }
     if (opened() && roomId) void loadList(roomId, roomGeneration)
   }))
 
@@ -460,6 +564,7 @@ export function CanvasPanel(props: CanvasPanelProps): JSX.Element {
       saving={editor.saving}
       onToggle={openPanel}
       onRetryList={() => void loadList(currentRoomId(), roomGeneration, activeId() || undefined)}
+      onRetryCreate={() => void retryUncertainCreate()}
       onRetryCanvas={() => void selectCanvas(activeId(), roomGeneration, true)}
       onRetrySync={() => void catchUp(true)}
       onCreate={(submitEvent) => void createCanvas(submitEvent)}

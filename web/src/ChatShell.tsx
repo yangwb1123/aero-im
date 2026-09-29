@@ -25,17 +25,38 @@ import {
 } from '@iris-ui-kit/solid'
 import {
   api,
-  messageText,
   sessionStorage,
   type AuthSession,
   type Message,
+  type MessageBlock,
   type Participant,
+  type ReactionSummary,
   type Room,
 } from './api'
+import { recallErrorToast } from './recall_errors.js'
+import type { RecallErrorNotice } from './recall_errors.js'
 import { CanvasPanel } from './CanvasPanel'
-import { mergeRoomMessages } from './room_state'
+import { mergeRoomMessages, newestRoomMessage } from './room_state'
+import { MessageRow } from './MessageRow'
+import {
+  editableMessageText,
+  isPlainTextMessage,
+  messageVersion,
+  participantLabel,
+  replyPreview,
+} from './message_format'
 import { WsClient } from '../ws.js'
 import { refreshWsAccessToken } from '../ws_auth.js'
+import type { PendingDelivery } from '../delivery.js'
+import {
+  clearPendingDelivery,
+  discardPersistedDeliveries,
+  findPendingMatch,
+  initReliableDelivery,
+  pendingTempId,
+  retryPendingMessage,
+  sendOptimistically,
+} from '../delivery.js'
 
 interface ChatShellProps {
   participant: Participant
@@ -43,6 +64,24 @@ interface ChatShellProps {
 }
 
 type SocketStatus = 'connecting' | 'online' | 'offline'
+
+type PendingOutbound = {
+  kind: 'blocks'
+  roomId: string
+  blocks: MessageBlock[]
+  replyTo?: string | null
+}
+
+type PendingMessage = Message & {
+  client_message_id: string
+  delivery_status: NonNullable<Message['delivery_status']>
+  attempts: number
+  outbound: PendingOutbound
+  retryable: boolean
+  persistence_warning?: boolean
+  last_connection_id?: number | string
+  _ackTimer?: ReturnType<typeof setTimeout> | null
+}
 
 interface ServerFrame {
   type?: string
@@ -52,6 +91,10 @@ interface ServerFrame {
   message?: Message
   event?: Message
   id?: string
+  message_id?: string
+  client_message_id?: string
+  emoji?: string
+  op?: string
   blocks?: Message['blocks']
 }
 
@@ -59,17 +102,26 @@ function roomLabel(room: Room): string {
   return room.name?.trim() || `${room.kind ?? 'room'} · ${room.id.slice(0, 8)}`
 }
 
-function participantLabel(id: string, current: Participant): string {
-  if (id === current.id) return current.display_name?.trim() || current.email || '我'
-  return id.slice(0, 10)
+function normalizeReactionSummaries(value: unknown): ReactionSummary[] {
+  if (!Array.isArray(value)) return []
+  return value.flatMap((item): ReactionSummary[] => {
+    if (!item || typeof item !== 'object') return []
+    const row = item as Record<string, unknown>
+    if (typeof row.emoji !== 'string' || !row.emoji
+      || !Number.isSafeInteger(row.count) || Number(row.count) < 1
+      || !Array.isArray(row.participants)) return []
+    return [{
+      emoji: row.emoji,
+      count: Number(row.count),
+      participants: [...new Set(row.participants.filter((id): id is string => typeof id === 'string'))],
+    }]
+  })
 }
 
-function messageTime(value?: string): string {
-  if (!value) return ''
-  const date = new Date(value)
-  return Number.isNaN(date.getTime())
-    ? ''
-    : date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
+function isUnknownEditOutcome(reason: unknown): boolean {
+  if (!reason || typeof reason !== 'object' || !('status' in reason)) return true
+  const status = Number((reason as { status?: unknown }).status)
+  return status === 0 || status >= 500
 }
 
 function isAuthSession(value: unknown): value is AuthSession {
@@ -90,7 +142,15 @@ export function ChatShell(props: ChatShellProps): JSX.Element {
   const [rooms, setRooms] = createSignal<Room[]>([])
   const [currentRoomId, setCurrentRoomId] = createSignal('')
   const [messagesByRoom, setMessagesByRoom] = createSignal<Record<string, Message[]>>({})
-  const messages = (): Message[] => messagesByRoom()[currentRoomId()] ?? []
+  const [replyToId, setReplyToId] = createSignal('')
+  const pendingByTempId = new Map<string, PendingDelivery>()
+  const [pendingRevision, setPendingRevision] = createSignal(0)
+  const messages = (): Message[] => {
+    pendingRevision()
+    const roomId = currentRoomId()
+    const pending = [...pendingByTempId.values()].filter((message) => message.room_id === roomId)
+    return mergeRoomMessages(messagesByRoom()[roomId] ?? [], pending)
+  }
   const [online, setOnline] = createSignal<string[]>([])
   const [draft, setDraft] = createSignal('')
   const [newRoomName, setNewRoomName] = createSignal('')
@@ -108,17 +168,51 @@ export function ChatShell(props: ChatShellProps): JSX.Element {
   const [sessionLoadError, setSessionLoadError] = createSignal('')
   const [sessionRevokeError, setSessionRevokeError] = createSignal('')
   const [revokingOthers, setRevokingOthers] = createSignal(false)
+  const [recallingMessages, setRecallingMessages] = createSignal<Record<string, boolean>>({})
+  const [recallFeedback, setRecallFeedback] = createSignal<Record<string, RecallErrorNotice>>({})
+  const [deletingMessages, setDeletingMessages] = createSignal<Record<string, boolean>>({})
+  const [deleteFeedback, setDeleteFeedback] = createSignal<Record<string, string>>({})
+  const [reactionsByMessage, setReactionsByMessage] = createSignal<Record<string, ReactionSummary[]>>({})
+  const [reacting, setReacting] = createSignal<Record<string, boolean>>({})
+  const [reactionFeedback, setReactionFeedback] = createSignal<Record<string, string>>({})
+  const [editingMessageId, setEditingMessageId] = createSignal('')
+  const [editDraft, setEditDraft] = createSignal('')
+  const [editOriginal, setEditOriginal] = createSignal('')
+  const [editBaseVersion, setEditBaseVersion] = createSignal<number>()
+  const [editSaving, setEditSaving] = createSignal(false)
+  const [editError, setEditError] = createSignal('')
+  const [editConflict, setEditConflict] = createSignal<Message | null>(null)
   const wsClient = new WsClient()
   const unsubscribe: Array<() => void> = []
   let messageLoadGeneration = 0
   let sessionLoadGeneration = 0
+  let editGeneration = 0
+  const reactionGenerations = new Map<string, number>()
+  let disposeReliableDelivery: (() => void) | undefined
   let sendResetTimer: number | undefined
   let disposed = false
 
   const selectedRoom = (): Room | undefined =>
     rooms().find((room) => room.id === currentRoomId())
 
-  const sendFrame = (frame: Record<string, unknown>): boolean => wsClient.send(frame)
+  const replyTarget = (): Message | undefined => {
+    const replyId = replyToId()
+    return replyId ? (messagesByRoom()[currentRoomId()] ?? []).find((message) => message.id === replyId) : undefined
+  }
+
+  const replyParent = (message: Message): Message | undefined => {
+    const replyId = message.reply_to
+    return replyId ? (messagesByRoom()[message.room_id] ?? []).find((item) => item.id === replyId) : undefined
+  }
+
+  const beginReply = (message: Message): void => {
+    if (message.room_id !== currentRoomId() || message.deleted_at || message.recalled_at) return
+    setReplyToId(message.id)
+  }
+
+  const cancelReply = (): void => {
+    setReplyToId('')
+  }
 
   const joinCurrentRoom = (): void => {
     const roomId = currentRoomId()
@@ -211,10 +305,16 @@ export function ChatShell(props: ChatShellProps): JSX.Element {
       if (generation !== messageLoadGeneration || roomId !== currentRoomId()) return
       const history = Array.isArray(result) ? result.slice() : []
       history.sort((a, b) => (a.created_at ?? '').localeCompare(b.created_at ?? ''))
+      for (const message of history) {
+        if (message.client_message_id) {
+          settlePendingMessage(message, message.client_message_id)
+        }
+      }
       setMessagesByRoom((current) => ({
         ...current,
         [roomId]: mergeRoomMessages(history, current[roomId] ?? []),
       }))
+      if (history.length > 0) void refreshReactions(history.map((message) => message.id))
       setOnline([])
     } catch (reason) {
       if (generation !== messageLoadGeneration || roomId !== currentRoomId()) return
@@ -226,30 +326,486 @@ export function ChatShell(props: ChatShellProps): JSX.Element {
     }
   }
 
+  const mergeRoomMessage = (roomId: string, incoming: Message): void => {
+    setMessagesByRoom((current) => {
+      const roomMessages = current[roomId] ?? []
+      const existing = roomMessages.find((message) => message.id === incoming.id)
+      const newest = newestRoomMessage(existing, incoming)
+      return {
+        ...current,
+        [roomId]: mergeRoomMessages(roomMessages, [newest]),
+      }
+    })
+  }
+
+  const bumpPendingRevision = (): void => {
+    setPendingRevision((revision) => revision + 1)
+  }
+
+  const addPendingMessage = (
+    roomId: string,
+    blocks: MessageBlock[],
+    replyTo: string | null,
+    delivery: Pick<PendingMessage, 'client_message_id' | 'delivery_status' | 'attempts'
+      | 'outbound' | 'retryable' | 'last_connection_id'>
+      & Partial<Pick<PendingMessage, 'failure_message'>>,
+  ): PendingMessage => {
+    const pending: PendingMessage = {
+      id: pendingTempId(delivery.client_message_id),
+      room_id: roomId,
+      sender_id: props.participant.id,
+      blocks,
+      reply_to: replyTo,
+      created_at: new Date().toISOString(),
+      failure_message: null,
+      ...delivery,
+    }
+    pendingByTempId.set(pending.id, pending)
+    bumpPendingRevision()
+    return pending
+  }
+
+  const restorePendingMessage = (item: PendingDelivery): PendingMessage | null => {
+    if (!item.outbound) return null
+    const restored = { ...item, id: pendingTempId(item.client_message_id) } as PendingMessage
+    pendingByTempId.set(restored.id, restored)
+    bumpPendingRevision()
+    return restored
+  }
+
+  const settlePendingMessage = (message: Message, clientMessageId?: string): void => {
+    if (disposed || !message.id || !message.room_id) return
+    const exactKey = clientMessageId ? pendingTempId(clientMessageId) : ''
+    const exactPending = exactKey ? pendingByTempId.get(exactKey) : undefined
+    const exactMatch = Boolean(clientMessageId && exactPending
+      && exactPending.client_message_id === clientMessageId
+      && exactPending.sender_id === message.sender_id
+      && exactPending.room_id === message.room_id)
+    const pendingKey = exactMatch
+      ? exactKey
+      : clientMessageId ? '' : findPendingMatch(message, pendingByTempId, props.participant.id)
+    if (pendingKey) {
+      const pending = pendingByTempId.get(pendingKey)
+      if (pending) clearPendingDelivery(pending)
+      pendingByTempId.delete(pendingKey)
+      bumpPendingRevision()
+    }
+    mergeRoomMessage(message.room_id, message)
+  }
+
+  const refreshReactions = async (messageIds: string[]): Promise<boolean> => {
+    const ids = [...new Set(messageIds.filter((id) => typeof id === 'string' && id.length > 0))]
+      .slice(0, 256)
+    if (ids.length === 0) return true
+    const generations = new Map<string, number>()
+    for (const id of ids) {
+      const generation = (reactionGenerations.get(id) ?? 0) + 1
+      reactionGenerations.set(id, generation)
+      generations.set(id, generation)
+    }
+    try {
+      const summaries = await api.reactionsBatch(ids)
+      if (disposed) return false
+      setReactionsByMessage((current) => {
+        const next = { ...current }
+        for (const id of ids) {
+          if (reactionGenerations.get(id) !== generations.get(id)) continue
+          const value = summaries && Object.prototype.hasOwnProperty.call(summaries, id)
+            ? summaries[id]
+            : []
+          next[id] = normalizeReactionSummaries(value)
+        }
+        return next
+      })
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  const clearReactionFeedback = (messageId: string): void => {
+    setReactionFeedback((current) => {
+      if (!current[messageId]) return current
+      const next = { ...current }
+      delete next[messageId]
+      return next
+    })
+  }
+
+  const reactionKey = (messageId: string, emoji: string): string => `${messageId}\u0000${emoji}`
+
+  const toggleReaction = async (message: Message, emoji: string): Promise<void> => {
+    if (disposed || message.room_id !== currentRoomId() || !message.id || !emoji
+      || message.deleted_at || message.recalled_at) return
+    const key = reactionKey(message.id, emoji)
+    if (reacting()[key]) return
+    clearReactionFeedback(message.id)
+    setReacting((current) => ({ ...current, [key]: true }))
+    try {
+      const result = await api.toggleReaction(message.id, emoji)
+      if (disposed) return
+      if (result.message_id !== message.id || result.emoji !== emoji
+        || (result.op !== 'add' && result.op !== 'remove')) {
+        throw new Error('服务器返回了无效的表情回应结果')
+      }
+      const synced = await refreshReactions([message.id])
+      if (disposed || currentRoomId() !== message.room_id) return
+      if (synced) clearReactionFeedback(message.id)
+      else {
+        setReactionFeedback((current) => ({
+          ...current,
+          [message.id]: '反应已提交，但状态同步失败；请稍后刷新。',
+        }))
+      }
+    } catch (reason) {
+      if (disposed) return
+      const status = Number((reason as { status?: unknown } | null)?.status)
+      if (status === 401) {
+        await props.onLogout()
+        return
+      }
+      if (status === 0 || status >= 500 || !reason || typeof reason !== 'object' || !('status' in reason)) {
+        const synced = await refreshReactions([message.id])
+        if (disposed || currentRoomId() !== message.room_id) return
+        setReactionFeedback((current) => ({
+          ...current,
+          [message.id]: synced
+            ? '请求结果不确定，已同步当前回应状态；请确认后再操作。'
+            : '请求结果不确定且状态同步失败，请勿盲目重试。',
+        }))
+      } else if (currentRoomId() === message.room_id) {
+        const detail = reason instanceof Error ? reason.message : '请求失败'
+        setReactionFeedback((current) => ({ ...current, [message.id]: `表情回应失败：${detail}` }))
+      }
+    } finally {
+      if (!disposed) {
+        setReacting((current) => {
+          const next = { ...current }
+          delete next[key]
+          return next
+        })
+      }
+    }
+  }
+
+  const clearDeleteFeedback = (messageId: string): void => {
+    setDeleteFeedback((current) => {
+      if (!current[messageId]) return current
+      const next = { ...current }
+      delete next[messageId]
+      return next
+    })
+  }
+
+  const markMessageDeleted = (roomId: string, messageId: string, fallback?: Message): void => {
+    const existing = (messagesByRoom()[roomId] ?? []).find((message) => message.id === messageId)
+    const current = existing ?? fallback
+    if (current) {
+      mergeRoomMessage(roomId, {
+        ...current,
+        deleted_at: current.deleted_at ?? new Date().toISOString(),
+        blocks: [],
+      })
+    }
+    clearDeleteFeedback(messageId)
+  }
+
+  const clearRecallFeedback = (roomId: string): void => {
+    setRecallFeedback((current) => {
+      if (!current[roomId]) return current
+      const next = { ...current }
+      delete next[roomId]
+      return next
+    })
+  }
+
+  const refreshMessage = async (roomId: string, messageId: string): Promise<void> => {
+    try {
+      const fresh = await api.getMessage(messageId)
+      if (disposed || fresh.id !== messageId || fresh.room_id !== roomId) return
+      mergeRoomMessage(roomId, fresh)
+    } catch {
+      if (!disposed) {
+        setRecallFeedback((current) => ({
+          ...current,
+          [roomId]: { type: 'error', text: '消息状态已变化，但同步失败；请重新加载消息。' },
+        }))
+      }
+    }
+  }
+
+  const recallMessage = async (message: Message): Promise<void> => {
+    const roomId = message.room_id
+    if (disposed || roomId !== currentRoomId() || !message.id
+      || message.deleted_at || message.recalled_at || recallingMessages()[message.id]
+      || deletingMessages()[message.id]) return
+    if (!window.confirm('确定撤回这条消息吗？')) return
+    clearRecallFeedback(roomId)
+    setRecallingMessages((current) => ({ ...current, [message.id]: true }))
+    try {
+      const recalled = await api.recallMessage(message.id)
+      if (disposed) return
+      if (recalled.id !== message.id || recalled.room_id !== roomId || !recalled.recalled_at) {
+        throw new Error('服务器返回了无效的撤回结果')
+      }
+      mergeRoomMessage(roomId, recalled)
+      clearRecallFeedback(roomId)
+    } catch (reason) {
+      if (disposed) return
+      if ((reason as { status?: unknown } | null)?.status === 401) {
+        await props.onLogout()
+        return
+      }
+      const notice = recallErrorToast(reason)
+      if (notice) {
+        setRecallFeedback((current) => ({ ...current, [roomId]: notice }))
+      } else {
+        await refreshMessage(roomId, message.id)
+      }
+    } finally {
+      if (!disposed) {
+        setRecallingMessages((current) => {
+          const next = { ...current }
+          delete next[message.id]
+          return next
+        })
+      }
+    }
+  }
+
+  const deleteMessage = async (message: Message): Promise<void> => {
+    const roomId = message.room_id
+    if (disposed || roomId !== currentRoomId() || !message.id
+      || message.sender_id !== props.participant.id
+      || message.deleted_at || message.recalled_at || deletingMessages()[message.id]
+      || recallingMessages()[message.id]) return
+    if (!window.confirm('确定删除这条消息吗？删除后它会从房间消息中隐藏。')) return
+    clearDeleteFeedback(message.id)
+    setDeletingMessages((current) => ({ ...current, [message.id]: true }))
+
+    const showFeedback = (text: string): void => {
+      if (disposed || currentRoomId() !== roomId) return
+      setDeleteFeedback((current) => ({ ...current, [message.id]: text }))
+    }
+    const reconcile = async (): Promise<void> => {
+      try {
+        const latest = await api.getMessage(message.id)
+        if (disposed || latest.id !== message.id || latest.room_id !== roomId) return
+        if (latest.deleted_at) {
+          markMessageDeleted(roomId, message.id, latest)
+          return
+        }
+        mergeRoomMessage(roomId, latest)
+        showFeedback('消息仍存在，删除尚未完成；你可以重试。')
+      } catch (reason) {
+        if (disposed) return
+        const status = Number((reason as { status?: unknown } | null)?.status)
+        if (status === 401) {
+          await props.onLogout()
+          return
+        }
+        if (status === 404) {
+          markMessageDeleted(roomId, message.id, message)
+          return
+        }
+        showFeedback('删除结果无法确认；消息和本地状态均已保留，请重试。')
+      }
+    }
+
+    try {
+      await api.deleteMessage(message.id)
+      if (disposed) return
+      markMessageDeleted(roomId, message.id, message)
+    } catch (reason) {
+      if (disposed) return
+      const status = Number((reason as { status?: unknown } | null)?.status)
+      if (status === 401) {
+        await props.onLogout()
+        return
+      }
+      if (status === 404) {
+        markMessageDeleted(roomId, message.id, message)
+        return
+      }
+      if (status === 409 || status === 0 || status >= 500
+        || !reason || typeof reason !== 'object' || !('status' in reason)) {
+        await reconcile()
+        return
+      }
+      const detail = reason instanceof Error ? reason.message : '请求失败'
+      showFeedback(`删除消息失败：${detail}`)
+    } finally {
+      if (!disposed) {
+        setDeletingMessages((current) => {
+          const next = { ...current }
+          delete next[message.id]
+          return next
+        })
+      }
+    }
+  }
+
+  const hasUnsavedMessageEdit = (): boolean => Boolean(
+    editingMessageId() && editDraft() !== editOriginal(),
+  )
+
+  const hasUnsavedChanges = (): boolean => canvasDraftDirty()
+    || hasUnsavedMessageEdit() || Boolean(replyToId())
+
+  const clearMessageEdit = (): void => {
+    editGeneration += 1
+    setEditingMessageId('')
+    setEditDraft('')
+    setEditOriginal('')
+    setEditBaseVersion(undefined)
+    setEditSaving(false)
+    setEditError('')
+    setEditConflict(null)
+  }
+
+  const beginMessageEdit = (message: Message): void => {
+    if (message.room_id !== currentRoomId() || message.sender_id !== props.participant.id
+      || message.deleted_at || message.recalled_at || !isPlainTextMessage(message)
+      || editSaving()) return
+    if (editingMessageId() && editingMessageId() !== message.id) {
+      if (hasUnsavedMessageEdit()
+        && !window.confirm('放弃另一条消息尚未保存的编辑草稿吗？')) return
+      clearMessageEdit()
+    }
+    editGeneration += 1
+    const text = editableMessageText(message)
+    setEditingMessageId(message.id)
+    setEditDraft(text)
+    setEditOriginal(text)
+    setEditBaseVersion(messageVersion(message))
+    setEditSaving(false)
+    setEditError('')
+    setEditConflict(null)
+  }
+
+  const loadLatestEditVersion = (latest: Message): void => {
+    if (latest.id !== editingMessageId()
+      || !window.confirm('载入服务器最新版本会放弃当前编辑草稿，继续吗？')) return
+    const text = editableMessageText(latest)
+    setEditDraft(text)
+    setEditOriginal(text)
+    setEditBaseVersion(messageVersion(latest))
+    setEditConflict(null)
+    setEditError('')
+  }
+
+  const rebaseEditOnLatestVersion = (latest: Message): void => {
+    if (latest.id !== editingMessageId()
+      || !window.confirm('将用当前草稿覆盖其他设备的最新修改，继续吗？')) return
+    setEditOriginal(editableMessageText(latest))
+    setEditBaseVersion(messageVersion(latest))
+    setEditConflict(null)
+    setEditError('')
+  }
+
+  const saveMessageEdit = async (event: Event, message: Message): Promise<void> => {
+    event.preventDefault()
+    if (editSaving() || editingMessageId() !== message.id) return
+    const roomId = message.room_id
+    const text = editDraft()
+    if (!text.trim()) {
+      setEditError('消息内容不能为空。')
+      return
+    }
+    if (text === editOriginal()) {
+      clearMessageEdit()
+      return
+    }
+    if (message.deleted_at || message.recalled_at) {
+      setEditError('这条消息已删除或撤回，不能继续编辑；草稿仍保留。')
+      return
+    }
+    const baseVersion = editBaseVersion()
+    const editToken = editGeneration
+    const blocks = [{ type: 'text', content: text }]
+    const isCurrentEdit = (): boolean => editGeneration === editToken
+      && editingMessageId() === message.id
+    setEditSaving(true)
+    setEditError('')
+    try {
+      const updated = await api.editMessage(message.id, blocks, baseVersion)
+      if (disposed) return
+      if (updated.id !== message.id || updated.room_id !== roomId
+        || (baseVersion !== undefined && messageVersion(updated) !== undefined
+          && messageVersion(updated)! <= baseVersion)) {
+        throw new Error('服务器返回了无效的编辑结果')
+      }
+      mergeRoomMessage(roomId, updated)
+      if (isCurrentEdit()) clearMessageEdit()
+    } catch (reason) {
+      if (disposed) return
+      if ((reason as { status?: unknown } | null)?.status === 401) {
+        await props.onLogout()
+        return
+      }
+      const status = Number((reason as { status?: unknown } | null)?.status)
+      if (status === 409 || isUnknownEditOutcome(reason)) {
+        try {
+          const latest = await api.getMessage(message.id)
+          if (disposed || latest.id !== message.id || latest.room_id !== roomId) return
+          mergeRoomMessage(roomId, latest)
+          if (!isCurrentEdit()) return
+          const latestVersion = messageVersion(latest)
+          const advanced = baseVersion === undefined
+            ? editableMessageText(latest) === text
+            : latestVersion !== undefined && latestVersion > baseVersion
+          if (advanced && editableMessageText(latest) === text) {
+            clearMessageEdit()
+            return
+          }
+          if ((latest.deleted_at || latest.recalled_at)
+            || (baseVersion !== undefined && latestVersion !== undefined
+              && latestVersion > baseVersion)) {
+            setEditConflict(latest)
+            setEditError(latest.deleted_at || latest.recalled_at
+              ? '这条消息已删除或撤回；本地草稿仍保留，无法提交。'
+              : '消息已在其他设备修改；本地草稿仍保留，请选择如何处理。')
+            return
+          }
+        } catch (refreshReason) {
+          if (isCurrentEdit()) {
+            const detail = refreshReason instanceof Error ? refreshReason.message : '无法加载最新消息'
+            setEditError(`编辑结果无法确认，草稿已保留。${detail}`)
+          }
+          return
+        }
+      }
+      if (isCurrentEdit()) {
+        setEditError(reason instanceof Error ? reason.message : '消息编辑失败，请重试。')
+      }
+    } finally {
+      if (isCurrentEdit()) setEditSaving(false)
+    }
+  }
+
   const handleFrame = (frame: ServerFrame): void => {
     if (frame.type === 'message' && frame.message?.room_id) {
-      const roomId = frame.message.room_id
-      setMessagesByRoom((current) => ({
-        ...current,
-        [roomId]: mergeRoomMessages(current[roomId] ?? [], [frame.message!]),
-      }))
+      settlePendingMessage(frame.message, frame.client_message_id ?? frame.message.client_message_id)
+      return
+    }
+    if (frame.type === 'recalled' && frame.message?.room_id) {
+      mergeRoomMessage(frame.message.room_id, frame.message)
       return
     }
     if (frame.type === 'edited' && frame.event?.room_id) {
-      const roomId = frame.event.room_id
-      setMessagesByRoom((current) => ({
-        ...current,
-        [roomId]: mergeRoomMessages(current[roomId] ?? [], [frame.event!]),
-      }))
+      mergeRoomMessage(frame.event.room_id, frame.event)
       return
     }
     if (frame.type === 'deleted' && frame.room_id && frame.id) {
-      setMessagesByRoom((current) => ({
-        ...current,
-        [frame.room_id!]: (current[frame.room_id!] ?? []).map((message) => message.id === frame.id
-          ? { ...message, deleted_at: new Date().toISOString(), blocks: [] }
-          : message),
-      }))
+      markMessageDeleted(frame.room_id, frame.id)
+      return
+    }
+    if (frame.type === 'reaction' && frame.room_id && frame.message_id && frame.emoji) {
+      const message = (messagesByRoom()[frame.room_id] ?? [])
+        .find((item) => item.id === frame.message_id)
+      if (message && !message.deleted_at && !message.recalled_at) {
+        void refreshReactions([frame.message_id])
+      }
       return
     }
     if (frame.type === 'presence' && frame.room_id === currentRoomId()) {
@@ -282,7 +838,10 @@ export function ChatShell(props: ChatShellProps): JSX.Element {
 
   const selectRoom = (roomId: string): void => {
     if (roomId === currentRoomId()) return
-    if (canvasDraftDirty() && !window.confirm('切换房间会离开未保存的 Canvas 草稿，是否继续？')) return
+    if (hasUnsavedChanges()
+      && !window.confirm('切换房间会离开未保存的 Canvas、消息编辑草稿或回复上下文，是否继续？')) return
+    clearMessageEdit()
+    cancelReply()
     setCurrentRoomId(roomId)
   }
 
@@ -291,15 +850,29 @@ export function ChatShell(props: ChatShellProps): JSX.Element {
     try {
       const room = await api.createRoom(newRoomKind(), newRoomName())
       if (disposed) return
-      const shouldSelect = !canvasDraftDirty()
-        || window.confirm('新房间已创建。切换过去会离开未保存的 Canvas 草稿，是否继续？')
+      const shouldSelect = !hasUnsavedChanges()
+        || window.confirm('新房间已创建。切换过去会离开未保存的 Canvas、消息编辑草稿或回复上下文，是否继续？')
       setRooms((current) => [...current, room])
       setNewRoomName('')
       setShowNewRoom(false)
-      if (shouldSelect) setCurrentRoomId(room.id)
+      if (shouldSelect) {
+        clearMessageEdit()
+        cancelReply()
+        setCurrentRoomId(room.id)
+      }
     } catch (reason) {
       if (!disposed) setError(reason instanceof Error ? reason.message : '创建房间失败')
     }
+  }
+
+  const logoutManually = async (): Promise<void> => {
+    disposeReliableDelivery?.()
+    disposeReliableDelivery = undefined
+    wsClient.close()
+    pendingByTempId.clear()
+    bumpPendingRevision()
+    discardPersistedDeliveries(props.participant.id)
+    await props.onLogout()
   }
 
   const sendMessage = (event: Event): void => {
@@ -307,17 +880,29 @@ export function ChatShell(props: ChatShellProps): JSX.Element {
     const roomId = currentRoomId()
     const text = draft().trim()
     if (!roomId || !text || sending()) return
-    if (!sendFrame({
-      type: 'send_message',
-      room_id: roomId,
-      blocks: [{ type: 'text', content: text }],
-      reply_to: null,
-    })) {
-      setError('实时连接尚未建立，消息未发送')
+    if (pendingByTempId.size >= 50) {
+      setError('待发送消息队列已满；请检查连接并处理失败消息后重试。')
       return
     }
+    const blocks: MessageBlock[] = [{ type: 'text', content: text }]
+    const replyTo = replyToId() || null
+    const accepted = sendOptimistically(
+      (clientMessageId) => wsClient.sendMessage(roomId, blocks, replyTo, clientMessageId),
+      (delivery) => {
+        const outbound = delivery.outbound
+        if (!outbound || outbound.kind !== 'blocks') return null
+        return addPendingMessage(roomId, blocks, replyTo, { ...delivery, outbound })
+      },
+      { kind: 'blocks', roomId, blocks, replyTo },
+    )
+    if (!accepted) {
+      setError('实时连接尚未建立，消息未发送。')
+      return
+    }
+    setError('')
     setSending(true)
     setDraft('')
+    cancelReply()
     if (sendResetTimer !== undefined) window.clearTimeout(sendResetTimer)
     sendResetTimer = window.setTimeout(() => {
       sendResetTimer = undefined
@@ -326,6 +911,15 @@ export function ChatShell(props: ChatShellProps): JSX.Element {
   }
 
   onMount(() => {
+    disposeReliableDelivery = initReliableDelivery({
+      ws: wsClient,
+      getPendingMap: () => pendingByTempId,
+      onCanonical: settlePendingMessage,
+      onRestore: restorePendingMessage,
+      onPendingChanged: bumpPendingRevision,
+      onFailure: () => {},
+      onNotice: () => {},
+    })
     unsubscribe.push(
       wsClient.on('status', (status) => {
         if (status === 'up') setSocketStatus('online')
@@ -349,6 +943,7 @@ export function ChatShell(props: ChatShellProps): JSX.Element {
     sessionLoadGeneration += 1
     if (sendResetTimer !== undefined) window.clearTimeout(sendResetTimer)
     for (const off of unsubscribe) off()
+    disposeReliableDelivery?.()
     wsClient.close()
   })
 
@@ -420,7 +1015,7 @@ export function ChatShell(props: ChatShellProps): JSX.Element {
               </div>
             </IrisDialogContent>
           </IrisDialog>
-          <IrisButton variant="ghost" size="sm" onClick={() => void props.onLogout()}>
+          <IrisButton variant="ghost" size="sm" onClick={() => void logoutManually()}>
             退出
           </IrisButton>
         </div>
@@ -494,6 +1089,15 @@ export function ChatShell(props: ChatShellProps): JSX.Element {
                 <Show when={error()}>
                   <IrisAlert tone="danger" class="inline-alert">{error()}</IrisAlert>
                 </Show>
+                <Show when={recallFeedback()[currentRoomId()]}>
+                  <IrisAlert
+                    tone={recallFeedback()[currentRoomId()]?.type === 'info' ? 'info' : 'danger'}
+                    class="inline-alert recall-feedback"
+                    role="status"
+                  >
+                    {recallFeedback()[currentRoomId()]?.text}
+                  </IrisAlert>
+                </Show>
 
                 <CanvasPanel
                   roomId={() => currentRoomId()}
@@ -507,20 +1111,47 @@ export function ChatShell(props: ChatShellProps): JSX.Element {
                     <Show when={messages().length > 0} fallback={<div class="empty-state">暂无消息，发起第一条消息吧。</div>}>
                       <For each={messages()}>
                         {(message) => (
-                          <article class="message-row" classList={{ mine: message.sender_id === props.participant.id }}>
-                            <IrisAvatar name={participantLabel(message.sender_id, props.participant)} size={32} />
-                            <div class="message-body">
-                              <div class="message-meta">
-                                <strong>{participantLabel(message.sender_id, props.participant)}</strong>
-                                <time>{messageTime(message.created_at)}</time>
-                              </div>
-                              <div class="message-bubble">
-                                <Show when={!message.deleted_at && !message.recalled_at} fallback={<em>消息已撤回</em>}>
-                                  {messageText(message) || '[非文本消息]'}
-                                </Show>
-                              </div>
-                            </div>
-                          </article>
+                          <MessageRow
+                            message={message}
+                            participant={props.participant}
+                            isEditing={() => editingMessageId() === message.id}
+                            editDraft={editDraft}
+                            editOriginal={editOriginal}
+                            editSaving={editSaving}
+                            editError={editError}
+                            editConflict={editConflict}
+                            isRecalling={() => Boolean(recallingMessages()[message.id])}
+                            isDeleting={() => Boolean(deletingMessages()[message.id])}
+                            deleteFeedback={() => deleteFeedback()[message.id]}
+                            reactions={() => reactionsByMessage()[message.id] ?? []}
+                            isReacting={(emoji) => Boolean(reacting()[reactionKey(message.id, emoji)])}
+                            reactionFeedback={() => reactionFeedback()[message.id]}
+                            deliveryStatus={() => {
+                              pendingRevision()
+                              return message.delivery_status
+                            }}
+                            failureMessage={() => {
+                              pendingRevision()
+                              return message.failure_message
+                            }}
+                            persistenceWarning={() => {
+                              pendingRevision()
+                              return Boolean((message as Message & { persistence_warning?: boolean }).persistence_warning)
+                            }}
+                            clientMessageId={() => message.client_message_id}
+                            replyParent={replyParent}
+                            onBeginEdit={beginMessageEdit}
+                            onRecall={(target) => void recallMessage(target)}
+                            onDelete={(target) => void deleteMessage(target)}
+                            onBeginReply={beginReply}
+                            onToggleReaction={(target, emoji) => void toggleReaction(target, emoji)}
+                            onRetryDelivery={(clientMessageId) => { retryPendingMessage(clientMessageId) }}
+                            onEditDraftChange={setEditDraft}
+                            onEditSubmit={(event, target) => void saveMessageEdit(event, target)}
+                            onLoadLatest={loadLatestEditVersion}
+                            onRebase={rebaseEditOnLatestVersion}
+                            onCancelEdit={clearMessageEdit}
+                          />
                         )}
                       </For>
                     </Show>
@@ -528,6 +1159,25 @@ export function ChatShell(props: ChatShellProps): JSX.Element {
                 </section>
 
                 <form class="composer" onSubmit={sendMessage}>
+                  <Show when={replyToId()}>
+                    <div class="composer-reply-context" role="status">
+                      <div>
+                        <strong>
+                          {replyTarget()
+                            ? `回复 ${participantLabel(replyTarget()!.sender_id, props.participant)}`
+                            : '回复消息'}:
+                        </strong>
+                        <span>{replyPreview(replyTarget(), replyToId())}</span>
+                      </div>
+                      <IrisButton
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        aria-label="取消回复"
+                        onClick={cancelReply}
+                      >取消</IrisButton>
+                    </div>
+                  </Show>
                   <textarea
                     value={draft()}
                     rows="2"

@@ -39,9 +39,10 @@ test('Solid Canvas API adapter encodes room-scoped requests and bodies', async (
     const roomId = 'room / #1';
     const canvasId = 'canvas /#1';
     const blocks = [{ type: 'text', content: 'start' }];
+    const clientCreateId = 'd5c9d733-76a3-79c0-bdb7-2497bc4fe779';
     const op = { type: 'set_text', text: 'saved' };
     await api.listCanvases(roomId);
-    await api.createCanvas(roomId, { title: 'Launch', blocks });
+    await api.createCanvas(roomId, { title: 'Launch', blocks, clientCreateId });
     await api.getCanvas(roomId, canvasId);
     await api.listCanvasOps(roomId, canvasId, { since: 17, limit: 23 });
     await api.appendCanvasOp(roomId, canvasId, op, 'client-op-id-1');
@@ -53,13 +54,113 @@ test('Solid Canvas API adapter encodes room-scoped requests and bodies', async (
       ['GET', '/api/rooms/room%20%2F%20%231/canvases/canvas%20%2F%231/ops?since=17&limit=23'],
       ['POST', '/api/rooms/room%20%2F%20%231/canvases/canvas%20%2F%231/ops'],
     ]);
-    assert.deepEqual(JSON.parse(requests[1].init.body), { title: 'Launch', blocks });
+    assert.deepEqual(JSON.parse(requests[1].init.body), {
+      title: 'Launch',
+      blocks,
+      client_create_id: clientCreateId,
+    });
     assert.deepEqual(JSON.parse(requests[4].init.body), {
       client_op_id: 'client-op-id-1',
       op,
     });
     assert.equal(requests[4].init.headers.Authorization, 'Bearer solid-access-token');
     assert.ok(requests.every(({ url }) => url.includes('/rooms/')));
+  } finally {
+    globalThis.fetch = previousFetch;
+    if (previousWindow === undefined) delete globalThis.window;
+    else Object.defineProperty(globalThis, 'window', previousWindow);
+  }
+});
+
+test('Solid message recall, deletion, and refresh APIs encode ids and preserve REST methods', async () => {
+  const previousWindow = Object.getOwnPropertyDescriptor(globalThis, 'window');
+  const previousFetch = globalThis.fetch;
+  const requests = [];
+  Object.defineProperty(globalThis, 'window', {
+    configurable: true,
+    value: { localStorage: { getItem: (key) => key === 'aero_token' ? 'solid-access-token' : null } },
+  });
+  globalThis.fetch = async (url, init) => {
+    requests.push({ url: String(url), init });
+    return response({ id: 'message /#1', room_id: 'room-1', recalled_at: null });
+  };
+
+  try {
+    const { api } = await loadSolidApi();
+    await api.getMessage('message /#1');
+    await api.recallMessage('message /#1');
+    await api.deleteMessage('message /#1');
+
+    assert.deepEqual(requests.map(({ url, init }) => [init.method, url]), [
+      ['GET', '/api/messages/message%20%2F%231'],
+      ['POST', '/api/messages/message%20%2F%231/recall'],
+      ['DELETE', '/api/messages/message%20%2F%231'],
+    ]);
+    assert.equal(requests[0].init.body, undefined);
+    assert.ok(requests.every(({ init }) => init.body === undefined));
+    assert.ok(requests.every(({ init }) => init.headers.Authorization === 'Bearer solid-access-token'));
+  } finally {
+    globalThis.fetch = previousFetch;
+    if (previousWindow === undefined) delete globalThis.window;
+    else Object.defineProperty(globalThis, 'window', previousWindow);
+  }
+});
+
+test('Solid message edits send the optimistic version only when available', async () => {
+  const previousWindow = Object.getOwnPropertyDescriptor(globalThis, 'window');
+  const previousFetch = globalThis.fetch;
+  const requests = [];
+  Object.defineProperty(globalThis, 'window', {
+    configurable: true,
+    value: { localStorage: { getItem: () => 'solid-access-token' } },
+  });
+  globalThis.fetch = async (url, init) => {
+    requests.push({ url: String(url), init });
+    return response({ id: 'message-1', room_id: 'room-a', version: 2 });
+  };
+
+  try {
+    const { api } = await loadSolidApi();
+    const blocks = [{ type: 'text', content: 'edited text' }];
+    await api.editMessage('message /1', blocks, 7);
+    await api.editMessage('message-2', blocks);
+    assert.deepEqual(requests.map(({ url, init }) => [init.method, url]), [
+      ['PATCH', '/api/messages/message%20%2F1'],
+      ['PATCH', '/api/messages/message-2'],
+    ]);
+    assert.deepEqual(JSON.parse(requests[0].init.body), { blocks, expected_version: 7 });
+    assert.deepEqual(JSON.parse(requests[1].init.body), { blocks });
+  } finally {
+    globalThis.fetch = previousFetch;
+    if (previousWindow === undefined) delete globalThis.window;
+    else Object.defineProperty(globalThis, 'window', previousWindow);
+  }
+});
+
+test('Solid reaction APIs preserve the message scope and batch body', async () => {
+  const previousWindow = Object.getOwnPropertyDescriptor(globalThis, 'window');
+  const previousFetch = globalThis.fetch;
+  const requests = [];
+  Object.defineProperty(globalThis, 'window', {
+    configurable: true,
+    value: { localStorage: { getItem: () => 'solid-access-token' } },
+  });
+  globalThis.fetch = async (url, init) => {
+    requests.push({ url: String(url), init });
+    return response({});
+  };
+
+  try {
+    const { api } = await loadSolidApi();
+    await api.toggleReaction('message /#1', '👍');
+    await api.reactionsBatch(['message-1', 'message-2']);
+    assert.deepEqual(requests.map(({ url, init }) => [init.method, url]), [
+      ['POST', '/api/messages/message%20%2F%231/reactions'],
+      ['POST', '/api/messages/reactions'],
+    ]);
+    assert.deepEqual(JSON.parse(requests[0].init.body), { emoji: '👍' });
+    assert.deepEqual(JSON.parse(requests[1].init.body), { message_ids: ['message-1', 'message-2'] });
+    assert.ok(requests.every(({ init }) => init.headers.Authorization === 'Bearer solid-access-token'));
   } finally {
     globalThis.fetch = previousFetch;
     if (previousWindow === undefined) delete globalThis.window;
