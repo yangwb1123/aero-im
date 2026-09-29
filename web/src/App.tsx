@@ -29,7 +29,53 @@ const skinEngine = createSkinEngine({
 
 type AuthMode = 'login' | 'register'
 
-function AuthScreen(props: { onSuccess: (session: SessionResponse) => void }): JSX.Element {
+/**
+ * Snaplink entry point. The OIDC handshake is entirely server-side: the browser
+ * navigates to `/api/auth/oidc/start`, the server redirects to Snaplink, and
+ * `/callback` hands the session back through `oidc_callback.js`. There is no
+ * token in the URL at any point.
+ */
+function SnaplinkAuthScreen(props: { onLocal: () => void }): JSX.Element {
+  return (
+    <main class="auth-page">
+      <div class="auth-card">
+        <IrisCard padding="lg">
+          <div class="brand-lockup">
+            <div class="brand-mark">A</div>
+            <div>
+              <h1>Aero IM</h1>
+              <p>AI-native messaging · SolidJS + Iris UI</p>
+            </div>
+          </div>
+
+          <p style={{ 'margin-block': '1.25rem', color: 'var(--iris-text-muted)' }}>
+            使用平台统一身份登录。
+          </p>
+
+          <IrisButton
+            type="button"
+            variant="solid"
+            style={{ width: '100%' }}
+            onClick={() => { window.location.assign('/api/auth/oidc/start') }}
+          >
+            使用 Snaplink 登录
+          </IrisButton>
+
+          <button
+            type="button"
+            class="auth-tabs"
+            style={{ 'margin-block-start': '1rem', background: 'none', border: 'none' }}
+            onClick={props.onLocal}
+          >
+            使用 Aero IM 账号登录
+          </button>
+        </IrisCard>
+      </div>
+    </main>
+  )
+}
+
+function AuthScreen(props: { onSuccess: (session: SessionResponse) => void; onSnaplink: () => void }): JSX.Element {
   const [mode, setMode] = createSignal<AuthMode>('login')
   const [email, setEmail] = createSignal('')
   const [displayName, setDisplayName] = createSignal('')
@@ -80,6 +126,9 @@ function AuthScreen(props: { onSuccess: (session: SessionResponse) => void }): J
             onClick={() => setMode('register')}
           >
             注册
+          </button>
+          <button type="button" onClick={props.onSnaplink}>
+            Snaplink
           </button>
         </div>
 
@@ -156,6 +205,8 @@ function BootScreen(): JSX.Element {
 export function App(): JSX.Element {
   const [participant, setParticipant] = createSignal<Participant | null>(null)
   const [booting, setBooting] = createSignal(true)
+  // null until /api/auth/config answers; 'local' keeps the password form.
+  const [loginPage, setLoginPage] = createSignal<'snaplink' | 'local' | null>(null)
 
   onMount(async () => {
     if (sessionStorage.token) {
@@ -163,6 +214,19 @@ export function App(): JSX.Element {
         setParticipant(await api.me())
       } catch {
         sessionStorage.clear()
+      }
+    } else {
+      // Only ask which surface to render when there is no session: the answer
+      // is irrelevant once a participant is present, and this keeps the boot
+      // path to a single request.
+      try {
+        const config = await api.authConfig()
+        if (config.login_page === 'snaplink' && config.snaplink) {
+          setLoginPage('snaplink')
+        }
+      } catch {
+        // A missing/unreachable auth config must not block the app; fall back
+        // to the local account form.
       }
     }
     setBooting(false)
@@ -183,11 +247,25 @@ export function App(): JSX.Element {
     setParticipant(null)
   }
 
+  const authSurface = (): JSX.Element => (
+    <Show
+      when={loginPage() !== 'snaplink'}
+      fallback={
+        <SnaplinkAuthScreen onLocal={() => setLoginPage('local')} />
+      }
+    >
+      <AuthScreen
+        onSuccess={enter}
+        onSnaplink={() => setLoginPage('snaplink')}
+      />
+    </Show>
+  )
+
   return (
     <SkinProvider engine={skinEngine}>
       <IrisProvider>
         <Show when={!booting()} fallback={<BootScreen />}>
-          <Show when={participant()} fallback={<AuthScreen onSuccess={enter} />}>
+          <Show when={participant()} fallback={authSurface()}>
             {(current) => <ChatShell participant={current()} onLogout={logout} />}
           </Show>
         </Show>

@@ -179,7 +179,33 @@ async function request<T>(
   return body as T
 }
 
+/** Public OIDC parameters the server advertises for the Snaplink hand-off. */
+export interface PublicSnaplinkConfig {
+  base_url: string
+  authorization_endpoint: string
+  token_endpoint: string
+  client_id: string
+  redirect_uri: string
+  scope: string[]
+}
+
+export interface PublicAuthConfig {
+  login_page: string
+  snaplink: PublicSnaplinkConfig | null
+}
+
 export const api = {
+  /**
+   * Which login surface the server is configured to offer. `login_page` is
+   * `snaplink` when the deployment routes browser login through Snaplink; the
+   * OIDC handshake itself is server-side (`/api/auth/oidc/start` →
+   * `/callback` → `oidc_callback.js`), so the browser only needs this to know
+   * which entry point to render.
+   */
+  authConfig(): Promise<PublicAuthConfig> {
+    return request<PublicAuthConfig>('GET', '/api/auth/config', { authenticated: false })
+  },
+
   login(email: string, password: string, secondFactor = ''): Promise<SessionResponse> {
     const body: Record<string, string> = { email, password }
     if (/^\d{6}$/.test(secondFactor)) body.totp = secondFactor

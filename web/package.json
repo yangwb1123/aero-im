@@ -12,7 +12,7 @@
     "preview": "vite preview --config vite.config.ts",
     "typecheck": "tsc --noEmit",
     "lint": "pnpm typecheck && pnpm lint:legacy",
-    "test:legacy": "node --test api.test.js canvas.test.js canvas_create_intents.test.js solid_api.test.js compliance_admin.test.js delivery.test.js delivery_restore.test.js delivery_cursor.test.js drafts.test.js drafts_restore.test.js ws.test.js ws_delivery_barrier.test.js security_admin.test.js governance_utils.test.js rtc_config.test.js sfu_calls.test.js realtime_events.test.js render_giphy.test.js render_recall.test.js recall_errors.test.js solid_entry.test.js snaplink_sdk.test.js",
+    "test:legacy": "node --test sso_entry.test.js solid_runtime.test.js api.test.js canvas.test.js canvas_create_intents.test.js solid_api.test.js compliance_admin.test.js delivery.test.js delivery_restore.test.js delivery_cursor.test.js drafts.test.js drafts_restore.test.js ws.test.js ws_delivery_barrier.test.js security_admin.test.js governance_utils.test.js rtc_config.test.js sfu_calls.test.js realtime_events.test.js render_giphy.test.js render_recall.test.js recall_errors.test.js solid_entry.test.js snaplink_sdk.test.js",
     "test": "pnpm test:legacy && pnpm test:solid",
     "test:solid": "vitest run --config vite.config.ts --environment jsdom test-solid/",
     "lint:legacy": "eslint --config eslint.config.js --ignore-pattern 'vendor/**' --ignore-pattern 'dist/**' .",
